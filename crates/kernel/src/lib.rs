@@ -7,6 +7,7 @@ pub mod agent_struct;
 pub mod agent_syscalls;
 pub mod namespaces;
 pub mod init_system;
+pub mod cgroups;
 pub mod config;
 pub mod connector;
 pub mod context;

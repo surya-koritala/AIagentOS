@@ -33,6 +33,12 @@
     <button class="nav-item" class:active={view === 'dashboard'} on:click={() => dispatch('dashboard')}>
       <span>📊</span> Dashboard
     </button>
+    <button class="nav-item" class:active={view === 'activity'} on:click={() => dispatch('activity')}>
+      <span>📡</span> Activity
+    </button>
+    <button class="nav-item" class:active={view === 'settings'} on:click={() => dispatch('settings')}>
+      <span>⚙️</span> Settings
+    </button>
   </nav>
 
   <div class="section-header">

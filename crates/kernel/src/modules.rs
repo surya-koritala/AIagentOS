@@ -39,6 +39,19 @@ pub struct ModuleManifest {
     pub permissions: Vec<String>,
     pub capabilities: Vec<String>,
     pub resources: ResourceRequirements,
+    /// Tools this module provides (optional).
+    #[serde(default)]
+    pub tools: Vec<ModuleToolDeclaration>,
+}
+
+/// A tool declared by a module in its manifest.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModuleToolDeclaration {
+    pub name: String,
+    pub description: String,
+    pub function: String, // exported WASM function name
+    #[serde(default)]
+    pub parameters: serde_json::Value,
 }
 
 /// Information about an installed module.
@@ -69,6 +82,12 @@ struct ModuleState {
     wasm_bytes: Option<Vec<u8>>,
 }
 
+/// Host function context passed to WASM modules.
+pub struct HostContext {
+    /// Results from host function calls (module reads these).
+    pub last_result: String,
+}
+
 /// Concrete WASM module system implementation using Wasmtime.
 pub struct WasmModuleSystem {
     modules: DashMap<ModuleId, ModuleState>,
@@ -78,13 +97,85 @@ pub struct WasmModuleSystem {
 impl WasmModuleSystem {
     pub fn new() -> Result<Self, ModuleError> {
         let mut config = wasmtime::Config::new();
-        config.consume_fuel(true); // Enable fuel-based CPU limiting
+        config.consume_fuel(true);
         let engine = wasmtime::Engine::new(&config)
             .map_err(|e| ModuleError::LoadFailed(e.to_string()))?;
         Ok(Self {
             modules: DashMap::new(),
             engine: Mutex::new(engine),
         })
+    }
+
+    /// Execute a function exported by a loaded module.
+    /// Host functions (read_file, http_get, log) are available to the module.
+    pub fn execute_module_function(&self, module_id: &ModuleId, function: &str, input: &str) -> Result<String, ModuleError> {
+        let state = self.modules.get(module_id)
+            .ok_or_else(|| ModuleError::NotFound(module_id.clone()))?;
+
+        if state.info.status != ModuleStatus::Loaded && state.info.status != ModuleStatus::Active {
+            return Err(ModuleError::LoadFailed("Module not loaded".into()));
+        }
+
+        let bytes = state.wasm_bytes.as_ref()
+            .ok_or_else(|| ModuleError::LoadFailed("No WASM binary".into()))?;
+
+        let engine = self.engine.lock().unwrap();
+        let module = wasmtime::Module::new(&engine, bytes)
+            .map_err(|e| ModuleError::LoadFailed(e.to_string()))?;
+
+        let mut store = wasmtime::Store::new(&engine, HostContext { last_result: String::new() });
+        store.set_fuel(1_000_000).ok(); // CPU limit
+
+        let mut linker = wasmtime::Linker::new(&engine);
+
+        // Host function: log a message
+        linker.func_wrap("env", "host_log", |mut caller: wasmtime::Caller<'_, HostContext>, ptr: i32, len: i32| {
+            if let Some(memory) = caller.get_export("memory").and_then(|e| e.into_memory()) {
+                let data = memory.data(&caller);
+                if let Some(slice) = data.get(ptr as usize..(ptr as usize + len as usize)) {
+                    if let Ok(msg) = std::str::from_utf8(slice) {
+                        tracing::info!("[WASM module] {}", msg);
+                    }
+                }
+            }
+        }).ok();
+
+        // Host function: read a file (result stored in host context)
+        linker.func_wrap("env", "host_read_file", |mut caller: wasmtime::Caller<'_, HostContext>, ptr: i32, len: i32| -> i32 {
+            if let Some(memory) = caller.get_export("memory").and_then(|e| e.into_memory()) {
+                let data = memory.data(&caller);
+                if let Some(slice) = data.get(ptr as usize..(ptr as usize + len as usize)) {
+                    if let Ok(path) = std::str::from_utf8(slice) {
+                        match std::fs::read_to_string(path) {
+                            Ok(content) => {
+                                caller.data_mut().last_result = content;
+                                return 0; // success
+                            }
+                            Err(_) => return -1,
+                        }
+                    }
+                }
+            }
+            -1
+        }).ok();
+
+        // Host function: get result length
+        linker.func_wrap("env", "host_result_len", |caller: wasmtime::Caller<'_, HostContext>| -> i32 {
+            caller.data().last_result.len() as i32
+        }).ok();
+
+        // Instantiate module with host functions
+        let instance = linker.instantiate(&mut store, &module)
+            .map_err(|e| ModuleError::LoadFailed(format!("Instantiation failed: {}", e)))?;
+
+        // Call the requested function
+        let func = instance.get_typed_func::<(), i32>(&mut store, function)
+            .map_err(|e| ModuleError::LoadFailed(format!("Function '{}' not found: {}", function, e)))?;
+
+        let result = func.call(&mut store, ())
+            .map_err(|e| ModuleError::CrashDetected(format!("Module trapped: {}", e)))?;
+
+        Ok(result.to_string())
     }
 
     fn validate_manifest(manifest: &ModuleManifest) -> Result<(), ModuleError> {
@@ -286,6 +377,7 @@ filesystem_access = ["/tmp/*"]
             version: "1.0".to_string(),
             permissions: vec![],
             capabilities: vec![],
+            tools: vec![],
             resources: ResourceRequirements {
                 max_memory_bytes: None,
                 max_cpu_time_ms: None,

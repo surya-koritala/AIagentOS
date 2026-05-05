@@ -7,3 +7,4 @@ pub mod network;
 pub mod application;
 pub mod browser;
 pub mod peripheral;
+pub mod playwright;

@@ -29,6 +29,7 @@ pub mod database;
 pub mod delegation;
 pub mod production;
 pub mod indexer;
+pub mod vision;
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;

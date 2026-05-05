@@ -44,3 +44,6 @@ mod notification_props;
 
 #[cfg(test)]
 mod e2e_pipeline;
+
+#[cfg(test)]
+mod edge_cases;

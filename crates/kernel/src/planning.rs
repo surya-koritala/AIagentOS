@@ -113,7 +113,7 @@ pub async fn generate_plan(
 }
 
 /// Parse numbered steps from LLM response.
-fn parse_plan_steps(text: &str) -> Vec<PlanStep> {
+pub fn parse_plan_steps(text: &str) -> Vec<PlanStep> {
     text.lines()
         .filter_map(|line| {
             let trimmed = line.trim();

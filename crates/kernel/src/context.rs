@@ -137,7 +137,16 @@ impl SqliteContextManager {
                 embedding_json TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_facts_agent ON facts(agent_id);
-            CREATE INDEX IF NOT EXISTS idx_facts_category ON facts(agent_id, category);",
+            CREATE INDEX IF NOT EXISTS idx_facts_category ON facts(agent_id, category);
+            CREATE TABLE IF NOT EXISTS conversations (
+                id TEXT PRIMARY KEY,
+                agent_id TEXT NOT NULL,
+                messages_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_conv_agent ON conversations(agent_id);
+            CREATE INDEX IF NOT EXISTS idx_conv_updated ON conversations(updated_at);",
         ).map_err(|e| ContextError::StorageError(e.to_string()))?;
         Ok(())
     }
@@ -316,6 +325,52 @@ impl ContextManager for SqliteContextManager {
         }
 
         Ok(result)
+    }
+}
+
+/// Conversation persistence methods.
+impl SqliteContextManager {
+    /// Save a conversation (messages as JSON).
+    pub fn save_conversation(&self, id: &str, agent_id: AgentId, messages: &[crate::connector::StandardMessage]) -> Result<(), ContextError> {
+        let json = serde_json::to_string(messages)
+            .map_err(|e| ContextError::PersistenceFailed(e.to_string()))?;
+        let now = chrono::Utc::now().to_rfc3339();
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO conversations (id, agent_id, messages_json, created_at, updated_at) VALUES (?1, ?2, ?3, COALESCE((SELECT created_at FROM conversations WHERE id=?1), ?4), ?4)",
+            rusqlite::params![id, agent_id.to_string(), json, now],
+        ).map_err(|e| ContextError::PersistenceFailed(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Load a conversation's messages.
+    pub fn load_conversation(&self, id: &str) -> Result<Vec<crate::connector::StandardMessage>, ContextError> {
+        let conn = self.conn.lock().unwrap();
+        let json: String = conn.query_row(
+            "SELECT messages_json FROM conversations WHERE id = ?1",
+            rusqlite::params![id],
+            |row| row.get(0),
+        ).map_err(|e| ContextError::RestoreFailed(e.to_string()))?;
+        serde_json::from_str(&json).map_err(|e| ContextError::RestoreFailed(e.to_string()))
+    }
+
+    /// List all conversations, sorted by most recently updated.
+    pub fn list_conversations(&self) -> Vec<(String, String, String)> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, agent_id, updated_at FROM conversations ORDER BY updated_at DESC"
+        ).unwrap_or_else(|_| conn.prepare("SELECT 1, 2, 3 WHERE 0").unwrap());
+        stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+        }).ok().map(|rows| rows.filter_map(|r| r.ok()).collect()).unwrap_or_default()
+    }
+
+    /// Delete a conversation.
+    pub fn delete_conversation(&self, id: &str) -> Result<(), ContextError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM conversations WHERE id = ?1", rusqlite::params![id])
+            .map_err(|e| ContextError::PersistenceFailed(e.to_string()))?;
+        Ok(())
     }
 }
 

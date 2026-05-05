@@ -16,6 +16,7 @@ pub mod sandbox;
 pub mod scheduler;
 pub mod prerequisites;
 pub mod tools;
+pub mod custom_tools;
 pub mod execution;
 
 use serde::{Deserialize, Serialize};

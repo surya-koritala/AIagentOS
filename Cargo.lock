@@ -398,6 +398,7 @@ name = "cli-test"
 version = "0.1.0"
 dependencies = [
  "adapters",
+ "dirs 5.0.1",
  "kernel",
  "tokio",
 ]

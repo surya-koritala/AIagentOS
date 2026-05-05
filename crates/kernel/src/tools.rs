@@ -19,11 +19,13 @@ pub struct ToolBinding {
 /// Registry of available tools that agents can use.
 pub struct ToolRegistry {
     tools: HashMap<String, ToolBinding>,
+    /// Command templates for custom tools: name -> (command, args_template)
+    command_templates: HashMap<String, (String, Vec<String>)>,
 }
 
 impl ToolRegistry {
     pub fn new() -> Self {
-        let mut registry = Self { tools: HashMap::new() };
+        let mut registry = Self { tools: HashMap::new(), command_templates: HashMap::new() };
         registry.register_builtins();
         registry
     }
@@ -36,6 +38,12 @@ impl ToolRegistry {
     /// Unregister a tool by name.
     pub fn unregister(&mut self, name: &str) {
         self.tools.remove(name);
+        self.command_templates.remove(name);
+    }
+
+    /// Register a command template for a custom tool.
+    pub fn register_command_template(&mut self, name: &str, command: &str, args_template: &[String]) {
+        self.command_templates.insert(name.to_string(), (command.to_string(), args_template.to_vec()));
     }
 
     /// Generate LLM-compatible tool definitions.
@@ -51,7 +59,32 @@ impl ToolRegistry {
     pub fn resolve(&self, agent_id: AgentId, tool_call: &ToolCall) -> Option<ResourceRequest> {
         let binding = self.tools.get(&tool_call.name)?;
 
-        // Transform arguments for tools that need special mapping
+        // Check if this is a custom tool with a command template
+        if let Some((command, args_template)) = self.command_templates.get(&tool_call.name) {
+            let args: Vec<String> = args_template.iter().map(|tmpl| {
+                let mut result = tmpl.clone();
+                if let Some(obj) = tool_call.arguments.as_object() {
+                    for (key, val) in obj {
+                        let placeholder = format!("{{{}}}", key);
+                        let value = match val.as_str() {
+                            Some(s) => s.to_string(),
+                            None => val.to_string(),
+                        };
+                        result = result.replace(&placeholder, &value);
+                    }
+                }
+                result
+            }).collect();
+            return Some(ResourceRequest {
+                agent_id,
+                resource_type: ResourceType::Application,
+                operation: "launch".into(),
+                parameters: serde_json::json!({"command": command, "args": args}),
+                sandbox_context: None,
+            });
+        }
+
+        // Built-in tool resolution with special mappings
         let parameters = match tool_call.name.as_str() {
             "search_files" => {
                 let dir = tool_call.arguments.get("directory").and_then(|v| v.as_str()).unwrap_or(".");

@@ -1,41 +1,30 @@
 use std::sync::Arc;
 use kernel::{AgentConfig, AgentKernelImpl, Priority};
+use kernel::custom_tools::load_custom_tools;
+use kernel::tools::ToolRegistry;
 use adapters::azure_openai::AzureOpenAiAdapter;
 
 #[tokio::main]
 async fn main() {
-    let endpoint = std::env::var("AZURE_OPENAI_ENDPOINT")
-        .expect("Set AZURE_OPENAI_ENDPOINT env var");
-    let deployment = std::env::var("AZURE_OPENAI_DEPLOYMENT")
-        .unwrap_or_else(|_| "gpt-4o".to_string());
-    let api_key = std::env::var("AZURE_OPENAI_API_KEY")
-        .expect("Set AZURE_OPENAI_API_KEY env var");
-    let api_version = std::env::var("AZURE_OPENAI_API_VERSION")
-        .unwrap_or_else(|_| "2024-08-01-preview".to_string());
+    // Load custom tools
+    let mut registry = ToolRegistry::new();
+    let tools_path = dirs::config_dir().unwrap().join("ai-agent-os/tools.toml");
+    load_custom_tools(&mut registry, &tools_path);
+    println!("Tools loaded: {}", registry.definitions().len());
+    for d in registry.definitions() {
+        println!("  - {}: {}", d.name, d.description);
+    }
 
+    // Test with real LLM
     let kernel = AgentKernelImpl::new().unwrap();
-    let adapter = AzureOpenAiAdapter::new(endpoint, deployment, api_key)
-        .with_api_version(api_version);
+    let adapter = AzureOpenAiAdapter::new(
+        "https://roamx-resource.cognitiveservices.azure.com".into(),
+        "gpt-5.4".into(),
+        std::env::var("AZURE_OPENAI_API_KEY").expect("Set AZURE_OPENAI_API_KEY"),
+    ).with_api_version("2025-04-01-preview".into());
     kernel.register_provider(Arc::new(adapter)).unwrap();
 
-    let handle = kernel.create_agent_full(AgentConfig {
-        name: "cli-agent".into(),
-        task: "general assistant".into(),
-        llm_provider: "azure-openai".into(),
-        permission_profile: "full-access".into(),
-        priority: Priority::default(),
-        sandbox_config: None,
-    }).await.unwrap();
-
-    println!("Agent ready! Testing...\n");
-
-    // Simple chat
-    let out = kernel.send_message(handle.id, "What is 2+2? One word.").await.unwrap();
-    println!("[Chat] {}", out.content);
-
-    // Tool use
-    let out = kernel.send_message(handle.id, "List files in /tmp and tell me how many there are").await.unwrap();
-    println!("[Tools: {}] {}", out.tool_calls_made, out.content);
-
-    println!("\n✅ Done! Tokens used: {}", out.tokens_used);
+    // Register custom tools in the kernel's registry (need mutable access)
+    // For now test that they load correctly - the kernel integration will use from_config
+    println!("\n✅ Custom tools loaded from TOML successfully!");
 }

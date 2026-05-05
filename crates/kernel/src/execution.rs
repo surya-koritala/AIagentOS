@@ -2,6 +2,9 @@
 
 use std::sync::Arc;
 
+use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
+
 use crate::connector::{LlmSession, StandardMessage};
 use crate::context::{ContextManager, Fact, FactCategory, SqliteContextManager};
 use crate::resources::ResourceBroker;
@@ -17,6 +20,23 @@ const LLM_RETRIES: usize = 3;
 /// Message count threshold before triggering summarization.
 const MESSAGE_OVERFLOW_THRESHOLD: usize = 20;
 
+/// Events streamed during agent execution.
+#[derive(Debug, Clone)]
+pub enum StreamEvent {
+    /// A text token from the LLM.
+    Token(String),
+    /// A tool call is starting.
+    ToolCallStarted { name: String, arguments: String },
+    /// A tool call completed.
+    ToolCallResult { name: String, result: String },
+    /// Execution complete.
+    Done(AgentOutput),
+    /// Execution was cancelled.
+    Cancelled { tool_calls_made: usize },
+    /// An error occurred.
+    Error(String),
+}
+
 /// Output from the agent execution loop.
 #[derive(Debug, Clone)]
 pub struct AgentOutput {
@@ -28,11 +48,14 @@ pub struct AgentOutput {
 /// The agent executor — drives the think→act→observe loop.
 pub struct AgentExecutor {
     pub agent_id: AgentId,
+    pub conversation_id: String,
     session: Box<dyn LlmSession>,
     resource_broker: Arc<dyn ResourceBroker>,
     tool_registry: Arc<ToolRegistry>,
     context_manager: Arc<SqliteContextManager>,
     messages: Vec<StandardMessage>,
+    cancel_token: CancellationToken,
+    event_tx: Option<mpsc::Sender<StreamEvent>>,
     #[allow(dead_code)]
     system_prompt: String,
 }
@@ -44,17 +67,49 @@ impl AgentExecutor {
         resource_broker: Arc<dyn ResourceBroker>,
         tool_registry: Arc<ToolRegistry>,
         context_manager: Arc<SqliteContextManager>,
-        #[allow(dead_code)]
-    system_prompt: String,
+        system_prompt: String,
     ) -> Self {
         Self {
             agent_id,
+            conversation_id: uuid::Uuid::new_v4().to_string(),
             session,
             resource_broker,
             tool_registry,
             context_manager,
             messages: vec![StandardMessage::system(&system_prompt)],
+            cancel_token: CancellationToken::new(),
+            event_tx: None,
             system_prompt,
+        }
+    }
+
+    /// Resume from a saved conversation.
+    pub fn with_conversation(mut self, conversation_id: &str) -> Self {
+        self.conversation_id = conversation_id.to_string();
+        if let Ok(messages) = self.context_manager.load_conversation(conversation_id) {
+            self.messages = messages;
+        }
+        self
+    }
+
+    /// Set an event channel for streaming events to the caller.
+    pub fn set_event_channel(&mut self, tx: mpsc::Sender<StreamEvent>) {
+        self.event_tx = Some(tx);
+    }
+
+    /// Get a cancellation token for this executor.
+    pub fn cancel_token(&self) -> CancellationToken {
+        self.cancel_token.clone()
+    }
+
+    /// Cancel the running execution.
+    pub fn cancel(&self) {
+        self.cancel_token.cancel();
+    }
+
+    async fn emit(&self, event: StreamEvent) {
+        if let Some(ref tx) = self.event_tx {
+            let _ = tx.send(event).await;
         }
     }
 
@@ -93,6 +148,12 @@ impl AgentExecutor {
         let mut tool_calls_made: usize = 0;
 
         for _ in 0..MAX_ITERATIONS {
+            // Check cancellation
+            if self.cancel_token.is_cancelled() {
+                self.emit(StreamEvent::Cancelled { tool_calls_made }).await;
+                return Ok(AgentOutput { content: "Cancelled.".into(), tool_calls_made, tokens_used: total_tokens });
+            }
+
             // Think: send to LLM with retry
             let response = self.send_with_retry(&tools).await?;
 
@@ -115,11 +176,14 @@ impl AgentExecutor {
                     let _ = self.context_manager.store_fact(self.agent_id, fact).await;
                 }
 
-                return Ok(AgentOutput {
+                let output = AgentOutput {
                     content: response.content,
                     tool_calls_made,
                     tokens_used: total_tokens,
-                });
+                };
+                self.emit(StreamEvent::Done(output.clone())).await;
+                self.save_conversation();
+                return Ok(output);
             }
 
             // Act: execute tool calls
@@ -128,10 +192,20 @@ impl AgentExecutor {
             self.messages.push(assistant_msg);
 
             for tool_call in &response.tool_calls {
+                if self.cancel_token.is_cancelled() {
+                    self.emit(StreamEvent::Cancelled { tool_calls_made }).await;
+                    return Ok(AgentOutput { content: "Cancelled.".into(), tool_calls_made, tokens_used: total_tokens });
+                }
                 tool_calls_made += 1;
+                self.emit(StreamEvent::ToolCallStarted {
+                    name: tool_call.name.clone(),
+                    arguments: tool_call.arguments.to_string(),
+                }).await;
                 let result = self.execute_tool(tool_call).await;
-                // Observe: add tool result (success or error) to messages
-                // Errors are sent back to the LLM so it can recover
+                self.emit(StreamEvent::ToolCallResult {
+                    name: tool_call.name.clone(),
+                    result: result.chars().take(200).collect(),
+                }).await;
                 self.messages.push(StandardMessage::tool_result(&tool_call.id, &result));
             }
         }
@@ -183,6 +257,11 @@ impl AgentExecutor {
     /// Get the current message history.
     pub fn messages(&self) -> &[StandardMessage] {
         &self.messages
+    }
+
+    /// Save the current conversation to SQLite.
+    fn save_conversation(&self) {
+        let _ = self.context_manager.save_conversation(&self.conversation_id, self.agent_id, &self.messages);
     }
 }
 

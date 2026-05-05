@@ -11,3 +11,4 @@ path = "cli_test.rs"
 kernel = { path = "../crates/kernel" }
 adapters = { path = "../crates/adapters" }
 tokio = { version = "1", features = ["full"] }
+dirs = "5"

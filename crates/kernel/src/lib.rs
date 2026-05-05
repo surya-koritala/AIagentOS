@@ -3,6 +3,7 @@
 //! Core types, error hierarchy, and module declarations for the Agent Kernel.
 
 pub mod agent;
+pub mod agent_struct;
 pub mod config;
 pub mod connector;
 pub mod context;

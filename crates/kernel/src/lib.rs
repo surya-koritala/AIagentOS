@@ -18,6 +18,7 @@ pub mod prerequisites;
 pub mod tools;
 pub mod custom_tools;
 pub mod execution;
+pub mod planning;
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;

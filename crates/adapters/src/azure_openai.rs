@@ -137,6 +137,102 @@ impl LlmSession for AzureSession {
     }
 
     fn provider_id(&self) -> &ProviderId { &self.provider_id }
+
+    async fn send_streaming(&self, messages: Vec<StandardMessage>, tools: &[ToolDefinition]) -> Result<LlmResponse, ConnectorError> {
+        let msgs: Vec<serde_json::Value> = messages.iter().map(|m| {
+            let mut obj = serde_json::json!({"role": m.role, "content": m.content});
+            if let Some(ref id) = m.tool_call_id { obj["tool_call_id"] = serde_json::json!(id); }
+            if let Some(ref tcs) = m.tool_calls {
+                obj["tool_calls"] = serde_json::json!(tcs.iter().map(|tc| serde_json::json!({
+                    "id": tc.id, "type": "function", "function": {"name": tc.name, "arguments": tc.arguments.to_string()}
+                })).collect::<Vec<_>>());
+            }
+            obj
+        }).collect();
+
+        let mut body = serde_json::json!({"messages": msgs, "stream": true, "stream_options": {"include_usage": true}});
+        if !tools.is_empty() {
+            let tool_defs: Vec<serde_json::Value> = tools.iter().map(|t| serde_json::json!({
+                "type": "function", "function": {"name": t.name, "description": t.description, "parameters": t.parameters}
+            })).collect();
+            body["tools"] = serde_json::json!(tool_defs);
+        }
+
+        let resp = self.client.post(&self.chat_url)
+            .header("api-key", &self.api_key)
+            .header("Content-Type", "application/json")
+            .json(&body)
+            .send().await
+            .map_err(|e| ConnectorError::ConnectionFailed(e.to_string()))?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            return Err(ConnectorError::ConnectionFailed(format!("HTTP {} - {}", status, text)));
+        }
+
+        let full_body = resp.text().await.map_err(|e| ConnectorError::StreamError(e.to_string()))?;
+
+        // If response is not SSE (e.g., from wiremock), parse as regular JSON
+        if !full_body.starts_with("data:") {
+            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&full_body) {
+                let content = json["choices"][0]["message"]["content"].as_str().unwrap_or("").to_string();
+                let tokens = json["usage"]["total_tokens"].as_u64().unwrap_or(0) as u32;
+                let tool_calls = json["choices"][0]["message"]["tool_calls"].as_array()
+                    .map(|arr| arr.iter().filter_map(|tc| Some(ToolCall {
+                        id: tc["id"].as_str()?.to_string(),
+                        name: tc["function"]["name"].as_str()?.to_string(),
+                        arguments: serde_json::from_str(tc["function"]["arguments"].as_str()?).unwrap_or(serde_json::Value::Null),
+                    })).collect()).unwrap_or_default();
+                return Ok(LlmResponse { content, finish_reason: Some("stop".into()), tokens_used: tokens, tool_calls });
+            }
+        }
+
+        // Parse SSE stream
+        let mut content = String::new();
+        let mut tool_calls: Vec<ToolCall> = Vec::new();
+        let mut tool_args: std::collections::HashMap<usize, String> = std::collections::HashMap::new();
+        let mut tokens_used: u32 = 0;
+
+        for line in full_body.lines() {
+            if let Some(data) = line.strip_prefix("data: ") {
+                if data == "[DONE]" { continue; }
+                if let Ok(json) = serde_json::from_str::<serde_json::Value>(data) {
+                    if let Some(delta) = json["choices"].get(0).and_then(|c| c.get("delta")) {
+                        if let Some(text) = delta["content"].as_str() {
+                            content.push_str(text);
+                            eprint!("{}", text);
+                        }
+                        if let Some(tcs) = delta["tool_calls"].as_array() {
+                            for tc in tcs {
+                                let idx = tc["index"].as_u64().unwrap_or(0) as usize;
+                                if let Some(id) = tc["id"].as_str() {
+                                    let name = tc["function"]["name"].as_str().unwrap_or("").to_string();
+                                    tool_calls.push(ToolCall { id: id.to_string(), name, arguments: serde_json::Value::Null });
+                                }
+                                if let Some(args) = tc["function"]["arguments"].as_str() {
+                                    tool_args.entry(idx).or_default().push_str(args);
+                                }
+                            }
+                        }
+                    }
+                    if let Some(usage) = json.get("usage") {
+                        tokens_used = usage["total_tokens"].as_u64().unwrap_or(0) as u32;
+                    }
+                }
+            }
+        }
+
+        if !content.is_empty() { eprintln!(); }
+
+        for (idx, args) in &tool_args {
+            if let Some(tc) = tool_calls.get_mut(*idx) {
+                tc.arguments = serde_json::from_str(args).unwrap_or(serde_json::Value::Null);
+            }
+        }
+
+        Ok(LlmResponse { content, finish_reason: Some("stop".into()), tokens_used, tool_calls })
+    }
 }
 
 #[async_trait::async_trait]

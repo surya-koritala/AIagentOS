@@ -239,7 +239,7 @@ impl AgentExecutor {
             if attempt > 0 {
                 tokio::time::sleep(tokio::time::Duration::from_millis(500 * (1 << attempt))).await;
             }
-            match self.session.send_with_tools(self.messages.clone(), tools).await {
+            match self.session.send_streaming(self.messages.clone(), tools).await {
                 Ok(response) => return Ok(response),
                 Err(e) => { last_err = Some(e); }
             }

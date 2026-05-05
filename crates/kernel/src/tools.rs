@@ -313,3 +313,30 @@ impl ToolRegistry {
         });
     }
 }
+
+// Git tools registered via register_git_tools()
+impl ToolRegistry {
+    pub fn register_git_tools(&mut self) {
+        self.register(ToolBinding {
+            name: "git_commit".into(),
+            description: "Stage all changes and create a git commit with the given message".into(),
+            parameters_schema: serde_json::json!({
+                "type": "object",
+                "properties": {"message": {"type": "string", "description": "Commit message"}},
+                "required": ["message"]
+            }),
+            resource_type: ResourceType::Application,
+            operation: "launch".into(),
+        });
+        self.register_command_template("git_commit", "git", &["add".into(), "-A".into()]);
+
+        self.register(ToolBinding {
+            name: "git_diff".into(),
+            description: "Show the current git diff (unstaged changes)".into(),
+            parameters_schema: serde_json::json!({"type": "object", "properties": {}}),
+            resource_type: ResourceType::Application,
+            operation: "launch".into(),
+        });
+        self.register_command_template("git_diff", "git", &["diff".into()]);
+    }
+}

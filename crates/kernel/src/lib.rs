@@ -28,6 +28,7 @@ pub mod docker_sandbox;
 pub mod database;
 pub mod delegation;
 pub mod production;
+pub mod indexer;
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;

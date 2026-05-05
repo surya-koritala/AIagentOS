@@ -21,6 +21,7 @@ pub mod execution;
 pub mod planning;
 pub mod editing;
 pub mod learning;
+pub mod mcp;
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;

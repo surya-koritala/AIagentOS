@@ -377,22 +377,45 @@ struct BuiltinNetworkProvider;
 #[async_trait::async_trait]
 impl ResourceProvider for BuiltinNetworkProvider {
     fn resource_type(&self) -> ResourceType { ResourceType::Network }
-    fn supported_operations(&self) -> Vec<String> { vec!["get".into(), "post".into()] }
+    fn supported_operations(&self) -> Vec<String> { vec!["get".into(), "post".into(), "browse".into()] }
     async fn execute(&self, operation: &str, params: &serde_json::Value) -> Result<serde_json::Value, ResourceError> {
         let url = params.get("url").and_then(|v| v.as_str())
             .ok_or_else(|| ResourceError::OperationFailed("Missing 'url'".into()))?;
         let client = reqwest::Client::new();
-        let resp = match operation {
-            "get" => client.get(url).send().await,
+        match operation {
+            "get" => {
+                let resp = client.get(url).send().await.map_err(|e| ResourceError::OperationFailed(e.to_string()))?;
+                let status = resp.status().as_u16();
+                let body = resp.text().await.map_err(|e| ResourceError::OperationFailed(e.to_string()))?;
+                Ok(serde_json::json!({"status": status, "body": body}))
+            }
             "post" => {
                 let body = params.get("body").cloned().unwrap_or(serde_json::Value::Null);
-                client.post(url).json(&body).send().await
+                let resp = client.post(url).json(&body).send().await.map_err(|e| ResourceError::OperationFailed(e.to_string()))?;
+                let status = resp.status().as_u16();
+                let text = resp.text().await.map_err(|e| ResourceError::OperationFailed(e.to_string()))?;
+                Ok(serde_json::json!({"status": status, "body": text}))
             }
-            _ => return Err(ResourceError::OperationFailed(format!("Unknown op: {}", operation))),
-        }.map_err(|e| ResourceError::OperationFailed(e.to_string()))?;
-        let status = resp.status().as_u16();
-        let body = resp.text().await.map_err(|e| ResourceError::OperationFailed(e.to_string()))?;
-        Ok(serde_json::json!({"status": status, "body": body}))
+            "browse" => {
+                let resp = client.get(url).header("User-Agent", "Mozilla/5.0 AIAgentOS/1.0")
+                    .send().await.map_err(|e| ResourceError::OperationFailed(e.to_string()))?;
+                let html = resp.text().await.map_err(|e| ResourceError::OperationFailed(e.to_string()))?;
+                let mut in_tag = false;
+                let mut text = String::new();
+                for c in html.chars() {
+                    match c {
+                        '<' => in_tag = true,
+                        '>' => in_tag = false,
+                        _ if !in_tag => text.push(c),
+                        _ => {}
+                    }
+                }
+                let clean: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
+                let truncated: String = clean.chars().take(4000).collect();
+                Ok(serde_json::json!({"content": truncated}))
+            }
+            _ => Err(ResourceError::OperationFailed(format!("Unknown op: {}", operation))),
+        }
     }
 }
 

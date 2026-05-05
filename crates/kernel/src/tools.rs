@@ -295,3 +295,21 @@ mod tests {
         assert!(!reg.has_tool("custom_tool"));
     }
 }
+
+// Sprint 3 tools are registered separately via register_advanced_tools()
+impl ToolRegistry {
+    /// Register advanced tools (delegation, web browsing).
+    pub fn register_advanced_tools(&mut self) {
+        self.register(ToolBinding {
+            name: "browse_url".into(),
+            description: "Fetch a URL and extract readable text content (HTML stripped)".into(),
+            parameters_schema: serde_json::json!({
+                "type": "object",
+                "properties": {"url": {"type": "string", "description": "URL to browse"}},
+                "required": ["url"]
+            }),
+            resource_type: ResourceType::Network,
+            operation: "browse".into(),
+        });
+    }
+}

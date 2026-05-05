@@ -1,7 +1,7 @@
 # AI Agent OS
 
 [![Build Status](https://github.com/surya-koritala/AIagentOS/actions/workflows/ci.yml/badge.svg)](https://github.com/surya-koritala/AIagentOS/actions)
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL%20v3-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.75%2B-orange.svg)](https://www.rust-lang.org/)
 
 **An operating system kernel for AI agents** — manage multiple autonomous AI agents the way a traditional OS manages processes, with scheduling, isolation, permissions, and inter-process communication.

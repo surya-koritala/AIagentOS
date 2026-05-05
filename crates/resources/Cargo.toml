@@ -13,6 +13,8 @@ thiserror = { workspace = true }
 anyhow = { workspace = true }
 rusqlite = { workspace = true }
 reqwest = { workspace = true }
+scraper = { workspace = true }
+urlencoding = "2"
 tracing = { workspace = true }
 
 [dev-dependencies]

@@ -23,6 +23,8 @@ pub mod editing;
 pub mod learning;
 pub mod mcp;
 pub mod rate_limit;
+pub mod github;
+pub mod docker_sandbox;
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;

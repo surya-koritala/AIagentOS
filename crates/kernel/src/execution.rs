@@ -53,6 +53,7 @@ pub struct AgentExecutor {
     resource_broker: Arc<dyn ResourceBroker>,
     tool_registry: Arc<ToolRegistry>,
     context_manager: Arc<SqliteContextManager>,
+    rule_store: Option<Arc<crate::learning::RuleStore>>,
     messages: Vec<StandardMessage>,
     cancel_token: CancellationToken,
     event_tx: Option<mpsc::Sender<StreamEvent>>,
@@ -76,6 +77,7 @@ impl AgentExecutor {
             resource_broker,
             tool_registry,
             context_manager,
+            rule_store: None,
             messages: vec![StandardMessage::system(&system_prompt)],
             cancel_token: CancellationToken::new(),
             event_tx: None,
@@ -95,6 +97,11 @@ impl AgentExecutor {
     /// Set an event channel for streaming events to the caller.
     pub fn set_event_channel(&mut self, tx: mpsc::Sender<StreamEvent>) {
         self.event_tx = Some(tx);
+    }
+
+    /// Set a rule store for learning from corrections.
+    pub fn set_rule_store(&mut self, store: Arc<crate::learning::RuleStore>) {
+        self.rule_store = Some(store);
     }
 
     /// Get a cancellation token for this executor.
@@ -120,6 +127,13 @@ impl AgentExecutor {
             if !facts.is_empty() {
                 let memory_text = facts.iter().map(|f| f.content.as_str()).collect::<Vec<_>>().join("\n");
                 self.messages.push(StandardMessage::system(format!("Relevant memories:\n{}", memory_text)));
+            }
+        }
+
+        // Inject applicable correction rules
+        if let Some(ref store) = self.rule_store {
+            if let Some(rules_prompt) = store.rules_as_prompt(user_message) {
+                self.messages.push(StandardMessage::system(rules_prompt));
             }
         }
 

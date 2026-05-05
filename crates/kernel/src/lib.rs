@@ -473,6 +473,7 @@ use crate::resources::{ResourceBroker, ResourceBrokerImpl};
 use crate::sandbox::{SandboxManager, SandboxManagerImpl};
 use crate::scheduler::{AgentScheduler, PriorityScheduler};
 use crate::tools::ToolRegistry;
+use crate::rate_limit::{RateLimiter, RateLimitConfig};
 
 /// The wired kernel orchestrator holding all subsystem instances.
 pub struct AgentKernelImpl {
@@ -486,6 +487,7 @@ pub struct AgentKernelImpl {
     pub connector: Arc<AgentConnectorImpl>,
     pub resource_broker: Arc<ResourceBrokerImpl>,
     pub tool_registry: Arc<ToolRegistry>,
+    pub rate_limiter: Arc<RateLimiter>,
     executors: DashMap<AgentId, tokio::sync::Mutex<AgentExecutor>>,
     event_tx: broadcast::Sender<KernelEvent>,
 }
@@ -540,6 +542,7 @@ impl AgentKernelImpl {
             connector: Arc::new(AgentConnectorImpl::new()),
             resource_broker,
             tool_registry: Arc::new(ToolRegistry::new()),
+            rate_limiter: Arc::new(RateLimiter::new(RateLimitConfig::default())),
             executors: DashMap::new(),
             event_tx,
         })
@@ -609,17 +612,18 @@ impl AgentKernelImpl {
             self.executors.insert(agent_id, tokio::sync::Mutex::new(executor));
         }
 
-        // Run the execution loop
+        // Run the execution loop (rate limited)
+        let _guard = self.rate_limiter.acquire().await;
         let executor_entry = self.executors.get(&agent_id)
             .ok_or(AgentError::NotFound(agent_id))?;
         let mut executor = executor_entry.lock().await;
         let output = executor.run(message).await?;
 
-        // Record activity
+        // Record activity and usage
         self.agent_manager.record_activity(agent_id);
-
-        // Record metrics
+        self.rate_limiter.record_tokens(output.tokens_used as u64);
         ObservabilityEngine::record_metrics(&*self.observability, agent_id, output.tokens_used as u64, 1);
+        self.context_manager.log_usage(agent_id, output.tokens_used, "gpt-5.4", 0.01);
 
         Ok(output)
     }

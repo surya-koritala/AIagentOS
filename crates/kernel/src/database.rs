@@ -84,7 +84,7 @@ impl QueryResult {
             return format!("Rows affected: {}", self.rows_affected);
         }
         let mut out = self.columns.join(" | ") + "\n";
-        out += &"-".repeat(out.len()) + "\n";
+        out += &format!("{}\n", "-".repeat(out.len()));
         for row in &self.rows {
             let cells: Vec<String> = row.iter().map(|v| match v {
                 serde_json::Value::String(s) => s.clone(),

@@ -146,7 +146,16 @@ impl SqliteContextManager {
                 updated_at TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_conv_agent ON conversations(agent_id);
-            CREATE INDEX IF NOT EXISTS idx_conv_updated ON conversations(updated_at);",
+            CREATE INDEX IF NOT EXISTS idx_conv_updated ON conversations(updated_at);
+            CREATE TABLE IF NOT EXISTS usage_log (
+                id TEXT PRIMARY KEY,
+                agent_id TEXT NOT NULL,
+                timestamp TEXT NOT NULL,
+                tokens_used INTEGER NOT NULL,
+                model TEXT,
+                estimated_cost_usd REAL
+            );
+            CREATE VIRTUAL TABLE IF NOT EXISTS conversations_fts USING fts5(conversation_id, content);",
         ).map_err(|e| ContextError::StorageError(e.to_string()))?;
         Ok(())
     }
@@ -340,6 +349,11 @@ impl SqliteContextManager {
             "INSERT OR REPLACE INTO conversations (id, agent_id, messages_json, created_at, updated_at) VALUES (?1, ?2, ?3, COALESCE((SELECT created_at FROM conversations WHERE id=?1), ?4), ?4)",
             rusqlite::params![id, agent_id.to_string(), json, now],
         ).map_err(|e| ContextError::PersistenceFailed(e.to_string()))?;
+        let text_content: String = messages.iter().map(|m| m.content.as_str()).collect::<Vec<_>>().join(" ");
+        conn.execute(
+            "INSERT OR REPLACE INTO conversations_fts (conversation_id, content) VALUES (?1, ?2)",
+            rusqlite::params![id, text_content],
+        ).ok();
         Ok(())
     }
 
@@ -371,6 +385,57 @@ impl SqliteContextManager {
         conn.execute("DELETE FROM conversations WHERE id = ?1", rusqlite::params![id])
             .map_err(|e| ContextError::PersistenceFailed(e.to_string()))?;
         Ok(())
+    }
+
+    /// Export a conversation as JSON.
+    pub fn export_conversation(&self, id: &str) -> Result<String, ContextError> {
+        let messages = self.load_conversation(id)?;
+        let export = serde_json::json!({
+            "version": 1,
+            "conversation_id": id,
+            "messages": messages,
+            "exported_at": chrono::Utc::now().to_rfc3339(),
+        });
+        serde_json::to_string_pretty(&export).map_err(|e| ContextError::PersistenceFailed(e.to_string()))
+    }
+
+    /// Import a conversation from JSON.
+    pub fn import_conversation(&self, json: &str) -> Result<String, ContextError> {
+        let data: serde_json::Value = serde_json::from_str(json)
+            .map_err(|e| ContextError::RestoreFailed(format!("Invalid JSON: {}", e)))?;
+        let messages: Vec<crate::connector::StandardMessage> = serde_json::from_value(data["messages"].clone())
+            .map_err(|e| ContextError::RestoreFailed(format!("Invalid messages: {}", e)))?;
+        let id = uuid::Uuid::new_v4().to_string();
+        let agent_id = uuid::Uuid::nil();
+        self.save_conversation(&id, agent_id, &messages)?;
+        Ok(id)
+    }
+
+    pub fn log_usage(&self, agent_id: AgentId, tokens: u32, model: &str, cost_per_1k: f64) {
+        let cost = (tokens as f64 / 1000.0) * cost_per_1k;
+        let conn = self.conn.lock().unwrap();
+        let _ = conn.execute(
+            "INSERT INTO usage_log (id, agent_id, timestamp, tokens_used, model, estimated_cost_usd) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![uuid::Uuid::new_v4().to_string(), agent_id.to_string(), chrono::Utc::now().to_rfc3339(), tokens, model, cost],
+        );
+    }
+
+    pub fn get_total_usage(&self) -> (u64, f64) {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT COALESCE(SUM(tokens_used), 0), COALESCE(SUM(estimated_cost_usd), 0.0) FROM usage_log",
+            [], |row| Ok((row.get::<_, i64>(0)? as u64, row.get::<_, f64>(1)?)),
+        ).unwrap_or((0, 0.0))
+    }
+
+    pub fn search_conversations(&self, query: &str) -> Vec<(String, String)> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT conversation_id, snippet(conversations_fts, 1, '**', '**', '...', 32) FROM conversations_fts WHERE content MATCH ?1 LIMIT 20"
+        ).unwrap_or_else(|_| conn.prepare("SELECT 1, 2 WHERE 0").unwrap());
+        stmt.query_map(rusqlite::params![query], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        }).ok().map(|rows| rows.filter_map(|r| r.ok()).collect()).unwrap_or_default()
     }
 }
 

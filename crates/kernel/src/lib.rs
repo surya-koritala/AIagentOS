@@ -331,6 +331,14 @@ pub enum SandboxError {
 
 use crate::resources::{ResourceProvider, ResourceType};
 
+/// Configurable max chars for browse_url (set from config on startup).
+static MAX_BROWSE_CHARS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(16000);
+
+/// Set the max browse chars (call from config on startup).
+pub fn set_max_browse_chars(chars: usize) {
+    MAX_BROWSE_CHARS.store(chars, std::sync::atomic::Ordering::Relaxed);
+}
+
 struct BuiltinFilesystemProvider;
 
 #[async_trait::async_trait]
@@ -411,7 +419,7 @@ impl ResourceProvider for BuiltinNetworkProvider {
                     }
                 }
                 let clean: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
-                let truncated: String = clean.chars().take(4000).collect();
+                let truncated: String = clean.chars().take(MAX_BROWSE_CHARS.load(std::sync::atomic::Ordering::Relaxed)).collect();
                 Ok(serde_json::json!({"content": truncated}))
             }
             _ => Err(ResourceError::OperationFailed(format!("Unknown op: {}", operation))),
@@ -498,6 +506,7 @@ impl AgentKernelImpl {
 
     /// Create a kernel from config (uses config.data_dir for persistence).
     pub fn from_config(config: &crate::config::Config) -> Result<Self, KernelError> {
+        set_max_browse_chars(config.max_browse_chars);
         let db_path = config.data_dir.join("agent_os.db");
         Self::with_db_path(&db_path)
     }

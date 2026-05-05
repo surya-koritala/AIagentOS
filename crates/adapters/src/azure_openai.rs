@@ -146,10 +146,8 @@ impl LlmProviderAdapter for AzureOpenAiAdapter {
     fn provider_type(&self) -> ProviderType { ProviderType::Cloud }
 
     async fn is_available(&self) -> bool {
-        // Simple check — try to reach the endpoint
-        self.client.get(&self.endpoint)
-            .header("api-key", &self.api_key)
-            .send().await.is_ok()
+        // Azure endpoints don't respond to bare GET — just check we have credentials
+        !self.api_key.is_empty() && !self.endpoint.is_empty()
     }
 
     async fn create_session(&self) -> Result<Box<dyn LlmSession>, ConnectorError> {

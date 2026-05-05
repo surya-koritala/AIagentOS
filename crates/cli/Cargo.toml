@@ -1,0 +1,14 @@
+[package]
+name = "agent-cli"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "agent"
+path = "src/main.rs"
+
+[dependencies]
+kernel = { path = "../kernel" }
+adapters = { path = "../adapters" }
+tokio = { version = "1", features = ["full"] }
+dirs = "5"

@@ -23,6 +23,9 @@ pub struct Config {
     pub azure_deployment: Option<String>,
     #[serde(default)]
     pub azure_api_version: Option<String>,
+    /// Max characters to return from browse_url (default 16000).
+    #[serde(default = "default_max_browse_chars")]
+    pub max_browse_chars: usize,
 }
 
 impl Default for Config {
@@ -36,9 +39,12 @@ impl Default for Config {
             azure_endpoint: None,
             azure_deployment: None,
             azure_api_version: None,
+            max_browse_chars: default_max_browse_chars(),
         }
     }
 }
+
+fn default_max_browse_chars() -> usize { 16000 }
 
 impl Config {
     /// Load config from the default path, or create default if missing.

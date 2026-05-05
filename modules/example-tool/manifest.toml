@@ -1,0 +1,11 @@
+id = "example-tool"
+name = "Example Tool Module"
+version = "0.1.0"
+permissions = ["filesystem.read", "filesystem.list"]
+capabilities = ["tool.file_search", "tool.word_count"]
+
+[resources]
+max_memory_bytes = 10485760
+max_cpu_time_ms = 5000
+network_access = false
+filesystem_access = ["/tmp/*"]

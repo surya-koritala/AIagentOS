@@ -1,0 +1,33 @@
+[workspace]
+members = [
+    "crates/kernel",
+    "crates/adapters",
+    "crates/resources",
+    "crates/tauri-app",
+    "tests",
+]
+resolver = "2"
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["full"] }
+async-trait = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+thiserror = "2"
+anyhow = "1"
+rusqlite = { version = "0.32", features = ["bundled"] }
+reqwest = { version = "0.12", features = ["json", "stream"] }
+tokio-tungstenite = "0.24"
+wasmtime = "27"
+dashmap = "6"
+tokio-util = "0.7"
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+proptest = "1"
+wiremock = "0.6"
+tauri = "2"
+tauri-build = "2"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+dirs = "5"

@@ -1,0 +1,37 @@
+# Build artifacts
+/target/
+**/target/
+
+# Dependencies
+**/node_modules/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment
+.env
+.env.local
+
+# Config with secrets (don't commit API keys)
+config.toml
+
+# SQLite databases
+*.db
+*.db-journal
+*.db-wal
+
+# Compiled WASM
+*.wasm
+
+# Proptest regressions (auto-generated)
+**/proptest-regressions/
+
+# Frontend build output (regenerated)
+crates/tauri-app/ui/dist/

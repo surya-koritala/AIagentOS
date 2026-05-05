@@ -1,0 +1,16 @@
+[package]
+name = "tauri-app"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+kernel = { path = "../kernel" }
+adapters = { path = "../adapters" }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+tauri = { workspace = true, features = ["devtools"] }
+
+[build-dependencies]
+tauri-build = { workspace = true }

@@ -233,13 +233,17 @@ impl AgentExecutor {
     }
 
     /// Send to LLM with retry (3 attempts, exponential backoff).
+    /// Send to LLM with retry. Filters orphaned tool messages to prevent API errors.
     async fn send_with_retry(&self, tools: &[crate::connector::ToolDefinition]) -> Result<crate::connector::LlmResponse, KernelError> {
+        // Filter messages: remove tool results that don't have a preceding tool_calls message
+        let clean_messages = self.clean_messages();
+
         let mut last_err = None;
         for attempt in 0..LLM_RETRIES {
             if attempt > 0 {
                 tokio::time::sleep(tokio::time::Duration::from_millis(500 * (1 << attempt))).await;
             }
-            match self.session.send_streaming(self.messages.clone(), tools).await {
+            match self.session.send_streaming(clean_messages.clone(), tools).await {
                 Ok(response) => return Ok(response),
                 Err(e) => { last_err = Some(e); }
             }
@@ -276,6 +280,26 @@ impl AgentExecutor {
     /// Save the current conversation to SQLite.
     fn save_conversation(&self) {
         let _ = self.context_manager.save_conversation(&self.conversation_id, self.agent_id, &self.messages);
+    }
+
+    /// Clean messages: remove orphaned tool results (tool messages without preceding tool_calls).
+    fn clean_messages(&self) -> Vec<StandardMessage> {
+        let mut clean = Vec::new();
+        let mut last_had_tool_calls = false;
+
+        for msg in &self.messages {
+            if msg.role == "tool" {
+                // Only include tool messages if the previous assistant message had tool_calls
+                if last_had_tool_calls {
+                    clean.push(msg.clone());
+                }
+                // Don't update last_had_tool_calls for tool messages
+            } else {
+                last_had_tool_calls = msg.tool_calls.as_ref().map(|tc| !tc.is_empty()).unwrap_or(false);
+                clean.push(msg.clone());
+            }
+        }
+        clean
     }
 }
 

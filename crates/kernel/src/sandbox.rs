@@ -31,6 +31,7 @@ pub enum SandboxAction {
 
 /// Internal sandbox state.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 struct SandboxState {
     id: SandboxId,
     agent_id: AgentId,
@@ -56,7 +57,7 @@ impl SandboxManagerImpl {
     /// Canonicalize a path and check if it's within the sandbox boundary.
     fn is_within_boundary(workspace: &Path, target: &Path) -> bool {
         // Canonicalize both paths to resolve symlinks and ..
-        let workspace_canonical = workspace.to_path_buf();
+        let _workspace_canonical = workspace.to_path_buf();
         // Use lexical normalization for testing (real impl would use fs::canonicalize)
         let target_normalized = Self::normalize_path(target);
         let workspace_normalized = Self::normalize_path(workspace);

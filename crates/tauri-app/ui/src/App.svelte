@@ -15,6 +15,10 @@
   let metrics = { tokens_consumed: 0, api_calls_made: 0, time_elapsed_ms: 0 };
 
   async function init() {
+    // Wait for Tauri IPC to be ready
+    if (!window.__TAURI_INTERNALS__) {
+      await new Promise(r => setTimeout(r, 500));
+    }
     try {
       const config = await invoke('load_config');
       if (!config.setup_complete) { showSetup = true; return; }

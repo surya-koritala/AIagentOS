@@ -50,11 +50,36 @@ impl ToolRegistry {
     /// Resolve a tool call into a ResourceRequest.
     pub fn resolve(&self, agent_id: AgentId, tool_call: &ToolCall) -> Option<ResourceRequest> {
         let binding = self.tools.get(&tool_call.name)?;
+
+        // Transform arguments for tools that need special mapping
+        let parameters = match tool_call.name.as_str() {
+            "search_files" => {
+                let dir = tool_call.arguments.get("directory").and_then(|v| v.as_str()).unwrap_or(".");
+                let pattern = tool_call.arguments.get("pattern").and_then(|v| v.as_str()).unwrap_or("*");
+                serde_json::json!({"command": "find", "args": [dir, "-name", pattern, "-type", "f"]})
+            }
+            "git_status" => {
+                let dir = tool_call.arguments.get("directory").and_then(|v| v.as_str()).unwrap_or(".");
+                serde_json::json!({"command": "git", "args": ["-C", dir, "status", "--short"]})
+            }
+            "create_directory" => {
+                let path = tool_call.arguments.get("path").and_then(|v| v.as_str()).unwrap_or("");
+                serde_json::json!({"command": "mkdir", "args": ["-p", path]})
+            }
+            _ => tool_call.arguments.clone(),
+        };
+
+        // create_directory uses Application provider (mkdir -p)
+        let (resource_type, operation) = match tool_call.name.as_str() {
+            "create_directory" => (ResourceType::Application, "launch".to_string()),
+            _ => (binding.resource_type.clone(), binding.operation.clone()),
+        };
+
         Some(ResourceRequest {
             agent_id,
-            resource_type: binding.resource_type.clone(),
-            operation: binding.operation.clone(),
-            parameters: tool_call.arguments.clone(),
+            resource_type,
+            operation,
+            parameters,
             sandbox_context: None,
         })
     }
@@ -129,6 +154,47 @@ impl ToolRegistry {
             }),
             resource_type: ResourceType::Application,
             operation: "launch".into(),
+        });
+
+        self.register(ToolBinding {
+            name: "search_files".into(),
+            description: "Search for files matching a pattern recursively in a directory".into(),
+            parameters_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "directory": {"type": "string", "description": "Directory to search in"},
+                    "pattern": {"type": "string", "description": "Filename pattern to match (e.g., '*.rs', 'test*')"}
+                },
+                "required": ["directory", "pattern"]
+            }),
+            resource_type: ResourceType::Application,
+            operation: "launch".into(),
+        });
+
+        self.register(ToolBinding {
+            name: "git_status".into(),
+            description: "Get the git status of a repository".into(),
+            parameters_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "directory": {"type": "string", "description": "Path to the git repository"}
+                },
+                "required": ["directory"]
+            }),
+            resource_type: ResourceType::Application,
+            operation: "launch".into(),
+        });
+
+        self.register(ToolBinding {
+            name: "create_directory".into(),
+            description: "Create a directory (and parent directories if needed)".into(),
+            parameters_schema: serde_json::json!({
+                "type": "object",
+                "properties": {"path": {"type": "string", "description": "Directory path to create"}},
+                "required": ["path"]
+            }),
+            resource_type: ResourceType::Filesystem,
+            operation: "create_dir".into(),
         });
     }
 }

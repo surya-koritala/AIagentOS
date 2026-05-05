@@ -1,6 +1,5 @@
 //! OpenAI API adapter with retry and exponential backoff.
 
-use std::sync::Arc;
 
 use kernel::connector::*;
 use kernel::{ConnectorError, ProviderId};

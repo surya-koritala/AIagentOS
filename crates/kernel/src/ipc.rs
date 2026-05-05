@@ -1,6 +1,5 @@
 //! Inter-Agent Communication (IPC) — direct messaging, pub/sub, and task delegation.
 
-use std::collections::HashMap;
 use std::sync::Mutex;
 
 use dashmap::DashMap;
@@ -222,7 +221,7 @@ impl AgentIpc for IpcManager {
 
         // Propagate completion up the chain
         let from = task.from;
-        let to = task.to;
+        let _to = task.to;
         drop(task);
 
         // Check if this completion should propagate to a parent delegation

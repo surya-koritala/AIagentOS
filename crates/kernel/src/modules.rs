@@ -108,7 +108,7 @@ impl WasmModuleSystem {
 
     /// Execute a function exported by a loaded module.
     /// Host functions (read_file, http_get, log) are available to the module.
-    pub fn execute_module_function(&self, module_id: &ModuleId, function: &str, input: &str) -> Result<String, ModuleError> {
+    pub fn execute_module_function(&self, module_id: &ModuleId, function: &str, _input: &str) -> Result<String, ModuleError> {
         let state = self.modules.get(module_id)
             .ok_or_else(|| ModuleError::NotFound(module_id.clone()))?;
 

@@ -2,11 +2,11 @@
 
 use std::sync::Arc;
 
-use crate::connector::{LlmSession, StandardMessage, ToolDefinition};
+use crate::connector::{LlmSession, StandardMessage};
 use crate::context::{ContextManager, Fact, FactCategory, SqliteContextManager};
-use crate::resources::{ResourceBroker, ResourceRequest};
+use crate::resources::ResourceBroker;
 use crate::tools::ToolRegistry;
-use crate::{AgentId, KernelError, ResourceError};
+use crate::{AgentId, KernelError};
 
 /// Maximum tool call rounds before forcing termination.
 const MAX_ITERATIONS: usize = 10;
@@ -33,6 +33,7 @@ pub struct AgentExecutor {
     tool_registry: Arc<ToolRegistry>,
     context_manager: Arc<SqliteContextManager>,
     messages: Vec<StandardMessage>,
+    #[allow(dead_code)]
     system_prompt: String,
 }
 
@@ -43,7 +44,8 @@ impl AgentExecutor {
         resource_broker: Arc<dyn ResourceBroker>,
         tool_registry: Arc<ToolRegistry>,
         context_manager: Arc<SqliteContextManager>,
-        system_prompt: String,
+        #[allow(dead_code)]
+    system_prompt: String,
     ) -> Self {
         Self {
             agent_id,
@@ -187,8 +189,8 @@ impl AgentExecutor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::connector::{LlmResponse, ToolCall};
-    use crate::ConnectorError;
+    use crate::connector::{LlmResponse, ToolCall, ToolDefinition};
+    use crate::{ConnectorError, ResourceError};
     use crate::resources::{ResourceResponse, ResourceCapability, ResourceProvider};
     use crate::permissions::PermissionManager;
     use std::sync::atomic::{AtomicUsize, Ordering};

@@ -5,6 +5,7 @@ members = [
     "crates/resources",
     "crates/tauri-app",
     "tests",
+    "examples",
 ]
 resolver = "2"
 

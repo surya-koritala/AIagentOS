@@ -1,0 +1,13 @@
+[package]
+name = "cli-test"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "cli-test"
+path = "cli_test.rs"
+
+[dependencies]
+kernel = { path = "../crates/kernel" }
+adapters = { path = "../crates/adapters" }
+tokio = { version = "1", features = ["full"] }

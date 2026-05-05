@@ -13,6 +13,8 @@ thiserror = { workspace = true }
 anyhow = { workspace = true }
 reqwest = { workspace = true }
 tokio-tungstenite = { workspace = true }
+tokio-stream = "0.1"
+futures-core = "0.3"
 tracing = { workspace = true }
 
 [dev-dependencies]

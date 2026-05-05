@@ -14,7 +14,7 @@ use tokio::sync::broadcast;
 use crate::models::Agent;
 use crate::observability::Metrics;
 use crate::{
-    AgentCommand, AgentConfig, AgentError, AgentHandle, AgentId, AgentState, KernelError,
+    AgentConfig, AgentError, AgentHandle, AgentId, AgentState, KernelError,
     KernelEvent, Priority, SessionId,
 };
 
@@ -103,6 +103,7 @@ pub trait AgentKernel: Send + Sync {
 const INIT_TIMEOUT_SECS: u64 = 5;
 
 /// Duration after which an unresponsive agent is terminated.
+#[allow(dead_code)]
 const WATCHDOG_TIMEOUT_SECS: u64 = 30;
 
 /// Concrete implementation of the AgentKernel trait.
@@ -164,6 +165,7 @@ impl AgentManager {
 
     /// Start a watchdog timer for an agent. If the agent remains in the Running
     /// state without activity for 30 seconds, it is transitioned to Error.
+    #[allow(dead_code)]
     fn start_watchdog(self: &Arc<Self>, agent_id: AgentId) {
         let manager = Arc::clone(self);
         tokio::spawn(async move {

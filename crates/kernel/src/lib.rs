@@ -22,6 +22,7 @@ pub mod planning;
 pub mod editing;
 pub mod learning;
 pub mod mcp;
+pub mod rate_limit;
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;

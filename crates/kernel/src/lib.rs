@@ -25,6 +25,7 @@ pub mod mcp;
 pub mod rate_limit;
 pub mod github;
 pub mod docker_sandbox;
+pub mod database;
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;

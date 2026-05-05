@@ -44,6 +44,7 @@ dependencies = [
  "adapters",
  "dirs 5.0.1",
  "kernel",
+ "libc",
  "tokio",
 ]
 

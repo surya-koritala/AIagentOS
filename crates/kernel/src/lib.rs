@@ -26,6 +26,8 @@ pub mod rate_limit;
 pub mod github;
 pub mod docker_sandbox;
 pub mod database;
+pub mod delegation;
+pub mod production;
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;

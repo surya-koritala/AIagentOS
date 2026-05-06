@@ -15,6 +15,7 @@ pub mod mac;
 pub mod event_loop;
 pub mod syscall_interface;
 pub mod agent_sockets;
+pub mod service_discovery;
 pub mod config;
 pub mod connector;
 pub mod context;

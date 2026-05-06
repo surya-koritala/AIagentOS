@@ -122,3 +122,48 @@ mod tests {
         assert!(table.is_readonly("/ro/file"));
     }
 }
+
+// ─── Hot-plug: add/remove tools at runtime ───────────────────────────────────
+
+/// Event emitted when tools change.
+#[derive(Debug, Clone)]
+pub enum ToolEvent {
+    Mounted { target: String, source: String },
+    Unmounted { target: String },
+}
+
+impl MountTable {
+    /// Hot-plug: mount a new tool and notify agents.
+    pub fn hot_mount(&mut self, source: String, target: String, fs_type: String, agent_id: u64) -> Result<ToolEvent, &'static str> {
+        self.mount(source.clone(), target.clone(), fs_type, MountFlags::default(), agent_id)?;
+        Ok(ToolEvent::Mounted { target, source })
+    }
+
+    /// Hot-unplug: unmount a tool and notify agents.
+    pub fn hot_unmount(&mut self, target: &str) -> Result<ToolEvent, &'static str> {
+        self.unmount(target)?;
+        Ok(ToolEvent::Unmounted { target: target.to_string() })
+    }
+}
+
+#[cfg(test)]
+mod hotplug_tests {
+    use super::*;
+
+    #[test]
+    fn hot_mount_emits_event() {
+        let mut table = MountTable::new();
+        let event = table.hot_mount("mcp://slack".into(), "/tools/slack".into(), "mcp".into(), 1).unwrap();
+        assert!(matches!(event, ToolEvent::Mounted { .. }));
+        assert_eq!(table.count(), 1);
+    }
+
+    #[test]
+    fn hot_unmount_emits_event() {
+        let mut table = MountTable::new();
+        table.hot_mount("x".into(), "/mnt".into(), "t".into(), 1).unwrap();
+        let event = table.hot_unmount("/mnt").unwrap();
+        assert!(matches!(event, ToolEvent::Unmounted { .. }));
+        assert_eq!(table.count(), 0);
+    }
+}

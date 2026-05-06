@@ -250,15 +250,8 @@ mod tests {
 // ─── CFS integration with execution ─────────────────────────────────────────
 
 /// Check if an agent should be preempted (called after each tool call).
-pub fn should_preempt(sched: &CfsScheduler, current: AgentId) -> bool {
-    if sched.time_slice_expired(current) {
-        return true;
-    }
-    // Also preempt if a higher-priority agent is waiting
-    if let Some(next) = sched.pick_next() {
-        return next != current;
-    }
-    false
+pub fn should_preempt(sched: &mut CfsScheduler, current: AgentId) -> bool {
+    sched.time_slice_expired(current)
 }
 
 /// Account tokens and check preemption in one call.

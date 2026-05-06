@@ -352,3 +352,23 @@ nice = -5
         assert_eq!(def.resources.nice, Some(-5));
     }
 }
+
+// ─── Socket Activation ───────────────────────────────────────────────────────
+
+impl InitSystem {
+    /// Check if a service should be socket-activated (started on first connection).
+    pub fn is_socket_activated(&self, name: &str) -> bool {
+        self.services.get(name).map(|s| s.def.service.service_type == ServiceType::Notify && s.status == ServiceStatus::Inactive).unwrap_or(false)
+    }
+
+    /// Trigger socket activation for a service.
+    pub fn socket_activate(&mut self, name: &str) -> bool {
+        if let Some(state) = self.services.get_mut(name) {
+            if state.status == ServiceStatus::Inactive {
+                state.status = ServiceStatus::Starting;
+                return true;
+            }
+        }
+        false
+    }
+}

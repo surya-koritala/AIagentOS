@@ -181,3 +181,22 @@ mod tests {
         assert_eq!(eloop.tick_count(), 2);
     }
 }
+
+// ─── Timer Units (cron-like) ─────────────────────────────────────────────────
+
+/// A scheduled agent execution (like a cron job).
+#[derive(Debug, Clone)]
+pub struct TimerUnit {
+    pub name: String,
+    pub agent_name: String,
+    pub interval: Duration,
+    pub timer_id: u64,
+}
+
+impl EventLoop {
+    /// Register a timer unit (recurring agent execution).
+    pub fn add_timer_unit(&mut self, name: String, agent_name: String, interval: Duration) -> u64 {
+        let timer_id = self.set_timer(0, interval, Some(interval));
+        timer_id
+    }
+}

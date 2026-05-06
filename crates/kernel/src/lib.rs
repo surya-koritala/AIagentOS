@@ -19,6 +19,7 @@ pub mod service_discovery;
 pub mod procfs;
 pub mod pipes;
 pub mod mount_table;
+pub mod sysctl;
 pub mod config;
 pub mod connector;
 pub mod context;

@@ -21,6 +21,7 @@ pub mod pipes;
 pub mod mount_table;
 pub mod sysctl;
 pub mod package;
+pub mod agentctl;
 pub mod config;
 pub mod connector;
 pub mod context;

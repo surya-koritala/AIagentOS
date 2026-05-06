@@ -280,3 +280,65 @@ mod secure_tests {
         assert!(matches!(result, SyscallResult::Ok(42)));
     }
 }
+
+// ─── Capability-enforced dispatch ────────────────────────────────────────────
+
+use crate::agent_struct::CapabilitySet;
+
+/// Map syscall to required capability.
+pub fn required_capability(num: SyscallNum) -> Option<u64> {
+    match num {
+        SyscallNum::Create | SyscallNum::Clone => Some(CapabilitySet::CAP_AGENT_CREATE),
+        SyscallNum::Kill => Some(CapabilitySet::CAP_AGENT_KILL),
+        SyscallNum::ToolOpen | SyscallNum::ToolRead => None, // checked per-tool
+        SyscallNum::ToolWrite => Some(CapabilitySet::CAP_FILE_WRITE),
+        SyscallNum::Send | SyscallNum::Publish => Some(CapabilitySet::CAP_NET_ACCESS),
+        SyscallNum::Unshare | SyscallNum::SetNs => Some(CapabilitySet::CAP_ADMIN),
+        SyscallNum::Shutdown => Some(CapabilitySet::CAP_ADMIN),
+        SyscallNum::SetNice => Some(CapabilitySet::CAP_SYS_RESOURCE),
+        _ => None, // no capability required
+    }
+}
+
+/// Check if an agent has the required capability for a syscall.
+pub fn check_capability(caps: &CapabilitySet, num: SyscallNum) -> Result<(), SyscallError> {
+    if let Some(required) = required_capability(num) {
+        if !caps.has(required) {
+            return Err(SyscallError::EPERM);
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod cap_tests {
+    use super::*;
+
+    #[test]
+    fn kill_requires_cap() {
+        let caps = CapabilitySet::none();
+        assert_eq!(check_capability(&caps, SyscallNum::Kill), Err(SyscallError::EPERM));
+    }
+
+    #[test]
+    fn kill_allowed_with_cap() {
+        let mut caps = CapabilitySet::none();
+        caps.grant(CapabilitySet::CAP_AGENT_KILL);
+        assert_eq!(check_capability(&caps, SyscallNum::Kill), Ok(()));
+    }
+
+    #[test]
+    fn getpid_needs_no_cap() {
+        let caps = CapabilitySet::none();
+        assert_eq!(check_capability(&caps, SyscallNum::GetPid), Ok(()));
+    }
+
+    #[test]
+    fn admin_ops_need_cap_admin() {
+        let caps = CapabilitySet::none();
+        assert_eq!(check_capability(&caps, SyscallNum::Shutdown), Err(SyscallError::EPERM));
+        let mut admin_caps = CapabilitySet::none();
+        admin_caps.grant(CapabilitySet::CAP_ADMIN);
+        assert_eq!(check_capability(&admin_caps, SyscallNum::Shutdown), Ok(()));
+    }
+}

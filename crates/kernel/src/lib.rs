@@ -11,6 +11,7 @@ pub mod cgroups;
 pub mod tool_descriptors;
 pub mod context_paging;
 pub mod cfs;
+pub mod mac;
 pub mod config;
 pub mod connector;
 pub mod context;

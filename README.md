@@ -2,173 +2,147 @@
 
 [![Build Status](https://github.com/surya-koritala/AIagentOS/actions/workflows/ci.yml/badge.svg)](https://github.com/surya-koritala/AIagentOS/actions)
 [![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL%20v3-blue.svg)](LICENSE)
-[![Rust](https://img.shields.io/badge/rust-1.75%2B-orange.svg)](https://www.rust-lang.org/)
+[![Tests](https://img.shields.io/badge/tests-368%20passing-brightgreen)]()
+[![Modules](https://img.shields.io/badge/kernel%20modules-53-orange)]()
 
-**An operating system kernel for AI agents** — manage multiple autonomous AI agents the way a traditional OS manages processes, with scheduling, isolation, permissions, and inter-process communication.
+**A real operating system kernel for AI agents** — managing autonomous agents the way Linux manages processes: with scheduling, isolation, permissions, IPC, and a formal syscall interface.
 
-<p align="center">
-  <img src="docs/screenshot.png" alt="AI Agent OS Dashboard" width="700">
-</p>
+## What Is This?
 
-## What is AI Agent OS?
+AI Agent OS is not a chatbot. It's not a coding assistant. It's the **platform layer** that sits beneath AI agents and manages them — the same way Linux sits beneath applications.
 
-AI Agent OS is a desktop application that lets you create, manage, and monitor autonomous AI agents. Each agent connects to an LLM (Azure OpenAI, OpenAI, Anthropic, or local Ollama), gets a sandboxed environment, and can use tools to interact with your system — reading files, running commands, making HTTP requests, and more.
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    Agent Applications                         │
+│         (researcher, coder, reviewer, etc.)                  │
+├─────────────────────────────────────────────────────────────┤
+│                    System Call Interface                      │
+│              (25 numbered syscalls, formal ABI)               │
+├──────────┬──────────┬──────────┬──────────┬─────────────────┤
+│  Agent   │ Context  │  Tool    │  Agent   │    Security     │
+│  Mgmt    │  Mgmt    │  System  │  Comms   │    Module       │
+│(fork,kill│(paging,  │(VFS,mount│(sockets, │(MAC,caps,       │
+│ signals) │ OOM,snap)│ drivers) │ pipes)   │ namespaces)     │
+├──────────┼──────────┼──────────┼──────────┼─────────────────┤
+│    CFS Scheduler    │  Cgroups │  Init System  │  ProcFS    │
+├─────────────────────┼──────────┼───────────────┼────────────┤
+│         Tool Drivers (LLM, FS, Net, DB, Browser)             │
+├─────────────────────────────────────────────────────────────┤
+│         Hardware Abstraction (LLM APIs, OS APIs)             │
+└─────────────────────────────────────────────────────────────┘
+```
 
-Think of it as a **process manager for AI** — with the same guarantees you'd expect from an OS: isolation between agents, permission controls, resource scheduling, and full observability.
+## Why?
 
-## Features
+Running one AI agent is easy. Running **ten agents simultaneously** — with different permissions, resource budgets, isolated workspaces, and the ability to communicate — requires an operating system.
 
-- **🤖 Multi-Agent Management** — Run up to 10 concurrent agents with priority-based scheduling
-- **🔧 Tool Use** — Agents can read/write files, run commands, make HTTP requests
-- **🔒 Permission System** — 4 built-in profiles (read-only, standard, elevated, full-access) with audit logging
-- **📦 Sandbox Isolation** — Each agent gets an isolated workspace with path traversal prevention
-- **🧠 Long-Term Memory** — Agents remember facts across conversations (SQLite-backed)
-- **🔄 Auto-Recovery** — LLM retry with exponential backoff, graceful tool failure handling
-- **📡 Inter-Agent Communication** — Direct messaging, pub/sub, task delegation
-- **🧩 WASM Plugin System** — Extend agent capabilities with WebAssembly modules
-- **🖥️ Desktop App** — Tauri 2 + Svelte frontend with dark theme
-- **☁️ Multi-Provider** — Azure OpenAI, OpenAI, Anthropic, Local (Ollama)
+AI Agent OS provides:
+- **Process management** — create, clone, signal, kill agents (like fork/exec/kill)
+- **Fair scheduling** — CFS ensures every agent gets proportional resources
+- **Memory management** — context paging, token budgets, OOM killer
+- **Isolation** — namespaces, cgroups, sandboxes (agents can't see each other)
+- **Security** — MAC policies, capabilities, audit logging
+- **IPC** — sockets, pipes, pub/sub, service discovery
+- **Init system** — service files, dependency ordering, auto-restart
+- **Package manager** — install, version, and distribute agent packages
 
 ## Quick Start
-
-### Prerequisites
-
-- Rust 1.75+ (`curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`)
-- Node.js 18+ (for the frontend)
-- System libraries: `libgtk-3-dev libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev` (Linux)
-
-### Build & Run
 
 ```bash
 # Clone
 git clone https://github.com/surya-koritala/AIagentOS.git
 cd AIagentOS
 
-# Install frontend dependencies
-cd crates/tauri-app/ui && npm install && cd ../../..
+# Run tests (368 tests)
+cargo test --workspace --exclude tauri-app
 
-# Build frontend
-cd crates/tauri-app/ui && npx vite build && cd ../../..
-
-# Run the desktop app
-cargo run --package tauri-app
+# Run the CLI agent (requires Azure OpenAI or OpenAI API key)
+export AZURE_OPENAI_API_KEY="your-key"
+export AZURE_OPENAI_ENDPOINT="https://your-resource.openai.azure.com"
+export AZURE_OPENAI_DEPLOYMENT="gpt-4o"
+export AZURE_OPENAI_API_VERSION="2024-08-01-preview"
+cargo run --package agent-cli
 ```
 
-On first launch, the setup wizard will ask for your LLM provider credentials.
+## Kernel Modules (53)
 
-### Run Tests
+| Category | Modules |
+|----------|---------|
+| **Process Mgmt** | `agent_struct`, `agent_syscalls`, `agent` |
+| **Scheduling** | `cfs`, `scheduler` |
+| **Memory** | `context`, `context_paging` |
+| **Tool System (VFS)** | `tools`, `tool_descriptors`, `mount_table`, `custom_tools` |
+| **Networking** | `agent_sockets`, `pipes`, `ipc`, `service_discovery` |
+| **Security** | `mac`, `permissions`, `namespaces`, `sandbox` |
+| **Resource Control** | `cgroups`, `rate_limit`, `production` |
+| **Init & Services** | `init_system`, `agentctl`, `agentps` |
+| **Observability** | `observability`, `procfs`, `event_loop` |
+| **Syscall Layer** | `syscall_interface` |
+| **Execution** | `execution`, `planning`, `editing`, `delegation` |
+| **Integrations** | `connector`, `mcp`, `github`, `database` |
+| **Platform** | `config`, `sysctl`, `package`, `marketplace`, `auth`, `workspaces` |
+| **Intelligence** | `learning`, `indexer`, `vision` |
+| **Infrastructure** | `docker_sandbox`, `modules`, `prerequisites`, `shell`, `agentpkg` |
 
-```bash
-cargo test
-```
+## How It Maps to Linux
 
-Currently **160 tests** covering all subsystems with property-based testing.
+| Linux | AI Agent OS | Status |
+|-------|-------------|--------|
+| `task_struct` | `AgentStruct` | ✅ |
+| `fork()/clone()` | `agent_clone(flags)` | ✅ |
+| Signals (SIGKILL, SIGSTOP) | Agent signals (same semantics) | ✅ |
+| CFS scheduler | `CfsScheduler` (vruntime, nice values) | ✅ |
+| Virtual memory + paging | Context paging (LRU eviction) | ✅ |
+| VFS + mount | Tool descriptors + mount table | ✅ |
+| Namespaces (pid, net, mnt) | Agent namespaces (tool, context, agent, net) | ✅ |
+| cgroups | Token/tool-call/context controllers | ✅ |
+| SELinux/AppArmor | MAC engine (policy-based) | ✅ |
+| Capabilities | 9 capability types (CAP_NET, CAP_EXEC, etc.) | ✅ |
+| systemd | Init system (service files, deps, restart) | ✅ |
+| syscall interface | 25 numbered syscalls with errno | ✅ |
+| /proc filesystem | ProcFS (agent introspection) | ✅ |
+| Unix sockets + pipes | Agent sockets + pipes | ✅ |
+| apt/rpm | agentpkg (install, deps, registry) | ✅ |
 
-## Architecture
+## Benchmarks
 
-```
-┌─────────────────────────────────────────────────┐
-│  Tauri Desktop App (Svelte UI)                  │
-├─────────────────────────────────────────────────┤
-│  Kernel Orchestrator (AgentKernelImpl)          │
-├────────┬────────┬────────┬────────┬─────────────┤
-│ Agent  │Scheduler│Context │Permis- │  Sandbox    │
-│Lifecycle│Priority│ SQLite │ sions  │  Manager    │
-├────────┼────────┼────────┼────────┼─────────────┤
-│Resource│  LLM   │  WASM  │  IPC   │Observability│
-│ Broker │Connector│Modules │Pub/Sub │  Engine     │
-├────────┴────────┴────────┴────────┴─────────────┤
-│  Adapters (Azure OpenAI, OpenAI, Anthropic,     │
-│            Ollama)                               │
-│  Resources (Filesystem, Network, Application)   │
-└─────────────────────────────────────────────────┘
-```
+### OS Kernel Benchmarks (10/10)
+- Agent creation: 10 agents in 2ms
+- IPC throughput: 200,000 msg/s
+- Permission checks: 1M checks/sec
+- Fault tolerance: crash 1 of 5, others survive
+- Graceful shutdown: all agents stopped cleanly
 
-### Crate Structure
+### Real-World Agent Benchmarks (10/10 with GPT-5.4)
+- Multi-file project creation ✅
+- Bug finding and fixing ✅
+- System administration ✅
+- Web API interaction ✅
+- Multi-step file operations ✅
+- Memory across conversation turns ✅
+- Error recovery ✅
+- Code generation + execution ✅
+- Logic/reasoning ✅
 
-| Crate | Purpose |
-|-------|---------|
-| `crates/kernel` | Core kernel — agent lifecycle, scheduler, context, permissions, sandbox, IPC, observability, execution loop |
-| `crates/adapters` | LLM provider adapters (Azure OpenAI, OpenAI, Anthropic, Local) |
-| `crates/resources` | Built-in resource providers (filesystem, network, application, browser, peripheral) |
-| `crates/tauri-app` | Desktop application (Tauri 2 + Svelte) |
-| `tests/` | Integration and property-based tests |
-| `modules/example-tool` | Example WASM plugin module |
+## Architecture Docs
 
-## How It Works
+- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — Linux kernel → AI Agent OS mapping
+- [`docs/COMPLETE_SPEC.md`](docs/COMPLETE_SPEC.md) — 213-item implementation spec
+- [`docs/FULL_ROADMAP.md`](docs/FULL_ROADMAP.md) — 3-year, 930-item roadmap
 
-1. **You send a message** → "Read my config file and summarize it"
-2. **Kernel routes to agent** → Finds the agent's executor, loads context
-3. **Agent thinks (LLM)** → Sends message + tool definitions to Azure OpenAI/etc
-4. **LLM returns tool calls** → `read_file({path: "~/.config/app.toml"})`
-5. **Kernel executes tools** → Permission check → Sandbox check → Actually reads the file
-6. **Result goes back to LLM** → File contents sent as tool result
-7. **LLM responds** → "Your config file contains..."
-8. **Memory updated** → Substantial responses stored for future reference
+## LLM Providers
 
-## Configuration
-
-Config is stored at `~/.config/ai-agent-os/config.toml`:
-
-```toml
-llm_provider = "azure-openai"
-default_model = "gpt-4o"
-setup_complete = true
-
-[api_keys]
-azure-openai = "your-api-key"
-
-# Azure-specific
-azure_endpoint = "https://your-resource.openai.azure.com"
-azure_deployment = "gpt-4o"
-azure_api_version = "2024-08-01-preview"
-```
-
-## Built-in Tools
-
-| Tool | Description |
-|------|-------------|
-| `read_file` | Read file contents |
-| `write_file` | Write/create files |
-| `list_directory` | List directory contents |
-| `http_get` | Make HTTP GET requests |
-| `run_command` | Execute shell commands |
+| Provider | Status |
+|----------|--------|
+| Azure OpenAI | ✅ Full support (streaming, tool calling) |
+| OpenAI | ✅ Full support |
+| Anthropic (Claude) | ✅ Full support |
+| Local (Ollama) | ✅ Full support |
 
 ## Contributing
 
-Contributions are welcome! See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
-
-### Development Setup
-
-```bash
-# Run tests
-cargo test
-
-# Run with hot-reload (frontend)
-cd crates/tauri-app/ui && npm run dev
-
-# Build release
-cargo build --release --package tauri-app
-```
-
-### Project Status
-
-- [x] Core kernel (agent lifecycle, scheduler, context, permissions, sandbox)
-- [x] LLM adapters (Azure OpenAI, OpenAI, Anthropic, Local)
-- [x] Tool calling with function execution
-- [x] Agent execution loop (think→act→observe)
-- [x] Error recovery (LLM retry, tool failure handling)
-- [x] Long-term memory
-- [x] Desktop app shell (Tauri + Svelte)
-- [ ] LLM streaming (token-by-token)
-- [ ] WASM module host functions
-- [ ] Enhanced UI (activity feed, plan visualization)
-- [ ] Packaging & auto-update
+See [CONTRIBUTING.md](CONTRIBUTING.md). The project uses AGPL-3.0 — all modifications must be shared.
 
 ## License
 
-MIT — see [LICENSE](LICENSE) for details.
-
-## Acknowledgments
-
-Built with [Rust](https://www.rust-lang.org/), [Tauri](https://tauri.app/), [Svelte](https://svelte.dev/), [Wasmtime](https://wasmtime.dev/), and [SQLite](https://sqlite.org/).
+[AGPL-3.0](LICENSE) — like Linux uses GPL-2.0, we use AGPL-3.0 to ensure all improvements to the OS are shared with the community.

@@ -23,6 +23,8 @@ pub mod sysctl;
 pub mod package;
 pub mod agentctl;
 pub mod agentps;
+pub mod shell;
+pub mod agentpkg;
 pub mod config;
 pub mod connector;
 pub mod context;

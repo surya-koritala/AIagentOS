@@ -12,6 +12,7 @@ pub mod tool_descriptors;
 pub mod context_paging;
 pub mod cfs;
 pub mod mac;
+pub mod event_loop;
 pub mod config;
 pub mod connector;
 pub mod context;

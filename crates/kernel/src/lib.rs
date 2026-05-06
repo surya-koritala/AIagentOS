@@ -13,6 +13,7 @@ pub mod context_paging;
 pub mod cfs;
 pub mod mac;
 pub mod event_loop;
+pub mod syscall_interface;
 pub mod config;
 pub mod connector;
 pub mod context;

@@ -203,3 +203,51 @@ mod tests {
         assert_eq!(ns.parent, Some(parent));
     }
 }
+
+// ─── Namespace enforcement for tool access ───────────────────────────────────
+
+/// Check if an agent can access a tool path based on its tool namespace.
+pub fn check_tool_access(registry: &NamespaceRegistry, agent_id: AgentId, tool_ns: NamespaceId) -> bool {
+    // Agent must be a member of the tool namespace to access tools in it
+    registry.namespaces.get(&tool_ns)
+        .map(|ns| ns.members.contains(&agent_id))
+        .unwrap_or(false)
+}
+
+/// Check if an agent can communicate with another agent based on agent namespace.
+pub fn check_ipc_access(registry: &NamespaceRegistry, sender: AgentId, receiver: AgentId) -> bool {
+    registry.can_see(sender, receiver)
+}
+
+#[cfg(test)]
+mod enforcement_tests {
+    use super::*;
+
+    #[test]
+    fn tool_access_in_namespace() {
+        let reg = NamespaceRegistry::new();
+        let ns = reg.create(NamespaceType::Tool, None);
+        reg.join(ns, 1);
+        assert!(check_tool_access(&reg, 1, ns));
+        assert!(!check_tool_access(&reg, 2, ns)); // not a member
+    }
+
+    #[test]
+    fn ipc_blocked_across_namespaces() {
+        let reg = NamespaceRegistry::new();
+        let ns1 = reg.create(NamespaceType::Agent, None);
+        let ns2 = reg.create(NamespaceType::Agent, None);
+        reg.join(ns1, 1);
+        reg.join(ns2, 2);
+        assert!(!check_ipc_access(&reg, 1, 2));
+    }
+
+    #[test]
+    fn ipc_allowed_same_namespace() {
+        let reg = NamespaceRegistry::new();
+        let ns = reg.create(NamespaceType::Agent, None);
+        reg.join(ns, 1);
+        reg.join(ns, 2);
+        assert!(check_ipc_access(&reg, 1, 2));
+    }
+}

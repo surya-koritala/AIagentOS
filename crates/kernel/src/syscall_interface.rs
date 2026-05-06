@@ -195,3 +195,88 @@ mod tests {
         assert!((SyscallError::ENOSYS as i32) < 0);
     }
 }
+
+// ─── MAC-enforced dispatch ───────────────────────────────────────────────────
+
+use crate::mac::{MacEngine, MacDecision};
+
+/// Syscall dispatcher with MAC enforcement.
+pub struct SecureSyscallDispatch {
+    table: SyscallTable,
+    mac: MacEngine,
+}
+
+impl SecureSyscallDispatch {
+    pub fn new(table: SyscallTable, mac: MacEngine) -> Self {
+        Self { table, mac }
+    }
+
+    /// Dispatch a syscall with MAC check.
+    pub fn dispatch(&self, caller: AgentId, num: SyscallNum, args: SyscallArgs) -> SyscallResult {
+        // Map syscall to action string for MAC
+        let action = match num {
+            SyscallNum::Create | SyscallNum::Clone => "create",
+            SyscallNum::Kill => "kill",
+            SyscallNum::ToolOpen => "tool_open",
+            SyscallNum::ToolRead => "read",
+            SyscallNum::ToolWrite => "write",
+            SyscallNum::Send | SyscallNum::Publish => "send",
+            SyscallNum::Unshare | SyscallNum::SetNs => "namespace",
+            SyscallNum::Shutdown => "admin",
+            _ => "execute",
+        };
+
+        // Check MAC policy
+        let resource = args.str_arg.as_deref().unwrap_or("system");
+        match self.mac.check(caller, action, resource) {
+            MacDecision::Allow | MacDecision::Audit => {
+                // Proceed with syscall
+                self.table.dispatch(caller, num, args)
+            }
+            MacDecision::Deny => {
+                SyscallResult::Err(SyscallError::EACCES)
+            }
+        }
+    }
+
+    /// Get mutable reference to MAC engine (for policy updates).
+    pub fn mac_mut(&mut self) -> &mut MacEngine { &mut self.mac }
+}
+
+#[cfg(test)]
+mod secure_tests {
+    use super::*;
+    use crate::mac::PolicyRule;
+
+    #[test]
+    fn mac_blocks_unauthorized_syscall() {
+        let mut table = SyscallTable::new();
+        table.register(SyscallNum::Kill, |_, _| SyscallResult::Ok(0));
+
+        let mut mac = MacEngine::new(true);
+        mac.load_policy(vec![
+            PolicyRule { subject: "worker".into(), action: "kill".into(), object: "*".into(), decision: "deny".into() },
+        ]);
+        mac.label_agent(1, "worker".into());
+
+        let dispatch = SecureSyscallDispatch::new(table, mac);
+        let result = dispatch.dispatch(1, SyscallNum::Kill, SyscallArgs::none());
+        assert!(matches!(result, SyscallResult::Err(SyscallError::EACCES)));
+    }
+
+    #[test]
+    fn mac_allows_authorized_syscall() {
+        let mut table = SyscallTable::new();
+        table.register(SyscallNum::ToolRead, |_, _| SyscallResult::Ok(42));
+
+        let mut mac = MacEngine::new(true);
+        mac.load_policy(vec![
+            PolicyRule { subject: "reader".into(), action: "read".into(), object: "*".into(), decision: "allow".into() },
+        ]);
+        mac.label_agent(1, "reader".into());
+
+        let dispatch = SecureSyscallDispatch::new(table, mac);
+        let result = dispatch.dispatch(1, SyscallNum::ToolRead, SyscallArgs::none());
+        assert!(matches!(result, SyscallResult::Ok(42)));
+    }
+}

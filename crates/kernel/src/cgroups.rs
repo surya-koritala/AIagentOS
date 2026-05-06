@@ -204,3 +204,34 @@ mod tests {
         assert!(mgr.check_token_limit(cg, 80)); // reset, so 80 is fine again
     }
 }
+
+// ─── Cgroup enforcement in execution ─────────────────────────────────────────
+
+/// Check if an agent can proceed with a token-consuming operation.
+/// Returns Err with reason if blocked.
+pub fn enforce_limits(mgr: &CgroupManager, cgroup_id: CgroupId, tokens: u64) -> Result<(), &'static str> {
+    if !mgr.check_token_limit(cgroup_id, tokens) {
+        return Err("cgroup token limit exceeded");
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod enforce_tests {
+    use super::*;
+
+    #[test]
+    fn enforce_allows_within_limit() {
+        let mgr = CgroupManager::new();
+        let cg = mgr.create("test".into(), mgr.root(), CgroupLimits { tokens_per_min: 100, ..Default::default() });
+        assert!(enforce_limits(&mgr, cg, 50).is_ok());
+    }
+
+    #[test]
+    fn enforce_blocks_over_limit() {
+        let mgr = CgroupManager::new();
+        let cg = mgr.create("test".into(), mgr.root(), CgroupLimits { tokens_per_min: 100, ..Default::default() });
+        mgr.record_tokens(cg, 90);
+        assert!(enforce_limits(&mgr, cg, 20).is_err());
+    }
+}

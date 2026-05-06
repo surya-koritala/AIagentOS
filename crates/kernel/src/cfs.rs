@@ -246,3 +246,46 @@ mod tests {
         assert_eq!(nice_to_weight(0), 1024);
     }
 }
+
+// ─── CFS integration with execution ─────────────────────────────────────────
+
+/// Check if an agent should be preempted (called after each tool call).
+pub fn should_preempt(sched: &CfsScheduler, current: AgentId) -> bool {
+    if sched.time_slice_expired(current) {
+        return true;
+    }
+    // Also preempt if a higher-priority agent is waiting
+    if let Some(next) = sched.pick_next() {
+        return next != current;
+    }
+    false
+}
+
+/// Account tokens and check preemption in one call.
+pub fn account_and_check(sched: &mut CfsScheduler, agent_id: AgentId, tokens: u64) -> bool {
+    sched.account_tokens(agent_id, tokens);
+    should_preempt(sched, agent_id)
+}
+
+#[cfg(test)]
+mod integration_tests {
+    use super::*;
+
+    #[test]
+    fn preempt_after_time_slice() {
+        let mut sched = CfsScheduler::new(50);
+        sched.enqueue(1, 0, SchedClass::Normal);
+        sched.enqueue(2, 0, SchedClass::Normal);
+        // Agent 1 uses 60 tokens (exceeds 50 slice)
+        let preempt = account_and_check(&mut sched, 1, 60);
+        assert!(preempt);
+    }
+
+    #[test]
+    fn no_preempt_within_slice() {
+        let mut sched = CfsScheduler::new(100);
+        sched.enqueue(1, 0, SchedClass::Normal);
+        let preempt = account_and_check(&mut sched, 1, 30);
+        assert!(!preempt);
+    }
+}

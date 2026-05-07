@@ -28,6 +28,7 @@ pub mod agentpkg;
 pub mod auth;
 pub mod workspaces;
 pub mod marketplace;
+pub mod os_kernel;
 pub mod config;
 pub mod connector;
 pub mod context;

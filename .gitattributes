@@ -1,0 +1,12 @@
+# Force LF endings on every text file regardless of OS.
+# Resolves prior CRLF/LF drift when committing from WSL after editing on Windows.
+* text=auto eol=lf
+
+# Binary files — never normalize.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.lock binary -text
+*.pdf binary

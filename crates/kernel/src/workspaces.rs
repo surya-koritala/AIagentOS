@@ -30,6 +30,12 @@ pub struct WorkspaceManager {
     active: HashMap<String, String>,               // user_id → active workspace_id
 }
 
+impl Default for WorkspaceManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl WorkspaceManager {
     pub fn new() -> Self {
         Self {

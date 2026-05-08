@@ -34,6 +34,12 @@ pub struct Marketplace {
     reviews: Vec<Review>,
 }
 
+impl Default for Marketplace {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Marketplace {
     pub fn new() -> Self {
         Self {

@@ -23,7 +23,9 @@ use crate::agent_syscalls::AgentSyscalls;
 use crate::cfs::CfsScheduler;
 use crate::cgroups::CgroupManager;
 use crate::event_loop::{EventLoop, KernelEvent};
-use crate::init_system::{InitSystem, ServiceStatus};
+use crate::init_system::InitSystem;
+#[cfg(test)]
+use crate::init_system::ServiceStatus;
 use crate::mac::{MacDecision, MacEngine};
 use crate::namespaces::{NamespaceRegistry, NamespaceType};
 use crate::procfs::ProcFs;
@@ -59,6 +61,12 @@ pub struct OsKernel {
     pub event_tx: tokio::sync::mpsc::Sender<KernelEvent>,
     /// Boot complete flag.
     booted: std::sync::atomic::AtomicBool,
+}
+
+impl Default for OsKernel {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl OsKernel {

@@ -22,6 +22,12 @@ pub struct ProcFs {
     agent_info: HashMap<AgentId, HashMap<String, String>>,
 }
 
+impl Default for ProcFs {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ProcFs {
     pub fn new() -> Self {
         let mut system_info = HashMap::new();

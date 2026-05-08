@@ -2,7 +2,7 @@
 //!
 //! Uses Wasmtime for sandboxed execution with resource limits and crash isolation.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use dashmap::DashMap;
@@ -69,7 +69,7 @@ pub struct ModuleInfo {
 /// The Module System trait.
 #[async_trait::async_trait]
 pub trait ModuleSystem: Send + Sync {
-    async fn install(&self, module_path: &PathBuf) -> Result<ModuleInfo, ModuleError>;
+    async fn install(&self, module_path: &Path) -> Result<ModuleInfo, ModuleError>;
     async fn uninstall(&self, module_id: &ModuleId) -> Result<(), ModuleError>;
     async fn load(&self, module_id: &ModuleId) -> Result<(), ModuleError>;
     async fn unload(&self, module_id: &ModuleId) -> Result<(), ModuleError>;
@@ -256,7 +256,7 @@ impl WasmModuleSystem {
 
 #[async_trait::async_trait]
 impl ModuleSystem for WasmModuleSystem {
-    async fn install(&self, module_path: &PathBuf) -> Result<ModuleInfo, ModuleError> {
+    async fn install(&self, module_path: &Path) -> Result<ModuleInfo, ModuleError> {
         // Look for manifest.toml in the module directory
         let manifest_path = module_path.join("manifest.toml");
         let manifest = Self::parse_manifest(&manifest_path)?;

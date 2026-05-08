@@ -59,6 +59,12 @@ pub struct NamespaceRegistry {
     defaults: DashMap<NamespaceType, NamespaceId>,
 }
 
+impl Default for NamespaceRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl NamespaceRegistry {
     pub fn new() -> Self {
         let registry = Self {

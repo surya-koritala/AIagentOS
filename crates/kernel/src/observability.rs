@@ -86,6 +86,7 @@ pub trait ObservabilityEngine: Send + Sync {
     fn get_metrics(&self, scope: MetricScope) -> Metrics;
     fn record_metrics(&self, agent_id: AgentId, tokens: u64, api_calls: u64);
     fn add_reasoning_step(&self, agent_id: AgentId, action_id: uuid::Uuid, step: ReasoningStep);
+    #[allow(clippy::type_complexity)]
     fn on_deviation(&self, handler: Box<dyn Fn(AgentId, &AgentAction) + Send + Sync>);
 }
 
@@ -94,6 +95,7 @@ pub trait ObservabilityEngine: Send + Sync {
 pub const DEFAULT_MAX_ENTRIES_PER_AGENT: usize = 1000;
 
 /// Concrete observability engine implementation.
+#[allow(clippy::type_complexity)]
 pub struct ObservabilityEngineImpl {
     /// Per-agent action logs.
     action_logs: DashMap<AgentId, Vec<AgentAction>>,
@@ -107,6 +109,12 @@ pub struct ObservabilityEngineImpl {
     deviation_handlers: Mutex<Vec<Arc<dyn Fn(AgentId, &AgentAction) + Send + Sync>>>,
     /// Max retained log/reasoning entries per agent before oldest are dropped.
     max_entries_per_agent: usize,
+}
+
+impl Default for ObservabilityEngineImpl {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ObservabilityEngineImpl {
@@ -164,7 +172,7 @@ impl ObservabilityEngineImpl {
 impl ObservabilityEngine for ObservabilityEngineImpl {
     fn log_action(&self, agent_id: AgentId, action: AgentAction) {
         self.check_deviation(agent_id, &action);
-        let mut logs = self.action_logs.entry(agent_id).or_insert_with(Vec::new);
+        let mut logs = self.action_logs.entry(agent_id).or_default();
         logs.push(action);
         // Drop oldest entries when over retention cap.
         if logs.len() > self.max_entries_per_agent {
@@ -252,10 +260,7 @@ impl ObservabilityEngine for ObservabilityEngineImpl {
     }
 
     fn record_metrics(&self, agent_id: AgentId, tokens: u64, api_calls: u64) {
-        let mut metrics = self
-            .agent_metrics
-            .entry(agent_id)
-            .or_insert_with(Metrics::default);
+        let mut metrics = self.agent_metrics.entry(agent_id).or_default();
         metrics.tokens_consumed += tokens;
         metrics.api_calls_made += api_calls;
     }
@@ -264,7 +269,7 @@ impl ObservabilityEngine for ObservabilityEngineImpl {
         let mut chain = self
             .reasoning_chains
             .entry((agent_id, action_id))
-            .or_insert_with(Vec::new);
+            .or_default();
         chain.push(step);
         if chain.len() > self.max_entries_per_agent {
             let drop = chain.len() - self.max_entries_per_agent;

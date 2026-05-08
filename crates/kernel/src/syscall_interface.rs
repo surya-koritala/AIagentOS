@@ -145,6 +145,12 @@ pub struct SyscallTable {
     >,
 }
 
+impl Default for SyscallTable {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SyscallTable {
     pub fn new() -> Self {
         Self {

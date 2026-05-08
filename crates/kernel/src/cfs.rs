@@ -26,7 +26,9 @@ struct CfsEntry {
     agent_id: AgentId,
     vruntime: u64,
     weight: u64,
+    #[allow(dead_code)]
     nice: i8,
+    #[allow(dead_code)]
     class: SchedClass,
     tokens_used: u64,
 }
@@ -170,8 +172,10 @@ impl CfsScheduler {
         let key = self.runqueue.keys().find(|k| k.1 == agent_id);
         if let Some(key) = key {
             if let Some(entry) = self.runqueue.get(key) {
-                if self.total_weight > 0 {
-                    return (self.time_slice_tokens * entry.weight) / self.total_weight;
+                if let Some(share) =
+                    (self.time_slice_tokens * entry.weight).checked_div(self.total_weight)
+                {
+                    return share;
                 }
             }
         }

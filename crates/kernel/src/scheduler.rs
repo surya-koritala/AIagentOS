@@ -105,6 +105,12 @@ pub struct PriorityScheduler {
     under_pressure: std::sync::atomic::AtomicBool,
 }
 
+impl Default for PriorityScheduler {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl PriorityScheduler {
     pub fn new() -> Self {
         Self {

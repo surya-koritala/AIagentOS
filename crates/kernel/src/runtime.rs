@@ -48,6 +48,7 @@ impl KernelRuntime {
             .store(false, std::sync::atomic::Ordering::SeqCst);
     }
 
+    #[allow(dead_code)]
     fn is_running(&self) -> bool {
         self.running.load(std::sync::atomic::Ordering::SeqCst)
     }
@@ -171,6 +172,12 @@ pub struct WaitQueue {
     waiters: std::sync::Mutex<Vec<(AgentId, tokio::sync::oneshot::Sender<()>)>>,
 }
 
+impl Default for WaitQueue {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl WaitQueue {
     pub fn new() -> Self {
         Self {
@@ -209,6 +216,11 @@ impl WaitQueue {
     /// Number of waiters.
     pub fn len(&self) -> usize {
         self.waiters.lock().unwrap().len()
+    }
+
+    /// Whether the wait queue has no waiters.
+    pub fn is_empty(&self) -> bool {
+        self.waiters.lock().unwrap().is_empty()
     }
 }
 

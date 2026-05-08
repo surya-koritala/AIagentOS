@@ -111,7 +111,7 @@ pub async fn generate_plan(session: &dyn LlmSession, task: &str) -> Result<Plan,
     let response = session
         .send(messages)
         .await
-        .map_err(|e| KernelError::Connector(e))?;
+        .map_err(KernelError::Connector)?;
 
     let steps = parse_plan_steps(&response.content);
 

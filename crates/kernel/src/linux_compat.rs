@@ -24,10 +24,17 @@ pub enum Interrupt {
 }
 
 /// Interrupt handler registry.
+#[allow(clippy::type_complexity)]
 pub struct InterruptController {
     handlers: Mutex<HashMap<Interrupt, Vec<Box<dyn Fn(Interrupt) + Send + Sync>>>>,
     pending: Mutex<Vec<Interrupt>>,
     enabled: std::sync::atomic::AtomicBool,
+}
+
+impl Default for InterruptController {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl InterruptController {
@@ -135,6 +142,12 @@ impl FileMode {
 /// Runtime credential changes.
 pub struct CredentialManager {
     overrides: Mutex<HashMap<AgentId, (u64, u64)>>, // agent → (effective_uid, effective_gid)
+}
+
+impl Default for CredentialManager {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl CredentialManager {
@@ -255,6 +268,12 @@ pub struct Route {
     pub metric: u32,
 }
 
+impl Default for ProtocolStack {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ProtocolStack {
     pub fn new() -> Self {
         Self {
@@ -358,6 +377,12 @@ pub struct Epoll {
     interests: Mutex<HashMap<u64, Vec<EpollEvent>>>, // fd → events interested in
 }
 
+impl Default for Epoll {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Epoll {
     pub fn new() -> Self {
         Self {
@@ -390,6 +415,12 @@ pub struct DeviceNode {
 pub struct DeviceTree {
     devices: Mutex<Vec<DeviceNode>>,
 }
+impl Default for DeviceTree {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl DeviceTree {
     pub fn new() -> Self {
         Self {
@@ -435,6 +466,12 @@ pub enum PowerState {
 pub struct PowerManager {
     states: Mutex<HashMap<AgentId, PowerState>>,
 }
+impl Default for PowerManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl PowerManager {
     pub fn new() -> Self {
         Self {
@@ -481,8 +518,15 @@ pub struct AgentClock {
 struct AgentTime {
     started: Instant,
     cpu_time: Duration,
+    #[allow(dead_code)]
     wall_time: Duration,
     last_active: Instant,
+}
+
+impl Default for AgentClock {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl AgentClock {

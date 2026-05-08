@@ -13,7 +13,7 @@ static NEXT_CGROUP_ID: AtomicU64 = AtomicU64::new(1);
 pub type CgroupId = u64;
 
 /// Resource limits for a cgroup.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct CgroupLimits {
     /// Max tokens per minute (0 = unlimited).
     pub tokens_per_min: u64,
@@ -23,17 +23,6 @@ pub struct CgroupLimits {
     pub max_context_tokens: u64,
     /// Max agents in this group (0 = unlimited).
     pub max_agents: u32,
-}
-
-impl Default for CgroupLimits {
-    fn default() -> Self {
-        Self {
-            tokens_per_min: 0,
-            max_tool_calls: 0,
-            max_context_tokens: 0,
-            max_agents: 0,
-        }
-    }
 }
 
 /// Current resource usage for a cgroup.
@@ -61,6 +50,12 @@ pub struct Cgroup {
 pub struct CgroupManager {
     groups: DashMap<CgroupId, Cgroup>,
     root: CgroupId,
+}
+
+impl Default for CgroupManager {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl CgroupManager {

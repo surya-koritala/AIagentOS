@@ -645,6 +645,12 @@ pub struct OsSubsystems {
     pub services: tokio::sync::Mutex<ServiceRegistry>,
 }
 
+impl Default for OsSubsystems {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl OsSubsystems {
     pub fn new() -> Self {
         Self {
@@ -682,7 +688,7 @@ impl AgentKernelImpl {
     /// Create a new kernel with all subsystems wired together (in-memory DB for testing).
     pub fn new() -> Result<Self, KernelError> {
         let context_manager =
-            Arc::new(SqliteContextManager::in_memory().map_err(|e| KernelError::Context(e))?);
+            Arc::new(SqliteContextManager::in_memory().map_err(KernelError::Context)?);
         Self::with_context_manager(context_manager)
     }
 
@@ -692,7 +698,7 @@ impl AgentKernelImpl {
             std::fs::create_dir_all(parent).ok();
         }
         let context_manager =
-            Arc::new(SqliteContextManager::new(db_path).map_err(|e| KernelError::Context(e))?);
+            Arc::new(SqliteContextManager::new(db_path).map_err(KernelError::Context)?);
         Self::with_context_manager(context_manager)
     }
 
@@ -746,7 +752,7 @@ impl AgentKernelImpl {
     ) -> Result<(), KernelError> {
         self.connector
             .register_provider(adapter)
-            .map_err(|e| KernelError::Connector(e))
+            .map_err(KernelError::Connector)
     }
 
     /// Create agent with full subsystem coordination.
@@ -765,19 +771,19 @@ impl AgentKernelImpl {
         // 3. Create context
         ContextManager::create_context(&*self.context_manager, agent_id)
             .await
-            .map_err(|e| KernelError::Context(e))?;
+            .map_err(KernelError::Context)?;
 
         // 4. Create sandbox if configured
         if let Some(ref sandbox_config) = config.sandbox_config {
             self.sandbox_manager
                 .create_sandbox(agent_id, sandbox_config)
-                .map_err(|e| KernelError::Sandbox(e))?;
+                .map_err(KernelError::Sandbox)?;
         }
 
         // 5. Schedule agent
         AgentScheduler::schedule(&*self.scheduler, &handle)
             .await
-            .map_err(|e| KernelError::Scheduler(e))?;
+            .map_err(KernelError::Scheduler)?;
 
         // 6. Register IPC mailbox
         self.ipc.register_agent(agent_id);
@@ -841,7 +847,7 @@ impl AgentKernelImpl {
             // Connect to LLM provider
             let session = AgentConnector::connect(&*self.connector, agent_id, &provider_id)
                 .await
-                .map_err(|e| KernelError::Connector(e))?;
+                .map_err(KernelError::Connector)?;
 
             let mut executor = AgentExecutor::new(
                 agent_id,

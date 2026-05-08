@@ -80,6 +80,12 @@ pub struct IpcManager {
     allowed_pairs: Option<DashMap<(AgentId, AgentId), bool>>,
 }
 
+impl Default for IpcManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl IpcManager {
     pub fn new() -> Self {
         Self {
@@ -176,7 +182,7 @@ impl AgentIpc for IpcManager {
         // Track subscription
         self.subscriptions
             .entry(agent_id)
-            .or_insert_with(Vec::new)
+            .or_default()
             .push(topic.to_string());
         Ok(())
     }

@@ -56,6 +56,7 @@ struct JsonRpcRequest {
 /// JSON-RPC response.
 #[derive(Deserialize)]
 struct JsonRpcResponse {
+    #[allow(dead_code)]
     id: Option<u64>,
     result: Option<serde_json::Value>,
     error: Option<serde_json::Value>,

@@ -52,6 +52,7 @@ pub mod editing;
 pub mod learning;
 pub mod mcp;
 pub mod rate_limit;
+pub mod syscall_gate;
 pub mod github;
 pub mod docker_sandbox;
 pub mod database;
@@ -380,6 +381,35 @@ pub fn set_max_browse_chars(chars: usize) {
     MAX_BROWSE_CHARS.store(chars, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// Translate a permission profile id into a capability set used by the syscall gate.
+///
+/// Unknown / custom profiles fall back to fully-permissive so user-defined
+/// profiles continue to work — the operator can tighten by switching the gate's
+/// MAC engine into enforcing mode and loading rules.
+fn caps_for_profile(profile: &str) -> CapabilitySet {
+    let mut caps = CapabilitySet::none();
+    match profile {
+        "read-only" => {
+            // Reads only; no writes/exec/delete. Network read is permitted.
+            caps.grant(CapabilitySet::CAP_NET_ACCESS);
+        }
+        "standard" => {
+            caps.grant(CapabilitySet::CAP_FILE_WRITE);
+            caps.grant(CapabilitySet::CAP_NET_ACCESS);
+            caps.grant(CapabilitySet::CAP_EXEC);
+        }
+        "elevated" => {
+            caps.grant(CapabilitySet::CAP_FILE_WRITE);
+            caps.grant(CapabilitySet::CAP_FILE_DELETE);
+            caps.grant(CapabilitySet::CAP_NET_ACCESS);
+            caps.grant(CapabilitySet::CAP_EXEC);
+        }
+        "full-access" | "" => return CapabilitySet::all(),
+        _ => return CapabilitySet::all(),
+    }
+    caps
+}
+
 struct BuiltinFilesystemProvider;
 
 #[async_trait::async_trait]
@@ -507,6 +537,9 @@ use crate::sandbox::{SandboxManager, SandboxManagerImpl};
 use crate::scheduler::{AgentScheduler, PriorityScheduler};
 use crate::tools::ToolRegistry;
 use crate::rate_limit::{RateLimiter, RateLimitConfig};
+use crate::syscall_gate::SyscallGate;
+use crate::cgroups::CgroupManager;
+use crate::agent_struct::CapabilitySet;
 
 /// The wired kernel orchestrator holding all subsystem instances.
 pub struct AgentKernelImpl {
@@ -521,6 +554,8 @@ pub struct AgentKernelImpl {
     pub resource_broker: Arc<ResourceBrokerImpl>,
     pub tool_registry: Arc<ToolRegistry>,
     pub rate_limiter: Arc<RateLimiter>,
+    pub cgroups: Arc<CgroupManager>,
+    pub syscall_gate: Arc<SyscallGate>,
     executors: DashMap<AgentId, tokio::sync::Mutex<AgentExecutor>>,
     event_tx: broadcast::Sender<KernelEvent>,
 }
@@ -564,6 +599,9 @@ impl AgentKernelImpl {
         resource_broker.register_provider(Box::new(BuiltinNetworkProvider));
         resource_broker.register_provider(Box::new(BuiltinAppProvider));
 
+        let cgroups = Arc::new(CgroupManager::new());
+        let syscall_gate = Arc::new(SyscallGate::new(cgroups.clone()));
+
         Ok(Self {
             agent_manager: Arc::new(AgentManager::new(256)),
             scheduler: Arc::new(PriorityScheduler::new()),
@@ -576,6 +614,8 @@ impl AgentKernelImpl {
             resource_broker,
             tool_registry: Arc::new(ToolRegistry::new()),
             rate_limiter: Arc::new(RateLimiter::new(RateLimitConfig::default())),
+            cgroups,
+            syscall_gate,
             executors: DashMap::new(),
             event_tx,
         })
@@ -613,7 +653,13 @@ impl AgentKernelImpl {
         // 6. Register IPC mailbox
         self.ipc.register_agent(agent_id);
 
-        // 7. Broadcast event
+        // 7. Register with the syscall gate (capabilities derived from the
+        //    permission profile; fully-permissive if profile is unknown so
+        //    existing flows keep working).
+        let caps = caps_for_profile(&config.permission_profile);
+        self.syscall_gate.register_agent(agent_id, caps, None);
+
+        // 8. Broadcast event
         let _ = self.event_tx.send(KernelEvent::AgentCreated(agent_id));
 
         Ok(handle)
@@ -633,7 +679,7 @@ impl AgentKernelImpl {
             let session = AgentConnector::connect(&*self.connector, agent_id, &provider_id).await
                 .map_err(|e| KernelError::Connector(e))?;
 
-            let executor = AgentExecutor::new(
+            let mut executor = AgentExecutor::new(
                 agent_id,
                 session,
                 self.resource_broker.clone() as Arc<dyn ResourceBroker>,
@@ -641,6 +687,7 @@ impl AgentKernelImpl {
                 self.context_manager.clone(),
                 "You are a helpful AI assistant. Use the available tools to help the user.".into(),
             );
+            executor.set_syscall_gate(self.syscall_gate.clone());
 
             self.executors.insert(agent_id, tokio::sync::Mutex::new(executor));
         }
@@ -673,6 +720,11 @@ impl AgentKernelImpl {
                 let _ = self.agent_manager.stop_agent(info.id).await;
                 stopped.push(info.id);
             }
+            // Release per-agent state held by long-lived subsystems so
+            // multi-hour runs don't leak memory linearly with shutdowns.
+            self.observability.purge_agent(info.id);
+            self.syscall_gate.unregister_agent(info.id);
+            self.executors.remove(&info.id);
         }
 
         Ok(stopped)

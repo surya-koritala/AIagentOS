@@ -170,7 +170,8 @@ mod tests {
 
     #[test]
     fn build_repo_map() {
-        let map = RepoMap::build(std::path::Path::new("/home/surya/AI Agent OS/crates/kernel/src"));
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let map = RepoMap::build(&src);
         assert!(map.total_files > 10);
         assert!(map.total_lines > 1000);
         assert!(map.files.iter().any(|f| f.path.contains("execution")));

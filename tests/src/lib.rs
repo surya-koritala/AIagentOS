@@ -47,3 +47,6 @@ mod e2e_pipeline;
 
 #[cfg(test)]
 mod edge_cases;
+
+#[cfg(test)]
+mod os_enforcement;

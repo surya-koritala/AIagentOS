@@ -318,17 +318,65 @@ mod tests {
     }
 }
 
+#[cfg(test)]
+mod boot_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// Allocate a unique temp directory and seed it with three dependent service files.
+    fn seed_service_dir() -> std::path::PathBuf {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+        let pid = std::process::id();
+        let dir = std::env::temp_dir().join(format!("agentos_services_{}_{}", pid, n));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let database = r#"
+name = "database"
+description = "DB service"
+
+[exec]
+provider = "stub"
+system_prompt = "db"
+"#;
+        let researcher = r#"
+name = "researcher"
+description = "Research service"
+
+[exec]
+provider = "stub"
+system_prompt = "research"
+
+[dependencies]
+requires = ["database"]
+"#;
+        let writer = r#"
+name = "writer"
+description = "Writer service"
+
+[exec]
+provider = "stub"
+system_prompt = "write"
+
+[dependencies]
+requires = ["researcher"]
+"#;
+        std::fs::write(dir.join("database.toml"), database).unwrap();
+        std::fs::write(dir.join("researcher.toml"), researcher).unwrap();
+        std::fs::write(dir.join("writer.toml"), writer).unwrap();
+        dir
+    }
+
     #[tokio::test]
     async fn boot_from_service_files() {
         let kernel = OsKernel::new();
-        let dir = std::path::Path::new("/tmp/agent_services");
-        let started = kernel.boot(Some(dir)).await.unwrap();
+        let dir = seed_service_dir();
+        let started = kernel.boot(Some(&dir)).await.unwrap();
 
-        // Should start 3 agents in dependency order: database → researcher → writer
         assert_eq!(started.len(), 3);
         assert_eq!(kernel.status().total_agents, 3);
 
-        // Verify init system tracked them
         let init = kernel.init.lock().await;
         assert_eq!(init.status("database"), Some(ServiceStatus::Running));
         assert_eq!(init.status("researcher"), Some(ServiceStatus::Running));
@@ -338,69 +386,59 @@ mod tests {
     #[tokio::test]
     async fn boot_respects_dependency_order() {
         let kernel = OsKernel::new();
-        let dir = std::path::Path::new("/tmp/agent_services");
-        let started = kernel.boot(Some(dir)).await.unwrap();
+        let dir = seed_service_dir();
+        let started = kernel.boot(Some(&dir)).await.unwrap();
 
-        // database must start before researcher, researcher before writer
-        // IDs are monotonically increasing, so order is preserved
-        assert!(started[0] < started[1]); // database before researcher
-        assert!(started[1] < started[2]); // researcher before writer
+        assert_eq!(started.len(), 3);
+        assert!(started[0] < started[1]);
+        assert!(started[1] < started[2]);
     }
 
     #[tokio::test]
     async fn crash_one_others_survive() {
         let kernel = OsKernel::new();
         kernel.boot(None).await.unwrap();
-        let id1 = kernel.start_agent("survivor-1").await.unwrap();
+        let _id1 = kernel.start_agent("survivor-1").await.unwrap();
         let id2 = kernel.start_agent("crash-me").await.unwrap();
-        let id3 = kernel.start_agent("survivor-2").await.unwrap();
+        let _id3 = kernel.start_agent("survivor-2").await.unwrap();
 
-        // Crash agent 2
         kernel.stop_agent(id2).await.unwrap();
 
-        // Others still in scheduler
         let sched = kernel.scheduler.lock().await;
-        assert_eq!(sched.runnable_count(), 2); // id1 and id3 still running
+        assert_eq!(sched.runnable_count(), 2);
     }
 
     #[tokio::test]
     async fn full_lifecycle_integration() {
         let kernel = OsKernel::new();
-
-        // 1. Boot
         kernel.boot(None).await.unwrap();
         assert!(kernel.status().booted);
 
-        // 2. Start 5 agents
         let mut ids = Vec::new();
         for i in 0..5 {
             ids.push(kernel.start_agent(&format!("agent-{}", i)).await.unwrap());
         }
         assert_eq!(kernel.status().total_agents, 5);
 
-        // 3. Verify all in scheduler
         {
             let sched = kernel.scheduler.lock().await;
             assert_eq!(sched.runnable_count(), 5);
         }
 
-        // 4. Verify all in default namespace
         for &id in &ids {
-            let default_ns = kernel.namespaces.default_ns(NamespaceType::Agent).unwrap();
             assert!(kernel.namespaces.same_namespace(ids[0], id, NamespaceType::Agent));
         }
 
-        // 5. Crash one
         kernel.stop_agent(ids[2]).await.unwrap();
         {
             let sched = kernel.scheduler.lock().await;
             assert_eq!(sched.runnable_count(), 4);
         }
 
-        // 6. Shutdown
         let stopped = kernel.shutdown().await;
-        assert_eq!(stopped.len(), 5); // all 5 get stop signal
+        assert_eq!(stopped.len(), 5);
     }
+}
 
 // ─── Tool Call Path ──────────────────────────────────────────────────────────
 

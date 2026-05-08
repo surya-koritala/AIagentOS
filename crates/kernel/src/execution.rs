@@ -54,6 +54,7 @@ pub struct AgentExecutor {
     tool_registry: Arc<ToolRegistry>,
     context_manager: Arc<SqliteContextManager>,
     rule_store: Option<Arc<crate::learning::RuleStore>>,
+    syscall_gate: Option<Arc<crate::syscall_gate::SyscallGate>>,
     messages: Vec<StandardMessage>,
     cancel_token: CancellationToken,
     event_tx: Option<mpsc::Sender<StreamEvent>>,
@@ -78,11 +79,20 @@ impl AgentExecutor {
             tool_registry,
             context_manager,
             rule_store: None,
+            syscall_gate: None,
             messages: vec![StandardMessage::system(&system_prompt)],
             cancel_token: CancellationToken::new(),
             event_tx: None,
             system_prompt,
         }
+    }
+
+    /// Install a syscall gate. Once set, every tool call passes through it for
+    /// capability + MAC + cgroup enforcement. Without a gate the executor falls
+    /// back to the legacy direct-broker path (used by unit tests that don't
+    /// care about OS enforcement).
+    pub fn set_syscall_gate(&mut self, gate: Arc<crate::syscall_gate::SyscallGate>) {
+        self.syscall_gate = Some(gate);
     }
 
     /// Resume from a saved conversation.
@@ -252,8 +262,36 @@ impl AgentExecutor {
     }
 
     /// Execute a tool call, returning the result string (or error message for LLM recovery).
+    ///
+    /// When a `SyscallGate` is installed, every call is screened: capability →
+    /// MAC → cgroup quota. A denial is surfaced to the LLM as a tool error so
+    /// the model can recover (try another tool, ask the user, etc.) without
+    /// the kernel trusting the LLM to obey policy.
     async fn execute_tool(&self, tool_call: &crate::connector::ToolCall) -> String {
-        match self.tool_registry.resolve(self.agent_id, tool_call) {
+        // Estimate token cost: arguments + tool name. Conservative ratio of 4
+        // chars per token plus a 10-token floor so trivial calls still count.
+        let est_tokens: u64 = (tool_call.arguments.to_string().len() as u64 / 4)
+            .saturating_add(tool_call.name.len() as u64 / 4)
+            .saturating_add(10);
+
+        // Pull a representative resource string out of arguments for MAC.
+        let resource = tool_call.arguments.get("path")
+            .or_else(|| tool_call.arguments.get("url"))
+            .or_else(|| tool_call.arguments.get("command"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("*")
+            .to_string();
+
+        if let Some(ref gate) = self.syscall_gate {
+            match gate.check_tool_call(self.agent_id, &tool_call.name, &resource, est_tokens).await {
+                Ok(_) => { /* proceed */ }
+                Err(denial) => {
+                    return format!("Tool '{}' denied by kernel: {}", tool_call.name, denial.message());
+                }
+            }
+        }
+
+        let result = match self.tool_registry.resolve(self.agent_id, tool_call) {
             Some(request) => {
                 match self.resource_broker.execute(request).await {
                     Ok(resp) if resp.success => {
@@ -269,7 +307,13 @@ impl AgentExecutor {
             }
             None => format!("Unknown tool '{}'. Available tools: {}", tool_call.name,
                 self.tool_registry.definitions().iter().map(|t| t.name.as_str()).collect::<Vec<_>>().join(", ")),
+        };
+
+        if let Some(ref gate) = self.syscall_gate {
+            gate.record_tool_usage(self.agent_id, est_tokens);
         }
+
+        result
     }
 
     /// Get the current message history.

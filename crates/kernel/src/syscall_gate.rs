@@ -16,6 +16,7 @@ use tokio::sync::Mutex;
 use crate::agent_struct::CapabilitySet;
 use crate::cgroups::{CgroupId, CgroupManager};
 use crate::mac::{MacDecision, MacEngine};
+use crate::namespaces::NamespaceId;
 
 /// OS-level numeric agent identifier (analogue of a Linux PID).
 pub type Pid = u64;
@@ -34,6 +35,11 @@ pub enum GateDenial {
     },
     /// Cgroup token quota would be exceeded.
     CgroupQuota,
+    /// Tool is registered in a namespace the agent is not a member of.
+    NotInNamespace {
+        tool: String,
+        namespace: NamespaceId,
+    },
 }
 
 impl GateDenial {
@@ -46,6 +52,10 @@ impl GateDenial {
                 format!("MAC policy denies {} on {} (EACCES)", action, resource)
             }
             GateDenial::CgroupQuota => "cgroup token quota exceeded (EAGAIN)".to_string(),
+            GateDenial::NotInNamespace { tool, namespace } => format!(
+                "tool '{}' not visible in agent's namespaces (ns={}, ENOENT)",
+                tool, namespace
+            ),
         }
     }
 }
@@ -108,6 +118,9 @@ struct GateRecord {
     pid: Pid,
     caps: CapabilitySet,
     cgroup: CgroupId,
+    /// Namespaces this agent is a member of. A tool registered in any of these
+    /// namespaces is visible. Tools without a namespace are visible to everyone.
+    namespaces: Vec<NamespaceId>,
 }
 
 /// Counters surfaced for observability and tests.
@@ -118,6 +131,7 @@ pub struct GateStats {
     pub denied_mac: u64,
     pub denied_cgroup: u64,
     pub denied_unknown: u64,
+    pub denied_namespace: u64,
 }
 
 /// The syscall gate.
@@ -128,6 +142,9 @@ pub struct SyscallGate {
     default_cgroup: CgroupId,
     /// Kernel UUID → OS PID record.
     records: DashMap<uuid::Uuid, GateRecord>,
+    /// Tool namespace assignments. A tool with a namespace is only visible to
+    /// agents that are members of that namespace; absence means "global".
+    tool_namespaces: DashMap<String, NamespaceId>,
     /// Monotonic PID allocator (starts at 1 so 0 stays reserved for "kernel").
     next_pid: AtomicU64,
     /// Counters.
@@ -136,6 +153,7 @@ pub struct SyscallGate {
     denied_mac: AtomicU64,
     denied_cgroup: AtomicU64,
     denied_unknown: AtomicU64,
+    denied_namespace: AtomicU64,
 }
 
 impl SyscallGate {
@@ -151,12 +169,14 @@ impl SyscallGate {
             cgroups,
             default_cgroup,
             records: DashMap::new(),
+            tool_namespaces: DashMap::new(),
             next_pid: AtomicU64::new(1),
             allowed: AtomicU64::new(0),
             denied_capability: AtomicU64::new(0),
             denied_mac: AtomicU64::new(0),
             denied_cgroup: AtomicU64::new(0),
             denied_unknown: AtomicU64::new(0),
+            denied_namespace: AtomicU64::new(0),
         }
     }
 
@@ -177,9 +197,37 @@ impl SyscallGate {
                 pid,
                 caps,
                 cgroup: cg,
+                namespaces: Vec::new(),
             },
         );
         pid
+    }
+
+    /// Tag a tool with a namespace. Once tagged, only agents whose
+    /// `set_agent_namespaces` set contains this id will resolve the tool.
+    pub fn register_tool_namespace(&self, tool_name: impl Into<String>, ns: NamespaceId) {
+        self.tool_namespaces.insert(tool_name.into(), ns);
+    }
+
+    /// Remove a tool's namespace tag — makes it global again.
+    pub fn unregister_tool_namespace(&self, tool_name: &str) {
+        self.tool_namespaces.remove(tool_name);
+    }
+
+    /// Replace an agent's namespace memberships.
+    pub fn set_agent_namespaces(&self, kid: uuid::Uuid, namespaces: Vec<NamespaceId>) {
+        if let Some(mut rec) = self.records.get_mut(&kid) {
+            rec.namespaces = namespaces;
+        }
+    }
+
+    /// Add a namespace to an agent's existing memberships.
+    pub fn add_agent_namespace(&self, kid: uuid::Uuid, ns: NamespaceId) {
+        if let Some(mut rec) = self.records.get_mut(&kid) {
+            if !rec.namespaces.contains(&ns) {
+                rec.namespaces.push(ns);
+            }
+        }
     }
 
     /// Remove an agent from the gate.
@@ -196,8 +244,11 @@ impl SyscallGate {
 
     /// Check whether an agent may make this tool call.
     ///
-    /// Order: capability → MAC → cgroup quota. If all three pass, returns
-    /// `Ok(pid)` so the caller can record actual usage afterwards.
+    /// Order: namespace visibility → capability → MAC → cgroup quota. If all
+    /// pass, returns `Ok(pid)` so the caller can record actual usage afterwards.
+    /// Namespace runs first because the LLM should not learn anything about
+    /// tools it cannot see (an attacker probing a denied resource gets ENOENT,
+    /// not EACCES).
     pub async fn check_tool_call(
         &self,
         kid: uuid::Uuid,
@@ -207,13 +258,30 @@ impl SyscallGate {
     ) -> Result<Pid, GateDenial> {
         let action = classify_tool(tool_name);
 
-        let (pid, caps, cgroup) = match self.records.get(&kid) {
-            Some(rec) => (rec.pid, rec.caps.clone(), rec.cgroup),
+        let (pid, caps, cgroup, agent_namespaces) = match self.records.get(&kid) {
+            Some(rec) => (
+                rec.pid,
+                rec.caps.clone(),
+                rec.cgroup,
+                rec.namespaces.clone(),
+            ),
             None => {
                 self.denied_unknown.fetch_add(1, Ordering::Relaxed);
                 return Err(GateDenial::UnknownAgent);
             }
         };
+
+        // 0. Namespace visibility. If the tool is tagged with a namespace,
+        //    the agent must be a member of it. Untagged tools are global.
+        if let Some(tool_ns) = self.tool_namespaces.get(tool_name).map(|r| *r.value()) {
+            if !agent_namespaces.contains(&tool_ns) {
+                self.denied_namespace.fetch_add(1, Ordering::Relaxed);
+                return Err(GateDenial::NotInNamespace {
+                    tool: tool_name.to_string(),
+                    namespace: tool_ns,
+                });
+            }
+        }
 
         // 1. Capability check.
         if let Some(required) = action.required_cap {
@@ -278,6 +346,7 @@ impl SyscallGate {
             denied_mac: self.denied_mac.load(Ordering::Relaxed),
             denied_cgroup: self.denied_cgroup.load(Ordering::Relaxed),
             denied_unknown: self.denied_unknown.load(Ordering::Relaxed),
+            denied_namespace: self.denied_namespace.load(Ordering::Relaxed),
         }
     }
 }

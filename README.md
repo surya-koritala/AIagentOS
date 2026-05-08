@@ -101,7 +101,7 @@ We mark each subsystem honestly: **Live** = enforced on the runtime path, **Defi
 | `fork()/clone()` | `agent_clone(flags)` | Defined |
 | CFS scheduler | `CfsScheduler` (vruntime, nice) — Tokio still drives turn execution | Defined |
 | Virtual memory + paging | `ContextPager` LRU eviction — auto-summarization covers the live path | Defined |
-| Namespaces | Membership tags (no cross-namespace hiding yet) | Planned (Phase 3) |
+| Namespaces | Tool-namespace isolation: cross-namespace calls return `NotInNamespace` (≈ ENOENT) | **Live** |
 | VFS + mount | Tool descriptors + mount table | Planned (Phase 3) |
 | /proc filesystem | `ProcFs` snapshot reads (no live agent queries) | Planned (Phase 4) |
 | apt/rpm | `agentpkg` (in-memory mock, no remote registry) | Planned (Phase 4) |

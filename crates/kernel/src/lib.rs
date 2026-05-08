@@ -793,12 +793,19 @@ impl AgentKernelImpl {
         //    procfs entry. These were previously only wired by the standalone
         //    OsKernel — folding them into AgentKernelImpl makes the OS surface
         //    real for every agent created through the live path.
+        let mut agent_ns_ids = Vec::new();
         if let Some(ns) = self.os.namespaces.default_ns(NamespaceType::Agent) {
             self.os.namespaces.join(ns, pid);
+            agent_ns_ids.push(ns);
         }
         if let Some(ns) = self.os.namespaces.default_ns(NamespaceType::Tool) {
             self.os.namespaces.join(ns, pid);
+            agent_ns_ids.push(ns);
         }
+        // Mirror namespace memberships into the gate so namespace-scoped tool
+        // resolution (Phase 3) can deny tools registered in foreign namespaces.
+        self.syscall_gate
+            .set_agent_namespaces(agent_id, agent_ns_ids);
         {
             let mut sched = self.os.cfs.lock().await;
             sched.enqueue(pid, 0, SchedClass::Normal);

@@ -12,9 +12,17 @@ use crate::{AgentId, IsolationLevel, SandboxConfig, SandboxError, SandboxId};
 
 /// The Sandbox Manager trait.
 pub trait SandboxManager: Send + Sync {
-    fn create_sandbox(&self, agent_id: AgentId, config: &SandboxConfig) -> Result<SandboxId, SandboxError>;
+    fn create_sandbox(
+        &self,
+        agent_id: AgentId,
+        config: &SandboxConfig,
+    ) -> Result<SandboxId, SandboxError>;
     fn destroy_sandbox(&self, sandbox_id: SandboxId) -> Result<(), SandboxError>;
-    fn intercept_action(&self, sandbox_id: SandboxId, action: &SandboxAction) -> Result<(), SandboxError>;
+    fn intercept_action(
+        &self,
+        sandbox_id: SandboxId,
+        action: &SandboxAction,
+    ) -> Result<(), SandboxError>;
     fn get_sandbox_for_agent(&self, agent_id: AgentId) -> Option<SandboxId>;
 }
 
@@ -69,7 +77,9 @@ impl SandboxManagerImpl {
         let mut components = Vec::new();
         for component in path.components() {
             match component {
-                std::path::Component::ParentDir => { components.pop(); }
+                std::path::Component::ParentDir => {
+                    components.pop();
+                }
                 std::path::Component::CurDir => {}
                 c => components.push(c),
             }
@@ -79,10 +89,15 @@ impl SandboxManagerImpl {
 }
 
 impl SandboxManager for SandboxManagerImpl {
-    fn create_sandbox(&self, agent_id: AgentId, config: &SandboxConfig) -> Result<SandboxId, SandboxError> {
+    fn create_sandbox(
+        &self,
+        agent_id: AgentId,
+        config: &SandboxConfig,
+    ) -> Result<SandboxId, SandboxError> {
         let sandbox_id = uuid::Uuid::new_v4();
 
-        let allowed_hosts: HashSet<String> = config.allowed_network_hosts
+        let allowed_hosts: HashSet<String> = config
+            .allowed_network_hosts
             .as_ref()
             .map(|h| h.iter().cloned().collect())
             .unwrap_or_default();
@@ -102,38 +117,50 @@ impl SandboxManager for SandboxManagerImpl {
     }
 
     fn destroy_sandbox(&self, sandbox_id: SandboxId) -> Result<(), SandboxError> {
-        let state = self.sandboxes.remove(&sandbox_id)
+        let state = self
+            .sandboxes
+            .remove(&sandbox_id)
             .ok_or_else(|| SandboxError::DestructionFailed("Sandbox not found".to_string()))?;
         self.agent_sandboxes.remove(&state.1.agent_id);
         Ok(())
     }
 
-    fn intercept_action(&self, sandbox_id: SandboxId, action: &SandboxAction) -> Result<(), SandboxError> {
-        let state = self.sandboxes.get(&sandbox_id)
+    fn intercept_action(
+        &self,
+        sandbox_id: SandboxId,
+        action: &SandboxAction,
+    ) -> Result<(), SandboxError> {
+        let state = self
+            .sandboxes
+            .get(&sandbox_id)
             .ok_or_else(|| SandboxError::BoundaryViolation("Sandbox not found".to_string()))?;
 
         match action {
             SandboxAction::FileAccess(path) => {
                 if !Self::is_within_boundary(&state.workspace_dir, path) {
-                    return Err(SandboxError::BoundaryViolation(
-                        format!("Path {:?} is outside sandbox boundary {:?}", path, state.workspace_dir)
-                    ));
+                    return Err(SandboxError::BoundaryViolation(format!(
+                        "Path {:?} is outside sandbox boundary {:?}",
+                        path, state.workspace_dir
+                    )));
                 }
             }
             SandboxAction::NetworkAccess(host) => {
                 if !state.allowed_network_hosts.is_empty()
-                    && !state.allowed_network_hosts.contains(host) {
-                    return Err(SandboxError::BoundaryViolation(
-                        format!("Network access to '{}' not in allowlist", host)
-                    ));
+                    && !state.allowed_network_hosts.contains(host)
+                {
+                    return Err(SandboxError::BoundaryViolation(format!(
+                        "Network access to '{}' not in allowlist",
+                        host
+                    )));
                 }
             }
             SandboxAction::ProcessExec(cmd) => {
                 // Only container-level isolation allows arbitrary process execution
                 if state.isolation_level != IsolationLevel::Container {
-                    return Err(SandboxError::BoundaryViolation(
-                        format!("Process execution '{}' not allowed at {:?} isolation level", cmd, state.isolation_level)
-                    ));
+                    return Err(SandboxError::BoundaryViolation(format!(
+                        "Process execution '{}' not allowed at {:?} isolation level",
+                        cmd, state.isolation_level
+                    )));
                 }
             }
         }
@@ -175,7 +202,10 @@ mod tests {
         let mgr = SandboxManagerImpl::new();
         let agent_id = uuid::Uuid::new_v4();
         let sid = mgr.create_sandbox(agent_id, &test_config()).unwrap();
-        let result = mgr.intercept_action(sid, &SandboxAction::FileAccess(PathBuf::from("/tmp/sandbox/agent1/file.txt")));
+        let result = mgr.intercept_action(
+            sid,
+            &SandboxAction::FileAccess(PathBuf::from("/tmp/sandbox/agent1/file.txt")),
+        );
         assert!(result.is_ok());
     }
 
@@ -184,7 +214,10 @@ mod tests {
         let mgr = SandboxManagerImpl::new();
         let agent_id = uuid::Uuid::new_v4();
         let sid = mgr.create_sandbox(agent_id, &test_config()).unwrap();
-        let result = mgr.intercept_action(sid, &SandboxAction::FileAccess(PathBuf::from("/etc/passwd")));
+        let result = mgr.intercept_action(
+            sid,
+            &SandboxAction::FileAccess(PathBuf::from("/etc/passwd")),
+        );
         assert!(result.is_err());
     }
 
@@ -193,7 +226,10 @@ mod tests {
         let mgr = SandboxManagerImpl::new();
         let agent_id = uuid::Uuid::new_v4();
         let sid = mgr.create_sandbox(agent_id, &test_config()).unwrap();
-        let result = mgr.intercept_action(sid, &SandboxAction::FileAccess(PathBuf::from("/tmp/sandbox/agent1/../../etc/passwd")));
+        let result = mgr.intercept_action(
+            sid,
+            &SandboxAction::FileAccess(PathBuf::from("/tmp/sandbox/agent1/../../etc/passwd")),
+        );
         assert!(result.is_err());
     }
 
@@ -202,7 +238,10 @@ mod tests {
         let mgr = SandboxManagerImpl::new();
         let agent_id = uuid::Uuid::new_v4();
         let sid = mgr.create_sandbox(agent_id, &test_config()).unwrap();
-        let result = mgr.intercept_action(sid, &SandboxAction::NetworkAccess("api.openai.com".to_string()));
+        let result = mgr.intercept_action(
+            sid,
+            &SandboxAction::NetworkAccess("api.openai.com".to_string()),
+        );
         assert!(result.is_ok());
     }
 
@@ -211,7 +250,8 @@ mod tests {
         let mgr = SandboxManagerImpl::new();
         let agent_id = uuid::Uuid::new_v4();
         let sid = mgr.create_sandbox(agent_id, &test_config()).unwrap();
-        let result = mgr.intercept_action(sid, &SandboxAction::NetworkAccess("evil.com".to_string()));
+        let result =
+            mgr.intercept_action(sid, &SandboxAction::NetworkAccess("evil.com".to_string()));
         assert!(result.is_err());
     }
 

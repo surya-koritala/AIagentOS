@@ -6,13 +6,10 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::Mutex;
 use tokio::time::interval;
 
-use crate::agent_struct::{AgentId, AgentState};
-use crate::cfs::CfsScheduler;
-use crate::cgroups::CgroupManager;
-use crate::init_system::{InitSystem, ServiceStatus, RestartPolicy};
+use crate::agent_struct::AgentId;
+use crate::init_system::ServiceStatus;
 use crate::os_kernel::OsKernel;
 
 /// The kernel runtime — runs background tasks.
@@ -35,7 +32,8 @@ impl KernelRuntime {
 
     /// Start all kernel background threads.
     pub fn start(&self) -> Vec<tokio::task::JoinHandle<()>> {
-        self.running.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.running
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         vec![
             self.spawn_scheduler_loop(),
             self.spawn_supervisor(),
@@ -46,7 +44,8 @@ impl KernelRuntime {
 
     /// Stop all background threads.
     pub fn stop(&self) {
-        self.running.store(false, std::sync::atomic::Ordering::SeqCst);
+        self.running
+            .store(false, std::sync::atomic::Ordering::SeqCst);
     }
 
     fn is_running(&self) -> bool {
@@ -57,14 +56,16 @@ impl KernelRuntime {
     fn spawn_scheduler_loop(&self) -> tokio::task::JoinHandle<()> {
         let kernel = self.kernel.clone();
         let interval_ms = self.scheduler_interval_ms;
-        let running = self.running.load(std::sync::atomic::Ordering::SeqCst);
+        let _running = self.running.load(std::sync::atomic::Ordering::SeqCst);
 
         tokio::spawn(async move {
             let mut tick = interval(Duration::from_millis(interval_ms));
             loop {
                 tick.tick().await;
                 // Check if still running
-                if !kernel.status().booted { break; }
+                if !kernel.status().booted {
+                    break;
+                }
 
                 let mut sched = kernel.scheduler.lock().await;
                 if let Some(next_agent) = sched.pick_next() {
@@ -89,13 +90,18 @@ impl KernelRuntime {
             let mut tick = interval(Duration::from_millis(interval_ms));
             loop {
                 tick.tick().await;
-                if !kernel.status().booted { break; }
+                if !kernel.status().booted {
+                    break;
+                }
 
                 // Check init system for failed services that should restart
                 let to_restart: Vec<String> = {
                     let init = kernel.init.lock().await;
-                    init.list().iter()
-                        .filter(|(name, status)| *status == ServiceStatus::Failed && init.should_restart(name))
+                    init.list()
+                        .iter()
+                        .filter(|(name, status)| {
+                            *status == ServiceStatus::Failed && init.should_restart(name)
+                        })
                         .map(|(name, _)| name.to_string())
                         .collect()
                 };
@@ -123,7 +129,9 @@ impl KernelRuntime {
             let mut tick = interval(Duration::from_secs(10));
             loop {
                 tick.tick().await;
-                if !kernel.status().booted { break; }
+                if !kernel.status().booted {
+                    break;
+                }
 
                 // Check if system is over budget
                 let over_budget = !kernel.cgroups.check_token_limit(kernel.cgroups.root(), 0);
@@ -148,7 +156,9 @@ impl KernelRuntime {
             let mut tick = interval(Duration::from_secs(60));
             loop {
                 tick.tick().await;
-                if !kernel.status().booted { break; }
+                if !kernel.status().booted {
+                    break;
+                }
                 // Reset per-minute counters every minute
                 kernel.cgroups.reset_minute_counters();
             }
@@ -162,7 +172,11 @@ pub struct WaitQueue {
 }
 
 impl WaitQueue {
-    pub fn new() -> Self { Self { waiters: std::sync::Mutex::new(Vec::new()) } }
+    pub fn new() -> Self {
+        Self {
+            waiters: std::sync::Mutex::new(Vec::new()),
+        }
+    }
 
     /// Block an agent until woken.
     pub async fn wait(&self, agent_id: AgentId) {
@@ -177,19 +191,25 @@ impl WaitQueue {
         if let Some((id, tx)) = waiters.pop() {
             let _ = tx.send(());
             Some(id)
-        } else { None }
+        } else {
+            None
+        }
     }
 
     /// Wake all waiters.
     pub fn wake_all(&self) -> usize {
         let mut waiters = self.waiters.lock().unwrap();
         let count = waiters.len();
-        for (_, tx) in waiters.drain(..) { let _ = tx.send(()); }
+        for (_, tx) in waiters.drain(..) {
+            let _ = tx.send(());
+        }
         count
     }
 
     /// Number of waiters.
-    pub fn len(&self) -> usize { self.waiters.lock().unwrap().len() }
+    pub fn len(&self) -> usize {
+        self.waiters.lock().unwrap().len()
+    }
 }
 
 /// Kernel page cache — caches tool call results.
@@ -207,7 +227,10 @@ struct CacheEntry {
 
 impl PageCache {
     pub fn new(max_entries: usize) -> Self {
-        Self { cache: std::sync::Mutex::new(std::collections::HashMap::new()), max_entries }
+        Self {
+            cache: std::sync::Mutex::new(std::collections::HashMap::new()),
+            max_entries,
+        }
     }
 
     /// Get from cache.
@@ -229,17 +252,29 @@ impl PageCache {
         let mut cache = self.cache.lock().unwrap();
         if cache.len() >= self.max_entries {
             // Evict oldest
-            if let Some(oldest_key) = cache.iter()
+            if let Some(oldest_key) = cache
+                .iter()
                 .min_by_key(|(_, e)| e.inserted_at)
-                .map(|(k, _)| k.clone()) {
+                .map(|(k, _)| k.clone())
+            {
                 cache.remove(&oldest_key);
             }
         }
-        cache.insert(key, CacheEntry { value, inserted_at: std::time::Instant::now(), ttl, hits: 0 });
+        cache.insert(
+            key,
+            CacheEntry {
+                value,
+                inserted_at: std::time::Instant::now(),
+                ttl,
+                hits: 0,
+            },
+        );
     }
 
     /// Invalidate a cache entry.
-    pub fn invalidate(&self, key: &str) { self.cache.lock().unwrap().remove(key); }
+    pub fn invalidate(&self, key: &str) {
+        self.cache.lock().unwrap().remove(key);
+    }
 
     /// Cache stats.
     pub fn stats(&self) -> (usize, u64) {
@@ -260,7 +295,10 @@ pub struct CowContext {
 
 impl CowContext {
     pub fn new(data: Vec<String>) -> Self {
-        Self { shared: Arc::new(data), local: None }
+        Self {
+            shared: Arc::new(data),
+            local: None,
+        }
     }
 
     /// Read (cheap — no copy).
@@ -277,7 +315,9 @@ impl CowContext {
     }
 
     /// Check if this is still sharing (no writes yet).
-    pub fn is_shared(&self) -> bool { self.local.is_none() }
+    pub fn is_shared(&self) -> bool {
+        self.local.is_none()
+    }
 }
 
 #[cfg(test)]
@@ -295,14 +335,22 @@ mod tests {
     #[test]
     fn page_cache_put_get() {
         let cache = PageCache::new(10);
-        cache.put("key1".into(), serde_json::json!("value1"), Duration::from_secs(60));
+        cache.put(
+            "key1".into(),
+            serde_json::json!("value1"),
+            Duration::from_secs(60),
+        );
         assert_eq!(cache.get("key1"), Some(serde_json::json!("value1")));
     }
 
     #[test]
     fn page_cache_ttl_expiry() {
         let cache = PageCache::new(10);
-        cache.put("key".into(), serde_json::json!("val"), Duration::from_millis(1));
+        cache.put(
+            "key".into(),
+            serde_json::json!("val"),
+            Duration::from_millis(1),
+        );
         std::thread::sleep(Duration::from_millis(5));
         assert_eq!(cache.get("key"), None); // expired
     }

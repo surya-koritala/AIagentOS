@@ -23,7 +23,9 @@ pub struct SocketAddr {
 }
 
 impl SocketAddr {
-    pub fn new(agent_id: AgentId, port: u16) -> Self { Self { agent_id, port } }
+    pub fn new(agent_id: AgentId, port: u16) -> Self {
+        Self { agent_id, port }
+    }
 }
 
 /// Socket type.
@@ -73,7 +75,10 @@ pub struct SocketRegistry {
 
 impl SocketRegistry {
     pub fn new() -> Self {
-        Self { sockets: HashMap::new(), bindings: HashMap::new() }
+        Self {
+            sockets: HashMap::new(),
+            bindings: HashMap::new(),
+        }
     }
 
     /// Create a new socket.
@@ -82,8 +87,15 @@ impl SocketRegistry {
         let (tx, rx) = mpsc::channel(buffer_size);
         self.sockets.insert(id, tx.clone());
         Socket {
-            id, owner, sock_type, state: SocketState::Created,
-            local_addr: None, remote_addr: None, rx, tx, buffer_size,
+            id,
+            owner,
+            sock_type,
+            state: SocketState::Created,
+            local_addr: None,
+            remote_addr: None,
+            rx,
+            tx,
+            buffer_size,
         }
     }
 
@@ -109,11 +121,21 @@ impl SocketRegistry {
     }
 
     /// Send a message to a bound address.
-    pub fn send_to(&self, from: &SocketAddr, to: &SocketAddr, data: Vec<u8>) -> Result<(), &'static str> {
+    pub fn send_to(
+        &self,
+        from: &SocketAddr,
+        to: &SocketAddr,
+        data: Vec<u8>,
+    ) -> Result<(), &'static str> {
         let target_id = self.bindings.get(to).ok_or("destination not found")?;
         let sender = self.sockets.get(target_id).ok_or("socket closed")?;
-        let msg = SocketMessage { from: from.clone(), data };
-        sender.try_send(msg).map_err(|_| "send buffer full (EAGAIN)")
+        let msg = SocketMessage {
+            from: from.clone(),
+            data,
+        };
+        sender
+            .try_send(msg)
+            .map_err(|_| "send buffer full (EAGAIN)")
     }
 
     /// Close a socket.
@@ -126,10 +148,14 @@ impl SocketRegistry {
     }
 
     /// Get number of active sockets.
-    pub fn active_count(&self) -> usize { self.sockets.len() }
+    pub fn active_count(&self) -> usize {
+        self.sockets.len()
+    }
 
     /// Get number of bound addresses.
-    pub fn bound_count(&self) -> usize { self.bindings.len() }
+    pub fn bound_count(&self) -> usize {
+        self.bindings.len()
+    }
 }
 
 impl Socket {
@@ -194,7 +220,8 @@ mod tests {
         reg.bind(&mut server, server_addr.clone()).unwrap();
 
         let client_addr = SocketAddr::new(2, 6000);
-        reg.send_to(&client_addr, &server_addr, b"hello".to_vec()).unwrap();
+        reg.send_to(&client_addr, &server_addr, b"hello".to_vec())
+            .unwrap();
 
         let msg = server.try_recv().unwrap();
         assert_eq!(msg.data, b"hello");

@@ -1,6 +1,6 @@
 //! Production hardening — circuit breaker, budget enforcement, structured logging.
 
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Mutex;
 use std::time::Instant;
 
@@ -16,9 +16,9 @@ pub struct CircuitBreaker {
 
 #[derive(Debug, Clone, PartialEq)]
 enum BreakerState {
-    Closed,    // Normal operation
-    Open,      // Failing, reject requests
-    HalfOpen,  // Testing if recovered
+    Closed,   // Normal operation
+    Open,     // Failing, reject requests
+    HalfOpen, // Testing if recovered
 }
 
 impl CircuitBreaker {
@@ -67,7 +67,10 @@ impl CircuitBreaker {
 
     /// Get current state info.
     pub fn status(&self) -> (bool, u32) {
-        (self.is_available(), self.consecutive_failures.load(Ordering::SeqCst))
+        (
+            self.is_available(),
+            self.consecutive_failures.load(Ordering::SeqCst),
+        )
     }
 }
 
@@ -80,12 +83,17 @@ pub struct BudgetEnforcer {
 
 impl BudgetEnforcer {
     pub fn new(max_cost_usd: f64) -> Self {
-        Self { max_cost_usd, current_cost: Mutex::new(0.0) }
+        Self {
+            max_cost_usd,
+            current_cost: Mutex::new(0.0),
+        }
     }
 
     /// Check if budget allows another request.
     pub fn can_proceed(&self) -> bool {
-        if self.max_cost_usd <= 0.0 { return true; } // Unlimited
+        if self.max_cost_usd <= 0.0 {
+            return true;
+        } // Unlimited
         *self.current_cost.lock().unwrap() < self.max_cost_usd
     }
 
@@ -96,7 +104,9 @@ impl BudgetEnforcer {
 
     /// Get remaining budget.
     pub fn remaining(&self) -> f64 {
-        if self.max_cost_usd <= 0.0 { return f64::INFINITY; }
+        if self.max_cost_usd <= 0.0 {
+            return f64::INFINITY;
+        }
         self.max_cost_usd - *self.current_cost.lock().unwrap()
     }
 

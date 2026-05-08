@@ -67,23 +67,37 @@ pub struct CapabilitySet {
 }
 
 impl CapabilitySet {
-    pub const CAP_TOOL_MOUNT: u64   = 1 << 0;
+    pub const CAP_TOOL_MOUNT: u64 = 1 << 0;
     pub const CAP_AGENT_CREATE: u64 = 1 << 1;
-    pub const CAP_AGENT_KILL: u64   = 1 << 2;
-    pub const CAP_NET_ACCESS: u64   = 1 << 3;
-    pub const CAP_FILE_WRITE: u64   = 1 << 4;
-    pub const CAP_FILE_DELETE: u64  = 1 << 5;
-    pub const CAP_EXEC: u64         = 1 << 6;
-    pub const CAP_ADMIN: u64        = 1 << 7;
+    pub const CAP_AGENT_KILL: u64 = 1 << 2;
+    pub const CAP_NET_ACCESS: u64 = 1 << 3;
+    pub const CAP_FILE_WRITE: u64 = 1 << 4;
+    pub const CAP_FILE_DELETE: u64 = 1 << 5;
+    pub const CAP_EXEC: u64 = 1 << 6;
+    pub const CAP_ADMIN: u64 = 1 << 7;
     pub const CAP_SYS_RESOURCE: u64 = 1 << 8;
 
-    pub fn new(bits: u64) -> Self { Self { bits } }
-    pub fn all() -> Self { Self { bits: u64::MAX } }
-    pub fn none() -> Self { Self { bits: 0 } }
-    pub fn has(&self, cap: u64) -> bool { self.bits & cap != 0 }
-    pub fn grant(&mut self, cap: u64) { self.bits |= cap; }
-    pub fn revoke(&mut self, cap: u64) { self.bits &= !cap; }
-    pub fn drop_cap(&mut self, cap: u64) { self.revoke(cap); }
+    pub fn new(bits: u64) -> Self {
+        Self { bits }
+    }
+    pub fn all() -> Self {
+        Self { bits: u64::MAX }
+    }
+    pub fn none() -> Self {
+        Self { bits: 0 }
+    }
+    pub fn has(&self, cap: u64) -> bool {
+        self.bits & cap != 0
+    }
+    pub fn grant(&mut self, cap: u64) {
+        self.bits |= cap;
+    }
+    pub fn revoke(&mut self, cap: u64) {
+        self.bits &= !cap;
+    }
+    pub fn drop_cap(&mut self, cap: u64) {
+        self.revoke(cap);
+    }
 }
 
 /// Scheduling information.
@@ -137,7 +151,11 @@ pub enum SignalHandler {
 }
 impl std::fmt::Debug for SignalHandler {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        match self { Self::Default => write!(f, "Default"), Self::Ignore => write!(f, "Ignore"), Self::Custom(_) => write!(f, "Custom(...)") }
+        match self {
+            Self::Default => write!(f, "Default"),
+            Self::Ignore => write!(f, "Ignore"),
+            Self::Custom(_) => write!(f, "Custom(...)"),
+        }
     }
 }
 
@@ -297,23 +315,37 @@ impl AgentStruct {
 
     /// Deliver pending signals (called by scheduler).
     pub fn deliver_signals(&mut self) {
-        if self.signals.pending == 0 { return; }
+        if self.signals.pending == 0 {
+            return;
+        }
 
         for sig in 0..64u8 {
-            if self.signals.pending & (1 << sig) == 0 { continue; }
+            if self.signals.pending & (1 << sig) == 0 {
+                continue;
+            }
             self.signals.pending &= !(1 << sig);
 
             match sig {
-                signals::SIGKILL => { self.state = AgentState::Dead; return; }
-                signals::SIGSTOP => { self.state = AgentState::Stopped; return; }
+                signals::SIGKILL => {
+                    self.state = AgentState::Dead;
+                    return;
+                }
+                signals::SIGSTOP => {
+                    self.state = AgentState::Stopped;
+                    return;
+                }
                 signals::SIGCONT => {
-                    if self.state == AgentState::Stopped { self.state = AgentState::Ready; }
+                    if self.state == AgentState::Stopped {
+                        self.state = AgentState::Ready;
+                    }
                 }
                 signals::SIGTERM => {
                     match self.signals.handlers.get(&sig) {
                         Some(SignalHandler::Ignore) => {}
                         Some(SignalHandler::Custom(_)) => {} // handler will be called by runtime
-                        _ => { self.state = AgentState::Dead; } // default: terminate
+                        _ => {
+                            self.state = AgentState::Dead;
+                        } // default: terminate
                     }
                 }
                 _ => {
@@ -331,7 +363,9 @@ pub struct AgentTable {
 
 impl AgentTable {
     pub fn new() -> Self {
-        Self { agents: DashMap::new() }
+        Self {
+            agents: DashMap::new(),
+        }
     }
 
     /// Insert a new agent.
@@ -342,7 +376,10 @@ impl AgentTable {
     }
 
     /// Get agent by ID (read lock).
-    pub fn get(&self, id: AgentId) -> Option<dashmap::mapref::one::Ref<AgentId, RwLock<AgentStruct>>> {
+    pub fn get(
+        &self,
+        id: AgentId,
+    ) -> Option<dashmap::mapref::one::Ref<'_, AgentId, RwLock<AgentStruct>>> {
         self.agents.get(&id)
     }
 

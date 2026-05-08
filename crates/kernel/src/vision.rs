@@ -1,16 +1,19 @@
 //! Vision support — send images to vision-capable LLMs.
 
-use crate::connector::{StandardMessage, LlmSession, LlmResponse, ToolDefinition};
-use crate::ConnectorError;
-
 /// Encode an image file as a base64 data URL for vision models.
 pub fn image_to_data_url(path: &str) -> Result<String, String> {
     let bytes = std::fs::read(path).map_err(|e| format!("Can't read image: {}", e))?;
-    let mime = if path.ends_with(".png") { "image/png" }
-        else if path.ends_with(".jpg") || path.ends_with(".jpeg") { "image/jpeg" }
-        else if path.ends_with(".gif") { "image/gif" }
-        else if path.ends_with(".webp") { "image/webp" }
-        else { "image/png" };
+    let mime = if path.ends_with(".png") {
+        "image/png"
+    } else if path.ends_with(".jpg") || path.ends_with(".jpeg") {
+        "image/jpeg"
+    } else if path.ends_with(".gif") {
+        "image/gif"
+    } else if path.ends_with(".webp") {
+        "image/webp"
+    } else {
+        "image/png"
+    };
     let b64 = base64_encode(&bytes);
     Ok(format!("data:{};base64,{}", mime, b64))
 }
@@ -49,8 +52,16 @@ fn base64_encode(input: &[u8]) -> String {
         let triple = (b0 << 16) | (b1 << 8) | b2;
         output.push(TABLE[((triple >> 18) & 0x3F) as usize] as char);
         output.push(TABLE[((triple >> 12) & 0x3F) as usize] as char);
-        if chunk.len() > 1 { output.push(TABLE[((triple >> 6) & 0x3F) as usize] as char); } else { output.push('='); }
-        if chunk.len() > 2 { output.push(TABLE[(triple & 0x3F) as usize] as char); } else { output.push('='); }
+        if chunk.len() > 1 {
+            output.push(TABLE[((triple >> 6) & 0x3F) as usize] as char);
+        } else {
+            output.push('=');
+        }
+        if chunk.len() > 2 {
+            output.push(TABLE[(triple & 0x3F) as usize] as char);
+        } else {
+            output.push('=');
+        }
     }
     output
 }

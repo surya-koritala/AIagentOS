@@ -7,19 +7,34 @@ pub struct ApplicationProvider;
 
 #[async_trait::async_trait]
 impl ResourceProvider for ApplicationProvider {
-    fn resource_type(&self) -> ResourceType { ResourceType::Application }
-
-    fn supported_operations(&self) -> Vec<String> {
-        vec!["launch".into(), "close".into(), "send_input".into(), "read_output".into()]
+    fn resource_type(&self) -> ResourceType {
+        ResourceType::Application
     }
 
-    async fn execute(&self, operation: &str, params: &serde_json::Value) -> Result<serde_json::Value, ResourceError> {
+    fn supported_operations(&self) -> Vec<String> {
+        vec![
+            "launch".into(),
+            "close".into(),
+            "send_input".into(),
+            "read_output".into(),
+        ]
+    }
+
+    async fn execute(
+        &self,
+        operation: &str,
+        params: &serde_json::Value,
+    ) -> Result<serde_json::Value, ResourceError> {
         match operation {
             "launch" => {
-                let cmd = params.get("command")
+                let cmd = params
+                    .get("command")
                     .and_then(|v| v.as_str())
-                    .ok_or_else(|| ResourceError::OperationFailed("Missing 'command' parameter".into()))?;
-                let args: Vec<&str> = params.get("args")
+                    .ok_or_else(|| {
+                        ResourceError::OperationFailed("Missing 'command' parameter".into())
+                    })?;
+                let args: Vec<&str> = params
+                    .get("args")
                     .and_then(|v| v.as_array())
                     .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
                     .unwrap_or_default();
@@ -44,7 +59,10 @@ impl ResourceProvider for ApplicationProvider {
                 // Stub: would interact with a running process
                 Ok(serde_json::json!({"success": true}))
             }
-            _ => Err(ResourceError::OperationFailed(format!("Unknown operation: {}", operation))),
+            _ => Err(ResourceError::OperationFailed(format!(
+                "Unknown operation: {}",
+                operation
+            ))),
         }
     }
 }

@@ -4,11 +4,11 @@
 //! Property 23: Resource metrics accuracy (monotonically non-decreasing).
 //! Property 24: Reasoning chain retrieval.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
-use proptest::prelude::*;
 use chrono::Utc;
+use proptest::prelude::*;
 
 use kernel::observability::*;
 

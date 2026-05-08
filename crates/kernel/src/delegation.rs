@@ -1,9 +1,8 @@
 //! Multi-agent delegation — agents can delegate tasks to other agents.
 
-use std::sync::Arc;
-use crate::{AgentConfig, AgentId, AgentKernelImpl, KernelError, Priority};
 use crate::agent::AgentKernel;
 use crate::execution::AgentOutput;
+use crate::{AgentConfig, AgentId, AgentKernelImpl, KernelError, Priority};
 
 /// Maximum delegation depth to prevent infinite recursion.
 const MAX_DELEGATION_DEPTH: usize = 3;
@@ -18,14 +17,19 @@ pub async fn delegate_to_agent(
 ) -> Result<AgentOutput, KernelError> {
     if depth >= MAX_DELEGATION_DEPTH {
         return Ok(AgentOutput {
-            content: format!("Delegation depth limit ({}) reached. Cannot delegate further.", MAX_DELEGATION_DEPTH),
+            content: format!(
+                "Delegation depth limit ({}) reached. Cannot delegate further.",
+                MAX_DELEGATION_DEPTH
+            ),
             tool_calls_made: 0,
             tokens_used: 0,
         });
     }
 
     // Get parent's provider
-    let provider = kernel.agent_manager.get_agent_provider(parent_agent_id)
+    let provider = kernel
+        .agent_manager
+        .get_agent_provider(parent_agent_id)
         .unwrap_or_else(|| "azure-openai".to_string());
 
     // Create sub-agent

@@ -27,7 +27,10 @@ impl ProcFs {
         let mut system_info = HashMap::new();
         system_info.insert("version".into(), env!("CARGO_PKG_VERSION").to_string());
         system_info.insert("kernel".into(), "ai-agent-os".into());
-        Self { system_info, agent_info: HashMap::new() }
+        Self {
+            system_info,
+            agent_info: HashMap::new(),
+        }
     }
 
     /// Read a proc path.
@@ -36,22 +39,34 @@ impl ProcFs {
 
         match parts.as_slice() {
             // /system/*
-            ["system"] => Some(ProcEntry::Directory(self.system_info.keys().cloned().collect())),
-            ["system", key] => self.system_info.get(*key).map(|v| ProcEntry::File(v.clone())),
+            ["system"] => Some(ProcEntry::Directory(
+                self.system_info.keys().cloned().collect(),
+            )),
+            ["system", key] => self
+                .system_info
+                .get(*key)
+                .map(|v| ProcEntry::File(v.clone())),
 
             // /agents
-            ["agents"] => Some(ProcEntry::Directory(self.agent_info.keys().map(|id| id.to_string()).collect())),
+            ["agents"] => Some(ProcEntry::Directory(
+                self.agent_info.keys().map(|id| id.to_string()).collect(),
+            )),
 
             // /agents/<id>
             ["agents", id_str] => {
                 let id: AgentId = id_str.parse().ok()?;
-                self.agent_info.get(&id).map(|info| ProcEntry::Directory(info.keys().cloned().collect()))
+                self.agent_info
+                    .get(&id)
+                    .map(|info| ProcEntry::Directory(info.keys().cloned().collect()))
             }
 
             // /agents/<id>/<key>
             ["agents", id_str, key] => {
                 let id: AgentId = id_str.parse().ok()?;
-                self.agent_info.get(&id)?.get(*key).map(|v| ProcEntry::File(v.clone()))
+                self.agent_info
+                    .get(&id)?
+                    .get(*key)
+                    .map(|v| ProcEntry::File(v.clone()))
             }
 
             _ => None,
@@ -65,7 +80,10 @@ impl ProcFs {
 
     /// Update agent info.
     pub fn set_agent_info(&mut self, agent_id: AgentId, key: String, value: String) {
-        self.agent_info.entry(agent_id).or_default().insert(key, value);
+        self.agent_info
+            .entry(agent_id)
+            .or_default()
+            .insert(key, value);
     }
 
     /// Remove agent (on exit).
@@ -75,12 +93,14 @@ impl ProcFs {
 
     /// Set load average.
     pub fn update_loadavg(&mut self, running: usize, total: usize) {
-        self.system_info.insert("loadavg".into(), format!("{}/{}", running, total));
+        self.system_info
+            .insert("loadavg".into(), format!("{}/{}", running, total));
     }
 
     /// Set token usage.
     pub fn update_tokeninfo(&mut self, used: u64, budget: u64) {
-        self.system_info.insert("tokeninfo".into(), format!("{}/{}", used, budget));
+        self.system_info
+            .insert("tokeninfo".into(), format!("{}/{}", used, budget));
     }
 }
 

@@ -14,8 +14,8 @@ use tokio::sync::broadcast;
 use crate::models::Agent;
 use crate::observability::Metrics;
 use crate::{
-    AgentConfig, AgentError, AgentHandle, AgentId, AgentState, KernelError,
-    KernelEvent, Priority, SessionId,
+    AgentConfig, AgentError, AgentHandle, AgentId, AgentState, KernelError, KernelEvent, Priority,
+    SessionId,
 };
 
 /// Summary information about a running agent.
@@ -212,7 +212,9 @@ impl AgentManager {
 
     /// Get the LLM provider ID configured for an agent.
     pub fn get_agent_provider(&self, agent_id: AgentId) -> Option<String> {
-        self.agents.get(&agent_id).map(|a| a.config.llm_provider.clone())
+        self.agents
+            .get(&agent_id)
+            .map(|a| a.config.llm_provider.clone())
     }
 }
 
@@ -257,10 +259,8 @@ impl AgentKernel for AgentManager {
             }
             Ok(Err(e)) => {
                 // Initialization failed — transition to Error
-                let _ = self.transition_state(
-                    agent_id,
-                    AgentState::Error(format!("Init failed: {}", e)),
-                );
+                let _ = self
+                    .transition_state(agent_id, AgentState::Error(format!("Init failed: {}", e)));
                 return Err(e);
             }
             Err(_elapsed) => {
@@ -581,10 +581,7 @@ mod tests {
         let handle = manager.create_agent(test_config()).await.unwrap();
 
         manager.pause_agent(handle.id).await.unwrap();
-        assert_eq!(
-            manager.get_agent_state(handle.id),
-            Some(AgentState::Paused)
-        );
+        assert_eq!(manager.get_agent_state(handle.id), Some(AgentState::Paused));
     }
 
     #[tokio::test]

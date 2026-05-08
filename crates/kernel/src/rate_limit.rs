@@ -20,7 +20,11 @@ pub struct RateLimitConfig {
 
 impl Default for RateLimitConfig {
     fn default() -> Self {
-        Self { rpm: 60, tpm: 100_000, max_concurrent: 3 }
+        Self {
+            rpm: 60,
+            tpm: 100_000,
+            max_concurrent: 3,
+        }
     }
 }
 
@@ -131,7 +135,11 @@ mod tests {
 
     #[tokio::test]
     async fn acquire_within_limits() {
-        let limiter = RateLimiter::new(RateLimitConfig { rpm: 10, tpm: 1000, max_concurrent: 3 });
+        let limiter = RateLimiter::new(RateLimitConfig {
+            rpm: 10,
+            tpm: 1000,
+            max_concurrent: 3,
+        });
         let _guard = limiter.acquire().await;
         assert_eq!(limiter.stats().requests_this_minute, 1);
         assert_eq!(limiter.stats().concurrent_available, 2);
@@ -139,7 +147,11 @@ mod tests {
 
     #[tokio::test]
     async fn concurrency_limit() {
-        let limiter = Arc::new(RateLimiter::new(RateLimitConfig { rpm: 100, tpm: 100000, max_concurrent: 2 }));
+        let limiter = Arc::new(RateLimiter::new(RateLimitConfig {
+            rpm: 100,
+            tpm: 100000,
+            max_concurrent: 2,
+        }));
         let _g1 = limiter.acquire().await;
         let _g2 = limiter.acquire().await;
         assert_eq!(limiter.stats().concurrent_available, 0);
@@ -157,7 +169,11 @@ mod tests {
 
     #[tokio::test]
     async fn is_limited_when_at_cap() {
-        let limiter = RateLimiter::new(RateLimitConfig { rpm: 2, tpm: 1000, max_concurrent: 10 });
+        let limiter = RateLimiter::new(RateLimitConfig {
+            rpm: 2,
+            tpm: 1000,
+            max_concurrent: 10,
+        });
         let _g1 = limiter.acquire().await;
         let _g2 = limiter.acquire().await;
         assert!(limiter.is_limited());

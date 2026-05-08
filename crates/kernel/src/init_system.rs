@@ -60,8 +60,12 @@ impl Default for ServiceConfig {
     }
 }
 
-fn default_restart_delay() -> u64 { 5000 }
-fn default_max_restarts() -> u32 { 3 }
+fn default_restart_delay() -> u64 {
+    5000
+}
+fn default_max_restarts() -> u32 {
+    3
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RestartPolicy {
@@ -125,26 +129,37 @@ pub struct InitSystem {
 
 impl InitSystem {
     pub fn new() -> Self {
-        Self { services: HashMap::new(), boot_order: Vec::new() }
+        Self {
+            services: HashMap::new(),
+            boot_order: Vec::new(),
+        }
     }
 
     /// Load a service definition.
     pub fn load_service(&mut self, def: ServiceDef) {
         let name = def.name.clone();
-        self.services.insert(name.clone(), ServiceState {
-            def,
-            status: ServiceStatus::Inactive,
-            agent_id: None,
-            restart_count: 0,
-            last_exit_code: None,
-        });
+        self.services.insert(
+            name.clone(),
+            ServiceState {
+                def,
+                status: ServiceStatus::Inactive,
+                agent_id: None,
+                restart_count: 0,
+                last_exit_code: None,
+            },
+        );
     }
 
     /// Load all service files from a directory.
     pub fn load_directory(&mut self, dir: &Path) {
         if let Ok(entries) = std::fs::read_dir(dir) {
             for entry in entries.filter_map(|e| e.ok()) {
-                if entry.path().extension().map(|e| e == "toml").unwrap_or(false) {
+                if entry
+                    .path()
+                    .extension()
+                    .map(|e| e == "toml")
+                    .unwrap_or(false)
+                {
                     if let Ok(content) = std::fs::read_to_string(entry.path()) {
                         if let Ok(def) = toml::from_str::<ServiceDef>(&content) {
                             self.load_service(def);
@@ -171,12 +186,18 @@ impl InitSystem {
     }
 
     fn topo_sort(
-        &self, name: &str, order: &mut Vec<String>,
+        &self,
+        name: &str,
+        order: &mut Vec<String>,
         visited: &mut std::collections::HashSet<String>,
         visiting: &mut std::collections::HashSet<String>,
     ) -> Result<(), String> {
-        if visited.contains(name) { return Ok(()); }
-        if visiting.contains(name) { return Err(format!("Circular dependency: {}", name)); }
+        if visited.contains(name) {
+            return Ok(());
+        }
+        if visiting.contains(name) {
+            return Err(format!("Circular dependency: {}", name));
+        }
 
         visiting.insert(name.to_string());
 
@@ -226,7 +247,9 @@ impl InitSystem {
     /// Check if service should restart.
     pub fn should_restart(&self, name: &str) -> bool {
         if let Some(state) = self.services.get(name) {
-            if state.restart_count >= state.def.service.max_restarts { return false; }
+            if state.restart_count >= state.def.service.max_restarts {
+                return false;
+            }
             match state.def.service.restart {
                 RestartPolicy::Always => true,
                 RestartPolicy::OnFailure => state.last_exit_code.map(|c| c != 0).unwrap_or(false),
@@ -247,7 +270,10 @@ impl InitSystem {
 
     /// List all services.
     pub fn list(&self) -> Vec<(&str, ServiceStatus)> {
-        self.services.iter().map(|(k, v)| (k.as_str(), v.status)).collect()
+        self.services
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.status))
+            .collect()
     }
 }
 
@@ -259,7 +285,12 @@ mod tests {
         ServiceDef {
             name: name.into(),
             description: None,
-            exec: ExecConfig { provider: "test".into(), system_prompt: "test".into(), tools: vec![], model: None },
+            exec: ExecConfig {
+                provider: "test".into(),
+                system_prompt: "test".into(),
+                tools: vec![],
+                model: None,
+            },
             service: ServiceConfig::default(),
             dependencies: DependencyConfig::default(),
             resources: ResourceConfig::default(),
@@ -358,7 +389,13 @@ nice = -5
 impl InitSystem {
     /// Check if a service should be socket-activated (started on first connection).
     pub fn is_socket_activated(&self, name: &str) -> bool {
-        self.services.get(name).map(|s| s.def.service.service_type == ServiceType::Notify && s.status == ServiceStatus::Inactive).unwrap_or(false)
+        self.services
+            .get(name)
+            .map(|s| {
+                s.def.service.service_type == ServiceType::Notify
+                    && s.status == ServiceStatus::Inactive
+            })
+            .unwrap_or(false)
     }
 
     /// Trigger socket activation for a service.

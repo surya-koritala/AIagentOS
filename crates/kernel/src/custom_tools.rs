@@ -1,9 +1,9 @@
 //! Custom tool loading from TOML configuration.
 
-use std::path::Path;
-use serde::Deserialize;
-use crate::tools::{ToolBinding, ToolRegistry};
 use crate::resources::ResourceType;
+use crate::tools::{ToolBinding, ToolRegistry};
+use serde::Deserialize;
+use std::path::Path;
 
 #[derive(Debug, Deserialize)]
 struct ToolsConfig {
@@ -51,10 +51,13 @@ pub fn load_custom_tools(registry: &mut ToolRegistry, path: &Path) {
         let mut required = Vec::new();
 
         for (name, param) in &tool.parameters {
-            properties.insert(name.clone(), serde_json::json!({
-                "type": param.param_type,
-                "description": param.description,
-            }));
+            properties.insert(
+                name.clone(),
+                serde_json::json!({
+                    "type": param.param_type,
+                    "description": param.description,
+                }),
+            );
             if param.required {
                 required.push(serde_json::Value::String(name.clone()));
             }

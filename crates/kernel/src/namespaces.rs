@@ -66,8 +66,14 @@ impl NamespaceRegistry {
             defaults: DashMap::new(),
         };
         // Create default namespaces
-        for ns_type in [NamespaceType::Tool, NamespaceType::Context, NamespaceType::Agent,
-                        NamespaceType::Network, NamespaceType::User, NamespaceType::Mount] {
+        for ns_type in [
+            NamespaceType::Tool,
+            NamespaceType::Context,
+            NamespaceType::Agent,
+            NamespaceType::Network,
+            NamespaceType::User,
+            NamespaceType::Mount,
+        ] {
             let ns = Namespace::new(ns_type, None);
             let id = ns.id;
             registry.namespaces.insert(id, ns);
@@ -105,9 +111,17 @@ impl NamespaceRegistry {
     }
 
     /// Check if two agents are in the same namespace of a given type.
-    pub fn same_namespace(&self, agent_a: AgentId, agent_b: AgentId, ns_type: NamespaceType) -> bool {
+    pub fn same_namespace(
+        &self,
+        agent_a: AgentId,
+        agent_b: AgentId,
+        ns_type: NamespaceType,
+    ) -> bool {
         for entry in self.namespaces.iter() {
-            if entry.ns_type == ns_type && entry.members.contains(&agent_a) && entry.members.contains(&agent_b) {
+            if entry.ns_type == ns_type
+                && entry.members.contains(&agent_a)
+                && entry.members.contains(&agent_b)
+            {
                 return true;
             }
         }
@@ -127,7 +141,8 @@ impl NamespaceRegistry {
 
     /// Get members of a namespace.
     pub fn members(&self, ns_id: NamespaceId) -> Vec<AgentId> {
-        self.namespaces.get(&ns_id)
+        self.namespaces
+            .get(&ns_id)
             .map(|ns| ns.members.iter().cloned().collect())
             .unwrap_or_default()
     }
@@ -207,9 +222,15 @@ mod tests {
 // ─── Namespace enforcement for tool access ───────────────────────────────────
 
 /// Check if an agent can access a tool path based on its tool namespace.
-pub fn check_tool_access(registry: &NamespaceRegistry, agent_id: AgentId, tool_ns: NamespaceId) -> bool {
+pub fn check_tool_access(
+    registry: &NamespaceRegistry,
+    agent_id: AgentId,
+    tool_ns: NamespaceId,
+) -> bool {
     // Agent must be a member of the tool namespace to access tools in it
-    registry.namespaces.get(&tool_ns)
+    registry
+        .namespaces
+        .get(&tool_ns)
         .map(|ns| ns.members.contains(&agent_id))
         .unwrap_or(false)
 }

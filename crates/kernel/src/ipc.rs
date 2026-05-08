@@ -38,12 +38,27 @@ pub enum DelegationStatus {
 /// The Agent IPC trait.
 #[async_trait::async_trait]
 pub trait AgentIpc: Send + Sync {
-    async fn send(&self, from: AgentId, to: AgentId, payload: serde_json::Value) -> Result<(), IpcError>;
+    async fn send(
+        &self,
+        from: AgentId,
+        to: AgentId,
+        payload: serde_json::Value,
+    ) -> Result<(), IpcError>;
     async fn receive(&self, agent_id: AgentId) -> Result<IpcMessage, IpcError>;
     fn subscribe(&self, agent_id: AgentId, topic: &str) -> Result<(), IpcError>;
     fn unsubscribe(&self, agent_id: AgentId, topic: &str) -> Result<(), IpcError>;
-    async fn publish(&self, from: AgentId, topic: &str, payload: serde_json::Value) -> Result<usize, IpcError>;
-    async fn delegate(&self, from: AgentId, to: AgentId, description: String) -> Result<uuid::Uuid, IpcError>;
+    async fn publish(
+        &self,
+        from: AgentId,
+        topic: &str,
+        payload: serde_json::Value,
+    ) -> Result<usize, IpcError>;
+    async fn delegate(
+        &self,
+        from: AgentId,
+        to: AgentId,
+        description: String,
+    ) -> Result<uuid::Uuid, IpcError>;
     fn complete_delegation(&self, task_id: uuid::Uuid) -> Result<(), IpcError>;
     fn get_delegation_status(&self, task_id: uuid::Uuid) -> Option<DelegationStatus>;
 }
@@ -100,9 +115,10 @@ impl IpcManager {
     fn check_permission(&self, from: AgentId, to: AgentId) -> Result<(), IpcError> {
         if let Some(ref pairs) = self.allowed_pairs {
             if !pairs.contains_key(&(from, to)) {
-                return Err(IpcError::PermissionDenied(
-                    format!("Agent {} not allowed to message {}", from, to)
-                ));
+                return Err(IpcError::PermissionDenied(format!(
+                    "Agent {} not allowed to message {}",
+                    from, to
+                )));
             }
         }
         Ok(())
@@ -116,7 +132,12 @@ impl IpcManager {
 
 #[async_trait::async_trait]
 impl AgentIpc for IpcManager {
-    async fn send(&self, from: AgentId, to: AgentId, payload: serde_json::Value) -> Result<(), IpcError> {
+    async fn send(
+        &self,
+        from: AgentId,
+        to: AgentId,
+        payload: serde_json::Value,
+    ) -> Result<(), IpcError> {
         self.check_permission(from, to)?;
 
         let msg = IpcMessage {
@@ -126,8 +147,7 @@ impl AgentIpc for IpcManager {
             timestamp: chrono::Utc::now(),
         };
 
-        let sender = self.mailboxes.get(&to)
-            .ok_or(IpcError::AgentNotFound(to))?;
+        let sender = self.mailboxes.get(&to).ok_or(IpcError::AgentNotFound(to))?;
 
         match sender.try_send(msg.clone()) {
             Ok(()) => Ok(()),
@@ -139,7 +159,9 @@ impl AgentIpc for IpcManager {
     }
 
     async fn receive(&self, agent_id: AgentId) -> Result<IpcMessage, IpcError> {
-        let rx_entry = self.receivers.get(&agent_id)
+        let rx_entry = self
+            .receivers
+            .get(&agent_id)
             .ok_or(IpcError::AgentNotFound(agent_id))?;
         let mut rx = rx_entry.lock().unwrap();
         rx.try_recv().map_err(|_| IpcError::ChannelClosed)
@@ -152,7 +174,10 @@ impl AgentIpc for IpcManager {
             self.topics.insert(topic.to_string(), tx);
         }
         // Track subscription
-        self.subscriptions.entry(agent_id).or_insert_with(Vec::new).push(topic.to_string());
+        self.subscriptions
+            .entry(agent_id)
+            .or_insert_with(Vec::new)
+            .push(topic.to_string());
         Ok(())
     }
 
@@ -163,8 +188,15 @@ impl AgentIpc for IpcManager {
         Ok(())
     }
 
-    async fn publish(&self, from: AgentId, topic: &str, payload: serde_json::Value) -> Result<usize, IpcError> {
-        let sender = self.topics.get(topic)
+    async fn publish(
+        &self,
+        from: AgentId,
+        topic: &str,
+        payload: serde_json::Value,
+    ) -> Result<usize, IpcError> {
+        let sender = self
+            .topics
+            .get(topic)
             .ok_or_else(|| IpcError::DeliveryFailed(format!("Topic '{}' not found", topic)))?;
 
         let msg = IpcMessage {
@@ -180,7 +212,10 @@ impl AgentIpc for IpcManager {
             let agent_id = *entry.key();
             if entry.value().contains(&topic.to_string()) {
                 if let Some(mailbox) = self.mailboxes.get(&agent_id) {
-                    let agent_msg = IpcMessage { to: agent_id, ..msg.clone() };
+                    let agent_msg = IpcMessage {
+                        to: agent_id,
+                        ..msg.clone()
+                    };
                     if mailbox.try_send(agent_msg).is_ok() {
                         delivered += 1;
                     }
@@ -194,7 +229,12 @@ impl AgentIpc for IpcManager {
         Ok(delivered)
     }
 
-    async fn delegate(&self, from: AgentId, to: AgentId, description: String) -> Result<uuid::Uuid, IpcError> {
+    async fn delegate(
+        &self,
+        from: AgentId,
+        to: AgentId,
+        description: String,
+    ) -> Result<uuid::Uuid, IpcError> {
         self.check_permission(from, to)?;
 
         let task_id = uuid::Uuid::new_v4();
@@ -215,7 +255,9 @@ impl AgentIpc for IpcManager {
     }
 
     fn complete_delegation(&self, task_id: uuid::Uuid) -> Result<(), IpcError> {
-        let mut task = self.delegations.get_mut(&task_id)
+        let mut task = self
+            .delegations
+            .get_mut(&task_id)
             .ok_or_else(|| IpcError::DeliveryFailed("Delegation not found".into()))?;
         task.status = DelegationStatus::Completed;
 
@@ -252,7 +294,9 @@ mod tests {
         ipc.register_agent(a);
         ipc.register_agent(b);
 
-        ipc.send(a, b, serde_json::json!({"hello": "world"})).await.unwrap();
+        ipc.send(a, b, serde_json::json!({"hello": "world"}))
+            .await
+            .unwrap();
         let msg = ipc.receive(b).await.unwrap();
         assert_eq!(msg.from, a);
         assert_eq!(msg.payload["hello"], "world");
@@ -281,7 +325,10 @@ mod tests {
         ipc.subscribe(sub1, "news").unwrap();
         ipc.subscribe(sub2, "news").unwrap();
 
-        let delivered = ipc.publish(publisher, "news", serde_json::json!({"headline": "test"})).await.unwrap();
+        let delivered = ipc
+            .publish(publisher, "news", serde_json::json!({"headline": "test"}))
+            .await
+            .unwrap();
         assert_eq!(delivered, 2);
 
         let msg1 = ipc.receive(sub1).await.unwrap();
@@ -299,10 +346,16 @@ mod tests {
         ipc.register_agent(b);
 
         let task_id = ipc.delegate(a, b, "do something".into()).await.unwrap();
-        assert_eq!(ipc.get_delegation_status(task_id), Some(DelegationStatus::Pending));
+        assert_eq!(
+            ipc.get_delegation_status(task_id),
+            Some(DelegationStatus::Pending)
+        );
 
         ipc.complete_delegation(task_id).unwrap();
-        assert_eq!(ipc.get_delegation_status(task_id), Some(DelegationStatus::Completed));
+        assert_eq!(
+            ipc.get_delegation_status(task_id),
+            Some(DelegationStatus::Completed)
+        );
     }
 
     #[tokio::test]

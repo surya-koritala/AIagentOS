@@ -69,13 +69,34 @@ pub struct SyscallArgs {
 
 impl SyscallArgs {
     pub fn none() -> Self {
-        Self { arg0: 0, arg1: 0, arg2: 0, arg3: 0, str_arg: None, data: None }
+        Self {
+            arg0: 0,
+            arg1: 0,
+            arg2: 0,
+            arg3: 0,
+            str_arg: None,
+            data: None,
+        }
     }
     pub fn with_u64(arg0: u64) -> Self {
-        Self { arg0, arg1: 0, arg2: 0, arg3: 0, str_arg: None, data: None }
+        Self {
+            arg0,
+            arg1: 0,
+            arg2: 0,
+            arg3: 0,
+            str_arg: None,
+            data: None,
+        }
     }
     pub fn with_str(s: String) -> Self {
-        Self { arg0: 0, arg1: 0, arg2: 0, arg3: 0, str_arg: Some(s), data: None }
+        Self {
+            arg0: 0,
+            arg1: 0,
+            arg2: 0,
+            arg3: 0,
+            str_arg: Some(s),
+            data: None,
+        }
     }
 }
 
@@ -118,16 +139,25 @@ pub enum SyscallError {
 
 /// Syscall dispatch table.
 pub struct SyscallTable {
-    handlers: std::collections::HashMap<u32, Box<dyn Fn(AgentId, SyscallArgs) -> SyscallResult + Send + Sync>>,
+    handlers: std::collections::HashMap<
+        u32,
+        Box<dyn Fn(AgentId, SyscallArgs) -> SyscallResult + Send + Sync>,
+    >,
 }
 
 impl SyscallTable {
     pub fn new() -> Self {
-        Self { handlers: std::collections::HashMap::new() }
+        Self {
+            handlers: std::collections::HashMap::new(),
+        }
     }
 
     /// Register a syscall handler.
-    pub fn register(&mut self, num: SyscallNum, handler: impl Fn(AgentId, SyscallArgs) -> SyscallResult + Send + Sync + 'static) {
+    pub fn register(
+        &mut self,
+        num: SyscallNum,
+        handler: impl Fn(AgentId, SyscallArgs) -> SyscallResult + Send + Sync + 'static,
+    ) {
         self.handlers.insert(num as u32, Box::new(handler));
     }
 
@@ -152,7 +182,9 @@ mod tests {
     #[test]
     fn dispatch_registered_syscall() {
         let mut table = SyscallTable::new();
-        table.register(SyscallNum::GetPid, |caller, _args| SyscallResult::Ok(caller));
+        table.register(SyscallNum::GetPid, |caller, _args| {
+            SyscallResult::Ok(caller)
+        });
         let result = table.dispatch(42, SyscallNum::GetPid, SyscallArgs::none());
         assert!(matches!(result, SyscallResult::Ok(42)));
     }
@@ -168,20 +200,37 @@ mod tests {
     fn syscall_with_args() {
         let mut table = SyscallTable::new();
         table.register(SyscallNum::Kill, |_caller, args| {
-            if args.arg0 == 0 { SyscallResult::Err(SyscallError::ESRCH) }
-            else { SyscallResult::Ok(0) }
+            if args.arg0 == 0 {
+                SyscallResult::Err(SyscallError::ESRCH)
+            } else {
+                SyscallResult::Ok(0)
+            }
         });
-        assert!(matches!(table.dispatch(1, SyscallNum::Kill, SyscallArgs::with_u64(0)), SyscallResult::Err(SyscallError::ESRCH)));
-        assert!(matches!(table.dispatch(1, SyscallNum::Kill, SyscallArgs::with_u64(5)), SyscallResult::Ok(0)));
+        assert!(matches!(
+            table.dispatch(1, SyscallNum::Kill, SyscallArgs::with_u64(0)),
+            SyscallResult::Err(SyscallError::ESRCH)
+        ));
+        assert!(matches!(
+            table.dispatch(1, SyscallNum::Kill, SyscallArgs::with_u64(5)),
+            SyscallResult::Ok(0)
+        ));
     }
 
     #[test]
     fn all_syscall_numbers_unique() {
         let nums = [
-            SyscallNum::Create as u32, SyscallNum::Clone as u32, SyscallNum::Exit as u32,
-            SyscallNum::Wait as u32, SyscallNum::Kill as u32, SyscallNum::GetPid as u32,
-            SyscallNum::ToolOpen as u32, SyscallNum::ToolClose as u32, SyscallNum::ToolRead as u32,
-            SyscallNum::Send as u32, SyscallNum::Recv as u32, SyscallNum::Yield as u32,
+            SyscallNum::Create as u32,
+            SyscallNum::Clone as u32,
+            SyscallNum::Exit as u32,
+            SyscallNum::Wait as u32,
+            SyscallNum::Kill as u32,
+            SyscallNum::GetPid as u32,
+            SyscallNum::ToolOpen as u32,
+            SyscallNum::ToolClose as u32,
+            SyscallNum::ToolRead as u32,
+            SyscallNum::Send as u32,
+            SyscallNum::Recv as u32,
+            SyscallNum::Yield as u32,
             SyscallNum::Shutdown as u32,
         ];
         let unique: std::collections::HashSet<u32> = nums.iter().cloned().collect();
@@ -198,7 +247,7 @@ mod tests {
 
 // ─── MAC-enforced dispatch ───────────────────────────────────────────────────
 
-use crate::mac::{MacEngine, MacDecision};
+use crate::mac::{MacDecision, MacEngine};
 
 /// Syscall dispatcher with MAC enforcement.
 pub struct SecureSyscallDispatch {
@@ -233,14 +282,14 @@ impl SecureSyscallDispatch {
                 // Proceed with syscall
                 self.table.dispatch(caller, num, args)
             }
-            MacDecision::Deny => {
-                SyscallResult::Err(SyscallError::EACCES)
-            }
+            MacDecision::Deny => SyscallResult::Err(SyscallError::EACCES),
         }
     }
 
     /// Get mutable reference to MAC engine (for policy updates).
-    pub fn mac_mut(&mut self) -> &mut MacEngine { &mut self.mac }
+    pub fn mac_mut(&mut self) -> &mut MacEngine {
+        &mut self.mac
+    }
 }
 
 #[cfg(test)]
@@ -254,9 +303,12 @@ mod secure_tests {
         table.register(SyscallNum::Kill, |_, _| SyscallResult::Ok(0));
 
         let mut mac = MacEngine::new(true);
-        mac.load_policy(vec![
-            PolicyRule { subject: "worker".into(), action: "kill".into(), object: "*".into(), decision: "deny".into() },
-        ]);
+        mac.load_policy(vec![PolicyRule {
+            subject: "worker".into(),
+            action: "kill".into(),
+            object: "*".into(),
+            decision: "deny".into(),
+        }]);
         mac.label_agent(1, "worker".into());
 
         let dispatch = SecureSyscallDispatch::new(table, mac);
@@ -270,9 +322,12 @@ mod secure_tests {
         table.register(SyscallNum::ToolRead, |_, _| SyscallResult::Ok(42));
 
         let mut mac = MacEngine::new(true);
-        mac.load_policy(vec![
-            PolicyRule { subject: "reader".into(), action: "read".into(), object: "*".into(), decision: "allow".into() },
-        ]);
+        mac.load_policy(vec![PolicyRule {
+            subject: "reader".into(),
+            action: "read".into(),
+            object: "*".into(),
+            decision: "allow".into(),
+        }]);
         mac.label_agent(1, "reader".into());
 
         let dispatch = SecureSyscallDispatch::new(table, mac);
@@ -317,7 +372,10 @@ mod cap_tests {
     #[test]
     fn kill_requires_cap() {
         let caps = CapabilitySet::none();
-        assert_eq!(check_capability(&caps, SyscallNum::Kill), Err(SyscallError::EPERM));
+        assert_eq!(
+            check_capability(&caps, SyscallNum::Kill),
+            Err(SyscallError::EPERM)
+        );
     }
 
     #[test]
@@ -336,7 +394,10 @@ mod cap_tests {
     #[test]
     fn admin_ops_need_cap_admin() {
         let caps = CapabilitySet::none();
-        assert_eq!(check_capability(&caps, SyscallNum::Shutdown), Err(SyscallError::EPERM));
+        assert_eq!(
+            check_capability(&caps, SyscallNum::Shutdown),
+            Err(SyscallError::EPERM)
+        );
         let mut admin_caps = CapabilitySet::none();
         admin_caps.grant(CapabilitySet::CAP_ADMIN);
         assert_eq!(check_capability(&admin_caps, SyscallNum::Shutdown), Ok(()));

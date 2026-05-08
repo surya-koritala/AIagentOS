@@ -1,7 +1,7 @@
 //! Multi-user authentication — OAuth2, sessions, RBAC.
 
+use chrono::{DateTime, Duration, Utc};
 use std::collections::HashMap;
-use chrono::{DateTime, Utc, Duration};
 
 /// User account.
 #[derive(Debug, Clone)]
@@ -48,34 +48,53 @@ pub struct AuthSystem {
 
 impl AuthSystem {
     pub fn new() -> Self {
-        Self { users: HashMap::new(), sessions: HashMap::new(), api_keys: HashMap::new() }
+        Self {
+            users: HashMap::new(),
+            sessions: HashMap::new(),
+            api_keys: HashMap::new(),
+        }
     }
 
     /// Register a new user.
     pub fn register(&mut self, username: String, email: String, role: Role) -> String {
         let id = uuid::Uuid::new_v4().to_string();
-        self.users.insert(id.clone(), User {
-            id: id.clone(), username, email, role,
-            created_at: Utc::now(), api_keys: Vec::new(),
-        });
+        self.users.insert(
+            id.clone(),
+            User {
+                id: id.clone(),
+                username,
+                email,
+                role,
+                created_at: Utc::now(),
+                api_keys: Vec::new(),
+            },
+        );
         id
     }
 
     /// Create a session (login).
     pub fn create_session(&mut self, user_id: &str) -> Option<String> {
-        if !self.users.contains_key(user_id) { return None; }
+        if !self.users.contains_key(user_id) {
+            return None;
+        }
         let token = uuid::Uuid::new_v4().to_string();
-        self.sessions.insert(token.clone(), Session {
-            token: token.clone(), user_id: user_id.into(),
-            expires_at: Utc::now() + Duration::hours(24),
-        });
+        self.sessions.insert(
+            token.clone(),
+            Session {
+                token: token.clone(),
+                user_id: user_id.into(),
+                expires_at: Utc::now() + Duration::hours(24),
+            },
+        );
         Some(token)
     }
 
     /// Validate a session token.
     pub fn validate_session(&self, token: &str) -> Option<&str> {
         let session = self.sessions.get(token)?;
-        if Utc::now() > session.expires_at { return None; }
+        if Utc::now() > session.expires_at {
+            return None;
+        }
         Some(&session.user_id)
     }
 
@@ -84,7 +103,12 @@ impl AuthSystem {
         let key = format!("ak_{}", uuid::Uuid::new_v4().to_string().replace('-', ""));
         self.api_keys.insert(key.clone(), user_id.into());
         if let Some(user) = self.users.get_mut(user_id) {
-            user.api_keys.push(ApiKey { key: key.clone(), name, created_at: Utc::now(), last_used: None });
+            user.api_keys.push(ApiKey {
+                key: key.clone(),
+                name,
+                created_at: Utc::now(),
+                last_used: None,
+            });
         }
         Some(key)
     }
@@ -96,24 +120,31 @@ impl AuthSystem {
 
     /// Check if user has required role.
     pub fn check_role(&self, user_id: &str, required: Role) -> bool {
-        self.users.get(user_id).map(|u| {
-            match (u.role, required) {
+        self.users
+            .get(user_id)
+            .map(|u| match (u.role, required) {
                 (Role::Admin, _) => true,
                 (Role::User, Role::User | Role::ReadOnly) => true,
                 (Role::ReadOnly, Role::ReadOnly) => true,
                 _ => false,
-            }
-        }).unwrap_or(false)
+            })
+            .unwrap_or(false)
     }
 
     /// Get user by ID.
-    pub fn get_user(&self, id: &str) -> Option<&User> { self.users.get(id) }
+    pub fn get_user(&self, id: &str) -> Option<&User> {
+        self.users.get(id)
+    }
 
     /// List all users.
-    pub fn list_users(&self) -> Vec<&User> { self.users.values().collect() }
+    pub fn list_users(&self) -> Vec<&User> {
+        self.users.values().collect()
+    }
 
     /// Revoke a session.
-    pub fn revoke_session(&mut self, token: &str) { self.sessions.remove(token); }
+    pub fn revoke_session(&mut self, token: &str) {
+        self.sessions.remove(token);
+    }
 }
 
 #[cfg(test)]

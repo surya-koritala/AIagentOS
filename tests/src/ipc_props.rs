@@ -4,8 +4,8 @@
 //! Property 20: IPC permission enforcement.
 //! Property 21: Delegation chain completion propagation.
 
-use proptest::prelude::*;
 use kernel::ipc::*;
+use proptest::prelude::*;
 
 fn arb_payload() -> impl Strategy<Value = serde_json::Value> {
     "[a-zA-Z0-9 ]{5,30}".prop_map(|s| serde_json::json!({"data": s}))

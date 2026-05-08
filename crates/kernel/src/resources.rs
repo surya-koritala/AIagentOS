@@ -51,7 +51,11 @@ pub struct ResourceCapability {
 pub trait ResourceProvider: Send + Sync {
     fn resource_type(&self) -> ResourceType;
     fn supported_operations(&self) -> Vec<String>;
-    async fn execute(&self, operation: &str, params: &serde_json::Value) -> Result<serde_json::Value, ResourceError>;
+    async fn execute(
+        &self,
+        operation: &str,
+        params: &serde_json::Value,
+    ) -> Result<serde_json::Value, ResourceError>;
 }
 
 /// The Resource Broker trait.
@@ -97,7 +101,9 @@ impl ResourceBroker for ResourceBrokerImpl {
                     AccessDecision::Denied,
                     ActionOutcome::Failure,
                 );
-                return Err(ResourceError::OperationFailed("Permission denied".to_string()));
+                return Err(ResourceError::OperationFailed(
+                    "Permission denied".to_string(),
+                ));
             }
             AccessDecision::RequiresApproval => {
                 self.permission_system.log_action(
@@ -107,16 +113,21 @@ impl ResourceBroker for ResourceBrokerImpl {
                     AccessDecision::RequiresApproval,
                     ActionOutcome::Pending,
                 );
-                return Err(ResourceError::OperationFailed("Requires user approval".to_string()));
+                return Err(ResourceError::OperationFailed(
+                    "Requires user approval".to_string(),
+                ));
             }
             AccessDecision::Allowed => {}
         }
 
         // Dispatch to provider
-        let provider = self.providers.get(&request.resource_type)
-            .ok_or_else(|| ResourceError::ProviderNotFound(format!("{:?}", request.resource_type)))?;
+        let provider = self.providers.get(&request.resource_type).ok_or_else(|| {
+            ResourceError::ProviderNotFound(format!("{:?}", request.resource_type))
+        })?;
 
-        let result = provider.execute(&request.operation, &request.parameters).await;
+        let result = provider
+            .execute(&request.operation, &request.parameters)
+            .await;
 
         match result {
             Ok(data) => {
@@ -127,7 +138,11 @@ impl ResourceBroker for ResourceBrokerImpl {
                     AccessDecision::Allowed,
                     ActionOutcome::Success,
                 );
-                Ok(ResourceResponse { success: true, data, error: None })
+                Ok(ResourceResponse {
+                    success: true,
+                    data,
+                    error: None,
+                })
             }
             Err(e) => {
                 self.permission_system.log_action(
@@ -137,19 +152,24 @@ impl ResourceBroker for ResourceBrokerImpl {
                     AccessDecision::Allowed,
                     ActionOutcome::Failure,
                 );
-                Ok(ResourceResponse { success: false, data: serde_json::Value::Null, error: Some(e.to_string()) })
+                Ok(ResourceResponse {
+                    success: false,
+                    data: serde_json::Value::Null,
+                    error: Some(e.to_string()),
+                })
             }
         }
     }
 
     fn list_capabilities(&self) -> Vec<ResourceCapability> {
-        self.providers.iter().map(|entry| {
-            ResourceCapability {
+        self.providers
+            .iter()
+            .map(|entry| ResourceCapability {
                 resource_type: entry.value().resource_type(),
                 operations: entry.value().supported_operations(),
                 description: format!("{:?} provider", entry.value().resource_type()),
-            }
-        }).collect()
+            })
+            .collect()
     }
 
     fn register_provider(&self, provider: Box<dyn ResourceProvider>) {
@@ -167,9 +187,17 @@ mod tests {
 
     #[async_trait::async_trait]
     impl ResourceProvider for MockProvider {
-        fn resource_type(&self) -> ResourceType { ResourceType::Filesystem }
-        fn supported_operations(&self) -> Vec<String> { vec!["read".to_string(), "write".to_string()] }
-        async fn execute(&self, operation: &str, _params: &serde_json::Value) -> Result<serde_json::Value, ResourceError> {
+        fn resource_type(&self) -> ResourceType {
+            ResourceType::Filesystem
+        }
+        fn supported_operations(&self) -> Vec<String> {
+            vec!["read".to_string(), "write".to_string()]
+        }
+        async fn execute(
+            &self,
+            operation: &str,
+            _params: &serde_json::Value,
+        ) -> Result<serde_json::Value, ResourceError> {
             Ok(serde_json::json!({"op": operation, "result": "ok"}))
         }
     }

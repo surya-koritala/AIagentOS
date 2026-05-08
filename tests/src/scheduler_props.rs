@@ -17,7 +17,11 @@ use kernel::{AgentHandle, AgentState, Priority};
 
 fn make_handle(id: uuid::Uuid) -> AgentHandle {
     let (tx, _rx) = tokio::sync::mpsc::channel(1);
-    AgentHandle { id, state: AgentState::Running, cmd_tx: tx }
+    AgentHandle {
+        id,
+        state: AgentState::Running,
+        cmd_tx: tx,
+    }
 }
 
 /// Strategy for generating 2-5 priorities.

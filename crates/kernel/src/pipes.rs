@@ -32,8 +32,16 @@ impl Pipe {
     pub fn new(reader: AgentId, writer: AgentId, buffer: usize) -> Self {
         let (tx, rx) = mpsc::channel(buffer);
         Self {
-            read_end: PipeRead { rx, owner: reader, closed: false },
-            write_end: PipeWrite { tx, owner: writer, closed: false },
+            read_end: PipeRead {
+                rx,
+                owner: reader,
+                closed: false,
+            },
+            write_end: PipeWrite {
+                tx,
+                owner: writer,
+                closed: false,
+            },
         }
     }
 }
@@ -41,9 +49,14 @@ impl Pipe {
 impl PipeWrite {
     /// Write data to the pipe.
     pub async fn write(&self, data: Vec<u8>) -> Result<usize, &'static str> {
-        if self.closed { return Err("broken pipe (EPIPE)"); }
+        if self.closed {
+            return Err("broken pipe (EPIPE)");
+        }
         let len = data.len();
-        self.tx.send(data).await.map_err(|_| "broken pipe (EPIPE)")?;
+        self.tx
+            .send(data)
+            .await
+            .map_err(|_| "broken pipe (EPIPE)")?;
         Ok(len)
     }
 
@@ -53,19 +66,25 @@ impl PipeWrite {
     }
 
     /// Close the write end.
-    pub fn close(&mut self) { self.closed = true; }
+    pub fn close(&mut self) {
+        self.closed = true;
+    }
 }
 
 impl PipeRead {
     /// Read data from the pipe (blocks until data available or pipe closed).
     pub async fn read(&mut self) -> Option<Vec<u8>> {
-        if self.closed { return None; }
+        if self.closed {
+            return None;
+        }
         self.rx.recv().await
     }
 
     /// Read as string.
     pub async fn read_str(&mut self) -> Option<String> {
-        self.read().await.map(|b| String::from_utf8_lossy(&b).to_string())
+        self.read()
+            .await
+            .map(|b| String::from_utf8_lossy(&b).to_string())
     }
 
     /// Try to read without blocking.
@@ -74,7 +93,9 @@ impl PipeRead {
     }
 
     /// Close the read end.
-    pub fn close(&mut self) { self.closed = true; }
+    pub fn close(&mut self) {
+        self.closed = true;
+    }
 }
 
 #[cfg(test)]

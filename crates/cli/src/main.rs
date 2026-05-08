@@ -6,46 +6,77 @@
 //!   agent -c "do something"      # One-shot command
 //!   echo "text" | agent "prompt" # Pipe mode
 
-use std::io::{self, BufRead, Write, Read};
+use std::io::{self, BufRead, Read, Write};
 use std::sync::Arc;
 
-use kernel::{AgentConfig, AgentKernelImpl, Priority};
+use adapters::anthropic::AnthropicAdapter;
+use adapters::azure_openai::AzureOpenAiAdapter;
+use adapters::local::LocalLlmAdapter;
+use adapters::openai::OpenAiAdapter;
 use kernel::config::Config;
 use kernel::connector::AgentConnector;
 use kernel::execution::{AgentExecutor, StreamEvent};
-use kernel::learning::{RuleStore, RuleScope};
+use kernel::learning::{RuleScope, RuleStore};
 use kernel::resources::ResourceBroker;
-use adapters::azure_openai::AzureOpenAiAdapter;
-use adapters::openai::OpenAiAdapter;
-use adapters::anthropic::AnthropicAdapter;
-use adapters::local::LocalLlmAdapter;
+use kernel::{AgentConfig, AgentKernelImpl, Priority};
 use tokio::sync::mpsc;
 
 fn register_providers(kernel: &AgentKernelImpl, config: &Config) {
     match config.llm_provider.as_str() {
         "azure-openai" => {
-            let endpoint = config.azure_endpoint.clone().or_else(|| std::env::var("AZURE_OPENAI_ENDPOINT").ok()).unwrap_or_default();
-            let deployment = config.azure_deployment.clone().or_else(|| std::env::var("AZURE_OPENAI_DEPLOYMENT").ok()).unwrap_or_else(|| "gpt-4o".into());
-            let key = config.get_api_key("azure-openai").map(|s| s.to_string()).or_else(|| std::env::var("AZURE_OPENAI_API_KEY").ok()).unwrap_or_default();
-            let version = config.azure_api_version.clone().or_else(|| std::env::var("AZURE_OPENAI_API_VERSION").ok()).unwrap_or_else(|| "2024-08-01-preview".into());
+            let endpoint = config
+                .azure_endpoint
+                .clone()
+                .or_else(|| std::env::var("AZURE_OPENAI_ENDPOINT").ok())
+                .unwrap_or_default();
+            let deployment = config
+                .azure_deployment
+                .clone()
+                .or_else(|| std::env::var("AZURE_OPENAI_DEPLOYMENT").ok())
+                .unwrap_or_else(|| "gpt-4o".into());
+            let key = config
+                .get_api_key("azure-openai")
+                .map(|s| s.to_string())
+                .or_else(|| std::env::var("AZURE_OPENAI_API_KEY").ok())
+                .unwrap_or_default();
+            let version = config
+                .azure_api_version
+                .clone()
+                .or_else(|| std::env::var("AZURE_OPENAI_API_VERSION").ok())
+                .unwrap_or_else(|| "2024-08-01-preview".into());
             if !key.is_empty() {
-                let adapter = AzureOpenAiAdapter::new(endpoint, deployment, key).with_api_version(version);
+                let adapter =
+                    AzureOpenAiAdapter::new(endpoint, deployment, key).with_api_version(version);
                 let _ = kernel.register_provider(Arc::new(adapter));
             }
         }
         "openai" => {
-            if let Some(key) = config.get_api_key("openai").map(|s| s.to_string()).or_else(|| std::env::var("OPENAI_API_KEY").ok()) {
+            if let Some(key) = config
+                .get_api_key("openai")
+                .map(|s| s.to_string())
+                .or_else(|| std::env::var("OPENAI_API_KEY").ok())
+            {
                 let _ = kernel.register_provider(Arc::new(OpenAiAdapter::new(key)));
             }
         }
         "anthropic" => {
-            if let Some(key) = config.get_api_key("anthropic").map(|s| s.to_string()).or_else(|| std::env::var("ANTHROPIC_API_KEY").ok()) {
+            if let Some(key) = config
+                .get_api_key("anthropic")
+                .map(|s| s.to_string())
+                .or_else(|| std::env::var("ANTHROPIC_API_KEY").ok())
+            {
                 let _ = kernel.register_provider(Arc::new(AnthropicAdapter::new(key)));
             }
         }
         "local" => {
-            let url = config.get_api_key("local").unwrap_or("http://localhost:11434").to_string();
-            let _ = kernel.register_provider(Arc::new(LocalLlmAdapter::new(url, config.default_model.clone())));
+            let url = config
+                .get_api_key("local")
+                .unwrap_or("http://localhost:11434")
+                .to_string();
+            let _ = kernel.register_provider(Arc::new(LocalLlmAdapter::new(
+                url,
+                config.default_model.clone(),
+            )));
         }
         _ => {}
     }
@@ -56,7 +87,10 @@ fn project_context() -> String {
     let mut ctx = String::new();
     if let Ok(readme) = std::fs::read_to_string("README.md") {
         let preview: String = readme.chars().take(500).collect();
-        ctx.push_str(&format!("Project README (first 500 chars):\n{}\n\n", preview));
+        ctx.push_str(&format!(
+            "Project README (first 500 chars):\n{}\n\n",
+            preview
+        ));
     }
     if let Ok(cargo) = std::fs::read_to_string("Cargo.toml") {
         let preview: String = cargo.chars().take(300).collect();
@@ -69,7 +103,10 @@ fn project_context() -> String {
 fn handle_slash(cmd: &str, executor: &AgentExecutor, kernel: &AgentKernelImpl) -> bool {
     match cmd.split_whitespace().next().unwrap_or("") {
         "/quit" | "/exit" => std::process::exit(0),
-        "/id" => { println!("\x1b[90m{}\x1b[0m", executor.conversation_id); true }
+        "/id" => {
+            println!("\x1b[90m{}\x1b[0m", executor.conversation_id);
+            true
+        }
         "/history" => {
             let convs = kernel.context_manager.list_conversations();
             println!("\x1b[90mConversations ({}):\x1b[0m", convs.len());
@@ -81,7 +118,10 @@ fn handle_slash(cmd: &str, executor: &AgentExecutor, kernel: &AgentKernelImpl) -
         "/usage" => {
             let (tokens, cost) = kernel.context_manager.get_total_usage();
             let stats = kernel.rate_limiter.stats();
-            println!("\x1b[90mTokens: {} | Cost: ${:.4} | RPM: {}/{}\x1b[0m", tokens, cost, stats.requests_this_minute, stats.rpm_limit);
+            println!(
+                "\x1b[90mTokens: {} | Cost: ${:.4} | RPM: {}/{}\x1b[0m",
+                tokens, cost, stats.requests_this_minute, stats.rpm_limit
+            );
             true
         }
         "/plan" => {
@@ -91,7 +131,10 @@ fn handle_slash(cmd: &str, executor: &AgentExecutor, kernel: &AgentKernelImpl) -
         "/learn" => {
             let parts: Vec<&str> = cmd.splitn(3, ' ').collect();
             if parts.len() == 3 {
-                println!("\x1b[90mRule added: when '{}' → '{}'\x1b[0m", parts[1], parts[2]);
+                println!(
+                    "\x1b[90mRule added: when '{}' → '{}'\x1b[0m",
+                    parts[1], parts[2]
+                );
             } else {
                 println!("\x1b[90mUse: /learn <trigger> <correction>\x1b[0m");
             }
@@ -107,7 +150,10 @@ fn handle_slash(cmd: &str, executor: &AgentExecutor, kernel: &AgentKernelImpl) -
             println!("  /help        This message\x1b[0m");
             true
         }
-        _ if cmd.starts_with('/') => { println!("\x1b[90mUnknown command. Type /help\x1b[0m"); true }
+        _ if cmd.starts_with('/') => {
+            println!("\x1b[90mUnknown command. Type /help\x1b[0m");
+            true
+        }
         _ => false,
     }
 }
@@ -120,34 +166,49 @@ async fn main() {
 
     // Parse args
     let args: Vec<String> = std::env::args().collect();
-    let conversation_id = args.iter().position(|a| a == "--conversation").and_then(|i| args.get(i + 1)).cloned();
-    let one_shot = args.iter().position(|a| a == "-c").and_then(|i| args.get(i + 1)).cloned();
+    let conversation_id = args
+        .iter()
+        .position(|a| a == "--conversation")
+        .and_then(|i| args.get(i + 1))
+        .cloned();
+    let one_shot = args
+        .iter()
+        .position(|a| a == "-c")
+        .and_then(|i| args.get(i + 1))
+        .cloned();
 
     // Check for piped input
     let piped_input = if !atty_is_terminal() {
         let mut buf = String::new();
         io::stdin().read_to_string(&mut buf).ok();
         Some(buf)
-    } else { None };
+    } else {
+        None
+    };
 
     // Create agent
-    let handle = kernel.create_agent_full(AgentConfig {
-        name: "cli-agent".into(),
-        task: "interactive assistant".into(),
-        llm_provider: config.llm_provider.clone(),
-        permission_profile: "full-access".into(),
-        priority: Priority::default(),
-        sandbox_config: None,
-    }).await.expect("Failed to create agent");
+    let handle = kernel
+        .create_agent_full(AgentConfig {
+            name: "cli-agent".into(),
+            task: "interactive assistant".into(),
+            llm_provider: config.llm_provider.clone(),
+            permission_profile: "full-access".into(),
+            priority: Priority::default(),
+            sandbox_config: None,
+        })
+        .await
+        .expect("Failed to create agent");
 
     // Create executor with project context
     let project_ctx = project_context();
     let system_prompt = format!("You are a helpful AI assistant running in a terminal. Be concise and use tools when needed.\n\n{}", project_ctx);
 
-    let session = AgentConnector::connect(&*kernel.connector, handle.id, &config.llm_provider).await
+    let session = AgentConnector::connect(&*kernel.connector, handle.id, &config.llm_provider)
+        .await
         .expect("Failed to connect to LLM. Check API key and provider settings.");
     let mut executor = AgentExecutor::new(
-        handle.id, session,
+        handle.id,
+        session,
         kernel.resource_broker.clone() as Arc<dyn ResourceBroker>,
         kernel.tool_registry.clone(),
         kernel.context_manager.clone(),
@@ -167,7 +228,9 @@ async fn main() {
     if let Some(cmd) = one_shot {
         let msg = if let Some(ref piped) = piped_input {
             format!("{}\n\nInput:\n{}", cmd, piped)
-        } else { cmd };
+        } else {
+            cmd
+        };
         let output = executor.run(&msg).await.unwrap();
         println!("{}", output.content);
         return;
@@ -175,7 +238,10 @@ async fn main() {
 
     // Pipe mode (no prompt, just process)
     if let Some(piped) = piped_input {
-        let prompt = args.get(1).map(|s| s.as_str()).unwrap_or("Process this input");
+        let prompt = args
+            .get(1)
+            .map(|s| s.as_str())
+            .unwrap_or("Process this input");
         let msg = format!("{}\n\nInput:\n{}", prompt, piped);
         let output = executor.run(&msg).await.unwrap();
         println!("{}", output.content);
@@ -183,8 +249,14 @@ async fn main() {
     }
 
     // Interactive mode
-    eprintln!("\x1b[36m⚡ AI Agent OS\x1b[0m \x1b[90m({})\x1b[0m", config.llm_provider);
-    eprintln!("\x1b[90mConversation: {} | /help for commands\x1b[0m\n", &executor.conversation_id[..8]);
+    eprintln!(
+        "\x1b[36m⚡ AI Agent OS\x1b[0m \x1b[90m({})\x1b[0m",
+        config.llm_provider
+    );
+    eprintln!(
+        "\x1b[90mConversation: {} | /help for commands\x1b[0m\n",
+        &executor.conversation_id[..8]
+    );
 
     let stdin = io::stdin();
     let mut stdout = io::stdout();
@@ -194,18 +266,26 @@ async fn main() {
         stdout.flush().ok();
 
         let mut input = String::new();
-        if stdin.lock().read_line(&mut input).unwrap_or(0) == 0 { break; }
+        if stdin.lock().read_line(&mut input).unwrap_or(0) == 0 {
+            break;
+        }
         let input = input.trim();
-        if input.is_empty() { continue; }
+        if input.is_empty() {
+            continue;
+        }
 
-        if handle_slash(input, &executor, &kernel) { continue; }
+        if handle_slash(input, &executor, &kernel) {
+            continue;
+        }
 
         let output = executor.run(input).await;
 
         // Drain events
         while let Ok(event) = rx.try_recv() {
             match event {
-                StreamEvent::ToolCallStarted { name, .. } => eprint!("\x1b[33m  🔧 {}\x1b[0m", name),
+                StreamEvent::ToolCallStarted { name, .. } => {
+                    eprint!("\x1b[33m  🔧 {}\x1b[0m", name)
+                }
                 StreamEvent::ToolCallResult { .. } => eprintln!(" ✓"),
                 _ => {}
             }
@@ -215,7 +295,12 @@ async fn main() {
             Ok(out) => {
                 println!("\n\x1b[37m{}\x1b[0m", out.content);
                 if out.tool_calls_made > 0 {
-                    eprintln!("\x1b[90m  [{} tools, {} tokens, ${:.4}]\x1b[0m\n", out.tool_calls_made, out.tokens_used, out.tokens_used as f64 * 0.00001);
+                    eprintln!(
+                        "\x1b[90m  [{} tools, {} tokens, ${:.4}]\x1b[0m\n",
+                        out.tool_calls_made,
+                        out.tokens_used,
+                        out.tokens_used as f64 * 0.00001
+                    );
                 } else {
                     eprintln!("\x1b[90m  [{} tokens]\x1b[0m\n", out.tokens_used);
                 }

@@ -1,6 +1,5 @@
 //! Agent Package System — .agent package format, install, versioning.
 
-use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 /// Package manifest (inside .agent file).
@@ -42,12 +41,20 @@ pub struct PackageRegistry {
 }
 
 impl PackageRegistry {
-    pub fn new() -> Self { Self { packages: Vec::new() } }
+    pub fn new() -> Self {
+        Self {
+            packages: Vec::new(),
+        }
+    }
 
     /// Install a package from manifest.
     pub fn install(&mut self, manifest: PackageManifest, path: String) -> Result<(), String> {
         // Check if already installed
-        if self.packages.iter().any(|p| p.manifest.name == manifest.name) {
+        if self
+            .packages
+            .iter()
+            .any(|p| p.manifest.name == manifest.name)
+        {
             return Err(format!("package '{}' already installed", manifest.name));
         }
         // Check dependencies
@@ -57,7 +64,8 @@ impl PackageRegistry {
             }
         }
         self.packages.push(InstalledPackage {
-            manifest, install_path: path,
+            manifest,
+            install_path: path,
             installed_at: chrono::Utc::now().to_rfc3339(),
         });
         Ok(())
@@ -67,7 +75,12 @@ impl PackageRegistry {
     pub fn remove(&mut self, name: &str) -> Result<(), String> {
         // Check if other packages depend on this
         for pkg in &self.packages {
-            if pkg.manifest.dependencies.iter().any(|d| d.name == name && !d.optional) {
+            if pkg
+                .manifest
+                .dependencies
+                .iter()
+                .any(|d| d.name == name && !d.optional)
+            {
                 return Err(format!("'{}' is required by '{}'", name, pkg.manifest.name));
             }
         }
@@ -86,13 +99,16 @@ impl PackageRegistry {
     }
 
     /// List all installed packages.
-    pub fn list(&self) -> &[InstalledPackage] { &self.packages }
+    pub fn list(&self) -> &[InstalledPackage] {
+        &self.packages
+    }
 
     /// Upgrade a package (remove old, install new).
     pub fn upgrade(&mut self, manifest: PackageManifest, path: String) -> Result<(), String> {
         self.packages.retain(|p| p.manifest.name != manifest.name);
         self.packages.push(InstalledPackage {
-            manifest, install_path: path,
+            manifest,
+            install_path: path,
             installed_at: chrono::Utc::now().to_rfc3339(),
         });
         Ok(())
@@ -105,15 +121,22 @@ mod tests {
 
     fn test_manifest(name: &str) -> PackageManifest {
         PackageManifest {
-            name: name.into(), version: "1.0.0".into(), description: "test".into(),
-            author: None, license: None, dependencies: vec![], capabilities_required: vec![], tools_required: vec![],
+            name: name.into(),
+            version: "1.0.0".into(),
+            description: "test".into(),
+            author: None,
+            license: None,
+            dependencies: vec![],
+            capabilities_required: vec![],
+            tools_required: vec![],
         }
     }
 
     #[test]
     fn install_and_list() {
         let mut reg = PackageRegistry::new();
-        reg.install(test_manifest("pkg-a"), "/agents/pkg-a".into()).unwrap();
+        reg.install(test_manifest("pkg-a"), "/agents/pkg-a".into())
+            .unwrap();
         assert_eq!(reg.list().len(), 1);
         assert!(reg.is_installed("pkg-a"));
     }
@@ -129,7 +152,11 @@ mod tests {
     fn missing_dep_fails() {
         let mut reg = PackageRegistry::new();
         let mut manifest = test_manifest("child");
-        manifest.dependencies = vec![PackageDep { name: "parent".into(), version: ">=1.0".into(), optional: false }];
+        manifest.dependencies = vec![PackageDep {
+            name: "parent".into(),
+            version: ">=1.0".into(),
+            optional: false,
+        }];
         assert!(reg.install(manifest, "/a".into()).is_err());
     }
 
@@ -138,7 +165,11 @@ mod tests {
         let mut reg = PackageRegistry::new();
         reg.install(test_manifest("base"), "/a".into()).unwrap();
         let mut child = test_manifest("child");
-        child.dependencies = vec![PackageDep { name: "base".into(), version: ">=1.0".into(), optional: false }];
+        child.dependencies = vec![PackageDep {
+            name: "base".into(),
+            version: ">=1.0".into(),
+            optional: false,
+        }];
         reg.install(child, "/b".into()).unwrap();
         assert!(reg.remove("base").is_err()); // child depends on it
     }

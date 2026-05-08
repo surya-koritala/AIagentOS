@@ -1,8 +1,8 @@
 //! Stress test: 100 agents, measure kernel performance.
 
-use std::time::Instant;
-use kernel::os_kernel::OsKernel;
 use kernel::agent_struct::AgentId;
+use kernel::os_kernel::OsKernel;
+use std::time::Instant;
 
 #[tokio::main]
 async fn main() {
@@ -19,7 +19,11 @@ async fn main() {
         ids.push(kernel.start_agent(&format!("stress-{}", i)).await.unwrap());
     }
     let elapsed = start.elapsed();
-    println!("{}ms ({:.1} agents/ms)", elapsed.as_millis(), 100.0 / elapsed.as_millis() as f64);
+    println!(
+        "{}ms ({:.1} agents/ms)",
+        elapsed.as_millis(),
+        100.0 / elapsed.as_millis() as f64
+    );
 
     // Test 2: 1000 tool calls
     print!("1000 tool calls... ");
@@ -30,16 +34,26 @@ async fn main() {
         for &id in &ids {
             mac.label_agent(id, "worker".into());
         }
-        mac.load_policy(vec![
-            kernel::mac::PolicyRule { subject: "worker".into(), action: "*".into(), object: "*".into(), decision: "allow".into() },
-        ]);
+        mac.load_policy(vec![kernel::mac::PolicyRule {
+            subject: "worker".into(),
+            action: "*".into(),
+            object: "*".into(),
+            decision: "allow".into(),
+        }]);
     }
     for i in 0..1000 {
         let agent = ids[i % 100];
-        kernel.tool_call(agent, "/tools/fs", "read", &serde_json::json!({})).await.ok();
+        kernel
+            .tool_call(agent, "/tools/fs", "read", &serde_json::json!({}))
+            .await
+            .ok();
     }
     let elapsed = start.elapsed();
-    println!("{}ms ({:.0} calls/sec)", elapsed.as_millis(), 1000000.0 / elapsed.as_millis() as f64);
+    println!(
+        "{}ms ({:.0} calls/sec)",
+        elapsed.as_millis(),
+        1000000.0 / elapsed.as_millis() as f64
+    );
 
     // Test 3: Shutdown all
     print!("Shutting down 100 agents... ");

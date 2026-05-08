@@ -4,8 +4,8 @@
 
 use std::collections::HashMap;
 
-use crate::agent_struct::AgentId;
 use crate::agent_sockets::SocketAddr;
+use crate::agent_struct::AgentId;
 
 /// A registered service.
 #[derive(Debug, Clone)]
@@ -24,11 +24,28 @@ pub struct ServiceRegistry {
 }
 
 impl ServiceRegistry {
-    pub fn new() -> Self { Self { services: HashMap::new() } }
+    pub fn new() -> Self {
+        Self {
+            services: HashMap::new(),
+        }
+    }
 
     /// Register a service.
-    pub fn register(&mut self, name: String, agent_id: AgentId, address: SocketAddr, capabilities: Vec<String>) {
-        let entry = ServiceEntry { name: name.clone(), agent_id, address, capabilities, metadata: HashMap::new(), healthy: true };
+    pub fn register(
+        &mut self,
+        name: String,
+        agent_id: AgentId,
+        address: SocketAddr,
+        capabilities: Vec<String>,
+    ) {
+        let entry = ServiceEntry {
+            name: name.clone(),
+            agent_id,
+            address,
+            capabilities,
+            metadata: HashMap::new(),
+            healthy: true,
+        };
         self.services.entry(name).or_default().push(entry);
     }
 
@@ -41,19 +58,28 @@ impl ServiceRegistry {
 
     /// Find services by name.
     pub fn lookup(&self, name: &str) -> Vec<&ServiceEntry> {
-        self.services.get(name).map(|v| v.iter().filter(|e| e.healthy).collect()).unwrap_or_default()
+        self.services
+            .get(name)
+            .map(|v| v.iter().filter(|e| e.healthy).collect())
+            .unwrap_or_default()
     }
 
     /// Find services by capability.
     pub fn find_by_capability(&self, cap: &str) -> Vec<&ServiceEntry> {
-        self.services.values().flatten().filter(|e| e.healthy && e.capabilities.contains(&cap.to_string())).collect()
+        self.services
+            .values()
+            .flatten()
+            .filter(|e| e.healthy && e.capabilities.contains(&cap.to_string()))
+            .collect()
     }
 
     /// Mark a service as unhealthy.
     pub fn mark_unhealthy(&mut self, agent_id: AgentId) {
         for entries in self.services.values_mut() {
             for entry in entries.iter_mut() {
-                if entry.agent_id == agent_id { entry.healthy = false; }
+                if entry.agent_id == agent_id {
+                    entry.healthy = false;
+                }
             }
         }
     }
@@ -62,13 +88,17 @@ impl ServiceRegistry {
     pub fn mark_healthy(&mut self, agent_id: AgentId) {
         for entries in self.services.values_mut() {
             for entry in entries.iter_mut() {
-                if entry.agent_id == agent_id { entry.healthy = true; }
+                if entry.agent_id == agent_id {
+                    entry.healthy = true;
+                }
             }
         }
     }
 
     /// Get total registered services.
-    pub fn count(&self) -> usize { self.services.values().map(|v| v.len()).sum() }
+    pub fn count(&self) -> usize {
+        self.services.values().map(|v| v.len()).sum()
+    }
 }
 
 #[cfg(test)]
@@ -78,7 +108,12 @@ mod tests {
     #[test]
     fn register_and_lookup() {
         let mut reg = ServiceRegistry::new();
-        reg.register("researcher".into(), 1, SocketAddr::new(1, 8080), vec!["search".into(), "summarize".into()]);
+        reg.register(
+            "researcher".into(),
+            1,
+            SocketAddr::new(1, 8080),
+            vec!["search".into(), "summarize".into()],
+        );
         let results = reg.lookup("researcher");
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].agent_id, 1);
@@ -87,9 +122,24 @@ mod tests {
     #[test]
     fn find_by_capability() {
         let mut reg = ServiceRegistry::new();
-        reg.register("agent-a".into(), 1, SocketAddr::new(1, 80), vec!["code".into()]);
-        reg.register("agent-b".into(), 2, SocketAddr::new(2, 80), vec!["code".into(), "review".into()]);
-        reg.register("agent-c".into(), 3, SocketAddr::new(3, 80), vec!["research".into()]);
+        reg.register(
+            "agent-a".into(),
+            1,
+            SocketAddr::new(1, 80),
+            vec!["code".into()],
+        );
+        reg.register(
+            "agent-b".into(),
+            2,
+            SocketAddr::new(2, 80),
+            vec!["code".into(), "review".into()],
+        );
+        reg.register(
+            "agent-c".into(),
+            3,
+            SocketAddr::new(3, 80),
+            vec!["research".into()],
+        );
         let coders = reg.find_by_capability("code");
         assert_eq!(coders.len(), 2);
     }

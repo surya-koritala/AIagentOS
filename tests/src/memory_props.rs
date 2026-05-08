@@ -3,8 +3,8 @@
 //! Property 3: For any valid Fact, storing and querying SHALL return result
 //! containing original content.
 
-use proptest::prelude::*;
 use chrono::Utc;
+use proptest::prelude::*;
 
 use kernel::context::*;
 
@@ -18,15 +18,14 @@ fn arb_category() -> impl Strategy<Value = FactCategory> {
 }
 
 fn arb_fact() -> impl Strategy<Value = Fact> {
-    ("[a-zA-Z ]{5,50}", arb_category())
-        .prop_map(|(content, category)| Fact {
-            id: uuid::Uuid::new_v4(),
-            content,
-            category,
-            created_at: Utc::now(),
-            last_accessed_at: Utc::now(),
-            embedding: None,
-        })
+    ("[a-zA-Z ]{5,50}", arb_category()).prop_map(|(content, category)| Fact {
+        id: uuid::Uuid::new_v4(),
+        content,
+        category,
+        created_at: Utc::now(),
+        last_accessed_at: Utc::now(),
+        embedding: None,
+    })
 }
 
 proptest! {

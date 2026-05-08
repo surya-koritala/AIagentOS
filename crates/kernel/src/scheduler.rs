@@ -3,8 +3,8 @@
 //! Manages concurrent agent execution with priority-based scheduling,
 //! resource-aware throttling, and deadlock detection.
 
-use std::collections::BinaryHeap;
 use std::cmp::Ordering;
+use std::collections::BinaryHeap;
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::Mutex;
 
@@ -58,7 +58,10 @@ impl Ord for PriorityEntry {
     fn cmp(&self, other: &Self) -> Ordering {
         // Lower priority value = higher priority (1 is highest)
         // If same priority, earlier sequence wins (FIFO within same priority)
-        other.priority.value().cmp(&self.priority.value())
+        other
+            .priority
+            .value()
+            .cmp(&self.priority.value())
             .then_with(|| other.sequence.cmp(&self.sequence))
     }
 }
@@ -126,27 +129,37 @@ impl PriorityScheduler {
 
     /// Get the throttle delay for an agent (0 if not throttled).
     pub fn get_throttle_delay_ms(&self, agent_id: AgentId) -> u64 {
-        self.agents.get(&agent_id).map(|a| a.throttle_delay_ms).unwrap_or(0)
+        self.agents
+            .get(&agent_id)
+            .map(|a| a.throttle_delay_ms)
+            .unwrap_or(0)
     }
 
     /// Request resource access in priority order. Returns when access is granted.
     /// Implements deadlock detection via timeout.
     pub async fn request_resource_access(&self, agent_id: AgentId) -> Result<(), SchedulerError> {
-        let priority = self.agents.get(&agent_id)
+        let priority = self
+            .agents
+            .get(&agent_id)
             .map(|a| a.priority)
             .unwrap_or_default();
 
         let seq = self.sequence.fetch_add(1, AtomicOrdering::SeqCst) as u64;
         {
             let mut queue = self.resource_queue.lock().unwrap();
-            queue.push(PriorityEntry { agent_id, priority, sequence: seq });
+            queue.push(PriorityEntry {
+                agent_id,
+                priority,
+                sequence: seq,
+            });
         }
 
         // Wait until this agent is at the front of the queue (highest priority)
         let result = tokio::time::timeout(
             tokio::time::Duration::from_secs(DEADLOCK_TIMEOUT_SECS),
             self.wait_for_turn(agent_id),
-        ).await;
+        )
+        .await;
 
         match result {
             Ok(()) => Ok(()),
@@ -175,7 +188,10 @@ impl PriorityScheduler {
     /// Check if the given agent is at the front of the resource queue.
     pub fn is_next_in_queue(&self, agent_id: AgentId) -> bool {
         let queue = self.resource_queue.lock().unwrap();
-        queue.peek().map(|e| e.agent_id == agent_id).unwrap_or(false)
+        queue
+            .peek()
+            .map(|e| e.agent_id == agent_id)
+            .unwrap_or(false)
     }
 
     fn apply_throttling(&self) {
@@ -225,16 +241,20 @@ impl AgentScheduler for PriorityScheduler {
         let current = self.running_count.load(AtomicOrdering::SeqCst);
         if current >= MAX_CONCURRENT_AGENTS {
             // Queue the agent
-            self.agents.insert(agent.id, AgentScheduleInfo {
-                priority: Priority::default(),
-                state: AgentScheduleState::Queued,
-                throttle_delay_ms: 0,
-            });
+            self.agents.insert(
+                agent.id,
+                AgentScheduleInfo {
+                    priority: Priority::default(),
+                    state: AgentScheduleState::Queued,
+                    throttle_delay_ms: 0,
+                },
+            );
             // Wait for a slot
             let timeout_result = tokio::time::timeout(
                 tokio::time::Duration::from_secs(DEADLOCK_TIMEOUT_SECS),
                 self.wait_for_slot(),
-            ).await;
+            )
+            .await;
             if timeout_result.is_err() {
                 self.agents.remove(&agent.id);
                 return Err(SchedulerError::QueueFull);
@@ -242,16 +262,21 @@ impl AgentScheduler for PriorityScheduler {
         }
 
         self.running_count.fetch_add(1, AtomicOrdering::SeqCst);
-        self.agents.insert(agent.id, AgentScheduleInfo {
-            priority: Priority::default(),
-            state: AgentScheduleState::Running,
-            throttle_delay_ms: 0,
-        });
+        self.agents.insert(
+            agent.id,
+            AgentScheduleInfo {
+                priority: Priority::default(),
+                state: AgentScheduleState::Running,
+                throttle_delay_ms: 0,
+            },
+        );
         Ok(())
     }
 
     async fn suspend(&self, agent_id: AgentId) -> Result<(), SchedulerError> {
-        let mut info = self.agents.get_mut(&agent_id)
+        let mut info = self
+            .agents
+            .get_mut(&agent_id)
             .ok_or(SchedulerError::AgentNotScheduled(agent_id))?;
         if info.state != AgentScheduleState::Running {
             return Err(SchedulerError::AgentNotScheduled(agent_id));
@@ -264,7 +289,9 @@ impl AgentScheduler for PriorityScheduler {
     }
 
     async fn resume(&self, agent_id: AgentId) -> Result<(), SchedulerError> {
-        let mut info = self.agents.get_mut(&agent_id)
+        let mut info = self
+            .agents
+            .get_mut(&agent_id)
             .ok_or(SchedulerError::AgentNotScheduled(agent_id))?;
         if info.state != AgentScheduleState::Suspended {
             return Err(SchedulerError::AgentNotScheduled(agent_id));
@@ -295,7 +322,9 @@ impl AgentScheduler for PriorityScheduler {
 
     fn get_queue_status(&self) -> SchedulerStatus {
         let running = self.running_count.load(AtomicOrdering::SeqCst);
-        let queued = self.agents.iter()
+        let queued = self
+            .agents
+            .iter()
             .filter(|e| e.state == AgentScheduleState::Queued)
             .count();
         SchedulerStatus {
@@ -328,7 +357,11 @@ mod tests {
 
     fn make_handle(id: AgentId) -> AgentHandle {
         let (tx, _rx) = mpsc::channel(1);
-        AgentHandle { id, state: crate::AgentState::Running, cmd_tx: tx }
+        AgentHandle {
+            id,
+            state: crate::AgentState::Running,
+            cmd_tx: tx,
+        }
     }
 
     #[tokio::test]
@@ -406,6 +439,9 @@ mod tests {
             let id = uuid::Uuid::new_v4();
             sched.schedule(&make_handle(id)).await.unwrap();
         }
-        assert_eq!(sched.get_queue_status().running_agents, MAX_CONCURRENT_AGENTS);
+        assert_eq!(
+            sched.get_queue_status().running_agents,
+            MAX_CONCURRENT_AGENTS
+        );
     }
 }

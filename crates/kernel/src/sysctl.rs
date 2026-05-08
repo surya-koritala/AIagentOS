@@ -18,14 +18,25 @@ impl Sysctl {
         Self { params }
     }
 
-    pub fn get(&self, key: &str) -> Option<&str> { self.params.get(key).map(|s| s.as_str()) }
+    pub fn get(&self, key: &str) -> Option<&str> {
+        self.params.get(key).map(|s| s.as_str())
+    }
     pub fn set(&mut self, key: &str, value: String) -> Result<(), &'static str> {
-        if !self.params.contains_key(key) { return Err("unknown sysctl key"); }
+        if !self.params.contains_key(key) {
+            return Err("unknown sysctl key");
+        }
         self.params.insert(key.to_string(), value);
         Ok(())
     }
-    pub fn list(&self) -> Vec<(&str, &str)> { self.params.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect() }
-    pub fn get_u64(&self, key: &str) -> Option<u64> { self.get(key)?.parse().ok() }
+    pub fn list(&self) -> Vec<(&str, &str)> {
+        self.params
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect()
+    }
+    pub fn get_u64(&self, key: &str) -> Option<u64> {
+        self.get(key)?.parse().ok()
+    }
 }
 
 #[cfg(test)]

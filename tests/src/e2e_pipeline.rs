@@ -3,12 +3,12 @@
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
-    use wiremock::{Mock, MockServer, ResponseTemplate};
     use wiremock::matchers::{method, path_regex};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    use kernel::{AgentConfig, AgentKernelImpl, Priority};
-    use kernel::connector::LlmProviderAdapter;
     use adapters::azure_openai::AzureOpenAiAdapter;
+    use kernel::connector::LlmProviderAdapter;
+    use kernel::{AgentConfig, AgentKernelImpl, Priority};
 
     /// Full E2E test: create kernel → register Azure adapter → create agent → send message
     /// → LLM returns tool call → tool executes → LLM responds with final answer.
@@ -77,17 +77,26 @@ mod tests {
         struct RealFs;
         #[async_trait::async_trait]
         impl ResourceProvider for RealFs {
-            fn resource_type(&self) -> ResourceType { ResourceType::Filesystem }
-            fn supported_operations(&self) -> Vec<String> { vec!["read".into(), "write".into(), "list".into()] }
-            async fn execute(&self, operation: &str, params: &serde_json::Value) -> Result<serde_json::Value, ResourceError> {
+            fn resource_type(&self) -> ResourceType {
+                ResourceType::Filesystem
+            }
+            fn supported_operations(&self) -> Vec<String> {
+                vec!["read".into(), "write".into(), "list".into()]
+            }
+            async fn execute(
+                &self,
+                operation: &str,
+                params: &serde_json::Value,
+            ) -> Result<serde_json::Value, ResourceError> {
                 let path = params["path"].as_str().unwrap_or("");
                 match operation {
                     "read" => {
-                        let content = tokio::fs::read_to_string(path).await
+                        let content = tokio::fs::read_to_string(path)
+                            .await
                             .map_err(|e| ResourceError::OperationFailed(e.to_string()))?;
                         Ok(serde_json::json!({"content": content}))
                     }
-                    _ => Ok(serde_json::json!({}))
+                    _ => Ok(serde_json::json!({})),
                 }
             }
         }
@@ -106,7 +115,10 @@ mod tests {
 
         // Send message — this triggers the full pipeline:
         // user msg → LLM → tool_call(read_file) → actually reads /tmp/e2e_test_agent_os.txt → LLM → response
-        let output = kernel.send_message(handle.id, "Read the test file").await.unwrap();
+        let output = kernel
+            .send_message(handle.id, "Read the test file")
+            .await
+            .unwrap();
 
         // Verify
         assert!(output.content.contains("hello from e2e test"));
@@ -138,14 +150,17 @@ mod tests {
         let adapter = AzureOpenAiAdapter::new(mock_server.uri(), "gpt-4o".into(), "key".into());
         kernel.register_provider(Arc::new(adapter)).unwrap();
 
-        let handle = kernel.create_agent_full(AgentConfig {
-            name: "chat-agent".into(),
-            task: "chat".into(),
-            llm_provider: "azure-openai".into(),
-            permission_profile: "standard".into(),
-            priority: Priority::default(),
-            sandbox_config: None,
-        }).await.unwrap();
+        let handle = kernel
+            .create_agent_full(AgentConfig {
+                name: "chat-agent".into(),
+                task: "chat".into(),
+                llm_provider: "azure-openai".into(),
+                permission_profile: "standard".into(),
+                priority: Priority::default(),
+                sandbox_config: None,
+            })
+            .await
+            .unwrap();
 
         let output = kernel.send_message(handle.id, "Hi there").await.unwrap();
         assert_eq!(output.content, "Hello! I'm your AI assistant.");

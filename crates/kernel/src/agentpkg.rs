@@ -1,6 +1,6 @@
 //! agentpkg — package manager CLI + registry client.
 
-use crate::package::{PackageManifest, PackageRegistry, PackageDep};
+use crate::package::{PackageManifest, PackageRegistry};
 
 /// agentpkg command handler.
 pub struct AgentPkg {
@@ -10,7 +10,10 @@ pub struct AgentPkg {
 
 impl AgentPkg {
     pub fn new() -> Self {
-        Self { registry: PackageRegistry::new(), remote_url: None }
+        Self {
+            registry: PackageRegistry::new(),
+            remote_url: None,
+        }
     }
 
     pub fn with_remote(mut self, url: String) -> Self {
@@ -36,10 +39,17 @@ impl AgentPkg {
         let name = name.ok_or("usage: agentpkg install <package>")?;
         // In real impl, would fetch from registry
         let manifest = PackageManifest {
-            name: name.into(), version: "1.0.0".into(), description: format!("Package {}", name),
-            author: None, license: None, dependencies: vec![], capabilities_required: vec![], tools_required: vec![],
+            name: name.into(),
+            version: "1.0.0".into(),
+            description: format!("Package {}", name),
+            author: None,
+            license: None,
+            dependencies: vec![],
+            capabilities_required: vec![],
+            tools_required: vec![],
         };
-        self.registry.install(manifest, format!("/agents/{}", name))?;
+        self.registry
+            .install(manifest, format!("/agents/{}", name))?;
         Ok(format!("Installed {} v1.0.0", name))
     }
 
@@ -56,7 +66,10 @@ impl AgentPkg {
         }
         let mut out = format!("{:<20} {:<10} {}\n", "NAME", "VERSION", "PATH");
         for pkg in packages {
-            out += &format!("{:<20} {:<10} {}\n", pkg.manifest.name, pkg.manifest.version, pkg.install_path);
+            out += &format!(
+                "{:<20} {:<10} {}\n",
+                pkg.manifest.name, pkg.manifest.version, pkg.install_path
+            );
         }
         Ok(out)
     }
@@ -64,14 +77,19 @@ impl AgentPkg {
     fn cmd_search(&self, query: Option<&str>) -> Result<String, String> {
         let query = query.ok_or("usage: agentpkg search <query>")?;
         // In real impl, would search remote registry
-        Ok(format!("Searching registry for '{}'...\n(registry not configured)", query))
+        Ok(format!(
+            "Searching registry for '{}'...\n(registry not configured)",
+            query
+        ))
     }
 
     fn cmd_info(&self, name: Option<&str>) -> Result<String, String> {
         let name = name.ok_or("usage: agentpkg info <package>")?;
         match self.registry.get(name) {
-            Some(pkg) => Ok(format!("Name: {}\nVersion: {}\nDescription: {}\nPath: {}",
-                pkg.manifest.name, pkg.manifest.version, pkg.manifest.description, pkg.install_path)),
+            Some(pkg) => Ok(format!(
+                "Name: {}\nVersion: {}\nDescription: {}\nPath: {}",
+                pkg.manifest.name, pkg.manifest.version, pkg.manifest.description, pkg.install_path
+            )),
             None => Err(format!("package '{}' not installed", name)),
         }
     }

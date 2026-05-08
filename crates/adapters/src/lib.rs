@@ -1,9 +1,9 @@
 //! LLM Provider Adapters for the AI Agent OS.
 
-pub mod openai;
-pub mod azure_openai;
 pub mod anthropic;
+pub mod azure_openai;
 pub mod local;
+pub mod openai;
 pub mod streaming;
 
 #[cfg(test)]

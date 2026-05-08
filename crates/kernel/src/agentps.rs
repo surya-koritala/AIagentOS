@@ -1,9 +1,7 @@
 //! agentps — list running agents (like ps).
 //! agenttop — real-time agent monitor (like top/htop).
 
-use crate::agent_struct::{AgentId, AgentState, AgentStruct, AgentTable};
-use std::sync::Arc;
-use tokio::sync::RwLock;
+use crate::agent_struct::{AgentId, AgentTable};
 
 /// A row in agentps output.
 #[derive(Debug, Clone)]
@@ -20,12 +18,12 @@ pub struct PsEntry {
 
 /// agentps: snapshot of all agents.
 pub fn agentps(table: &AgentTable) -> Vec<PsEntry> {
-    let now = chrono::Utc::now();
+    let _now = chrono::Utc::now();
     let mut entries = Vec::new();
 
     for id in table.list_ids() {
         if let Some(agent_ref) = table.get(id) {
-            let agent = agent_ref.value();
+            let _agent = agent_ref.value();
             // We need to read-lock the agent
             // For now, create entry from what we can access
             entries.push(PsEntry {
@@ -45,13 +43,17 @@ pub fn agentps(table: &AgentTable) -> Vec<PsEntry> {
 
 /// Format agentps output as a table string.
 pub fn format_ps(entries: &[PsEntry]) -> String {
-    let mut out = format!("{:<6} {:<15} {:<10} {:<6} {:<5} {:<10} {:<8} {}\n",
-        "ID", "NAME", "STATE", "PPID", "NI", "TOKENS", "TOOLS", "UPTIME");
+    let mut out = format!(
+        "{:<6} {:<15} {:<10} {:<6} {:<5} {:<10} {:<8} {}\n",
+        "ID", "NAME", "STATE", "PPID", "NI", "TOKENS", "TOOLS", "UPTIME"
+    );
     out += &"-".repeat(75);
     out += "\n";
     for e in entries {
-        out += &format!("{:<6} {:<15} {:<10} {:<6} {:<5} {:<10} {:<8} {}s\n",
-            e.id, e.name, e.state, e.parent, e.nice, e.tokens_total, e.tool_calls, e.uptime_secs);
+        out += &format!(
+            "{:<6} {:<15} {:<10} {:<6} {:<5} {:<10} {:<8} {}s\n",
+            e.id, e.name, e.state, e.parent, e.nice, e.tokens_total, e.tool_calls, e.uptime_secs
+        );
     }
     out += &format!("\nTotal: {} agents\n", entries.len());
     out
@@ -84,9 +86,14 @@ pub fn agenttop(entries: &[PsEntry]) -> TopStats {
 
 /// Format agenttop output.
 pub fn format_top(stats: &TopStats, entries: &[PsEntry]) -> String {
-    let mut out = format!("AI Agent OS — {} agents ({} running, {} blocked, {} stopped)\n",
-        stats.total_agents, stats.running, stats.blocked, stats.stopped);
-    out += &format!("Tokens: {} total | Tool calls: {} total\n\n", stats.total_tokens, stats.total_tool_calls);
+    let mut out = format!(
+        "AI Agent OS — {} agents ({} running, {} blocked, {} stopped)\n",
+        stats.total_agents, stats.running, stats.blocked, stats.stopped
+    );
+    out += &format!(
+        "Tokens: {} total | Tool calls: {} total\n\n",
+        stats.total_tokens, stats.total_tool_calls
+    );
     out += &format_ps(entries);
     out
 }
@@ -98,8 +105,26 @@ mod tests {
     #[test]
     fn format_ps_output() {
         let entries = vec![
-            PsEntry { id: 1, name: "researcher".into(), state: "running".into(), parent: 0, nice: 0, tokens_total: 5000, tool_calls: 12, uptime_secs: 300 },
-            PsEntry { id: 2, name: "coder".into(), state: "blocked".into(), parent: 1, nice: -5, tokens_total: 8000, tool_calls: 25, uptime_secs: 600 },
+            PsEntry {
+                id: 1,
+                name: "researcher".into(),
+                state: "running".into(),
+                parent: 0,
+                nice: 0,
+                tokens_total: 5000,
+                tool_calls: 12,
+                uptime_secs: 300,
+            },
+            PsEntry {
+                id: 2,
+                name: "coder".into(),
+                state: "blocked".into(),
+                parent: 1,
+                nice: -5,
+                tokens_total: 8000,
+                tool_calls: 25,
+                uptime_secs: 600,
+            },
         ];
         let output = format_ps(&entries);
         assert!(output.contains("researcher"));
@@ -110,9 +135,36 @@ mod tests {
     #[test]
     fn top_stats() {
         let entries = vec![
-            PsEntry { id: 1, name: "a".into(), state: "running".into(), parent: 0, nice: 0, tokens_total: 100, tool_calls: 5, uptime_secs: 10 },
-            PsEntry { id: 2, name: "b".into(), state: "running".into(), parent: 0, nice: 0, tokens_total: 200, tool_calls: 10, uptime_secs: 20 },
-            PsEntry { id: 3, name: "c".into(), state: "stopped".into(), parent: 0, nice: 0, tokens_total: 50, tool_calls: 2, uptime_secs: 5 },
+            PsEntry {
+                id: 1,
+                name: "a".into(),
+                state: "running".into(),
+                parent: 0,
+                nice: 0,
+                tokens_total: 100,
+                tool_calls: 5,
+                uptime_secs: 10,
+            },
+            PsEntry {
+                id: 2,
+                name: "b".into(),
+                state: "running".into(),
+                parent: 0,
+                nice: 0,
+                tokens_total: 200,
+                tool_calls: 10,
+                uptime_secs: 20,
+            },
+            PsEntry {
+                id: 3,
+                name: "c".into(),
+                state: "stopped".into(),
+                parent: 0,
+                nice: 0,
+                tokens_total: 50,
+                tool_calls: 2,
+                uptime_secs: 5,
+            },
         ];
         let stats = agenttop(&entries);
         assert_eq!(stats.total_agents, 3);
@@ -124,9 +176,16 @@ mod tests {
 
     #[test]
     fn format_top_output() {
-        let entries = vec![
-            PsEntry { id: 1, name: "test".into(), state: "running".into(), parent: 0, nice: 0, tokens_total: 100, tool_calls: 5, uptime_secs: 60 },
-        ];
+        let entries = vec![PsEntry {
+            id: 1,
+            name: "test".into(),
+            state: "running".into(),
+            parent: 0,
+            nice: 0,
+            tokens_total: 100,
+            tool_calls: 5,
+            uptime_secs: 60,
+        }];
         let stats = agenttop(&entries);
         let output = format_top(&stats, &entries);
         assert!(output.contains("1 agents"));

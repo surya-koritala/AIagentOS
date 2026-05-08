@@ -32,20 +32,31 @@ impl ShellEnv {
         variables.insert("HOME".into(), "/".into());
         variables.insert("SHELL".into(), "agentsh".into());
         Self {
-            variables, aliases: HashMap::new(),
-            history: Vec::new(), cwd: "/".into(), last_exit_code: 0,
+            variables,
+            aliases: HashMap::new(),
+            history: Vec::new(),
+            cwd: "/".into(),
+            last_exit_code: 0,
         }
     }
 
-    pub fn set_var(&mut self, key: &str, value: String) { self.variables.insert(key.into(), value); }
-    pub fn get_var(&self, key: &str) -> Option<&str> { self.variables.get(key).map(|s| s.as_str()) }
-    pub fn set_alias(&mut self, name: &str, cmd: String) { self.aliases.insert(name.into(), cmd); }
+    pub fn set_var(&mut self, key: &str, value: String) {
+        self.variables.insert(key.into(), value);
+    }
+    pub fn get_var(&self, key: &str) -> Option<&str> {
+        self.variables.get(key).map(|s| s.as_str())
+    }
+    pub fn set_alias(&mut self, name: &str, cmd: String) {
+        self.aliases.insert(name.into(), cmd);
+    }
 }
 
 /// Parse a command line into a ShellCommand.
 pub fn parse_command(input: &str) -> Option<ShellCommand> {
     let input = input.trim();
-    if input.is_empty() { return None; }
+    if input.is_empty() {
+        return None;
+    }
 
     // Check for pipe
     if let Some(pipe_pos) = input.find('|') {
@@ -61,7 +72,9 @@ pub fn parse_command(input: &str) -> Option<ShellCommand> {
 
 fn parse_simple(input: &str) -> Option<ShellCommand> {
     let input = input.trim();
-    if input.is_empty() { return None; }
+    if input.is_empty() {
+        return None;
+    }
 
     let mut background = false;
     let mut redirect_out = None;
@@ -88,7 +101,9 @@ fn parse_simple(input: &str) -> Option<ShellCommand> {
     }
 
     let parts: Vec<String> = cleaned.split_whitespace().map(|s| s.to_string()).collect();
-    if parts.is_empty() { return None; }
+    if parts.is_empty() {
+        return None;
+    }
 
     Some(ShellCommand {
         program: parts[0].clone(),
@@ -102,7 +117,10 @@ fn parse_simple(input: &str) -> Option<ShellCommand> {
 
 /// Built-in shell commands.
 pub fn is_builtin(cmd: &str) -> bool {
-    matches!(cmd, "cd" | "export" | "alias" | "history" | "exit" | "help" | "echo" | "set")
+    matches!(
+        cmd,
+        "cd" | "export" | "alias" | "history" | "exit" | "help" | "echo" | "set"
+    )
 }
 
 /// Execute a built-in command.
@@ -129,9 +147,20 @@ pub fn exec_builtin(cmd: &ShellCommand, env: &mut ShellEnv) -> String {
             }
             format!("{} aliases defined", env.aliases.len())
         }
-        "history" => env.history.iter().enumerate().map(|(i, h)| format!("{}: {}", i + 1, h)).collect::<Vec<_>>().join("\n"),
+        "history" => env
+            .history
+            .iter()
+            .enumerate()
+            .map(|(i, h)| format!("{}: {}", i + 1, h))
+            .collect::<Vec<_>>()
+            .join("\n"),
         "echo" => cmd.args.join(" "),
-        "set" => env.variables.iter().map(|(k, v)| format!("{}={}", k, v)).collect::<Vec<_>>().join("\n"),
+        "set" => env
+            .variables
+            .iter()
+            .map(|(k, v)| format!("{}={}", k, v))
+            .collect::<Vec<_>>()
+            .join("\n"),
         "help" => "Built-in commands: cd, export, alias, history, echo, set, exit, help".into(),
         "exit" => "exit".into(),
         _ => format!("unknown builtin: {}", cmd.program),

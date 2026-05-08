@@ -34,14 +34,19 @@ impl LlmSession for LocalSession {
         self.send_with_tools(messages, &[]).await
     }
 
-    async fn send_with_tools(&self, messages: Vec<StandardMessage>, _tools: &[ToolDefinition]) -> Result<LlmResponse, ConnectorError> {
+    async fn send_with_tools(
+        &self,
+        messages: Vec<StandardMessage>,
+        _tools: &[ToolDefinition],
+    ) -> Result<LlmResponse, ConnectorError> {
         let body = serde_json::json!({
             "model": self.model,
             "messages": messages.iter().map(|m| serde_json::json!({"role": m.role, "content": m.content})).collect::<Vec<_>>(),
             "stream": false,
         });
 
-        let resp = self.client
+        let resp = self
+            .client
             .post(format!("{}/api/chat", self.base_url))
             .json(&body)
             .send()
@@ -49,12 +54,20 @@ impl LlmSession for LocalSession {
             .map_err(|e| ConnectorError::ConnectionFailed(e.to_string()))?;
 
         if !resp.status().is_success() {
-            return Err(ConnectorError::ConnectionFailed(format!("HTTP {}", resp.status())));
+            return Err(ConnectorError::ConnectionFailed(format!(
+                "HTTP {}",
+                resp.status()
+            )));
         }
 
-        let json: serde_json::Value = resp.json().await
+        let json: serde_json::Value = resp
+            .json()
+            .await
             .map_err(|e| ConnectorError::ProtocolError(e.to_string()))?;
-        let content = json["message"]["content"].as_str().unwrap_or("").to_string();
+        let content = json["message"]["content"]
+            .as_str()
+            .unwrap_or("")
+            .to_string();
 
         Ok(LlmResponse {
             content,
@@ -64,18 +77,30 @@ impl LlmSession for LocalSession {
         })
     }
 
-    fn provider_id(&self) -> &ProviderId { &self.provider_id }
+    fn provider_id(&self) -> &ProviderId {
+        &self.provider_id
+    }
 }
 
 #[async_trait::async_trait]
 impl LlmProviderAdapter for LocalLlmAdapter {
-    fn id(&self) -> &ProviderId { &self.id }
-    fn name(&self) -> &str { "Local LLM (Ollama)" }
-    fn provider_type(&self) -> ProviderType { ProviderType::Local }
+    fn id(&self) -> &ProviderId {
+        &self.id
+    }
+    fn name(&self) -> &str {
+        "Local LLM (Ollama)"
+    }
+    fn provider_type(&self) -> ProviderType {
+        ProviderType::Local
+    }
 
     async fn is_available(&self) -> bool {
-        self.client.get(format!("{}/api/tags", self.base_url))
-            .send().await.map(|r| r.status().is_success()).unwrap_or(false)
+        self.client
+            .get(format!("{}/api/tags", self.base_url))
+            .send()
+            .await
+            .map(|r| r.status().is_success())
+            .unwrap_or(false)
     }
 
     async fn create_session(&self) -> Result<Box<dyn LlmSession>, ConnectorError> {

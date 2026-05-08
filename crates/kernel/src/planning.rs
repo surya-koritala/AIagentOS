@@ -3,17 +3,12 @@
 //! Agents create explicit plans before acting, execute steps sequentially,
 //! and can revise plans when steps fail.
 
-use std::sync::Arc;
-
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
-use crate::connector::{LlmSession, StandardMessage, ToolDefinition};
-use crate::context::SqliteContextManager;
-use crate::execution::{AgentExecutor, AgentOutput, StreamEvent};
-use crate::resources::ResourceBroker;
-use crate::tools::ToolRegistry;
-use crate::{AgentId, KernelError};
+use crate::connector::{LlmSession, StandardMessage};
+use crate::execution::AgentExecutor;
+use crate::KernelError;
 
 // ─── Data Model ──────────────────────────────────────────────────────────────
 
@@ -69,12 +64,29 @@ pub enum PlanStatus {
 #[derive(Debug, Clone)]
 pub enum PlanEvent {
     PlanCreated(Plan),
-    StepStarted { step: usize, description: String },
-    StepCompleted { step: usize, output: String },
-    StepFailed { step: usize, error: String },
-    PlanRevised { revision: usize, new_steps: Vec<PlanStep> },
-    ApprovalRequired { step: usize, description: String },
-    PlanCompleted { total_steps: usize },
+    StepStarted {
+        step: usize,
+        description: String,
+    },
+    StepCompleted {
+        step: usize,
+        output: String,
+    },
+    StepFailed {
+        step: usize,
+        error: String,
+    },
+    PlanRevised {
+        revision: usize,
+        new_steps: Vec<PlanStep>,
+    },
+    ApprovalRequired {
+        step: usize,
+        description: String,
+    },
+    PlanCompleted {
+        total_steps: usize,
+    },
 }
 
 // ─── Plan Generator ──────────────────────────────────────────────────────────
@@ -90,16 +102,15 @@ Rules:
 - Do NOT include explanations, just the steps"#;
 
 /// Generate a plan from a task description using the LLM.
-pub async fn generate_plan(
-    session: &dyn LlmSession,
-    task: &str,
-) -> Result<Plan, KernelError> {
+pub async fn generate_plan(session: &dyn LlmSession, task: &str) -> Result<Plan, KernelError> {
     let messages = vec![
         StandardMessage::system(PLAN_SYSTEM_PROMPT),
         StandardMessage::user(format!("Create a plan for: {}", task)),
     ];
 
-    let response = session.send(messages).await
+    let response = session
+        .send(messages)
+        .await
         .map_err(|e| KernelError::Connector(e))?;
 
     let steps = parse_plan_steps(&response.content);
@@ -118,17 +129,25 @@ pub fn parse_plan_steps(text: &str) -> Vec<PlanStep> {
         .filter_map(|line| {
             let trimmed = line.trim();
             // Match "1. Do something" or "1) Do something"
-            let content = trimmed.strip_prefix(|c: char| c.is_ascii_digit())
+            let content = trimmed
+                .strip_prefix(|c: char| c.is_ascii_digit())
                 .and_then(|s| s.strip_prefix('.').or(s.strip_prefix(')')))
                 .map(|s| s.trim().to_string())?;
-            if content.is_empty() { return None; }
+            if content.is_empty() {
+                return None;
+            }
             Some(content)
         })
         .enumerate()
         .map(|(i, description)| {
-            let risk_level = if description.contains("[HIGH RISK]") || description.to_lowercase().contains("delete") || description.to_lowercase().contains("remove") {
+            let risk_level = if description.contains("[HIGH RISK]")
+                || description.to_lowercase().contains("delete")
+                || description.to_lowercase().contains("remove")
+            {
                 RiskLevel::High
-            } else if description.to_lowercase().contains("modify") || description.to_lowercase().contains("overwrite") {
+            } else if description.to_lowercase().contains("modify")
+                || description.to_lowercase().contains("overwrite")
+            {
                 RiskLevel::Medium
             } else {
                 RiskLevel::Low
@@ -208,7 +227,11 @@ impl PlanExecutor {
 
             if self.require_approval_for_high_risk && risk == RiskLevel::High {
                 self.plan.steps[i].status = PlanStepStatus::NeedsApproval;
-                self.emit(PlanEvent::ApprovalRequired { step: num, description: desc.clone() }).await;
+                self.emit(PlanEvent::ApprovalRequired {
+                    step: num,
+                    description: desc.clone(),
+                })
+                .await;
 
                 if let Some(ref mut rx) = self.approval_rx {
                     match rx.recv().await {
@@ -224,7 +247,11 @@ impl PlanExecutor {
 
             // Execute step
             self.plan.steps[i].status = PlanStepStatus::Running;
-            self.emit(PlanEvent::StepStarted { step: num, description: desc.clone() }).await;
+            self.emit(PlanEvent::StepStarted {
+                step: num,
+                description: desc.clone(),
+            })
+            .await;
 
             let prompt = format!(
                 "Execute this step of the plan: {}\n\nContext: You are executing step {} of {} for the task: '{}'",
@@ -238,12 +265,17 @@ impl PlanExecutor {
                     self.emit(PlanEvent::StepCompleted {
                         step: i + 1,
                         output: output.content.chars().take(200).collect(),
-                    }).await;
+                    })
+                    .await;
                 }
                 Err(e) => {
                     let error = e.to_string();
                     self.plan.steps[i].status = PlanStepStatus::Failed(error.clone());
-                    self.emit(PlanEvent::StepFailed { step: i + 1, error: error.clone() }).await;
+                    self.emit(PlanEvent::StepFailed {
+                        step: i + 1,
+                        error: error.clone(),
+                    })
+                    .await;
 
                     // Try to revise the plan
                     if let Ok(revised) = self.revise_plan(i, &error).await {
@@ -253,7 +285,8 @@ impl PlanExecutor {
                         self.emit(PlanEvent::PlanRevised {
                             revision: self.plan.revision,
                             new_steps: self.plan.steps.clone(),
-                        }).await;
+                        })
+                        .await;
                         // Don't increment i — retry from current position with new step
                         continue;
                     } else {
@@ -266,13 +299,21 @@ impl PlanExecutor {
         }
 
         self.plan.status = PlanStatus::Completed;
-        self.emit(PlanEvent::PlanCompleted { total_steps: step_count }).await;
+        self.emit(PlanEvent::PlanCompleted {
+            total_steps: step_count,
+        })
+        .await;
         Ok(self.plan.clone())
     }
 
     /// Revise the plan after a step failure.
-    async fn revise_plan(&mut self, failed_step: usize, error: &str) -> Result<Vec<PlanStep>, KernelError> {
-        let completed: Vec<String> = self.plan.steps[..failed_step].iter()
+    async fn revise_plan(
+        &mut self,
+        failed_step: usize,
+        error: &str,
+    ) -> Result<Vec<PlanStep>, KernelError> {
+        let completed: Vec<String> = self.plan.steps[..failed_step]
+            .iter()
             .filter(|s| s.status == PlanStepStatus::Done)
             .map(|s| format!("✓ {}", s.description))
             .collect();
@@ -327,7 +368,13 @@ mod tests {
     fn plan_initial_state() {
         let plan = Plan {
             task: "test".into(),
-            steps: vec![PlanStep { number: 1, description: "step 1".into(), status: PlanStepStatus::Pending, output: None, risk_level: RiskLevel::Low }],
+            steps: vec![PlanStep {
+                number: 1,
+                description: "step 1".into(),
+                status: PlanStepStatus::Pending,
+                output: None,
+                risk_level: RiskLevel::Low,
+            }],
             revision: 0,
             status: PlanStatus::Planning,
         };

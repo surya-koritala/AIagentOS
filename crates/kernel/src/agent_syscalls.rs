@@ -3,19 +3,18 @@
 //! The fundamental operations on agents, equivalent to Linux process syscalls.
 
 use std::sync::Arc;
-use tokio::sync::RwLock;
 
 use crate::agent_struct::*;
 
 /// Flags for agent_clone() — control what's shared vs copied.
 pub mod clone_flags {
-    pub const CLONE_CONTEXT: u32   = 1 << 0;  // Share context (conversation history)
-    pub const CLONE_TOOLS: u32     = 1 << 1;  // Share tool descriptors
-    pub const CLONE_NAMESPACE: u32 = 1 << 2;  // Share all namespaces
-    pub const CLONE_CGROUP: u32    = 1 << 3;  // Share resource limits
-    pub const CLONE_CREDS: u32     = 1 << 4;  // Share credentials
-    pub const CLONE_SIGNALS: u32   = 1 << 5;  // Share signal handlers
-    pub const CLONE_PARENT: u32    = 1 << 6;  // New agent has same parent (sibling)
+    pub const CLONE_CONTEXT: u32 = 1 << 0; // Share context (conversation history)
+    pub const CLONE_TOOLS: u32 = 1 << 1; // Share tool descriptors
+    pub const CLONE_NAMESPACE: u32 = 1 << 2; // Share all namespaces
+    pub const CLONE_CGROUP: u32 = 1 << 3; // Share resource limits
+    pub const CLONE_CREDS: u32 = 1 << 4; // Share credentials
+    pub const CLONE_SIGNALS: u32 = 1 << 5; // Share signal handlers
+    pub const CLONE_PARENT: u32 = 1 << 6; // New agent has same parent (sibling)
 }
 
 /// Result of agent_wait().
@@ -43,7 +42,7 @@ impl AgentSyscalls {
 
         // Inherit parent's credentials and namespace (if parent exists)
         if let Some(parent_ref) = self.table.get(parent) {
-            let parent_lock = parent_ref.value();
+            let _parent_lock = parent_ref.value();
             // We can't async here, so just copy basic fields
             // In real impl this would be async
             agent.creds.uid = 1000; // inherit from parent in async version
@@ -55,7 +54,7 @@ impl AgentSyscalls {
         self.table.insert(agent);
 
         // Add to parent's children list
-        if let Some(parent_ref) = self.table.get(parent) {
+        if let Some(_parent_ref) = self.table.get(parent) {
             // Would need write lock in async version
         }
 
@@ -65,7 +64,7 @@ impl AgentSyscalls {
     /// Clone an agent with selective resource sharing.
     pub fn agent_clone(&self, source_id: AgentId, flags: u32) -> Option<AgentId> {
         let source_ref = self.table.get(source_id)?;
-        let source = source_ref.value();
+        let _source = source_ref.value();
 
         // Create new agent
         let parent = if flags & clone_flags::CLONE_PARENT != 0 {
@@ -106,9 +105,9 @@ impl AgentSyscalls {
     }
 
     /// Terminate an agent with an exit code.
-    pub fn agent_exit(&self, agent_id: AgentId, code: i32) -> bool {
+    pub fn agent_exit(&self, agent_id: AgentId, _code: i32) -> bool {
         if let Some(agent_ref) = self.table.get(agent_id) {
-            let agent = agent_ref.value();
+            let _agent = agent_ref.value();
             // Would need write lock
             // agent.state = AgentState::Zombie;
             // agent.exit_info = Some(ExitInfo { code, signal: None, exited_at: Utc::now() });
@@ -119,15 +118,20 @@ impl AgentSyscalls {
     }
 
     /// Send a signal to an agent.
-    pub fn agent_kill(&self, target_id: AgentId, signal: u8, sender_id: AgentId) -> Result<(), &'static str> {
+    pub fn agent_kill(
+        &self,
+        target_id: AgentId,
+        _signal: u8,
+        sender_id: AgentId,
+    ) -> Result<(), &'static str> {
         // Check sender has CAP_AGENT_KILL or is sending to self/child
         if sender_id != target_id {
-            if let Some(sender_ref) = self.table.get(sender_id) {
+            if let Some(_sender_ref) = self.table.get(sender_id) {
                 // Would check capabilities
             }
         }
 
-        if let Some(target_ref) = self.table.get(target_id) {
+        if let Some(_target_ref) = self.table.get(target_id) {
             // Would need write lock to send signal
             Ok(())
         } else {
@@ -187,7 +191,10 @@ mod tests {
     fn clone_with_shared_namespace() {
         let sys = setup();
         let parent = sys.agent_create("parent".into(), 0);
-        let child = sys.agent_clone(parent, clone_flags::CLONE_NAMESPACE | clone_flags::CLONE_CREDS);
+        let child = sys.agent_clone(
+            parent,
+            clone_flags::CLONE_NAMESPACE | clone_flags::CLONE_CREDS,
+        );
         assert!(child.is_some());
     }
 

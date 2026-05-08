@@ -1,6 +1,5 @@
 //! OpenAI API adapter with retry and exponential backoff.
 
-
 use kernel::connector::*;
 use kernel::{ConnectorError, ProviderId};
 
@@ -40,20 +39,29 @@ impl LlmSession for OpenAiSession {
         self.send_with_tools(messages, &[]).await
     }
 
-    async fn send_with_tools(&self, messages: Vec<StandardMessage>, tools: &[ToolDefinition]) -> Result<LlmResponse, ConnectorError> {
-        let msgs: Vec<serde_json::Value> = messages.iter().map(|m| {
-            let mut obj = serde_json::json!({"role": m.role, "content": m.content});
-            if let Some(ref id) = m.tool_call_id {
-                obj["tool_call_id"] = serde_json::json!(id);
-            }
-            if let Some(ref tcs) = m.tool_calls {
-                obj["tool_calls"] = serde_json::json!(tcs.iter().map(|tc| serde_json::json!({
+    async fn send_with_tools(
+        &self,
+        messages: Vec<StandardMessage>,
+        tools: &[ToolDefinition],
+    ) -> Result<LlmResponse, ConnectorError> {
+        let msgs: Vec<serde_json::Value> =
+            messages
+                .iter()
+                .map(|m| {
+                    let mut obj = serde_json::json!({"role": m.role, "content": m.content});
+                    if let Some(ref id) = m.tool_call_id {
+                        obj["tool_call_id"] = serde_json::json!(id);
+                    }
+                    if let Some(ref tcs) = m.tool_calls {
+                        obj["tool_calls"] =
+                            serde_json::json!(tcs.iter().map(|tc| serde_json::json!({
                     "id": tc.id, "type": "function",
                     "function": {"name": tc.name, "arguments": tc.arguments.to_string()}
                 })).collect::<Vec<_>>());
-            }
-            obj
-        }).collect();
+                    }
+                    obj
+                })
+                .collect();
 
         let mut body = serde_json::json!({
             "model": "gpt-4",
@@ -74,7 +82,8 @@ impl LlmSession for OpenAiSession {
                 tokio::time::sleep(tokio::time::Duration::from_millis(1000 * (1 << attempt))).await;
             }
 
-            let result = self.client
+            let result = self
+                .client
                 .post(format!("{}/chat/completions", self.base_url))
                 .header("Authorization", format!("Bearer {}", self.api_key))
                 .json(&body)
@@ -83,30 +92,46 @@ impl LlmSession for OpenAiSession {
 
             match result {
                 Ok(resp) if resp.status().is_success() => {
-                    let json: serde_json::Value = resp.json().await
+                    let json: serde_json::Value = resp
+                        .json()
+                        .await
                         .map_err(|e| ConnectorError::ProtocolError(e.to_string()))?;
                     let content = json["choices"][0]["message"]["content"]
-                        .as_str().unwrap_or("").to_string();
+                        .as_str()
+                        .unwrap_or("")
+                        .to_string();
                     let tokens = json["usage"]["total_tokens"].as_u64().unwrap_or(0) as u32;
                     let tool_calls = json["choices"][0]["message"]["tool_calls"]
                         .as_array()
-                        .map(|arr| arr.iter().filter_map(|tc| {
-                            Some(ToolCall {
-                                id: tc["id"].as_str()?.to_string(),
-                                name: tc["function"]["name"].as_str()?.to_string(),
-                                arguments: serde_json::from_str(tc["function"]["arguments"].as_str()?).unwrap_or(serde_json::Value::Null),
-                            })
-                        }).collect())
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|tc| {
+                                    Some(ToolCall {
+                                        id: tc["id"].as_str()?.to_string(),
+                                        name: tc["function"]["name"].as_str()?.to_string(),
+                                        arguments: serde_json::from_str(
+                                            tc["function"]["arguments"].as_str()?,
+                                        )
+                                        .unwrap_or(serde_json::Value::Null),
+                                    })
+                                })
+                                .collect()
+                        })
                         .unwrap_or_default();
                     return Ok(LlmResponse {
                         content,
-                        finish_reason: json["choices"][0]["finish_reason"].as_str().map(|s| s.to_string()),
+                        finish_reason: json["choices"][0]["finish_reason"]
+                            .as_str()
+                            .map(|s| s.to_string()),
                         tokens_used: tokens,
                         tool_calls,
                     });
                 }
                 Ok(resp) => {
-                    last_err = Some(ConnectorError::ConnectionFailed(format!("HTTP {}", resp.status())));
+                    last_err = Some(ConnectorError::ConnectionFailed(format!(
+                        "HTTP {}",
+                        resp.status()
+                    )));
                 }
                 Err(e) => {
                     last_err = Some(ConnectorError::ConnectionFailed(e.to_string()));
@@ -116,19 +141,31 @@ impl LlmSession for OpenAiSession {
         Err(last_err.unwrap())
     }
 
-    fn provider_id(&self) -> &ProviderId { &self.provider_id }
+    fn provider_id(&self) -> &ProviderId {
+        &self.provider_id
+    }
 }
 
 #[async_trait::async_trait]
 impl LlmProviderAdapter for OpenAiAdapter {
-    fn id(&self) -> &ProviderId { &self.id }
-    fn name(&self) -> &str { "OpenAI" }
-    fn provider_type(&self) -> ProviderType { ProviderType::Cloud }
+    fn id(&self) -> &ProviderId {
+        &self.id
+    }
+    fn name(&self) -> &str {
+        "OpenAI"
+    }
+    fn provider_type(&self) -> ProviderType {
+        ProviderType::Cloud
+    }
 
     async fn is_available(&self) -> bool {
-        self.client.get(format!("{}/models", self.base_url))
+        self.client
+            .get(format!("{}/models", self.base_url))
             .header("Authorization", format!("Bearer {}", self.api_key))
-            .send().await.map(|r| r.status().is_success()).unwrap_or(false)
+            .send()
+            .await
+            .map(|r| r.status().is_success())
+            .unwrap_or(false)
     }
 
     async fn create_session(&self) -> Result<Box<dyn LlmSession>, ConnectorError> {

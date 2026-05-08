@@ -22,7 +22,9 @@ capabilities = ["tool.test"]
 max_memory_bytes = 1048576
 network_access = false
 filesystem_access = ["/tmp/*"]
-"#, id, name, version);
+"#,
+        id, name, version
+    );
     let mut f = std::fs::File::create(dir.join("manifest.toml")).unwrap();
     f.write_all(manifest.as_bytes()).unwrap();
 }

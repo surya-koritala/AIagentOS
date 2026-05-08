@@ -69,7 +69,7 @@ Goal: `AgentKernelImpl` owns the OS surface; `OsKernel` is no longer the source 
 
 Goal: namespaces actually hide resources; scheduler actually decides who runs.
 
-- [ ] **Namespace enforcement in tool resolution** — `tool_registry.resolve(agent_id, …)` returns `None` for tools not in the agent's namespace; `EnotEnt` syscall error
+- [x] **Namespace enforcement in tool resolution** — `SyscallGate` now consults a `tool_namespaces` table and per-agent `namespaces: Vec<NamespaceId>` membership; tools tagged with a namespace return `GateDenial::NotInNamespace` (≈ ENOENT) for non-members. The check runs first so foreign tools look indistinguishable from non-existent ones (no MAC-probe leak). Proven by `tests/src/os_enforcement.rs::namespace_isolation_denies_foreign_tool` and `namespace_denial_precedes_capability_and_mac`.
 - [ ] **Per-namespace IPC** — sockets/pipes scoped by namespace; `same_namespace()` is consulted on send
 - [ ] **Scheduler-driven turn admission** — instead of "Tokio runs whatever," `AgentKernelImpl::send_message` requests a slice from `CfsScheduler::pick_next` before spawning the LLM call; nice values change observable wait time
 - [ ] **Real OOM kill** — `context_paging` overflow triggers signal to lowest-priority agent in the cgroup

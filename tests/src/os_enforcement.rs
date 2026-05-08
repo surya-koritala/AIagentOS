@@ -255,3 +255,105 @@ async fn unified_kernel_places_agent_in_os_subsystems() {
         "syscall gate should drop the agent on shutdown"
     );
 }
+
+/// Phase 3: a tool registered in namespace X is invisible to an agent in
+/// namespace Y. The gate denies with `NotInNamespace` (≈ ENOENT) — the LLM
+/// learns nothing about a tool it cannot see.
+#[tokio::test]
+async fn namespace_isolation_denies_foreign_tool() {
+    let (gate, _cg) = fresh_gate();
+
+    // Two namespaces: "team-a" (id 100) and "team-b" (id 200). The actual ids
+    // are arbitrary u64s — in production they come from `NamespaceRegistry`.
+    let ns_a: u64 = 100;
+    let ns_b: u64 = 200;
+
+    // Tool `db_admin` is exclusive to team-a's namespace.
+    gate.register_tool_namespace("db_admin", ns_a);
+
+    // Agent in team-a can call it.
+    let alice = uuid::Uuid::new_v4();
+    gate.register_agent(alice, CapabilitySet::all(), None);
+    gate.set_agent_namespaces(alice, vec![ns_a]);
+    let r = gate
+        .check_tool_call(alice, "db_admin", "/db/users", 5)
+        .await;
+    assert!(
+        r.is_ok(),
+        "agent in tool's namespace should resolve the tool"
+    );
+
+    // Agent in team-b is denied with NotInNamespace.
+    let bob = uuid::Uuid::new_v4();
+    gate.register_agent(bob, CapabilitySet::all(), None);
+    gate.set_agent_namespaces(bob, vec![ns_b]);
+    let r = gate.check_tool_call(bob, "db_admin", "/db/users", 5).await;
+    match r {
+        Err(GateDenial::NotInNamespace { tool, namespace }) => {
+            assert_eq!(tool, "db_admin");
+            assert_eq!(namespace, ns_a);
+        }
+        other => panic!("expected NotInNamespace denial, got {:?}", other),
+    }
+
+    // Untagged tools remain global — bob can still call read_file.
+    let r = gate
+        .check_tool_call(bob, "read_file", "/etc/hosts", 5)
+        .await;
+    assert!(r.is_ok(), "global (untagged) tools must remain visible");
+
+    // Adding bob to team-a unblocks db_admin for him without restarting.
+    gate.add_agent_namespace(bob, ns_a);
+    let r = gate.check_tool_call(bob, "db_admin", "/db/users", 5).await;
+    assert!(
+        r.is_ok(),
+        "after joining the namespace bob can resolve the tool"
+    );
+
+    // Counter increment is observable.
+    let stats = gate.stats();
+    assert_eq!(
+        stats.denied_namespace, 1,
+        "one namespace denial recorded across the run"
+    );
+}
+
+/// Phase 3: namespace check runs *before* MAC and capability so the agent
+/// receives a uniform "doesn't exist" denial and cannot probe foreign tools
+/// to discover whether they would be MAC-allowed.
+#[tokio::test]
+async fn namespace_denial_precedes_capability_and_mac() {
+    let (gate, _cg) = fresh_gate();
+    let ns_secure: u64 = 42;
+    gate.register_tool_namespace("write_file", ns_secure);
+
+    // Agent has CAP_FILE_WRITE *and* MAC would allow, but it's not in the
+    // namespace — namespace must fire first.
+    let kid = uuid::Uuid::new_v4();
+    let pid = gate.register_agent(kid, CapabilitySet::all(), None);
+    {
+        let mut mac = gate.mac.lock().await;
+        mac.set_enforcing(true);
+        mac.label_agent(pid, "trusted".into());
+        mac.load_policy(vec![PolicyRule {
+            subject: "*".into(),
+            action: "*".into(),
+            object: "*".into(),
+            decision: "allow".into(),
+        }]);
+    }
+    // Note: agent intentionally has no namespaces.
+    let r = gate.check_tool_call(kid, "write_file", "/tmp/x", 5).await;
+    match r {
+        Err(GateDenial::NotInNamespace { .. }) => {}
+        other => panic!(
+            "namespace must take precedence over capability/MAC, got {:?}",
+            other
+        ),
+    }
+
+    let stats = gate.stats();
+    assert_eq!(stats.denied_namespace, 1);
+    assert_eq!(stats.denied_capability, 0);
+    assert_eq!(stats.denied_mac, 0);
+}

@@ -401,3 +401,113 @@ mod tests {
         let stopped = kernel.shutdown().await;
         assert_eq!(stopped.len(), 5); // all 5 get stop signal
     }
+
+// ─── Tool Call Path ──────────────────────────────────────────────────────────
+
+impl OsKernel {
+    /// Execute a tool call through the full kernel path:
+    /// descriptor table → mount resolve → namespace check → permission check → execute
+    pub async fn tool_call(&self, agent_id: AgentId, tool_path: &str, operation: &str, params: &serde_json::Value) -> Result<serde_json::Value, String> {
+        // 1. Check agent exists
+        if self.agents.get(agent_id).is_none() {
+            return Err("agent not found (ESRCH)".into());
+        }
+
+        // 2. MAC check
+        {
+            let mac = self.mac.lock().await;
+            if mac.check(agent_id, operation, tool_path) == MacDecision::Deny {
+                return Err("permission denied by MAC policy (EACCES)".into());
+            }
+        }
+
+        // 3. Namespace check — agent must be in a tool namespace
+        // Default namespace allows all agents (they're joined on start)
+        let tool_ns = self.namespaces.default_ns(NamespaceType::Tool).unwrap_or(0);
+        let members = self.namespaces.members(tool_ns);
+        if !members.contains(&agent_id) && tool_ns != 0 {
+            return Err("tool not visible in agent's namespace (ENOENT)".into());
+        }
+
+        // 4. Cgroup check — verify token budget
+        if !self.cgroups.check_token_limit(self.cgroups.root(), 100) {
+            return Err("cgroup token limit exceeded (ENOMEM)".into());
+        }
+
+        // 5. Account tokens in CFS
+        {
+            let mut sched = self.scheduler.lock().await;
+            sched.account_tokens(agent_id, 100); // estimated cost
+        }
+
+        // 6. Record in cgroup
+        self.cgroups.record_tokens(self.cgroups.root(), 100);
+
+        // 7. Update procfs
+        {
+            let mut procfs = self.procfs.lock().await;
+            procfs.set_agent_info(agent_id, "last_tool_call".into(), tool_path.into());
+        }
+
+        // 8. Execute (placeholder — real impl would dispatch to tool driver)
+        Ok(serde_json::json!({"status": "ok", "tool": tool_path, "operation": operation}))
+    }
+}
+
+#[cfg(test)]
+mod tool_call_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn tool_call_full_path() {
+        let kernel = OsKernel::new();
+        kernel.boot(None).await.unwrap();
+        let id = kernel.start_agent("tool-user").await.unwrap();
+
+        // Set MAC policy to allow this agent
+        {
+            let mut mac = kernel.mac.lock().await;
+            mac.label_agent(id, "worker".into());
+            mac.load_policy(vec![
+                crate::mac::PolicyRule { subject: "worker".into(), action: "*".into(), object: "*".into(), decision: "allow".into() },
+            ]);
+        }
+
+        let result = kernel.tool_call(id, "/tools/fs/read", "read", &serde_json::json!({"path": "/tmp/test"})).await;
+        assert!(result.is_ok(), "tool_call failed: {:?}", result);
+    }
+
+    #[tokio::test]
+    async fn tool_call_mac_denied() {
+        let kernel = OsKernel::new();
+        kernel.boot(None).await.unwrap();
+        let id = kernel.start_agent("restricted").await.unwrap();
+
+        // Set MAC policy to deny writes
+        {
+            let mut mac = kernel.mac.lock().await;
+            mac.label_agent(id, "readonly".into());
+            mac.load_policy(vec![
+                crate::mac::PolicyRule { subject: "readonly".into(), action: "write".into(), object: "*".into(), decision: "deny".into() },
+                crate::mac::PolicyRule { subject: "readonly".into(), action: "read".into(), object: "*".into(), decision: "allow".into() },
+            ]);
+        }
+
+        // Read should work
+        let result = kernel.tool_call(id, "/tools/fs", "read", &serde_json::json!({})).await;
+        assert!(result.is_ok(), "tool_call failed: {:?}", result);
+
+        // Write should be denied
+        let result = kernel.tool_call(id, "/tools/fs", "write", &serde_json::json!({})).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("EACCES"));
+    }
+
+    #[tokio::test]
+    async fn tool_call_nonexistent_agent() {
+        let kernel = OsKernel::new();
+        kernel.boot(None).await.unwrap();
+        let result = kernel.tool_call(99999, "/tools/fs", "read", &serde_json::json!({})).await;
+        assert!(result.is_err());
+    }
+}

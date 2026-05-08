@@ -86,7 +86,7 @@ Goal: someone can `agentpkg install foo` from a real registry and it runs.
 - [ ] **Install / verify / uninstall** end-to-end with deps
 - [ ] **Live procfs** — agent can read `/proc/agents/<id>/status`, `/proc/cgroups`, `/proc/syscalls/stats`
 - [ ] **Cross-platform sandbox** — Windows Job Objects, macOS sandbox-exec, Linux via existing docker_sandbox
-- [ ] **Feature-gate heavy deps** — `wasmtime` behind `wasm`, `chromiumoxide` behind `browser`, `scraper` behind `web` so the lean build is small
+- [x] **Feature-gate heavy deps in `resources` crate** — `chromiumoxide` (~50 MB) behind `browser`, `scraper` behind `web`. Default build is lean. CI exercises both lean (`cargo test`) and full (`cargo build --all-features`) modes. Note: `wasmtime` (~10 MB) is still load-bearing in the kernel for `models.rs` types — gating it out is a follow-up that requires moving `ResourceRequirements` out of `modules.rs`.
 
 **Exit criteria for Phase 4:** `cargo install agent-cli && agent` works for a fresh user with no env vars beyond an LLM key.
 

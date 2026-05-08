@@ -3,6 +3,15 @@ name = "resources"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+# Default lean: kernel + filesystem + network + application providers.
+# Heavy web tooling is opt-in.
+default = []
+# Headless browser automation (chromiumoxide, ~50 MB compiled).
+browser = ["dep:chromiumoxide", "dep:futures"]
+# HTML parsing (scraper, ~3 MB compiled).
+web = ["dep:scraper"]
+
 [dependencies]
 kernel = { path = "../kernel" }
 tokio = { workspace = true }
@@ -13,10 +22,10 @@ thiserror = { workspace = true }
 anyhow = { workspace = true }
 rusqlite = { workspace = true }
 reqwest = { workspace = true }
-scraper = { workspace = true }
+scraper = { workspace = true, optional = true }
 urlencoding = "2"
-chromiumoxide = { workspace = true }
-futures = "0.3"
+chromiumoxide = { workspace = true, optional = true }
+futures = { version = "0.3", optional = true }
 tracing = { workspace = true }
 
 [dev-dependencies]

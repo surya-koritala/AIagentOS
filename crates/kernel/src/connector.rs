@@ -154,6 +154,12 @@ pub struct AgentConnectorImpl {
     sessions: DashMap<AgentId, ProviderId>,
 }
 
+impl Default for AgentConnectorImpl {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl AgentConnectorImpl {
     pub fn new() -> Self {
         Self {

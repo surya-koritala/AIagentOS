@@ -54,6 +54,12 @@ pub struct SandboxManagerImpl {
     agent_sandboxes: DashMap<AgentId, SandboxId>,
 }
 
+impl Default for SandboxManagerImpl {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SandboxManagerImpl {
     pub fn new() -> Self {
         Self {

@@ -23,6 +23,12 @@ pub struct ServiceRegistry {
     services: HashMap<String, Vec<ServiceEntry>>,
 }
 
+impl Default for ServiceRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ServiceRegistry {
     pub fn new() -> Self {
         Self {

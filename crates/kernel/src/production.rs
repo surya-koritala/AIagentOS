@@ -15,6 +15,7 @@ pub struct CircuitBreaker {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+#[allow(dead_code)]
 enum BreakerState {
     Closed,   // Normal operation
     Open,     // Failing, reject requests

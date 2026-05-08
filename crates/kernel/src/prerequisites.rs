@@ -96,10 +96,8 @@ pub fn check_with_thresholds(
         }
     }
 
-    if check_internet {
-        if std::net::ToSocketAddrs::to_socket_addrs(&("dns.google", 443)).is_err() {
-            deficiencies.push("No internet connectivity".to_string());
-        }
+    if check_internet && std::net::ToSocketAddrs::to_socket_addrs(&("dns.google", 443)).is_err() {
+        deficiencies.push("No internet connectivity".to_string());
     }
 
     PrerequisiteResult {
@@ -117,7 +115,7 @@ fn disk_free_gb(path: &str) -> Option<u64> {
         unsafe {
             let mut stat: libc::statvfs = std::mem::zeroed();
             if libc::statvfs(c_path.as_ptr(), &mut stat) == 0 {
-                let free_bytes = stat.f_bavail as u64 * stat.f_frsize as u64;
+                let free_bytes = stat.f_bavail * stat.f_frsize;
                 return Some(free_bytes / 1024 / 1024 / 1024);
             }
         }

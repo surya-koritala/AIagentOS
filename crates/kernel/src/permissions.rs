@@ -114,6 +114,12 @@ pub struct PermissionManager {
     audit_log: Mutex<Vec<AuditEntry>>,
 }
 
+impl Default for PermissionManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl PermissionManager {
     pub fn new() -> Self {
         let mgr = Self {
@@ -254,12 +260,10 @@ impl PermissionManager {
         if pattern == "*" {
             return true;
         }
-        if pattern.ends_with('*') {
-            let prefix = &pattern[..pattern.len() - 1];
+        if let Some(prefix) = pattern.strip_suffix('*') {
             return target.starts_with(prefix);
         }
-        if pattern.starts_with('*') {
-            let suffix = &pattern[1..];
+        if let Some(suffix) = pattern.strip_prefix('*') {
             return target.ends_with(suffix);
         }
         pattern == target

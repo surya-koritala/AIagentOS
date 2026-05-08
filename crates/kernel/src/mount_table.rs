@@ -28,6 +28,12 @@ pub struct MountTable {
     mounts: Vec<MountEntry>,
 }
 
+impl Default for MountTable {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl MountTable {
     pub fn new() -> Self {
         Self { mounts: Vec::new() }

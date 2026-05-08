@@ -6,6 +6,12 @@ pub struct Sysctl {
     params: HashMap<String, String>,
 }
 
+impl Default for Sysctl {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Sysctl {
     pub fn new() -> Self {
         let mut params = HashMap::new();

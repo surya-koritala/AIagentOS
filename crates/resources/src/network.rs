@@ -7,6 +7,12 @@ pub struct NetworkProvider {
     client: reqwest::Client,
 }
 
+impl Default for NetworkProvider {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl NetworkProvider {
     pub fn new() -> Self {
         Self {

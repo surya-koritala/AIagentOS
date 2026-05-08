@@ -127,6 +127,12 @@ pub struct InitSystem {
     boot_order: Vec<String>,
 }
 
+impl Default for InitSystem {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl InitSystem {
     pub fn new() -> Self {
         Self {

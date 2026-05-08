@@ -23,6 +23,12 @@ pub struct ToolRegistry {
     command_templates: HashMap<String, (String, Vec<String>)>,
 }
 
+impl Default for ToolRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ToolRegistry {
     pub fn new() -> Self {
         let mut registry = Self {

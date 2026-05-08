@@ -16,7 +16,6 @@ use adapters::openai::OpenAiAdapter;
 use kernel::config::Config;
 use kernel::connector::AgentConnector;
 use kernel::execution::{AgentExecutor, StreamEvent};
-use kernel::learning::{RuleScope, RuleStore};
 use kernel::resources::ResourceBroker;
 use kernel::{AgentConfig, AgentKernelImpl, Priority};
 use tokio::sync::mpsc;

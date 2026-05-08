@@ -62,7 +62,9 @@ pub struct Socket {
     pub state: SocketState,
     pub local_addr: Option<SocketAddr>,
     pub remote_addr: Option<SocketAddr>,
+    #[allow(dead_code)]
     rx: mpsc::Receiver<SocketMessage>,
+    #[allow(dead_code)]
     tx: mpsc::Sender<SocketMessage>,
     pub buffer_size: usize,
 }
@@ -71,6 +73,12 @@ pub struct Socket {
 pub struct SocketRegistry {
     sockets: HashMap<SocketId, mpsc::Sender<SocketMessage>>,
     bindings: HashMap<SocketAddr, SocketId>,
+}
+
+impl Default for SocketRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl SocketRegistry {

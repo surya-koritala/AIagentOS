@@ -44,6 +44,12 @@ pub struct EditTransaction {
     applied: bool,
 }
 
+impl Default for EditTransaction {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl EditTransaction {
     pub fn new() -> Self {
         Self {

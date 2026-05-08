@@ -8,6 +8,12 @@ pub struct AgentPkg {
     remote_url: Option<String>,
 }
 
+impl Default for AgentPkg {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl AgentPkg {
     pub fn new() -> Self {
         Self {

@@ -33,6 +33,12 @@ pub struct RuleStore {
     file_path: Option<std::path::PathBuf>,
 }
 
+impl Default for RuleStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl RuleStore {
     pub fn new() -> Self {
         Self {

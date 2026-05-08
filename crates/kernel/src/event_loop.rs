@@ -222,7 +222,6 @@ impl EventLoop {
         _agent_name: String,
         interval: Duration,
     ) -> u64 {
-        let timer_id = self.set_timer(0, interval, Some(interval));
-        timer_id
+        self.set_timer(0, interval, Some(interval))
     }
 }

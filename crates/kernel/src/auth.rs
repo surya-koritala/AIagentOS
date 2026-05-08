@@ -46,6 +46,12 @@ pub struct AuthSystem {
     api_keys: HashMap<String, String>, // key → user_id
 }
 
+impl Default for AuthSystem {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl AuthSystem {
     pub fn new() -> Self {
         Self {
@@ -122,11 +128,13 @@ impl AuthSystem {
     pub fn check_role(&self, user_id: &str, required: Role) -> bool {
         self.users
             .get(user_id)
-            .map(|u| match (u.role, required) {
-                (Role::Admin, _) => true,
-                (Role::User, Role::User | Role::ReadOnly) => true,
-                (Role::ReadOnly, Role::ReadOnly) => true,
-                _ => false,
+            .map(|u| {
+                matches!(
+                    (u.role, required),
+                    (Role::Admin, _)
+                        | (Role::User, Role::User | Role::ReadOnly)
+                        | (Role::ReadOnly, Role::ReadOnly)
+                )
             })
             .unwrap_or(false)
     }

@@ -25,6 +25,12 @@ pub struct ShellEnv {
     pub last_exit_code: i32,
 }
 
+impl Default for ShellEnv {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ShellEnv {
     pub fn new() -> Self {
         let mut variables = HashMap::new();

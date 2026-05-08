@@ -26,7 +26,9 @@ struct CfsEntry {
     agent_id: AgentId,
     vruntime: u64,
     weight: u64,
+    #[allow(dead_code)]
     nice: i8,
+    #[allow(dead_code)]
     class: SchedClass,
     tokens_used: u64,
 }

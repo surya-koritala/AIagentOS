@@ -131,7 +131,6 @@ pub enum SchedClass {
 }
 
 /// Signal information.
-
 pub struct SignalInfo {
     /// Pending signals (bitmask).
     pub pending: u64,
@@ -195,7 +194,6 @@ pub struct ExitInfo {
 }
 
 /// The core agent descriptor. Every agent has exactly one.
-
 pub struct AgentStruct {
     // ─── Identity ────────────────────────────────────────
     /// Unique agent ID (like PID).
@@ -359,6 +357,12 @@ impl AgentStruct {
 /// Global agent table (like the process table).
 pub struct AgentTable {
     agents: DashMap<AgentId, RwLock<AgentStruct>>,
+}
+
+impl Default for AgentTable {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl AgentTable {

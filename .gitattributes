@@ -8,5 +8,4 @@
 *.jpeg binary
 *.gif binary
 *.ico binary
-*.lock binary -text
 *.pdf binary

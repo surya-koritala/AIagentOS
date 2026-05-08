@@ -332,10 +332,8 @@ impl AgentStruct {
                     self.state = AgentState::Stopped;
                     return;
                 }
-                signals::SIGCONT => {
-                    if self.state == AgentState::Stopped {
-                        self.state = AgentState::Ready;
-                    }
+                signals::SIGCONT if self.state == AgentState::Stopped => {
+                    self.state = AgentState::Ready;
                 }
                 signals::SIGTERM => {
                     match self.signals.handlers.get(&sig) {

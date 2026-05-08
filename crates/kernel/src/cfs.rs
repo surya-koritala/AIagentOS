@@ -172,8 +172,10 @@ impl CfsScheduler {
         let key = self.runqueue.keys().find(|k| k.1 == agent_id);
         if let Some(key) = key {
             if let Some(entry) = self.runqueue.get(key) {
-                if self.total_weight > 0 {
-                    return (self.time_slice_tokens * entry.weight) / self.total_weight;
+                if let Some(share) =
+                    (self.time_slice_tokens * entry.weight).checked_div(self.total_weight)
+                {
+                    return share;
                 }
             }
         }

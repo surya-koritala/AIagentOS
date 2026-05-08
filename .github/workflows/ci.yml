@@ -32,8 +32,11 @@ jobs:
             target
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
-      - name: Run tests
+      - name: Run tests (default lean features)
         run: cargo test --workspace --exclude tauri-app
+
+      - name: Build with all optional features (browser, web)
+        run: cargo build --workspace --exclude tauri-app --all-features
 
       - name: Check formatting
         run: cargo fmt --all -- --check

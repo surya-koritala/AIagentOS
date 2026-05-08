@@ -1,8 +1,8 @@
 //! Docker-based sandboxing — isolated containers per agent.
 
-use std::collections::HashMap;
-use serde::{Deserialize, Serialize};
 use crate::AgentId;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 /// Docker sandbox configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -29,7 +29,11 @@ impl Default for DockerSandboxConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum NetworkMode { None, Host, Bridge }
+pub enum NetworkMode {
+    None,
+    Host,
+    Bridge,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VolumeMount {
@@ -51,15 +55,25 @@ impl DockerSandbox {
         let name = format!("agent-os-{}", &agent_id.to_string()[..8]);
 
         let mut args = vec![
-            "run".into(), "-d".into(),
-            "--name".into(), name.clone(),
-            "--memory".into(), config.memory_limit.clone(),
-            "--cpus".into(), config.cpu_limit.clone(),
+            "run".into(),
+            "-d".into(),
+            "--name".into(),
+            name.clone(),
+            "--memory".into(),
+            config.memory_limit.clone(),
+            "--cpus".into(),
+            config.cpu_limit.clone(),
         ];
 
         match config.network_mode {
-            NetworkMode::None => { args.push("--network".into()); args.push("none".into()); }
-            NetworkMode::Host => { args.push("--network".into()); args.push("host".into()); }
+            NetworkMode::None => {
+                args.push("--network".into());
+                args.push("none".into());
+            }
+            NetworkMode::Host => {
+                args.push("--network".into());
+                args.push("host".into());
+            }
             NetworkMode::Bridge => {}
         }
 
@@ -80,22 +94,31 @@ impl DockerSandbox {
 
         let output = tokio::process::Command::new("docker")
             .args(&args)
-            .output().await
+            .output()
+            .await
             .map_err(|e| format!("Docker not available: {}", e))?;
 
         if !output.status.success() {
-            return Err(format!("Docker create failed: {}", String::from_utf8_lossy(&output.stderr)));
+            return Err(format!(
+                "Docker create failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            ));
         }
 
         let container_id = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        Ok(Self { container_id, agent_id, config })
+        Ok(Self {
+            container_id,
+            agent_id,
+            config,
+        })
     }
 
     /// Execute a command inside the container.
     pub async fn exec(&self, command: &str) -> Result<String, String> {
         let output = tokio::process::Command::new("docker")
             .args(["exec", &self.container_id, "sh", "-c", command])
-            .output().await
+            .output()
+            .await
             .map_err(|e| e.to_string())?;
 
         if output.status.success() {
@@ -108,24 +131,45 @@ impl DockerSandbox {
     /// Copy a file into the container.
     pub async fn copy_in(&self, host_path: &str, container_path: &str) -> Result<(), String> {
         let output = tokio::process::Command::new("docker")
-            .args(["cp", host_path, &format!("{}:{}", self.container_id, container_path)])
-            .output().await.map_err(|e| e.to_string())?;
-        if output.status.success() { Ok(()) } else { Err(String::from_utf8_lossy(&output.stderr).to_string()) }
+            .args([
+                "cp",
+                host_path,
+                &format!("{}:{}", self.container_id, container_path),
+            ])
+            .output()
+            .await
+            .map_err(|e| e.to_string())?;
+        if output.status.success() {
+            Ok(())
+        } else {
+            Err(String::from_utf8_lossy(&output.stderr).to_string())
+        }
     }
 
     /// Copy a file out of the container.
     pub async fn copy_out(&self, container_path: &str, host_path: &str) -> Result<(), String> {
         let output = tokio::process::Command::new("docker")
-            .args(["cp", &format!("{}:{}", self.container_id, container_path), host_path])
-            .output().await.map_err(|e| e.to_string())?;
-        if output.status.success() { Ok(()) } else { Err(String::from_utf8_lossy(&output.stderr).to_string()) }
+            .args([
+                "cp",
+                &format!("{}:{}", self.container_id, container_path),
+                host_path,
+            ])
+            .output()
+            .await
+            .map_err(|e| e.to_string())?;
+        if output.status.success() {
+            Ok(())
+        } else {
+            Err(String::from_utf8_lossy(&output.stderr).to_string())
+        }
     }
 
     /// Stop and remove the container.
     pub async fn destroy(&self) -> Result<(), String> {
         let _ = tokio::process::Command::new("docker")
             .args(["rm", "-f", &self.container_id])
-            .output().await;
+            .output()
+            .await;
         Ok(())
     }
 }
@@ -135,7 +179,9 @@ impl Drop for DockerSandbox {
         // Best-effort cleanup
         let id = self.container_id.clone();
         std::thread::spawn(move || {
-            let _ = std::process::Command::new("docker").args(["rm", "-f", &id]).output();
+            let _ = std::process::Command::new("docker")
+                .args(["rm", "-f", &id])
+                .output();
         });
     }
 }

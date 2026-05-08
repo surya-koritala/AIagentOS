@@ -9,13 +9,13 @@ use crate::agent_struct::*;
 
 /// Flags for agent_clone() — control what's shared vs copied.
 pub mod clone_flags {
-    pub const CLONE_CONTEXT: u32   = 1 << 0;  // Share context (conversation history)
-    pub const CLONE_TOOLS: u32     = 1 << 1;  // Share tool descriptors
-    pub const CLONE_NAMESPACE: u32 = 1 << 2;  // Share all namespaces
-    pub const CLONE_CGROUP: u32    = 1 << 3;  // Share resource limits
-    pub const CLONE_CREDS: u32     = 1 << 4;  // Share credentials
-    pub const CLONE_SIGNALS: u32   = 1 << 5;  // Share signal handlers
-    pub const CLONE_PARENT: u32    = 1 << 6;  // New agent has same parent (sibling)
+    pub const CLONE_CONTEXT: u32 = 1 << 0; // Share context (conversation history)
+    pub const CLONE_TOOLS: u32 = 1 << 1; // Share tool descriptors
+    pub const CLONE_NAMESPACE: u32 = 1 << 2; // Share all namespaces
+    pub const CLONE_CGROUP: u32 = 1 << 3; // Share resource limits
+    pub const CLONE_CREDS: u32 = 1 << 4; // Share credentials
+    pub const CLONE_SIGNALS: u32 = 1 << 5; // Share signal handlers
+    pub const CLONE_PARENT: u32 = 1 << 6; // New agent has same parent (sibling)
 }
 
 /// Result of agent_wait().
@@ -119,7 +119,12 @@ impl AgentSyscalls {
     }
 
     /// Send a signal to an agent.
-    pub fn agent_kill(&self, target_id: AgentId, signal: u8, sender_id: AgentId) -> Result<(), &'static str> {
+    pub fn agent_kill(
+        &self,
+        target_id: AgentId,
+        signal: u8,
+        sender_id: AgentId,
+    ) -> Result<(), &'static str> {
         // Check sender has CAP_AGENT_KILL or is sending to self/child
         if sender_id != target_id {
             if let Some(sender_ref) = self.table.get(sender_id) {
@@ -187,7 +192,10 @@ mod tests {
     fn clone_with_shared_namespace() {
         let sys = setup();
         let parent = sys.agent_create("parent".into(), 0);
-        let child = sys.agent_clone(parent, clone_flags::CLONE_NAMESPACE | clone_flags::CLONE_CREDS);
+        let child = sys.agent_clone(
+            parent,
+            clone_flags::CLONE_NAMESPACE | clone_flags::CLONE_CREDS,
+        );
         assert!(child.is_some());
     }
 

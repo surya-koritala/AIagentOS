@@ -16,9 +16,16 @@ pub fn check_prerequisites() -> PrerequisiteResult {
     // Check RAM
     if let Ok(content) = std::fs::read_to_string("/proc/meminfo") {
         if let Some(line) = content.lines().find(|l| l.starts_with("MemTotal:")) {
-            let kb: u64 = line.split_whitespace().nth(1).and_then(|s| s.parse().ok()).unwrap_or(0);
+            let kb: u64 = line
+                .split_whitespace()
+                .nth(1)
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
             if kb < 8 * 1024 * 1024 {
-                deficiencies.push(format!("Insufficient RAM: {}GB (need 8GB)", kb / 1024 / 1024));
+                deficiencies.push(format!(
+                    "Insufficient RAM: {}GB (need 8GB)",
+                    kb / 1024 / 1024
+                ));
             }
         }
     } else {
@@ -26,9 +33,15 @@ pub fn check_prerequisites() -> PrerequisiteResult {
     }
 
     // Check disk space (check /home or /)
-    let check_path = if Path::new("/home").exists() { "/home" } else { "/" };
+    let check_path = if Path::new("/home").exists() {
+        "/home"
+    } else {
+        "/"
+    };
     match disk_free_gb(check_path) {
-        Some(gb) if gb < 10 => deficiencies.push(format!("Insufficient disk: {}GB (need 10GB)", gb)),
+        Some(gb) if gb < 10 => {
+            deficiencies.push(format!("Insufficient disk: {}GB (need 10GB)", gb))
+        }
         None => {} // skip if can't determine
         _ => {}
     }
@@ -45,23 +58,41 @@ pub fn check_prerequisites() -> PrerequisiteResult {
 }
 
 /// Check prerequisites with custom thresholds (for testing).
-pub fn check_with_thresholds(min_ram_gb: u64, min_disk_gb: u64, check_internet: bool) -> PrerequisiteResult {
+pub fn check_with_thresholds(
+    min_ram_gb: u64,
+    min_disk_gb: u64,
+    check_internet: bool,
+) -> PrerequisiteResult {
     let mut deficiencies = Vec::new();
 
     if let Ok(content) = std::fs::read_to_string("/proc/meminfo") {
         if let Some(line) = content.lines().find(|l| l.starts_with("MemTotal:")) {
-            let kb: u64 = line.split_whitespace().nth(1).and_then(|s| s.parse().ok()).unwrap_or(0);
+            let kb: u64 = line
+                .split_whitespace()
+                .nth(1)
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
             let gb = kb / 1024 / 1024;
             if gb < min_ram_gb {
-                deficiencies.push(format!("Insufficient RAM: {}GB (need {}GB)", gb, min_ram_gb));
+                deficiencies.push(format!(
+                    "Insufficient RAM: {}GB (need {}GB)",
+                    gb, min_ram_gb
+                ));
             }
         }
     }
 
-    let check_path = if Path::new("/home").exists() { "/home" } else { "/" };
+    let check_path = if Path::new("/home").exists() {
+        "/home"
+    } else {
+        "/"
+    };
     if let Some(gb) = disk_free_gb(check_path) {
         if gb < min_disk_gb {
-            deficiencies.push(format!("Insufficient disk: {}GB (need {}GB)", gb, min_disk_gb));
+            deficiencies.push(format!(
+                "Insufficient disk: {}GB (need {}GB)",
+                gb, min_disk_gb
+            ));
         }
     }
 

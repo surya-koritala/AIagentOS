@@ -98,8 +98,8 @@ impl WasmModuleSystem {
     pub fn new() -> Result<Self, ModuleError> {
         let mut config = wasmtime::Config::new();
         config.consume_fuel(true);
-        let engine = wasmtime::Engine::new(&config)
-            .map_err(|e| ModuleError::LoadFailed(e.to_string()))?;
+        let engine =
+            wasmtime::Engine::new(&config).map_err(|e| ModuleError::LoadFailed(e.to_string()))?;
         Ok(Self {
             modules: DashMap::new(),
             engine: Mutex::new(engine),
@@ -108,71 +108,110 @@ impl WasmModuleSystem {
 
     /// Execute a function exported by a loaded module.
     /// Host functions (read_file, http_get, log) are available to the module.
-    pub fn execute_module_function(&self, module_id: &ModuleId, function: &str, _input: &str) -> Result<String, ModuleError> {
-        let state = self.modules.get(module_id)
+    pub fn execute_module_function(
+        &self,
+        module_id: &ModuleId,
+        function: &str,
+        _input: &str,
+    ) -> Result<String, ModuleError> {
+        let state = self
+            .modules
+            .get(module_id)
             .ok_or_else(|| ModuleError::NotFound(module_id.clone()))?;
 
         if state.info.status != ModuleStatus::Loaded && state.info.status != ModuleStatus::Active {
             return Err(ModuleError::LoadFailed("Module not loaded".into()));
         }
 
-        let bytes = state.wasm_bytes.as_ref()
+        let bytes = state
+            .wasm_bytes
+            .as_ref()
             .ok_or_else(|| ModuleError::LoadFailed("No WASM binary".into()))?;
 
         let engine = self.engine.lock().unwrap();
         let module = wasmtime::Module::new(&engine, bytes)
             .map_err(|e| ModuleError::LoadFailed(e.to_string()))?;
 
-        let mut store = wasmtime::Store::new(&engine, HostContext { last_result: String::new() });
+        let mut store = wasmtime::Store::new(
+            &engine,
+            HostContext {
+                last_result: String::new(),
+            },
+        );
         store.set_fuel(1_000_000).ok(); // CPU limit
 
         let mut linker = wasmtime::Linker::new(&engine);
 
         // Host function: log a message
-        linker.func_wrap("env", "host_log", |mut caller: wasmtime::Caller<'_, HostContext>, ptr: i32, len: i32| {
-            if let Some(memory) = caller.get_export("memory").and_then(|e| e.into_memory()) {
-                let data = memory.data(&caller);
-                if let Some(slice) = data.get(ptr as usize..(ptr as usize + len as usize)) {
-                    if let Ok(msg) = std::str::from_utf8(slice) {
-                        tracing::info!("[WASM module] {}", msg);
-                    }
-                }
-            }
-        }).ok();
-
-        // Host function: read a file (result stored in host context)
-        linker.func_wrap("env", "host_read_file", |mut caller: wasmtime::Caller<'_, HostContext>, ptr: i32, len: i32| -> i32 {
-            if let Some(memory) = caller.get_export("memory").and_then(|e| e.into_memory()) {
-                let data = memory.data(&caller);
-                if let Some(slice) = data.get(ptr as usize..(ptr as usize + len as usize)) {
-                    if let Ok(path) = std::str::from_utf8(slice) {
-                        match std::fs::read_to_string(path) {
-                            Ok(content) => {
-                                caller.data_mut().last_result = content;
-                                return 0; // success
+        linker
+            .func_wrap(
+                "env",
+                "host_log",
+                |mut caller: wasmtime::Caller<'_, HostContext>, ptr: i32, len: i32| {
+                    if let Some(memory) = caller.get_export("memory").and_then(|e| e.into_memory())
+                    {
+                        let data = memory.data(&caller);
+                        if let Some(slice) = data.get(ptr as usize..(ptr as usize + len as usize)) {
+                            if let Ok(msg) = std::str::from_utf8(slice) {
+                                tracing::info!("[WASM module] {}", msg);
                             }
-                            Err(_) => return -1,
                         }
                     }
-                }
-            }
-            -1
-        }).ok();
+                },
+            )
+            .ok();
+
+        // Host function: read a file (result stored in host context)
+        linker
+            .func_wrap(
+                "env",
+                "host_read_file",
+                |mut caller: wasmtime::Caller<'_, HostContext>, ptr: i32, len: i32| -> i32 {
+                    if let Some(memory) = caller.get_export("memory").and_then(|e| e.into_memory())
+                    {
+                        let data = memory.data(&caller);
+                        if let Some(slice) = data.get(ptr as usize..(ptr as usize + len as usize)) {
+                            if let Ok(path) = std::str::from_utf8(slice) {
+                                match std::fs::read_to_string(path) {
+                                    Ok(content) => {
+                                        caller.data_mut().last_result = content;
+                                        return 0; // success
+                                    }
+                                    Err(_) => return -1,
+                                }
+                            }
+                        }
+                    }
+                    -1
+                },
+            )
+            .ok();
 
         // Host function: get result length
-        linker.func_wrap("env", "host_result_len", |caller: wasmtime::Caller<'_, HostContext>| -> i32 {
-            caller.data().last_result.len() as i32
-        }).ok();
+        linker
+            .func_wrap(
+                "env",
+                "host_result_len",
+                |caller: wasmtime::Caller<'_, HostContext>| -> i32 {
+                    caller.data().last_result.len() as i32
+                },
+            )
+            .ok();
 
         // Instantiate module with host functions
-        let instance = linker.instantiate(&mut store, &module)
+        let instance = linker
+            .instantiate(&mut store, &module)
             .map_err(|e| ModuleError::LoadFailed(format!("Instantiation failed: {}", e)))?;
 
         // Call the requested function
-        let func = instance.get_typed_func::<(), i32>(&mut store, function)
-            .map_err(|e| ModuleError::LoadFailed(format!("Function '{}' not found: {}", function, e)))?;
+        let func = instance
+            .get_typed_func::<(), i32>(&mut store, function)
+            .map_err(|e| {
+                ModuleError::LoadFailed(format!("Function '{}' not found: {}", function, e))
+            })?;
 
-        let result = func.call(&mut store, ())
+        let result = func
+            .call(&mut store, ())
             .map_err(|e| ModuleError::CrashDetected(format!("Module trapped: {}", e)))?;
 
         Ok(result.to_string())
@@ -180,18 +219,27 @@ impl WasmModuleSystem {
 
     fn validate_manifest(manifest: &ModuleManifest) -> Result<(), ModuleError> {
         if manifest.id.is_empty() {
-            return Err(ModuleError::ValidationFailed("Module ID cannot be empty".into()));
+            return Err(ModuleError::ValidationFailed(
+                "Module ID cannot be empty".into(),
+            ));
         }
         if manifest.name.is_empty() {
-            return Err(ModuleError::ValidationFailed("Module name cannot be empty".into()));
+            return Err(ModuleError::ValidationFailed(
+                "Module name cannot be empty".into(),
+            ));
         }
         if manifest.version.is_empty() {
-            return Err(ModuleError::ValidationFailed("Module version cannot be empty".into()));
+            return Err(ModuleError::ValidationFailed(
+                "Module version cannot be empty".into(),
+            ));
         }
         // Validate resource requirements are reasonable
         if let Some(mem) = manifest.resources.max_memory_bytes {
-            if mem > 1024 * 1024 * 1024 { // 1GB max
-                return Err(ModuleError::ValidationFailed("Memory requirement exceeds 1GB limit".into()));
+            if mem > 1024 * 1024 * 1024 {
+                // 1GB max
+                return Err(ModuleError::ValidationFailed(
+                    "Memory requirement exceeds 1GB limit".into(),
+                ));
             }
         }
         Ok(())
@@ -219,8 +267,10 @@ impl ModuleSystem for WasmModuleSystem {
         // Check for WASM binary
         let wasm_path = module_path.join("module.wasm");
         let wasm_bytes = if wasm_path.exists() {
-            Some(std::fs::read(&wasm_path)
-                .map_err(|e| ModuleError::InstallFailed(format!("Cannot read WASM: {}", e)))?)
+            Some(
+                std::fs::read(&wasm_path)
+                    .map_err(|e| ModuleError::InstallFailed(format!("Cannot read WASM: {}", e)))?,
+            )
         } else {
             None
         };
@@ -228,8 +278,9 @@ impl ModuleSystem for WasmModuleSystem {
         // Validate WASM binary if present
         if let Some(ref bytes) = wasm_bytes {
             let engine = self.engine.lock().unwrap();
-            wasmtime::Module::validate(&engine, bytes)
-                .map_err(|e| ModuleError::ValidationFailed(format!("Invalid WASM binary: {}", e)))?;
+            wasmtime::Module::validate(&engine, bytes).map_err(|e| {
+                ModuleError::ValidationFailed(format!("Invalid WASM binary: {}", e))
+            })?;
         }
 
         let info = ModuleInfo {
@@ -242,22 +293,28 @@ impl ModuleSystem for WasmModuleSystem {
             resource_requirements: manifest.resources,
         };
 
-        self.modules.insert(manifest.id.clone(), ModuleState {
-            info: info.clone(),
-            wasm_bytes,
-        });
+        self.modules.insert(
+            manifest.id.clone(),
+            ModuleState {
+                info: info.clone(),
+                wasm_bytes,
+            },
+        );
 
         Ok(info)
     }
 
     async fn uninstall(&self, module_id: &ModuleId) -> Result<(), ModuleError> {
-        self.modules.remove(module_id)
+        self.modules
+            .remove(module_id)
             .ok_or_else(|| ModuleError::NotFound(module_id.clone()))?;
         Ok(())
     }
 
     async fn load(&self, module_id: &ModuleId) -> Result<(), ModuleError> {
-        let mut state = self.modules.get_mut(module_id)
+        let mut state = self
+            .modules
+            .get_mut(module_id)
             .ok_or_else(|| ModuleError::NotFound(module_id.clone()))?;
 
         if state.wasm_bytes.is_none() {
@@ -275,14 +332,19 @@ impl ModuleSystem for WasmModuleSystem {
     }
 
     async fn unload(&self, module_id: &ModuleId) -> Result<(), ModuleError> {
-        let mut state = self.modules.get_mut(module_id)
+        let mut state = self
+            .modules
+            .get_mut(module_id)
             .ok_or_else(|| ModuleError::NotFound(module_id.clone()))?;
         state.info.status = ModuleStatus::Installed;
         Ok(())
     }
 
     fn list_modules(&self) -> Vec<ModuleInfo> {
-        self.modules.iter().map(|entry| entry.value().info.clone()).collect()
+        self.modules
+            .iter()
+            .map(|entry| entry.value().info.clone())
+            .collect()
     }
 }
 

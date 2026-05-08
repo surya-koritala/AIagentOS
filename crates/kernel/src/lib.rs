@@ -3,63 +3,63 @@
 //! Core types, error hierarchy, and module declarations for the Agent Kernel.
 
 pub mod agent;
+pub mod agent_sockets;
 pub mod agent_struct;
 pub mod agent_syscalls;
-pub mod namespaces;
-pub mod init_system;
-pub mod cgroups;
-pub mod tool_descriptors;
-pub mod context_paging;
-pub mod cfs;
-pub mod mac;
-pub mod event_loop;
-pub mod syscall_interface;
-pub mod agent_sockets;
-pub mod service_discovery;
-pub mod procfs;
-pub mod pipes;
-pub mod mount_table;
-pub mod sysctl;
-pub mod package;
 pub mod agentctl;
-pub mod agentps;
-pub mod shell;
 pub mod agentpkg;
+pub mod agentps;
 pub mod auth;
-pub mod workspaces;
-pub mod marketplace;
-pub mod os_kernel;
-pub mod voice;
-pub mod runtime;
-pub mod linux_compat;
+pub mod cfs;
+pub mod cgroups;
 pub mod config;
 pub mod connector;
 pub mod context;
-pub mod ipc;
-pub mod models;
-pub mod modules;
-pub mod observability;
-pub mod permissions;
-pub mod resources;
-pub mod sandbox;
-pub mod scheduler;
-pub mod prerequisites;
-pub mod tools;
+pub mod context_paging;
 pub mod custom_tools;
-pub mod execution;
-pub mod planning;
-pub mod editing;
-pub mod learning;
-pub mod mcp;
-pub mod rate_limit;
-pub mod syscall_gate;
-pub mod github;
-pub mod docker_sandbox;
 pub mod database;
 pub mod delegation;
-pub mod production;
+pub mod docker_sandbox;
+pub mod editing;
+pub mod event_loop;
+pub mod execution;
+pub mod github;
 pub mod indexer;
+pub mod init_system;
+pub mod ipc;
+pub mod learning;
+pub mod linux_compat;
+pub mod mac;
+pub mod marketplace;
+pub mod mcp;
+pub mod models;
+pub mod modules;
+pub mod mount_table;
+pub mod namespaces;
+pub mod observability;
+pub mod os_kernel;
+pub mod package;
+pub mod permissions;
+pub mod pipes;
+pub mod planning;
+pub mod prerequisites;
+pub mod procfs;
+pub mod production;
+pub mod rate_limit;
+pub mod resources;
+pub mod runtime;
+pub mod sandbox;
+pub mod scheduler;
+pub mod service_discovery;
+pub mod shell;
+pub mod syscall_gate;
+pub mod syscall_interface;
+pub mod sysctl;
+pub mod tool_descriptors;
+pub mod tools;
 pub mod vision;
+pub mod voice;
+pub mod workspaces;
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
@@ -374,7 +374,8 @@ pub enum SandboxError {
 use crate::resources::{ResourceProvider, ResourceType};
 
 /// Configurable max chars for browse_url (set from config on startup).
-static MAX_BROWSE_CHARS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(16000);
+static MAX_BROWSE_CHARS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(16000);
 
 /// Set the max browse chars (call from config on startup).
 pub fn set_max_browse_chars(chars: usize) {
@@ -414,39 +415,65 @@ struct BuiltinFilesystemProvider;
 
 #[async_trait::async_trait]
 impl ResourceProvider for BuiltinFilesystemProvider {
-    fn resource_type(&self) -> ResourceType { ResourceType::Filesystem }
-    fn supported_operations(&self) -> Vec<String> { vec!["read".into(), "write".into(), "create".into(), "delete".into(), "list".into()] }
-    async fn execute(&self, operation: &str, params: &serde_json::Value) -> Result<serde_json::Value, ResourceError> {
-        let path = params.get("path").and_then(|v| v.as_str())
+    fn resource_type(&self) -> ResourceType {
+        ResourceType::Filesystem
+    }
+    fn supported_operations(&self) -> Vec<String> {
+        vec![
+            "read".into(),
+            "write".into(),
+            "create".into(),
+            "delete".into(),
+            "list".into(),
+        ]
+    }
+    async fn execute(
+        &self,
+        operation: &str,
+        params: &serde_json::Value,
+    ) -> Result<serde_json::Value, ResourceError> {
+        let path = params
+            .get("path")
+            .and_then(|v| v.as_str())
             .ok_or_else(|| ResourceError::OperationFailed("Missing 'path'".into()))?;
         match operation {
             "read" => {
-                let content = tokio::fs::read_to_string(path).await
+                let content = tokio::fs::read_to_string(path)
+                    .await
                     .map_err(|e| ResourceError::OperationFailed(e.to_string()))?;
                 Ok(serde_json::json!({"content": content}))
             }
             "write" | "create" => {
                 let content = params.get("content").and_then(|v| v.as_str()).unwrap_or("");
-                tokio::fs::write(path, content).await
+                tokio::fs::write(path, content)
+                    .await
                     .map_err(|e| ResourceError::OperationFailed(e.to_string()))?;
                 Ok(serde_json::json!({"written": true}))
             }
             "delete" => {
-                tokio::fs::remove_file(path).await
+                tokio::fs::remove_file(path)
+                    .await
                     .map_err(|e| ResourceError::OperationFailed(e.to_string()))?;
                 Ok(serde_json::json!({"deleted": true}))
             }
             "list" => {
                 let mut entries = Vec::new();
-                let mut dir = tokio::fs::read_dir(path).await
+                let mut dir = tokio::fs::read_dir(path)
+                    .await
                     .map_err(|e| ResourceError::OperationFailed(e.to_string()))?;
-                while let Some(entry) = dir.next_entry().await
-                    .map_err(|e| ResourceError::OperationFailed(e.to_string()))? {
+                while let Some(entry) = dir
+                    .next_entry()
+                    .await
+                    .map_err(|e| ResourceError::OperationFailed(e.to_string()))?
+                {
                     entries.push(entry.file_name().to_string_lossy().to_string());
                 }
                 Ok(serde_json::json!({"entries": entries}))
             }
-            _ => Err(ResourceError::OperationFailed(format!("Unknown op: {}", operation))),
+            _ => Err(ResourceError::OperationFailed(format!(
+                "Unknown op: {}",
+                operation
+            ))),
         }
     }
 }
@@ -455,30 +482,65 @@ struct BuiltinNetworkProvider;
 
 #[async_trait::async_trait]
 impl ResourceProvider for BuiltinNetworkProvider {
-    fn resource_type(&self) -> ResourceType { ResourceType::Network }
-    fn supported_operations(&self) -> Vec<String> { vec!["get".into(), "post".into(), "browse".into()] }
-    async fn execute(&self, operation: &str, params: &serde_json::Value) -> Result<serde_json::Value, ResourceError> {
-        let url = params.get("url").and_then(|v| v.as_str())
+    fn resource_type(&self) -> ResourceType {
+        ResourceType::Network
+    }
+    fn supported_operations(&self) -> Vec<String> {
+        vec!["get".into(), "post".into(), "browse".into()]
+    }
+    async fn execute(
+        &self,
+        operation: &str,
+        params: &serde_json::Value,
+    ) -> Result<serde_json::Value, ResourceError> {
+        let url = params
+            .get("url")
+            .and_then(|v| v.as_str())
             .ok_or_else(|| ResourceError::OperationFailed("Missing 'url'".into()))?;
         let client = reqwest::Client::new();
         match operation {
             "get" => {
-                let resp = client.get(url).send().await.map_err(|e| ResourceError::OperationFailed(e.to_string()))?;
+                let resp = client
+                    .get(url)
+                    .send()
+                    .await
+                    .map_err(|e| ResourceError::OperationFailed(e.to_string()))?;
                 let status = resp.status().as_u16();
-                let body = resp.text().await.map_err(|e| ResourceError::OperationFailed(e.to_string()))?;
+                let body = resp
+                    .text()
+                    .await
+                    .map_err(|e| ResourceError::OperationFailed(e.to_string()))?;
                 Ok(serde_json::json!({"status": status, "body": body}))
             }
             "post" => {
-                let body = params.get("body").cloned().unwrap_or(serde_json::Value::Null);
-                let resp = client.post(url).json(&body).send().await.map_err(|e| ResourceError::OperationFailed(e.to_string()))?;
+                let body = params
+                    .get("body")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
+                let resp = client
+                    .post(url)
+                    .json(&body)
+                    .send()
+                    .await
+                    .map_err(|e| ResourceError::OperationFailed(e.to_string()))?;
                 let status = resp.status().as_u16();
-                let text = resp.text().await.map_err(|e| ResourceError::OperationFailed(e.to_string()))?;
+                let text = resp
+                    .text()
+                    .await
+                    .map_err(|e| ResourceError::OperationFailed(e.to_string()))?;
                 Ok(serde_json::json!({"status": status, "body": text}))
             }
             "browse" => {
-                let resp = client.get(url).header("User-Agent", "Mozilla/5.0 AIAgentOS/1.0")
-                    .send().await.map_err(|e| ResourceError::OperationFailed(e.to_string()))?;
-                let html = resp.text().await.map_err(|e| ResourceError::OperationFailed(e.to_string()))?;
+                let resp = client
+                    .get(url)
+                    .header("User-Agent", "Mozilla/5.0 AIAgentOS/1.0")
+                    .send()
+                    .await
+                    .map_err(|e| ResourceError::OperationFailed(e.to_string()))?;
+                let html = resp
+                    .text()
+                    .await
+                    .map_err(|e| ResourceError::OperationFailed(e.to_string()))?;
                 let mut in_tag = false;
                 let mut text = String::new();
                 for c in html.chars() {
@@ -490,10 +552,16 @@ impl ResourceProvider for BuiltinNetworkProvider {
                     }
                 }
                 let clean: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
-                let truncated: String = clean.chars().take(MAX_BROWSE_CHARS.load(std::sync::atomic::Ordering::Relaxed)).collect();
+                let truncated: String = clean
+                    .chars()
+                    .take(MAX_BROWSE_CHARS.load(std::sync::atomic::Ordering::Relaxed))
+                    .collect();
                 Ok(serde_json::json!({"content": truncated}))
             }
-            _ => Err(ResourceError::OperationFailed(format!("Unknown op: {}", operation))),
+            _ => Err(ResourceError::OperationFailed(format!(
+                "Unknown op: {}",
+                operation
+            ))),
         }
     }
 }
@@ -502,14 +570,30 @@ struct BuiltinAppProvider;
 
 #[async_trait::async_trait]
 impl ResourceProvider for BuiltinAppProvider {
-    fn resource_type(&self) -> ResourceType { ResourceType::Application }
-    fn supported_operations(&self) -> Vec<String> { vec!["launch".into()] }
-    async fn execute(&self, _operation: &str, params: &serde_json::Value) -> Result<serde_json::Value, ResourceError> {
-        let cmd = params.get("command").and_then(|v| v.as_str())
+    fn resource_type(&self) -> ResourceType {
+        ResourceType::Application
+    }
+    fn supported_operations(&self) -> Vec<String> {
+        vec!["launch".into()]
+    }
+    async fn execute(
+        &self,
+        _operation: &str,
+        params: &serde_json::Value,
+    ) -> Result<serde_json::Value, ResourceError> {
+        let cmd = params
+            .get("command")
+            .and_then(|v| v.as_str())
             .ok_or_else(|| ResourceError::OperationFailed("Missing 'command'".into()))?;
-        let args: Vec<&str> = params.get("args").and_then(|v| v.as_array())
-            .map(|a| a.iter().filter_map(|v| v.as_str()).collect()).unwrap_or_default();
-        let output = tokio::process::Command::new(cmd).args(&args).output().await
+        let args: Vec<&str> = params
+            .get("args")
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+            .unwrap_or_default();
+        let output = tokio::process::Command::new(cmd)
+            .args(&args)
+            .output()
+            .await
             .map_err(|e| ResourceError::OperationFailed(e.to_string()))?;
         Ok(serde_json::json!({
             "stdout": String::from_utf8_lossy(&output.stdout).to_string(),
@@ -521,31 +605,31 @@ impl ResourceProvider for BuiltinAppProvider {
 
 // ─── Kernel Orchestrator ─────────────────────────────────────────────────────
 
+use dashmap::DashMap;
 use std::sync::Arc;
 use tokio::sync::broadcast;
-use dashmap::DashMap;
 
 use crate::agent::{AgentKernel, AgentManager};
+use crate::agent_struct::{CapabilitySet, SchedClass};
+use crate::cfs::CfsScheduler;
+use crate::cgroups::CgroupManager;
 use crate::connector::{AgentConnector, AgentConnectorImpl, LlmProviderAdapter};
 use crate::context::{ContextManager, SqliteContextManager};
 use crate::execution::{AgentExecutor, AgentOutput};
+use crate::init_system::InitSystem;
 use crate::ipc::IpcManager;
+use crate::namespaces::{NamespaceRegistry, NamespaceType};
 use crate::observability::{ObservabilityEngine, ObservabilityEngineImpl};
 use crate::permissions::{PermissionManager, PermissionSystem};
+use crate::procfs::ProcFs;
+use crate::rate_limit::{RateLimitConfig, RateLimiter};
 use crate::resources::{ResourceBroker, ResourceBrokerImpl};
 use crate::sandbox::{SandboxManager, SandboxManagerImpl};
 use crate::scheduler::{AgentScheduler, PriorityScheduler};
-use crate::tools::ToolRegistry;
-use crate::rate_limit::{RateLimiter, RateLimitConfig};
-use crate::syscall_gate::SyscallGate;
-use crate::cgroups::CgroupManager;
-use crate::agent_struct::{CapabilitySet, SchedClass};
-use crate::cfs::CfsScheduler;
-use crate::namespaces::{NamespaceRegistry, NamespaceType};
-use crate::init_system::InitSystem;
-use crate::procfs::ProcFs;
-use crate::sysctl::Sysctl;
 use crate::service_discovery::ServiceRegistry;
+use crate::syscall_gate::SyscallGate;
+use crate::sysctl::Sysctl;
+use crate::tools::ToolRegistry;
 
 /// OS-style subsystems unified into the kernel orchestrator.
 ///
@@ -597,10 +681,8 @@ pub struct AgentKernelImpl {
 impl AgentKernelImpl {
     /// Create a new kernel with all subsystems wired together (in-memory DB for testing).
     pub fn new() -> Result<Self, KernelError> {
-        let context_manager = Arc::new(
-            SqliteContextManager::in_memory()
-                .map_err(|e| KernelError::Context(e))?
-        );
+        let context_manager =
+            Arc::new(SqliteContextManager::in_memory().map_err(|e| KernelError::Context(e))?);
         Self::with_context_manager(context_manager)
     }
 
@@ -609,10 +691,8 @@ impl AgentKernelImpl {
         if let Some(parent) = db_path.parent() {
             std::fs::create_dir_all(parent).ok();
         }
-        let context_manager = Arc::new(
-            SqliteContextManager::new(db_path)
-                .map_err(|e| KernelError::Context(e))?
-        );
+        let context_manager =
+            Arc::new(SqliteContextManager::new(db_path).map_err(|e| KernelError::Context(e))?);
         Self::with_context_manager(context_manager)
     }
 
@@ -623,7 +703,9 @@ impl AgentKernelImpl {
         Self::with_db_path(&db_path)
     }
 
-    fn with_context_manager(context_manager: Arc<SqliteContextManager>) -> Result<Self, KernelError> {
+    fn with_context_manager(
+        context_manager: Arc<SqliteContextManager>,
+    ) -> Result<Self, KernelError> {
         let (event_tx, _) = broadcast::channel(256);
         let permission_manager = Arc::new(PermissionManager::new());
         let resource_broker = Arc::new(ResourceBrokerImpl::new(permission_manager.clone()));
@@ -658,8 +740,12 @@ impl AgentKernelImpl {
     }
 
     /// Register an LLM provider adapter.
-    pub fn register_provider(&self, adapter: Arc<dyn LlmProviderAdapter>) -> Result<(), KernelError> {
-        self.connector.register_provider(adapter)
+    pub fn register_provider(
+        &self,
+        adapter: Arc<dyn LlmProviderAdapter>,
+    ) -> Result<(), KernelError> {
+        self.connector
+            .register_provider(adapter)
             .map_err(|e| KernelError::Connector(e))
     }
 
@@ -670,20 +756,27 @@ impl AgentKernelImpl {
         let agent_id = handle.id;
 
         // 2. Assign permission profile
-        PermissionSystem::assign_profile(&*self.permission_manager, agent_id, &config.permission_profile);
+        PermissionSystem::assign_profile(
+            &*self.permission_manager,
+            agent_id,
+            &config.permission_profile,
+        );
 
         // 3. Create context
-        ContextManager::create_context(&*self.context_manager, agent_id).await
+        ContextManager::create_context(&*self.context_manager, agent_id)
+            .await
             .map_err(|e| KernelError::Context(e))?;
 
         // 4. Create sandbox if configured
         if let Some(ref sandbox_config) = config.sandbox_config {
-            self.sandbox_manager.create_sandbox(agent_id, sandbox_config)
+            self.sandbox_manager
+                .create_sandbox(agent_id, sandbox_config)
                 .map_err(|e| KernelError::Sandbox(e))?;
         }
 
         // 5. Schedule agent
-        AgentScheduler::schedule(&*self.scheduler, &handle).await
+        AgentScheduler::schedule(&*self.scheduler, &handle)
+            .await
             .map_err(|e| KernelError::Scheduler(e))?;
 
         // 6. Register IPC mailbox
@@ -725,16 +818,22 @@ impl AgentKernelImpl {
 
     /// Send a message to an agent and get a response.
     /// Creates an executor on first message using the agent's LLM provider.
-    pub async fn send_message(&self, agent_id: AgentId, message: &str) -> Result<AgentOutput, KernelError> {
+    pub async fn send_message(
+        &self,
+        agent_id: AgentId,
+        message: &str,
+    ) -> Result<AgentOutput, KernelError> {
         // Ensure executor exists for this agent
         if !self.executors.contains_key(&agent_id) {
             // Get agent's LLM provider from its config
-            let provider_id = self.agent_manager
+            let provider_id = self
+                .agent_manager
                 .get_agent_provider(agent_id)
                 .ok_or(AgentError::NotFound(agent_id))?;
 
             // Connect to LLM provider
-            let session = AgentConnector::connect(&*self.connector, agent_id, &provider_id).await
+            let session = AgentConnector::connect(&*self.connector, agent_id, &provider_id)
+                .await
                 .map_err(|e| KernelError::Connector(e))?;
 
             let mut executor = AgentExecutor::new(
@@ -747,12 +846,15 @@ impl AgentKernelImpl {
             );
             executor.set_syscall_gate(self.syscall_gate.clone());
 
-            self.executors.insert(agent_id, tokio::sync::Mutex::new(executor));
+            self.executors
+                .insert(agent_id, tokio::sync::Mutex::new(executor));
         }
 
         // Run the execution loop (rate limited)
         let _guard = self.rate_limiter.acquire().await;
-        let executor_entry = self.executors.get(&agent_id)
+        let executor_entry = self
+            .executors
+            .get(&agent_id)
             .ok_or(AgentError::NotFound(agent_id))?;
         let mut executor = executor_entry.lock().await;
         let output = executor.run(message).await?;
@@ -760,8 +862,14 @@ impl AgentKernelImpl {
         // Record activity and usage
         self.agent_manager.record_activity(agent_id);
         self.rate_limiter.record_tokens(output.tokens_used as u64);
-        ObservabilityEngine::record_metrics(&*self.observability, agent_id, output.tokens_used as u64, 1);
-        self.context_manager.log_usage(agent_id, output.tokens_used, "gpt-5.4", 0.01);
+        ObservabilityEngine::record_metrics(
+            &*self.observability,
+            agent_id,
+            output.tokens_used as u64,
+            1,
+        );
+        self.context_manager
+            .log_usage(agent_id, output.tokens_used, "gpt-5.4", 0.01);
 
         Ok(output)
     }
@@ -831,63 +939,90 @@ mod tests {
     fn kernel_error_from_agent_error() {
         let agent_err = AgentError::CreationTimeout;
         let kernel_err: KernelError = agent_err.into();
-        assert!(matches!(kernel_err, KernelError::Agent(AgentError::CreationTimeout)));
+        assert!(matches!(
+            kernel_err,
+            KernelError::Agent(AgentError::CreationTimeout)
+        ));
     }
 
     #[test]
     fn kernel_error_from_scheduler_error() {
         let err = SchedulerError::QueueFull;
         let kernel_err: KernelError = err.into();
-        assert!(matches!(kernel_err, KernelError::Scheduler(SchedulerError::QueueFull)));
+        assert!(matches!(
+            kernel_err,
+            KernelError::Scheduler(SchedulerError::QueueFull)
+        ));
     }
 
     #[test]
     fn kernel_error_from_context_error() {
         let err = ContextError::StorageError("disk full".to_string());
         let kernel_err: KernelError = err.into();
-        assert!(matches!(kernel_err, KernelError::Context(ContextError::StorageError(_))));
+        assert!(matches!(
+            kernel_err,
+            KernelError::Context(ContextError::StorageError(_))
+        ));
     }
 
     #[test]
     fn kernel_error_from_resource_error() {
         let err = ResourceError::Timeout;
         let kernel_err: KernelError = err.into();
-        assert!(matches!(kernel_err, KernelError::Resource(ResourceError::Timeout)));
+        assert!(matches!(
+            kernel_err,
+            KernelError::Resource(ResourceError::Timeout)
+        ));
     }
 
     #[test]
     fn kernel_error_from_permission_error() {
         let err = PermissionError::AccessDenied("no access".to_string());
         let kernel_err: KernelError = err.into();
-        assert!(matches!(kernel_err, KernelError::Permission(PermissionError::AccessDenied(_))));
+        assert!(matches!(
+            kernel_err,
+            KernelError::Permission(PermissionError::AccessDenied(_))
+        ));
     }
 
     #[test]
     fn kernel_error_from_connector_error() {
         let err = ConnectorError::ProviderUnavailable("openai".to_string());
         let kernel_err: KernelError = err.into();
-        assert!(matches!(kernel_err, KernelError::Connector(ConnectorError::ProviderUnavailable(_))));
+        assert!(matches!(
+            kernel_err,
+            KernelError::Connector(ConnectorError::ProviderUnavailable(_))
+        ));
     }
 
     #[test]
     fn kernel_error_from_module_error() {
         let err = ModuleError::NotFound("my-module".to_string());
         let kernel_err: KernelError = err.into();
-        assert!(matches!(kernel_err, KernelError::Module(ModuleError::NotFound(_))));
+        assert!(matches!(
+            kernel_err,
+            KernelError::Module(ModuleError::NotFound(_))
+        ));
     }
 
     #[test]
     fn kernel_error_from_ipc_error() {
         let err = IpcError::ChannelClosed;
         let kernel_err: KernelError = err.into();
-        assert!(matches!(kernel_err, KernelError::Ipc(IpcError::ChannelClosed)));
+        assert!(matches!(
+            kernel_err,
+            KernelError::Ipc(IpcError::ChannelClosed)
+        ));
     }
 
     #[test]
     fn kernel_error_from_sandbox_error() {
         let err = SandboxError::BoundaryViolation("path traversal".to_string());
         let kernel_err: KernelError = err.into();
-        assert!(matches!(kernel_err, KernelError::Sandbox(SandboxError::BoundaryViolation(_))));
+        assert!(matches!(
+            kernel_err,
+            KernelError::Sandbox(SandboxError::BoundaryViolation(_))
+        ));
     }
 
     #[test]

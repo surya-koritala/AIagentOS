@@ -1,7 +1,7 @@
 //! Property test for prerequisite validation (Property 26).
 
-use proptest::prelude::*;
 use kernel::prerequisites::*;
+use proptest::prelude::*;
 
 proptest! {
     /// Property 26: For any system config, checker SHALL correctly identify all

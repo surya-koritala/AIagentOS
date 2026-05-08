@@ -6,21 +6,22 @@
 
 use proptest::prelude::*;
 
-use kernel::connector::*;
-use adapters::openai::OpenAiAdapter;
 use adapters::anthropic::AnthropicAdapter;
 use adapters::local::LocalLlmAdapter;
+use adapters::openai::OpenAiAdapter;
+use kernel::connector::*;
 
 fn arb_standard_message() -> impl Strategy<Value = StandardMessage> {
     (
         prop_oneof![Just("user"), Just("assistant"), Just("system")],
         "[a-zA-Z0-9 .,!?]{5,100}",
-    ).prop_map(|(role, content)| StandardMessage {
-        role: role.to_string(),
-        content,
-        tool_call_id: None,
-        tool_calls: None,
-    })
+    )
+        .prop_map(|(role, content)| StandardMessage {
+            role: role.to_string(),
+            content,
+            tool_call_id: None,
+            tool_calls: None,
+        })
 }
 
 proptest! {

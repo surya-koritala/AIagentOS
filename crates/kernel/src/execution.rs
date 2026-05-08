@@ -133,10 +133,21 @@ impl AgentExecutor {
     /// Run the execution loop for a user message.
     pub async fn run(&mut self, user_message: &str) -> Result<AgentOutput, KernelError> {
         // Query long-term memory for relevant facts
-        if let Ok(facts) = self.context_manager.query_memory(self.agent_id, user_message).await {
+        if let Ok(facts) = self
+            .context_manager
+            .query_memory(self.agent_id, user_message)
+            .await
+        {
             if !facts.is_empty() {
-                let memory_text = facts.iter().map(|f| f.content.as_str()).collect::<Vec<_>>().join("\n");
-                self.messages.push(StandardMessage::system(format!("Relevant memories:\n{}", memory_text)));
+                let memory_text = facts
+                    .iter()
+                    .map(|f| f.content.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                self.messages.push(StandardMessage::system(format!(
+                    "Relevant memories:\n{}",
+                    memory_text
+                )));
             }
         }
 
@@ -152,18 +163,37 @@ impl AgentExecutor {
         // Auto-summarize if messages exceed threshold
         if self.messages.len() > MESSAGE_OVERFLOW_THRESHOLD {
             let ctx = crate::context::AgentContext {
-                conversation_history: self.messages.iter().map(|m| crate::context::Message {
-                    role: m.role.clone(),
-                    content: m.content.clone(),
-                    timestamp: chrono::Utc::now(),
-                }).collect(),
-                token_count: self.messages.iter().map(|m| m.content.len() as u32 / 4 + 1).sum(),
+                conversation_history: self
+                    .messages
+                    .iter()
+                    .map(|m| crate::context::Message {
+                        role: m.role.clone(),
+                        content: m.content.clone(),
+                        timestamp: chrono::Utc::now(),
+                    })
+                    .collect(),
+                token_count: self
+                    .messages
+                    .iter()
+                    .map(|m| m.content.len() as u32 / 4 + 1)
+                    .sum(),
                 ..Default::default()
             };
-            if let Ok(summarized) = self.context_manager.summarize_overflow(&ctx, ctx.token_count / 2).await {
-                self.messages = summarized.conversation_history.iter().map(|m| {
-                    StandardMessage { role: m.role.clone(), content: m.content.clone(), tool_call_id: None, tool_calls: None }
-                }).collect();
+            if let Ok(summarized) = self
+                .context_manager
+                .summarize_overflow(&ctx, ctx.token_count / 2)
+                .await
+            {
+                self.messages = summarized
+                    .conversation_history
+                    .iter()
+                    .map(|m| StandardMessage {
+                        role: m.role.clone(),
+                        content: m.content.clone(),
+                        tool_call_id: None,
+                        tool_calls: None,
+                    })
+                    .collect();
             }
         }
 
@@ -175,7 +205,11 @@ impl AgentExecutor {
             // Check cancellation
             if self.cancel_token.is_cancelled() {
                 self.emit(StreamEvent::Cancelled { tool_calls_made }).await;
-                return Ok(AgentOutput { content: "Cancelled.".into(), tool_calls_made, tokens_used: total_tokens });
+                return Ok(AgentOutput {
+                    content: "Cancelled.".into(),
+                    tool_calls_made,
+                    tokens_used: total_tokens,
+                });
             }
 
             // Think: send to LLM with retry
@@ -185,7 +219,8 @@ impl AgentExecutor {
 
             // If no tool calls, we're done — return content
             if response.tool_calls.is_empty() {
-                self.messages.push(StandardMessage::assistant(&response.content));
+                self.messages
+                    .push(StandardMessage::assistant(&response.content));
 
                 // Store as fact if response is substantial (>100 chars)
                 if response.content.len() > 100 {
@@ -218,19 +253,26 @@ impl AgentExecutor {
             for tool_call in &response.tool_calls {
                 if self.cancel_token.is_cancelled() {
                     self.emit(StreamEvent::Cancelled { tool_calls_made }).await;
-                    return Ok(AgentOutput { content: "Cancelled.".into(), tool_calls_made, tokens_used: total_tokens });
+                    return Ok(AgentOutput {
+                        content: "Cancelled.".into(),
+                        tool_calls_made,
+                        tokens_used: total_tokens,
+                    });
                 }
                 tool_calls_made += 1;
                 self.emit(StreamEvent::ToolCallStarted {
                     name: tool_call.name.clone(),
                     arguments: tool_call.arguments.to_string(),
-                }).await;
+                })
+                .await;
                 let result = self.execute_tool(tool_call).await;
                 self.emit(StreamEvent::ToolCallResult {
                     name: tool_call.name.clone(),
                     result: result.chars().take(200).collect(),
-                }).await;
-                self.messages.push(StandardMessage::tool_result(&tool_call.id, &result));
+                })
+                .await;
+                self.messages
+                    .push(StandardMessage::tool_result(&tool_call.id, &result));
             }
         }
 
@@ -244,7 +286,10 @@ impl AgentExecutor {
 
     /// Send to LLM with retry (3 attempts, exponential backoff).
     /// Send to LLM with retry. Filters orphaned tool messages to prevent API errors.
-    async fn send_with_retry(&self, tools: &[crate::connector::ToolDefinition]) -> Result<crate::connector::LlmResponse, KernelError> {
+    async fn send_with_retry(
+        &self,
+        tools: &[crate::connector::ToolDefinition],
+    ) -> Result<crate::connector::LlmResponse, KernelError> {
         // Filter messages: remove tool results that don't have a preceding tool_calls message
         let clean_messages = self.clean_messages();
 
@@ -253,9 +298,15 @@ impl AgentExecutor {
             if attempt > 0 {
                 tokio::time::sleep(tokio::time::Duration::from_millis(500 * (1 << attempt))).await;
             }
-            match self.session.send_streaming(clean_messages.clone(), tools).await {
+            match self
+                .session
+                .send_streaming(clean_messages.clone(), tools)
+                .await
+            {
                 Ok(response) => return Ok(response),
-                Err(e) => { last_err = Some(e); }
+                Err(e) => {
+                    last_err = Some(e);
+                }
             }
         }
         Err(KernelError::Connector(last_err.unwrap()))
@@ -275,7 +326,9 @@ impl AgentExecutor {
             .saturating_add(10);
 
         // Pull a representative resource string out of arguments for MAC.
-        let resource = tool_call.arguments.get("path")
+        let resource = tool_call
+            .arguments
+            .get("path")
             .or_else(|| tool_call.arguments.get("url"))
             .or_else(|| tool_call.arguments.get("command"))
             .and_then(|v| v.as_str())
@@ -283,30 +336,48 @@ impl AgentExecutor {
             .to_string();
 
         if let Some(ref gate) = self.syscall_gate {
-            match gate.check_tool_call(self.agent_id, &tool_call.name, &resource, est_tokens).await {
+            match gate
+                .check_tool_call(self.agent_id, &tool_call.name, &resource, est_tokens)
+                .await
+            {
                 Ok(_) => { /* proceed */ }
                 Err(denial) => {
-                    return format!("Tool '{}' denied by kernel: {}", tool_call.name, denial.message());
+                    return format!(
+                        "Tool '{}' denied by kernel: {}",
+                        tool_call.name,
+                        denial.message()
+                    );
                 }
             }
         }
 
         let result = match self.tool_registry.resolve(self.agent_id, tool_call) {
-            Some(request) => {
-                match self.resource_broker.execute(request).await {
-                    Ok(resp) if resp.success => {
-                        serde_json::to_string(&resp.data).unwrap_or_default()
-                    }
-                    Ok(resp) => {
-                        format!("Tool '{}' failed: {}. Try a different approach.", tool_call.name, resp.error.unwrap_or_default())
-                    }
-                    Err(e) => {
-                        format!("Tool '{}' error: {}. Try a different approach or tool.", tool_call.name, e)
-                    }
+            Some(request) => match self.resource_broker.execute(request).await {
+                Ok(resp) if resp.success => serde_json::to_string(&resp.data).unwrap_or_default(),
+                Ok(resp) => {
+                    format!(
+                        "Tool '{}' failed: {}. Try a different approach.",
+                        tool_call.name,
+                        resp.error.unwrap_or_default()
+                    )
                 }
-            }
-            None => format!("Unknown tool '{}'. Available tools: {}", tool_call.name,
-                self.tool_registry.definitions().iter().map(|t| t.name.as_str()).collect::<Vec<_>>().join(", ")),
+                Err(e) => {
+                    format!(
+                        "Tool '{}' error: {}. Try a different approach or tool.",
+                        tool_call.name, e
+                    )
+                }
+            },
+            None => format!(
+                "Unknown tool '{}'. Available tools: {}",
+                tool_call.name,
+                self.tool_registry
+                    .definitions()
+                    .iter()
+                    .map(|t| t.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
         };
 
         if let Some(ref gate) = self.syscall_gate {
@@ -323,7 +394,11 @@ impl AgentExecutor {
 
     /// Save the current conversation to SQLite.
     fn save_conversation(&self) {
-        let _ = self.context_manager.save_conversation(&self.conversation_id, self.agent_id, &self.messages);
+        let _ = self.context_manager.save_conversation(
+            &self.conversation_id,
+            self.agent_id,
+            &self.messages,
+        );
     }
 
     /// Clean messages: remove orphaned tool results (tool messages without preceding tool_calls).
@@ -339,7 +414,11 @@ impl AgentExecutor {
                 }
                 // Don't update last_had_tool_calls for tool messages
             } else {
-                last_had_tool_calls = msg.tool_calls.as_ref().map(|tc| !tc.is_empty()).unwrap_or(false);
+                last_had_tool_calls = msg
+                    .tool_calls
+                    .as_ref()
+                    .map(|tc| !tc.is_empty())
+                    .unwrap_or(false);
                 clean.push(msg.clone());
             }
         }
@@ -351,9 +430,9 @@ impl AgentExecutor {
 mod tests {
     use super::*;
     use crate::connector::{LlmResponse, ToolCall, ToolDefinition};
-    use crate::{ConnectorError, ResourceError};
-    use crate::resources::{ResourceResponse, ResourceCapability, ResourceProvider};
     use crate::permissions::PermissionManager;
+    use crate::resources::{ResourceCapability, ResourceProvider, ResourceResponse};
+    use crate::{ConnectorError, ResourceError};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn mock_context_manager() -> Arc<SqliteContextManager> {
@@ -368,10 +447,17 @@ mod tests {
 
     #[async_trait::async_trait]
     impl LlmSession for MockToolSession {
-        async fn send(&self, messages: Vec<StandardMessage>) -> Result<LlmResponse, ConnectorError> {
+        async fn send(
+            &self,
+            messages: Vec<StandardMessage>,
+        ) -> Result<LlmResponse, ConnectorError> {
             self.send_with_tools(messages, &[]).await
         }
-        async fn send_with_tools(&self, _messages: Vec<StandardMessage>, _tools: &[ToolDefinition]) -> Result<LlmResponse, ConnectorError> {
+        async fn send_with_tools(
+            &self,
+            _messages: Vec<StandardMessage>,
+            _tools: &[ToolDefinition],
+        ) -> Result<LlmResponse, ConnectorError> {
             let count = self.call_count.fetch_add(1, Ordering::SeqCst);
             if count == 0 {
                 Ok(LlmResponse {
@@ -393,26 +479,43 @@ mod tests {
                 })
             }
         }
-        fn provider_id(&self) -> &crate::ProviderId { &self.id }
+        fn provider_id(&self) -> &crate::ProviderId {
+            &self.id
+        }
     }
 
     /// Mock session that always returns tool calls (for testing max iterations).
-    struct InfiniteToolSession { id: String }
+    struct InfiniteToolSession {
+        id: String,
+    }
 
     #[async_trait::async_trait]
     impl LlmSession for InfiniteToolSession {
-        async fn send(&self, messages: Vec<StandardMessage>) -> Result<LlmResponse, ConnectorError> {
+        async fn send(
+            &self,
+            messages: Vec<StandardMessage>,
+        ) -> Result<LlmResponse, ConnectorError> {
             self.send_with_tools(messages, &[]).await
         }
-        async fn send_with_tools(&self, _messages: Vec<StandardMessage>, _tools: &[ToolDefinition]) -> Result<LlmResponse, ConnectorError> {
+        async fn send_with_tools(
+            &self,
+            _messages: Vec<StandardMessage>,
+            _tools: &[ToolDefinition],
+        ) -> Result<LlmResponse, ConnectorError> {
             Ok(LlmResponse {
                 content: "".into(),
                 finish_reason: Some("tool_calls".into()),
                 tokens_used: 5,
-                tool_calls: vec![ToolCall { id: "call_x".into(), name: "read_file".into(), arguments: serde_json::json!({"path": "/x"}) }],
+                tool_calls: vec![ToolCall {
+                    id: "call_x".into(),
+                    name: "read_file".into(),
+                    arguments: serde_json::json!({"path": "/x"}),
+                }],
             })
         }
-        fn provider_id(&self) -> &crate::ProviderId { &self.id }
+        fn provider_id(&self) -> &crate::ProviderId {
+            &self.id
+        }
     }
 
     fn mock_broker() -> Arc<dyn ResourceBroker> {
@@ -423,9 +526,17 @@ mod tests {
         struct MockFs;
         #[async_trait::async_trait]
         impl ResourceProvider for MockFs {
-            fn resource_type(&self) -> crate::resources::ResourceType { crate::resources::ResourceType::Filesystem }
-            fn supported_operations(&self) -> Vec<String> { vec!["read".into(), "write".into(), "list".into()] }
-            async fn execute(&self, _op: &str, _params: &serde_json::Value) -> Result<serde_json::Value, ResourceError> {
+            fn resource_type(&self) -> crate::resources::ResourceType {
+                crate::resources::ResourceType::Filesystem
+            }
+            fn supported_operations(&self) -> Vec<String> {
+                vec!["read".into(), "write".into(), "list".into()]
+            }
+            async fn execute(
+                &self,
+                _op: &str,
+                _params: &serde_json::Value,
+            ) -> Result<serde_json::Value, ResourceError> {
                 Ok(serde_json::json!({"content": "hello world"}))
             }
         }
@@ -435,12 +546,20 @@ mod tests {
 
     #[tokio::test]
     async fn execution_loop_with_tool_call() {
-        let session = Box::new(MockToolSession { call_count: AtomicUsize::new(0), id: "mock".into() });
+        let session = Box::new(MockToolSession {
+            call_count: AtomicUsize::new(0),
+            id: "mock".into(),
+        });
         let broker = mock_broker();
         let registry = Arc::new(ToolRegistry::new());
 
         let mut executor = AgentExecutor::new(
-            uuid::Uuid::new_v4(), session, broker, registry, mock_context_manager(), "You are a helpful assistant.".into(),
+            uuid::Uuid::new_v4(),
+            session,
+            broker,
+            registry,
+            mock_context_manager(),
+            "You are a helpful assistant.".into(),
         );
 
         let output = executor.run("Read /tmp/test.txt").await.unwrap();
@@ -456,7 +575,12 @@ mod tests {
         let registry = Arc::new(ToolRegistry::new());
 
         let mut executor = AgentExecutor::new(
-            uuid::Uuid::new_v4(), session, broker, registry, mock_context_manager(), "You are a helpful assistant.".into(),
+            uuid::Uuid::new_v4(),
+            session,
+            broker,
+            registry,
+            mock_context_manager(),
+            "You are a helpful assistant.".into(),
         );
 
         let output = executor.run("Do something forever").await.unwrap();
@@ -465,32 +589,57 @@ mod tests {
     }
 
     /// Mock session that fails twice then succeeds (tests LLM retry).
-    struct FailThenSucceedSession { call_count: AtomicUsize, id: String }
+    struct FailThenSucceedSession {
+        call_count: AtomicUsize,
+        id: String,
+    }
 
     #[async_trait::async_trait]
     impl LlmSession for FailThenSucceedSession {
-        async fn send(&self, messages: Vec<StandardMessage>) -> Result<LlmResponse, ConnectorError> {
+        async fn send(
+            &self,
+            messages: Vec<StandardMessage>,
+        ) -> Result<LlmResponse, ConnectorError> {
             self.send_with_tools(messages, &[]).await
         }
-        async fn send_with_tools(&self, _messages: Vec<StandardMessage>, _tools: &[ToolDefinition]) -> Result<LlmResponse, ConnectorError> {
+        async fn send_with_tools(
+            &self,
+            _messages: Vec<StandardMessage>,
+            _tools: &[ToolDefinition],
+        ) -> Result<LlmResponse, ConnectorError> {
             let count = self.call_count.fetch_add(1, Ordering::SeqCst);
             if count < 2 {
                 Err(ConnectorError::ConnectionFailed("server error".into()))
             } else {
-                Ok(LlmResponse { content: "recovered!".into(), finish_reason: Some("stop".into()), tokens_used: 10, tool_calls: vec![] })
+                Ok(LlmResponse {
+                    content: "recovered!".into(),
+                    finish_reason: Some("stop".into()),
+                    tokens_used: 10,
+                    tool_calls: vec![],
+                })
             }
         }
-        fn provider_id(&self) -> &crate::ProviderId { &self.id }
+        fn provider_id(&self) -> &crate::ProviderId {
+            &self.id
+        }
     }
 
     #[tokio::test]
     async fn llm_retry_recovers_from_transient_failure() {
-        let session = Box::new(FailThenSucceedSession { call_count: AtomicUsize::new(0), id: "mock".into() });
+        let session = Box::new(FailThenSucceedSession {
+            call_count: AtomicUsize::new(0),
+            id: "mock".into(),
+        });
         let broker = mock_broker();
         let registry = Arc::new(ToolRegistry::new());
 
         let mut executor = AgentExecutor::new(
-            uuid::Uuid::new_v4(), session, broker, registry, mock_context_manager(), "test".into(),
+            uuid::Uuid::new_v4(),
+            session,
+            broker,
+            registry,
+            mock_context_manager(),
+            "test".into(),
         );
 
         let output = executor.run("test").await.unwrap();
@@ -498,20 +647,36 @@ mod tests {
     }
 
     /// Mock session that calls a nonexistent tool — tests error recovery message to LLM.
-    struct BadToolSession { call_count: AtomicUsize, id: String }
+    struct BadToolSession {
+        call_count: AtomicUsize,
+        id: String,
+    }
 
     #[async_trait::async_trait]
     impl LlmSession for BadToolSession {
-        async fn send(&self, messages: Vec<StandardMessage>) -> Result<LlmResponse, ConnectorError> {
+        async fn send(
+            &self,
+            messages: Vec<StandardMessage>,
+        ) -> Result<LlmResponse, ConnectorError> {
             self.send_with_tools(messages, &[]).await
         }
-        async fn send_with_tools(&self, messages: Vec<StandardMessage>, _tools: &[ToolDefinition]) -> Result<LlmResponse, ConnectorError> {
+        async fn send_with_tools(
+            &self,
+            messages: Vec<StandardMessage>,
+            _tools: &[ToolDefinition],
+        ) -> Result<LlmResponse, ConnectorError> {
             let count = self.call_count.fetch_add(1, Ordering::SeqCst);
             if count == 0 {
                 // First call: return a bad tool call
                 Ok(LlmResponse {
-                    content: "".into(), finish_reason: Some("tool_calls".into()), tokens_used: 10,
-                    tool_calls: vec![ToolCall { id: "c1".into(), name: "nonexistent_tool".into(), arguments: serde_json::json!({}) }],
+                    content: "".into(),
+                    finish_reason: Some("tool_calls".into()),
+                    tokens_used: 10,
+                    tool_calls: vec![ToolCall {
+                        id: "c1".into(),
+                        name: "nonexistent_tool".into(),
+                        arguments: serde_json::json!({}),
+                    }],
                 })
             } else {
                 // Second call: LLM sees the error and responds with content
@@ -519,20 +684,35 @@ mod tests {
                 let last_msg = messages.last().unwrap();
                 assert!(last_msg.content.contains("Unknown tool"));
                 assert!(last_msg.content.contains("read_file")); // suggests available tools
-                Ok(LlmResponse { content: "Sorry, let me try differently.".into(), finish_reason: Some("stop".into()), tokens_used: 8, tool_calls: vec![] })
+                Ok(LlmResponse {
+                    content: "Sorry, let me try differently.".into(),
+                    finish_reason: Some("stop".into()),
+                    tokens_used: 8,
+                    tool_calls: vec![],
+                })
             }
         }
-        fn provider_id(&self) -> &crate::ProviderId { &self.id }
+        fn provider_id(&self) -> &crate::ProviderId {
+            &self.id
+        }
     }
 
     #[tokio::test]
     async fn tool_failure_sends_error_back_to_llm() {
-        let session = Box::new(BadToolSession { call_count: AtomicUsize::new(0), id: "mock".into() });
+        let session = Box::new(BadToolSession {
+            call_count: AtomicUsize::new(0),
+            id: "mock".into(),
+        });
         let broker = mock_broker();
         let registry = Arc::new(ToolRegistry::new());
 
         let mut executor = AgentExecutor::new(
-            uuid::Uuid::new_v4(), session, broker, registry, mock_context_manager(), "test".into(),
+            uuid::Uuid::new_v4(),
+            session,
+            broker,
+            registry,
+            mock_context_manager(),
+            "test".into(),
         );
 
         let output = executor.run("use a bad tool").await.unwrap();
@@ -563,14 +743,23 @@ mod tests {
     }
 
     /// Mock session that returns a long response (>100 chars) to trigger fact storage.
-    struct LongResponseSession { id: String }
+    struct LongResponseSession {
+        id: String,
+    }
 
     #[async_trait::async_trait]
     impl LlmSession for LongResponseSession {
-        async fn send(&self, messages: Vec<StandardMessage>) -> Result<LlmResponse, ConnectorError> {
+        async fn send(
+            &self,
+            messages: Vec<StandardMessage>,
+        ) -> Result<LlmResponse, ConnectorError> {
             self.send_with_tools(messages, &[]).await
         }
-        async fn send_with_tools(&self, _messages: Vec<StandardMessage>, _tools: &[ToolDefinition]) -> Result<LlmResponse, ConnectorError> {
+        async fn send_with_tools(
+            &self,
+            _messages: Vec<StandardMessage>,
+            _tools: &[ToolDefinition],
+        ) -> Result<LlmResponse, ConnectorError> {
             Ok(LlmResponse {
                 content: "This is a very long response that exceeds one hundred characters in length so it will be stored as a fact in long-term memory for future reference.".into(),
                 finish_reason: Some("stop".into()),
@@ -578,7 +767,9 @@ mod tests {
                 tool_calls: vec![],
             })
         }
-        fn provider_id(&self) -> &crate::ProviderId { &self.id }
+        fn provider_id(&self) -> &crate::ProviderId {
+            &self.id
+        }
     }
 
     #[tokio::test]
@@ -590,46 +781,75 @@ mod tests {
         let registry = Arc::new(ToolRegistry::new());
 
         let mut executor = AgentExecutor::new(
-            agent_id, session, broker, registry, ctx_mgr.clone(), "test".into(),
+            agent_id,
+            session,
+            broker,
+            registry,
+            ctx_mgr.clone(),
+            "test".into(),
         );
 
         executor.run("tell me something").await.unwrap();
 
         // Verify fact was stored
-        let facts = ctx_mgr.query_memory(agent_id, "long-term memory").await.unwrap();
+        let facts = ctx_mgr
+            .query_memory(agent_id, "long-term memory")
+            .await
+            .unwrap();
         assert_eq!(facts.len(), 1);
     }
 
     /// Mock session for summarization test — tracks messages received.
-    struct SummarizationSession { id: String, msg_count: AtomicUsize }
+    struct SummarizationSession {
+        id: String,
+        msg_count: AtomicUsize,
+    }
 
     #[async_trait::async_trait]
     impl LlmSession for SummarizationSession {
-        async fn send(&self, messages: Vec<StandardMessage>) -> Result<LlmResponse, ConnectorError> {
+        async fn send(
+            &self,
+            messages: Vec<StandardMessage>,
+        ) -> Result<LlmResponse, ConnectorError> {
             self.send_with_tools(messages, &[]).await
         }
-        async fn send_with_tools(&self, messages: Vec<StandardMessage>, _tools: &[ToolDefinition]) -> Result<LlmResponse, ConnectorError> {
+        async fn send_with_tools(
+            &self,
+            messages: Vec<StandardMessage>,
+            _tools: &[ToolDefinition],
+        ) -> Result<LlmResponse, ConnectorError> {
             self.msg_count.store(messages.len(), Ordering::SeqCst);
-            Ok(LlmResponse { content: "ok".into(), finish_reason: Some("stop".into()), tokens_used: 5, tool_calls: vec![] })
+            Ok(LlmResponse {
+                content: "ok".into(),
+                finish_reason: Some("stop".into()),
+                tokens_used: 5,
+                tool_calls: vec![],
+            })
         }
-        fn provider_id(&self) -> &crate::ProviderId { &self.id }
+        fn provider_id(&self) -> &crate::ProviderId {
+            &self.id
+        }
     }
 
     #[tokio::test]
     async fn summarization_triggers_when_messages_exceed_threshold() {
         let ctx_mgr = mock_context_manager();
         let agent_id = uuid::Uuid::new_v4();
-        let session = Box::new(SummarizationSession { id: "mock".into(), msg_count: AtomicUsize::new(0) });
+        let session = Box::new(SummarizationSession {
+            id: "mock".into(),
+            msg_count: AtomicUsize::new(0),
+        });
         let broker = mock_broker();
         let registry = Arc::new(ToolRegistry::new());
 
-        let mut executor = AgentExecutor::new(
-            agent_id, session, broker, registry, ctx_mgr, "test".into(),
-        );
+        let mut executor =
+            AgentExecutor::new(agent_id, session, broker, registry, ctx_mgr, "test".into());
 
         // Manually fill messages to exceed threshold
         for i in 0..MESSAGE_OVERFLOW_THRESHOLD {
-            executor.messages.push(StandardMessage::user(format!("message {}", i)));
+            executor
+                .messages
+                .push(StandardMessage::user(format!("message {}", i)));
         }
 
         // Run should trigger summarization

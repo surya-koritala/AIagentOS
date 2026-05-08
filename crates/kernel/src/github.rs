@@ -40,35 +40,70 @@ impl GitHubClient {
     pub fn new(token: String) -> Self {
         let client = reqwest::Client::builder()
             .user_agent("AIAgentOS/1.0")
-            .build().unwrap();
+            .build()
+            .unwrap();
         Self { client, token }
     }
 
     pub async fn list_issues(&self, owner: &str, repo: &str) -> Result<Vec<Issue>, String> {
-        let url = format!("{}/repos/{}/{}/issues?state=open&per_page=20", GITHUB_API, owner, repo);
+        let url = format!(
+            "{}/repos/{}/{}/issues?state=open&per_page=20",
+            GITHUB_API, owner, repo
+        );
         let resp = self.get(&url).await?;
         serde_json::from_value(resp).map_err(|e| e.to_string())
     }
 
-    pub async fn create_issue(&self, owner: &str, repo: &str, title: &str, body: &str) -> Result<Issue, String> {
+    pub async fn create_issue(
+        &self,
+        owner: &str,
+        repo: &str,
+        title: &str,
+        body: &str,
+    ) -> Result<Issue, String> {
         let url = format!("{}/repos/{}/{}/issues", GITHUB_API, owner, repo);
-        let resp = self.post(&url, serde_json::json!({"title": title, "body": body})).await?;
+        let resp = self
+            .post(&url, serde_json::json!({"title": title, "body": body}))
+            .await?;
         serde_json::from_value(resp).map_err(|e| e.to_string())
     }
 
-    pub async fn create_pr(&self, owner: &str, repo: &str, title: &str, body: &str, head: &str, base: &str) -> Result<PullRequest, String> {
+    pub async fn create_pr(
+        &self,
+        owner: &str,
+        repo: &str,
+        title: &str,
+        body: &str,
+        head: &str,
+        base: &str,
+    ) -> Result<PullRequest, String> {
         let url = format!("{}/repos/{}/{}/pulls", GITHUB_API, owner, repo);
-        let resp = self.post(&url, serde_json::json!({"title": title, "body": body, "head": head, "base": base})).await?;
+        let resp = self
+            .post(
+                &url,
+                serde_json::json!({"title": title, "body": body, "head": head, "base": base}),
+            )
+            .await?;
         serde_json::from_value(resp).map_err(|e| e.to_string())
     }
 
-    pub async fn list_files(&self, owner: &str, repo: &str, path: &str) -> Result<Vec<serde_json::Value>, String> {
+    pub async fn list_files(
+        &self,
+        owner: &str,
+        repo: &str,
+        path: &str,
+    ) -> Result<Vec<serde_json::Value>, String> {
         let url = format!("{}/repos/{}/{}/contents/{}", GITHUB_API, owner, repo, path);
         let resp = self.get(&url).await?;
         resp.as_array().cloned().ok_or("Not an array".into())
     }
 
-    pub async fn get_file_content(&self, owner: &str, repo: &str, path: &str) -> Result<String, String> {
+    pub async fn get_file_content(
+        &self,
+        owner: &str,
+        repo: &str,
+        path: &str,
+    ) -> Result<String, String> {
         let url = format!("{}/repos/{}/{}/contents/{}", GITHUB_API, owner, repo, path);
         let resp = self.get(&url).await?;
         let content = resp["content"].as_str().ok_or("No content")?;
@@ -77,35 +112,52 @@ impl GitHubClient {
     }
 
     async fn get(&self, url: &str) -> Result<serde_json::Value, String> {
-        self.client.get(url)
+        self.client
+            .get(url)
             .header("Authorization", format!("Bearer {}", self.token))
             .header("Accept", "application/vnd.github+json")
-            .send().await.map_err(|e| e.to_string())?
-            .json().await.map_err(|e| e.to_string())
+            .send()
+            .await
+            .map_err(|e| e.to_string())?
+            .json()
+            .await
+            .map_err(|e| e.to_string())
     }
 
     async fn post(&self, url: &str, body: serde_json::Value) -> Result<serde_json::Value, String> {
-        self.client.post(url)
+        self.client
+            .post(url)
             .header("Authorization", format!("Bearer {}", self.token))
             .header("Accept", "application/vnd.github+json")
             .json(&body)
-            .send().await.map_err(|e| e.to_string())?
-            .json().await.map_err(|e| e.to_string())
+            .send()
+            .await
+            .map_err(|e| e.to_string())?
+            .json()
+            .await
+            .map_err(|e| e.to_string())
     }
 }
 
 fn base64_decode(input: &str) -> Vec<u8> {
     // Simple base64 decode (standard alphabet)
-    let table: Vec<u8> = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/".to_vec();
+    let table: Vec<u8> =
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/".to_vec();
     let mut output = Vec::new();
     let mut buf: u32 = 0;
     let mut bits: u32 = 0;
     for &byte in input.as_bytes() {
-        if byte == b'=' { break; }
+        if byte == b'=' {
+            break;
+        }
         if let Some(val) = table.iter().position(|&b| b == byte) {
             buf = (buf << 6) | val as u32;
             bits += 6;
-            if bits >= 8 { bits -= 8; output.push((buf >> bits) as u8); buf &= (1 << bits) - 1; }
+            if bits >= 8 {
+                bits -= 8;
+                output.push((buf >> bits) as u8);
+                buf &= (1 << bits) - 1;
+            }
         }
     }
     output

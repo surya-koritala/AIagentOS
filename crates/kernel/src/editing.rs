@@ -2,8 +2,8 @@
 //!
 //! Diff-based editing with atomic transactions and rollback support.
 
-use std::path::{Path, PathBuf};
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -47,7 +47,11 @@ pub struct EditTransaction {
 
 impl EditTransaction {
     pub fn new() -> Self {
-        Self { edits: Vec::new(), backups: HashMap::new(), applied: false }
+        Self {
+            edits: Vec::new(),
+            backups: HashMap::new(),
+            applied: false,
+        }
     }
 
     /// Add an edit to the transaction.
@@ -71,7 +75,12 @@ impl EditTransaction {
                 Ok(msg) => results.push(msg),
                 Err(e) => {
                     self.rollback();
-                    return Err(format!("Edit {} failed ({}), rolled back all changes: {}", i + 1, path_display, e));
+                    return Err(format!(
+                        "Edit {} failed ({}), rolled back all changes: {}",
+                        i + 1,
+                        path_display,
+                        e
+                    ));
                 }
             }
         }
@@ -84,8 +93,12 @@ impl EditTransaction {
     pub fn rollback(&mut self) {
         for (path, original) in &self.backups {
             match original {
-                Some(content) => { let _ = std::fs::write(path, content); }
-                None => { let _ = std::fs::remove_file(path); }
+                Some(content) => {
+                    let _ = std::fs::write(path, content);
+                }
+                None => {
+                    let _ = std::fs::remove_file(path);
+                }
             }
         }
         self.applied = false;
@@ -114,7 +127,10 @@ impl EditTransaction {
             }
             EditOperation::Append { content } => {
                 use std::io::Write;
-                let mut file = std::fs::OpenOptions::new().append(true).create(true).open(&edit.path)
+                let mut file = std::fs::OpenOptions::new()
+                    .append(true)
+                    .create(true)
+                    .open(&edit.path)
                     .map_err(|e| format!("Can't open {}: {}", edit.path.display(), e))?;
                 file.write_all(content.as_bytes())
                     .map_err(|e| format!("Can't append to {}: {}", edit.path.display(), e))?;
@@ -128,7 +144,11 @@ impl EditTransaction {
                 lines.insert(idx, content.as_str());
                 std::fs::write(&edit.path, lines.join("\n"))
                     .map_err(|e| format!("Can't write {}: {}", edit.path.display(), e))?;
-                Ok(format!("Inserted at line {} in {}", line, edit.path.display()))
+                Ok(format!(
+                    "Inserted at line {} in {}",
+                    line,
+                    edit.path.display()
+                ))
             }
             EditOperation::Delete => {
                 std::fs::remove_file(&edit.path)
@@ -139,9 +159,19 @@ impl EditTransaction {
                 if let Some(parent) = new_path.parent() {
                     std::fs::create_dir_all(parent).ok();
                 }
-                std::fs::rename(&edit.path, new_path)
-                    .map_err(|e| format!("Can't rename {} → {}: {}", edit.path.display(), new_path.display(), e))?;
-                Ok(format!("Renamed {} → {}", edit.path.display(), new_path.display()))
+                std::fs::rename(&edit.path, new_path).map_err(|e| {
+                    format!(
+                        "Can't rename {} → {}: {}",
+                        edit.path.display(),
+                        new_path.display(),
+                        e
+                    )
+                })?;
+                Ok(format!(
+                    "Renamed {} → {}",
+                    edit.path.display(),
+                    new_path.display()
+                ))
             }
         }
     }
@@ -207,7 +237,13 @@ mod tests {
         std::fs::write(&file, "hello world").unwrap();
 
         let mut tx = EditTransaction::new();
-        tx.add(FileEdit { path: file.clone(), operation: EditOperation::Replace { search: "world".into(), replace: "rust".into() } });
+        tx.add(FileEdit {
+            path: file.clone(),
+            operation: EditOperation::Replace {
+                search: "world".into(),
+                replace: "rust".into(),
+            },
+        });
         let results = tx.apply().unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "hello rust");
@@ -225,8 +261,20 @@ mod tests {
         // file2 doesn't exist — edit will fail
 
         let mut tx = EditTransaction::new();
-        tx.add(FileEdit { path: file1.clone(), operation: EditOperation::Replace { search: "original".into(), replace: "modified".into() } });
-        tx.add(FileEdit { path: file2.clone(), operation: EditOperation::Replace { search: "x".into(), replace: "y".into() } });
+        tx.add(FileEdit {
+            path: file1.clone(),
+            operation: EditOperation::Replace {
+                search: "original".into(),
+                replace: "modified".into(),
+            },
+        });
+        tx.add(FileEdit {
+            path: file2.clone(),
+            operation: EditOperation::Replace {
+                search: "x".into(),
+                replace: "y".into(),
+            },
+        });
 
         let result = tx.apply();
         assert!(result.is_err());
@@ -242,18 +290,31 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
 
         let mut tx = EditTransaction::new();
-        tx.add(FileEdit { path: dir.join("new.txt"), operation: EditOperation::Create { content: "new file".into() } });
+        tx.add(FileEdit {
+            path: dir.join("new.txt"),
+            operation: EditOperation::Create {
+                content: "new file".into(),
+            },
+        });
         tx.apply().unwrap();
         assert!(dir.join("new.txt").exists());
 
         let mut tx2 = EditTransaction::new();
-        tx2.add(FileEdit { path: dir.join("new.txt"), operation: EditOperation::Rename { new_path: dir.join("renamed.txt") } });
+        tx2.add(FileEdit {
+            path: dir.join("new.txt"),
+            operation: EditOperation::Rename {
+                new_path: dir.join("renamed.txt"),
+            },
+        });
         tx2.apply().unwrap();
         assert!(!dir.join("new.txt").exists());
         assert!(dir.join("renamed.txt").exists());
 
         let mut tx3 = EditTransaction::new();
-        tx3.add(FileEdit { path: dir.join("renamed.txt"), operation: EditOperation::Delete });
+        tx3.add(FileEdit {
+            path: dir.join("renamed.txt"),
+            operation: EditOperation::Delete,
+        });
         tx3.apply().unwrap();
         assert!(!dir.join("renamed.txt").exists());
 

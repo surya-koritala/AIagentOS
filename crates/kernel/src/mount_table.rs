@@ -10,9 +10,9 @@ use crate::agent_struct::AgentId;
 /// A mount entry.
 #[derive(Debug, Clone)]
 pub struct MountEntry {
-    pub source: String,      // e.g., "mcp://github" or "builtin://filesystem"
-    pub target: String,      // e.g., "/tools/github"
-    pub fs_type: String,     // e.g., "mcp", "builtin", "wasm"
+    pub source: String,  // e.g., "mcp://github" or "builtin://filesystem"
+    pub target: String,  // e.g., "/tools/github"
+    pub fs_type: String, // e.g., "mcp", "builtin", "wasm"
     pub flags: MountFlags,
     pub mounted_by: AgentId,
 }
@@ -31,21 +31,40 @@ pub struct MountTable {
 }
 
 impl MountTable {
-    pub fn new() -> Self { Self { mounts: Vec::new() } }
+    pub fn new() -> Self {
+        Self { mounts: Vec::new() }
+    }
 
     /// Mount a tool provider at a path.
-    pub fn mount(&mut self, source: String, target: String, fs_type: String, flags: MountFlags, agent_id: AgentId) -> Result<(), &'static str> {
+    pub fn mount(
+        &mut self,
+        source: String,
+        target: String,
+        fs_type: String,
+        flags: MountFlags,
+        agent_id: AgentId,
+    ) -> Result<(), &'static str> {
         // Check target not already mounted
         if self.mounts.iter().any(|m| m.target == target) {
             return Err("mount point busy (EBUSY)");
         }
-        self.mounts.push(MountEntry { source, target, fs_type, flags, mounted_by: agent_id });
+        self.mounts.push(MountEntry {
+            source,
+            target,
+            fs_type,
+            flags,
+            mounted_by: agent_id,
+        });
         Ok(())
     }
 
     /// Unmount a path.
     pub fn unmount(&mut self, target: &str) -> Result<(), &'static str> {
-        let idx = self.mounts.iter().position(|m| m.target == target).ok_or("not mounted (EINVAL)")?;
+        let idx = self
+            .mounts
+            .iter()
+            .position(|m| m.target == target)
+            .ok_or("not mounted (EINVAL)")?;
         self.mounts.remove(idx);
         Ok(())
     }
@@ -66,14 +85,20 @@ impl MountTable {
     }
 
     /// List all mounts.
-    pub fn list(&self) -> &[MountEntry] { &self.mounts }
+    pub fn list(&self) -> &[MountEntry] {
+        &self.mounts
+    }
 
     /// Count mounts.
-    pub fn count(&self) -> usize { self.mounts.len() }
+    pub fn count(&self) -> usize {
+        self.mounts.len()
+    }
 
     /// Check if a path is mounted read-only.
     pub fn is_readonly(&self, path: &str) -> bool {
-        self.resolve(path).map(|(m, _)| m.flags.read_only).unwrap_or(false)
+        self.resolve(path)
+            .map(|(m, _)| m.flags.read_only)
+            .unwrap_or(false)
     }
 }
 
@@ -84,7 +109,15 @@ mod tests {
     #[test]
     fn mount_and_resolve() {
         let mut table = MountTable::new();
-        table.mount("builtin://fs".into(), "/tools/fs".into(), "builtin".into(), MountFlags::default(), 1).unwrap();
+        table
+            .mount(
+                "builtin://fs".into(),
+                "/tools/fs".into(),
+                "builtin".into(),
+                MountFlags::default(),
+                1,
+            )
+            .unwrap();
         let (entry, remainder) = table.resolve("/tools/fs/read").unwrap();
         assert_eq!(entry.source, "builtin://fs");
         assert_eq!(remainder, "read");
@@ -93,8 +126,24 @@ mod tests {
     #[test]
     fn longest_match() {
         let mut table = MountTable::new();
-        table.mount("a".into(), "/tools".into(), "x".into(), MountFlags::default(), 1).unwrap();
-        table.mount("b".into(), "/tools/github".into(), "mcp".into(), MountFlags::default(), 1).unwrap();
+        table
+            .mount(
+                "a".into(),
+                "/tools".into(),
+                "x".into(),
+                MountFlags::default(),
+                1,
+            )
+            .unwrap();
+        table
+            .mount(
+                "b".into(),
+                "/tools/github".into(),
+                "mcp".into(),
+                MountFlags::default(),
+                1,
+            )
+            .unwrap();
         let (entry, _) = table.resolve("/tools/github/issues").unwrap();
         assert_eq!(entry.source, "b");
     }
@@ -102,7 +151,15 @@ mod tests {
     #[test]
     fn unmount() {
         let mut table = MountTable::new();
-        table.mount("x".into(), "/mnt".into(), "t".into(), MountFlags::default(), 1).unwrap();
+        table
+            .mount(
+                "x".into(),
+                "/mnt".into(),
+                "t".into(),
+                MountFlags::default(),
+                1,
+            )
+            .unwrap();
         table.unmount("/mnt").unwrap();
         assert_eq!(table.count(), 0);
     }
@@ -110,15 +167,40 @@ mod tests {
     #[test]
     fn duplicate_mount_fails() {
         let mut table = MountTable::new();
-        table.mount("a".into(), "/mnt".into(), "t".into(), MountFlags::default(), 1).unwrap();
-        let result = table.mount("b".into(), "/mnt".into(), "t".into(), MountFlags::default(), 1);
+        table
+            .mount(
+                "a".into(),
+                "/mnt".into(),
+                "t".into(),
+                MountFlags::default(),
+                1,
+            )
+            .unwrap();
+        let result = table.mount(
+            "b".into(),
+            "/mnt".into(),
+            "t".into(),
+            MountFlags::default(),
+            1,
+        );
         assert!(result.is_err());
     }
 
     #[test]
     fn readonly_check() {
         let mut table = MountTable::new();
-        table.mount("x".into(), "/ro".into(), "t".into(), MountFlags { read_only: true, ..Default::default() }, 1).unwrap();
+        table
+            .mount(
+                "x".into(),
+                "/ro".into(),
+                "t".into(),
+                MountFlags {
+                    read_only: true,
+                    ..Default::default()
+                },
+                1,
+            )
+            .unwrap();
         assert!(table.is_readonly("/ro/file"));
     }
 }
@@ -134,15 +216,29 @@ pub enum ToolEvent {
 
 impl MountTable {
     /// Hot-plug: mount a new tool and notify agents.
-    pub fn hot_mount(&mut self, source: String, target: String, fs_type: String, agent_id: u64) -> Result<ToolEvent, &'static str> {
-        self.mount(source.clone(), target.clone(), fs_type, MountFlags::default(), agent_id)?;
+    pub fn hot_mount(
+        &mut self,
+        source: String,
+        target: String,
+        fs_type: String,
+        agent_id: u64,
+    ) -> Result<ToolEvent, &'static str> {
+        self.mount(
+            source.clone(),
+            target.clone(),
+            fs_type,
+            MountFlags::default(),
+            agent_id,
+        )?;
         Ok(ToolEvent::Mounted { target, source })
     }
 
     /// Hot-unplug: unmount a tool and notify agents.
     pub fn hot_unmount(&mut self, target: &str) -> Result<ToolEvent, &'static str> {
         self.unmount(target)?;
-        Ok(ToolEvent::Unmounted { target: target.to_string() })
+        Ok(ToolEvent::Unmounted {
+            target: target.to_string(),
+        })
     }
 }
 
@@ -153,7 +249,9 @@ mod hotplug_tests {
     #[test]
     fn hot_mount_emits_event() {
         let mut table = MountTable::new();
-        let event = table.hot_mount("mcp://slack".into(), "/tools/slack".into(), "mcp".into(), 1).unwrap();
+        let event = table
+            .hot_mount("mcp://slack".into(), "/tools/slack".into(), "mcp".into(), 1)
+            .unwrap();
         assert!(matches!(event, ToolEvent::Mounted { .. }));
         assert_eq!(table.count(), 1);
     }
@@ -161,7 +259,9 @@ mod hotplug_tests {
     #[test]
     fn hot_unmount_emits_event() {
         let mut table = MountTable::new();
-        table.hot_mount("x".into(), "/mnt".into(), "t".into(), 1).unwrap();
+        table
+            .hot_mount("x".into(), "/mnt".into(), "t".into(), 1)
+            .unwrap();
         let event = table.hot_unmount("/mnt").unwrap();
         assert!(matches!(event, ToolEvent::Unmounted { .. }));
         assert_eq!(table.count(), 0);

@@ -138,20 +138,34 @@ impl AgentCtl {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::init_system::{ServiceDef, ExecConfig, ServiceConfig, DependencyConfig, ResourceConfig};
+    use crate::init_system::{
+        DependencyConfig, ExecConfig, ResourceConfig, ServiceConfig, ServiceDef,
+    };
 
     fn setup() -> AgentCtl {
         let mut init = InitSystem::new();
         init.load_service(ServiceDef {
-            name: "researcher".into(), description: None,
-            exec: ExecConfig { provider: "openai".into(), system_prompt: "research".into(), tools: vec![], model: None },
+            name: "researcher".into(),
+            description: None,
+            exec: ExecConfig {
+                provider: "openai".into(),
+                system_prompt: "research".into(),
+                tools: vec![],
+                model: None,
+            },
             service: ServiceConfig::default(),
             dependencies: DependencyConfig::default(),
             resources: ResourceConfig::default(),
         });
         init.load_service(ServiceDef {
-            name: "coder".into(), description: None,
-            exec: ExecConfig { provider: "openai".into(), system_prompt: "code".into(), tools: vec![], model: None },
+            name: "coder".into(),
+            description: None,
+            exec: ExecConfig {
+                provider: "openai".into(),
+                system_prompt: "code".into(),
+                tools: vec![],
+                model: None,
+            },
             service: ServiceConfig::default(),
             dependencies: DependencyConfig::default(),
             resources: ResourceConfig::default(),
@@ -163,7 +177,8 @@ mod tests {
     fn list_services() {
         let ctl = setup();
         let result = ctl.execute(&["list"]);
-        assert!(matches!(result, AgentCtlResult::Table(ref t) if t.len() == 3)); // header + 2 services
+        assert!(matches!(result, AgentCtlResult::Table(ref t) if t.len() == 3));
+        // header + 2 services
     }
 
     #[test]

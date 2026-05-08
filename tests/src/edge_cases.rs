@@ -1,18 +1,18 @@
 //! Edge case tests for all modules.
 //! Tests boundary conditions, error paths, and unusual inputs.
 
-use std::sync::Arc;
-use kernel::*;
-use kernel::context::*;
-use kernel::tools::*;
 use kernel::connector::*;
-use kernel::planning::*;
-use kernel::editing::*;
-use kernel::learning::*;
-use kernel::rate_limit::*;
-use kernel::production::*;
-use kernel::indexer::*;
+use kernel::context::*;
 use kernel::database::*;
+use kernel::editing::*;
+use kernel::indexer::*;
+use kernel::learning::*;
+use kernel::planning::*;
+use kernel::production::*;
+use kernel::rate_limit::*;
+use kernel::tools::*;
+use kernel::*;
+use std::sync::Arc;
 
 // ─── Execution Edge Cases ────────────────────────────────────────────────────
 
@@ -21,11 +21,17 @@ async fn execution_empty_message() {
     // Empty message should still work (LLM handles it)
     let kernel = AgentKernelImpl::new().unwrap();
     // Can't test without provider, but verify kernel doesn't panic on empty
-    let handle = kernel.create_agent_full(AgentConfig {
-        name: "test".into(), task: "test".into(),
-        llm_provider: "nonexistent".into(), permission_profile: "standard".into(),
-        priority: Priority::default(), sandbox_config: None,
-    }).await.unwrap();
+    let handle = kernel
+        .create_agent_full(AgentConfig {
+            name: "test".into(),
+            task: "test".into(),
+            llm_provider: "nonexistent".into(),
+            permission_profile: "standard".into(),
+            priority: Priority::default(),
+            sandbox_config: None,
+        })
+        .await
+        .unwrap();
     // send_message with empty string should return error (no provider), not panic
     let result = kernel.send_message(handle.id, "").await;
     assert!(result.is_err());
@@ -35,11 +41,17 @@ async fn execution_empty_message() {
 async fn execution_very_long_message() {
     // 100KB message shouldn't panic
     let kernel = AgentKernelImpl::new().unwrap();
-    let handle = kernel.create_agent_full(AgentConfig {
-        name: "test".into(), task: "test".into(),
-        llm_provider: "nonexistent".into(), permission_profile: "standard".into(),
-        priority: Priority::default(), sandbox_config: None,
-    }).await.unwrap();
+    let handle = kernel
+        .create_agent_full(AgentConfig {
+            name: "test".into(),
+            task: "test".into(),
+            llm_provider: "nonexistent".into(),
+            permission_profile: "standard".into(),
+            priority: Priority::default(),
+            sandbox_config: None,
+        })
+        .await
+        .unwrap();
     let long_msg = "x".repeat(100_000);
     let result = kernel.send_message(handle.id, &long_msg).await;
     assert!(result.is_err()); // No provider, but shouldn't panic
@@ -69,7 +81,10 @@ async fn context_persist_unicode_content() {
     });
     mgr.persist_context(id, &ctx).await.unwrap();
     let restored = mgr.restore_context(id).await.unwrap();
-    assert_eq!(restored.conversation_history[0].content, "こんにちは 🌍 émojis ñ ü ∞ 中文");
+    assert_eq!(
+        restored.conversation_history[0].content,
+        "こんにちは 🌍 émojis ñ ü ∞ 中文"
+    );
 }
 
 #[tokio::test]
@@ -85,7 +100,9 @@ async fn context_conversation_save_empty_messages() {
 async fn context_search_special_characters() {
     let mgr = SqliteContextManager::in_memory().unwrap();
     let id = uuid::Uuid::new_v4();
-    let msgs = vec![StandardMessage::user("test with 'quotes' and \"double quotes\"")];
+    let msgs = vec![StandardMessage::user(
+        "test with 'quotes' and \"double quotes\"",
+    )];
     mgr.save_conversation("conv_special", id, &msgs).unwrap();
     // Search shouldn't crash on special chars
     let results = mgr.search_conversations("quotes");
@@ -100,7 +117,11 @@ fn tools_resolve_with_missing_arguments() {
     let reg = ToolRegistry::new();
     let agent_id = uuid::Uuid::new_v4();
     // Tool call with empty arguments
-    let tc = ToolCall { id: "1".into(), name: "read_file".into(), arguments: serde_json::json!({}) };
+    let tc = ToolCall {
+        id: "1".into(),
+        name: "read_file".into(),
+        arguments: serde_json::json!({}),
+    };
     let req = reg.resolve(agent_id, &tc);
     assert!(req.is_some()); // Should resolve (missing path handled by provider)
 }
@@ -109,7 +130,11 @@ fn tools_resolve_with_missing_arguments() {
 fn tools_resolve_with_null_arguments() {
     let reg = ToolRegistry::new();
     let agent_id = uuid::Uuid::new_v4();
-    let tc = ToolCall { id: "1".into(), name: "read_file".into(), arguments: serde_json::Value::Null };
+    let tc = ToolCall {
+        id: "1".into(),
+        name: "read_file".into(),
+        arguments: serde_json::Value::Null,
+    };
     let req = reg.resolve(agent_id, &tc);
     assert!(req.is_some());
 }
@@ -118,16 +143,24 @@ fn tools_resolve_with_null_arguments() {
 fn tools_custom_template_with_missing_param() {
     let mut reg = ToolRegistry::new();
     reg.register(ToolBinding {
-        name: "custom".into(), description: "test".into(),
+        name: "custom".into(),
+        description: "test".into(),
         parameters_schema: serde_json::json!({}),
         resource_type: kernel::resources::ResourceType::Application,
         operation: "launch".into(),
     });
     reg.register_command_template("custom", "echo", &["{missing_param}".into()]);
-    let tc = ToolCall { id: "1".into(), name: "custom".into(), arguments: serde_json::json!({"other": "val"}) };
+    let tc = ToolCall {
+        id: "1".into(),
+        name: "custom".into(),
+        arguments: serde_json::json!({"other": "val"}),
+    };
     let req = reg.resolve(uuid::Uuid::new_v4(), &tc).unwrap();
     // Missing param should remain as literal {missing_param}
-    assert!(req.parameters["args"][0].as_str().unwrap().contains("{missing_param}"));
+    assert!(req.parameters["args"][0]
+        .as_str()
+        .unwrap()
+        .contains("{missing_param}"));
 }
 
 // ─── Planning Edge Cases ─────────────────────────────────────────────────────
@@ -161,7 +194,13 @@ fn editing_replace_not_found() {
     std::fs::write(&file, "hello world").unwrap();
 
     let mut tx = EditTransaction::new();
-    tx.add(FileEdit { path: file.clone(), operation: EditOperation::Replace { search: "NOTFOUND".into(), replace: "x".into() } });
+    tx.add(FileEdit {
+        path: file.clone(),
+        operation: EditOperation::Replace {
+            search: "NOTFOUND".into(),
+            replace: "x".into(),
+        },
+    });
     let result = tx.apply();
     assert!(result.is_err());
     // File should be unchanged
@@ -171,9 +210,17 @@ fn editing_replace_not_found() {
 
 #[test]
 fn editing_create_in_nonexistent_directory() {
-    let path = std::env::temp_dir().join(format!("edge_{}/deep/nested/file.txt", uuid::Uuid::new_v4()));
+    let path = std::env::temp_dir().join(format!(
+        "edge_{}/deep/nested/file.txt",
+        uuid::Uuid::new_v4()
+    ));
     let mut tx = EditTransaction::new();
-    tx.add(FileEdit { path: path.clone(), operation: EditOperation::Create { content: "hello".into() } });
+    tx.add(FileEdit {
+        path: path.clone(),
+        operation: EditOperation::Create {
+            content: "hello".into(),
+        },
+    });
     let result = tx.apply();
     assert!(result.is_ok());
     assert_eq!(std::fs::read_to_string(&path).unwrap(), "hello");
@@ -195,7 +242,11 @@ fn editing_empty_file_operations() {
 async fn rate_limit_zero_rpm() {
     // rpm=0 should effectively block everything... but our impl uses u32
     // This tests the boundary
-    let limiter = RateLimiter::new(RateLimitConfig { rpm: 1, tpm: 100, max_concurrent: 1 });
+    let limiter = RateLimiter::new(RateLimitConfig {
+        rpm: 1,
+        tpm: 100,
+        max_concurrent: 1,
+    });
     let _g = limiter.acquire().await;
     assert!(limiter.is_limited()); // 1 >= 1
 }
@@ -273,12 +324,17 @@ fn indexer_deeply_nested() {
 fn database_sql_injection_attempt() {
     let path = "/tmp/edge_db_inject.db";
     let conn = rusqlite::Connection::open(path).unwrap();
-    conn.execute("CREATE TABLE IF NOT EXISTS t (x TEXT)", []).unwrap();
+    conn.execute("CREATE TABLE IF NOT EXISTS t (x TEXT)", [])
+        .unwrap();
     conn.execute("INSERT INTO t VALUES ('safe')", []).unwrap();
     drop(conn);
 
     // This should not execute the DROP TABLE
-    let result = query_sqlite(path, "SELECT * FROM t WHERE x = 'a'; DROP TABLE t; --'", true);
+    let result = query_sqlite(
+        path,
+        "SELECT * FROM t WHERE x = 'a'; DROP TABLE t; --'",
+        true,
+    );
     // SQLite doesn't execute multiple statements in one query_row, so this is safe
     // But it might error — either way, table should still exist
     let check = query_sqlite(path, "SELECT COUNT(*) FROM t", true);

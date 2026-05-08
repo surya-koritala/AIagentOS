@@ -6,8 +6,8 @@ use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 
-use crate::AgentId;
 use crate::scheduler::ResourceMetrics;
+use crate::AgentId;
 
 /// An action performed by an agent.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -76,7 +76,11 @@ pub enum MetricScope {
 pub trait ObservabilityEngine: Send + Sync {
     fn log_action(&self, agent_id: AgentId, action: AgentAction);
     fn get_activity_log(&self, agent_id: AgentId, filter: Option<&LogFilter>) -> Vec<AgentAction>;
-    fn get_reasoning_chain(&self, agent_id: AgentId, action_id: uuid::Uuid) -> Option<Vec<ReasoningStep>>;
+    fn get_reasoning_chain(
+        &self,
+        agent_id: AgentId,
+        action_id: uuid::Uuid,
+    ) -> Option<Vec<ReasoningStep>>;
     fn get_agent_plan(&self, agent_id: AgentId) -> Vec<PlanStep>;
     fn set_agent_plan(&self, agent_id: AgentId, plan: Vec<PlanStep>);
     fn get_metrics(&self, scope: MetricScope) -> Metrics;
@@ -133,11 +137,20 @@ impl ObservabilityEngineImpl {
     fn check_deviation(&self, agent_id: AgentId, action: &AgentAction) {
         if let Some(plan) = self.agent_plans.get(&agent_id) {
             // Find the next pending/in-progress step
-            let next_step = plan.iter().find(|s| s.status == PlanStepStatus::Pending || s.status == PlanStepStatus::InProgress);
+            let next_step = plan.iter().find(|s| {
+                s.status == PlanStepStatus::Pending || s.status == PlanStepStatus::InProgress
+            });
             if let Some(step) = next_step {
                 // Simple deviation check: if action description doesn't contain plan step keywords
-                if !action.description.to_lowercase().contains(&step.description.to_lowercase())
-                    && !step.description.to_lowercase().contains(&action.action_type.to_lowercase()) {
+                if !action
+                    .description
+                    .to_lowercase()
+                    .contains(&step.description.to_lowercase())
+                    && !step
+                        .description
+                        .to_lowercase()
+                        .contains(&action.action_type.to_lowercase())
+                {
                     let handlers = self.deviation_handlers.lock().unwrap();
                     for handler in handlers.iter() {
                         handler(agent_id, action);
@@ -161,22 +174,35 @@ impl ObservabilityEngine for ObservabilityEngineImpl {
     }
 
     fn get_activity_log(&self, agent_id: AgentId, filter: Option<&LogFilter>) -> Vec<AgentAction> {
-        let logs = self.action_logs.get(&agent_id).map(|l| l.clone()).unwrap_or_default();
+        let logs = self
+            .action_logs
+            .get(&agent_id)
+            .map(|l| l.clone())
+            .unwrap_or_default();
         match filter {
             None => logs,
             Some(f) => {
-                let mut filtered: Vec<_> = logs.into_iter().filter(|a| {
-                    if let Some(ref at) = f.action_type {
-                        if &a.action_type != at { return false; }
-                    }
-                    if let Some(from) = f.from {
-                        if a.timestamp < from { return false; }
-                    }
-                    if let Some(to) = f.to {
-                        if a.timestamp > to { return false; }
-                    }
-                    true
-                }).collect();
+                let mut filtered: Vec<_> = logs
+                    .into_iter()
+                    .filter(|a| {
+                        if let Some(ref at) = f.action_type {
+                            if &a.action_type != at {
+                                return false;
+                            }
+                        }
+                        if let Some(from) = f.from {
+                            if a.timestamp < from {
+                                return false;
+                            }
+                        }
+                        if let Some(to) = f.to {
+                            if a.timestamp > to {
+                                return false;
+                            }
+                        }
+                        true
+                    })
+                    .collect();
                 if let Some(limit) = f.limit {
                     filtered.truncate(limit);
                 }
@@ -185,12 +211,21 @@ impl ObservabilityEngine for ObservabilityEngineImpl {
         }
     }
 
-    fn get_reasoning_chain(&self, agent_id: AgentId, action_id: uuid::Uuid) -> Option<Vec<ReasoningStep>> {
-        self.reasoning_chains.get(&(agent_id, action_id)).map(|r| r.clone())
+    fn get_reasoning_chain(
+        &self,
+        agent_id: AgentId,
+        action_id: uuid::Uuid,
+    ) -> Option<Vec<ReasoningStep>> {
+        self.reasoning_chains
+            .get(&(agent_id, action_id))
+            .map(|r| r.clone())
     }
 
     fn get_agent_plan(&self, agent_id: AgentId) -> Vec<PlanStep> {
-        self.agent_plans.get(&agent_id).map(|p| p.clone()).unwrap_or_default()
+        self.agent_plans
+            .get(&agent_id)
+            .map(|p| p.clone())
+            .unwrap_or_default()
     }
 
     fn set_agent_plan(&self, agent_id: AgentId, plan: Vec<PlanStep>) {
@@ -199,9 +234,11 @@ impl ObservabilityEngine for ObservabilityEngineImpl {
 
     fn get_metrics(&self, scope: MetricScope) -> Metrics {
         match scope {
-            MetricScope::Agent(id) => {
-                self.agent_metrics.get(&id).map(|m| m.clone()).unwrap_or_default()
-            }
+            MetricScope::Agent(id) => self
+                .agent_metrics
+                .get(&id)
+                .map(|m| m.clone())
+                .unwrap_or_default(),
             MetricScope::System => {
                 let mut total = Metrics::default();
                 for entry in self.agent_metrics.iter() {
@@ -215,13 +252,19 @@ impl ObservabilityEngine for ObservabilityEngineImpl {
     }
 
     fn record_metrics(&self, agent_id: AgentId, tokens: u64, api_calls: u64) {
-        let mut metrics = self.agent_metrics.entry(agent_id).or_insert_with(Metrics::default);
+        let mut metrics = self
+            .agent_metrics
+            .entry(agent_id)
+            .or_insert_with(Metrics::default);
         metrics.tokens_consumed += tokens;
         metrics.api_calls_made += api_calls;
     }
 
     fn add_reasoning_step(&self, agent_id: AgentId, action_id: uuid::Uuid, step: ReasoningStep) {
-        let mut chain = self.reasoning_chains.entry((agent_id, action_id)).or_insert_with(Vec::new);
+        let mut chain = self
+            .reasoning_chains
+            .entry((agent_id, action_id))
+            .or_insert_with(Vec::new);
         chain.push(step);
         if chain.len() > self.max_entries_per_agent {
             let drop = chain.len() - self.max_entries_per_agent;
@@ -230,7 +273,10 @@ impl ObservabilityEngine for ObservabilityEngineImpl {
     }
 
     fn on_deviation(&self, handler: Box<dyn Fn(AgentId, &AgentAction) + Send + Sync>) {
-        self.deviation_handlers.lock().unwrap().push(Arc::from(handler));
+        self.deviation_handlers
+            .lock()
+            .unwrap()
+            .push(Arc::from(handler));
     }
 }
 
@@ -273,15 +319,18 @@ mod tests {
         let engine = ObservabilityEngineImpl::with_retention(5);
         let id = uuid::Uuid::new_v4();
         for i in 0..20 {
-            engine.log_action(id, AgentAction {
-                id: uuid::Uuid::new_v4(),
-                action_type: format!("act-{}", i),
-                description: format!("desc-{}", i),
-                resources_accessed: vec![],
-                reasoning: None,
-                plan_context: None,
-                timestamp: Utc::now(),
-            });
+            engine.log_action(
+                id,
+                AgentAction {
+                    id: uuid::Uuid::new_v4(),
+                    action_type: format!("act-{}", i),
+                    description: format!("desc-{}", i),
+                    resources_accessed: vec![],
+                    reasoning: None,
+                    plan_context: None,
+                    timestamp: Utc::now(),
+                },
+            );
         }
         let log = engine.get_activity_log(id, None);
         assert_eq!(log.len(), 5, "retention cap should hold log at 5 entries");
@@ -294,15 +343,18 @@ mod tests {
     fn purge_agent_clears_all_state() {
         let engine = ObservabilityEngineImpl::new();
         let id = uuid::Uuid::new_v4();
-        engine.log_action(id, AgentAction {
-            id: uuid::Uuid::new_v4(),
-            action_type: "x".into(),
-            description: "d".into(),
-            resources_accessed: vec![],
-            reasoning: None,
-            plan_context: None,
-            timestamp: Utc::now(),
-        });
+        engine.log_action(
+            id,
+            AgentAction {
+                id: uuid::Uuid::new_v4(),
+                action_type: "x".into(),
+                description: "d".into(),
+                resources_accessed: vec![],
+                reasoning: None,
+                plan_context: None,
+                timestamp: Utc::now(),
+            },
+        );
         engine.record_metrics(id, 100, 1);
         engine.purge_agent(id);
         assert!(engine.get_activity_log(id, None).is_empty());
@@ -315,12 +367,16 @@ mod tests {
         let engine = ObservabilityEngineImpl::new();
         let agent_id = uuid::Uuid::new_v4();
         let action_id = uuid::Uuid::new_v4();
-        engine.add_reasoning_step(agent_id, action_id, ReasoningStep {
-            thought: "Need to read file".into(),
-            evidence: Some("User asked for file contents".into()),
-            conclusion: Some("Will use filesystem.read".into()),
-            timestamp: Utc::now(),
-        });
+        engine.add_reasoning_step(
+            agent_id,
+            action_id,
+            ReasoningStep {
+                thought: "Need to read file".into(),
+                evidence: Some("User asked for file contents".into()),
+                conclusion: Some("Will use filesystem.read".into()),
+                timestamp: Utc::now(),
+            },
+        );
         let chain = engine.get_reasoning_chain(agent_id, action_id).unwrap();
         assert_eq!(chain.len(), 1);
         assert_eq!(chain[0].thought, "Need to read file");
@@ -333,9 +389,14 @@ mod tests {
         let agent_id = uuid::Uuid::new_v4();
 
         // Set a plan
-        engine.set_agent_plan(agent_id, vec![
-            PlanStep { step_number: 1, description: "Read config file".into(), status: PlanStepStatus::Pending },
-        ]);
+        engine.set_agent_plan(
+            agent_id,
+            vec![PlanStep {
+                step_number: 1,
+                description: "Read config file".into(),
+                status: PlanStepStatus::Pending,
+            }],
+        );
 
         // Register deviation handler
         let deviated = Arc::new(AtomicBool::new(false));
@@ -345,15 +406,18 @@ mod tests {
         }));
 
         // Log an action that doesn't match the plan
-        engine.log_action(agent_id, AgentAction {
-            id: uuid::Uuid::new_v4(),
-            action_type: "network_call".into(),
-            description: "Send HTTP request to API".into(),
-            resources_accessed: vec![],
-            reasoning: None,
-            plan_context: None,
-            timestamp: Utc::now(),
-        });
+        engine.log_action(
+            agent_id,
+            AgentAction {
+                id: uuid::Uuid::new_v4(),
+                action_type: "network_call".into(),
+                description: "Send HTTP request to API".into(),
+                resources_accessed: vec![],
+                reasoning: None,
+                plan_context: None,
+                timestamp: Utc::now(),
+            },
+        );
 
         assert!(deviated.load(Ordering::SeqCst));
     }

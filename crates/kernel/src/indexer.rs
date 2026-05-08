@@ -30,11 +30,24 @@ impl RepoMap {
         let mut total_lines = 0;
         Self::scan_dir(root, root, &mut files, &mut total_lines, 0);
         let total_files = files.len();
-        Self { root: root.to_path_buf(), files, total_files, total_lines }
+        Self {
+            root: root.to_path_buf(),
+            files,
+            total_files,
+            total_lines,
+        }
     }
 
-    fn scan_dir(root: &Path, dir: &Path, files: &mut Vec<FileEntry>, total_lines: &mut usize, depth: usize) {
-        if depth > 5 { return; } // Max depth
+    fn scan_dir(
+        root: &Path,
+        dir: &Path,
+        files: &mut Vec<FileEntry>,
+        total_lines: &mut usize,
+        depth: usize,
+    ) {
+        if depth > 5 {
+            return;
+        } // Max depth
         let entries = match std::fs::read_dir(dir) {
             Ok(e) => e,
             Err(_) => return,
@@ -45,7 +58,12 @@ impl RepoMap {
             let name = entry.file_name().to_string_lossy().to_string();
 
             // Skip hidden dirs, target, node_modules, etc.
-            if name.starts_with('.') || name == "target" || name == "node_modules" || name == "dist" || name == "__pycache__" {
+            if name.starts_with('.')
+                || name == "target"
+                || name == "node_modules"
+                || name == "dist"
+                || name == "__pycache__"
+            {
                 continue;
             }
 
@@ -56,8 +74,17 @@ impl RepoMap {
                     let lines = content.lines().count();
                     *total_lines += lines;
                     let symbols = extract_symbols(&content, &lang);
-                    let rel_path = path.strip_prefix(root).unwrap_or(&path).to_string_lossy().to_string();
-                    files.push(FileEntry { path: rel_path, language: lang, lines, symbols });
+                    let rel_path = path
+                        .strip_prefix(root)
+                        .unwrap_or(&path)
+                        .to_string_lossy()
+                        .to_string();
+                    files.push(FileEntry {
+                        path: rel_path,
+                        language: lang,
+                        lines,
+                        symbols,
+                    });
                 }
             }
         }
@@ -65,15 +92,28 @@ impl RepoMap {
 
     /// Format as a condensed string for the LLM system prompt.
     pub fn to_prompt(&self, max_chars: usize) -> String {
-        let mut out = format!("Repository: {} ({} files, {} lines)\n\n", self.root.display(), self.total_files, self.total_lines);
+        let mut out = format!(
+            "Repository: {} ({} files, {} lines)\n\n",
+            self.root.display(),
+            self.total_files,
+            self.total_lines
+        );
 
         for file in &self.files {
             let line = if file.symbols.is_empty() {
                 format!("{} ({}, {} lines)\n", file.path, file.language, file.lines)
             } else {
-                format!("{} ({}, {} lines): {}\n", file.path, file.language, file.lines, file.symbols.join(", "))
+                format!(
+                    "{} ({}, {} lines): {}\n",
+                    file.path,
+                    file.language,
+                    file.lines,
+                    file.symbols.join(", ")
+                )
             };
-            if out.len() + line.len() > max_chars { break; }
+            if out.len() + line.len() > max_chars {
+                break;
+            }
             out.push_str(&line);
         }
         out
@@ -109,24 +149,51 @@ fn extract_symbols(content: &str, language: &str) -> Vec<String> {
         let sym = match language {
             "Rust" => {
                 if trimmed.starts_with("pub fn ") || trimmed.starts_with("fn ") {
-                    trimmed.split('(').next().and_then(|s| s.split_whitespace().last()).map(|s| s.to_string())
+                    trimmed
+                        .split('(')
+                        .next()
+                        .and_then(|s| s.split_whitespace().last())
+                        .map(|s| s.to_string())
                 } else if trimmed.starts_with("pub struct ") || trimmed.starts_with("struct ") {
-                    trimmed.split_whitespace().nth(if trimmed.starts_with("pub") { 2 } else { 1 }).map(|s| s.trim_end_matches('{').to_string())
+                    trimmed
+                        .split_whitespace()
+                        .nth(if trimmed.starts_with("pub") { 2 } else { 1 })
+                        .map(|s| s.trim_end_matches('{').to_string())
                 } else if trimmed.starts_with("pub enum ") || trimmed.starts_with("enum ") {
-                    trimmed.split_whitespace().nth(if trimmed.starts_with("pub") { 2 } else { 1 }).map(|s| s.trim_end_matches('{').to_string())
-                } else { None }
+                    trimmed
+                        .split_whitespace()
+                        .nth(if trimmed.starts_with("pub") { 2 } else { 1 })
+                        .map(|s| s.trim_end_matches('{').to_string())
+                } else {
+                    None
+                }
             }
             "Python" => {
                 if trimmed.starts_with("def ") || trimmed.starts_with("class ") {
-                    trimmed.split('(').next().and_then(|s| s.split_whitespace().last()).map(|s| s.trim_end_matches(':').to_string())
-                } else { None }
+                    trimmed
+                        .split('(')
+                        .next()
+                        .and_then(|s| s.split_whitespace().last())
+                        .map(|s| s.trim_end_matches(':').to_string())
+                } else {
+                    None
+                }
             }
             "JavaScript" | "TypeScript" => {
                 if trimmed.starts_with("function ") || trimmed.starts_with("export function ") {
-                    trimmed.split('(').next().and_then(|s| s.split_whitespace().last()).map(|s| s.to_string())
+                    trimmed
+                        .split('(')
+                        .next()
+                        .and_then(|s| s.split_whitespace().last())
+                        .map(|s| s.to_string())
                 } else if trimmed.contains("class ") && trimmed.contains('{') {
-                    trimmed.split_whitespace().find(|w| w.chars().next().map(|c| c.is_uppercase()).unwrap_or(false)).map(|s| s.trim_end_matches('{').to_string())
-                } else { None }
+                    trimmed
+                        .split_whitespace()
+                        .find(|w| w.chars().next().map(|c| c.is_uppercase()).unwrap_or(false))
+                        .map(|s| s.trim_end_matches('{').to_string())
+                } else {
+                    None
+                }
             }
             _ => None,
         };

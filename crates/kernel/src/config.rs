@@ -44,7 +44,9 @@ impl Default for Config {
     }
 }
 
-fn default_max_browse_chars() -> usize { 16000 }
+fn default_max_browse_chars() -> usize {
+    16000
+}
 
 impl Config {
     /// Load config from the default path, or create default if missing.

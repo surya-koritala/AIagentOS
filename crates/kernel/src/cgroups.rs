@@ -28,7 +28,12 @@ pub struct CgroupLimits {
 
 impl Default for CgroupLimits {
     fn default() -> Self {
-        Self { tokens_per_min: 0, max_tool_calls: 0, max_context_tokens: 0, max_agents: 0 }
+        Self {
+            tokens_per_min: 0,
+            max_tool_calls: 0,
+            max_context_tokens: 0,
+            max_agents: 0,
+        }
     }
 }
 
@@ -71,7 +76,10 @@ impl CgroupManager {
             usage: CgroupUsage::default(),
             members: Vec::new(),
         };
-        let mgr = Self { groups: DashMap::new(), root: root_id };
+        let mgr = Self {
+            groups: DashMap::new(),
+            root: root_id,
+        };
         mgr.groups.insert(root_id, root);
         mgr
     }
@@ -80,8 +88,13 @@ impl CgroupManager {
     pub fn create(&self, name: String, parent: CgroupId, limits: CgroupLimits) -> CgroupId {
         let id = NEXT_CGROUP_ID.fetch_add(1, Ordering::SeqCst);
         let cg = Cgroup {
-            id, name, parent: Some(parent), children: Vec::new(),
-            limits, usage: CgroupUsage::default(), members: Vec::new(),
+            id,
+            name,
+            parent: Some(parent),
+            children: Vec::new(),
+            limits,
+            usage: CgroupUsage::default(),
+            members: Vec::new(),
         };
         self.groups.insert(id, cg);
         if let Some(mut parent_cg) = self.groups.get_mut(&parent) {
@@ -114,7 +127,9 @@ impl CgroupManager {
         let mut current = Some(cgroup_id);
         while let Some(id) = current {
             if let Some(cg) = self.groups.get(&id) {
-                if cg.limits.tokens_per_min > 0 && cg.usage.tokens_this_min + tokens > cg.limits.tokens_per_min {
+                if cg.limits.tokens_per_min > 0
+                    && cg.usage.tokens_this_min + tokens > cg.limits.tokens_per_min
+                {
                     return false; // would exceed limit
                 }
                 current = cg.parent;
@@ -151,7 +166,9 @@ impl CgroupManager {
     }
 
     /// Get root cgroup ID.
-    pub fn root(&self) -> CgroupId { self.root }
+    pub fn root(&self) -> CgroupId {
+        self.root
+    }
 }
 
 #[cfg(test)]
@@ -161,8 +178,22 @@ mod tests {
     #[test]
     fn create_hierarchy() {
         let mgr = CgroupManager::new();
-        let child = mgr.create("team-a".into(), mgr.root(), CgroupLimits { tokens_per_min: 1000, ..Default::default() });
-        let grandchild = mgr.create("agent-1".into(), child, CgroupLimits { tokens_per_min: 500, ..Default::default() });
+        let child = mgr.create(
+            "team-a".into(),
+            mgr.root(),
+            CgroupLimits {
+                tokens_per_min: 1000,
+                ..Default::default()
+            },
+        );
+        let grandchild = mgr.create(
+            "agent-1".into(),
+            child,
+            CgroupLimits {
+                tokens_per_min: 500,
+                ..Default::default()
+            },
+        );
         let gc = mgr.get(grandchild).unwrap();
         assert_eq!(gc.parent, Some(child));
     }
@@ -170,7 +201,14 @@ mod tests {
     #[test]
     fn token_limit_enforcement() {
         let mgr = CgroupManager::new();
-        let cg = mgr.create("limited".into(), mgr.root(), CgroupLimits { tokens_per_min: 100, ..Default::default() });
+        let cg = mgr.create(
+            "limited".into(),
+            mgr.root(),
+            CgroupLimits {
+                tokens_per_min: 100,
+                ..Default::default()
+            },
+        );
         assert!(mgr.check_token_limit(cg, 50));
         mgr.record_tokens(cg, 80);
         assert!(!mgr.check_token_limit(cg, 30)); // 80 + 30 > 100
@@ -179,8 +217,22 @@ mod tests {
     #[test]
     fn hierarchical_limit() {
         let mgr = CgroupManager::new();
-        let parent = mgr.create("parent".into(), mgr.root(), CgroupLimits { tokens_per_min: 100, ..Default::default() });
-        let child = mgr.create("child".into(), parent, CgroupLimits { tokens_per_min: 200, ..Default::default() });
+        let parent = mgr.create(
+            "parent".into(),
+            mgr.root(),
+            CgroupLimits {
+                tokens_per_min: 100,
+                ..Default::default()
+            },
+        );
+        let child = mgr.create(
+            "child".into(),
+            parent,
+            CgroupLimits {
+                tokens_per_min: 200,
+                ..Default::default()
+            },
+        );
         // Child has 200 limit but parent has 100 — parent limit should block
         mgr.record_tokens(child, 90); // propagates to parent too
         assert!(!mgr.check_token_limit(child, 20)); // parent at 90, 90+20 > 100
@@ -189,7 +241,14 @@ mod tests {
     #[test]
     fn max_agents_enforcement() {
         let mgr = CgroupManager::new();
-        let cg = mgr.create("small".into(), mgr.root(), CgroupLimits { max_agents: 2, ..Default::default() });
+        let cg = mgr.create(
+            "small".into(),
+            mgr.root(),
+            CgroupLimits {
+                max_agents: 2,
+                ..Default::default()
+            },
+        );
         assert!(mgr.add_agent(cg, 1).is_ok());
         assert!(mgr.add_agent(cg, 2).is_ok());
         assert!(mgr.add_agent(cg, 3).is_err()); // max reached
@@ -198,7 +257,14 @@ mod tests {
     #[test]
     fn reset_counters() {
         let mgr = CgroupManager::new();
-        let cg = mgr.create("test".into(), mgr.root(), CgroupLimits { tokens_per_min: 100, ..Default::default() });
+        let cg = mgr.create(
+            "test".into(),
+            mgr.root(),
+            CgroupLimits {
+                tokens_per_min: 100,
+                ..Default::default()
+            },
+        );
         mgr.record_tokens(cg, 80);
         mgr.reset_minute_counters();
         assert!(mgr.check_token_limit(cg, 80)); // reset, so 80 is fine again
@@ -209,7 +275,11 @@ mod tests {
 
 /// Check if an agent can proceed with a token-consuming operation.
 /// Returns Err with reason if blocked.
-pub fn enforce_limits(mgr: &CgroupManager, cgroup_id: CgroupId, tokens: u64) -> Result<(), &'static str> {
+pub fn enforce_limits(
+    mgr: &CgroupManager,
+    cgroup_id: CgroupId,
+    tokens: u64,
+) -> Result<(), &'static str> {
     if !mgr.check_token_limit(cgroup_id, tokens) {
         return Err("cgroup token limit exceeded");
     }
@@ -223,14 +293,28 @@ mod enforce_tests {
     #[test]
     fn enforce_allows_within_limit() {
         let mgr = CgroupManager::new();
-        let cg = mgr.create("test".into(), mgr.root(), CgroupLimits { tokens_per_min: 100, ..Default::default() });
+        let cg = mgr.create(
+            "test".into(),
+            mgr.root(),
+            CgroupLimits {
+                tokens_per_min: 100,
+                ..Default::default()
+            },
+        );
         assert!(enforce_limits(&mgr, cg, 50).is_ok());
     }
 
     #[test]
     fn enforce_blocks_over_limit() {
         let mgr = CgroupManager::new();
-        let cg = mgr.create("test".into(), mgr.root(), CgroupLimits { tokens_per_min: 100, ..Default::default() });
+        let cg = mgr.create(
+            "test".into(),
+            mgr.root(),
+            CgroupLimits {
+                tokens_per_min: 100,
+                ..Default::default()
+            },
+        );
         mgr.record_tokens(cg, 90);
         assert!(enforce_limits(&mgr, cg, 20).is_err());
     }

@@ -25,7 +25,10 @@ pub struct ToolRegistry {
 
 impl ToolRegistry {
     pub fn new() -> Self {
-        let mut registry = Self { tools: HashMap::new(), command_templates: HashMap::new() };
+        let mut registry = Self {
+            tools: HashMap::new(),
+            command_templates: HashMap::new(),
+        };
         registry.register_builtins();
         registry
     }
@@ -42,17 +45,28 @@ impl ToolRegistry {
     }
 
     /// Register a command template for a custom tool.
-    pub fn register_command_template(&mut self, name: &str, command: &str, args_template: &[String]) {
-        self.command_templates.insert(name.to_string(), (command.to_string(), args_template.to_vec()));
+    pub fn register_command_template(
+        &mut self,
+        name: &str,
+        command: &str,
+        args_template: &[String],
+    ) {
+        self.command_templates.insert(
+            name.to_string(),
+            (command.to_string(), args_template.to_vec()),
+        );
     }
 
     /// Generate LLM-compatible tool definitions.
     pub fn definitions(&self) -> Vec<ToolDefinition> {
-        self.tools.values().map(|b| ToolDefinition {
-            name: b.name.clone(),
-            description: b.description.clone(),
-            parameters: b.parameters_schema.clone(),
-        }).collect()
+        self.tools
+            .values()
+            .map(|b| ToolDefinition {
+                name: b.name.clone(),
+                description: b.description.clone(),
+                parameters: b.parameters_schema.clone(),
+            })
+            .collect()
     }
 
     /// Resolve a tool call into a ResourceRequest.
@@ -61,20 +75,23 @@ impl ToolRegistry {
 
         // Check if this is a custom tool with a command template
         if let Some((command, args_template)) = self.command_templates.get(&tool_call.name) {
-            let args: Vec<String> = args_template.iter().map(|tmpl| {
-                let mut result = tmpl.clone();
-                if let Some(obj) = tool_call.arguments.as_object() {
-                    for (key, val) in obj {
-                        let placeholder = format!("{{{}}}", key);
-                        let value = match val.as_str() {
-                            Some(s) => s.to_string(),
-                            None => val.to_string(),
-                        };
-                        result = result.replace(&placeholder, &value);
+            let args: Vec<String> = args_template
+                .iter()
+                .map(|tmpl| {
+                    let mut result = tmpl.clone();
+                    if let Some(obj) = tool_call.arguments.as_object() {
+                        for (key, val) in obj {
+                            let placeholder = format!("{{{}}}", key);
+                            let value = match val.as_str() {
+                                Some(s) => s.to_string(),
+                                None => val.to_string(),
+                            };
+                            result = result.replace(&placeholder, &value);
+                        }
                     }
-                }
-                result
-            }).collect();
+                    result
+                })
+                .collect();
             return Some(ResourceRequest {
                 agent_id,
                 resource_type: ResourceType::Application,
@@ -87,16 +104,32 @@ impl ToolRegistry {
         // Built-in tool resolution with special mappings
         let parameters = match tool_call.name.as_str() {
             "search_files" => {
-                let dir = tool_call.arguments.get("directory").and_then(|v| v.as_str()).unwrap_or(".");
-                let pattern = tool_call.arguments.get("pattern").and_then(|v| v.as_str()).unwrap_or("*");
+                let dir = tool_call
+                    .arguments
+                    .get("directory")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(".");
+                let pattern = tool_call
+                    .arguments
+                    .get("pattern")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("*");
                 serde_json::json!({"command": "find", "args": [dir, "-name", pattern, "-type", "f"]})
             }
             "git_status" => {
-                let dir = tool_call.arguments.get("directory").and_then(|v| v.as_str()).unwrap_or(".");
+                let dir = tool_call
+                    .arguments
+                    .get("directory")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(".");
                 serde_json::json!({"command": "git", "args": ["-C", dir, "status", "--short"]})
             }
             "create_directory" => {
-                let path = tool_call.arguments.get("path").and_then(|v| v.as_str()).unwrap_or("");
+                let path = tool_call
+                    .arguments
+                    .get("path")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
                 serde_json::json!({"command": "mkdir", "args": ["-p", path]})
             }
             _ => tool_call.arguments.clone(),
@@ -276,7 +309,11 @@ mod tests {
     #[test]
     fn resolve_unknown_tool_returns_none() {
         let reg = ToolRegistry::new();
-        let tool_call = ToolCall { id: "x".into(), name: "nonexistent".into(), arguments: serde_json::json!({}) };
+        let tool_call = ToolCall {
+            id: "x".into(),
+            name: "nonexistent".into(),
+            arguments: serde_json::json!({}),
+        };
         assert!(reg.resolve(uuid::Uuid::new_v4(), &tool_call).is_none());
     }
 

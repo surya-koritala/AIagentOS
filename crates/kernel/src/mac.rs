@@ -76,7 +76,9 @@ impl MacEngine {
     /// Load policy from TOML string.
     pub fn load_policy_toml(&mut self, toml_str: &str) -> Result<(), String> {
         #[derive(Deserialize)]
-        struct PolicyFile { rule: Vec<PolicyRule> }
+        struct PolicyFile {
+            rule: Vec<PolicyRule>,
+        }
         let policy: PolicyFile = toml::from_str(toml_str).map_err(|e| e.to_string())?;
         self.rules = policy.rule;
         Ok(())
@@ -84,8 +86,16 @@ impl MacEngine {
 
     /// Check if an agent can perform an action on a resource.
     pub fn check(&self, agent_id: AgentId, action: &str, resource: &str) -> MacDecision {
-        let subject_label = self.labels.get(&agent_id).map(|s| s.as_str()).unwrap_or("unconfined");
-        let object_label = self.resource_labels.get(resource).map(|s| s.as_str()).unwrap_or("unconfined");
+        let subject_label = self
+            .labels
+            .get(&agent_id)
+            .map(|s| s.as_str())
+            .unwrap_or("unconfined");
+        let object_label = self
+            .resource_labels
+            .get(resource)
+            .map(|s| s.as_str())
+            .unwrap_or("unconfined");
 
         // Find matching rule
         for rule in &self.rules {
@@ -99,12 +109,20 @@ impl MacEngine {
                     "audit" => MacDecision::Audit,
                     _ => MacDecision::Deny,
                 };
-                return if self.enforcing { decision } else { MacDecision::Allow };
+                return if self.enforcing {
+                    decision
+                } else {
+                    MacDecision::Allow
+                };
             }
         }
 
         // No rule matched — use default
-        if self.enforcing { self.default } else { MacDecision::Allow }
+        if self.enforcing {
+            self.default
+        } else {
+            MacDecision::Allow
+        }
     }
 
     /// Pattern matching (supports "*" wildcard).
@@ -113,10 +131,14 @@ impl MacEngine {
     }
 
     /// Check if engine is in enforcing mode.
-    pub fn is_enforcing(&self) -> bool { self.enforcing }
+    pub fn is_enforcing(&self) -> bool {
+        self.enforcing
+    }
 
     /// Set enforcing mode.
-    pub fn set_enforcing(&mut self, enforcing: bool) { self.enforcing = enforcing; }
+    pub fn set_enforcing(&mut self, enforcing: bool) {
+        self.enforcing = enforcing;
+    }
 
     /// Get agent's label.
     pub fn get_label(&self, agent_id: AgentId) -> Option<&str> {
@@ -131,10 +153,30 @@ mod tests {
     fn setup() -> MacEngine {
         let mut engine = MacEngine::new(true);
         engine.load_policy(vec![
-            PolicyRule { subject: "researcher".into(), action: "read".into(), object: "*".into(), decision: "allow".into() },
-            PolicyRule { subject: "researcher".into(), action: "write".into(), object: "filesystem".into(), decision: "deny".into() },
-            PolicyRule { subject: "admin".into(), action: "*".into(), object: "*".into(), decision: "allow".into() },
-            PolicyRule { subject: "worker".into(), action: "execute".into(), object: "commands".into(), decision: "audit".into() },
+            PolicyRule {
+                subject: "researcher".into(),
+                action: "read".into(),
+                object: "*".into(),
+                decision: "allow".into(),
+            },
+            PolicyRule {
+                subject: "researcher".into(),
+                action: "write".into(),
+                object: "filesystem".into(),
+                decision: "deny".into(),
+            },
+            PolicyRule {
+                subject: "admin".into(),
+                action: "*".into(),
+                object: "*".into(),
+                decision: "allow".into(),
+            },
+            PolicyRule {
+                subject: "worker".into(),
+                action: "execute".into(),
+                object: "commands".into(),
+                decision: "audit".into(),
+            },
         ]);
         engine.label_agent(1, "researcher".into());
         engine.label_agent(2, "admin".into());

@@ -1,8 +1,8 @@
 //! Property test for notification generation (Property 28).
 
-use proptest::prelude::*;
-use kernel::{AgentConfig, AgentKernelImpl, AgentState, KernelEvent, Priority};
 use kernel::agent::AgentKernel;
+use kernel::{AgentConfig, AgentKernelImpl, AgentState, KernelEvent, Priority};
+use proptest::prelude::*;
 
 proptest! {
     /// Property 28: For any agent event (completion, error, approval request),

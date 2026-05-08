@@ -12,16 +12,18 @@ use chrono::Utc;
 use kernel::context::*;
 
 fn arb_message() -> impl Strategy<Value = Message> {
-    ("[a-z]{3,10}", "[a-zA-Z0-9 ]{5,100}")
-        .prop_map(|(role, content)| Message {
-            role,
-            content,
-            timestamp: Utc::now(),
-        })
+    ("[a-z]{3,10}", "[a-zA-Z0-9 ]{5,100}").prop_map(|(role, content)| Message {
+        role,
+        content,
+        timestamp: Utc::now(),
+    })
 }
 
 fn arb_task() -> impl Strategy<Value = Task> {
-    ("[a-zA-Z ]{5,30}", prop_oneof![Just("pending"), Just("done"), Just("in_progress")])
+    (
+        "[a-zA-Z ]{5,30}",
+        prop_oneof![Just("pending"), Just("done"), Just("in_progress")],
+    )
         .prop_map(|(desc, status)| Task {
             id: uuid::Uuid::new_v4(),
             description: desc,
@@ -45,29 +47,31 @@ fn arb_context() -> impl Strategy<Value = AgentContext> {
         proptest::collection::vec(arb_task(), 0..5),
         proptest::collection::vec(arb_task_result(), 0..5),
         0u32..10000,
-    ).prop_map(|(messages, tasks, results, token_count)| AgentContext {
-        conversation_history: messages,
-        working_state: serde_json::json!({"key": "value"}),
-        active_tasks: tasks,
-        intermediate_results: results,
-        token_count,
-    })
+    )
+        .prop_map(|(messages, tasks, results, token_count)| AgentContext {
+            conversation_history: messages,
+            working_state: serde_json::json!({"key": "value"}),
+            active_tasks: tasks,
+            intermediate_results: results,
+            token_count,
+        })
 }
 
 fn arb_large_context() -> impl Strategy<Value = AgentContext> {
-    proptest::collection::vec(arb_message(), 20..50)
-        .prop_map(|messages| {
-            let token_count = messages.iter()
-                .map(|m| (m.content.len() as u32) / 4 + 1)
-                .sum::<u32>() + 5000; // ensure it exceeds any reasonable limit
-            AgentContext {
-                conversation_history: messages,
-                working_state: serde_json::json!({}),
-                active_tasks: Vec::new(),
-                intermediate_results: Vec::new(),
-                token_count,
-            }
-        })
+    proptest::collection::vec(arb_message(), 20..50).prop_map(|messages| {
+        let token_count = messages
+            .iter()
+            .map(|m| (m.content.len() as u32) / 4 + 1)
+            .sum::<u32>()
+            + 5000; // ensure it exceeds any reasonable limit
+        AgentContext {
+            conversation_history: messages,
+            working_state: serde_json::json!({}),
+            active_tasks: Vec::new(),
+            intermediate_results: Vec::new(),
+            token_count,
+        }
+    })
 }
 
 proptest! {

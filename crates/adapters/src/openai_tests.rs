@@ -2,10 +2,10 @@
 
 #[cfg(test)]
 mod tests {
-    use wiremock::{Mock, MockServer, ResponseTemplate};
-    use wiremock::matchers::{method, path, body_partial_json};
-    use kernel::connector::*;
     use crate::openai::OpenAiAdapter;
+    use kernel::connector::*;
+    use wiremock::matchers::{body_partial_json, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     #[tokio::test]
     async fn openai_sends_tools_and_parses_tool_calls() {
@@ -37,8 +37,7 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let adapter = OpenAiAdapter::new("test-key".to_string())
-            .with_base_url(mock_server.uri());
+        let adapter = OpenAiAdapter::new("test-key".to_string()).with_base_url(mock_server.uri());
         let session = adapter.create_session().await.unwrap();
 
         let tools = vec![ToolDefinition {
@@ -47,10 +46,10 @@ mod tests {
             parameters: serde_json::json!({"type": "object", "properties": {"path": {"type": "string"}}}),
         }];
 
-        let resp = session.send_with_tools(
-            vec![StandardMessage::user("Read /tmp/test.txt")],
-            &tools,
-        ).await.unwrap();
+        let resp = session
+            .send_with_tools(vec![StandardMessage::user("Read /tmp/test.txt")], &tools)
+            .await
+            .unwrap();
 
         assert_eq!(resp.tool_calls.len(), 1);
         assert_eq!(resp.tool_calls[0].id, "call_abc123");
@@ -77,11 +76,13 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let adapter = OpenAiAdapter::new("test-key".to_string())
-            .with_base_url(mock_server.uri());
+        let adapter = OpenAiAdapter::new("test-key".to_string()).with_base_url(mock_server.uri());
         let session = adapter.create_session().await.unwrap();
 
-        let resp = session.send(vec![StandardMessage::user("Hi")]).await.unwrap();
+        let resp = session
+            .send(vec![StandardMessage::user("Hi")])
+            .await
+            .unwrap();
 
         assert_eq!(resp.content, "Hello! How can I help?");
         assert!(resp.tool_calls.is_empty());
@@ -109,11 +110,13 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let adapter = OpenAiAdapter::new("test-key".to_string())
-            .with_base_url(mock_server.uri());
+        let adapter = OpenAiAdapter::new("test-key".to_string()).with_base_url(mock_server.uri());
         let session = adapter.create_session().await.unwrap();
 
-        let resp = session.send(vec![StandardMessage::user("test")]).await.unwrap();
+        let resp = session
+            .send(vec![StandardMessage::user("test")])
+            .await
+            .unwrap();
         assert_eq!(resp.content, "recovered");
     }
 
@@ -142,14 +145,20 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let adapter = OpenAiAdapter::new("test-key".to_string())
-            .with_base_url(mock_server.uri());
+        let adapter = OpenAiAdapter::new("test-key".to_string()).with_base_url(mock_server.uri());
         let session = adapter.create_session().await.unwrap();
 
-        let resp = session.send_with_tools(
-            vec![StandardMessage::user("Read both files")],
-            &[ToolDefinition { name: "read_file".into(), description: "Read".into(), parameters: serde_json::json!({}) }],
-        ).await.unwrap();
+        let resp = session
+            .send_with_tools(
+                vec![StandardMessage::user("Read both files")],
+                &[ToolDefinition {
+                    name: "read_file".into(),
+                    description: "Read".into(),
+                    parameters: serde_json::json!({}),
+                }],
+            )
+            .await
+            .unwrap();
 
         assert_eq!(resp.tool_calls.len(), 2);
         assert_eq!(resp.tool_calls[0].name, "read_file");

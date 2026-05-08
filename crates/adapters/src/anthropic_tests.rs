@@ -2,10 +2,10 @@
 
 #[cfg(test)]
 mod tests {
-    use wiremock::{Mock, MockServer, ResponseTemplate};
-    use wiremock::matchers::{method, path};
-    use kernel::connector::*;
     use crate::anthropic::AnthropicAdapter;
+    use kernel::connector::*;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     #[tokio::test]
     async fn anthropic_tool_use_response() {
@@ -24,8 +24,8 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let adapter = AnthropicAdapter::new("test-key".to_string())
-            .with_base_url(mock_server.uri());
+        let adapter =
+            AnthropicAdapter::new("test-key".to_string()).with_base_url(mock_server.uri());
         let session = adapter.create_session().await.unwrap();
 
         let tools = vec![ToolDefinition {
@@ -34,10 +34,10 @@ mod tests {
             parameters: serde_json::json!({"type": "object", "properties": {"path": {"type": "string"}}}),
         }];
 
-        let resp = session.send_with_tools(
-            vec![StandardMessage::user("Read /tmp/test.txt")],
-            &tools,
-        ).await.unwrap();
+        let resp = session
+            .send_with_tools(vec![StandardMessage::user("Read /tmp/test.txt")], &tools)
+            .await
+            .unwrap();
 
         assert_eq!(resp.tool_calls.len(), 1);
         assert_eq!(resp.tool_calls[0].id, "toolu_01");
@@ -60,11 +60,14 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let adapter = AnthropicAdapter::new("test-key".to_string())
-            .with_base_url(mock_server.uri());
+        let adapter =
+            AnthropicAdapter::new("test-key".to_string()).with_base_url(mock_server.uri());
         let session = adapter.create_session().await.unwrap();
 
-        let resp = session.send(vec![StandardMessage::user("Hi")]).await.unwrap();
+        let resp = session
+            .send(vec![StandardMessage::user("Hi")])
+            .await
+            .unwrap();
         assert_eq!(resp.content, "Hello! How can I help?");
         assert!(resp.tool_calls.is_empty());
     }

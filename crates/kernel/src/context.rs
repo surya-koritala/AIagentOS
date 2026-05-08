@@ -85,11 +85,20 @@ impl Default for AgentContext {
 pub trait ContextManager: Send + Sync {
     async fn create_context(&self, agent_id: AgentId) -> Result<(), ContextError>;
     async fn get_context(&self, agent_id: AgentId) -> Result<AgentContext, ContextError>;
-    async fn persist_context(&self, agent_id: AgentId, context: &AgentContext) -> Result<(), ContextError>;
+    async fn persist_context(
+        &self,
+        agent_id: AgentId,
+        context: &AgentContext,
+    ) -> Result<(), ContextError>;
     async fn restore_context(&self, agent_id: AgentId) -> Result<AgentContext, ContextError>;
-    async fn summarize_overflow(&self, context: &AgentContext, token_limit: u32) -> Result<AgentContext, ContextError>;
+    async fn summarize_overflow(
+        &self,
+        context: &AgentContext,
+        token_limit: u32,
+    ) -> Result<AgentContext, ContextError>;
     async fn store_fact(&self, agent_id: AgentId, fact: Fact) -> Result<(), ContextError>;
-    async fn query_memory(&self, agent_id: AgentId, query: &str) -> Result<Vec<Fact>, ContextError>;
+    async fn query_memory(&self, agent_id: AgentId, query: &str)
+        -> Result<Vec<Fact>, ContextError>;
 }
 
 /// Maximum retry attempts for persistence operations.
@@ -103,18 +112,22 @@ pub struct SqliteContextManager {
 impl SqliteContextManager {
     /// Create a new SqliteContextManager with the given database path.
     pub fn new(db_path: &Path) -> Result<Self, ContextError> {
-        let conn = Connection::open(db_path)
-            .map_err(|e| ContextError::StorageError(e.to_string()))?;
-        let mgr = Self { conn: Mutex::new(conn) };
+        let conn =
+            Connection::open(db_path).map_err(|e| ContextError::StorageError(e.to_string()))?;
+        let mgr = Self {
+            conn: Mutex::new(conn),
+        };
         mgr.init_schema()?;
         Ok(mgr)
     }
 
     /// Create an in-memory context manager (for testing).
     pub fn in_memory() -> Result<Self, ContextError> {
-        let conn = Connection::open_in_memory()
-            .map_err(|e| ContextError::StorageError(e.to_string()))?;
-        let mgr = Self { conn: Mutex::new(conn) };
+        let conn =
+            Connection::open_in_memory().map_err(|e| ContextError::StorageError(e.to_string()))?;
+        let mgr = Self {
+            conn: Mutex::new(conn),
+        };
         mgr.init_schema()?;
         Ok(mgr)
     }
@@ -160,7 +173,11 @@ impl SqliteContextManager {
         Ok(())
     }
 
-    fn persist_with_retry(&self, agent_id: AgentId, context: &AgentContext) -> Result<(), ContextError> {
+    fn persist_with_retry(
+        &self,
+        agent_id: AgentId,
+        context: &AgentContext,
+    ) -> Result<(), ContextError> {
         let json = serde_json::to_string(context)
             .map_err(|e| ContextError::PersistenceFailed(e.to_string()))?;
         let now = Utc::now().to_rfc3339();
@@ -178,9 +195,12 @@ impl SqliteContextManager {
                     tracing::warn!("Persist attempt {} failed: {}", attempt + 1, e);
                     continue;
                 }
-                Err(e) => return Err(ContextError::PersistenceFailed(
-                    format!("Failed after {} attempts: {}", MAX_RETRIES, e)
-                )),
+                Err(e) => {
+                    return Err(ContextError::PersistenceFailed(format!(
+                        "Failed after {} attempts: {}",
+                        MAX_RETRIES, e
+                    )))
+                }
             }
         }
         unreachable!()
@@ -203,16 +223,22 @@ impl ContextManager for SqliteContextManager {
             |row| row.get::<_, String>(0),
         );
         match result {
-            Ok(json) => serde_json::from_str(&json)
-                .map_err(|e| ContextError::RestoreFailed(e.to_string())),
-            Err(rusqlite::Error::QueryReturnedNoRows) => {
-                Err(ContextError::RestoreFailed(format!("No context for agent {}", agent_id)))
+            Ok(json) => {
+                serde_json::from_str(&json).map_err(|e| ContextError::RestoreFailed(e.to_string()))
             }
+            Err(rusqlite::Error::QueryReturnedNoRows) => Err(ContextError::RestoreFailed(format!(
+                "No context for agent {}",
+                agent_id
+            ))),
             Err(e) => Err(ContextError::StorageError(e.to_string())),
         }
     }
 
-    async fn persist_context(&self, agent_id: AgentId, context: &AgentContext) -> Result<(), ContextError> {
+    async fn persist_context(
+        &self,
+        agent_id: AgentId,
+        context: &AgentContext,
+    ) -> Result<(), ContextError> {
         self.persist_with_retry(agent_id, context)
     }
 
@@ -220,7 +246,11 @@ impl ContextManager for SqliteContextManager {
         self.get_context(agent_id).await
     }
 
-    async fn summarize_overflow(&self, context: &AgentContext, token_limit: u32) -> Result<AgentContext, ContextError> {
+    async fn summarize_overflow(
+        &self,
+        context: &AgentContext,
+        token_limit: u32,
+    ) -> Result<AgentContext, ContextError> {
         if context.token_count <= token_limit {
             return Ok(context.clone());
         }
@@ -261,7 +291,9 @@ impl ContextManager for SqliteContextManager {
 
     async fn store_fact(&self, agent_id: AgentId, fact: Fact) -> Result<(), ContextError> {
         let conn = self.conn.lock().unwrap();
-        let embedding_json = fact.embedding.as_ref()
+        let embedding_json = fact
+            .embedding
+            .as_ref()
             .map(|e| serde_json::to_string(e).unwrap_or_default());
         let category_str = serde_json::to_string(&fact.category)
             .map_err(|e| ContextError::StorageError(e.to_string()))?;
@@ -282,26 +314,41 @@ impl ContextManager for SqliteContextManager {
         Ok(())
     }
 
-    async fn query_memory(&self, agent_id: AgentId, query: &str) -> Result<Vec<Fact>, ContextError> {
+    async fn query_memory(
+        &self,
+        agent_id: AgentId,
+        query: &str,
+    ) -> Result<Vec<Fact>, ContextError> {
         let conn = self.conn.lock().unwrap();
         let id_str = agent_id.to_string();
         let pattern = format!("%{}%", query);
 
-        let mut stmt = conn.prepare(
-            "SELECT id, content, category, created_at, last_accessed_at, embedding_json
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, content, category, created_at, last_accessed_at, embedding_json
              FROM facts WHERE agent_id = ?1 AND content LIKE ?2
-             ORDER BY last_accessed_at DESC"
-        ).map_err(|e| ContextError::StorageError(e.to_string()))?;
+             ORDER BY last_accessed_at DESC",
+            )
+            .map_err(|e| ContextError::StorageError(e.to_string()))?;
 
-        let facts = stmt.query_map(params![id_str, pattern], |row| {
-            let id_str: String = row.get(0)?;
-            let content: String = row.get(1)?;
-            let category_str: String = row.get(2)?;
-            let created_str: String = row.get(3)?;
-            let accessed_str: String = row.get(4)?;
-            let embedding_str: Option<String> = row.get(5)?;
-            Ok((id_str, content, category_str, created_str, accessed_str, embedding_str))
-        }).map_err(|e| ContextError::StorageError(e.to_string()))?;
+        let facts = stmt
+            .query_map(params![id_str, pattern], |row| {
+                let id_str: String = row.get(0)?;
+                let content: String = row.get(1)?;
+                let category_str: String = row.get(2)?;
+                let created_str: String = row.get(3)?;
+                let accessed_str: String = row.get(4)?;
+                let embedding_str: Option<String> = row.get(5)?;
+                Ok((
+                    id_str,
+                    content,
+                    category_str,
+                    created_str,
+                    accessed_str,
+                    embedding_str,
+                ))
+            })
+            .map_err(|e| ContextError::StorageError(e.to_string()))?;
 
         let mut result = Vec::new();
         for row in facts {
@@ -318,10 +365,16 @@ impl ContextManager for SqliteContextManager {
             let last_accessed_at = DateTime::parse_from_rfc3339(&accessed_str)
                 .map_err(|e| ContextError::StorageError(e.to_string()))?
                 .with_timezone(&Utc);
-            let embedding = embedding_str
-                .and_then(|s| serde_json::from_str(&s).ok());
+            let embedding = embedding_str.and_then(|s| serde_json::from_str(&s).ok());
 
-            result.push(Fact { id, content, category, created_at, last_accessed_at, embedding });
+            result.push(Fact {
+                id,
+                content,
+                category,
+                created_at,
+                last_accessed_at,
+                embedding,
+            });
         }
 
         // Update last_accessed_at for returned facts
@@ -340,7 +393,12 @@ impl ContextManager for SqliteContextManager {
 /// Conversation persistence methods.
 impl SqliteContextManager {
     /// Save a conversation (messages as JSON).
-    pub fn save_conversation(&self, id: &str, agent_id: AgentId, messages: &[crate::connector::StandardMessage]) -> Result<(), ContextError> {
+    pub fn save_conversation(
+        &self,
+        id: &str,
+        agent_id: AgentId,
+        messages: &[crate::connector::StandardMessage],
+    ) -> Result<(), ContextError> {
         let json = serde_json::to_string(messages)
             .map_err(|e| ContextError::PersistenceFailed(e.to_string()))?;
         let now = chrono::Utc::now().to_rfc3339();
@@ -349,41 +407,61 @@ impl SqliteContextManager {
             "INSERT OR REPLACE INTO conversations (id, agent_id, messages_json, created_at, updated_at) VALUES (?1, ?2, ?3, COALESCE((SELECT created_at FROM conversations WHERE id=?1), ?4), ?4)",
             rusqlite::params![id, agent_id.to_string(), json, now],
         ).map_err(|e| ContextError::PersistenceFailed(e.to_string()))?;
-        let text_content: String = messages.iter().map(|m| m.content.as_str()).collect::<Vec<_>>().join(" ");
+        let text_content: String = messages
+            .iter()
+            .map(|m| m.content.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
         conn.execute(
             "INSERT OR REPLACE INTO conversations_fts (conversation_id, content) VALUES (?1, ?2)",
             rusqlite::params![id, text_content],
-        ).ok();
+        )
+        .ok();
         Ok(())
     }
 
     /// Load a conversation's messages.
-    pub fn load_conversation(&self, id: &str) -> Result<Vec<crate::connector::StandardMessage>, ContextError> {
+    pub fn load_conversation(
+        &self,
+        id: &str,
+    ) -> Result<Vec<crate::connector::StandardMessage>, ContextError> {
         let conn = self.conn.lock().unwrap();
-        let json: String = conn.query_row(
-            "SELECT messages_json FROM conversations WHERE id = ?1",
-            rusqlite::params![id],
-            |row| row.get(0),
-        ).map_err(|e| ContextError::RestoreFailed(e.to_string()))?;
+        let json: String = conn
+            .query_row(
+                "SELECT messages_json FROM conversations WHERE id = ?1",
+                rusqlite::params![id],
+                |row| row.get(0),
+            )
+            .map_err(|e| ContextError::RestoreFailed(e.to_string()))?;
         serde_json::from_str(&json).map_err(|e| ContextError::RestoreFailed(e.to_string()))
     }
 
     /// List all conversations, sorted by most recently updated.
     pub fn list_conversations(&self) -> Vec<(String, String, String)> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT id, agent_id, updated_at FROM conversations ORDER BY updated_at DESC"
-        ).unwrap_or_else(|_| conn.prepare("SELECT 1, 2, 3 WHERE 0").unwrap());
+        let mut stmt = conn
+            .prepare("SELECT id, agent_id, updated_at FROM conversations ORDER BY updated_at DESC")
+            .unwrap_or_else(|_| conn.prepare("SELECT 1, 2, 3 WHERE 0").unwrap());
         stmt.query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
-        }).ok().map(|rows| rows.filter_map(|r| r.ok()).collect()).unwrap_or_default()
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .ok()
+        .map(|rows| rows.filter_map(|r| r.ok()).collect())
+        .unwrap_or_default()
     }
 
     /// Delete a conversation.
     pub fn delete_conversation(&self, id: &str) -> Result<(), ContextError> {
         let conn = self.conn.lock().unwrap();
-        conn.execute("DELETE FROM conversations WHERE id = ?1", rusqlite::params![id])
-            .map_err(|e| ContextError::PersistenceFailed(e.to_string()))?;
+        conn.execute(
+            "DELETE FROM conversations WHERE id = ?1",
+            rusqlite::params![id],
+        )
+        .map_err(|e| ContextError::PersistenceFailed(e.to_string()))?;
         Ok(())
     }
 
@@ -396,15 +474,17 @@ impl SqliteContextManager {
             "messages": messages,
             "exported_at": chrono::Utc::now().to_rfc3339(),
         });
-        serde_json::to_string_pretty(&export).map_err(|e| ContextError::PersistenceFailed(e.to_string()))
+        serde_json::to_string_pretty(&export)
+            .map_err(|e| ContextError::PersistenceFailed(e.to_string()))
     }
 
     /// Import a conversation from JSON.
     pub fn import_conversation(&self, json: &str) -> Result<String, ContextError> {
         let data: serde_json::Value = serde_json::from_str(json)
             .map_err(|e| ContextError::RestoreFailed(format!("Invalid JSON: {}", e)))?;
-        let messages: Vec<crate::connector::StandardMessage> = serde_json::from_value(data["messages"].clone())
-            .map_err(|e| ContextError::RestoreFailed(format!("Invalid messages: {}", e)))?;
+        let messages: Vec<crate::connector::StandardMessage> =
+            serde_json::from_value(data["messages"].clone())
+                .map_err(|e| ContextError::RestoreFailed(format!("Invalid messages: {}", e)))?;
         let id = uuid::Uuid::new_v4().to_string();
         let agent_id = uuid::Uuid::nil();
         self.save_conversation(&id, agent_id, &messages)?;
@@ -435,7 +515,10 @@ impl SqliteContextManager {
         ).unwrap_or_else(|_| conn.prepare("SELECT 1, 2 WHERE 0").unwrap());
         stmt.query_map(rusqlite::params![query], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        }).ok().map(|rows| rows.filter_map(|r| r.ok()).collect()).unwrap_or_default()
+        })
+        .ok()
+        .map(|rows| rows.filter_map(|r| r.ok()).collect())
+        .unwrap_or_default()
     }
 }
 
@@ -495,7 +578,10 @@ mod tests {
     #[tokio::test]
     async fn summarize_within_limit_unchanged() {
         let mgr = SqliteContextManager::in_memory().unwrap();
-        let ctx = AgentContext { token_count: 500, ..Default::default() };
+        let ctx = AgentContext {
+            token_count: 500,
+            ..Default::default()
+        };
         let result = mgr.summarize_overflow(&ctx, 1000).await.unwrap();
         assert_eq!(result.token_count, 500);
     }

@@ -28,7 +28,10 @@ pub enum GateDenial {
     /// Required capability missing.
     MissingCapability(u64),
     /// MAC policy denied this action.
-    MacDeny { action: &'static str, resource: String },
+    MacDeny {
+        action: &'static str,
+        resource: String,
+    },
     /// Cgroup token quota would be exceeded.
     CgroupQuota,
 }
@@ -39,7 +42,9 @@ impl GateDenial {
         match self {
             GateDenial::UnknownAgent => "agent not registered with kernel (ESRCH)".to_string(),
             GateDenial::MissingCapability(cap) => format!("missing capability 0x{:x} (EPERM)", cap),
-            GateDenial::MacDeny { action, resource } => format!("MAC policy denies {} on {} (EACCES)", action, resource),
+            GateDenial::MacDeny { action, resource } => {
+                format!("MAC policy denies {} on {} (EACCES)", action, resource)
+            }
             GateDenial::CgroupQuota => "cgroup token quota exceeded (EAGAIN)".to_string(),
         }
     }
@@ -54,11 +59,26 @@ pub struct ToolAction {
 }
 
 impl ToolAction {
-    pub const READ:    Self = Self { action: "read",  required_cap: None };
-    pub const WRITE:   Self = Self { action: "write", required_cap: Some(CapabilitySet::CAP_FILE_WRITE) };
-    pub const NET:     Self = Self { action: "net",   required_cap: Some(CapabilitySet::CAP_NET_ACCESS) };
-    pub const EXEC:    Self = Self { action: "exec",  required_cap: Some(CapabilitySet::CAP_EXEC) };
-    pub const EXECUTE: Self = Self { action: "execute", required_cap: None };
+    pub const READ: Self = Self {
+        action: "read",
+        required_cap: None,
+    };
+    pub const WRITE: Self = Self {
+        action: "write",
+        required_cap: Some(CapabilitySet::CAP_FILE_WRITE),
+    };
+    pub const NET: Self = Self {
+        action: "net",
+        required_cap: Some(CapabilitySet::CAP_NET_ACCESS),
+    };
+    pub const EXEC: Self = Self {
+        action: "exec",
+        required_cap: Some(CapabilitySet::CAP_EXEC),
+    };
+    pub const EXECUTE: Self = Self {
+        action: "execute",
+        required_cap: None,
+    };
 }
 
 /// Classify a built-in tool name into an action + required capability.
@@ -69,7 +89,9 @@ impl ToolAction {
 pub fn classify_tool(tool_name: &str) -> ToolAction {
     match tool_name {
         // Pure reads
-        "read_file" | "list_directory" | "search_files" | "git_status" | "git_diff" => ToolAction::READ,
+        "read_file" | "list_directory" | "search_files" | "git_status" | "git_diff" => {
+            ToolAction::READ
+        }
         // Filesystem mutations
         "write_file" | "create_directory" | "git_commit" => ToolAction::WRITE,
         // Network
@@ -149,7 +171,14 @@ impl SyscallGate {
         let pid = self.next_pid.fetch_add(1, Ordering::SeqCst);
         let cg = cgroup.unwrap_or(self.default_cgroup);
         let _ = self.cgroups.add_agent(cg, pid);
-        self.records.insert(kid, GateRecord { pid, caps, cgroup: cg });
+        self.records.insert(
+            kid,
+            GateRecord {
+                pid,
+                caps,
+                cgroup: cg,
+            },
+        );
         pid
     }
 
@@ -280,7 +309,9 @@ mod tests {
         let kid = uuid::Uuid::new_v4();
         gate.register_agent(kid, CapabilitySet::all(), None);
 
-        let pid = gate.check_tool_call(kid, "read_file", "/etc/hosts", 10).await;
+        let pid = gate
+            .check_tool_call(kid, "read_file", "/etc/hosts", 10)
+            .await;
         assert!(pid.is_ok());
         assert_eq!(gate.stats().allowed, 1);
     }
@@ -335,7 +366,9 @@ mod tests {
             ]);
         }
 
-        let r = gate.check_tool_call(kid, "http_get", "https://example.com", 1).await;
+        let r = gate
+            .check_tool_call(kid, "http_get", "https://example.com", 1)
+            .await;
         assert!(matches!(r, Err(GateDenial::MacDeny { .. })));
         assert_eq!(gate.stats().denied_mac, 1);
 
@@ -347,10 +380,14 @@ mod tests {
     #[tokio::test]
     async fn denies_over_cgroup_quota() {
         let (gate, cgroups) = fresh_gate();
-        let cg = cgroups.create("tight".into(), cgroups.root(), CgroupLimits {
-            tokens_per_min: 100,
-            ..Default::default()
-        });
+        let cg = cgroups.create(
+            "tight".into(),
+            cgroups.root(),
+            CgroupLimits {
+                tokens_per_min: 100,
+                ..Default::default()
+            },
+        );
         let kid = uuid::Uuid::new_v4();
         gate.register_agent(kid, CapabilitySet::all(), Some(cg));
 
@@ -370,10 +407,14 @@ mod tests {
     #[tokio::test]
     async fn unregister_releases_cgroup_slot() {
         let (gate, cgroups) = fresh_gate();
-        let cg = cgroups.create("small".into(), cgroups.root(), CgroupLimits {
-            max_agents: 1,
-            ..Default::default()
-        });
+        let cg = cgroups.create(
+            "small".into(),
+            cgroups.root(),
+            CgroupLimits {
+                max_agents: 1,
+                ..Default::default()
+            },
+        );
         let kid1 = uuid::Uuid::new_v4();
         let kid2 = uuid::Uuid::new_v4();
 

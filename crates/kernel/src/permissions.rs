@@ -70,15 +70,39 @@ pub struct AuditFilter {
 /// The Permission System trait.
 #[async_trait::async_trait]
 pub trait PermissionSystem: Send + Sync {
-    fn check_access(&self, agent_id: AgentId, resource: &ResourceType, operation: &str, target: Option<&str>) -> AccessDecision;
-    async fn request_elevation(&self, agent_id: AgentId, action: &str) -> Result<AccessDecision, PermissionError>;
+    fn check_access(
+        &self,
+        agent_id: AgentId,
+        resource: &ResourceType,
+        operation: &str,
+        target: Option<&str>,
+    ) -> AccessDecision;
+    async fn request_elevation(
+        &self,
+        agent_id: AgentId,
+        action: &str,
+    ) -> Result<AccessDecision, PermissionError>;
     fn assign_profile(&self, agent_id: AgentId, profile_id: &PermissionProfileId);
     fn get_audit_log(&self, filter: Option<&AuditFilter>) -> Vec<AuditEntry>;
-    fn log_action(&self, agent_id: AgentId, action: &str, resource: &str, decision: AccessDecision, outcome: ActionOutcome);
+    fn log_action(
+        &self,
+        agent_id: AgentId,
+        action: &str,
+        resource: &str,
+        decision: AccessDecision,
+        outcome: ActionOutcome,
+    );
 }
 
 /// Operations considered high-risk that always require approval (except full-access).
-const HIGH_RISK_OPS: &[&str] = &["delete", "execute", "install", "uninstall", "format", "sudo"];
+const HIGH_RISK_OPS: &[&str] = &[
+    "delete",
+    "execute",
+    "install",
+    "uninstall",
+    "format",
+    "sudo",
+];
 
 /// Concrete permission system implementation.
 pub struct PermissionManager {
@@ -103,89 +127,127 @@ impl PermissionManager {
 
     fn register_predefined_profiles(&self) {
         // Read-only: only read operations allowed
-        self.profiles.insert("read-only".to_string(), PermissionProfile {
-            id: "read-only".to_string(),
-            name: "Read Only".to_string(),
-            rules: vec![
-                PermissionRule {
-                    resource_type: ResourceType::Filesystem,
-                    operations: vec!["read".to_string(), "list".to_string()],
-                    targets: None,
-                    decision: AccessDecision::Allowed,
-                },
-                PermissionRule {
-                    resource_type: ResourceType::Network,
-                    operations: vec!["get".to_string()],
-                    targets: None,
-                    decision: AccessDecision::Allowed,
-                },
-            ],
-        });
+        self.profiles.insert(
+            "read-only".to_string(),
+            PermissionProfile {
+                id: "read-only".to_string(),
+                name: "Read Only".to_string(),
+                rules: vec![
+                    PermissionRule {
+                        resource_type: ResourceType::Filesystem,
+                        operations: vec!["read".to_string(), "list".to_string()],
+                        targets: None,
+                        decision: AccessDecision::Allowed,
+                    },
+                    PermissionRule {
+                        resource_type: ResourceType::Network,
+                        operations: vec!["get".to_string()],
+                        targets: None,
+                        decision: AccessDecision::Allowed,
+                    },
+                ],
+            },
+        );
 
         // Standard: read/write but no destructive ops
-        self.profiles.insert("standard".to_string(), PermissionProfile {
-            id: "standard".to_string(),
-            name: "Standard".to_string(),
-            rules: vec![
-                PermissionRule {
-                    resource_type: ResourceType::Filesystem,
-                    operations: vec!["read".to_string(), "write".to_string(), "create".to_string(), "list".to_string()],
-                    targets: None,
-                    decision: AccessDecision::Allowed,
-                },
-                PermissionRule {
-                    resource_type: ResourceType::Network,
-                    operations: vec!["get".to_string(), "post".to_string()],
-                    targets: None,
-                    decision: AccessDecision::Allowed,
-                },
-                PermissionRule {
-                    resource_type: ResourceType::Application,
-                    operations: vec!["launch".to_string(), "read_output".to_string()],
-                    targets: None,
-                    decision: AccessDecision::Allowed,
-                },
-            ],
-        });
+        self.profiles.insert(
+            "standard".to_string(),
+            PermissionProfile {
+                id: "standard".to_string(),
+                name: "Standard".to_string(),
+                rules: vec![
+                    PermissionRule {
+                        resource_type: ResourceType::Filesystem,
+                        operations: vec![
+                            "read".to_string(),
+                            "write".to_string(),
+                            "create".to_string(),
+                            "list".to_string(),
+                        ],
+                        targets: None,
+                        decision: AccessDecision::Allowed,
+                    },
+                    PermissionRule {
+                        resource_type: ResourceType::Network,
+                        operations: vec!["get".to_string(), "post".to_string()],
+                        targets: None,
+                        decision: AccessDecision::Allowed,
+                    },
+                    PermissionRule {
+                        resource_type: ResourceType::Application,
+                        operations: vec!["launch".to_string(), "read_output".to_string()],
+                        targets: None,
+                        decision: AccessDecision::Allowed,
+                    },
+                ],
+            },
+        );
 
         // Elevated: most operations allowed, destructive require approval
-        self.profiles.insert("elevated".to_string(), PermissionProfile {
-            id: "elevated".to_string(),
-            name: "Elevated".to_string(),
-            rules: vec![
-                PermissionRule {
-                    resource_type: ResourceType::Filesystem,
-                    operations: vec!["read".to_string(), "write".to_string(), "create".to_string(), "list".to_string(), "delete".to_string()],
-                    targets: None,
-                    decision: AccessDecision::Allowed,
-                },
-                PermissionRule {
-                    resource_type: ResourceType::Network,
-                    operations: vec!["get".to_string(), "post".to_string(), "put".to_string(), "delete".to_string()],
-                    targets: None,
-                    decision: AccessDecision::Allowed,
-                },
-                PermissionRule {
-                    resource_type: ResourceType::Application,
-                    operations: vec!["launch".to_string(), "close".to_string(), "send_input".to_string(), "read_output".to_string()],
-                    targets: None,
-                    decision: AccessDecision::Allowed,
-                },
-                PermissionRule {
-                    resource_type: ResourceType::Browser,
-                    operations: vec!["navigate".to_string(), "click".to_string(), "type".to_string(), "read".to_string()],
-                    targets: None,
-                    decision: AccessDecision::Allowed,
-                },
-            ],
-        });
+        self.profiles.insert(
+            "elevated".to_string(),
+            PermissionProfile {
+                id: "elevated".to_string(),
+                name: "Elevated".to_string(),
+                rules: vec![
+                    PermissionRule {
+                        resource_type: ResourceType::Filesystem,
+                        operations: vec![
+                            "read".to_string(),
+                            "write".to_string(),
+                            "create".to_string(),
+                            "list".to_string(),
+                            "delete".to_string(),
+                        ],
+                        targets: None,
+                        decision: AccessDecision::Allowed,
+                    },
+                    PermissionRule {
+                        resource_type: ResourceType::Network,
+                        operations: vec![
+                            "get".to_string(),
+                            "post".to_string(),
+                            "put".to_string(),
+                            "delete".to_string(),
+                        ],
+                        targets: None,
+                        decision: AccessDecision::Allowed,
+                    },
+                    PermissionRule {
+                        resource_type: ResourceType::Application,
+                        operations: vec![
+                            "launch".to_string(),
+                            "close".to_string(),
+                            "send_input".to_string(),
+                            "read_output".to_string(),
+                        ],
+                        targets: None,
+                        decision: AccessDecision::Allowed,
+                    },
+                    PermissionRule {
+                        resource_type: ResourceType::Browser,
+                        operations: vec![
+                            "navigate".to_string(),
+                            "click".to_string(),
+                            "type".to_string(),
+                            "read".to_string(),
+                        ],
+                        targets: None,
+                        decision: AccessDecision::Allowed,
+                    },
+                ],
+            },
+        );
 
         // Full-access: everything allowed, no approval needed
-        self.profiles.insert("full-access".to_string(), PermissionProfile {
-            id: "full-access".to_string(),
-            name: "Full Access".to_string(),
-            rules: vec![], // Empty rules = allow everything
-        });
+        self.profiles.insert(
+            "full-access".to_string(),
+            PermissionProfile {
+                id: "full-access".to_string(),
+                name: "Full Access".to_string(),
+                rules: vec![], // Empty rules = allow everything
+            },
+        );
     }
 
     fn matches_glob(pattern: &str, target: &str) -> bool {
@@ -203,12 +265,22 @@ impl PermissionManager {
         pattern == target
     }
 
-    fn find_matching_rule(&self, profile: &PermissionProfile, resource: &ResourceType, operation: &str, target: Option<&str>) -> Option<AccessDecision> {
+    fn find_matching_rule(
+        &self,
+        profile: &PermissionProfile,
+        resource: &ResourceType,
+        operation: &str,
+        target: Option<&str>,
+    ) -> Option<AccessDecision> {
         for rule in &profile.rules {
             if &rule.resource_type != resource {
                 continue;
             }
-            if !rule.operations.iter().any(|op| op == operation || op == "*") {
+            if !rule
+                .operations
+                .iter()
+                .any(|op| op == operation || op == "*")
+            {
                 continue;
             }
             // Check target patterns if specified
@@ -225,8 +297,16 @@ impl PermissionManager {
 
 #[async_trait::async_trait]
 impl PermissionSystem for PermissionManager {
-    fn check_access(&self, agent_id: AgentId, resource: &ResourceType, operation: &str, target: Option<&str>) -> AccessDecision {
-        let profile_id = self.agent_profiles.get(&agent_id)
+    fn check_access(
+        &self,
+        agent_id: AgentId,
+        resource: &ResourceType,
+        operation: &str,
+        target: Option<&str>,
+    ) -> AccessDecision {
+        let profile_id = self
+            .agent_profiles
+            .get(&agent_id)
             .map(|r| r.value().clone())
             .unwrap_or_else(|| "standard".to_string());
 
@@ -249,7 +329,11 @@ impl PermissionSystem for PermissionManager {
             .unwrap_or(AccessDecision::Denied)
     }
 
-    async fn request_elevation(&self, _agent_id: AgentId, _action: &str) -> Result<AccessDecision, PermissionError> {
+    async fn request_elevation(
+        &self,
+        _agent_id: AgentId,
+        _action: &str,
+    ) -> Result<AccessDecision, PermissionError> {
         // In a real implementation, this would prompt the user via the UI.
         // For now, return RequiresApproval to indicate the request was registered.
         Ok(AccessDecision::RequiresApproval)
@@ -263,28 +347,49 @@ impl PermissionSystem for PermissionManager {
         let log = self.audit_log.lock().unwrap();
         match filter {
             None => log.clone(),
-            Some(f) => log.iter().filter(|entry| {
-                if let Some(aid) = f.agent_id {
-                    if entry.agent_id != aid { return false; }
-                }
-                if let Some(ref res) = f.resource {
-                    if &entry.resource != res { return false; }
-                }
-                if let Some(ref dec) = f.decision {
-                    if &entry.decision != dec { return false; }
-                }
-                if let Some(from) = f.from {
-                    if entry.timestamp < from { return false; }
-                }
-                if let Some(to) = f.to {
-                    if entry.timestamp > to { return false; }
-                }
-                true
-            }).cloned().collect(),
+            Some(f) => log
+                .iter()
+                .filter(|entry| {
+                    if let Some(aid) = f.agent_id {
+                        if entry.agent_id != aid {
+                            return false;
+                        }
+                    }
+                    if let Some(ref res) = f.resource {
+                        if &entry.resource != res {
+                            return false;
+                        }
+                    }
+                    if let Some(ref dec) = f.decision {
+                        if &entry.decision != dec {
+                            return false;
+                        }
+                    }
+                    if let Some(from) = f.from {
+                        if entry.timestamp < from {
+                            return false;
+                        }
+                    }
+                    if let Some(to) = f.to {
+                        if entry.timestamp > to {
+                            return false;
+                        }
+                    }
+                    true
+                })
+                .cloned()
+                .collect(),
         }
     }
 
-    fn log_action(&self, agent_id: AgentId, action: &str, resource: &str, decision: AccessDecision, outcome: ActionOutcome) {
+    fn log_action(
+        &self,
+        agent_id: AgentId,
+        action: &str,
+        resource: &str,
+        decision: AccessDecision,
+        outcome: ActionOutcome,
+    ) {
         let entry = AuditEntry {
             timestamp: Utc::now(),
             agent_id,
@@ -306,7 +411,10 @@ mod tests {
         let mgr = PermissionManager::new();
         let id = uuid::Uuid::new_v4();
         mgr.assign_profile(id, &"read-only".to_string());
-        assert_eq!(mgr.check_access(id, &ResourceType::Filesystem, "read", None), AccessDecision::Allowed);
+        assert_eq!(
+            mgr.check_access(id, &ResourceType::Filesystem, "read", None),
+            AccessDecision::Allowed
+        );
     }
 
     #[test]
@@ -314,7 +422,10 @@ mod tests {
         let mgr = PermissionManager::new();
         let id = uuid::Uuid::new_v4();
         mgr.assign_profile(id, &"read-only".to_string());
-        assert_eq!(mgr.check_access(id, &ResourceType::Filesystem, "write", None), AccessDecision::Denied);
+        assert_eq!(
+            mgr.check_access(id, &ResourceType::Filesystem, "write", None),
+            AccessDecision::Denied
+        );
     }
 
     #[test]
@@ -322,7 +433,10 @@ mod tests {
         let mgr = PermissionManager::new();
         let id = uuid::Uuid::new_v4();
         mgr.assign_profile(id, &"standard".to_string());
-        assert_eq!(mgr.check_access(id, &ResourceType::Filesystem, "write", None), AccessDecision::Allowed);
+        assert_eq!(
+            mgr.check_access(id, &ResourceType::Filesystem, "write", None),
+            AccessDecision::Allowed
+        );
     }
 
     #[test]
@@ -330,7 +444,10 @@ mod tests {
         let mgr = PermissionManager::new();
         let id = uuid::Uuid::new_v4();
         mgr.assign_profile(id, &"standard".to_string());
-        assert_eq!(mgr.check_access(id, &ResourceType::Filesystem, "delete", None), AccessDecision::RequiresApproval);
+        assert_eq!(
+            mgr.check_access(id, &ResourceType::Filesystem, "delete", None),
+            AccessDecision::RequiresApproval
+        );
     }
 
     #[test]
@@ -338,14 +455,23 @@ mod tests {
         let mgr = PermissionManager::new();
         let id = uuid::Uuid::new_v4();
         mgr.assign_profile(id, &"full-access".to_string());
-        assert_eq!(mgr.check_access(id, &ResourceType::Filesystem, "delete", None), AccessDecision::Allowed);
+        assert_eq!(
+            mgr.check_access(id, &ResourceType::Filesystem, "delete", None),
+            AccessDecision::Allowed
+        );
     }
 
     #[test]
     fn audit_log_records_actions() {
         let mgr = PermissionManager::new();
         let id = uuid::Uuid::new_v4();
-        mgr.log_action(id, "read file", "filesystem", AccessDecision::Allowed, ActionOutcome::Success);
+        mgr.log_action(
+            id,
+            "read file",
+            "filesystem",
+            AccessDecision::Allowed,
+            ActionOutcome::Success,
+        );
         let log = mgr.get_audit_log(None);
         assert_eq!(log.len(), 1);
         assert_eq!(log[0].action, "read file");
@@ -356,10 +482,28 @@ mod tests {
         let mgr = PermissionManager::new();
         let id1 = uuid::Uuid::new_v4();
         let id2 = uuid::Uuid::new_v4();
-        mgr.log_action(id1, "read", "fs", AccessDecision::Allowed, ActionOutcome::Success);
-        mgr.log_action(id2, "write", "fs", AccessDecision::Denied, ActionOutcome::Failure);
+        mgr.log_action(
+            id1,
+            "read",
+            "fs",
+            AccessDecision::Allowed,
+            ActionOutcome::Success,
+        );
+        mgr.log_action(
+            id2,
+            "write",
+            "fs",
+            AccessDecision::Denied,
+            ActionOutcome::Failure,
+        );
 
-        let filter = AuditFilter { agent_id: Some(id1), resource: None, decision: None, from: None, to: None };
+        let filter = AuditFilter {
+            agent_id: Some(id1),
+            resource: None,
+            decision: None,
+            from: None,
+            to: None,
+        };
         let log = mgr.get_audit_log(Some(&filter));
         assert_eq!(log.len(), 1);
         assert_eq!(log[0].agent_id, id1);
@@ -370,8 +514,14 @@ mod tests {
         let mgr = PermissionManager::new();
         let id = uuid::Uuid::new_v4();
         // No profile assigned — defaults to standard
-        assert_eq!(mgr.check_access(id, &ResourceType::Filesystem, "read", None), AccessDecision::Allowed);
-        assert_eq!(mgr.check_access(id, &ResourceType::Filesystem, "write", None), AccessDecision::Allowed);
+        assert_eq!(
+            mgr.check_access(id, &ResourceType::Filesystem, "read", None),
+            AccessDecision::Allowed
+        );
+        assert_eq!(
+            mgr.check_access(id, &ResourceType::Filesystem, "write", None),
+            AccessDecision::Allowed
+        );
     }
 
     #[test]

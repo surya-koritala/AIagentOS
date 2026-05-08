@@ -1,13 +1,13 @@
 //! Tauri command handlers for the AI Agent OS desktop app.
 
-use tauri::State;
-use kernel::{
-    AgentConfig, AgentKernelImpl, Priority,
-    agent::{AgentKernel, AgentInfo},
-    config::Config,
-    observability::{ObservabilityEngine, MetricScope},
-};
 use crate::AppState;
+use kernel::{
+    agent::{AgentInfo, AgentKernel},
+    config::Config,
+    observability::{MetricScope, ObservabilityEngine},
+    AgentConfig, AgentKernelImpl, Priority,
+};
+use tauri::State;
 
 #[tauri::command]
 pub async fn create_agent(
@@ -24,7 +24,10 @@ pub async fn create_agent(
         priority: Priority::default(),
         sandbox_config: None,
     };
-    let handle = state.kernel.create_agent_full(config).await
+    let handle = state
+        .kernel
+        .create_agent_full(config)
+        .await
         .map_err(|e| e.to_string())?;
     Ok(handle.id.to_string())
 }
@@ -36,7 +39,10 @@ pub async fn send_message(
     message: String,
 ) -> Result<serde_json::Value, String> {
     let id = uuid::Uuid::parse_str(&agent_id).map_err(|e| e.to_string())?;
-    let output = state.kernel.send_message(id, &message).await
+    let output = state
+        .kernel
+        .send_message(id, &message)
+        .await
         .map_err(|e| e.to_string())?;
     Ok(serde_json::json!({
         "content": output.content,
@@ -48,31 +54,51 @@ pub async fn send_message(
 #[tauri::command]
 pub async fn pause_agent(state: State<'_, AppState>, agent_id: String) -> Result<(), String> {
     let id = uuid::Uuid::parse_str(&agent_id).map_err(|e| e.to_string())?;
-    state.kernel.agent_manager.pause_agent(id).await.map_err(|e| e.to_string())
+    state
+        .kernel
+        .agent_manager
+        .pause_agent(id)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 pub async fn resume_agent(state: State<'_, AppState>, agent_id: String) -> Result<(), String> {
     let id = uuid::Uuid::parse_str(&agent_id).map_err(|e| e.to_string())?;
-    state.kernel.agent_manager.resume_agent(id).await.map_err(|e| e.to_string())
+    state
+        .kernel
+        .agent_manager
+        .resume_agent(id)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 pub async fn stop_agent(state: State<'_, AppState>, agent_id: String) -> Result<(), String> {
     let id = uuid::Uuid::parse_str(&agent_id).map_err(|e| e.to_string())?;
-    state.kernel.agent_manager.stop_agent(id).await.map_err(|e| e.to_string())
+    state
+        .kernel
+        .agent_manager
+        .stop_agent(id)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 pub fn list_agents(state: State<'_, AppState>) -> Vec<serde_json::Value> {
-    state.kernel.agent_manager.list_agents(None)
+    state
+        .kernel
+        .agent_manager
+        .list_agents(None)
         .iter()
-        .map(|info| serde_json::json!({
-            "id": info.id.to_string(),
-            "name": info.name,
-            "state": format!("{:?}", info.state),
-            "priority": info.priority.value(),
-        }))
+        .map(|info| {
+            serde_json::json!({
+                "id": info.id.to_string(),
+                "name": info.name,
+                "state": format!("{:?}", info.state),
+                "priority": info.priority.value(),
+            })
+        })
         .collect()
 }
 

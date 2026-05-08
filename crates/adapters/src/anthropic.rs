@@ -39,7 +39,11 @@ impl LlmSession for AnthropicSession {
         self.send_with_tools(messages, &[]).await
     }
 
-    async fn send_with_tools(&self, messages: Vec<StandardMessage>, tools: &[ToolDefinition]) -> Result<LlmResponse, ConnectorError> {
+    async fn send_with_tools(
+        &self,
+        messages: Vec<StandardMessage>,
+        tools: &[ToolDefinition],
+    ) -> Result<LlmResponse, ConnectorError> {
         let mut body = serde_json::json!({
             "model": "claude-3-5-sonnet-20241022",
             "max_tokens": 4096,
@@ -47,9 +51,14 @@ impl LlmSession for AnthropicSession {
         });
 
         if !tools.is_empty() {
-            let tool_defs: Vec<serde_json::Value> = tools.iter().map(|t| serde_json::json!({
-                "name": t.name, "description": t.description, "input_schema": t.parameters
-            })).collect();
+            let tool_defs: Vec<serde_json::Value> = tools
+                .iter()
+                .map(|t| {
+                    serde_json::json!({
+                        "name": t.name, "description": t.description, "input_schema": t.parameters
+                    })
+                })
+                .collect();
             body["tools"] = serde_json::json!(tool_defs);
         }
 
@@ -59,7 +68,8 @@ impl LlmSession for AnthropicSession {
                 tokio::time::sleep(tokio::time::Duration::from_millis(1000 * (1 << attempt))).await;
             }
 
-            let result = self.client
+            let result = self
+                .client
                 .post(format!("{}/messages", self.base_url))
                 .header("x-api-key", &self.api_key)
                 .header("anthropic-version", "2023-06-01")
@@ -69,21 +79,33 @@ impl LlmSession for AnthropicSession {
 
             match result {
                 Ok(resp) if resp.status().is_success() => {
-                    let json: serde_json::Value = resp.json().await
+                    let json: serde_json::Value = resp
+                        .json()
+                        .await
                         .map_err(|e| ConnectorError::ProtocolError(e.to_string()))?;
-                    let content = json["content"][0]["text"].as_str().unwrap_or("").to_string();
+                    let content = json["content"][0]["text"]
+                        .as_str()
+                        .unwrap_or("")
+                        .to_string();
                     let input_tokens = json["usage"]["input_tokens"].as_u64().unwrap_or(0);
                     let output_tokens = json["usage"]["output_tokens"].as_u64().unwrap_or(0);
-                    let tool_calls = json["content"].as_array()
-                        .map(|arr| arr.iter().filter_map(|block| {
-                            if block["type"].as_str()? == "tool_use" {
-                                Some(ToolCall {
-                                    id: block["id"].as_str()?.to_string(),
-                                    name: block["name"].as_str()?.to_string(),
-                                    arguments: block["input"].clone(),
+                    let tool_calls = json["content"]
+                        .as_array()
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|block| {
+                                    if block["type"].as_str()? == "tool_use" {
+                                        Some(ToolCall {
+                                            id: block["id"].as_str()?.to_string(),
+                                            name: block["name"].as_str()?.to_string(),
+                                            arguments: block["input"].clone(),
+                                        })
+                                    } else {
+                                        None
+                                    }
                                 })
-                            } else { None }
-                        }).collect())
+                                .collect()
+                        })
                         .unwrap_or_default();
                     return Ok(LlmResponse {
                         content,
@@ -93,7 +115,10 @@ impl LlmSession for AnthropicSession {
                     });
                 }
                 Ok(resp) => {
-                    last_err = Some(ConnectorError::ConnectionFailed(format!("HTTP {}", resp.status())));
+                    last_err = Some(ConnectorError::ConnectionFailed(format!(
+                        "HTTP {}",
+                        resp.status()
+                    )));
                 }
                 Err(e) => {
                     last_err = Some(ConnectorError::ConnectionFailed(e.to_string()));
@@ -103,14 +128,22 @@ impl LlmSession for AnthropicSession {
         Err(last_err.unwrap())
     }
 
-    fn provider_id(&self) -> &ProviderId { &self.provider_id }
+    fn provider_id(&self) -> &ProviderId {
+        &self.provider_id
+    }
 }
 
 #[async_trait::async_trait]
 impl LlmProviderAdapter for AnthropicAdapter {
-    fn id(&self) -> &ProviderId { &self.id }
-    fn name(&self) -> &str { "Anthropic" }
-    fn provider_type(&self) -> ProviderType { ProviderType::Cloud }
+    fn id(&self) -> &ProviderId {
+        &self.id
+    }
+    fn name(&self) -> &str {
+        "Anthropic"
+    }
+    fn provider_type(&self) -> ProviderType {
+        ProviderType::Cloud
+    }
 
     async fn is_available(&self) -> bool {
         // Simple connectivity check

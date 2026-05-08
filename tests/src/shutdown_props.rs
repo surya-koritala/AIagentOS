@@ -3,20 +3,19 @@
 //! Property 25: For any set of running agents at shutdown, all states SHALL be
 //! persisted and sessions terminated.
 
-use proptest::prelude::*;
-use kernel::{AgentConfig, AgentKernelImpl, AgentState, Priority};
 use kernel::agent::AgentKernel;
+use kernel::{AgentConfig, AgentKernelImpl, AgentState, Priority};
+use proptest::prelude::*;
 
 fn arb_config() -> impl Strategy<Value = AgentConfig> {
-    ("[a-z]{3,10}", "[a-zA-Z ]{5,20}")
-        .prop_map(|(name, task)| AgentConfig {
-            name,
-            task,
-            llm_provider: "openai".to_string(),
-            permission_profile: "standard".to_string(),
-            priority: Priority::default(),
-            sandbox_config: None,
-        })
+    ("[a-z]{3,10}", "[a-zA-Z ]{5,20}").prop_map(|(name, task)| AgentConfig {
+        name,
+        task,
+        llm_provider: "openai".to_string(),
+        permission_profile: "standard".to_string(),
+        priority: Priority::default(),
+        sandbox_config: None,
+    })
 }
 
 proptest! {

@@ -22,12 +22,10 @@ pub async fn parse_azure_sse_stream(
     response: reqwest::Response,
     tx: mpsc::Sender<StreamChunk>,
 ) -> Result<LlmResponse, ConnectorError> {
-    
-    
-
     let mut content = String::new();
     let mut tool_calls: Vec<ToolCall> = Vec::new();
-    let mut current_tool_args: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut current_tool_args: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
     let mut tokens_used: u32 = 0;
 
     let mut stream = response.bytes_stream();
@@ -49,7 +47,8 @@ pub async fn parse_azure_sse_stream(
                         // Build final response
                         for (id, args) in &current_tool_args {
                             if let Some(tc) = tool_calls.iter_mut().find(|t| &t.id == id) {
-                                tc.arguments = serde_json::from_str(args).unwrap_or(serde_json::Value::Null);
+                                tc.arguments =
+                                    serde_json::from_str(args).unwrap_or(serde_json::Value::Null);
                             }
                         }
                         return Ok(LlmResponse {
@@ -76,16 +75,34 @@ pub async fn parse_azure_sse_stream(
                             for tc in tcs {
                                 let idx = tc["index"].as_u64().unwrap_or(0) as usize;
                                 if let Some(id) = tc["id"].as_str() {
-                                    let name = tc["function"]["name"].as_str().unwrap_or("").to_string();
-                                    tool_calls.push(ToolCall { id: id.to_string(), name: name.clone(), arguments: serde_json::Value::Null });
+                                    let name =
+                                        tc["function"]["name"].as_str().unwrap_or("").to_string();
+                                    tool_calls.push(ToolCall {
+                                        id: id.to_string(),
+                                        name: name.clone(),
+                                        arguments: serde_json::Value::Null,
+                                    });
                                     current_tool_args.insert(id.to_string(), String::new());
-                                    let _ = tx.send(StreamChunk::ToolCallStart { id: id.to_string(), name }).await;
+                                    let _ = tx
+                                        .send(StreamChunk::ToolCallStart {
+                                            id: id.to_string(),
+                                            name,
+                                        })
+                                        .await;
                                 }
                                 if let Some(args) = tc["function"]["arguments"].as_str() {
                                     if let Some(tc_ref) = tool_calls.get(idx) {
                                         let id = tc_ref.id.clone();
-                                        current_tool_args.entry(id.clone()).or_default().push_str(args);
-                                        let _ = tx.send(StreamChunk::ToolCallDelta { id, arguments_delta: args.to_string() }).await;
+                                        current_tool_args
+                                            .entry(id.clone())
+                                            .or_default()
+                                            .push_str(args);
+                                        let _ = tx
+                                            .send(StreamChunk::ToolCallDelta {
+                                                id,
+                                                arguments_delta: args.to_string(),
+                                            })
+                                            .await;
                                     }
                                 }
                             }
@@ -108,5 +125,10 @@ pub async fn parse_azure_sse_stream(
         }
     }
 
-    Ok(LlmResponse { content, finish_reason: Some("stop".into()), tokens_used, tool_calls })
+    Ok(LlmResponse {
+        content,
+        finish_reason: Some("stop".into()),
+        tokens_used,
+        tool_calls,
+    })
 }

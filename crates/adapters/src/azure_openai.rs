@@ -60,20 +60,29 @@ impl LlmSession for AzureSession {
         self.send_with_tools(messages, &[]).await
     }
 
-    async fn send_with_tools(&self, messages: Vec<StandardMessage>, tools: &[ToolDefinition]) -> Result<LlmResponse, ConnectorError> {
-        let msgs: Vec<serde_json::Value> = messages.iter().map(|m| {
-            let mut obj = serde_json::json!({"role": m.role, "content": m.content});
-            if let Some(ref id) = m.tool_call_id {
-                obj["tool_call_id"] = serde_json::json!(id);
-            }
-            if let Some(ref tcs) = m.tool_calls {
-                obj["tool_calls"] = serde_json::json!(tcs.iter().map(|tc| serde_json::json!({
+    async fn send_with_tools(
+        &self,
+        messages: Vec<StandardMessage>,
+        tools: &[ToolDefinition],
+    ) -> Result<LlmResponse, ConnectorError> {
+        let msgs: Vec<serde_json::Value> =
+            messages
+                .iter()
+                .map(|m| {
+                    let mut obj = serde_json::json!({"role": m.role, "content": m.content});
+                    if let Some(ref id) = m.tool_call_id {
+                        obj["tool_call_id"] = serde_json::json!(id);
+                    }
+                    if let Some(ref tcs) = m.tool_calls {
+                        obj["tool_calls"] =
+                            serde_json::json!(tcs.iter().map(|tc| serde_json::json!({
                     "id": tc.id, "type": "function",
                     "function": {"name": tc.name, "arguments": tc.arguments.to_string()}
                 })).collect::<Vec<_>>());
-            }
-            obj
-        }).collect();
+                    }
+                    obj
+                })
+                .collect();
 
         let mut body = serde_json::json!({ "messages": msgs });
 
@@ -91,7 +100,8 @@ impl LlmSession for AzureSession {
                 tokio::time::sleep(tokio::time::Duration::from_millis(1000 * (1 << attempt))).await;
             }
 
-            let result = self.client
+            let result = self
+                .client
                 .post(&self.chat_url)
                 .header("api-key", &self.api_key)
                 .header("Content-Type", "application/json")
@@ -101,24 +111,37 @@ impl LlmSession for AzureSession {
 
             match result {
                 Ok(resp) if resp.status().is_success() => {
-                    let json: serde_json::Value = resp.json().await
+                    let json: serde_json::Value = resp
+                        .json()
+                        .await
                         .map_err(|e| ConnectorError::ProtocolError(e.to_string()))?;
                     let content = json["choices"][0]["message"]["content"]
-                        .as_str().unwrap_or("").to_string();
+                        .as_str()
+                        .unwrap_or("")
+                        .to_string();
                     let tokens = json["usage"]["total_tokens"].as_u64().unwrap_or(0) as u32;
                     let tool_calls = json["choices"][0]["message"]["tool_calls"]
                         .as_array()
-                        .map(|arr| arr.iter().filter_map(|tc| {
-                            Some(ToolCall {
-                                id: tc["id"].as_str()?.to_string(),
-                                name: tc["function"]["name"].as_str()?.to_string(),
-                                arguments: serde_json::from_str(tc["function"]["arguments"].as_str()?).unwrap_or(serde_json::Value::Null),
-                            })
-                        }).collect())
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|tc| {
+                                    Some(ToolCall {
+                                        id: tc["id"].as_str()?.to_string(),
+                                        name: tc["function"]["name"].as_str()?.to_string(),
+                                        arguments: serde_json::from_str(
+                                            tc["function"]["arguments"].as_str()?,
+                                        )
+                                        .unwrap_or(serde_json::Value::Null),
+                                    })
+                                })
+                                .collect()
+                        })
                         .unwrap_or_default();
                     return Ok(LlmResponse {
                         content,
-                        finish_reason: json["choices"][0]["finish_reason"].as_str().map(|s| s.to_string()),
+                        finish_reason: json["choices"][0]["finish_reason"]
+                            .as_str()
+                            .map(|s| s.to_string()),
                         tokens_used: tokens,
                         tool_calls,
                     });
@@ -126,7 +149,10 @@ impl LlmSession for AzureSession {
                 Ok(resp) => {
                     let status = resp.status();
                     let body = resp.text().await.unwrap_or_default();
-                    last_err = Some(ConnectorError::ConnectionFailed(format!("HTTP {} - {}", status, body)));
+                    last_err = Some(ConnectorError::ConnectionFailed(format!(
+                        "HTTP {} - {}",
+                        status, body
+                    )));
                 }
                 Err(e) => {
                     last_err = Some(ConnectorError::ConnectionFailed(e.to_string()));
@@ -136,9 +162,15 @@ impl LlmSession for AzureSession {
         Err(last_err.unwrap())
     }
 
-    fn provider_id(&self) -> &ProviderId { &self.provider_id }
+    fn provider_id(&self) -> &ProviderId {
+        &self.provider_id
+    }
 
-    async fn send_streaming(&self, messages: Vec<StandardMessage>, tools: &[ToolDefinition]) -> Result<LlmResponse, ConnectorError> {
+    async fn send_streaming(
+        &self,
+        messages: Vec<StandardMessage>,
+        tools: &[ToolDefinition],
+    ) -> Result<LlmResponse, ConnectorError> {
         let msgs: Vec<serde_json::Value> = messages.iter().map(|m| {
             let mut obj = serde_json::json!({"role": m.role, "content": m.content});
             if let Some(ref id) = m.tool_call_id { obj["tool_call_id"] = serde_json::json!(id); }
@@ -158,45 +190,76 @@ impl LlmSession for AzureSession {
             body["tools"] = serde_json::json!(tool_defs);
         }
 
-        let resp = self.client.post(&self.chat_url)
+        let resp = self
+            .client
+            .post(&self.chat_url)
             .header("api-key", &self.api_key)
             .header("Content-Type", "application/json")
             .json(&body)
-            .send().await
+            .send()
+            .await
             .map_err(|e| ConnectorError::ConnectionFailed(e.to_string()))?;
 
         if !resp.status().is_success() {
             let status = resp.status();
             let text = resp.text().await.unwrap_or_default();
-            return Err(ConnectorError::ConnectionFailed(format!("HTTP {} - {}", status, text)));
+            return Err(ConnectorError::ConnectionFailed(format!(
+                "HTTP {} - {}",
+                status, text
+            )));
         }
 
-        let full_body = resp.text().await.map_err(|e| ConnectorError::StreamError(e.to_string()))?;
+        let full_body = resp
+            .text()
+            .await
+            .map_err(|e| ConnectorError::StreamError(e.to_string()))?;
 
         // If response is not SSE (e.g., from wiremock), parse as regular JSON
         if !full_body.starts_with("data:") {
             if let Ok(json) = serde_json::from_str::<serde_json::Value>(&full_body) {
-                let content = json["choices"][0]["message"]["content"].as_str().unwrap_or("").to_string();
+                let content = json["choices"][0]["message"]["content"]
+                    .as_str()
+                    .unwrap_or("")
+                    .to_string();
                 let tokens = json["usage"]["total_tokens"].as_u64().unwrap_or(0) as u32;
-                let tool_calls = json["choices"][0]["message"]["tool_calls"].as_array()
-                    .map(|arr| arr.iter().filter_map(|tc| Some(ToolCall {
-                        id: tc["id"].as_str()?.to_string(),
-                        name: tc["function"]["name"].as_str()?.to_string(),
-                        arguments: serde_json::from_str(tc["function"]["arguments"].as_str()?).unwrap_or(serde_json::Value::Null),
-                    })).collect()).unwrap_or_default();
-                return Ok(LlmResponse { content, finish_reason: Some("stop".into()), tokens_used: tokens, tool_calls });
+                let tool_calls = json["choices"][0]["message"]["tool_calls"]
+                    .as_array()
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|tc| {
+                                Some(ToolCall {
+                                    id: tc["id"].as_str()?.to_string(),
+                                    name: tc["function"]["name"].as_str()?.to_string(),
+                                    arguments: serde_json::from_str(
+                                        tc["function"]["arguments"].as_str()?,
+                                    )
+                                    .unwrap_or(serde_json::Value::Null),
+                                })
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                return Ok(LlmResponse {
+                    content,
+                    finish_reason: Some("stop".into()),
+                    tokens_used: tokens,
+                    tool_calls,
+                });
             }
         }
 
         // Parse SSE stream
         let mut content = String::new();
         let mut tool_calls: Vec<ToolCall> = Vec::new();
-        let mut tool_args: std::collections::HashMap<usize, String> = std::collections::HashMap::new();
+        let mut tool_args: std::collections::HashMap<usize, String> =
+            std::collections::HashMap::new();
         let mut tokens_used: u32 = 0;
 
         for line in full_body.lines() {
             if let Some(data) = line.strip_prefix("data: ") {
-                if data == "[DONE]" { continue; }
+                if data == "[DONE]" {
+                    continue;
+                }
                 if let Ok(json) = serde_json::from_str::<serde_json::Value>(data) {
                     if let Some(delta) = json["choices"].get(0).and_then(|c| c.get("delta")) {
                         if let Some(text) = delta["content"].as_str() {
@@ -207,8 +270,13 @@ impl LlmSession for AzureSession {
                             for tc in tcs {
                                 let idx = tc["index"].as_u64().unwrap_or(0) as usize;
                                 if let Some(id) = tc["id"].as_str() {
-                                    let name = tc["function"]["name"].as_str().unwrap_or("").to_string();
-                                    tool_calls.push(ToolCall { id: id.to_string(), name, arguments: serde_json::Value::Null });
+                                    let name =
+                                        tc["function"]["name"].as_str().unwrap_or("").to_string();
+                                    tool_calls.push(ToolCall {
+                                        id: id.to_string(),
+                                        name,
+                                        arguments: serde_json::Value::Null,
+                                    });
                                 }
                                 if let Some(args) = tc["function"]["arguments"].as_str() {
                                     tool_args.entry(idx).or_default().push_str(args);
@@ -223,7 +291,9 @@ impl LlmSession for AzureSession {
             }
         }
 
-        if !content.is_empty() { eprintln!(); }
+        if !content.is_empty() {
+            eprintln!();
+        }
 
         for (idx, args) in &tool_args {
             if let Some(tc) = tool_calls.get_mut(*idx) {
@@ -231,15 +301,26 @@ impl LlmSession for AzureSession {
             }
         }
 
-        Ok(LlmResponse { content, finish_reason: Some("stop".into()), tokens_used, tool_calls })
+        Ok(LlmResponse {
+            content,
+            finish_reason: Some("stop".into()),
+            tokens_used,
+            tool_calls,
+        })
     }
 }
 
 #[async_trait::async_trait]
 impl LlmProviderAdapter for AzureOpenAiAdapter {
-    fn id(&self) -> &ProviderId { &self.id }
-    fn name(&self) -> &str { "Azure OpenAI" }
-    fn provider_type(&self) -> ProviderType { ProviderType::Cloud }
+    fn id(&self) -> &ProviderId {
+        &self.id
+    }
+    fn name(&self) -> &str {
+        "Azure OpenAI"
+    }
+    fn provider_type(&self) -> ProviderType {
+        ProviderType::Cloud
+    }
 
     async fn is_available(&self) -> bool {
         // Azure endpoints don't respond to bare GET — just check we have credentials
@@ -262,7 +343,11 @@ impl LlmProviderAdapter for AzureOpenAiAdapter {
     fn translate_from_provider(&self, value: &serde_json::Value) -> Option<StandardMessage> {
         Some(StandardMessage {
             role: value.get("role")?.as_str()?.to_string(),
-            content: value.get("content").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            content: value
+                .get("content")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
             tool_call_id: None,
             tool_calls: None,
         })

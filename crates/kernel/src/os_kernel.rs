@@ -16,20 +16,22 @@
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
-use crate::agent_struct::{AgentId, AgentState, AgentStruct, AgentTable, CapabilitySet};
-use crate::agent_syscalls::{AgentSyscalls, clone_flags};
-use crate::cfs::CfsScheduler;
+use crate::agent_sockets::SocketRegistry;
 use crate::agent_struct::SchedClass;
-use crate::cgroups::{CgroupManager, CgroupLimits};
+use crate::agent_struct::{AgentId, AgentState, AgentStruct, AgentTable, CapabilitySet};
+use crate::agent_syscalls::{clone_flags, AgentSyscalls};
+use crate::cfs::CfsScheduler;
+use crate::cgroups::{CgroupLimits, CgroupManager};
 use crate::event_loop::{EventLoop, KernelEvent};
 use crate::init_system::{InitSystem, ServiceStatus};
-use crate::mac::{MacEngine, MacDecision};
+use crate::mac::{MacDecision, MacEngine};
 use crate::namespaces::{NamespaceRegistry, NamespaceType};
 use crate::procfs::ProcFs;
-use crate::sysctl::Sysctl;
-use crate::syscall_interface::{SyscallNum, SyscallArgs, SyscallResult, SyscallError, check_capability};
-use crate::agent_sockets::SocketRegistry;
 use crate::service_discovery::ServiceRegistry;
+use crate::syscall_interface::{
+    check_capability, SyscallArgs, SyscallError, SyscallNum, SyscallResult,
+};
+use crate::sysctl::Sysctl;
 
 /// The unified OS kernel.
 pub struct OsKernel {
@@ -86,12 +88,16 @@ impl OsKernel {
     }
 
     /// Boot the kernel: load services, resolve deps, start agents.
-    pub async fn boot(&self, service_dir: Option<&std::path::Path>) -> Result<Vec<AgentId>, String> {
+    pub async fn boot(
+        &self,
+        service_dir: Option<&std::path::Path>,
+    ) -> Result<Vec<AgentId>, String> {
         // Load service files
         if let Some(dir) = service_dir {
             let mut init = self.init.lock().await;
             init.load_directory(dir);
-            init.resolve_boot_order().map_err(|e| format!("Boot failed: {}", e))?;
+            init.resolve_boot_order()
+                .map_err(|e| format!("Boot failed: {}", e))?;
         }
 
         // Start agents in dependency order
@@ -156,7 +162,12 @@ impl OsKernel {
     }
 
     /// Execute a syscall with full security enforcement.
-    pub async fn syscall(&self, caller: AgentId, num: SyscallNum, args: SyscallArgs) -> SyscallResult {
+    pub async fn syscall(
+        &self,
+        caller: AgentId,
+        num: SyscallNum,
+        args: SyscallArgs,
+    ) -> SyscallResult {
         // 1. MAC check
         let action = match num {
             SyscallNum::Create | SyscallNum::Clone => "create",
@@ -204,7 +215,10 @@ impl OsKernel {
         for ns_id in [
             self.namespaces.default_ns(NamespaceType::Agent),
             self.namespaces.default_ns(NamespaceType::Tool),
-        ].into_iter().flatten() {
+        ]
+        .into_iter()
+        .flatten()
+        {
             self.namespaces.leave(ns_id, id);
         }
 
@@ -216,7 +230,10 @@ impl OsKernel {
         procfs.set_agent_info(id, "state".into(), "stopped".into());
 
         // 5. Emit event
-        let _ = self.event_tx.send(KernelEvent::AgentExited { id, code: 0 }).await;
+        let _ = self
+            .event_tx
+            .send(KernelEvent::AgentExited { id, code: 0 })
+            .await;
 
         Ok(())
     }
@@ -306,12 +323,17 @@ mod tests {
         {
             let mut mac = kernel.mac.lock().await;
             mac.label_agent(id, "worker".into());
-            mac.load_policy(vec![
-                crate::mac::PolicyRule { subject: "worker".into(), action: "kill".into(), object: "*".into(), decision: "deny".into() },
-            ]);
+            mac.load_policy(vec![crate::mac::PolicyRule {
+                subject: "worker".into(),
+                action: "kill".into(),
+                object: "*".into(),
+                decision: "deny".into(),
+            }]);
         }
 
-        let result = kernel.syscall(id, SyscallNum::Kill, SyscallArgs::none()).await;
+        let result = kernel
+            .syscall(id, SyscallNum::Kill, SyscallArgs::none())
+            .await;
         assert!(matches!(result, SyscallResult::Err(SyscallError::EACCES)));
     }
 
@@ -324,7 +346,9 @@ mod tests {
 
         // Both should be in default agent namespace
         let default_ns = kernel.namespaces.default_ns(NamespaceType::Agent).unwrap();
-        assert!(kernel.namespaces.same_namespace(id1, id2, NamespaceType::Agent));
+        assert!(kernel
+            .namespaces
+            .same_namespace(id1, id2, NamespaceType::Agent));
     }
 }
 
@@ -436,7 +460,9 @@ requires = ["researcher"]
         }
 
         for &id in &ids {
-            assert!(kernel.namespaces.same_namespace(ids[0], id, NamespaceType::Agent));
+            assert!(kernel
+                .namespaces
+                .same_namespace(ids[0], id, NamespaceType::Agent));
         }
 
         kernel.stop_agent(ids[2]).await.unwrap();
@@ -455,7 +481,13 @@ requires = ["researcher"]
 impl OsKernel {
     /// Execute a tool call through the full kernel path:
     /// descriptor table → mount resolve → namespace check → permission check → execute
-    pub async fn tool_call(&self, agent_id: AgentId, tool_path: &str, operation: &str, params: &serde_json::Value) -> Result<serde_json::Value, String> {
+    pub async fn tool_call(
+        &self,
+        agent_id: AgentId,
+        tool_path: &str,
+        operation: &str,
+        params: &serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
         // 1. Check agent exists
         if self.agents.get(agent_id).is_none() {
             return Err("agent not found (ESRCH)".into());
@@ -516,12 +548,22 @@ mod tool_call_tests {
         {
             let mut mac = kernel.mac.lock().await;
             mac.label_agent(id, "worker".into());
-            mac.load_policy(vec![
-                crate::mac::PolicyRule { subject: "worker".into(), action: "*".into(), object: "*".into(), decision: "allow".into() },
-            ]);
+            mac.load_policy(vec![crate::mac::PolicyRule {
+                subject: "worker".into(),
+                action: "*".into(),
+                object: "*".into(),
+                decision: "allow".into(),
+            }]);
         }
 
-        let result = kernel.tool_call(id, "/tools/fs/read", "read", &serde_json::json!({"path": "/tmp/test"})).await;
+        let result = kernel
+            .tool_call(
+                id,
+                "/tools/fs/read",
+                "read",
+                &serde_json::json!({"path": "/tmp/test"}),
+            )
+            .await;
         assert!(result.is_ok(), "tool_call failed: {:?}", result);
     }
 
@@ -536,17 +578,31 @@ mod tool_call_tests {
             let mut mac = kernel.mac.lock().await;
             mac.label_agent(id, "readonly".into());
             mac.load_policy(vec![
-                crate::mac::PolicyRule { subject: "readonly".into(), action: "write".into(), object: "*".into(), decision: "deny".into() },
-                crate::mac::PolicyRule { subject: "readonly".into(), action: "read".into(), object: "*".into(), decision: "allow".into() },
+                crate::mac::PolicyRule {
+                    subject: "readonly".into(),
+                    action: "write".into(),
+                    object: "*".into(),
+                    decision: "deny".into(),
+                },
+                crate::mac::PolicyRule {
+                    subject: "readonly".into(),
+                    action: "read".into(),
+                    object: "*".into(),
+                    decision: "allow".into(),
+                },
             ]);
         }
 
         // Read should work
-        let result = kernel.tool_call(id, "/tools/fs", "read", &serde_json::json!({})).await;
+        let result = kernel
+            .tool_call(id, "/tools/fs", "read", &serde_json::json!({}))
+            .await;
         assert!(result.is_ok(), "tool_call failed: {:?}", result);
 
         // Write should be denied
-        let result = kernel.tool_call(id, "/tools/fs", "write", &serde_json::json!({})).await;
+        let result = kernel
+            .tool_call(id, "/tools/fs", "write", &serde_json::json!({}))
+            .await;
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("EACCES"));
     }
@@ -555,7 +611,9 @@ mod tool_call_tests {
     async fn tool_call_nonexistent_agent() {
         let kernel = OsKernel::new();
         kernel.boot(None).await.unwrap();
-        let result = kernel.tool_call(99999, "/tools/fs", "read", &serde_json::json!({})).await;
+        let result = kernel
+            .tool_call(99999, "/tools/fs", "read", &serde_json::json!({}))
+            .await;
         assert!(result.is_err());
     }
 }

@@ -53,14 +53,17 @@ impl EventLoop {
     pub fn new() -> (Self, mpsc::Sender<KernelEvent>) {
         let (tx, rx) = mpsc::channel(1024);
         let tx_clone = tx.clone();
-        (Self {
-            event_rx: rx,
-            event_tx: tx,
-            timers: Vec::new(),
-            next_timer_id: 1,
-            tick_count: 0,
-            running: false,
-        }, tx_clone)
+        (
+            Self {
+                event_rx: rx,
+                event_tx: tx,
+                timers: Vec::new(),
+                next_timer_id: 1,
+                tick_count: 0,
+                running: false,
+            },
+            tx_clone,
+        )
     }
 
     /// Get a sender to submit events to the kernel.
@@ -69,11 +72,19 @@ impl EventLoop {
     }
 
     /// Register a timer.
-    pub fn set_timer(&mut self, agent_id: AgentId, delay: Duration, recurring: Option<Duration>) -> u64 {
+    pub fn set_timer(
+        &mut self,
+        agent_id: AgentId,
+        delay: Duration,
+        recurring: Option<Duration>,
+    ) -> u64 {
         let id = self.next_timer_id;
         self.next_timer_id += 1;
         self.timers.push(Timer {
-            id, agent_id, fires_at: Instant::now() + delay, recurring,
+            id,
+            agent_id,
+            fires_at: Instant::now() + delay,
+            recurring,
         });
         id
     }
@@ -122,13 +133,19 @@ impl EventLoop {
     }
 
     /// Get tick count.
-    pub fn tick_count(&self) -> u64 { self.tick_count }
+    pub fn tick_count(&self) -> u64 {
+        self.tick_count
+    }
 
     /// Get pending timer count.
-    pub fn timer_count(&self) -> usize { self.timers.len() }
+    pub fn timer_count(&self) -> usize {
+        self.timers.len()
+    }
 
     /// Stop the event loop.
-    pub fn stop(&mut self) { self.running = false; }
+    pub fn stop(&mut self) {
+        self.running = false;
+    }
 }
 
 #[cfg(test)]
@@ -150,14 +167,20 @@ mod tests {
         eloop.set_timer(1, Duration::from_millis(10), None);
         tokio::time::sleep(Duration::from_millis(20)).await;
         let events = eloop.tick().await;
-        assert!(events.iter().any(|e| matches!(e, KernelEvent::TimerFired { .. })));
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, KernelEvent::TimerFired { .. })));
         assert_eq!(eloop.timer_count(), 0); // one-shot removed
     }
 
     #[tokio::test]
     async fn recurring_timer() {
         let (mut eloop, _tx) = EventLoop::new();
-        eloop.set_timer(1, Duration::from_millis(10), Some(Duration::from_millis(10)));
+        eloop.set_timer(
+            1,
+            Duration::from_millis(10),
+            Some(Duration::from_millis(10)),
+        );
         tokio::time::sleep(Duration::from_millis(15)).await;
         let events = eloop.tick().await;
         assert!(!events.is_empty());

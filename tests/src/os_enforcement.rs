@@ -27,21 +27,33 @@ async fn capability_denies_network_tool_without_cap_net() {
     // Read-only-ish caps: no CAP_NET_ACCESS.
     gate.register_agent(kid, CapabilitySet::none(), None);
 
-    let result = gate.check_tool_call(kid, "http_get", "https://example.com", 5).await;
+    let result = gate
+        .check_tool_call(kid, "http_get", "https://example.com", 5)
+        .await;
     match result {
         Err(GateDenial::MissingCapability(cap)) => assert_eq!(cap, CapabilitySet::CAP_NET_ACCESS),
-        other => panic!("expected MissingCapability(CAP_NET_ACCESS), got {:?}", other),
+        other => panic!(
+            "expected MissingCapability(CAP_NET_ACCESS), got {:?}",
+            other
+        ),
     }
 
     // Reads should still pass — no capability required.
-    let result = gate.check_tool_call(kid, "read_file", "/etc/hosts", 5).await;
-    assert!(result.is_ok(), "read_file should pass without capability requirements");
+    let result = gate
+        .check_tool_call(kid, "read_file", "/etc/hosts", 5)
+        .await;
+    assert!(
+        result.is_ok(),
+        "read_file should pass without capability requirements"
+    );
 
     // Granting CAP_NET_ACCESS unblocks the network tool.
     let mut caps = CapabilitySet::none();
     caps.grant(CapabilitySet::CAP_NET_ACCESS);
     gate.set_capabilities(kid, caps);
-    let result = gate.check_tool_call(kid, "http_get", "https://example.com", 5).await;
+    let result = gate
+        .check_tool_call(kid, "http_get", "https://example.com", 5)
+        .await;
     assert!(result.is_ok(), "http_get should pass with CAP_NET_ACCESS");
 }
 
@@ -52,7 +64,10 @@ async fn cgroup_quota_blocks_when_over_budget() {
     let cg = cgroups.create(
         "tight".into(),
         cgroups.root(),
-        CgroupLimits { tokens_per_min: 100, ..Default::default() },
+        CgroupLimits {
+            tokens_per_min: 100,
+            ..Default::default()
+        },
     );
 
     let kid = uuid::Uuid::new_v4();
@@ -60,12 +75,16 @@ async fn cgroup_quota_blocks_when_over_budget() {
 
     // Burn 90 tokens; now 30 more would breach the 100-token-per-minute cap.
     gate.record_tool_usage(kid, 90);
-    let result = gate.check_tool_call(kid, "read_file", "/etc/hosts", 30).await;
+    let result = gate
+        .check_tool_call(kid, "read_file", "/etc/hosts", 30)
+        .await;
     assert_eq!(result, Err(GateDenial::CgroupQuota));
 
     // Resetting the per-minute counter restores headroom.
     cgroups.reset_minute_counters();
-    let result = gate.check_tool_call(kid, "read_file", "/etc/hosts", 30).await;
+    let result = gate
+        .check_tool_call(kid, "read_file", "/etc/hosts", 30)
+        .await;
     assert!(result.is_ok(), "after reset the call should succeed");
 }
 
@@ -97,12 +116,19 @@ async fn mac_policy_denies_labelled_agent() {
         ]);
     }
 
-    let result = gate.check_tool_call(kid, "write_file", "/tmp/secret", 5).await;
+    let result = gate
+        .check_tool_call(kid, "write_file", "/tmp/secret", 5)
+        .await;
     assert!(matches!(result, Err(GateDenial::MacDeny { .. })));
 
     // Reads must still pass under the same policy.
-    let result = gate.check_tool_call(kid, "read_file", "/tmp/secret", 5).await;
-    assert!(result.is_ok(), "read should be allowed by the * → allow rule");
+    let result = gate
+        .check_tool_call(kid, "read_file", "/tmp/secret", 5)
+        .await;
+    assert!(
+        result.is_ok(),
+        "read should be allowed by the * → allow rule"
+    );
 }
 
 /// Three layers stack: the gate hits whichever fires first, but counters
@@ -113,7 +139,10 @@ async fn enforcement_stacks_in_order_capability_then_mac_then_cgroup() {
     let cg = cgroups.create(
         "stacked".into(),
         cgroups.root(),
-        CgroupLimits { tokens_per_min: 50, ..Default::default() },
+        CgroupLimits {
+            tokens_per_min: 50,
+            ..Default::default()
+        },
     );
 
     // Agent A: no CAP_FILE_WRITE. Capability layer should fire first.
@@ -130,8 +159,18 @@ async fn enforcement_stacks_in_order_capability_then_mac_then_cgroup() {
         mac.set_enforcing(true);
         mac.label_agent(pid_b, "ro".into());
         mac.load_policy(vec![
-            PolicyRule { subject: "ro".into(), action: "write".into(), object: "*".into(), decision: "deny".into() },
-            PolicyRule { subject: "*".into(),  action: "*".into(),     object: "*".into(), decision: "allow".into() },
+            PolicyRule {
+                subject: "ro".into(),
+                action: "write".into(),
+                object: "*".into(),
+                decision: "deny".into(),
+            },
+            PolicyRule {
+                subject: "*".into(),
+                action: "*".into(),
+                object: "*".into(),
+                decision: "allow".into(),
+            },
         ]);
     }
     let r = gate.check_tool_call(b, "write_file", "/tmp/y", 5).await;
@@ -161,7 +200,7 @@ async fn enforcement_stacks_in_order_capability_then_mac_then_cgroup() {
 #[tokio::test]
 async fn unified_kernel_places_agent_in_os_subsystems() {
     use kernel::namespaces::NamespaceType;
-    use kernel::{AgentKernelImpl, AgentConfig};
+    use kernel::{AgentConfig, AgentKernelImpl};
 
     let kernel = AgentKernelImpl::new().expect("kernel new");
 
@@ -174,28 +213,45 @@ async fn unified_kernel_places_agent_in_os_subsystems() {
         sandbox_config: None,
     };
     let handle = kernel.create_agent_full(config).await.expect("create");
-    let pid = kernel.syscall_gate.pid_of(handle.id).expect("pid registered with gate");
+    let pid = kernel
+        .syscall_gate
+        .pid_of(handle.id)
+        .expect("pid registered with gate");
 
     // 1. CFS scheduler holds the agent.
     {
         let sched = kernel.os.cfs.lock().await;
-        assert!(sched.runnable_count() >= 1, "CFS should have the new agent enqueued");
+        assert!(
+            sched.runnable_count() >= 1,
+            "CFS should have the new agent enqueued"
+        );
     }
 
     // 2. Default Agent namespace contains the PID.
-    let agent_ns = kernel.os.namespaces.default_ns(NamespaceType::Agent).expect("default agent ns");
-    assert!(kernel.os.namespaces.members(agent_ns).contains(&pid),
-        "agent should be a member of the default Agent namespace");
+    let agent_ns = kernel
+        .os
+        .namespaces
+        .default_ns(NamespaceType::Agent)
+        .expect("default agent ns");
+    assert!(
+        kernel.os.namespaces.members(agent_ns).contains(&pid),
+        "agent should be a member of the default Agent namespace"
+    );
 
     // 3. ProcFs has agent metadata.
     {
         let procfs = kernel.os.procfs.lock().await;
         let entry = procfs.read(&format!("/agents/{}/state", pid));
-        assert!(entry.is_some(), "procfs should expose state for the new agent");
+        assert!(
+            entry.is_some(),
+            "procfs should expose state for the new agent"
+        );
     }
 
     // 4. After shutdown, the gate has unregistered the agent.
     kernel.shutdown().await.expect("shutdown");
-    assert!(kernel.syscall_gate.pid_of(handle.id).is_none(),
-        "syscall gate should drop the agent on shutdown");
+    assert!(
+        kernel.syscall_gate.pid_of(handle.id).is_none(),
+        "syscall gate should drop the agent on shutdown"
+    );
 }

@@ -4,12 +4,12 @@
 
 mod commands;
 
-use std::sync::Arc;
-use kernel::{AgentKernelImpl, config::Config};
-use adapters::azure_openai::AzureOpenAiAdapter;
-use adapters::openai::OpenAiAdapter;
 use adapters::anthropic::AnthropicAdapter;
+use adapters::azure_openai::AzureOpenAiAdapter;
 use adapters::local::LocalLlmAdapter;
+use adapters::openai::OpenAiAdapter;
+use kernel::{config::Config, AgentKernelImpl};
+use std::sync::Arc;
 
 pub struct AppState {
     pub kernel: Arc<AgentKernelImpl>,
@@ -18,7 +18,9 @@ pub struct AppState {
 fn register_providers(kernel: &AgentKernelImpl, config: &Config) {
     match config.llm_provider.as_str() {
         "azure-openai" => {
-            if let (Some(endpoint), Some(ref key)) = (&config.azure_endpoint, config.get_api_key("azure-openai")) {
+            if let (Some(endpoint), Some(ref key)) =
+                (&config.azure_endpoint, config.get_api_key("azure-openai"))
+            {
                 let deployment = config.azure_deployment.as_deref().unwrap_or("gpt-4o");
                 let adapter = AzureOpenAiAdapter::new(
                     endpoint.clone(),
@@ -41,7 +43,9 @@ fn register_providers(kernel: &AgentKernelImpl, config: &Config) {
             }
         }
         "local" => {
-            let url = config.get_api_key("local").unwrap_or("http://localhost:11434");
+            let url = config
+                .get_api_key("local")
+                .unwrap_or("http://localhost:11434");
             let model = config.default_model.clone();
             let adapter = LocalLlmAdapter::new(url.to_string(), model);
             let _ = kernel.register_provider(Arc::new(adapter));
@@ -52,8 +56,7 @@ fn register_providers(kernel: &AgentKernelImpl, config: &Config) {
 
 fn main() {
     let config = Config::load();
-    let kernel = AgentKernelImpl::from_config(&config)
-        .expect("Failed to initialize kernel");
+    let kernel = AgentKernelImpl::from_config(&config).expect("Failed to initialize kernel");
 
     register_providers(&kernel, &config);
 

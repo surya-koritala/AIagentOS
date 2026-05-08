@@ -15,8 +15,8 @@ pub type ToolDescriptor = u32;
 pub mod open_flags {
     pub const O_RDONLY: u32 = 0b001;
     pub const O_WRONLY: u32 = 0b010;
-    pub const O_RDWR: u32   = 0b011;
-    pub const O_EXEC: u32   = 0b100;
+    pub const O_RDWR: u32 = 0b011;
+    pub const O_EXEC: u32 = 0b100;
 }
 
 /// A tool descriptor entry in the per-agent table.
@@ -51,9 +51,16 @@ impl ToolDescTable {
             return Err("too many open tools (EMFILE)");
         }
         let td = self.next_td.fetch_add(1, Ordering::SeqCst);
-        self.entries.insert(td, ToolDescEntry {
-            td, tool_path: path, flags, position: 0, ref_count: 1,
-        });
+        self.entries.insert(
+            td,
+            ToolDescEntry {
+                td,
+                tool_path: path,
+                flags,
+                position: 0,
+                ref_count: 1,
+            },
+        );
         Ok(td)
     }
 
@@ -73,19 +80,31 @@ impl ToolDescTable {
 
     /// Check if flags allow read.
     pub fn can_read(&self, td: ToolDescriptor) -> bool {
-        self.entries.get(&td).map(|e| (e.flags & open_flags::O_RDONLY) != 0).unwrap_or(false)
+        self.entries
+            .get(&td)
+            .map(|e| (e.flags & open_flags::O_RDONLY) != 0)
+            .unwrap_or(false)
     }
 
     /// Check if flags allow write.
     pub fn can_write(&self, td: ToolDescriptor) -> bool {
-        self.entries.get(&td).map(|e| (e.flags & open_flags::O_WRONLY) != 0).unwrap_or(false)
+        self.entries
+            .get(&td)
+            .map(|e| (e.flags & open_flags::O_WRONLY) != 0)
+            .unwrap_or(false)
     }
 
     /// Duplicate a descriptor (like dup()).
     pub fn dup(&mut self, td: ToolDescriptor) -> Result<ToolDescriptor, &'static str> {
         let entry = self.entries.get(&td).ok_or("bad tool descriptor")?.clone();
         let new_td = self.next_td.fetch_add(1, Ordering::SeqCst);
-        self.entries.insert(new_td, ToolDescEntry { td: new_td, ..entry });
+        self.entries.insert(
+            new_td,
+            ToolDescEntry {
+                td: new_td,
+                ..entry
+            },
+        );
         Ok(new_td)
     }
 
@@ -106,7 +125,10 @@ impl ToolDescTable {
 
     /// List all open tool paths.
     pub fn list(&self) -> Vec<(ToolDescriptor, &str)> {
-        self.entries.iter().map(|(td, e)| (*td, e.tool_path.as_str())).collect()
+        self.entries
+            .iter()
+            .map(|(td, e)| (*td, e.tool_path.as_str()))
+            .collect()
     }
 }
 
@@ -117,7 +139,9 @@ mod tests {
     #[test]
     fn open_and_close() {
         let mut table = ToolDescTable::new(256);
-        let td = table.open("/tools/filesystem".into(), open_flags::O_RDWR).unwrap();
+        let td = table
+            .open("/tools/filesystem".into(), open_flags::O_RDWR)
+            .unwrap();
         assert_eq!(table.count(), 1);
         table.close(td).unwrap();
         assert_eq!(table.count(), 0);
@@ -135,7 +159,9 @@ mod tests {
     #[test]
     fn permission_check() {
         let mut table = ToolDescTable::new(256);
-        let td = table.open("/tools/fs".into(), open_flags::O_RDONLY).unwrap();
+        let td = table
+            .open("/tools/fs".into(), open_flags::O_RDONLY)
+            .unwrap();
         assert!(table.can_read(td));
         assert!(!table.can_write(td));
     }

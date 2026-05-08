@@ -78,13 +78,22 @@ impl ContextPager {
         }
 
         let page = ContextPage {
-            id: page_id, agent_id, content, token_count,
-            created_at: now, last_accessed: now, pinned: false,
+            id: page_id,
+            agent_id,
+            content,
+            token_count,
+            created_at: now,
+            last_accessed: now,
+            pinned: false,
         };
 
         self.active_tokens += token_count;
         self.active.push_back(page);
-        self.page_table.push(PageTableEntry { page_id, location: PageLocation::Active, dirty: false });
+        self.page_table.push(PageTableEntry {
+            page_id,
+            location: PageLocation::Active,
+            dirty: false,
+        });
 
         page_id
     }
@@ -111,7 +120,9 @@ impl ContextPager {
         page.last_accessed = Utc::now();
 
         // Evict if needed to make room
-        while self.active_tokens + page.token_count > self.max_active_tokens && !self.active.is_empty() {
+        while self.active_tokens + page.token_count > self.max_active_tokens
+            && !self.active.is_empty()
+        {
             self.evict_lru();
         }
 
@@ -136,13 +147,19 @@ impl ContextPager {
     }
 
     /// Get active token count.
-    pub fn active_token_count(&self) -> u32 { self.active_tokens }
+    pub fn active_token_count(&self) -> u32 {
+        self.active_tokens
+    }
 
     /// Get swapped page count.
-    pub fn swapped_count(&self) -> usize { self.swapped.len() }
+    pub fn swapped_count(&self) -> usize {
+        self.swapped.len()
+    }
 
     /// Get total pages.
-    pub fn total_pages(&self) -> usize { self.active.len() + self.swapped.len() }
+    pub fn total_pages(&self) -> usize {
+        self.active.len() + self.swapped.len()
+    }
 }
 
 #[cfg(test)]

@@ -13,8 +13,8 @@ use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
 
 use crate::connector::ToolDefinition;
-use crate::tools::{ToolBinding, ToolRegistry};
 use crate::resources::ResourceType;
+use crate::tools::{ToolBinding, ToolRegistry};
 
 /// MCP server configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -75,7 +75,9 @@ impl McpServer {
             cmd.env(k, v);
         }
 
-        let mut process = cmd.spawn().map_err(|e| format!("Failed to start MCP server '{}': {}", config.name, e))?;
+        let mut process = cmd
+            .spawn()
+            .map_err(|e| format!("Failed to start MCP server '{}': {}", config.name, e))?;
 
         let stdin = process.stdin.take().ok_or("No stdin")?;
         let stdout = process.stdout.take().ok_or("No stdout")?;
@@ -90,25 +92,42 @@ impl McpServer {
         };
 
         // Initialize
-        server.send_request("initialize", Some(serde_json::json!({
-            "protocolVersion": "2024-11-05",
-            "capabilities": {},
-            "clientInfo": {"name": "ai-agent-os", "version": "0.1.0"}
-        }))).await?;
+        server
+            .send_request(
+                "initialize",
+                Some(serde_json::json!({
+                    "protocolVersion": "2024-11-05",
+                    "capabilities": {},
+                    "clientInfo": {"name": "ai-agent-os", "version": "0.1.0"}
+                })),
+            )
+            .await?;
 
         // Send initialized notification
-        server.send_notification("notifications/initialized").await?;
+        server
+            .send_notification("notifications/initialized")
+            .await?;
 
         // Discover tools
         let tools_response = server.send_request("tools/list", None).await?;
         if let Some(tools_arr) = tools_response.get("tools").and_then(|t| t.as_array()) {
-            server.tools = tools_arr.iter().filter_map(|t| {
-                Some(McpTool {
-                    name: t.get("name")?.as_str()?.to_string(),
-                    description: t.get("description").and_then(|d| d.as_str()).unwrap_or("").to_string(),
-                    input_schema: t.get("inputSchema").cloned().unwrap_or(serde_json::json!({})),
+            server.tools = tools_arr
+                .iter()
+                .filter_map(|t| {
+                    Some(McpTool {
+                        name: t.get("name")?.as_str()?.to_string(),
+                        description: t
+                            .get("description")
+                            .and_then(|d| d.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                        input_schema: t
+                            .get("inputSchema")
+                            .cloned()
+                            .unwrap_or(serde_json::json!({})),
+                    })
                 })
-            }).collect();
+                .collect();
         }
 
         Ok(server)
@@ -120,19 +139,31 @@ impl McpServer {
     }
 
     /// Call a tool on this MCP server.
-    pub async fn call_tool(&mut self, name: &str, arguments: serde_json::Value) -> Result<String, String> {
-        let result = self.send_request("tools/call", Some(serde_json::json!({
-            "name": name,
-            "arguments": arguments
-        }))).await?;
+    pub async fn call_tool(
+        &mut self,
+        name: &str,
+        arguments: serde_json::Value,
+    ) -> Result<String, String> {
+        let result = self
+            .send_request(
+                "tools/call",
+                Some(serde_json::json!({
+                    "name": name,
+                    "arguments": arguments
+                })),
+            )
+            .await?;
 
         // Extract text content from result
         if let Some(content) = result.get("content").and_then(|c| c.as_array()) {
-            let text: Vec<String> = content.iter()
+            let text: Vec<String> = content
+                .iter()
                 .filter_map(|item| {
                     if item.get("type")?.as_str()? == "text" {
                         Some(item.get("text")?.as_str()?.to_string())
-                    } else { None }
+                    } else {
+                        None
+                    }
                 })
                 .collect();
             Ok(text.join("\n"))
@@ -155,23 +186,38 @@ impl McpServer {
         }
     }
 
-    async fn send_request(&mut self, method: &str, params: Option<serde_json::Value>) -> Result<serde_json::Value, String> {
+    async fn send_request(
+        &mut self,
+        method: &str,
+        params: Option<serde_json::Value>,
+    ) -> Result<serde_json::Value, String> {
         let id = self.next_id;
         self.next_id += 1;
 
-        let request = JsonRpcRequest { jsonrpc: "2.0", id, method: method.to_string(), params };
+        let request = JsonRpcRequest {
+            jsonrpc: "2.0",
+            id,
+            method: method.to_string(),
+            params,
+        };
         let mut payload = serde_json::to_string(&request).map_err(|e| e.to_string())?;
         payload.push('\n');
 
         let mut stdin = self.stdin.lock().await;
-        stdin.write_all(payload.as_bytes()).await.map_err(|e| e.to_string())?;
+        stdin
+            .write_all(payload.as_bytes())
+            .await
+            .map_err(|e| e.to_string())?;
         stdin.flush().await.map_err(|e| e.to_string())?;
         drop(stdin);
 
         // Read response
         let mut stdout = self.stdout.lock().await;
         let mut line = String::new();
-        stdout.read_line(&mut line).await.map_err(|e| e.to_string())?;
+        stdout
+            .read_line(&mut line)
+            .await
+            .map_err(|e| e.to_string())?;
 
         let response: JsonRpcResponse = serde_json::from_str(&line)
             .map_err(|e| format!("Invalid JSON-RPC response: {} (raw: {})", e, line.trim()))?;
@@ -189,7 +235,10 @@ impl McpServer {
         payload.push('\n');
 
         let mut stdin = self.stdin.lock().await;
-        stdin.write_all(payload.as_bytes()).await.map_err(|e| e.to_string())?;
+        stdin
+            .write_all(payload.as_bytes())
+            .await
+            .map_err(|e| e.to_string())?;
         stdin.flush().await.map_err(|e| e.to_string())?;
         Ok(())
     }
@@ -207,7 +256,8 @@ pub fn load_mcp_configs() -> Vec<McpServerConfig> {
         .unwrap_or_default()
         .join("ai-agent-os/mcp_servers.json");
 
-    std::fs::read_to_string(&config_path).ok()
+    std::fs::read_to_string(&config_path)
+        .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default()
 }

@@ -7,6 +7,10 @@ edition = "2021"
 name = "os-benchmark"
 path = "os_benchmark.rs"
 
+[[bin]]
+name = "stress-test"
+path = "stress_test.rs"
+
 [dependencies]
 kernel = { path = "../crates/kernel" }
 tokio = { version = "1", features = ["full"] }

@@ -884,7 +884,54 @@ impl AgentKernelImpl {
         self.context_manager
             .log_usage(agent_id, output.tokens_used, "gpt-5.4", 0.01);
 
+        // Account turn tokens against the agent's CFS vruntime so nice values
+        // produce observable scheduling effects: low-nice agents (higher
+        // priority) have larger weight and advance vruntime more slowly,
+        // therefore stay closer to the front of the runqueue.
+        if let Some(pid) = self.syscall_gate.pid_of(agent_id) {
+            let mut sched = self.os.cfs.lock().await;
+            sched.account_tokens(pid, output.tokens_used as u64);
+        }
+
         Ok(output)
+    }
+
+    /// Update an agent's nice value (priority hint for the CFS scheduler).
+    /// Range: -20 (highest priority) to +19 (lowest). Linux semantics.
+    pub async fn set_nice(&self, agent_id: AgentId, nice: i8) -> Result<(), KernelError> {
+        let pid = self
+            .syscall_gate
+            .pid_of(agent_id)
+            .ok_or(AgentError::NotFound(agent_id))?;
+        let mut sched = self.os.cfs.lock().await;
+        // Re-enqueue at the same class with new nice; preserve current
+        // tokens-used by reading + dequeueing first.
+        sched.dequeue(pid);
+        sched.enqueue(pid, nice, SchedClass::Normal);
+        Ok(())
+    }
+
+    /// Look up which agent CFS would pick next. Useful for fairness tests
+    /// and for callers that want admission control.
+    pub async fn next_runnable_agent(&self) -> Option<AgentId> {
+        let mut sched = self.os.cfs.lock().await;
+        let pid = sched.pick_next()?;
+        // Reverse PID → UUID lookup. Linear scan is fine given the
+        // typical fleet size (10s, not 10K).
+        for entry in self.executors.iter() {
+            let kid = *entry.key();
+            if self.syscall_gate.pid_of(kid) == Some(pid) {
+                return Some(kid);
+            }
+        }
+        // Agents may exist without an executor (created but never sent a
+        // message); fall back to scanning the agent manager.
+        for info in self.agent_manager.list_agents(None) {
+            if self.syscall_gate.pid_of(info.id) == Some(pid) {
+                return Some(info.id);
+            }
+        }
+        None
     }
 
     /// Graceful shutdown — persist all agent states, terminate sessions.

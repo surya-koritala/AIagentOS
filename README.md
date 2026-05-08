@@ -99,7 +99,7 @@ We mark each subsystem honestly: **Live** = enforced on the runtime path, **Defi
 | systemd | Init system (service files, deps, supervisor restart) | **Live** |
 | syscall interface | 25 numbered syscalls + `SecureSyscallDispatch` | Defined — gate covers tool-call path |
 | `fork()/clone()` | `agent_clone(flags)` | Defined |
-| CFS scheduler | `CfsScheduler` (vruntime, nice) — Tokio still drives turn execution | Defined |
+| CFS scheduler | Each turn's tokens accounted to vruntime; `set_nice` / `next_runnable_agent` make fairness queryable | **Live (observability)** |
 | Virtual memory + paging | `ContextPager` LRU eviction — auto-summarization covers the live path | Defined |
 | Namespaces | Tool-namespace isolation: cross-namespace calls return `NotInNamespace` (≈ ENOENT) | **Live** |
 | VFS + mount | Tool descriptors + mount table | Planned (Phase 3) |

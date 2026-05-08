@@ -1,7 +1,17 @@
-//! The Unified Kernel — one struct that wires all subsystems together.
+//! Legacy unified kernel — superseded by [`crate::AgentKernelImpl`] in Phase 2.
 //!
-//! This is the "main" of the OS. It boots, manages the lifecycle of all
-//! subsystems, and provides the single entry point for all operations.
+//! As of the Phase 2 unification, the production runtime path lives on
+//! [`crate::AgentKernelImpl`], which now also owns the OS-style subsystems
+//! through [`crate::OsSubsystems`] (CFS scheduler, namespaces, init system,
+//! procfs, sysctl, service registry). New code should use that orchestrator.
+//!
+//! This module remains for two reasons:
+//!   1. The stress benchmark in `benchmarks/stress_test.rs` still drives raw
+//!      u64-PID workflows that don't need an LLM session.
+//!   2. Tests in this file pin Phase 1 / Phase 2 behaviour for the older
+//!      surface so future refactors stay honest.
+//!
+//! Tracking issue for full removal: #1 (Phase 3 cleanup).
 
 use std::sync::Arc;
 use tokio::sync::Mutex;

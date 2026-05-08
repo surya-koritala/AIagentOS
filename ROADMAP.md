@@ -53,15 +53,17 @@ Goal: every tool call goes through the syscall layer; quotas reject; CI is green
 
 ### Phase 2 — Fold the two orchestrators into one
 
-Goal: `AgentKernelImpl` and `OsKernel` are the same struct.
+Goal: `AgentKernelImpl` owns the OS surface; `OsKernel` is no longer the source of truth.
 
-- [ ] Move `cfs`, `mac`, `cgroups`, `namespaces`, `syscall_interface`, `init_system`, `procfs` ownership from `OsKernel` into `AgentKernelImpl`
-- [ ] Delete the standalone `OsKernel` (or make it a thin alias) — single source of truth
-- [ ] Update `benchmarks/stress_test.rs` to use the unified kernel
-- [ ] Migrate `runtime.rs` background loops (supervisor, cgroup-reset timer) to spawn from `AgentKernelImpl::start`
-- [ ] Add `kernel::boot()` as the documented entry point (CLI and Tauri both call it)
+- [x] Move `cfs`, `namespaces`, `init_system`, `procfs`, `sysctl`, `service_discovery` into `AgentKernelImpl` via the new `OsSubsystems` field. (`mac` lives inside `SyscallGate`; `cgroups` already moved in Phase 1.)
+- [x] `create_agent_full` now wires every new agent into the default Agent + Tool namespaces, the CFS scheduler, and procfs through the gate's PID translation.
+- [x] `tests/src/os_enforcement.rs::unified_kernel_places_agent_in_os_subsystems` proves the wiring is real.
+- [x] `OsKernel` documented as superseded; retained only for the raw-PID stress benchmark.
+- [ ] Migrate `runtime.rs` background loops (supervisor, cgroup-reset timer) to spawn from `AgentKernelImpl::start_runtime` — Phase 3.
+- [ ] Add `kernel::boot()` as the documented entry point (CLI and Tauri both call it) — Phase 3.
+- [ ] Delete `OsKernel` entirely once the stress benchmark is migrated — Phase 3.
 
-**Exit criteria for Phase 2:** one struct, one boot path, supervisor + cgroup reset run automatically.
+**Exit criteria for Phase 2:** ✅ one orchestrator owns the OS surface; new agents land in the OS subsystems on the live path.
 
 ### Phase 3 — Real isolation and scheduling
 

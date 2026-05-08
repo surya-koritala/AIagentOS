@@ -154,3 +154,48 @@ async fn enforcement_stacks_in_order_capability_then_mac_then_cgroup() {
     assert_eq!(stats.denied_mac, 1);
     assert_eq!(stats.denied_cgroup, 1);
 }
+
+/// Phase 2: creating an agent through the unified kernel really places it in
+/// CFS, the default namespaces, and procfs — the OS-style subsystems are no
+/// longer just decorative on a separate `OsKernel`.
+#[tokio::test]
+async fn unified_kernel_places_agent_in_os_subsystems() {
+    use kernel::namespaces::NamespaceType;
+    use kernel::{AgentKernelImpl, AgentConfig};
+
+    let kernel = AgentKernelImpl::new().expect("kernel new");
+
+    let config = AgentConfig {
+        name: "phase-2-agent".into(),
+        task: "test".into(),
+        llm_provider: "stub".into(),
+        permission_profile: "standard".into(),
+        priority: kernel::Priority::new(3).unwrap(),
+        sandbox_config: None,
+    };
+    let handle = kernel.create_agent_full(config).await.expect("create");
+    let pid = kernel.syscall_gate.pid_of(handle.id).expect("pid registered with gate");
+
+    // 1. CFS scheduler holds the agent.
+    {
+        let sched = kernel.os.cfs.lock().await;
+        assert!(sched.runnable_count() >= 1, "CFS should have the new agent enqueued");
+    }
+
+    // 2. Default Agent namespace contains the PID.
+    let agent_ns = kernel.os.namespaces.default_ns(NamespaceType::Agent).expect("default agent ns");
+    assert!(kernel.os.namespaces.members(agent_ns).contains(&pid),
+        "agent should be a member of the default Agent namespace");
+
+    // 3. ProcFs has agent metadata.
+    {
+        let procfs = kernel.os.procfs.lock().await;
+        let entry = procfs.read(&format!("/agents/{}/state", pid));
+        assert!(entry.is_some(), "procfs should expose state for the new agent");
+    }
+
+    // 4. After shutdown, the gate has unregistered the agent.
+    kernel.shutdown().await.expect("shutdown");
+    assert!(kernel.syscall_gate.pid_of(handle.id).is_none(),
+        "syscall gate should drop the agent on shutdown");
+}

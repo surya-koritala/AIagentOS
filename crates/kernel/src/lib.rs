@@ -539,7 +539,40 @@ use crate::tools::ToolRegistry;
 use crate::rate_limit::{RateLimiter, RateLimitConfig};
 use crate::syscall_gate::SyscallGate;
 use crate::cgroups::CgroupManager;
-use crate::agent_struct::CapabilitySet;
+use crate::agent_struct::{CapabilitySet, SchedClass};
+use crate::cfs::CfsScheduler;
+use crate::namespaces::{NamespaceRegistry, NamespaceType};
+use crate::init_system::InitSystem;
+use crate::procfs::ProcFs;
+use crate::sysctl::Sysctl;
+use crate::service_discovery::ServiceRegistry;
+
+/// OS-style subsystems unified into the kernel orchestrator.
+///
+/// Phase 2: these used to live only on the standalone `OsKernel` struct.
+/// Folding them into `AgentKernelImpl` makes the kernel a single source of
+/// truth — both halves now share IDs through the syscall gate's PID table.
+pub struct OsSubsystems {
+    pub cfs: tokio::sync::Mutex<CfsScheduler>,
+    pub namespaces: NamespaceRegistry,
+    pub init: tokio::sync::Mutex<InitSystem>,
+    pub procfs: tokio::sync::Mutex<ProcFs>,
+    pub sysctl: tokio::sync::Mutex<Sysctl>,
+    pub services: tokio::sync::Mutex<ServiceRegistry>,
+}
+
+impl OsSubsystems {
+    pub fn new() -> Self {
+        Self {
+            cfs: tokio::sync::Mutex::new(CfsScheduler::new(1000)),
+            namespaces: NamespaceRegistry::new(),
+            init: tokio::sync::Mutex::new(InitSystem::new()),
+            procfs: tokio::sync::Mutex::new(ProcFs::new()),
+            sysctl: tokio::sync::Mutex::new(Sysctl::new()),
+            services: tokio::sync::Mutex::new(ServiceRegistry::new()),
+        }
+    }
+}
 
 /// The wired kernel orchestrator holding all subsystem instances.
 pub struct AgentKernelImpl {
@@ -556,6 +589,7 @@ pub struct AgentKernelImpl {
     pub rate_limiter: Arc<RateLimiter>,
     pub cgroups: Arc<CgroupManager>,
     pub syscall_gate: Arc<SyscallGate>,
+    pub os: Arc<OsSubsystems>,
     executors: DashMap<AgentId, tokio::sync::Mutex<AgentExecutor>>,
     event_tx: broadcast::Sender<KernelEvent>,
 }
@@ -601,6 +635,7 @@ impl AgentKernelImpl {
 
         let cgroups = Arc::new(CgroupManager::new());
         let syscall_gate = Arc::new(SyscallGate::new(cgroups.clone()));
+        let os = Arc::new(OsSubsystems::new());
 
         Ok(Self {
             agent_manager: Arc::new(AgentManager::new(256)),
@@ -616,6 +651,7 @@ impl AgentKernelImpl {
             rate_limiter: Arc::new(RateLimiter::new(RateLimitConfig::default())),
             cgroups,
             syscall_gate,
+            os,
             executors: DashMap::new(),
             event_tx,
         })
@@ -657,9 +693,31 @@ impl AgentKernelImpl {
         //    permission profile; fully-permissive if profile is unknown so
         //    existing flows keep working).
         let caps = caps_for_profile(&config.permission_profile);
-        self.syscall_gate.register_agent(agent_id, caps, None);
+        let pid = self.syscall_gate.register_agent(agent_id, caps, None);
 
-        // 8. Broadcast event
+        // 8. Place the agent in the OS-level subsystems using its PID.
+        //    Default Agent + Tool namespaces; root-cgroup membership; CFS enqueue;
+        //    procfs entry. These were previously only wired by the standalone
+        //    OsKernel — folding them into AgentKernelImpl makes the OS surface
+        //    real for every agent created through the live path.
+        if let Some(ns) = self.os.namespaces.default_ns(NamespaceType::Agent) {
+            self.os.namespaces.join(ns, pid);
+        }
+        if let Some(ns) = self.os.namespaces.default_ns(NamespaceType::Tool) {
+            self.os.namespaces.join(ns, pid);
+        }
+        {
+            let mut sched = self.os.cfs.lock().await;
+            sched.enqueue(pid, 0, SchedClass::Normal);
+        }
+        {
+            let mut procfs = self.os.procfs.lock().await;
+            procfs.set_agent_info(pid, "name".into(), config.name.clone());
+            procfs.set_agent_info(pid, "uuid".into(), agent_id.to_string());
+            procfs.set_agent_info(pid, "state".into(), "running".into());
+        }
+
+        // 9. Broadcast event
         let _ = self.event_tx.send(KernelEvent::AgentCreated(agent_id));
 
         Ok(handle)

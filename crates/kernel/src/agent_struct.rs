@@ -379,7 +379,7 @@ impl AgentTable {
     pub fn get(
         &self,
         id: AgentId,
-    ) -> Option<dashmap::mapref::one::Ref<AgentId, RwLock<AgentStruct>>> {
+    ) -> Option<dashmap::mapref::one::Ref<'_, AgentId, RwLock<AgentStruct>>> {
         self.agents.get(&id)
     }
 

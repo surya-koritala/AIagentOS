@@ -1,6 +1,6 @@
 //! agentpkg — package manager CLI + registry client.
 
-use crate::package::{PackageDep, PackageManifest, PackageRegistry};
+use crate::package::{PackageManifest, PackageRegistry};
 
 /// agentpkg command handler.
 pub struct AgentPkg {

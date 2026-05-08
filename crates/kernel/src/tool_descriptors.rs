@@ -6,8 +6,6 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use crate::agent_struct::AgentId;
-
 /// Tool descriptor (like a file descriptor number).
 pub type ToolDescriptor = u32;
 

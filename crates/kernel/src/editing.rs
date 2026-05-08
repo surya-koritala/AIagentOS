@@ -3,11 +3,10 @@
 //! Diff-based editing with atomic transactions and rollback support.
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use crate::connector::{ToolCall, ToolDefinition};
 use crate::resources::ResourceType;
 use crate::tools::{ToolBinding, ToolRegistry};
 

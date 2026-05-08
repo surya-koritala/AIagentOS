@@ -8,8 +8,6 @@ use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 
-use crate::AgentId;
-
 /// A learned rule from user correction.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CorrectionRule {

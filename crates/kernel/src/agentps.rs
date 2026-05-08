@@ -1,9 +1,7 @@
 //! agentps — list running agents (like ps).
 //! agenttop — real-time agent monitor (like top/htop).
 
-use crate::agent_struct::{AgentId, AgentState, AgentStruct, AgentTable};
-use std::sync::Arc;
-use tokio::sync::RwLock;
+use crate::agent_struct::{AgentId, AgentTable};
 
 /// A row in agentps output.
 #[derive(Debug, Clone)]
@@ -20,12 +18,12 @@ pub struct PsEntry {
 
 /// agentps: snapshot of all agents.
 pub fn agentps(table: &AgentTable) -> Vec<PsEntry> {
-    let now = chrono::Utc::now();
+    let _now = chrono::Utc::now();
     let mut entries = Vec::new();
 
     for id in table.list_ids() {
         if let Some(agent_ref) = table.get(id) {
-            let agent = agent_ref.value();
+            let _agent = agent_ref.value();
             // We need to read-lock the agent
             // For now, create entry from what we can access
             entries.push(PsEntry {

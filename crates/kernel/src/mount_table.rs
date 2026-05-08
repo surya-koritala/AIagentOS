@@ -3,8 +3,6 @@
 //! Like Linux VFS mount. Tools are mounted at paths, agents access
 //! them through the path hierarchy.
 
-use std::collections::HashMap;
-
 use crate::agent_struct::AgentId;
 
 /// A mount entry.

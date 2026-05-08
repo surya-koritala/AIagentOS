@@ -5,13 +5,12 @@
 use kernel::agent::AgentKernel;
 use kernel::ipc::{AgentIpc, IpcManager};
 use kernel::permissions::{AccessDecision, PermissionManager, PermissionSystem};
-use kernel::production::{BudgetEnforcer, CircuitBreaker};
+use kernel::production::CircuitBreaker;
 use kernel::rate_limit::{RateLimitConfig, RateLimiter};
 use kernel::resources::ResourceType;
 use kernel::sandbox::{SandboxAction, SandboxManager, SandboxManagerImpl};
 use kernel::scheduler::{AgentScheduler, PriorityScheduler};
 use kernel::*;
-use std::sync::Arc;
 use std::time::Instant;
 
 #[tokio::main]
@@ -96,7 +95,7 @@ async fn main() {
             },
         )
         .unwrap();
-    let sid_b = sandbox_mgr
+    let _sid_b = sandbox_mgr
         .create_sandbox(
             agent_b,
             &SandboxConfig {

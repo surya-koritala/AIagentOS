@@ -35,3 +35,4 @@ config.toml
 
 # Frontend build output (regenerated)
 crates/tauri-app/ui/dist/
+.claude/

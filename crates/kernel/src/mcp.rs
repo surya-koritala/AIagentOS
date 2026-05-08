@@ -12,7 +12,6 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
 
-use crate::connector::ToolDefinition;
 use crate::resources::ResourceType;
 use crate::tools::{ToolBinding, ToolRegistry};
 

@@ -36,7 +36,7 @@ pub async fn browse_url(url: &str, max_chars: usize) -> Result<BrowseResult, Str
 
     // Remove script and style elements, extract text
     let body_sel = Selector::parse("body").unwrap();
-    let script_sel = Selector::parse("script, style, nav, footer, header").unwrap();
+    let _script_sel = Selector::parse("script, style, nav, footer, header").unwrap();
 
     let mut text = String::new();
     if let Some(body) = document.select(&body_sel).next() {

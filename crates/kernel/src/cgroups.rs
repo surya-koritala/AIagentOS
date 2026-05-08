@@ -2,7 +2,6 @@
 //!
 //! Like Linux cgroups. Organize agents into groups with enforced resource limits.
 
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use dashmap::DashMap;

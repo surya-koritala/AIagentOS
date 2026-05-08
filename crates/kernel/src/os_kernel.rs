@@ -18,19 +18,17 @@ use tokio::sync::Mutex;
 
 use crate::agent_sockets::SocketRegistry;
 use crate::agent_struct::SchedClass;
-use crate::agent_struct::{AgentId, AgentState, AgentStruct, AgentTable, CapabilitySet};
-use crate::agent_syscalls::{clone_flags, AgentSyscalls};
+use crate::agent_struct::{AgentId, AgentTable};
+use crate::agent_syscalls::AgentSyscalls;
 use crate::cfs::CfsScheduler;
-use crate::cgroups::{CgroupLimits, CgroupManager};
+use crate::cgroups::CgroupManager;
 use crate::event_loop::{EventLoop, KernelEvent};
 use crate::init_system::{InitSystem, ServiceStatus};
 use crate::mac::{MacDecision, MacEngine};
 use crate::namespaces::{NamespaceRegistry, NamespaceType};
 use crate::procfs::ProcFs;
 use crate::service_discovery::ServiceRegistry;
-use crate::syscall_interface::{
-    check_capability, SyscallArgs, SyscallError, SyscallNum, SyscallResult,
-};
+use crate::syscall_interface::{SyscallArgs, SyscallError, SyscallNum, SyscallResult};
 use crate::sysctl::Sysctl;
 
 /// The unified OS kernel.
@@ -68,7 +66,7 @@ impl OsKernel {
     pub fn new() -> Self {
         let agents = Arc::new(AgentTable::new());
         let syscalls = AgentSyscalls::new(agents.clone());
-        let (mut event_loop, event_tx) = EventLoop::new();
+        let (_event_loop, event_tx) = EventLoop::new();
 
         Self {
             agents,
@@ -187,7 +185,7 @@ impl OsKernel {
 
         // 2. Capability check
         if let Some(agent_ref) = self.agents.get(caller) {
-            let agent = agent_ref.value();
+            let _agent = agent_ref.value();
             // Would read caps from agent — simplified for now
         }
 
@@ -486,7 +484,7 @@ impl OsKernel {
         agent_id: AgentId,
         tool_path: &str,
         operation: &str,
-        params: &serde_json::Value,
+        _params: &serde_json::Value,
     ) -> Result<serde_json::Value, String> {
         // 1. Check agent exists
         if self.agents.get(agent_id).is_none() {

@@ -6,13 +6,10 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::Mutex;
 use tokio::time::interval;
 
-use crate::agent_struct::{AgentId, AgentState};
-use crate::cfs::CfsScheduler;
-use crate::cgroups::CgroupManager;
-use crate::init_system::{InitSystem, RestartPolicy, ServiceStatus};
+use crate::agent_struct::AgentId;
+use crate::init_system::ServiceStatus;
 use crate::os_kernel::OsKernel;
 
 /// The kernel runtime — runs background tasks.
@@ -59,7 +56,7 @@ impl KernelRuntime {
     fn spawn_scheduler_loop(&self) -> tokio::task::JoinHandle<()> {
         let kernel = self.kernel.clone();
         let interval_ms = self.scheduler_interval_ms;
-        let running = self.running.load(std::sync::atomic::Ordering::SeqCst);
+        let _running = self.running.load(std::sync::atomic::Ordering::SeqCst);
 
         tokio::spawn(async move {
             let mut tick = interval(Duration::from_millis(interval_ms));

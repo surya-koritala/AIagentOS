@@ -3,17 +3,12 @@
 //! Agents create explicit plans before acting, execute steps sequentially,
 //! and can revise plans when steps fail.
 
-use std::sync::Arc;
-
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
-use crate::connector::{LlmSession, StandardMessage, ToolDefinition};
-use crate::context::SqliteContextManager;
-use crate::execution::{AgentExecutor, AgentOutput, StreamEvent};
-use crate::resources::ResourceBroker;
-use crate::tools::ToolRegistry;
-use crate::{AgentId, KernelError};
+use crate::connector::{LlmSession, StandardMessage};
+use crate::execution::AgentExecutor;
+use crate::KernelError;
 
 // ─── Data Model ──────────────────────────────────────────────────────────────
 

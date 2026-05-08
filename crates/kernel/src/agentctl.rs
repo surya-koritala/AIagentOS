@@ -4,7 +4,6 @@
 
 use std::sync::Arc;
 
-use crate::agent_struct::{AgentId, AgentState};
 use crate::init_system::{InitSystem, ServiceStatus};
 
 /// agentctl command results.

@@ -4,7 +4,7 @@
 mod tests {
     use crate::openai::OpenAiAdapter;
     use kernel::connector::*;
-    use wiremock::matchers::{body_partial_json, method, path};
+    use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     #[tokio::test]

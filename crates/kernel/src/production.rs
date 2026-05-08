@@ -1,6 +1,6 @@
 //! Production hardening — circuit breaker, budget enforcement, structured logging.
 
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Mutex;
 use std::time::Instant;
 

@@ -3,11 +3,9 @@
 //! Like Linux's core scheduler loop. Processes signals, runs the scheduler,
 //! dispatches agent work, handles timers.
 
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc;
-use tokio::time::interval;
 
 use crate::agent_struct::AgentId;
 
@@ -218,7 +216,12 @@ pub struct TimerUnit {
 
 impl EventLoop {
     /// Register a timer unit (recurring agent execution).
-    pub fn add_timer_unit(&mut self, name: String, agent_name: String, interval: Duration) -> u64 {
+    pub fn add_timer_unit(
+        &mut self,
+        _name: String,
+        _agent_name: String,
+        interval: Duration,
+    ) -> u64 {
         let timer_id = self.set_timer(0, interval, Some(interval));
         timer_id
     }

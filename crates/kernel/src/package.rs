@@ -1,7 +1,6 @@
 //! Agent Package System — .agent package format, install, versioning.
 
 use serde::{Deserialize, Serialize};
-use std::path::Path;
 
 /// Package manifest (inside .agent file).
 #[derive(Debug, Clone, Serialize, Deserialize)]

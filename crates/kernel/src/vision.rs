@@ -1,8 +1,5 @@
 //! Vision support — send images to vision-capable LLMs.
 
-use crate::connector::{LlmResponse, LlmSession, StandardMessage, ToolDefinition};
-use crate::ConnectorError;
-
 /// Encode an image file as a base64 data URL for vision models.
 pub fn image_to_data_url(path: &str) -> Result<String, String> {
     let bytes = std::fs::read(path).map_err(|e| format!("Can't read image: {}", e))?;

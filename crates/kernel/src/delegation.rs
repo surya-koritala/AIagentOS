@@ -3,7 +3,6 @@
 use crate::agent::AgentKernel;
 use crate::execution::AgentOutput;
 use crate::{AgentConfig, AgentId, AgentKernelImpl, KernelError, Priority};
-use std::sync::Arc;
 
 /// Maximum delegation depth to prevent infinite recursion.
 const MAX_DELEGATION_DEPTH: usize = 3;

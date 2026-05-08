@@ -30,6 +30,7 @@ pub mod workspaces;
 pub mod marketplace;
 pub mod os_kernel;
 pub mod voice;
+pub mod runtime;
 pub mod config;
 pub mod connector;
 pub mod context;

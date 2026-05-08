@@ -31,6 +31,7 @@ pub mod marketplace;
 pub mod os_kernel;
 pub mod voice;
 pub mod runtime;
+pub mod linux_compat;
 pub mod config;
 pub mod connector;
 pub mod context;

@@ -63,6 +63,16 @@ pub trait AgentIpc: Send + Sync {
     fn get_delegation_status(&self, task_id: uuid::Uuid) -> Option<DelegationStatus>;
 }
 
+/// Pluggable namespace visibility check for IPC.
+///
+/// The syscall gate implements this so that IPC respects the same namespace
+/// memberships as tool resolution: an agent in namespace X cannot send a
+/// message into namespace Y unless they share a namespace.
+pub trait NamespaceVisibility: Send + Sync {
+    /// Returns true if `from` may communicate with `to`.
+    fn allows(&self, from: AgentId, to: AgentId) -> bool;
+}
+
 /// Concrete IPC implementation using Tokio channels.
 pub struct IpcManager {
     /// Per-agent mailboxes (mpsc channels).
@@ -78,6 +88,8 @@ pub struct IpcManager {
     dead_letters: Mutex<Vec<IpcMessage>>,
     /// Allowed communication pairs (None = all allowed).
     allowed_pairs: Option<DashMap<(AgentId, AgentId), bool>>,
+    /// Namespace visibility checker (None = no namespace enforcement).
+    namespace_check: std::sync::RwLock<Option<std::sync::Arc<dyn NamespaceVisibility>>>,
 }
 
 impl Default for IpcManager {
@@ -96,6 +108,21 @@ impl IpcManager {
             delegations: DashMap::new(),
             dead_letters: Mutex::new(Vec::new()),
             allowed_pairs: None,
+            namespace_check: std::sync::RwLock::new(None),
+        }
+    }
+
+    /// Install a namespace visibility checker. Once set, every send/publish
+    /// is filtered through it — agents cannot reach mailboxes in foreign
+    /// namespaces.
+    pub fn set_namespace_visibility(&self, checker: std::sync::Arc<dyn NamespaceVisibility>) {
+        *self.namespace_check.write().unwrap() = Some(checker);
+    }
+
+    fn namespace_allows(&self, from: AgentId, to: AgentId) -> bool {
+        match &*self.namespace_check.read().unwrap() {
+            Some(checker) => checker.allows(from, to),
+            None => true,
         }
     }
 
@@ -144,6 +171,12 @@ impl AgentIpc for IpcManager {
         to: AgentId,
         payload: serde_json::Value,
     ) -> Result<(), IpcError> {
+        // Namespace visibility runs first so a sender cannot probe whether a
+        // receiver exists in a foreign namespace; they get the same response
+        // as a non-existent agent.
+        if !self.namespace_allows(from, to) {
+            return Err(IpcError::AgentNotFound(to));
+        }
         self.check_permission(from, to)?;
 
         let msg = IpcMessage {
@@ -212,10 +245,13 @@ impl AgentIpc for IpcManager {
             timestamp: chrono::Utc::now(),
         };
 
-        // Deliver to all subscribed agents' mailboxes
+        // Deliver to subscribers, skipping any not in the publisher's namespace.
         let mut delivered = 0;
         for entry in self.subscriptions.iter() {
             let agent_id = *entry.key();
+            if !self.namespace_allows(from, agent_id) {
+                continue;
+            }
             if entry.value().contains(&topic.to_string()) {
                 if let Some(mailbox) = self.mailboxes.get(&agent_id) {
                     let agent_msg = IpcMessage {

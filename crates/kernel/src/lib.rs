@@ -725,13 +725,18 @@ impl AgentKernelImpl {
         let syscall_gate = Arc::new(SyscallGate::new(cgroups.clone()));
         let os = Arc::new(OsSubsystems::new());
 
+        let ipc = Arc::new(IpcManager::new());
+        // Wire the gate as the IPC namespace visibility checker so that
+        // cross-namespace sends fail like sends to a non-existent agent.
+        ipc.set_namespace_visibility(syscall_gate.clone());
+
         Ok(Self {
             agent_manager: Arc::new(AgentManager::new(256)),
             scheduler: Arc::new(PriorityScheduler::new()),
             context_manager,
             permission_manager,
             sandbox_manager: Arc::new(SandboxManagerImpl::new()),
-            ipc: Arc::new(IpcManager::new()),
+            ipc,
             observability: Arc::new(ObservabilityEngineImpl::new()),
             connector: Arc::new(AgentConnectorImpl::new()),
             resource_broker,

@@ -361,9 +361,6 @@ async fn namespace_denial_precedes_capability_and_mac() {
 /// Phase 3: nice values change observable scheduler ordering. After both
 /// agents accumulate equal "token spend", the lower-nice agent (higher
 /// priority, larger weight) has lower vruntime and is the one CFS picks next.
-///
-/// This test exercises the kernel's `set_nice` and `next_runnable_agent`
-/// surface — the contract that lets fairness be observable from outside.
 #[tokio::test]
 async fn nice_values_change_scheduler_pick_next() {
     use kernel::{AgentConfig, AgentKernelImpl};
@@ -388,18 +385,12 @@ async fn nice_values_change_scheduler_pick_next() {
         .await
         .expect("create low");
 
-    // High-priority agent: nice = -10 (large weight, slow vruntime growth).
-    // Low-priority agent: nice = +10 (small weight, fast vruntime growth).
     kernel
         .set_nice(high_pri.id, -10)
         .await
         .expect("set nice high");
     kernel.set_nice(low_pri.id, 10).await.expect("set nice low");
 
-    // Account the same number of tokens against both agents directly through
-    // the CFS scheduler (this simulates what `send_message` does after a
-    // turn). With identical token spend but different weights, vruntimes will
-    // diverge: the high-priority agent advances slowly.
     let high_pid = kernel.syscall_gate.pid_of(high_pri.id).unwrap();
     let low_pid = kernel.syscall_gate.pid_of(low_pri.id).unwrap();
 
@@ -409,7 +400,6 @@ async fn nice_values_change_scheduler_pick_next() {
         sched.account_tokens(low_pid, 1000);
     }
 
-    // CFS should now prefer the high-priority agent (lower vruntime).
     let next = kernel.next_runnable_agent().await;
     assert_eq!(
         next,
@@ -417,8 +407,6 @@ async fn nice_values_change_scheduler_pick_next() {
         "after equal token spend, CFS must pick the lower-nice agent first"
     );
 
-    // The fair-share API should report the high-priority agent gets a larger
-    // slice than the low-priority one.
     let (high_share, low_share) = {
         let sched = kernel.os.cfs.lock().await;
         (sched.fair_share(high_pid), sched.fair_share(low_pid))
@@ -429,4 +417,50 @@ async fn nice_values_change_scheduler_pick_next() {
         high_share,
         low_share
     );
+}
+
+/// Phase 3: IPC respects namespace isolation. An agent in namespace X cannot
+/// send a message to an agent in namespace Y. The error is `AgentNotFound` —
+/// the same response as a non-existent agent — so a sender cannot probe for
+/// the existence of foreign mailboxes.
+#[tokio::test]
+async fn namespace_isolation_blocks_cross_namespace_ipc() {
+    use kernel::ipc::AgentIpc;
+    use kernel::IpcError;
+
+    let (gate, _cg) = fresh_gate();
+    let alice = uuid::Uuid::new_v4();
+    let bob = uuid::Uuid::new_v4();
+    let carol = uuid::Uuid::new_v4();
+
+    gate.register_agent(alice, CapabilitySet::all(), None);
+    gate.register_agent(bob, CapabilitySet::all(), None);
+    gate.register_agent(carol, CapabilitySet::all(), None);
+
+    gate.set_agent_namespaces(alice, vec![100]);
+    gate.set_agent_namespaces(bob, vec![100]);
+    gate.set_agent_namespaces(carol, vec![200]);
+
+    let ipc = std::sync::Arc::new(kernel::ipc::IpcManager::new());
+    ipc.set_namespace_visibility(gate.clone());
+    ipc.register_agent(alice);
+    ipc.register_agent(bob);
+    ipc.register_agent(carol);
+
+    ipc.send(alice, bob, serde_json::json!({"hello": "bob"}))
+        .await
+        .expect("alice → bob (same ns) should succeed");
+
+    let r = ipc
+        .send(alice, carol, serde_json::json!({"leak": true}))
+        .await;
+    match r {
+        Err(IpcError::AgentNotFound(id)) => assert_eq!(id, carol),
+        other => panic!("expected AgentNotFound, got {:?}", other),
+    }
+
+    gate.add_agent_namespace(alice, 200);
+    ipc.send(alice, carol, serde_json::json!({"now visible": true}))
+        .await
+        .expect("after joining team-b, alice → carol should succeed");
 }

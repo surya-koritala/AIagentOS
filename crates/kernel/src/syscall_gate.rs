@@ -349,6 +349,33 @@ impl SyscallGate {
             denied_namespace: self.denied_namespace.load(Ordering::Relaxed),
         }
     }
+
+    /// Whether two agents share at least one namespace. Foundation for
+    /// namespace-aware IPC and any other cross-agent visibility check.
+    /// If either agent is unregistered, returns true (the call sites already
+    /// fail elsewhere; we don't want a missing-record race to drop messages).
+    pub fn shares_namespace(&self, a: uuid::Uuid, b: uuid::Uuid) -> bool {
+        let ns_a = match self.records.get(&a) {
+            Some(rec) => rec.namespaces.clone(),
+            None => return true,
+        };
+        let ns_b = match self.records.get(&b) {
+            Some(rec) => rec.namespaces.clone(),
+            None => return true,
+        };
+        // Empty memberships on either side → unconfined → allow (matches
+        // the "untagged tools are global" rule from `check_tool_call`).
+        if ns_a.is_empty() || ns_b.is_empty() {
+            return true;
+        }
+        ns_a.iter().any(|n| ns_b.contains(n))
+    }
+}
+
+impl crate::ipc::NamespaceVisibility for SyscallGate {
+    fn allows(&self, from: uuid::Uuid, to: uuid::Uuid) -> bool {
+        self.shares_namespace(from, to)
+    }
 }
 
 #[cfg(test)]

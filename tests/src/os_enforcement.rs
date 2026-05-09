@@ -357,3 +357,76 @@ async fn namespace_denial_precedes_capability_and_mac() {
     assert_eq!(stats.denied_capability, 0);
     assert_eq!(stats.denied_mac, 0);
 }
+
+/// Phase 3: nice values change observable scheduler ordering. After both
+/// agents accumulate equal "token spend", the lower-nice agent (higher
+/// priority, larger weight) has lower vruntime and is the one CFS picks next.
+///
+/// This test exercises the kernel's `set_nice` and `next_runnable_agent`
+/// surface — the contract that lets fairness be observable from outside.
+#[tokio::test]
+async fn nice_values_change_scheduler_pick_next() {
+    use kernel::{AgentConfig, AgentKernelImpl};
+
+    let kernel = AgentKernelImpl::new().expect("kernel new");
+
+    let config_for = |name: &str| AgentConfig {
+        name: name.to_string(),
+        task: "test".into(),
+        llm_provider: "stub".into(),
+        permission_profile: "standard".into(),
+        priority: kernel::Priority::new(3).unwrap(),
+        sandbox_config: None,
+    };
+
+    let high_pri = kernel
+        .create_agent_full(config_for("high-priority"))
+        .await
+        .expect("create high");
+    let low_pri = kernel
+        .create_agent_full(config_for("low-priority"))
+        .await
+        .expect("create low");
+
+    // High-priority agent: nice = -10 (large weight, slow vruntime growth).
+    // Low-priority agent: nice = +10 (small weight, fast vruntime growth).
+    kernel
+        .set_nice(high_pri.id, -10)
+        .await
+        .expect("set nice high");
+    kernel.set_nice(low_pri.id, 10).await.expect("set nice low");
+
+    // Account the same number of tokens against both agents directly through
+    // the CFS scheduler (this simulates what `send_message` does after a
+    // turn). With identical token spend but different weights, vruntimes will
+    // diverge: the high-priority agent advances slowly.
+    let high_pid = kernel.syscall_gate.pid_of(high_pri.id).unwrap();
+    let low_pid = kernel.syscall_gate.pid_of(low_pri.id).unwrap();
+
+    {
+        let mut sched = kernel.os.cfs.lock().await;
+        sched.account_tokens(high_pid, 1000);
+        sched.account_tokens(low_pid, 1000);
+    }
+
+    // CFS should now prefer the high-priority agent (lower vruntime).
+    let next = kernel.next_runnable_agent().await;
+    assert_eq!(
+        next,
+        Some(high_pri.id),
+        "after equal token spend, CFS must pick the lower-nice agent first"
+    );
+
+    // The fair-share API should report the high-priority agent gets a larger
+    // slice than the low-priority one.
+    let (high_share, low_share) = {
+        let sched = kernel.os.cfs.lock().await;
+        (sched.fair_share(high_pid), sched.fair_share(low_pid))
+    };
+    assert!(
+        high_share > low_share,
+        "fair_share for nice=-10 ({}) must exceed nice=+10 ({})",
+        high_share,
+        low_share
+    );
+}

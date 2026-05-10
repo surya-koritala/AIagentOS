@@ -1,22 +1,31 @@
-//! Stress test: 100 agents, measure kernel performance.
+//! Stress test: 100 agents, measure kernel performance through the unified
+//! `AgentKernelImpl` and its `SyscallGate`. Replaces the legacy `OsKernel`
+//! benchmark from before the Phase 2 unification.
 
-use kernel::agent_struct::AgentId;
-use kernel::os_kernel::OsKernel;
 use std::time::Instant;
+
+use kernel::{AgentConfig, AgentKernelImpl, Priority};
 
 #[tokio::main]
 async fn main() {
     println!("=== AI Agent OS Stress Test ===\n");
 
-    let kernel = OsKernel::new();
-    kernel.boot(None).await.unwrap();
+    let kernel = AgentKernelImpl::new().expect("kernel new");
 
-    // Test 1: Create 100 agents
+    // Test 1: Create 100 agents through the live path.
     print!("Creating 100 agents... ");
     let start = Instant::now();
-    let mut ids: Vec<AgentId> = Vec::new();
+    let mut handles = Vec::with_capacity(100);
     for i in 0..100 {
-        ids.push(kernel.start_agent(&format!("stress-{}", i)).await.unwrap());
+        let config = AgentConfig {
+            name: format!("stress-{}", i),
+            task: "stress".into(),
+            llm_provider: "stub".into(),
+            permission_profile: "full-access".into(),
+            priority: Priority::default(),
+            sandbox_config: None,
+        };
+        handles.push(kernel.create_agent_full(config).await.expect("create"));
     }
     let elapsed = start.elapsed();
     println!(
@@ -25,26 +34,17 @@ async fn main() {
         100.0 / elapsed.as_millis() as f64
     );
 
-    // Test 2: 1000 tool calls
-    print!("1000 tool calls... ");
+    // Test 2: 1000 syscall-gate tool checks. With "full-access" permission
+    // profile every agent has all caps, MAC defaults to permissive, and each
+    // call is well under the cgroup quota — so this measures gate throughput
+    // on the hot path.
+    print!("1000 tool calls through SyscallGate... ");
     let start = Instant::now();
-    // Set MAC policy to allow
-    {
-        let mut mac = kernel.mac.lock().await;
-        for &id in &ids {
-            mac.label_agent(id, "worker".into());
-        }
-        mac.load_policy(vec![kernel::mac::PolicyRule {
-            subject: "worker".into(),
-            action: "*".into(),
-            object: "*".into(),
-            decision: "allow".into(),
-        }]);
-    }
     for i in 0..1000 {
-        let agent = ids[i % 100];
+        let agent = handles[i % 100].id;
         kernel
-            .tool_call(agent, "/tools/fs", "read", &serde_json::json!({}))
+            .syscall_gate
+            .check_tool_call(agent, "read_file", "/tmp/stress", 10)
             .await
             .ok();
     }
@@ -52,13 +52,13 @@ async fn main() {
     println!(
         "{}ms ({:.0} calls/sec)",
         elapsed.as_millis(),
-        1000000.0 / elapsed.as_millis() as f64
+        1_000_000.0 / elapsed.as_millis() as f64
     );
 
-    // Test 3: Shutdown all
+    // Test 3: Shutdown — gate + observability + executors all purge.
     print!("Shutting down 100 agents... ");
     let start = Instant::now();
-    kernel.shutdown().await;
+    kernel.shutdown().await.expect("shutdown");
     let elapsed = start.elapsed();
     println!("{}ms", elapsed.as_millis());
 

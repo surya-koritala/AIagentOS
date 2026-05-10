@@ -2,7 +2,79 @@
 
 All notable changes to this project will be documented in this file.
 
-## [0.1.0] - 2025-05-05
+## [0.1.0] - 2026-05-09
+
+First tagged release. Marks the point at which the Linux-mapped subsystems
+became *load-bearing* — capability checks, MAC policy, cgroup quotas, and
+namespace isolation now enforce on every tool call and IPC send instead of
+existing as scaffolding next to the runtime path.
+
+### Added — OS contract
+
+- **`SyscallGate`** chokepoint (`crates/kernel/src/syscall_gate.rs`). Every
+  tool call from `AgentExecutor::execute_tool` runs:
+  `namespace visibility → capability → MAC → cgroup quota` before reaching
+  the resource broker. Denials surface to the LLM as structured tool errors
+  so the model can recover without the kernel trusting it.
+- **Capabilities** — 9 capability types; `http_get` requires
+  `CAP_NET_ACCESS`, `write_file` requires `CAP_FILE_WRITE`, etc. Profiles
+  (`read-only`/`standard`/`elevated`/`full-access`) translate to capability
+  sets.
+- **MAC policy enforcement** — `MacEngine` consulted on every tool call;
+  `MacDeny` returned to the LLM.
+- **Cgroup quotas reject** — `tokens_per_min` over-budget calls return
+  `CgroupQuota` (≈ EAGAIN); the minute-counter resets via background timer.
+- **Namespace-scoped tools** — `register_tool_namespace(name, ns)` plus
+  per-agent `set_agent_namespaces` produces `NotInNamespace` (≈ ENOENT)
+  for foreign tools. Check runs first so MAC information cannot leak.
+- **Namespace-scoped IPC** — `IpcManager.send/publish` consults a
+  `NamespaceVisibility` checker; cross-namespace sends look like
+  `AgentNotFound`.
+- **Scheduler observability** — every `send_message` accounts tokens against
+  CFS vruntime; `set_nice` and `next_runnable_agent` make fairness queryable.
+
+### Added — orchestration
+
+- **Unified `AgentKernelImpl`** with `OsSubsystems` (CFS, namespaces, init,
+  procfs, sysctl, service registry). The standalone `OsKernel` is removed.
+- **`kernel::boot(config)`** as the documented top-level entry point;
+  spawns `KernelRuntime` automatically. CLI and Tauri use this.
+- **`KernelRuntime::start()`** — scheduler observer + cgroup minute reset
+  timer running as background tasks driven by the unified kernel.
+- **Bounded observability retention** (default 1000 entries/agent) plus
+  `purge_agent` on shutdown so multi-hour runs don't leak.
+
+### Added — distribution
+
+- **Lean default build** — `chromiumoxide` (~50 MB) and `scraper` moved
+  behind `browser` and `web` cargo features on the `resources` crate. CI
+  exercises both lean (`cargo test`) and full (`--all-features`) modes.
+
+### Added — quality
+
+- `tests/src/os_enforcement.rs` — 8 e2e tests pinning every contract above.
+- `cargo clippy --workspace --exclude tauri-app -- -D warnings` runs clean.
+- CI (`cargo fmt --check` + `cargo test --workspace --exclude tauri-app`)
+  green on `main`. Test count: 416 passing.
+- `.gitattributes` enforces LF line endings to prevent CRLF drift on
+  cross-platform contributions.
+
+### Removed
+
+- **`OsKernel`** — superseded by `AgentKernelImpl`. Functionality fully
+  migrated; stress benchmark (`benchmarks/stress_test.rs`) now drives the
+  unified kernel + `SyscallGate`.
+
+### Documentation
+
+- **`ROADMAP.md`** — 5-phase plan with exit criteria; tracks load-bearing
+  status of each subsystem.
+- **`CLAUDE.md`** — orientation for AI assistants working in the repo;
+  documents the syscall-gate convention.
+- **`README.md`** — honest "Live / Defined / Planned" status table
+  replacing the prior all-✅ marketing.
+
+## [Pre-audit baseline] - 2025-05-05
 
 ### Added
 

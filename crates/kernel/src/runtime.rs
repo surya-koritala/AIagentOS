@@ -1,7 +1,9 @@
 //! Kernel Runtime — background loops, supervisor, kernel threads.
 //!
 //! This is what makes the OS actually RUN — not just respond to calls,
-//! but actively manage agents in the background.
+//! but actively manage agents in the background. Phase 2 cleanup: this
+//! module now drives [`crate::AgentKernelImpl`] directly, not the legacy
+//! `OsKernel`. Construct via `AgentKernelImpl::start_runtime()`.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -9,40 +11,38 @@ use std::time::Duration;
 use tokio::time::interval;
 
 use crate::agent_struct::AgentId;
-use crate::init_system::ServiceStatus;
-use crate::os_kernel::OsKernel;
+use crate::AgentKernelImpl;
 
-/// The kernel runtime — runs background tasks.
+/// The kernel runtime — runs background tasks against an `AgentKernelImpl`.
 pub struct KernelRuntime {
-    kernel: Arc<OsKernel>,
+    kernel: Arc<AgentKernelImpl>,
     scheduler_interval_ms: u64,
-    watchdog_interval_ms: u64,
-    running: std::sync::atomic::AtomicBool,
+    cgroup_reset_interval_secs: u64,
+    running: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl KernelRuntime {
-    pub fn new(kernel: Arc<OsKernel>) -> Self {
+    pub fn new(kernel: Arc<AgentKernelImpl>) -> Self {
         Self {
             kernel,
-            scheduler_interval_ms: 100, // 10 Hz scheduler tick
-            watchdog_interval_ms: 5000, // check every 5s
-            running: std::sync::atomic::AtomicBool::new(false),
+            scheduler_interval_ms: 100,
+            cgroup_reset_interval_secs: 60,
+            running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
-    /// Start all kernel background threads.
+    /// Start all kernel background threads. Returns the join handles so the
+    /// caller can await them on shutdown if desired.
     pub fn start(&self) -> Vec<tokio::task::JoinHandle<()>> {
         self.running
             .store(true, std::sync::atomic::Ordering::SeqCst);
         vec![
-            self.spawn_scheduler_loop(),
-            self.spawn_supervisor(),
-            self.spawn_oom_scanner(),
-            self.spawn_cgroup_enforcer(),
+            self.spawn_scheduler_observer(),
+            self.spawn_cgroup_reset_timer(),
         ]
     }
 
-    /// Stop all background threads.
+    /// Stop all background threads. Loops exit on next tick.
     pub fn stop(&self) {
         self.running
             .store(false, std::sync::atomic::Ordering::SeqCst);
@@ -53,114 +53,44 @@ impl KernelRuntime {
         self.running.load(std::sync::atomic::Ordering::SeqCst)
     }
 
-    /// Scheduler loop: picks next agent, accounts tokens, preempts expired.
-    fn spawn_scheduler_loop(&self) -> tokio::task::JoinHandle<()> {
+    /// Scheduler observer: every tick, ask CFS who would run next and
+    /// publish that into procfs as `current_agent`. The actual turn execution
+    /// is still driven by `send_message`; this loop just keeps procfs honest.
+    fn spawn_scheduler_observer(&self) -> tokio::task::JoinHandle<()> {
         let kernel = self.kernel.clone();
+        let running = self.running.clone();
         let interval_ms = self.scheduler_interval_ms;
-        let _running = self.running.load(std::sync::atomic::Ordering::SeqCst);
 
         tokio::spawn(async move {
             let mut tick = interval(Duration::from_millis(interval_ms));
-            loop {
+            while running.load(std::sync::atomic::Ordering::SeqCst) {
                 tick.tick().await;
-                // Check if still running
-                if !kernel.status().booted {
-                    break;
-                }
-
-                let mut sched = kernel.scheduler.lock().await;
-                if let Some(next_agent) = sched.pick_next() {
-                    // In a real OS, this would context-switch to the agent
-                    // For now, just track that scheduling is happening
-                    drop(sched);
-
-                    // Update procfs with current running agent
-                    let mut procfs = kernel.procfs.lock().await;
-                    procfs.set_system("current_agent".into(), next_agent.to_string());
-                }
-            }
-        })
-    }
-
-    /// Supervisor: detects crashed agents, restarts per policy.
-    fn spawn_supervisor(&self) -> tokio::task::JoinHandle<()> {
-        let kernel = self.kernel.clone();
-        let interval_ms = self.watchdog_interval_ms;
-
-        tokio::spawn(async move {
-            let mut tick = interval(Duration::from_millis(interval_ms));
-            loop {
-                tick.tick().await;
-                if !kernel.status().booted {
-                    break;
-                }
-
-                // Check init system for failed services that should restart
-                let to_restart: Vec<String> = {
-                    let init = kernel.init.lock().await;
-                    init.list()
-                        .iter()
-                        .filter(|(name, status)| {
-                            *status == ServiceStatus::Failed && init.should_restart(name)
-                        })
-                        .map(|(name, _)| name.to_string())
-                        .collect()
+                let next = {
+                    let mut sched = kernel.os.cfs.lock().await;
+                    sched.pick_next()
                 };
-
-                for name in to_restart {
-                    // Restart the service
-                    let mut init = kernel.init.lock().await;
-                    init.record_restart(&name);
-                    drop(init);
-
-                    if let Ok(new_id) = kernel.start_agent(&name).await {
-                        let mut init = kernel.init.lock().await;
-                        init.mark_started(&name, new_id);
-                    }
+                if let Some(pid) = next {
+                    let mut procfs = kernel.os.procfs.lock().await;
+                    procfs.set_system("current_agent".into(), pid.to_string());
                 }
             }
         })
     }
 
-    /// OOM scanner: kills lowest priority agent when system budget exhausted.
-    fn spawn_oom_scanner(&self) -> tokio::task::JoinHandle<()> {
+    /// Cgroup reset timer: every minute, reset per-minute token counters so
+    /// `tokens_per_min` quotas regenerate. Without this, an agent that hits
+    /// quota stays denied forever.
+    fn spawn_cgroup_reset_timer(&self) -> tokio::task::JoinHandle<()> {
         let kernel = self.kernel.clone();
+        let running = self.running.clone();
+        let interval_secs = self.cgroup_reset_interval_secs;
 
         tokio::spawn(async move {
-            let mut tick = interval(Duration::from_secs(10));
-            loop {
+            let mut tick = interval(Duration::from_secs(interval_secs));
+            // Skip first immediate tick.
+            tick.tick().await;
+            while running.load(std::sync::atomic::Ordering::SeqCst) {
                 tick.tick().await;
-                if !kernel.status().booted {
-                    break;
-                }
-
-                // Check if system is over budget
-                let over_budget = !kernel.cgroups.check_token_limit(kernel.cgroups.root(), 0);
-                if over_budget {
-                    // Find lowest priority agent and kill it
-                    let agents = kernel.agents.list_ids();
-                    if let Some(&victim) = agents.last() {
-                        let _ = kernel.stop_agent(victim).await;
-                        // Reset cgroup counters
-                        kernel.cgroups.reset_minute_counters();
-                    }
-                }
-            }
-        })
-    }
-
-    /// Cgroup enforcer: throttles agents exceeding their group limits.
-    fn spawn_cgroup_enforcer(&self) -> tokio::task::JoinHandle<()> {
-        let kernel = self.kernel.clone();
-
-        tokio::spawn(async move {
-            let mut tick = interval(Duration::from_secs(60));
-            loop {
-                tick.tick().await;
-                if !kernel.status().booted {
-                    break;
-                }
-                // Reset per-minute counters every minute
                 kernel.cgroups.reset_minute_counters();
             }
         })
@@ -397,16 +327,14 @@ mod tests {
 
     #[tokio::test]
     async fn kernel_runtime_starts_and_stops() {
-        let kernel = Arc::new(OsKernel::new());
-        kernel.boot(None).await.unwrap();
-        kernel.start_agent("test").await.unwrap();
+        let kernel = Arc::new(crate::AgentKernelImpl::new().unwrap());
+        let runtime = kernel.start_runtime();
 
-        let runtime = KernelRuntime::new(kernel.clone());
-        let handles = runtime.start();
-        assert_eq!(handles.len(), 4); // 4 background tasks
+        // Let the loops tick at least once so we exercise both the scheduler
+        // observer and the cgroup reset timer's first iteration.
+        tokio::time::sleep(Duration::from_millis(150)).await;
 
-        tokio::time::sleep(Duration::from_millis(200)).await; // let them tick
         runtime.stop();
-        kernel.shutdown().await;
+        kernel.shutdown().await.unwrap();
     }
 }

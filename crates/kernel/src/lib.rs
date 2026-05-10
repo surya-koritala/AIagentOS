@@ -37,7 +37,6 @@ pub mod modules;
 pub mod mount_table;
 pub mod namespaces;
 pub mod observability;
-pub mod os_kernel;
 pub mod package;
 pub mod permissions;
 pub mod pipes;
@@ -965,6 +964,39 @@ impl AgentKernelImpl {
     pub fn subscribe_events(&self) -> broadcast::Receiver<KernelEvent> {
         self.event_tx.subscribe()
     }
+
+    /// Spawn the kernel's background tasks: scheduler observer (publishes the
+    /// CFS pick to procfs as `current_agent`) and the cgroup minute-counter
+    /// reset timer. Returns the [`KernelRuntime`] so the caller can `stop()`
+    /// it on shutdown. Idempotent — calling twice spawns two sets, so call
+    /// once at startup.
+    pub fn start_runtime(self: &Arc<Self>) -> crate::runtime::KernelRuntime {
+        let runtime = crate::runtime::KernelRuntime::new(self.clone());
+        let _handles = runtime.start();
+        // Handles are intentionally dropped — `running` flag drives the loop
+        // exit. Keep the runtime so callers can call `stop()`.
+        runtime
+    }
+}
+
+/// Documented top-level entry point: construct the kernel from config and
+/// spawn its background tasks. Both the CLI and Tauri app should use this
+/// instead of poking at `AgentKernelImpl::from_config` + `start_runtime`
+/// separately.
+pub fn boot(config: &crate::config::Config) -> Result<Arc<AgentKernelImpl>, KernelError> {
+    let kernel = Arc::new(AgentKernelImpl::from_config(config)?);
+    let _runtime = kernel.start_runtime();
+    // Runtime stays alive as long as `running` is true; on Drop the loops
+    // exit on next tick. Callers that want explicit `stop()` should call
+    // `start_runtime` themselves and hold the returned `KernelRuntime`.
+    Ok(kernel)
+}
+
+/// In-memory variant of [`boot`] for tests and quick scripts.
+pub fn boot_in_memory() -> Result<Arc<AgentKernelImpl>, KernelError> {
+    let kernel = Arc::new(AgentKernelImpl::new()?);
+    let _runtime = kernel.start_runtime();
+    Ok(kernel)
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────────

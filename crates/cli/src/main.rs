@@ -191,7 +191,7 @@ async fn main() {
             name: "cli-agent".into(),
             task: "interactive assistant".into(),
             llm_provider: config.llm_provider.clone(),
-            permission_profile: "full-access".into(),
+            permission_profile: config.permission_profile.clone(),
             priority: Priority::default(),
             sandbox_config: None,
         })
@@ -213,6 +213,11 @@ async fn main() {
         kernel.context_manager.clone(),
         system_prompt,
     );
+    // Route every tool call through the kernel's syscall gate (capability /
+    // MAC / cgroup / namespace enforcement). The agent was registered with the
+    // gate in `create_agent_full` using `config.permission_profile`'s caps, so
+    // tool calls are now enforced instead of running unconfined.
+    executor.set_syscall_gate(kernel.syscall_gate.clone());
 
     if let Some(ref conv_id) = conversation_id {
         executor = executor.with_conversation(conv_id);

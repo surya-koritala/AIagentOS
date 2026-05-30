@@ -239,6 +239,21 @@ impl PriorityScheduler {
             queue.push(e);
         }
     }
+
+    /// Remove an agent from the scheduler entirely, freeing its admission slot
+    /// if it was running. Called when an agent terminates (stop/shutdown) so the
+    /// `MAX_CONCURRENT_AGENTS` gate tracks real liveness — without this,
+    /// `running_count` only ever increments (`schedule` adds it, and the only
+    /// decrement was `suspend`, which has no live caller) and the gate wedges.
+    pub fn deschedule(&self, agent_id: AgentId) {
+        if let Some((_, info)) = self.agents.remove(&agent_id) {
+            if info.state == AgentScheduleState::Running {
+                self.running_count.fetch_sub(1, AtomicOrdering::SeqCst);
+                self.slot_available.notify_one();
+            }
+        }
+        self.remove_from_queue(agent_id);
+    }
 }
 
 #[async_trait::async_trait]
@@ -379,6 +394,37 @@ mod tests {
         assert_eq!(sched.get_queue_status().running_agents, 1);
         sched.suspend(id).await.unwrap();
         assert_eq!(sched.get_queue_status().running_agents, 0);
+    }
+
+    #[tokio::test]
+    async fn deschedule_frees_running_slot() {
+        let sched = PriorityScheduler::new();
+        let ids: Vec<AgentId> = (0..MAX_CONCURRENT_AGENTS)
+            .map(|_| uuid::Uuid::new_v4())
+            .collect();
+        for id in &ids {
+            sched.schedule(&make_handle(*id)).await.unwrap();
+        }
+        assert_eq!(
+            sched.get_queue_status().running_agents,
+            MAX_CONCURRENT_AGENTS
+        );
+
+        // Terminating an agent frees its slot (vs. the old monotonic leak).
+        sched.deschedule(ids[0]);
+        assert_eq!(
+            sched.get_queue_status().running_agents,
+            MAX_CONCURRENT_AGENTS - 1
+        );
+
+        // A new agent now admits immediately instead of blocking on the
+        // 10s deadlock timeout.
+        let extra = uuid::Uuid::new_v4();
+        sched.schedule(&make_handle(extra)).await.unwrap();
+        assert_eq!(
+            sched.get_queue_status().running_agents,
+            MAX_CONCURRENT_AGENTS
+        );
     }
 
     #[tokio::test]

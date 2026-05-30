@@ -464,3 +464,89 @@ async fn namespace_isolation_blocks_cross_namespace_ipc() {
         .await
         .expect("after joining team-b, alice → carol should succeed");
 }
+
+/// LIVE-PATH cgroup enforcement: an agent created via `create_agent_full` now
+/// lands in a bounded per-profile cgroup, so `CgroupQuota` fires for a
+/// non-`full-access` profile while `full-access` stays unlimited. (The existing
+/// `cgroup_quota_blocks_when_over_budget` only exercises a hand-built cgroup;
+/// this covers the real agent-creation path the CLI/Tauri use.)
+#[tokio::test]
+async fn live_create_path_enforces_cgroup_quota() {
+    use kernel::{AgentConfig, AgentKernelImpl};
+
+    let kernel = AgentKernelImpl::new().expect("kernel new");
+    let cfg = |name: &str, profile: &str| AgentConfig {
+        name: name.into(),
+        task: "test".into(),
+        llm_provider: "stub".into(),
+        permission_profile: profile.into(),
+        priority: kernel::Priority::new(3).unwrap(),
+        sandbox_config: None,
+    };
+
+    // "standard" → bounded cgroup (default 50_000 tok/min). A single call
+    // estimating more than the per-minute budget is denied with CgroupQuota.
+    let std_agent = kernel
+        .create_agent_full(cfg("std", "standard"))
+        .await
+        .unwrap();
+    let denied = kernel
+        .syscall_gate
+        .check_tool_call(std_agent.id, "read_file", "/x", 60_000)
+        .await;
+    assert!(
+        matches!(denied, Err(GateDenial::CgroupQuota)),
+        "standard agent over budget should be denied CgroupQuota, got {denied:?}"
+    );
+    // A small call stays within budget.
+    assert!(kernel
+        .syscall_gate
+        .check_tool_call(std_agent.id, "read_file", "/x", 10)
+        .await
+        .is_ok());
+
+    // "full-access" → unlimited cgroup: the same large call is allowed.
+    let fa = kernel
+        .create_agent_full(cfg("fa", "full-access"))
+        .await
+        .unwrap();
+    assert!(
+        kernel
+            .syscall_gate
+            .check_tool_call(fa.id, "read_file", "/x", 60_000)
+            .await
+            .is_ok(),
+        "full-access agent should be unlimited"
+    );
+}
+
+/// Shutdown frees CFS run-queue entries — previously `runnable_count` only ever
+/// grew because agents were enqueued at creation and never dequeued.
+#[tokio::test]
+async fn shutdown_dequeues_agents_from_cfs() {
+    use kernel::{AgentConfig, AgentKernelImpl};
+
+    let kernel = AgentKernelImpl::new().expect("kernel new");
+    let cfg = |name: &str| AgentConfig {
+        name: name.into(),
+        task: "test".into(),
+        llm_provider: "stub".into(),
+        permission_profile: "standard".into(),
+        priority: kernel::Priority::new(3).unwrap(),
+        sandbox_config: None,
+    };
+    for i in 0..3 {
+        kernel
+            .create_agent_full(cfg(&format!("a{i}")))
+            .await
+            .unwrap();
+    }
+    assert_eq!(kernel.os.cfs.lock().await.runnable_count(), 3);
+
+    kernel.shutdown().await.unwrap();
+    assert_eq!(
+        kernel.os.cfs.lock().await.runnable_count(),
+        0,
+        "shutdown should dequeue every agent from the CFS run queue"
+    );
+}

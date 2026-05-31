@@ -737,3 +737,74 @@ async fn from_config_enables_mac_enforcement() {
     );
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// #12: two agents exchange a message through the `send_agent_message` /
+/// `check_inbox` tools, routed by the resource broker to the IpcManager. This
+/// activates the IPC subsystem as agent-callable tools (same-namespace delivery;
+/// the gate's namespace isolation still governs cross-namespace sends).
+#[tokio::test]
+async fn live_path_agents_message_via_ipc_tools() {
+    use kernel::connector::ToolCall;
+    use kernel::resources::{ResourceBroker, ResourceType};
+    use kernel::AgentKernelImpl;
+
+    let kernel = AgentKernelImpl::new().expect("kernel new");
+    let a = kernel
+        .create_agent_full(agent_cfg("a", "standard"))
+        .await
+        .unwrap();
+    let b = kernel
+        .create_agent_full(agent_cfg("b", "standard"))
+        .await
+        .unwrap();
+    assert!(kernel.tool_registry.has_tool("send_agent_message"));
+    assert!(kernel.tool_registry.has_tool("check_inbox"));
+
+    // A → B through the tool path (resolve → broker → IpcResourceProvider → IpcManager).
+    let req = kernel
+        .tool_registry
+        .resolve(
+            a.id,
+            &ToolCall {
+                id: "1".into(),
+                name: "send_agent_message".into(),
+                arguments: serde_json::json!({"to": b.id.to_string(), "message": {"hi": "there"}}),
+            },
+        )
+        .unwrap();
+    assert_eq!(req.resource_type, ResourceType::Ipc);
+    assert!(kernel.resource_broker.execute(req).await.unwrap().success);
+
+    // B checks its inbox and receives A's message.
+    let req2 = kernel
+        .tool_registry
+        .resolve(
+            b.id,
+            &ToolCall {
+                id: "2".into(),
+                name: "check_inbox".into(),
+                arguments: serde_json::json!({}),
+            },
+        )
+        .unwrap();
+    let resp2 = kernel.resource_broker.execute(req2).await.unwrap();
+    assert!(resp2.success);
+    assert_eq!(resp2.data["from"], a.id.to_string());
+    assert_eq!(resp2.data["payload"]["hi"], "there");
+
+    // A's own inbox is empty — returns gracefully, not an error.
+    let req3 = kernel
+        .tool_registry
+        .resolve(
+            a.id,
+            &ToolCall {
+                id: "3".into(),
+                name: "check_inbox".into(),
+                arguments: serde_json::json!({}),
+            },
+        )
+        .unwrap();
+    let resp3 = kernel.resource_broker.execute(req3).await.unwrap();
+    assert!(resp3.success);
+    assert_eq!(resp3.data["empty"], true);
+}

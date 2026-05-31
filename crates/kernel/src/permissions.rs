@@ -187,6 +187,12 @@ impl PermissionManager {
                         targets: None,
                         decision: AccessDecision::Allowed,
                     },
+                    PermissionRule {
+                        resource_type: ResourceType::Ipc,
+                        operations: vec!["send".to_string(), "receive".to_string()],
+                        targets: None,
+                        decision: AccessDecision::Allowed,
+                    },
                 ],
             },
         );
@@ -242,6 +248,12 @@ impl PermissionManager {
                             "type".to_string(),
                             "read".to_string(),
                         ],
+                        targets: None,
+                        decision: AccessDecision::Allowed,
+                    },
+                    PermissionRule {
+                        resource_type: ResourceType::Ipc,
+                        operations: vec!["send".to_string(), "receive".to_string()],
                         targets: None,
                         decision: AccessDecision::Allowed,
                     },

@@ -93,6 +93,10 @@ impl ToolAction {
         action: "delete",
         required_cap: Some(CapabilitySet::CAP_FILE_DELETE),
     };
+    pub const IPC: Self = Self {
+        action: "ipc",
+        required_cap: None,
+    };
 }
 
 /// Classify a built-in tool name into an action + required capability.
@@ -116,6 +120,8 @@ pub fn classify_tool(tool_name: &str) -> ToolAction {
         "http_get" | "browse_url" => ToolAction::NET,
         // Process execution
         "run_command" => ToolAction::EXEC,
+        // Inter-agent messaging (namespace isolation is the real boundary).
+        "send_agent_message" | "check_inbox" => ToolAction::IPC,
         _ => ToolAction::EXECUTE,
     }
 }

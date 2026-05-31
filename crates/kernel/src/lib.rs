@@ -529,6 +529,69 @@ impl ResourceProvider for BuiltinFilesystemProvider {
     }
 }
 
+/// Routes the `Ipc` resource type to the kernel's `IpcManager`, so the
+/// `send_agent_message` / `check_inbox` tools deliver real inter-agent messages.
+/// Namespace isolation is enforced inside `IpcManager::send`.
+struct IpcResourceProvider {
+    ipc: Arc<IpcManager>,
+}
+
+#[async_trait::async_trait]
+impl ResourceProvider for IpcResourceProvider {
+    fn resource_type(&self) -> ResourceType {
+        ResourceType::Ipc
+    }
+    fn supported_operations(&self) -> Vec<String> {
+        vec!["send".into(), "receive".into()]
+    }
+    async fn execute(
+        &self,
+        operation: &str,
+        params: &serde_json::Value,
+    ) -> Result<serde_json::Value, ResourceError> {
+        use crate::ipc::AgentIpc;
+        let parse_id = |key: &str| -> Result<AgentId, ResourceError> {
+            params
+                .get(key)
+                .and_then(|v| v.as_str())
+                .and_then(|s| uuid::Uuid::parse_str(s).ok())
+                .ok_or_else(|| {
+                    ResourceError::OperationFailed(format!("invalid or missing '{key}' agent id"))
+                })
+        };
+        match operation {
+            "send" => {
+                let from = parse_id("from")?;
+                let to = parse_id("to")?;
+                let payload = params
+                    .get("payload")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
+                self.ipc
+                    .send(from, to, payload)
+                    .await
+                    .map_err(|e| ResourceError::OperationFailed(e.to_string()))?;
+                Ok(serde_json::json!({"sent": true}))
+            }
+            "receive" => {
+                let agent = parse_id("agent")?;
+                match self.ipc.receive(agent).await {
+                    Ok(msg) => Ok(serde_json::json!({
+                        "from": msg.from.to_string(),
+                        "payload": msg.payload,
+                    })),
+                    // An empty inbox is not an error.
+                    Err(crate::IpcError::ChannelClosed) => Ok(serde_json::json!({"empty": true})),
+                    Err(e) => Err(ResourceError::OperationFailed(e.to_string())),
+                }
+            }
+            _ => Err(ResourceError::OperationFailed(format!(
+                "Unknown IPC op: {operation}"
+            ))),
+        }
+    }
+}
+
 struct BuiltinNetworkProvider;
 
 #[async_trait::async_trait]
@@ -824,6 +887,9 @@ impl AgentKernelImpl {
         // Wire the gate as the IPC namespace visibility checker so that
         // cross-namespace sends fail like sends to a non-existent agent.
         ipc.set_namespace_visibility(syscall_gate.clone());
+        // Route the Ipc resource type to the kernel's IpcManager so the
+        // inter-agent messaging tools deliver real messages through the broker.
+        resource_broker.register_provider(Box::new(IpcResourceProvider { ipc: ipc.clone() }));
 
         // Register the full default toolset on the shared registry: built-ins
         // (registered in `ToolRegistry::new`) plus the advanced (browse_url),
@@ -832,6 +898,7 @@ impl AgentKernelImpl {
         let tool_registry = Arc::new(ToolRegistry::new());
         tool_registry.register_advanced_tools();
         tool_registry.register_git_tools();
+        tool_registry.register_ipc_tools();
         crate::editing::register_edit_tools(&tool_registry);
 
         Ok(Self {

@@ -634,3 +634,106 @@ async fn live_path_extended_tools_edit_and_delete_capability() {
     assert_eq!(std::fs::read_to_string(&file).unwrap(), "hello rust");
     std::fs::remove_dir_all(&dir).ok();
 }
+
+fn agent_cfg(name: &str, profile: &str) -> kernel::AgentConfig {
+    kernel::AgentConfig {
+        name: name.into(),
+        task: "test".into(),
+        llm_provider: "stub".into(),
+        permission_profile: profile.into(),
+        priority: kernel::Priority::new(3).unwrap(),
+        sandbox_config: None,
+    }
+}
+
+/// #6: agents created through the live path are MAC-labelled `profile:<profile>`,
+/// so an enforcing policy denies on the real `check_tool_call` path — the MAC
+/// stage of the gate is no longer inert. (A "standard" agent HAS CAP_FILE_WRITE,
+/// so capability passes and MAC is what actually denies the write.)
+#[tokio::test]
+async fn live_path_mac_denies_by_profile_label() {
+    use kernel::mac::PolicyRule;
+    use kernel::AgentKernelImpl;
+
+    let kernel = AgentKernelImpl::new().expect("kernel new");
+    {
+        let mut mac = kernel.syscall_gate.mac.lock().await;
+        mac.set_enforcing(true);
+        mac.load_policy(vec![
+            PolicyRule {
+                subject: "profile:standard".into(),
+                action: "write".into(),
+                object: "*".into(),
+                decision: "deny".into(),
+            },
+            PolicyRule {
+                subject: "*".into(),
+                action: "*".into(),
+                object: "*".into(),
+                decision: "allow".into(),
+            },
+        ]);
+    }
+
+    let agent = kernel
+        .create_agent_full(agent_cfg("a", "standard"))
+        .await
+        .unwrap();
+    let denied = kernel
+        .syscall_gate
+        .check_tool_call(agent.id, "write_file", "/tmp/x", 5)
+        .await;
+    assert!(
+        matches!(denied, Err(GateDenial::MacDeny { .. })),
+        "MAC should deny write for profile:standard, got {denied:?}"
+    );
+    // Reads are allowed by the catch-all rule.
+    assert!(kernel
+        .syscall_gate
+        .check_tool_call(agent.id, "read_file", "/tmp/x", 5)
+        .await
+        .is_ok());
+}
+
+/// #18: `from_config` wires `mac_enforcing` + `mac_rules` into the gate, so MAC
+/// is operator-controllable on the shipped binary (not just in tests).
+#[tokio::test]
+async fn from_config_enables_mac_enforcement() {
+    use kernel::config::Config;
+    use kernel::mac::PolicyRule;
+    use kernel::AgentKernelImpl;
+
+    let dir = std::env::temp_dir().join(format!("mac_cfg_{}", uuid::Uuid::new_v4()));
+    let mut config = Config::default();
+    config.data_dir = dir.clone();
+    config.mac_enforcing = true;
+    config.mac_rules = vec![
+        PolicyRule {
+            subject: "profile:standard".into(),
+            action: "write".into(),
+            object: "*".into(),
+            decision: "deny".into(),
+        },
+        PolicyRule {
+            subject: "*".into(),
+            action: "*".into(),
+            object: "*".into(),
+            decision: "allow".into(),
+        },
+    ];
+
+    let kernel = AgentKernelImpl::from_config(&config).expect("from_config");
+    let agent = kernel
+        .create_agent_full(agent_cfg("a", "standard"))
+        .await
+        .unwrap();
+    let denied = kernel
+        .syscall_gate
+        .check_tool_call(agent.id, "write_file", "/tmp/x", 5)
+        .await;
+    assert!(
+        matches!(denied, Err(GateDenial::MacDeny { .. })),
+        "from_config-loaded MAC policy should deny, got {denied:?}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}

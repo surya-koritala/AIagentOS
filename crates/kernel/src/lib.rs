@@ -745,7 +745,12 @@ impl AgentKernelImpl {
     pub fn new() -> Result<Self, KernelError> {
         let context_manager =
             Arc::new(SqliteContextManager::in_memory().map_err(KernelError::Context)?);
-        Self::with_context_manager(context_manager, &crate::config::BudgetConfig::default())
+        Self::with_context_manager(
+            context_manager,
+            &crate::config::BudgetConfig::default(),
+            false,
+            &[],
+        )
     }
 
     /// Create a kernel with persistent SQLite storage at the given path.
@@ -755,7 +760,12 @@ impl AgentKernelImpl {
         }
         let context_manager =
             Arc::new(SqliteContextManager::new(db_path).map_err(KernelError::Context)?);
-        Self::with_context_manager(context_manager, &crate::config::BudgetConfig::default())
+        Self::with_context_manager(
+            context_manager,
+            &crate::config::BudgetConfig::default(),
+            false,
+            &[],
+        )
     }
 
     /// Create a kernel from config (uses config.data_dir for persistence and
@@ -768,12 +778,19 @@ impl AgentKernelImpl {
         }
         let context_manager =
             Arc::new(SqliteContextManager::new(&db_path).map_err(KernelError::Context)?);
-        Self::with_context_manager(context_manager, &config.budgets)
+        Self::with_context_manager(
+            context_manager,
+            &config.budgets,
+            config.mac_enforcing,
+            &config.mac_rules,
+        )
     }
 
     fn with_context_manager(
         context_manager: Arc<SqliteContextManager>,
         budgets: &crate::config::BudgetConfig,
+        mac_enforcing: bool,
+        mac_rules: &[crate::mac::PolicyRule],
     ) -> Result<Self, KernelError> {
         let (event_tx, _) = broadcast::channel(256);
         let permission_manager = Arc::new(PermissionManager::new());
@@ -796,7 +813,11 @@ impl AgentKernelImpl {
             );
             profile_cgroups.insert(profile.to_string(), cg);
         }
-        let syscall_gate = Arc::new(SyscallGate::new(cgroups.clone()));
+        let syscall_gate = Arc::new(SyscallGate::with_mac(
+            cgroups.clone(),
+            mac_enforcing,
+            mac_rules.to_vec(),
+        ));
         let os = Arc::new(OsSubsystems::new());
 
         let ipc = Arc::new(IpcManager::new());
@@ -894,6 +915,14 @@ impl AgentKernelImpl {
             .or_else(|| self.profile_cgroups.get("standard"))
             .copied();
         let pid = self.syscall_gate.register_agent(agent_id, caps, cgroup);
+
+        // MAC: label the agent by its permission profile so an enforcing policy
+        // can discriminate by subject (e.g. "profile:read-only"). No-op while the
+        // gate's MAC engine is permissive (the default).
+        {
+            let mut mac = self.syscall_gate.mac.lock().await;
+            mac.label_agent(pid, format!("profile:{}", config.permission_profile));
+        }
 
         // 8. Place the agent in the OS-level subsystems using its PID.
         //    Default Agent + Tool namespaces; root-cgroup membership; CFS enqueue;

@@ -170,8 +170,20 @@ impl SyscallGate {
     /// enforcing via `mac().set_enforcing(true)` and load policy rules to
     /// activate denial.
     pub fn new(cgroups: std::sync::Arc<CgroupManager>) -> Self {
+        Self::with_mac(cgroups, false, Vec::new())
+    }
+
+    /// Create a gate with an explicit MAC configuration: `mac_enforcing` mode
+    /// and an initial policy. The kernel uses this to wire operator MAC settings
+    /// from config; `new` is the permissive (default-allow, no rules) shortcut.
+    pub fn with_mac(
+        cgroups: std::sync::Arc<CgroupManager>,
+        mac_enforcing: bool,
+        mac_rules: Vec<crate::mac::PolicyRule>,
+    ) -> Self {
         let default_cgroup = cgroups.root();
-        let mac = MacEngine::new(false);
+        let mut mac = MacEngine::new(mac_enforcing);
+        mac.load_policy(mac_rules);
         Self {
             mac: Mutex::new(mac),
             cgroups,

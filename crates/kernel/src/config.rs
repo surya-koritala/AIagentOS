@@ -36,6 +36,25 @@ pub struct Config {
     /// Resource budgets (cgroup token quotas + rate limiter) applied to agents.
     #[serde(default)]
     pub budgets: BudgetConfig,
+    /// Mandatory Access Control: when true, the syscall gate's MAC stage
+    /// enforces `mac_rules` (default-deny on no match). When false (default) the
+    /// MAC stage is permissive, preserving prior behavior. Agents are labelled
+    /// `profile:<permission_profile>` at creation so rules can target them.
+    #[serde(default)]
+    pub mac_enforcing: bool,
+    /// MAC policy rules (subject/action/object/decision strings), consulted only
+    /// when `mac_enforcing` is true. Operator notes:
+    /// - Matching is default-DENY on no match, so include a trailing catch-all
+    ///   `{subject="*", action="*", object="*", decision="allow"}` unless you
+    ///   intend strict whitelist semantics. Enforcing with an empty `mac_rules`
+    ///   denies everything for confined agents.
+    /// - Subjects are `profile:<name>` where name is one of
+    ///   read-only/standard/elevated/full-access.
+    /// - Object matching is exact-or-`*` against a resource's label; until
+    ///   per-path resource labels are wired, every resource is `unconfined`, so
+    ///   use `object = "*"` (or `"unconfined"`).
+    #[serde(default)]
+    pub mac_rules: Vec<crate::mac::PolicyRule>,
 }
 
 /// Resource budgets applied at agent creation and to the shared rate limiter.
@@ -87,6 +106,8 @@ impl Default for Config {
             max_browse_chars: default_max_browse_chars(),
             permission_profile: default_permission_profile(),
             budgets: BudgetConfig::default(),
+            mac_enforcing: false,
+            mac_rules: Vec::new(),
         }
     }
 }
@@ -238,5 +259,30 @@ mod tests {
         let s = toml::to_string_pretty(&cfg).unwrap();
         let parsed: Config = toml::from_str(&s).unwrap();
         assert_eq!(parsed.budgets.agent_tokens_per_min, 12_345);
+    }
+
+    #[test]
+    fn mac_fields_default_and_roundtrip() {
+        // MAC is off and rule-less by default; a config without the fields loads.
+        let toml =
+            "llm_provider = \"local\"\ndefault_model = \"m\"\ndata_dir = \"/tmp/x\"\n[api_keys]\n";
+        let cfg: Config = toml::from_str(toml).unwrap();
+        assert!(!cfg.mac_enforcing);
+        assert!(cfg.mac_rules.is_empty());
+
+        // Enforcing + a rule round-trips through TOML.
+        let mut cfg = Config::default();
+        cfg.mac_enforcing = true;
+        cfg.mac_rules = vec![crate::mac::PolicyRule {
+            subject: "profile:standard".into(),
+            action: "write".into(),
+            object: "*".into(),
+            decision: "deny".into(),
+        }];
+        let s = toml::to_string_pretty(&cfg).unwrap();
+        let parsed: Config = toml::from_str(&s).unwrap();
+        assert!(parsed.mac_enforcing);
+        assert_eq!(parsed.mac_rules.len(), 1);
+        assert_eq!(parsed.mac_rules[0].decision, "deny");
     }
 }

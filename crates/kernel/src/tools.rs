@@ -145,6 +145,18 @@ impl ToolRegistry {
                     .unwrap_or("");
                 serde_json::json!({"command": "mkdir", "args": ["-p", path]})
             }
+            // IPC tools: inject the caller's id as the sender (the LLM only
+            // supplies the recipient / nothing). Recipient is addressed by id.
+            "send_agent_message" => serde_json::json!({
+                "from": agent_id.to_string(),
+                "to": tool_call.arguments.get("to").and_then(|v| v.as_str()).unwrap_or(""),
+                "payload": tool_call
+                    .arguments
+                    .get("message")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null),
+            }),
+            "check_inbox" => serde_json::json!({"agent": agent_id.to_string()}),
             _ => tool_call.arguments.clone(),
         };
 
@@ -380,6 +392,46 @@ mod tests {
         assert_eq!(req.resource_type, ResourceType::Filesystem);
         assert_eq!(req.operation, "edit");
     }
+
+    #[test]
+    fn ipc_tools_register_and_inject_sender() {
+        let reg = ToolRegistry::new();
+        reg.register_ipc_tools();
+        assert!(reg.has_tool("send_agent_message"));
+        assert!(reg.has_tool("check_inbox"));
+
+        let from = uuid::Uuid::new_v4();
+        let to = uuid::Uuid::new_v4();
+        let req = reg
+            .resolve(
+                from,
+                &ToolCall {
+                    id: "s".into(),
+                    name: "send_agent_message".into(),
+                    arguments: serde_json::json!({"to": to.to_string(), "message": {"hi": 1}}),
+                },
+            )
+            .unwrap();
+        assert_eq!(req.resource_type, ResourceType::Ipc);
+        assert_eq!(req.operation, "send");
+        // Caller id is injected as the sender; recipient comes from the args.
+        assert_eq!(req.parameters["from"], from.to_string());
+        assert_eq!(req.parameters["to"], to.to_string());
+        assert_eq!(req.parameters["payload"]["hi"], 1);
+
+        let inbox = reg
+            .resolve(
+                from,
+                &ToolCall {
+                    id: "c".into(),
+                    name: "check_inbox".into(),
+                    arguments: serde_json::json!({}),
+                },
+            )
+            .unwrap();
+        assert_eq!(inbox.operation, "receive");
+        assert_eq!(inbox.parameters["agent"], from.to_string());
+    }
 }
 
 // Sprint 3 tools are registered separately via register_advanced_tools()
@@ -435,5 +487,36 @@ impl ToolRegistry {
             operation: "launch".into(),
         });
         self.register_command_template("git_diff", "git", &["diff".into()]);
+    }
+}
+
+// Inter-agent messaging tools registered via register_ipc_tools()
+impl ToolRegistry {
+    pub fn register_ipc_tools(&self) {
+        self.register(ToolBinding {
+            name: "send_agent_message".into(),
+            description:
+                "Send a JSON message to another agent by its agent id. Delivery requires sharing \
+                 a namespace with the recipient."
+                    .into(),
+            parameters_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "to": {"type": "string", "description": "Recipient agent id (UUID)"},
+                    "message": {"description": "JSON payload to deliver"}
+                },
+                "required": ["to", "message"]
+            }),
+            resource_type: ResourceType::Ipc,
+            operation: "send".into(),
+        });
+        self.register(ToolBinding {
+            name: "check_inbox".into(),
+            description: "Receive the next pending message from your agent inbox (empty if none)."
+                .into(),
+            parameters_schema: serde_json::json!({"type": "object", "properties": {}}),
+            resource_type: ResourceType::Ipc,
+            operation: "receive".into(),
+        });
     }
 }

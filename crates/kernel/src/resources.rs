@@ -18,6 +18,8 @@ pub enum ResourceType {
     Browser,
     Peripheral,
     Network,
+    /// Inter-agent communication (mailboxes) routed to `IpcManager`.
+    Ipc,
 }
 
 /// A request from an agent to access a resource.

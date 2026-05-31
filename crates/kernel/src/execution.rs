@@ -544,6 +544,66 @@ mod tests {
         Arc::new(broker)
     }
 
+    // Regression guard for the CLI wiring fix: once a syscall gate is installed
+    // on the executor (as the `agent` CLI now does via `set_syscall_gate`), tool
+    // calls must be enforced against the agent's capabilities. A tool requiring a
+    // missing capability is denied by the kernel; a tool requiring none passes.
+    #[tokio::test]
+    async fn executor_with_gate_enforces_capabilities() {
+        use crate::agent_struct::CapabilitySet;
+        use crate::cgroups::CgroupManager;
+        use crate::syscall_gate::SyscallGate;
+
+        let agent_id = uuid::Uuid::new_v4();
+
+        // Register the agent with the gate WITHOUT CAP_FILE_WRITE (net only),
+        // mirroring a restricted permission profile rather than full-access.
+        let gate = Arc::new(SyscallGate::new(Arc::new(CgroupManager::new())));
+        let mut caps = CapabilitySet::none();
+        caps.grant(CapabilitySet::CAP_NET_ACCESS);
+        gate.register_agent(agent_id, caps, None);
+
+        let session = Box::new(MockToolSession {
+            call_count: AtomicUsize::new(0),
+            id: "mock".into(),
+        });
+        let mut executor = AgentExecutor::new(
+            agent_id,
+            session,
+            mock_broker(),
+            Arc::new(ToolRegistry::new()),
+            mock_context_manager(),
+            "test".into(),
+        );
+        executor.set_syscall_gate(gate);
+
+        // write_file requires CAP_FILE_WRITE, which this agent lacks → denied.
+        let denied = executor
+            .execute_tool(&ToolCall {
+                id: "c1".into(),
+                name: "write_file".into(),
+                arguments: serde_json::json!({"path": "/tmp/x", "content": "y"}),
+            })
+            .await;
+        assert!(
+            denied.contains("denied by kernel"),
+            "write_file should be denied by the gate, got: {denied}"
+        );
+
+        // read_file needs no capability → passes the gate (no kernel denial).
+        let allowed = executor
+            .execute_tool(&ToolCall {
+                id: "c2".into(),
+                name: "read_file".into(),
+                arguments: serde_json::json!({"path": "/tmp/x"}),
+            })
+            .await;
+        assert!(
+            !allowed.contains("denied by kernel"),
+            "read_file should pass the gate, got: {allowed}"
+        );
+    }
+
     #[tokio::test]
     async fn execution_loop_with_tool_call() {
         let session = Box::new(MockToolSession {

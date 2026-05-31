@@ -26,6 +26,13 @@ pub struct Config {
     /// Max characters to return from browse_url (default 16000).
     #[serde(default = "default_max_browse_chars")]
     pub max_browse_chars: usize,
+    /// Permission profile assigned to agents created by the CLI. Drives both
+    /// the syscall-gate capability set (`caps_for_profile`) and the resource
+    /// broker's MAC-style access rules. Defaults to "standard" (read/write/
+    /// create/list + network + process launch; destructive ops gated). Set to
+    /// "read-only", "elevated", or "full-access" to widen/narrow.
+    #[serde(default = "default_permission_profile")]
+    pub permission_profile: String,
 }
 
 impl Default for Config {
@@ -40,12 +47,17 @@ impl Default for Config {
             azure_deployment: None,
             azure_api_version: None,
             max_browse_chars: default_max_browse_chars(),
+            permission_profile: default_permission_profile(),
         }
     }
 }
 
 fn default_max_browse_chars() -> usize {
     16000
+}
+
+fn default_permission_profile() -> String {
+    "standard".to_string()
 }
 
 impl Config {

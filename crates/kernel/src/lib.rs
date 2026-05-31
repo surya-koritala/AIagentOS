@@ -550,19 +550,21 @@ impl ResourceProvider for IpcResourceProvider {
         params: &serde_json::Value,
     ) -> Result<serde_json::Value, ResourceError> {
         use crate::ipc::AgentIpc;
-        let parse_id = |key: &str| -> Result<AgentId, ResourceError> {
+        let parse_uuid = |key: &str| -> Result<uuid::Uuid, ResourceError> {
             params
                 .get(key)
                 .and_then(|v| v.as_str())
                 .and_then(|s| uuid::Uuid::parse_str(s).ok())
                 .ok_or_else(|| {
-                    ResourceError::OperationFailed(format!("invalid or missing '{key}' agent id"))
+                    ResourceError::OperationFailed(format!(
+                        "invalid or missing '{key}' (expected UUID)"
+                    ))
                 })
         };
         match operation {
             "send" => {
-                let from = parse_id("from")?;
-                let to = parse_id("to")?;
+                let from = parse_uuid("from")?;
+                let to = parse_uuid("to")?;
                 let payload = params
                     .get("payload")
                     .cloned()
@@ -574,7 +576,7 @@ impl ResourceProvider for IpcResourceProvider {
                 Ok(serde_json::json!({"sent": true}))
             }
             "receive" => {
-                let agent = parse_id("agent")?;
+                let agent = parse_uuid("agent")?;
                 match self.ipc.receive(agent).await {
                     Ok(msg) => Ok(serde_json::json!({
                         "from": msg.from.to_string(),
@@ -584,6 +586,39 @@ impl ResourceProvider for IpcResourceProvider {
                     Err(crate::IpcError::ChannelClosed) => Ok(serde_json::json!({"empty": true})),
                     Err(e) => Err(ResourceError::OperationFailed(e.to_string())),
                 }
+            }
+            "delegate" => {
+                let from = parse_uuid("from")?;
+                let to = parse_uuid("to")?;
+                let description = params
+                    .get("description")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let task_id = self
+                    .ipc
+                    .delegate(from, to, description)
+                    .await
+                    .map_err(|e| ResourceError::OperationFailed(e.to_string()))?;
+                Ok(serde_json::json!({"task_id": task_id.to_string()}))
+            }
+            "delegation_status" => {
+                let task_id = parse_uuid("task_id")?;
+                let status = match self.ipc.get_delegation_status(task_id) {
+                    Some(crate::ipc::DelegationStatus::Pending) => "pending",
+                    Some(crate::ipc::DelegationStatus::InProgress) => "in_progress",
+                    Some(crate::ipc::DelegationStatus::Completed) => "completed",
+                    Some(crate::ipc::DelegationStatus::Failed(_)) => "failed",
+                    None => "unknown",
+                };
+                Ok(serde_json::json!({"status": status}))
+            }
+            "complete_delegation" => {
+                let task_id = parse_uuid("task_id")?;
+                self.ipc
+                    .complete_delegation(task_id)
+                    .map_err(|e| ResourceError::OperationFailed(e.to_string()))?;
+                Ok(serde_json::json!({"completed": true}))
             }
             _ => Err(ResourceError::OperationFailed(format!(
                 "Unknown IPC op: {operation}"

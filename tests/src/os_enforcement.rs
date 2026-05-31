@@ -808,3 +808,90 @@ async fn live_path_agents_message_via_ipc_tools() {
     assert!(resp3.success);
     assert_eq!(resp3.data["empty"], true);
 }
+
+/// #25: A delegates a task to B through `delegate_task` (routed via
+/// `IpcManager::delegate`); B sees the delegation in its inbox; the task status
+/// tracks Pending → Completed once B completes it. All through the tool path.
+#[tokio::test]
+async fn live_path_delegation_lifecycle_via_ipc_tools() {
+    use kernel::connector::ToolCall;
+    use kernel::resources::ResourceBroker;
+    use kernel::AgentKernelImpl;
+
+    let kernel = AgentKernelImpl::new().expect("kernel new");
+    let a = kernel
+        .create_agent_full(agent_cfg("a", "standard"))
+        .await
+        .unwrap();
+    let b = kernel
+        .create_agent_full(agent_cfg("b", "standard"))
+        .await
+        .unwrap();
+
+    // Helper: run a tool for `agent` and return the ResourceResponse.
+    async fn run(
+        kernel: &AgentKernelImpl,
+        agent: uuid::Uuid,
+        name: &str,
+        args: serde_json::Value,
+    ) -> kernel::resources::ResourceResponse {
+        let req = kernel
+            .tool_registry
+            .resolve(
+                agent,
+                &ToolCall {
+                    id: "t".into(),
+                    name: name.into(),
+                    arguments: args,
+                },
+            )
+            .unwrap();
+        kernel.resource_broker.execute(req).await.unwrap()
+    }
+
+    // A delegates a task to B.
+    let resp = run(
+        &kernel,
+        a.id,
+        "delegate_task",
+        serde_json::json!({"to": b.id.to_string(), "task": "summarize the logs"}),
+    )
+    .await;
+    assert!(resp.success);
+    let task_id = resp.data["task_id"].as_str().unwrap().to_string();
+
+    // B finds the delegation message in its inbox.
+    let inbox = run(&kernel, b.id, "check_inbox", serde_json::json!({})).await;
+    assert_eq!(inbox.data["payload"]["type"], "delegation");
+    assert_eq!(inbox.data["payload"]["task_id"], task_id);
+
+    // Status starts Pending.
+    let st = run(
+        &kernel,
+        a.id,
+        "delegation_status",
+        serde_json::json!({"task_id": task_id}),
+    )
+    .await;
+    assert_eq!(st.data["status"], "pending");
+
+    // B completes the task; status becomes Completed.
+    assert!(
+        run(
+            &kernel,
+            b.id,
+            "complete_delegation",
+            serde_json::json!({"task_id": task_id})
+        )
+        .await
+        .success
+    );
+    let st2 = run(
+        &kernel,
+        a.id,
+        "delegation_status",
+        serde_json::json!({"task_id": task_id}),
+    )
+    .await;
+    assert_eq!(st2.data["status"], "completed");
+}

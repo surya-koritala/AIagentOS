@@ -120,8 +120,13 @@ pub fn classify_tool(tool_name: &str) -> ToolAction {
         "http_get" | "browse_url" => ToolAction::NET,
         // Process execution
         "run_command" => ToolAction::EXEC,
-        // Inter-agent messaging (namespace isolation is the real boundary).
-        "send_agent_message" | "check_inbox" => ToolAction::IPC,
+        // Inter-agent messaging + delegation (namespace isolation + the broker
+        // Ipc profile rule are the real boundaries).
+        "send_agent_message"
+        | "check_inbox"
+        | "delegate_task"
+        | "delegation_status"
+        | "complete_delegation" => ToolAction::IPC,
         _ => ToolAction::EXECUTE,
     }
 }

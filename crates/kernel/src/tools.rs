@@ -157,6 +157,13 @@ impl ToolRegistry {
                     .unwrap_or(serde_json::Value::Null),
             }),
             "check_inbox" => serde_json::json!({"agent": agent_id.to_string()}),
+            // Delegation: inject the caller as the delegator; recipient + task
+            // come from the args. (status/complete pass {task_id} through.)
+            "delegate_task" => serde_json::json!({
+                "from": agent_id.to_string(),
+                "to": tool_call.arguments.get("to").and_then(|v| v.as_str()).unwrap_or(""),
+                "description": tool_call.arguments.get("task").and_then(|v| v.as_str()).unwrap_or(""),
+            }),
             _ => tool_call.arguments.clone(),
         };
 
@@ -517,6 +524,46 @@ impl ToolRegistry {
             parameters_schema: serde_json::json!({"type": "object", "properties": {}}),
             resource_type: ResourceType::Ipc,
             operation: "receive".into(),
+        });
+        self.register(ToolBinding {
+            name: "delegate_task".into(),
+            description: "Delegate a task to another agent by id; returns a task_id you can poll \
+                          with delegation_status. The recipient must share a namespace with you."
+                .into(),
+            parameters_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "to": {"type": "string", "description": "Delegate-to agent id (UUID)"},
+                    "task": {"type": "string", "description": "Task description"}
+                },
+                "required": ["to", "task"]
+            }),
+            resource_type: ResourceType::Ipc,
+            operation: "delegate".into(),
+        });
+        self.register(ToolBinding {
+            name: "delegation_status".into(),
+            description: "Check a delegated task's status by task_id \
+                          (pending/in_progress/completed/failed/unknown)."
+                .into(),
+            parameters_schema: serde_json::json!({
+                "type": "object",
+                "properties": {"task_id": {"type": "string", "description": "Id from delegate_task"}},
+                "required": ["task_id"]
+            }),
+            resource_type: ResourceType::Ipc,
+            operation: "delegation_status".into(),
+        });
+        self.register(ToolBinding {
+            name: "complete_delegation".into(),
+            description: "Mark a task delegated to you (by its task_id) as completed.".into(),
+            parameters_schema: serde_json::json!({
+                "type": "object",
+                "properties": {"task_id": {"type": "string", "description": "Task id to complete"}},
+                "required": ["task_id"]
+            }),
+            resource_type: ResourceType::Ipc,
+            operation: "complete_delegation".into(),
         });
     }
 }

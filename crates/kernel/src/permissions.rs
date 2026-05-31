@@ -189,7 +189,13 @@ impl PermissionManager {
                     },
                     PermissionRule {
                         resource_type: ResourceType::Ipc,
-                        operations: vec!["send".to_string(), "receive".to_string()],
+                        operations: vec![
+                            "send".to_string(),
+                            "receive".to_string(),
+                            "delegate".to_string(),
+                            "delegation_status".to_string(),
+                            "complete_delegation".to_string(),
+                        ],
                         targets: None,
                         decision: AccessDecision::Allowed,
                     },
@@ -253,7 +259,13 @@ impl PermissionManager {
                     },
                     PermissionRule {
                         resource_type: ResourceType::Ipc,
-                        operations: vec!["send".to_string(), "receive".to_string()],
+                        operations: vec![
+                            "send".to_string(),
+                            "receive".to_string(),
+                            "delegate".to_string(),
+                            "delegation_status".to_string(),
+                            "complete_delegation".to_string(),
+                        ],
                         targets: None,
                         decision: AccessDecision::Allowed,
                     },

@@ -799,7 +799,7 @@ use crate::context::{ContextManager, SqliteContextManager};
 use crate::execution::{AgentExecutor, AgentOutput};
 use crate::init_system::InitSystem;
 use crate::ipc::IpcManager;
-use crate::namespaces::{NamespaceRegistry, NamespaceType};
+use crate::namespaces::{NamespaceId, NamespaceRegistry, NamespaceType};
 use crate::observability::{ObservabilityEngine, ObservabilityEngineImpl};
 use crate::permissions::{PermissionManager, PermissionSystem};
 use crate::procfs::ProcFs;
@@ -866,6 +866,10 @@ pub struct AgentKernelImpl {
     /// `CgroupQuota` enforcement is live on the real agent-creation path
     /// (rather than every agent landing in the unlimited root cgroup).
     profile_cgroups: std::collections::HashMap<String, CgroupId>,
+    /// Agent+Tool namespaces per agent group, created lazily. Agents created via
+    /// `create_agent_in_namespace` with the same group share these (and can
+    /// see/message each other); ungrouped agents use the registry defaults.
+    group_namespaces: DashMap<String, (NamespaceId, NamespaceId)>,
     executors: DashMap<AgentId, tokio::sync::Mutex<AgentExecutor>>,
     event_tx: broadcast::Sender<KernelEvent>,
 }
@@ -993,6 +997,7 @@ impl AgentKernelImpl {
             syscall_gate,
             os,
             profile_cgroups,
+            group_namespaces: DashMap::new(),
             executors: DashMap::new(),
             event_tx,
         })
@@ -1010,6 +1015,53 @@ impl AgentKernelImpl {
 
     /// Create agent with full subsystem coordination.
     pub async fn create_agent_full(&self, config: AgentConfig) -> Result<AgentHandle, KernelError> {
+        self.create_agent_grouped(config, None).await
+    }
+
+    /// Create an agent placed in a named namespace `group`. Agents in the same
+    /// group share Agent + Tool namespaces (and can discover/message each
+    /// other); agents in different groups are isolated by the syscall gate —
+    /// cross-group IPC/delegation is denied like a non-existent agent. The
+    /// ungrouped `create_agent_full` uses the shared default namespaces (prior
+    /// behavior), so ungrouped agents still collaborate.
+    pub async fn create_agent_in_namespace(
+        &self,
+        config: AgentConfig,
+        group: &str,
+    ) -> Result<AgentHandle, KernelError> {
+        self.create_agent_grouped(config, Some(group)).await
+    }
+
+    /// Resolve the (Agent, Tool) namespaces for a group, creating them lazily.
+    /// `None` → the registry's shared defaults.
+    fn namespaces_for_group(
+        &self,
+        group: Option<&str>,
+    ) -> (Option<NamespaceId>, Option<NamespaceId>) {
+        match group {
+            None => (
+                self.os.namespaces.default_ns(NamespaceType::Agent),
+                self.os.namespaces.default_ns(NamespaceType::Tool),
+            ),
+            Some(g) => {
+                // Atomic get-or-create so two agents created concurrently for a
+                // new group land in the SAME namespaces (no over-isolation race).
+                let e = self.group_namespaces.entry(g.to_string()).or_insert_with(|| {
+                    (
+                        self.os.namespaces.create(NamespaceType::Agent, None),
+                        self.os.namespaces.create(NamespaceType::Tool, None),
+                    )
+                });
+                (Some(e.0), Some(e.1))
+            }
+        }
+    }
+
+    async fn create_agent_grouped(
+        &self,
+        config: AgentConfig,
+        group: Option<&str>,
+    ) -> Result<AgentHandle, KernelError> {
         // 1. Create agent via agent manager
         let handle = self.agent_manager.create_agent(config.clone()).await?;
         let agent_id = handle.id;
@@ -1068,17 +1120,21 @@ impl AgentKernelImpl {
         //    procfs entry. These were previously only wired by the standalone
         //    OsKernel — folding them into AgentKernelImpl makes the OS surface
         //    real for every agent created through the live path.
+        // Join the Agent + Tool namespaces for this agent's group: same-group
+        // agents share namespaces (can see/message each other); different groups
+        // are isolated. `None` uses the shared defaults (prior behavior).
+        let (agent_ns, tool_ns) = self.namespaces_for_group(group);
         let mut agent_ns_ids = Vec::new();
-        if let Some(ns) = self.os.namespaces.default_ns(NamespaceType::Agent) {
+        if let Some(ns) = agent_ns {
             self.os.namespaces.join(ns, pid);
             agent_ns_ids.push(ns);
         }
-        if let Some(ns) = self.os.namespaces.default_ns(NamespaceType::Tool) {
+        if let Some(ns) = tool_ns {
             self.os.namespaces.join(ns, pid);
             agent_ns_ids.push(ns);
         }
         // Mirror namespace memberships into the gate so namespace-scoped tool
-        // resolution (Phase 3) can deny tools registered in foreign namespaces.
+        // resolution and inter-agent IPC visibility deny foreign-namespace access.
         self.syscall_gate
             .set_agent_namespaces(agent_id, agent_ns_ids);
         {

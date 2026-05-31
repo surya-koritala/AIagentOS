@@ -444,6 +444,7 @@ impl ResourceProvider for BuiltinFilesystemProvider {
             "read".into(),
             "write".into(),
             "create".into(),
+            "edit".into(),
             "delete".into(),
             "list".into(),
         ]
@@ -470,6 +471,35 @@ impl ResourceProvider for BuiltinFilesystemProvider {
                     .await
                     .map_err(|e| ResourceError::OperationFailed(e.to_string()))?;
                 Ok(serde_json::json!({"written": true}))
+            }
+            "edit" => {
+                // Precise find→replace via the transactional editing engine
+                // (atomic apply + rollback on failure). EditTransaction is
+                // synchronous std::fs, so run it on the blocking pool to avoid
+                // stalling an async runtime worker on large files / slow disks.
+                let search = params
+                    .get("search")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| ResourceError::OperationFailed("Missing 'search'".into()))?
+                    .to_string();
+                let replace = params
+                    .get("replace")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let path = path.to_string();
+                let results = tokio::task::spawn_blocking(move || {
+                    let mut tx = crate::editing::EditTransaction::new();
+                    tx.add(crate::editing::FileEdit {
+                        path: std::path::PathBuf::from(path),
+                        operation: crate::editing::EditOperation::Replace { search, replace },
+                    });
+                    tx.apply()
+                })
+                .await
+                .map_err(|e| ResourceError::OperationFailed(e.to_string()))?
+                .map_err(ResourceError::OperationFailed)?;
+                Ok(serde_json::json!({"edited": true, "detail": results}))
             }
             "delete" => {
                 tokio::fs::remove_file(path)
@@ -774,6 +804,15 @@ impl AgentKernelImpl {
         // cross-namespace sends fail like sends to a non-existent agent.
         ipc.set_namespace_visibility(syscall_gate.clone());
 
+        // Register the full default toolset on the shared registry: built-ins
+        // (registered in `ToolRegistry::new`) plus the advanced (browse_url),
+        // git (git_commit/git_diff), and file-editing (edit/create/delete_file)
+        // sets. Interior mutability (#10) lets these land on the Arc directly.
+        let tool_registry = Arc::new(ToolRegistry::new());
+        tool_registry.register_advanced_tools();
+        tool_registry.register_git_tools();
+        crate::editing::register_edit_tools(&tool_registry);
+
         Ok(Self {
             agent_manager: Arc::new(AgentManager::new(256)),
             scheduler: Arc::new(PriorityScheduler::new()),
@@ -784,7 +823,7 @@ impl AgentKernelImpl {
             observability: Arc::new(ObservabilityEngineImpl::new()),
             connector: Arc::new(AgentConnectorImpl::new()),
             resource_broker,
-            tool_registry: Arc::new(ToolRegistry::new()),
+            tool_registry,
             rate_limiter: Arc::new(RateLimiter::new(RateLimitConfig {
                 rpm: budgets.rpm,
                 tpm: budgets.tpm,

@@ -550,3 +550,87 @@ async fn shutdown_dequeues_agents_from_cfs() {
         "shutdown should dequeue every agent from the CFS run queue"
     );
 }
+
+/// #10/#11/#15/#16: the live kernel registers the extended toolset, the gate
+/// classifies deletion as requiring CAP_FILE_DELETE (distinct from write), and
+/// the transactional `edit` op actually rewrites a file through the broker.
+#[tokio::test]
+async fn live_path_extended_tools_edit_and_delete_capability() {
+    use kernel::resources::{ResourceBroker, ResourceRequest, ResourceType};
+    use kernel::{AgentConfig, AgentKernelImpl};
+
+    let kernel = AgentKernelImpl::new().expect("kernel new");
+
+    // #11/#15: advanced + git + edit tools are registered on the live kernel.
+    for t in [
+        "browse_url",
+        "git_commit",
+        "git_diff",
+        "edit_file",
+        "create_file",
+        "delete_file",
+    ] {
+        assert!(
+            kernel.tool_registry.has_tool(t),
+            "kernel should register {t}"
+        );
+    }
+
+    let cfg = |name: &str, profile: &str| AgentConfig {
+        name: name.into(),
+        task: "test".into(),
+        llm_provider: "stub".into(),
+        permission_profile: profile.into(),
+        priority: kernel::Priority::new(3).unwrap(),
+        sandbox_config: None,
+    };
+
+    // #16: delete_file requires CAP_FILE_DELETE — "standard" lacks it, so the
+    // gate denies; "full-access" has every cap, so the gate allows.
+    let std_agent = kernel
+        .create_agent_full(cfg("std", "standard"))
+        .await
+        .unwrap();
+    let denied = kernel
+        .syscall_gate
+        .check_tool_call(std_agent.id, "delete_file", "/x", 10)
+        .await;
+    assert!(
+        matches!(denied, Err(GateDenial::MissingCapability(_))),
+        "standard agent delete_file should be denied (no CAP_FILE_DELETE), got {denied:?}"
+    );
+    let fa = kernel
+        .create_agent_full(cfg("fa", "full-access"))
+        .await
+        .unwrap();
+    assert!(kernel
+        .syscall_gate
+        .check_tool_call(fa.id, "delete_file", "/x", 10)
+        .await
+        .is_ok());
+
+    // #15: the edit op rewrites a real file via the transactional EditTransaction
+    // engine, through the resource broker (full-access bypasses MAC approval).
+    let dir = std::env::temp_dir().join(format!("edit_it_{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("f.txt");
+    std::fs::write(&file, "hello world").unwrap();
+    let resp = kernel
+        .resource_broker
+        .execute(ResourceRequest {
+            agent_id: fa.id,
+            resource_type: ResourceType::Filesystem,
+            operation: "edit".into(),
+            parameters: serde_json::json!({
+                "path": file.to_str().unwrap(),
+                "search": "world",
+                "replace": "rust"
+            }),
+            sandbox_context: None,
+        })
+        .await
+        .unwrap();
+    assert!(resp.success, "edit op should succeed");
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "hello rust");
+    std::fs::remove_dir_all(&dir).ok();
+}

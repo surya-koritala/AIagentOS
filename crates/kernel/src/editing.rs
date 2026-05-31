@@ -185,7 +185,7 @@ impl EditTransaction {
 // ─── Tool Registration ───────────────────────────────────────────────────────
 
 /// Register file editing tools in the registry.
-pub fn register_edit_tools(registry: &mut ToolRegistry) {
+pub fn register_edit_tools(registry: &ToolRegistry) {
     registry.register(ToolBinding {
         name: "edit_file".into(),
         description: "Replace specific text in a file. Use this for precise edits.".into(),

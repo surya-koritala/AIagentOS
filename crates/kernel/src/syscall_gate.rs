@@ -126,7 +126,8 @@ pub fn classify_tool(tool_name: &str) -> ToolAction {
         | "check_inbox"
         | "delegate_task"
         | "delegation_status"
-        | "complete_delegation" => ToolAction::IPC,
+        | "complete_delegation"
+        | "discover_agents" => ToolAction::IPC,
         _ => ToolAction::EXECUTE,
     }
 }

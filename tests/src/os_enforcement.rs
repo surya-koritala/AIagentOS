@@ -895,3 +895,85 @@ async fn live_path_delegation_lifecycle_via_ipc_tools() {
     .await;
     assert_eq!(st2.data["status"], "completed");
 }
+
+/// #33: discover_agents returns the live directory, and send_agent_message
+/// resolves a peer by NAME (not just UUID) and delivers.
+#[tokio::test]
+async fn live_path_discovery_and_name_addressing() {
+    use kernel::connector::ToolCall;
+    use kernel::resources::ResourceBroker;
+    use kernel::AgentKernelImpl;
+
+    let kernel = AgentKernelImpl::new().expect("kernel new");
+    let alice = kernel
+        .create_agent_full(agent_cfg("alice", "standard"))
+        .await
+        .unwrap();
+    let bob = kernel
+        .create_agent_full(agent_cfg("bob", "standard"))
+        .await
+        .unwrap();
+
+    async fn run(
+        kernel: &AgentKernelImpl,
+        agent: uuid::Uuid,
+        name: &str,
+        args: serde_json::Value,
+    ) -> Result<kernel::resources::ResourceResponse, kernel::ResourceError> {
+        let req = kernel
+            .tool_registry
+            .resolve(
+                agent,
+                &ToolCall {
+                    id: "t".into(),
+                    name: name.into(),
+                    arguments: args,
+                },
+            )
+            .unwrap();
+        kernel.resource_broker.execute(req).await
+    }
+
+    // discover_agents lists both agents by name.
+    let disc = run(&kernel, alice.id, "discover_agents", serde_json::json!({}))
+        .await
+        .unwrap();
+    let names: Vec<String> = disc.data["agents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| a["name"].as_str().unwrap().to_string())
+        .collect();
+    assert!(names.contains(&"alice".to_string()) && names.contains(&"bob".to_string()));
+
+    // alice messages "bob" BY NAME → resolved to bob's id and delivered.
+    assert!(
+        run(
+            &kernel,
+            alice.id,
+            "send_agent_message",
+            serde_json::json!({"to": "bob", "message": {"ping": 1}})
+        )
+        .await
+        .unwrap()
+        .success
+    );
+    let inbox = run(&kernel, bob.id, "check_inbox", serde_json::json!({}))
+        .await
+        .unwrap();
+    assert_eq!(inbox.data["from"], alice.id.to_string());
+    assert_eq!(inbox.data["payload"]["ping"], 1);
+
+    // An unknown name does not silently succeed.
+    let bad = run(
+        &kernel,
+        alice.id,
+        "send_agent_message",
+        serde_json::json!({"to": "nobody", "message": {}}),
+    )
+    .await;
+    assert!(
+        !bad.map(|r| r.success).unwrap_or(false),
+        "unknown recipient name must not succeed"
+    );
+}

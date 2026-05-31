@@ -89,8 +89,14 @@ async fn main() {
 
     let full_pid = kernel.syscall_gate.pid_of(full.id).expect("full pid");
     let ro_pid = kernel.syscall_gate.pid_of(readonly.id).expect("ro pid");
-    println!("    booted; full-access agent uuid={} pid={}", full.id, full_pid);
-    println!("    booted; read-only  agent uuid={} pid={}", readonly.id, ro_pid);
+    println!(
+        "    booted; full-access agent uuid={} pid={}",
+        full.id, full_pid
+    );
+    println!(
+        "    booted; read-only  agent uuid={} pid={}",
+        readonly.id, ro_pid
+    );
     board.check(
         "boot",
         full_pid != ro_pid,

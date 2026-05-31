@@ -534,6 +534,8 @@ impl ResourceProvider for BuiltinFilesystemProvider {
 /// Namespace isolation is enforced inside `IpcManager::send`.
 struct IpcResourceProvider {
     ipc: Arc<IpcManager>,
+    /// Live agent directory, for `discover` and name→UUID recipient resolution.
+    agents: Arc<AgentManager>,
 }
 
 #[async_trait::async_trait]
@@ -561,10 +563,25 @@ impl ResourceProvider for IpcResourceProvider {
                     ))
                 })
         };
+        // Resolve a recipient given as either a UUID or a live agent NAME.
+        let resolve_recipient = |key: &str| -> Result<uuid::Uuid, ResourceError> {
+            let s = params.get(key).and_then(|v| v.as_str()).unwrap_or("");
+            if let Ok(id) = uuid::Uuid::parse_str(s) {
+                return Ok(id);
+            }
+            self.agents
+                .list_agents(None)
+                .into_iter()
+                .find(|a| a.name == s)
+                .map(|a| a.id)
+                .ok_or_else(|| {
+                    ResourceError::OperationFailed(format!("no agent with id or name '{s}'"))
+                })
+        };
         match operation {
             "send" => {
                 let from = parse_uuid("from")?;
-                let to = parse_uuid("to")?;
+                let to = resolve_recipient("to")?;
                 let payload = params
                     .get("payload")
                     .cloned()
@@ -589,7 +606,7 @@ impl ResourceProvider for IpcResourceProvider {
             }
             "delegate" => {
                 let from = parse_uuid("from")?;
-                let to = parse_uuid("to")?;
+                let to = resolve_recipient("to")?;
                 let description = params
                     .get("description")
                     .and_then(|v| v.as_str())
@@ -619,6 +636,21 @@ impl ResourceProvider for IpcResourceProvider {
                     .complete_delegation(task_id)
                     .map_err(|e| ResourceError::OperationFailed(e.to_string()))?;
                 Ok(serde_json::json!({"completed": true}))
+            }
+            "discover" => {
+                let agents: Vec<serde_json::Value> = self
+                    .agents
+                    .list_agents(None)
+                    .into_iter()
+                    .map(|a| {
+                        serde_json::json!({
+                            "name": a.name,
+                            "id": a.id.to_string(),
+                            "state": format!("{:?}", a.state),
+                        })
+                    })
+                    .collect();
+                Ok(serde_json::json!({"agents": agents}))
             }
             _ => Err(ResourceError::OperationFailed(format!(
                 "Unknown IPC op: {operation}"
@@ -922,9 +954,14 @@ impl AgentKernelImpl {
         // Wire the gate as the IPC namespace visibility checker so that
         // cross-namespace sends fail like sends to a non-existent agent.
         ipc.set_namespace_visibility(syscall_gate.clone());
-        // Route the Ipc resource type to the kernel's IpcManager so the
-        // inter-agent messaging tools deliver real messages through the broker.
-        resource_broker.register_provider(Box::new(IpcResourceProvider { ipc: ipc.clone() }));
+        let agent_manager = Arc::new(AgentManager::new(256));
+        // Route the Ipc resource type to the kernel's IpcManager (messaging +
+        // delegation) and give it the agent directory for discovery / name
+        // resolution, all through the broker.
+        resource_broker.register_provider(Box::new(IpcResourceProvider {
+            ipc: ipc.clone(),
+            agents: agent_manager.clone(),
+        }));
 
         // Register the full default toolset on the shared registry: built-ins
         // (registered in `ToolRegistry::new`) plus the advanced (browse_url),
@@ -937,7 +974,7 @@ impl AgentKernelImpl {
         crate::editing::register_edit_tools(&tool_registry);
 
         Ok(Self {
-            agent_manager: Arc::new(AgentManager::new(256)),
+            agent_manager,
             scheduler: Arc::new(PriorityScheduler::new()),
             context_manager,
             permission_manager,

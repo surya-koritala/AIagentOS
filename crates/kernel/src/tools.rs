@@ -509,7 +509,7 @@ impl ToolRegistry {
             parameters_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "to": {"type": "string", "description": "Recipient agent id (UUID)"},
+                    "to": {"type": "string", "description": "Recipient agent name or id (UUID)"},
                     "message": {"description": "JSON payload to deliver"}
                 },
                 "required": ["to", "message"]
@@ -533,7 +533,7 @@ impl ToolRegistry {
             parameters_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "to": {"type": "string", "description": "Delegate-to agent id (UUID)"},
+                    "to": {"type": "string", "description": "Delegate-to agent name or id (UUID)"},
                     "task": {"type": "string", "description": "Task description"}
                 },
                 "required": ["to", "task"]
@@ -564,6 +564,15 @@ impl ToolRegistry {
             }),
             resource_type: ResourceType::Ipc,
             operation: "complete_delegation".into(),
+        });
+        self.register(ToolBinding {
+            name: "discover_agents".into(),
+            description: "List the other agents you can address (name, id, state) so you can \
+                          send_agent_message or delegate_task to them by name or id."
+                .into(),
+            parameters_schema: serde_json::json!({"type": "object", "properties": {}}),
+            resource_type: ResourceType::Ipc,
+            operation: "discover".into(),
         });
     }
 }

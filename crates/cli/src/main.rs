@@ -160,7 +160,12 @@ fn handle_slash(cmd: &str, executor: &AgentExecutor, kernel: &AgentKernelImpl) -
 #[tokio::main]
 async fn main() {
     let config = Config::load();
-    let kernel = AgentKernelImpl::from_config(&config).expect("Failed to init kernel");
+    let kernel = Arc::new(AgentKernelImpl::from_config(&config).expect("Failed to init kernel"));
+    // Start the kernel's background runtime on the live path: the scheduler
+    // observer (publishes the CFS pick into procfs `current_agent`) and the
+    // per-minute cgroup-counter reset that regenerates token quotas. Held for
+    // the process lifetime; graceful stop()/signal handling is a follow-up.
+    let _runtime = kernel.start_runtime();
     register_providers(&kernel, &config);
 
     // Parse args

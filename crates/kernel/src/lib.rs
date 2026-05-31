@@ -410,6 +410,28 @@ fn caps_for_profile(profile: &str) -> CapabilitySet {
     caps
 }
 
+/// Per-profile cgroup limits, derived from the operator's budget config.
+/// `full-access` (and the empty profile) is unlimited; every other profile —
+/// including unknown/custom ones — is bounded so that `CgroupQuota` actually
+/// fires on the live agent-creation path. `elevated` gets a wider budget.
+fn cgroup_for_profile(profile: &str, budgets: &crate::config::BudgetConfig) -> CgroupLimits {
+    match profile {
+        "full-access" | "" => CgroupLimits::default(), // all zeros = unlimited
+        "elevated" => CgroupLimits {
+            tokens_per_min: budgets.agent_tokens_per_min.saturating_mul(4),
+            max_tool_calls: budgets.max_tool_calls,
+            max_context_tokens: budgets.max_context_tokens,
+            max_agents: 0,
+        },
+        _ => CgroupLimits {
+            tokens_per_min: budgets.agent_tokens_per_min,
+            max_tool_calls: budgets.max_tool_calls,
+            max_context_tokens: budgets.max_context_tokens,
+            max_agents: 0,
+        },
+    }
+}
+
 struct BuiltinFilesystemProvider;
 
 #[async_trait::async_trait]
@@ -611,7 +633,7 @@ use tokio::sync::broadcast;
 use crate::agent::{AgentKernel, AgentManager};
 use crate::agent_struct::{CapabilitySet, SchedClass};
 use crate::cfs::CfsScheduler;
-use crate::cgroups::CgroupManager;
+use crate::cgroups::{CgroupId, CgroupLimits, CgroupManager};
 use crate::connector::{AgentConnector, AgentConnectorImpl, LlmProviderAdapter};
 use crate::context::{ContextManager, SqliteContextManager};
 use crate::execution::{AgentExecutor, AgentOutput};
@@ -679,6 +701,11 @@ pub struct AgentKernelImpl {
     pub cgroups: Arc<CgroupManager>,
     pub syscall_gate: Arc<SyscallGate>,
     pub os: Arc<OsSubsystems>,
+    /// One cgroup per permission profile, created at boot with budget-derived
+    /// limits. Agents are placed into their profile's cgroup at creation so
+    /// `CgroupQuota` enforcement is live on the real agent-creation path
+    /// (rather than every agent landing in the unlimited root cgroup).
+    profile_cgroups: std::collections::HashMap<String, CgroupId>,
     executors: DashMap<AgentId, tokio::sync::Mutex<AgentExecutor>>,
     event_tx: broadcast::Sender<KernelEvent>,
 }
@@ -688,7 +715,7 @@ impl AgentKernelImpl {
     pub fn new() -> Result<Self, KernelError> {
         let context_manager =
             Arc::new(SqliteContextManager::in_memory().map_err(KernelError::Context)?);
-        Self::with_context_manager(context_manager)
+        Self::with_context_manager(context_manager, &crate::config::BudgetConfig::default())
     }
 
     /// Create a kernel with persistent SQLite storage at the given path.
@@ -698,18 +725,25 @@ impl AgentKernelImpl {
         }
         let context_manager =
             Arc::new(SqliteContextManager::new(db_path).map_err(KernelError::Context)?);
-        Self::with_context_manager(context_manager)
+        Self::with_context_manager(context_manager, &crate::config::BudgetConfig::default())
     }
 
-    /// Create a kernel from config (uses config.data_dir for persistence).
+    /// Create a kernel from config (uses config.data_dir for persistence and
+    /// config.budgets for cgroup/rate-limit quotas).
     pub fn from_config(config: &crate::config::Config) -> Result<Self, KernelError> {
         set_max_browse_chars(config.max_browse_chars);
         let db_path = config.data_dir.join("agent_os.db");
-        Self::with_db_path(&db_path)
+        if let Some(parent) = db_path.parent() {
+            std::fs::create_dir_all(parent).ok();
+        }
+        let context_manager =
+            Arc::new(SqliteContextManager::new(&db_path).map_err(KernelError::Context)?);
+        Self::with_context_manager(context_manager, &config.budgets)
     }
 
     fn with_context_manager(
         context_manager: Arc<SqliteContextManager>,
+        budgets: &crate::config::BudgetConfig,
     ) -> Result<Self, KernelError> {
         let (event_tx, _) = broadcast::channel(256);
         let permission_manager = Arc::new(PermissionManager::new());
@@ -721,6 +755,17 @@ impl AgentKernelImpl {
         resource_broker.register_provider(Box::new(BuiltinAppProvider));
 
         let cgroups = Arc::new(CgroupManager::new());
+        // One child cgroup per permission profile with budget-derived limits,
+        // so agents created through the live path inherit a real token quota.
+        let mut profile_cgroups = std::collections::HashMap::new();
+        for profile in ["read-only", "standard", "elevated", "full-access"] {
+            let cg = cgroups.create(
+                format!("profile/{profile}"),
+                cgroups.root(),
+                cgroup_for_profile(profile, budgets),
+            );
+            profile_cgroups.insert(profile.to_string(), cg);
+        }
         let syscall_gate = Arc::new(SyscallGate::new(cgroups.clone()));
         let os = Arc::new(OsSubsystems::new());
 
@@ -740,10 +785,15 @@ impl AgentKernelImpl {
             connector: Arc::new(AgentConnectorImpl::new()),
             resource_broker,
             tool_registry: Arc::new(ToolRegistry::new()),
-            rate_limiter: Arc::new(RateLimiter::new(RateLimitConfig::default())),
+            rate_limiter: Arc::new(RateLimiter::new(RateLimitConfig {
+                rpm: budgets.rpm,
+                tpm: budgets.tpm,
+                max_concurrent: budgets.max_concurrent,
+            })),
             cgroups,
             syscall_gate,
             os,
+            profile_cgroups,
             executors: DashMap::new(),
             event_tx,
         })
@@ -796,7 +846,15 @@ impl AgentKernelImpl {
         //    permission profile; fully-permissive if profile is unknown so
         //    existing flows keep working).
         let caps = caps_for_profile(&config.permission_profile);
-        let pid = self.syscall_gate.register_agent(agent_id, caps, None);
+        // Place the agent in its permission profile's cgroup (bounded token
+        // budget) rather than the unlimited root cgroup, so `CgroupQuota`
+        // enforcement is live. Unknown profiles fall back to "standard".
+        let cgroup = self
+            .profile_cgroups
+            .get(&config.permission_profile)
+            .or_else(|| self.profile_cgroups.get("standard"))
+            .copied();
+        let pid = self.syscall_gate.register_agent(agent_id, caps, cgroup);
 
         // 8. Place the agent in the OS-level subsystems using its PID.
         //    Default Agent + Tool namespaces; root-cgroup membership; CFS enqueue;
@@ -949,6 +1007,14 @@ impl AgentKernelImpl {
             if info.state != AgentState::Stopped {
                 let _ = self.agent_manager.stop_agent(info.id).await;
                 stopped.push(info.id);
+            }
+            // Free the agent's scheduler admission slot and CFS run-queue entry
+            // so `running_count` / `runnable_count` track real liveness instead
+            // of growing monotonically. Capture the PID before unregistering
+            // (which drops the UUID->PID mapping in the gate).
+            self.scheduler.deschedule(info.id);
+            if let Some(pid) = self.syscall_gate.pid_of(info.id) {
+                self.os.cfs.lock().await.dequeue(pid);
             }
             // Release per-agent state held by long-lived subsystems so
             // multi-hour runs don't leak memory linearly with shutdowns.

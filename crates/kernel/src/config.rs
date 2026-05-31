@@ -33,6 +33,44 @@ pub struct Config {
     /// "read-only", "elevated", or "full-access" to widen/narrow.
     #[serde(default = "default_permission_profile")]
     pub permission_profile: String,
+    /// Resource budgets (cgroup token quotas + rate limiter) applied to agents.
+    #[serde(default)]
+    pub budgets: BudgetConfig,
+}
+
+/// Resource budgets applied at agent creation and to the shared rate limiter.
+///
+/// `agent_tokens_per_min` bounds a non-`full-access` agent's per-minute token
+/// spend via its cgroup (0 = unlimited); `full-access` agents are unlimited and
+/// `elevated` gets a wider budget. `rpm`/`tpm`/`max_concurrent` configure the
+/// shared `RateLimiter`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BudgetConfig {
+    #[serde(default = "default_agent_tokens_per_min")]
+    pub agent_tokens_per_min: u64,
+    #[serde(default)]
+    pub max_tool_calls: u32,
+    #[serde(default)]
+    pub max_context_tokens: u64,
+    #[serde(default = "default_rpm")]
+    pub rpm: u32,
+    #[serde(default = "default_tpm")]
+    pub tpm: u64,
+    #[serde(default = "default_max_concurrent")]
+    pub max_concurrent: u32,
+}
+
+impl Default for BudgetConfig {
+    fn default() -> Self {
+        Self {
+            agent_tokens_per_min: default_agent_tokens_per_min(),
+            max_tool_calls: 0,
+            max_context_tokens: 0,
+            rpm: default_rpm(),
+            tpm: default_tpm(),
+            max_concurrent: default_max_concurrent(),
+        }
+    }
 }
 
 impl Default for Config {
@@ -48,6 +86,7 @@ impl Default for Config {
             azure_api_version: None,
             max_browse_chars: default_max_browse_chars(),
             permission_profile: default_permission_profile(),
+            budgets: BudgetConfig::default(),
         }
     }
 }
@@ -58,6 +97,22 @@ fn default_max_browse_chars() -> usize {
 
 fn default_permission_profile() -> String {
     "standard".to_string()
+}
+
+fn default_agent_tokens_per_min() -> u64 {
+    50_000
+}
+
+fn default_rpm() -> u32 {
+    60
+}
+
+fn default_tpm() -> u64 {
+    100_000
+}
+
+fn default_max_concurrent() -> u32 {
+    3
 }
 
 impl Config {
@@ -166,5 +221,22 @@ mod tests {
         let parsed: Config = toml::from_str(&toml_str).unwrap();
         assert_eq!(parsed.default_model, "claude-3");
         assert_eq!(parsed.get_api_key("anthropic"), Some("sk-ant-xxx"));
+    }
+
+    #[test]
+    fn budgets_default_when_absent_and_roundtrip() {
+        // A config file with no [budgets] section still loads (serde default).
+        let toml =
+            "llm_provider = \"local\"\ndefault_model = \"m\"\ndata_dir = \"/tmp/x\"\n[api_keys]\n";
+        let cfg: Config = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.budgets.agent_tokens_per_min, 50_000);
+        assert_eq!(cfg.budgets.rpm, 60);
+
+        // And an explicit budget round-trips through TOML.
+        let mut cfg = Config::default();
+        cfg.budgets.agent_tokens_per_min = 12_345;
+        let s = toml::to_string_pretty(&cfg).unwrap();
+        let parsed: Config = toml::from_str(&s).unwrap();
+        assert_eq!(parsed.budgets.agent_tokens_per_min, 12_345);
     }
 }

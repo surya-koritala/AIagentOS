@@ -977,3 +977,79 @@ async fn live_path_discovery_and_name_addressing() {
         "unknown recipient name must not succeed"
     );
 }
+
+/// #29: agents created in different namespace groups are isolated — same-group
+/// messaging delivers, cross-group messaging is denied (like a non-existent
+/// agent). Ungrouped agents (create_agent_full) still share the default ns.
+#[tokio::test]
+async fn live_path_namespace_isolation_between_groups() {
+    use kernel::connector::ToolCall;
+    use kernel::resources::ResourceBroker;
+    use kernel::AgentKernelImpl;
+
+    let kernel = AgentKernelImpl::new().expect("kernel new");
+    let alice = kernel
+        .create_agent_in_namespace(agent_cfg("alice", "standard"), "team-a")
+        .await
+        .unwrap();
+    let bob = kernel
+        .create_agent_in_namespace(agent_cfg("bob", "standard"), "team-a")
+        .await
+        .unwrap();
+    let eve = kernel
+        .create_agent_in_namespace(agent_cfg("eve", "standard"), "team-b")
+        .await
+        .unwrap();
+
+    async fn send(
+        kernel: &AgentKernelImpl,
+        from: uuid::Uuid,
+        to: uuid::Uuid,
+        body: serde_json::Value,
+    ) -> Result<kernel::resources::ResourceResponse, kernel::ResourceError> {
+        let req = kernel
+            .tool_registry
+            .resolve(
+                from,
+                &ToolCall {
+                    id: "s".into(),
+                    name: "send_agent_message".into(),
+                    arguments: serde_json::json!({"to": to.to_string(), "message": body}),
+                },
+            )
+            .unwrap();
+        kernel.resource_broker.execute(req).await
+    }
+    async fn inbox(kernel: &AgentKernelImpl, who: uuid::Uuid) -> serde_json::Value {
+        let req = kernel
+            .tool_registry
+            .resolve(
+                who,
+                &ToolCall {
+                    id: "i".into(),
+                    name: "check_inbox".into(),
+                    arguments: serde_json::json!({}),
+                },
+            )
+            .unwrap();
+        kernel.resource_broker.execute(req).await.unwrap().data
+    }
+
+    // Same group (team-a): alice → bob delivers.
+    assert!(
+        send(&kernel, alice.id, bob.id, serde_json::json!({"x": 1}))
+            .await
+            .unwrap()
+            .success
+    );
+    // Different group (team-a → team-b): alice → eve is isolated.
+    let cross = send(&kernel, alice.id, eve.id, serde_json::json!({"x": 2})).await;
+    assert!(
+        !cross.map(|r| r.success).unwrap_or(false),
+        "cross-group send must be denied"
+    );
+
+    // bob got alice's message; eve got nothing.
+    assert_eq!(inbox(&kernel, bob.id).await["payload"]["x"], 1);
+    assert_eq!(inbox(&kernel, eve.id).await["empty"], true);
+}

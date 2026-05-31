@@ -141,7 +141,7 @@ fn tools_resolve_with_null_arguments() {
 
 #[test]
 fn tools_custom_template_with_missing_param() {
-    let mut reg = ToolRegistry::new();
+    let reg = ToolRegistry::new();
     reg.register(ToolBinding {
         name: "custom".into(),
         description: "test".into(),

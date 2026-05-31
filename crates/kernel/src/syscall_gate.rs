@@ -89,6 +89,10 @@ impl ToolAction {
         action: "execute",
         required_cap: None,
     };
+    pub const DELETE: Self = Self {
+        action: "delete",
+        required_cap: Some(CapabilitySet::CAP_FILE_DELETE),
+    };
 }
 
 /// Classify a built-in tool name into an action + required capability.
@@ -103,7 +107,11 @@ pub fn classify_tool(tool_name: &str) -> ToolAction {
             ToolAction::READ
         }
         // Filesystem mutations
-        "write_file" | "create_directory" | "git_commit" => ToolAction::WRITE,
+        "write_file" | "create_directory" | "create_file" | "edit_file" | "git_commit" => {
+            ToolAction::WRITE
+        }
+        // Filesystem deletion — requires CAP_FILE_DELETE (distinct from write).
+        "delete_file" => ToolAction::DELETE,
         // Network
         "http_get" | "browse_url" => ToolAction::NET,
         // Process execution
@@ -397,6 +405,20 @@ mod tests {
         assert_eq!(classify_tool("http_get").action, "net");
         assert_eq!(classify_tool("run_command").action, "exec");
         assert_eq!(classify_tool("totally_custom_tool").action, "execute");
+    }
+
+    #[test]
+    fn classify_edit_and_delete_tools() {
+        // File mutations require CAP_FILE_WRITE.
+        for t in ["create_file", "edit_file"] {
+            let a = classify_tool(t);
+            assert_eq!(a.action, "write");
+            assert_eq!(a.required_cap, Some(CapabilitySet::CAP_FILE_WRITE));
+        }
+        // Deletion is a distinct action requiring CAP_FILE_DELETE.
+        let d = classify_tool("delete_file");
+        assert_eq!(d.action, "delete");
+        assert_eq!(d.required_cap, Some(CapabilitySet::CAP_FILE_DELETE));
     }
 
     #[tokio::test]

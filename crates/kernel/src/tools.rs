@@ -1,6 +1,6 @@
 //! Tool Registry — maps tool names to ResourceBroker operations.
 
-use std::collections::HashMap;
+use dashmap::DashMap;
 
 use crate::connector::{ToolCall, ToolDefinition};
 use crate::resources::{ResourceRequest, ResourceType};
@@ -17,10 +17,15 @@ pub struct ToolBinding {
 }
 
 /// Registry of available tools that agents can use.
+///
+/// Uses interior mutability (`DashMap`) so tools can be registered on a shared
+/// `Arc<ToolRegistry>` at runtime: the kernel registers built-ins, then the
+/// advanced/git/edit tool sets, and later subsystems (MCP, custom tools) can
+/// extend the same registry without rebuilding it.
 pub struct ToolRegistry {
-    tools: HashMap<String, ToolBinding>,
+    tools: DashMap<String, ToolBinding>,
     /// Command templates for custom tools: name -> (command, args_template)
-    command_templates: HashMap<String, (String, Vec<String>)>,
+    command_templates: DashMap<String, (String, Vec<String>)>,
 }
 
 impl Default for ToolRegistry {
@@ -31,32 +36,27 @@ impl Default for ToolRegistry {
 
 impl ToolRegistry {
     pub fn new() -> Self {
-        let mut registry = Self {
-            tools: HashMap::new(),
-            command_templates: HashMap::new(),
+        let registry = Self {
+            tools: DashMap::new(),
+            command_templates: DashMap::new(),
         };
         registry.register_builtins();
         registry
     }
 
     /// Register a tool binding.
-    pub fn register(&mut self, binding: ToolBinding) {
+    pub fn register(&self, binding: ToolBinding) {
         self.tools.insert(binding.name.clone(), binding);
     }
 
     /// Unregister a tool by name.
-    pub fn unregister(&mut self, name: &str) {
+    pub fn unregister(&self, name: &str) {
         self.tools.remove(name);
         self.command_templates.remove(name);
     }
 
     /// Register a command template for a custom tool.
-    pub fn register_command_template(
-        &mut self,
-        name: &str,
-        command: &str,
-        args_template: &[String],
-    ) {
+    pub fn register_command_template(&self, name: &str, command: &str, args_template: &[String]) {
         self.command_templates.insert(
             name.to_string(),
             (command.to_string(), args_template.to_vec()),
@@ -66,7 +66,7 @@ impl ToolRegistry {
     /// Generate LLM-compatible tool definitions.
     pub fn definitions(&self) -> Vec<ToolDefinition> {
         self.tools
-            .values()
+            .iter()
             .map(|b| ToolDefinition {
                 name: b.name.clone(),
                 description: b.description.clone(),
@@ -77,10 +77,17 @@ impl ToolRegistry {
 
     /// Resolve a tool call into a ResourceRequest.
     pub fn resolve(&self, agent_id: AgentId, tool_call: &ToolCall) -> Option<ResourceRequest> {
-        let binding = self.tools.get(&tool_call.name)?;
+        // Read out what we need and drop the `tools` shard read-lock immediately,
+        // so resolution (and the command-template lookup below) doesn't hold it
+        // and block a concurrent register/unregister on the same shard.
+        let (binding_rt, binding_op) = {
+            let binding = self.tools.get(&tool_call.name)?;
+            (binding.resource_type.clone(), binding.operation.clone())
+        };
 
         // Check if this is a custom tool with a command template
-        if let Some((command, args_template)) = self.command_templates.get(&tool_call.name) {
+        if let Some(entry) = self.command_templates.get(&tool_call.name) {
+            let (command, args_template) = entry.value();
             let args: Vec<String> = args_template
                 .iter()
                 .map(|tmpl| {
@@ -144,7 +151,7 @@ impl ToolRegistry {
         // create_directory uses Application provider (mkdir -p)
         let (resource_type, operation) = match tool_call.name.as_str() {
             "create_directory" => (ResourceType::Application, "launch".to_string()),
-            _ => (binding.resource_type.clone(), binding.operation.clone()),
+            _ => (binding_rt, binding_op),
         };
 
         Some(ResourceRequest {
@@ -161,7 +168,7 @@ impl ToolRegistry {
         self.tools.contains_key(name)
     }
 
-    fn register_builtins(&mut self) {
+    fn register_builtins(&self) {
         self.register(ToolBinding {
             name: "read_file".into(),
             description: "Read the contents of a file at the given path".into(),
@@ -325,7 +332,7 @@ mod tests {
 
     #[test]
     fn register_and_unregister_custom_tool() {
-        let mut reg = ToolRegistry::new();
+        let reg = ToolRegistry::new();
         reg.register(ToolBinding {
             name: "custom_tool".into(),
             description: "A custom tool".into(),
@@ -337,12 +344,48 @@ mod tests {
         reg.unregister("custom_tool");
         assert!(!reg.has_tool("custom_tool"));
     }
+
+    #[test]
+    fn registry_is_runtime_extensible_via_shared_ref() {
+        // #10 keystone: register_* take &self, so tools can be added to a
+        // shared Arc<ToolRegistry> after construction (the path the kernel and
+        // future MCP/custom-tool registration use).
+        let reg = std::sync::Arc::new(ToolRegistry::new());
+        assert!(!reg.has_tool("git_commit"));
+        reg.register_advanced_tools();
+        reg.register_git_tools();
+        crate::editing::register_edit_tools(&reg);
+        for t in [
+            "browse_url",
+            "git_commit",
+            "git_diff",
+            "edit_file",
+            "create_file",
+            "delete_file",
+        ] {
+            assert!(reg.has_tool(t), "expected tool {t} after registration");
+        }
+    }
+
+    #[test]
+    fn edit_file_resolves_to_filesystem_edit() {
+        let reg = ToolRegistry::new();
+        crate::editing::register_edit_tools(&reg);
+        let tc = ToolCall {
+            id: "e".into(),
+            name: "edit_file".into(),
+            arguments: serde_json::json!({"path": "/tmp/x", "search": "a", "replace": "b"}),
+        };
+        let req = reg.resolve(uuid::Uuid::new_v4(), &tc).unwrap();
+        assert_eq!(req.resource_type, ResourceType::Filesystem);
+        assert_eq!(req.operation, "edit");
+    }
 }
 
 // Sprint 3 tools are registered separately via register_advanced_tools()
 impl ToolRegistry {
     /// Register advanced tools (delegation, web browsing).
-    pub fn register_advanced_tools(&mut self) {
+    pub fn register_advanced_tools(&self) {
         self.register(ToolBinding {
             name: "browse_url".into(),
             description: "Fetch a URL and extract readable text content (HTML stripped)".into(),
@@ -359,10 +402,10 @@ impl ToolRegistry {
 
 // Git tools registered via register_git_tools()
 impl ToolRegistry {
-    pub fn register_git_tools(&mut self) {
+    pub fn register_git_tools(&self) {
         self.register(ToolBinding {
             name: "git_commit".into(),
-            description: "Stage all changes and create a git commit with the given message".into(),
+            description: "Commit tracked changes with the given message (git commit -a -m)".into(),
             parameters_schema: serde_json::json!({
                 "type": "object",
                 "properties": {"message": {"type": "string", "description": "Commit message"}},
@@ -371,7 +414,18 @@ impl ToolRegistry {
             resource_type: ResourceType::Application,
             operation: "launch".into(),
         });
-        self.register_command_template("git_commit", "git", &["add".into(), "-A".into()]);
+        // `-a -m {message}` so the tool actually commits (the previous template
+        // was `git add -A`, which only staged and never created a commit).
+        self.register_command_template(
+            "git_commit",
+            "git",
+            &[
+                "commit".into(),
+                "-a".into(),
+                "-m".into(),
+                "{message}".into(),
+            ],
+        );
 
         self.register(ToolBinding {
             name: "git_diff".into(),

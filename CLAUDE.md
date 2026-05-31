@@ -32,9 +32,9 @@ echo "input" | cargo run --package agent-cli -- "prompt"  # pipe mode
 cd crates/tauri-app/ui && npm install && npx vite build
 cargo build --package tauri-app
 
-# Benchmarks
-cargo run --package benchmarks --bin os_benchmark
-cargo run --package benchmarks --bin stress_test
+# Benchmarks (package is `os-benchmark`; bin names use hyphens, not underscores)
+cargo run --package os-benchmark --bin os-benchmark
+cargo run --package os-benchmark --bin stress-test
 ```
 
 LLM provider config is via env vars (see `.env.example`); Azure OpenAI is the default. Other supported providers: `openai`, `anthropic`, `local` (Ollama). The CLI reads `config.llm_provider` to decide which adapter to register — see `crates/cli/src/main.rs` `register_providers`.
@@ -57,23 +57,28 @@ examples/      # CLI usage examples
 
 ### Kernel orchestrator
 
-`AgentKernelImpl` in `crates/kernel/src/lib.rs:512` is the wired root object that owns every subsystem (`agent_manager`, `scheduler`, `context_manager`, `permission_manager`, `sandbox_manager`, `ipc`, `observability`, `connector`, `resource_broker`, `tool_registry`, `rate_limiter`, `cgroups`, `syscall_gate`). Three constructors exist:
+`AgentKernelImpl` in `crates/kernel/src/lib.rs:667` is the wired root object that owns every subsystem (`agent_manager`, `scheduler`, `context_manager`, `permission_manager`, `sandbox_manager`, `ipc`, `observability`, `connector`, `resource_broker`, `tool_registry`, `rate_limiter`, `cgroups`, `syscall_gate`). Constructors:
 
 - `AgentKernelImpl::new()` — in-memory SQLite, used by tests
 - `AgentKernelImpl::with_db_path(path)` — persistent SQLite at a chosen path
 - `AgentKernelImpl::from_config(&config)` — reads `config.data_dir` and persists to `agent_os.db`
 
+The documented top-level entry points are the free functions `kernel::boot(&config)` and `kernel::boot_in_memory()` (lib.rs): they build the kernel **and** call `AgentKernelImpl::start_runtime()`, which spawns the background tasks — a scheduler observer that publishes the CFS pick into procfs as `current_agent`, and a per-minute cgroup-counter reset so `tokens_per_min` quotas regenerate. `from_config`/`new` do *not* start the runtime. Prefer `boot()` for new entry points — note the CLI and Tauri `main.rs` currently call `from_config` directly, so the background tasks don't run in those binaries yet.
+
+Agent creation flows through `create_agent_full`, which enqueues into both the priority `scheduler` and the CFS run queue. The priority scheduler hard-caps at `MAX_CONCURRENT_AGENTS = 10` (`scheduler.rs`): beyond that, `schedule()` *blocks* waiting for a free slot and returns `QueueFull` after a 10s deadlock timeout — so bulk-creating agents that never run to completion will stall.
+
 When adding a new subsystem, wire it through `AgentKernelImpl::with_context_manager`. The CLI and Tauri app both go through this orchestrator — never instantiate subsystems directly in entry points.
 
 ### The syscall gate (load-bearing OS layer)
 
-`crates/kernel/src/syscall_gate.rs` is the **chokepoint that makes capabilities, MAC, and cgroups load-bearing**. Every tool call from `AgentExecutor::execute_tool` (`crates/kernel/src/execution.rs:255`) consults `SyscallGate::check_tool_call`, which runs:
+`crates/kernel/src/syscall_gate.rs` is the **chokepoint that makes namespaces, capabilities, MAC, and cgroups load-bearing**. Every tool call from `AgentExecutor::execute_tool` (`crates/kernel/src/execution.rs:321`) consults `SyscallGate::check_tool_call`, which runs these in order (first failure wins):
 
+0. **Namespace visibility** — if the tool is tagged with a namespace, the calling agent must be a member; `NotInNamespace` otherwise. Untagged tools are global. (Phase 3 — runs *before* capability/MAC.)
 1. **Capability check** — `classify_tool(name)` → required cap (e.g. `http_get` requires `CAP_NET_ACCESS`); `MissingCapability` denial otherwise.
 2. **MAC check** — `MacEngine::check(pid, action, resource)`; `MacDeny` if the policy returns Deny.
 3. **Cgroup quota check** — `cgroups.check_token_limit(cg, est_tokens)`; `CgroupQuota` if over budget.
 
-The gate maintains a translation table from kernel `Uuid` agent IDs to `agent_struct::AgentId` (u64 "PIDs") so the older OS-style subsystems (which use u64) can talk to the newer kernel orchestrator (which uses Uuid) without either side changing. Capabilities are derived from the `permission_profile` string at agent creation via `caps_for_profile` in `lib.rs`. The contract is locked by `tests/src/os_enforcement.rs` — if those four tests fail, the OS framing is broken.
+The gate maintains a translation table from kernel `Uuid` agent IDs to `agent_struct::AgentId` (u64 "PIDs") so the older OS-style subsystems (which use u64) can talk to the newer kernel orchestrator (which uses Uuid) without either side changing. Capabilities are derived from the `permission_profile` string at agent creation via `caps_for_profile` in `lib.rs`. The contract is locked by the `tests/src/os_enforcement.rs` suite (capability/MAC/cgroup ordering, namespace isolation for both tools and IPC, scheduler `pick_next` honoring nice values) — if those tests fail, the OS framing is broken.
 
 When adding a new tool, **classify it in `syscall_gate::classify_tool`** so it inherits the right action label and capability requirement. Don't bypass the gate from new code paths.
 

@@ -157,6 +157,7 @@ impl ToolRegistry {
                     .unwrap_or(serde_json::Value::Null),
             }),
             "check_inbox" => serde_json::json!({"agent": agent_id.to_string()}),
+            "discover_agents" => serde_json::json!({"viewer": agent_id.to_string()}),
             // Delegation: inject the caller as the delegator; recipient + task
             // come from the args. (status/complete pass {task_id} through.)
             "delegate_task" => serde_json::json!({

@@ -280,18 +280,28 @@ impl AgentIpc for IpcManager {
         self.check_permission(from, to)?;
 
         let task_id = uuid::Uuid::new_v4();
-        let task = DelegatedTask {
-            id: task_id,
-            from,
-            to,
-            description: description.clone(),
-            status: DelegationStatus::Pending,
-        };
-        self.delegations.insert(task_id, task);
 
-        // Notify the target agent
-        let payload = serde_json::json!({"type": "delegation", "task_id": task_id.to_string(), "description": description});
+        // Notify the target FIRST: send() runs the namespace-visibility and
+        // permission/mailbox checks. Only record the task if delivery actually
+        // succeeded — otherwise a rejected (e.g. cross-namespace) delegation
+        // would leave an orphaned Pending task in the table forever.
+        let payload = serde_json::json!({
+            "type": "delegation",
+            "task_id": task_id.to_string(),
+            "description": description.clone(),
+        });
         self.send(from, to, payload).await?;
+
+        self.delegations.insert(
+            task_id,
+            DelegatedTask {
+                id: task_id,
+                from,
+                to,
+                description,
+                status: DelegationStatus::Pending,
+            },
+        );
 
         Ok(task_id)
     }
@@ -397,6 +407,21 @@ mod tests {
         assert_eq!(
             ipc.get_delegation_status(task_id),
             Some(DelegationStatus::Completed)
+        );
+    }
+
+    #[tokio::test]
+    async fn delegate_does_not_orphan_on_failed_send() {
+        let ipc = IpcManager::new();
+        let a = uuid::Uuid::new_v4();
+        let b = uuid::Uuid::new_v4();
+        ipc.register_agent(a);
+        // b is NOT registered → the delegation's send fails.
+        let result = ipc.delegate(a, b, "task".into()).await;
+        assert!(result.is_err());
+        assert!(
+            ipc.delegations.is_empty(),
+            "a failed delegation must not leave an orphaned task in the table"
         );
     }
 

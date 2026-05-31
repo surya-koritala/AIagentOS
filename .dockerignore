@@ -1,0 +1,47 @@
+# Keep the Docker build context small and reproducible.
+# (Cargo.lock IS sent — the build uses --locked.)
+
+# Rust build artifacts — by far the biggest cruft.
+target/
+**/target/
+
+# Version control + CI metadata.
+.git/
+.gitignore
+.gitattributes
+.github/
+
+# Frontend / Node — only used by tauri-app, which we never build here.
+**/node_modules/
+crates/tauri-app/ui/dist/
+
+# Local databases & WAL/journal sidecars (the container makes its own).
+*.db
+*.db-journal
+*.db-wal
+
+# Secrets / local env — never bake these into an image layer.
+.env
+.env.local
+config.toml
+
+# Editor / OS / tooling junk.
+.idea/
+.vscode/
+.kiro/
+.claude/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Compiled WASM artifacts.
+*.wasm
+
+# Auto-generated test regressions.
+**/proptest-regressions/
+
+# NOTE: README.md and the workspace Cargo.toml are intentionally NOT ignored
+# (they are part of the source tree and cheap to send). The CLI's
+# project_context() does an optional read of README.md / Cargo.toml from its
+# CWD; this just degrades gracefully if absent, so it is not load-bearing.

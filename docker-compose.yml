@@ -1,0 +1,80 @@
+# AI Agent OS — local stack: Ollama (keyless LLM) + the agent container.
+#
+# Two tiers:
+#   Tier 1 (keyless, no LLM): the agentos image's default CMD runs `os-demo`,
+#     which proves the syscall-gate enforcement layer with no model at all.
+#     You don't even need the ollama service for this:
+#         docker compose run --rm agentos os-demo
+#
+#   Tier 2 (full interactive CLI against Ollama):
+#     1. Start the stack:        docker compose up -d
+#     2. Pull a model into Ollama (one time):
+#                                docker compose exec ollama ollama pull llama3.2
+#     3. Run the interactive CLI (attaches a TTY):
+#                                docker compose run --rm agentos agent
+#        or one-shot:            docker compose run --rm agentos agent -c "list 3 facts about Linux cgroups"
+#
+# The CLI panics at startup if its provider is unreachable, so for Tier 2 the
+# ollama service MUST be healthy AND have a model pulled before you run `agent`.
+
+services:
+  ollama:
+    image: ollama/ollama:latest
+    container_name: agentos-ollama
+    # Persist downloaded models so `ollama pull` survives restarts.
+    volumes:
+      - ollama-models:/root/.ollama
+    ports:
+      # Exposed for host debugging (e.g. `curl localhost:11434/api/tags`).
+      - "11434:11434"
+    healthcheck:
+      # /api/tags is exactly what the CLI's LocalLlmAdapter::is_available()
+      # probes, so a healthy state here means the CLI's connect() will succeed.
+      test: ["CMD-SHELL", "ollama list >/dev/null 2>&1 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+    restart: unless-stopped
+    # If you have an NVIDIA GPU + nvidia-container-toolkit, uncomment to enable:
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: all
+    #           capabilities: [gpu]
+
+  agentos:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: agentos:latest
+    container_name: agentos-cli
+    depends_on:
+      ollama:
+        condition: service_healthy
+    environment:
+      # Keyless Ollama wiring — these are consumed by docker/entrypoint.sh to
+      # render config.toml (provider/model/URL come from the TOML, not env).
+      AGENTOS_LLM_PROVIDER: "local"
+      AGENTOS_MODEL: "llama3.2"
+      OLLAMA_BASE_URL: "http://ollama:11434"
+      # XDG paths land config.toml + agent_os.db under the /data volume.
+      HOME: "/data"
+      XDG_CONFIG_HOME: "/data/config"
+      XDG_DATA_HOME: "/data/share"
+    volumes:
+      # Persists agent_os.db and the rendered config.toml across runs.
+      - agentos-data:/data
+    # Keep STDIN open + allocate a TTY so the interactive `agent` REPL works
+    # when launched via `docker compose run agentos agent`.
+    stdin_open: true
+    tty: true
+    # Default CMD from the Dockerfile is `os-demo` (keyless). Override per-run:
+    #   docker compose run --rm agentos agent
+    #   docker compose run --rm agentos os-benchmark
+
+volumes:
+  ollama-models:
+  agentos-data:

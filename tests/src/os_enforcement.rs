@@ -1052,4 +1052,34 @@ async fn live_path_namespace_isolation_between_groups() {
     // bob got alice's message; eve got nothing.
     assert_eq!(inbox(&kernel, bob.id).await["payload"]["x"], 1);
     assert_eq!(inbox(&kernel, eve.id).await["empty"], true);
+
+    // discover_agents is namespace-scoped: alice (team-a) sees bob, not eve.
+    let disc = {
+        let req = kernel
+            .tool_registry
+            .resolve(
+                alice.id,
+                &ToolCall {
+                    id: "d".into(),
+                    name: "discover_agents".into(),
+                    arguments: serde_json::json!({}),
+                },
+            )
+            .unwrap();
+        kernel.resource_broker.execute(req).await.unwrap().data
+    };
+    let names: Vec<String> = disc["agents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| a["name"].as_str().unwrap().to_string())
+        .collect();
+    assert!(
+        names.contains(&"bob".to_string()),
+        "alice should discover same-group bob"
+    );
+    assert!(
+        !names.contains(&"eve".to_string()),
+        "alice must NOT discover cross-group eve"
+    );
 }

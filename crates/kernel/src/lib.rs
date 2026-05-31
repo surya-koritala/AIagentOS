@@ -536,6 +536,9 @@ struct IpcResourceProvider {
     ipc: Arc<IpcManager>,
     /// Live agent directory, for `discover` and name→UUID recipient resolution.
     agents: Arc<AgentManager>,
+    /// Namespace-visibility checker, so `discover` only lists peers the caller
+    /// shares a namespace with (matching what `send`/`delegate` can reach).
+    gate: Arc<SyscallGate>,
 }
 
 #[async_trait::async_trait]
@@ -551,7 +554,7 @@ impl ResourceProvider for IpcResourceProvider {
         operation: &str,
         params: &serde_json::Value,
     ) -> Result<serde_json::Value, ResourceError> {
-        use crate::ipc::AgentIpc;
+        use crate::ipc::{AgentIpc, NamespaceVisibility};
         let parse_uuid = |key: &str| -> Result<uuid::Uuid, ResourceError> {
             params
                 .get(key)
@@ -638,10 +641,14 @@ impl ResourceProvider for IpcResourceProvider {
                 Ok(serde_json::json!({"completed": true}))
             }
             "discover" => {
+                // Only list peers the caller shares a namespace with — matching
+                // what send/delegate can actually reach (no cross-group leak).
+                let viewer = parse_uuid("viewer")?;
                 let agents: Vec<serde_json::Value> = self
                     .agents
                     .list_agents(None)
                     .into_iter()
+                    .filter(|a| self.gate.allows(viewer, a.id))
                     .map(|a| {
                         serde_json::json!({
                             "name": a.name,
@@ -964,6 +971,7 @@ impl AgentKernelImpl {
         // resolution, all through the broker.
         resource_broker.register_provider(Box::new(IpcResourceProvider {
             ipc: ipc.clone(),
+            gate: syscall_gate.clone(),
             agents: agent_manager.clone(),
         }));
 
@@ -1046,12 +1054,15 @@ impl AgentKernelImpl {
             Some(g) => {
                 // Atomic get-or-create so two agents created concurrently for a
                 // new group land in the SAME namespaces (no over-isolation race).
-                let e = self.group_namespaces.entry(g.to_string()).or_insert_with(|| {
-                    (
-                        self.os.namespaces.create(NamespaceType::Agent, None),
-                        self.os.namespaces.create(NamespaceType::Tool, None),
-                    )
-                });
+                let e = self
+                    .group_namespaces
+                    .entry(g.to_string())
+                    .or_insert_with(|| {
+                        (
+                            self.os.namespaces.create(NamespaceType::Agent, None),
+                            self.os.namespaces.create(NamespaceType::Tool, None),
+                        )
+                    });
                 (Some(e.0), Some(e.1))
             }
         }

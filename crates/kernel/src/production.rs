@@ -75,47 +75,9 @@ impl CircuitBreaker {
     }
 }
 
-/// Budget enforcement — stop agent when cost exceeds limit.
-pub struct BudgetEnforcer {
-    /// Maximum cost in USD (0 = unlimited).
-    max_cost_usd: f64,
-    current_cost: Mutex<f64>,
-}
-
-impl BudgetEnforcer {
-    pub fn new(max_cost_usd: f64) -> Self {
-        Self {
-            max_cost_usd,
-            current_cost: Mutex::new(0.0),
-        }
-    }
-
-    /// Check if budget allows another request.
-    pub fn can_proceed(&self) -> bool {
-        if self.max_cost_usd <= 0.0 {
-            return true;
-        } // Unlimited
-        *self.current_cost.lock().unwrap() < self.max_cost_usd
-    }
-
-    /// Record cost from a request.
-    pub fn record_cost(&self, cost: f64) {
-        *self.current_cost.lock().unwrap() += cost;
-    }
-
-    /// Get remaining budget.
-    pub fn remaining(&self) -> f64 {
-        if self.max_cost_usd <= 0.0 {
-            return f64::INFINITY;
-        }
-        self.max_cost_usd - *self.current_cost.lock().unwrap()
-    }
-
-    /// Get current spend.
-    pub fn current_spend(&self) -> f64 {
-        *self.current_cost.lock().unwrap()
-    }
-}
+// Budget enforcement lives in [`crate::budget::BudgetEnforcer`] — the live,
+// token-priced, per-agent enforcer wired into the execution loop. The earlier
+// global-only stub that lived here was consolidated into it (#44).
 
 #[cfg(test)]
 mod tests {
@@ -140,22 +102,5 @@ mod tests {
         cb.record_success();
         assert!(cb.is_available());
         assert_eq!(cb.status().1, 0);
-    }
-
-    #[test]
-    fn budget_enforcer_blocks_at_limit() {
-        let be = BudgetEnforcer::new(1.0);
-        assert!(be.can_proceed());
-        be.record_cost(0.5);
-        assert!(be.can_proceed());
-        be.record_cost(0.6);
-        assert!(!be.can_proceed()); // 1.1 > 1.0
-    }
-
-    #[test]
-    fn budget_unlimited() {
-        let be = BudgetEnforcer::new(0.0);
-        be.record_cost(1000.0);
-        assert!(be.can_proceed()); // 0 = unlimited
     }
 }

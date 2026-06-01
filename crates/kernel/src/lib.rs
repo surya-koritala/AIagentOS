@@ -10,6 +10,7 @@ pub mod agentctl;
 pub mod agentpkg;
 pub mod agentps;
 pub mod auth;
+pub mod budget;
 pub mod cfs;
 pub mod cgroups;
 pub mod config;
@@ -867,6 +868,10 @@ pub struct AgentKernelImpl {
     pub rate_limiter: Arc<RateLimiter>,
     pub cgroups: Arc<CgroupManager>,
     pub syscall_gate: Arc<SyscallGate>,
+    /// Hard cumulative USD spend ceiling on the LLM path (the cgroup quota only
+    /// bounds per-minute tokens, not lifetime cost). Inert unless config sets a
+    /// price + ceiling. Installed on each executor in `send_message`.
+    pub budget_enforcer: Arc<crate::budget::BudgetEnforcer>,
     pub os: Arc<OsSubsystems>,
     /// One cgroup per permission profile, created at boot with budget-derived
     /// limits. Agents are placed into their profile's cgroup at creation so
@@ -963,6 +968,8 @@ impl AgentKernelImpl {
         // decisions (and denials) are recorded in the agent activity log.
         let observability = Arc::new(ObservabilityEngineImpl::new());
         syscall_gate.set_audit_sink(observability.clone());
+        // Cumulative USD spend ceiling (inert unless price + ceiling configured).
+        let budget_enforcer = Arc::new(crate::budget::BudgetEnforcer::from_config(budgets));
         let os = Arc::new(OsSubsystems::new());
 
         let ipc = Arc::new(IpcManager::new());
@@ -1007,6 +1014,7 @@ impl AgentKernelImpl {
             })),
             cgroups,
             syscall_gate,
+            budget_enforcer,
             os,
             profile_cgroups,
             group_namespaces: DashMap::new(),
@@ -1198,6 +1206,7 @@ impl AgentKernelImpl {
                 "You are a helpful AI assistant. Use the available tools to help the user.".into(),
             );
             executor.set_syscall_gate(self.syscall_gate.clone());
+            executor.set_budget_enforcer(self.budget_enforcer.clone());
 
             self.executors
                 .insert(agent_id, tokio::sync::Mutex::new(executor));
@@ -1297,6 +1306,9 @@ impl AgentKernelImpl {
             // Release per-agent state held by long-lived subsystems so
             // multi-hour runs don't leak memory linearly with shutdowns.
             self.observability.purge_agent(info.id);
+            // Drop per-agent spend tracking; global cumulative spend is retained
+            // so the lifetime ceiling spans agent churn.
+            self.budget_enforcer.purge_agent(info.id);
             self.syscall_gate.unregister_agent(info.id);
             self.executors.remove(&info.id);
         }

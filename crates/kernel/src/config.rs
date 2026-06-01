@@ -77,6 +77,21 @@ pub struct BudgetConfig {
     pub tpm: u64,
     #[serde(default = "default_max_concurrent")]
     pub max_concurrent: u32,
+    /// Hard cumulative USD spend ceiling across all agents (0.0 = unlimited).
+    /// Enforced by [`crate::budget::BudgetEnforcer`] on the LLM path.
+    #[serde(default)]
+    pub max_usd: f64,
+    /// Hard cumulative USD ceiling per agent (0.0 = unlimited).
+    #[serde(default)]
+    pub per_agent_max_usd: f64,
+    /// Default blended price in USD per 1000 tokens, used to cost LLM responses
+    /// (0.0 = free → the USD ceilings never trigger). Per-provider overrides go
+    /// in `provider_pricing`.
+    #[serde(default)]
+    pub usd_per_1k_tokens: f64,
+    /// Per-provider price overrides (provider id → USD per 1000 tokens).
+    #[serde(default)]
+    pub provider_pricing: HashMap<ProviderId, f64>,
 }
 
 impl Default for BudgetConfig {
@@ -88,6 +103,10 @@ impl Default for BudgetConfig {
             rpm: default_rpm(),
             tpm: default_tpm(),
             max_concurrent: default_max_concurrent(),
+            max_usd: 0.0,
+            per_agent_max_usd: 0.0,
+            usd_per_1k_tokens: 0.0,
+            provider_pricing: HashMap::new(),
         }
     }
 }

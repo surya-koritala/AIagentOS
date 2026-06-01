@@ -50,7 +50,6 @@ pub mod resources;
 pub mod runtime;
 pub mod sandbox;
 pub mod scheduler;
-pub mod service_discovery;
 pub mod shell;
 pub mod syscall_gate;
 pub mod syscall_interface;
@@ -59,7 +58,6 @@ pub mod tool_descriptors;
 pub mod tools;
 pub mod vision;
 pub mod voice;
-pub mod workspaces;
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
@@ -815,7 +813,6 @@ use crate::rate_limit::{RateLimitConfig, RateLimiter};
 use crate::resources::{ResourceBroker, ResourceBrokerImpl};
 use crate::sandbox::{SandboxManager, SandboxManagerImpl};
 use crate::scheduler::{AgentScheduler, PriorityScheduler};
-use crate::service_discovery::ServiceRegistry;
 use crate::syscall_gate::SyscallGate;
 use crate::sysctl::Sysctl;
 use crate::tools::ToolRegistry;
@@ -831,7 +828,6 @@ pub struct OsSubsystems {
     pub init: tokio::sync::Mutex<InitSystem>,
     pub procfs: tokio::sync::Mutex<ProcFs>,
     pub sysctl: tokio::sync::Mutex<Sysctl>,
-    pub services: tokio::sync::Mutex<ServiceRegistry>,
 }
 
 impl Default for OsSubsystems {
@@ -848,7 +844,6 @@ impl OsSubsystems {
             init: tokio::sync::Mutex::new(InitSystem::new()),
             procfs: tokio::sync::Mutex::new(ProcFs::new()),
             sysctl: tokio::sync::Mutex::new(Sysctl::new()),
-            services: tokio::sync::Mutex::new(ServiceRegistry::new()),
         }
     }
 }
@@ -1342,9 +1337,12 @@ impl AgentKernelImpl {
 pub fn boot(config: &crate::config::Config) -> Result<Arc<AgentKernelImpl>, KernelError> {
     let kernel = Arc::new(AgentKernelImpl::from_config(config)?);
     let _runtime = kernel.start_runtime();
-    // Runtime stays alive as long as `running` is true; on Drop the loops
-    // exit on next tick. Callers that want explicit `stop()` should call
-    // `start_runtime` themselves and hold the returned `KernelRuntime`.
+    // The background tasks are detached: each holds its own clone of the
+    // runtime's `running` flag, so dropping the `KernelRuntime` here does NOT
+    // stop them — they run for the life of the process (the intended behavior
+    // for a long-lived daemon). Callers that need graceful shutdown should call
+    // `start_runtime()` themselves and hold the returned `KernelRuntime` to call
+    // `stop()` (which flips `running` and lets the loops exit on next tick).
     Ok(kernel)
 }
 

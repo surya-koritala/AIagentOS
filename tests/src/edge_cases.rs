@@ -1,6 +1,7 @@
 //! Edge case tests for all modules.
 //! Tests boundary conditions, error paths, and unusual inputs.
 
+use kernel::budget::BudgetEnforcer;
 use kernel::connector::*;
 use kernel::context::*;
 use kernel::database::*;

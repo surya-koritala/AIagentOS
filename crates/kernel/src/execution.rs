@@ -55,6 +55,7 @@ pub struct AgentExecutor {
     context_manager: Arc<SqliteContextManager>,
     rule_store: Option<Arc<crate::learning::RuleStore>>,
     syscall_gate: Option<Arc<crate::syscall_gate::SyscallGate>>,
+    budget_enforcer: Option<Arc<crate::budget::BudgetEnforcer>>,
     messages: Vec<StandardMessage>,
     cancel_token: CancellationToken,
     event_tx: Option<mpsc::Sender<StreamEvent>>,
@@ -80,6 +81,7 @@ impl AgentExecutor {
             context_manager,
             rule_store: None,
             syscall_gate: None,
+            budget_enforcer: None,
             messages: vec![StandardMessage::system(&system_prompt)],
             cancel_token: CancellationToken::new(),
             event_tx: None,
@@ -93,6 +95,13 @@ impl AgentExecutor {
     /// care about OS enforcement).
     pub fn set_syscall_gate(&mut self, gate: Arc<crate::syscall_gate::SyscallGate>) {
         self.syscall_gate = Some(gate);
+    }
+
+    /// Install a budget enforcer. Once set, the loop refuses to make a further
+    /// LLM call once the cumulative USD ceiling is reached, and prices each
+    /// response against the agent's provider. Without one, no cost is tracked.
+    pub fn set_budget_enforcer(&mut self, enforcer: Arc<crate::budget::BudgetEnforcer>) {
+        self.budget_enforcer = Some(enforcer);
     }
 
     /// Resume from a saved conversation.
@@ -212,10 +221,35 @@ impl AgentExecutor {
                 });
             }
 
+            // Budget: refuse a further LLM call once the cumulative USD ceiling
+            // is reached. This is a hard stop — distinct from the cgroup quota,
+            // which only bounds per-minute tokens, not lifetime cost.
+            if let Some(ref budget) = self.budget_enforcer {
+                if let Err(exceeded) = budget.check(self.agent_id) {
+                    let output = AgentOutput {
+                        content: format!("Stopped before LLM call: {}.", exceeded.message()),
+                        tool_calls_made,
+                        tokens_used: total_tokens,
+                    };
+                    self.emit(StreamEvent::Done(output.clone())).await;
+                    self.save_conversation();
+                    return Ok(output);
+                }
+            }
+
             // Think: send to LLM with retry
             let response = self.send_with_retry(&tools).await?;
 
             total_tokens += response.tokens_used;
+
+            // Price this response against the agent's provider and accrue spend.
+            if let Some(ref budget) = self.budget_enforcer {
+                budget.record(
+                    self.agent_id,
+                    self.session.provider_id(),
+                    response.tokens_used,
+                );
+            }
 
             // If no tool calls, we're done — return content
             if response.tool_calls.is_empty() {
@@ -602,6 +636,44 @@ mod tests {
             !allowed.contains("denied by kernel"),
             "read_file should pass the gate, got: {allowed}"
         );
+    }
+
+    // #44: a cumulative USD ceiling hard-stops the think→act loop. The
+    // InfiniteToolSession would otherwise run all MAX_ITERATIONS rounds; with a
+    // budget priced so one response exhausts the ceiling, the loop refuses the
+    // *next* LLM call and returns a budget message instead.
+    #[tokio::test]
+    async fn execution_loop_stops_at_budget_ceiling() {
+        use crate::budget::BudgetEnforcer;
+
+        let agent_id = uuid::Uuid::new_v4();
+        let session = Box::new(InfiniteToolSession {
+            id: "infinite".into(),
+        });
+        let mut executor = AgentExecutor::new(
+            agent_id,
+            session,
+            mock_broker(),
+            Arc::new(ToolRegistry::new()),
+            mock_context_manager(),
+            "test".into(),
+        );
+        // $1 per 1k tokens; each response is 5 tokens = $0.005. A $0.004 ceiling
+        // is exhausted by the first response, so the 2nd iteration is refused.
+        let budget = Arc::new(BudgetEnforcer::with_pricing(1.0, 0.004, 0.0));
+        executor.set_budget_enforcer(budget.clone());
+
+        let output = executor.run("go").await.unwrap();
+
+        assert!(
+            output.content.contains("budget exhausted"),
+            "loop should stop with a budget message, got: {}",
+            output.content
+        );
+        // Exactly one LLM round happened (one tool call), not all 10 iterations.
+        assert_eq!(output.tool_calls_made, 1);
+        // One response was priced: 5 tokens × $1/1k = $0.005.
+        assert!((budget.global_spent_usd() - 0.005).abs() < 1e-6);
     }
 
     #[tokio::test]

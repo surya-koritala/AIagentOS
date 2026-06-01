@@ -159,11 +159,18 @@ impl ToolRegistry {
             "check_inbox" => serde_json::json!({"agent": agent_id.to_string()}),
             "discover_agents" => serde_json::json!({"viewer": agent_id.to_string()}),
             // Delegation: inject the caller as the delegator; recipient + task
-            // come from the args. (status/complete pass {task_id} through.)
+            // come from the args.
             "delegate_task" => serde_json::json!({
                 "from": agent_id.to_string(),
                 "to": tool_call.arguments.get("to").and_then(|v| v.as_str()).unwrap_or(""),
                 "description": tool_call.arguments.get("task").and_then(|v| v.as_str()).unwrap_or(""),
+            }),
+            // Delegation status/complete: inject the caller as `from` so the
+            // IpcManager can authorize (only parties may read; only the assignee
+            // may complete). The LLM supplies just the task_id.
+            "delegation_status" | "complete_delegation" => serde_json::json!({
+                "from": agent_id.to_string(),
+                "task_id": tool_call.arguments.get("task_id").and_then(|v| v.as_str()).unwrap_or(""),
             }),
             _ => tool_call.arguments.clone(),
         };

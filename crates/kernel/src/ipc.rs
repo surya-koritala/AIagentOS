@@ -59,8 +59,18 @@ pub trait AgentIpc: Send + Sync {
         to: AgentId,
         description: String,
     ) -> Result<uuid::Uuid, IpcError>;
-    fn complete_delegation(&self, task_id: uuid::Uuid) -> Result<(), IpcError>;
-    fn get_delegation_status(&self, task_id: uuid::Uuid) -> Option<DelegationStatus>;
+    /// Mark a delegation completed. Only the assignee (`to`) may complete it —
+    /// `caller` must match, otherwise `PermissionDenied`. Knowing the task id is
+    /// not sufficient authorization.
+    fn complete_delegation(&self, caller: AgentId, task_id: uuid::Uuid) -> Result<(), IpcError>;
+    /// Read a delegation's status. Only the two parties (`from`/`to`) may see
+    /// it; any other caller gets `None` (indistinguishable from a non-existent
+    /// task — no existence leak), as does an unknown id.
+    fn get_delegation_status(
+        &self,
+        caller: AgentId,
+        task_id: uuid::Uuid,
+    ) -> Option<DelegationStatus>;
 }
 
 /// Pluggable namespace visibility check for IPC.
@@ -306,11 +316,22 @@ impl AgentIpc for IpcManager {
         Ok(task_id)
     }
 
-    fn complete_delegation(&self, task_id: uuid::Uuid) -> Result<(), IpcError> {
+    fn complete_delegation(&self, caller: AgentId, task_id: uuid::Uuid) -> Result<(), IpcError> {
         let mut task = self
             .delegations
             .get_mut(&task_id)
             .ok_or_else(|| IpcError::DeliveryFailed("Delegation not found".into()))?;
+
+        // Authorization: only the assignee may report completion. Knowing the
+        // (unguessable) task id is not enough — an agent that learns an id it
+        // wasn't assigned must not be able to flip the task's state.
+        if caller != task.to {
+            return Err(IpcError::PermissionDenied(format!(
+                "agent {} is not the assignee of delegation {}",
+                caller, task_id
+            )));
+        }
+
         task.status = DelegationStatus::Completed;
 
         // Propagate completion up the chain
@@ -329,8 +350,19 @@ impl AgentIpc for IpcManager {
         Ok(())
     }
 
-    fn get_delegation_status(&self, task_id: uuid::Uuid) -> Option<DelegationStatus> {
-        self.delegations.get(&task_id).map(|t| t.status.clone())
+    fn get_delegation_status(
+        &self,
+        caller: AgentId,
+        task_id: uuid::Uuid,
+    ) -> Option<DelegationStatus> {
+        let task = self.delegations.get(&task_id)?;
+        // Only the delegator or the assignee may observe the status. Anyone
+        // else is told `None` — the same answer as a non-existent task, so a
+        // probe can't even confirm the delegation exists.
+        if caller != task.from && caller != task.to {
+            return None;
+        }
+        Some(task.status.clone())
     }
 }
 
@@ -398,14 +430,57 @@ mod tests {
         ipc.register_agent(b);
 
         let task_id = ipc.delegate(a, b, "do something".into()).await.unwrap();
+        // Both parties can read the status.
         assert_eq!(
-            ipc.get_delegation_status(task_id),
+            ipc.get_delegation_status(a, task_id),
+            Some(DelegationStatus::Pending)
+        );
+        assert_eq!(
+            ipc.get_delegation_status(b, task_id),
             Some(DelegationStatus::Pending)
         );
 
-        ipc.complete_delegation(task_id).unwrap();
+        // The assignee completes it.
+        ipc.complete_delegation(b, task_id).unwrap();
         assert_eq!(
-            ipc.get_delegation_status(task_id),
+            ipc.get_delegation_status(a, task_id),
+            Some(DelegationStatus::Completed)
+        );
+    }
+
+    #[tokio::test]
+    async fn delegation_authz_blocks_non_parties() {
+        let ipc = IpcManager::new();
+        let from = uuid::Uuid::new_v4();
+        let to = uuid::Uuid::new_v4();
+        let outsider = uuid::Uuid::new_v4();
+        ipc.register_agent(from);
+        ipc.register_agent(to);
+        ipc.register_agent(outsider);
+
+        let task_id = ipc.delegate(from, to, "work".into()).await.unwrap();
+
+        // Outsider cannot even observe the task (None == "doesn't exist").
+        assert_eq!(ipc.get_delegation_status(outsider, task_id), None);
+        // Outsider cannot complete it (knowing the id is not authorization).
+        assert!(matches!(
+            ipc.complete_delegation(outsider, task_id),
+            Err(IpcError::PermissionDenied(_))
+        ));
+        // The delegator is a party but is NOT the assignee → cannot complete.
+        assert!(matches!(
+            ipc.complete_delegation(from, task_id),
+            Err(IpcError::PermissionDenied(_))
+        ));
+        // Still Pending after the rejected attempts.
+        assert_eq!(
+            ipc.get_delegation_status(to, task_id),
+            Some(DelegationStatus::Pending)
+        );
+        // The assignee can complete.
+        ipc.complete_delegation(to, task_id).unwrap();
+        assert_eq!(
+            ipc.get_delegation_status(to, task_id),
             Some(DelegationStatus::Completed)
         );
     }

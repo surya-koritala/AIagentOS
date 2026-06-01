@@ -90,7 +90,7 @@ When adding a new tool, **classify it in `syscall_gate::classify_tool`** so it i
 | `cfs`, `scheduler` | CFS-style fair scheduling with vruntime/nice |
 | `context`, `context_paging` | Virtual memory: token budgets, LRU eviction, OOM kills lowest-priority agent |
 | `tools`, `tool_descriptors`, `mount_table`, `custom_tools` | VFS: tools are files, descriptors mount at paths |
-| `agent_sockets`, `pipes`, `ipc` | Networking + Unix sockets; agent discovery is via the agent directory (`discover_agents`), not a separate registry |
+| `ipc` | Inter-agent messaging + delegation, broker-routed; agent discovery is via the agent directory (`discover_agents`). (Raw socket/pipe primitives were unwired scaffold and removed — `IpcManager` is the live path.) |
 | `mac`, `permissions`, `namespaces`, `sandbox`, `cgroups` | Security: SELinux-style MAC, capabilities, isolation |
 | `init_system`, `agentctl`, `agentps` | systemd-style service files + dependency ordering |
 | `syscall_interface` | Numbered syscalls with errno + capability checks |

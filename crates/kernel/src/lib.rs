@@ -3,7 +3,6 @@
 //! Core types, error hierarchy, and module declarations for the Agent Kernel.
 
 pub mod agent;
-pub mod agent_sockets;
 pub mod agent_struct;
 pub mod agent_syscalls;
 pub mod agentctl;
@@ -40,7 +39,6 @@ pub mod namespaces;
 pub mod observability;
 pub mod package;
 pub mod permissions;
-pub mod pipes;
 pub mod planning;
 pub mod prerequisites;
 pub mod procfs;

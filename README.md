@@ -42,7 +42,7 @@ AI Agent OS provides:
 - **Memory management** — context paging, token budgets, OOM killer
 - **Isolation** — namespaces, cgroups, sandboxes (agents can't see each other)
 - **Security** — MAC policies, capabilities, audit logging
-- **IPC** — sockets, pipes, pub/sub, service discovery
+- **IPC** — inter-agent messaging, delegation, and discovery (broker-routed via `IpcManager`)
 - **Init system** — service files, dependency ordering, auto-restart
 - **Package manager** — install, version, and distribute agent packages
 
@@ -72,7 +72,7 @@ cargo run --package agent-cli
 | **Scheduling** | `cfs`, `scheduler` |
 | **Memory** | `context`, `context_paging` |
 | **Tool System (VFS)** | `tools`, `tool_descriptors`, `mount_table`, `custom_tools` |
-| **Networking** | `agent_sockets`, `pipes`, `ipc` |
+| **Networking** | `ipc` |
 | **Security** | `mac`, `permissions`, `namespaces`, `sandbox` |
 | **Resource Control** | `cgroups`, `rate_limit`, `production` |
 | **Init & Services** | `init_system`, `agentctl`, `agentps` |
@@ -95,7 +95,7 @@ We mark each subsystem honestly: **Live** = enforced on the runtime path, **Defi
 | cgroups | Token / agent-count quotas — `EAGAIN` returned over-budget | **Live** |
 | `task_struct` | `AgentStruct` (Uuid + u64 PID via gate translation) | **Live** |
 | Signals (SIGKILL, SIGSTOP) | Agent signals stored in agent struct | **Live** |
-| Unix sockets + pipes | Agent sockets + pipes (IPC) | **Live** |
+| Unix sockets / IPC | Inter-agent messaging + delegation + discovery via `IpcManager` (broker-routed tools) | **Live** |
 | systemd | Init system (service files, deps, supervisor restart) | **Live** |
 | syscall interface | 25 numbered syscalls + `SecureSyscallDispatch` | Defined — gate covers tool-call path |
 | `fork()/clone()` | `agent_clone(flags)` | Defined |

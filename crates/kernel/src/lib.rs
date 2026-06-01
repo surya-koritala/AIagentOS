@@ -1045,6 +1045,28 @@ impl AgentKernelImpl {
         self.create_agent_grouped(config, Some(group)).await
     }
 
+    /// Register a tool that is visible **only** to agents in `group`'s
+    /// namespace. The binding is added to the shared tool registry (so it
+    /// resolves and executes like any other tool) *and* tagged in the syscall
+    /// gate with the group's Tool namespace, so the gate's namespace-visibility
+    /// check (step 0 of `check_tool_call`) denies any caller outside the group
+    /// with `NotInNamespace` — including ungrouped agents.
+    ///
+    /// Grouped agents already join their group's Tool namespace at creation
+    /// (`create_agent_grouped`), so a same-group agent passes; agents in another
+    /// group or in the default namespace do not. This is what makes the gate's
+    /// tool-namespace isolation load-bearing (previously no tool was ever
+    /// tagged, so every tool was global).
+    pub fn register_group_tool(&self, group: &str, binding: crate::tools::ToolBinding) {
+        let name = binding.name.clone();
+        self.tool_registry.register(binding);
+        // Lazily ensures the group's namespaces exist; tag with the Tool ns.
+        let (_agent_ns, tool_ns) = self.namespaces_for_group(Some(group));
+        if let Some(ns) = tool_ns {
+            self.syscall_gate.register_tool_namespace(name, ns);
+        }
+    }
+
     /// Resolve the (Agent, Tool) namespaces for a group, creating them lazily.
     /// `None` → the registry's shared defaults.
     fn namespaces_for_group(

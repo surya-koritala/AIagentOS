@@ -1242,3 +1242,92 @@ async fn live_path_namespace_isolation_between_groups() {
         "alice must NOT discover cross-group eve"
     );
 }
+
+/// Tool namespace-tagging: a tool registered to a group via `register_group_tool`
+/// is visible only to that group's agents. The gate's namespace-visibility check
+/// (step 0) denies callers outside the group with `NotInNamespace`, while
+/// untagged built-ins stay global. This makes the gate's tool-isolation path
+/// load-bearing on the live path (previously no tool was ever tagged).
+#[tokio::test]
+async fn live_path_group_scoped_tool_isolation() {
+    use kernel::resources::ResourceType;
+    use kernel::tools::ToolBinding;
+    use kernel::AgentKernelImpl;
+
+    let kernel = AgentKernelImpl::new().expect("kernel new");
+
+    // A tool private to team-a.
+    kernel.register_group_tool(
+        "team-a",
+        ToolBinding {
+            name: "team_a_secret".into(),
+            description: "team-a only".into(),
+            parameters_schema: serde_json::json!({"type": "object", "properties": {}}),
+            resource_type: ResourceType::Application,
+            operation: "noop".into(),
+        },
+    );
+
+    let alice = kernel
+        .create_agent_in_namespace(agent_cfg("alice", "standard"), "team-a")
+        .await
+        .unwrap();
+    let eve = kernel
+        .create_agent_in_namespace(agent_cfg("eve", "standard"), "team-b")
+        .await
+        .unwrap();
+    let carol = kernel
+        .create_agent_full(agent_cfg("carol", "standard"))
+        .await
+        .unwrap();
+
+    // Same group → passes the namespace gate (no NotInNamespace).
+    assert!(
+        !matches!(
+            kernel
+                .syscall_gate
+                .check_tool_call(alice.id, "team_a_secret", "x", 5)
+                .await,
+            Err(GateDenial::NotInNamespace { .. })
+        ),
+        "team-a agent must see the team-a tool"
+    );
+
+    // Different group → denied as not visible.
+    assert!(
+        matches!(
+            kernel
+                .syscall_gate
+                .check_tool_call(eve.id, "team_a_secret", "x", 5)
+                .await,
+            Err(GateDenial::NotInNamespace { .. })
+        ),
+        "team-b agent must NOT see the team-a tool"
+    );
+
+    // Ungrouped agent (default namespace) → also denied.
+    assert!(
+        matches!(
+            kernel
+                .syscall_gate
+                .check_tool_call(carol.id, "team_a_secret", "x", 5)
+                .await,
+            Err(GateDenial::NotInNamespace { .. })
+        ),
+        "ungrouped agent must NOT see the team-a tool"
+    );
+
+    // An untagged built-in stays global — every agent can call it.
+    for who in [alice.id, eve.id, carol.id] {
+        assert!(
+            !matches!(
+                kernel
+                    .syscall_gate
+                    .check_tool_call(who, "read_file", "/etc/hosts", 5)
+                    .await,
+                Err(GateDenial::NotInNamespace { .. })
+            ),
+            "untagged built-in must remain globally visible"
+        );
+    }
+}

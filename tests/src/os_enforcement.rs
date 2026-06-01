@@ -1055,6 +1055,107 @@ async fn live_path_delegation_lifecycle_via_ipc_tools() {
     assert_eq!(st2.data["status"], "completed");
 }
 
+/// Delegation authorization (hardening): knowing a task_id is not enough.
+/// Through the tool path, an agent that is not a party to a delegation can
+/// neither read its status (sees "unknown") nor complete it (denied), even
+/// though it shares the default namespace with the parties. Only the assignee
+/// may complete.
+#[tokio::test]
+async fn live_path_delegation_authz_rejects_non_parties() {
+    use kernel::connector::ToolCall;
+    use kernel::resources::ResourceBroker;
+    use kernel::AgentKernelImpl;
+
+    let kernel = AgentKernelImpl::new().expect("kernel new");
+    let a = kernel
+        .create_agent_full(agent_cfg("a", "standard"))
+        .await
+        .unwrap();
+    let b = kernel
+        .create_agent_full(agent_cfg("b", "standard"))
+        .await
+        .unwrap();
+    let c = kernel
+        .create_agent_full(agent_cfg("c", "standard"))
+        .await
+        .unwrap();
+
+    async fn run(
+        kernel: &AgentKernelImpl,
+        agent: uuid::Uuid,
+        name: &str,
+        args: serde_json::Value,
+    ) -> kernel::resources::ResourceResponse {
+        let req = kernel
+            .tool_registry
+            .resolve(
+                agent,
+                &ToolCall {
+                    id: "t".into(),
+                    name: name.into(),
+                    arguments: args,
+                },
+            )
+            .unwrap();
+        kernel.resource_broker.execute(req).await.unwrap()
+    }
+
+    // a → b delegation.
+    let task_id = run(
+        &kernel,
+        a.id,
+        "delegate_task",
+        serde_json::json!({"to": b.id.to_string(), "task": "do it"}),
+    )
+    .await
+    .data["task_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Outsider c cannot read the status (non-party → "unknown", no leak).
+    let st = run(
+        &kernel,
+        c.id,
+        "delegation_status",
+        serde_json::json!({"task_id": task_id}),
+    )
+    .await;
+    assert_eq!(st.data["status"], "unknown");
+
+    // Outsider c cannot complete it (knowing the id is not authorization).
+    let bad = run(
+        &kernel,
+        c.id,
+        "complete_delegation",
+        serde_json::json!({"task_id": task_id}),
+    )
+    .await;
+    assert!(!bad.success, "non-party must not complete a delegation");
+
+    // The delegator a is a party but not the assignee → still cannot complete.
+    let bad2 = run(
+        &kernel,
+        a.id,
+        "complete_delegation",
+        serde_json::json!({"task_id": task_id}),
+    )
+    .await;
+    assert!(!bad2.success, "delegator (non-assignee) must not complete");
+
+    // The assignee b can complete.
+    assert!(
+        run(
+            &kernel,
+            b.id,
+            "complete_delegation",
+            serde_json::json!({"task_id": task_id})
+        )
+        .await
+        .success
+    );
+}
+
 /// #33: discover_agents returns the live directory, and send_agent_message
 /// resolves a peer by NAME (not just UUID) and delivers.
 #[tokio::test]

@@ -111,21 +111,21 @@ proptest! {
             ipc.register_agent(b);
             ipc.register_agent(c);
 
-            // a delegates to b
+            // a delegates to b (a and b are the parties to task1)
             let task1 = ipc.delegate(a, b, desc.clone()).await.unwrap();
-            prop_assert_eq!(ipc.get_delegation_status(task1), Some(DelegationStatus::Pending));
+            prop_assert_eq!(ipc.get_delegation_status(a, task1), Some(DelegationStatus::Pending));
 
-            // b delegates to c (sub-delegation)
+            // b delegates to c (sub-delegation; b and c are the parties to task2)
             let task2 = ipc.delegate(b, c, format!("sub: {}", desc)).await.unwrap();
-            prop_assert_eq!(ipc.get_delegation_status(task2), Some(DelegationStatus::Pending));
+            prop_assert_eq!(ipc.get_delegation_status(b, task2), Some(DelegationStatus::Pending));
 
-            // c completes its task
-            ipc.complete_delegation(task2).unwrap();
-            prop_assert_eq!(ipc.get_delegation_status(task2), Some(DelegationStatus::Completed));
+            // c (the assignee) completes its task
+            ipc.complete_delegation(c, task2).unwrap();
+            prop_assert_eq!(ipc.get_delegation_status(c, task2), Some(DelegationStatus::Completed));
 
-            // b completes its task (after sub-task done)
-            ipc.complete_delegation(task1).unwrap();
-            prop_assert_eq!(ipc.get_delegation_status(task1), Some(DelegationStatus::Completed));
+            // b (the assignee of task1) completes its task (after sub-task done)
+            ipc.complete_delegation(b, task1).unwrap();
+            prop_assert_eq!(ipc.get_delegation_status(a, task1), Some(DelegationStatus::Completed));
 
             Ok(())
         })?;

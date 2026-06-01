@@ -620,8 +620,12 @@ impl ResourceProvider for IpcResourceProvider {
                 Ok(serde_json::json!({"task_id": task_id.to_string()}))
             }
             "delegation_status" => {
+                // `from` is the calling agent (injected at tool resolution).
+                // Non-parties see "unknown" — the gate already returns None for
+                // them, so there is no existence leak.
+                let caller = parse_uuid("from")?;
                 let task_id = parse_uuid("task_id")?;
-                let status = match self.ipc.get_delegation_status(task_id) {
+                let status = match self.ipc.get_delegation_status(caller, task_id) {
                     Some(crate::ipc::DelegationStatus::Pending) => "pending",
                     Some(crate::ipc::DelegationStatus::InProgress) => "in_progress",
                     Some(crate::ipc::DelegationStatus::Completed) => "completed",
@@ -631,9 +635,10 @@ impl ResourceProvider for IpcResourceProvider {
                 Ok(serde_json::json!({"status": status}))
             }
             "complete_delegation" => {
+                let caller = parse_uuid("from")?;
                 let task_id = parse_uuid("task_id")?;
                 self.ipc
-                    .complete_delegation(task_id)
+                    .complete_delegation(caller, task_id)
                     .map_err(|e| ResourceError::OperationFailed(e.to_string()))?;
                 Ok(serde_json::json!({"completed": true}))
             }

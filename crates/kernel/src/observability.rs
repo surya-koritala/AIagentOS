@@ -285,6 +285,34 @@ impl ObservabilityEngine for ObservabilityEngineImpl {
     }
 }
 
+/// Let the syscall gate write MAC `audit` decisions (and denials) into the
+/// agent activity log. The action type is `mac_audit` (allowed) or `mac_deny`,
+/// so audit queries can filter for security events via [`LogFilter`].
+impl crate::syscall_gate::AuditSink for ObservabilityEngineImpl {
+    fn audit(&self, event: crate::syscall_gate::AuditEvent) {
+        use crate::syscall_gate::AuditDecision;
+        let (action_type, verb) = match event.decision {
+            AuditDecision::Allowed => ("mac_audit", "allowed"),
+            AuditDecision::Denied => ("mac_deny", "denied"),
+        };
+        self.log_action(
+            event.agent,
+            AgentAction {
+                id: uuid::Uuid::new_v4(),
+                action_type: action_type.into(),
+                description: format!(
+                    "MAC {} {} ({}) on {} [pid {}]",
+                    verb, event.tool, event.action, event.resource, event.pid
+                ),
+                resources_accessed: vec![event.resource],
+                reasoning: None,
+                plan_context: None,
+                timestamp: Utc::now(),
+            },
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

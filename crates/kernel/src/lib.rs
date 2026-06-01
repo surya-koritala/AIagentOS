@@ -959,6 +959,10 @@ impl AgentKernelImpl {
             mac_enforcing,
             mac_rules.to_vec(),
         ));
+        // Wire observability in as the gate's audit sink so MAC `audit`
+        // decisions (and denials) are recorded in the agent activity log.
+        let observability = Arc::new(ObservabilityEngineImpl::new());
+        syscall_gate.set_audit_sink(observability.clone());
         let os = Arc::new(OsSubsystems::new());
 
         let ipc = Arc::new(IpcManager::new());
@@ -992,7 +996,7 @@ impl AgentKernelImpl {
             permission_manager,
             sandbox_manager: Arc::new(SandboxManagerImpl::new()),
             ipc,
-            observability: Arc::new(ObservabilityEngineImpl::new()),
+            observability,
             connector: Arc::new(AgentConnectorImpl::new()),
             resource_broker,
             tool_registry,

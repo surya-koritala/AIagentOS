@@ -56,6 +56,9 @@ pub struct AgentExecutor {
     rule_store: Option<Arc<crate::learning::RuleStore>>,
     syscall_gate: Option<Arc<crate::syscall_gate::SyscallGate>>,
     budget_enforcer: Option<Arc<crate::budget::BudgetEnforcer>>,
+    /// Max active-context tokens; older non-system messages are paged out (via
+    /// the context pager) when exceeded. 0 = disabled (no token bound).
+    context_budget_tokens: u32,
     messages: Vec<StandardMessage>,
     cancel_token: CancellationToken,
     event_tx: Option<mpsc::Sender<StreamEvent>>,
@@ -82,6 +85,7 @@ impl AgentExecutor {
             rule_store: None,
             syscall_gate: None,
             budget_enforcer: None,
+            context_budget_tokens: 0,
             messages: vec![StandardMessage::system(&system_prompt)],
             cancel_token: CancellationToken::new(),
             event_tx: None,
@@ -102,6 +106,47 @@ impl AgentExecutor {
     /// response against the agent's provider. Without one, no cost is tracked.
     pub fn set_budget_enforcer(&mut self, enforcer: Arc<crate::budget::BudgetEnforcer>) {
         self.budget_enforcer = Some(enforcer);
+    }
+
+    /// Set the active-context token budget. When > 0, the loop pages out the
+    /// oldest non-system messages before each LLM call so the working set stays
+    /// within the budget (the context-paging / virtual-memory analogue). 0
+    /// disables it (unbounded — prior behavior).
+    pub fn set_context_budget(&mut self, max_tokens: u32) {
+        self.context_budget_tokens = max_tokens;
+    }
+
+    /// Bound the active context window to `context_budget_tokens` using the
+    /// context pager (token budget + LRU page-out). The system prompt (index 0)
+    /// is always retained; older non-system messages are evicted oldest-first
+    /// when over budget. Orphaned tool results left behind are stripped by
+    /// `clean_messages` before the request is sent. No-op when the budget is 0
+    /// or only the system prompt is present.
+    fn compact_to_token_budget(&mut self) {
+        let budget = self.context_budget_tokens;
+        if budget == 0 || self.messages.len() <= 1 {
+            return;
+        }
+        let mut pager = crate::context_paging::ContextPager::new(budget);
+        // Feed non-system messages oldest→newest; the pager evicts the LRU
+        // (oldest) when over budget, leaving the most recent that fit active.
+        let page_ids: Vec<u64> = self.messages[1..]
+            .iter()
+            .map(|m| pager.add_page(0, m.content.clone()))
+            .collect();
+        let active: std::collections::HashSet<u64> =
+            pager.active_pages().iter().map(|p| p.id).collect();
+        if active.len() == page_ids.len() {
+            return; // nothing evicted
+        }
+        let mut kept = Vec::with_capacity(active.len() + 1);
+        kept.push(self.messages[0].clone()); // system prompt, always retained
+        for (msg, id) in self.messages[1..].iter().zip(page_ids.iter()) {
+            if active.contains(id) {
+                kept.push(msg.clone());
+            }
+        }
+        self.messages = kept;
     }
 
     /// Resume from a saved conversation.
@@ -220,6 +265,10 @@ impl AgentExecutor {
                     tokens_used: total_tokens,
                 });
             }
+
+            // Page out old context to keep the active window within the token
+            // budget before each LLM call (no-op when the budget is 0).
+            self.compact_to_token_budget();
 
             // Budget: refuse a further LLM call once the cumulative USD ceiling
             // is reached. This is a hard stop — distinct from the cgroup quota,
@@ -642,6 +691,52 @@ mod tests {
     // InfiniteToolSession would otherwise run all MAX_ITERATIONS rounds; with a
     // budget priced so one response exhausts the ceiling, the loop refuses the
     // *next* LLM call and returns a budget message instead.
+    // #4: the context pager bounds the active window by token budget — older
+    // non-system messages are paged out, the system prompt is always retained.
+    #[tokio::test]
+    async fn context_pager_bounds_active_window_by_tokens() {
+        let mut executor = AgentExecutor::new(
+            uuid::Uuid::new_v4(),
+            Box::new(InfiniteToolSession { id: "x".into() }),
+            mock_broker(),
+            Arc::new(ToolRegistry::new()),
+            mock_context_manager(),
+            "SYSTEM PROMPT".into(),
+        );
+        executor.set_context_budget(20); // tiny window (~80 chars active)
+
+        // 10 user messages of ~40 chars each (~11 tokens apiece).
+        for _ in 0..10 {
+            executor
+                .messages
+                .push(StandardMessage::user(&"x".repeat(40)));
+        }
+        let before = executor.messages.len();
+        executor.compact_to_token_budget();
+        let after = executor.messages.len();
+
+        assert!(
+            after < before,
+            "should page out old messages (was {before})"
+        );
+        // System prompt is always kept at index 0.
+        assert_eq!(executor.messages[0].role, "system");
+        assert_eq!(executor.messages[0].content, "SYSTEM PROMPT");
+        // Each kept message ~11 tokens, budget 20 → only a couple fit.
+        assert!(after <= 3, "active window should be small, got {after}");
+
+        // Disabling the budget is a no-op even with a large history.
+        executor.set_context_budget(0);
+        for _ in 0..5 {
+            executor
+                .messages
+                .push(StandardMessage::user(&"y".repeat(40)));
+        }
+        let n = executor.messages.len();
+        executor.compact_to_token_budget();
+        assert_eq!(executor.messages.len(), n, "budget 0 must not trim");
+    }
+
     #[tokio::test]
     async fn execution_loop_stops_at_budget_ceiling() {
         use crate::budget::BudgetEnforcer;

@@ -72,9 +72,12 @@ impl ContextPager {
         let page_id = NEXT_PAGE_ID.fetch_add(1, Ordering::SeqCst);
         let now = Utc::now();
 
-        // Evict if needed
-        while self.active_tokens + token_count > self.max_active_tokens && !self.active.is_empty() {
-            self.evict_lru();
+        // Evict if needed. Stop if there's nothing evictable (e.g. only pinned
+        // pages remain) so an oversized/pinned working set can't spin forever.
+        while self.active_tokens + token_count > self.max_active_tokens {
+            if !self.evict_lru() {
+                break;
+            }
         }
 
         let page = ContextPage {
@@ -98,8 +101,9 @@ impl ContextPager {
         page_id
     }
 
-    /// Evict the least recently used non-pinned page.
-    fn evict_lru(&mut self) {
+    /// Evict the least recently used non-pinned page. Returns `true` if a page
+    /// was evicted, `false` if there is nothing evictable (no non-pinned page).
+    fn evict_lru(&mut self) -> bool {
         // Find oldest non-pinned page
         let idx = self.active.iter().position(|p| !p.pinned);
         if let Some(idx) = idx {
@@ -110,6 +114,9 @@ impl ContextPager {
                 entry.location = PageLocation::Swapped;
             }
             self.swapped.push(page);
+            true
+        } else {
+            false
         }
     }
 
@@ -119,11 +126,11 @@ impl ContextPager {
         let mut page = self.swapped.remove(idx);
         page.last_accessed = Utc::now();
 
-        // Evict if needed to make room
-        while self.active_tokens + page.token_count > self.max_active_tokens
-            && !self.active.is_empty()
-        {
-            self.evict_lru();
+        // Evict if needed to make room; stop if nothing is evictable.
+        while self.active_tokens + page.token_count > self.max_active_tokens {
+            if !self.evict_lru() {
+                break;
+            }
         }
 
         self.active_tokens += page.token_count;
@@ -202,6 +209,19 @@ mod tests {
         pager.add_page(1, "third page also tries".into());
         // Pinned page should still be active
         assert!(pager.active_pages().iter().any(|p| p.id == id1));
+    }
+
+    #[test]
+    fn all_pinned_over_budget_does_not_hang() {
+        // Regression: if every active page is pinned and we're over budget,
+        // add_page must not spin forever trying to evict.
+        let mut pager = ContextPager::new(10);
+        let id1 = pager.add_page(1, "x".repeat(80)); // ~21 tokens, over budget
+        pager.pin(id1);
+        // Adding another page can't evict the pinned one — must return promptly.
+        pager.add_page(1, "y".repeat(80));
+        assert!(pager.active_pages().iter().any(|p| p.id == id1));
+        assert!(pager.total_pages() >= 1);
     }
 
     #[test]

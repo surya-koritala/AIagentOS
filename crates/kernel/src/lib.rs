@@ -870,6 +870,9 @@ pub struct AgentKernelImpl {
     /// bounds per-minute tokens, not lifetime cost). Inert unless config sets a
     /// price + ceiling. Installed on each executor in `send_message`.
     pub budget_enforcer: Arc<crate::budget::BudgetEnforcer>,
+    /// Active-context token budget applied to each executor (from
+    /// `budgets.max_context_tokens`; 0 = unbounded). Drives context paging.
+    context_budget_tokens: u32,
     pub os: Arc<OsSubsystems>,
     /// One cgroup per permission profile, created at boot with budget-derived
     /// limits. Agents are placed into their profile's cgroup at creation so
@@ -1013,6 +1016,7 @@ impl AgentKernelImpl {
             cgroups,
             syscall_gate,
             budget_enforcer,
+            context_budget_tokens: budgets.max_context_tokens.min(u32::MAX as u64) as u32,
             os,
             profile_cgroups,
             group_namespaces: DashMap::new(),
@@ -1232,6 +1236,7 @@ impl AgentKernelImpl {
             );
             executor.set_syscall_gate(self.syscall_gate.clone());
             executor.set_budget_enforcer(self.budget_enforcer.clone());
+            executor.set_context_budget(self.context_budget_tokens);
 
             self.executors
                 .insert(agent_id, tokio::sync::Mutex::new(executor));

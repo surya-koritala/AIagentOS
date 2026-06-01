@@ -55,7 +55,7 @@ Goal: every tool call goes through the syscall layer; quotas reject; CI is green
 
 Goal: `AgentKernelImpl` owns the OS surface; `OsKernel` is no longer the source of truth.
 
-- [x] Move `cfs`, `namespaces`, `init_system`, `procfs`, `sysctl`, `service_discovery` into `AgentKernelImpl` via the new `OsSubsystems` field. (`mac` lives inside `SyscallGate`; `cgroups` already moved in Phase 1.)
+- [x] Move `cfs`, `namespaces`, `init_system`, `procfs`, `sysctl` into `AgentKernelImpl` via the new `OsSubsystems` field. (`mac` lives inside `SyscallGate`; `cgroups` already moved in Phase 1. The socket-style `service_discovery::ServiceRegistry` was later removed — agent discovery ships through the agent directory via the `discover_agents` tool, so the registry was dead weight.)
 - [x] `create_agent_full` now wires every new agent into the default Agent + Tool namespaces, the CFS scheduler, and procfs through the gate's PID translation.
 - [x] `tests/src/os_enforcement.rs::unified_kernel_places_agent_in_os_subsystems` proves the wiring is real.
 - [x] `OsKernel` documented as superseded; retained only for the raw-PID stress benchmark.

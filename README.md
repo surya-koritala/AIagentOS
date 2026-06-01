@@ -72,7 +72,7 @@ cargo run --package agent-cli
 | **Scheduling** | `cfs`, `scheduler` |
 | **Memory** | `context`, `context_paging` |
 | **Tool System (VFS)** | `tools`, `tool_descriptors`, `mount_table`, `custom_tools` |
-| **Networking** | `agent_sockets`, `pipes`, `ipc`, `service_discovery` |
+| **Networking** | `agent_sockets`, `pipes`, `ipc` |
 | **Security** | `mac`, `permissions`, `namespaces`, `sandbox` |
 | **Resource Control** | `cgroups`, `rate_limit`, `production` |
 | **Init & Services** | `init_system`, `agentctl`, `agentps` |
@@ -80,7 +80,7 @@ cargo run --package agent-cli
 | **Syscall Layer** | `syscall_interface` |
 | **Execution** | `execution`, `planning`, `editing`, `delegation` |
 | **Integrations** | `connector`, `mcp`, `github`, `database` |
-| **Platform** | `config`, `sysctl`, `package`, `marketplace`, `auth`, `workspaces` |
+| **Platform** | `config`, `sysctl`, `package`, `marketplace`, `auth` |
 | **Intelligence** | `learning`, `indexer`, `vision` |
 | **Infrastructure** | `docker_sandbox`, `modules`, `prerequisites`, `shell`, `agentpkg` |
 

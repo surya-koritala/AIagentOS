@@ -6,7 +6,7 @@ Today, ~33% of the Linux-mapped subsystems are load-bearing on the live runtime 
 
 | Layer | Status today | Becomes load-bearing in |
 |---|---|---|
-| IPC (sockets, pipes, pub/sub) | Real and used | — |
+| IPC (agent messaging + delegation + discovery) | Real and used | — |
 | Init system (boot order + supervisor) | Real and used | — |
 | Signals + agent state machine | Real, partial | Phase 1 |
 | Context storage (SQLite) | Real and used | — |

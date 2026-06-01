@@ -755,6 +755,79 @@ async fn live_path_mac_denies_by_path_glob() {
         .is_ok());
 }
 
+/// #17: a MAC `audit` decision is "allow but log". Through the live gate, an
+/// audited tool call proceeds (not denied) AND lands in the observability
+/// activity log as a `mac_audit` action, because the kernel wires its
+/// observability engine in as the gate's audit sink. A denial is recorded too
+/// (`mac_deny`), so the audit trail covers both outcomes.
+#[tokio::test]
+async fn live_path_audit_decision_lands_in_activity_log() {
+    use kernel::mac::PolicyRule;
+    use kernel::observability::ObservabilityEngine;
+    use kernel::AgentKernelImpl;
+
+    let kernel = AgentKernelImpl::new().expect("kernel new");
+    {
+        let mut mac = kernel.syscall_gate.mac.lock().await;
+        mac.set_enforcing(true);
+        mac.load_policy(vec![
+            // Audit (allow + log) every write by a standard-profile agent.
+            PolicyRule {
+                subject: "profile:standard".into(),
+                action: "write".into(),
+                object: "*".into(),
+                decision: "audit".into(),
+            },
+            // Deny network.
+            PolicyRule {
+                subject: "profile:standard".into(),
+                action: "net".into(),
+                object: "*".into(),
+                decision: "deny".into(),
+            },
+            PolicyRule {
+                subject: "*".into(),
+                action: "*".into(),
+                object: "*".into(),
+                decision: "allow".into(),
+            },
+        ]);
+    }
+
+    let agent = kernel
+        .create_agent_full(agent_cfg("a", "standard"))
+        .await
+        .unwrap();
+
+    // Audited write is allowed (not a denial).
+    assert!(kernel
+        .syscall_gate
+        .check_tool_call(agent.id, "write_file", "/tmp/out", 5)
+        .await
+        .is_ok());
+    assert_eq!(kernel.syscall_gate.stats().audited, 1);
+
+    // Denied network call.
+    assert!(matches!(
+        kernel
+            .syscall_gate
+            .check_tool_call(agent.id, "http_get", "https://x", 5)
+            .await,
+        Err(GateDenial::MacDeny { .. })
+    ));
+
+    // Both events are now in the agent's activity log.
+    let log = kernel.observability.get_activity_log(agent.id, None);
+    assert!(
+        log.iter().any(|a| a.action_type == "mac_audit"),
+        "audited write should be logged as mac_audit; log = {log:?}"
+    );
+    assert!(
+        log.iter().any(|a| a.action_type == "mac_deny"),
+        "denied net call should be logged as mac_deny; log = {log:?}"
+    );
+}
+
 /// #18: `from_config` wires `mac_enforcing` + `mac_rules` into the gate, so MAC
 /// is operator-controllable on the shipped binary (not just in tests).
 #[tokio::test]

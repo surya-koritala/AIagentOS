@@ -152,6 +152,42 @@ pub struct GateStats {
     pub denied_cgroup: u64,
     pub denied_unknown: u64,
     pub denied_namespace: u64,
+    /// Calls allowed by an `audit` MAC rule (allowed *and* logged).
+    pub audited: u64,
+}
+
+/// What the gate decided about an audited tool call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuditDecision {
+    /// A MAC `audit` rule matched: the call was allowed, and this event records it.
+    Allowed,
+    /// The call was denied (security-relevant; recorded for the audit trail).
+    Denied,
+}
+
+/// An access-control audit record, emitted to the configured [`AuditSink`].
+/// Analogous to an SELinux AVC audit message.
+#[derive(Debug, Clone)]
+pub struct AuditEvent {
+    /// Kernel agent id (subject).
+    pub agent: uuid::Uuid,
+    /// OS PID of the subject.
+    pub pid: Pid,
+    /// Tool the agent invoked.
+    pub tool: String,
+    /// Classified action label (read/write/net/exec/...).
+    pub action: &'static str,
+    /// Resource string the action targeted (path/url/command).
+    pub resource: String,
+    /// Outcome.
+    pub decision: AuditDecision,
+}
+
+/// A sink the gate writes access-control audit events to. The kernel wires its
+/// observability engine in as the sink so MAC `audit` decisions land in the
+/// agent activity log instead of vanishing.
+pub trait AuditSink: Send + Sync {
+    fn audit(&self, event: AuditEvent);
 }
 
 /// The syscall gate.
@@ -167,6 +203,9 @@ pub struct SyscallGate {
     tool_namespaces: DashMap<String, NamespaceId>,
     /// Monotonic PID allocator (starts at 1 so 0 stays reserved for "kernel").
     next_pid: AtomicU64,
+    /// Optional audit sink for MAC `audit` decisions (and denials). Wired to the
+    /// observability engine by the kernel; `None` keeps audit events as counters only.
+    audit_sink: std::sync::Mutex<Option<std::sync::Arc<dyn AuditSink>>>,
     /// Counters.
     allowed: AtomicU64,
     denied_capability: AtomicU64,
@@ -174,6 +213,7 @@ pub struct SyscallGate {
     denied_cgroup: AtomicU64,
     denied_unknown: AtomicU64,
     denied_namespace: AtomicU64,
+    audited: AtomicU64,
 }
 
 impl SyscallGate {
@@ -203,12 +243,28 @@ impl SyscallGate {
             records: DashMap::new(),
             tool_namespaces: DashMap::new(),
             next_pid: AtomicU64::new(1),
+            audit_sink: std::sync::Mutex::new(None),
             allowed: AtomicU64::new(0),
             denied_capability: AtomicU64::new(0),
             denied_mac: AtomicU64::new(0),
             denied_cgroup: AtomicU64::new(0),
             denied_unknown: AtomicU64::new(0),
             denied_namespace: AtomicU64::new(0),
+            audited: AtomicU64::new(0),
+        }
+    }
+
+    /// Install the audit sink. The kernel passes its observability engine so
+    /// MAC `audit` decisions are recorded in the agent activity log.
+    pub fn set_audit_sink(&self, sink: std::sync::Arc<dyn AuditSink>) {
+        *self.audit_sink.lock().unwrap() = Some(sink);
+    }
+
+    /// Emit an audit event to the configured sink, if any.
+    fn emit_audit(&self, event: AuditEvent) {
+        let sink = self.audit_sink.lock().unwrap().clone();
+        if let Some(sink) = sink {
+            sink.audit(event);
         }
     }
 
@@ -328,12 +384,36 @@ impl SyscallGate {
             let mac = self.mac.lock().await;
             mac.check(pid, action.action, resource)
         };
-        if mac_decision == MacDecision::Deny {
-            self.denied_mac.fetch_add(1, Ordering::Relaxed);
-            return Err(GateDenial::MacDeny {
-                action: action.action,
-                resource: resource.to_string(),
-            });
+        match mac_decision {
+            MacDecision::Deny => {
+                self.denied_mac.fetch_add(1, Ordering::Relaxed);
+                self.emit_audit(AuditEvent {
+                    agent: kid,
+                    pid,
+                    tool: tool_name.to_string(),
+                    action: action.action,
+                    resource: resource.to_string(),
+                    decision: AuditDecision::Denied,
+                });
+                return Err(GateDenial::MacDeny {
+                    action: action.action,
+                    resource: resource.to_string(),
+                });
+            }
+            // "Allow but log": let the call proceed, but record it. Without a
+            // sink this is just a counter; with one wired it lands in the audit log.
+            MacDecision::Audit => {
+                self.audited.fetch_add(1, Ordering::Relaxed);
+                self.emit_audit(AuditEvent {
+                    agent: kid,
+                    pid,
+                    tool: tool_name.to_string(),
+                    action: action.action,
+                    resource: resource.to_string(),
+                    decision: AuditDecision::Allowed,
+                });
+            }
+            MacDecision::Allow => {}
         }
 
         // 3. Cgroup quota check.
@@ -379,6 +459,7 @@ impl SyscallGate {
             denied_cgroup: self.denied_cgroup.load(Ordering::Relaxed),
             denied_unknown: self.denied_unknown.load(Ordering::Relaxed),
             denied_namespace: self.denied_namespace.load(Ordering::Relaxed),
+            audited: self.audited.load(Ordering::Relaxed),
         }
     }
 
@@ -544,6 +625,99 @@ mod tests {
         // 5 more is under budget.
         let r = gate.check_tool_call(kid, "read_file", "/x", 5).await;
         assert!(r.is_ok());
+    }
+
+    #[tokio::test]
+    async fn audit_decision_allows_and_emits_event() {
+        use std::sync::Arc;
+        use std::sync::Mutex;
+
+        // A test sink that just collects events.
+        struct RecordingSink(Mutex<Vec<AuditEvent>>);
+        impl AuditSink for RecordingSink {
+            fn audit(&self, event: AuditEvent) {
+                self.0.lock().unwrap().push(event);
+            }
+        }
+
+        let (gate, _) = fresh_gate();
+        let sink = Arc::new(RecordingSink(Mutex::new(Vec::new())));
+        gate.set_audit_sink(sink.clone());
+
+        let kid = uuid::Uuid::new_v4();
+        let pid = gate.register_agent(kid, CapabilitySet::all(), None);
+        {
+            let mut mac = gate.mac.lock().await;
+            mac.set_enforcing(true);
+            mac.label_agent(pid, "watched".into());
+            mac.load_policy(vec![
+                PolicyRule {
+                    subject: "watched".into(),
+                    action: "exec".into(),
+                    object: "*".into(),
+                    decision: "audit".into(),
+                },
+                PolicyRule {
+                    subject: "*".into(),
+                    action: "*".into(),
+                    object: "*".into(),
+                    decision: "allow".into(),
+                },
+            ]);
+        }
+
+        // run_command is an `exec` action → audit rule → allowed *and* logged.
+        let r = gate.check_tool_call(kid, "run_command", "/bin/ls", 5).await;
+        assert!(r.is_ok(), "audit decision must allow the call");
+        assert_eq!(gate.stats().audited, 1);
+        assert_eq!(gate.stats().allowed, 1);
+
+        let events = sink.0.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].decision, AuditDecision::Allowed);
+        assert_eq!(events[0].action, "exec");
+        assert_eq!(events[0].tool, "run_command");
+        assert_eq!(events[0].resource, "/bin/ls");
+        assert_eq!(events[0].agent, kid);
+    }
+
+    #[tokio::test]
+    async fn deny_emits_audit_event() {
+        use std::sync::Arc;
+        use std::sync::Mutex;
+
+        struct RecordingSink(Mutex<Vec<AuditEvent>>);
+        impl AuditSink for RecordingSink {
+            fn audit(&self, event: AuditEvent) {
+                self.0.lock().unwrap().push(event);
+            }
+        }
+
+        let (gate, _) = fresh_gate();
+        let sink = Arc::new(RecordingSink(Mutex::new(Vec::new())));
+        gate.set_audit_sink(sink.clone());
+
+        let kid = uuid::Uuid::new_v4();
+        let pid = gate.register_agent(kid, CapabilitySet::all(), None);
+        {
+            let mut mac = gate.mac.lock().await;
+            mac.set_enforcing(true);
+            mac.label_agent(pid, "blocked".into());
+            mac.load_policy(vec![PolicyRule {
+                subject: "blocked".into(),
+                action: "net".into(),
+                object: "*".into(),
+                decision: "deny".into(),
+            }]);
+        }
+
+        let r = gate
+            .check_tool_call(kid, "http_get", "https://x.example", 5)
+            .await;
+        assert!(matches!(r, Err(GateDenial::MacDeny { .. })));
+        let events = sink.0.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].decision, AuditDecision::Denied);
     }
 
     #[tokio::test]

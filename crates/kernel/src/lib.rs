@@ -810,7 +810,7 @@ use crate::procfs::ProcFs;
 use crate::rate_limit::{RateLimitConfig, RateLimiter};
 use crate::resources::{ResourceBroker, ResourceBrokerImpl};
 use crate::sandbox::{SandboxManager, SandboxManagerImpl};
-use crate::scheduler::{AgentScheduler, PriorityScheduler};
+use crate::scheduler::PriorityScheduler;
 use crate::syscall_gate::SyscallGate;
 use crate::sysctl::Sysctl;
 use crate::tools::ToolRegistry;
@@ -1101,10 +1101,15 @@ impl AgentKernelImpl {
                 .map_err(KernelError::Sandbox)?;
         }
 
-        // 5. Schedule agent
-        AgentScheduler::schedule(&*self.scheduler, &handle)
-            .await
-            .map_err(KernelError::Scheduler)?;
+        // 5. Admit the agent to the scheduler (non-blocking). Creation is
+        //    admission to the *system*, not the CPU — an agent that was just
+        //    created is not executing, so this must not block on the
+        //    concurrent-execution gate. The running slot is taken/released
+        //    around each actual turn in `send_message`; concurrent execution is
+        //    bounded by the rate limiter. (Previously this called the blocking
+        //    `schedule()`, so creating the 11th live agent stalled ~10s then
+        //    failed with `QueueFull` — see #38.)
+        self.scheduler.admit(&handle);
 
         // 6. Register IPC mailbox
         self.ipc.register_agent(agent_id);
@@ -1212,7 +1217,14 @@ impl AgentKernelImpl {
             .get(&agent_id)
             .ok_or(AgentError::NotFound(agent_id))?;
         let mut executor = executor_entry.lock().await;
-        let output = executor.run(message).await?;
+        // Mark the agent as actively executing for the duration of this turn so
+        // `running_agents` reflects real concurrency, then return it to Queued.
+        // Set/clear around `run` (not via `?`) so the slot is freed even when
+        // the turn errors.
+        self.scheduler.set_running(agent_id);
+        let run_result = executor.run(message).await;
+        self.scheduler.set_queued(agent_id);
+        let output = run_result?;
 
         // Record activity and usage
         self.agent_manager.record_activity(agent_id);

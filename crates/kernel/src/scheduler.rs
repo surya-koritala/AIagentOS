@@ -240,6 +240,63 @@ impl PriorityScheduler {
         }
     }
 
+    /// Admit an agent to the scheduler **without** consuming a running slot.
+    ///
+    /// This is admission *to the system*, not *to the CPU*: an agent that was
+    /// just created is not yet executing, so creation must never block on the
+    /// concurrent-execution gate. The agent starts `Queued` and transitions to
+    /// `Running` only for the duration of an actual execution (via
+    /// [`set_running`](Self::set_running) / [`set_queued`](Self::set_queued)).
+    /// Non-blocking and infallible — this is what the kernel's create path uses
+    /// instead of the blocking [`AgentScheduler::schedule`], so bulk-creating
+    /// agents past `MAX_CONCURRENT_AGENTS` no longer stalls on the 10s timeout.
+    pub fn admit(&self, agent: &AgentHandle) {
+        self.agents.insert(
+            agent.id,
+            AgentScheduleInfo {
+                priority: Priority::default(),
+                state: AgentScheduleState::Queued,
+                throttle_delay_ms: 0,
+            },
+        );
+    }
+
+    /// Mark an agent as actively executing, incrementing the running count so
+    /// `running_agents` reflects real concurrency. Idempotent — a second call
+    /// while already `Running` does not double-count. If the agent was never
+    /// admitted, it is inserted as `Running` (defensive).
+    pub fn set_running(&self, agent_id: AgentId) {
+        if let Some(mut info) = self.agents.get_mut(&agent_id) {
+            if info.state != AgentScheduleState::Running {
+                info.state = AgentScheduleState::Running;
+                self.running_count.fetch_add(1, AtomicOrdering::SeqCst);
+            }
+            return;
+        }
+        self.agents.insert(
+            agent_id,
+            AgentScheduleInfo {
+                priority: Priority::default(),
+                state: AgentScheduleState::Running,
+                throttle_delay_ms: 0,
+            },
+        );
+        self.running_count.fetch_add(1, AtomicOrdering::SeqCst);
+    }
+
+    /// Return an agent to `Queued` after its execution finishes, freeing its
+    /// running slot and waking a waiter. Idempotent — a no-op if the agent is
+    /// not currently `Running`.
+    pub fn set_queued(&self, agent_id: AgentId) {
+        if let Some(mut info) = self.agents.get_mut(&agent_id) {
+            if info.state == AgentScheduleState::Running {
+                info.state = AgentScheduleState::Queued;
+                self.running_count.fetch_sub(1, AtomicOrdering::SeqCst);
+                self.slot_available.notify_one();
+            }
+        }
+    }
+
     /// Remove an agent from the scheduler entirely, freeing its admission slot
     /// if it was running. Called when an agent terminates (stop/shutdown) so the
     /// `MAX_CONCURRENT_AGENTS` gate tracks real liveness — without this,
@@ -425,6 +482,30 @@ mod tests {
             sched.get_queue_status().running_agents,
             MAX_CONCURRENT_AGENTS
         );
+    }
+
+    #[tokio::test]
+    async fn admit_does_not_consume_running_slots() {
+        let sched = PriorityScheduler::new();
+        // Admit far more than MAX_CONCURRENT_AGENTS — must not block or cap.
+        let ids: Vec<AgentId> = (0..MAX_CONCURRENT_AGENTS * 3)
+            .map(|_| uuid::Uuid::new_v4())
+            .collect();
+        for id in &ids {
+            sched.admit(&make_handle(*id));
+        }
+        // None are "running" yet — admission is not execution.
+        assert_eq!(sched.get_queue_status().running_agents, 0);
+        assert_eq!(sched.get_queue_status().queued_agents, ids.len());
+
+        // Executing transitions to Running and back, tracking real concurrency.
+        sched.set_running(ids[0]);
+        sched.set_running(ids[1]);
+        sched.set_running(ids[1]); // idempotent — no double count
+        assert_eq!(sched.get_queue_status().running_agents, 2);
+        sched.set_queued(ids[0]);
+        sched.set_queued(ids[0]); // idempotent — no underflow
+        assert_eq!(sched.get_queue_status().running_agents, 1);
     }
 
     #[tokio::test]

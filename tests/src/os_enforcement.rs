@@ -695,6 +695,66 @@ async fn live_path_mac_denies_by_profile_label() {
         .is_ok());
 }
 
+/// #20: MAC rules can target concrete resource paths/URLs by glob (not just
+/// pre-assigned labels). Through the live gate, a `/etc/**` deny rule blocks a
+/// write to a real path the kernel never labelled, while a sibling path is
+/// allowed by the catch-all — proving the object field is matched against the
+/// raw resource string the executor passes in.
+#[tokio::test]
+async fn live_path_mac_denies_by_path_glob() {
+    use kernel::mac::PolicyRule;
+    use kernel::AgentKernelImpl;
+
+    let kernel = AgentKernelImpl::new().expect("kernel new");
+    {
+        let mut mac = kernel.syscall_gate.mac.lock().await;
+        mac.set_enforcing(true);
+        mac.load_policy(vec![
+            PolicyRule {
+                subject: "*".into(),
+                action: "write".into(),
+                object: "/etc/**".into(),
+                decision: "deny".into(),
+            },
+            PolicyRule {
+                subject: "*".into(),
+                action: "*".into(),
+                object: "*".into(),
+                decision: "allow".into(),
+            },
+        ]);
+    }
+
+    let agent = kernel
+        .create_agent_full(agent_cfg("a", "standard"))
+        .await
+        .unwrap();
+
+    // Write under /etc → denied purely by the raw-path glob (no resource label).
+    let denied = kernel
+        .syscall_gate
+        .check_tool_call(agent.id, "write_file", "/etc/ssl/key", 5)
+        .await;
+    assert!(
+        matches!(denied, Err(GateDenial::MacDeny { .. })),
+        "write under /etc should be denied by glob, got {denied:?}"
+    );
+
+    // Write elsewhere → allowed by the catch-all.
+    assert!(kernel
+        .syscall_gate
+        .check_tool_call(agent.id, "write_file", "/home/u/file", 5)
+        .await
+        .is_ok());
+
+    // Reading /etc is fine — the deny rule is scoped to the write action.
+    assert!(kernel
+        .syscall_gate
+        .check_tool_call(agent.id, "read_file", "/etc/passwd", 5)
+        .await
+        .is_ok());
+}
+
 /// #18: `from_config` wires `mac_enforcing` + `mac_rules` into the gate, so MAC
 /// is operator-controllable on the shipped binary (not just in tests).
 #[tokio::test]

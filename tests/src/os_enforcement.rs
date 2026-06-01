@@ -635,6 +635,32 @@ async fn live_path_extended_tools_edit_and_delete_capability() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// #38: creating more agents than `MAX_CONCURRENT_AGENTS` (=10) must not block
+/// or fail. Creation is admission to the system (non-blocking); the
+/// concurrent-execution gate applies per turn, not at creation. Before the fix
+/// the 11th `create_agent_full` queued on the priority scheduler, waited ~10s,
+/// then returned `QueueFull` — so this loop would have errored (and crawled).
+#[tokio::test]
+async fn live_path_bulk_create_does_not_stall_on_scheduler() {
+    use kernel::scheduler::AgentScheduler;
+    use kernel::AgentKernelImpl;
+
+    let kernel = AgentKernelImpl::new().expect("kernel new");
+    for i in 0..25 {
+        let h = kernel
+            .create_agent_full(agent_cfg(&format!("a{i}"), "standard"))
+            .await;
+        assert!(
+            h.is_ok(),
+            "create #{i} should succeed without stalling: {h:?}"
+        );
+    }
+    // All 25 are admitted but none are executing → no running slots consumed.
+    let status = kernel.scheduler.get_queue_status();
+    assert_eq!(status.running_agents, 0);
+    assert_eq!(status.queued_agents, 25);
+}
+
 fn agent_cfg(name: &str, profile: &str) -> kernel::AgentConfig {
     kernel::AgentConfig {
         name: name.into(),

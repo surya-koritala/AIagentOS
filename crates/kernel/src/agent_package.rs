@@ -124,6 +124,25 @@ impl AgentManifest {
         Ok(())
     }
 
+    /// Resolve this manifest's declared `tools` against a shared tool registry,
+    /// returning the matching [`SharedToolDef`]s in declaration order.
+    ///
+    /// This lets a packaged agent reference reusable tool definitions by name:
+    /// the names in `tools` are looked up in the [`SharedToolRegistry`], and any
+    /// that aren't published surface as
+    /// [`crate::tool_registry_share::ShareError::Unresolved`].
+    ///
+    /// [`SharedToolDef`]: crate::tool_registry_share::SharedToolDef
+    /// [`SharedToolRegistry`]: crate::tool_registry_share::SharedToolRegistry
+    pub fn resolve_tools(
+        &self,
+        registry: &crate::tool_registry_share::SharedToolRegistry,
+    ) -> Result<Vec<crate::tool_registry_share::SharedToolDef>, AgentPackageError> {
+        registry
+            .resolve_names(&self.tools)
+            .map_err(|e| AgentPackageError::Invalid(e.to_string()))
+    }
+
     /// Build the kernel [`AgentConfig`] this manifest describes.
     pub fn to_agent_config(&self) -> AgentConfig {
         AgentConfig {
@@ -255,6 +274,33 @@ memory = ["Prefer primary sources.", "Cite everything."]
         ));
         assert!(matches!(
             AgentManifest::from_toml_str("name = \"a\"\ntask = \"t\"\nnice = 50"),
+            Err(AgentPackageError::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn resolve_tools_against_shared_registry() {
+        use crate::tool_registry_share::{SharedToolDef, SharedToolRegistry};
+
+        let mut registry = SharedToolRegistry::new();
+        registry
+            .publish(SharedToolDef::new("read_file", "read a file"))
+            .unwrap();
+        registry
+            .publish(SharedToolDef::new("http_get", "fetch a url"))
+            .unwrap();
+
+        let m = AgentManifest::from_toml_str(SAMPLE).unwrap();
+        let resolved = m.resolve_tools(&registry).unwrap();
+        assert_eq!(resolved.len(), 2);
+        assert_eq!(resolved[0].name, "read_file");
+        assert_eq!(resolved[1].name, "http_get");
+
+        // A manifest declaring an unpublished tool fails to resolve.
+        let bad = AgentManifest::from_toml_str("name = \"x\"\ntask = \"t\"\ntools = [\"ghost\"]\n")
+            .unwrap();
+        assert!(matches!(
+            bad.resolve_tools(&registry),
             Err(AgentPackageError::Invalid(_))
         ));
     }

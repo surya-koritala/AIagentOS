@@ -143,6 +143,48 @@ struct GateRecord {
     namespaces: Vec<NamespaceId>,
 }
 
+/// Read-only snapshot of an agent's enforcement state inside the gate.
+///
+/// Answers "what am I allowed to do?" for an SDK/agent without mutating any
+/// gate state (no counter bumps, no cgroup accounting). Built from the agent's
+/// [`GateRecord`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentGateInfo {
+    /// OS PID (Linux-analogue) the gate assigned to this agent.
+    pub pid: Pid,
+    /// Human-readable names of the capabilities currently granted.
+    pub capabilities: Vec<String>,
+    /// Cgroup the agent is accounted against.
+    pub cgroup: CgroupId,
+    /// Namespaces the agent is a member of (empty means unconfined/global).
+    pub namespaces: Vec<NamespaceId>,
+}
+
+/// All known capability bits paired with their human-readable name. The single
+/// source of truth for [`capability_names`]; kept in sync with the
+/// `CapabilitySet::CAP_*` constants.
+const CAPABILITY_NAMES: &[(u64, &str)] = &[
+    (CapabilitySet::CAP_TOOL_MOUNT, "CAP_TOOL_MOUNT"),
+    (CapabilitySet::CAP_AGENT_CREATE, "CAP_AGENT_CREATE"),
+    (CapabilitySet::CAP_AGENT_KILL, "CAP_AGENT_KILL"),
+    (CapabilitySet::CAP_NET_ACCESS, "CAP_NET_ACCESS"),
+    (CapabilitySet::CAP_FILE_WRITE, "CAP_FILE_WRITE"),
+    (CapabilitySet::CAP_FILE_DELETE, "CAP_FILE_DELETE"),
+    (CapabilitySet::CAP_EXEC, "CAP_EXEC"),
+    (CapabilitySet::CAP_ADMIN, "CAP_ADMIN"),
+    (CapabilitySet::CAP_SYS_RESOURCE, "CAP_SYS_RESOURCE"),
+];
+
+/// Map a capability set to the human-readable names of its granted caps, in a
+/// stable (bit-ascending) order.
+fn capability_names(caps: &CapabilitySet) -> Vec<String> {
+    CAPABILITY_NAMES
+        .iter()
+        .filter(|(bit, _)| caps.has(*bit))
+        .map(|(_, name)| name.to_string())
+        .collect()
+}
+
 /// Counters surfaced for observability and tests.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct GateStats {
@@ -328,6 +370,21 @@ impl SyscallGate {
     /// Look up the OS PID for a kernel UUID (useful for MAC labelling).
     pub fn pid_of(&self, kid: uuid::Uuid) -> Option<Pid> {
         self.records.get(&kid).map(|r| r.pid)
+    }
+
+    /// Read-only introspection: report the agent's enforcement state (PID,
+    /// granted capabilities, cgroup, namespaces) so an SDK/agent can answer
+    /// "what am I allowed to do?". Returns `None` if the agent is unknown.
+    ///
+    /// Side-effect-free: it does not bump any counter, touch the cgroup
+    /// accounting, or consult MAC — it only reads the per-agent record.
+    pub fn agent_info(&self, kid: uuid::Uuid) -> Option<AgentGateInfo> {
+        self.records.get(&kid).map(|rec| AgentGateInfo {
+            pid: rec.pid,
+            capabilities: capability_names(&rec.caps),
+            cgroup: rec.cgroup,
+            namespaces: rec.namespaces.clone(),
+        })
     }
 
     /// Check whether an agent may make this tool call.
@@ -741,5 +798,48 @@ mod tests {
         // If the slot wasn't released the second register would have failed silently
         // and pid_of would return Some — verify by checking we have a PID.
         assert!(gate.pid_of(kid2).is_some());
+    }
+
+    #[test]
+    fn agent_info_reports_capabilities_and_namespaces() {
+        let (gate, _) = fresh_gate();
+        let kid = uuid::Uuid::new_v4();
+
+        // A read-only style agent: network access, but no file write/delete/exec.
+        let caps = CapabilitySet::new(CapabilitySet::CAP_NET_ACCESS);
+        let pid = gate.register_agent(kid, caps, None);
+        gate.set_agent_namespaces(kid, vec![7, 42]);
+
+        let info = gate.agent_info(kid).expect("registered agent has info");
+        assert_eq!(info.pid, pid);
+        assert_eq!(info.capabilities, vec!["CAP_NET_ACCESS".to_string()]);
+        assert_eq!(info.namespaces, vec![7, 42]);
+        assert_eq!(info.cgroup, gate.default_cgroup);
+
+        // Introspection is side-effect-free: counters must be untouched.
+        let stats = gate.stats();
+        assert_eq!(stats.allowed, 0);
+        assert_eq!(stats.denied_capability, 0);
+        assert_eq!(stats.denied_unknown, 0);
+
+        // Unknown agent → None.
+        assert!(gate.agent_info(uuid::Uuid::new_v4()).is_none());
+    }
+
+    #[test]
+    fn agent_info_lists_all_caps_for_full_set() {
+        let (gate, _) = fresh_gate();
+        let kid = uuid::Uuid::new_v4();
+        gate.register_agent(kid, CapabilitySet::all(), None);
+
+        let info = gate.agent_info(kid).unwrap();
+        assert_eq!(info.capabilities.len(), CAPABILITY_NAMES.len());
+        assert!(info.capabilities.contains(&"CAP_FILE_WRITE".to_string()));
+        assert!(info.capabilities.contains(&"CAP_ADMIN".to_string()));
+
+        // No capabilities → empty list.
+        let bare = uuid::Uuid::new_v4();
+        gate.register_agent(bare, CapabilitySet::none(), None);
+        assert!(gate.agent_info(bare).unwrap().capabilities.is_empty());
     }
 }

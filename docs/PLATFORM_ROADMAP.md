@@ -81,7 +81,7 @@ Sizes: **S** ≈ days, **M** ≈ 1–2 weeks, **L** ≈ 3–6 weeks, **XL** ≈ 
 
 | ID | Title | Size | Deps | Notes |
 |----|-------|------|------|-------|
-| **B6.1** | Remote kernel / distributed deployment | L | B0.1 | |
+| **B6.1** | Remote kernel / distributed deployment | L | B0.1 | **Done** (single-node remote = syscall server TCP/Unix+auth; `agent_sdk::cluster::ClusterClient` drives N nodes — `NodeInfo` load syscall, least-loaded/round-robin placement, cross-node aggregation, owner-routed calls; TLS is a follow-up) |
 | **B6.2** | Benchmarks + eval harness: run `stress_test` in CI; add an agent-task benchmark | M | — | **Done** (`agent-bench` bin + Rust eval harness in `benchmarks/`; fast CI smoke test runs under `cargo test --workspace`) |
 | **B6.3** | Docs site + examples | M | — | **Done** (mdBook site under `docs/`: `book.toml` + `SUMMARY.md`; intro/getting-started/concepts pages wrapping the canonical docs) |
 

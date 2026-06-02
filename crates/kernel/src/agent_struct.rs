@@ -482,6 +482,7 @@ mod tests {
         table.insert(a2);
         assert_eq!(table.count(), 2);
         assert!(table.get(id1).is_some());
+        assert!(table.get(id2).is_some());
         table.remove(id1);
         assert_eq!(table.count(), 1);
         assert!(table.get(id1).is_none());

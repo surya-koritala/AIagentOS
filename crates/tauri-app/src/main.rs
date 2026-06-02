@@ -56,13 +56,19 @@ fn register_providers(kernel: &AgentKernelImpl, config: &Config) {
 
 fn main() {
     let config = Config::load();
-    let kernel = AgentKernelImpl::from_config(&config).expect("Failed to initialize kernel");
+    let kernel =
+        Arc::new(AgentKernelImpl::from_config(&config).expect("Failed to initialize kernel"));
 
     register_providers(&kernel, &config);
 
+    // Start the kernel's background tasks (scheduler observer publishing the CFS
+    // pick into procfs + the per-minute cgroup counter reset), matching the CLI
+    // and agent-server. Held for the app's lifetime; dropped at shutdown.
+    let _runtime = kernel.start_runtime();
+
     tauri::Builder::default()
         .manage(AppState {
-            kernel: Arc::new(kernel),
+            kernel: Arc::clone(&kernel),
         })
         .invoke_handler(tauri::generate_handler![
             commands::create_agent,

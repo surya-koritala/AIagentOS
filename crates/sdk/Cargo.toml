@@ -10,9 +10,12 @@ kernel = { path = "../kernel" }
 tokio = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+tokio-rustls = { workspace = true }
+rustls = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
 adapters = { path = "../adapters" }
 wiremock = { workspace = true }
 async-trait = { workspace = true }
+rcgen = { workspace = true }

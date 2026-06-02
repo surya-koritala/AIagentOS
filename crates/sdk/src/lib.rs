@@ -130,6 +130,20 @@ impl KernelClient {
         })
     }
 
+    /// Connect to a running syscall server over TLS. Mirrors [`connect`](Self::connect)
+    /// but performs a rustls handshake first: the server's certificate is verified
+    /// against `config`'s root store and must present `server_name` (e.g.
+    /// `"localhost"`). Lets SDK / cluster users dial a TLS-terminated kernel node.
+    pub async fn connect_tls(
+        addr: impl ToSocketAddrs,
+        server_name: impl Into<String>,
+        config: rustls::ClientConfig,
+    ) -> Result<Self, SdkError> {
+        Ok(Self {
+            inner: SyscallClient::connect_tls(addr, server_name, config).await?,
+        })
+    }
+
     /// Build a [`KernelClient`] from an already-connected [`SyscallClient`].
     pub fn from_client(inner: SyscallClient) -> Self {
         Self { inner }
@@ -587,5 +601,58 @@ impl Agent {
     ) -> Result<serde_json::Value, SdkError> {
         let id = self.id.clone();
         self.client.call_tool(id, tool, args).await
+    }
+}
+
+#[cfg(test)]
+mod tls_tests {
+    use super::*;
+    use kernel::syscall_server::SyscallServer;
+    use kernel::AgentKernelImpl;
+    use std::sync::Arc;
+
+    /// The SDK's `connect_tls` dials a TLS-terminated kernel node and drives it
+    /// through the typed client over the encrypted transport.
+    #[tokio::test]
+    async fn sdk_connect_tls_roundtrip() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
+            .expect("generate self-signed cert");
+        let cert_der = cert.cert.der().clone();
+        let key_der = rustls::pki_types::PrivateKeyDer::try_from(cert.key_pair.serialize_der())
+            .expect("private key der");
+
+        let server_config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert_der.clone()], key_der)
+            .expect("server config");
+
+        let kernel = Arc::new(AgentKernelImpl::new().expect("kernel new"));
+        let server = SyscallServer::bind_tls(kernel, "127.0.0.1:0", server_config)
+            .await
+            .expect("bind_tls");
+        let addr = server.local_addr().unwrap();
+        tokio::spawn(server.serve());
+
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(cert_der).expect("trust cert");
+        let client_config = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+
+        let mut client = KernelClient::connect_tls(addr, "localhost", client_config)
+            .await
+            .expect("sdk connect_tls");
+
+        let id = client
+            .create_agent("tls-sdk", "demo", None, None, None)
+            .await
+            .expect("create agent over TLS");
+        let agents = client.list_agents().await.expect("list over TLS");
+        assert!(
+            agents.iter().any(|a| a.id == id && a.name == "tls-sdk"),
+            "agent created over the SDK TLS client should be listed: {agents:?}"
+        );
     }
 }

@@ -1,0 +1,38 @@
+# Sample agent package — a declarative, loadable agent description.
+# Load it with the SDK (`KernelClient::load_package`) or the in-process
+# loader (`kernel::agent_package::run_package`). See docs/AGENT_PACKAGE.md.
+
+# Unique package name (required).
+name = "researcher"
+
+# What the agent is for (optional).
+description = "Reads sources and summarizes topics with citations."
+
+# The agent's standing task / purpose (required).
+task = "Research a topic and produce a cited summary."
+
+# Optional entry prompt: the runner drives one turn with this on load.
+entry = "Summarize the project's README and list its key components."
+
+# LLM provider id to create the agent against (defaults to "stub").
+provider = "stub"
+
+# Permission profile — decides capabilities at the syscall gate.
+# "read-only" grants read/network but not write.
+profile = "read-only"
+
+# Scheduling priority, 1 (highest) .. 5 (lowest); defaults to 3.
+priority = 2
+
+# Optional CFS nice value, -20 (most favored) .. 19; applied after creation.
+nice = -5
+
+# Declared tool set (intent/documentation). Actual access is enforced by the
+# permission profile through the gate, not by this list.
+tools = ["read_file", "http_get"]
+
+# Seed facts written to the agent's long-term memory on load.
+memory = [
+  "Prefer primary sources over summaries.",
+  "Always cite where a claim came from.",
+]

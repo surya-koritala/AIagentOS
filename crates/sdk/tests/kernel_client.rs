@@ -114,6 +114,47 @@ async fn memory_store_query_and_list_providers_via_sdk() {
 }
 
 #[tokio::test]
+async fn load_package_via_sdk() {
+    let addr = spawn_server().await;
+    let mut client = KernelClient::connect(addr).await.expect("connect");
+
+    let id = client
+        .load_package(
+            r#"
+name = "sdk-pkg"
+task = "packaged via sdk"
+profile = "read-only"
+priority = 3
+memory = ["seeded by package"]
+"#,
+        )
+        .await
+        .expect("load_package");
+
+    // The packaged agent is live and queryable for its seeded memory.
+    let agents = client.list_agents().await.expect("list_agents");
+    assert!(agents.iter().any(|a| a.id == id && a.name == "sdk-pkg"));
+
+    let facts = client
+        .memory_query(&id, "seeded")
+        .await
+        .expect("memory_query");
+    assert!(facts
+        .iter()
+        .any(|f| f.content.contains("seeded by package")));
+
+    // A malformed manifest comes back as a kernel error, not a panic.
+    let err = client
+        .load_package("name = \"x\"")
+        .await
+        .expect_err("missing task should fail");
+    match err {
+        SdkError::Kernel(msg) => assert!(msg.contains("invalid package"), "{msg}"),
+        other => panic!("expected Kernel error, got {other:?}"),
+    }
+}
+
+#[tokio::test]
 async fn read_only_agent_tool_call_is_denied() {
     let addr = spawn_server().await;
 

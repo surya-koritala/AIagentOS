@@ -7,6 +7,9 @@
 mod agent_lifecycle_props;
 
 #[cfg(test)]
+mod agent_package_e2e;
+
+#[cfg(test)]
 mod scheduler_props;
 
 #[cfg(test)]

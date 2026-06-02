@@ -30,6 +30,7 @@ pub mod init_system;
 pub mod ipc;
 pub mod learning;
 pub mod linux_compat;
+pub mod llm_sched;
 pub mod mac;
 pub mod marketplace;
 pub mod mcp;
@@ -810,6 +811,7 @@ use crate::context::{ContextManager, SqliteContextManager};
 use crate::execution::{AgentExecutor, AgentOutput};
 use crate::init_system::InitSystem;
 use crate::ipc::IpcManager;
+use crate::llm_sched::{LlmScheduler, DEFAULT_LLM_CORES};
 use crate::namespaces::{NamespaceId, NamespaceRegistry, NamespaceType};
 use crate::observability::{ObservabilityEngine, ObservabilityEngineImpl};
 use crate::permissions::{PermissionManager, PermissionSystem};
@@ -879,6 +881,11 @@ pub struct AgentKernelImpl {
     /// `budgets.max_concurrent` and, under contention, grants the next slot to
     /// the CFS-preferred (lowest-vruntime / highest-priority) waiting agent.
     turn_admission: Arc<TurnAdmission>,
+    /// LLM-request scheduler: a bounded pool of "LLM cores". Where
+    /// `turn_admission` gates whole agent turns, this gates the LLM-request step
+    /// inside `send_message`, and under contention grants the next freed core to
+    /// the highest-priority (lowest-nice) waiter — mirroring CFS ordering.
+    llm_scheduler: Arc<LlmScheduler>,
     pub os: Arc<OsSubsystems>,
     /// One cgroup per permission profile, created at boot with budget-derived
     /// limits. Agents are placed into their profile's cgroup at creation so
@@ -1024,6 +1031,7 @@ impl AgentKernelImpl {
             budget_enforcer,
             context_budget_tokens: budgets.max_context_tokens.min(u32::MAX as u64) as u32,
             turn_admission: Arc::new(TurnAdmission::new(budgets.max_concurrent as usize)),
+            llm_scheduler: Arc::new(LlmScheduler::new(DEFAULT_LLM_CORES)),
             os,
             profile_cgroups,
             group_namespaces: DashMap::new(),
@@ -1256,6 +1264,22 @@ impl AgentKernelImpl {
         // for the whole turn; released on drop. Keyed by the agent's CFS PID.
         let _turn_slot = match self.syscall_gate.pid_of(agent_id) {
             Some(pid) => Some(self.turn_admission.acquire(pid, &self.os.cfs).await),
+            None => None,
+        };
+
+        // LLM-request scheduling (B1.2): acquire one of the bounded LLM "cores"
+        // for the duration of this turn's LLM execution. When more requests are
+        // pending than cores, the next freed core is granted to the
+        // highest-priority (lowest-nice) waiter rather than FIFO — mirroring CFS
+        // ordering. The agent's nice is read from CFS (default 0 if unknown).
+        // Held across `executor.run(...)`; released on drop. Uncontended
+        // requests admit immediately (no added latency when cores are free).
+        let pid_for_llm = self.syscall_gate.pid_of(agent_id);
+        let _llm_core = match pid_for_llm {
+            Some(pid) => {
+                let nice = self.os.cfs.lock().await.nice_of(pid).unwrap_or(0);
+                Some(self.llm_scheduler.acquire(pid, nice).await)
+            }
             None => None,
         };
 

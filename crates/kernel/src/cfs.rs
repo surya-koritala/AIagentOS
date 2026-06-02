@@ -26,7 +26,6 @@ struct CfsEntry {
     agent_id: AgentId,
     vruntime: u64,
     weight: u64,
-    #[allow(dead_code)]
     nice: i8,
     #[allow(dead_code)]
     class: SchedClass,
@@ -193,6 +192,28 @@ impl CfsScheduler {
                 entry.tokens_used = 0;
             }
         }
+    }
+
+    /// Read an agent's current nice value (priority hint), if enqueued.
+    /// Read-only; used by the LLM-request scheduler to order contenders by
+    /// priority without duplicating nice bookkeeping.
+    pub fn nice_of(&self, agent_id: AgentId) -> Option<i8> {
+        for e in &self.rt_queue {
+            if e.agent_id == agent_id {
+                return Some(e.nice);
+            }
+        }
+        for entry in self.runqueue.values() {
+            if entry.agent_id == agent_id {
+                return Some(entry.nice);
+            }
+        }
+        for e in &self.bg_queue {
+            if e.agent_id == agent_id {
+                return Some(e.nice);
+            }
+        }
+        None
     }
 
     /// Get the number of runnable agents.

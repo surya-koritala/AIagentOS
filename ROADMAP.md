@@ -2,10 +2,9 @@
 
 > **Next frontier:** the Phase 1–3 OS-unification work below is complete (the syscall gate,
 > namespaces, MAC, cgroups, CFS turn admission, context paging, and budget enforcement are
-> load-bearing; `OsKernel` is gone). The forward-looking platform backlog — reaching
-> feature-comparability with [AIOS](https://github.com/agiresearch/AIOS) (kernel-as-server,
-> agent SDK, LLM-core breadth, context switching, memory/storage retrieval) — lives in
-> [docs/AIOS_PARITY_BACKLOG.md](docs/AIOS_PARITY_BACKLOG.md).
+> load-bearing; `OsKernel` is gone). The forward-looking platform roadmap — kernel-as-server,
+> an embeddable Rust SDK, LLM-core breadth, context management, memory/storage retrieval, and
+> tooling (all Rust) — lives in [docs/PLATFORM_ROADMAP.md](docs/PLATFORM_ROADMAP.md).
 
 ## Where we are (May 2026 audit)
 

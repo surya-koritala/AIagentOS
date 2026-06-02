@@ -382,10 +382,7 @@ Linux isn't just a kernel. It's a kernel + userspace + ecosystem. Here's EVERYTH
 ### Q11: Developer Experience (Months 31-33)
 
 #### Month 31: SDK
-- Rust SDK (native)
-- Python SDK (bindings)
-- TypeScript/JavaScript SDK
-- Go SDK
+- Rust SDK (native) — the project is Rust-only; no other-language bindings
 - SDK documentation
 - SDK examples
 - SDK testing framework

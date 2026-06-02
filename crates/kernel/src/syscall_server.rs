@@ -128,6 +128,10 @@ pub enum Syscall {
     /// and seed its memory. Replies with the new agent's id (`AgentCreated`).
     /// Running the package's entry prompt is left to the in-process runner.
     LoadPackage { manifest_toml: String },
+    /// Read-only node load/health, for distributed placement. Reports how many
+    /// agents this kernel node hosts (total + currently running) so a cluster
+    /// client can pick the least-loaded node. No side effects.
+    NodeInfo,
 }
 
 /// A short, serializable view of an agent.
@@ -232,6 +236,11 @@ pub enum SyscallReply {
     },
     /// The connection is authenticated (reply to [`Syscall::Authenticate`]).
     Authenticated,
+    /// Node load/health (reply to [`Syscall::NodeInfo`]).
+    NodeInfo {
+        agent_count: usize,
+        running_agents: usize,
+    },
     /// Any error is surfaced to the caller rather than dropping the connection.
     Error {
         message: String,
@@ -609,6 +618,17 @@ pub async fn dispatch(kernel: &AgentKernelImpl, call: Syscall) -> SyscallReply {
                 Err(e) => SyscallReply::Error {
                     message: format!("invalid package: {e}"),
                 },
+            }
+        }
+        Syscall::NodeInfo => {
+            let agents = kernel.agent_manager.list_agents(None);
+            let running = agents
+                .iter()
+                .filter(|a| matches!(a.state, crate::AgentState::Running))
+                .count();
+            SyscallReply::NodeInfo {
+                agent_count: agents.len(),
+                running_agents: running,
             }
         }
     }
@@ -1300,6 +1320,39 @@ mod tests {
         {
             SyscallReply::Error { message } => assert!(message.contains("invalid agent id")),
             other => panic!("expected Error for bad id, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn node_info_reports_agent_load() {
+        let kernel = Arc::new(AgentKernelImpl::new().expect("kernel new"));
+        let server = SyscallServer::bind(kernel, "127.0.0.1:0").await.unwrap();
+        let addr = server.local_addr().unwrap();
+        tokio::spawn(server.serve());
+        let mut client = SyscallClient::connect(addr).await.unwrap();
+
+        // Fresh node: zero agents.
+        match client.call(Syscall::NodeInfo).await.unwrap() {
+            SyscallReply::NodeInfo { agent_count, .. } => assert_eq!(agent_count, 0),
+            other => panic!("expected NodeInfo, got {other:?}"),
+        }
+
+        // After creating two agents, the node reports the load.
+        for n in ["a", "b"] {
+            client
+                .call(Syscall::CreateAgent {
+                    name: n.into(),
+                    task: "t".into(),
+                    provider: "stub".into(),
+                    profile: "standard".into(),
+                    priority: 3,
+                })
+                .await
+                .unwrap();
+        }
+        match client.call(Syscall::NodeInfo).await.unwrap() {
+            SyscallReply::NodeInfo { agent_count, .. } => assert_eq!(agent_count, 2),
+            other => panic!("expected NodeInfo, got {other:?}"),
         }
     }
 

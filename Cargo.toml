@@ -6,6 +6,7 @@ members = [
     "crates/tauri-app",
     "crates/cli",
     "crates/sdk",
+    "crates/tui",
     "tests",
     "examples",
     "benchmarks",

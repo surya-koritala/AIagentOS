@@ -35,10 +35,12 @@
 //! # }
 //! ```
 
-use kernel::syscall_server::{
-    AgentSummary, FactSummary, ProviderSummary, Syscall, SyscallClient, SyscallReply,
-};
+use kernel::syscall_server::{Syscall, SyscallClient, SyscallReply};
 use tokio::net::ToSocketAddrs;
+
+// Re-export the kernel wire types that appear in this crate's public API, so
+// SDK consumers can name them without depending on the kernel directly.
+pub use kernel::syscall_server::{AgentSummary, FactSummary, ProviderSummary};
 
 pub mod cluster;
 pub mod patterns;

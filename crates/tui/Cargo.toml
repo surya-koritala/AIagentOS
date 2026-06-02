@@ -1,0 +1,19 @@
+[package]
+name = "agent-tui"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0"
+description = "Rust terminal UI for observing and driving AI Agent OS over the syscall server"
+
+[[bin]]
+name = "agent-tui"
+path = "src/main.rs"
+
+[dependencies]
+agent-sdk = { path = "../sdk" }
+tokio = { workspace = true }
+serde_json = { workspace = true }
+ratatui = "0.29"
+
+[dev-dependencies]
+kernel = { path = "../kernel" }

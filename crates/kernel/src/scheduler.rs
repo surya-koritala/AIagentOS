@@ -226,7 +226,18 @@ impl PriorityScheduler {
             if self.is_next_in_queue(agent_id) {
                 return;
             }
-            self.slot_available.notified().await;
+            // `release_resource_access` signals via `Notify::notify_waiters`,
+            // which only wakes waiters *already* registered at the instant it
+            // fires — a waiter that reaches this point just after a release
+            // would miss that edge and, if it happens to be the new queue head,
+            // strand every other waiter (no further release can occur).
+            // Racing the notification against a short poll interval closes that
+            // lost-wakeup window: a missed edge costs at most one poll tick, so
+            // progress is guaranteed without busy-spinning.
+            tokio::select! {
+                _ = self.slot_available.notified() => {}
+                _ = tokio::time::sleep(std::time::Duration::from_millis(5)) => {}
+            }
         }
     }
 

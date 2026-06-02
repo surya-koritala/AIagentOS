@@ -35,7 +35,9 @@
 //! # }
 //! ```
 
-use kernel::syscall_server::{AgentSummary, Syscall, SyscallClient, SyscallReply};
+use kernel::syscall_server::{
+    AgentSummary, FactSummary, ProviderSummary, Syscall, SyscallClient, SyscallReply,
+};
 use tokio::net::ToSocketAddrs;
 
 /// Errors surfaced by the SDK.
@@ -212,6 +214,64 @@ impl KernelClient {
                 audited,
             }),
             other => Err(unexpected("GateStats", &other)),
+        }
+    }
+
+    /// List the LLM providers registered with the kernel.
+    pub async fn list_providers(&mut self) -> Result<Vec<ProviderSummary>, SdkError> {
+        match self.call(Syscall::ListProviders).await? {
+            SyscallReply::Providers { providers } => Ok(providers),
+            other => Err(unexpected("Providers", &other)),
+        }
+    }
+
+    /// Store a fact in an agent's long-term memory. `category` is one of
+    /// `preference` / `learned_pattern` / `fact` / `instruction` (defaults to
+    /// `fact` when `None`). Returns the new fact's id.
+    pub async fn memory_store(
+        &mut self,
+        agent_id: impl Into<String>,
+        content: impl Into<String>,
+        category: Option<String>,
+    ) -> Result<String, SdkError> {
+        let call = Syscall::MemoryStore {
+            agent_id: agent_id.into(),
+            content: content.into(),
+            category,
+        };
+        match self.call(call).await? {
+            SyscallReply::MemoryStored { id } => Ok(id),
+            other => Err(unexpected("MemoryStored", &other)),
+        }
+    }
+
+    /// Query an agent's long-term memory by substring (newest first).
+    pub async fn memory_query(
+        &mut self,
+        agent_id: impl Into<String>,
+        query: impl Into<String>,
+    ) -> Result<Vec<FactSummary>, SdkError> {
+        let call = Syscall::MemoryQuery {
+            agent_id: agent_id.into(),
+            query: query.into(),
+        };
+        match self.call(call).await? {
+            SyscallReply::Memory { facts } => Ok(facts),
+            other => Err(unexpected("Memory", &other)),
+        }
+    }
+
+    /// Authenticate the connection with the server's shared secret. Required
+    /// before any other syscall when the server is configured with a token.
+    pub async fn authenticate(&mut self, token: impl Into<String>) -> Result<(), SdkError> {
+        match self
+            .call(Syscall::Authenticate {
+                token: token.into(),
+            })
+            .await?
+        {
+            SyscallReply::Authenticated => Ok(()),
+            other => Err(unexpected("Authenticated", &other)),
         }
     }
 

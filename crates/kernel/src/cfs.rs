@@ -117,6 +117,39 @@ impl CfsScheduler {
         None
     }
 
+    /// Pick the most-deserving agent **among `candidates`** (CFS order:
+    /// RealTime first, then lowest vruntime in the normal runqueue, then
+    /// Background). Returns `None` if none of the candidates are enqueued.
+    ///
+    /// Unlike [`pick_next`](Self::pick_next), this restricts the choice to a
+    /// given set — the agents actually contending for a turn — so turn-admission
+    /// ordering reflects who *wants* to run, not every enqueued agent.
+    pub fn pick_among(&self, candidates: &[AgentId]) -> Option<AgentId> {
+        if candidates.is_empty() {
+            return None;
+        }
+        // RealTime candidates first (queue order).
+        for e in &self.rt_queue {
+            if candidates.contains(&e.agent_id) {
+                return Some(e.agent_id);
+            }
+        }
+        // Normal: the runqueue is ordered by (vruntime, id), so the first
+        // candidate encountered is the lowest-vruntime one.
+        for (&(_, id), _) in self.runqueue.iter() {
+            if candidates.contains(&id) {
+                return Some(id);
+            }
+        }
+        // Background last.
+        for e in &self.bg_queue {
+            if candidates.contains(&e.agent_id) {
+                return Some(e.agent_id);
+            }
+        }
+        None
+    }
+
     /// Record that an agent used tokens (advances its vruntime).
     pub fn account_tokens(&mut self, agent_id: AgentId, tokens: u64) {
         let key = self.runqueue.keys().find(|k| k.1 == agent_id).cloned();
@@ -183,6 +216,106 @@ impl CfsScheduler {
     }
 }
 
+/// CFS-ordered turn admission.
+///
+/// Bounds concurrent agent turns to `max_concurrent`. When more agents contend
+/// for a turn than there are slots, the next freed slot is granted to the
+/// **CFS-preferred waiter** (RealTime, else lowest vruntime) rather than FIFO —
+/// so nice values affect *who runs next* under contention, not just vruntime
+/// bookkeeping. Uncontended turns are admitted immediately.
+///
+/// Correctness: the choice is made only among agents currently waiting in
+/// [`acquire`](Self::acquire) (the real contenders). Whenever a slot is free
+/// the preferred waiter — which is itself looping in `acquire` — admits, so
+/// progress is always made (no waiting on an agent that isn't trying to run).
+pub struct TurnAdmission {
+    state: std::sync::Mutex<AdmissionInner>,
+    notify: tokio::sync::Notify,
+}
+
+struct AdmissionInner {
+    running: usize,
+    max_concurrent: usize,
+    waiters: Vec<AgentId>,
+}
+
+impl TurnAdmission {
+    pub fn new(max_concurrent: usize) -> Self {
+        Self {
+            state: std::sync::Mutex::new(AdmissionInner {
+                running: 0,
+                max_concurrent: max_concurrent.max(1),
+                waiters: Vec::new(),
+            }),
+            notify: tokio::sync::Notify::new(),
+        }
+    }
+
+    /// Number of turns currently admitted (running).
+    pub fn running(&self) -> usize {
+        self.state.lock().unwrap().running
+    }
+
+    /// Acquire a turn slot for `agent_id`, blocking until a slot is free and
+    /// this agent is the CFS-preferred waiter. The returned [`TurnSlot`] frees
+    /// the slot (and wakes the next waiter) on drop. `cfs` is consulted only to
+    /// order contenders; its lock is never held across the wait.
+    pub async fn acquire<'a>(
+        &'a self,
+        agent_id: AgentId,
+        cfs: &tokio::sync::Mutex<CfsScheduler>,
+    ) -> TurnSlot<'a> {
+        // Register as a contender exactly once.
+        {
+            let mut st = self.state.lock().unwrap();
+            st.waiters.push(agent_id);
+        }
+        loop {
+            // Snapshot the waiter set if a slot is free — without holding the
+            // state lock across the (async) cfs lock below.
+            let waiters = {
+                let st = self.state.lock().unwrap();
+                (st.running < st.max_concurrent).then(|| st.waiters.clone())
+            };
+            if let Some(waiters) = waiters {
+                let chosen = {
+                    let cfs = cfs.lock().await;
+                    cfs.pick_among(&waiters)
+                };
+                // If CFS has no opinion (agent not enqueued), don't starve it.
+                if chosen.map_or(true, |c| c == agent_id) {
+                    let mut st = self.state.lock().unwrap();
+                    if st.running < st.max_concurrent && st.waiters.contains(&agent_id) {
+                        st.running += 1;
+                        st.waiters.retain(|a| *a != agent_id);
+                        return TurnSlot { admission: self };
+                    }
+                }
+            }
+            // Not admitted yet — wait for a slot to free. The short timeout is a
+            // safety net against a missed notification; releases notify directly.
+            let _ =
+                tokio::time::timeout(std::time::Duration::from_millis(25), self.notify.notified())
+                    .await;
+        }
+    }
+}
+
+/// RAII turn slot. Frees the admission slot and wakes the next waiter on drop.
+pub struct TurnSlot<'a> {
+    admission: &'a TurnAdmission,
+}
+
+impl Drop for TurnSlot<'_> {
+    fn drop(&mut self) {
+        {
+            let mut st = self.admission.state.lock().unwrap();
+            st.running = st.running.saturating_sub(1);
+        }
+        self.admission.notify.notify_waiters();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -241,6 +374,93 @@ mod tests {
         sched.dequeue(1);
         assert_eq!(sched.runnable_count(), 1);
         assert_eq!(sched.pick_next(), Some(2));
+    }
+
+    #[test]
+    fn pick_among_restricts_to_candidates_in_cfs_order() {
+        let mut sched = CfsScheduler::new(1000);
+        sched.enqueue(1, 0, SchedClass::Normal);
+        sched.enqueue(2, 0, SchedClass::Normal);
+        sched.enqueue(3, 0, SchedClass::Normal);
+        // Advance agent 1's vruntime so 2 and 3 are more deserving.
+        sched.account_tokens(1, 500);
+        // pick_next would consider all; pick_among restricts to the set.
+        assert_eq!(sched.pick_among(&[1]), Some(1)); // only candidate
+        assert_eq!(sched.pick_among(&[2, 3]), Some(2)); // lowest vruntime among {2,3}
+        assert_eq!(sched.pick_among(&[]), None);
+        // A candidate not enqueued is ignored.
+        assert_eq!(sched.pick_among(&[99]), None);
+    }
+
+    #[test]
+    fn pick_among_respects_nice_under_contention() {
+        let mut sched = CfsScheduler::new(10_000);
+        sched.enqueue(1, -10, SchedClass::Normal); // high priority (heavy weight)
+        sched.enqueue(2, 10, SchedClass::Normal); // low priority (light weight)
+                                                  // Both do the same work; the light-weight agent's vruntime races ahead.
+        sched.account_tokens(1, 1000);
+        sched.account_tokens(2, 1000);
+        // So under contention the nice=-10 agent is the preferred next turn.
+        assert_eq!(sched.pick_among(&[1, 2]), Some(1));
+    }
+
+    #[test]
+    fn pick_among_realtime_precedence() {
+        let mut sched = CfsScheduler::new(1000);
+        sched.enqueue(1, -20, SchedClass::Normal); // very light vruntime growth
+        sched.enqueue(2, 0, SchedClass::RealTime);
+        assert_eq!(sched.pick_among(&[1, 2]), Some(2)); // RT beats any normal
+    }
+
+    #[tokio::test]
+    async fn turn_admission_uncontended_admits_immediately() {
+        let cfs = tokio::sync::Mutex::new(CfsScheduler::new(1000));
+        cfs.lock().await.enqueue(1, 0, SchedClass::Normal);
+        let adm = TurnAdmission::new(2);
+        let slot = adm.acquire(1, &cfs).await;
+        assert_eq!(adm.running(), 1);
+        drop(slot);
+        assert_eq!(adm.running(), 0);
+    }
+
+    #[tokio::test]
+    async fn turn_admission_grants_freed_slot_in_cfs_order() {
+        use std::sync::Arc;
+
+        let cfs = Arc::new(tokio::sync::Mutex::new(CfsScheduler::new(10_000)));
+        {
+            let mut c = cfs.lock().await;
+            c.enqueue(1, 0, SchedClass::Normal); // holder
+            c.enqueue(2, 0, SchedClass::Normal); // LOW vruntime contender
+            c.enqueue(3, 0, SchedClass::Normal); // HIGH vruntime contender
+            c.account_tokens(3, 5000); // push agent 3's vruntime far ahead
+        }
+        let adm = Arc::new(TurnAdmission::new(1)); // single slot → strict ordering
+
+        // Holder takes the only slot.
+        let holder = adm.acquire(1, &cfs).await;
+
+        let order = Arc::new(tokio::sync::Mutex::new(Vec::<u64>::new()));
+        // Spawn the two contenders (3 = HIGH vruntime, 2 = LOW vruntime).
+        let mut tasks = Vec::new();
+        for id in [3u64, 2u64] {
+            let (adm, cfs, order) = (adm.clone(), cfs.clone(), order.clone());
+            tasks.push(tokio::spawn(async move {
+                let _slot = adm.acquire(id, &cfs).await;
+                order.lock().await.push(id);
+                // Hold briefly so admissions are observably sequential.
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }));
+        }
+        // Ensure both are registered as waiters before the slot frees.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        drop(holder);
+
+        for t in tasks {
+            t.await.unwrap();
+        }
+        // Agent 2 (lower vruntime) must be admitted before agent 3.
+        assert_eq!(*order.lock().await, vec![2, 3]);
     }
 
     #[test]

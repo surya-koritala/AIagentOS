@@ -801,7 +801,7 @@ use tokio::sync::broadcast;
 
 use crate::agent::{AgentKernel, AgentManager};
 use crate::agent_struct::{CapabilitySet, SchedClass};
-use crate::cfs::CfsScheduler;
+use crate::cfs::{CfsScheduler, TurnAdmission};
 use crate::cgroups::{CgroupId, CgroupLimits, CgroupManager};
 use crate::connector::{AgentConnector, AgentConnectorImpl, LlmProviderAdapter};
 use crate::context::{ContextManager, SqliteContextManager};
@@ -873,6 +873,10 @@ pub struct AgentKernelImpl {
     /// Active-context token budget applied to each executor (from
     /// `budgets.max_context_tokens`; 0 = unbounded). Drives context paging.
     context_budget_tokens: u32,
+    /// CFS-ordered turn admission: bounds concurrent turns to
+    /// `budgets.max_concurrent` and, under contention, grants the next slot to
+    /// the CFS-preferred (lowest-vruntime / highest-priority) waiting agent.
+    turn_admission: Arc<TurnAdmission>,
     pub os: Arc<OsSubsystems>,
     /// One cgroup per permission profile, created at boot with budget-derived
     /// limits. Agents are placed into their profile's cgroup at creation so
@@ -1017,6 +1021,7 @@ impl AgentKernelImpl {
             syscall_gate,
             budget_enforcer,
             context_budget_tokens: budgets.max_context_tokens.min(u32::MAX as u64) as u32,
+            turn_admission: Arc::new(TurnAdmission::new(budgets.max_concurrent as usize)),
             os,
             profile_cgroups,
             group_namespaces: DashMap::new(),
@@ -1241,6 +1246,16 @@ impl AgentKernelImpl {
             self.executors
                 .insert(agent_id, tokio::sync::Mutex::new(executor));
         }
+
+        // CFS-ordered turn admission: under contention (more agents than
+        // `max_concurrent` slots) the next freed slot goes to the
+        // lowest-vruntime / highest-priority waiter, so nice values decide who
+        // runs next — not just FIFO. Uncontended turns admit immediately. Held
+        // for the whole turn; released on drop. Keyed by the agent's CFS PID.
+        let _turn_slot = match self.syscall_gate.pid_of(agent_id) {
+            Some(pid) => Some(self.turn_admission.acquire(pid, &self.os.cfs).await),
+            None => None,
+        };
 
         // Run the execution loop (rate limited)
         let _guard = self.rate_limiter.acquire().await;

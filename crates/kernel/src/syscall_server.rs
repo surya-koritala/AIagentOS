@@ -25,6 +25,8 @@ use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{TcpListener, TcpStream, ToSocketAddrs};
 
 use crate::agent::AgentKernel;
+use crate::connector::ToolCall;
+use crate::resources::ResourceBroker;
 use crate::{AgentConfig, AgentKernelImpl, Priority};
 
 fn default_provider() -> String {
@@ -57,6 +59,15 @@ pub enum Syscall {
     ListAgents,
     /// Drive one think→act→observe turn for an agent (LLM-backed).
     SendMessage { agent_id: String, message: String },
+    /// Invoke a single tool as an agent. Goes through the syscall gate
+    /// (capability / MAC / cgroup / namespace) before the resource broker, so a
+    /// denial is returned as an `Error` — enforcement applies over the wire.
+    CallTool {
+        agent_id: String,
+        tool: String,
+        #[serde(default)]
+        args: serde_json::Value,
+    },
     /// Snapshot of the syscall gate's enforcement counters.
     GateStats,
 }
@@ -83,6 +94,9 @@ pub enum SyscallReply {
         content: String,
         tool_calls: usize,
         tokens: u32,
+    },
+    ToolResult {
+        data: serde_json::Value,
     },
     GateStats {
         allowed: u64,
@@ -157,6 +171,68 @@ pub async fn dispatch(kernel: &AgentKernelImpl, call: Syscall) -> SyscallReply {
                 message: format!("invalid agent id: {agent_id}"),
             },
         },
+        Syscall::CallTool {
+            agent_id,
+            tool,
+            args,
+        } => {
+            let id = match uuid::Uuid::parse_str(&agent_id) {
+                Ok(id) => id,
+                Err(_) => {
+                    return SyscallReply::Error {
+                        message: format!("invalid agent id: {agent_id}"),
+                    }
+                }
+            };
+            // Token estimate + representative resource, mirroring the executor's
+            // tool path so gate accounting/MAC matching are consistent.
+            let est_tokens = (args.to_string().len() as u64 / 4)
+                .saturating_add(tool.len() as u64 / 4)
+                .saturating_add(10);
+            let resource = args
+                .get("path")
+                .or_else(|| args.get("url"))
+                .or_else(|| args.get("command"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("*")
+                .to_string();
+
+            // Enforcement first — a denial never reaches the broker.
+            if let Err(denial) = kernel
+                .syscall_gate
+                .check_tool_call(id, &tool, &resource, est_tokens)
+                .await
+            {
+                return SyscallReply::Error {
+                    message: format!("tool '{tool}' denied by kernel: {}", denial.message()),
+                };
+            }
+
+            let call = ToolCall {
+                id: "syscall".into(),
+                name: tool.clone(),
+                arguments: args,
+            };
+            let reply = match kernel.tool_registry.resolve(id, &call) {
+                Some(request) => match kernel.resource_broker.execute(request).await {
+                    Ok(resp) if resp.success => SyscallReply::ToolResult { data: resp.data },
+                    Ok(resp) => SyscallReply::Error {
+                        message: format!(
+                            "tool '{tool}' failed: {}",
+                            resp.error.unwrap_or_default()
+                        ),
+                    },
+                    Err(e) => SyscallReply::Error {
+                        message: format!("tool '{tool}' error: {e}"),
+                    },
+                },
+                None => SyscallReply::Error {
+                    message: format!("unknown tool '{tool}'"),
+                },
+            };
+            kernel.syscall_gate.record_tool_usage(id, est_tokens);
+            reply
+        }
         Syscall::GateStats => {
             let s = kernel.syscall_gate.stats();
             SyscallReply::GateStats {
@@ -308,6 +384,61 @@ mod tests {
             client.call(Syscall::GateStats).await.unwrap(),
             SyscallReply::GateStats { .. }
         ));
+    }
+
+    #[tokio::test]
+    async fn enforcement_applies_over_the_wire() {
+        let kernel = Arc::new(AgentKernelImpl::new().expect("kernel new"));
+        let server = SyscallServer::bind(kernel.clone(), "127.0.0.1:0")
+            .await
+            .unwrap();
+        let addr = server.local_addr().unwrap();
+        tokio::spawn(server.serve());
+        let mut client = SyscallClient::connect(addr).await.unwrap();
+
+        // A read-only agent lacks CAP_FILE_WRITE.
+        let id = match client
+            .call(Syscall::CreateAgent {
+                name: "ro".into(),
+                task: "t".into(),
+                provider: "stub".into(),
+                profile: "read-only".into(),
+                priority: 3,
+            })
+            .await
+            .unwrap()
+        {
+            SyscallReply::AgentCreated { id } => id,
+            other => panic!("expected AgentCreated, got {other:?}"),
+        };
+
+        // write_file is gate-denied — and that denial is delivered over the wire.
+        match client
+            .call(Syscall::CallTool {
+                agent_id: id,
+                tool: "write_file".into(),
+                args: serde_json::json!({"path": "/tmp/x", "content": "y"}),
+            })
+            .await
+            .unwrap()
+        {
+            SyscallReply::Error { message } => assert!(
+                message.contains("denied by kernel"),
+                "expected a kernel denial, got: {message}"
+            ),
+            other => panic!("expected Error denial, got {other:?}"),
+        }
+
+        // The gate's counters reflect the denial happening on the syscall path.
+        match client.call(Syscall::GateStats).await.unwrap() {
+            SyscallReply::GateStats {
+                denied_capability, ..
+            } => assert!(
+                denied_capability >= 1,
+                "gate should have denied a capability"
+            ),
+            other => panic!("expected GateStats, got {other:?}"),
+        }
     }
 
     #[tokio::test]

@@ -35,6 +35,7 @@ pub mod llm_sched;
 pub mod mac;
 pub mod marketplace;
 pub mod mcp;
+pub mod mcp_server;
 pub mod models;
 pub mod modules;
 pub mod mount_table;

@@ -75,7 +75,7 @@ Sizes: **S** ≈ days, **M** ≈ 1–2 weeks, **L** ≈ 3–6 weeks, **XL** ≈ 
 |----|-------|------|------|-------|
 | **B5.1** | Rust agent templates + reference patterns (ReAct-style loop, planner/executor) shipped on the SDK | L | B0.2 | **Done** (`agent_sdk::patterns`: `ReActLoop<Reasoner>` + `PlannerExecutor<Planner>` over `KernelClient`; wiremock-backed e2e) |
 | **B5.2** | Agent hub (publish/fetch/share Rust agent packages) | L | B0.3 | **Done** (`agent_hub::AgentHub`: versioned publish/fetch/list/search of `AgentManifest`s; fetched package loads via `load_package`) |
-| **B5.3** | Rust TUI / extend the desktop app for observing + driving agents | M | B0.2 | |
+| **B5.3** | Rust TUI / extend the desktop app for observing + driving agents | M | B0.2 | **Done** (`agent-tui` crate: ratatui/crossterm TUI over the syscall server — live agents/gate/node, create + message; render-free testable `App`) |
 
 ## Phase 6 — Distributed & validation
 

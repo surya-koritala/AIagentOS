@@ -97,6 +97,11 @@ pub enum Syscall {
     /// the first syscall when the server is configured with a token; a no-op
     /// (always accepted) when it is not.
     Authenticate { token: String },
+    /// Load an agent package from a TOML manifest (see `crate::agent_package`):
+    /// parse + validate, then create the agent through the full admission path
+    /// and seed its memory. Replies with the new agent's id (`AgentCreated`).
+    /// Running the package's entry prompt is left to the in-process runner.
+    LoadPackage { manifest_toml: String },
 }
 
 /// A short, serializable view of an agent.
@@ -401,6 +406,21 @@ pub async fn dispatch(kernel: &AgentKernelImpl, call: Syscall) -> SyscallReply {
         // Authentication is handled at the connection layer (see
         // `SyscallServer::handle`); reaching dispatch means it is accepted.
         Syscall::Authenticate { .. } => SyscallReply::Authenticated,
+        Syscall::LoadPackage { manifest_toml } => {
+            match crate::agent_package::AgentManifest::from_toml_str(&manifest_toml) {
+                Ok(manifest) => match crate::agent_package::load_package(kernel, &manifest).await {
+                    Ok(handle) => SyscallReply::AgentCreated {
+                        id: handle.id.to_string(),
+                    },
+                    Err(e) => SyscallReply::Error {
+                        message: format!("load package failed: {e}"),
+                    },
+                },
+                Err(e) => SyscallReply::Error {
+                    message: format!("invalid package: {e}"),
+                },
+            }
+        }
     }
 }
 
@@ -863,6 +883,53 @@ mod tests {
                 );
             }
             other => panic!("expected Memory, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn load_package_over_the_wire() {
+        let kernel = Arc::new(AgentKernelImpl::new().expect("kernel new"));
+        let server = SyscallServer::bind(kernel, "127.0.0.1:0").await.unwrap();
+        let addr = server.local_addr().unwrap();
+        tokio::spawn(server.serve());
+        let mut client = SyscallClient::connect(addr).await.unwrap();
+
+        let manifest = r#"
+name = "packaged"
+task = "do packaged work"
+profile = "read-only"
+priority = 2
+memory = ["remember this"]
+"#;
+        let id = match client
+            .call(Syscall::LoadPackage {
+                manifest_toml: manifest.into(),
+            })
+            .await
+            .unwrap()
+        {
+            SyscallReply::AgentCreated { id } => id,
+            other => panic!("expected AgentCreated from LoadPackage, got {other:?}"),
+        };
+
+        // The packaged agent is live and listed.
+        match client.call(Syscall::ListAgents).await.unwrap() {
+            SyscallReply::Agents { agents } => {
+                assert!(agents.iter().any(|a| a.id == id && a.name == "packaged"))
+            }
+            other => panic!("expected Agents, got {other:?}"),
+        }
+
+        // A malformed manifest is an error over the wire, not a disconnect.
+        match client
+            .call(Syscall::LoadPackage {
+                manifest_toml: "name = \"x\"".into(), // missing required `task`
+            })
+            .await
+            .unwrap()
+        {
+            SyscallReply::Error { message } => assert!(message.contains("invalid package")),
+            other => panic!("expected Error for bad manifest, got {other:?}"),
         }
     }
 

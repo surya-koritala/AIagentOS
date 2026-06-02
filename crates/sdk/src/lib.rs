@@ -261,6 +261,22 @@ impl KernelClient {
         }
     }
 
+    /// Load an agent package from a TOML manifest. The kernel parses and
+    /// validates it, then creates the agent through the full admission path and
+    /// seeds its memory. Returns the new agent's id.
+    pub async fn load_package(
+        &mut self,
+        manifest_toml: impl Into<String>,
+    ) -> Result<String, SdkError> {
+        let call = Syscall::LoadPackage {
+            manifest_toml: manifest_toml.into(),
+        };
+        match self.call(call).await? {
+            SyscallReply::AgentCreated { id } => Ok(id),
+            other => Err(unexpected("AgentCreated", &other)),
+        }
+    }
+
     /// Authenticate the connection with the server's shared secret. Required
     /// before any other syscall when the server is configured with a token.
     pub async fn authenticate(&mut self, token: impl Into<String>) -> Result<(), SdkError> {

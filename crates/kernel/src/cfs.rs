@@ -283,7 +283,11 @@ impl TurnAdmission {
                     cfs.pick_among(&waiters)
                 };
                 // If CFS has no opinion (agent not enqueued), don't starve it.
-                if chosen.map_or(true, |c| c == agent_id) {
+                let is_preferred = match chosen {
+                    Some(c) => c == agent_id,
+                    None => true,
+                };
+                if is_preferred {
                     let mut st = self.state.lock().unwrap();
                     if st.running < st.max_concurrent && st.waiters.contains(&agent_id) {
                         st.running += 1;

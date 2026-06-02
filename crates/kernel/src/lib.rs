@@ -51,6 +51,7 @@ pub mod scheduler;
 pub mod shell;
 pub mod syscall_gate;
 pub mod syscall_interface;
+pub mod syscall_server;
 pub mod sysctl;
 pub mod tool_descriptors;
 pub mod tools;

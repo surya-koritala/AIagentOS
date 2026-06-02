@@ -70,6 +70,10 @@ pub enum Syscall {
     },
     /// Snapshot of the syscall gate's enforcement counters.
     GateStats,
+    /// Read-only introspection of one agent's enforcement state: the
+    /// capabilities and namespaces the gate grants it. Answers "what am I
+    /// allowed to do?" without side effects.
+    AgentInfo { agent_id: String },
 }
 
 /// A short, serializable view of an agent.
@@ -106,6 +110,12 @@ pub enum SyscallReply {
         denied_namespace: u64,
         denied_unknown: u64,
         audited: u64,
+    },
+    /// Read-only enforcement state for one agent (reply to [`Syscall::AgentInfo`]).
+    AgentInfo {
+        pid: u64,
+        capabilities: Vec<String>,
+        namespaces: Vec<u64>,
     },
     /// Any error is surfaced to the caller rather than dropping the connection.
     Error {
@@ -243,6 +253,26 @@ pub async fn dispatch(kernel: &AgentKernelImpl, call: Syscall) -> SyscallReply {
                 denied_namespace: s.denied_namespace,
                 denied_unknown: s.denied_unknown,
                 audited: s.audited,
+            }
+        }
+        Syscall::AgentInfo { agent_id } => {
+            let id = match uuid::Uuid::parse_str(&agent_id) {
+                Ok(id) => id,
+                Err(_) => {
+                    return SyscallReply::Error {
+                        message: format!("invalid agent id: {agent_id}"),
+                    }
+                }
+            };
+            match kernel.syscall_gate.agent_info(id) {
+                Some(info) => SyscallReply::AgentInfo {
+                    pid: info.pid,
+                    capabilities: info.capabilities,
+                    namespaces: info.namespaces,
+                },
+                None => SyscallReply::Error {
+                    message: format!("unknown agent: {agent_id}"),
+                },
             }
         }
     }
@@ -438,6 +468,67 @@ mod tests {
                 "gate should have denied a capability"
             ),
             other => panic!("expected GateStats, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn agent_info_reports_enforcement_state_over_the_wire() {
+        let kernel = Arc::new(AgentKernelImpl::new().expect("kernel new"));
+        let server = SyscallServer::bind(kernel.clone(), "127.0.0.1:0")
+            .await
+            .unwrap();
+        let addr = server.local_addr().unwrap();
+        tokio::spawn(server.serve());
+        let mut client = SyscallClient::connect(addr).await.unwrap();
+
+        // A read-only agent: no CAP_FILE_WRITE.
+        let id = match client
+            .call(Syscall::CreateAgent {
+                name: "introspect".into(),
+                task: "t".into(),
+                provider: "stub".into(),
+                profile: "read-only".into(),
+                priority: 3,
+            })
+            .await
+            .unwrap()
+        {
+            SyscallReply::AgentCreated { id } => id,
+            other => panic!("expected AgentCreated, got {other:?}"),
+        };
+
+        // AgentInfo reports the gate's view of the agent's capabilities.
+        match client
+            .call(Syscall::AgentInfo {
+                agent_id: id.clone(),
+            })
+            .await
+            .unwrap()
+        {
+            SyscallReply::AgentInfo {
+                pid, capabilities, ..
+            } => {
+                assert!(pid >= 1, "agent should have a real PID");
+                assert!(
+                    !capabilities.contains(&"CAP_FILE_WRITE".to_string()),
+                    "read-only agent must not be granted CAP_FILE_WRITE: {capabilities:?}"
+                );
+            }
+            other => panic!("expected AgentInfo, got {other:?}"),
+        }
+
+        // An unknown agent id yields an Error, not a panic / disconnect.
+        match client
+            .call(Syscall::AgentInfo {
+                agent_id: uuid::Uuid::new_v4().to_string(),
+            })
+            .await
+            .unwrap()
+        {
+            SyscallReply::Error { message } => {
+                assert!(message.contains("unknown agent"), "got: {message}")
+            }
+            other => panic!("expected Error for unknown agent, got {other:?}"),
         }
     }
 

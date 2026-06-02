@@ -40,8 +40,10 @@ use kernel::syscall_server::{
 };
 use tokio::net::ToSocketAddrs;
 
+pub mod cluster;
 pub mod patterns;
 
+pub use cluster::{ClusterClient, NodeHandle, PlacedAgent, Placement};
 pub use patterns::{
     Decision, DirectiveReasoner, FnPlanner, PlanRun, Planner, PlannerExecutor, ReActLoop,
     ReActOutcome, ReActStep, Reasoner, Step, StepResult, ToolInvocation,
@@ -97,6 +99,15 @@ pub struct GateStats {
     pub denied_namespace: u64,
     pub denied_unknown: u64,
     pub audited: u64,
+}
+
+/// A kernel node's load/health snapshot (reply to `node_info`).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NodeLoad {
+    /// Total agents the node hosts.
+    pub agent_count: usize,
+    /// Agents currently executing a turn.
+    pub running_agents: usize,
 }
 
 /// A typed, async client over the kernel's syscall protocol.
@@ -221,6 +232,21 @@ impl KernelClient {
                 audited,
             }),
             other => Err(unexpected("GateStats", &other)),
+        }
+    }
+
+    /// Read a kernel node's load/health (agent counts) — used by
+    /// [`ClusterClient`](crate::cluster::ClusterClient) for placement.
+    pub async fn node_info(&mut self) -> Result<NodeLoad, SdkError> {
+        match self.call(Syscall::NodeInfo).await? {
+            SyscallReply::NodeInfo {
+                agent_count,
+                running_agents,
+            } => Ok(NodeLoad {
+                agent_count,
+                running_agents,
+            }),
+            other => Err(unexpected("NodeInfo", &other)),
         }
     }
 

@@ -50,7 +50,7 @@ Sizes: **S** ≈ days, **M** ≈ 1–2 weeks, **L** ≈ 3–6 weeks, **XL** ≈ 
 
 | ID | Title | Size | Deps | Notes |
 |----|-------|------|------|-------|
-| **B2.1** | Context snapshot / restore (persist + restore an agent's in-flight context so a turn can pause/resume) | L | — | |
+| **B2.1** | Context snapshot / restore (persist + restore an agent's in-flight context so a turn can pause/resume) | L | — | **Done** (`context_snapshots` table + `snapshot/restore/list/delete` methods; `Snapshot*`/`RestoreSnapshot` syscalls + SDK) |
 | **B2.2** | Mid-generation context switch (pause/resume LLM decoding; feasible with local/vLLM, checkpoint-at-token-boundary for hosted APIs) | XL | B2.1, B1.1 | We only trim the buffer today (ContextPager) |
 
 ## Phase 3 — Memory & storage
@@ -74,7 +74,7 @@ Sizes: **S** ≈ days, **M** ≈ 1–2 weeks, **L** ≈ 3–6 weeks, **XL** ≈ 
 | ID | Title | Size | Deps | Notes |
 |----|-------|------|------|-------|
 | **B5.1** | Rust agent templates + reference patterns (ReAct-style loop, planner/executor) shipped on the SDK | L | B0.2 | **Done** (`agent_sdk::patterns`: `ReActLoop<Reasoner>` + `PlannerExecutor<Planner>` over `KernelClient`; wiremock-backed e2e) |
-| **B5.2** | Agent hub (publish/fetch/share Rust agent packages) | L | B0.3 | |
+| **B5.2** | Agent hub (publish/fetch/share Rust agent packages) | L | B0.3 | **Done** (`agent_hub::AgentHub`: versioned publish/fetch/list/search of `AgentManifest`s; fetched package loads via `load_package`) |
 | **B5.3** | Rust TUI / extend the desktop app for observing + driving agents | M | B0.2 | |
 
 ## Phase 6 — Distributed & validation
@@ -83,7 +83,7 @@ Sizes: **S** ≈ days, **M** ≈ 1–2 weeks, **L** ≈ 3–6 weeks, **XL** ≈ 
 |----|-------|------|------|-------|
 | **B6.1** | Remote kernel / distributed deployment | L | B0.1 | |
 | **B6.2** | Benchmarks + eval harness: run `stress_test` in CI; add an agent-task benchmark | M | — | **Done** (`agent-bench` bin + Rust eval harness in `benchmarks/`; fast CI smoke test runs under `cargo test --workspace`) |
-| **B6.3** | Docs site + examples | M | — | |
+| **B6.3** | Docs site + examples | M | — | **Done** (mdBook site under `docs/`: `book.toml` + `SUMMARY.md`; intro/getting-started/concepts pages wrapping the canonical docs) |
 
 ## Keep our lead (do not regress)
 

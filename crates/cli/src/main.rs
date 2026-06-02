@@ -11,6 +11,8 @@ use std::sync::Arc;
 
 use adapters::anthropic::AnthropicAdapter;
 use adapters::azure_openai::AzureOpenAiAdapter;
+use adapters::deepseek::DeepseekAdapter;
+use adapters::groq::GroqAdapter;
 use adapters::local::LocalLlmAdapter;
 use adapters::openai::OpenAiAdapter;
 use kernel::config::Config;
@@ -65,6 +67,26 @@ fn register_providers(kernel: &AgentKernelImpl, config: &Config) {
                 .or_else(|| std::env::var("ANTHROPIC_API_KEY").ok())
             {
                 let _ = kernel.register_provider(Arc::new(AnthropicAdapter::new(key)));
+            }
+        }
+        "groq" => {
+            if let Some(key) = config
+                .get_api_key("groq")
+                .map(|s| s.to_string())
+                .or_else(|| std::env::var("GROQ_API_KEY").ok())
+            {
+                let adapter = GroqAdapter::new(key).with_model(config.default_model.clone());
+                let _ = kernel.register_provider(Arc::new(adapter));
+            }
+        }
+        "deepseek" => {
+            if let Some(key) = config
+                .get_api_key("deepseek")
+                .map(|s| s.to_string())
+                .or_else(|| std::env::var("DEEPSEEK_API_KEY").ok())
+            {
+                let adapter = DeepseekAdapter::new(key).with_model(config.default_model.clone());
+                let _ = kernel.register_provider(Arc::new(adapter));
             }
         }
         "local" => {

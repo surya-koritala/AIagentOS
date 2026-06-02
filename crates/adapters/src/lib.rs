@@ -2,6 +2,8 @@
 
 pub mod anthropic;
 pub mod azure_openai;
+pub mod deepseek;
+pub mod groq;
 pub mod local;
 pub mod openai;
 pub mod streaming;
@@ -11,3 +13,9 @@ mod openai_tests;
 
 #[cfg(test)]
 mod anthropic_tests;
+
+#[cfg(test)]
+mod groq_tests;
+
+#[cfg(test)]
+mod deepseek_tests;

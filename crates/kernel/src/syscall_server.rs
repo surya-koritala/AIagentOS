@@ -93,6 +93,22 @@ pub enum Syscall {
     },
     /// Query an agent's long-term memory by substring, newest first.
     MemoryQuery { agent_id: String, query: String },
+    /// Put (insert-or-overwrite) a value into the agent's durable key/value
+    /// store (the per-agent `agent_kv` table). `value` is an opaque string —
+    /// callers may JSON-encode structured data.
+    StoragePut {
+        agent_id: String,
+        key: String,
+        value: String,
+    },
+    /// Get a value from the agent's key/value store (reply carries
+    /// `value: None` when the key is absent).
+    StorageGet { agent_id: String, key: String },
+    /// List the keys in the agent's key/value store.
+    StorageList { agent_id: String },
+    /// Delete a key from the agent's key/value store (reply reports whether it
+    /// existed).
+    StorageDelete { agent_id: String, key: String },
     /// Authenticate the connection with the server's shared secret. Required as
     /// the first syscall when the server is configured with a token; a no-op
     /// (always accepted) when it is not.
@@ -173,6 +189,21 @@ pub enum SyscallReply {
     /// Facts matching a memory query (reply to [`Syscall::MemoryQuery`]).
     Memory {
         facts: Vec<FactSummary>,
+    },
+    /// A value was written to the key/value store (reply to [`Syscall::StoragePut`]).
+    StorageOk,
+    /// A value read from the key/value store (reply to [`Syscall::StorageGet`]);
+    /// `None` when the key is absent.
+    StorageValue {
+        value: Option<String>,
+    },
+    /// The keys in an agent's key/value store (reply to [`Syscall::StorageList`]).
+    StorageKeys {
+        keys: Vec<String>,
+    },
+    /// Whether the deleted key existed (reply to [`Syscall::StorageDelete`]).
+    StorageDeleted {
+        existed: bool,
     },
     /// The connection is authenticated (reply to [`Syscall::Authenticate`]).
     Authenticated,
@@ -400,6 +431,74 @@ pub async fn dispatch(kernel: &AgentKernelImpl, call: Syscall) -> SyscallReply {
                 },
                 Err(e) => SyscallReply::Error {
                     message: format!("memory query failed: {e}"),
+                },
+            }
+        }
+        Syscall::StoragePut {
+            agent_id,
+            key,
+            value,
+        } => {
+            let id = match uuid::Uuid::parse_str(&agent_id) {
+                Ok(id) => id,
+                Err(_) => {
+                    return SyscallReply::Error {
+                        message: format!("invalid agent id: {agent_id}"),
+                    }
+                }
+            };
+            match kernel.context_manager.kv_put(id, &key, &value) {
+                Ok(()) => SyscallReply::StorageOk,
+                Err(e) => SyscallReply::Error {
+                    message: format!("storage put failed: {e}"),
+                },
+            }
+        }
+        Syscall::StorageGet { agent_id, key } => {
+            let id = match uuid::Uuid::parse_str(&agent_id) {
+                Ok(id) => id,
+                Err(_) => {
+                    return SyscallReply::Error {
+                        message: format!("invalid agent id: {agent_id}"),
+                    }
+                }
+            };
+            match kernel.context_manager.kv_get(id, &key) {
+                Ok(value) => SyscallReply::StorageValue { value },
+                Err(e) => SyscallReply::Error {
+                    message: format!("storage get failed: {e}"),
+                },
+            }
+        }
+        Syscall::StorageList { agent_id } => {
+            let id = match uuid::Uuid::parse_str(&agent_id) {
+                Ok(id) => id,
+                Err(_) => {
+                    return SyscallReply::Error {
+                        message: format!("invalid agent id: {agent_id}"),
+                    }
+                }
+            };
+            match kernel.context_manager.kv_list(id) {
+                Ok(keys) => SyscallReply::StorageKeys { keys },
+                Err(e) => SyscallReply::Error {
+                    message: format!("storage list failed: {e}"),
+                },
+            }
+        }
+        Syscall::StorageDelete { agent_id, key } => {
+            let id = match uuid::Uuid::parse_str(&agent_id) {
+                Ok(id) => id,
+                Err(_) => {
+                    return SyscallReply::Error {
+                        message: format!("invalid agent id: {agent_id}"),
+                    }
+                }
+            };
+            match kernel.context_manager.kv_delete(id, &key) {
+                Ok(existed) => SyscallReply::StorageDeleted { existed },
+                Err(e) => SyscallReply::Error {
+                    message: format!("storage delete failed: {e}"),
                 },
             }
         }
@@ -883,6 +982,118 @@ mod tests {
                 );
             }
             other => panic!("expected Memory, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn storage_put_get_list_delete_roundtrip() {
+        let kernel = Arc::new(AgentKernelImpl::new().expect("kernel new"));
+        let server = SyscallServer::bind(kernel, "127.0.0.1:0").await.unwrap();
+        let addr = server.local_addr().unwrap();
+        tokio::spawn(server.serve());
+        let mut client = SyscallClient::connect(addr).await.unwrap();
+
+        let id = match client
+            .call(Syscall::CreateAgent {
+                name: "kv".into(),
+                task: "t".into(),
+                provider: "stub".into(),
+                profile: "standard".into(),
+                priority: 3,
+            })
+            .await
+            .unwrap()
+        {
+            SyscallReply::AgentCreated { id } => id,
+            other => panic!("expected AgentCreated, got {other:?}"),
+        };
+
+        // Missing key → StorageValue { value: None }.
+        match client
+            .call(Syscall::StorageGet {
+                agent_id: id.clone(),
+                key: "color".into(),
+            })
+            .await
+            .unwrap()
+        {
+            SyscallReply::StorageValue { value } => assert_eq!(value, None),
+            other => panic!("expected StorageValue, got {other:?}"),
+        }
+
+        // Put a value.
+        assert!(matches!(
+            client
+                .call(Syscall::StoragePut {
+                    agent_id: id.clone(),
+                    key: "color".into(),
+                    value: "blue".into(),
+                })
+                .await
+                .unwrap(),
+            SyscallReply::StorageOk
+        ));
+
+        // Get it back.
+        match client
+            .call(Syscall::StorageGet {
+                agent_id: id.clone(),
+                key: "color".into(),
+            })
+            .await
+            .unwrap()
+        {
+            SyscallReply::StorageValue { value } => assert_eq!(value.as_deref(), Some("blue")),
+            other => panic!("expected StorageValue, got {other:?}"),
+        }
+
+        // List shows the key.
+        match client
+            .call(Syscall::StorageList {
+                agent_id: id.clone(),
+            })
+            .await
+            .unwrap()
+        {
+            SyscallReply::StorageKeys { keys } => assert_eq!(keys, vec!["color".to_string()]),
+            other => panic!("expected StorageKeys, got {other:?}"),
+        }
+
+        // Delete it → existed: true; deleting again → false.
+        match client
+            .call(Syscall::StorageDelete {
+                agent_id: id.clone(),
+                key: "color".into(),
+            })
+            .await
+            .unwrap()
+        {
+            SyscallReply::StorageDeleted { existed } => assert!(existed),
+            other => panic!("expected StorageDeleted, got {other:?}"),
+        }
+        match client
+            .call(Syscall::StorageDelete {
+                agent_id: id.clone(),
+                key: "color".into(),
+            })
+            .await
+            .unwrap()
+        {
+            SyscallReply::StorageDeleted { existed } => assert!(!existed),
+            other => panic!("expected StorageDeleted, got {other:?}"),
+        }
+
+        // An invalid agent id is an error, not a disconnect.
+        match client
+            .call(Syscall::StorageGet {
+                agent_id: "not-a-uuid".into(),
+                key: "color".into(),
+            })
+            .await
+            .unwrap()
+        {
+            SyscallReply::Error { message } => assert!(message.contains("invalid agent id")),
+            other => panic!("expected Error for bad id, got {other:?}"),
         }
     }
 

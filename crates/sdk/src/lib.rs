@@ -268,6 +268,74 @@ impl KernelClient {
         }
     }
 
+    /// Put (insert-or-overwrite) a value into an agent's durable key/value store
+    /// (the per-agent `agent_kv` table, distinct from long-term memory). `value`
+    /// is an opaque string — JSON-encode structured data on the caller side.
+    pub async fn storage_put(
+        &mut self,
+        agent_id: impl Into<String>,
+        key: impl Into<String>,
+        value: impl Into<String>,
+    ) -> Result<(), SdkError> {
+        let call = Syscall::StoragePut {
+            agent_id: agent_id.into(),
+            key: key.into(),
+            value: value.into(),
+        };
+        match self.call(call).await? {
+            SyscallReply::StorageOk => Ok(()),
+            other => Err(unexpected("StorageOk", &other)),
+        }
+    }
+
+    /// Get a value from an agent's key/value store. Returns `None` when the key
+    /// is absent.
+    pub async fn storage_get(
+        &mut self,
+        agent_id: impl Into<String>,
+        key: impl Into<String>,
+    ) -> Result<Option<String>, SdkError> {
+        let call = Syscall::StorageGet {
+            agent_id: agent_id.into(),
+            key: key.into(),
+        };
+        match self.call(call).await? {
+            SyscallReply::StorageValue { value } => Ok(value),
+            other => Err(unexpected("StorageValue", &other)),
+        }
+    }
+
+    /// List the keys in an agent's key/value store.
+    pub async fn storage_list(
+        &mut self,
+        agent_id: impl Into<String>,
+    ) -> Result<Vec<String>, SdkError> {
+        let call = Syscall::StorageList {
+            agent_id: agent_id.into(),
+        };
+        match self.call(call).await? {
+            SyscallReply::StorageKeys { keys } => Ok(keys),
+            other => Err(unexpected("StorageKeys", &other)),
+        }
+    }
+
+    /// Delete a key from an agent's key/value store. Returns `true` if the key
+    /// existed, `false` otherwise.
+    pub async fn storage_delete(
+        &mut self,
+        agent_id: impl Into<String>,
+        key: impl Into<String>,
+    ) -> Result<bool, SdkError> {
+        let call = Syscall::StorageDelete {
+            agent_id: agent_id.into(),
+            key: key.into(),
+        };
+        match self.call(call).await? {
+            SyscallReply::StorageDeleted { existed } => Ok(existed),
+            other => Err(unexpected("StorageDeleted", &other)),
+        }
+    }
+
     /// Load an agent package from a TOML manifest. The kernel parses and
     /// validates it, then creates the agent through the full admission path and
     /// seeds its memory. Returns the new agent's id.

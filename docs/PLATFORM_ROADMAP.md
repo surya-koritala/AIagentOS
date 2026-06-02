@@ -34,7 +34,7 @@ Sizes: **S** ≈ days, **M** ≈ 1–2 weeks, **L** ≈ 3–6 weeks, **XL** ≈ 
 
 | ID | Title | Size | Deps | Status |
 |----|-------|------|------|--------|
-| **B0.1** | Syscall server: expose `AgentKernelImpl` over a JSON syscall API (TCP + Unix socket); promote `syscall_interface` toward the real agent↔kernel boundary | XL | — | Increment 1 merged (`syscall_server`: protocol + dispatch + server/client + round-trip) |
+| **B0.1** | Syscall server: expose `AgentKernelImpl` over a JSON syscall API (TCP + Unix socket); promote `syscall_interface` toward the real agent↔kernel boundary | XL | — | **Done** (`syscall_server`: agent lifecycle + LLM turn/providers + memory store/query + tool call + gate stats/agent info; TCP **and** Unix socket; optional shared-secret auth; enforcement over the wire) |
 | **B0.2** | Embeddable **Rust SDK** crate: `Agent` builder + typed client over the syscall API (and an in-process mode), `llm` / `memory` / `storage` / `tool` calls | L | B0.1 | |
 | **B0.3** | Agent package format + loader/runner (a Rust agent crate + a manifest the kernel can load and run) | M | B0.2 | |
 

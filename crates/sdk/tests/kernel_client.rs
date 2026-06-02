@@ -169,6 +169,57 @@ async fn storage_put_get_list_delete_via_sdk() {
 }
 
 #[tokio::test]
+async fn snapshot_context_via_sdk() {
+    let addr = spawn_server().await;
+    let mut client = KernelClient::connect(addr).await.expect("connect");
+
+    // create_agent seeds an initial (default) context, snapshottable immediately.
+    let id = client
+        .create_agent("snap", "t", None, None, None)
+        .await
+        .expect("create_agent");
+
+    // Capture, list, restore, delete round-trip through the typed methods.
+    client
+        .snapshot_context(&id, "start")
+        .await
+        .expect("snapshot_context");
+
+    let labels = client.list_snapshots(&id).await.expect("list_snapshots");
+    assert_eq!(labels, vec!["start".to_string()]);
+
+    let tokens = client
+        .restore_snapshot(&id, "start")
+        .await
+        .expect("restore_snapshot");
+    assert_eq!(tokens, 0, "fresh context has zero tokens");
+
+    assert!(client
+        .delete_snapshot(&id, "start")
+        .await
+        .expect("delete_snapshot"));
+    assert!(!client
+        .delete_snapshot(&id, "start")
+        .await
+        .expect("delete_snapshot again"));
+    assert!(client
+        .list_snapshots(&id)
+        .await
+        .expect("list_snapshots")
+        .is_empty());
+
+    // Restoring a missing snapshot is a kernel error, not a panic.
+    let err = client
+        .restore_snapshot(&id, "missing")
+        .await
+        .expect_err("missing snapshot should fail");
+    match err {
+        SdkError::Kernel(msg) => assert!(msg.contains("restore snapshot failed"), "{msg}"),
+        other => panic!("expected Kernel error, got {other:?}"),
+    }
+}
+
+#[tokio::test]
 async fn load_package_via_sdk() {
     let addr = spawn_server().await;
     let mut client = KernelClient::connect(addr).await.expect("connect");

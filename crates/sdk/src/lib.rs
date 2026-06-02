@@ -336,6 +336,71 @@ impl KernelClient {
         }
     }
 
+    /// Capture an agent's current working context under `label` (a point-in-time
+    /// snapshot). Overwrites an existing snapshot with the same label.
+    pub async fn snapshot_context(
+        &mut self,
+        agent_id: impl Into<String>,
+        label: impl Into<String>,
+    ) -> Result<(), SdkError> {
+        let call = Syscall::SnapshotContext {
+            agent_id: agent_id.into(),
+            label: label.into(),
+        };
+        match self.call(call).await? {
+            SyscallReply::SnapshotSaved => Ok(()),
+            other => Err(unexpected("SnapshotSaved", &other)),
+        }
+    }
+
+    /// Restore a previously captured snapshot, making it the agent's current
+    /// context. Returns the restored context's token count.
+    pub async fn restore_snapshot(
+        &mut self,
+        agent_id: impl Into<String>,
+        label: impl Into<String>,
+    ) -> Result<u32, SdkError> {
+        let call = Syscall::RestoreSnapshot {
+            agent_id: agent_id.into(),
+            label: label.into(),
+        };
+        match self.call(call).await? {
+            SyscallReply::SnapshotRestored { tokens } => Ok(tokens),
+            other => Err(unexpected("SnapshotRestored", &other)),
+        }
+    }
+
+    /// List the snapshot labels stored for an agent, newest first.
+    pub async fn list_snapshots(
+        &mut self,
+        agent_id: impl Into<String>,
+    ) -> Result<Vec<String>, SdkError> {
+        let call = Syscall::ListSnapshots {
+            agent_id: agent_id.into(),
+        };
+        match self.call(call).await? {
+            SyscallReply::Snapshots { labels } => Ok(labels),
+            other => Err(unexpected("Snapshots", &other)),
+        }
+    }
+
+    /// Delete a snapshot by label. Returns `true` if the snapshot existed,
+    /// `false` otherwise.
+    pub async fn delete_snapshot(
+        &mut self,
+        agent_id: impl Into<String>,
+        label: impl Into<String>,
+    ) -> Result<bool, SdkError> {
+        let call = Syscall::DeleteSnapshot {
+            agent_id: agent_id.into(),
+            label: label.into(),
+        };
+        match self.call(call).await? {
+            SyscallReply::SnapshotDeleted { existed } => Ok(existed),
+            other => Err(unexpected("SnapshotDeleted", &other)),
+        }
+    }
+
     /// Load an agent package from a TOML manifest. The kernel parses and
     /// validates it, then creates the agent through the full admission path and
     /// seeds its memory. Returns the new agent's id.

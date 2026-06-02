@@ -176,7 +176,15 @@ impl SqliteContextManager {
                 updated_at TEXT NOT NULL,
                 PRIMARY KEY(agent_id, key)
             );
-            CREATE INDEX IF NOT EXISTS idx_agent_kv_agent ON agent_kv(agent_id);",
+            CREATE INDEX IF NOT EXISTS idx_agent_kv_agent ON agent_kv(agent_id);
+            CREATE TABLE IF NOT EXISTS context_snapshots (
+                agent_id TEXT NOT NULL,
+                label TEXT NOT NULL,
+                context_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY(agent_id, label)
+            );
+            CREATE INDEX IF NOT EXISTS idx_snapshots_agent ON context_snapshots(agent_id);",
         ).map_err(|e| ContextError::StorageError(e.to_string()))?;
         Ok(())
     }
@@ -620,6 +628,114 @@ impl SqliteContextManager {
     }
 }
 
+/// Named context snapshots — point-in-time copies of an agent's working context.
+///
+/// A snapshot captures the agent's current [`AgentContext`] under a `label` so a
+/// turn can pause/resume or you can branch/rewind. Snapshots live in the
+/// `context_snapshots` table on the same single SQLite handle as everything else
+/// (no separate db). Restoring a snapshot writes it back as the agent's current
+/// context via the same persist path `get_context`/`persist_context` use.
+impl SqliteContextManager {
+    /// Capture the agent's current context under `label` (insert-or-overwrite).
+    ///
+    /// Fetches the live context the same way [`get_context`](ContextManager::get_context)
+    /// does, then serializes it into the snapshots table keyed by
+    /// `(agent_id, label)`. Errors with [`ContextError::RestoreFailed`] if the
+    /// agent has no current context to snapshot.
+    pub fn snapshot_context(&self, agent_id: AgentId, label: &str) -> Result<(), ContextError> {
+        let conn = self.conn.lock().unwrap();
+        let id_str = agent_id.to_string();
+        // Read the agent's current context (mirrors get_context's query path).
+        let json = match conn.query_row(
+            "SELECT context_json FROM contexts WHERE agent_id = ?1",
+            params![id_str],
+            |row| row.get::<_, String>(0),
+        ) {
+            Ok(json) => json,
+            Err(rusqlite::Error::QueryReturnedNoRows) => {
+                return Err(ContextError::RestoreFailed(format!(
+                    "No context for agent {} to snapshot",
+                    agent_id
+                )))
+            }
+            Err(e) => return Err(ContextError::StorageError(e.to_string())),
+        };
+        let now = Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT OR REPLACE INTO context_snapshots (agent_id, label, context_json, created_at) VALUES (?1, ?2, ?3, ?4)",
+            params![id_str, label, json, now],
+        )
+        .map_err(|e| ContextError::PersistenceFailed(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Restore a snapshot, making it the agent's current context.
+    ///
+    /// Loads the snapshot stored under `(agent_id, label)`, writes it back as the
+    /// agent's current context (via the same persist path), and returns the
+    /// restored [`AgentContext`]. Errors with [`ContextError::RestoreFailed`] if
+    /// no such snapshot exists.
+    pub fn restore_snapshot(
+        &self,
+        agent_id: AgentId,
+        label: &str,
+    ) -> Result<AgentContext, ContextError> {
+        let json = {
+            let conn = self.conn.lock().unwrap();
+            match conn.query_row(
+                "SELECT context_json FROM context_snapshots WHERE agent_id = ?1 AND label = ?2",
+                params![agent_id.to_string(), label],
+                |row| row.get::<_, String>(0),
+            ) {
+                Ok(json) => json,
+                Err(rusqlite::Error::QueryReturnedNoRows) => {
+                    return Err(ContextError::RestoreFailed(format!(
+                        "No snapshot '{}' for agent {}",
+                        label, agent_id
+                    )))
+                }
+                Err(e) => return Err(ContextError::StorageError(e.to_string())),
+            }
+        };
+        let context: AgentContext =
+            serde_json::from_str(&json).map_err(|e| ContextError::RestoreFailed(e.to_string()))?;
+        // Make the snapshot the agent's current context via the persist path.
+        self.persist_with_retry(agent_id, &context)?;
+        Ok(context)
+    }
+
+    /// List the snapshot labels stored for `agent_id`, newest first.
+    pub fn list_snapshots(&self, agent_id: AgentId) -> Result<Vec<String>, ContextError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT label FROM context_snapshots WHERE agent_id = ?1 ORDER BY created_at DESC, label DESC",
+            )
+            .map_err(|e| ContextError::StorageError(e.to_string()))?;
+        let rows = stmt
+            .query_map(params![agent_id.to_string()], |row| row.get::<_, String>(0))
+            .map_err(|e| ContextError::StorageError(e.to_string()))?;
+        let mut labels = Vec::new();
+        for row in rows {
+            labels.push(row.map_err(|e| ContextError::StorageError(e.to_string()))?);
+        }
+        Ok(labels)
+    }
+
+    /// Delete the snapshot stored under `(agent_id, label)`. Returns `true` if a
+    /// row was removed, `false` if no such snapshot existed.
+    pub fn delete_snapshot(&self, agent_id: AgentId, label: &str) -> Result<bool, ContextError> {
+        let conn = self.conn.lock().unwrap();
+        let affected = conn
+            .execute(
+                "DELETE FROM context_snapshots WHERE agent_id = ?1 AND label = ?2",
+                params![agent_id.to_string(), label],
+            )
+            .map_err(|e| ContextError::PersistenceFailed(e.to_string()))?;
+        Ok(affected > 0)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -828,6 +944,82 @@ mod tests {
         assert!(mgr.kv_delete(a, "shared").unwrap());
         assert_eq!(mgr.kv_get(a, "shared").unwrap(), None);
         assert_eq!(mgr.kv_get(b, "shared").unwrap().as_deref(), Some("b-value"));
+    }
+
+    #[tokio::test]
+    async fn snapshot_restore_list_delete_roundtrip() {
+        let mgr = SqliteContextManager::in_memory().unwrap();
+        let id = uuid::Uuid::new_v4();
+        mgr.create_context(id).await.unwrap();
+
+        // Establish an initial context and snapshot it.
+        let mut ctx = AgentContext::default();
+        ctx.conversation_history.push(Message {
+            role: "user".to_string(),
+            content: "first".to_string(),
+            timestamp: Utc::now(),
+        });
+        ctx.token_count = 7;
+        mgr.persist_context(id, &ctx).await.unwrap();
+        mgr.snapshot_context(id, "checkpoint-a").unwrap();
+
+        // Mutate the live context away from the snapshot.
+        let mut mutated = ctx.clone();
+        mutated.conversation_history.push(Message {
+            role: "assistant".to_string(),
+            content: "second".to_string(),
+            timestamp: Utc::now(),
+        });
+        mutated.token_count = 42;
+        mgr.persist_context(id, &mutated).await.unwrap();
+        assert_eq!(mgr.get_context(id).await.unwrap().token_count, 42);
+
+        // A second snapshot (created later) should sort newest-first.
+        mgr.snapshot_context(id, "checkpoint-b").unwrap();
+        assert_eq!(
+            mgr.list_snapshots(id).unwrap(),
+            vec!["checkpoint-b".to_string(), "checkpoint-a".to_string()]
+        );
+
+        // Restoring the first snapshot returns the original and makes it current.
+        let restored = mgr.restore_snapshot(id, "checkpoint-a").unwrap();
+        assert_eq!(restored, ctx);
+        let current = mgr.get_context(id).await.unwrap();
+        assert_eq!(current, ctx);
+        assert_eq!(current.token_count, 7);
+        assert_eq!(current.conversation_history.len(), 1);
+
+        // Delete is idempotent: true once, false after.
+        assert!(mgr.delete_snapshot(id, "checkpoint-a").unwrap());
+        assert!(!mgr.delete_snapshot(id, "checkpoint-a").unwrap());
+        assert_eq!(
+            mgr.list_snapshots(id).unwrap(),
+            vec!["checkpoint-b".to_string()]
+        );
+
+        // Restoring or snapshotting unknown things errors rather than panics.
+        assert!(mgr.restore_snapshot(id, "missing").is_err());
+        let no_ctx = uuid::Uuid::new_v4();
+        assert!(mgr.snapshot_context(no_ctx, "x").is_err());
+    }
+
+    #[test]
+    fn snapshots_are_isolated_between_agents() {
+        let mgr = SqliteContextManager::in_memory().unwrap();
+        let a = uuid::Uuid::new_v4();
+        let b = uuid::Uuid::new_v4();
+        mgr.persist_with_retry(a, &AgentContext::default()).unwrap();
+        mgr.persist_with_retry(b, &AgentContext::default()).unwrap();
+
+        mgr.snapshot_context(a, "shared").unwrap();
+        mgr.snapshot_context(b, "shared").unwrap();
+
+        // Agent A's snapshot listing doesn't include agent B's, and deleting
+        // from A leaves B's untouched.
+        assert_eq!(mgr.list_snapshots(a).unwrap(), vec!["shared".to_string()]);
+        assert!(mgr.delete_snapshot(a, "shared").unwrap());
+        assert!(mgr.list_snapshots(a).unwrap().is_empty());
+        assert_eq!(mgr.list_snapshots(b).unwrap(), vec!["shared".to_string()]);
     }
 
     #[tokio::test]

@@ -109,6 +109,16 @@ pub enum Syscall {
     /// Delete a key from the agent's key/value store (reply reports whether it
     /// existed).
     StorageDelete { agent_id: String, key: String },
+    /// Capture the agent's current working context under `label` (a point-in-time
+    /// snapshot in the `context_snapshots` table). Overwrites an existing label.
+    SnapshotContext { agent_id: String, label: String },
+    /// Restore a previously captured snapshot, making it the agent's current
+    /// context. Replies with the restored token count (`SnapshotRestored`).
+    RestoreSnapshot { agent_id: String, label: String },
+    /// List the snapshot labels stored for an agent, newest first.
+    ListSnapshots { agent_id: String },
+    /// Delete a snapshot by label (reply reports whether it existed).
+    DeleteSnapshot { agent_id: String, label: String },
     /// Authenticate the connection with the server's shared secret. Required as
     /// the first syscall when the server is configured with a token; a no-op
     /// (always accepted) when it is not.
@@ -203,6 +213,21 @@ pub enum SyscallReply {
     },
     /// Whether the deleted key existed (reply to [`Syscall::StorageDelete`]).
     StorageDeleted {
+        existed: bool,
+    },
+    /// A snapshot was captured (reply to [`Syscall::SnapshotContext`]).
+    SnapshotSaved,
+    /// A snapshot was restored and is now the agent's current context (reply to
+    /// [`Syscall::RestoreSnapshot`]); carries the restored context's token count.
+    SnapshotRestored {
+        tokens: u32,
+    },
+    /// The snapshot labels stored for an agent (reply to [`Syscall::ListSnapshots`]).
+    Snapshots {
+        labels: Vec<String>,
+    },
+    /// Whether the deleted snapshot existed (reply to [`Syscall::DeleteSnapshot`]).
+    SnapshotDeleted {
         existed: bool,
     },
     /// The connection is authenticated (reply to [`Syscall::Authenticate`]).
@@ -499,6 +524,72 @@ pub async fn dispatch(kernel: &AgentKernelImpl, call: Syscall) -> SyscallReply {
                 Ok(existed) => SyscallReply::StorageDeleted { existed },
                 Err(e) => SyscallReply::Error {
                     message: format!("storage delete failed: {e}"),
+                },
+            }
+        }
+        Syscall::SnapshotContext { agent_id, label } => {
+            let id = match uuid::Uuid::parse_str(&agent_id) {
+                Ok(id) => id,
+                Err(_) => {
+                    return SyscallReply::Error {
+                        message: format!("invalid agent id: {agent_id}"),
+                    }
+                }
+            };
+            match kernel.context_manager.snapshot_context(id, &label) {
+                Ok(()) => SyscallReply::SnapshotSaved,
+                Err(e) => SyscallReply::Error {
+                    message: format!("snapshot failed: {e}"),
+                },
+            }
+        }
+        Syscall::RestoreSnapshot { agent_id, label } => {
+            let id = match uuid::Uuid::parse_str(&agent_id) {
+                Ok(id) => id,
+                Err(_) => {
+                    return SyscallReply::Error {
+                        message: format!("invalid agent id: {agent_id}"),
+                    }
+                }
+            };
+            match kernel.context_manager.restore_snapshot(id, &label) {
+                Ok(ctx) => SyscallReply::SnapshotRestored {
+                    tokens: ctx.token_count,
+                },
+                Err(e) => SyscallReply::Error {
+                    message: format!("restore snapshot failed: {e}"),
+                },
+            }
+        }
+        Syscall::ListSnapshots { agent_id } => {
+            let id = match uuid::Uuid::parse_str(&agent_id) {
+                Ok(id) => id,
+                Err(_) => {
+                    return SyscallReply::Error {
+                        message: format!("invalid agent id: {agent_id}"),
+                    }
+                }
+            };
+            match kernel.context_manager.list_snapshots(id) {
+                Ok(labels) => SyscallReply::Snapshots { labels },
+                Err(e) => SyscallReply::Error {
+                    message: format!("list snapshots failed: {e}"),
+                },
+            }
+        }
+        Syscall::DeleteSnapshot { agent_id, label } => {
+            let id = match uuid::Uuid::parse_str(&agent_id) {
+                Ok(id) => id,
+                Err(_) => {
+                    return SyscallReply::Error {
+                        message: format!("invalid agent id: {agent_id}"),
+                    }
+                }
+            };
+            match kernel.context_manager.delete_snapshot(id, &label) {
+                Ok(existed) => SyscallReply::SnapshotDeleted { existed },
+                Err(e) => SyscallReply::Error {
+                    message: format!("delete snapshot failed: {e}"),
                 },
             }
         }
@@ -1088,6 +1179,121 @@ mod tests {
             .call(Syscall::StorageGet {
                 agent_id: "not-a-uuid".into(),
                 key: "color".into(),
+            })
+            .await
+            .unwrap()
+        {
+            SyscallReply::Error { message } => assert!(message.contains("invalid agent id")),
+            other => panic!("expected Error for bad id, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn snapshot_context_roundtrip() {
+        let kernel = Arc::new(AgentKernelImpl::new().expect("kernel new"));
+        let server = SyscallServer::bind(kernel, "127.0.0.1:0").await.unwrap();
+        let addr = server.local_addr().unwrap();
+        tokio::spawn(server.serve());
+        let mut client = SyscallClient::connect(addr).await.unwrap();
+
+        // create_agent_full seeds an initial (default) context, so it is
+        // snapshottable immediately.
+        let id = match client
+            .call(Syscall::CreateAgent {
+                name: "snap".into(),
+                task: "t".into(),
+                provider: "stub".into(),
+                profile: "standard".into(),
+                priority: 3,
+            })
+            .await
+            .unwrap()
+        {
+            SyscallReply::AgentCreated { id } => id,
+            other => panic!("expected AgentCreated, got {other:?}"),
+        };
+
+        // Snapshot the current (token_count == 0) context.
+        assert!(matches!(
+            client
+                .call(Syscall::SnapshotContext {
+                    agent_id: id.clone(),
+                    label: "start".into(),
+                })
+                .await
+                .unwrap(),
+            SyscallReply::SnapshotSaved
+        ));
+
+        // List shows the label.
+        match client
+            .call(Syscall::ListSnapshots {
+                agent_id: id.clone(),
+            })
+            .await
+            .unwrap()
+        {
+            SyscallReply::Snapshots { labels } => assert_eq!(labels, vec!["start".to_string()]),
+            other => panic!("expected Snapshots, got {other:?}"),
+        }
+
+        // Restore reports the snapshot's token count (0 for the fresh context).
+        match client
+            .call(Syscall::RestoreSnapshot {
+                agent_id: id.clone(),
+                label: "start".into(),
+            })
+            .await
+            .unwrap()
+        {
+            SyscallReply::SnapshotRestored { tokens } => assert_eq!(tokens, 0),
+            other => panic!("expected SnapshotRestored, got {other:?}"),
+        }
+
+        // Delete → existed: true; deleting again → false.
+        match client
+            .call(Syscall::DeleteSnapshot {
+                agent_id: id.clone(),
+                label: "start".into(),
+            })
+            .await
+            .unwrap()
+        {
+            SyscallReply::SnapshotDeleted { existed } => assert!(existed),
+            other => panic!("expected SnapshotDeleted, got {other:?}"),
+        }
+        match client
+            .call(Syscall::DeleteSnapshot {
+                agent_id: id.clone(),
+                label: "start".into(),
+            })
+            .await
+            .unwrap()
+        {
+            SyscallReply::SnapshotDeleted { existed } => assert!(!existed),
+            other => panic!("expected SnapshotDeleted, got {other:?}"),
+        }
+
+        // Restoring a missing snapshot is an error, not a disconnect.
+        match client
+            .call(Syscall::RestoreSnapshot {
+                agent_id: id.clone(),
+                label: "nope".into(),
+            })
+            .await
+            .unwrap()
+        {
+            SyscallReply::Error { message } => {
+                assert!(message.contains("restore snapshot failed"), "{message}")
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+
+        // An invalid agent id is an error, not a disconnect.
+        match client
+            .call(Syscall::SnapshotContext {
+                agent_id: "not-a-uuid".into(),
+                label: "x".into(),
             })
             .await
             .unwrap()

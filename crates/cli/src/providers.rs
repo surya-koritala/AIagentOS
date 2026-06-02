@@ -8,9 +8,12 @@ use std::sync::Arc;
 use adapters::anthropic::AnthropicAdapter;
 use adapters::azure_openai::AzureOpenAiAdapter;
 use adapters::deepseek::DeepseekAdapter;
+use adapters::gemini::GeminiAdapter;
 use adapters::groq::GroqAdapter;
+use adapters::huggingface::HuggingFaceAdapter;
 use adapters::local::LocalLlmAdapter;
 use adapters::openai::OpenAiAdapter;
+use adapters::vllm::VllmAdapter;
 use kernel::config::Config;
 use kernel::AgentKernelImpl;
 
@@ -93,6 +96,41 @@ pub fn register_providers(kernel: &AgentKernelImpl, config: &Config) {
                 url,
                 config.default_model.clone(),
             )));
+        }
+        "gemini" => {
+            if let Some(key) = config
+                .get_api_key("gemini")
+                .map(|s| s.to_string())
+                .or_else(|| std::env::var("GEMINI_API_KEY").ok())
+            {
+                let adapter = GeminiAdapter::new(key).with_model(config.default_model.clone());
+                let _ = kernel.register_provider(Arc::new(adapter));
+            }
+        }
+        "vllm" => {
+            // vLLM is self-hosted; the API key is optional. A configured base URL
+            // can be supplied via the `local`-style key slot or the env var.
+            let key = config
+                .get_api_key("vllm")
+                .map(|s| s.to_string())
+                .or_else(|| std::env::var("VLLM_API_KEY").ok())
+                .unwrap_or_default();
+            let mut adapter = VllmAdapter::new(key).with_model(config.default_model.clone());
+            if let Ok(url) = std::env::var("VLLM_BASE_URL") {
+                adapter = adapter.with_base_url(url);
+            }
+            let _ = kernel.register_provider(Arc::new(adapter));
+        }
+        "huggingface" => {
+            if let Some(key) = config
+                .get_api_key("huggingface")
+                .map(|s| s.to_string())
+                .or_else(|| std::env::var("HUGGINGFACE_API_KEY").ok())
+                .or_else(|| std::env::var("HF_API_KEY").ok())
+            {
+                let adapter = HuggingFaceAdapter::new(key).with_model(config.default_model.clone());
+                let _ = kernel.register_provider(Arc::new(adapter));
+            }
         }
         _ => {}
     }

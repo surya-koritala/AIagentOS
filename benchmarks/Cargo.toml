@@ -15,6 +15,10 @@ path = "stress_test.rs"
 name = "os-demo"
 path = "os_demo.rs"
 
+[[bin]]
+name = "agent-bench"
+path = "agent_bench.rs"
+
 [dependencies]
 kernel = { path = "../crates/kernel" }
 tokio = { version = "1", features = ["full"] }

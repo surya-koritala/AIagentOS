@@ -300,8 +300,18 @@ impl AgentExecutor {
                 );
             }
 
-            // If no tool calls, we're done — return content
-            if response.tool_calls.is_empty() {
+            // Function-calling shim: models without native structured
+            // tool-calling return their tool requests as plaintext. Only when
+            // the response carries no native tool_calls do we scan the content
+            // for shim-encoded call(s) and recover them — the native FC path is
+            // untouched (this fallback only runs when it would otherwise end).
+            let mut tool_calls = response.tool_calls.clone();
+            if tool_calls.is_empty() {
+                tool_calls = crate::function_calling::parse_tool_calls(&response.content);
+            }
+
+            // If no tool calls (native or shim-recovered), we're done — return content
+            if tool_calls.is_empty() {
                 self.messages
                     .push(StandardMessage::assistant(&response.content));
 
@@ -328,12 +338,15 @@ impl AgentExecutor {
                 return Ok(output);
             }
 
-            // Act: execute tool calls
+            // Act: execute tool calls (native, or shim-recovered from plaintext).
+            // For shim-recovered calls the model's prose is preserved as the
+            // assistant content; the structured calls are attached so the tool
+            // results that follow are correctly paired with this turn.
             let mut assistant_msg = StandardMessage::assistant(&response.content);
-            assistant_msg.tool_calls = Some(response.tool_calls.clone());
+            assistant_msg.tool_calls = Some(tool_calls.clone());
             self.messages.push(assistant_msg);
 
-            for tool_call in &response.tool_calls {
+            for tool_call in &tool_calls {
                 if self.cancel_token.is_cancelled() {
                     self.emit(StreamEvent::Cancelled { tool_calls_made }).await;
                     return Ok(AgentOutput {
@@ -769,6 +782,72 @@ mod tests {
         assert_eq!(output.tool_calls_made, 1);
         // One response was priced: 5 tokens × $1/1k = $0.005.
         assert!((budget.global_spent_usd() - 0.005).abs() < 1e-6);
+    }
+
+    /// Mock session that emits a shim-style plaintext tool call (no native
+    /// `tool_calls`), then plain content — exercises the function-calling shim.
+    struct PlaintextShimSession {
+        call_count: AtomicUsize,
+        id: String,
+    }
+
+    #[async_trait::async_trait]
+    impl LlmSession for PlaintextShimSession {
+        async fn send(
+            &self,
+            messages: Vec<StandardMessage>,
+        ) -> Result<LlmResponse, ConnectorError> {
+            self.send_with_tools(messages, &[]).await
+        }
+        async fn send_with_tools(
+            &self,
+            _messages: Vec<StandardMessage>,
+            _tools: &[ToolDefinition],
+        ) -> Result<LlmResponse, ConnectorError> {
+            let count = self.call_count.fetch_add(1, Ordering::SeqCst);
+            if count == 0 {
+                // Plaintext reply with a fenced shim call and NO native tool_calls.
+                Ok(LlmResponse {
+                    content: "I'll read it.\n```json\n{\"tool\": \"read_file\", \"arguments\": {\"path\": \"/tmp/test.txt\"}}\n```".into(),
+                    finish_reason: Some("stop".into()),
+                    tokens_used: 12,
+                    tool_calls: vec![],
+                })
+            } else {
+                Ok(LlmResponse {
+                    content: "The file contains: hello world".into(),
+                    finish_reason: Some("stop".into()),
+                    tokens_used: 8,
+                    tool_calls: vec![],
+                })
+            }
+        }
+        fn provider_id(&self) -> &crate::ProviderId {
+            &self.id
+        }
+    }
+
+    // The function-calling shim is load-bearing: a model that emits a tool call
+    // as plaintext (no native `tool_calls`) still drives the tool-execution path.
+    #[tokio::test]
+    async fn execution_loop_recovers_plaintext_tool_call() {
+        let session = Box::new(PlaintextShimSession {
+            call_count: AtomicUsize::new(0),
+            id: "mock".into(),
+        });
+        let mut executor = AgentExecutor::new(
+            uuid::Uuid::new_v4(),
+            session,
+            mock_broker(),
+            Arc::new(ToolRegistry::new()),
+            mock_context_manager(),
+            "test".into(),
+        );
+
+        let output = executor.run("Read /tmp/test.txt").await.unwrap();
+        // The plaintext call was recovered and executed (one tool call made).
+        assert_eq!(output.tool_calls_made, 1);
+        assert_eq!(output.content, "The file contains: hello world");
     }
 
     #[tokio::test]

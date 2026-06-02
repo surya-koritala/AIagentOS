@@ -24,6 +24,7 @@ pub mod docker_sandbox;
 pub mod editing;
 pub mod event_loop;
 pub mod execution;
+pub mod function_calling;
 pub mod github;
 pub mod indexer;
 pub mod init_system;

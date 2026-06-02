@@ -1,0 +1,20 @@
+[book]
+title = "AI Agent OS"
+description = "An OS kernel for AI agents — agents are processes, context is memory, tools are files, and the kernel orchestrates them."
+authors = ["AI Agent OS contributors"]
+language = "en"
+src = "src"
+
+[build]
+build-dir = "book"
+create-missing = false
+
+[output.html]
+default-theme = "navy"
+preferred-dark-theme = "navy"
+git-repository-url = "https://github.com/surya-koritala/AIagentOS"
+edit-url-template = "https://github.com/surya-koritala/AIagentOS/edit/main/docs/{path}"
+
+[output.html.fold]
+enable = true
+level = 1

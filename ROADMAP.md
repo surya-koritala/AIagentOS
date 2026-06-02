@@ -1,5 +1,12 @@
 # AI Agent OS — Roadmap to a True OS
 
+> **Next frontier:** the Phase 1–3 OS-unification work below is complete (the syscall gate,
+> namespaces, MAC, cgroups, CFS turn admission, context paging, and budget enforcement are
+> load-bearing; `OsKernel` is gone). The forward-looking platform backlog — reaching
+> feature-comparability with [AIOS](https://github.com/agiresearch/AIOS) (kernel-as-server,
+> agent SDK, LLM-core breadth, context switching, memory/storage retrieval) — lives in
+> [docs/AIOS_PARITY_BACKLOG.md](docs/AIOS_PARITY_BACKLOG.md).
+
 ## Where we are (May 2026 audit)
 
 Today, ~33% of the Linux-mapped subsystems are load-bearing on the live runtime path; ~67% exist in code but are bypassed. Two parallel orchestrators (`AgentKernelImpl` used by CLI/Tauri, `OsKernel` used only in benchmarks) own different halves of the design — that split is the single biggest reason "OS" is currently naming rather than architecture.

@@ -33,8 +33,71 @@ pub enum StreamEvent {
     Done(AgentOutput),
     /// Execution was cancelled.
     Cancelled { tool_calls_made: usize },
+    /// Execution was paused at a safe boundary; the accumulated work is
+    /// preserved in a checkpoint (see [`GenerationCheckpoint`]) rather than
+    /// discarded. Distinct from `Cancelled`, which drops progress.
+    Paused { tool_calls_made: usize },
     /// An error occurred.
     Error(String),
+}
+
+/// A checkpoint of an in-flight turn, captured when a running turn is paused at
+/// a safe boundary (a "mid-generation context switch"). It carries everything a
+/// fresh executor needs to continue the turn to completion.
+///
+/// # Pause granularity — honest about the approximation
+///
+/// A pause is taken at a *cooperative boundary*, not at an arbitrary point in
+/// the model's decode:
+///
+/// - **Between tool iterations** — after the accumulated messages (assistant
+///   turn + tool results) are appended, before the next LLM round. This is the
+///   only boundary that is real for every backend.
+/// - **Between streamed tokens** — for local/streaming backends that surface
+///   per-token events, a pause here approaches *true* mid-decode switching:
+///   tokens emitted so far are kept in `partial_content`.
+///
+/// For hosted request/response APIs there is **no token-level pause**: a single
+/// `send` call is atomic from the kernel's point of view, so the finest real
+/// boundary is the turn/iteration boundary. Resuming such a turn is a
+/// *continuation* — the executor re-issues the request with the accumulated
+/// context (the prior assistant turn + tool results already in `messages`). We
+/// do not claim to interrupt a hosted decode in flight; `partial_content` for
+/// those backends is only ever populated at a completed-message boundary.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct GenerationCheckpoint {
+    /// The agent this turn belongs to (kernel UUID).
+    pub agent_id: AgentId,
+    /// The conversation this turn belongs to, so a resuming executor can
+    /// persist back to the same SQLite conversation.
+    pub conversation_id: String,
+    /// The original user message that started the turn.
+    pub user_message: String,
+    /// The full accumulated conversation at the pause boundary — system prompt,
+    /// memories, the user message, and any assistant/tool turns completed so
+    /// far. A fresh executor seeded with this can continue without replaying.
+    pub messages: Vec<StandardMessage>,
+    /// Any partial assistant text accumulated but not yet committed as a final
+    /// message (only ever non-empty for streaming backends that pause
+    /// mid-token; empty for hosted request/response APIs — see type docs).
+    pub partial_content: String,
+    /// Tool calls executed before the pause — carried so the resumed turn's
+    /// final `AgentOutput.tool_calls_made` reflects the whole turn.
+    pub tool_calls_made: usize,
+    /// Tokens consumed before the pause — carried so the resumed turn's final
+    /// `AgentOutput.tokens_used` reflects the whole turn.
+    pub tokens_used: u32,
+}
+
+/// The result of a pause-aware turn: either it ran to completion, or it stopped
+/// at a safe boundary with a checkpoint to resume from.
+#[derive(Debug, Clone)]
+pub enum TurnResult {
+    /// The turn finished; the output reflects the whole turn.
+    Completed(AgentOutput),
+    /// The turn was paused at a boundary; resume with
+    /// [`AgentExecutor::resume`] to finish it.
+    Paused(GenerationCheckpoint),
 }
 
 /// Output from the agent execution loop.
@@ -185,7 +248,38 @@ impl AgentExecutor {
     }
 
     /// Run the execution loop for a user message.
+    ///
+    /// This is the original, pause-unaware entry point and its behavior is
+    /// unchanged: if the `cancel_token` fires at a boundary it returns a
+    /// `"Cancelled."` output and discards in-flight progress. It delegates to
+    /// the pause-aware [`AgentExecutor::run_resumable`]; a `Paused` outcome
+    /// (which `run` itself can only reach via cancellation) is collapsed back
+    /// into the legacy cancelled output so existing callers see no change.
     pub async fn run(&mut self, user_message: &str) -> Result<AgentOutput, KernelError> {
+        match self.run_resumable(user_message).await? {
+            TurnResult::Completed(output) => Ok(output),
+            TurnResult::Paused(checkpoint) => {
+                // Preserve `run`'s historical contract: a cancellation surfaces
+                // as a "Cancelled." output. The accumulated work still lives in
+                // the checkpoint for callers that use `run_resumable` directly.
+                self.emit(StreamEvent::Cancelled {
+                    tool_calls_made: checkpoint.tool_calls_made,
+                })
+                .await;
+                Ok(AgentOutput {
+                    content: "Cancelled.".into(),
+                    tool_calls_made: checkpoint.tool_calls_made,
+                    tokens_used: checkpoint.tokens_used,
+                })
+            }
+        }
+    }
+
+    /// Prepare a fresh turn: inject memories + correction rules, append the user
+    /// message, and auto-summarize if over the overflow threshold. Shared by
+    /// `run`/`run_resumable`; not called on the resume path (the checkpoint
+    /// already carries the prepared `messages`).
+    async fn prepare_turn(&mut self, user_message: &str) {
         // Query long-term memory for relevant facts
         if let Ok(facts) = self
             .context_manager
@@ -250,20 +344,84 @@ impl AgentExecutor {
                     .collect();
             }
         }
+    }
 
+    /// Pause-aware run of a turn for `user_message`.
+    ///
+    /// Behaves exactly like [`AgentExecutor::run`] (think→act→observe to
+    /// completion) but, instead of discarding progress when the `cancel_token`
+    /// fires at a safe boundary, it stops at the boundary and returns
+    /// `TurnResult::Paused(checkpoint)` capturing the accumulated messages,
+    /// tool-call count, and token count. Resume later with
+    /// [`AgentExecutor::resume`] — even into a *different* executor instance.
+    ///
+    /// The pause is cooperative and taken at the same boundaries the legacy
+    /// cancel path checked: at the top of each iteration (between LLM rounds)
+    /// and before each tool execution (between tool iterations). See
+    /// [`GenerationCheckpoint`] for the honest note on token-level vs
+    /// turn-boundary granularity across local and hosted backends.
+    pub async fn run_resumable(&mut self, user_message: &str) -> Result<TurnResult, KernelError> {
+        self.prepare_turn(user_message).await;
+        self.drive_loop(user_message.to_string(), 0, 0).await
+    }
+
+    /// Resume a turn from a checkpoint and drive it to completion (it can itself
+    /// be paused again). The executor's `messages`/`conversation_id` are seeded
+    /// from the checkpoint, so the final `AgentOutput` reflects the whole turn —
+    /// both the pre-pause and post-pause work (tool calls and tokens are carried
+    /// forward). The prologue (memory/rules/user-message/summarize) is *not*
+    /// re-run: the checkpoint already encodes that state.
+    ///
+    /// This may be called on a fresh executor backed by a new session — the
+    /// continuation re-issues against the accumulated context, which is exactly
+    /// the turn-boundary continuation semantics for hosted APIs described on
+    /// [`GenerationCheckpoint`].
+    pub async fn resume(
+        &mut self,
+        checkpoint: GenerationCheckpoint,
+    ) -> Result<TurnResult, KernelError> {
+        self.conversation_id = checkpoint.conversation_id;
+        self.messages = checkpoint.messages;
+        // If a streaming backend paused mid-token, the partial assistant text is
+        // re-seeded as context so the continuation can build on it. Hosted APIs
+        // never populate this (see GenerationCheckpoint docs), so this is a
+        // no-op for them.
+        if !checkpoint.partial_content.is_empty() {
+            self.messages
+                .push(StandardMessage::assistant(&checkpoint.partial_content));
+        }
+        self.drive_loop(
+            checkpoint.user_message,
+            checkpoint.tool_calls_made,
+            checkpoint.tokens_used,
+        )
+        .await
+    }
+
+    /// The core think→act→observe loop, shared by the fresh and resume paths.
+    ///
+    /// `tool_calls_made` / `total_tokens` are seeded (0 for a fresh turn, or the
+    /// carried-forward counts for a resume) so a completed `AgentOutput` always
+    /// reflects the entire turn. A cancellation at a boundary returns
+    /// `TurnResult::Paused(checkpoint)` with the accumulated state preserved.
+    async fn drive_loop(
+        &mut self,
+        user_message: String,
+        seed_tool_calls: usize,
+        seed_tokens: u32,
+    ) -> Result<TurnResult, KernelError> {
         let tools = self.tool_registry.definitions();
-        let mut total_tokens: u32 = 0;
-        let mut tool_calls_made: usize = 0;
+        let mut total_tokens: u32 = seed_tokens;
+        let mut tool_calls_made: usize = seed_tool_calls;
 
         for _ in 0..MAX_ITERATIONS {
-            // Check cancellation
+            // Pause boundary: between LLM rounds. Capture a checkpoint of the
+            // work so far instead of discarding it.
             if self.cancel_token.is_cancelled() {
-                self.emit(StreamEvent::Cancelled { tool_calls_made }).await;
-                return Ok(AgentOutput {
-                    content: "Cancelled.".into(),
-                    tool_calls_made,
-                    tokens_used: total_tokens,
-                });
+                return Ok(TurnResult::Paused(
+                    self.checkpoint(&user_message, tool_calls_made, total_tokens, String::new())
+                        .await,
+                ));
             }
 
             // Page out old context to keep the active window within the token
@@ -282,7 +440,7 @@ impl AgentExecutor {
                     };
                     self.emit(StreamEvent::Done(output.clone())).await;
                     self.save_conversation();
-                    return Ok(output);
+                    return Ok(TurnResult::Completed(output));
                 }
             }
 
@@ -335,7 +493,7 @@ impl AgentExecutor {
                 };
                 self.emit(StreamEvent::Done(output.clone())).await;
                 self.save_conversation();
-                return Ok(output);
+                return Ok(TurnResult::Completed(output));
             }
 
             // Act: execute tool calls (native, or shim-recovered from plaintext).
@@ -347,13 +505,20 @@ impl AgentExecutor {
             self.messages.push(assistant_msg);
 
             for tool_call in &tool_calls {
+                // Pause boundary: between tool iterations. The assistant turn is
+                // already committed to `messages`; the as-yet-unexecuted call is
+                // re-issued on resume (its result simply isn't in `messages`
+                // yet), so no progress is lost.
                 if self.cancel_token.is_cancelled() {
-                    self.emit(StreamEvent::Cancelled { tool_calls_made }).await;
-                    return Ok(AgentOutput {
-                        content: "Cancelled.".into(),
-                        tool_calls_made,
-                        tokens_used: total_tokens,
-                    });
+                    return Ok(TurnResult::Paused(
+                        self.checkpoint(
+                            &user_message,
+                            tool_calls_made,
+                            total_tokens,
+                            String::new(),
+                        )
+                        .await,
+                    ));
                 }
                 tool_calls_made += 1;
                 self.emit(StreamEvent::ToolCallStarted {
@@ -373,11 +538,33 @@ impl AgentExecutor {
         }
 
         // Max iterations reached
-        Ok(AgentOutput {
+        Ok(TurnResult::Completed(AgentOutput {
             content: "I've reached the maximum number of tool call iterations. Here's what I've done so far.".to_string(),
             tool_calls_made,
             tokens_used: total_tokens,
-        })
+        }))
+    }
+
+    /// Build a checkpoint of the in-flight turn at a pause boundary and emit a
+    /// `Paused` stream event. The accumulated `messages` are snapshotted so a
+    /// resuming executor can continue without replaying the prologue.
+    async fn checkpoint(
+        &self,
+        user_message: &str,
+        tool_calls_made: usize,
+        tokens_used: u32,
+        partial_content: String,
+    ) -> GenerationCheckpoint {
+        self.emit(StreamEvent::Paused { tool_calls_made }).await;
+        GenerationCheckpoint {
+            agent_id: self.agent_id,
+            conversation_id: self.conversation_id.clone(),
+            user_message: user_message.to_string(),
+            messages: self.messages.clone(),
+            partial_content,
+            tool_calls_made,
+            tokens_used,
+        }
     }
 
     /// Send to LLM with retry (3 attempts, exponential backoff).
@@ -527,7 +714,7 @@ mod tests {
     use super::*;
     use crate::connector::{LlmResponse, ToolCall, ToolDefinition};
     use crate::permissions::PermissionManager;
-    use crate::resources::{ResourceCapability, ResourceProvider, ResourceResponse};
+    use crate::resources::ResourceProvider;
     use crate::{ConnectorError, ResourceError};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -1163,5 +1350,250 @@ mod tests {
 
         // After summarization, message count should be less than what we started with
         assert!(executor.messages().len() < MESSAGE_OVERFLOW_THRESHOLD + 3);
+    }
+
+    // ---- Mid-generation context switch (#56) ----
+
+    /// A no-pause `run_resumable` runs to completion just like `run`.
+    #[tokio::test]
+    async fn run_resumable_completes_when_not_paused() {
+        let session = Box::new(MockToolSession {
+            call_count: AtomicUsize::new(0),
+            id: "mock".into(),
+        });
+        let mut executor = AgentExecutor::new(
+            uuid::Uuid::new_v4(),
+            session,
+            mock_broker(),
+            Arc::new(ToolRegistry::new()),
+            mock_context_manager(),
+            "test".into(),
+        );
+
+        match executor.run_resumable("Read /tmp/test.txt").await.unwrap() {
+            TurnResult::Completed(output) => {
+                assert_eq!(output.content, "The file contains: hello world");
+                assert_eq!(output.tool_calls_made, 1);
+                assert_eq!(output.tokens_used, 35);
+            }
+            TurnResult::Paused(_) => panic!("should have completed, not paused"),
+        }
+    }
+
+    /// Cancelling before the first LLM round pauses at the boundary and returns
+    /// a checkpoint carrying the accumulated (prologue) messages — the user
+    /// message is present, so a fresh executor can continue the turn. This is
+    /// deterministic: the cancel token is set before `run_resumable`, so the
+    /// very first boundary check trips.
+    #[tokio::test]
+    async fn run_resumable_pauses_at_boundary_with_checkpoint() {
+        let agent_id = uuid::Uuid::new_v4();
+        let session = Box::new(InfiniteToolSession { id: "x".into() });
+        let mut executor = AgentExecutor::new(
+            agent_id,
+            session,
+            mock_broker(),
+            Arc::new(ToolRegistry::new()),
+            mock_context_manager(),
+            "SYSTEM".into(),
+        );
+
+        // Deterministic pause: signal cancel up front so the first boundary
+        // check (top of the loop) trips — no wall-clock timing involved.
+        executor.cancel();
+
+        let checkpoint = match executor.run_resumable("do work").await.unwrap() {
+            TurnResult::Paused(cp) => cp,
+            TurnResult::Completed(_) => panic!("should have paused, not completed"),
+        };
+
+        // No LLM round ran, but the prologue is captured: system + user message.
+        assert_eq!(checkpoint.agent_id, agent_id);
+        assert_eq!(checkpoint.user_message, "do work");
+        assert_eq!(checkpoint.tool_calls_made, 0);
+        assert!(
+            checkpoint.messages.iter().any(|m| m.role == "system"),
+            "checkpoint should retain the system prompt"
+        );
+        assert!(
+            checkpoint
+                .messages
+                .iter()
+                .any(|m| m.role == "user" && m.content == "do work"),
+            "checkpoint should retain the user message"
+        );
+    }
+
+    /// A broker whose filesystem provider trips a shared cancel token as a side
+    /// effect of executing the tool. This makes the pause boundary
+    /// *deterministic*: the first tool runs to completion (so `tool_calls_made`
+    /// is 1), and by the time the executor reaches iteration 2's top-of-loop
+    /// check the token is already set — no event-channel race, no wall clock.
+    fn cancel_on_tool_broker(cancel: CancellationToken) -> Arc<dyn ResourceBroker> {
+        use crate::resources::ResourceBrokerImpl;
+        let perms = Arc::new(PermissionManager::new());
+        let broker = ResourceBrokerImpl::new(perms);
+        struct CancelFs {
+            cancel: CancellationToken,
+        }
+        #[async_trait::async_trait]
+        impl ResourceProvider for CancelFs {
+            fn resource_type(&self) -> crate::resources::ResourceType {
+                crate::resources::ResourceType::Filesystem
+            }
+            fn supported_operations(&self) -> Vec<String> {
+                vec!["read".into(), "write".into(), "list".into()]
+            }
+            async fn execute(
+                &self,
+                _op: &str,
+                _params: &serde_json::Value,
+            ) -> Result<serde_json::Value, ResourceError> {
+                self.cancel.cancel();
+                Ok(serde_json::json!({"content": "hello world"}))
+            }
+        }
+        broker.register_provider(Box::new(CancelFs { cancel }));
+        Arc::new(broker)
+    }
+
+    /// Resuming a checkpoint into a *fresh* executor (new mock session) finishes
+    /// the turn, and the completed output reflects both phases: the tool call
+    /// made before the pause is carried forward, and tokens accumulate across
+    /// the pre- and post-pause work.
+    #[tokio::test]
+    async fn resume_from_checkpoint_reflects_both_phases() {
+        let agent_id = uuid::Uuid::new_v4();
+
+        // Phase 1: run exactly one tool round, then pause at the next boundary.
+        // `MockToolSession` returns a tool call on call 0; the broker trips the
+        // cancel token while executing that tool, so the pause is taken at the
+        // top of iteration 2 — deterministic, gated on the cancel flag being set
+        // before the boundary check, not on timing.
+        let shared_cancel = CancellationToken::new();
+        let mut exec1 = AgentExecutor::new(
+            agent_id,
+            Box::new(MockToolSession {
+                call_count: AtomicUsize::new(0),
+                id: "phase1".into(),
+            }),
+            cancel_on_tool_broker(shared_cancel.clone()),
+            Arc::new(ToolRegistry::new()),
+            mock_context_manager(),
+            "SYSTEM".into(),
+        );
+        exec1.cancel_token = shared_cancel;
+
+        let checkpoint = match exec1.run_resumable("Read /tmp/test.txt").await.unwrap() {
+            TurnResult::Paused(cp) => cp,
+            TurnResult::Completed(_) => panic!("phase 1 should pause after one tool round"),
+        };
+        assert_eq!(checkpoint.tool_calls_made, 1, "one tool call before pause");
+        assert!(checkpoint.tokens_used >= 20, "phase-1 tokens accumulated");
+        // The assistant turn + tool result are in the checkpoint.
+        assert!(checkpoint.messages.iter().any(|m| m.role == "tool"));
+
+        // Phase 2: resume into a FRESH executor with a session that returns the
+        // remainder (final content, no tool calls).
+        let resume_session = Box::new(LongResponseSession {
+            id: "phase2".into(),
+        });
+        let mut exec2 = AgentExecutor::new(
+            agent_id,
+            resume_session,
+            mock_broker(),
+            Arc::new(ToolRegistry::new()),
+            mock_context_manager(),
+            "SYSTEM".into(),
+        );
+        let phase1_tokens = checkpoint.tokens_used;
+
+        let output = match exec2.resume(checkpoint).await.unwrap() {
+            TurnResult::Completed(out) => out,
+            TurnResult::Paused(_) => panic!("phase 2 should complete"),
+        };
+
+        // The final output reflects the WHOLE turn: the pre-pause tool call is
+        // carried forward, and tokens are the sum of both phases.
+        assert_eq!(output.tool_calls_made, 1, "pre-pause tool call carried");
+        assert!(
+            output.tokens_used > phase1_tokens,
+            "tokens accumulate across pause ({} should exceed {})",
+            output.tokens_used,
+            phase1_tokens
+        );
+        assert!(output.content.contains("long response"));
+    }
+
+    /// A paused turn can be paused again on resume: resuming with the cancel
+    /// token already set re-pauses immediately, preserving the carried-forward
+    /// counts (idempotent re-checkpointing).
+    #[tokio::test]
+    async fn resume_can_pause_again() {
+        let agent_id = uuid::Uuid::new_v4();
+        let checkpoint = GenerationCheckpoint {
+            agent_id,
+            conversation_id: "conv".into(),
+            user_message: "keep going".into(),
+            messages: vec![
+                StandardMessage::system("SYSTEM"),
+                StandardMessage::user("keep going"),
+            ],
+            partial_content: String::new(),
+            tool_calls_made: 2,
+            tokens_used: 42,
+        };
+
+        let session = Box::new(InfiniteToolSession { id: "x".into() });
+        let mut exec = AgentExecutor::new(
+            agent_id,
+            session,
+            mock_broker(),
+            Arc::new(ToolRegistry::new()),
+            mock_context_manager(),
+            "SYSTEM".into(),
+        );
+        exec.cancel(); // re-pause at the first boundary on resume
+
+        match exec.resume(checkpoint).await.unwrap() {
+            TurnResult::Paused(cp) => {
+                // Carried-forward counts are preserved across the re-pause.
+                assert_eq!(cp.tool_calls_made, 2);
+                assert_eq!(cp.tokens_used, 42);
+                assert_eq!(cp.user_message, "keep going");
+                assert_eq!(cp.conversation_id, "conv");
+            }
+            TurnResult::Completed(_) => panic!("should re-pause, not complete"),
+        }
+    }
+
+    /// A `GenerationCheckpoint` round-trips through serde unchanged.
+    #[test]
+    fn checkpoint_serde_round_trip() {
+        let mut assistant = StandardMessage::assistant("calling a tool");
+        assistant.tool_calls = Some(vec![ToolCall {
+            id: "call_1".into(),
+            name: "read_file".into(),
+            arguments: serde_json::json!({"path": "/tmp/x"}),
+        }]);
+
+        let checkpoint = GenerationCheckpoint {
+            agent_id: uuid::Uuid::new_v4(),
+            conversation_id: "conv-123".into(),
+            user_message: "do the thing".into(),
+            messages: vec![
+                StandardMessage::system("SYSTEM"),
+                StandardMessage::user("do the thing"),
+                assistant,
+                StandardMessage::tool_result("call_1", "hello world"),
+            ],
+            partial_content: "partial assistant text".into(),
+            tool_calls_made: 3,
+            tokens_used: 123,
+        };
+
+        let json = serde_json::to_string(&checkpoint).unwrap();
+        let restored: GenerationCheckpoint = serde_json::from_str(&json).unwrap();
+        assert_eq!(checkpoint, restored);
     }
 }

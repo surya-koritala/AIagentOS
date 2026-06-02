@@ -59,6 +59,7 @@ pub mod syscall_interface;
 pub mod syscall_server;
 pub mod sysctl;
 pub mod tool_descriptors;
+pub mod tool_registry_share;
 pub mod tools;
 pub mod vision;
 pub mod voice;

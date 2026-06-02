@@ -13,3 +13,6 @@ thiserror = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
+adapters = { path = "../adapters" }
+wiremock = { workspace = true }
+async-trait = { workspace = true }

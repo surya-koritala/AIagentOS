@@ -291,10 +291,14 @@ impl ContextManager for SqliteContextManager {
 
     async fn store_fact(&self, agent_id: AgentId, fact: Fact) -> Result<(), ContextError> {
         let conn = self.conn.lock().unwrap();
-        let embedding_json = fact
-            .embedding
-            .as_ref()
-            .map(|e| serde_json::to_string(e).unwrap_or_default());
+        // Every stored fact gets a deterministic embedding. If the caller didn't
+        // supply one, compute it from the content via the Memory Manager so
+        // query_memory can rank by semantic (cosine) similarity later.
+        let embedding = match &fact.embedding {
+            Some(e) => e.clone(),
+            None => crate::memory_manager::embed(&fact.content),
+        };
+        let embedding_json = Some(serde_json::to_string(&embedding).unwrap_or_default());
         let category_str = serde_json::to_string(&fact.category)
             .map_err(|e| ContextError::StorageError(e.to_string()))?;
 
@@ -321,18 +325,21 @@ impl ContextManager for SqliteContextManager {
     ) -> Result<Vec<Fact>, ContextError> {
         let conn = self.conn.lock().unwrap();
         let id_str = agent_id.to_string();
-        let pattern = format!("%{}%", query);
 
+        // Fetch the agent's candidate facts. We pull all of the agent's facts
+        // (rather than a substring `LIKE` prefilter) so that semantic ranking
+        // can surface relevant facts that don't share literal tokens with the
+        // query — that's the whole point of vector retrieval.
         let mut stmt = conn
             .prepare(
                 "SELECT id, content, category, created_at, last_accessed_at, embedding_json
-             FROM facts WHERE agent_id = ?1 AND content LIKE ?2
+             FROM facts WHERE agent_id = ?1
              ORDER BY last_accessed_at DESC",
             )
             .map_err(|e| ContextError::StorageError(e.to_string()))?;
 
         let facts = stmt
-            .query_map(params![id_str, pattern], |row| {
+            .query_map(params![id_str], |row| {
                 let id_str: String = row.get(0)?;
                 let content: String = row.get(1)?;
                 let category_str: String = row.get(2)?;
@@ -376,6 +383,25 @@ impl ContextManager for SqliteContextManager {
                 embedding,
             });
         }
+
+        // Semantic ranking: embed the query and sort facts by cosine similarity
+        // (best-first). A fact missing a stored embedding falls back to embedding
+        // its content on the fly; an empty/unparseable embedding scores 0.
+        let query_vec = crate::memory_manager::embed(query);
+        let scored: Vec<(Fact, Vec<f32>)> = result
+            .into_iter()
+            .map(|fact| {
+                let emb = match &fact.embedding {
+                    Some(e) if !e.is_empty() => e.clone(),
+                    _ => crate::memory_manager::embed(&fact.content),
+                };
+                (fact, emb)
+            })
+            .collect();
+        let result: Vec<Fact> = crate::memory_manager::rank(&query_vec, scored)
+            .into_iter()
+            .map(|(fact, _score)| fact)
+            .collect();
 
         // Update last_accessed_at for returned facts
         let now = Utc::now().to_rfc3339();
@@ -606,20 +632,73 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn query_memory_no_match() {
+    async fn query_memory_empty_when_no_facts() {
+        // With semantic ranking, query_memory ranks an agent's facts rather than
+        // substring-filtering them, so it only returns empty when there are no
+        // facts stored for the agent.
+        let mgr = SqliteContextManager::in_memory().unwrap();
+        let id = uuid::Uuid::new_v4();
+        let results = mgr.query_memory(id, "tea").await.unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[tokio::test]
+    async fn store_fact_persists_computed_embedding() {
+        // store_fact should compute an embedding when none is supplied, so the
+        // round-tripped fact comes back with a populated embedding vector.
         let mgr = SqliteContextManager::in_memory().unwrap();
         let id = uuid::Uuid::new_v4();
         let fact = Fact {
             id: uuid::Uuid::new_v4(),
-            content: "likes coffee".to_string(),
+            content: "likes coffee in the morning".to_string(),
             category: FactCategory::Preference,
             created_at: Utc::now(),
             last_accessed_at: Utc::now(),
             embedding: None,
         };
         mgr.store_fact(id, fact).await.unwrap();
-        let results = mgr.query_memory(id, "tea").await.unwrap();
-        assert!(results.is_empty());
+        let results = mgr.query_memory(id, "coffee").await.unwrap();
+        assert_eq!(results.len(), 1);
+        let emb = results[0].embedding.as_ref().expect("embedding persisted");
+        assert_eq!(emb.len(), crate::memory_manager::EMBED_DIM);
+    }
+
+    #[tokio::test]
+    async fn query_memory_ranks_semantically_closest_first() {
+        let mgr = SqliteContextManager::in_memory().unwrap();
+        let id = uuid::Uuid::new_v4();
+
+        let facts = [
+            "the user prefers dark mode in the editor",
+            "the spacecraft reached orbital velocity at dawn",
+            "the user enjoys drinking coffee every morning",
+        ];
+        for content in facts {
+            mgr.store_fact(
+                id,
+                Fact {
+                    id: uuid::Uuid::new_v4(),
+                    content: content.to_string(),
+                    category: FactCategory::Fact,
+                    created_at: Utc::now(),
+                    last_accessed_at: Utc::now(),
+                    embedding: None,
+                },
+            )
+            .await
+            .unwrap();
+        }
+
+        let results = mgr
+            .query_memory(id, "what theme does the user like in their editor")
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 3);
+        // The dark-mode/editor fact is semantically closest to the query.
+        assert_eq!(
+            results[0].content,
+            "the user prefers dark mode in the editor"
+        );
     }
 
     #[tokio::test]

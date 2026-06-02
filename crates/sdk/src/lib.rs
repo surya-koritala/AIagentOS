@@ -40,6 +40,13 @@ use kernel::syscall_server::{
 };
 use tokio::net::ToSocketAddrs;
 
+pub mod patterns;
+
+pub use patterns::{
+    Decision, DirectiveReasoner, FnPlanner, PlanRun, Planner, PlannerExecutor, ReActLoop,
+    ReActOutcome, ReActStep, Reasoner, Step, StepResult, ToolInvocation,
+};
+
 /// Errors surfaced by the SDK.
 ///
 /// [`SdkError::Kernel`] carries a denial or failure message that the kernel

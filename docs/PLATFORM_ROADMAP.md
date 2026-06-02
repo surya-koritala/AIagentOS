@@ -1,0 +1,108 @@
+# Platform Roadmap
+
+Forward-looking feature roadmap for **AI Agent OS**: turning the load-bearing
+Rust kernel into a complete, usable agent platform.
+
+> **Rust-only.** The kernel, the SDK, agents, and all tooling are Rust. We do not
+> introduce other languages or runtimes. The one external boundary (the syscall
+> server) speaks plain JSON so it is language-neutral on the wire, but everything
+> we build and ship is Rust.
+
+## Where we stand
+
+- **Strong — OS-grade enforcement & isolation.** SELinux-style MAC (label + path/URL
+  glob), Linux capabilities, cgroup token quotas, a cumulative-USD budget ceiling,
+  namespace isolation across agents/IPC/delegation/discovery/tools, an audit trail,
+  and CFS fairness driving turn admission. This is the differentiator; keep it.
+- **Thin — the platform surface.** No way yet for *external* agents to drive the
+  kernel (no SDK / server until now); narrow LLM-backend coverage; no context
+  snapshot/restore; basic memory (no retrieval); small tool ecosystem.
+
+## Direction
+
+Expose the kernel over a **syscall API** (a long-lived server) and ship an
+**embeddable Rust SDK**, so agents — in-process or in separate Rust processes —
+drive the kernel through a single boundary that always flows through the
+enforcement gate. Build outward from there: LLM-core breadth, context
+management, memory/storage with retrieval, and tooling.
+
+Sizes: **S** ≈ days, **M** ≈ 1–2 weeks, **L** ≈ 3–6 weeks, **XL** ≈ a quarter (solo).
+
+---
+
+## Phase 0 — Kernel-as-server + SDK (unblocks everything)
+
+| ID | Title | Size | Deps | Status |
+|----|-------|------|------|--------|
+| **B0.1** | Syscall server: expose `AgentKernelImpl` over a JSON syscall API (TCP + Unix socket); promote `syscall_interface` toward the real agent↔kernel boundary | XL | — | Increment 1 merged (`syscall_server`: protocol + dispatch + server/client + round-trip) |
+| **B0.2** | Embeddable **Rust SDK** crate: `Agent` builder + typed client over the syscall API (and an in-process mode), `llm` / `memory` / `storage` / `tool` calls | L | B0.1 | |
+| **B0.3** | Agent package format + loader/runner (a Rust agent crate + a manifest the kernel can load and run) | M | B0.2 | |
+
+## Phase 1 — LLM Core
+
+| ID | Title | Size | Deps | Notes |
+|----|-------|------|------|-------|
+| **B1.1** | LLM backend breadth: add more `LlmProviderAdapter`s (e.g. vLLM, Gemini, Groq, Deepseek, HuggingFace) — 4 → 9+ | M | — | Rust adapters + a provider-routing layer |
+| **B1.2** | LLM-request scheduling: scheduler dispatches queued LLM *requests* to LLM cores (today CFS/TurnAdmission gates agent *turns*) | L | B0.1 | |
+| **B1.3** | Function-calling shim for open-source models (structured tool-calling for models without native support) | M | — | |
+
+## Phase 2 — Context management
+
+| ID | Title | Size | Deps | Notes |
+|----|-------|------|------|-------|
+| **B2.1** | Context snapshot / restore (persist + restore an agent's in-flight context so a turn can pause/resume) | L | — | |
+| **B2.2** | Mid-generation context switch (pause/resume LLM decoding; feasible with local/vLLM, checkpoint-at-token-boundary for hosted APIs) | XL | B2.1, B1.1 | We only trim the buffer today (ContextPager) |
+
+## Phase 3 — Memory & storage
+
+| ID | Title | Size | Deps | Notes |
+|----|-------|------|------|-------|
+| **B3.1** | Memory Manager with retrieval: promote `query_memory` into a per-agent subsystem with embeddings + vector search | L | — | `indexer`/embeddings seam exists |
+| **B3.2** | Storage Manager: formalize persistent-storage syscalls beyond raw SQLite | M | B0.1 | |
+| **B3.3** | Semantic file system over agent storage | XL | B3.2 | **Optional / defer** |
+
+## Phase 4 — Tools
+
+| ID | Title | Size | Deps | Notes |
+|----|-------|------|------|-------|
+| **B4.1** | MCP *server* (we have an MCP client; add a server so agents expose/consume MCP tools) | M | — | |
+| **B4.2** | Shareable tool registry (downloadable Rust tools / templates) | M | B0.3 | |
+| **B4.3** | Computer-use / sandboxed automation controller | XL | — | **Optional / defer** |
+
+## Phase 5 — Ecosystem
+
+| ID | Title | Size | Deps | Notes |
+|----|-------|------|------|-------|
+| **B5.1** | Rust agent templates + reference patterns (ReAct-style loop, planner/executor) shipped on the SDK | L | B0.2 | Replaces any external-framework dependency — all Rust |
+| **B5.2** | Agent hub (publish/fetch/share Rust agent packages) | L | B0.3 | |
+| **B5.3** | Rust TUI / extend the desktop app for observing + driving agents | M | B0.2 | |
+
+## Phase 6 — Distributed & validation
+
+| ID | Title | Size | Deps | Notes |
+|----|-------|------|------|-------|
+| **B6.1** | Remote kernel / distributed deployment | L | B0.1 | |
+| **B6.2** | Benchmarks + eval harness: run `stress_test` in CI; add an agent-task benchmark | M | — | SWE-bench harness seam exists |
+| **B6.3** | Docs site + examples | M | — | |
+
+## Keep our lead (do not regress)
+
+| ID | Title | Size | Deps | Notes |
+|----|-------|------|------|-------|
+| **B7.1** | Surface enforcement (MAC / capabilities / cgroups / namespaces / audit / USD-budget) as first-class SDK calls | M | B0.1 | Our genuine differentiator — make it visible. Do alongside Phase 0 |
+
+---
+
+## Recommended sequencing
+
+**B0.1 syscall server → B0.2 Rust SDK → B1.1 backend breadth**, with **B7.1** in
+parallel so the security model is a headline SDK feature from day one. That turns
+the kernel library into a usable platform and unblocks the later phases.
+
+## Notes
+
+- Everything stays **Rust**. Where the broader agent ecosystem leans on other
+  languages, we provide the Rust-native equivalent (SDK, templates, patterns)
+  rather than embedding another runtime.
+- **Defer** the optional XLs (semantic FS B3.3, computer-use B4.3) until the core
+  platform exists.

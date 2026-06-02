@@ -1,15 +1,17 @@
 //! Syscall server — exposes the kernel over a socket as an agent↔kernel boundary.
 //!
-//! This is the network/IPC face of [`AgentKernelImpl`] (AIOS-parity #35,
-//! "kernel-as-server"). Agents — including out-of-process / non-Rust ones via an
-//! SDK — drive the kernel by sending **syscalls** (newline-delimited JSON) over a
-//! TCP connection; each is dispatched to the same kernel methods the in-process
-//! CLI uses, so every syscall still flows through the syscall gate's enforcement.
+//! This is the network/IPC face of [`AgentKernelImpl`] ("kernel-as-server").
+//! Agents — in-process, or in separate Rust processes via the SDK — drive the
+//! kernel by sending **syscalls** (newline-delimited JSON) over a connection;
+//! each is dispatched to the same kernel methods the in-process CLI uses, so
+//! every syscall still flows through the syscall gate's enforcement.
 //!
 //! Transport is deliberately dependency-light (tokio + serde_json, both already
 //! in the workspace): one JSON [`Syscall`] per line, one JSON [`SyscallReply`]
-//! per line. The numbered, in-process [`crate::syscall_interface`] ABI remains a
-//! separate concern; this module is the live remoting boundary.
+//! per line. The wire format is plain JSON, so the boundary is language-neutral,
+//! but the SDK and clients we ship are Rust. The numbered, in-process
+//! [`crate::syscall_interface`] ABI remains a separate concern; this module is
+//! the live remoting boundary.
 //!
 //! This first increment covers the agent-lifecycle syscalls (create / list /
 //! send / gate stats). LLM, memory, storage and tool syscalls extend the same
@@ -230,8 +232,8 @@ impl SyscallServer {
     }
 }
 
-/// A thin client for the syscall server (used by the in-tree SDK shims and
-/// round-trip tests; the Python SDK speaks the same wire format).
+/// A thin client for the syscall server (used by the Rust SDK and round-trip
+/// tests). The wire format is plain JSON, so any client could speak it.
 pub struct SyscallClient {
     reader: Lines<BufReader<OwnedReadHalf>>,
     writer: OwnedWriteHalf,
@@ -339,7 +341,7 @@ mod tests {
 
     #[test]
     fn syscall_wire_format_is_tagged_json() {
-        // The Python SDK depends on this exact shape.
+        // The SDK depends on this exact shape.
         let v = serde_json::to_value(Syscall::SendMessage {
             agent_id: "x".into(),
             message: "hi".into(),

@@ -58,7 +58,7 @@ Sizes: **S** ≈ days, **M** ≈ 1–2 weeks, **L** ≈ 3–6 weeks, **XL** ≈ 
 | ID | Title | Size | Deps | Notes |
 |----|-------|------|------|-------|
 | **B3.1** | Memory Manager with retrieval: promote `query_memory` into a per-agent subsystem with embeddings + vector search | L | — | **Done** (`memory_manager`: deterministic offline feature-hash embedder + cosine ranking; `query_memory` now semantic, transparent to the memory syscalls) |
-| **B3.2** | Storage Manager: formalize persistent-storage syscalls beyond raw SQLite | M | B0.1 | |
+| **B3.2** | Storage Manager: formalize persistent-storage syscalls beyond raw SQLite | M | B0.1 | **Done** (per-agent `agent_kv` store on SqliteContextManager; `Storage{Put,Get,List,Delete}` syscalls + SDK methods) |
 | **B3.3** | Semantic file system over agent storage | XL | B3.2 | **Optional / defer** |
 
 ## Phase 4 — Tools
@@ -66,7 +66,7 @@ Sizes: **S** ≈ days, **M** ≈ 1–2 weeks, **L** ≈ 3–6 weeks, **XL** ≈ 
 | ID | Title | Size | Deps | Notes |
 |----|-------|------|------|-------|
 | **B4.1** | MCP *server* (we have an MCP client; add a server so agents expose/consume MCP tools) | M | — | **Done** (`mcp_server`: JSON-RPC `initialize`/`tools.list`/`tools.call` over TCP; gate-enforced call path, denials as JSON-RPC errors) |
-| **B4.2** | Shareable tool registry (downloadable Rust tools / templates) | M | B0.3 | |
+| **B4.2** | Shareable tool registry (downloadable Rust tools / templates) | M | B0.3 | **Done** (`tool_registry_share`: `SharedToolRegistry`/`SharedToolDef`; publish/fetch, install into `ToolRegistry`, resolve from package `tools`) |
 | **B4.3** | Computer-use / sandboxed automation controller | XL | — | **Optional / defer** |
 
 ## Phase 5 — Ecosystem
@@ -82,7 +82,7 @@ Sizes: **S** ≈ days, **M** ≈ 1–2 weeks, **L** ≈ 3–6 weeks, **XL** ≈ 
 | ID | Title | Size | Deps | Notes |
 |----|-------|------|------|-------|
 | **B6.1** | Remote kernel / distributed deployment | L | B0.1 | |
-| **B6.2** | Benchmarks + eval harness: run `stress_test` in CI; add an agent-task benchmark | M | — | SWE-bench harness seam exists |
+| **B6.2** | Benchmarks + eval harness: run `stress_test` in CI; add an agent-task benchmark | M | — | **Done** (`agent-bench` bin + Rust eval harness in `benchmarks/`; fast CI smoke test runs under `cargo test --workspace`) |
 | **B6.3** | Docs site + examples | M | — | |
 
 ## Keep our lead (do not regress)

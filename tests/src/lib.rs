@@ -53,3 +53,6 @@ mod edge_cases;
 
 #[cfg(test)]
 mod os_enforcement;
+
+#[cfg(test)]
+mod governance_e2e;

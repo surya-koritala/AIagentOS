@@ -49,6 +49,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "agent-sdk"
+version = "0.1.0"
+dependencies = [
+ "kernel",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+]
+
+[[package]]
 name = "ahash"
 version = "0.8.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"

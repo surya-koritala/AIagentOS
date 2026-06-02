@@ -83,6 +83,37 @@ async fn builder_requires_name_and_task() {
 }
 
 #[tokio::test]
+async fn memory_store_query_and_list_providers_via_sdk() {
+    let addr = spawn_server().await;
+    let mut client = KernelClient::connect(addr).await.expect("connect");
+
+    let id = client
+        .create_agent("mem", "t", None, None, None)
+        .await
+        .expect("create_agent");
+
+    // Store a fact, then retrieve it by substring.
+    let fact_id = client
+        .memory_store(&id, "api token rotates monthly", Some("instruction".into()))
+        .await
+        .expect("memory_store");
+    assert!(!fact_id.is_empty());
+
+    let facts = client
+        .memory_query(&id, "token rotates")
+        .await
+        .expect("memory_query");
+    assert!(
+        facts.iter().any(|f| f.content.contains("api token")),
+        "stored fact should be retrievable: {facts:?}"
+    );
+
+    // No providers registered in the bare test kernel, but the call round-trips.
+    let providers = client.list_providers().await.expect("list_providers");
+    assert!(providers.is_empty());
+}
+
+#[tokio::test]
 async fn read_only_agent_tool_call_is_denied() {
     let addr = spawn_server().await;
 

@@ -114,6 +114,61 @@ async fn memory_store_query_and_list_providers_via_sdk() {
 }
 
 #[tokio::test]
+async fn storage_put_get_list_delete_via_sdk() {
+    let addr = spawn_server().await;
+    let mut client = KernelClient::connect(addr).await.expect("connect");
+
+    let id = client
+        .create_agent("kv", "t", None, None, None)
+        .await
+        .expect("create_agent");
+
+    // Missing key → None.
+    assert_eq!(
+        client.storage_get(&id, "color").await.expect("storage_get"),
+        None
+    );
+
+    // Put then get.
+    client
+        .storage_put(&id, "color", "blue")
+        .await
+        .expect("storage_put");
+    assert_eq!(
+        client
+            .storage_get(&id, "color")
+            .await
+            .expect("storage_get")
+            .as_deref(),
+        Some("blue")
+    );
+
+    // Overwrite, then list.
+    client
+        .storage_put(&id, "color", "green")
+        .await
+        .expect("storage_put overwrite");
+    assert_eq!(
+        client.storage_list(&id).await.expect("storage_list"),
+        vec!["color".to_string()]
+    );
+
+    // Delete returns true; deleting again returns false.
+    assert!(client
+        .storage_delete(&id, "color")
+        .await
+        .expect("storage_delete"));
+    assert!(!client
+        .storage_delete(&id, "color")
+        .await
+        .expect("storage_delete again"));
+    assert_eq!(
+        client.storage_get(&id, "color").await.expect("storage_get"),
+        None
+    );
+}
+
+#[tokio::test]
 async fn load_package_via_sdk() {
     let addr = spawn_server().await;
     let mut client = KernelClient::connect(addr).await.expect("connect");

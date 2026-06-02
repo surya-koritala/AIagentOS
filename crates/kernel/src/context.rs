@@ -168,7 +168,15 @@ impl SqliteContextManager {
                 model TEXT,
                 estimated_cost_usd REAL
             );
-            CREATE VIRTUAL TABLE IF NOT EXISTS conversations_fts USING fts5(conversation_id, content);",
+            CREATE VIRTUAL TABLE IF NOT EXISTS conversations_fts USING fts5(conversation_id, content);
+            CREATE TABLE IF NOT EXISTS agent_kv (
+                agent_id TEXT NOT NULL,
+                key TEXT NOT NULL,
+                value TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY(agent_id, key)
+            );
+            CREATE INDEX IF NOT EXISTS idx_agent_kv_agent ON agent_kv(agent_id);",
         ).map_err(|e| ContextError::StorageError(e.to_string()))?;
         Ok(())
     }
@@ -548,6 +556,70 @@ impl SqliteContextManager {
     }
 }
 
+/// Per-agent durable key/value store ("storage manager").
+///
+/// A simple persistent KV namespace scoped per agent — distinct from the
+/// long-term-memory facts table (which is semantic / queryable). Values are
+/// opaque strings (callers may JSON-encode structured data). Backed by the same
+/// single SQLite handle as the rest of the context manager (no separate db).
+impl SqliteContextManager {
+    /// Put (insert-or-overwrite) a value for `key` under `agent_id`.
+    pub fn kv_put(&self, agent_id: AgentId, key: &str, value: &str) -> Result<(), ContextError> {
+        let now = Utc::now().to_rfc3339();
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO agent_kv (agent_id, key, value, updated_at) VALUES (?1, ?2, ?3, ?4)",
+            params![agent_id.to_string(), key, value, now],
+        )
+        .map_err(|e| ContextError::PersistenceFailed(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Get the value for `key` under `agent_id`, or `None` if absent.
+    pub fn kv_get(&self, agent_id: AgentId, key: &str) -> Result<Option<String>, ContextError> {
+        let conn = self.conn.lock().unwrap();
+        let result = conn.query_row(
+            "SELECT value FROM agent_kv WHERE agent_id = ?1 AND key = ?2",
+            params![agent_id.to_string(), key],
+            |row| row.get::<_, String>(0),
+        );
+        match result {
+            Ok(value) => Ok(Some(value)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(ContextError::StorageError(e.to_string())),
+        }
+    }
+
+    /// List the keys stored under `agent_id` (sorted ascending).
+    pub fn kv_list(&self, agent_id: AgentId) -> Result<Vec<String>, ContextError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare("SELECT key FROM agent_kv WHERE agent_id = ?1 ORDER BY key ASC")
+            .map_err(|e| ContextError::StorageError(e.to_string()))?;
+        let rows = stmt
+            .query_map(params![agent_id.to_string()], |row| row.get::<_, String>(0))
+            .map_err(|e| ContextError::StorageError(e.to_string()))?;
+        let mut keys = Vec::new();
+        for row in rows {
+            keys.push(row.map_err(|e| ContextError::StorageError(e.to_string()))?);
+        }
+        Ok(keys)
+    }
+
+    /// Delete the value for `key` under `agent_id`. Returns `true` if a row was
+    /// removed, `false` if no such key existed.
+    pub fn kv_delete(&self, agent_id: AgentId, key: &str) -> Result<bool, ContextError> {
+        let conn = self.conn.lock().unwrap();
+        let affected = conn
+            .execute(
+                "DELETE FROM agent_kv WHERE agent_id = ?1 AND key = ?2",
+                params![agent_id.to_string(), key],
+            )
+            .map_err(|e| ContextError::PersistenceFailed(e.to_string()))?;
+        Ok(affected > 0)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -699,6 +771,63 @@ mod tests {
             results[0].content,
             "the user prefers dark mode in the editor"
         );
+    }
+
+    #[test]
+    fn kv_put_get_list_delete_roundtrip() {
+        let mgr = SqliteContextManager::in_memory().unwrap();
+        let id = uuid::Uuid::new_v4();
+
+        // Missing key → None.
+        assert_eq!(mgr.kv_get(id, "color").unwrap(), None);
+
+        // Put then get.
+        mgr.kv_put(id, "color", "blue").unwrap();
+        mgr.kv_put(id, "size", "large").unwrap();
+        assert_eq!(mgr.kv_get(id, "color").unwrap().as_deref(), Some("blue"));
+
+        // List returns both keys, sorted.
+        assert_eq!(
+            mgr.kv_list(id).unwrap(),
+            vec!["color".to_string(), "size".to_string()]
+        );
+
+        // Overwrite an existing key.
+        mgr.kv_put(id, "color", "green").unwrap();
+        assert_eq!(mgr.kv_get(id, "color").unwrap().as_deref(), Some("green"));
+        assert_eq!(
+            mgr.kv_list(id).unwrap().len(),
+            2,
+            "overwrite must not add a row"
+        );
+
+        // Delete an existing key returns true; deleting again returns false.
+        assert!(mgr.kv_delete(id, "color").unwrap());
+        assert!(!mgr.kv_delete(id, "color").unwrap());
+        assert_eq!(mgr.kv_get(id, "color").unwrap(), None);
+        assert_eq!(mgr.kv_list(id).unwrap(), vec!["size".to_string()]);
+    }
+
+    #[test]
+    fn kv_is_isolated_between_agents() {
+        let mgr = SqliteContextManager::in_memory().unwrap();
+        let a = uuid::Uuid::new_v4();
+        let b = uuid::Uuid::new_v4();
+
+        mgr.kv_put(a, "shared", "a-value").unwrap();
+        mgr.kv_put(b, "shared", "b-value").unwrap();
+
+        assert_eq!(mgr.kv_get(a, "shared").unwrap().as_deref(), Some("a-value"));
+        assert_eq!(mgr.kv_get(b, "shared").unwrap().as_deref(), Some("b-value"));
+
+        // Agent A's keys don't leak into agent B's listing.
+        assert_eq!(mgr.kv_list(a).unwrap(), vec!["shared".to_string()]);
+        assert_eq!(mgr.kv_list(b).unwrap(), vec!["shared".to_string()]);
+
+        // Deleting from A leaves B untouched.
+        assert!(mgr.kv_delete(a, "shared").unwrap());
+        assert_eq!(mgr.kv_get(a, "shared").unwrap(), None);
+        assert_eq!(mgr.kv_get(b, "shared").unwrap().as_deref(), Some("b-value"));
     }
 
     #[tokio::test]

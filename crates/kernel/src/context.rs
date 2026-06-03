@@ -59,6 +59,30 @@ pub struct Fact {
     pub embedding: Option<Vec<f32>>,
 }
 
+/// The durable identity + config of a created agent, as stored in the `agents`
+/// table. This is what lets a kernel rehydrate its agent registry after a
+/// restart (graceful or crashed): the in-memory `AgentManager` is rebuilt from
+/// these rows so a restored agent keeps its name, task, permission profile,
+/// priority, and creation time — and the kernel can re-place it into the right
+/// cgroup / namespaces / gate translation table so enforcement still applies.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PersistedAgent {
+    pub id: uuid::Uuid,
+    pub session_id: uuid::Uuid,
+    pub name: String,
+    pub task: String,
+    pub llm_provider: String,
+    pub permission_profile: String,
+    /// Scheduling priority as the raw 1..=5 value (see `Priority`).
+    pub priority: u8,
+    /// Serialized lifecycle state (`AgentState` as JSON).
+    pub status: String,
+    /// Serialized `SandboxConfig` (JSON), if the agent had one.
+    pub sandbox_config_json: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub last_activity_at: DateTime<Utc>,
+}
+
 /// Agent's working context — short-term memory for the current session.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct AgentContext {
@@ -120,6 +144,12 @@ impl SqliteContextManager {
     pub fn new(db_path: &Path) -> Result<Self, ContextError> {
         let conn =
             Connection::open(db_path).map_err(|e| ContextError::StorageError(e.to_string()))?;
+        // WAL so committed transactions survive an abrupt process stop and a
+        // fresh handle on the same file recovers them; NORMAL synchronous is the
+        // recommended durability/throughput tradeoff under WAL (committed txns are
+        // crash-safe). Pragmas are best-effort — an older/locked DB still opens.
+        let _ = conn.pragma_update(None, "journal_mode", "WAL");
+        let _ = conn.pragma_update(None, "synchronous", "NORMAL");
         let mgr = Self {
             conn: Mutex::new(conn),
             embedder: crate::memory_manager::default_embedder(),
@@ -200,7 +230,20 @@ impl SqliteContextManager {
                 created_at TEXT NOT NULL,
                 PRIMARY KEY(agent_id, label)
             );
-            CREATE INDEX IF NOT EXISTS idx_snapshots_agent ON context_snapshots(agent_id);",
+            CREATE INDEX IF NOT EXISTS idx_snapshots_agent ON context_snapshots(agent_id);
+            CREATE TABLE IF NOT EXISTS agents (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                name TEXT NOT NULL,
+                task TEXT NOT NULL,
+                llm_provider TEXT NOT NULL,
+                permission_profile TEXT NOT NULL,
+                priority INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                sandbox_config_json TEXT,
+                created_at TEXT NOT NULL,
+                last_activity_at TEXT NOT NULL
+            );",
         ).map_err(|e| ContextError::StorageError(e.to_string()))?;
         Ok(())
     }
@@ -752,6 +795,131 @@ impl SqliteContextManager {
     }
 }
 
+/// Agent registry persistence — the durable identity of every created agent.
+///
+/// This is the piece that makes a restart "bring the agents back": when an
+/// agent is created through the live path it is written here, and on boot from a
+/// persistent DB the kernel reads these rows and rehydrates them into the
+/// in-memory `AgentManager`. Backed by the same single SQLite handle (no second
+/// db). Writes commit immediately, so a crash (drop without graceful shutdown)
+/// still leaves committed agents recoverable.
+impl SqliteContextManager {
+    /// Insert-or-update an agent's durable identity + config.
+    pub fn save_agent(&self, agent: &PersistedAgent) -> Result<(), ContextError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO agents
+                (id, session_id, name, task, llm_provider, permission_profile, priority, status, sandbox_config_json, created_at, last_activity_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            params![
+                agent.id.to_string(),
+                agent.session_id.to_string(),
+                agent.name,
+                agent.task,
+                agent.llm_provider,
+                agent.permission_profile,
+                agent.priority as i64,
+                agent.status,
+                agent.sandbox_config_json,
+                agent.created_at.to_rfc3339(),
+                agent.last_activity_at.to_rfc3339(),
+            ],
+        )
+        .map_err(|e| ContextError::PersistenceFailed(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Load every persisted agent (registry rehydration on boot).
+    pub fn load_all_agents(&self) -> Result<Vec<PersistedAgent>, ContextError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, session_id, name, task, llm_provider, permission_profile, priority, status, sandbox_config_json, created_at, last_activity_at
+                 FROM agents ORDER BY created_at ASC",
+            )
+            .map_err(|e| ContextError::StorageError(e.to_string()))?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, i64>(6)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, Option<String>>(8)?,
+                    row.get::<_, String>(9)?,
+                    row.get::<_, String>(10)?,
+                ))
+            })
+            .map_err(|e| ContextError::StorageError(e.to_string()))?;
+
+        let mut agents = Vec::new();
+        for row in rows {
+            let (
+                id_str,
+                session_str,
+                name,
+                task,
+                llm_provider,
+                permission_profile,
+                priority,
+                status,
+                sandbox_config_json,
+                created_str,
+                accessed_str,
+            ) = row.map_err(|e| ContextError::StorageError(e.to_string()))?;
+            let id = uuid::Uuid::parse_str(&id_str)
+                .map_err(|e| ContextError::StorageError(e.to_string()))?;
+            let session_id = uuid::Uuid::parse_str(&session_str)
+                .map_err(|e| ContextError::StorageError(e.to_string()))?;
+            let created_at = DateTime::parse_from_rfc3339(&created_str)
+                .map_err(|e| ContextError::StorageError(e.to_string()))?
+                .with_timezone(&Utc);
+            let last_activity_at = DateTime::parse_from_rfc3339(&accessed_str)
+                .map_err(|e| ContextError::StorageError(e.to_string()))?
+                .with_timezone(&Utc);
+            agents.push(PersistedAgent {
+                id,
+                session_id,
+                name,
+                task,
+                llm_provider,
+                permission_profile,
+                priority: priority.clamp(0, u8::MAX as i64) as u8,
+                status,
+                sandbox_config_json,
+                created_at,
+                last_activity_at,
+            });
+        }
+        Ok(agents)
+    }
+
+    /// Remove an agent's durable identity (e.g. on permanent teardown).
+    pub fn delete_agent(&self, agent_id: AgentId) -> Result<bool, ContextError> {
+        let conn = self.conn.lock().unwrap();
+        let affected = conn
+            .execute(
+                "DELETE FROM agents WHERE id = ?1",
+                params![agent_id.to_string()],
+            )
+            .map_err(|e| ContextError::PersistenceFailed(e.to_string()))?;
+        Ok(affected > 0)
+    }
+
+    /// Flush the WAL into the main database file (truncating checkpoint) so a
+    /// subsequent open recovers a fully-consolidated, consistent DB. Called on
+    /// graceful shutdown; best-effort (a busy DB simply checkpoints later).
+    pub fn checkpoint(&self) -> Result<(), ContextError> {
+        let conn = self.conn.lock().unwrap();
+        let _ = conn.pragma_update(None, "wal_checkpoint", "TRUNCATE");
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1044,5 +1212,40 @@ mod tests {
         let id = uuid::Uuid::new_v4();
         let result = mgr.get_context(id).await;
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn agent_registry_save_load_roundtrip() {
+        let mgr = SqliteContextManager::in_memory().unwrap();
+        let now = Utc::now();
+        let a = PersistedAgent {
+            id: uuid::Uuid::new_v4(),
+            session_id: uuid::Uuid::new_v4(),
+            name: "alpha".into(),
+            task: "do the thing".into(),
+            llm_provider: "stub".into(),
+            permission_profile: "read-only".into(),
+            priority: 2,
+            status: "\"Running\"".into(),
+            sandbox_config_json: None,
+            created_at: now,
+            last_activity_at: now,
+        };
+        mgr.save_agent(&a).unwrap();
+        let loaded = mgr.load_all_agents().unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0], a);
+
+        // Upsert (INSERT OR REPLACE) on the same id does not duplicate.
+        let mut a2 = a.clone();
+        a2.name = "alpha-renamed".into();
+        mgr.save_agent(&a2).unwrap();
+        let loaded = mgr.load_all_agents().unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].name, "alpha-renamed");
+
+        // Delete removes it.
+        assert!(mgr.delete_agent(a.id).unwrap());
+        assert!(mgr.load_all_agents().unwrap().is_empty());
     }
 }

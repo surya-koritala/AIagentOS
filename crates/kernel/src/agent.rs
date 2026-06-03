@@ -216,6 +216,48 @@ impl AgentManager {
             .get(&agent_id)
             .map(|a| a.config.llm_provider.clone())
     }
+
+    /// Get an agent's task description (the prompt it was created for).
+    pub fn get_agent_task(&self, agent_id: AgentId) -> Option<String> {
+        self.agents.get(&agent_id).map(|a| a.config.task.clone())
+    }
+
+    /// Rehydrate a previously-persisted agent directly into the in-memory map,
+    /// bypassing the create/init state machine (the agent already existed across
+    /// the restart). Used by the kernel's boot-time registry rehydration to bring
+    /// agents back with their original id, session, config, and timestamps. A
+    /// restored agent that was mid-flight is brought up `Running` so it is
+    /// schedulable again; terminal states are preserved as-is.
+    pub fn restore_agent(
+        &self,
+        id: AgentId,
+        session_id: SessionId,
+        config: AgentConfig,
+        state: AgentState,
+        created_at: DateTime<Utc>,
+        last_activity_at: DateTime<Utc>,
+    ) {
+        // Map non-terminal/transient states to Running so the agent is live again
+        // after a restart; keep terminal states (Stopped/Error) intact.
+        let restored_state = match state {
+            AgentState::Stopped => AgentState::Stopped,
+            AgentState::Error(e) => AgentState::Error(e),
+            _ => AgentState::Running,
+        };
+        let sandbox_id = config.sandbox_config.as_ref().map(|_| uuid::Uuid::new_v4());
+        let agent = Agent {
+            id,
+            session_id,
+            name: config.name.clone(),
+            state: restored_state,
+            config,
+            sandbox_id,
+            created_at,
+            last_activity_at,
+            metrics: Metrics::default(),
+        };
+        self.agents.insert(id, agent);
+    }
 }
 
 #[async_trait::async_trait]

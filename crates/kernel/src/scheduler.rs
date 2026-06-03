@@ -262,8 +262,17 @@ impl PriorityScheduler {
     /// instead of the blocking [`AgentScheduler::schedule`], so bulk-creating
     /// agents past `MAX_CONCURRENT_AGENTS` no longer stalls on the 10s timeout.
     pub fn admit(&self, agent: &AgentHandle) {
+        self.admit_id(agent.id);
+    }
+
+    /// Admit an agent by id alone (no [`AgentHandle`] needed). Used by the
+    /// kernel's boot-time rehydration to re-admit a restored agent — which has
+    /// an id but no live command channel — so it is `Queued` and schedulable
+    /// again. Same non-blocking, infallible system-admission semantics as
+    /// [`admit`](Self::admit).
+    pub fn admit_id(&self, agent_id: AgentId) {
         self.agents.insert(
-            agent.id,
+            agent_id,
             AgentScheduleInfo {
                 priority: Priority::default(),
                 state: AgentScheduleState::Queued,

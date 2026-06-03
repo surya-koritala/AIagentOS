@@ -925,12 +925,16 @@ impl AgentKernelImpl {
         }
         let context_manager =
             Arc::new(SqliteContextManager::new(db_path).map_err(KernelError::Context)?);
-        Self::with_context_manager(
+        let kernel = Self::with_context_manager(
             context_manager,
             &crate::config::BudgetConfig::default(),
             false,
             &[],
-        )
+        )?;
+        // Bring back any agents persisted by a previous run on this DB so a
+        // restart restores the full registry (and re-arms enforcement).
+        kernel.rehydrate_agents_blocking();
+        Ok(kernel)
     }
 
     /// Create a kernel from config (uses config.data_dir for persistence and
@@ -943,12 +947,16 @@ impl AgentKernelImpl {
         }
         let context_manager =
             Arc::new(SqliteContextManager::new(&db_path).map_err(KernelError::Context)?);
-        Self::with_context_manager(
+        let kernel = Self::with_context_manager(
             context_manager,
             &config.budgets,
             config.mac_enforcing,
             &config.mac_rules,
-        )
+        )?;
+        // Bring back any agents persisted by a previous run on this DB so a
+        // restart restores the full registry (and re-arms enforcement).
+        kernel.rehydrate_agents_blocking();
+        Ok(kernel)
     }
 
     fn with_context_manager(
@@ -1162,12 +1170,35 @@ impl AgentKernelImpl {
         //    failed with `QueueFull` — see #38.)
         self.scheduler.admit(&handle);
 
-        // 6. Register IPC mailbox
+        // 6–8. Place the agent in IPC / syscall gate / namespaces / CFS / procfs.
+        self.place_agent_in_subsystems(agent_id, &config, group)
+            .await;
+
+        // 9. Persist the agent's durable identity so it survives a restart, then
+        //    broadcast the creation event. Persistence commits immediately, so
+        //    even an abrupt stop (no graceful shutdown) recovers this agent.
+        self.persist_agent_registry(agent_id, &config);
+        let _ = self.event_tx.send(KernelEvent::AgentCreated(agent_id));
+
+        Ok(handle)
+    }
+
+    /// Place an already-existing agent (id + config) into the OS-level
+    /// subsystems: syscall gate (capabilities + profile cgroup), MAC label, the
+    /// group's Agent/Tool namespaces, the CFS run queue, and procfs. Shared by
+    /// the live create path and boot-time rehydration so a restored agent is
+    /// enforced exactly like a freshly-created one.
+    async fn place_agent_in_subsystems(
+        &self,
+        agent_id: AgentId,
+        config: &AgentConfig,
+        group: Option<&str>,
+    ) {
+        // Register IPC mailbox.
         self.ipc.register_agent(agent_id);
 
-        // 7. Register with the syscall gate (capabilities derived from the
-        //    permission profile; fully-permissive if profile is unknown so
-        //    existing flows keep working).
+        // Register with the syscall gate (capabilities derived from the
+        // permission profile; fully-permissive if the profile is unknown).
         let caps = caps_for_profile(&config.permission_profile);
         // Place the agent in its permission profile's cgroup (bounded token
         // budget) rather than the unlimited root cgroup, so `CgroupQuota`
@@ -1180,21 +1211,13 @@ impl AgentKernelImpl {
         let pid = self.syscall_gate.register_agent(agent_id, caps, cgroup);
 
         // MAC: label the agent by its permission profile so an enforcing policy
-        // can discriminate by subject (e.g. "profile:read-only"). No-op while the
-        // gate's MAC engine is permissive (the default).
+        // can discriminate by subject (e.g. "profile:read-only").
         {
             let mut mac = self.syscall_gate.mac.lock().await;
             mac.label_agent(pid, format!("profile:{}", config.permission_profile));
         }
 
-        // 8. Place the agent in the OS-level subsystems using its PID.
-        //    Default Agent + Tool namespaces; root-cgroup membership; CFS enqueue;
-        //    procfs entry. These were previously only wired by the standalone
-        //    OsKernel — folding them into AgentKernelImpl makes the OS surface
-        //    real for every agent created through the live path.
-        // Join the Agent + Tool namespaces for this agent's group: same-group
-        // agents share namespaces (can see/message each other); different groups
-        // are isolated. `None` uses the shared defaults (prior behavior).
+        // Join the Agent + Tool namespaces for this agent's group.
         let (agent_ns, tool_ns) = self.namespaces_for_group(group);
         let mut agent_ns_ids = Vec::new();
         if let Some(ns) = agent_ns {
@@ -1219,11 +1242,129 @@ impl AgentKernelImpl {
             procfs.set_agent_info(pid, "uuid".into(), agent_id.to_string());
             procfs.set_agent_info(pid, "state".into(), "running".into());
         }
+    }
 
-        // 9. Broadcast event
-        let _ = self.event_tx.send(KernelEvent::AgentCreated(agent_id));
+    /// Write the agent's durable identity + config to the `agents` table via the
+    /// single SQLite handle. Best-effort: a persistence failure is logged but
+    /// does not fail agent creation (the in-memory agent is still live).
+    fn persist_agent_registry(&self, agent_id: AgentId, config: &AgentConfig) {
+        let state = self
+            .agent_manager
+            .get_agent_state(agent_id)
+            .unwrap_or(AgentState::Running);
+        let status = serde_json::to_string(&state).unwrap_or_else(|_| "\"Running\"".to_string());
+        let now = chrono::Utc::now();
+        let sandbox_config_json = config
+            .sandbox_config
+            .as_ref()
+            .and_then(|s| serde_json::to_string(s).ok());
+        let record = crate::context::PersistedAgent {
+            id: agent_id,
+            session_id: self
+                .agent_manager
+                .list_agents(None)
+                .into_iter()
+                .find(|a| a.id == agent_id)
+                .and_then(|a| a.session_id)
+                .unwrap_or(agent_id),
+            name: config.name.clone(),
+            task: config.task.clone(),
+            llm_provider: config.llm_provider.clone(),
+            permission_profile: config.permission_profile.clone(),
+            priority: config.priority.value(),
+            status,
+            sandbox_config_json,
+            created_at: now,
+            last_activity_at: now,
+        };
+        if let Err(e) = self.context_manager.save_agent(&record) {
+            tracing::warn!("Failed to persist agent {agent_id} to registry: {e}");
+        }
+    }
 
-        Ok(handle)
+    /// Rehydrate the agent registry from the persistent DB on boot.
+    ///
+    /// Reads every row from the `agents` table, reinserts each agent into the
+    /// in-memory [`AgentManager`] (preserving id/session/config/timestamps), and
+    /// re-places it into the syscall gate / cgroups / namespaces / CFS / procfs
+    /// so a restored agent is enforced exactly like a freshly-created one. Idempotent
+    /// and best-effort per agent: a malformed row is skipped, not fatal. Returns
+    /// the ids that were brought back. A fresh / empty DB rehydrates nothing.
+    pub async fn rehydrate_agents(&self) -> Result<Vec<AgentId>, KernelError> {
+        let persisted = self
+            .context_manager
+            .load_all_agents()
+            .map_err(KernelError::Context)?;
+        let mut restored = Vec::new();
+        for p in persisted {
+            let priority = Priority::new(p.priority).unwrap_or_default();
+            let sandbox_config = p
+                .sandbox_config_json
+                .as_deref()
+                .and_then(|s| serde_json::from_str::<SandboxConfig>(s).ok());
+            let config = AgentConfig {
+                name: p.name.clone(),
+                task: p.task.clone(),
+                llm_provider: p.llm_provider.clone(),
+                permission_profile: p.permission_profile.clone(),
+                priority,
+                sandbox_config,
+            };
+            let state: AgentState = serde_json::from_str(&p.status).unwrap_or(AgentState::Running);
+            // Rebuild the in-memory agent (bypassing the create/init state machine).
+            self.agent_manager.restore_agent(
+                p.id,
+                p.session_id,
+                config.clone(),
+                state,
+                p.created_at,
+                p.last_activity_at,
+            );
+            // Re-admit to the priority scheduler and re-place into OS subsystems.
+            self.scheduler.admit_id(p.id);
+            self.place_agent_in_subsystems(p.id, &config, None).await;
+            let _ = self.event_tx.send(KernelEvent::AgentCreated(p.id));
+            restored.push(p.id);
+        }
+        Ok(restored)
+    }
+
+    /// Synchronous wrapper around [`rehydrate_agents`](Self::rehydrate_agents)
+    /// for use from the sync constructors (`with_db_path`/`from_config`).
+    ///
+    /// Rehydration is async (it locks the kernel's Tokio mutexes when re-placing
+    /// agents into CFS/MAC/procfs), but the constructors are sync and may be
+    /// called from any runtime flavor (the CLI's multi-thread `#[tokio::main]`,
+    /// a current-thread `#[tokio::test]`, or no runtime at all). To work under
+    /// all of them without nested-runtime panics, the async work runs on a
+    /// dedicated thread with its own current-thread runtime, and we join it.
+    /// Best-effort: a rehydration error is logged, not fatal, so a kernel still
+    /// boots on a partially-readable DB.
+    fn rehydrate_agents_blocking(&self) {
+        // SAFETY/scoping: `std::thread::scope` lets the spawned thread borrow
+        // `self` for its lifetime, so no `'static`/`Arc` is required here.
+        let result = std::thread::scope(|s| {
+            s.spawn(|| {
+                match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(rt) => rt.block_on(self.rehydrate_agents()),
+                    Err(e) => Err(KernelError::Context(crate::ContextError::StorageError(
+                        format!("runtime build for rehydration failed: {e}"),
+                    ))),
+                }
+            })
+            .join()
+        });
+        match result {
+            Ok(Ok(ids)) if !ids.is_empty() => {
+                tracing::info!("Rehydrated {} agent(s) from persistent store", ids.len());
+            }
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => tracing::warn!("Agent rehydration failed: {e}"),
+            Err(_) => tracing::warn!("Agent rehydration thread panicked"),
+        }
     }
 
     /// Send a message to an agent and get a response.
@@ -1394,6 +1535,14 @@ impl AgentKernelImpl {
             self.budget_enforcer.purge_agent(info.id);
             self.syscall_gate.unregister_agent(info.id);
             self.executors.remove(&info.id);
+        }
+
+        // Flush the WAL into the main DB file so a subsequent open recovers a
+        // fully-consolidated, consistent database. Best-effort. (Crash recovery
+        // does NOT depend on this — committed transactions are already durable;
+        // this just truncates the WAL on a clean exit.)
+        if let Err(e) = self.context_manager.checkpoint() {
+            tracing::warn!("WAL checkpoint on shutdown failed: {e}");
         }
 
         Ok(stopped)

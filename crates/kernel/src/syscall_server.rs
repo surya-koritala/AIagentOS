@@ -644,9 +644,48 @@ fn parse_fact_category(s: Option<&str>) -> FactCategory {
     }
 }
 
+/// Build a [`rustls::ServerConfig`] (no client auth) from a PEM certificate
+/// chain and a PEM private key — the common case for terminating TLS on the
+/// syscall server. `cert_pem` may contain a full chain (leaf first); `key_pem`
+/// is a PKCS#8, PKCS#1, or SEC1 private key. Pass the result to
+/// [`SyscallServer::bind_tls`].
+pub fn server_config_from_pem(
+    cert_pem: &[u8],
+    key_pem: &[u8],
+) -> std::io::Result<rustls::ServerConfig> {
+    // Ensure a process-wide crypto provider is installed (idempotent — a second
+    // install returns an error we ignore). Lets callers build a config without
+    // naming the rustls crypto provider themselves.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let certs = rustls_pemfile::certs(&mut std::io::BufReader::new(cert_pem))
+        .collect::<Result<Vec<_>, _>>()?;
+    if certs.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "no certificates found in cert_pem",
+        ));
+    }
+    let key = match rustls_pemfile::private_key(&mut std::io::BufReader::new(key_pem))? {
+        Some(key) => key,
+        None => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "no private key found in key_pem",
+            ))
+        }
+    };
+    rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))
+}
+
 /// The transport a [`SyscallServer`] is bound to.
 enum Listener {
     Tcp(TcpListener),
+    /// TCP listener whose accepted streams are wrapped in a rustls server-side
+    /// TLS session before being handed to the (generic) connection handler.
+    Tls(TcpListener, tokio_rustls::TlsAcceptor),
     #[cfg(unix)]
     Unix(tokio::net::UnixListener),
 }
@@ -691,6 +730,30 @@ impl SyscallServer {
         })
     }
 
+    /// Bind a TLS listener to `addr`, terminating rustls on every accepted TCP
+    /// connection before handing the encrypted stream to the same generic
+    /// [`handle`](Self::handle) loop used by the plaintext transports.
+    ///
+    /// `config` is a fully-built [`rustls::ServerConfig`] (certificate chain +
+    /// private key, ALPN, client-auth policy, …). Build it however you like; a
+    /// convenience constructor from a PEM cert chain + key is provided by
+    /// [`server_config_from_pem`]. Shared-secret auth composes on top — call
+    /// [`with_auth_token`](Self::with_auth_token) as usual and the
+    /// [`Authenticate`](Syscall::Authenticate) handshake runs *inside* the TLS
+    /// session.
+    pub async fn bind_tls(
+        kernel: Arc<AgentKernelImpl>,
+        addr: impl ToSocketAddrs,
+        config: rustls::ServerConfig,
+    ) -> std::io::Result<Self> {
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
+        Ok(Self {
+            kernel,
+            listener: Listener::Tls(TcpListener::bind(addr).await?, acceptor),
+            auth_token: None,
+        })
+    }
+
     /// Require connections to authenticate with `token` before any other
     /// syscall. Recommended for any non-loopback TCP bind.
     pub fn with_auth_token(mut self, token: impl Into<String>) -> Self {
@@ -703,6 +766,7 @@ impl SyscallServer {
     pub fn local_addr(&self) -> std::io::Result<std::net::SocketAddr> {
         match &self.listener {
             Listener::Tcp(l) => l.local_addr(),
+            Listener::Tls(l, _) => l.local_addr(),
             #[cfg(unix)]
             Listener::Unix(_) => Err(std::io::Error::new(
                 std::io::ErrorKind::Unsupported,
@@ -721,6 +785,24 @@ impl SyscallServer {
                 let auth = self.auth_token.clone();
                 tokio::spawn(async move {
                     let (read, write) = stream.into_split();
+                    let _ = Self::handle(kernel, read, write, auth).await;
+                });
+            },
+            Listener::Tls(listener, acceptor) => loop {
+                let (stream, _peer) = listener.accept().await?;
+                let kernel = self.kernel.clone();
+                let auth = self.auth_token.clone();
+                let acceptor = acceptor.clone();
+                tokio::spawn(async move {
+                    // Perform the rustls handshake; a failed handshake drops the
+                    // connection without affecting the accept loop.
+                    let tls = match acceptor.accept(stream).await {
+                        Ok(tls) => tls,
+                        Err(_) => return,
+                    };
+                    // The TLS stream is one AsyncRead+AsyncWrite object; split it
+                    // into halves so it drops into the existing generic handler.
+                    let (read, write) = tokio::io::split(tls);
                     let _ = Self::handle(kernel, read, write, auth).await;
                 });
             },
@@ -808,6 +890,30 @@ impl SyscallClient {
     pub async fn connect_unix(path: impl AsRef<std::path::Path>) -> std::io::Result<Self> {
         let (read, writer) = tokio::net::UnixStream::connect(path).await?.into_split();
         Ok(Self::from_halves(Box::new(read), Box::new(writer)))
+    }
+
+    /// Connect over TLS: open a TCP connection to `addr`, perform the rustls
+    /// client handshake (verifying the server certificate against `config`'s
+    /// root store and matching `server_name`), then speak the same JSON
+    /// protocol over the encrypted stream. The TLS stream's split halves are
+    /// boxed into the existing transport-agnostic client, so every typed call
+    /// works unchanged over TLS.
+    ///
+    /// `server_name` is the DNS name presented for certificate verification
+    /// (e.g. `"localhost"`); it must match a SAN in the server's certificate.
+    pub async fn connect_tls(
+        addr: impl ToSocketAddrs,
+        server_name: impl Into<String>,
+        config: rustls::ClientConfig,
+    ) -> std::io::Result<Self> {
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
+        let name = server_name.into();
+        let dns = rustls::pki_types::ServerName::try_from(name)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+        let tcp = TcpStream::connect(addr).await?;
+        let tls = connector.connect(dns, tcp).await?;
+        let (read, write) = tokio::io::split(tls);
+        Ok(Self::from_halves(Box::new(read), Box::new(write)))
     }
 
     fn from_halves(
@@ -1491,6 +1597,114 @@ memory = ["remember this"]
             other => panic!("expected Agents over unix socket, got {other:?}"),
         }
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// Generate a self-signed cert for `localhost`, returning the server config
+    /// and a client root store that trusts exactly that cert.
+    fn self_signed_tls() -> (rustls::ServerConfig, rustls::RootCertStore) {
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
+            .expect("generate self-signed cert");
+        let cert_der = cert.cert.der().clone();
+        let key_der = rustls::pki_types::PrivateKeyDer::try_from(cert.key_pair.serialize_der())
+            .expect("private key der");
+
+        let server_config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert_der.clone()], key_der)
+            .expect("server config");
+
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(cert_der).expect("trust self-signed cert");
+
+        (server_config, roots)
+    }
+
+    #[tokio::test]
+    async fn tls_roundtrip_create_and_list() {
+        // Install the ring crypto provider for the process (idempotent across
+        // tests — a second install is a no-op error we ignore).
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        let (server_config, roots) = self_signed_tls();
+
+        let kernel = Arc::new(AgentKernelImpl::new().expect("kernel new"));
+        let server = SyscallServer::bind_tls(kernel.clone(), "127.0.0.1:0", server_config)
+            .await
+            .expect("bind_tls");
+        let addr = server.local_addr().unwrap();
+        tokio::spawn(server.serve());
+
+        let client_config = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let mut client = SyscallClient::connect_tls(addr, "localhost", client_config)
+            .await
+            .expect("connect_tls");
+
+        // CreateAgent over the encrypted transport → real kernel path.
+        let id = match client
+            .call(Syscall::CreateAgent {
+                name: "tls-alpha".into(),
+                task: "demo".into(),
+                provider: "stub".into(),
+                profile: "standard".into(),
+                priority: 3,
+            })
+            .await
+            .unwrap()
+        {
+            SyscallReply::AgentCreated { id } => id,
+            other => panic!("expected AgentCreated over TLS, got {other:?}"),
+        };
+
+        // ListAgents reflects it — round-trip over TLS confirmed.
+        match client.call(Syscall::ListAgents).await.unwrap() {
+            SyscallReply::Agents { agents } => assert!(
+                agents.iter().any(|a| a.id == id && a.name == "tls-alpha"),
+                "created agent should appear over TLS: {agents:?}"
+            ),
+            other => panic!("expected Agents over TLS, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn tls_composes_with_auth_token() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let (server_config, roots) = self_signed_tls();
+
+        let kernel = Arc::new(AgentKernelImpl::new().expect("kernel new"));
+        let server = SyscallServer::bind_tls(kernel, "127.0.0.1:0", server_config)
+            .await
+            .expect("bind_tls")
+            .with_auth_token("s3cret");
+        let addr = server.local_addr().unwrap();
+        tokio::spawn(server.serve());
+
+        let client_config = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let mut client = SyscallClient::connect_tls(addr, "localhost", client_config)
+            .await
+            .expect("connect_tls");
+
+        // Auth still gates syscalls inside the TLS session.
+        match client.call(Syscall::ListAgents).await.unwrap() {
+            SyscallReply::Error { message } => {
+                assert!(
+                    message.contains("authentication required"),
+                    "got: {message}"
+                )
+            }
+            other => panic!("expected auth-required error over TLS, got {other:?}"),
+        }
+        assert!(matches!(
+            client.authenticate("s3cret").await.unwrap(),
+            SyscallReply::Authenticated
+        ));
+        assert!(matches!(
+            client.call(Syscall::ListAgents).await.unwrap(),
+            SyscallReply::Agents { .. }
+        ));
     }
 
     #[test]

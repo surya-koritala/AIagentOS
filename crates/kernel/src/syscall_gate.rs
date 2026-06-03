@@ -186,7 +186,7 @@ fn capability_names(caps: &CapabilitySet) -> Vec<String> {
 }
 
 /// Counters surfaced for observability and tests.
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct GateStats {
     pub allowed: u64,
     pub denied_capability: u64,

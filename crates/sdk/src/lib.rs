@@ -112,6 +112,19 @@ pub struct NodeLoad {
     pub running_agents: usize,
 }
 
+/// The kernel's operational metrics (reply to `metrics`). Carries the rendered
+/// Prometheus text exposition plus a couple of the headline numbers as typed
+/// fields.
+#[derive(Debug, Clone, Default)]
+pub struct Metrics {
+    /// The full `text/plain; version=0.0.4` Prometheus exposition.
+    pub prometheus: String,
+    /// Total agents the kernel hosts.
+    pub agent_count: usize,
+    /// System-wide tokens consumed.
+    pub tokens_consumed: u64,
+}
+
 /// A typed, async client over the kernel's syscall protocol.
 ///
 /// Wraps [`SyscallClient`]: each method serializes the matching [`Syscall`],
@@ -263,6 +276,24 @@ impl KernelClient {
                 running_agents,
             }),
             other => Err(unexpected("NodeInfo", &other)),
+        }
+    }
+
+    /// Pull the kernel's operational metrics as a Prometheus text exposition
+    /// (gate enforcement counters, agent counts, token/api totals, uptime). Lets
+    /// a client scrape metrics over the syscall protocol without an HTTP port.
+    pub async fn metrics(&mut self) -> Result<Metrics, SdkError> {
+        match self.call(Syscall::Metrics).await? {
+            SyscallReply::Metrics {
+                prometheus,
+                agent_count,
+                tokens_consumed,
+            } => Ok(Metrics {
+                prometheus,
+                agent_count,
+                tokens_consumed,
+            }),
+            other => Err(unexpected("Metrics", &other)),
         }
     }
 

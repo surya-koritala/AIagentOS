@@ -13,3 +13,5 @@ adapters = { path = "../adapters" }
 tokio = { version = "1", features = ["full"] }
 dirs = "5"
 libc = "0.2"
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

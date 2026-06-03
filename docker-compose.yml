@@ -49,6 +49,9 @@ services:
     command: ["agent-server", "0.0.0.0:7777"]
     ports:
       - "7777:7777"
+      # Prometheus scrape endpoint (only live because AGENT_SERVER_METRICS_ADDR
+      # is set below). Scrape GET http://localhost:9090/metrics.
+      - "9090:9090"
     environment:
       # Keyless boot: provider `local` registers the Ollama adapter, but the
       # non-LLM syscalls work with no model at all. No hard dependency on ollama.
@@ -58,6 +61,13 @@ services:
       HOME: "/data"
       XDG_CONFIG_HOME: "/data/config"
       XDG_DATA_HOME: "/data/share"
+      # Structured logging: human format at info by default. Set RUST_LOG for
+      # finer control (e.g. "kernel=debug,info") and LOG_FORMAT=json to emit
+      # JSON log lines for ingestion.
+      RUST_LOG: "info"
+      # Start the in-process Prometheus /metrics endpoint on 0.0.0.0:9090.
+      # Unset to disable it (no extra port is opened then).
+      AGENT_SERVER_METRICS_ADDR: "0.0.0.0:9090"
     volumes:
       # Persists agent_os.db + the rendered config.toml across restarts.
       - agentos-data:/data

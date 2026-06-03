@@ -69,6 +69,10 @@ pub struct Fact {
 pub struct PersistedAgent {
     pub id: uuid::Uuid,
     pub session_id: uuid::Uuid,
+    /// The tenant this agent belongs to (the top-level isolation unit). Legacy
+    /// rows / un-tenanted agents use [`DEFAULT_TENANT`]. Restored on rehydrate so
+    /// the agent re-joins its tenant's namespace + cgroup after a restart.
+    pub tenant_id: String,
     pub name: String,
     pub task: String,
     pub llm_provider: String,
@@ -128,6 +132,11 @@ pub trait ContextManager: Send + Sync {
 
 /// Maximum retry attempts for persistence operations.
 const MAX_RETRIES: u32 = 3;
+
+/// The implicit tenant assigned to agents that predate tenancy (or are created
+/// through the un-tenanted `create_agent_full` path). Cross-tenant isolation is
+/// still enforced relative to this id.
+pub const DEFAULT_TENANT: &str = "default";
 
 /// SQLite-backed context manager implementation.
 pub struct SqliteContextManager {
@@ -243,8 +252,48 @@ impl SqliteContextManager {
                 sandbox_config_json TEXT,
                 created_at TEXT NOT NULL,
                 last_activity_at TEXT NOT NULL
+            );
+            -- Tenancy: tenants are the top-level isolation unit; users/sessions/
+            -- api-keys are scoped to a tenant. Secrets are stored hashed (the
+            -- *_hash columns), never in plaintext (see auth.rs).
+            CREATE TABLE IF NOT EXISTS tenants (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS users (
+                id TEXT PRIMARY KEY,
+                tenant_id TEXT NOT NULL,
+                username TEXT NOT NULL,
+                email TEXT NOT NULL,
+                role TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_users_tenant ON users(tenant_id);
+            CREATE TABLE IF NOT EXISTS api_keys (
+                key_hash TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                user_id TEXT NOT NULL,
+                tenant_id TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS sessions (
+                token_hash TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL,
+                tenant_id TEXT NOT NULL,
+                expires_at TEXT NOT NULL
             );",
         ).map_err(|e| ContextError::StorageError(e.to_string()))?;
+        // Tenant scoping for the agent registry. Added via ALTER so an older DB
+        // (created before tenancy) upgrades in place: legacy agents land in the
+        // implicit "default" tenant. A duplicate-column error on a DB that
+        // already has the column is expected and ignored.
+        {
+            let _ = conn.execute(
+                "ALTER TABLE agents ADD COLUMN tenant_id TEXT NOT NULL DEFAULT 'default'",
+                [],
+            );
+        }
         Ok(())
     }
 
@@ -809,11 +858,12 @@ impl SqliteContextManager {
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "INSERT OR REPLACE INTO agents
-                (id, session_id, name, task, llm_provider, permission_profile, priority, status, sandbox_config_json, created_at, last_activity_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                (id, session_id, tenant_id, name, task, llm_provider, permission_profile, priority, status, sandbox_config_json, created_at, last_activity_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![
                 agent.id.to_string(),
                 agent.session_id.to_string(),
+                agent.tenant_id,
                 agent.name,
                 agent.task,
                 agent.llm_provider,
@@ -834,7 +884,7 @@ impl SqliteContextManager {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn
             .prepare(
-                "SELECT id, session_id, name, task, llm_provider, permission_profile, priority, status, sandbox_config_json, created_at, last_activity_at
+                "SELECT id, session_id, tenant_id, name, task, llm_provider, permission_profile, priority, status, sandbox_config_json, created_at, last_activity_at
                  FROM agents ORDER BY created_at ASC",
             )
             .map_err(|e| ContextError::StorageError(e.to_string()))?;
@@ -847,11 +897,12 @@ impl SqliteContextManager {
                     row.get::<_, String>(3)?,
                     row.get::<_, String>(4)?,
                     row.get::<_, String>(5)?,
-                    row.get::<_, i64>(6)?,
-                    row.get::<_, String>(7)?,
-                    row.get::<_, Option<String>>(8)?,
-                    row.get::<_, String>(9)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, i64>(7)?,
+                    row.get::<_, String>(8)?,
+                    row.get::<_, Option<String>>(9)?,
                     row.get::<_, String>(10)?,
+                    row.get::<_, String>(11)?,
                 ))
             })
             .map_err(|e| ContextError::StorageError(e.to_string()))?;
@@ -861,6 +912,7 @@ impl SqliteContextManager {
             let (
                 id_str,
                 session_str,
+                tenant_id,
                 name,
                 task,
                 llm_provider,
@@ -884,6 +936,7 @@ impl SqliteContextManager {
             agents.push(PersistedAgent {
                 id,
                 session_id,
+                tenant_id,
                 name,
                 task,
                 llm_provider,
@@ -896,6 +949,42 @@ impl SqliteContextManager {
             });
         }
         Ok(agents)
+    }
+
+    /// The tenant that owns `agent_id`, if the agent is in the registry. Used to
+    /// enforce that a caller may only read data for agents in its own tenant.
+    pub fn agent_tenant(&self, agent_id: AgentId) -> Result<Option<String>, ContextError> {
+        let conn = self.conn.lock().unwrap();
+        let result = conn.query_row(
+            "SELECT tenant_id FROM agents WHERE id = ?1",
+            params![agent_id.to_string()],
+            |row| row.get::<_, String>(0),
+        );
+        match result {
+            Ok(t) => Ok(Some(t)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(ContextError::StorageError(e.to_string())),
+        }
+    }
+
+    /// List the ids of agents that belong to `tenant_id` (tenant-scoped registry
+    /// view — a tenant-A caller never sees tenant-B agents).
+    pub fn list_agents_for_tenant(&self, tenant_id: &str) -> Result<Vec<AgentId>, ContextError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare("SELECT id FROM agents WHERE tenant_id = ?1 ORDER BY created_at ASC")
+            .map_err(|e| ContextError::StorageError(e.to_string()))?;
+        let rows = stmt
+            .query_map(params![tenant_id], |row| row.get::<_, String>(0))
+            .map_err(|e| ContextError::StorageError(e.to_string()))?;
+        let mut ids = Vec::new();
+        for row in rows {
+            let s = row.map_err(|e| ContextError::StorageError(e.to_string()))?;
+            if let Ok(id) = uuid::Uuid::parse_str(&s) {
+                ids.push(id);
+            }
+        }
+        Ok(ids)
     }
 
     /// Remove an agent's durable identity (e.g. on permanent teardown).
@@ -917,6 +1006,279 @@ impl SqliteContextManager {
         let conn = self.conn.lock().unwrap();
         let _ = conn.pragma_update(None, "wal_checkpoint", "TRUNCATE");
         Ok(())
+    }
+}
+
+/// Tenancy persistence — tenants, users, sessions and api-keys, plus the
+/// tenant-scoped data reads that make cross-tenant access impossible.
+///
+/// All on the single SQLite handle (no second db). Secrets are persisted
+/// **hashed** (the `auth.rs` `*_hash` columns) — the plaintext is never written.
+/// On boot the kernel calls [`load_tenancy`](Self::load_tenancy) to rehydrate the
+/// in-memory `AuthSystem`, so tenants/users/keys survive a restart.
+impl SqliteContextManager {
+    /// Persist a tenant (insert-or-replace).
+    pub fn save_tenant(&self, t: &crate::auth::Tenant) -> Result<(), ContextError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO tenants (id, name, created_at) VALUES (?1, ?2, ?3)",
+            params![t.id, t.name, t.created_at.to_rfc3339()],
+        )
+        .map_err(|e| ContextError::PersistenceFailed(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Persist a user (insert-or-replace).
+    pub fn save_user(&self, u: &crate::auth::User) -> Result<(), ContextError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO users (id, tenant_id, username, email, role, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                u.id,
+                u.tenant_id,
+                u.username,
+                u.email,
+                u.role.as_str(),
+                u.created_at.to_rfc3339()
+            ],
+        )
+        .map_err(|e| ContextError::PersistenceFailed(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Persist an api-key record (hash only — never the plaintext).
+    pub fn save_api_key(&self, k: &crate::auth::ApiKey) -> Result<(), ContextError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO api_keys (key_hash, name, user_id, tenant_id, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                k.key_hash,
+                k.name,
+                k.user_id,
+                k.tenant_id,
+                k.created_at.to_rfc3339()
+            ],
+        )
+        .map_err(|e| ContextError::PersistenceFailed(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Persist a session record (hash only — never the plaintext token).
+    pub fn save_session(&self, s: &crate::auth::Session) -> Result<(), ContextError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO sessions (token_hash, user_id, tenant_id, expires_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                s.token_hash,
+                s.user_id,
+                s.tenant_id,
+                s.expires_at.to_rfc3339()
+            ],
+        )
+        .map_err(|e| ContextError::PersistenceFailed(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Load all persisted tenancy state. Returns `(tenants, users, api_keys,
+    /// sessions)` for the kernel to reinsert into a fresh `AuthSystem` on boot.
+    /// A malformed row is skipped, never fatal (best-effort rehydration).
+    #[allow(clippy::type_complexity)]
+    pub fn load_tenancy(
+        &self,
+    ) -> Result<
+        (
+            Vec<crate::auth::Tenant>,
+            Vec<crate::auth::User>,
+            Vec<crate::auth::ApiKey>,
+            Vec<crate::auth::Session>,
+        ),
+        ContextError,
+    > {
+        let conn = self.conn.lock().unwrap();
+        let parse_ts = |s: &str| {
+            DateTime::parse_from_rfc3339(s)
+                .map(|d| d.with_timezone(&Utc))
+                .unwrap_or_else(|_| Utc::now())
+        };
+
+        let mut tenants = Vec::new();
+        {
+            let mut stmt = conn
+                .prepare("SELECT id, name, created_at FROM tenants")
+                .map_err(|e| ContextError::StorageError(e.to_string()))?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                })
+                .map_err(|e| ContextError::StorageError(e.to_string()))?;
+            for r in rows.flatten() {
+                tenants.push(crate::auth::Tenant {
+                    id: r.0,
+                    name: r.1,
+                    created_at: parse_ts(&r.2),
+                });
+            }
+        }
+
+        let mut users = Vec::new();
+        {
+            let mut stmt = conn
+                .prepare("SELECT id, tenant_id, username, email, role, created_at FROM users")
+                .map_err(|e| ContextError::StorageError(e.to_string()))?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                    ))
+                })
+                .map_err(|e| ContextError::StorageError(e.to_string()))?;
+            for r in rows.flatten() {
+                users.push(crate::auth::User {
+                    id: r.0,
+                    tenant_id: r.1,
+                    username: r.2,
+                    email: r.3,
+                    role: crate::auth::Role::parse(&r.4),
+                    created_at: parse_ts(&r.5),
+                });
+            }
+        }
+
+        let mut api_keys = Vec::new();
+        {
+            let mut stmt = conn
+                .prepare("SELECT key_hash, name, user_id, tenant_id, created_at FROM api_keys")
+                .map_err(|e| ContextError::StorageError(e.to_string()))?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                    ))
+                })
+                .map_err(|e| ContextError::StorageError(e.to_string()))?;
+            for r in rows.flatten() {
+                api_keys.push(crate::auth::ApiKey {
+                    key_hash: r.0,
+                    name: r.1,
+                    user_id: r.2,
+                    tenant_id: r.3,
+                    created_at: parse_ts(&r.4),
+                });
+            }
+        }
+
+        let mut sessions = Vec::new();
+        {
+            let mut stmt = conn
+                .prepare("SELECT token_hash, user_id, tenant_id, expires_at FROM sessions")
+                .map_err(|e| ContextError::StorageError(e.to_string()))?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                })
+                .map_err(|e| ContextError::StorageError(e.to_string()))?;
+            for r in rows.flatten() {
+                sessions.push(crate::auth::Session {
+                    token_hash: r.0,
+                    user_id: r.1,
+                    tenant_id: r.2,
+                    expires_at: parse_ts(&r.3),
+                });
+            }
+        }
+
+        Ok((tenants, users, api_keys, sessions))
+    }
+}
+
+/// Tenant-scoped data reads. These prove cross-tenant isolation at the storage
+/// layer: each takes the caller's `tenant_id` and returns the agent's data
+/// **only** if that agent belongs to the caller's tenant — otherwise an empty /
+/// `None` result, exactly as if the data did not exist. The kernel routes
+/// tenant-bound connections through these instead of the raw per-agent reads.
+impl SqliteContextManager {
+    /// `true` if `agent_id` is owned by `tenant_id` (or the agent is unknown,
+    /// which callers treat as "no data"). The single isolation predicate the
+    /// scoped reads below share.
+    fn agent_in_tenant(&self, agent_id: AgentId, tenant_id: &str) -> bool {
+        match self.agent_tenant(agent_id) {
+            Ok(Some(t)) => t == tenant_id,
+            _ => false,
+        }
+    }
+
+    /// Query an agent's long-term memory, scoped to `tenant_id`. Returns an empty
+    /// vec if the agent belongs to a different tenant.
+    pub async fn query_memory_for_tenant(
+        &self,
+        tenant_id: &str,
+        agent_id: AgentId,
+        query: &str,
+    ) -> Result<Vec<Fact>, ContextError> {
+        if !self.agent_in_tenant(agent_id, tenant_id) {
+            return Ok(Vec::new());
+        }
+        self.query_memory(agent_id, query).await
+    }
+
+    /// Get a KV value for an agent, scoped to `tenant_id`. Returns `None` if the
+    /// agent belongs to a different tenant.
+    pub fn kv_get_for_tenant(
+        &self,
+        tenant_id: &str,
+        agent_id: AgentId,
+        key: &str,
+    ) -> Result<Option<String>, ContextError> {
+        if !self.agent_in_tenant(agent_id, tenant_id) {
+            return Ok(None);
+        }
+        self.kv_get(agent_id, key)
+    }
+
+    /// List an agent's KV keys, scoped to `tenant_id`. Empty for a foreign tenant.
+    pub fn kv_list_for_tenant(
+        &self,
+        tenant_id: &str,
+        agent_id: AgentId,
+    ) -> Result<Vec<String>, ContextError> {
+        if !self.agent_in_tenant(agent_id, tenant_id) {
+            return Ok(Vec::new());
+        }
+        self.kv_list(agent_id)
+    }
+
+    /// List an agent's snapshot labels, scoped to `tenant_id`. Empty for a
+    /// foreign tenant.
+    pub fn list_snapshots_for_tenant(
+        &self,
+        tenant_id: &str,
+        agent_id: AgentId,
+    ) -> Result<Vec<String>, ContextError> {
+        if !self.agent_in_tenant(agent_id, tenant_id) {
+            return Ok(Vec::new());
+        }
+        self.list_snapshots(agent_id)
     }
 }
 
@@ -1221,6 +1583,7 @@ mod tests {
         let a = PersistedAgent {
             id: uuid::Uuid::new_v4(),
             session_id: uuid::Uuid::new_v4(),
+            tenant_id: DEFAULT_TENANT.to_string(),
             name: "alpha".into(),
             task: "do the thing".into(),
             llm_provider: "stub".into(),

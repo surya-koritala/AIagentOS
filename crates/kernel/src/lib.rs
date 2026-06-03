@@ -901,6 +901,18 @@ pub struct AgentKernelImpl {
     /// `create_agent_in_namespace` with the same group share these (and can
     /// see/message each other); ungrouped agents use the registry defaults.
     group_namespaces: DashMap<String, (NamespaceId, NamespaceId)>,
+    /// Multi-tenant auth/identity. Owned by the kernel (behind a `RwLock` — auth
+    /// resolution is read-heavy), persisted + rehydrated through the single
+    /// SQLite handle. Resolves an API key / session token to a `(user, tenant,
+    /// role)`; the tenant then maps onto the namespace group + cgroup below.
+    pub auth: Arc<tokio::sync::RwLock<crate::auth::AuthSystem>>,
+    /// One cgroup per tenant (token budget), created lazily so one tenant can't
+    /// exhaust another's per-minute quota. Sibling to `profile_cgroups` under the
+    /// root; a tenant's agents are placed in *its tenant's* cgroup.
+    tenant_cgroups: DashMap<String, CgroupId>,
+    /// Per-minute token budget applied to each tenant's cgroup at creation,
+    /// derived from the kernel's `BudgetConfig` (`tokens_per_min`).
+    tenant_budget: CgroupLimits,
     executors: DashMap<AgentId, tokio::sync::Mutex<AgentExecutor>>,
     event_tx: broadcast::Sender<KernelEvent>,
 }
@@ -959,7 +971,12 @@ impl AgentKernelImpl {
         Ok(kernel)
     }
 
-    fn with_context_manager(
+    /// Build a kernel around a provided context manager + budget/MAC config.
+    /// This is the canonical wiring entry point (the CLI/Tauri/`from_config` all
+    /// funnel through it); exposed so tests can construct a kernel with a custom
+    /// `BudgetConfig` (e.g. a small per-minute token quota). Does *not* rehydrate
+    /// or start background tasks — use `from_config`/`boot` for that.
+    pub fn with_context_manager(
         context_manager: Arc<SqliteContextManager>,
         budgets: &crate::config::BudgetConfig,
         mac_enforcing: bool,
@@ -1048,6 +1065,16 @@ impl AgentKernelImpl {
             os,
             profile_cgroups,
             group_namespaces: DashMap::new(),
+            auth: Arc::new(tokio::sync::RwLock::new(crate::auth::AuthSystem::new())),
+            tenant_cgroups: DashMap::new(),
+            // Each tenant's cgroup caps per-minute tokens at the configured TPM so
+            // one tenant exhausting its budget can't starve another (whose cgroup
+            // is independent). 0 = unlimited, matching the rest of the budget model.
+            tenant_budget: CgroupLimits {
+                tokens_per_min: budgets.tpm,
+                max_context_tokens: budgets.max_context_tokens,
+                ..Default::default()
+            },
             executors: DashMap::new(),
             event_tx,
         })
@@ -1065,7 +1092,54 @@ impl AgentKernelImpl {
 
     /// Create agent with full subsystem coordination.
     pub async fn create_agent_full(&self, config: AgentConfig) -> Result<AgentHandle, KernelError> {
-        self.create_agent_grouped(config, None).await
+        self.create_agent_grouped(config, None, crate::context::DEFAULT_TENANT)
+            .await
+    }
+
+    /// Create an agent that belongs to `tenant_id`. The agent is placed into the
+    /// tenant's **namespace group** (so it cannot see or message agents/tools of
+    /// any other tenant — enforced at the syscall gate) and the tenant's
+    /// **cgroup** (so its token use counts against the tenant's budget, not
+    /// another tenant's). The tenant is persisted on the agent record and
+    /// restored on rehydrate, so tenancy survives a restart.
+    ///
+    /// `tenant_id` should be a tenant created via the `AuthSystem`; an unknown id
+    /// still isolates correctly (it just gets its own fresh namespace + cgroup).
+    pub async fn create_agent_for_tenant(
+        &self,
+        tenant_id: &str,
+        config: AgentConfig,
+    ) -> Result<AgentHandle, KernelError> {
+        // The namespace group of a tenanted agent IS its tenant id, so two
+        // tenants land in distinct namespaces and the gate denies cross-tenant
+        // tool/IPC access. (DEFAULT_TENANT keeps the shared default namespaces so
+        // legacy / un-tenanted agents still collaborate.)
+        let group = if tenant_id == crate::context::DEFAULT_TENANT {
+            None
+        } else {
+            Some(tenant_id)
+        };
+        self.create_agent_grouped(config, group, tenant_id).await
+    }
+
+    /// Get-or-create the cgroup that bounds a tenant's per-minute token budget.
+    /// `DEFAULT_TENANT` keeps the prior behavior (profile cgroups); every other
+    /// tenant gets its own sibling cgroup under the root so budgets are isolated.
+    fn tenant_cgroup(&self, tenant_id: &str) -> Option<CgroupId> {
+        if tenant_id == crate::context::DEFAULT_TENANT {
+            return None;
+        }
+        let entry = self
+            .tenant_cgroups
+            .entry(tenant_id.to_string())
+            .or_insert_with(|| {
+                self.cgroups.create(
+                    format!("tenant/{tenant_id}"),
+                    self.cgroups.root(),
+                    self.tenant_budget.clone(),
+                )
+            });
+        Some(*entry)
     }
 
     /// Create an agent placed in a named namespace `group`. Agents in the same
@@ -1079,7 +1153,8 @@ impl AgentKernelImpl {
         config: AgentConfig,
         group: &str,
     ) -> Result<AgentHandle, KernelError> {
-        self.create_agent_grouped(config, Some(group)).await
+        self.create_agent_grouped(config, Some(group), crate::context::DEFAULT_TENANT)
+            .await
     }
 
     /// Register a tool that is visible **only** to agents in `group`'s
@@ -1136,6 +1211,7 @@ impl AgentKernelImpl {
         &self,
         config: AgentConfig,
         group: Option<&str>,
+        tenant_id: &str,
     ) -> Result<AgentHandle, KernelError> {
         // 1. Create agent via agent manager
         let handle = self.agent_manager.create_agent(config.clone()).await?;
@@ -1170,14 +1246,15 @@ impl AgentKernelImpl {
         //    failed with `QueueFull` — see #38.)
         self.scheduler.admit(&handle);
 
-        // 6–8. Place the agent in IPC / syscall gate / namespaces / CFS / procfs.
-        self.place_agent_in_subsystems(agent_id, &config, group)
+        // 6–8. Place the agent in IPC / syscall gate / namespaces / CFS / procfs,
+        //       in its tenant's cgroup + namespace group.
+        self.place_agent_in_subsystems(agent_id, &config, group, tenant_id)
             .await;
 
-        // 9. Persist the agent's durable identity so it survives a restart, then
-        //    broadcast the creation event. Persistence commits immediately, so
-        //    even an abrupt stop (no graceful shutdown) recovers this agent.
-        self.persist_agent_registry(agent_id, &config);
+        // 9. Persist the agent's durable identity (incl. tenant) so it survives a
+        //    restart, then broadcast the creation event. Persistence commits
+        //    immediately, so even an abrupt stop recovers this agent + its tenant.
+        self.persist_agent_registry(agent_id, &config, tenant_id);
         let _ = self.event_tx.send(KernelEvent::AgentCreated(agent_id));
 
         Ok(handle)
@@ -1193,6 +1270,7 @@ impl AgentKernelImpl {
         agent_id: AgentId,
         config: &AgentConfig,
         group: Option<&str>,
+        tenant_id: &str,
     ) {
         // Register IPC mailbox.
         self.ipc.register_agent(agent_id);
@@ -1200,14 +1278,16 @@ impl AgentKernelImpl {
         // Register with the syscall gate (capabilities derived from the
         // permission profile; fully-permissive if the profile is unknown).
         let caps = caps_for_profile(&config.permission_profile);
-        // Place the agent in its permission profile's cgroup (bounded token
-        // budget) rather than the unlimited root cgroup, so `CgroupQuota`
-        // enforcement is live. Unknown profiles fall back to "standard".
-        let cgroup = self
-            .profile_cgroups
-            .get(&config.permission_profile)
-            .or_else(|| self.profile_cgroups.get("standard"))
-            .copied();
+        // Choose the cgroup: a tenanted agent goes in its tenant's cgroup so its
+        // tokens count against the tenant's budget (and one tenant exhausting its
+        // quota can't starve another). Un-tenanted agents fall back to the
+        // permission-profile cgroup (prior behavior); unknown profiles → standard.
+        let cgroup = self.tenant_cgroup(tenant_id).or_else(|| {
+            self.profile_cgroups
+                .get(&config.permission_profile)
+                .or_else(|| self.profile_cgroups.get("standard"))
+                .copied()
+        });
         let pid = self.syscall_gate.register_agent(agent_id, caps, cgroup);
 
         // MAC: label the agent by its permission profile so an enforcing policy
@@ -1247,7 +1327,7 @@ impl AgentKernelImpl {
     /// Write the agent's durable identity + config to the `agents` table via the
     /// single SQLite handle. Best-effort: a persistence failure is logged but
     /// does not fail agent creation (the in-memory agent is still live).
-    fn persist_agent_registry(&self, agent_id: AgentId, config: &AgentConfig) {
+    fn persist_agent_registry(&self, agent_id: AgentId, config: &AgentConfig, tenant_id: &str) {
         let state = self
             .agent_manager
             .get_agent_state(agent_id)
@@ -1267,6 +1347,7 @@ impl AgentKernelImpl {
                 .find(|a| a.id == agent_id)
                 .and_then(|a| a.session_id)
                 .unwrap_or(agent_id),
+            tenant_id: tenant_id.to_string(),
             name: config.name.clone(),
             task: config.task.clone(),
             llm_provider: config.llm_provider.clone(),
@@ -1291,6 +1372,9 @@ impl AgentKernelImpl {
     /// and best-effort per agent: a malformed row is skipped, not fatal. Returns
     /// the ids that were brought back. A fresh / empty DB rehydrates nothing.
     pub async fn rehydrate_agents(&self) -> Result<Vec<AgentId>, KernelError> {
+        // Rehydrate tenancy first so an agent's tenant is known to the AuthSystem
+        // by the time the agent is re-placed into its tenant's namespace/cgroup.
+        self.rehydrate_tenancy().await;
         let persisted = self
             .context_manager
             .load_all_agents()
@@ -1320,13 +1404,164 @@ impl AgentKernelImpl {
                 p.created_at,
                 p.last_activity_at,
             );
-            // Re-admit to the priority scheduler and re-place into OS subsystems.
+            // Re-admit to the priority scheduler and re-place into OS subsystems,
+            // re-arming the agent's tenant isolation: a tenanted agent rejoins its
+            // tenant's namespace group + cgroup exactly as at creation, so
+            // cross-tenant isolation survives the restart.
             self.scheduler.admit_id(p.id);
-            self.place_agent_in_subsystems(p.id, &config, None).await;
+            let group = if p.tenant_id == crate::context::DEFAULT_TENANT {
+                None
+            } else {
+                Some(p.tenant_id.as_str())
+            };
+            self.place_agent_in_subsystems(p.id, &config, group, &p.tenant_id)
+                .await;
             let _ = self.event_tx.send(KernelEvent::AgentCreated(p.id));
             restored.push(p.id);
         }
         Ok(restored)
+    }
+
+    /// Rehydrate the multi-tenant auth state (tenants, users, hashed api-keys,
+    /// hashed sessions) from the persistent DB into the in-memory `AuthSystem` so
+    /// tenancy + credentials survive a restart. Best-effort: a read error leaves
+    /// the AuthSystem empty rather than failing the boot.
+    pub async fn rehydrate_tenancy(&self) {
+        let loaded = match self.context_manager.load_tenancy() {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!("Failed to load tenancy state: {e}");
+                return;
+            }
+        };
+        let (tenants, users, api_keys, sessions) = loaded;
+        let mut auth = self.auth.write().await;
+        for t in tenants {
+            auth.insert_tenant(t);
+        }
+        for u in users {
+            auth.insert_user(u);
+        }
+        for k in api_keys {
+            auth.insert_api_key(k);
+        }
+        for s in sessions {
+            auth.insert_session(s);
+        }
+    }
+
+    /// Create a tenant and persist it, returning its id. The tenant's namespace
+    /// group + cgroup are created lazily when its first agent is created.
+    pub async fn create_tenant(&self, name: &str) -> Result<String, KernelError> {
+        let (id, record) = {
+            let mut auth = self.auth.write().await;
+            let id = auth.create_tenant(name);
+            let record = auth.get_tenant(&id).cloned();
+            (id, record)
+        };
+        if let Some(t) = record {
+            self.context_manager
+                .save_tenant(&t)
+                .map_err(KernelError::Context)?;
+        }
+        Ok(id)
+    }
+
+    /// Register a user under a tenant and persist it. Returns the user id, or an
+    /// error if the tenant is unknown.
+    pub async fn register_user(
+        &self,
+        tenant_id: &str,
+        username: &str,
+        email: &str,
+        role: crate::auth::Role,
+    ) -> Result<String, KernelError> {
+        let (id, record) = {
+            let mut auth = self.auth.write().await;
+            let id = match auth.register(tenant_id, username, email, role) {
+                Some(id) => id,
+                None => {
+                    return Err(KernelError::Context(crate::ContextError::StorageError(
+                        format!("unknown tenant: {tenant_id}"),
+                    )))
+                }
+            };
+            let record = auth.get_user(&id).cloned();
+            (id, record)
+        };
+        if let Some(u) = record {
+            self.context_manager
+                .save_user(&u)
+                .map_err(KernelError::Context)?;
+        }
+        Ok(id)
+    }
+
+    /// Issue an API key for a user and persist it (hashed). Returns the
+    /// **plaintext** key (shown once). Errors if the user is unknown.
+    pub async fn issue_api_key(&self, user_id: &str, name: &str) -> Result<String, KernelError> {
+        let (key, record) = {
+            let mut auth = self.auth.write().await;
+            let key = match auth.create_api_key(user_id, name) {
+                Some(k) => k,
+                None => {
+                    return Err(KernelError::Context(crate::ContextError::StorageError(
+                        format!("unknown user: {user_id}"),
+                    )))
+                }
+            };
+            // The stored record is keyed by the hash of the returned plaintext.
+            let record = auth.authenticate(&key).map(|p| crate::auth::ApiKey {
+                key_hash: crate::auth::hash_secret(&key),
+                name: name.to_string(),
+                user_id: p.user_id,
+                tenant_id: p.tenant_id,
+                created_at: chrono::Utc::now(),
+            });
+            (key, record)
+        };
+        if let Some(k) = record {
+            self.context_manager
+                .save_api_key(&k)
+                .map_err(KernelError::Context)?;
+        }
+        Ok(key)
+    }
+
+    /// Open a session (login) for a user and persist it (hashed). Returns the
+    /// **plaintext** session token (shown once). Errors if the user is unknown.
+    pub async fn open_session(&self, user_id: &str) -> Result<String, KernelError> {
+        let (token, record) = {
+            let mut auth = self.auth.write().await;
+            let token = match auth.create_session(user_id) {
+                Some(t) => t,
+                None => {
+                    return Err(KernelError::Context(crate::ContextError::StorageError(
+                        format!("unknown user: {user_id}"),
+                    )))
+                }
+            };
+            let record = auth.authenticate(&token).map(|p| crate::auth::Session {
+                token_hash: crate::auth::hash_secret(&token),
+                user_id: p.user_id,
+                tenant_id: p.tenant_id,
+                expires_at: chrono::Utc::now() + chrono::Duration::hours(24),
+            });
+            (token, record)
+        };
+        if let Some(s) = record {
+            self.context_manager
+                .save_session(&s)
+                .map_err(KernelError::Context)?;
+        }
+        Ok(token)
+    }
+
+    /// Resolve a presented secret (API key or session token) to a
+    /// [`Principal`](crate::auth::Principal): the `(user, tenant, role)` the
+    /// connection acts as. `None` if the secret is unknown/expired.
+    pub async fn resolve_principal(&self, secret: &str) -> Option<crate::auth::Principal> {
+        self.auth.read().await.authenticate(secret)
     }
 
     /// Synchronous wrapper around [`rehydrate_agents`](Self::rehydrate_agents)

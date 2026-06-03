@@ -62,3 +62,6 @@ mod governance_e2e;
 
 #[cfg(test)]
 mod persistence_props;
+
+#[cfg(test)]
+mod tenancy_props;

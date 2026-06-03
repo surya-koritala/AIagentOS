@@ -250,7 +250,24 @@ pub enum SyscallReply {
 /// Dispatch a single syscall against the kernel. Pure routing — every call goes
 /// through the same `AgentKernelImpl` methods the in-process paths use, so the
 /// syscall gate's capability/MAC/cgroup/namespace checks still apply.
+///
+/// Tenant-agnostic entry point (no bound tenant): equivalent to
+/// [`dispatch_scoped`] with `None`. Used by the MCP server and any caller that
+/// doesn't carry a tenant context.
 pub async fn dispatch(kernel: &AgentKernelImpl, call: Syscall) -> SyscallReply {
+    dispatch_scoped(kernel, call, None).await
+}
+
+/// Dispatch a syscall on behalf of an optional bound `tenant`. When a tenant is
+/// bound (the connection authenticated with an API key / session token),
+/// agent-creating and agent-listing syscalls are scoped to that tenant: created
+/// agents land in the tenant's namespace + cgroup, and listings only show the
+/// tenant's own agents. With `None` the behavior is the prior un-tenanted one.
+pub async fn dispatch_scoped(
+    kernel: &AgentKernelImpl,
+    call: Syscall,
+    tenant: Option<&str>,
+) -> SyscallReply {
     match call {
         Syscall::CreateAgent {
             name,
@@ -268,7 +285,13 @@ pub async fn dispatch(kernel: &AgentKernelImpl, call: Syscall) -> SyscallReply {
                 priority: prio,
                 sandbox_config: None,
             };
-            match kernel.create_agent_full(config).await {
+            // A tenant-bound connection creates agents inside its tenant (own
+            // namespace + cgroup); otherwise the un-tenanted full path.
+            let created = match tenant {
+                Some(t) => kernel.create_agent_for_tenant(t, config).await,
+                None => kernel.create_agent_full(config).await,
+            };
+            match created {
                 Ok(handle) => SyscallReply::AgentCreated {
                     id: handle.id.to_string(),
                 },
@@ -278,10 +301,24 @@ pub async fn dispatch(kernel: &AgentKernelImpl, call: Syscall) -> SyscallReply {
             }
         }
         Syscall::ListAgents => {
+            // Scope the listing to the bound tenant's agents (from the registry's
+            // tenant column) so a tenant-A connection never sees tenant-B agents.
+            let ids: Option<std::collections::HashSet<uuid::Uuid>> = tenant.map(|t| {
+                kernel
+                    .context_manager
+                    .list_agents_for_tenant(t)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .collect()
+            });
             let agents = kernel
                 .agent_manager
                 .list_agents(None)
                 .into_iter()
+                .filter(|a| match &ids {
+                    Some(set) => set.contains(&a.id),
+                    None => true,
+                })
                 .map(|a| AgentSummary {
                     id: a.id.to_string(),
                     name: a.name,
@@ -834,27 +871,49 @@ impl SyscallServer {
         W: AsyncWrite + Unpin,
     {
         let mut lines = BufReader::new(read).lines();
-        // No token configured ⇒ authenticated from the start.
+        // No shared-secret token configured ⇒ authenticated from the start.
         let mut authed = auth.is_none();
+        // The tenant this connection is bound to, once it authenticates with an
+        // API key / session token. `None` = un-tenanted (shared-secret or open
+        // connection): syscalls run with the prior, un-scoped behavior.
+        let mut tenant: Option<String> = None;
         while let Some(line) = lines.next_line().await? {
             if line.trim().is_empty() {
                 continue;
             }
             let reply = match serde_json::from_str::<Syscall>(&line) {
-                Ok(Syscall::Authenticate { token }) => match &auth {
-                    Some(expected) if token == **expected => {
+                // Authentication accepts two credentials, tried in order:
+                //   1. the server's shared secret (unchanged legacy path), and
+                //   2. an AuthSystem API key / session token, which additionally
+                //      binds this connection to the credential's tenant.
+                Ok(Syscall::Authenticate { token }) => {
+                    // An AuthSystem credential always wins first so that the
+                    // connection binds to its tenant — even on an open server.
+                    if let Some(principal) = kernel.resolve_principal(&token).await {
                         authed = true;
+                        tenant = Some(principal.tenant_id);
                         SyscallReply::Authenticated
+                    } else {
+                        // Otherwise fall back to the legacy shared-secret check
+                        // (or accept outright when no secret is configured).
+                        let shared_ok = match &auth {
+                            Some(expected) => token == **expected,
+                            None => true,
+                        };
+                        if shared_ok {
+                            authed = true;
+                            SyscallReply::Authenticated
+                        } else {
+                            SyscallReply::Error {
+                                message: "authentication failed".into(),
+                            }
+                        }
                     }
-                    Some(_) => SyscallReply::Error {
-                        message: "authentication failed".into(),
-                    },
-                    None => SyscallReply::Authenticated,
-                },
+                }
                 Ok(_) if !authed => SyscallReply::Error {
                     message: "authentication required".into(),
                 },
-                Ok(call) => dispatch(&kernel, call).await,
+                Ok(call) => dispatch_scoped(&kernel, call, tenant.as_deref()).await,
                 Err(e) => SyscallReply::Error {
                     message: format!("bad request: {e}"),
                 },

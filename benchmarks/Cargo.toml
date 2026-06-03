@@ -19,8 +19,13 @@ path = "os_demo.rs"
 name = "agent-bench"
 path = "agent_bench.rs"
 
+[[bin]]
+name = "governance-demo"
+path = "src/bin/governance-demo.rs"
+
 [dependencies]
 kernel = { path = "../crates/kernel" }
+adapters = { path = "../crates/adapters" }
 tokio = { version = "1", features = ["full"] }
 uuid = { version = "1", features = ["v4"] }
 serde_json = "1"

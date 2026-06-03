@@ -12,25 +12,49 @@
 AI Agent OS is not a chatbot. It's not a coding assistant. It's the **platform layer** that sits beneath AI agents and manages them — the same way Linux sits beneath applications.
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                    Agent Applications                         │
-│         (researcher, coder, reviewer, etc.)                  │
-├─────────────────────────────────────────────────────────────┤
-│                    System Call Interface                      │
-│              (25 numbered syscalls, formal ABI)               │
-├──────────┬──────────┬──────────┬──────────┬─────────────────┤
-│  Agent   │ Context  │  Tool    │  Agent   │    Security     │
-│  Mgmt    │  Mgmt    │  System  │  Comms   │    Module       │
-│(fork,kill│(paging,  │(VFS,mount│(sockets, │(MAC,caps,       │
-│ signals) │ OOM,snap)│ drivers) │ pipes)   │ namespaces)     │
-├──────────┼──────────┼──────────┼──────────┼─────────────────┤
-│    CFS Scheduler    │  Cgroups │  Init System  │  ProcFS    │
-├─────────────────────┼──────────┼───────────────┼────────────┤
-│         Tool Drivers (LLM, FS, Net, DB, Browser)             │
-├─────────────────────────────────────────────────────────────┤
-│         Hardware Abstraction (LLM APIs, OS APIs)             │
-└─────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────────┐
+│  CLIENTS   agent CLI · Rust SDK · ClusterClient · TUI · desktop · MCP       │
+└───────────────────────────────────┬────────────────────────────────────────┘
+              Syscall / SyscallReply (newline-JSON over TCP · Unix · TLS, auth)
+┌───────────────────────────────────▼────────────────────────────────────────┐
+│  WIRE LAYER  syscall_server — kernel as a service (CreateAgent, SendMessage, │
+│  CallTool, Memory*, Storage*, Snapshot*, LoadPackage, NodeInfo, …)           │
+└───────────────────────────────────┬────────────────────────────────────────┘
+┌───────────────────────────────────▼────────────────────────────────────────┐
+│  AgentKernelImpl — the wired root orchestrator (boot → start_runtime)        │
+│                                                                              │
+│  PROCESS/EXEC         SCHEDULING            CONTEXT (virtual memory)          │
+│  agent_manager        cfs (vruntime/nice)   context_paging (summarize·OOM)    │
+│  agent_struct (PID)   PriorityScheduler     memory_manager (Embedder+Index)   │
+│  execution loop       TurnAdmission                                           │
+│  think→act→observe    LlmScheduler                                            │
+│  mid-gen pause/resume                                                         │
+│         │ every tool call                                                    │
+│         ▼                                                                    │
+│  ╔════════════════════════════════════════════════════════════════════════╗ │
+│  ║  SYSCALL GATE  —  THE CHOKEPOINT, first-failure-wins                      ║ │
+│  ║   0 namespace → 1 capability → 2 MAC → 3 cgroup quota → AuditSink         ║ │
+│  ╚════════════════════════════════════════════════════════════════════════╝ │
+│         │ (only on Ok)                                                       │
+│  SECURITY/TENANCY     INTEGRATION           RESOURCES (VFS)                   │
+│  permissions·mac      connector (9 LLMs,    resource_broker                   │
+│  namespaces·cgroups    failover·retry·rate)  filesystem·network·application   │
+│  budget($)·sandbox    mcp · github · db     tools · mount_table · registry    │
+│  auth                 IpcManager (broker)                                     │
+│                                                                              │
+│  OS SERVICES  init_system·agentctl·procfs·sysctl·observability/audit          │
+│  PLATFORM     agent_package·agentpkg·marketplace·agent_hub                    │
+└───────────────────────────────────┬────────────────────────────────────────┘
+┌───────────────────────────────────▼────────────────────────────────────────┐
+│  PERSISTENCE  single SqliteContextManager                                    │
+│   conversations · messages · facts(+embeddings) · agent_kv · snapshots       │
+└───────────────────────────────────┬────────────────────────────────────────┘
+                  EXTERNAL  LLM APIs · Ollama/vLLM · filesystem · HTTP · GitHub
 ```
+
+> **The one thing this diagram says:** every tool call from every agent crosses
+> *one* gate, and the gate runs *before* the resource broker. That's the product
+> thesis in a single box — agents governed like Linux processes.
 
 ## Why?
 
@@ -53,7 +77,7 @@ AI Agent OS provides:
 git clone https://github.com/surya-koritala/AIagentOS.git
 cd AIagentOS
 
-# Run tests (412 across the workspace)
+# Run tests (kernel 441 + integration-tests 102, across the workspace)
 cargo test --workspace --exclude tauri-app
 
 # Run the CLI agent (requires Azure OpenAI or OpenAI API key)
@@ -112,11 +136,12 @@ Every tool call from an agent goes through `SyscallGate::check_tool_call`:
 
 ```
 agent → AgentExecutor::execute_tool
-      → SyscallGate
-          1. capability check  (e.g. http_get requires CAP_NET_ACCESS)
-          2. MAC policy check  (subject/action/object rule match)
-          3. cgroup quota check (token budget per minute)
-      → ResourceBroker (if all three pass)
+      → SyscallGate::check_tool_call   (first failure wins)
+          0. namespace visibility (tool tagged to a namespace ⇒ caller must be a member)
+          1. capability check     (e.g. http_get requires CAP_NET_ACCESS)
+          2. MAC policy check     (subject/action/object rule match)
+          3. cgroup quota check   (token budget per minute)
+      → ResourceBroker (only if all four pass)
       → record_tool_usage  (propagates up cgroup hierarchy)
 ```
 
@@ -144,11 +169,18 @@ Tool-using benchmarks (file ops, git, HTTP, multi-step plans) live in `benchmark
 
 ## LLM Providers
 
+All adapters share centralized streaming and run behind a connector with failover, retry/backoff, and rate-limiting under load. Tests use `wiremock` — never real APIs.
+
 | Provider | Status |
 |----------|--------|
-| Azure OpenAI | ✅ Full support (streaming, tool calling) |
+| Azure OpenAI | ✅ Full support (streaming, tool calling) — default |
 | OpenAI | ✅ Full support |
 | Anthropic (Claude) | ✅ Full support |
+| Gemini | ✅ Full support |
+| Groq | ✅ Full support |
+| DeepSeek | ✅ Full support |
+| Hugging Face | ✅ Full support |
+| vLLM | ✅ Full support |
 | Local (Ollama) | ✅ Full support |
 
 ## Contributing

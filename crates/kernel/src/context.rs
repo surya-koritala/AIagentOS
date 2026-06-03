@@ -4,12 +4,13 @@
 //! tasks, results, and long-term facts with retry logic and summarization.
 
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 
+use crate::memory_manager::Embedder;
 use crate::{AgentId, ContextError};
 
 /// A message in the agent's conversation history.
@@ -107,6 +108,11 @@ const MAX_RETRIES: u32 = 3;
 /// SQLite-backed context manager implementation.
 pub struct SqliteContextManager {
     conn: Mutex<Connection>,
+    /// Pluggable embedder used for the long-term-memory store/query/ranking
+    /// path. Defaults to [`crate::memory_manager::default_embedder`]; swap it
+    /// via [`SqliteContextManager::with_embedder`] to change embedding strategy
+    /// without touching persistence.
+    embedder: Arc<dyn Embedder>,
 }
 
 impl SqliteContextManager {
@@ -116,6 +122,7 @@ impl SqliteContextManager {
             Connection::open(db_path).map_err(|e| ContextError::StorageError(e.to_string()))?;
         let mgr = Self {
             conn: Mutex::new(conn),
+            embedder: crate::memory_manager::default_embedder(),
         };
         mgr.init_schema()?;
         Ok(mgr)
@@ -127,9 +134,18 @@ impl SqliteContextManager {
             Connection::open_in_memory().map_err(|e| ContextError::StorageError(e.to_string()))?;
         let mgr = Self {
             conn: Mutex::new(conn),
+            embedder: crate::memory_manager::default_embedder(),
         };
         mgr.init_schema()?;
         Ok(mgr)
+    }
+
+    /// Swap the embedder used by the long-term-memory store/query path. Returns
+    /// `self` for builder-style chaining. The seam where a different
+    /// [`Embedder`] can drop in without changing persistence.
+    pub fn with_embedder(mut self, embedder: Arc<dyn Embedder>) -> Self {
+        self.embedder = embedder;
+        self
     }
 
     fn init_schema(&self) -> Result<(), ContextError> {
@@ -312,7 +328,7 @@ impl ContextManager for SqliteContextManager {
         // query_memory can rank by semantic (cosine) similarity later.
         let embedding = match &fact.embedding {
             Some(e) => e.clone(),
-            None => crate::memory_manager::embed(&fact.content),
+            None => self.embedder.embed(&fact.content),
         };
         let embedding_json = Some(serde_json::to_string(&embedding).unwrap_or_default());
         let category_str = serde_json::to_string(&fact.category)
@@ -403,13 +419,13 @@ impl ContextManager for SqliteContextManager {
         // Semantic ranking: embed the query and sort facts by cosine similarity
         // (best-first). A fact missing a stored embedding falls back to embedding
         // its content on the fly; an empty/unparseable embedding scores 0.
-        let query_vec = crate::memory_manager::embed(query);
+        let query_vec = self.embedder.embed(query);
         let scored: Vec<(Fact, Vec<f32>)> = result
             .into_iter()
             .map(|fact| {
                 let emb = match &fact.embedding {
                     Some(e) if !e.is_empty() => e.clone(),
-                    _ => crate::memory_manager::embed(&fact.content),
+                    _ => self.embedder.embed(&fact.content),
                 };
                 (fact, emb)
             })

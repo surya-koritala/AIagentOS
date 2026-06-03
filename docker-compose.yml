@@ -1,6 +1,20 @@
-# AI Agent OS — local stack: Ollama (keyless LLM) + the agent container.
+# AI Agent OS — local stack: the wire server, Ollama (keyless LLM), + the CLI.
 #
-# Two tiers:
+# One-command bootstrap (the primary entry surface — a running, reachable,
+# persistent kernel exposing the JSON syscall protocol on tcp://localhost:7777):
+#
+#         docker compose up -d --build agentos-server
+#         # or the scripted version that also does a real round-trip:
+#         ./scripts/quickstart.sh
+#
+# Three tiers:
+#   Server (keyless wire service): the `agentos-server` service runs
+#     `agent-server 0.0.0.0:7777`. It boots keyless (provider `local`), so the
+#     enforcement / non-LLM syscalls (NodeInfo, CreateAgent, GateStats, ...)
+#     answer with NO API keys and WITHOUT Ollama running. Connect with the SDK
+#     or any client speaking newline-JSON syscalls. Its healthcheck sends a
+#     real `node_info` syscall and checks the reply — not just a port probe.
+#
 #   Tier 1 (keyless, no LLM): the agentos image's default CMD runs `os-demo`,
 #     which proves the syscall-gate enforcement layer with no model at all.
 #     You don't even need the ollama service for this:
@@ -18,6 +32,49 @@
 # ollama service MUST be healthy AND have a model pulled before you run `agent`.
 
 services:
+  # The primary entry surface: a long-lived kernel exposing the JSON syscall
+  # wire protocol on tcp://0.0.0.0:7777. Boots keyless (provider `local`) so it
+  # comes up with NO API keys and does NOT hard-depend on ollama — the
+  # enforcement / non-LLM syscalls answer immediately. LLM-backed SendMessage
+  # needs a reachable provider (point OLLAMA_BASE_URL at the ollama service and
+  # pull a model), but the server itself never blocks on that.
+  agentos-server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: agentos:latest
+    container_name: agentos-server
+    # Bind 0.0.0.0 inside the container so the published port is reachable from
+    # the host; 127.0.0.1 would only be reachable inside the container.
+    command: ["agent-server", "0.0.0.0:7777"]
+    ports:
+      - "7777:7777"
+    environment:
+      # Keyless boot: provider `local` registers the Ollama adapter, but the
+      # non-LLM syscalls work with no model at all. No hard dependency on ollama.
+      AGENTOS_LLM_PROVIDER: "local"
+      AGENTOS_MODEL: "llama3.2"
+      OLLAMA_BASE_URL: "http://ollama:11434"
+      HOME: "/data"
+      XDG_CONFIG_HOME: "/data/config"
+      XDG_DATA_HOME: "/data/share"
+    volumes:
+      # Persists agent_os.db + the rendered config.toml across restarts.
+      - agentos-data:/data
+    healthcheck:
+      # Prove the server actually ANSWERS a syscall, not just that the port is
+      # open: send the exact newline-JSON `node_info` request and require a
+      # "status":"node_info" reply. `nc` is netcat-openbsd (installed in the
+      # runtime stage); -q1 closes stdin after 1s so nc returns the reply.
+      test:
+        - "CMD-SHELL"
+        - "printf '{\"op\":\"node_info\"}\\n' | nc -w2 -q1 127.0.0.1 7777 | grep -q '\"status\":\"node_info\"'"
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 10s
+    restart: unless-stopped
+
   ollama:
     image: ollama/ollama:latest
     container_name: agentos-ollama

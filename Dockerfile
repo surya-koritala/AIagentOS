@@ -3,8 +3,12 @@
 # AI Agent OS — minimal runtime image.
 #
 # Builds ONLY the two packages that matter for a headless container:
-#   * agent-cli   -> binary `agent`        (the interactive/one-shot CLI)
+#   * agent-cli   -> binaries `agent` (the interactive/one-shot CLI) and
+#                    `agent-server` (the long-lived JSON syscall wire service)
 #   * os-benchmark -> binaries `os-demo`, `os-benchmark`, `stress-test`
+#
+# `agent-server` lives at crates/cli/src/bin/agent-server.rs, so `-p agent-cli`
+# already compiles it — the runtime stage just has to COPY it in.
 #
 # crates/tauri-app is deliberately NOT built — it needs GTK/WebKit/libsoup
 # system libraries that have no place in a slim runtime image. Targeting
@@ -56,10 +60,14 @@ FROM debian:bookworm-slim AS runtime
 # Runtime system deps:
 #   libssl3         -> libssl.so.3 / libcrypto.so.3 (reqwest native-tls)
 #   ca-certificates -> trust store for HTTPS calls to LLM providers
+#   netcat-openbsd  -> tiny `nc` used by the agent-server container's
+#                      healthcheck to send a real newline-JSON syscall and read
+#                      the reply (a port-open probe is not enough).
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         libssl3 \
         ca-certificates \
+        netcat-openbsd \
     && rm -rf /var/lib/apt/lists/*
 
 # Non-root user. HOME=/data so the `dirs` crate resolves XDG paths under the
@@ -68,8 +76,10 @@ RUN useradd --create-home --home-dir /data --uid 10001 --shell /usr/sbin/nologin
     && mkdir -p /data/config/ai-agent-os /data/share/ai-agent-os \
     && chown -R agentos:agentos /data
 
-# Copy the produced binaries from the builder.
-COPY --from=builder /build/target/release/agent        /usr/local/bin/agent
+# Copy the produced binaries from the builder. `agent-server` is the primary
+# wire-service entry surface (long-lived JSON syscall protocol over TCP).
+COPY --from=builder /build/target/release/agent         /usr/local/bin/agent
+COPY --from=builder /build/target/release/agent-server  /usr/local/bin/agent-server
 COPY --from=builder /build/target/release/os-demo       /usr/local/bin/os-demo
 COPY --from=builder /build/target/release/os-benchmark  /usr/local/bin/os-benchmark
 COPY --from=builder /build/target/release/stress-test   /usr/local/bin/stress-test

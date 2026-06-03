@@ -72,6 +72,35 @@ AI Agent OS provides:
 
 ## Quick Start
 
+### One command: bring up the server
+
+The primary entry surface is `agent-server` — a long-lived kernel exposing the
+JSON syscall protocol over TCP. One command builds the image, starts it, waits
+until it actually answers a syscall, and prints the reply:
+
+```bash
+./scripts/quickstart.sh
+```
+
+That brings up a running, reachable, persistent server on
+`tcp://localhost:7777` with **no API keys and no Ollama required** (the
+enforcement / non-LLM syscalls boot keyless). State (the SQLite DB + rendered
+config) persists in the `agentos-data` volume across restarts.
+
+Equivalent raw one-liner, plus a manual round-trip:
+
+```bash
+docker compose up -d --build agentos-server
+# Send a real NodeInfo syscall and read the reply:
+exec 3<>/dev/tcp/127.0.0.1/7777; printf '{"op":"node_info"}\n' >&3; head -1 <&3
+# -> {"status":"node_info","agent_count":0,"running_agents":0}
+```
+
+Connect with the SDK or any client speaking newline-delimited JSON syscalls.
+See [docs/SERVER_QUICKSTART.md](docs/SERVER_QUICKSTART.md) for details.
+
+### From source
+
 ```bash
 # Clone
 git clone https://github.com/surya-koritala/AIagentOS.git

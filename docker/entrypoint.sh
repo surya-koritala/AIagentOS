@@ -44,7 +44,7 @@ EOF
 # Convenience: allow `docker run <image> agent ...`, `os-demo`, etc. to be
 # passed as the bare binary name. Anything else is exec'd verbatim.
 case "${1:-}" in
-    agent|os-demo|os-benchmark|stress-test)
+    agent|agent-server|os-demo|os-benchmark|stress-test)
         exec "$@"
         ;;
     "")

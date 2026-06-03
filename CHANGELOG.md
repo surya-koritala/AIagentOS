@@ -10,7 +10,15 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
 
 ## [Unreleased]
 
-_Next release accrues here. Add an entry with each merged PR._
+### Observability
+
+- **Production logging** — `agent-server` and the CLI install a `tracing`
+  subscriber driven by `RUST_LOG` (default `info`), with `LOG_FORMAT=json` for
+  ingestion; the kernel's existing `tracing` lines now actually emit (#96).
+- **Prometheus metrics** — hand-rendered `text/plain; version=0.0.4` exposition
+  (gate counters, agent counts, token/api totals, uptime) readable two ways: a
+  `Metrics` syscall + `KernelClient::metrics()`, and an optional dependency-free
+  HTTP `/metrics` endpoint started via `AGENT_SERVER_METRICS_ADDR` (#96).
 
 ## [0.2.0] - 2026-06-03
 

@@ -2,6 +2,113 @@
 
 All notable changes to this project will be documented in this file.
 
+The format follows [Keep a Changelog](https://keepachangelog.com/), and the
+project uses [Semantic Versioning](https://semver.org/). While pre-1.0, a
+**minor** bump (0.x.0) marks a shipped feature batch and a **patch** (0.x.y)
+marks fixes. Every PR adds an entry under `## [Unreleased]`; cutting a release
+moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
+
+## [Unreleased]
+
+_Next release accrues here. Add an entry with each merged PR._
+
+## [0.2.0] - 2026-06-03
+
+**Platform + Governed Execution.** Since 0.1.0 made the syscall gate
+load-bearing, 0.2.0 turns the kernel into a real, reachable, multi-tenant
+service: a JSON wire API over TCP/Unix/TLS, an embeddable Rust SDK and clients,
+nine LLM providers with a hardened send-path, durable state across restarts,
+first-class tenancy, and a one-command container. The governance wedge — agents
+governed like Linux processes — is now proven un-bypassable and demonstrated
+end-to-end. (64 commits since 0.1.0.)
+
+### Kernel as a service (wire API)
+
+- **Syscall server** — expose the kernel over a newline-delimited JSON protocol,
+  generic over the transport (#41, #43, #47).
+- **Transports** — TCP, **Unix-domain socket**, and **TLS** (rustls/ring), with
+  an optional shared-secret `Authenticate` (#47, #84).
+- **Syscall surface** — `AgentInfo` introspection (#44), `CallTool` (#43),
+  per-agent **storage** (`StoragePut/Get/List/Delete`) (#71), **context
+  snapshot/restore** (#78), and **`NodeInfo`** node-load (#80).
+
+### SDK & clients
+
+- **Embeddable Rust SDK** (`KernelClient`) over the syscall server (#46).
+- **Agent patterns** — `ReActLoop` and `PlannerExecutor` templates (#69).
+- **Distributed `ClusterClient`** — N nodes, `LeastLoaded` / `RoundRobin`
+  placement (#80).
+- **Terminal UI** — a ratatui TUI for observing and driving agents (#82).
+
+### LLM providers & path
+
+- **Six new adapters** — Groq, Deepseek (#45), Gemini, vLLM, HuggingFace (#51),
+  bringing the total to **nine** providers.
+- **Function-calling shim** for models without native tool support (#53).
+- **Hardened send-path** — provider **failover**, bounded **retry/backoff**, and
+  **rate-limiting under concurrent load** (atomic RPM/TPM reserve) (#90).
+
+### Scheduling
+
+- **CFS-ordered turn admission** — nice decides who runs under contention (#33).
+- **LLM-request scheduling** — priority-ordered LLM-core admission (#52).
+- **Mid-generation context switch** — pause/resume a turn at a boundary (#85).
+- **Non-blocking create-time admission** (#29) and a **lost-wakeup fix** in the
+  resource-access scheduler (#75).
+
+### Memory & context
+
+- **Memory manager** — embeddings + vector search (#67).
+- **Pluggable embedding seam** — object-safe `Embedder` + `VectorIndex` traits
+  with a stronger pure-Rust default (#89).
+- **ContextPager** wired to bound the active context by tokens (#32).
+
+### Security, governance & tenancy
+
+- **Namespace differentiation** — isolate agent groups; group-scoped tools make
+  tool-namespace isolation load-bearing (#22, #30).
+- **MAC** — enforceable gate stage (#17), allow-and-log `Audit` decisions (#25),
+  glob object matching on raw paths/URLs (#24).
+- **Budget** — hard cumulative USD spend ceiling on the LLM path (#26).
+- **Adversarial gate fuzz** — ~2500 proptest cases per run with an independent
+  oracle, proving the 4-layer gate has no bypass (#87).
+- **First-class multi-tenancy** — a tenant model atop namespaces/cgroups/auth;
+  cross-tenant tool/IPC/state access is denied at the gate (#93).
+
+### Persistence
+
+- **Durable agent registry** — agents (and conversations/memory/KV/snapshots)
+  survive a process restart; enforcement is re-armed on rehydrate (#92).
+
+### IPC & multi-agent
+
+- Agent-to-agent **messaging** (#18), **delegation** tools with orphan-on-reject
+  (#19), **discovery** + address-by-name (#21), namespace-scoped discovery (#23),
+  and delegation authorized by caller identity (#31).
+
+### Packages, hub & MCP
+
+- **Agent package format** + loader/runner (#49).
+- **Shareable tool registry** (#72) and an **agent hub** — publish/fetch/share
+  packages (#77).
+- **MCP server** exposing kernel tools over JSON-RPC, gate-enforced (#68).
+
+### Tools
+
+- Extensible tool **registry** + git/browse/edit tools (#16).
+
+### Benchmarks, demos & distribution
+
+- **Agent-task benchmark** + eval harness with a CI smoke test (#73).
+- **Governed-execution scenario** + runnable keyless demo (#88); keyless
+  `os-demo` + Docker/Ollama test harness (#13).
+- **Container image + one-command bootstrap** — ships `agent-server`, keyless by
+  default, with a real-syscall healthcheck and `scripts/quickstart.sh` (#94).
+
+### CLI
+
+- Enforce the syscall gate on CLI tool calls (#12).
+
 ## [0.1.0] - 2026-05-09
 
 First tagged release. Marks the point at which the Linux-mapped subsystems

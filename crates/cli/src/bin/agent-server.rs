@@ -10,6 +10,8 @@
 //!   agent-server [ADDR]                 # TCP, default 127.0.0.1:7777
 //!   AGENT_SERVER_UNIX=/path.sock agent-server   # Unix-domain socket instead
 //!   AGENT_SERVER_TOKEN=secret agent-server      # require auth before any syscall
+//!   AGENT_SERVER_TLS_CERT=cert.pem AGENT_SERVER_TLS_KEY=key.pem agent-server
+//!                                       # terminate TLS (rustls) on the TCP bind
 
 #[path = "../providers.rs"]
 mod providers;
@@ -30,6 +32,18 @@ async fn main() {
     let token = std::env::var("AGENT_SERVER_TOKEN")
         .ok()
         .filter(|t| !t.is_empty());
+    // TLS is enabled only when both cert and key paths are provided.
+    let tls = match (
+        std::env::var("AGENT_SERVER_TLS_CERT")
+            .ok()
+            .filter(|s| !s.is_empty()),
+        std::env::var("AGENT_SERVER_TLS_KEY")
+            .ok()
+            .filter(|s| !s.is_empty()),
+    ) {
+        (Some(cert), Some(key)) => Some((cert, key)),
+        _ => None,
+    };
 
     let config = Config::load();
     let kernel = Arc::new(AgentKernelImpl::from_config(&config).expect("failed to init kernel"));
@@ -55,12 +69,35 @@ async fn main() {
             eprintln!("agent-server: AGENT_SERVER_UNIX is only supported on Unix platforms");
             std::process::exit(1);
         }
-        None => SyscallServer::bind(kernel, addr.as_str())
-            .await
-            .unwrap_or_else(|e| {
-                eprintln!("agent-server: failed to bind {addr}: {e}");
-                std::process::exit(1);
-            }),
+        None => match &tls {
+            Some((cert_path, key_path)) => {
+                let cert_pem = std::fs::read(cert_path).unwrap_or_else(|e| {
+                    eprintln!("agent-server: failed to read TLS cert {cert_path}: {e}");
+                    std::process::exit(1);
+                });
+                let key_pem = std::fs::read(key_path).unwrap_or_else(|e| {
+                    eprintln!("agent-server: failed to read TLS key {key_path}: {e}");
+                    std::process::exit(1);
+                });
+                let config = kernel::syscall_server::server_config_from_pem(&cert_pem, &key_pem)
+                    .unwrap_or_else(|e| {
+                        eprintln!("agent-server: invalid TLS cert/key: {e}");
+                        std::process::exit(1);
+                    });
+                SyscallServer::bind_tls(kernel, addr.as_str(), config)
+                    .await
+                    .unwrap_or_else(|e| {
+                        eprintln!("agent-server: failed to bind TLS {addr}: {e}");
+                        std::process::exit(1);
+                    })
+            }
+            None => SyscallServer::bind(kernel, addr.as_str())
+                .await
+                .unwrap_or_else(|e| {
+                    eprintln!("agent-server: failed to bind {addr}: {e}");
+                    std::process::exit(1);
+                }),
+        },
     };
 
     if let Some(token) = token {
@@ -72,7 +109,8 @@ async fn main() {
         Some(path) => eprintln!("agent-server listening on unix:{path}"),
         None => {
             let bound = server.local_addr().expect("local addr");
-            eprintln!("agent-server listening on {bound}");
+            let scheme = if tls.is_some() { "tls" } else { "tcp" };
+            eprintln!("agent-server listening on {scheme}:{bound}");
         }
     }
 

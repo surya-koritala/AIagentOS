@@ -40,6 +40,9 @@ mod observability_props;
 mod shutdown_props;
 
 #[cfg(test)]
+mod gate_adversarial_props;
+
+#[cfg(test)]
 mod prerequisite_props;
 
 #[cfg(test)]

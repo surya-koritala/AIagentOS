@@ -1,0 +1,102 @@
+# Release pipeline.
+#
+# Fires on a pushed semver tag (vX.Y.Z). It re-runs the full quality gate, then
+# proves the two things a release must guarantee — that the product wedge still
+# works (the governed-execution demo) and that the shippable artifact (the
+# agent-server container) actually builds — and only then publishes a GitHub
+# Release whose notes are the matching CHANGELOG section.
+#
+# Cut a release with:  git tag vX.Y.Z && git push origin vX.Y.Z
+# (See RELEASING.md.)
+
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write # needed to create the GitHub Release
+
+jobs:
+  # 1. The same gate CI runs per-PR, re-run against the exact tagged commit.
+  gate:
+    name: quality gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: fmt
+        run: cargo fmt --all -- --check
+      - name: clippy
+        run: cargo clippy --workspace --exclude tauri-app -- -D warnings
+      - name: test
+        run: cargo test --workspace --exclude tauri-app
+
+  # 2. The product wedge must still hold: the governed-execution demo contains
+  #    its violators and keeps compliant agents working. Keyless, no LLM.
+  wedge:
+    name: wedge acceptance (governance demo)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: governed-execution demo
+        run: cargo run --release --package os-benchmark --bin governance-demo
+
+  # 3. The shippable artifact must build and boot: build the agent-server image
+  #    and confirm it answers a real NodeInfo syscall.
+  container:
+    name: container artifact
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: build agent-server image
+        run: docker build -t agentos:${{ github.ref_name }} .
+      - name: boot + syscall round-trip
+        run: |
+          docker run -d --name agentos-rel -p 7777:7777 \
+            agentos:${{ github.ref_name }} agent-server 0.0.0.0:7777
+          for i in $(seq 1 30); do
+            if printf '{"op":"node_info"}\n' | nc -w2 -q1 127.0.0.1 7777 2>/dev/null | grep -q '"status":"node_info"'; then
+              echo "agent-server answered NodeInfo"; ok=1; break
+            fi
+            sleep 2
+          done
+          docker logs agentos-rel || true
+          docker rm -f agentos-rel || true
+          test "${ok:-0}" = "1"
+
+  # 4. Only after all three pass: publish the Release with the CHANGELOG section.
+  publish:
+    name: publish github release
+    needs: [gate, wedge, container]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: extract CHANGELOG section for this tag
+        id: notes
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          # Pull the lines between this version's heading and the next "## [" heading.
+          awk -v v="$version" '
+            $0 ~ "^## \\[" v "\\]" {grab=1; next}
+            grab && /^## \[/ {exit}
+            grab {print}
+          ' CHANGELOG.md > RELEASE_NOTES.md
+          if [ ! -s RELEASE_NOTES.md ]; then
+            echo "No CHANGELOG section for $version" >&2; exit 1
+          fi
+      - name: create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --title "$GITHUB_REF_NAME" \
+            --notes-file RELEASE_NOTES.md \
+            --verify-tag

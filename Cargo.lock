@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "adapters"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -39,7 +39,7 @@ checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
 name = "agent-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "adapters",
  "dirs 5.0.1",
@@ -50,7 +50,7 @@ dependencies = [
 
 [[package]]
 name = "agent-sdk"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "adapters",
  "async-trait",
@@ -66,7 +66,7 @@ dependencies = [
 
 [[package]]
 name = "agent-tui"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "agent-sdk",
  "kernel",
@@ -712,7 +712,7 @@ dependencies = [
 
 [[package]]
 name = "cli-test"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "adapters",
  "dirs 5.0.1",
@@ -2536,7 +2536,7 @@ dependencies = [
 
 [[package]]
 name = "integration-tests"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "adapters",
  "anyhow",
@@ -2727,7 +2727,7 @@ dependencies = [
 
 [[package]]
 name = "kernel"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3403,7 +3403,7 @@ checksum = "04744f49eae99ab78e0d5c0b603ab218f515ea8cfe5a456d7629ad883a3b6e7d"
 
 [[package]]
 name = "os-benchmark"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "adapters",
  "kernel",
@@ -4203,7 +4203,7 @@ dependencies = [
 
 [[package]]
 name = "resources"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5159,7 +5159,7 @@ dependencies = [
 
 [[package]]
 name = "tauri-app"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "adapters",
  "kernel",

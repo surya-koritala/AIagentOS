@@ -5,7 +5,7 @@
 
 **An OS kernel for AI agents.** Tool calls go through a real syscall gate — capability checks, MAC policy, and cgroup token quotas enforce on every call, not as scaffolding.
 
-> **Status:** v0.1 in progress. The core enforcement path is live (Phase 1). Full Linux-parity isolation, scheduling, and a real package manager are tracked in [ROADMAP.md](ROADMAP.md).
+> **Status:** **v0.2.0** — the kernel is a reachable, multi-tenant service: JSON syscall API over TCP/Unix/TLS, an embeddable Rust SDK + clients, nine LLM providers, durable state across restarts, first-class tenancy, and a one-command container. The governance wedge is fuzz-proven un-bypassable and demonstrated end-to-end. See [CHANGELOG.md](CHANGELOG.md) for what shipped and [RELEASING.md](RELEASING.md) for how we tag releases.
 
 ## What Is This?
 

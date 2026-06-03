@@ -38,6 +38,7 @@ pub mod marketplace;
 pub mod mcp;
 pub mod mcp_server;
 pub mod memory_manager;
+pub mod metrics;
 pub mod models;
 pub mod modules;
 pub mod mount_table;

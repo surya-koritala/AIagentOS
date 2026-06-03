@@ -95,3 +95,60 @@ docker compose down        # keeps named volumes
 - `AGENT_SERVER_TLS_CERT` / `AGENT_SERVER_TLS_KEY` — terminate TLS (rustls) on
   the TCP bind.
 - `AGENT_SERVER_UNIX` — bind a Unix-domain socket instead of TCP.
+
+## Observability
+
+`agent-server` (and the `agent` CLI) install a `tracing` subscriber at startup,
+so the kernel's structured logs actually emit:
+
+- `RUST_LOG` — env-filter directive; defaults to `info` when unset (e.g.
+  `RUST_LOG=kernel=debug,info`).
+- `LOG_FORMAT=json` (or `AGENT_LOG_FORMAT=json`) — emit machine-readable JSON
+  log lines for ingestion. Any other value keeps the human-readable format.
+
+### Metrics
+
+The kernel renders a Prometheus text exposition (format version `0.0.4`) from
+the syscall-gate enforcement counters, agent counts, system token/api totals,
+and process uptime. There are two ways to read it:
+
+- **Over the wire** — the `metrics` syscall (`{"op":"metrics"}`) returns the
+  exposition in a `metrics` reply; the SDK exposes it as
+  `KernelClient::metrics()`.
+- **HTTP scrape endpoint** — set `AGENT_SERVER_METRICS_ADDR` (e.g.
+  `0.0.0.0:9090`) to start a tiny built-in HTTP listener. `GET /metrics`
+  returns `200` with the exposition; any other path returns `404`. The endpoint
+  is only opened when the variable is set, so it costs nothing by default. In
+  `docker-compose.yml` the `agentos-server` service sets it and publishes
+  `9090`, so a scraper can hit `http://localhost:9090/metrics`.
+
+Sample exposition:
+
+```
+# HELP agentos_syscall_gate_total Tool-call decisions made by the syscall gate, by result.
+# TYPE agentos_syscall_gate_total counter
+agentos_syscall_gate_total{result="allowed"} 5
+agentos_syscall_gate_total{result="denied_capability"} 2
+agentos_syscall_gate_total{result="denied_mac"} 0
+agentos_syscall_gate_total{result="denied_cgroup"} 0
+agentos_syscall_gate_total{result="denied_namespace"} 1
+agentos_syscall_gate_total{result="denied_unknown"} 0
+# HELP agentos_syscall_gate_audited_total Allowed tool calls that also matched a MAC audit rule.
+# TYPE agentos_syscall_gate_audited_total counter
+agentos_syscall_gate_audited_total 0
+# HELP agentos_agents Total agents the kernel hosts.
+# TYPE agentos_agents gauge
+agentos_agents 3
+# HELP agentos_running_agents Agents currently executing a turn.
+# TYPE agentos_running_agents gauge
+agentos_running_agents 1
+# HELP agentos_tokens_consumed_total Tokens consumed across all agents.
+# TYPE agentos_tokens_consumed_total counter
+agentos_tokens_consumed_total 1280
+# HELP agentos_api_calls_total LLM API calls made across all agents.
+# TYPE agentos_api_calls_total counter
+agentos_api_calls_total 7
+# HELP agentos_process_uptime_seconds Seconds since this server process rendered its first metrics.
+# TYPE agentos_process_uptime_seconds gauge
+agentos_process_uptime_seconds 42
+```

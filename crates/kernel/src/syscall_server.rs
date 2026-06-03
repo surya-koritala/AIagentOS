@@ -132,6 +132,12 @@ pub enum Syscall {
     /// agents this kernel node hosts (total + currently running) so a cluster
     /// client can pick the least-loaded node. No side effects.
     NodeInfo,
+    /// Pull the kernel's operational metrics as a Prometheus text exposition
+    /// (format version 0.0.4), rendered from the syscall-gate enforcement
+    /// counters, agent counts, system token/api totals, and process uptime.
+    /// Read-only; lets an SDK/client scrape metrics over the existing protocol
+    /// without an HTTP endpoint. Reply: [`SyscallReply::Metrics`].
+    Metrics,
 }
 
 /// A short, serializable view of an agent.
@@ -240,6 +246,17 @@ pub enum SyscallReply {
     NodeInfo {
         agent_count: usize,
         running_agents: usize,
+    },
+    /// The kernel's operational metrics (reply to [`Syscall::Metrics`]). Carries
+    /// the rendered Prometheus text exposition plus a couple of the headline
+    /// numbers as structured fields, so a client can use either form.
+    Metrics {
+        /// The full `text/plain; version=0.0.4` Prometheus exposition.
+        prometheus: String,
+        /// Total agents the kernel hosts (also present in `prometheus`).
+        agent_count: usize,
+        /// System-wide tokens consumed (also present in `prometheus`).
+        tokens_consumed: u64,
     },
     /// Any error is surfaced to the caller rather than dropping the connection.
     Error {
@@ -666,6 +683,14 @@ pub async fn dispatch_scoped(
             SyscallReply::NodeInfo {
                 agent_count: agents.len(),
                 running_agents: running,
+            }
+        }
+        Syscall::Metrics => {
+            let snap = crate::metrics::MetricsSnapshot::collect(kernel);
+            SyscallReply::Metrics {
+                prometheus: snap.render_prometheus(),
+                agent_count: snap.agent_count as usize,
+                tokens_consumed: snap.tokens_consumed,
             }
         }
     }
@@ -1518,6 +1543,79 @@ mod tests {
         match client.call(Syscall::NodeInfo).await.unwrap() {
             SyscallReply::NodeInfo { agent_count, .. } => assert_eq!(agent_count, 2),
             other => panic!("expected NodeInfo, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn metrics_syscall_roundtrips_and_reflects_gate_counters() {
+        let kernel = Arc::new(AgentKernelImpl::new().expect("kernel new"));
+        let server = SyscallServer::bind(kernel, "127.0.0.1:0").await.unwrap();
+        let addr = server.local_addr().unwrap();
+        tokio::spawn(server.serve());
+        let mut client = SyscallClient::connect(addr).await.unwrap();
+
+        // A read-only agent: it can read but lacks CAP_FILE_WRITE.
+        let agent_id = match client
+            .call(Syscall::CreateAgent {
+                name: "ro".into(),
+                task: "t".into(),
+                provider: "stub".into(),
+                profile: "read-only".into(),
+                priority: 3,
+            })
+            .await
+            .unwrap()
+        {
+            SyscallReply::AgentCreated { id } => id,
+            other => panic!("expected AgentCreated, got {other:?}"),
+        };
+
+        // Allowed: read_file passes the gate (the broker may still error, but the
+        // gate counts the allow first).
+        let _ = client
+            .call(Syscall::CallTool {
+                agent_id: agent_id.clone(),
+                tool: "read_file".into(),
+                args: serde_json::json!({ "path": "/etc/hosts" }),
+            })
+            .await
+            .unwrap();
+
+        // Denied: write_file requires CAP_FILE_WRITE, which read-only lacks.
+        match client
+            .call(Syscall::CallTool {
+                agent_id: agent_id.clone(),
+                tool: "write_file".into(),
+                args: serde_json::json!({ "path": "/tmp/x", "content": "y" }),
+            })
+            .await
+            .unwrap()
+        {
+            SyscallReply::Error { message } => assert!(message.contains("denied by kernel")),
+            other => panic!("expected denial Error, got {other:?}"),
+        }
+
+        // The Metrics syscall round-trips and the exposition reflects the gate.
+        match client.call(Syscall::Metrics).await.unwrap() {
+            SyscallReply::Metrics {
+                prometheus,
+                agent_count,
+                ..
+            } => {
+                assert_eq!(agent_count, 1);
+                assert!(prometheus.contains("# TYPE agentos_syscall_gate_total counter"));
+                assert!(
+                    prometheus.contains("agentos_syscall_gate_total{result=\"allowed\"} 1"),
+                    "exposition:\n{prometheus}"
+                );
+                assert!(
+                    prometheus
+                        .contains("agentos_syscall_gate_total{result=\"denied_capability\"} 1"),
+                    "exposition:\n{prometheus}"
+                );
+                assert!(prometheus.contains("agentos_agents 1"));
+            }
+            other => panic!("expected Metrics, got {other:?}"),
         }
     }
 

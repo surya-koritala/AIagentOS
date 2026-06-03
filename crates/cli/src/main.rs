@@ -16,6 +16,7 @@ use kernel::resources::ResourceBroker;
 use kernel::{AgentConfig, AgentKernelImpl, Priority};
 use tokio::sync::mpsc;
 
+mod logging;
 mod providers;
 use providers::register_providers;
 
@@ -97,6 +98,8 @@ fn handle_slash(cmd: &str, executor: &AgentExecutor, kernel: &AgentKernelImpl) -
 
 #[tokio::main]
 async fn main() {
+    // Install structured logging first so kernel init (persistence/auth) logs emit.
+    logging::init_logging();
     let config = Config::load();
     let kernel = Arc::new(AgentKernelImpl::from_config(&config).expect("Failed to init kernel"));
     // Start the kernel's background runtime on the live path: the scheduler

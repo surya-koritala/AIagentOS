@@ -52,7 +52,21 @@ async fn main() {
     };
 
     let config = Config::load();
-    let kernel = Arc::new(AgentKernelImpl::from_config(&config).expect("failed to init kernel"));
+    // Kernel init can fail on a non-writable/locked data dir or a corrupt DB.
+    // Degrade to a clear, actionable message and a non-zero exit instead of an
+    // un-actionable panic backtrace.
+    let kernel = match AgentKernelImpl::from_config(&config) {
+        Ok(k) => Arc::new(k),
+        Err(e) => {
+            tracing::error!(error = %e, data_dir = %config.data_dir.display(), "failed to initialize kernel");
+            eprintln!("agent-server: failed to initialize kernel: {e}");
+            eprintln!(
+                "  (is the data dir writable? {})",
+                config.data_dir.display()
+            );
+            std::process::exit(1);
+        }
+    };
     // Make SendMessage syscalls functional against the configured backend.
     register_providers(&kernel, &config);
     // Background tasks (scheduler observer + cgroup minute-reset).
@@ -139,9 +153,16 @@ async fn main() {
     match &unix_path {
         Some(path) => eprintln!("agent-server listening on unix:{path}"),
         None => {
-            let bound = server.local_addr().expect("local addr");
             let scheme = if tls.is_some() { "tls" } else { "tcp" };
-            eprintln!("agent-server listening on {scheme}:{bound}");
+            match server.local_addr() {
+                Ok(bound) => eprintln!("agent-server listening on {scheme}:{bound}"),
+                // The socket is bound and serving; only the readback failed.
+                // Report the configured addr rather than aborting a live server.
+                Err(e) => {
+                    tracing::warn!(error = %e, "could not read bound local addr");
+                    eprintln!("agent-server listening on {scheme}:{addr}");
+                }
+            }
         }
     }
 

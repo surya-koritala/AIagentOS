@@ -10,6 +10,16 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-06-04
+
+**Production-shell hardening + toward a stable API.** 0.2.0 made the kernel a
+reachable, multi-tenant service; 0.3.0 hardens it for operation and takes the
+first concrete step toward a 1.0 stability promise. Startup degrades gracefully
+instead of panicking, the wire protocol is now explicitly versioned with a
+negotiation handshake, and long-term memory gets a real approximate-nearest-
+neighbor index behind its existing seam — all pure-Rust and offline, with the
+governance wedge unchanged and still proven by the release gate.
+
 ### Memory & retrieval
 
 - **Approximate-nearest-neighbor index** — a real, dependency-free ANN behind the

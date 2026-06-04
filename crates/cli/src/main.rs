@@ -101,7 +101,15 @@ async fn main() {
     // Install structured logging first so kernel init (persistence/auth) logs emit.
     logging::init_logging();
     let config = Config::load();
-    let kernel = Arc::new(AgentKernelImpl::from_config(&config).expect("Failed to init kernel"));
+    // Startup failures (unwritable data dir, corrupt DB, unreachable provider)
+    // degrade to a clear message + non-zero exit rather than a panic backtrace.
+    let kernel = match AgentKernelImpl::from_config(&config) {
+        Ok(k) => Arc::new(k),
+        Err(e) => fail(format!(
+            "failed to initialize kernel: {e}\n  (is the data dir writable? {})",
+            config.data_dir.display()
+        )),
+    };
     // Start the kernel's background runtime on the live path: the scheduler
     // observer (publishes the CFS pick into procfs `current_agent`) and the
     // per-minute cgroup-counter reset that regenerates token quotas. Held for
@@ -142,7 +150,7 @@ async fn main() {
             sandbox_config: None,
         })
         .await
-        .expect("Failed to create agent");
+        .unwrap_or_else(|e| fail(format!("failed to create agent: {e}")));
 
     // Create executor with project context
     let project_ctx = project_context();
@@ -150,7 +158,12 @@ async fn main() {
 
     let session = AgentConnector::connect(&*kernel.connector, handle.id, &config.llm_provider)
         .await
-        .expect("Failed to connect to LLM. Check API key and provider settings.");
+        .unwrap_or_else(|e| {
+            fail(format!(
+                "failed to connect to LLM provider '{}': {e}\n  (check the API key and provider settings in your config/env)",
+                config.llm_provider
+            ))
+        });
     let mut executor = AgentExecutor::new(
         handle.id,
         session,
@@ -181,7 +194,10 @@ async fn main() {
         } else {
             cmd
         };
-        let output = executor.run(&msg).await.unwrap();
+        let output = executor
+            .run(&msg)
+            .await
+            .unwrap_or_else(|e| fail(format!("run failed: {e}")));
         println!("{}", output.content);
         return;
     }
@@ -193,7 +209,10 @@ async fn main() {
             .map(|s| s.as_str())
             .unwrap_or("Process this input");
         let msg = format!("{}\n\nInput:\n{}", prompt, piped);
-        let output = executor.run(&msg).await.unwrap();
+        let output = executor
+            .run(&msg)
+            .await
+            .unwrap_or_else(|e| fail(format!("run failed: {e}")));
         println!("{}", output.content);
         return;
     }
@@ -263,4 +282,15 @@ async fn main() {
 
 fn atty_is_terminal() -> bool {
     unsafe { libc::isatty(0) != 0 }
+}
+
+/// Print a clean, user-facing startup error and exit non-zero.
+///
+/// Startup failures (config, persistence, provider) are operator errors, not
+/// bugs — surface them as a readable message instead of a panic backtrace.
+/// Returns `!` so it can stand in for any value at a `?`-less call site.
+fn fail(msg: impl std::fmt::Display) -> ! {
+    tracing::error!("{msg}");
+    eprintln!("\x1b[31magent: {msg}\x1b[0m");
+    std::process::exit(1);
 }

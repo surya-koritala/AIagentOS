@@ -165,7 +165,20 @@ impl Config {
     /// Load config from a specific path.
     pub fn load_from(path: &Path) -> Self {
         match std::fs::read_to_string(path) {
-            Ok(content) => toml::from_str(&content).unwrap_or_default(),
+            // A malformed config is degraded to defaults rather than aborting,
+            // but we warn loudly: silently running with the wrong provider/keys
+            // because of a typo is worse than a visible fallback.
+            Ok(content) => match toml::from_str(&content) {
+                Ok(cfg) => cfg,
+                Err(e) => {
+                    tracing::warn!(
+                        path = %path.display(),
+                        error = %e,
+                        "config file is malformed; falling back to defaults"
+                    );
+                    Self::default()
+                }
+            },
             Err(_) => Self::default(),
         }
     }
@@ -218,7 +231,6 @@ fn default_data_dir() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
 
     #[test]
     fn default_config() {
@@ -249,6 +261,22 @@ mod tests {
     fn load_missing_file_returns_default() {
         let cfg = Config::load_from(Path::new("/nonexistent/path/config.toml"));
         assert_eq!(cfg.llm_provider, "azure-openai");
+    }
+
+    #[test]
+    fn load_malformed_file_degrades_to_default() {
+        // A corrupt config must not abort startup — it falls back to defaults
+        // (and warns). This pins the graceful-degradation contract.
+        let dir = std::env::temp_dir().join(format!("cfg_bad_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(&path, "this is = not valid toml ][").unwrap();
+
+        let cfg = Config::load_from(&path);
+        assert_eq!(cfg.llm_provider, "azure-openai");
+        assert!(!cfg.setup_complete);
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

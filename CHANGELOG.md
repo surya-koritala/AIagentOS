@@ -10,6 +10,15 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
 
 ## [Unreleased]
 
+### Reliability
+
+- **Graceful startup degradation** — `agent-server` and the `agent` CLI no longer
+  panic on operator errors (unwritable/locked data dir, corrupt DB, unreachable
+  LLM provider). Kernel init, agent creation, provider connect, and one-shot/pipe
+  runs now exit non-zero with a clear, actionable message instead of a panic
+  backtrace. A malformed `config.toml` warns and falls back to defaults rather
+  than being silently swallowed (#98).
+
 ### Observability
 
 - **Production logging** — `agent-server` and the CLI install a `tracing`

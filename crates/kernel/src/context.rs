@@ -508,9 +508,18 @@ impl ContextManager for SqliteContextManager {
             });
         }
 
-        // Semantic ranking: embed the query and sort facts by cosine similarity
-        // (best-first). A fact missing a stored embedding falls back to embedding
-        // its content on the fly; an empty/unparseable embedding scores 0.
+        // Semantic ranking: embed the query and return the top-K facts by cosine
+        // similarity (best-first). A fact missing a stored embedding falls back to
+        // embedding its content on the fly; an empty/unparseable embedding scores 0.
+        //
+        // Ranking goes through the `VectorIndex` seam (`rank_topk`): an exact scan
+        // at small candidate counts, and the approximate `LshIndex` above
+        // `ANN_EXACT_THRESHOLD` so an agent with a large fact store bounds the work
+        // instead of scoring every vector. The top-K cap also keeps the caller
+        // (which injects these facts into the LLM context) from dumping the whole
+        // store into the prompt.
+        const MEMORY_QUERY_TOP_K: usize = 16;
+        const ANN_EXACT_THRESHOLD: usize = 64;
         let query_vec = self.embedder.embed(query);
         let scored: Vec<(Fact, Vec<f32>)> = result
             .into_iter()
@@ -522,10 +531,15 @@ impl ContextManager for SqliteContextManager {
                 (fact, emb)
             })
             .collect();
-        let result: Vec<Fact> = crate::memory_manager::rank(&query_vec, scored)
-            .into_iter()
-            .map(|(fact, _score)| fact)
-            .collect();
+        let result: Vec<Fact> = crate::memory_manager::rank_topk(
+            &query_vec,
+            scored,
+            MEMORY_QUERY_TOP_K,
+            ANN_EXACT_THRESHOLD,
+        )
+        .into_iter()
+        .map(|(fact, _score)| fact)
+        .collect();
 
         // Update last_accessed_at for returned facts
         let now = Utc::now().to_rfc3339();
@@ -1432,6 +1446,63 @@ mod tests {
         assert_eq!(
             results[0].content,
             "the user prefers dark mode in the editor"
+        );
+    }
+
+    #[tokio::test]
+    async fn query_memory_large_store_caps_topk_and_finds_target() {
+        // An agent with many facts (above the ANN threshold) still surfaces the
+        // semantically closest fact, and the result set is capped (not the whole
+        // store dumped into the caller's prompt).
+        let mgr = SqliteContextManager::in_memory().unwrap();
+        let id = uuid::Uuid::new_v4();
+
+        for i in 0..150 {
+            mgr.store_fact(
+                id,
+                Fact {
+                    id: uuid::Uuid::new_v4(),
+                    content: format!("noise fact {i} about gardening and the weather"),
+                    category: FactCategory::Fact,
+                    created_at: Utc::now(),
+                    last_accessed_at: Utc::now(),
+                    embedding: None,
+                },
+            )
+            .await
+            .unwrap();
+        }
+        mgr.store_fact(
+            id,
+            Fact {
+                id: uuid::Uuid::new_v4(),
+                content: "the syscall gate enforces capability and MAC checks".to_string(),
+                category: FactCategory::Fact,
+                created_at: Utc::now(),
+                last_accessed_at: Utc::now(),
+                embedding: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let results = mgr
+            .query_memory(id, "how does the syscall gate enforce capabilities")
+            .await
+            .unwrap();
+
+        // Capped to the top-K, not all 151 facts.
+        assert!(
+            results.len() <= 16,
+            "results should be capped, got {}",
+            results.len()
+        );
+        // The planted, semantically-closest fact is surfaced.
+        assert!(
+            results
+                .iter()
+                .any(|f| f.content.contains("syscall gate enforces capability")),
+            "the closest fact should be in the capped results"
         );
     }
 

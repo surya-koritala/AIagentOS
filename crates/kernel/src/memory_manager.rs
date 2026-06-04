@@ -353,6 +353,231 @@ impl VectorIndex for BruteForceIndex {
     }
 }
 
+/// A deterministic, dependency-free PRNG (SplitMix64) used to generate the
+/// random hyperplanes for [`LshIndex`]. Seeded from a constant so the planes —
+/// and therefore every signature and search result — are identical across runs
+/// and process restarts, which the [`VectorIndex`] contract requires.
+struct SplitMix64(u64);
+
+impl SplitMix64 {
+    fn next_u64(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    /// Uniform f32 in [0, 1).
+    fn next_f32(&mut self) -> f32 {
+        // Top 24 bits → mantissa precision; divide into [0, 1).
+        (self.next_u64() >> 40) as f32 / (1u32 << 24) as f32
+    }
+
+    /// Standard-normal sample via Box–Muller. Random hyperplanes with Gaussian
+    /// components give an unbiased SimHash (each plane a uniformly-random
+    /// direction), which is what makes sign-bit collisions track cosine angle.
+    fn next_gaussian(&mut self) -> f32 {
+        // Guard u1 away from 0 so ln() is finite.
+        let u1 = self.next_f32().max(1e-7);
+        let u2 = self.next_f32();
+        (-2.0 * u1.ln()).sqrt() * (std::f32::consts::TAU * u2).cos()
+    }
+}
+
+/// One LSH table: a fixed set of random hyperplanes plus the buckets they induce.
+struct LshTable {
+    /// `bits` hyperplanes, each a `dim`-length Gaussian vector.
+    planes: Vec<Vec<f32>>,
+    /// Signature → ids that hash to it in this table.
+    buckets: std::collections::HashMap<u64, Vec<u64>>,
+}
+
+impl LshTable {
+    /// The `bits`-bit SimHash signature of `vec` in this table: bit `i` = sign of
+    /// `vec · plane[i]`.
+    fn signature(&self, vec: &[f32]) -> u64 {
+        let mut sig = 0u64;
+        for (i, plane) in self.planes.iter().enumerate() {
+            let mut dot = 0.0f32;
+            for (a, b) in vec.iter().zip(plane.iter()) {
+                dot += a * b;
+            }
+            if dot >= 0.0 {
+                sig |= 1 << i;
+            }
+        }
+        sig
+    }
+}
+
+/// Approximate nearest-neighbor index via multi-table random-hyperplane LSH
+/// (SimHash).
+///
+/// Each of `L` independent tables reduces a vector to a short sign-bit signature
+/// (one bit per random hyperplane). Two vectors with a small cosine angle agree
+/// on each bit with probability `1 - θ/π`, so they land in the same bucket of at
+/// least one table with high probability — the more tables, the higher the
+/// recall. A query gathers the union of its same-bucket ids across all tables
+/// (cheap: one bucket lookup per table), then ranks those candidates *exactly* by
+/// cosine. The approximation is only in *which* vectors get scored, never in how
+/// they're scored.
+///
+/// This is the scale-oriented sibling of [`BruteForceIndex`]: same
+/// [`VectorIndex`] contract, deterministic (hyperplanes come from a fixed-seed
+/// PRNG), but a large corpus scores only the colliding candidates instead of
+/// every vector. A safety net widens to single-bit-flipped buckets and finally a
+/// full scan if the tables didn't surface at least `k` candidates, so recall
+/// degrades gracefully rather than dropping results.
+pub struct LshIndex {
+    tables: Vec<LshTable>,
+    /// Source of truth: id → vector. Survives bucket churn on overwrite.
+    vectors: std::collections::HashMap<u64, Vec<f32>>,
+}
+
+impl LshIndex {
+    /// Fixed seed → identical hyperplanes every run (determinism contract).
+    const SEED: u64 = 0x5A17_C0DE_1DEA_2025;
+
+    /// Build an index for `dim`-dimensional vectors with `num_tables` independent
+    /// tables of `bits_per_table` hyperplanes each (bits clamped to 1..=64 so a
+    /// signature fits a `u64`). More tables raise recall; more bits per table
+    /// shrink buckets (faster, lower recall per table).
+    pub fn new(dim: usize, num_tables: usize, bits_per_table: usize) -> Self {
+        let num_tables = num_tables.max(1);
+        let bits = bits_per_table.clamp(1, 64);
+        let mut rng = SplitMix64(Self::SEED);
+        let tables = (0..num_tables)
+            .map(|_| LshTable {
+                planes: (0..bits)
+                    .map(|_| (0..dim).map(|_| rng.next_gaussian()).collect())
+                    .collect(),
+                buckets: std::collections::HashMap::new(),
+            })
+            .collect();
+        Self {
+            tables,
+            vectors: std::collections::HashMap::new(),
+        }
+    }
+
+    /// Sensible defaults for the kernel's [`EMBED_DIM`] vectors: many tables with
+    /// short signatures, since text embeddings make even "similar" pairs only
+    /// moderately cosine-close, so high recall needs several independent chances
+    /// to collide (combined with the always-on radius-1 probe in `search`).
+    pub fn with_dim(dim: usize) -> Self {
+        Self::new(dim, 16, 8)
+    }
+
+    fn remove_id(&mut self, vec: &[f32], id: u64) {
+        for table in &mut self.tables {
+            let sig = table.signature(vec);
+            if let Some(ids) = table.buckets.get_mut(&sig) {
+                ids.retain(|&x| x != id);
+                if ids.is_empty() {
+                    table.buckets.remove(&sig);
+                }
+            }
+        }
+    }
+}
+
+impl VectorIndex for LshIndex {
+    fn add(&mut self, id: u64, vec: Vec<f32>) {
+        // Overwrite: drop the id from every table's old bucket first so no table
+        // holds a stale signature for it.
+        if let Some(old) = self.vectors.get(&id).cloned() {
+            self.remove_id(&old, id);
+        }
+        for table in &mut self.tables {
+            let sig = table.signature(&vec);
+            table.buckets.entry(sig).or_default().push(id);
+        }
+        self.vectors.insert(id, vec);
+    }
+
+    fn search(&self, query: &[f32], k: usize) -> Vec<(u64, f32)> {
+        if k == 0 || self.vectors.is_empty() {
+            return Vec::new();
+        }
+
+        // Gather candidates from each table at Hamming radius 0 and 1: the
+        // query's own bucket plus every single-bit-flipped neighbor. Probing
+        // radius 1 (cheap: `bits` extra lookups per table) is what lifts recall
+        // for the moderate-cosine pairs that text embeddings produce — a near
+        // pair that misses on one bit per table still collides.
+        let mut candidates: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        for table in &self.tables {
+            let sig = table.signature(query);
+            if let Some(ids) = table.buckets.get(&sig) {
+                candidates.extend(ids.iter().copied());
+            }
+            for bit in 0..table.planes.len() {
+                if let Some(ids) = table.buckets.get(&(sig ^ (1 << bit))) {
+                    candidates.extend(ids.iter().copied());
+                }
+            }
+        }
+
+        // Safety net: still too few (sparse/unlucky) — score everything. Exact
+        // and bounded by the corpus size, so results are never silently dropped.
+        if candidates.len() < k {
+            candidates = self.vectors.keys().copied().collect();
+        }
+
+        let mut scored: Vec<(u64, f32)> = candidates
+            .into_iter()
+            .filter_map(|id| {
+                self.vectors
+                    .get(&id)
+                    .map(|v| (id, cosine_similarity(query, v)))
+            })
+            .collect();
+        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        scored.truncate(k);
+        scored
+    }
+
+    fn len(&self) -> usize {
+        self.vectors.len()
+    }
+}
+
+/// Rank `(item, embedding)` pairs against a `query` embedding and return the top
+/// `k`, best-first — choosing the index strategy by candidate-set size.
+///
+/// At or below `exact_threshold` items an exact [`BruteForceIndex`] scan is used
+/// (cheap and exactly correct); above it, the approximate [`LshIndex`] bounds the
+/// work by probing signature buckets instead of scoring every vector. The seam is
+/// the same either way, so callers get exact results on the common small case and
+/// graceful degradation to approximate on large corpora.
+pub fn rank_topk<T>(
+    query: &[f32],
+    items: Vec<(T, Vec<f32>)>,
+    k: usize,
+    exact_threshold: usize,
+) -> Vec<(T, f32)> {
+    if items.is_empty() || k == 0 {
+        return Vec::new();
+    }
+    let dim = query.len();
+    let mut index: Box<dyn VectorIndex> = if items.len() > exact_threshold {
+        Box::new(LshIndex::with_dim(dim))
+    } else {
+        Box::new(BruteForceIndex::new())
+    };
+    for (i, (_, emb)) in items.iter().enumerate() {
+        index.add(i as u64, emb.clone());
+    }
+    let hits = index.search(query, k);
+    // Map index positions back to items. Collect by position so we can move each
+    // item out exactly once, preserving the index's best-first order.
+    let mut slots: Vec<Option<T>> = items.into_iter().map(|(item, _)| Some(item)).collect();
+    hits.into_iter()
+        .filter_map(|(id, score)| slots[id as usize].take().map(|item| (item, score)))
+        .collect()
+}
+
 /// Bundles a pluggable [`Embedder`] with ranking helpers.
 ///
 /// This is the injectable entry point: construct it with [`MemoryManager::new`]
@@ -544,6 +769,138 @@ mod tests {
         idx.add(7, embed("first"));
         idx.add(7, embed("second"));
         assert_eq!(idx.len(), 1, "same id should overwrite, not duplicate");
+    }
+
+    #[test]
+    fn lsh_index_overwrites_and_counts() {
+        let mut idx = LshIndex::with_dim(EMBED_DIM);
+        idx.add(7, embed("first"));
+        idx.add(7, embed("second"));
+        assert_eq!(idx.len(), 1, "same id should overwrite, not duplicate");
+        assert!(!idx.is_empty());
+    }
+
+    #[test]
+    fn lsh_index_is_deterministic_across_instances() {
+        // Two independently-built indexes must hash identically (fixed-seed
+        // planes) — the VectorIndex determinism contract.
+        let mut a = LshIndex::with_dim(EMBED_DIM);
+        let mut b = LshIndex::with_dim(EMBED_DIM);
+        for (i, t) in ["alpha beta", "gamma delta", "epsilon"].iter().enumerate() {
+            a.add(i as u64, embed(t));
+            b.add(i as u64, embed(t));
+        }
+        let q = embed("alpha beta");
+        assert_eq!(a.search(&q, 3), b.search(&q, 3));
+    }
+
+    #[test]
+    fn lsh_index_finds_planted_nearest_neighbor() {
+        // A clearly-closest fact among many noise vectors must surface near the
+        // top, even though search probes buckets rather than scanning everything.
+        let mut idx = LshIndex::with_dim(EMBED_DIM);
+        let target_text = "the user prefers dark mode in the editor";
+        idx.add(1000, embed(target_text));
+        for i in 0..200u64 {
+            idx.add(
+                i,
+                embed(&format!("unrelated noise fact number {i} about rockets")),
+            );
+        }
+        let q = embed("what editor theme does the user like, dark mode?");
+        let hits = idx.search(&q, 5);
+        assert!(!hits.is_empty());
+        assert!(
+            hits.iter().any(|h| h.0 == 1000),
+            "planted dark-mode fact should be among the top-5 ANN hits"
+        );
+        // Scores are non-increasing.
+        for w in hits.windows(2) {
+            assert!(w[0].1 >= w[1].1);
+        }
+    }
+
+    #[test]
+    fn lsh_search_recall_matches_brute_force_topk() {
+        // The LSH top-3 should recover most of the exact top-3 across queries.
+        // This pins recall without demanding an approximate index match an exact
+        // one perfectly. Deterministic (fixed-seed planes + fixed embeddings).
+        let corpus = [
+            "rust ownership and borrowing rules",
+            "the spacecraft reached orbital velocity at dawn",
+            "the user enjoys drinking coffee every morning",
+            "dark mode is the preferred editor theme",
+            "tokio async runtime and futures",
+            "a recipe for sourdough bread starter",
+            "linux kernel scheduler and cgroups",
+            "the cat slept on the warm windowsill",
+        ];
+        let mut lsh = LshIndex::with_dim(EMBED_DIM);
+        let mut brute = BruteForceIndex::new();
+        for (i, t) in corpus.iter().enumerate() {
+            lsh.add(i as u64, embed(t));
+            brute.add(i as u64, embed(t));
+        }
+        let queries = [
+            "borrow checker in rust",
+            "morning coffee habit",
+            "editor color theme dark",
+            "async futures in tokio",
+            "cgroup scheduling on linux",
+        ];
+        let mut top1_agree = 0;
+        let mut overlap = 0usize;
+        let mut total = 0usize;
+        for q in queries {
+            let qv = embed(q);
+            let l = lsh.search(&qv, 3);
+            let b = brute.search(&qv, 3);
+            if l.first().map(|h| h.0) == b.first().map(|h| h.0) {
+                top1_agree += 1;
+            }
+            let lset: std::collections::HashSet<u64> = l.iter().map(|h| h.0).collect();
+            overlap += b.iter().filter(|h| lset.contains(&h.0)).count();
+            total += b.len();
+        }
+        // Most queries get the exact best result, and most of the exact top-3 is
+        // recovered overall.
+        assert!(
+            top1_agree >= 3,
+            "LSH top-1 agreement too low: {top1_agree}/5"
+        );
+        assert!(
+            overlap * 100 >= total * 80,
+            "LSH top-3 recall too low: {overlap}/{total}"
+        );
+    }
+
+    #[test]
+    fn rank_topk_small_is_exact_and_truncates() {
+        let items: Vec<(&str, Vec<f32>)> = vec![
+            ("rockets", embed("rockets and orbital mechanics")),
+            ("coffee", embed("i drink coffee every morning")),
+            ("tea", embed("tea is a warm beverage")),
+        ];
+        let q = embed("coffee in the morning");
+        let top = rank_topk(&q, items, 2, 64);
+        assert_eq!(top.len(), 2);
+        assert_eq!(top[0].0, "coffee", "closest item first");
+    }
+
+    #[test]
+    fn rank_topk_large_uses_ann_and_finds_target() {
+        // Above the exact threshold, rank_topk switches to LSH; the planted
+        // closest item must still surface.
+        let mut items: Vec<(u64, Vec<f32>)> = (0..300u64)
+            .map(|i| (i, embed(&format!("noise document {i} concerning weather"))))
+            .collect();
+        items.push((9999, embed("the kernel syscall gate enforces capabilities")));
+        let q = embed("how does the syscall gate enforce capability checks");
+        let top = rank_topk(&q, items, 3, 64);
+        assert!(
+            top.iter().any(|(id, _)| *id == 9999),
+            "ANN should surface the planted target"
+        );
     }
 
     #[test]

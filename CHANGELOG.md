@@ -10,6 +10,17 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
 
 ## [Unreleased]
 
+### Memory & retrieval
+
+- **Approximate-nearest-neighbor index** — a real, dependency-free ANN behind the
+  existing `VectorIndex` seam: multi-table random-hyperplane LSH (`LshIndex`),
+  deterministic via a fixed-seed PRNG, with a radius-1 probe and a full-scan
+  safety net so recall degrades gracefully. The live memory-query path now ranks
+  through the seam (`rank_topk`) — exact `BruteForceIndex` at small fact counts,
+  `LshIndex` above a threshold so a large fact store bounds the work instead of
+  scoring every vector — and caps results to a top-K so the caller stops dumping
+  the whole store into the prompt. Stays pure-Rust and fully offline (#100).
+
 ### Wire protocol (toward 1.0)
 
 - **Versioned wire protocol** — the `Syscall`/`SyscallReply` schema now carries an

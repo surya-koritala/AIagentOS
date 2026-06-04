@@ -33,6 +33,22 @@ use crate::context::{ContextManager, Fact, FactCategory};
 use crate::resources::ResourceBroker;
 use crate::{AgentConfig, AgentKernelImpl, Priority};
 
+/// The wire-protocol version this build speaks.
+///
+/// The `Syscall`/`SyscallReply` schema is versioned independently of the crate
+/// release: bump this whenever a wire-breaking change lands (a removed/renamed
+/// variant or field, or a changed serialization). Additive, backward-compatible
+/// changes (a new optional syscall) do **not** bump it. A client negotiates with
+/// [`Syscall::Hello`] and learns the server's `[MIN_PROTOCOL_VERSION, PROTOCOL_VERSION]`
+/// support window; an out-of-range client gets a clear error rather than silent
+/// breakage. See `RELEASING.md` ("Toward a stable API").
+pub const PROTOCOL_VERSION: u32 = 1;
+
+/// The oldest wire-protocol version this server still accepts. Equal to
+/// [`PROTOCOL_VERSION`] until we ship a wire-breaking change and choose to keep
+/// serving older clients through a compatibility window.
+pub const MIN_PROTOCOL_VERSION: u32 = 1;
+
 fn default_provider() -> String {
     "stub".to_string()
 }
@@ -119,6 +135,13 @@ pub enum Syscall {
     ListSnapshots { agent_id: String },
     /// Delete a snapshot by label (reply reports whether it existed).
     DeleteSnapshot { agent_id: String, label: String },
+    /// Negotiate the wire-protocol version. Optional opening handshake: a client
+    /// announces the protocol version it speaks; the server replies with
+    /// [`SyscallReply::Hello`] (its support window + crate version) when the
+    /// client is in range, or [`SyscallReply::Error`] when it is incompatible.
+    /// Allowed before [`Authenticate`](Syscall::Authenticate) so a client can
+    /// check compatibility before presenting credentials. Has no side effects.
+    Hello { protocol_version: u32 },
     /// Authenticate the connection with the server's shared secret. Required as
     /// the first syscall when the server is configured with a token; a no-op
     /// (always accepted) when it is not.
@@ -239,6 +262,17 @@ pub enum SyscallReply {
     /// Whether the deleted snapshot existed (reply to [`Syscall::DeleteSnapshot`]).
     SnapshotDeleted {
         existed: bool,
+    },
+    /// Protocol negotiation succeeded (reply to a compatible [`Syscall::Hello`]).
+    /// Reports the server's supported wire-protocol window and crate version so
+    /// the client can record what it negotiated.
+    Hello {
+        /// The newest wire-protocol version the server speaks ([`PROTOCOL_VERSION`]).
+        protocol_version: u32,
+        /// The oldest wire-protocol version the server still accepts.
+        min_protocol_version: u32,
+        /// The server's crate version (`CARGO_PKG_VERSION`), informational.
+        server_version: String,
     },
     /// The connection is authenticated (reply to [`Syscall::Authenticate`]).
     Authenticated,
@@ -659,6 +693,14 @@ pub async fn dispatch_scoped(
         // Authentication is handled at the connection layer (see
         // `SyscallServer::handle`); reaching dispatch means it is accepted.
         Syscall::Authenticate { .. } => SyscallReply::Authenticated,
+        // Protocol negotiation is likewise handled in the connection layer; if a
+        // Hello reaches dispatch (e.g. the in-process dispatch path), answer with
+        // this server's support window rather than re-validating.
+        Syscall::Hello { .. } => SyscallReply::Hello {
+            protocol_version: PROTOCOL_VERSION,
+            min_protocol_version: MIN_PROTOCOL_VERSION,
+            server_version: env!("CARGO_PKG_VERSION").to_string(),
+        },
         Syscall::LoadPackage { manifest_toml } => {
             match crate::agent_package::AgentManifest::from_toml_str(&manifest_toml) {
                 Ok(manifest) => match crate::agent_package::load_package(kernel, &manifest).await {
@@ -907,6 +949,25 @@ impl SyscallServer {
                 continue;
             }
             let reply = match serde_json::from_str::<Syscall>(&line) {
+                // Protocol negotiation. Allowed before auth so a client can
+                // confirm compatibility before presenting credentials; has no
+                // side effects and never changes `authed`/`tenant`.
+                Ok(Syscall::Hello { protocol_version }) => {
+                    if (MIN_PROTOCOL_VERSION..=PROTOCOL_VERSION).contains(&protocol_version) {
+                        SyscallReply::Hello {
+                            protocol_version: PROTOCOL_VERSION,
+                            min_protocol_version: MIN_PROTOCOL_VERSION,
+                            server_version: env!("CARGO_PKG_VERSION").to_string(),
+                        }
+                    } else {
+                        SyscallReply::Error {
+                            message: format!(
+                                "incompatible wire-protocol version: client speaks v{protocol_version}, \
+                                 server supports v{MIN_PROTOCOL_VERSION}..=v{PROTOCOL_VERSION}"
+                            ),
+                        }
+                    }
+                }
                 // Authentication accepts two credentials, tried in order:
                 //   1. the server's shared secret (unchanged legacy path), and
                 //   2. an AuthSystem API key / session token, which additionally
@@ -1543,6 +1604,100 @@ mod tests {
         match client.call(Syscall::NodeInfo).await.unwrap() {
             SyscallReply::NodeInfo { agent_count, .. } => assert_eq!(agent_count, 2),
             other => panic!("expected NodeInfo, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn hello_negotiates_compatible_version() {
+        let kernel = Arc::new(AgentKernelImpl::new().expect("kernel new"));
+        let server = SyscallServer::bind(kernel, "127.0.0.1:0").await.unwrap();
+        let addr = server.local_addr().unwrap();
+        tokio::spawn(server.serve());
+        let mut client = SyscallClient::connect(addr).await.unwrap();
+
+        match client
+            .call(Syscall::Hello {
+                protocol_version: PROTOCOL_VERSION,
+            })
+            .await
+            .unwrap()
+        {
+            SyscallReply::Hello {
+                protocol_version,
+                min_protocol_version,
+                server_version,
+            } => {
+                assert_eq!(protocol_version, PROTOCOL_VERSION);
+                assert_eq!(min_protocol_version, MIN_PROTOCOL_VERSION);
+                assert_eq!(server_version, env!("CARGO_PKG_VERSION"));
+            }
+            other => panic!("expected Hello, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn hello_rejects_incompatible_version_with_clear_error() {
+        let kernel = Arc::new(AgentKernelImpl::new().expect("kernel new"));
+        let server = SyscallServer::bind(kernel, "127.0.0.1:0").await.unwrap();
+        let addr = server.local_addr().unwrap();
+        tokio::spawn(server.serve());
+        let mut client = SyscallClient::connect(addr).await.unwrap();
+
+        // A future protocol version the server doesn't understand: clear error,
+        // not a dropped connection or silent acceptance.
+        match client
+            .call(Syscall::Hello {
+                protocol_version: PROTOCOL_VERSION + 99,
+            })
+            .await
+            .unwrap()
+        {
+            SyscallReply::Error { message } => {
+                assert!(
+                    message.contains("incompatible wire-protocol version"),
+                    "{message}"
+                );
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+
+        // The connection survives the rejection: a follow-up syscall still works.
+        match client.call(Syscall::NodeInfo).await.unwrap() {
+            SyscallReply::NodeInfo { .. } => {}
+            other => panic!("expected NodeInfo after rejected Hello, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn hello_is_allowed_before_authentication() {
+        // With a shared-secret token set, every syscall except Authenticate is
+        // rejected until authed — except Hello, which must work pre-auth so a
+        // client can check compatibility before presenting credentials.
+        let kernel = Arc::new(AgentKernelImpl::new().expect("kernel new"));
+        let server = SyscallServer::bind(kernel, "127.0.0.1:0")
+            .await
+            .unwrap()
+            .with_auth_token("sekret");
+        let addr = server.local_addr().unwrap();
+        tokio::spawn(server.serve());
+        let mut client = SyscallClient::connect(addr).await.unwrap();
+
+        // Hello before auth: negotiates fine.
+        match client
+            .call(Syscall::Hello {
+                protocol_version: PROTOCOL_VERSION,
+            })
+            .await
+            .unwrap()
+        {
+            SyscallReply::Hello { .. } => {}
+            other => panic!("expected Hello pre-auth, got {other:?}"),
+        }
+
+        // A non-Hello, non-Authenticate syscall is still gated until auth.
+        match client.call(Syscall::NodeInfo).await.unwrap() {
+            SyscallReply::Error { message } => assert!(message.contains("authentication required")),
+            other => panic!("expected auth-required error, got {other:?}"),
         }
     }
 

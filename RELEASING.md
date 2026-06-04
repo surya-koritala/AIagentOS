@@ -66,8 +66,24 @@ release that can't contain a rogue agent or boot a server doesn't ship.
 
 ## Toward a stable API (the 1.0 bar)
 
-`1.0.0` is gated on a **versioned, stable wire protocol**: the `Syscall`/
-`SyscallReply` schema carries an explicit protocol version, old clients get a
-clear incompatibility error rather than silent breakage, and the SDK pins a
-compatibility range. Until then, the protocol may change between minors — note
-any wire-breaking change prominently in the changelog entry.
+`1.0.0` is gated on a **versioned, stable wire protocol**, and the mechanism for
+it is now in place (as of v0.3.0):
+
+- The protocol carries an explicit version, `kernel::syscall_server::PROTOCOL_VERSION`
+  (currently **1**), versioned independently of the crate release. Bump it on any
+  wire-breaking change (a removed/renamed variant or field); additive changes (a
+  new optional syscall) don't.
+- A client negotiates with the optional `Syscall::Hello { protocol_version }`
+  handshake and learns the server's `[MIN_PROTOCOL_VERSION, PROTOCOL_VERSION]`
+  window. An out-of-range client — or one talking to a server too old to
+  understand `Hello` — gets a clear `SdkError::IncompatibleProtocol` up front
+  rather than a confusing failure on a later syscall.
+- The SDK pins the version it was built against (re-exported `PROTOCOL_VERSION`)
+  and exposes `KernelClient::hello()` to verify compatibility right after connect.
+
+What remains for the 1.0 promise: a commitment to *hold* `PROTOCOL_VERSION`
+stable across minors and to serve a real backward-compatibility window
+(`MIN_PROTOCOL_VERSION < PROTOCOL_VERSION`) once we ship a second protocol
+revision. Until 1.0, the protocol may still change between minors — bump
+`PROTOCOL_VERSION` and note any wire-breaking change prominently in the
+changelog entry.

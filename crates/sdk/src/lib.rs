@@ -42,6 +42,12 @@ use tokio::net::ToSocketAddrs;
 // SDK consumers can name them without depending on the kernel directly.
 pub use kernel::syscall_server::{AgentSummary, FactSummary, ProviderSummary};
 
+/// The wire-protocol version this SDK build was compiled against. A client
+/// announces it via [`KernelClient::hello`]; a server outside its support
+/// window is reported as [`SdkError::IncompatibleProtocol`] rather than failing
+/// later with a confusing parse error.
+pub use kernel::syscall_server::PROTOCOL_VERSION;
+
 pub mod cluster;
 pub mod patterns;
 
@@ -78,6 +84,21 @@ pub enum SdkError {
         /// A debug rendering of the variant actually received.
         got: String,
     },
+
+    /// The server's wire-protocol support window doesn't include the version
+    /// this SDK speaks ([`PROTOCOL_VERSION`]). Either the server is too old to
+    /// understand the [`Hello`](Syscall::Hello) handshake at all (it predates
+    /// protocol versioning), or its `[min, max]` window excludes us. Surfaced by
+    /// [`KernelClient::hello`] so a version skew fails clearly up front rather
+    /// than as a confusing error on a later syscall.
+    #[error("incompatible wire protocol: this client speaks v{client}, server supports {server}")]
+    IncompatibleProtocol {
+        /// The protocol version this SDK build speaks.
+        client: u32,
+        /// A human description of the server's support (its window, or that it
+        /// predates protocol versioning).
+        server: String,
+    },
 }
 
 /// Result of a [`KernelClient::send_message`] / [`AgentHandle::send`] turn.
@@ -110,6 +131,17 @@ pub struct NodeLoad {
     pub agent_count: usize,
     /// Agents currently executing a turn.
     pub running_agents: usize,
+}
+
+/// The server's wire-protocol support window (reply to `hello`).
+#[derive(Debug, Clone)]
+pub struct ProtocolInfo {
+    /// The newest wire-protocol version the server speaks.
+    pub protocol_version: u32,
+    /// The oldest wire-protocol version the server still accepts.
+    pub min_protocol_version: u32,
+    /// The server's crate version (informational).
+    pub server_version: String,
 }
 
 /// The kernel's operational metrics (reply to `metrics`). Carries the rendered
@@ -261,6 +293,56 @@ impl KernelClient {
                 audited,
             }),
             other => Err(unexpected("GateStats", &other)),
+        }
+    }
+
+    /// Negotiate the wire protocol with the server.
+    ///
+    /// Sends [`Syscall::Hello`] with this SDK's [`PROTOCOL_VERSION`] and verifies
+    /// the version is inside the server's `[min, max]` support window. Returns
+    /// the server's [`ProtocolInfo`] on success, or [`SdkError::IncompatibleProtocol`]
+    /// when the windows don't overlap — including the case where the server is too
+    /// old to understand `Hello` at all (it answers with an error, which predates
+    /// protocol versioning). Call this once right after connecting to fail fast on
+    /// a version skew instead of hitting a confusing error on a later syscall.
+    pub async fn hello(&mut self) -> Result<ProtocolInfo, SdkError> {
+        // Use the raw transport, not `self.call`: the latter folds
+        // `SyscallReply::Error` into `SdkError::Kernel`, but here an Error reply
+        // is itself a meaningful signal (an old server rejecting the handshake).
+        match self
+            .inner
+            .call(Syscall::Hello {
+                protocol_version: PROTOCOL_VERSION,
+            })
+            .await?
+        {
+            SyscallReply::Hello {
+                protocol_version,
+                min_protocol_version,
+                server_version,
+            } => {
+                if (min_protocol_version..=protocol_version).contains(&PROTOCOL_VERSION) {
+                    Ok(ProtocolInfo {
+                        protocol_version,
+                        min_protocol_version,
+                        server_version,
+                    })
+                } else {
+                    Err(SdkError::IncompatibleProtocol {
+                        client: PROTOCOL_VERSION,
+                        server: format!(
+                            "v{min_protocol_version}..=v{protocol_version} ({server_version})"
+                        ),
+                    })
+                }
+            }
+            // A server that predates protocol versioning can't parse `hello` and
+            // answers with an error — that itself is the incompatibility signal.
+            SyscallReply::Error { message } => Err(SdkError::IncompatibleProtocol {
+                client: PROTOCOL_VERSION,
+                server: format!("rejected handshake: {message}"),
+            }),
+            other => Err(unexpected("Hello", &other)),
         }
     }
 
@@ -632,6 +714,29 @@ impl Agent {
     ) -> Result<serde_json::Value, SdkError> {
         let id = self.id.clone();
         self.client.call_tool(id, tool, args).await
+    }
+}
+
+#[cfg(test)]
+mod protocol_tests {
+    use super::*;
+    use kernel::syscall_server::SyscallServer;
+    use kernel::AgentKernelImpl;
+    use std::sync::Arc;
+
+    /// `hello()` negotiates against a current server and returns its window.
+    #[tokio::test]
+    async fn sdk_hello_negotiates_current_server() {
+        let kernel = Arc::new(AgentKernelImpl::new().expect("kernel new"));
+        let server = SyscallServer::bind(kernel, "127.0.0.1:0").await.unwrap();
+        let addr = server.local_addr().unwrap();
+        tokio::spawn(server.serve());
+
+        let mut client = KernelClient::connect(addr).await.expect("connect");
+        let info = client.hello().await.expect("hello should negotiate");
+        assert_eq!(info.protocol_version, PROTOCOL_VERSION);
+        assert!(info.min_protocol_version <= PROTOCOL_VERSION);
+        assert!(!info.server_version.is_empty());
     }
 }
 

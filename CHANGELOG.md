@@ -10,6 +10,18 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
 
 ## [Unreleased]
 
+### Wire protocol (toward 1.0)
+
+- **Versioned wire protocol** — the `Syscall`/`SyscallReply` schema now carries an
+  explicit `PROTOCOL_VERSION` (1), versioned independently of the crate release.
+  A new optional `Hello { protocol_version }` handshake lets a client negotiate:
+  the server replies with its `[MIN_PROTOCOL_VERSION, PROTOCOL_VERSION]` support
+  window, and an out-of-range (or pre-versioning) server surfaces as a clear
+  `SdkError::IncompatibleProtocol` rather than a confusing later failure. The SDK
+  pins the version it was built against and adds `KernelClient::hello()`. `Hello`
+  is allowed before authentication so a client can check compatibility before
+  presenting credentials. Foundation for the 1.0 stability promise (#99).
+
 ### Reliability
 
 - **Graceful startup degradation** — `agent-server` and the `agent` CLI no longer

@@ -47,6 +47,7 @@ pub mod observability;
 pub mod package;
 pub mod permissions;
 pub mod planning;
+pub mod policy;
 pub mod prerequisites;
 pub mod procfs;
 pub mod production;
@@ -237,6 +238,9 @@ pub enum KernelError {
 
     #[error("Sandbox error: {0}")]
     Sandbox(#[from] SandboxError),
+
+    #[error("Policy error: {0}")]
+    Policy(String),
 }
 
 /// Errors related to agent lifecycle management.
@@ -960,11 +964,15 @@ impl AgentKernelImpl {
         }
         let context_manager =
             Arc::new(SqliteContextManager::new(&db_path).map_err(KernelError::Context)?);
+        // Resolve the effective MAC config: a `policy_file`, when set,
+        // supersedes the inline `mac_enforcing`/`mac_rules`. A malformed or
+        // unreadable policy file fails startup with a clear message.
+        let (mac_enforcing, mac_rules) = config.resolve_mac().map_err(KernelError::Policy)?;
         let kernel = Self::with_context_manager(
             context_manager,
             &config.budgets,
-            config.mac_enforcing,
-            &config.mac_rules,
+            mac_enforcing,
+            &mac_rules,
         )?;
         // Bring back any agents persisted by a previous run on this DB so a
         // restart restores the full registry (and re-arms enforcement).

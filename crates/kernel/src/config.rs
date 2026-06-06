@@ -55,6 +55,14 @@ pub struct Config {
     ///   use `object = "*"` (or `"unconfined"`).
     #[serde(default)]
     pub mac_rules: Vec<crate::mac::PolicyRule>,
+    /// Path to a declarative policy document (see `docs/POLICY.md`). When set,
+    /// it is the source of truth and **supersedes** the inline
+    /// `mac_enforcing`/`mac_rules`: the document's `enforcing` flag and its
+    /// compiled rules are used instead. An unreadable or malformed policy file
+    /// is a hard startup error (clear message + non-zero exit, never a silent
+    /// fallback to permissive) — see [`Config::resolve_mac`].
+    #[serde(default)]
+    pub policy_file: Option<PathBuf>,
 }
 
 /// Resource budgets applied at agent creation and to the shared rate limiter.
@@ -127,6 +135,7 @@ impl Default for Config {
             budgets: BudgetConfig::default(),
             mac_enforcing: false,
             mac_rules: Vec::new(),
+            policy_file: None,
         }
     }
 }
@@ -156,6 +165,28 @@ fn default_max_concurrent() -> u32 {
 }
 
 impl Config {
+    /// Resolve the effective MAC configuration `(enforcing, rules)`.
+    ///
+    /// When `policy_file` is set it is the source of truth: the file is read,
+    /// parsed/validated as a [`crate::policy::PolicyDocument`], and its
+    /// `enforcing` flag + compiled rules are returned — superseding the inline
+    /// `mac_enforcing`/`mac_rules`. An unreadable or malformed policy file is a
+    /// hard error so startup fails loudly with a clear message rather than
+    /// silently dropping to permissive mode. With no `policy_file`, the inline
+    /// fields are returned unchanged.
+    pub fn resolve_mac(&self) -> Result<(bool, Vec<crate::mac::PolicyRule>), String> {
+        match &self.policy_file {
+            Some(path) => {
+                let content = std::fs::read_to_string(path)
+                    .map_err(|e| format!("cannot read policy file {}: {e}", path.display()))?;
+                let doc = crate::policy::PolicyDocument::from_toml(&content)
+                    .map_err(|e| format!("invalid policy file {}: {e}", path.display()))?;
+                Ok((doc.enforcing, doc.compile()))
+            }
+            None => Ok((self.mac_enforcing, self.mac_rules.clone())),
+        }
+    }
+
     /// Load config from the default path, or create default if missing.
     pub fn load() -> Self {
         let path = config_file_path();
@@ -331,5 +362,85 @@ mod tests {
         assert!(parsed.mac_enforcing);
         assert_eq!(parsed.mac_rules.len(), 1);
         assert_eq!(parsed.mac_rules[0].decision, "deny");
+    }
+
+    #[test]
+    fn resolve_mac_uses_inline_when_no_policy_file() {
+        let mut cfg = Config::default();
+        cfg.mac_enforcing = true;
+        cfg.mac_rules = vec![crate::mac::PolicyRule {
+            subject: "*".into(),
+            action: "read".into(),
+            object: "*".into(),
+            decision: "allow".into(),
+        }];
+        let (enforcing, rules) = cfg.resolve_mac().unwrap();
+        assert!(enforcing);
+        assert_eq!(rules.len(), 1);
+    }
+
+    #[test]
+    fn resolve_mac_policy_file_supersedes_inline() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("agentos-test-policy-supersede.toml");
+        std::fs::write(
+            &path,
+            r#"
+enforcing = true
+default = "deny"
+
+[[rule]]
+subject = "*"
+action = "write"
+object = "/etc/**"
+decision = "deny"
+"#,
+        )
+        .unwrap();
+
+        let mut cfg = Config::default();
+        // Inline says enforcing=false with no rules; the file must win.
+        cfg.mac_enforcing = false;
+        cfg.mac_rules.clear();
+        cfg.policy_file = Some(path.clone());
+
+        let (enforcing, rules) = cfg.resolve_mac().unwrap();
+        assert!(
+            enforcing,
+            "policy file's enforcing flag should supersede inline"
+        );
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].object, "/etc/**");
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn resolve_mac_malformed_policy_file_is_an_error() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("agentos-test-policy-bad.toml");
+        // Unknown decision value — typed parse rejects it.
+        std::fs::write(
+            &path,
+            "[[rule]]\nsubject = \"*\"\naction = \"read\"\nobject = \"*\"\ndecision = \"alow\"\n",
+        )
+        .unwrap();
+
+        let mut cfg = Config::default();
+        cfg.policy_file = Some(path.clone());
+        let err = cfg.resolve_mac().unwrap_err();
+        assert!(err.contains("invalid policy file"), "got: {err}");
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn resolve_mac_missing_policy_file_is_an_error() {
+        let mut cfg = Config::default();
+        cfg.policy_file = Some(std::path::PathBuf::from(
+            "/nonexistent/agentos/policy/does-not-exist.toml",
+        ));
+        let err = cfg.resolve_mac().unwrap_err();
+        assert!(err.contains("cannot read policy file"), "got: {err}");
     }
 }

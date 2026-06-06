@@ -176,6 +176,8 @@ agent → AgentExecutor::execute_tool
 
 A denial returns a structured error message back to the LLM as a tool failure, so the model can recover gracefully without the kernel trusting it to obey policy. The contract is proven by `tests/src/os_enforcement.rs` — four end-to-end tests that fail loudly if any layer stops enforcing.
 
+The MAC policy at step 2 is **authorable as a declarative document** — operators write rules in TOML, validate and dry-run them with `agent policy validate` / `agent policy explain`, and point the kernel at a `policy_file`. See [docs/POLICY.md](docs/POLICY.md).
+
 ## Benchmarks
 
 ### OS Kernel Benchmarks
@@ -193,6 +195,7 @@ Tool-using benchmarks (file ops, git, HTTP, multi-step plans) live in `benchmark
 - [`ROADMAP.md`](ROADMAP.md) — current phase plan with exit criteria (start here)
 - [`CLAUDE.md`](CLAUDE.md) — orientation for AI assistants working in the repo
 - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — Linux kernel → AI Agent OS mapping
+- [`docs/POLICY.md`](docs/POLICY.md) — authoring, validating, and explaining MAC policy
 - [`docs/COMPLETE_SPEC.md`](docs/COMPLETE_SPEC.md) — long-form implementation spec
 - [`docs/FULL_ROADMAP.md`](docs/FULL_ROADMAP.md) — long-form vision roadmap
 

@@ -10,6 +10,33 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
 
 ## [Unreleased]
 
+### Governance
+
+- **Declarative policy documents** — MAC policy is now an authorable, validated
+  document instead of stringly-typed rules buried in the kernel config. A
+  `PolicyDocument` (`kernel::policy`) carries metadata (`version`,
+  `description`), an explicit typed `default` (allow/deny/audit), an `enforcing`
+  flag, and named/described rules with a **typed `Decision`** so a misspelled
+  decision (`"alow"`) is rejected at parse time rather than silently collapsing
+  to deny. Documents lower (`compile`) to the unchanged `MacEngine` — a
+  `default = allow` compiles to an explicit terminal catch-all — so enforcement
+  semantics are identical, only authoring changes. `validate` reports hard
+  errors; `lint` flags soft mistakes (an enforcing+empty+deny policy that denies
+  everything; rules shadowed by an earlier `*/*/*` catch-all).
+- **`explain` / dry-run** — given (subject, action, object) a document reports
+  *which rule decided and why*, the authoring feedback loop. `MacEngine` was
+  refactored to expose a single label-based `evaluate` returning the matched
+  rule index, shared by `check` and `explain` so the live decision and the
+  explanation can never drift (proven by a 2000-case property test).
+- **`agent policy` CLI** — `agent policy validate <file>` and `agent policy
+  explain <file> --subject … --action … --object …` validate and dry-run a
+  policy without booting a kernel or touching the database (the SELinux
+  `checkpolicy`/`sesearch` analogue). See [docs/POLICY.md](docs/POLICY.md).
+- **`policy_file` config** — a `policy_file` path, when set, supersedes the
+  inline `mac_enforcing`/`mac_rules`; an unreadable or malformed policy file is
+  a hard startup error (clear message + non-zero exit, never a silent drop to
+  permissive), consistent with the graceful-degradation discipline. (#102)
+
 ## [0.3.0] - 2026-06-04
 
 **Production-shell hardening + toward a stable API.** 0.2.0 made the kernel a

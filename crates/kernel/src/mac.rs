@@ -96,9 +96,26 @@ impl MacEngine {
             .get(resource)
             .map(|s| s.as_str())
             .unwrap_or("unconfined");
+        self.evaluate(subject_label, action, object_label, resource)
+            .0
+    }
 
-        // Find matching rule
-        for rule in &self.rules {
+    /// Evaluate a decision directly from labels (no agent/resource lookup),
+    /// returning both the decision *and* the index of the matching rule (if
+    /// any). This is the single matching implementation shared by [`check`]
+    /// (which resolves labels first) and the policy-authoring `explain` path,
+    /// so the two can never drift. `None` for the index means no rule matched
+    /// and the engine fell back to its default.
+    ///
+    /// [`check`]: Self::check
+    pub fn evaluate(
+        &self,
+        subject_label: &str,
+        action: &str,
+        object_label: &str,
+        resource: &str,
+    ) -> (MacDecision, Option<usize>) {
+        for (idx, rule) in self.rules.iter().enumerate() {
             if Self::matches(&rule.subject, subject_label)
                 && Self::matches(&rule.action, action)
                 && Self::object_matches(&rule.object, object_label, resource)
@@ -109,20 +126,22 @@ impl MacEngine {
                     "audit" => MacDecision::Audit,
                     _ => MacDecision::Deny,
                 };
-                return if self.enforcing {
+                let effective = if self.enforcing {
                     decision
                 } else {
                     MacDecision::Allow
                 };
+                return (effective, Some(idx));
             }
         }
 
-        // No rule matched — use default
-        if self.enforcing {
+        // No rule matched — use default.
+        let effective = if self.enforcing {
             self.default
         } else {
             MacDecision::Allow
-        }
+        };
+        (effective, None)
     }
 
     /// Label matching (supports the bare `*` catch-all and exact equality).

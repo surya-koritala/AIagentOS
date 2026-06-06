@@ -65,3 +65,6 @@ mod persistence_props;
 
 #[cfg(test)]
 mod tenancy_props;
+
+#[cfg(test)]
+mod policy_props;

@@ -17,6 +17,7 @@ use kernel::{AgentConfig, AgentKernelImpl, Priority};
 use tokio::sync::mpsc;
 
 mod logging;
+mod policy_cmd;
 mod providers;
 use providers::register_providers;
 
@@ -98,6 +99,14 @@ fn handle_slash(cmd: &str, executor: &AgentExecutor, kernel: &AgentKernelImpl) -
 
 #[tokio::main]
 async fn main() {
+    // Offline subcommands that don't need a kernel/DB are dispatched before any
+    // initialization. `agent policy …` validates/dry-runs a declarative policy
+    // document (the SELinux checkpolicy/sesearch analogue) — see docs/POLICY.md.
+    let argv: Vec<String> = std::env::args().collect();
+    if argv.get(1).map(String::as_str) == Some("policy") {
+        std::process::exit(policy_cmd::run(&argv));
+    }
+
     // Install structured logging first so kernel init (persistence/auth) logs emit.
     logging::init_logging();
     let config = Config::load();

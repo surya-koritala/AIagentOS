@@ -117,7 +117,12 @@ pub struct AgentExecutor {
     tool_registry: Arc<ToolRegistry>,
     context_manager: Arc<SqliteContextManager>,
     rule_store: Option<Arc<crate::learning::RuleStore>>,
-    syscall_gate: Option<Arc<crate::syscall_gate::SyscallGate>>,
+    /// The syscall gate every tool call is checked against. **Mandatory** — it is
+    /// a required constructor argument, so an executor cannot exist in an
+    /// ungoverned state. Running without enforcement requires an explicit
+    /// [`crate::syscall_gate::SyscallGate::unconfined`] gate, never the absence
+    /// of one.
+    syscall_gate: Arc<crate::syscall_gate::SyscallGate>,
     budget_enforcer: Option<Arc<crate::budget::BudgetEnforcer>>,
     /// Max active-context tokens; older non-system messages are paged out (via
     /// the context pager) when exceeded. 0 = disabled (no token bound).
@@ -136,6 +141,7 @@ impl AgentExecutor {
         resource_broker: Arc<dyn ResourceBroker>,
         tool_registry: Arc<ToolRegistry>,
         context_manager: Arc<SqliteContextManager>,
+        syscall_gate: Arc<crate::syscall_gate::SyscallGate>,
         system_prompt: String,
     ) -> Self {
         Self {
@@ -146,7 +152,7 @@ impl AgentExecutor {
             tool_registry,
             context_manager,
             rule_store: None,
-            syscall_gate: None,
+            syscall_gate,
             budget_enforcer: None,
             context_budget_tokens: 0,
             messages: vec![StandardMessage::system(&system_prompt)],
@@ -156,12 +162,28 @@ impl AgentExecutor {
         }
     }
 
-    /// Install a syscall gate. Once set, every tool call passes through it for
-    /// capability + MAC + cgroup enforcement. Without a gate the executor falls
-    /// back to the legacy direct-broker path (used by unit tests that don't
-    /// care about OS enforcement).
-    pub fn set_syscall_gate(&mut self, gate: Arc<crate::syscall_gate::SyscallGate>) {
-        self.syscall_gate = Some(gate);
+    /// Test-only constructor that wires an explicitly *unconfined* gate, for
+    /// unit tests that exercise the think→act loop without OS enforcement. It is
+    /// `#[cfg(test)]` so it can never be reached from production code: the only
+    /// way to build an ungoverned executor is to ask for one by name, in a test.
+    #[cfg(test)]
+    pub fn new_unconfined(
+        agent_id: AgentId,
+        session: Box<dyn LlmSession>,
+        resource_broker: Arc<dyn ResourceBroker>,
+        tool_registry: Arc<ToolRegistry>,
+        context_manager: Arc<SqliteContextManager>,
+        system_prompt: String,
+    ) -> Self {
+        Self::new(
+            agent_id,
+            session,
+            resource_broker,
+            tool_registry,
+            context_manager,
+            Arc::new(crate::syscall_gate::SyscallGate::unconfined()),
+            system_prompt,
+        )
     }
 
     /// Install a budget enforcer. Once set, the loop refuses to make a further
@@ -618,19 +640,21 @@ impl AgentExecutor {
             .unwrap_or("*")
             .to_string();
 
-        if let Some(ref gate) = self.syscall_gate {
-            match gate
-                .check_tool_call(self.agent_id, &tool_call.name, &resource, est_tokens)
-                .await
-            {
-                Ok(_) => { /* proceed */ }
-                Err(denial) => {
-                    return format!(
-                        "Tool '{}' denied by kernel: {}",
-                        tool_call.name,
-                        denial.message()
-                    );
-                }
+        // Mandatory enforcement: every tool call is checked against the gate
+        // (namespace → capability → MAC → cgroup). There is no ungoverned path —
+        // an unconfined gate is the only bypass and must be requested by name.
+        match self
+            .syscall_gate
+            .check_tool_call(self.agent_id, &tool_call.name, &resource, est_tokens)
+            .await
+        {
+            Ok(_) => { /* proceed */ }
+            Err(denial) => {
+                return format!(
+                    "Tool '{}' denied by kernel: {}",
+                    tool_call.name,
+                    denial.message()
+                );
             }
         }
 
@@ -663,9 +687,8 @@ impl AgentExecutor {
             ),
         };
 
-        if let Some(ref gate) = self.syscall_gate {
-            gate.record_tool_usage(self.agent_id, est_tokens);
-        }
+        self.syscall_gate
+            .record_tool_usage(self.agent_id, est_tokens);
 
         result
     }
@@ -856,9 +879,9 @@ mod tests {
             mock_broker(),
             Arc::new(ToolRegistry::new()),
             mock_context_manager(),
+            gate,
             "test".into(),
         );
-        executor.set_syscall_gate(gate);
 
         // write_file requires CAP_FILE_WRITE, which this agent lacks → denied.
         let denied = executor
@@ -887,6 +910,81 @@ mod tests {
         );
     }
 
+    // Structural guarantee: an executor built the normal way (`new`, with a real
+    // non-unconfined gate) is ungoverned for *no one*. An agent that was never
+    // registered with the gate is denied (UnknownAgent), NOT silently allowed —
+    // the inverse of the old footgun where a missing gate meant "skip all checks".
+    // Production code cannot reach an ungoverned executor: `new` requires a gate
+    // and the only bypass, `SyscallGate::unconfined`, is `#[cfg(test)]`-gated at
+    // the executor (`new_unconfined`) and must be named explicitly.
+    #[tokio::test]
+    async fn unregistered_agent_is_denied_not_unconfined() {
+        use crate::cgroups::CgroupManager;
+        use crate::syscall_gate::SyscallGate;
+
+        // A real (enforcing-capable) gate with NO agent registered.
+        let gate = Arc::new(SyscallGate::new(Arc::new(CgroupManager::new())));
+        let agent_id = uuid::Uuid::new_v4();
+        let session = Box::new(MockToolSession {
+            call_count: AtomicUsize::new(0),
+            id: "mock".into(),
+        });
+        let executor = AgentExecutor::new(
+            agent_id,
+            session,
+            mock_broker(),
+            Arc::new(ToolRegistry::new()),
+            mock_context_manager(),
+            gate,
+            "test".into(),
+        );
+
+        // read_file needs no capability, but the agent is unknown to the gate, so
+        // the call must be denied rather than reaching the broker unchecked.
+        let result = executor
+            .execute_tool(&ToolCall {
+                id: "c1".into(),
+                name: "read_file".into(),
+                arguments: serde_json::json!({"path": "/tmp/x"}),
+            })
+            .await;
+        assert!(
+            result.contains("denied by kernel"),
+            "an unregistered agent must be denied by the gate, got: {result}"
+        );
+    }
+
+    // The explicit escape hatch behaves as documented: an unconfined executor
+    // allows a call for an unregistered agent (the only sanctioned ungoverned
+    // path), proving `new_unconfined` is wired to the short-circuiting gate.
+    #[tokio::test]
+    async fn unconfined_executor_allows_unregistered_agent() {
+        let agent_id = uuid::Uuid::new_v4();
+        let session = Box::new(MockToolSession {
+            call_count: AtomicUsize::new(0),
+            id: "mock".into(),
+        });
+        let executor = AgentExecutor::new_unconfined(
+            agent_id,
+            session,
+            mock_broker(),
+            Arc::new(ToolRegistry::new()),
+            mock_context_manager(),
+            "test".into(),
+        );
+        let result = executor
+            .execute_tool(&ToolCall {
+                id: "c1".into(),
+                name: "read_file".into(),
+                arguments: serde_json::json!({"path": "/tmp/x"}),
+            })
+            .await;
+        assert!(
+            !result.contains("denied by kernel"),
+            "an unconfined executor should not deny, got: {result}"
+        );
+    }
+
     // #44: a cumulative USD ceiling hard-stops the think→act loop. The
     // InfiniteToolSession would otherwise run all MAX_ITERATIONS rounds; with a
     // budget priced so one response exhausts the ceiling, the loop refuses the
@@ -895,7 +993,7 @@ mod tests {
     // non-system messages are paged out, the system prompt is always retained.
     #[tokio::test]
     async fn context_pager_bounds_active_window_by_tokens() {
-        let mut executor = AgentExecutor::new(
+        let mut executor = AgentExecutor::new_unconfined(
             uuid::Uuid::new_v4(),
             Box::new(InfiniteToolSession { id: "x".into() }),
             mock_broker(),
@@ -945,7 +1043,7 @@ mod tests {
         let session = Box::new(InfiniteToolSession {
             id: "infinite".into(),
         });
-        let mut executor = AgentExecutor::new(
+        let mut executor = AgentExecutor::new_unconfined(
             agent_id,
             session,
             mock_broker(),
@@ -1022,7 +1120,7 @@ mod tests {
             call_count: AtomicUsize::new(0),
             id: "mock".into(),
         });
-        let mut executor = AgentExecutor::new(
+        let mut executor = AgentExecutor::new_unconfined(
             uuid::Uuid::new_v4(),
             session,
             mock_broker(),
@@ -1046,7 +1144,7 @@ mod tests {
         let broker = mock_broker();
         let registry = Arc::new(ToolRegistry::new());
 
-        let mut executor = AgentExecutor::new(
+        let mut executor = AgentExecutor::new_unconfined(
             uuid::Uuid::new_v4(),
             session,
             broker,
@@ -1067,7 +1165,7 @@ mod tests {
         let broker = mock_broker();
         let registry = Arc::new(ToolRegistry::new());
 
-        let mut executor = AgentExecutor::new(
+        let mut executor = AgentExecutor::new_unconfined(
             uuid::Uuid::new_v4(),
             session,
             broker,
@@ -1126,7 +1224,7 @@ mod tests {
         let broker = mock_broker();
         let registry = Arc::new(ToolRegistry::new());
 
-        let mut executor = AgentExecutor::new(
+        let mut executor = AgentExecutor::new_unconfined(
             uuid::Uuid::new_v4(),
             session,
             broker,
@@ -1199,7 +1297,7 @@ mod tests {
         let broker = mock_broker();
         let registry = Arc::new(ToolRegistry::new());
 
-        let mut executor = AgentExecutor::new(
+        let mut executor = AgentExecutor::new_unconfined(
             uuid::Uuid::new_v4(),
             session,
             broker,
@@ -1273,7 +1371,7 @@ mod tests {
         let broker = mock_broker();
         let registry = Arc::new(ToolRegistry::new());
 
-        let mut executor = AgentExecutor::new(
+        let mut executor = AgentExecutor::new_unconfined(
             agent_id,
             session,
             broker,
@@ -1335,8 +1433,14 @@ mod tests {
         let broker = mock_broker();
         let registry = Arc::new(ToolRegistry::new());
 
-        let mut executor =
-            AgentExecutor::new(agent_id, session, broker, registry, ctx_mgr, "test".into());
+        let mut executor = AgentExecutor::new_unconfined(
+            agent_id,
+            session,
+            broker,
+            registry,
+            ctx_mgr,
+            "test".into(),
+        );
 
         // Manually fill messages to exceed threshold
         for i in 0..MESSAGE_OVERFLOW_THRESHOLD {
@@ -1361,7 +1465,7 @@ mod tests {
             call_count: AtomicUsize::new(0),
             id: "mock".into(),
         });
-        let mut executor = AgentExecutor::new(
+        let mut executor = AgentExecutor::new_unconfined(
             uuid::Uuid::new_v4(),
             session,
             mock_broker(),
@@ -1389,7 +1493,7 @@ mod tests {
     async fn run_resumable_pauses_at_boundary_with_checkpoint() {
         let agent_id = uuid::Uuid::new_v4();
         let session = Box::new(InfiniteToolSession { id: "x".into() });
-        let mut executor = AgentExecutor::new(
+        let mut executor = AgentExecutor::new_unconfined(
             agent_id,
             session,
             mock_broker(),
@@ -1471,7 +1575,7 @@ mod tests {
         // top of iteration 2 — deterministic, gated on the cancel flag being set
         // before the boundary check, not on timing.
         let shared_cancel = CancellationToken::new();
-        let mut exec1 = AgentExecutor::new(
+        let mut exec1 = AgentExecutor::new_unconfined(
             agent_id,
             Box::new(MockToolSession {
                 call_count: AtomicUsize::new(0),
@@ -1498,7 +1602,7 @@ mod tests {
         let resume_session = Box::new(LongResponseSession {
             id: "phase2".into(),
         });
-        let mut exec2 = AgentExecutor::new(
+        let mut exec2 = AgentExecutor::new_unconfined(
             agent_id,
             resume_session,
             mock_broker(),
@@ -1545,7 +1649,7 @@ mod tests {
         };
 
         let session = Box::new(InfiniteToolSession { id: "x".into() });
-        let mut exec = AgentExecutor::new(
+        let mut exec = AgentExecutor::new_unconfined(
             agent_id,
             session,
             mock_broker(),

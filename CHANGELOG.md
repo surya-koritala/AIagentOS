@@ -10,6 +10,24 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
 
 ## [Unreleased]
 
+### Security
+
+- **Enforcement is mandatory by construction** — the syscall gate is now a
+  required dependency of `AgentExecutor` (a constructor argument) rather than an
+  `Option` set after the fact. Previously an executor built without
+  `set_syscall_gate` ran *completely ungoverned* — every tool call skipped the
+  namespace/capability/MAC/cgroup checks — so enforcement held only by
+  convention: any new code path that forgot the setter silently ran unconfined.
+  Now an ungoverned executor cannot be constructed by omission. The single
+  sanctioned bypass is an explicit, greppable `SyscallGate::unconfined()` gate,
+  wired only through the `#[cfg(test)]` `AgentExecutor::new_unconfined` helper, so
+  it can never be reached from production code. `execute_tool` consults the gate
+  unconditionally; an unregistered agent is *denied* (UnknownAgent), not allowed.
+  Regression tests pin both halves: an unregistered agent on a real gate is
+  denied, and an unconfined gate allows. This closes the gap between "governed by
+  convention" and "governed by construction" — the load-bearing property behind
+  calling the gate un-bypassable. (#103)
+
 ### Governance
 
 - **Declarative policy documents** — MAC policy is now an authorable, validated

@@ -236,6 +236,12 @@ pub trait AuditSink: Send + Sync {
 pub struct SyscallGate {
     pub mac: Mutex<MacEngine>,
     pub cgroups: std::sync::Arc<CgroupManager>,
+    /// When `true`, `check_tool_call` short-circuits to `Allow` for every call.
+    /// This is the **single, explicit, greppable** way to run ungoverned — built
+    /// only via [`SyscallGate::unconfined`]. Enforcement is otherwise mandatory:
+    /// an executor cannot exist without a gate (it is a required constructor
+    /// argument), so there is no "forgot to enable the gate" failure mode.
+    unconfined: bool,
     /// Default cgroup new agents are placed in if the caller doesn't specify one.
     default_cgroup: CgroupId,
     /// Kernel UUID → OS PID record.
@@ -281,6 +287,7 @@ impl SyscallGate {
         Self {
             mac: Mutex::new(mac),
             cgroups,
+            unconfined: false,
             default_cgroup,
             records: DashMap::new(),
             tool_namespaces: DashMap::new(),
@@ -294,6 +301,21 @@ impl SyscallGate {
             denied_namespace: AtomicU64::new(0),
             audited: AtomicU64::new(0),
         }
+    }
+
+    /// Build an **explicitly ungoverned** gate: `check_tool_call` allows every
+    /// call without consulting capabilities, MAC, namespaces, or quotas.
+    ///
+    /// This exists so that tests and non-OS contexts that genuinely don't want
+    /// enforcement must *say so by name* — `SyscallGate::unconfined()` is greppable
+    /// and unmistakable. It replaces the old footgun where an executor simply
+    /// having no gate ran unconfined by default: enforcement is now mandatory by
+    /// construction (the gate is a required executor dependency), and bypassing it
+    /// is possible only through this one clearly-labelled door.
+    pub fn unconfined() -> Self {
+        let mut gate = Self::new(std::sync::Arc::new(CgroupManager::new()));
+        gate.unconfined = true;
+        gate
     }
 
     /// Install the audit sink. The kernel passes its observability engine so
@@ -401,6 +423,13 @@ impl SyscallGate {
         resource: &str,
         est_tokens: u64,
     ) -> Result<Pid, GateDenial> {
+        // Explicitly-ungoverned gate (test / non-OS contexts only — see
+        // `SyscallGate::unconfined`): allow everything without registration.
+        if self.unconfined {
+            self.allowed.fetch_add(1, Ordering::Relaxed);
+            return Ok(0);
+        }
+
         let action = classify_tool(tool_name);
 
         let (pid, caps, cgroup, agent_namespaces) = match self.records.get(&kid) {
@@ -841,5 +870,31 @@ mod tests {
         let bare = uuid::Uuid::new_v4();
         gate.register_agent(bare, CapabilitySet::none(), None);
         assert!(gate.agent_info(bare).unwrap().capabilities.is_empty());
+    }
+
+    // A real gate denies an unregistered agent (no silent allow). This is the
+    // default posture that makes enforcement mandatory: absence of registration
+    // is a denial, not a bypass.
+    #[tokio::test]
+    async fn default_gate_denies_unregistered_agent() {
+        let (gate, _) = fresh_gate();
+        let res = gate
+            .check_tool_call(uuid::Uuid::new_v4(), "read_file", "/tmp/x", 10)
+            .await;
+        assert!(matches!(res, Err(GateDenial::UnknownAgent)));
+    }
+
+    // The explicit escape hatch allows everything, even for an unregistered
+    // agent, and bumps the `allowed` counter — the one sanctioned ungoverned path.
+    #[tokio::test]
+    async fn unconfined_gate_allows_any_call() {
+        let gate = SyscallGate::unconfined();
+        // A privileged action for an agent that was never registered: allowed.
+        let res = gate
+            .check_tool_call(uuid::Uuid::new_v4(), "write_file", "/etc/passwd", 10)
+            .await;
+        assert_eq!(res, Ok(0));
+        assert_eq!(gate.stats().allowed, 1);
+        assert_eq!(gate.stats().denied_unknown, 0);
     }
 }

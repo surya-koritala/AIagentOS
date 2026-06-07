@@ -1637,9 +1637,9 @@ impl AgentKernelImpl {
                 self.resource_broker.clone() as Arc<dyn ResourceBroker>,
                 self.tool_registry.clone(),
                 self.context_manager.clone(),
+                self.syscall_gate.clone(),
                 "You are a helpful AI assistant. Use the available tools to help the user.".into(),
             );
-            executor.set_syscall_gate(self.syscall_gate.clone());
             executor.set_budget_enforcer(self.budget_enforcer.clone());
             executor.set_context_budget(self.context_budget_tokens);
 

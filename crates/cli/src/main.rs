@@ -173,19 +173,19 @@ async fn main() {
                 config.llm_provider
             ))
         });
+    // Route every tool call through the kernel's syscall gate (capability /
+    // MAC / cgroup / namespace enforcement). The gate is a required argument, so
+    // there is no ungoverned path: the agent was registered with the gate in
+    // `create_agent_full` using `config.permission_profile`'s caps.
     let mut executor = AgentExecutor::new(
         handle.id,
         session,
         kernel.resource_broker.clone() as Arc<dyn ResourceBroker>,
         kernel.tool_registry.clone(),
         kernel.context_manager.clone(),
+        kernel.syscall_gate.clone(),
         system_prompt,
     );
-    // Route every tool call through the kernel's syscall gate (capability /
-    // MAC / cgroup / namespace enforcement). The agent was registered with the
-    // gate in `create_agent_full` using `config.permission_profile`'s caps, so
-    // tool calls are now enforced instead of running unconfined.
-    executor.set_syscall_gate(kernel.syscall_gate.clone());
 
     if let Some(ref conv_id) = conversation_id {
         executor = executor.with_conversation(conv_id);

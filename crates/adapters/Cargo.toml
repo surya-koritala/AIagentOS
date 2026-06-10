@@ -17,6 +17,19 @@ tokio-stream = "0.1"
 futures-core = "0.3"
 tracing = { workspace = true }
 
+# On-device inference (pure-Rust, CPU). Optional + feature-gated so the default
+# build and CI footprint are untouched — these pull a large ML stack and long
+# compile times. Enable with `--features candle`. See src/on_device.rs.
+candle-core = { version = "0.10", optional = true }
+candle-transformers = { version = "0.10", optional = true }
+tokenizers = { version = "0.21", optional = true }
+
+[features]
+default = []
+# In-process LLM inference via candle (quantized GGUF on CPU). No Python, no
+# C++ FFI — the whole stack is Rust. Heavy: only build it when you need it.
+candle = ["dep:candle-core", "dep:candle-transformers", "dep:tokenizers"]
+
 [dev-dependencies]
 proptest = { workspace = true }
 wiremock = { workspace = true }

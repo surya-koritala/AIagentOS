@@ -132,6 +132,22 @@ pub fn register_providers(kernel: &AgentKernelImpl, config: &Config) {
                 let _ = kernel.register_provider(Arc::new(adapter));
             }
         }
+        // In-process GGUF inference — no network, no sidecar. Only compiled with
+        // `--features candle`; reads the model + tokenizer paths from the env
+        // (AGENTOS_GGUF_MODEL / AGENTOS_TOKENIZER). A load failure or missing
+        // model degrades to a logged warning, leaving the non-LLM syscalls live.
+        #[cfg(feature = "candle")]
+        "on-device" => match adapters::on_device::OnDeviceConfig::from_env() {
+            Some(cfg) => match adapters::on_device::OnDeviceLlmAdapter::load(cfg) {
+                Ok(adapter) => {
+                    let _ = kernel.register_provider(Arc::new(adapter));
+                }
+                Err(e) => tracing::error!("on-device model load failed: {e}"),
+            },
+            None => tracing::warn!(
+                "llm_provider=on-device but AGENTOS_GGUF_MODEL/AGENTOS_TOKENIZER are unset"
+            ),
+        },
         _ => {}
     }
 }

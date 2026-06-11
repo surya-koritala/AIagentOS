@@ -7,6 +7,12 @@ edition = "2021"
 name = "agent"
 path = "src/main.rs"
 
+[features]
+default = []
+# Enable in-process GGUF inference (`llm_provider = "on-device"`). Forwards to
+# the adapters `candle` feature; off by default so the shipped binary stays slim.
+candle = ["adapters/candle"]
+
 [dependencies]
 kernel = { path = "../kernel" }
 adapters = { path = "../adapters" }

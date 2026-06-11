@@ -10,6 +10,25 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
 
 ## [Unreleased]
 
+### Added
+
+- **On-device inference adapter (spike, pure-Rust)** — a new `on-device` LLM
+  provider that loads a quantized **GGUF** model and runs the forward pass
+  *inside the kernel process* via `candle` (CPU). It is the in-process
+  counterpart to the `local` Ollama adapter: no network, no sidecar, no Python,
+  no C++ FFI — the whole inference stack is Rust, so it cross-compiles to
+  `aarch64`/`armv7` and can run headless on a small board. It plugs into the
+  unchanged `LlmProviderAdapter` seam, so the kernel, syscall gate, scheduler and
+  persistence treat it like any other provider. Gated behind a non-default
+  `candle` feature on both `adapters` and `agent-cli`, so the shipped binary and
+  CI footprint are untouched (`cargo build -p agent-cli --features candle`).
+  Model + tokenizer paths come from `AGENTOS_GGUF_MODEL` / `AGENTOS_TOKENIZER`; a
+  missing or unloadable model degrades to a logged warning, leaving the non-LLM
+  syscalls live. Scope is a spike: greedy/temperature sampling, a model-agnostic
+  prompt format, no native tool-calls (the executor's plaintext shim recovers
+  them), and per-turn cache priming. A `#[ignore]`d end-to-end test generates
+  real tokens when a model is provisioned on the box. (#104)
+
 ### Security
 
 - **Enforcement is mandatory by construction** — the syscall gate is now a

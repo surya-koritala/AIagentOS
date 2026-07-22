@@ -143,7 +143,8 @@ jobs:
       - name: Boot and verify syscall health
         run: |
           docker volume create agentos-ci-data
-          docker run -d --name agentos-ci -p 7777:7777 -v agentos-ci-data:/data \
+          docker run -d --name agentos-ci -p 127.0.0.1:7777:7777 \
+            -e AGENT_SERVER_ALLOW_INSECURE_REMOTE=1 -v agentos-ci-data:/data \
             agentos:ci agent-server 0.0.0.0:7777
           for i in $(seq 1 30); do
             if printf '{"op":"node_info"}\n' | nc -w2 127.0.0.1 7777 | grep -q '"status":"node_info"'; then

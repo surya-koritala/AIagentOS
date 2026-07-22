@@ -44,6 +44,12 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
   sandbox identity. Filesystem paths are canonicalized inside the workspace
   before provider dispatch, including regression coverage for traversal and
   symlink escapes. Full OS/container isolation still requires #111.
+- **Rust supply-chain repair** — upgraded Wasmtime, Tauri, `quick-xml`,
+  `crossbeam-epoch`, Ratatui, and `memmap2`; replaced the discontinued direct
+  PEM parser with rustls PKI parsing; and added valid AGPL SPDX metadata to
+  every Rust package. RustSec reports zero vulnerabilities. Remaining
+  unmaintained Tauri/Chromium transitive notices are exact, reviewed
+  cargo-deny exceptions rather than vulnerability waivers. (#110)
 
 ### Governance
 
@@ -83,7 +89,7 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
 - Regression coverage expanded across authorization, sandbox escapes, lifecycle
   cleanup, checkpoints, scheduling, context pressure, accounting, persistence,
   services, packages, providers, wire compatibility, CLI/TUI state, and claim
-  integrity. Local line coverage is 77.38% with a 60% CI floor.
+  integrity. Local line coverage is 77.45% with a 60% CI floor.
 
 ## [0.3.0] - 2026-06-04
 

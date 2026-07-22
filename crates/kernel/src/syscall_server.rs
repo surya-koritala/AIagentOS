@@ -1665,27 +1665,31 @@ pub fn server_config_from_pem(
     cert_pem: &[u8],
     key_pem: &[u8],
 ) -> std::io::Result<rustls::ServerConfig> {
+    use rustls::pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer};
+
     // Ensure a process-wide crypto provider is installed (idempotent — a second
     // install returns an error we ignore). Lets callers build a config without
     // naming the rustls crypto provider themselves.
     let _ = rustls::crypto::ring::default_provider().install_default();
-    let certs = rustls_pemfile::certs(&mut std::io::BufReader::new(cert_pem))
-        .collect::<Result<Vec<_>, _>>()?;
+    let certs = CertificateDer::pem_slice_iter(cert_pem)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
     if certs.is_empty() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "no certificates found in cert_pem",
         ));
     }
-    let key = match rustls_pemfile::private_key(&mut std::io::BufReader::new(key_pem))? {
-        Some(key) => key,
-        None => {
-            return Err(std::io::Error::new(
+    let key = PrivateKeyDer::pem_slice_iter(key_pem)
+        .next()
+        .transpose()
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?
+        .ok_or_else(|| {
+            std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "no private key found in key_pem",
-            ))
-        }
-    };
+            )
+        })?;
     rustls::ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(certs, key)
@@ -2916,6 +2920,36 @@ memory = ["remember this"]
         roots.add(cert_der).expect("trust self-signed cert");
 
         (server_config, roots)
+    }
+
+    #[test]
+    fn pem_server_config_accepts_certificate_and_private_key() {
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
+            .expect("generate self-signed cert");
+
+        server_config_from_pem(
+            cert.cert.pem().as_bytes(),
+            cert.key_pair.serialize_pem().as_bytes(),
+        )
+        .expect("PEM certificate and key should build a server config");
+    }
+
+    #[test]
+    fn pem_server_config_rejects_missing_certificate_or_key() {
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
+            .expect("generate self-signed cert");
+        let cert_pem = cert.cert.pem();
+        let key_pem = cert.key_pair.serialize_pem();
+
+        let missing_cert = server_config_from_pem(b"", key_pem.as_bytes())
+            .expect_err("missing certificate should fail");
+        assert_eq!(missing_cert.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(missing_cert.to_string().contains("no certificates found"));
+
+        let missing_key = server_config_from_pem(cert_pem.as_bytes(), b"")
+            .expect_err("missing private key should fail");
+        assert_eq!(missing_key.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(missing_key.to_string().contains("no private key found"));
     }
 
     #[tokio::test]

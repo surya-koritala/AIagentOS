@@ -3,7 +3,7 @@ name = "agent-sdk"
 version = "0.3.0"
 edition = "2021"
 description = "Embeddable Rust SDK for building agents against the AI Agent OS kernel over its syscall server."
-license = "AGPL-3.0"
+license.workspace = true
 
 [dependencies]
 kernel = { path = "../kernel" }

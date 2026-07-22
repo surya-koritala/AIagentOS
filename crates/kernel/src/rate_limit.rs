@@ -57,6 +57,7 @@ impl Default for RateLimitConfig {
 #[derive(Debug)]
 struct WindowState {
     start: Instant,
+    generation: u64,
     requests: u64,
     tokens: u64,
 }
@@ -68,6 +69,7 @@ impl WindowState {
         let elapsed = self.start.elapsed();
         if elapsed >= WINDOW {
             self.start = Instant::now();
+            self.generation = self.generation.saturating_add(1);
             self.requests = 0;
             self.tokens = 0;
             WINDOW
@@ -84,18 +86,30 @@ pub struct RateLimiter {
     /// Semaphore for the concurrent execution limit.
     concurrency: Arc<Semaphore>,
     /// Windowed request/token accounting (single mutex → atomic reserve).
-    window: Mutex<WindowState>,
+    window: Arc<Mutex<WindowState>>,
+}
+
+#[derive(Debug, thiserror::Error, Clone, PartialEq, Eq)]
+pub enum RateLimitError {
+    #[error("request estimate {requested} tokens exceeds configured TPM limit {limit}")]
+    RequestExceedsTpm { requested: u64, limit: u64 },
 }
 
 impl RateLimiter {
     pub fn new(config: RateLimitConfig) -> Self {
+        let permits = if config.max_concurrent == 0 {
+            Semaphore::MAX_PERMITS
+        } else {
+            config.max_concurrent as usize
+        };
         Self {
-            concurrency: Arc::new(Semaphore::new(config.max_concurrent as usize)),
-            window: Mutex::new(WindowState {
+            concurrency: Arc::new(Semaphore::new(permits)),
+            window: Arc::new(Mutex::new(WindowState {
                 start: Instant::now(),
+                generation: 0,
                 requests: 0,
                 tokens: 0,
-            }),
+            })),
             config,
         }
     }
@@ -103,53 +117,63 @@ impl RateLimiter {
     /// Acquire permission to make a request, reserving one request slot. Blocks
     /// until both the RPM bound has room and a concurrency permit is free.
     pub async fn acquire(&self) -> RateLimitGuard {
-        self.acquire_tokens(0).await
+        self.acquire_tokens(0)
+            .await
+            .expect("a zero-token reservation always fits")
     }
 
     /// Like [`acquire`](Self::acquire) but also reserves `est_tokens` against
     /// the TPM bound up front. The reservation is corrected once the true cost
     /// is known via [`record_tokens`](Self::record_tokens).
-    pub async fn acquire_tokens(&self, est_tokens: u64) -> RateLimitGuard {
+    pub async fn acquire_tokens(&self, est_tokens: u64) -> Result<RateLimitGuard, RateLimitError> {
+        if self.config.tpm > 0 && est_tokens > self.config.tpm {
+            return Err(RateLimitError::RequestExceedsTpm {
+                requested: est_tokens,
+                limit: self.config.tpm,
+            });
+        }
         // Phase 1: reserve an RPM (and TPM) slot atomically, polling across
         // window rollovers. We loop because the reservation may have to wait
         // for the current window to expire.
-        loop {
+        let generation = loop {
             let wait = {
                 let mut w = self.window.lock().unwrap();
                 let remaining = w.roll_if_expired();
 
-                let rpm_ok = w.requests < self.config.rpm as u64;
-                // A single request larger than the whole TPM budget would never
-                // fit; admit it rather than deadlock (the bound is best-effort
-                // for oversized single calls).
-                let tpm_ok = w.tokens.saturating_add(est_tokens) <= self.config.tpm
-                    || est_tokens > self.config.tpm;
+                let rpm_ok = self.config.rpm == 0 || w.requests < self.config.rpm as u64;
+                let tpm_ok =
+                    self.config.tpm == 0 || w.tokens.saturating_add(est_tokens) <= self.config.tpm;
 
                 if rpm_ok && tpm_ok {
-                    w.requests += 1;
+                    w.requests = w.requests.saturating_add(1);
                     w.tokens = w.tokens.saturating_add(est_tokens);
-                    None
+                    Ok(w.generation)
                 } else {
                     // Wait for the window to roll over, bounded so we re-poll
                     // soon after the rollover instant.
-                    Some(remaining.min(MAX_POLL_WAIT))
+                    Err(remaining.min(MAX_POLL_WAIT))
                 }
             };
 
             match wait {
-                None => break,
-                Some(d) if d > Duration::ZERO => sleep(d).await,
-                Some(_) => {
+                Ok(generation) => break generation,
+                Err(d) if d > Duration::ZERO => sleep(d).await,
+                Err(_) => {
                     // Window just expired but another caller may race us to the
                     // reset; yield and re-check immediately.
                     tokio::task::yield_now().await;
                 }
             }
-        }
+        };
 
         // Phase 2: acquire a concurrency permit. Held until the guard drops.
         let permit = self.concurrency.clone().acquire_owned().await.unwrap();
-        RateLimitGuard { _permit: permit }
+        Ok(RateLimitGuard {
+            _permit: permit,
+            window: self.window.clone(),
+            generation,
+            reserved_tokens: est_tokens,
+        })
     }
 
     /// Record tokens actually used (call after the LLM response). This is the
@@ -174,7 +198,11 @@ impl RateLimiter {
             tokens_this_minute: w.tokens,
             rpm_limit: self.config.rpm,
             tpm_limit: self.config.tpm,
-            concurrent_available: self.concurrency.available_permits() as u32,
+            concurrent_available: if self.config.max_concurrent == 0 {
+                0
+            } else {
+                self.concurrency.available_permits() as u32
+            },
             max_concurrent: self.config.max_concurrent,
         }
     }
@@ -183,6 +211,27 @@ impl RateLimiter {
 /// Guard that releases the concurrency permit on drop.
 pub struct RateLimitGuard {
     _permit: tokio::sync::OwnedSemaphorePermit,
+    window: Arc<Mutex<WindowState>>,
+    generation: u64,
+    reserved_tokens: u64,
+}
+
+impl RateLimitGuard {
+    /// Replace the up-front token estimate with provider-reported or
+    /// conservatively estimated actual usage. If the minute rolled while the
+    /// request was in flight, actual usage is charged to the new window.
+    pub fn reconcile(self, actual_tokens: u64) {
+        let mut window = self.window.lock().unwrap();
+        window.roll_if_expired();
+        if window.generation == self.generation {
+            window.tokens = window
+                .tokens
+                .saturating_sub(self.reserved_tokens)
+                .saturating_add(actual_tokens);
+        } else {
+            window.tokens = window.tokens.saturating_add(actual_tokens);
+        }
+    }
 }
 
 /// Current rate limit statistics.
@@ -333,11 +382,61 @@ mod tests {
             max_concurrent: 10,
         }));
         // Reserve the whole token budget.
-        let _g = limiter.acquire_tokens(100).await;
+        let _g = limiter.acquire_tokens(100).await.unwrap();
         assert_eq!(limiter.stats().tokens_this_minute, 100);
 
         // A further reservation that would exceed TPM must block (times out).
         let res = tokio::time::timeout(Duration::from_millis(50), limiter.acquire_tokens(1)).await;
         assert!(res.is_err(), "reservation should have blocked on TPM");
+    }
+
+    #[tokio::test]
+    async fn oversized_request_is_rejected_instead_of_waiting_forever() {
+        let limiter = RateLimiter::new(RateLimitConfig {
+            rpm: 10,
+            tpm: 100,
+            max_concurrent: 1,
+        });
+        let error = match limiter.acquire_tokens(101).await {
+            Ok(_) => panic!("oversized reservation unexpectedly admitted"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            error,
+            RateLimitError::RequestExceedsTpm {
+                requested: 101,
+                limit: 100
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn zero_limits_are_explicitly_unlimited() {
+        let limiter = RateLimiter::new(RateLimitConfig {
+            rpm: 0,
+            tpm: 0,
+            max_concurrent: 0,
+        });
+        let guard = limiter.acquire_tokens(u64::MAX).await.unwrap();
+        guard.reconcile(u64::MAX);
+        let stats = limiter.stats();
+        assert_eq!(stats.requests_this_minute, 1);
+        assert_eq!(stats.tokens_this_minute, u64::MAX);
+        assert_eq!(stats.rpm_limit, 0);
+        assert_eq!(stats.tpm_limit, 0);
+        assert_eq!(stats.max_concurrent, 0);
+    }
+
+    #[tokio::test]
+    async fn provider_actual_usage_replaces_reservation() {
+        let limiter = RateLimiter::new(RateLimitConfig {
+            rpm: 10,
+            tpm: 1_000,
+            max_concurrent: 1,
+        });
+        let guard = limiter.acquire_tokens(300).await.unwrap();
+        assert_eq!(limiter.stats().tokens_this_minute, 300);
+        guard.reconcile(125);
+        assert_eq!(limiter.stats().tokens_this_minute, 125);
     }
 }

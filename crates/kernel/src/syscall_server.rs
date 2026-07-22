@@ -28,8 +28,10 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader
 use tokio::net::{TcpListener, TcpStream, ToSocketAddrs};
 
 use crate::agent::AgentKernel;
+use crate::auth::{Principal, Role};
 use crate::connector::{AgentConnector, ToolCall};
-use crate::context::{ContextManager, Fact, FactCategory};
+use crate::context::{ContextManager, ContextPressureStats, Fact, FactCategory};
+use crate::observability::{AgentAction, ObservabilityEngine};
 use crate::resources::ResourceBroker;
 use crate::{AgentConfig, AgentKernelImpl, Priority};
 
@@ -42,11 +44,10 @@ use crate::{AgentConfig, AgentKernelImpl, Priority};
 /// [`Syscall::Hello`] and learns the server's `[MIN_PROTOCOL_VERSION, PROTOCOL_VERSION]`
 /// support window; an out-of-range client gets a clear error rather than silent
 /// breakage. See `RELEASING.md` ("Toward a stable API").
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
-/// The oldest wire-protocol version this server still accepts. Equal to
-/// [`PROTOCOL_VERSION`] until we ship a wire-breaking change and choose to keep
-/// serving older clients through a compatibility window.
+/// The oldest wire-protocol version this server still accepts. Version 1 keeps
+/// the released prose-only error reply; version 2 adds typed public errors.
 pub const MIN_PROTOCOL_VERSION: u32 = 1;
 
 fn default_provider() -> String {
@@ -77,8 +78,52 @@ pub enum Syscall {
     },
     /// List all agents the kernel knows about.
     ListAgents,
+    /// Pause new work and cooperatively cancel an in-flight turn.
+    PauseAgent {
+        agent_id: String,
+    },
+    /// Make a paused agent runnable again.
+    ResumeAgent {
+        agent_id: String,
+    },
+    /// Gracefully transition an agent to its terminal state and clean up all
+    /// live kernel resources.
+    StopAgent {
+        agent_id: String,
+    },
+    /// Force a terminal transition and run the same cleanup invariant as stop.
+    KillAgent {
+        agent_id: String,
+    },
+    /// Return the current durable lifecycle state.
+    GetAgentStatus {
+        agent_id: String,
+    },
+    /// Wait until an agent becomes terminal or the timeout expires.
+    WaitAgent {
+        agent_id: String,
+        timeout_ms: u64,
+    },
+    /// List resumable in-flight turn checkpoints for one agent. Only metadata is
+    /// returned; prompt/tool payloads remain protected in SQLite.
+    ListGenerationCheckpoints {
+        agent_id: String,
+    },
+    /// Resume an explicit durable checkpoint instead of the latest one.
+    ResumeGenerationCheckpoint {
+        agent_id: String,
+        checkpoint_id: String,
+    },
+    /// Delete an inactive checkpoint before its retention expiry.
+    DeleteGenerationCheckpoint {
+        agent_id: String,
+        checkpoint_id: String,
+    },
     /// Drive one think→act→observe turn for an agent (LLM-backed).
-    SendMessage { agent_id: String, message: String },
+    SendMessage {
+        agent_id: String,
+        message: String,
+    },
     /// Invoke a single tool as an agent. Goes through the syscall gate
     /// (capability / MAC / cgroup / namespace) before the resource broker, so a
     /// denial is returned as an `Error` — enforcement applies over the wire.
@@ -93,7 +138,9 @@ pub enum Syscall {
     /// Read-only introspection of one agent's enforcement state: the
     /// capabilities and namespaces the gate grants it. Answers "what am I
     /// allowed to do?" without side effects.
-    AgentInfo { agent_id: String },
+    AgentInfo {
+        agent_id: String,
+    },
     /// List the LLM providers registered with the kernel connector — the LLM
     /// backends an agent can be created against and driven through
     /// [`SendMessage`](Self::SendMessage).
@@ -108,7 +155,10 @@ pub enum Syscall {
         category: Option<String>,
     },
     /// Query an agent's long-term memory by substring, newest first.
-    MemoryQuery { agent_id: String, query: String },
+    MemoryQuery {
+        agent_id: String,
+        query: String,
+    },
     /// Put (insert-or-overwrite) a value into the agent's durable key/value
     /// store (the per-agent `agent_kv` table). `value` is an opaque string —
     /// callers may JSON-encode structured data.
@@ -119,38 +169,68 @@ pub enum Syscall {
     },
     /// Get a value from the agent's key/value store (reply carries
     /// `value: None` when the key is absent).
-    StorageGet { agent_id: String, key: String },
+    StorageGet {
+        agent_id: String,
+        key: String,
+    },
     /// List the keys in the agent's key/value store.
-    StorageList { agent_id: String },
+    StorageList {
+        agent_id: String,
+    },
+    /// Inspect bounded active-context usage and durable spill/error counters.
+    /// Spill payload content is intentionally not returned.
+    ContextPressure {
+        agent_id: String,
+    },
     /// Delete a key from the agent's key/value store (reply reports whether it
     /// existed).
-    StorageDelete { agent_id: String, key: String },
+    StorageDelete {
+        agent_id: String,
+        key: String,
+    },
     /// Capture the agent's current working context under `label` (a point-in-time
     /// snapshot in the `context_snapshots` table). Overwrites an existing label.
-    SnapshotContext { agent_id: String, label: String },
+    SnapshotContext {
+        agent_id: String,
+        label: String,
+    },
     /// Restore a previously captured snapshot, making it the agent's current
     /// context. Replies with the restored token count (`SnapshotRestored`).
-    RestoreSnapshot { agent_id: String, label: String },
+    RestoreSnapshot {
+        agent_id: String,
+        label: String,
+    },
     /// List the snapshot labels stored for an agent, newest first.
-    ListSnapshots { agent_id: String },
+    ListSnapshots {
+        agent_id: String,
+    },
     /// Delete a snapshot by label (reply reports whether it existed).
-    DeleteSnapshot { agent_id: String, label: String },
+    DeleteSnapshot {
+        agent_id: String,
+        label: String,
+    },
     /// Negotiate the wire-protocol version. Optional opening handshake: a client
     /// announces the protocol version it speaks; the server replies with
     /// [`SyscallReply::Hello`] (its support window + crate version) when the
-    /// client is in range, or [`SyscallReply::Error`] when it is incompatible.
+    /// client is in range, or a version-appropriate error when incompatible.
     /// Allowed before [`Authenticate`](Syscall::Authenticate) so a client can
     /// check compatibility before presenting credentials. Has no side effects.
-    Hello { protocol_version: u32 },
+    Hello {
+        protocol_version: u32,
+    },
     /// Authenticate the connection with the server's shared secret. Required as
     /// the first syscall when the server is configured with a token; a no-op
     /// (always accepted) when it is not.
-    Authenticate { token: String },
+    Authenticate {
+        token: String,
+    },
     /// Load an agent package from a TOML manifest (see `crate::agent_package`):
     /// parse + validate, then create the agent through the full admission path
     /// and seed its memory. Replies with the new agent's id (`AgentCreated`).
     /// Running the package's entry prompt is left to the in-process runner.
-    LoadPackage { manifest_toml: String },
+    LoadPackage {
+        manifest_toml: String,
+    },
     /// Read-only node load/health, for distributed placement. Reports how many
     /// agents this kernel node hosts (total + currently running) so a cluster
     /// client can pick the least-loaded node. No side effects.
@@ -161,6 +241,22 @@ pub enum Syscall {
     /// Read-only; lets an SDK/client scrape metrics over the existing protocol
     /// without an HTTP endpoint. Reply: [`SyscallReply::Metrics`].
     Metrics,
+    /// Capture a timestamped live operations view. Tenant credentials receive
+    /// only their agents and no global counters/services; trusted system
+    /// callers receive the global scheduler/gate snapshot as well.
+    OperatorSnapshot,
+    /// System-scoped service supervisor operations. Tenant credentials cannot
+    /// access these until service ownership is tenant-aware.
+    ListServices,
+    StartService {
+        name: String,
+    },
+    StopService {
+        name: String,
+    },
+    RestartService {
+        name: String,
+    },
 }
 
 /// A short, serializable view of an agent.
@@ -188,6 +284,134 @@ pub struct FactSummary {
     pub category: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GenerationCheckpointSummary {
+    pub id: String,
+    pub agent_id: String,
+    pub version: u32,
+    pub provider_id: String,
+    pub model_id: String,
+    pub created_at: String,
+    pub expires_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OperatorAgentSnapshot {
+    pub id: String,
+    pub name: String,
+    pub state: String,
+    pub priority: u8,
+    pub scheduler_state: String,
+    pub sandbox_active: bool,
+    pub capabilities: Vec<String>,
+    pub namespaces: Vec<u64>,
+    pub checkpoint_count: usize,
+    pub context_pressure: ContextPressureStats,
+    pub latest_usage: Option<crate::context::UsageRecord>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OperatorServiceSnapshot {
+    pub name: String,
+    pub state: String,
+    pub agent_id: Option<String>,
+    pub restart_count: u32,
+    pub last_exit_code: Option<i32>,
+}
+
+/// Timestamped remote operations view. `system_metrics` and `services` are
+/// absent for tenant-bound callers to avoid leaking global population/activity.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OperatorSnapshot {
+    pub captured_at: String,
+    pub consistency: String,
+    pub scope: String,
+    pub kernel_version: String,
+    pub protocol_version: u32,
+    pub agents: Vec<OperatorAgentSnapshot>,
+    pub providers: Vec<ProviderSummary>,
+    pub services: Option<Vec<OperatorServiceSnapshot>>,
+    pub system_metrics: Option<crate::metrics::MetricsSnapshot>,
+    pub global_spend_usd: Option<f64>,
+}
+
+/// Stable, machine-readable error categories on the public wire. New detail
+/// may be added to a category without forcing clients to parse prose.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WireErrorCode {
+    AuthenticationRequired,
+    AuthenticationFailed,
+    AuthorizationDenied,
+    InvalidRequest,
+    InvalidArgument,
+    NotFound,
+    PermissionDenied,
+    QuotaExceeded,
+    SandboxDenied,
+    Conflict,
+    Unavailable,
+    Timeout,
+    Cancelled,
+    IncompatibleVersion,
+    Provider,
+    Lifecycle,
+    Internal,
+}
+
+impl WireErrorCode {
+    fn classify(message: &str) -> (Self, bool) {
+        let message = message.to_ascii_lowercase();
+        if message.contains("incompatible wire-protocol") {
+            (Self::IncompatibleVersion, false)
+        } else if message.contains("authentication required") {
+            (Self::AuthenticationRequired, false)
+        } else if message.contains("authentication failed") {
+            (Self::AuthenticationFailed, false)
+        } else if message.contains("authorization denied") {
+            (Self::AuthorizationDenied, false)
+        } else if message.contains("bad request") {
+            (Self::InvalidRequest, false)
+        } else if message.contains("invalid agent id") || message.contains("invalid ") {
+            (Self::InvalidArgument, false)
+        } else if message.contains("sandbox") {
+            (Self::SandboxDenied, false)
+        } else if message.contains("quota")
+            || message.contains("budget")
+            || message.contains("rate limit")
+            || message.contains("queue is full")
+            || message.contains("admission")
+        {
+            (Self::QuotaExceeded, true)
+        } else if message.contains("timeout") || message.contains("timed out") {
+            (Self::Timeout, true)
+        } else if message.contains("cancel") {
+            (Self::Cancelled, false)
+        } else if message.contains("provider") || message.contains("connector") {
+            (Self::Provider, true)
+        } else if message.contains("not found") || message.contains("unknown agent") {
+            (Self::NotFound, false)
+        } else if message.contains("permission") || message.contains("denied") {
+            (Self::PermissionDenied, false)
+        } else if message.contains("transition")
+            || message.contains("paused")
+            || message.contains("stopped")
+        {
+            (Self::Lifecycle, false)
+        } else if message.contains("busy")
+            || message.contains("conflict")
+            || message.contains("already")
+            || message.contains("claimed")
+        {
+            (Self::Conflict, true)
+        } else if message.contains("unavailable") || message.contains("not registered") {
+            (Self::Unavailable, true)
+        } else {
+            (Self::Internal, false)
+        }
+    }
+}
+
 /// The kernel's reply to a [`Syscall`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
@@ -197,6 +421,24 @@ pub enum SyscallReply {
     },
     Agents {
         agents: Vec<AgentSummary>,
+    },
+    /// Lifecycle state returned by pause/resume/stop/kill/status/wait.
+    AgentStatus {
+        state: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        checkpoint_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        resumed_content: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        resumed_tool_calls: Option<usize>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        resumed_tokens: Option<u32>,
+    },
+    GenerationCheckpoints {
+        checkpoints: Vec<GenerationCheckpointSummary>,
+    },
+    GenerationCheckpointDeleted {
+        existed: bool,
     },
     Message {
         content: String,
@@ -244,6 +486,10 @@ pub enum SyscallReply {
     StorageKeys {
         keys: Vec<String>,
     },
+    /// Non-sensitive context-pressure counters for one tenant-scoped agent.
+    ContextPressure {
+        stats: ContextPressureStats,
+    },
     /// Whether the deleted key existed (reply to [`Syscall::StorageDelete`]).
     StorageDeleted {
         existed: bool,
@@ -280,6 +526,16 @@ pub enum SyscallReply {
     NodeInfo {
         agent_count: usize,
         running_agents: usize,
+        live_agents: usize,
+        queued_agents: usize,
+        paused_agents: usize,
+        stopped_agents: usize,
+        active_turns: usize,
+        waiting_turns: usize,
+        turn_capacity: usize,
+        llm_requests_in_flight: usize,
+        llm_requests_waiting: usize,
+        llm_core_capacity: usize,
     },
     /// The kernel's operational metrics (reply to [`Syscall::Metrics`]). Carries
     /// the rendered Prometheus text exposition plus a couple of the headline
@@ -292,10 +548,255 @@ pub enum SyscallReply {
         /// System-wide tokens consumed (also present in `prometheus`).
         tokens_consumed: u64,
     },
+    OperatorSnapshot {
+        snapshot: Box<OperatorSnapshot>,
+    },
+    Services {
+        services: Vec<crate::init_system::ServiceRuntimeInfo>,
+    },
+    Service {
+        service: crate::init_system::ServiceRuntimeInfo,
+    },
     /// Any error is surfaced to the caller rather than dropping the connection.
     Error {
         message: String,
     },
+    /// Public wire error with a stable category and retry hint. The legacy
+    /// `Error` variant remains an internal/compatibility representation and is
+    /// converted to this form before a server reply is serialized.
+    TypedError {
+        code: WireErrorCode,
+        message: String,
+        retryable: bool,
+    },
+}
+
+impl SyscallReply {
+    fn into_public_wire(self, negotiated_version: u32) -> Self {
+        match self {
+            Self::Error { message } if negotiated_version >= 2 => {
+                let (code, retryable) = WireErrorCode::classify(&message);
+                Self::TypedError {
+                    code,
+                    message,
+                    retryable,
+                }
+            }
+            reply => reply,
+        }
+    }
+}
+
+const AUTHORIZATION_DENIED: &str = "resource not found or access denied";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AccessLevel {
+    ReadOnly,
+    User,
+    Admin,
+    /// Trusted local/open-server or shared-secret operator only. Tenant-bound
+    /// principals cannot read global counters until tenant-scoped equivalents
+    /// exist, even when their role is Admin.
+    System,
+}
+
+fn role_allows(role: Role, required: AccessLevel) -> bool {
+    match required {
+        AccessLevel::ReadOnly => true,
+        AccessLevel::User => matches!(role, Role::User | Role::Admin),
+        AccessLevel::Admin => matches!(role, Role::Admin),
+        AccessLevel::System => false,
+    }
+}
+
+fn syscall_policy(call: &Syscall) -> (AccessLevel, &'static str, Option<&str>) {
+    match call {
+        Syscall::CreateAgent { .. } => (AccessLevel::User, "agent.create", None),
+        Syscall::ListAgents => (AccessLevel::ReadOnly, "agent.list", None),
+        Syscall::PauseAgent { agent_id } => (AccessLevel::User, "agent.pause", Some(agent_id)),
+        Syscall::ResumeAgent { agent_id } => (AccessLevel::User, "agent.resume", Some(agent_id)),
+        Syscall::StopAgent { agent_id } => (AccessLevel::User, "agent.stop", Some(agent_id)),
+        Syscall::KillAgent { agent_id } => (AccessLevel::Admin, "agent.kill", Some(agent_id)),
+        Syscall::GetAgentStatus { agent_id } => {
+            (AccessLevel::ReadOnly, "agent.status", Some(agent_id))
+        }
+        Syscall::WaitAgent { agent_id, .. } => {
+            (AccessLevel::ReadOnly, "agent.wait", Some(agent_id))
+        }
+        Syscall::ListGenerationCheckpoints { agent_id } => {
+            (AccessLevel::ReadOnly, "checkpoint.list", Some(agent_id))
+        }
+        Syscall::ResumeGenerationCheckpoint { agent_id, .. } => {
+            (AccessLevel::User, "checkpoint.resume", Some(agent_id))
+        }
+        Syscall::DeleteGenerationCheckpoint { agent_id, .. } => {
+            (AccessLevel::User, "checkpoint.delete", Some(agent_id))
+        }
+        Syscall::SendMessage { agent_id, .. } => {
+            (AccessLevel::User, "agent.send_message", Some(agent_id))
+        }
+        Syscall::CallTool { agent_id, .. } => {
+            (AccessLevel::User, "agent.call_tool", Some(agent_id))
+        }
+        Syscall::GateStats => (AccessLevel::System, "system.gate_stats", None),
+        Syscall::AgentInfo { agent_id } => (AccessLevel::ReadOnly, "agent.info", Some(agent_id)),
+        Syscall::ListProviders => (AccessLevel::ReadOnly, "provider.list", None),
+        Syscall::MemoryStore { agent_id, .. } => {
+            (AccessLevel::User, "memory.store", Some(agent_id))
+        }
+        Syscall::MemoryQuery { agent_id, .. } => {
+            (AccessLevel::ReadOnly, "memory.query", Some(agent_id))
+        }
+        Syscall::StoragePut { agent_id, .. } => (AccessLevel::User, "storage.put", Some(agent_id)),
+        Syscall::StorageGet { agent_id, .. } => {
+            (AccessLevel::ReadOnly, "storage.get", Some(agent_id))
+        }
+        Syscall::StorageList { agent_id } => {
+            (AccessLevel::ReadOnly, "storage.list", Some(agent_id))
+        }
+        Syscall::ContextPressure { agent_id } => {
+            (AccessLevel::ReadOnly, "context.pressure", Some(agent_id))
+        }
+        Syscall::StorageDelete { agent_id, .. } => {
+            (AccessLevel::User, "storage.delete", Some(agent_id))
+        }
+        Syscall::SnapshotContext { agent_id, .. } => {
+            (AccessLevel::User, "snapshot.create", Some(agent_id))
+        }
+        Syscall::RestoreSnapshot { agent_id, .. } => {
+            (AccessLevel::User, "snapshot.restore", Some(agent_id))
+        }
+        Syscall::ListSnapshots { agent_id } => {
+            (AccessLevel::ReadOnly, "snapshot.list", Some(agent_id))
+        }
+        Syscall::DeleteSnapshot { agent_id, .. } => {
+            (AccessLevel::User, "snapshot.delete", Some(agent_id))
+        }
+        Syscall::Hello { .. } => (AccessLevel::ReadOnly, "protocol.hello", None),
+        Syscall::Authenticate { .. } => (AccessLevel::ReadOnly, "auth.authenticate", None),
+        Syscall::LoadPackage { .. } => (AccessLevel::Admin, "package.load", None),
+        Syscall::NodeInfo => (AccessLevel::System, "system.node_info", None),
+        Syscall::Metrics => (AccessLevel::System, "system.metrics", None),
+        Syscall::OperatorSnapshot => (AccessLevel::ReadOnly, "operator.snapshot", None),
+        Syscall::ListServices => (AccessLevel::System, "service.list", None),
+        Syscall::StartService { .. } => (AccessLevel::System, "service.start", None),
+        Syscall::StopService { .. } => (AccessLevel::System, "service.stop", None),
+        Syscall::RestartService { .. } => (AccessLevel::System, "service.restart", None),
+    }
+}
+
+fn authorization_error() -> SyscallReply {
+    SyscallReply::Error {
+        message: AUTHORIZATION_DENIED.to_string(),
+    }
+}
+
+fn audit_authorization_denial(
+    kernel: &AgentKernelImpl,
+    principal: &Principal,
+    action: &str,
+    agent_id: Option<uuid::Uuid>,
+    reason: &str,
+) {
+    let resource = agent_id
+        .map(|id| format!("agent:{id}"))
+        .unwrap_or_else(|| "system".to_string());
+    tracing::warn!(
+        target: "agentos::authorization",
+        user_id = %principal.user_id,
+        tenant_id = %principal.tenant_id,
+        role = principal.role.as_str(),
+        action,
+        resource,
+        reason,
+        "authorization denied"
+    );
+    if let Some(agent_id) = agent_id {
+        kernel.observability.log_action(
+            agent_id,
+            AgentAction {
+                id: uuid::Uuid::new_v4(),
+                action_type: "authorization_deny".into(),
+                description: format!(
+                    "Denied {action} for user {} in tenant {} ({reason})",
+                    principal.user_id, principal.tenant_id
+                ),
+                resources_accessed: vec![resource],
+                reasoning: None,
+                plan_context: None,
+                timestamp: chrono::Utc::now(),
+            },
+        );
+    }
+}
+
+async fn authorize(
+    kernel: &AgentKernelImpl,
+    principal: Option<&Principal>,
+    call: &Syscall,
+) -> Result<(), SyscallReply> {
+    // Open and shared-secret connections are explicit trusted-system callers.
+    // Tenant credentials always take the fail-closed path below.
+    let Some(principal) = principal else {
+        return Ok(());
+    };
+    let (required, action, target) = syscall_policy(call);
+    let target_id = target.and_then(|value| uuid::Uuid::parse_str(value).ok());
+
+    if !role_allows(principal.role, required) {
+        audit_authorization_denial(kernel, principal, action, target_id, "insufficient role");
+        return Err(authorization_error());
+    }
+
+    if let Some(target) = target {
+        let Ok(agent_id) = uuid::Uuid::parse_str(target) else {
+            audit_authorization_denial(kernel, principal, action, None, "invalid resource id");
+            return Err(authorization_error());
+        };
+        let owned = matches!(
+            kernel.context_manager.agent_tenant(agent_id),
+            Ok(Some(ref tenant_id)) if tenant_id == &principal.tenant_id
+        );
+        if !owned {
+            audit_authorization_denial(
+                kernel,
+                principal,
+                action,
+                Some(agent_id),
+                "resource is absent or belongs to another tenant",
+            );
+            return Err(authorization_error());
+        }
+    }
+
+    Ok(())
+}
+
+async fn dispatch_lifecycle<F, Fut>(agent_id: String, action: F) -> SyscallReply
+where
+    F: FnOnce(uuid::Uuid) -> Fut,
+    Fut: std::future::Future<Output = Result<crate::AgentState, crate::KernelError>>,
+{
+    let id = match uuid::Uuid::parse_str(&agent_id) {
+        Ok(id) => id,
+        Err(_) => {
+            return SyscallReply::Error {
+                message: format!("invalid agent id: {agent_id}"),
+            }
+        }
+    };
+    match action(id).await {
+        Ok(state) => SyscallReply::AgentStatus {
+            state: format!("{state:?}"),
+            checkpoint_id: None,
+            resumed_content: None,
+            resumed_tool_calls: None,
+            resumed_tokens: None,
+        },
+        Err(error) => SyscallReply::Error {
+            message: error.to_string(),
+        },
+    }
 }
 
 /// Dispatch a single syscall against the kernel. Pure routing — every call goes
@@ -309,16 +810,18 @@ pub async fn dispatch(kernel: &AgentKernelImpl, call: Syscall) -> SyscallReply {
     dispatch_scoped(kernel, call, None).await
 }
 
-/// Dispatch a syscall on behalf of an optional bound `tenant`. When a tenant is
-/// bound (the connection authenticated with an API key / session token),
-/// agent-creating and agent-listing syscalls are scoped to that tenant: created
-/// agents land in the tenant's namespace + cgroup, and listings only show the
-/// tenant's own agents. With `None` the behavior is the prior un-tenanted one.
+/// Dispatch a syscall on behalf of an optional authenticated principal. A
+/// tenant principal is centrally authorized before operation-specific routing;
+/// trusted open/shared-secret connections use `None` as the system caller.
 pub async fn dispatch_scoped(
     kernel: &AgentKernelImpl,
     call: Syscall,
-    tenant: Option<&str>,
+    principal: Option<&Principal>,
 ) -> SyscallReply {
+    if let Err(reply) = authorize(kernel, principal, &call).await {
+        return reply;
+    }
+    let tenant = principal.map(|principal| principal.tenant_id.as_str());
     match call {
         Syscall::CreateAgent {
             name,
@@ -378,6 +881,186 @@ pub async fn dispatch_scoped(
                 .collect();
             SyscallReply::Agents { agents }
         }
+        Syscall::PauseAgent { agent_id } => match uuid::Uuid::parse_str(&agent_id) {
+            Ok(id) => match kernel.pause_agent(id).await {
+                Ok(state) => match kernel.latest_generation_checkpoint(id) {
+                    Ok(checkpoint) => SyscallReply::AgentStatus {
+                        state: format!("{state:?}"),
+                        checkpoint_id: checkpoint.map(|checkpoint| checkpoint.id.to_string()),
+                        resumed_content: None,
+                        resumed_tool_calls: None,
+                        resumed_tokens: None,
+                    },
+                    Err(error) => SyscallReply::Error {
+                        message: error.to_string(),
+                    },
+                },
+                Err(error) => SyscallReply::Error {
+                    message: error.to_string(),
+                },
+            },
+            Err(_) => SyscallReply::Error {
+                message: format!("invalid agent id: {agent_id}"),
+            },
+        },
+        Syscall::ResumeAgent { agent_id } => match uuid::Uuid::parse_str(&agent_id) {
+            Ok(id) => match kernel.resume_agent_from_checkpoint(id, None).await {
+                Ok((state, output, checkpoint_id)) => SyscallReply::AgentStatus {
+                    state: format!("{state:?}"),
+                    checkpoint_id: checkpoint_id.map(|id| id.to_string()),
+                    resumed_content: output.as_ref().map(|output| output.content.clone()),
+                    resumed_tool_calls: output.as_ref().map(|output| output.tool_calls_made),
+                    resumed_tokens: output.as_ref().map(|output| output.tokens_used),
+                },
+                Err(error) => SyscallReply::Error {
+                    message: error.to_string(),
+                },
+            },
+            Err(_) => SyscallReply::Error {
+                message: format!("invalid agent id: {agent_id}"),
+            },
+        },
+        Syscall::StopAgent { agent_id } => {
+            dispatch_lifecycle(agent_id, |id| kernel.stop_agent(id)).await
+        }
+        Syscall::KillAgent { agent_id } => {
+            dispatch_lifecycle(agent_id, |id| kernel.kill_agent(id)).await
+        }
+        Syscall::GetAgentStatus { agent_id } => match uuid::Uuid::parse_str(&agent_id) {
+            Ok(id) => match kernel.get_agent_status(id) {
+                Ok(state) => SyscallReply::AgentStatus {
+                    state: format!("{state:?}"),
+                    checkpoint_id: None,
+                    resumed_content: None,
+                    resumed_tool_calls: None,
+                    resumed_tokens: None,
+                },
+                Err(error) => SyscallReply::Error {
+                    message: error.to_string(),
+                },
+            },
+            Err(_) => SyscallReply::Error {
+                message: format!("invalid agent id: {agent_id}"),
+            },
+        },
+        Syscall::WaitAgent {
+            agent_id,
+            timeout_ms,
+        } => match uuid::Uuid::parse_str(&agent_id) {
+            Ok(id) => match kernel
+                .wait_agent(id, std::time::Duration::from_millis(timeout_ms))
+                .await
+            {
+                Ok(state) => SyscallReply::AgentStatus {
+                    state: format!("{state:?}"),
+                    checkpoint_id: None,
+                    resumed_content: None,
+                    resumed_tool_calls: None,
+                    resumed_tokens: None,
+                },
+                Err(error) => SyscallReply::Error {
+                    message: error.to_string(),
+                },
+            },
+            Err(_) => SyscallReply::Error {
+                message: format!("invalid agent id: {agent_id}"),
+            },
+        },
+        Syscall::ListGenerationCheckpoints { agent_id } => {
+            let id = match uuid::Uuid::parse_str(&agent_id) {
+                Ok(id) => id,
+                Err(_) => {
+                    return SyscallReply::Error {
+                        message: format!("invalid agent id: {agent_id}"),
+                    }
+                }
+            };
+            let tenant = match kernel.context_manager.agent_tenant(id) {
+                Ok(Some(tenant)) => tenant,
+                Ok(None) => return authorization_error(),
+                Err(error) => {
+                    return SyscallReply::Error {
+                        message: error.to_string(),
+                    }
+                }
+            };
+            match kernel
+                .context_manager
+                .list_generation_checkpoints(&tenant, Some(id))
+            {
+                Ok(checkpoints) => SyscallReply::GenerationCheckpoints {
+                    checkpoints: checkpoints
+                        .into_iter()
+                        .map(|checkpoint| GenerationCheckpointSummary {
+                            id: checkpoint.id.to_string(),
+                            agent_id: checkpoint.agent_id.to_string(),
+                            version: checkpoint.version,
+                            provider_id: checkpoint.provider_id,
+                            model_id: checkpoint.model_id,
+                            created_at: checkpoint.created_at.to_rfc3339(),
+                            expires_at: checkpoint.expires_at.to_rfc3339(),
+                        })
+                        .collect(),
+                },
+                Err(error) => SyscallReply::Error {
+                    message: error.to_string(),
+                },
+            }
+        }
+        Syscall::ResumeGenerationCheckpoint {
+            agent_id,
+            checkpoint_id,
+        } => {
+            let parsed = uuid::Uuid::parse_str(&agent_id).and_then(|agent| {
+                uuid::Uuid::parse_str(&checkpoint_id).map(|checkpoint| (agent, checkpoint))
+            });
+            match parsed {
+                Ok((agent, checkpoint)) => match kernel
+                    .resume_agent_from_checkpoint(agent, Some(checkpoint))
+                    .await
+                {
+                    Ok((state, output, next_checkpoint)) => SyscallReply::AgentStatus {
+                        state: format!("{state:?}"),
+                        checkpoint_id: next_checkpoint.map(|id| id.to_string()),
+                        resumed_content: output.as_ref().map(|output| output.content.clone()),
+                        resumed_tool_calls: output.as_ref().map(|output| output.tool_calls_made),
+                        resumed_tokens: output.as_ref().map(|output| output.tokens_used),
+                    },
+                    Err(error) => SyscallReply::Error {
+                        message: error.to_string(),
+                    },
+                },
+                Err(_) => SyscallReply::Error {
+                    message: "invalid agent or checkpoint id".into(),
+                },
+            }
+        }
+        Syscall::DeleteGenerationCheckpoint {
+            agent_id,
+            checkpoint_id,
+        } => {
+            let id = match uuid::Uuid::parse_str(&agent_id) {
+                Ok(id) => id,
+                Err(_) => return authorization_error(),
+            };
+            let checkpoint = match uuid::Uuid::parse_str(&checkpoint_id) {
+                Ok(id) => id,
+                Err(_) => return authorization_error(),
+            };
+            let tenant = match kernel.context_manager.agent_tenant(id) {
+                Ok(Some(tenant)) => tenant,
+                _ => return authorization_error(),
+            };
+            match kernel
+                .context_manager
+                .delete_generation_checkpoint(checkpoint, &tenant)
+            {
+                Ok(existed) => SyscallReply::GenerationCheckpointDeleted { existed },
+                Err(error) => SyscallReply::Error {
+                    message: error.to_string(),
+                },
+            }
+        }
         Syscall::SendMessage { agent_id, message } => match uuid::Uuid::parse_str(&agent_id) {
             Ok(id) => match kernel.send_message(id, &message).await {
                 Ok(out) => SyscallReply::Message {
@@ -406,29 +1089,38 @@ pub async fn dispatch_scoped(
                     }
                 }
             };
-            // Token estimate + representative resource, mirroring the executor's
-            // tool path so gate accounting/MAC matching are consistent.
+            // Token estimate plus the registry's declared resource extractor,
+            // shared with executor/MCP so policy cannot drift by entry point.
             let est_tokens = (args.to_string().len() as u64 / 4)
                 .saturating_add(tool.len() as u64 / 4)
                 .saturating_add(10);
-            let resource = args
-                .get("path")
-                .or_else(|| args.get("url"))
-                .or_else(|| args.get("command"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("*")
-                .to_string();
+            let (security, resource) = match kernel.tool_registry.security_context(&tool, &args) {
+                Ok(context) => context,
+                Err(error) => {
+                    return SyscallReply::Error {
+                        message: format!("tool '{tool}' denied by kernel: {error}"),
+                    }
+                }
+            };
 
             // Enforcement first — a denial never reaches the broker.
             if let Err(denial) = kernel
                 .syscall_gate
-                .check_tool_call(id, &tool, &resource, est_tokens)
+                .check_tool_call_declared(id, &tool, &resource, est_tokens, &security)
                 .await
             {
                 return SyscallReply::Error {
                     message: format!("tool '{tool}' denied by kernel: {}", denial.message()),
                 };
             }
+            let _tool_slot = match kernel.syscall_gate.acquire_tool_call(id) {
+                Ok(slot) => slot,
+                Err(denial) => {
+                    return SyscallReply::Error {
+                        message: format!("tool '{tool}' denied by kernel: {}", denial.message()),
+                    }
+                }
+            };
 
             let call = ToolCall {
                 id: "syscall".into(),
@@ -452,7 +1144,6 @@ pub async fn dispatch_scoped(
                     message: format!("unknown tool '{tool}'"),
                 },
             };
-            kernel.syscall_gate.record_tool_usage(id, est_tokens);
             reply
         }
         Syscall::GateStats => {
@@ -608,6 +1299,22 @@ pub async fn dispatch_scoped(
                 },
             }
         }
+        Syscall::ContextPressure { agent_id } => {
+            let id = match uuid::Uuid::parse_str(&agent_id) {
+                Ok(id) => id,
+                Err(_) => {
+                    return SyscallReply::Error {
+                        message: format!("invalid agent id: {agent_id}"),
+                    }
+                }
+            };
+            match kernel.context_manager.context_pressure_stats(id) {
+                Ok(stats) => SyscallReply::ContextPressure { stats },
+                Err(error) => SyscallReply::Error {
+                    message: format!("context pressure inspection failed: {error}"),
+                },
+            }
+        }
         Syscall::StorageDelete { agent_id, key } => {
             let id = match uuid::Uuid::parse_str(&agent_id) {
                 Ok(id) => id,
@@ -703,28 +1410,45 @@ pub async fn dispatch_scoped(
         },
         Syscall::LoadPackage { manifest_toml } => {
             match crate::agent_package::AgentManifest::from_toml_str(&manifest_toml) {
-                Ok(manifest) => match crate::agent_package::load_package(kernel, &manifest).await {
-                    Ok(handle) => SyscallReply::AgentCreated {
-                        id: handle.id.to_string(),
-                    },
-                    Err(e) => SyscallReply::Error {
-                        message: format!("load package failed: {e}"),
-                    },
-                },
+                Ok(manifest) => {
+                    let loaded = match tenant {
+                        Some(tenant_id) => {
+                            crate::agent_package::load_package_for_tenant(
+                                kernel, tenant_id, &manifest,
+                            )
+                            .await
+                        }
+                        None => crate::agent_package::load_package(kernel, &manifest).await,
+                    };
+                    match loaded {
+                        Ok(handle) => SyscallReply::AgentCreated {
+                            id: handle.id.to_string(),
+                        },
+                        Err(e) => SyscallReply::Error {
+                            message: format!("load package failed: {e}"),
+                        },
+                    }
+                }
                 Err(e) => SyscallReply::Error {
                     message: format!("invalid package: {e}"),
                 },
             }
         }
         Syscall::NodeInfo => {
-            let agents = kernel.agent_manager.list_agents(None);
-            let running = agents
-                .iter()
-                .filter(|a| matches!(a.state, crate::AgentState::Running))
-                .count();
+            let snapshot = crate::metrics::MetricsSnapshot::collect(kernel);
             SyscallReply::NodeInfo {
-                agent_count: agents.len(),
-                running_agents: running,
+                agent_count: snapshot.agent_count as usize,
+                running_agents: snapshot.running_agents as usize,
+                live_agents: snapshot.live_agents as usize,
+                queued_agents: snapshot.queued_agents as usize,
+                paused_agents: snapshot.paused_agents as usize,
+                stopped_agents: snapshot.stopped_agents as usize,
+                active_turns: snapshot.active_turns as usize,
+                waiting_turns: kernel.turn_admission.waiting(),
+                turn_capacity: snapshot.turn_capacity as usize,
+                llm_requests_in_flight: snapshot.llm_requests_in_flight as usize,
+                llm_requests_waiting: snapshot.llm_requests_waiting as usize,
+                llm_core_capacity: snapshot.llm_core_capacity as usize,
             }
         }
         Syscall::Metrics => {
@@ -735,6 +1459,190 @@ pub async fn dispatch_scoped(
                 tokens_consumed: snap.tokens_consumed,
             }
         }
+        Syscall::OperatorSnapshot => {
+            let allowed_ids: Option<std::collections::HashSet<uuid::Uuid>> = tenant.map(|tenant| {
+                kernel
+                    .context_manager
+                    .list_agents_for_tenant(tenant)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .collect()
+            });
+            let mut agents = Vec::new();
+            for agent in kernel
+                .agent_manager
+                .list_agents(None)
+                .into_iter()
+                .filter(|agent| {
+                    allowed_ids
+                        .as_ref()
+                        .is_none_or(|allowed| allowed.contains(&agent.id))
+                })
+            {
+                let gate = kernel.syscall_gate.agent_info(agent.id);
+                let checkpoint_count = kernel
+                    .context_manager
+                    .agent_tenant(agent.id)
+                    .ok()
+                    .flatten()
+                    .and_then(|tenant| {
+                        kernel
+                            .context_manager
+                            .list_generation_checkpoints(&tenant, Some(agent.id))
+                            .ok()
+                    })
+                    .map_or(0, |checkpoints| checkpoints.len());
+                let context_pressure = kernel
+                    .context_manager
+                    .context_pressure_stats(agent.id)
+                    .unwrap_or_else(|_| ContextPressureStats {
+                        agent_id: agent.id,
+                        active_tokens: 0,
+                        budget_tokens: 0,
+                        spill_count: 0,
+                        evicted_messages: 0,
+                        stored_spills: 0,
+                        stored_spill_bytes: 0,
+                        error_count: 0,
+                        last_error: Some("pressure statistics unavailable".into()),
+                        updated_at: chrono::Utc::now(),
+                    });
+                agents.push(OperatorAgentSnapshot {
+                    id: agent.id.to_string(),
+                    name: agent.name,
+                    state: format!("{:?}", agent.state),
+                    priority: agent.priority.value(),
+                    scheduler_state: kernel
+                        .scheduler
+                        .schedule_state(agent.id)
+                        .unwrap_or("stopped")
+                        .to_string(),
+                    sandbox_active: crate::sandbox::SandboxManager::get_sandbox_for_agent(
+                        kernel.sandbox_manager.as_ref(),
+                        agent.id,
+                    )
+                    .is_some(),
+                    capabilities: gate
+                        .as_ref()
+                        .map(|info| info.capabilities.clone())
+                        .unwrap_or_default(),
+                    namespaces: gate
+                        .as_ref()
+                        .map(|info| info.namespaces.clone())
+                        .unwrap_or_default(),
+                    checkpoint_count,
+                    context_pressure,
+                    latest_usage: kernel.context_manager.latest_usage(agent.id),
+                });
+            }
+            agents.sort_by(|a, b| a.id.cmp(&b.id));
+
+            let providers = kernel
+                .connector
+                .probe_providers()
+                .await
+                .into_iter()
+                .map(|provider| ProviderSummary {
+                    id: provider.id,
+                    name: provider.name,
+                    provider_type: format!("{:?}", provider.provider_type),
+                    available: provider.available,
+                })
+                .collect();
+            let trusted_system = principal.is_none();
+            let services = if trusted_system {
+                let mut services = kernel
+                    .os
+                    .init
+                    .lock()
+                    .await
+                    .list_runtime()
+                    .into_iter()
+                    .map(|service| OperatorServiceSnapshot {
+                        name: service.name,
+                        state: format!("{:?}", service.status),
+                        agent_id: service.agent_id.map(|id| id.to_string()),
+                        restart_count: service.restart_count,
+                        last_exit_code: service.last_exit_code,
+                    })
+                    .collect::<Vec<_>>();
+                services.sort_by(|a, b| a.name.cmp(&b.name));
+                Some(services)
+            } else {
+                None
+            };
+            SyscallReply::OperatorSnapshot {
+                snapshot: Box::new(OperatorSnapshot {
+                    captured_at: chrono::Utc::now().to_rfc3339(),
+                    consistency:
+                        "single collection pass; subsystem counters may advance during sampling"
+                            .into(),
+                    scope: tenant
+                        .map(|tenant| format!("tenant:{tenant}"))
+                        .unwrap_or_else(|| "system".into()),
+                    kernel_version: env!("CARGO_PKG_VERSION").into(),
+                    protocol_version: PROTOCOL_VERSION,
+                    agents,
+                    providers,
+                    services,
+                    system_metrics: trusted_system
+                        .then(|| crate::metrics::MetricsSnapshot::collect(kernel)),
+                    global_spend_usd: trusted_system
+                        .then(|| kernel.budget_enforcer.current_spend()),
+                }),
+            }
+        }
+        Syscall::ListServices => SyscallReply::Services {
+            services: kernel.list_services().await,
+        },
+        Syscall::StartService { name } => match kernel.start_service(&name).await {
+            Ok(_) => match kernel
+                .list_services()
+                .await
+                .into_iter()
+                .find(|service| service.name == name)
+            {
+                Some(service) => SyscallReply::Service { service },
+                None => SyscallReply::Error {
+                    message: format!("service '{name}' disappeared after start"),
+                },
+            },
+            Err(error) => SyscallReply::Error {
+                message: error.to_string(),
+            },
+        },
+        Syscall::StopService { name } => match kernel.stop_service(&name).await {
+            Ok(()) => match kernel
+                .list_services()
+                .await
+                .into_iter()
+                .find(|service| service.name == name)
+            {
+                Some(service) => SyscallReply::Service { service },
+                None => SyscallReply::Error {
+                    message: format!("service '{name}' disappeared after stop"),
+                },
+            },
+            Err(error) => SyscallReply::Error {
+                message: error.to_string(),
+            },
+        },
+        Syscall::RestartService { name } => match kernel.restart_service(&name).await {
+            Ok(_) => match kernel
+                .list_services()
+                .await
+                .into_iter()
+                .find(|service| service.name == name)
+            {
+                Some(service) => SyscallReply::Service { service },
+                None => SyscallReply::Error {
+                    message: format!("service '{name}' disappeared after restart"),
+                },
+            },
+            Err(error) => SyscallReply::Error {
+                message: error.to_string(),
+            },
+        },
     }
 }
 
@@ -940,10 +1848,12 @@ impl SyscallServer {
         let mut lines = BufReader::new(read).lines();
         // No shared-secret token configured ⇒ authenticated from the start.
         let mut authed = auth.is_none();
-        // The tenant this connection is bound to, once it authenticates with an
-        // API key / session token. `None` = un-tenanted (shared-secret or open
-        // connection): syscalls run with the prior, un-scoped behavior.
-        let mut tenant: Option<String> = None;
+        // A client that skips Hello receives the released v1 response shape.
+        // Negotiation upgrades only this connection, preserving old clients.
+        let mut negotiated_version = MIN_PROTOCOL_VERSION;
+        // The presented tenant credential is retained and re-resolved before
+        // every syscall so revocation takes effect without a reconnect window.
+        let mut credential: Option<String> = None;
         while let Some(line) = lines.next_line().await? {
             if line.trim().is_empty() {
                 continue;
@@ -951,9 +1861,10 @@ impl SyscallServer {
             let reply = match serde_json::from_str::<Syscall>(&line) {
                 // Protocol negotiation. Allowed before auth so a client can
                 // confirm compatibility before presenting credentials; has no
-                // side effects and never changes `authed`/`tenant`.
+                // side effects and never changes authentication state.
                 Ok(Syscall::Hello { protocol_version }) => {
                     if (MIN_PROTOCOL_VERSION..=PROTOCOL_VERSION).contains(&protocol_version) {
+                        negotiated_version = protocol_version;
                         SyscallReply::Hello {
                             protocol_version: PROTOCOL_VERSION,
                             min_protocol_version: MIN_PROTOCOL_VERSION,
@@ -975,19 +1886,24 @@ impl SyscallServer {
                 Ok(Syscall::Authenticate { token }) => {
                     // An AuthSystem credential always wins first so that the
                     // connection binds to its tenant — even on an open server.
-                    if let Some(principal) = kernel.resolve_principal(&token).await {
+                    if kernel.resolve_principal(&token).await.is_some() {
                         authed = true;
-                        tenant = Some(principal.tenant_id);
+                        credential = Some(token);
                         SyscallReply::Authenticated
                     } else {
                         // Otherwise fall back to the legacy shared-secret check
                         // (or accept outright when no secret is configured).
                         let shared_ok = match &auth {
                             Some(expected) => token == **expected,
-                            None => true,
+                            // An open server is already a trusted-system mode;
+                            // presenting an unknown credential must never turn
+                            // it into a new system credential or let a revoked
+                            // tenant token escape back to unscoped authority.
+                            None => false,
                         };
                         if shared_ok {
                             authed = true;
+                            credential = None;
                             SyscallReply::Authenticated
                         } else {
                             SyscallReply::Error {
@@ -999,11 +1915,30 @@ impl SyscallServer {
                 Ok(_) if !authed => SyscallReply::Error {
                     message: "authentication required".into(),
                 },
-                Ok(call) => dispatch_scoped(&kernel, call, tenant.as_deref()).await,
+                Ok(call) => {
+                    // Re-resolve tenant credentials for every request. Revoked,
+                    // expired, deleted, or role-changed credentials never keep
+                    // the authority captured at login time.
+                    if let Some(token) = credential.as_deref() {
+                        match kernel.resolve_principal(token).await {
+                            Some(resolved) => dispatch_scoped(&kernel, call, Some(&resolved)).await,
+                            None => {
+                                authed = false;
+                                credential = None;
+                                SyscallReply::Error {
+                                    message: "authentication required".into(),
+                                }
+                            }
+                        }
+                    } else {
+                        dispatch_scoped(&kernel, call, None).await
+                    }
+                }
                 Err(e) => SyscallReply::Error {
                     message: format!("bad request: {e}"),
                 },
             };
+            let reply = reply.into_public_wire(negotiated_version);
             let mut buf = serde_json::to_vec(&reply).unwrap_or_else(|_| {
                 br#"{"status":"error","message":"serialization failed"}"#.to_vec()
             });
@@ -1099,6 +2034,54 @@ impl SyscallClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn v1_error_fixture_and_v2_typed_error_are_both_served() {
+        let kernel = Arc::new(AgentKernelImpl::new().expect("kernel new"));
+        let server = SyscallServer::bind(kernel, "127.0.0.1:0").await.unwrap();
+        let addr = server.local_addr().unwrap();
+        tokio::spawn(server.serve());
+
+        let mut v1 = SyscallClient::connect(addr).await.unwrap();
+        assert!(matches!(
+            v1.call(Syscall::Hello {
+                protocol_version: 1
+            })
+            .await
+            .unwrap(),
+            SyscallReply::Hello { .. }
+        ));
+        assert!(matches!(
+            v1.call(Syscall::GetAgentStatus {
+                agent_id: "not-a-uuid".into()
+            })
+            .await
+            .unwrap(),
+            SyscallReply::Error { .. }
+        ));
+
+        let mut v2 = SyscallClient::connect(addr).await.unwrap();
+        assert!(matches!(
+            v2.call(Syscall::Hello {
+                protocol_version: 2
+            })
+            .await
+            .unwrap(),
+            SyscallReply::Hello { .. }
+        ));
+        assert!(matches!(
+            v2.call(Syscall::GetAgentStatus {
+                agent_id: "not-a-uuid".into()
+            })
+            .await
+            .unwrap(),
+            SyscallReply::TypedError {
+                code: WireErrorCode::InvalidArgument,
+                retryable: false,
+                ..
+            }
+        ));
+    }
 
     #[tokio::test]
     async fn roundtrip_create_list_and_gate_stats() {
@@ -1696,8 +2679,12 @@ mod tests {
 
         // A non-Hello, non-Authenticate syscall is still gated until auth.
         match client.call(Syscall::NodeInfo).await.unwrap() {
-            SyscallReply::Error { message } => assert!(message.contains("authentication required")),
-            other => panic!("expected auth-required error, got {other:?}"),
+            SyscallReply::TypedError {
+                code: WireErrorCode::AuthenticationRequired,
+                message,
+                retryable: false,
+            } => assert!(message.contains("authentication required")),
+            other => panic!("expected typed auth-required error, got {other:?}"),
         }
     }
 
@@ -2017,6 +3004,326 @@ memory = ["remember this"]
             client.call(Syscall::ListAgents).await.unwrap(),
             SyscallReply::Agents { .. }
         ));
+    }
+
+    fn assert_authorization_denied(reply: SyscallReply) {
+        match reply {
+            SyscallReply::Error { message } => assert_eq!(message, AUTHORIZATION_DENIED),
+            other => panic!("expected stable authorization denial, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn tenant_authorizer_denies_every_foreign_agent_operation() {
+        let kernel = AgentKernelImpl::new().expect("kernel new");
+        let tenant_a = kernel.create_tenant("a").await.unwrap();
+        let tenant_b = kernel.create_tenant("b").await.unwrap();
+        let user_a = kernel
+            .register_user(&tenant_a, "alice", "alice@a.test", Role::User)
+            .await
+            .unwrap();
+        let principal_a = Principal {
+            user_id: user_a,
+            tenant_id: tenant_a,
+            role: Role::User,
+        };
+        let foreign = kernel
+            .create_agent_for_tenant(
+                &tenant_b,
+                AgentConfig {
+                    name: "foreign".into(),
+                    task: "private".into(),
+                    llm_provider: "stub".into(),
+                    permission_profile: "standard".into(),
+                    priority: Priority::default(),
+                    sandbox_config: None,
+                },
+            )
+            .await
+            .unwrap();
+        let id = foreign.id.to_string();
+
+        let calls = vec![
+            Syscall::SendMessage {
+                agent_id: id.clone(),
+                message: "probe".into(),
+            },
+            Syscall::CallTool {
+                agent_id: id.clone(),
+                tool: "read_file".into(),
+                args: serde_json::json!({"path": "/tmp/x"}),
+            },
+            Syscall::AgentInfo {
+                agent_id: id.clone(),
+            },
+            Syscall::MemoryStore {
+                agent_id: id.clone(),
+                content: "poison".into(),
+                category: None,
+            },
+            Syscall::MemoryQuery {
+                agent_id: id.clone(),
+                query: "private".into(),
+            },
+            Syscall::StoragePut {
+                agent_id: id.clone(),
+                key: "k".into(),
+                value: "v".into(),
+            },
+            Syscall::StorageGet {
+                agent_id: id.clone(),
+                key: "k".into(),
+            },
+            Syscall::StorageList {
+                agent_id: id.clone(),
+            },
+            Syscall::ContextPressure {
+                agent_id: id.clone(),
+            },
+            Syscall::StorageDelete {
+                agent_id: id.clone(),
+                key: "k".into(),
+            },
+            Syscall::SnapshotContext {
+                agent_id: id.clone(),
+                label: "x".into(),
+            },
+            Syscall::RestoreSnapshot {
+                agent_id: id.clone(),
+                label: "x".into(),
+            },
+            Syscall::ListSnapshots {
+                agent_id: id.clone(),
+            },
+            Syscall::DeleteSnapshot {
+                agent_id: id,
+                label: "x".into(),
+            },
+        ];
+
+        for call in calls {
+            assert_authorization_denied(dispatch_scoped(&kernel, call, Some(&principal_a)).await);
+        }
+        assert!(
+            kernel
+                .observability
+                .get_activity_log(foreign.id, None)
+                .iter()
+                .any(|entry| entry.action_type == "authorization_deny"),
+            "foreign-resource denials must be auditable"
+        );
+    }
+
+    #[tokio::test]
+    async fn operator_snapshot_is_live_and_tenant_scoped() {
+        let kernel = AgentKernelImpl::new().expect("kernel new");
+        let tenant_a = kernel.create_tenant("ops-a").await.unwrap();
+        let tenant_b = kernel.create_tenant("ops-b").await.unwrap();
+        let user_a = kernel
+            .register_user(&tenant_a, "operator", "ops@a.test", Role::ReadOnly)
+            .await
+            .unwrap();
+        let principal_a = Principal {
+            user_id: user_a,
+            tenant_id: tenant_a.clone(),
+            role: Role::ReadOnly,
+        };
+        let own = kernel
+            .create_agent_for_tenant(
+                &tenant_a,
+                AgentConfig {
+                    name: "visible".into(),
+                    task: "owned".into(),
+                    llm_provider: "stub".into(),
+                    permission_profile: "standard".into(),
+                    priority: Priority::default(),
+                    sandbox_config: None,
+                },
+            )
+            .await
+            .unwrap();
+        let foreign = kernel
+            .create_agent_for_tenant(
+                &tenant_b,
+                AgentConfig {
+                    name: "secret-foreign-name".into(),
+                    task: "private".into(),
+                    llm_provider: "stub".into(),
+                    permission_profile: "standard".into(),
+                    priority: Priority::default(),
+                    sandbox_config: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        let tenant_snapshot =
+            match dispatch_scoped(&kernel, Syscall::OperatorSnapshot, Some(&principal_a)).await {
+                SyscallReply::OperatorSnapshot { snapshot } => snapshot,
+                other => panic!("expected operator snapshot, got {other:?}"),
+            };
+        assert_eq!(tenant_snapshot.scope, format!("tenant:{tenant_a}"));
+        assert_eq!(tenant_snapshot.agents.len(), 1);
+        assert_eq!(tenant_snapshot.agents[0].id, own.id.to_string());
+        assert!(!tenant_snapshot.agents.iter().any(
+            |agent| agent.id == foreign.id.to_string() || agent.name.contains("secret-foreign")
+        ));
+        assert!(tenant_snapshot.system_metrics.is_none());
+        assert!(tenant_snapshot.services.is_none());
+        assert!(tenant_snapshot.global_spend_usd.is_none());
+
+        kernel.pause_agent(own.id).await.unwrap();
+        let paused =
+            match dispatch_scoped(&kernel, Syscall::OperatorSnapshot, Some(&principal_a)).await {
+                SyscallReply::OperatorSnapshot { snapshot } => snapshot,
+                other => panic!("expected operator snapshot, got {other:?}"),
+            };
+        assert_eq!(paused.agents[0].state, "Paused");
+        assert_eq!(paused.agents[0].scheduler_state, "paused");
+        assert!(paused.agents[0].sandbox_active);
+
+        kernel.kill_agent(own.id).await.unwrap();
+        let stopped =
+            match dispatch_scoped(&kernel, Syscall::OperatorSnapshot, Some(&principal_a)).await {
+                SyscallReply::OperatorSnapshot { snapshot } => snapshot,
+                other => panic!("expected operator snapshot, got {other:?}"),
+            };
+        assert_eq!(stopped.agents[0].state, "Stopped");
+        assert_eq!(stopped.agents[0].scheduler_state, "stopped");
+        assert!(!stopped.agents[0].sandbox_active);
+
+        let system = match dispatch(&kernel, Syscall::OperatorSnapshot).await {
+            SyscallReply::OperatorSnapshot { snapshot } => snapshot,
+            other => panic!("expected system snapshot, got {other:?}"),
+        };
+        assert_eq!(system.agents.len(), 2);
+        assert!(system.system_metrics.is_some());
+        assert!(system.services.is_some());
+    }
+
+    #[tokio::test]
+    async fn rbac_is_fail_closed_and_package_agents_keep_tenant_ownership() {
+        let kernel = AgentKernelImpl::new().expect("kernel new");
+        let tenant = kernel.create_tenant("acme").await.unwrap();
+        let read_only_id = kernel
+            .register_user(&tenant, "reader", "reader@acme.test", Role::ReadOnly)
+            .await
+            .unwrap();
+        let admin_id = kernel
+            .register_user(&tenant, "admin", "admin@acme.test", Role::Admin)
+            .await
+            .unwrap();
+        let read_only = Principal {
+            user_id: read_only_id,
+            tenant_id: tenant.clone(),
+            role: Role::ReadOnly,
+        };
+        let admin = Principal {
+            user_id: admin_id,
+            tenant_id: tenant.clone(),
+            role: Role::Admin,
+        };
+        let agent = kernel
+            .create_agent_for_tenant(
+                &tenant,
+                AgentConfig {
+                    name: "owned".into(),
+                    task: "readable".into(),
+                    llm_provider: "stub".into(),
+                    permission_profile: "standard".into(),
+                    priority: Priority::default(),
+                    sandbox_config: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            dispatch_scoped(
+                &kernel,
+                Syscall::AgentInfo {
+                    agent_id: agent.id.to_string()
+                },
+                Some(&read_only)
+            )
+            .await,
+            SyscallReply::AgentInfo { .. }
+        ));
+        assert_authorization_denied(
+            dispatch_scoped(
+                &kernel,
+                Syscall::StoragePut {
+                    agent_id: agent.id.to_string(),
+                    key: "k".into(),
+                    value: "v".into(),
+                },
+                Some(&read_only),
+            )
+            .await,
+        );
+        assert_authorization_denied(dispatch_scoped(&kernel, Syscall::Metrics, Some(&admin)).await);
+        assert_authorization_denied(
+            dispatch_scoped(&kernel, Syscall::ListServices, Some(&admin)).await,
+        );
+
+        let manifest_toml = r#"
+name = "tenant-package"
+task = "stay scoped"
+provider = "stub"
+profile = "standard"
+"#;
+        let created = dispatch_scoped(
+            &kernel,
+            Syscall::LoadPackage {
+                manifest_toml: manifest_toml.into(),
+            },
+            Some(&admin),
+        )
+        .await;
+        let id = match created {
+            SyscallReply::AgentCreated { id } => uuid::Uuid::parse_str(&id).unwrap(),
+            other => panic!("expected tenant package creation, got {other:?}"),
+        };
+        assert_eq!(
+            kernel.context_manager.agent_tenant(id).unwrap(),
+            Some(tenant)
+        );
+    }
+
+    #[tokio::test]
+    async fn revoked_tenant_session_loses_authority_without_reconnect() {
+        let kernel = Arc::new(AgentKernelImpl::new().expect("kernel new"));
+        let tenant = kernel.create_tenant("revocation").await.unwrap();
+        let user = kernel
+            .register_user(&tenant, "alice", "alice@revocation.test", Role::User)
+            .await
+            .unwrap();
+        let token = kernel.open_session(&user).await.unwrap();
+        let server = SyscallServer::bind(kernel.clone(), "127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = server.local_addr().unwrap();
+        tokio::spawn(server.serve());
+        let mut client = SyscallClient::connect(addr).await.unwrap();
+
+        assert!(matches!(
+            client.authenticate(token.clone()).await.unwrap(),
+            SyscallReply::Authenticated
+        ));
+        assert!(matches!(
+            client.call(Syscall::ListAgents).await.unwrap(),
+            SyscallReply::Agents { .. }
+        ));
+
+        kernel.auth.write().await.revoke_session(&token);
+        match client.call(Syscall::ListAgents).await.unwrap() {
+            SyscallReply::Error { message } => assert_eq!(message, "authentication required"),
+            other => panic!("revoked session retained authority: {other:?}"),
+        }
+        match client.authenticate(token).await.unwrap() {
+            SyscallReply::Error { message } => assert_eq!(message, "authentication failed"),
+            other => panic!("revoked token was accepted again: {other:?}"),
+        }
     }
 
     #[test]

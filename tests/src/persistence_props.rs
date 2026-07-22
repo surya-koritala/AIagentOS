@@ -117,7 +117,7 @@ async fn seed(kernel: &AgentKernelImpl) -> Seeded {
 }
 
 /// Assert that a freshly-booted kernel on the same DB recovered everything.
-async fn assert_recovered(kernel: &AgentKernelImpl, seeded: &Seeded) {
+async fn assert_recovered(kernel: &AgentKernelImpl, seeded: &Seeded, expect_live: bool) {
     // 1. Both agents are back in the registry with the right names/profiles.
     let agents = kernel.agent_manager.list_agents(None);
     assert_eq!(agents.len(), 2, "both agents should rehydrate");
@@ -148,18 +148,31 @@ async fn assert_recovered(kernel: &AgentKernelImpl, seeded: &Seeded) {
         .syscall_gate
         .check_tool_call(seeded.read_only_id, "write_file", "/tmp/x", 1)
         .await;
-    assert!(
-        matches!(ro_write, Err(GateDenial::MissingCapability(_))),
-        "restored read-only agent must be denied write_file, got {ro_write:?}"
-    );
     let fa_write = kernel
         .syscall_gate
         .check_tool_call(seeded.full_access_id, "write_file", "/tmp/x", 1)
         .await;
-    assert!(
-        fa_write.is_ok(),
-        "restored full-access agent must be allowed write_file, got {fa_write:?}"
-    );
+    if expect_live {
+        assert!(
+            matches!(ro_write, Err(GateDenial::MissingCapability(_))),
+            "crash-restored read-only agent must be denied write_file, got {ro_write:?}"
+        );
+        assert!(
+            fa_write.is_ok(),
+            "crash-restored full-access agent must be allowed write_file, got {fa_write:?}"
+        );
+    } else {
+        assert!(matches!(ro_write, Err(GateDenial::UnknownAgent)));
+        assert!(matches!(fa_write, Err(GateDenial::UnknownAgent)));
+        assert_eq!(
+            kernel.get_agent_status(seeded.read_only_id).unwrap(),
+            kernel::AgentState::Stopped
+        );
+        assert_eq!(
+            kernel.get_agent_status(seeded.full_access_id).unwrap(),
+            kernel::AgentState::Stopped
+        );
+    }
 
     // 3. Conversation history is intact.
     let msgs = kernel
@@ -229,7 +242,7 @@ async fn crash_recovery_restores_everything() {
 
     // Fresh kernel from the SAME path — this triggers boot-time rehydration.
     let kernel2 = AgentKernelImpl::with_db_path(&db_path).expect("reboot persistent kernel");
-    assert_recovered(&kernel2, &seeded).await;
+    assert_recovered(&kernel2, &seeded, true).await;
 
     std::fs::remove_dir_all(db_path.parent().unwrap()).ok();
 }
@@ -250,7 +263,10 @@ async fn graceful_shutdown_then_restart_restores_everything() {
     };
 
     let kernel2 = AgentKernelImpl::with_db_path(&db_path).expect("reboot persistent kernel");
-    assert_recovered(&kernel2, &seeded).await;
+    // Coordinated shutdown persists agents as terminal history. Their durable
+    // context remains available, but live gate/scheduler/sandbox state is not
+    // re-armed on restart.
+    assert_recovered(&kernel2, &seeded, false).await;
 
     std::fs::remove_dir_all(db_path.parent().unwrap()).ok();
 }

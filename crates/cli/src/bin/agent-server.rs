@@ -69,6 +69,13 @@ async fn main() {
     };
     // Make SendMessage syscalls functional against the configured backend.
     register_providers(&kernel, &config);
+    if config.service_dir.is_some() {
+        if let Err(error) = kernel.boot_services().await {
+            tracing::error!(error = %error, "service boot failed; rolling back started services");
+            eprintln!("agent-server: service boot failed: {error}");
+            std::process::exit(1);
+        }
+    }
     // Background tasks (scheduler observer + cgroup minute-reset).
     let _runtime = kernel.start_runtime();
 

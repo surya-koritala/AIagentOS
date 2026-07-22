@@ -210,6 +210,13 @@ impl AgentManager {
         }
     }
 
+    /// Permanently remove a partially-created agent from the in-memory
+    /// registry. Normal stop/kill deliberately retain terminal history; this
+    /// narrower operation is reserved for transactional creation rollback.
+    pub(crate) fn purge_agent(&self, agent_id: AgentId) -> bool {
+        self.agents.remove(&agent_id).is_some()
+    }
+
     /// Get the LLM provider ID configured for an agent.
     pub fn get_agent_provider(&self, agent_id: AgentId) -> Option<String> {
         self.agents
@@ -220,6 +227,31 @@ impl AgentManager {
     /// Get an agent's task description (the prompt it was created for).
     pub fn get_agent_task(&self, agent_id: AgentId) -> Option<String> {
         self.agents.get(&agent_id).map(|a| a.config.task.clone())
+    }
+
+    pub fn get_agent_config(&self, agent_id: AgentId) -> Option<AgentConfig> {
+        self.agents.get(&agent_id).map(|agent| agent.config.clone())
+    }
+
+    /// Forced terminal transition used only by the kernel lifecycle coordinator
+    /// after it has cancelled execution and begun subsystem cleanup.
+    pub fn force_stopped(&self, agent_id: AgentId) -> Result<(), KernelError> {
+        let mut agent = self
+            .agents
+            .get_mut(&agent_id)
+            .ok_or(AgentError::NotFound(agent_id))?;
+        let old = agent.state.clone();
+        if old == AgentState::Stopped {
+            return Ok(());
+        }
+        agent.state = AgentState::Stopped;
+        agent.last_activity_at = Utc::now();
+        let _ = self.event_tx.send(KernelEvent::AgentStateChanged {
+            agent_id,
+            old,
+            new: AgentState::Stopped,
+        });
+        Ok(())
     }
 
     /// Rehydrate a previously-persisted agent directly into the in-memory map,
@@ -237,9 +269,11 @@ impl AgentManager {
         created_at: DateTime<Utc>,
         last_activity_at: DateTime<Utc>,
     ) {
-        // Map non-terminal/transient states to Running so the agent is live again
-        // after a restart; keep terminal states (Stopped/Error) intact.
+        // Map only transient states to Running so interrupted initialization or
+        // stopping can recover. A deliberate pause must survive restart, while
+        // terminal states remain terminal and are not re-admitted by the kernel.
         let restored_state = match state {
+            AgentState::Paused => AgentState::Paused,
             AgentState::Stopped => AgentState::Stopped,
             AgentState::Error(e) => AgentState::Error(e),
             _ => AgentState::Running,

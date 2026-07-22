@@ -15,9 +15,10 @@ The load-bearing idea is a direct mapping from the Linux kernel:
 - **Agents are processes.** Each agent is a `task_struct`-style record you can
   create, clone, signal, and kill.
 - **Context is virtual memory.** Token budgets, context windows, and LRU
-  eviction stand in for pages, paging, and the OOM killer.
-- **Tools are files.** Tool descriptors and a mount table mirror the VFS; a tool
-  call is an `open`/`read`/`write` against a mounted provider.
+  durable prompt spills and explicit pressure errors stand in for paging.
+- **Tools are governed resources.** Named calls have validated declarations and
+  cross one authorization/sandbox/accounting route. Descriptor/mount prototypes
+  remain an explicitly experimental VFS analogy outside v1.
 - **The kernel orchestrates.** A CFS-style scheduler, cgroups, namespaces, a MAC
   engine, capabilities, an init system, and a syscall gate tie it together.
 
@@ -34,7 +35,7 @@ each other — is an operating-systems problem. AI Agent OS provides:
 
 - **Process management** — create, clone, signal, kill agents.
 - **Fair scheduling** — CFS keeps every agent's share proportional.
-- **Memory management** — context paging, token budgets, an OOM killer.
+- **Context management** — active token budgets, durable spills, and explicit backpressure.
 - **Isolation** — namespaces, cgroups, sandboxes.
 - **Security** — MAC policies, capabilities, audit logging.
 - **IPC** — inter-agent messaging, delegation, and discovery (broker-routed via

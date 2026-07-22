@@ -13,7 +13,6 @@ use kernel::production::*;
 use kernel::rate_limit::*;
 use kernel::tools::*;
 use kernel::*;
-use std::sync::Arc;
 
 // ─── Execution Edge Cases ────────────────────────────────────────────────────
 
@@ -146,10 +145,16 @@ fn tools_custom_template_with_missing_param() {
     reg.register(ToolBinding {
         name: "custom".into(),
         description: "test".into(),
-        parameters_schema: serde_json::json!({}),
+        parameters_schema: serde_json::json!({"type": "object", "properties": {}}),
         resource_type: kernel::resources::ResourceType::Application,
         operation: "launch".into(),
-    });
+        security: kernel::tools::ToolSecurity::constant(
+            kernel::tools::SecurityAction::Execute,
+            "test:custom",
+        )
+        .sandboxed(),
+    })
+    .unwrap();
     reg.register_command_template("custom", "echo", &["{missing_param}".into()]);
     let tc = ToolCall {
         id: "1".into(),
@@ -298,7 +303,7 @@ fn indexer_empty_directory() {
 fn indexer_binary_files_skipped() {
     let dir = std::env::temp_dir().join(format!("edge_idx2_{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(dir.join("image.png"), &[0x89, 0x50, 0x4E, 0x47]).unwrap();
+    std::fs::write(dir.join("image.png"), [0x89, 0x50, 0x4E, 0x47]).unwrap();
     std::fs::write(dir.join("code.rs"), "fn main() {}").unwrap();
     let map = RepoMap::build(&dir);
     assert_eq!(map.total_files, 1); // Only .rs, not .png
@@ -331,7 +336,7 @@ fn database_sql_injection_attempt() {
     drop(conn);
 
     // This should not execute the DROP TABLE
-    let result = query_sqlite(
+    let _result = query_sqlite(
         path,
         "SELECT * FROM t WHERE x = 'a'; DROP TABLE t; --'",
         true,
@@ -380,7 +385,7 @@ fn vision_nonexistent_file() {
 
 #[test]
 fn vision_empty_file() {
-    std::fs::write("/tmp/empty_image.png", &[]).unwrap();
+    std::fs::write("/tmp/empty_image.png", []).unwrap();
     let result = kernel::vision::image_to_data_url("/tmp/empty_image.png");
     assert!(result.is_ok()); // Empty but valid
     assert!(result.unwrap().contains("base64,"));

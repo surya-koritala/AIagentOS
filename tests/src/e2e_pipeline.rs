@@ -7,8 +7,7 @@ mod tests {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use adapters::azure_openai::AzureOpenAiAdapter;
-    use kernel::connector::LlmProviderAdapter;
-    use kernel::{AgentConfig, AgentKernelImpl, Priority};
+    use kernel::{AgentConfig, AgentKernelImpl, IsolationLevel, Priority, SandboxConfig};
 
     /// Full E2E test: create kernel → register Azure adapter → create agent → send message
     /// → LLM returns tool call → tool executes → LLM responds with final answer.
@@ -35,7 +34,7 @@ mod tests {
                     },
                     "finish_reason": "tool_calls"
                 }],
-                "usage": {"total_tokens": 30}
+                "usage": {"prompt_tokens": 20, "completion_tokens": 10, "total_tokens": 30}
             })))
             .up_to_n_times(1)
             .mount(&mock_server)
@@ -52,7 +51,7 @@ mod tests {
                     },
                     "finish_reason": "stop"
                 }],
-                "usage": {"total_tokens": 25}
+                "usage": {"prompt_tokens": 15, "completion_tokens": 10, "total_tokens": 25}
             })))
             .mount(&mock_server)
             .await;
@@ -109,7 +108,16 @@ mod tests {
             llm_provider: "azure-openai".into(),
             permission_profile: "full-access".into(), // skip permission checks for test
             priority: Priority::default(),
-            sandbox_config: None,
+            // This test intentionally exercises a host fixture provider. Real
+            // wire/package agents cannot select Trusted; they receive a managed
+            // per-agent workspace by default.
+            sandbox_config: Some(SandboxConfig {
+                workspace_dir: "/".into(),
+                allowed_network_hosts: None,
+                max_disk_usage_bytes: None,
+                max_memory_bytes: None,
+                isolation_level: IsolationLevel::Trusted,
+            }),
         };
         let handle = kernel.create_agent_full(config).await.unwrap();
 
@@ -124,6 +132,10 @@ mod tests {
         assert!(output.content.contains("hello from e2e test"));
         assert_eq!(output.tool_calls_made, 1);
         assert_eq!(output.tokens_used, 55); // 30 + 25
+        assert_eq!(output.usage.input_tokens, 35);
+        assert_eq!(output.usage.output_tokens, 20);
+        assert_eq!(output.usage.provider_reported_requests, 2);
+        assert_eq!(output.usage.estimated_requests, 0);
 
         // Cleanup
         std::fs::remove_file("/tmp/e2e_test_agent_os.txt").ok();
@@ -141,7 +153,7 @@ mod tests {
                     "message": {"role": "assistant", "content": "Hello! I'm your AI assistant."},
                     "finish_reason": "stop"
                 }],
-                "usage": {"total_tokens": 15}
+                "usage": {"prompt_tokens": 8, "completion_tokens": 7, "total_tokens": 15}
             })))
             .mount(&mock_server)
             .await;

@@ -16,7 +16,12 @@ mod tests {
                 "content": {"role": "model", "parts": [{"text": "Hello from Gemini!"}]},
                 "finishReason": "STOP"
             }],
-            "usageMetadata": {"totalTokenCount": 17}
+            "usageMetadata": {
+                "promptTokenCount": 10,
+                "candidatesTokenCount": 7,
+                "cachedContentTokenCount": 4,
+                "totalTokenCount": 17
+            }
         });
 
         Mock::given(method("POST"))
@@ -35,6 +40,7 @@ mod tests {
 
         assert_eq!(resp.content, "Hello from Gemini!");
         assert_eq!(resp.tokens_used, 17);
+        assert_eq!(resp.usage, LlmUsage::reported(10, 7, 4));
         assert_eq!(resp.finish_reason, Some("STOP".to_string()));
         assert!(resp.tool_calls.is_empty());
     }

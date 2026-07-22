@@ -13,6 +13,7 @@
 //! prices) and a `max_usd` / `per_agent_max_usd` ceiling in [`crate::config`].
 
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use dashmap::DashMap;
 
@@ -34,10 +35,17 @@ fn micros_to_usd(micros: u64) -> f64 {
     micros as f64 / MICROS_PER_USD
 }
 
+fn atomic_saturating_add(counter: &AtomicU64, amount: u64) {
+    let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+        Some(current.saturating_add(amount))
+    });
+}
+
 /// Which ceiling a call would breach.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BudgetScope {
     Global,
+    Tenant,
     Agent,
 }
 
@@ -54,6 +62,7 @@ impl BudgetExceeded {
     pub fn message(&self) -> String {
         let scope = match self.scope {
             BudgetScope::Global => "global",
+            BudgetScope::Tenant => "per-tenant",
             BudgetScope::Agent => "per-agent",
         };
         format!(
@@ -73,10 +82,30 @@ pub struct BudgetEnforcer {
     max_micros: u64,
     /// Per-agent ceiling in micro-USD; `0` = unlimited.
     per_agent_max_micros: u64,
+    /// Per-tenant ceiling in micro-USD; `0` = unlimited.
+    per_tenant_max_micros: u64,
     /// Cumulative global spend (micro-USD).
     spent_micros: AtomicU64,
     /// Cumulative per-agent spend (micro-USD).
     per_agent_micros: DashMap<AgentId, u64>,
+    /// Durable tenant association for each live/rehydrated agent.
+    agent_tenants: DashMap<AgentId, String>,
+    /// Cumulative per-tenant spend (micro-USD).
+    per_tenant_micros: DashMap<String, u64>,
+    /// Admission locks make check→request→record atomic for every configured
+    /// ceiling scope, preventing concurrent requests from racing past a limit.
+    global_call_lock: Arc<tokio::sync::Mutex<()>>,
+    tenant_call_locks: DashMap<String, Arc<tokio::sync::Mutex<()>>>,
+    agent_call_locks: DashMap<AgentId, Arc<tokio::sync::Mutex<()>>>,
+}
+
+/// Holds configured budget-scope locks from admission until actual provider
+/// usage has been recorded. The fields are intentionally unused except for
+/// their drop behavior.
+pub(crate) struct BudgetCallGuard {
+    _global: Option<tokio::sync::OwnedMutexGuard<()>>,
+    _tenant: Option<tokio::sync::OwnedMutexGuard<()>>,
+    _agent: Option<tokio::sync::OwnedMutexGuard<()>>,
 }
 
 impl BudgetEnforcer {
@@ -90,20 +119,40 @@ impl BudgetEnforcer {
     /// Construct with a default blended price and global/per-agent ceilings (USD;
     /// `0.0` or negative = unlimited / inert).
     pub fn with_pricing(default_price_per_1k: f64, max_usd: f64, per_agent_max_usd: f64) -> Self {
+        Self::with_limits(default_price_per_1k, max_usd, per_agent_max_usd, 0.0)
+    }
+
+    /// Construct with global, per-agent, and per-tenant cumulative ceilings.
+    pub fn with_limits(
+        default_price_per_1k: f64,
+        max_usd: f64,
+        per_agent_max_usd: f64,
+        per_tenant_max_usd: f64,
+    ) -> Self {
         Self {
             pricing: DashMap::new(),
             default_price_per_1k: default_price_per_1k.max(0.0),
             max_micros: usd_to_micros(max_usd),
             per_agent_max_micros: usd_to_micros(per_agent_max_usd),
+            per_tenant_max_micros: usd_to_micros(per_tenant_max_usd),
             spent_micros: AtomicU64::new(0),
             per_agent_micros: DashMap::new(),
+            agent_tenants: DashMap::new(),
+            per_tenant_micros: DashMap::new(),
+            global_call_lock: Arc::new(tokio::sync::Mutex::new(())),
+            tenant_call_locks: DashMap::new(),
+            agent_call_locks: DashMap::new(),
         }
     }
 
     /// Build from the operator's budget config.
     pub fn from_config(cfg: &crate::config::BudgetConfig) -> Self {
-        let enforcer =
-            Self::with_pricing(cfg.usd_per_1k_tokens, cfg.max_usd, cfg.per_agent_max_usd);
+        let enforcer = Self::with_limits(
+            cfg.usd_per_1k_tokens,
+            cfg.max_usd,
+            cfg.per_agent_max_usd,
+            cfg.per_tenant_max_usd,
+        );
         for (provider, price) in &cfg.provider_pricing {
             enforcer.set_provider_price(provider, *price);
         }
@@ -130,7 +179,65 @@ impl BudgetEnforcer {
 
     /// Whether any ceiling is configured (otherwise the enforcer is inert).
     pub fn is_active(&self) -> bool {
-        self.max_micros > 0 || self.per_agent_max_micros > 0
+        self.max_micros > 0 || self.per_agent_max_micros > 0 || self.per_tenant_max_micros > 0
+    }
+
+    /// Associate an agent with its tenant for tenant-scoped accounting. Calling
+    /// this again after rehydration is idempotent.
+    pub fn register_agent_tenant(&self, agent: AgentId, tenant: impl Into<String>) {
+        self.agent_tenants.insert(agent, tenant.into());
+    }
+
+    /// Atomically admit one provider request against every configured USD
+    /// scope. The returned guard must live until [`record`](Self::record) has
+    /// charged the response. This prevents multiple executors from passing the
+    /// same pre-call check concurrently.
+    pub(crate) async fn begin_call(
+        &self,
+        agent: AgentId,
+    ) -> Result<BudgetCallGuard, BudgetExceeded> {
+        let global = if self.max_micros > 0 {
+            Some(self.global_call_lock.clone().lock_owned().await)
+        } else {
+            None
+        };
+
+        let tenant_name = self
+            .agent_tenants
+            .get(&agent)
+            .map(|tenant| tenant.value().clone());
+        let tenant = if self.per_tenant_max_micros > 0 {
+            if let Some(name) = tenant_name {
+                let lock = self
+                    .tenant_call_locks
+                    .entry(name)
+                    .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+                    .clone();
+                Some(lock.lock_owned().await)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        let agent_guard = if self.per_agent_max_micros > 0 {
+            let lock = self
+                .agent_call_locks
+                .entry(agent)
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+                .clone();
+            Some(lock.lock_owned().await)
+        } else {
+            None
+        };
+
+        self.check(agent)?;
+        Ok(BudgetCallGuard {
+            _global: global,
+            _tenant: tenant,
+            _agent: agent_guard,
+        })
     }
 
     /// Check whether `agent` may make another LLM call. Returns `Err` when a
@@ -161,6 +268,22 @@ impl BudgetEnforcer {
                 });
             }
         }
+        if self.per_tenant_max_micros > 0 {
+            if let Some(tenant) = self.agent_tenants.get(&agent) {
+                let spent = self
+                    .per_tenant_micros
+                    .get(tenant.value())
+                    .map(|value| *value.value())
+                    .unwrap_or(0);
+                if spent >= self.per_tenant_max_micros {
+                    return Err(BudgetExceeded {
+                        scope: BudgetScope::Tenant,
+                        spent_usd: micros_to_usd(spent),
+                        limit_usd: micros_to_usd(self.per_tenant_max_micros),
+                    });
+                }
+            }
+        }
         Ok(())
     }
 
@@ -169,8 +292,16 @@ impl BudgetEnforcer {
         let cost_usd = self.cost_of(provider, tokens);
         let micros = usd_to_micros(cost_usd);
         if micros > 0 {
-            self.spent_micros.fetch_add(micros, Ordering::Relaxed);
-            *self.per_agent_micros.entry(agent).or_insert(0) += micros;
+            atomic_saturating_add(&self.spent_micros, micros);
+            let mut agent_spend = self.per_agent_micros.entry(agent).or_insert(0);
+            *agent_spend = agent_spend.saturating_add(micros);
+            if let Some(tenant) = self.agent_tenants.get(&agent) {
+                let mut tenant_spend = self
+                    .per_tenant_micros
+                    .entry(tenant.value().clone())
+                    .or_insert(0);
+                *tenant_spend = tenant_spend.saturating_add(micros);
+            }
         }
         cost_usd
     }
@@ -190,10 +321,22 @@ impl BudgetEnforcer {
         )
     }
 
+    /// Cumulative spend for one tenant in USD.
+    pub fn tenant_spent_usd(&self, tenant: &str) -> f64 {
+        micros_to_usd(
+            self.per_tenant_micros
+                .get(tenant)
+                .map(|value| *value.value())
+                .unwrap_or(0),
+        )
+    }
+
     /// Drop tracking for an agent (call on shutdown / unregister). Global spend
     /// is intentionally retained — the lifetime ceiling spans agents.
     pub fn purge_agent(&self, agent: AgentId) {
         self.per_agent_micros.remove(&agent);
+        self.agent_tenants.remove(&agent);
+        self.agent_call_locks.remove(&agent);
     }
 
     // ── Agent-agnostic API (caller supplies USD directly) ────────────────────
@@ -209,7 +352,7 @@ impl BudgetEnforcer {
     pub fn record_cost(&self, cost_usd: f64) {
         let micros = usd_to_micros(cost_usd);
         if micros > 0 {
-            self.spent_micros.fetch_add(micros, Ordering::Relaxed);
+            atomic_saturating_add(&self.spent_micros, micros);
         }
     }
 
@@ -279,6 +422,62 @@ mod tests {
         assert_eq!(b.check(a).unwrap_err().scope, BudgetScope::Agent);
         // A different agent is unaffected.
         assert!(b.check(other).is_ok());
+    }
+
+    #[test]
+    fn per_tenant_ceiling_is_shared_and_isolated() {
+        let b = BudgetEnforcer::with_limits(1.0, 0.0, 0.0, 0.05);
+        let a1 = uuid::Uuid::new_v4();
+        let a2 = uuid::Uuid::new_v4();
+        let other = uuid::Uuid::new_v4();
+        b.register_agent_tenant(a1, "tenant-a");
+        b.register_agent_tenant(a2, "tenant-a");
+        b.register_agent_tenant(other, "tenant-b");
+
+        b.record(a1, "p", 30);
+        b.record(a2, "p", 20);
+        assert_eq!(b.check(a1).unwrap_err().scope, BudgetScope::Tenant);
+        assert_eq!(b.check(a2).unwrap_err().scope, BudgetScope::Tenant);
+        assert!(b.check(other).is_ok());
+        assert!((b.tenant_spent_usd("tenant-a") - 0.05).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn counters_saturate_instead_of_overflowing() {
+        let b = BudgetEnforcer::new(0.0);
+        b.record_cost(f64::MAX);
+        let first = b.spent_micros.load(Ordering::Relaxed);
+        b.record_cost(f64::MAX);
+        assert_eq!(first, u64::MAX);
+        assert_eq!(b.spent_micros.load(Ordering::Relaxed), u64::MAX);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_calls_cannot_race_past_global_ceiling() {
+        let budget = Arc::new(BudgetEnforcer::with_pricing(1.0, 0.10, 0.0));
+        let barrier = Arc::new(tokio::sync::Barrier::new(32));
+        let mut tasks = Vec::new();
+        for _ in 0..32 {
+            let budget = budget.clone();
+            let barrier = barrier.clone();
+            tasks.push(tokio::spawn(async move {
+                let agent = uuid::Uuid::new_v4();
+                barrier.wait().await;
+                match budget.begin_call(agent).await {
+                    Ok(_guard) => {
+                        budget.record(agent, "p", 100);
+                        true
+                    }
+                    Err(_) => false,
+                }
+            }));
+        }
+        let mut admitted = 0;
+        for task in tasks {
+            admitted += usize::from(task.await.unwrap());
+        }
+        assert_eq!(admitted, 1);
+        assert!((budget.global_spent_usd() - 0.10).abs() < f64::EPSILON);
     }
 
     #[test]

@@ -59,6 +59,25 @@ pub struct Fact {
     pub embedding: Option<Vec<f32>>,
 }
 
+/// Durable usage record used for billing/metric reconciliation tests and
+/// operator inspection.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct UsageRecord {
+    pub tokens_used: u32,
+    pub input_tokens: u32,
+    pub output_tokens: u32,
+    pub cached_tokens: u32,
+    pub llm_requests: u32,
+    pub retries: u32,
+    pub provider_latency_ms: u64,
+    pub provider_reported_requests: u32,
+    pub estimated_requests: u32,
+    pub provider: String,
+    pub model: String,
+    pub tool_calls: usize,
+    pub estimated_cost_usd: f64,
+}
+
 /// The durable identity + config of a created agent, as stored in the `agents`
 /// table. This is what lets a kernel rehydrate its agent registry after a
 /// restart (graceful or crashed): the in-memory `AgentManager` is rebuilt from
@@ -86,6 +105,48 @@ pub struct PersistedAgent {
     pub created_at: DateTime<Utc>,
     pub last_activity_at: DateTime<Utc>,
 }
+
+/// Public, non-sensitive metadata for a durable in-flight generation
+/// checkpoint. The serialized prompt/messages remain inside the protected
+/// SQLite store and are never returned by list APIs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GenerationCheckpointMetadata {
+    pub id: uuid::Uuid,
+    pub agent_id: AgentId,
+    pub version: u32,
+    pub provider_id: String,
+    pub model_id: String,
+    pub created_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
+}
+
+/// A claimed checkpoint plus the compatibility metadata needed by the kernel
+/// before it restores a provider session.
+#[derive(Debug, Clone)]
+pub struct StoredGenerationCheckpoint {
+    pub metadata: GenerationCheckpointMetadata,
+    pub checkpoint: crate::execution::GenerationCheckpoint,
+}
+
+/// Durable operator view of context-pressure decisions for one agent. Spill
+/// payloads remain in the protected per-agent KV namespace; this exposes only
+/// counters and byte totals.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextPressureStats {
+    pub agent_id: AgentId,
+    pub active_tokens: u32,
+    pub budget_tokens: u32,
+    pub spill_count: u64,
+    pub evicted_messages: u64,
+    pub stored_spills: u64,
+    pub stored_spill_bytes: u64,
+    pub error_count: u64,
+    pub last_error: Option<String>,
+    pub updated_at: DateTime<Utc>,
+}
+
+pub const GENERATION_CHECKPOINT_VERSION: u32 = 1;
+const MAX_GENERATION_CHECKPOINTS_PER_AGENT: usize = 8;
 
 /// Agent's working context — short-term memory for the current session.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -153,6 +214,15 @@ impl SqliteContextManager {
     pub fn new(db_path: &Path) -> Result<Self, ContextError> {
         let conn =
             Connection::open(db_path).map_err(|e| ContextError::StorageError(e.to_string()))?;
+        // Generation checkpoints contain prompts and tool results. Protect the
+        // SQLite file with owner-only permissions on Unix before writing them.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let permissions = std::fs::Permissions::from_mode(0o600);
+            std::fs::set_permissions(db_path, permissions)
+                .map_err(|error| ContextError::StorageError(error.to_string()))?;
+        }
         // WAL so committed transactions survive an abrupt process stop and a
         // fresh handle on the same file recovers them; NORMAL synchronous is the
         // recommended durability/throughput tradeoff under WAL (committed txns are
@@ -220,6 +290,14 @@ impl SqliteContextManager {
                 agent_id TEXT NOT NULL,
                 timestamp TEXT NOT NULL,
                 tokens_used INTEGER NOT NULL,
+                input_tokens INTEGER NOT NULL DEFAULT 0,
+                output_tokens INTEGER NOT NULL DEFAULT 0,
+                cached_tokens INTEGER NOT NULL DEFAULT 0,
+                llm_requests INTEGER NOT NULL DEFAULT 0,
+                retries INTEGER NOT NULL DEFAULT 0,
+                provider_latency_ms INTEGER NOT NULL DEFAULT 0,
+                provider_reported_requests INTEGER NOT NULL DEFAULT 0,
+                estimated_requests INTEGER NOT NULL DEFAULT 0,
                 model TEXT,
                 estimated_cost_usd REAL
             );
@@ -232,6 +310,16 @@ impl SqliteContextManager {
                 PRIMARY KEY(agent_id, key)
             );
             CREATE INDEX IF NOT EXISTS idx_agent_kv_agent ON agent_kv(agent_id);
+            CREATE TABLE IF NOT EXISTS context_pressure (
+                agent_id TEXT PRIMARY KEY,
+                active_tokens INTEGER NOT NULL,
+                budget_tokens INTEGER NOT NULL,
+                spill_count INTEGER NOT NULL DEFAULT 0,
+                evicted_messages INTEGER NOT NULL DEFAULT 0,
+                error_count INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT,
+                updated_at TEXT NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS context_snapshots (
                 agent_id TEXT NOT NULL,
                 label TEXT NOT NULL,
@@ -240,6 +328,22 @@ impl SqliteContextManager {
                 PRIMARY KEY(agent_id, label)
             );
             CREATE INDEX IF NOT EXISTS idx_snapshots_agent ON context_snapshots(agent_id);
+            CREATE TABLE IF NOT EXISTS generation_checkpoints (
+                id TEXT PRIMARY KEY,
+                agent_id TEXT NOT NULL,
+                tenant_id TEXT NOT NULL,
+                version INTEGER NOT NULL,
+                provider_id TEXT NOT NULL,
+                model_id TEXT NOT NULL,
+                checkpoint_json TEXT NOT NULL,
+                status TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_generation_checkpoints_agent
+                ON generation_checkpoints(agent_id, created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_generation_checkpoints_tenant
+                ON generation_checkpoints(tenant_id, status, expires_at);
             CREATE TABLE IF NOT EXISTS agents (
                 id TEXT PRIMARY KEY,
                 session_id TEXT NOT NULL,
@@ -292,6 +396,36 @@ impl SqliteContextManager {
             let _ = conn.execute(
                 "ALTER TABLE agents ADD COLUMN tenant_id TEXT NOT NULL DEFAULT 'default'",
                 [],
+            );
+            let _ = conn.execute("ALTER TABLE usage_log ADD COLUMN provider TEXT", []);
+            let _ = conn.execute(
+                "ALTER TABLE usage_log ADD COLUMN tool_calls INTEGER NOT NULL DEFAULT 0",
+                [],
+            );
+            for column in [
+                "input_tokens INTEGER NOT NULL DEFAULT 0",
+                "output_tokens INTEGER NOT NULL DEFAULT 0",
+                "cached_tokens INTEGER NOT NULL DEFAULT 0",
+                "llm_requests INTEGER NOT NULL DEFAULT 0",
+                "retries INTEGER NOT NULL DEFAULT 0",
+                "provider_latency_ms INTEGER NOT NULL DEFAULT 0",
+                "provider_reported_requests INTEGER NOT NULL DEFAULT 0",
+                "estimated_requests INTEGER NOT NULL DEFAULT 0",
+            ] {
+                let _ = conn.execute(&format!("ALTER TABLE usage_log ADD COLUMN {column}"), []);
+            }
+            // A process can die after atomically claiming a checkpoint. Re-arm
+            // that claim on boot: external side effects therefore have the
+            // documented at-least-once crash semantics unless the tool uses its
+            // stable call id as an idempotency key.
+            let _ = conn.execute(
+                "UPDATE generation_checkpoints SET status = 'active'
+                 WHERE status = 'resuming' AND expires_at > ?1",
+                params![Utc::now().to_rfc3339()],
+            );
+            let _ = conn.execute(
+                "DELETE FROM generation_checkpoints WHERE expires_at <= ?1",
+                params![Utc::now().to_rfc3339()],
             );
         }
         Ok(())
@@ -655,12 +789,11 @@ impl SqliteContextManager {
         Ok(id)
     }
 
-    pub fn log_usage(&self, agent_id: AgentId, tokens: u32, model: &str, cost_per_1k: f64) {
-        let cost = (tokens as f64 / 1000.0) * cost_per_1k;
+    pub fn log_usage(&self, agent_id: AgentId, record: &UsageRecord) {
         let conn = self.conn.lock().unwrap();
         let _ = conn.execute(
-            "INSERT INTO usage_log (id, agent_id, timestamp, tokens_used, model, estimated_cost_usd) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            rusqlite::params![uuid::Uuid::new_v4().to_string(), agent_id.to_string(), chrono::Utc::now().to_rfc3339(), tokens, model, cost],
+            "INSERT INTO usage_log (id, agent_id, timestamp, tokens_used, input_tokens, output_tokens, cached_tokens, llm_requests, retries, provider_latency_ms, provider_reported_requests, estimated_requests, provider, model, tool_calls, estimated_cost_usd) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+            rusqlite::params![uuid::Uuid::new_v4().to_string(), agent_id.to_string(), chrono::Utc::now().to_rfc3339(), record.tokens_used, record.input_tokens, record.output_tokens, record.cached_tokens, record.llm_requests, record.retries, record.provider_latency_ms, record.provider_reported_requests, record.estimated_requests, record.provider, record.model, record.tool_calls as i64, record.estimated_cost_usd.max(0.0)],
         );
     }
 
@@ -670,6 +803,60 @@ impl SqliteContextManager {
             "SELECT COALESCE(SUM(tokens_used), 0), COALESCE(SUM(estimated_cost_usd), 0.0) FROM usage_log",
             [], |row| Ok((row.get::<_, i64>(0)? as u64, row.get::<_, f64>(1)?)),
         ).unwrap_or((0, 0.0))
+    }
+
+    pub fn latest_usage(&self, agent_id: AgentId) -> Option<UsageRecord> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT tokens_used, input_tokens, output_tokens, cached_tokens, llm_requests, retries, provider_latency_ms, provider_reported_requests, estimated_requests, COALESCE(provider, ''), COALESCE(model, ''), tool_calls, COALESCE(estimated_cost_usd, 0.0) FROM usage_log WHERE agent_id = ?1 ORDER BY rowid DESC LIMIT 1",
+            [agent_id.to_string()],
+            |row| {
+                Ok(UsageRecord {
+                    tokens_used: row.get(0)?,
+                    input_tokens: row.get(1)?,
+                    output_tokens: row.get(2)?,
+                    cached_tokens: row.get(3)?,
+                    llm_requests: row.get(4)?,
+                    retries: row.get(5)?,
+                    provider_latency_ms: row.get(6)?,
+                    provider_reported_requests: row.get(7)?,
+                    estimated_requests: row.get(8)?,
+                    provider: row.get(9)?,
+                    model: row.get(10)?,
+                    tool_calls: row.get::<_, i64>(11)? as usize,
+                    estimated_cost_usd: row.get(12)?,
+                })
+            },
+        )
+        .ok()
+    }
+
+    /// Persist a lifecycle transition without rewriting the agent's immutable
+    /// identity/config or creation timestamp.
+    pub fn update_agent_status(
+        &self,
+        agent_id: AgentId,
+        status: &crate::AgentState,
+    ) -> Result<(), ContextError> {
+        let status = serde_json::to_string(status)
+            .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
+        let conn = self.conn.lock().unwrap();
+        let changed = conn
+            .execute(
+                "UPDATE agents SET status = ?1, last_activity_at = ?2 WHERE id = ?3",
+                rusqlite::params![
+                    status,
+                    chrono::Utc::now().to_rfc3339(),
+                    agent_id.to_string()
+                ],
+            )
+            .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
+        if changed == 0 {
+            return Err(ContextError::PersistenceFailed(
+                "agent registry row not found".into(),
+            ));
+        }
+        Ok(())
     }
 
     pub fn search_conversations(&self, query: &str) -> Vec<(String, String)> {
@@ -747,6 +934,114 @@ impl SqliteContextManager {
             )
             .map_err(|e| ContextError::PersistenceFailed(e.to_string()))?;
         Ok(affected > 0)
+    }
+
+    /// Record a successful durable spill or a fail-closed pressure decision.
+    /// Counters are cumulative; the active/budget values and last error describe
+    /// the most recent decision.
+    pub fn record_context_pressure(
+        &self,
+        agent_id: AgentId,
+        active_tokens: u32,
+        budget_tokens: u32,
+        evicted_messages: usize,
+        error: Option<&str>,
+    ) -> Result<(), ContextError> {
+        let spill_increment = u64::from(error.is_none() && evicted_messages > 0);
+        let error_increment = u64::from(error.is_some());
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO context_pressure
+                (agent_id, active_tokens, budget_tokens, spill_count,
+                 evicted_messages, error_count, last_error, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT(agent_id) DO UPDATE SET
+                active_tokens = excluded.active_tokens,
+                budget_tokens = excluded.budget_tokens,
+                spill_count = context_pressure.spill_count + excluded.spill_count,
+                evicted_messages = context_pressure.evicted_messages + excluded.evicted_messages,
+                error_count = context_pressure.error_count + excluded.error_count,
+                last_error = excluded.last_error,
+                updated_at = excluded.updated_at",
+            params![
+                agent_id.to_string(),
+                active_tokens,
+                budget_tokens,
+                spill_increment,
+                evicted_messages as u64,
+                error_increment,
+                error,
+                Utc::now().to_rfc3339(),
+            ],
+        )
+        .map_err(|e| ContextError::PersistenceFailed(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Inspect context pressure without exposing spilled prompt content. Current
+    /// storage totals are derived from live spill rows, so deleting a spill is
+    /// reflected immediately rather than leaving approximate counters behind.
+    pub fn context_pressure_stats(
+        &self,
+        agent_id: AgentId,
+    ) -> Result<ContextPressureStats, ContextError> {
+        let conn = self.conn.lock().unwrap();
+        let recorded = conn.query_row(
+            "SELECT active_tokens, budget_tokens, spill_count, evicted_messages,
+                    error_count, last_error, updated_at
+             FROM context_pressure WHERE agent_id = ?1",
+            params![agent_id.to_string()],
+            |row| {
+                Ok((
+                    row.get::<_, u32>(0)?,
+                    row.get::<_, u32>(1)?,
+                    row.get::<_, u64>(2)?,
+                    row.get::<_, u64>(3)?,
+                    row.get::<_, u64>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, String>(6)?,
+                ))
+            },
+        );
+        let (
+            active_tokens,
+            budget_tokens,
+            spill_count,
+            evicted_messages,
+            error_count,
+            last_error,
+            updated_at,
+        ) = match recorded {
+            Ok(values) => values,
+            Err(rusqlite::Error::QueryReturnedNoRows) => {
+                (0, 0, 0, 0, 0, None, Utc::now().to_rfc3339())
+            }
+            Err(error) => return Err(ContextError::StorageError(error.to_string())),
+        };
+        let (stored_spills, stored_spill_bytes) = conn
+            .query_row(
+                "SELECT COUNT(*), COALESCE(SUM(LENGTH(value)), 0)
+                 FROM agent_kv
+                 WHERE agent_id = ?1 AND key LIKE 'context_spill:%'",
+                params![agent_id.to_string()],
+                |row| Ok((row.get::<_, u64>(0)?, row.get::<_, u64>(1)?)),
+            )
+            .map_err(|error| ContextError::StorageError(error.to_string()))?;
+        let updated_at = DateTime::parse_from_rfc3339(&updated_at)
+            .map_err(|error| ContextError::StorageError(error.to_string()))?
+            .with_timezone(&Utc);
+        Ok(ContextPressureStats {
+            agent_id,
+            active_tokens,
+            budget_tokens,
+            spill_count,
+            evicted_messages,
+            stored_spills,
+            stored_spill_bytes,
+            error_count,
+            last_error,
+            updated_at,
+        })
     }
 }
 
@@ -981,6 +1276,272 @@ impl SqliteContextManager {
         }
     }
 
+    /// Persist a versioned resumable turn. Sensitive content is kept in the
+    /// owner-only SQLite database; callers receive only the opaque id.
+    pub fn save_generation_checkpoint(
+        &self,
+        tenant_id: &str,
+        provider_id: &str,
+        model_id: &str,
+        checkpoint: &crate::execution::GenerationCheckpoint,
+        ttl: std::time::Duration,
+    ) -> Result<uuid::Uuid, ContextError> {
+        if checkpoint.agent_id.is_nil() {
+            return Err(ContextError::PersistenceFailed(
+                "checkpoint has an invalid agent id".into(),
+            ));
+        }
+        let id = uuid::Uuid::new_v4();
+        let now = Utc::now();
+        let ttl = chrono::Duration::from_std(ttl)
+            .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
+        let expires_at = now + ttl;
+        let json = serde_json::to_string(checkpoint)
+            .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
+        let mut conn = self.conn.lock().unwrap();
+        let transaction = conn
+            .transaction()
+            .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
+        transaction
+            .execute(
+                "DELETE FROM generation_checkpoints WHERE expires_at <= ?1",
+                params![now.to_rfc3339()],
+            )
+            .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
+        transaction
+            .execute(
+                "INSERT INTO generation_checkpoints (id, agent_id, tenant_id, version, provider_id, model_id, checkpoint_json, status, created_at, expires_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'active', ?8, ?9)",
+                params![
+                    id.to_string(),
+                    checkpoint.agent_id.to_string(),
+                    tenant_id,
+                    i64::from(GENERATION_CHECKPOINT_VERSION),
+                    provider_id,
+                    model_id,
+                    json,
+                    now.to_rfc3339(),
+                    expires_at.to_rfc3339()
+                ],
+            )
+            .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
+        transaction
+            .execute(
+                "DELETE FROM generation_checkpoints WHERE id IN (
+                    SELECT id FROM generation_checkpoints
+                    WHERE agent_id = ?1 AND status = 'active'
+                    ORDER BY created_at DESC LIMIT -1 OFFSET ?2
+                )",
+                params![
+                    checkpoint.agent_id.to_string(),
+                    MAX_GENERATION_CHECKPOINTS_PER_AGENT as i64
+                ],
+            )
+            .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
+        transaction
+            .commit()
+            .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
+        Ok(id)
+    }
+
+    /// List only metadata for active, unexpired checkpoints in one tenant.
+    pub fn list_generation_checkpoints(
+        &self,
+        tenant_id: &str,
+        agent_id: Option<AgentId>,
+    ) -> Result<Vec<GenerationCheckpointMetadata>, ContextError> {
+        let conn = self.conn.lock().unwrap();
+        let now = Utc::now().to_rfc3339();
+        let sql = if agent_id.is_some() {
+            "SELECT id, agent_id, version, provider_id, model_id, created_at, expires_at
+             FROM generation_checkpoints
+             WHERE tenant_id = ?1 AND agent_id = ?2 AND status = 'active' AND expires_at > ?3
+             ORDER BY created_at DESC"
+        } else {
+            "SELECT id, agent_id, version, provider_id, model_id, created_at, expires_at
+             FROM generation_checkpoints
+             WHERE tenant_id = ?1 AND status = 'active' AND expires_at > ?3
+             ORDER BY created_at DESC"
+        };
+        let mut statement = conn
+            .prepare(sql)
+            .map_err(|error| ContextError::StorageError(error.to_string()))?;
+        let parse = |row: &rusqlite::Row<'_>| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, String>(6)?,
+            ))
+        };
+        let mut rows = match agent_id {
+            Some(agent_id) => statement
+                .query_map(params![tenant_id, agent_id.to_string(), now], parse)
+                .map_err(|error| ContextError::StorageError(error.to_string()))?,
+            None => statement
+                .query_map(params![tenant_id, "", now], parse)
+                .map_err(|error| ContextError::StorageError(error.to_string()))?,
+        };
+        let mut checkpoints = Vec::new();
+        rows.try_for_each(|row| {
+            let (id, agent_id, version, provider_id, model_id, created_at, expires_at) =
+                row.map_err(|error| ContextError::StorageError(error.to_string()))?;
+            checkpoints.push(GenerationCheckpointMetadata {
+                id: uuid::Uuid::parse_str(&id)
+                    .map_err(|error| ContextError::StorageError(error.to_string()))?,
+                agent_id: uuid::Uuid::parse_str(&agent_id)
+                    .map_err(|error| ContextError::StorageError(error.to_string()))?,
+                version: u32::try_from(version).map_err(|error| {
+                    ContextError::StorageError(format!("invalid checkpoint version: {error}"))
+                })?,
+                provider_id,
+                model_id,
+                created_at: DateTime::parse_from_rfc3339(&created_at)
+                    .map_err(|error| ContextError::StorageError(error.to_string()))?
+                    .with_timezone(&Utc),
+                expires_at: DateTime::parse_from_rfc3339(&expires_at)
+                    .map_err(|error| ContextError::StorageError(error.to_string()))?
+                    .with_timezone(&Utc),
+            });
+            Ok::<(), ContextError>(())
+        })?;
+        Ok(checkpoints)
+    }
+
+    /// Atomically claim a checkpoint. A second concurrent resume fails instead
+    /// of replaying a tool side effect twice.
+    pub fn claim_generation_checkpoint(
+        &self,
+        checkpoint_id: uuid::Uuid,
+        agent_id: AgentId,
+        tenant_id: &str,
+    ) -> Result<StoredGenerationCheckpoint, ContextError> {
+        let conn = self.conn.lock().unwrap();
+        let changed = conn
+            .execute(
+                "UPDATE generation_checkpoints SET status = 'resuming'
+                 WHERE id = ?1 AND agent_id = ?2 AND tenant_id = ?3
+                   AND status = 'active' AND expires_at > ?4",
+                params![
+                    checkpoint_id.to_string(),
+                    agent_id.to_string(),
+                    tenant_id,
+                    Utc::now().to_rfc3339()
+                ],
+            )
+            .map_err(|error| ContextError::RestoreFailed(error.to_string()))?;
+        if changed != 1 {
+            return Err(ContextError::RestoreFailed(
+                "checkpoint is absent, expired, foreign, or already being resumed".into(),
+            ));
+        }
+        let row = conn
+            .query_row(
+                "SELECT version, provider_id, model_id, checkpoint_json, created_at, expires_at
+                 FROM generation_checkpoints WHERE id = ?1",
+                params![checkpoint_id.to_string()],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                    ))
+                },
+            )
+            .map_err(|error| ContextError::RestoreFailed(error.to_string()))?;
+        let version =
+            u32::try_from(row.0).map_err(|error| ContextError::RestoreFailed(error.to_string()))?;
+        if version != GENERATION_CHECKPOINT_VERSION {
+            let _ = conn.execute(
+                "UPDATE generation_checkpoints SET status = 'incompatible' WHERE id = ?1",
+                params![checkpoint_id.to_string()],
+            );
+            return Err(ContextError::RestoreFailed(format!(
+                "checkpoint version {version} is incompatible with runtime version {GENERATION_CHECKPOINT_VERSION}"
+            )));
+        }
+        let checkpoint = match serde_json::from_str(&row.3) {
+            Ok(checkpoint) => checkpoint,
+            Err(error) => {
+                let _ = conn.execute(
+                    "UPDATE generation_checkpoints SET status = 'corrupt' WHERE id = ?1",
+                    params![checkpoint_id.to_string()],
+                );
+                return Err(ContextError::RestoreFailed(format!(
+                    "checkpoint payload is corrupt: {error}"
+                )));
+            }
+        };
+        Ok(StoredGenerationCheckpoint {
+            metadata: GenerationCheckpointMetadata {
+                id: checkpoint_id,
+                agent_id,
+                version,
+                provider_id: row.1,
+                model_id: row.2,
+                created_at: DateTime::parse_from_rfc3339(&row.4)
+                    .map_err(|error| ContextError::RestoreFailed(error.to_string()))?
+                    .with_timezone(&Utc),
+                expires_at: DateTime::parse_from_rfc3339(&row.5)
+                    .map_err(|error| ContextError::RestoreFailed(error.to_string()))?
+                    .with_timezone(&Utc),
+            },
+            checkpoint,
+        })
+    }
+
+    pub fn release_generation_checkpoint(
+        &self,
+        checkpoint_id: uuid::Uuid,
+    ) -> Result<(), ContextError> {
+        self.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE generation_checkpoints SET status = 'active' WHERE id = ?1 AND status = 'resuming'",
+                params![checkpoint_id.to_string()],
+            )
+            .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
+        Ok(())
+    }
+
+    pub fn consume_generation_checkpoint(
+        &self,
+        checkpoint_id: uuid::Uuid,
+    ) -> Result<(), ContextError> {
+        self.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE generation_checkpoints SET status = 'consumed', checkpoint_json = '{}' WHERE id = ?1 AND status = 'resuming'",
+                params![checkpoint_id.to_string()],
+            )
+            .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
+        Ok(())
+    }
+
+    pub fn delete_generation_checkpoint(
+        &self,
+        checkpoint_id: uuid::Uuid,
+        tenant_id: &str,
+    ) -> Result<bool, ContextError> {
+        let changed = self
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "DELETE FROM generation_checkpoints WHERE id = ?1 AND tenant_id = ?2 AND status != 'resuming'",
+                params![checkpoint_id.to_string(), tenant_id],
+            )
+            .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
+        Ok(changed == 1)
+    }
+
     /// List the ids of agents that belong to `tenant_id` (tenant-scoped registry
     /// view — a tenant-A caller never sees tenant-B agents).
     pub fn list_agents_for_tenant(&self, tenant_id: &str) -> Result<Vec<AgentId>, ContextError> {
@@ -1011,6 +1572,44 @@ impl SqliteContextManager {
             )
             .map_err(|e| ContextError::PersistenceFailed(e.to_string()))?;
         Ok(affected > 0)
+    }
+
+    /// Transactionally remove every durable row owned by an agent whose
+    /// creation must be rolled back (for example, a package load that fails
+    /// while seeding memory). Normal stop/kill intentionally does not call this
+    /// because terminal history is retained.
+    pub fn purge_agent_data(&self, agent_id: AgentId) -> Result<(), ContextError> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn
+            .transaction()
+            .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
+        let id = agent_id.to_string();
+        tx.execute(
+            "DELETE FROM conversations_fts WHERE conversation_id IN
+             (SELECT id FROM conversations WHERE agent_id = ?1)",
+            params![&id],
+        )
+        .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
+        for table in [
+            "contexts",
+            "facts",
+            "conversations",
+            "usage_log",
+            "agent_kv",
+            "context_snapshots",
+            "generation_checkpoints",
+            "context_pressure",
+        ] {
+            tx.execute(
+                &format!("DELETE FROM {table} WHERE agent_id = ?1"),
+                params![&id],
+            )
+            .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
+        }
+        tx.execute("DELETE FROM agents WHERE id = ?1", params![&id])
+            .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
+        tx.commit()
+            .map_err(|error| ContextError::PersistenceFailed(error.to_string()))
     }
 
     /// Flush the WAL into the main database file (truncating checkpoint) so a
@@ -1681,5 +2280,30 @@ mod tests {
         // Delete removes it.
         assert!(mgr.delete_agent(a.id).unwrap());
         assert!(mgr.load_all_agents().unwrap().is_empty());
+    }
+
+    #[test]
+    fn usage_log_preserves_provider_model_tokens_retries_latency_and_price() {
+        let mgr = SqliteContextManager::in_memory().unwrap();
+        let agent = uuid::Uuid::new_v4();
+        let expected = UsageRecord {
+            tokens_used: 150,
+            input_tokens: 120,
+            output_tokens: 30,
+            cached_tokens: 20,
+            llm_requests: 2,
+            retries: 1,
+            provider_latency_ms: 345,
+            provider_reported_requests: 1,
+            estimated_requests: 0,
+            provider: "openai".into(),
+            model: "gpt-test".into(),
+            tool_calls: 3,
+            estimated_cost_usd: 0.0045,
+        };
+        mgr.log_usage(agent, &expected);
+
+        let record = mgr.latest_usage(agent).expect("usage row");
+        assert_eq!(record, expected);
     }
 }

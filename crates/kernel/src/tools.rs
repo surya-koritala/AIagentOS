@@ -1,10 +1,195 @@
 //! Tool Registry — maps tool names to ResourceBroker operations.
 
 use dashmap::DashMap;
+use std::collections::HashMap;
 
+use crate::agent_struct::CapabilitySet;
 use crate::connector::{ToolCall, ToolDefinition};
 use crate::resources::{ResourceRequest, ResourceType};
 use crate::AgentId;
+
+/// Security action enforced for a tool. This typed value is the declaration
+/// used for both capability and MAC decisions; callers must not infer it from
+/// a tool's name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SecurityAction {
+    Read,
+    Write,
+    Delete,
+    Network,
+    Execute,
+    Ipc,
+    BrowserAutomation,
+    CredentialAccess,
+    PackageInstall,
+}
+
+impl SecurityAction {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Read => "read",
+            Self::Write => "write",
+            Self::Delete => "delete",
+            Self::Network => "net",
+            Self::Execute => "exec",
+            Self::Ipc => "ipc",
+            Self::BrowserAutomation => "browser",
+            Self::CredentialAccess => "credential",
+            Self::PackageInstall => "package-install",
+        }
+    }
+
+    fn minimum_capability(self) -> Option<u64> {
+        match self {
+            Self::Read | Self::Ipc => None,
+            Self::Write => Some(CapabilitySet::CAP_FILE_WRITE),
+            Self::Delete => Some(CapabilitySet::CAP_FILE_DELETE),
+            Self::Network | Self::BrowserAutomation => Some(CapabilitySet::CAP_NET_ACCESS),
+            Self::Execute | Self::PackageInstall => Some(CapabilitySet::CAP_EXEC),
+            Self::CredentialAccess => Some(CapabilitySet::CAP_ADMIN),
+        }
+    }
+}
+
+/// How the MAC resource string is obtained from untrusted tool arguments.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", content = "value", rename_all = "kebab-case")]
+pub enum ResourceExtractor {
+    Argument(String),
+    Constant(String),
+}
+
+/// Visibility of a declaration before any concrete namespace id is assigned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum NamespaceVisibility {
+    Global,
+    CallerNamespace,
+}
+
+/// Human approval required before a high-risk provider invocation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ApprovalPolicy {
+    None,
+    User,
+    Administrator,
+}
+
+/// Whether provider execution must run inside a configured sandbox boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SandboxRequirement {
+    NotRequired,
+    Required,
+}
+
+/// Complete authorization contract carried by every executable tool.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ToolSecurity {
+    pub action: SecurityAction,
+    pub required_capabilities: Vec<u64>,
+    pub resource_extractor: ResourceExtractor,
+    pub namespace_visibility: NamespaceVisibility,
+    pub approval_policy: ApprovalPolicy,
+    pub sandbox_requirement: SandboxRequirement,
+}
+
+impl ToolSecurity {
+    pub fn new(action: SecurityAction, resource_extractor: ResourceExtractor) -> Self {
+        Self {
+            action,
+            required_capabilities: action.minimum_capability().into_iter().collect(),
+            resource_extractor,
+            namespace_visibility: NamespaceVisibility::Global,
+            approval_policy: ApprovalPolicy::None,
+            sandbox_requirement: SandboxRequirement::NotRequired,
+        }
+    }
+
+    pub fn argument(action: SecurityAction, argument: &str) -> Self {
+        Self::new(action, ResourceExtractor::Argument(argument.to_string()))
+    }
+
+    pub fn constant(action: SecurityAction, resource: &str) -> Self {
+        Self::new(action, ResourceExtractor::Constant(resource.to_string()))
+    }
+
+    pub fn with_approval(mut self, approval: ApprovalPolicy) -> Self {
+        self.approval_policy = approval;
+        self
+    }
+
+    pub fn with_capability(mut self, capability: u64) -> Self {
+        if !self.required_capabilities.contains(&capability) {
+            self.required_capabilities.push(capability);
+        }
+        self
+    }
+
+    pub fn sandboxed(mut self) -> Self {
+        self.sandbox_requirement = SandboxRequirement::Required;
+        self
+    }
+
+    pub fn caller_namespace(mut self) -> Self {
+        self.namespace_visibility = NamespaceVisibility::CallerNamespace;
+        self
+    }
+
+    pub fn extract_resource(&self, arguments: &serde_json::Value) -> Result<String, String> {
+        match &self.resource_extractor {
+            ResourceExtractor::Constant(value) if !value.trim().is_empty() => Ok(value.clone()),
+            ResourceExtractor::Constant(_) => Err("constant resource cannot be empty".into()),
+            ResourceExtractor::Argument(name) => arguments
+                .get(name)
+                .and_then(|value| value.as_str())
+                .filter(|value| !value.trim().is_empty())
+                .map(str::to_string)
+                .ok_or_else(|| format!("resource argument '{name}' must be a non-empty string")),
+        }
+    }
+
+    fn summary(&self) -> String {
+        let capabilities = if self.required_capabilities.is_empty() {
+            "none".to_string()
+        } else {
+            self.required_capabilities
+                .iter()
+                .map(|cap| format!("0x{cap:x}"))
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        format!(
+            "action={}; capabilities={capabilities}; approval={:?}; sandbox={:?}; visibility={:?}",
+            self.action.as_str(),
+            self.approval_policy,
+            self.sandbox_requirement,
+            self.namespace_visibility
+        )
+    }
+}
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum ToolRegistrationError {
+    #[error("tool name and description are required")]
+    MissingIdentity,
+    #[error("tool parameters must be an object JSON schema")]
+    InvalidSchema,
+    #[error("resource extractor argument '{0}' is not declared in the parameter schema")]
+    MissingResourceArgument(String),
+    #[error("security action {action} requires capability 0x{capability:x}")]
+    MissingCapability {
+        action: &'static str,
+        capability: u64,
+    },
+    #[error("{0} requires explicit user or administrator approval")]
+    MissingApproval(&'static str),
+    #[error("{0} must execute in a sandbox")]
+    MissingSandbox(&'static str),
+}
 
 /// Binding between a tool name and a resource operation.
 #[derive(Debug, Clone)]
@@ -14,6 +199,7 @@ pub struct ToolBinding {
     pub parameters_schema: serde_json::Value,
     pub resource_type: ResourceType,
     pub operation: String,
+    pub security: ToolSecurity,
 }
 
 /// Registry of available tools that agents can use.
@@ -44,9 +230,63 @@ impl ToolRegistry {
         registry
     }
 
-    /// Register a tool binding.
-    pub fn register(&self, binding: ToolBinding) {
+    /// Validate and register a tool binding. Untrusted/custom declarations are
+    /// rejected before they become visible to an LLM or executable provider.
+    pub fn register(&self, binding: ToolBinding) -> Result<(), ToolRegistrationError> {
+        Self::validate_binding(&binding)?;
         self.tools.insert(binding.name.clone(), binding);
+        Ok(())
+    }
+
+    fn validate_binding(binding: &ToolBinding) -> Result<(), ToolRegistrationError> {
+        if binding.name.trim().is_empty() || binding.description.trim().is_empty() {
+            return Err(ToolRegistrationError::MissingIdentity);
+        }
+        let properties = binding
+            .parameters_schema
+            .as_object()
+            .and_then(|schema| schema.get("properties"))
+            .and_then(serde_json::Value::as_object)
+            .ok_or(ToolRegistrationError::InvalidSchema)?;
+        if let ResourceExtractor::Argument(argument) = &binding.security.resource_extractor {
+            if argument.trim().is_empty() || !properties.contains_key(argument) {
+                return Err(ToolRegistrationError::MissingResourceArgument(
+                    argument.clone(),
+                ));
+            }
+        }
+        if let Some(required) = binding.security.action.minimum_capability() {
+            if !binding.security.required_capabilities.contains(&required) {
+                return Err(ToolRegistrationError::MissingCapability {
+                    action: binding.security.action.as_str(),
+                    capability: required,
+                });
+            }
+        }
+        if matches!(
+            binding.security.action,
+            SecurityAction::Delete
+                | SecurityAction::CredentialAccess
+                | SecurityAction::PackageInstall
+                | SecurityAction::BrowserAutomation
+        ) && binding.security.approval_policy == ApprovalPolicy::None
+        {
+            return Err(ToolRegistrationError::MissingApproval(
+                binding.security.action.as_str(),
+            ));
+        }
+        if matches!(
+            binding.security.action,
+            SecurityAction::Execute
+                | SecurityAction::PackageInstall
+                | SecurityAction::BrowserAutomation
+        ) && binding.security.sandbox_requirement != SandboxRequirement::Required
+        {
+            return Err(ToolRegistrationError::MissingSandbox(
+                binding.security.action.as_str(),
+            ));
+        }
+        Ok(())
     }
 
     /// Unregister a tool by name.
@@ -69,9 +309,48 @@ impl ToolRegistry {
             .iter()
             .map(|b| ToolDefinition {
                 name: b.name.clone(),
-                description: b.description.clone(),
+                description: format!(
+                    "{}\nSecurity constraints: {}",
+                    b.description,
+                    b.security.summary()
+                ),
                 parameters: b.parameters_schema.clone(),
             })
+            .collect()
+    }
+
+    /// Return the validated security contract for a registered tool.
+    pub fn security(&self, name: &str) -> Option<ToolSecurity> {
+        self.tools.get(name).map(|binding| binding.security.clone())
+    }
+
+    /// Resolve the exact validated security contract and MAC resource for an
+    /// untrusted call. All public call paths share this extraction logic.
+    pub fn security_context(
+        &self,
+        name: &str,
+        arguments: &serde_json::Value,
+    ) -> Result<(ToolSecurity, String), String> {
+        let security = self
+            .security(name)
+            .ok_or_else(|| format!("unknown tool '{name}'"))?;
+        let resource = security.extract_resource(arguments)?;
+        Ok((security, resource))
+    }
+
+    /// Build the validated security catalog shipped by the kernel. This is
+    /// also consumed by the legacy direct-gate compatibility API, ensuring its
+    /// built-in classifications are generated from the same bindings.
+    pub fn default_security_catalog() -> HashMap<String, ToolSecurity> {
+        let registry = Self::new();
+        registry.register_advanced_tools();
+        registry.register_git_tools();
+        registry.register_ipc_tools();
+        crate::editing::register_edit_tools(&registry);
+        registry
+            .tools
+            .iter()
+            .map(|binding| (binding.name.clone(), binding.security.clone()))
             .collect()
     }
 
@@ -206,7 +485,9 @@ impl ToolRegistry {
             }),
             resource_type: ResourceType::Filesystem,
             operation: "read".into(),
-        });
+            security: ToolSecurity::argument(SecurityAction::Read, "path"),
+        })
+        .expect("built-in read_file security declaration must be valid");
 
         self.register(ToolBinding {
             name: "write_file".into(),
@@ -221,7 +502,9 @@ impl ToolRegistry {
             }),
             resource_type: ResourceType::Filesystem,
             operation: "write".into(),
-        });
+            security: ToolSecurity::argument(SecurityAction::Write, "path").sandboxed(),
+        })
+        .expect("built-in write_file security declaration must be valid");
 
         self.register(ToolBinding {
             name: "list_directory".into(),
@@ -233,7 +516,9 @@ impl ToolRegistry {
             }),
             resource_type: ResourceType::Filesystem,
             operation: "list".into(),
-        });
+            security: ToolSecurity::argument(SecurityAction::Read, "path"),
+        })
+        .expect("built-in list_directory security declaration must be valid");
 
         self.register(ToolBinding {
             name: "http_get".into(),
@@ -245,7 +530,9 @@ impl ToolRegistry {
             }),
             resource_type: ResourceType::Network,
             operation: "get".into(),
-        });
+            security: ToolSecurity::argument(SecurityAction::Network, "url"),
+        })
+        .expect("built-in http_get security declaration must be valid");
 
         self.register(ToolBinding {
             name: "run_command".into(),
@@ -260,7 +547,11 @@ impl ToolRegistry {
             }),
             resource_type: ResourceType::Application,
             operation: "launch".into(),
-        });
+            security: ToolSecurity::argument(SecurityAction::Execute, "command")
+                .with_approval(ApprovalPolicy::User)
+                .sandboxed(),
+        })
+        .expect("built-in run_command security declaration must be valid");
 
         self.register(ToolBinding {
             name: "search_files".into(),
@@ -275,7 +566,9 @@ impl ToolRegistry {
             }),
             resource_type: ResourceType::Application,
             operation: "launch".into(),
-        });
+            security: ToolSecurity::argument(SecurityAction::Execute, "directory").sandboxed(),
+        })
+        .expect("built-in search_files security declaration must be valid");
 
         self.register(ToolBinding {
             name: "git_status".into(),
@@ -289,7 +582,9 @@ impl ToolRegistry {
             }),
             resource_type: ResourceType::Application,
             operation: "launch".into(),
-        });
+            security: ToolSecurity::argument(SecurityAction::Execute, "directory").sandboxed(),
+        })
+        .expect("built-in git_status security declaration must be valid");
 
         self.register(ToolBinding {
             name: "create_directory".into(),
@@ -301,11 +596,16 @@ impl ToolRegistry {
             }),
             resource_type: ResourceType::Filesystem,
             operation: "create_dir".into(),
-        });
+            security: ToolSecurity::argument(SecurityAction::Write, "path")
+                .with_capability(CapabilitySet::CAP_EXEC)
+                .sandboxed(),
+        })
+        .expect("built-in create_directory security declaration must be valid");
     }
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
 
@@ -326,7 +626,75 @@ mod tests {
         assert!(defs.len() >= 5);
         let read = defs.iter().find(|d| d.name == "read_file").unwrap();
         assert!(read.description.contains("Read"));
+        assert!(read.description.contains("Security constraints:"));
+        assert!(read.description.contains("action=read"));
         assert!(read.parameters["properties"]["path"].is_object());
+    }
+
+    #[test]
+    fn registration_rejects_incomplete_or_contradictory_security() {
+        let reg = ToolRegistry::new();
+        let mut missing_capability = ToolSecurity::argument(SecurityAction::Network, "url");
+        missing_capability.required_capabilities.clear();
+        let error = reg
+            .register(ToolBinding {
+                name: "unsafe_custom".into(),
+                description: "must not register".into(),
+                parameters_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {"url": {"type": "string"}}
+                }),
+                resource_type: ResourceType::Network,
+                operation: "get".into(),
+                security: missing_capability,
+            })
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ToolRegistrationError::MissingCapability { .. }
+        ));
+        assert!(!reg.has_tool("unsafe_custom"));
+
+        let error = reg
+            .register(ToolBinding {
+                name: "bad_extractor".into(),
+                description: "must not register".into(),
+                parameters_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {"path": {"type": "string"}}
+                }),
+                resource_type: ResourceType::Filesystem,
+                operation: "read".into(),
+                security: ToolSecurity::argument(SecurityAction::Read, "undeclared"),
+            })
+            .unwrap_err();
+        assert_eq!(
+            error,
+            ToolRegistrationError::MissingResourceArgument("undeclared".into())
+        );
+    }
+
+    #[test]
+    fn resource_extraction_is_typed_and_fail_closed() {
+        let reg = ToolRegistry::new();
+        assert!(reg
+            .security_context("http_get", &serde_json::json!({"url": 7}))
+            .unwrap_err()
+            .contains("non-empty string"));
+        assert!(reg
+            .security_context("http_get", &serde_json::json!({"path": "https://bypass"}))
+            .unwrap_err()
+            .contains("resource argument 'url'"));
+        let (_, resource) = reg
+            .security_context(
+                "http_get",
+                &serde_json::json!({"url": "https://example.com/a/../b?path=/etc/passwd"}),
+            )
+            .unwrap();
+        assert_eq!(
+            resource, "https://example.com/a/../b?path=/etc/passwd",
+            "the declared URL field is preserved exactly for MAC matching"
+        );
     }
 
     #[test]
@@ -363,10 +731,14 @@ mod tests {
         reg.register(ToolBinding {
             name: "custom_tool".into(),
             description: "A custom tool".into(),
-            parameters_schema: serde_json::json!({}),
+            parameters_schema: serde_json::json!({"type": "object", "properties": {}}),
             resource_type: ResourceType::Browser,
             operation: "navigate".into(),
-        });
+            security: ToolSecurity::constant(SecurityAction::BrowserAutomation, "browser")
+                .with_approval(ApprovalPolicy::User)
+                .sandboxed(),
+        })
+        .unwrap();
         assert!(reg.has_tool("custom_tool"));
         reg.unregister("custom_tool");
         assert!(!reg.has_tool("custom_tool"));
@@ -463,7 +835,9 @@ impl ToolRegistry {
             }),
             resource_type: ResourceType::Network,
             operation: "browse".into(),
-        });
+            security: ToolSecurity::argument(SecurityAction::Network, "url"),
+        })
+        .expect("built-in browse_url security declaration must be valid");
     }
 }
 
@@ -480,7 +854,12 @@ impl ToolRegistry {
             }),
             resource_type: ResourceType::Application,
             operation: "launch".into(),
-        });
+            security: ToolSecurity::constant(SecurityAction::Execute, "git:working-tree")
+                .with_capability(CapabilitySet::CAP_FILE_WRITE)
+                .with_approval(ApprovalPolicy::User)
+                .sandboxed(),
+        })
+        .expect("built-in git_commit security declaration must be valid");
         // `-a -m {message}` so the tool actually commits (the previous template
         // was `git add -A`, which only staged and never created a commit).
         self.register_command_template(
@@ -500,7 +879,10 @@ impl ToolRegistry {
             parameters_schema: serde_json::json!({"type": "object", "properties": {}}),
             resource_type: ResourceType::Application,
             operation: "launch".into(),
-        });
+            security: ToolSecurity::constant(SecurityAction::Execute, "git:working-tree")
+                .sandboxed(),
+        })
+        .expect("built-in git_diff security declaration must be valid");
         self.register_command_template("git_diff", "git", &["diff".into()]);
     }
 }
@@ -524,7 +906,9 @@ impl ToolRegistry {
             }),
             resource_type: ResourceType::Ipc,
             operation: "send".into(),
-        });
+            security: ToolSecurity::argument(SecurityAction::Ipc, "to").caller_namespace(),
+        })
+        .expect("built-in send_agent_message security declaration must be valid");
         self.register(ToolBinding {
             name: "check_inbox".into(),
             description: "Receive the next pending message from your agent inbox (empty if none)."
@@ -532,7 +916,9 @@ impl ToolRegistry {
             parameters_schema: serde_json::json!({"type": "object", "properties": {}}),
             resource_type: ResourceType::Ipc,
             operation: "receive".into(),
-        });
+            security: ToolSecurity::constant(SecurityAction::Ipc, "ipc:self").caller_namespace(),
+        })
+        .expect("built-in check_inbox security declaration must be valid");
         self.register(ToolBinding {
             name: "delegate_task".into(),
             description: "Delegate a task to another agent by id; returns a task_id you can poll \
@@ -548,7 +934,9 @@ impl ToolRegistry {
             }),
             resource_type: ResourceType::Ipc,
             operation: "delegate".into(),
-        });
+            security: ToolSecurity::argument(SecurityAction::Ipc, "to").caller_namespace(),
+        })
+        .expect("built-in delegate_task security declaration must be valid");
         self.register(ToolBinding {
             name: "delegation_status".into(),
             description: "Check a delegated task's status by task_id \
@@ -561,7 +949,9 @@ impl ToolRegistry {
             }),
             resource_type: ResourceType::Ipc,
             operation: "delegation_status".into(),
-        });
+            security: ToolSecurity::argument(SecurityAction::Ipc, "task_id").caller_namespace(),
+        })
+        .expect("built-in delegation_status security declaration must be valid");
         self.register(ToolBinding {
             name: "complete_delegation".into(),
             description: "Mark a task delegated to you (by its task_id) as completed.".into(),
@@ -572,7 +962,9 @@ impl ToolRegistry {
             }),
             resource_type: ResourceType::Ipc,
             operation: "complete_delegation".into(),
-        });
+            security: ToolSecurity::argument(SecurityAction::Ipc, "task_id").caller_namespace(),
+        })
+        .expect("built-in complete_delegation security declaration must be valid");
         self.register(ToolBinding {
             name: "discover_agents".into(),
             description: "List the other agents you can address (name, id, state) so you can \
@@ -581,6 +973,9 @@ impl ToolRegistry {
             parameters_schema: serde_json::json!({"type": "object", "properties": {}}),
             resource_type: ResourceType::Ipc,
             operation: "discover".into(),
-        });
+            security: ToolSecurity::constant(SecurityAction::Ipc, "ipc:namespace")
+                .caller_namespace(),
+        })
+        .expect("built-in discover_agents security declaration must be valid");
     }
 }

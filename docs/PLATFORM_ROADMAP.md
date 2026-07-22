@@ -1,5 +1,11 @@
 # Platform Roadmap
 
+> **Archived implementation log (2026-07-21).** “Done” below records that an
+> implementation checkpoint existed; it is not a production-readiness claim.
+> Current maturity is authoritative only in
+> [the capability registry](capabilities.toml), and all remaining qualification
+> work is tracked by the [v1 roadmap issue](https://github.com/surya-koritala/AIagentOS/issues/105).
+
 Forward-looking feature roadmap for **AI Agent OS**: turning the load-bearing
 Rust kernel into a complete, usable agent platform.
 
@@ -34,7 +40,7 @@ Sizes: **S** ≈ days, **M** ≈ 1–2 weeks, **L** ≈ 3–6 weeks, **XL** ≈ 
 
 | ID | Title | Size | Deps | Status |
 |----|-------|------|------|--------|
-| **B0.1** | Syscall server: expose `AgentKernelImpl` over a JSON syscall API (TCP + Unix socket); promote `syscall_interface` toward the real agent↔kernel boundary | XL | — | **Done** (`syscall_server`: agent lifecycle + LLM turn/providers + memory store/query + tool call + gate stats/agent info; TCP **and** Unix socket; optional shared-secret auth; enforcement over the wire) |
+| **B0.1** | Syscall server: expose `AgentKernelImpl` over the canonical JSON syscall API (TCP + Unix socket); explicitly retire the numbered prototype from the public boundary | XL | — | **Done** (`syscall_server`: agent lifecycle + LLM turn/providers + memory store/query + tool call + gate stats/agent info; TCP **and** Unix socket; optional shared-secret auth; enforcement over the wire; see ADR 0001) |
 | **B0.2** | Embeddable **Rust SDK** crate: `Agent` builder + typed client over the syscall API (and an in-process mode), `llm` / `memory` / `storage` / `tool` calls | L | B0.1 | **Done** (`agent-sdk`: `KernelClient` + `Agent` builder; create/list/send/tool/gate + providers/memory/load_package) |
 | **B0.3** | Agent package format + loader/runner (a Rust agent crate + a manifest the kernel can load and run) | M | B0.2 | **Done** (`agent_package`: TOML `AgentManifest` + `load_package`/`run_package`; `LoadPackage` syscall + SDK; `docs/AGENT_PACKAGE.md` + sample) |
 
@@ -51,7 +57,7 @@ Sizes: **S** ≈ days, **M** ≈ 1–2 weeks, **L** ≈ 3–6 weeks, **XL** ≈ 
 | ID | Title | Size | Deps | Notes |
 |----|-------|------|------|-------|
 | **B2.1** | Context snapshot / restore (persist + restore an agent's in-flight context so a turn can pause/resume) | L | — | **Done** (`context_snapshots` table + `snapshot/restore/list/delete` methods; `Snapshot*`/`RestoreSnapshot` syscalls + SDK) |
-| **B2.2** | Mid-generation context switch (pause/resume LLM decoding; feasible with local/vLLM, checkpoint-at-token-boundary for hosted APIs) | XL | B2.1, B1.1 | We only trim the buffer today (ContextPager) |
+| **B2.2** | Mid-generation context switch (pause/resume LLM decoding; feasible with local/vLLM, checkpoint-at-token-boundary for hosted APIs) | XL | B2.1, B1.1 | **Public-API E2E implemented** (versioned/tenant-scoped durable checkpoints, lifecycle pause/resume, restart recovery, pending-tool reconstruction; hosted APIs remain request-boundary and crash-window side effects are documented at-least-once). Production qualification remains open in #113. |
 
 ## Phase 3 — Memory & storage
 

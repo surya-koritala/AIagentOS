@@ -19,7 +19,7 @@ mod tests {
                     {"type": "tool_use", "id": "toolu_01", "name": "read_file", "input": {"path": "/tmp/test.txt"}}
                 ],
                 "stop_reason": "tool_use",
-                "usage": {"input_tokens": 30, "output_tokens": 20}
+                "usage": {"input_tokens": 30, "output_tokens": 20, "cache_read_input_tokens": 9}
             })))
             .mount(&mock_server)
             .await;
@@ -44,6 +44,7 @@ mod tests {
         assert_eq!(resp.tool_calls[0].name, "read_file");
         assert_eq!(resp.tool_calls[0].arguments["path"], "/tmp/test.txt");
         assert_eq!(resp.tokens_used, 50);
+        assert_eq!(resp.usage, LlmUsage::reported(30, 20, 9));
     }
 
     #[tokio::test]

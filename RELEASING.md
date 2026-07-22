@@ -37,10 +37,12 @@ All workspace crates share one version number; bump them together.
 3. Bump the version in every crate's `Cargo.toml` (`crates/*/Cargo.toml`); run
    `cargo build` so `Cargo.lock` updates.
 4. Open a `chore/release-vX.Y.Z` PR; merge once green.
-5. Tag the merged commit and push:
+5. Create a signed, annotated tag for the merged commit, verify it locally, and
+   push it. Published tags are immutable; never move or recreate one:
    ```bash
    git checkout main && git pull
-   git tag vX.Y.Z
+   git tag -s vX.Y.Z -m "AI Agent OS vX.Y.Z"
+   git tag -v vX.Y.Z
    git push origin vX.Y.Z
    ```
 6. The [`release` workflow](.github/workflows/release.yml) takes over — see below.
@@ -55,22 +57,42 @@ of these pass** against the exact tagged commit:
 2. **Wedge acceptance** — the keyless `governance-demo` runs: violators are
    contained and audited, compliant agents keep working. If the product's one
    job regresses, the release is blocked.
-3. **Container artifact** — the `agent-server` image builds, boots, and answers a
-   real `{"op":"node_info"}` syscall round-trip.
+3. **Reproducible platform binaries** — Linux, macOS, and Windows CLI, server,
+   and TUI binaries are built twice in isolated target directories and must be
+   byte-for-byte identical before deterministic archives are accepted.
+4. **Container artifact** — the non-root `agent-server` image builds, boots,
+   answers a real `{"op":"node_info"}` syscall round-trip, and retains mounted
+   data across restart.
+5. **Supply-chain evidence** — each platform archive has a CycloneDX SBOM, the
+   container has an SPDX SBOM, every asset appears in `SHA256SUMS`, and assets
+   are keyless-signed with Sigstore and covered by GitHub build provenance.
 
-Then it publishes a GitHub Release whose notes are the matching `CHANGELOG.md`
-section.
+Only then does the workflow publish a GitHub Release whose notes are the matching
+`CHANGELOG.md` section. Verify a downloaded release with:
+
+```bash
+sha256sum --check SHA256SUMS
+cosign verify-blob \
+  --bundle agentos-vX.Y.Z-x86_64-unknown-linux-gnu.zip.sigstore.json \
+  --certificate-identity-regexp 'github.com/surya-koritala/AIagentOS' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  agentos-vX.Y.Z-x86_64-unknown-linux-gnu.zip
+gh attestation verify agentos-vX.Y.Z-x86_64-unknown-linux-gnu.zip \
+  --repo surya-koritala/AIagentOS
+```
 
 This is how "are we building the right product?" gets enforced mechanically: a
 release that can't contain a rogue agent or boot a server doesn't ship.
 
 ## Toward a stable API (the 1.0 bar)
 
-`1.0.0` is gated on a **versioned, stable wire protocol**, and the mechanism for
-it is now in place (as of v0.3.0):
+`1.0.0` is gated on a **versioned, stable wire protocol**. The negotiation
+mechanism shipped in v0.3.0 with protocol version 1. The current unreleased tree
+adds version 2 while continuing to serve versions 1 through 2:
 
 - The protocol carries an explicit version, `kernel::syscall_server::PROTOCOL_VERSION`
-  (currently **1**), versioned independently of the crate release. Bump it on any
+  (currently **2** in the unreleased tree, serving **1..=2**), versioned
+  independently of the crate release. Bump it on any
   wire-breaking change (a removed/renamed variant or field); additive changes (a
   new optional syscall) don't.
 - A client negotiates with the optional `Syscall::Hello { protocol_version }`
@@ -79,11 +101,12 @@ it is now in place (as of v0.3.0):
   understand `Hello` — gets a clear `SdkError::IncompatibleProtocol` up front
   rather than a confusing failure on a later syscall.
 - The SDK pins the version it was built against (re-exported `PROTOCOL_VERSION`)
-  and exposes `KernelClient::hello()` to verify compatibility right after connect.
+  and negotiates automatically on connect; `KernelClient::hello()` remains
+  available for explicit inspection.
 
-What remains for the 1.0 promise: a commitment to *hold* `PROTOCOL_VERSION`
-stable across minors and to serve a real backward-compatibility window
-(`MIN_PROTOCOL_VERSION < PROTOCOL_VERSION`) once we ship a second protocol
-revision. Until 1.0, the protocol may still change between minors — bump
-`PROTOCOL_VERSION` and note any wire-breaking change prominently in the
-changelog entry.
+Version 1 keeps the released prose-only error reply. Version 2 adds stable typed
+error categories and a retry hint; a connection that omits `Hello` stays on v1.
+What remains for the 1.0 promise is a schema-driven compatibility policy and
+longer support commitment. Until 1.0, the protocol may still change between
+minors — bump `PROTOCOL_VERSION`, retain or explicitly retire older fixtures,
+and note any wire-breaking change prominently in the changelog entry.

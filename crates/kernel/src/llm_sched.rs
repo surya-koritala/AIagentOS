@@ -23,12 +23,11 @@ pub const DEFAULT_LLM_CORES: usize = 4;
 /// (nice — lower is higher priority, Linux semantics).
 #[derive(Debug, Clone, Copy)]
 struct Waiter {
-    #[allow(dead_code)]
-    agent_id: AgentId,
     nice: i8,
     /// Monotonic sequence number — tie-breaks equal-nice waiters in FIFO order
     /// so admission is deterministic and starvation-free among equals.
     seq: u64,
+    enqueued_at: std::time::Instant,
 }
 
 struct SchedInner {
@@ -36,6 +35,7 @@ struct SchedInner {
     in_flight: usize,
     /// Total cores in the pool.
     cores: usize,
+    max_waiters: usize,
     /// Agents currently blocked in `acquire`.
     waiters: Vec<Waiter>,
     /// Next sequence number to hand to a waiter.
@@ -46,19 +46,46 @@ struct SchedInner {
 pub struct LlmScheduler {
     state: std::sync::Mutex<SchedInner>,
     notify: tokio::sync::Notify,
+    admitted_total: std::sync::atomic::AtomicU64,
+    cancelled_total: std::sync::atomic::AtomicU64,
+    wait_ns_total: std::sync::atomic::AtomicU64,
+    run_ns_total: std::sync::atomic::AtomicU64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LlmSchedulerMetrics {
+    pub in_flight: usize,
+    pub waiting: usize,
+    pub cores: usize,
+    pub queue_capacity: usize,
+    pub admitted_total: u64,
+    pub cancelled_total: u64,
+    pub wait_ns_total: u64,
+    pub run_ns_total: u64,
 }
 
 impl LlmScheduler {
     /// Create a scheduler with `cores` LLM cores (at least 1).
     pub fn new(cores: usize) -> Self {
+        let cores = cores.max(1);
+        Self::with_queue_limit(cores, cores.saturating_mul(64).max(64))
+    }
+
+    pub fn with_queue_limit(cores: usize, max_waiters: usize) -> Self {
+        let cores = cores.max(1);
         Self {
             state: std::sync::Mutex::new(SchedInner {
                 in_flight: 0,
-                cores: cores.max(1),
+                cores,
+                max_waiters: max_waiters.max(1),
                 waiters: Vec::new(),
                 next_seq: 0,
             }),
             notify: tokio::sync::Notify::new(),
+            admitted_total: std::sync::atomic::AtomicU64::new(0),
+            cancelled_total: std::sync::atomic::AtomicU64::new(0),
+            wait_ns_total: std::sync::atomic::AtomicU64::new(0),
+            run_ns_total: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -78,11 +105,42 @@ impl LlmScheduler {
         self.state.lock().unwrap().in_flight
     }
 
-    /// Pick the preferred waiter (lowest nice, then lowest seq) from a snapshot.
+    /// Provider requests currently waiting for an LLM core.
+    pub fn waiting(&self) -> usize {
+        self.state.lock().unwrap().waiters.len()
+    }
+
+    pub fn metrics(&self) -> LlmSchedulerMetrics {
+        use std::sync::atomic::Ordering;
+        let state = self.state.lock().unwrap();
+        LlmSchedulerMetrics {
+            in_flight: state.in_flight,
+            waiting: state.waiters.len(),
+            cores: state.cores,
+            queue_capacity: state.max_waiters,
+            admitted_total: self.admitted_total.load(Ordering::Relaxed),
+            cancelled_total: self.cancelled_total.load(Ordering::Relaxed),
+            wait_ns_total: self.wait_ns_total.load(Ordering::Relaxed),
+            run_ns_total: self.run_ns_total.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Pick the preferred waiter by aged priority, then FIFO. Every full second
+    /// of waiting improves effective nice by one until -20, so a low-priority
+    /// request eventually ties new high-priority arrivals and its older
+    /// sequence wins. This is bounded aging, not Linux priority inheritance.
     fn preferred(waiters: &[Waiter]) -> Option<Waiter> {
         waiters
             .iter()
-            .min_by(|a, b| a.nice.cmp(&b.nice).then(a.seq.cmp(&b.seq)))
+            .min_by(|a, b| {
+                let effective = |waiter: &Waiter| {
+                    waiter
+                        .nice
+                        .saturating_sub(waiter.enqueued_at.elapsed().as_secs().min(39) as i8)
+                        .max(-20)
+                };
+                effective(a).cmp(&effective(b)).then(a.seq.cmp(&b.seq))
+            })
             .copied()
     }
 
@@ -93,17 +151,47 @@ impl LlmScheduler {
     /// `nice` follows Linux semantics: lower = higher priority. Uncontended
     /// requests admit immediately (no added latency when cores are free).
     pub async fn acquire(&self, agent_id: AgentId, nice: i8) -> LlmCoreSlot<'_> {
+        self.acquire_inner(agent_id, nice, None)
+            .await
+            .expect("uncancelled LLM admission queue unexpectedly full")
+    }
+
+    pub async fn acquire_cancellable(
+        &self,
+        agent_id: AgentId,
+        nice: i8,
+        cancellation: &tokio_util::sync::CancellationToken,
+    ) -> Result<LlmCoreSlot<'_>, crate::SchedulerError> {
+        self.acquire_inner(agent_id, nice, Some(cancellation)).await
+    }
+
+    async fn acquire_inner(
+        &self,
+        agent_id: AgentId,
+        nice: i8,
+        cancellation: Option<&tokio_util::sync::CancellationToken>,
+    ) -> Result<LlmCoreSlot<'_>, crate::SchedulerError> {
         // Register as a contender exactly once, with a monotonic sequence.
         let my_seq = {
             let mut st = self.state.lock().unwrap();
+            if st.waiters.len() >= st.max_waiters {
+                return Err(crate::SchedulerError::LlmQueueFull {
+                    capacity: st.max_waiters,
+                });
+            }
             let seq = st.next_seq;
-            st.next_seq += 1;
+            st.next_seq = st.next_seq.wrapping_add(1);
             st.waiters.push(Waiter {
-                agent_id,
                 nice,
                 seq,
+                enqueued_at: std::time::Instant::now(),
             });
             seq
+        };
+        let mut registration = LlmWaitRegistration {
+            scheduler: self,
+            seq: my_seq,
+            admitted: false,
         };
         loop {
             // If a core is free, snapshot the preferred waiter without holding
@@ -123,17 +211,76 @@ impl LlmScheduler {
                     // still registered (a concurrent drop/admit may have raced).
                     let still_registered = st.waiters.iter().any(|w| w.seq == my_seq);
                     if st.in_flight < st.cores && still_registered {
+                        let position = st
+                            .waiters
+                            .iter()
+                            .position(|waiter| waiter.seq == my_seq)
+                            .expect("registered waiter");
+                        let waiter = st.waiters.remove(position);
                         st.in_flight += 1;
-                        st.waiters.retain(|w| w.seq != my_seq);
-                        return LlmCoreSlot { sched: self };
+                        drop(st);
+                        registration.admitted = true;
+                        use std::sync::atomic::Ordering;
+                        self.admitted_total.fetch_add(1, Ordering::Relaxed);
+                        self.wait_ns_total.fetch_add(
+                            waiter
+                                .enqueued_at
+                                .elapsed()
+                                .as_nanos()
+                                .min(u128::from(u64::MAX)) as u64,
+                            Ordering::Relaxed,
+                        );
+                        return Ok(LlmCoreSlot {
+                            sched: self,
+                            started_at: std::time::Instant::now(),
+                        });
                     }
                 }
             }
             // Not admitted yet — wait for a core to free. The short timeout is a
             // safety net against a missed notification; releases notify directly.
-            let _ =
-                tokio::time::timeout(std::time::Duration::from_millis(25), self.notify.notified())
-                    .await;
+            if let Some(cancellation) = cancellation {
+                tokio::select! {
+                    _ = cancellation.cancelled() => {
+                        return Err(crate::SchedulerError::LlmAdmissionCancelled(agent_id));
+                    }
+                    _ = self.notify.notified() => {}
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(25)) => {}
+                }
+            } else {
+                let _ = tokio::time::timeout(
+                    std::time::Duration::from_millis(25),
+                    self.notify.notified(),
+                )
+                .await;
+            }
+        }
+    }
+}
+
+struct LlmWaitRegistration<'a> {
+    scheduler: &'a LlmScheduler,
+    seq: u64,
+    admitted: bool,
+}
+
+impl Drop for LlmWaitRegistration<'_> {
+    fn drop(&mut self) {
+        if self.admitted {
+            return;
+        }
+        let removed = {
+            let mut state = self.scheduler.state.lock().unwrap();
+            let before = state.waiters.len();
+            state.waiters.retain(|waiter| waiter.seq != self.seq);
+            state.waiters.len() != before
+        };
+        if removed {
+            use std::sync::atomic::Ordering;
+            self.scheduler
+                .cancelled_total
+                .fetch_add(1, Ordering::Relaxed);
+            self.scheduler.notify.notify_waiters();
         }
     }
 }
@@ -141,6 +288,7 @@ impl LlmScheduler {
 /// RAII LLM-core slot. Frees the core and wakes the next waiter on drop.
 pub struct LlmCoreSlot<'a> {
     sched: &'a LlmScheduler,
+    started_at: std::time::Instant,
 }
 
 impl Drop for LlmCoreSlot<'_> {
@@ -149,6 +297,14 @@ impl Drop for LlmCoreSlot<'_> {
             let mut st = self.sched.state.lock().unwrap();
             st.in_flight = st.in_flight.saturating_sub(1);
         }
+        use std::sync::atomic::Ordering;
+        self.sched.run_ns_total.fetch_add(
+            self.started_at
+                .elapsed()
+                .as_nanos()
+                .min(u128::from(u64::MAX)) as u64,
+            Ordering::Relaxed,
+        );
         self.sched.notify.notify_waiters();
     }
 }
@@ -258,6 +414,32 @@ mod tests {
             t.await.unwrap();
         }
         assert_eq!(*order.lock().await, vec![2, 3]);
+    }
+
+    #[tokio::test]
+    async fn cancelled_llm_waiter_is_removed_and_metrics_update() {
+        let sched = Arc::new(LlmScheduler::with_queue_limit(1, 2));
+        let held = sched.acquire(1, 0).await;
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let waiter = {
+            let sched = Arc::clone(&sched);
+            let cancellation = cancellation.clone();
+            tokio::spawn(async move {
+                let _slot = sched.acquire_cancellable(2, 0, &cancellation).await?;
+                Ok::<(), crate::SchedulerError>(())
+            })
+        };
+        while sched.waiting() != 1 {
+            tokio::task::yield_now().await;
+        }
+        cancellation.cancel();
+        assert!(matches!(
+            waiter.await.unwrap(),
+            Err(crate::SchedulerError::LlmAdmissionCancelled(2))
+        ));
+        assert_eq!(sched.waiting(), 0);
+        assert_eq!(sched.metrics().cancelled_total, 1);
+        drop(held);
     }
 
     #[tokio::test]

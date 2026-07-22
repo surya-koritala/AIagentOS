@@ -223,24 +223,25 @@ async fn handle_tools_call(
 
     let args = params.get("arguments").cloned().unwrap_or(json!({}));
 
-    // Token estimate + representative resource, mirroring the executor's tool
-    // path (and syscall_server's CallTool) so gate accounting / MAC matching are
-    // consistent across the in-process, syscall, and MCP entry points.
+    // Token estimate + registry-declared resource extractor, mirroring the
+    // executor and syscall paths exactly.
     let est_tokens = (args.to_string().len() as u64 / 4)
         .saturating_add(tool.len() as u64 / 4)
         .saturating_add(10);
-    let resource = args
-        .get("path")
-        .or_else(|| args.get("url"))
-        .or_else(|| args.get("command"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("*")
-        .to_string();
+    let (security, resource) = kernel
+        .tool_registry
+        .security_context(&tool, &args)
+        .map_err(|error| {
+            (
+                error_codes::INVALID_PARAMS,
+                format!("tool '{tool}' denied by kernel: {error}"),
+            )
+        })?;
 
     // Enforcement first — a denial never reaches the broker.
     if let Err(denial) = kernel
         .syscall_gate
-        .check_tool_call(agent_id, &tool, &resource, est_tokens)
+        .check_tool_call_declared(agent_id, &tool, &resource, est_tokens, &security)
         .await
     {
         return Err((
@@ -248,6 +249,16 @@ async fn handle_tools_call(
             format!("tool '{tool}' denied by kernel: {}", denial.message()),
         ));
     }
+
+    let _tool_slot = kernel
+        .syscall_gate
+        .acquire_tool_call(agent_id)
+        .map_err(|denial| {
+            (
+                error_codes::INTERNAL_ERROR,
+                format!("tool '{tool}' denied by kernel: {}", denial.message()),
+            )
+        })?;
 
     let call = ToolCall {
         id: "mcp".into(),
@@ -284,9 +295,6 @@ async fn handle_tools_call(
         )),
     };
 
-    // Record usage even on a broker-level failure — the gate already admitted
-    // the call (matches syscall_server's CallTool accounting).
-    kernel.syscall_gate.record_tool_usage(agent_id, est_tokens);
     result
 }
 

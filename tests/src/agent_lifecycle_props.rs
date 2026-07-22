@@ -10,7 +10,6 @@
 
 use std::sync::Arc;
 
-use chrono::Utc;
 use proptest::prelude::*;
 
 use kernel::agent::{AgentKernel, AgentManager};
@@ -232,18 +231,6 @@ proptest! {
                 Some(AgentState::Running)
             );
 
-            // Simulate unresponsiveness: set last_activity_at to 31 seconds ago
-            {
-                // Access the internal agents map to manipulate last_activity_at
-                // This simulates the passage of time without waiting 30 real seconds
-                let agents_field = &manager;
-                // We need to use the record_activity pattern in reverse - directly
-                // manipulate the agent's last_activity_at through the DashMap
-                // The AgentManager exposes agents as a DashMap field
-                // Since we can't directly access private fields from tests crate,
-                // we simulate the watchdog behavior by calling transition_state
-            }
-
             // Simulate what the watchdog does when it detects unresponsiveness:
             // 1. Transition to Error state
             // 2. Transition to Stopped state (resources released)
@@ -272,11 +259,11 @@ proptest! {
                             found_error_event = true;
                         }
                     }
-                    KernelEvent::AgentStateChanged { agent_id: eid, new: AgentState::Stopped, .. } => {
-                        if *eid == agent_id {
-                            found_stopped_event = true;
-                        }
-                    }
+                    KernelEvent::AgentStateChanged {
+                        agent_id: eid,
+                        new: AgentState::Stopped,
+                        ..
+                    } if *eid == agent_id => found_stopped_event = true,
                     _ => {}
                 }
             }

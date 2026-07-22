@@ -35,8 +35,8 @@ impl NodeHandle {
 /// Placement policy for new agents across cluster nodes.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum Placement {
-    /// Put the agent on the node hosting the fewest agents (queries each node's
-    /// load first). Ties break toward the earliest node.
+    /// Put the agent on the node with the lowest actual turn/LLM pressure,
+    /// then fewest queued/live agents. Ties break toward the earliest node.
     #[default]
     LeastLoaded,
     /// Cycle through nodes in order, one after another.
@@ -109,11 +109,26 @@ impl ClusterClient {
             }
             Placement::LeastLoaded => {
                 let mut best = 0usize;
-                let mut best_load = usize::MAX;
+                let mut best_load = (usize::MAX, usize::MAX, usize::MAX);
                 for (idx, node) in self.nodes.iter_mut().enumerate() {
                     let load = node.client.node_info().await?;
-                    if load.agent_count < best_load {
-                        best_load = load.agent_count;
+                    let turn_pressure = load
+                        .active_turns
+                        .saturating_mul(1_000)
+                        .checked_div(load.turn_capacity.max(1))
+                        .unwrap_or(usize::MAX);
+                    let llm_pressure = load
+                        .llm_requests_in_flight
+                        .saturating_mul(1_000)
+                        .checked_div(load.llm_core_capacity.max(1))
+                        .unwrap_or(usize::MAX);
+                    let score = (
+                        turn_pressure.max(llm_pressure),
+                        load.queued_agents.saturating_add(load.waiting_turns),
+                        load.live_agents,
+                    );
+                    if score < best_load {
+                        best_load = score;
                         best = idx;
                     }
                 }

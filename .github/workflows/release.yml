@@ -1,14 +1,3 @@
-# Release pipeline.
-#
-# Fires on a pushed semver tag (vX.Y.Z). It re-runs the full quality gate, then
-# proves the two things a release must guarantee — that the product wedge still
-# works (the governed-execution demo) and that the shippable artifact (the
-# agent-server container) actually builds — and only then publishes a GitHub
-# Release whose notes are the matching CHANGELOG section.
-#
-# Cut a release with:  git tag vX.Y.Z && git push origin vX.Y.Z
-# (See RELEASING.md.)
-
 name: release
 
 on:
@@ -17,12 +6,18 @@ on:
       - "v*"
 
 permissions:
-  contents: write # needed to create the GitHub Release
+  contents: write
+  id-token: write
+  attestations: write
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  CARGO_PROFILE_RELEASE_CODEGEN_UNITS: 1
 
 jobs:
-  # 1. The same gate CI runs per-PR, re-run against the exact tagged commit.
   gate:
-    name: quality gate
+    name: tagged-commit quality gate
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -30,73 +25,173 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
-      - name: fmt
-        run: cargo fmt --all -- --check
-      - name: clippy
-        run: cargo clippy --workspace --exclude tauri-app -- -D warnings
-      - name: test
-        run: cargo test --workspace --exclude tauri-app
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --exclude tauri-app --all-targets --locked -- -D warnings
+      - run: cargo test --workspace --exclude tauri-app --locked
+      - run: cargo test -p integration-tests capability_registry --locked
 
-  # 2. The product wedge must still hold: the governed-execution demo contains
-  #    its violators and keeps compliant agents working. Keyless, no LLM.
   wedge:
-    name: wedge acceptance (governance demo)
+    name: governed-execution acceptance
+    needs: gate
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: governed-execution demo
-        run: cargo run --release --package os-benchmark --bin governance-demo
+      - run: cargo run --release --locked --package os-benchmark --bin governance-demo
 
-  # 3. The shippable artifact must build and boot: build the agent-server image
-  #    and confirm it answers a real NodeInfo syscall.
+  release-artifacts:
+    name: reproducible binaries (${{ matrix.target }})
+    needs: gate
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            extension: ""
+          - runner: macos-13
+            target: x86_64-apple-darwin
+            extension: ""
+          - runner: windows-latest
+            target: x86_64-pc-windows-msvc
+            extension: ".exe"
+    runs-on: ${{ matrix.runner }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Set deterministic build inputs
+        run: |
+          echo "SOURCE_DATE_EPOCH=$(git show -s --format=%ct HEAD)" >> "$GITHUB_ENV"
+          echo "RUSTFLAGS=--remap-path-prefix=${GITHUB_WORKSPACE}=." >> "$GITHUB_ENV"
+      - name: Build twice from isolated target directories
+        run: |
+          CARGO_TARGET_DIR=target-a cargo build --release --locked --target "${{ matrix.target }}" -p agent-cli --bins -p agent-tui
+          CARGO_TARGET_DIR=target-b cargo build --release --locked --target "${{ matrix.target }}" -p agent-cli --bins -p agent-tui
+      - name: Prove binaries are byte-for-byte reproducible
+        run: |
+          for binary in agent agent-server agent-tui; do
+            cmp "target-a/${{ matrix.target }}/release/${binary}${{ matrix.extension }}" \
+                "target-b/${{ matrix.target }}/release/${binary}${{ matrix.extension }}"
+          done
+      - name: Create deterministic archive
+        run: |
+          mkdir -p dist/stage
+          for binary in agent agent-server agent-tui; do
+            cp "target-a/${{ matrix.target }}/release/${binary}${{ matrix.extension }}" dist/stage/
+          done
+          artifact="agentos-${GITHUB_REF_NAME}-${{ matrix.target }}.zip"
+          python - "$artifact" <<'PY'
+          import pathlib, stat, sys, zipfile
+          name = sys.argv[1]
+          root = pathlib.Path("dist/stage")
+          with zipfile.ZipFile(pathlib.Path("dist") / name, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as archive:
+              for path in sorted(root.iterdir()):
+                  info = zipfile.ZipInfo(path.name, (1980, 1, 1, 0, 0, 0))
+                  info.create_system = 3
+                  info.external_attr = (stat.S_IFREG | 0o755) << 16
+                  info.compress_type = zipfile.ZIP_DEFLATED
+                  archive.writestr(info, path.read_bytes())
+          PY
+      - uses: anchore/sbom-action/download-syft@v0
+      - name: Generate CycloneDX SBOM
+        run: |
+          artifact="agentos-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          syft dir:dist/stage -o "cyclonedx-json=dist/${artifact}.cdx.json"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.target }}
+          path: |
+            dist/*.zip
+            dist/*.cdx.json
+          if-no-files-found: error
+
   container:
     name: container artifact
+    needs: gate
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: build agent-server image
-        run: docker build -t agentos:${{ github.ref_name }} .
-      - name: boot + syscall round-trip
+      - name: Build agent-server image
+        run: docker build --pull -t agentos:${{ github.ref_name }} .
+      - name: Verify non-root boot and syscall health
         run: |
-          docker run -d --name agentos-rel -p 7777:7777 \
+          docker volume create agentos-release-data
+          docker run -d --name agentos-release -p 7777:7777 -v agentos-release-data:/data \
             agentos:${{ github.ref_name }} agent-server 0.0.0.0:7777
           for i in $(seq 1 30); do
-            if printf '{"op":"node_info"}\n' | nc -w2 -q1 127.0.0.1 7777 2>/dev/null | grep -q '"status":"node_info"'; then
-              echo "agent-server answered NodeInfo"; ok=1; break
+            if printf '{"op":"node_info"}\n' | nc -w2 127.0.0.1 7777 | grep -q '"status":"node_info"'; then
+              healthy=1
+              break
             fi
             sleep 2
           done
-          docker logs agentos-rel || true
-          docker rm -f agentos-rel || true
-          test "${ok:-0}" = "1"
+          test "${healthy:-0}" = "1"
+          test "$(docker exec agentos-release id -u)" = "10001"
+          docker exec agentos-release sh -c 'printf persistence-proof > /data/persistence-proof'
+          docker restart agentos-release
+          docker exec agentos-release test -f /data/persistence-proof
+      - uses: anchore/sbom-action/download-syft@v0
+      - name: Generate container SPDX SBOM
+        run: syft agentos:${{ github.ref_name }} -o spdx-json=agentos-${{ github.ref_name }}-container.spdx.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-container
+          path: agentos-${{ github.ref_name }}-container.spdx.json
+          if-no-files-found: error
+      - name: Diagnostics and cleanup
+        if: always()
+        run: |
+          docker logs agentos-release || true
+          docker rm -f agentos-release || true
+          docker volume rm agentos-release-data || true
 
-  # 4. Only after all three pass: publish the Release with the CHANGELOG section.
   publish:
-    name: publish github release
-    needs: [gate, wedge, container]
+    name: attest, sign, and publish release
+    needs: [gate, wedge, release-artifacts, container]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: extract CHANGELOG section for this tag
-        id: notes
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+      - name: Generate SHA-256 manifest
+        working-directory: dist
+        run: sha256sum *.zip *.json > SHA256SUMS
+      - uses: sigstore/cosign-installer@v3
+      - name: Keyless-sign every artifact and checksum manifest
+        run: |
+          for asset in dist/*.zip dist/*.json dist/SHA256SUMS; do
+            cosign sign-blob --yes --bundle "${asset}.sigstore.json" "$asset"
+          done
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: |
+            dist/*.zip
+            dist/*.json
+            dist/SHA256SUMS
+      - name: Extract matching changelog section
         run: |
           version="${GITHUB_REF_NAME#v}"
-          # Pull the lines between this version's heading and the next "## [" heading.
           awk -v v="$version" '
             $0 ~ "^## \\[" v "\\]" {grab=1; next}
             grab && /^## \[/ {exit}
             grab {print}
           ' CHANGELOG.md > RELEASE_NOTES.md
-          if [ ! -s RELEASE_NOTES.md ]; then
-            echo "No CHANGELOG section for $version" >&2; exit 1
-          fi
-      - name: create release
+          test -s RELEASE_NOTES.md
+      - name: Create immutable GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "$GITHUB_REF_NAME" \
+          gh release create "$GITHUB_REF_NAME" dist/* \
             --title "$GITHUB_REF_NAME" \
             --notes-file RELEASE_NOTES.md \
             --verify-tag

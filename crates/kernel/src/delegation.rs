@@ -23,6 +23,10 @@ pub async fn delegate_to_agent(
             ),
             tool_calls_made: 0,
             tokens_used: 0,
+            provider_id: "none".into(),
+            model_id: "none".into(),
+            estimated_cost_usd: 0.0,
+            usage: Default::default(),
         });
     }
 

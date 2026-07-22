@@ -49,6 +49,7 @@ impl AzureOpenAiAdapter {
 
 struct AzureSession {
     provider_id: ProviderId,
+    model_id: String,
     client: reqwest::Client,
     api_key: String,
     chat_url: String,
@@ -143,6 +144,13 @@ impl LlmSession for AzureSession {
                             .as_str()
                             .map(|s| s.to_string()),
                         tokens_used: tokens,
+                        usage: kernel::connector::LlmUsage::reported(
+                            json["usage"]["prompt_tokens"].as_u64().unwrap_or(0) as u32,
+                            json["usage"]["completion_tokens"].as_u64().unwrap_or(0) as u32,
+                            json["usage"]["prompt_tokens_details"]["cached_tokens"]
+                                .as_u64()
+                                .unwrap_or(0) as u32,
+                        ),
                         tool_calls,
                     });
                 }
@@ -164,6 +172,10 @@ impl LlmSession for AzureSession {
 
     fn provider_id(&self) -> &ProviderId {
         &self.provider_id
+    }
+
+    fn model_id(&self) -> &str {
+        &self.model_id
     }
 
     async fn send_streaming(
@@ -243,6 +255,13 @@ impl LlmSession for AzureSession {
                     content,
                     finish_reason: Some("stop".into()),
                     tokens_used: tokens,
+                    usage: kernel::connector::LlmUsage::reported(
+                        json["usage"]["prompt_tokens"].as_u64().unwrap_or(0) as u32,
+                        json["usage"]["completion_tokens"].as_u64().unwrap_or(0) as u32,
+                        json["usage"]["prompt_tokens_details"]["cached_tokens"]
+                            .as_u64()
+                            .unwrap_or(0) as u32,
+                    ),
                     tool_calls,
                 });
             }
@@ -305,6 +324,7 @@ impl LlmSession for AzureSession {
             content,
             finish_reason: Some("stop".into()),
             tokens_used,
+            usage: Default::default(),
             tool_calls,
         })
     }
@@ -330,6 +350,7 @@ impl LlmProviderAdapter for AzureOpenAiAdapter {
     async fn create_session(&self) -> Result<Box<dyn LlmSession>, ConnectorError> {
         Ok(Box::new(AzureSession {
             provider_id: self.id.clone(),
+            model_id: self.deployment.clone(),
             client: self.client.clone(),
             api_key: self.api_key.clone(),
             chat_url: self.chat_url(),

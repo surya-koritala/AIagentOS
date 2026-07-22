@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 use crate::resources::ResourceType;
-use crate::tools::{ToolBinding, ToolRegistry};
+use crate::tools::{ApprovalPolicy, SecurityAction, ToolBinding, ToolRegistry, ToolSecurity};
 
 // ─── Data Model ──────────────────────────────────────────────────────────────
 
@@ -200,34 +200,44 @@ pub fn register_edit_tools(registry: &ToolRegistry) {
         }),
         resource_type: ResourceType::Filesystem,
         operation: "edit".into(),
-    });
+        security: ToolSecurity::argument(SecurityAction::Write, "path").sandboxed(),
+    })
+    .expect("built-in edit_file security declaration must be valid");
 
-    registry.register(ToolBinding {
-        name: "create_file".into(),
-        description: "Create a new file with the given content.".into(),
-        parameters_schema: serde_json::json!({
-            "type": "object",
-            "properties": {
-                "path": {"type": "string", "description": "File path to create"},
-                "content": {"type": "string", "description": "File content"}
-            },
-            "required": ["path", "content"]
-        }),
-        resource_type: ResourceType::Filesystem,
-        operation: "create".into(),
-    });
+    registry
+        .register(ToolBinding {
+            name: "create_file".into(),
+            description: "Create a new file with the given content.".into(),
+            parameters_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "File path to create"},
+                    "content": {"type": "string", "description": "File content"}
+                },
+                "required": ["path", "content"]
+            }),
+            resource_type: ResourceType::Filesystem,
+            operation: "create".into(),
+            security: ToolSecurity::argument(SecurityAction::Write, "path").sandboxed(),
+        })
+        .expect("built-in create_file security declaration must be valid");
 
-    registry.register(ToolBinding {
-        name: "delete_file".into(),
-        description: "Delete a file.".into(),
-        parameters_schema: serde_json::json!({
-            "type": "object",
-            "properties": {"path": {"type": "string", "description": "File path to delete"}},
-            "required": ["path"]
-        }),
-        resource_type: ResourceType::Filesystem,
-        operation: "delete".into(),
-    });
+    registry
+        .register(ToolBinding {
+            name: "delete_file".into(),
+            description: "Delete a file.".into(),
+            parameters_schema: serde_json::json!({
+                "type": "object",
+                "properties": {"path": {"type": "string", "description": "File path to delete"}},
+                "required": ["path"]
+            }),
+            resource_type: ResourceType::Filesystem,
+            operation: "delete".into(),
+            security: ToolSecurity::argument(SecurityAction::Delete, "path")
+                .with_approval(ApprovalPolicy::User)
+                .sandboxed(),
+        })
+        .expect("built-in delete_file security declaration must be valid");
 }
 
 #[cfg(test)]

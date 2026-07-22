@@ -1,5 +1,12 @@
 # AI Agent OS — Roadmap to a True OS
 
+> **Archived historical roadmap (2026-07-21).** This document explains how the
+> architecture evolved; its checkboxes are not the active backlog. Remaining
+> work was migrated to the evidence-gated
+> [v1 roadmap and child issues](https://github.com/surya-koritala/AIagentOS/issues/105).
+> Current capability maturity lives in
+> [`docs/capabilities.toml`](docs/capabilities.toml).
+
 > **Next frontier:** the Phase 1–3 OS-unification work below is complete (the syscall gate,
 > namespaces, MAC, cgroups, CFS turn admission, context paging, and budget enforcement are
 > load-bearing; `OsKernel` is gone). The forward-looking platform roadmap — kernel-as-server,
@@ -49,8 +56,8 @@ Goal: every tool call goes through the syscall layer; quotas reject; CI is green
   - Modify `AgentExecutor::execute_tool` (`crates/kernel/src/execution.rs:255`) to call the gate first; on deny return a structured `EPERM`/`EACCES`/`EAGAIN` to the LLM
   - Wire from `AgentKernelImpl::send_message` (`lib.rs:622`) so every CLI/Tauri call exercises it
   - Each agent gets a default cgroup at create time; default policy is `allow` so existing behaviour is preserved unless a profile asserts otherwise
-- [ ] **Wire context paging into context.rs**
-  - On `save_message` / `append`, call `ContextPager::add_page`; OOM eviction returns paged-out content via summarization
+- [x] **Wire context pressure into live execution**
+  - Before each provider call, enforce the active token budget; serialize evicted messages to a durable per-agent spill and fail closed when pinned state cannot fit. See `docs/CONTEXT_PRESSURE.md`.
 - [ ] **Observability retention** — bounded ring buffer (default 10k events) + per-agent purge on shutdown
 - [ ] **Honest README** — replace "368 tests passing" badge with live CI badge; replace the Linux-mapping table with a "load-bearing today / planned" table; link to this roadmap
 - [ ] **OS-ness e2e test** — `tests/src/os_enforcement.rs` exercising the three denials above
@@ -78,7 +85,7 @@ Goal: namespaces actually hide resources; scheduler actually decides who runs.
 - [x] **Namespace enforcement in tool resolution** — `SyscallGate` now consults a `tool_namespaces` table and per-agent `namespaces: Vec<NamespaceId>` membership; tools tagged with a namespace return `GateDenial::NotInNamespace` (≈ ENOENT) for non-members. The check runs first so foreign tools look indistinguishable from non-existent ones (no MAC-probe leak). Proven by `tests/src/os_enforcement.rs::namespace_isolation_denies_foreign_tool` and `namespace_denial_precedes_capability_and_mac`.
 - [x] **Per-namespace IPC** — `IpcManager` consults a `NamespaceVisibility` trait (impl by `SyscallGate::shares_namespace`) on every `send` and `publish`. Cross-namespace sends fail as `AgentNotFound` so a sender cannot probe for foreign mailboxes. Proven by `tests/src/os_enforcement.rs::namespace_isolation_blocks_cross_namespace_ipc`.
 - [x] **Scheduler observability + accounting** — `AgentKernelImpl::send_message` accounts each turn's tokens against the agent's CFS vruntime; new `kernel.set_nice(agent_id, nice)` and `kernel.next_runnable_agent()` make fairness inspectable. Proven by `tests/src/os_enforcement.rs::nice_values_change_scheduler_pick_next` — equal token spend with different nice values produces ordered `pick_next()` outcomes. Strict admission gating (block `send_message` until the agent's CFS turn) is a follow-up.
-- [ ] **Real OOM kill** — `context_paging` overflow triggers signal to lowest-priority agent in the cgroup
+- [ ] **Host-memory pressure policy** — qualify RSS/cgroup limits and explicit backpressure; the runtime does not currently claim an OOM killer
 - [ ] **VFS for tools** — agents `tool_open()` a path → fd; `tool_call()` takes fd; descriptor table enforces per-agent open limits
 
 **Exit criteria for Phase 3:** Stress test runs 100 agents across 3 namespaces and 5 cgroups; isolation and quota are observable from the outside.

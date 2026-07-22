@@ -112,6 +112,7 @@ impl LlmSession for HuggingFaceSession {
                         content,
                         finish_reason: Some("stop".to_string()),
                         tokens_used: 0,
+                        usage: Default::default(),
                         tool_calls: vec![],
                     });
                 }
@@ -131,6 +132,10 @@ impl LlmSession for HuggingFaceSession {
 
     fn provider_id(&self) -> &ProviderId {
         &self.provider_id
+    }
+
+    fn model_id(&self) -> &str {
+        &self.model
     }
 }
 

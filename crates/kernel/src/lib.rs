@@ -146,6 +146,9 @@ pub struct SandboxConfig {
 /// Level of isolation for the sandbox.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum IsolationLevel {
+    /// Explicit operator-trusted host access. This is never selected by wire or
+    /// package creation defaults and must not be used for untrusted agents.
+    Trusted,
     /// Filesystem-only isolation (chroot-like path restrictions).
     Filesystem,
     /// Process-level isolation (separate process with restricted syscalls).
@@ -270,6 +273,18 @@ pub enum SchedulerError {
 
     #[error("Deadlock detected")]
     DeadlockDetected,
+
+    #[error("Turn admission queue is full (capacity {capacity}); retry with backoff")]
+    AdmissionQueueFull { capacity: usize },
+
+    #[error("Turn admission cancelled for scheduler pid {0}")]
+    AdmissionCancelled(u64),
+
+    #[error("LLM admission queue is full (capacity {capacity}); retry with backoff")]
+    LlmQueueFull { capacity: usize },
+
+    #[error("LLM admission cancelled for scheduler pid {0}")]
+    LlmAdmissionCancelled(u64),
 }
 
 /// Errors related to context and memory management.
@@ -393,9 +408,9 @@ pub fn set_max_browse_chars(chars: usize) {
 
 /// Translate a permission profile id into a capability set used by the syscall gate.
 ///
-/// Unknown / custom profiles fall back to fully-permissive so user-defined
-/// profiles continue to work — the operator can tighten by switching the gate's
-/// MAC engine into enforcing mode and loading rules.
+/// Unknown / custom profiles fail closed with no capabilities. Custom profiles
+/// must be explicitly defined before they can grant authority; a typo must
+/// never silently become `full-access`.
 fn caps_for_profile(profile: &str) -> CapabilitySet {
     let mut caps = CapabilitySet::none();
     match profile {
@@ -414,8 +429,8 @@ fn caps_for_profile(profile: &str) -> CapabilitySet {
             caps.grant(CapabilitySet::CAP_NET_ACCESS);
             caps.grant(CapabilitySet::CAP_EXEC);
         }
-        "full-access" | "" => return CapabilitySet::all(),
-        _ => return CapabilitySet::all(),
+        "full-access" => return CapabilitySet::all(),
+        _ => {}
     }
     caps
 }
@@ -817,9 +832,9 @@ use crate::agent_struct::{CapabilitySet, SchedClass};
 use crate::cfs::{CfsScheduler, TurnAdmission};
 use crate::cgroups::{CgroupId, CgroupLimits, CgroupManager};
 use crate::connector::{AgentConnector, AgentConnectorImpl, LlmProviderAdapter};
-use crate::context::{ContextManager, SqliteContextManager};
-use crate::execution::{AgentExecutor, AgentOutput};
-use crate::init_system::InitSystem;
+use crate::context::{ContextManager, SqliteContextManager, UsageRecord};
+use crate::execution::{AgentExecutor, AgentOutput, TurnResult};
+use crate::init_system::{InitSystem, ServiceRuntimeInfo, ServiceStatus};
 use crate::ipc::IpcManager;
 use crate::llm_sched::{LlmScheduler, DEFAULT_LLM_CORES};
 use crate::namespaces::{NamespaceId, NamespaceRegistry, NamespaceType};
@@ -918,7 +933,9 @@ pub struct AgentKernelImpl {
     /// Per-minute token budget applied to each tenant's cgroup at creation,
     /// derived from the kernel's `BudgetConfig` (`tokens_per_min`).
     tenant_budget: CgroupLimits,
-    executors: DashMap<AgentId, tokio::sync::Mutex<AgentExecutor>>,
+    executors: DashMap<AgentId, Arc<tokio::sync::Mutex<AgentExecutor>>>,
+    lifecycle_locks: DashMap<AgentId, Arc<tokio::sync::Mutex<()>>>,
+    active_cancellations: DashMap<AgentId, tokio_util::sync::CancellationToken>,
     event_tx: broadcast::Sender<KernelEvent>,
 }
 
@@ -968,12 +985,25 @@ impl AgentKernelImpl {
         // supersedes the inline `mac_enforcing`/`mac_rules`. A malformed or
         // unreadable policy file fails startup with a clear message.
         let (mac_enforcing, mac_rules) = config.resolve_mac().map_err(KernelError::Policy)?;
+        if !mac_enforcing {
+            tracing::warn!(
+                target: "agentos::security",
+                "MAC enforcement is DISABLED by local configuration; tool policy is permissive"
+            );
+        }
         let kernel = Self::with_context_manager(
             context_manager,
             &config.budgets,
             mac_enforcing,
             &mac_rules,
         )?;
+        if let Some(service_dir) = &config.service_dir {
+            let mut init = kernel.os.init.try_lock().map_err(|_| {
+                KernelError::Policy("service supervisor was unexpectedly busy during boot".into())
+            })?;
+            init.load_directory_checked(service_dir)
+                .map_err(KernelError::Policy)?;
+        }
         // Bring back any agents persisted by a previous run on this DB so a
         // restart restores the full registry (and re-arms enforcement).
         kernel.rehydrate_agents_blocking();
@@ -993,7 +1023,11 @@ impl AgentKernelImpl {
     ) -> Result<Self, KernelError> {
         let (event_tx, _) = broadcast::channel(256);
         let permission_manager = Arc::new(PermissionManager::new());
-        let resource_broker = Arc::new(ResourceBrokerImpl::new(permission_manager.clone()));
+        let sandbox_manager = Arc::new(SandboxManagerImpl::new());
+        let resource_broker = Arc::new(ResourceBrokerImpl::new(
+            permission_manager.clone(),
+            sandbox_manager.clone(),
+        ));
 
         // Register built-in resource providers
         resource_broker.register_provider(Box::new(BuiltinFilesystemProvider));
@@ -1054,7 +1088,7 @@ impl AgentKernelImpl {
             scheduler: Arc::new(PriorityScheduler::new()),
             context_manager,
             permission_manager,
-            sandbox_manager: Arc::new(SandboxManagerImpl::new()),
+            sandbox_manager,
             ipc,
             observability,
             connector: Arc::new(AgentConnectorImpl::new()),
@@ -1085,6 +1119,8 @@ impl AgentKernelImpl {
                 ..Default::default()
             },
             executors: DashMap::new(),
+            lifecycle_locks: DashMap::new(),
+            active_cancellations: DashMap::new(),
             event_tx,
         })
     }
@@ -1178,14 +1214,20 @@ impl AgentKernelImpl {
     /// group or in the default namespace do not. This is what makes the gate's
     /// tool-namespace isolation load-bearing (previously no tool was ever
     /// tagged, so every tool was global).
-    pub fn register_group_tool(&self, group: &str, binding: crate::tools::ToolBinding) {
+    pub fn register_group_tool(
+        &self,
+        group: &str,
+        mut binding: crate::tools::ToolBinding,
+    ) -> Result<(), crate::tools::ToolRegistrationError> {
         let name = binding.name.clone();
-        self.tool_registry.register(binding);
+        binding.security.namespace_visibility = crate::tools::NamespaceVisibility::CallerNamespace;
+        self.tool_registry.register(binding)?;
         // Lazily ensures the group's namespaces exist; tag with the Tool ns.
         let (_agent_ns, tool_ns) = self.namespaces_for_group(Some(group));
         if let Some(ns) = tool_ns {
             self.syscall_gate.register_tool_namespace(name, ns);
         }
+        Ok(())
     }
 
     /// Resolve the (Agent, Tool) namespaces for a group, creating them lazily.
@@ -1218,10 +1260,17 @@ impl AgentKernelImpl {
 
     async fn create_agent_grouped(
         &self,
-        config: AgentConfig,
+        mut config: AgentConfig,
         group: Option<&str>,
         tenant_id: &str,
     ) -> Result<AgentHandle, KernelError> {
+        // Absence means the secure managed default, never host-unconfined. Only
+        // in-process operator code can explicitly request IsolationLevel::Trusted;
+        // the wire and package formats do not expose that bypass.
+        let managed_sandbox = config.sandbox_config.is_none();
+        if managed_sandbox {
+            config.sandbox_config = Some(SandboxManagerImpl::default_config());
+        }
         // 1. Create agent via agent manager
         let handle = self.agent_manager.create_agent(config.clone()).await?;
         let agent_id = handle.id;
@@ -1234,15 +1283,27 @@ impl AgentKernelImpl {
         );
 
         // 3. Create context
-        ContextManager::create_context(&*self.context_manager, agent_id)
-            .await
-            .map_err(KernelError::Context)?;
+        if let Err(error) = ContextManager::create_context(&*self.context_manager, agent_id).await {
+            self.rollback_created_agent(agent_id).await;
+            return Err(KernelError::Context(error));
+        }
 
-        // 4. Create sandbox if configured
-        if let Some(ref sandbox_config) = config.sandbox_config {
+        // 4. Create the mandatory sandbox. Managed workspaces are owned and
+        // removed by lifecycle cleanup; explicit operator workspaces are not.
+        let sandbox_config = config
+            .sandbox_config
+            .as_ref()
+            .expect("secure default installed above");
+        let sandbox_result = if managed_sandbox {
+            self.sandbox_manager
+                .create_managed_sandbox(agent_id, sandbox_config)
+        } else {
             self.sandbox_manager
                 .create_sandbox(agent_id, sandbox_config)
-                .map_err(KernelError::Sandbox)?;
+        };
+        if let Err(error) = sandbox_result {
+            self.rollback_created_agent(agent_id).await;
+            return Err(KernelError::Sandbox(error));
         }
 
         // 5. Admit the agent to the scheduler (non-blocking). Creation is
@@ -1281,6 +1342,9 @@ impl AgentKernelImpl {
         group: Option<&str>,
         tenant_id: &str,
     ) {
+        self.budget_enforcer
+            .register_agent_tenant(agent_id, tenant_id);
+
         // Register IPC mailbox.
         self.ipc.register_agent(agent_id);
 
@@ -1390,26 +1454,63 @@ impl AgentKernelImpl {
             .map_err(KernelError::Context)?;
         let mut restored = Vec::new();
         for p in persisted {
+            // An explicit reconciliation pass may run after boot. Treat an
+            // identity already present in the live registry as successfully
+            // reconciled instead of trying to create a second sandbox and
+            // incorrectly reporting a restore failure.
+            if self.agent_manager.get_agent_state(p.id).is_some() {
+                restored.push(p.id);
+                continue;
+            }
             let priority = Priority::new(p.priority).unwrap_or_default();
             let sandbox_config = p
                 .sandbox_config_json
                 .as_deref()
-                .and_then(|s| serde_json::from_str::<SandboxConfig>(s).ok());
+                .and_then(|s| serde_json::from_str::<SandboxConfig>(s).ok())
+                .unwrap_or_else(SandboxManagerImpl::default_config);
             let config = AgentConfig {
                 name: p.name.clone(),
                 task: p.task.clone(),
                 llm_provider: p.llm_provider.clone(),
                 permission_profile: p.permission_profile.clone(),
                 priority,
-                sandbox_config,
+                sandbox_config: Some(sandbox_config.clone()),
             };
             let state: AgentState = serde_json::from_str(&p.status).unwrap_or(AgentState::Running);
-            // Rebuild the in-memory agent (bypassing the create/init state machine).
+            let terminal = matches!(state, AgentState::Stopped | AgentState::Error(_));
+            if terminal {
+                // Terminal registry rows are durable history, not live kernel
+                // processes. Restore the identity/status only: no sandbox,
+                // mailbox, scheduler entry, namespace, cgroup, or procfs row.
+                self.agent_manager.restore_agent(
+                    p.id,
+                    p.session_id,
+                    config,
+                    state,
+                    p.created_at,
+                    p.last_activity_at,
+                );
+                restored.push(p.id);
+                continue;
+            }
+            let sandbox_result = if SandboxManagerImpl::is_managed_config(&sandbox_config) {
+                self.sandbox_manager
+                    .create_managed_sandbox(p.id, &sandbox_config)
+            } else {
+                self.sandbox_manager.create_sandbox(p.id, &sandbox_config)
+            };
+            if let Err(error) = sandbox_result {
+                tracing::warn!("Skipping agent {}: sandbox restore failed: {error}", p.id);
+                continue;
+            }
+            // Rebuild the in-memory agent only after its mandatory isolation has
+            // been restored, so a sandbox failure cannot leave a live unconfined
+            // registry entry.
             self.agent_manager.restore_agent(
                 p.id,
                 p.session_id,
                 config.clone(),
-                state,
+                state.clone(),
                 p.created_at,
                 p.last_activity_at,
             );
@@ -1425,6 +1526,9 @@ impl AgentKernelImpl {
             };
             self.place_agent_in_subsystems(p.id, &config, group, &p.tenant_id)
                 .await;
+            if state == AgentState::Paused {
+                self.scheduler.set_paused(p.id);
+            }
             let _ = self.event_tx.send(KernelEvent::AgentCreated(p.id));
             restored.push(p.id);
         }
@@ -1611,6 +1715,661 @@ impl AgentKernelImpl {
         }
     }
 
+    fn lifecycle_lock(&self, agent_id: AgentId) -> Arc<tokio::sync::Mutex<()>> {
+        self.lifecycle_locks
+            .entry(agent_id)
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    }
+
+    async fn cleanup_agent_resources(&self, agent_id: AgentId) {
+        let gate_info = self.syscall_gate.agent_info(agent_id);
+        self.scheduler.deschedule(agent_id);
+        self.scheduler.release_resource_access(agent_id);
+        self.ipc.unregister_agent(agent_id);
+        self.permission_manager.purge_agent(agent_id);
+        self.active_cancellations.remove(&agent_id);
+        self.executors.remove(&agent_id);
+
+        if let Some(info) = gate_info {
+            self.os.cfs.lock().await.dequeue(info.pid);
+            self.os.procfs.lock().await.remove_agent(info.pid);
+            for namespace in info.namespaces {
+                self.os.namespaces.leave(namespace, info.pid);
+            }
+        }
+
+        if let Some(sandbox_id) = self.sandbox_manager.get_sandbox_for_agent(agent_id) {
+            if let Err(error) = self.sandbox_manager.destroy_sandbox(sandbox_id) {
+                tracing::warn!("sandbox cleanup failed for {agent_id}: {error}");
+            }
+        }
+        self.observability.purge_agent(agent_id);
+        self.budget_enforcer.purge_agent(agent_id);
+        self.syscall_gate.unregister_agent(agent_id);
+    }
+
+    /// Roll back a creation that failed after the AgentManager allocated an
+    /// identity. Unlike normal lifecycle termination, rollback removes all
+    /// in-memory and durable history because the creation never committed.
+    pub(crate) async fn rollback_created_agent(&self, agent_id: AgentId) {
+        let lock = self.lifecycle_lock(agent_id);
+        let _guard = lock.lock().await;
+        if self.agent_manager.get_agent_state(agent_id).is_some() {
+            let _ = self.agent_manager.force_stopped(agent_id);
+        }
+        self.quiesce_agent(agent_id).await;
+        self.cleanup_agent_resources(agent_id).await;
+        self.agent_manager.purge_agent(agent_id);
+        let _ = self.context_manager.purge_agent_data(agent_id);
+        self.lifecycle_locks.remove(&agent_id);
+    }
+
+    /// Reload a complete service directory atomically. This validates parsing,
+    /// duplicate names, required dependencies, ordering, and cycles before the
+    /// live definition set is replaced.
+    pub async fn reload_service_directory(
+        &self,
+        path: &std::path::Path,
+    ) -> Result<Vec<String>, KernelError> {
+        let mut init = self.os.init.lock().await;
+        if init.list_runtime().iter().any(|service| {
+            !matches!(
+                service.status,
+                ServiceStatus::Inactive | ServiceStatus::Failed
+            )
+        }) {
+            return Err(KernelError::Policy(
+                "service reload requires all services to be inactive or failed; stop them before retrying"
+                    .into(),
+            ));
+        }
+        init.load_directory_checked(path)
+            .map_err(KernelError::Policy)
+    }
+
+    pub async fn list_services(&self) -> Vec<ServiceRuntimeInfo> {
+        self.os.init.lock().await.list_runtime()
+    }
+
+    /// Start one validated service through the same full agent admission path
+    /// as every other agent. Required dependencies must already be running.
+    pub async fn start_service(&self, name: &str) -> Result<AgentId, KernelError> {
+        let state = self
+            .os
+            .init
+            .lock()
+            .await
+            .state(name)
+            .ok_or_else(|| KernelError::Policy(format!("service '{name}' not found")))?;
+        if state.status == ServiceStatus::Running {
+            if let Some(agent_id) = state.agent_id {
+                if let Ok(agent_state) = self.get_agent_status(agent_id) {
+                    if !matches!(agent_state, AgentState::Stopped | AgentState::Error(_)) {
+                        return Ok(agent_id);
+                    }
+                }
+            }
+        }
+        {
+            let init = self.os.init.lock().await;
+            for required in &state.def.dependencies.requires {
+                if init.status(required) != Some(ServiceStatus::Running) {
+                    return Err(KernelError::Policy(format!(
+                        "service '{name}' is blocked by required service '{required}'"
+                    )));
+                }
+            }
+        }
+        self.os.init.lock().await.mark_starting(name);
+
+        let provider = if state.def.exec.provider.trim().is_empty() {
+            "stub".to_string()
+        } else {
+            state.def.exec.provider.clone()
+        };
+        let task = state
+            .def
+            .description
+            .clone()
+            .filter(|description| !description.trim().is_empty())
+            .unwrap_or_else(|| {
+                if state.def.exec.system_prompt.trim().is_empty() {
+                    format!("run service {name}")
+                } else {
+                    state.def.exec.system_prompt.clone()
+                }
+            });
+        let nice = state.def.resources.nice.unwrap_or(0).clamp(-20, 19);
+        let priority_value = match nice {
+            -20..=-12 => 1,
+            -11..=-4 => 2,
+            -3..=4 => 3,
+            5..=12 => 4,
+            _ => 5,
+        };
+        let created = self
+            .create_agent_full(AgentConfig {
+                name: format!("service:{name}"),
+                task,
+                llm_provider: provider,
+                permission_profile: "standard".into(),
+                priority: Priority::new(priority_value).unwrap_or_default(),
+                sandbox_config: None,
+            })
+            .await;
+        match created {
+            Ok(handle) => {
+                if state.def.resources.nice.is_some() {
+                    if let Err(error) = self.set_nice(handle.id, nice).await {
+                        let _ = self.kill_agent(handle.id).await;
+                        self.os.init.lock().await.mark_failed(name, 1);
+                        return Err(error);
+                    }
+                }
+                self.os.init.lock().await.mark_started(name, handle.id);
+                Ok(handle.id)
+            }
+            Err(error) => {
+                self.os.init.lock().await.mark_failed(name, 1);
+                Err(error)
+            }
+        }
+    }
+
+    pub async fn stop_service(&self, name: &str) -> Result<(), KernelError> {
+        let state = self
+            .os
+            .init
+            .lock()
+            .await
+            .state(name)
+            .ok_or_else(|| KernelError::Policy(format!("service '{name}' not found")))?;
+        if state.status == ServiceStatus::Inactive {
+            return Ok(());
+        }
+        self.os.init.lock().await.mark_stopping(name);
+        if let Some(agent_id) = state.agent_id {
+            if let Err(error) = self.stop_agent(agent_id).await {
+                self.os.init.lock().await.mark_failed(name, 1);
+                return Err(error);
+            }
+        }
+        self.os.init.lock().await.mark_stopped(name);
+        Ok(())
+    }
+
+    pub async fn restart_service(&self, name: &str) -> Result<AgentId, KernelError> {
+        let state = self
+            .os
+            .init
+            .lock()
+            .await
+            .state(name)
+            .ok_or_else(|| KernelError::Policy(format!("service '{name}' not found")))?;
+        self.stop_service(name).await?;
+        self.os.init.lock().await.record_restart(name);
+        tokio::time::sleep(std::time::Duration::from_millis(
+            state.def.service.restart_delay_ms.min(30_000),
+        ))
+        .await;
+        self.start_service(name).await
+    }
+
+    /// Start all services in validated dependency order. A failure rolls back
+    /// services started by this attempt in reverse order.
+    pub async fn boot_services(&self) -> Result<Vec<AgentId>, KernelError> {
+        let order = self.os.init.lock().await.boot_order().to_vec();
+        let mut started = Vec::new();
+        for name in order {
+            match self.start_service(&name).await {
+                Ok(agent_id) => started.push((name, agent_id)),
+                Err(error) => {
+                    for (started_name, _) in started.iter().rev() {
+                        let _ = self.stop_service(started_name).await;
+                    }
+                    return Err(error);
+                }
+            }
+        }
+        Ok(started.into_iter().map(|(_, agent_id)| agent_id).collect())
+    }
+
+    /// Cancel an active turn and wait until the per-agent executor is idle.
+    /// Callers hold the lifecycle lock, which prevents resume or new admission;
+    /// `send_message` never waits for that lock while holding the executor.
+    async fn quiesce_agent(&self, agent_id: AgentId) {
+        if let Some(token) = self.active_cancellations.get(&agent_id) {
+            token.cancel();
+        }
+        let executor = self
+            .executors
+            .get(&agent_id)
+            .map(|entry| Arc::clone(entry.value()));
+        if let Some(executor) = executor {
+            let _idle = executor.lock().await;
+        }
+    }
+
+    /// Pause admission for an agent and cooperatively cancel any active turn.
+    /// Repeating a pause is idempotent.
+    pub async fn pause_agent(&self, agent_id: AgentId) -> Result<AgentState, KernelError> {
+        let lock = self.lifecycle_lock(agent_id);
+        let _guard = lock.lock().await;
+        let state = self
+            .agent_manager
+            .get_agent_state(agent_id)
+            .ok_or(AgentError::NotFound(agent_id))?;
+        if state == AgentState::Paused {
+            return Ok(state);
+        }
+        if state != AgentState::Running {
+            return Err(AgentError::InvalidTransition {
+                from: state,
+                to: AgentState::Paused,
+            }
+            .into());
+        }
+        self.agent_manager.pause_agent(agent_id).await?;
+        self.scheduler.set_paused(agent_id);
+        self.context_manager
+            .update_agent_status(agent_id, &AgentState::Paused)?;
+        self.quiesce_agent(agent_id).await;
+        Ok(AgentState::Paused)
+    }
+
+    /// Resume admission for a paused agent. The next turn receives a fresh
+    /// cancellation token; repeating resume on Running is idempotent.
+    pub async fn resume_agent(&self, agent_id: AgentId) -> Result<AgentState, KernelError> {
+        let lock = self.lifecycle_lock(agent_id);
+        let _guard = lock.lock().await;
+        let state = self
+            .agent_manager
+            .get_agent_state(agent_id)
+            .ok_or(AgentError::NotFound(agent_id))?;
+        if state == AgentState::Running {
+            return Ok(state);
+        }
+        self.agent_manager.resume_agent(agent_id).await?;
+        self.scheduler.set_queued(agent_id);
+        self.context_manager
+            .update_agent_status(agent_id, &AgentState::Running)?;
+        Ok(AgentState::Running)
+    }
+
+    /// Gracefully stop an agent and atomically remove its live subsystem state.
+    /// Durable conversations, facts, usage, and the terminal registry row are
+    /// retained; repeating stop is idempotent.
+    pub async fn stop_agent(&self, agent_id: AgentId) -> Result<AgentState, KernelError> {
+        let lock = self.lifecycle_lock(agent_id);
+        let _guard = lock.lock().await;
+        let state = self
+            .agent_manager
+            .get_agent_state(agent_id)
+            .ok_or(AgentError::NotFound(agent_id))?;
+        if state == AgentState::Stopped {
+            return Ok(state);
+        }
+        self.agent_manager.stop_agent(agent_id).await?;
+        self.context_manager
+            .update_agent_status(agent_id, &AgentState::Stopped)?;
+        self.quiesce_agent(agent_id).await;
+        self.cleanup_agent_resources(agent_id).await;
+        Ok(AgentState::Stopped)
+    }
+
+    /// Force a terminal state from any non-terminal lifecycle state, then run
+    /// the exact same cleanup invariant as graceful stop.
+    pub async fn kill_agent(&self, agent_id: AgentId) -> Result<AgentState, KernelError> {
+        let lock = self.lifecycle_lock(agent_id);
+        let _guard = lock.lock().await;
+        let state = self
+            .agent_manager
+            .get_agent_state(agent_id)
+            .ok_or(AgentError::NotFound(agent_id))?;
+        if state == AgentState::Stopped {
+            return Ok(state);
+        }
+        self.agent_manager.force_stopped(agent_id)?;
+        self.context_manager
+            .update_agent_status(agent_id, &AgentState::Stopped)?;
+        self.quiesce_agent(agent_id).await;
+        self.cleanup_agent_resources(agent_id).await;
+        Ok(AgentState::Stopped)
+    }
+
+    pub fn get_agent_status(&self, agent_id: AgentId) -> Result<AgentState, KernelError> {
+        self.agent_manager
+            .get_agent_state(agent_id)
+            .ok_or_else(|| AgentError::NotFound(agent_id).into())
+    }
+
+    pub async fn wait_agent(
+        &self,
+        agent_id: AgentId,
+        timeout: std::time::Duration,
+    ) -> Result<AgentState, KernelError> {
+        tokio::time::timeout(timeout, async {
+            loop {
+                let state = self.get_agent_status(agent_id)?;
+                if matches!(state, AgentState::Stopped | AgentState::Error(_)) {
+                    return Ok(state);
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .map_err(|_| KernelError::Policy("wait_agent timed out".into()))?
+    }
+
+    /// Latest active durable turn checkpoint for an agent, if any.
+    pub fn latest_generation_checkpoint(
+        &self,
+        agent_id: AgentId,
+    ) -> Result<Option<crate::context::GenerationCheckpointMetadata>, KernelError> {
+        let tenant = self
+            .context_manager
+            .agent_tenant(agent_id)?
+            .ok_or(AgentError::NotFound(agent_id))?;
+        Ok(self
+            .context_manager
+            .list_generation_checkpoints(&tenant, Some(agent_id))?
+            .into_iter()
+            .next())
+    }
+
+    /// Resume the newest (or explicitly selected) durable in-flight turn while
+    /// holding lifecycle admission. Returns the completed output, or a new
+    /// checkpoint id if another pause interrupted the continuation.
+    pub async fn resume_agent_from_checkpoint(
+        &self,
+        agent_id: AgentId,
+        checkpoint_id: Option<uuid::Uuid>,
+    ) -> Result<(AgentState, Option<AgentOutput>, Option<uuid::Uuid>), KernelError> {
+        let lifecycle_lock = self.lifecycle_lock(agent_id);
+        let lifecycle_guard = lifecycle_lock.lock().await;
+        let state = self.get_agent_status(agent_id)?;
+        if state == AgentState::Running && checkpoint_id.is_none() {
+            return Ok((state, None, None));
+        }
+        if state != AgentState::Paused {
+            return Err(AgentError::InvalidTransition {
+                from: state,
+                to: AgentState::Running,
+            }
+            .into());
+        }
+        let tenant = self
+            .context_manager
+            .agent_tenant(agent_id)?
+            .ok_or(AgentError::NotFound(agent_id))?;
+        let checkpoint_id = match checkpoint_id {
+            Some(id) => Some(id),
+            None => self
+                .context_manager
+                .list_generation_checkpoints(&tenant, Some(agent_id))?
+                .into_iter()
+                .next()
+                .map(|checkpoint| checkpoint.id),
+        };
+
+        // A pause that won a completion race legitimately has no turn to
+        // restore. It still behaves as a normal lifecycle resume.
+        let Some(checkpoint_id) = checkpoint_id else {
+            self.agent_manager.resume_agent(agent_id).await?;
+            self.scheduler.set_queued(agent_id);
+            self.context_manager
+                .update_agent_status(agent_id, &AgentState::Running)?;
+            return Ok((AgentState::Running, None, None));
+        };
+
+        let stored =
+            self.context_manager
+                .claim_generation_checkpoint(checkpoint_id, agent_id, &tenant)?;
+        let executor = match self.ensure_executor(agent_id).await {
+            Ok(executor) => executor,
+            Err(error) => {
+                self.context_manager
+                    .release_generation_checkpoint(checkpoint_id)?;
+                return Err(error);
+            }
+        };
+        let mut executor = executor.lock().await;
+        if executor.provider_id() != stored.metadata.provider_id
+            || executor.model_id() != stored.metadata.model_id
+        {
+            let actual = format!("{}/{}", executor.provider_id(), executor.model_id());
+            let expected = format!(
+                "{}/{}",
+                stored.metadata.provider_id, stored.metadata.model_id
+            );
+            drop(executor);
+            self.context_manager
+                .release_generation_checkpoint(checkpoint_id)?;
+            return Err(KernelError::Policy(format!(
+                "checkpoint provider/model mismatch: expected {expected}, current {actual}; restore the original config or delete the checkpoint"
+            )));
+        }
+
+        self.agent_manager.resume_agent(agent_id).await?;
+        self.scheduler.set_queued(agent_id);
+        self.context_manager
+            .update_agent_status(agent_id, &AgentState::Running)?;
+        let cancellation = executor.renew_cancel_token();
+        self.active_cancellations.insert(agent_id, cancellation);
+        drop(lifecycle_guard);
+
+        let admission_cancellation = executor.cancel_token();
+        let _turn_slot = match self.syscall_gate.pid_of(agent_id) {
+            Some(pid) => match self
+                .turn_admission
+                .acquire_cancellable(pid, &self.os.cfs, &admission_cancellation)
+                .await
+            {
+                Ok(slot) => Some(slot),
+                Err(SchedulerError::AdmissionCancelled(_)) => None,
+                Err(error) => {
+                    self.active_cancellations.remove(&agent_id);
+                    return Err(error.into());
+                }
+            },
+            None => None,
+        };
+        self.scheduler.set_running(agent_id);
+        let baseline = stored.checkpoint.clone();
+        let run_result = executor.resume(stored.checkpoint).await;
+        self.active_cancellations.remove(&agent_id);
+        match self.agent_manager.get_agent_state(agent_id) {
+            Some(AgentState::Running) => self.scheduler.set_queued(agent_id),
+            Some(AgentState::Paused) => self.scheduler.set_paused(agent_id),
+            _ => self.scheduler.deschedule(agent_id),
+        }
+        drop(_turn_slot);
+        drop(executor);
+
+        match run_result {
+            Ok(TurnResult::Completed(output)) => {
+                self.context_manager
+                    .consume_generation_checkpoint(checkpoint_id)?;
+                self.record_output_since(
+                    agent_id,
+                    &output,
+                    baseline.tokens_used,
+                    baseline.tool_calls_made,
+                    baseline.usage,
+                )
+                .await;
+                Ok((self.get_agent_status(agent_id)?, Some(output), None))
+            }
+            Ok(TurnResult::Paused(checkpoint)) => {
+                let executor = self
+                    .executors
+                    .get(&agent_id)
+                    .map(|entry| Arc::clone(entry.value()))
+                    .ok_or(AgentError::NotFound(agent_id))?;
+                let executor = executor.lock().await;
+                let new_id = self.context_manager.save_generation_checkpoint(
+                    &tenant,
+                    executor.provider_id(),
+                    executor.model_id(),
+                    &checkpoint,
+                    std::time::Duration::from_secs(24 * 60 * 60),
+                )?;
+                let output = AgentOutput {
+                    content: format!("Paused at durable checkpoint {new_id}."),
+                    tool_calls_made: checkpoint.tool_calls_made,
+                    tokens_used: checkpoint.tokens_used,
+                    provider_id: executor.provider_id().to_string(),
+                    model_id: executor.model_id().to_string(),
+                    estimated_cost_usd: self
+                        .budget_enforcer
+                        .cost_of(executor.provider_id(), checkpoint.tokens_used),
+                    usage: checkpoint.usage,
+                };
+                drop(executor);
+                self.context_manager
+                    .consume_generation_checkpoint(checkpoint_id)?;
+                self.record_output_since(
+                    agent_id,
+                    &output,
+                    baseline.tokens_used,
+                    baseline.tool_calls_made,
+                    baseline.usage,
+                )
+                .await;
+                Ok((AgentState::Paused, Some(output), Some(new_id)))
+            }
+            Err(error) => {
+                self.context_manager
+                    .release_generation_checkpoint(checkpoint_id)?;
+                let lifecycle_guard = lifecycle_lock.lock().await;
+                if self.get_agent_status(agent_id)? == AgentState::Running {
+                    self.agent_manager.pause_agent(agent_id).await?;
+                    self.scheduler.set_paused(agent_id);
+                    self.context_manager
+                        .update_agent_status(agent_id, &AgentState::Paused)?;
+                }
+                drop(lifecycle_guard);
+                Err(error)
+            }
+        }
+    }
+
+    /// Create and configure the per-agent executor. Callers serialize this with
+    /// the lifecycle lock, so provider sessions cannot be created after stop.
+    async fn ensure_executor(
+        &self,
+        agent_id: AgentId,
+    ) -> Result<Arc<tokio::sync::Mutex<AgentExecutor>>, KernelError> {
+        if let Some(executor) = self.executors.get(&agent_id) {
+            return Ok(Arc::clone(executor.value()));
+        }
+        let provider_id = self
+            .agent_manager
+            .get_agent_provider(agent_id)
+            .ok_or(AgentError::NotFound(agent_id))?;
+        let session = AgentConnector::connect(&*self.connector, agent_id, &provider_id)
+            .await
+            .map_err(KernelError::Connector)?;
+        let mut executor = AgentExecutor::new(
+            agent_id,
+            session,
+            self.resource_broker.clone() as Arc<dyn ResourceBroker>,
+            self.tool_registry.clone(),
+            self.context_manager.clone(),
+            self.syscall_gate.clone(),
+            "You are a helpful AI assistant. Use the available tools to help the user.".into(),
+        );
+        executor.set_budget_enforcer(self.budget_enforcer.clone());
+        executor.set_rate_limiter(self.rate_limiter.clone());
+        executor.set_context_budget(self.context_budget_tokens);
+        if let Some(pid) = self.syscall_gate.pid_of(agent_id) {
+            let nice = self.os.cfs.lock().await.nice_of(pid).unwrap_or(0);
+            executor.set_llm_scheduler(self.llm_scheduler.clone(), pid, nice);
+        }
+        let executor = Arc::new(tokio::sync::Mutex::new(executor));
+        self.executors.insert(agent_id, Arc::clone(&executor));
+        Ok(executor)
+    }
+
+    async fn record_output_since(
+        &self,
+        agent_id: AgentId,
+        output: &AgentOutput,
+        baseline_tokens: u32,
+        baseline_tools: usize,
+        baseline_usage: crate::execution::UsageTelemetry,
+    ) {
+        let tokens = output.tokens_used.saturating_sub(baseline_tokens);
+        let tools = output.tool_calls_made.saturating_sub(baseline_tools);
+        let usage = crate::execution::UsageTelemetry {
+            input_tokens: output
+                .usage
+                .input_tokens
+                .saturating_sub(baseline_usage.input_tokens),
+            output_tokens: output
+                .usage
+                .output_tokens
+                .saturating_sub(baseline_usage.output_tokens),
+            cached_tokens: output
+                .usage
+                .cached_tokens
+                .saturating_sub(baseline_usage.cached_tokens),
+            llm_requests: output
+                .usage
+                .llm_requests
+                .saturating_sub(baseline_usage.llm_requests),
+            retries: output.usage.retries.saturating_sub(baseline_usage.retries),
+            provider_latency_ms: output
+                .usage
+                .provider_latency_ms
+                .saturating_sub(baseline_usage.provider_latency_ms),
+            provider_reported_requests: output
+                .usage
+                .provider_reported_requests
+                .saturating_sub(baseline_usage.provider_reported_requests),
+            estimated_requests: output
+                .usage
+                .estimated_requests
+                .saturating_sub(baseline_usage.estimated_requests),
+        };
+        self.agent_manager.record_activity(agent_id);
+        ObservabilityEngine::record_metrics(
+            &*self.observability,
+            agent_id,
+            u64::from(tokens),
+            u64::from(usage.llm_requests),
+        );
+        let baseline_cost = self
+            .budget_enforcer
+            .cost_of(&output.provider_id, baseline_tokens);
+        self.context_manager.log_usage(
+            agent_id,
+            &UsageRecord {
+                tokens_used: tokens,
+                input_tokens: usage.input_tokens,
+                output_tokens: usage.output_tokens,
+                cached_tokens: usage.cached_tokens,
+                llm_requests: usage.llm_requests,
+                retries: usage.retries,
+                provider_latency_ms: usage.provider_latency_ms,
+                provider_reported_requests: usage.provider_reported_requests,
+                estimated_requests: usage.estimated_requests,
+                provider: output.provider_id.clone(),
+                model: output.model_id.clone(),
+                tool_calls: tools,
+                estimated_cost_usd: (output.estimated_cost_usd - baseline_cost).max(0.0),
+            },
+        );
+        if let Some(pid) = self.syscall_gate.pid_of(agent_id) {
+            self.os
+                .cfs
+                .lock()
+                .await
+                .account_tokens(pid, u64::from(tokens));
+        }
+    }
+
     /// Send a message to an agent and get a response.
     /// Creates an executor on first message using the agent's LLM provider.
     pub async fn send_message(
@@ -1618,97 +2377,127 @@ impl AgentKernelImpl {
         agent_id: AgentId,
         message: &str,
     ) -> Result<AgentOutput, KernelError> {
-        // Ensure executor exists for this agent
-        if !self.executors.contains_key(&agent_id) {
-            // Get agent's LLM provider from its config
-            let provider_id = self
-                .agent_manager
-                .get_agent_provider(agent_id)
-                .ok_or(AgentError::NotFound(agent_id))?;
-
-            // Connect to LLM provider
-            let session = AgentConnector::connect(&*self.connector, agent_id, &provider_id)
-                .await
-                .map_err(KernelError::Connector)?;
-
-            let mut executor = AgentExecutor::new(
-                agent_id,
-                session,
-                self.resource_broker.clone() as Arc<dyn ResourceBroker>,
-                self.tool_registry.clone(),
-                self.context_manager.clone(),
-                self.syscall_gate.clone(),
-                "You are a helpful AI assistant. Use the available tools to help the user.".into(),
-            );
-            executor.set_budget_enforcer(self.budget_enforcer.clone());
-            executor.set_context_budget(self.context_budget_tokens);
-
-            self.executors
-                .insert(agent_id, tokio::sync::Mutex::new(executor));
+        // Serialize executor creation against pause/stop/kill and reject work
+        // unless the agent is currently runnable.
+        let lifecycle_lock = self.lifecycle_lock(agent_id);
+        let lifecycle_guard = lifecycle_lock.lock().await;
+        let state = self.get_agent_status(agent_id)?;
+        if state != AgentState::Running {
+            return Err(AgentError::InvalidTransition {
+                from: state,
+                to: AgentState::Running,
+            }
+            .into());
         }
+
+        // Ensure executor exists for this agent. The lifecycle lock makes the
+        // check-and-insert atomic without holding a DashMap shard across await.
+        let executor = self.ensure_executor(agent_id).await?;
+        drop(lifecycle_guard);
+
+        // Serialize same-agent turns before consuming any global admission,
+        // rate-limit, or LLM capacity. A second request for this agent waits on
+        // its executor mutex without occupying scarce system slots.
+        // Acquire lifecycle + executor without ever waiting for lifecycle while
+        // holding the executor. This ordering lets pause/stop cancel and then
+        // wait for an active turn without deadlocking a queued same-agent turn.
+        let mut executor = loop {
+            let lifecycle_guard = lifecycle_lock.lock().await;
+            let state = self.get_agent_status(agent_id)?;
+            if state != AgentState::Running {
+                return Err(AgentError::InvalidTransition {
+                    from: state,
+                    to: AgentState::Running,
+                }
+                .into());
+            }
+            match executor.try_lock() {
+                Ok(mut executor_guard) => {
+                    let cancellation = executor_guard.renew_cancel_token();
+                    self.active_cancellations.insert(agent_id, cancellation);
+                    drop(lifecycle_guard);
+                    break executor_guard;
+                }
+                Err(_) => {
+                    drop(lifecycle_guard);
+                    // Wait for the active turn to finish, immediately release,
+                    // then retry the state+lock pair atomically.
+                    let busy = executor.lock().await;
+                    drop(busy);
+                }
+            }
+        };
 
         // CFS-ordered turn admission: under contention (more agents than
         // `max_concurrent` slots) the next freed slot goes to the
         // lowest-vruntime / highest-priority waiter, so nice values decide who
         // runs next — not just FIFO. Uncontended turns admit immediately. Held
         // for the whole turn; released on drop. Keyed by the agent's CFS PID.
+        let admission_cancellation = executor.cancel_token();
         let _turn_slot = match self.syscall_gate.pid_of(agent_id) {
-            Some(pid) => Some(self.turn_admission.acquire(pid, &self.os.cfs).await),
+            Some(pid) => match self
+                .turn_admission
+                .acquire_cancellable(pid, &self.os.cfs, &admission_cancellation)
+                .await
+            {
+                Ok(slot) => Some(slot),
+                Err(SchedulerError::AdmissionCancelled(_)) => None,
+                Err(error) => {
+                    self.active_cancellations.remove(&agent_id);
+                    return Err(error.into());
+                }
+            },
             None => None,
         };
 
-        // LLM-request scheduling (B1.2): acquire one of the bounded LLM "cores"
-        // for the duration of this turn's LLM execution. When more requests are
-        // pending than cores, the next freed core is granted to the
-        // highest-priority (lowest-nice) waiter rather than FIFO — mirroring CFS
-        // ordering. The agent's nice is read from CFS (default 0 if unknown).
-        // Held across `executor.run(...)`; released on drop. Uncontended
-        // requests admit immediately (no added latency when cores are free).
-        let pid_for_llm = self.syscall_gate.pid_of(agent_id);
-        let _llm_core = match pid_for_llm {
-            Some(pid) => {
-                let nice = self.os.cfs.lock().await.nice_of(pid).unwrap_or(0);
-                Some(self.llm_scheduler.acquire(pid, nice).await)
-            }
-            None => None,
-        };
-
-        // Run the execution loop (rate limited)
-        let _guard = self.rate_limiter.acquire().await;
-        let executor_entry = self
-            .executors
-            .get(&agent_id)
-            .ok_or(AgentError::NotFound(agent_id))?;
-        let mut executor = executor_entry.lock().await;
+        // Run the execution loop. Provider-attempt RPM/TPM/concurrency is
+        // enforced inside the executor; this outer gate is turn admission only.
         // Mark the agent as actively executing for the duration of this turn so
         // `running_agents` reflects real concurrency, then return it to Queued.
         // Set/clear around `run` (not via `?`) so the slot is freed even when
         // the turn errors.
         self.scheduler.set_running(agent_id);
-        let run_result = executor.run(message).await;
-        self.scheduler.set_queued(agent_id);
-        let output = run_result?;
-
-        // Record activity and usage
-        self.agent_manager.record_activity(agent_id);
-        self.rate_limiter.record_tokens(output.tokens_used as u64);
-        ObservabilityEngine::record_metrics(
-            &*self.observability,
-            agent_id,
-            output.tokens_used as u64,
-            1,
-        );
-        self.context_manager
-            .log_usage(agent_id, output.tokens_used, "gpt-5.4", 0.01);
-
-        // Account turn tokens against the agent's CFS vruntime so nice values
-        // produce observable scheduling effects: low-nice agents (higher
-        // priority) have larger weight and advance vruntime more slowly,
-        // therefore stay closer to the front of the runqueue.
-        if let Some(pid) = self.syscall_gate.pid_of(agent_id) {
-            let mut sched = self.os.cfs.lock().await;
-            sched.account_tokens(pid, output.tokens_used as u64);
+        let run_result = executor.run_resumable(message).await;
+        self.active_cancellations.remove(&agent_id);
+        match self.agent_manager.get_agent_state(agent_id) {
+            Some(AgentState::Running) => self.scheduler.set_queued(agent_id),
+            Some(AgentState::Paused) => self.scheduler.set_paused(agent_id),
+            _ => self.scheduler.deschedule(agent_id),
         }
+        let output = match run_result? {
+            TurnResult::Completed(output) => output,
+            TurnResult::Paused(checkpoint) => {
+                let tenant = self
+                    .context_manager
+                    .agent_tenant(agent_id)?
+                    .ok_or(AgentError::NotFound(agent_id))?;
+                let checkpoint_id = self.context_manager.save_generation_checkpoint(
+                    &tenant,
+                    executor.provider_id(),
+                    executor.model_id(),
+                    &checkpoint,
+                    std::time::Duration::from_secs(24 * 60 * 60),
+                )?;
+                AgentOutput {
+                    content: format!("Paused at durable checkpoint {checkpoint_id}."),
+                    tool_calls_made: checkpoint.tool_calls_made,
+                    tokens_used: checkpoint.tokens_used,
+                    provider_id: executor.provider_id().to_string(),
+                    model_id: executor.model_id().to_string(),
+                    estimated_cost_usd: 0.0,
+                    usage: checkpoint.usage,
+                }
+            }
+        };
+
+        self.record_output_since(
+            agent_id,
+            &output,
+            0,
+            0,
+            crate::execution::UsageTelemetry::default(),
+        )
+        .await;
 
         Ok(output)
     }
@@ -1721,11 +2510,11 @@ impl AgentKernelImpl {
             .pid_of(agent_id)
             .ok_or(AgentError::NotFound(agent_id))?;
         let mut sched = self.os.cfs.lock().await;
-        // Re-enqueue at the same class with new nice; preserve current
-        // tokens-used by reading + dequeueing first.
-        sched.dequeue(pid);
-        sched.enqueue(pid, nice, SchedClass::Normal);
-        Ok(())
+        if sched.update_nice(pid, nice) {
+            Ok(())
+        } else {
+            Err(AgentError::NotFound(agent_id).into())
+        }
     }
 
     /// Look up which agent CFS would pick next. Useful for fairness tests
@@ -1755,30 +2544,46 @@ impl AgentKernelImpl {
     pub async fn shutdown(&self) -> Result<Vec<AgentId>, KernelError> {
         let _ = self.event_tx.send(KernelEvent::ShutdownInitiated);
 
-        let agents = self.agent_manager.list_agents(None);
         let mut stopped = Vec::new();
 
-        for info in &agents {
-            if info.state != AgentState::Stopped {
-                let _ = self.agent_manager.stop_agent(info.id).await;
-                stopped.push(info.id);
+        // Coordinated services stop first in reverse dependency order. Their
+        // agents become terminal through `stop_agent`, so the general pass
+        // below naturally skips them.
+        let service_shutdown_order = {
+            let init = self.os.init.lock().await;
+            init.reverse_boot_order()
+        };
+        for service in service_shutdown_order {
+            let agent_id = self
+                .os
+                .init
+                .lock()
+                .await
+                .state(&service)
+                .and_then(|state| state.agent_id);
+            if self.stop_service(&service).await.is_ok() {
+                if let Some(agent_id) = agent_id {
+                    stopped.push(agent_id);
+                }
             }
-            // Free the agent's scheduler admission slot and CFS run-queue entry
-            // so `running_count` / `runnable_count` track real liveness instead
-            // of growing monotonically. Capture the PID before unregistering
-            // (which drops the UUID->PID mapping in the gate).
-            self.scheduler.deschedule(info.id);
-            if let Some(pid) = self.syscall_gate.pid_of(info.id) {
-                self.os.cfs.lock().await.dequeue(pid);
+        }
+
+        let agents = self.agent_manager.list_agents(None);
+
+        for info in agents {
+            match info.state {
+                AgentState::Stopped | AgentState::Error(_) => {}
+                AgentState::Running | AgentState::Paused => {
+                    if self.stop_agent(info.id).await.is_ok() {
+                        stopped.push(info.id);
+                    }
+                }
+                AgentState::Initializing | AgentState::Stopping => {
+                    if self.kill_agent(info.id).await.is_ok() {
+                        stopped.push(info.id);
+                    }
+                }
             }
-            // Release per-agent state held by long-lived subsystems so
-            // multi-hour runs don't leak memory linearly with shutdowns.
-            self.observability.purge_agent(info.id);
-            // Drop per-agent spend tracking; global cumulative spend is retained
-            // so the lifetime ceiling spans agent churn.
-            self.budget_enforcer.purge_agent(info.id);
-            self.syscall_gate.unregister_agent(info.id);
-            self.executors.remove(&info.id);
         }
 
         // Flush the WAL into the main DB file so a subsequent open recovers a
@@ -1969,7 +2774,7 @@ mod tests {
 
     #[test]
     fn agent_command_variants() {
-        let cmds = vec![
+        let cmds = [
             AgentCommand::Pause,
             AgentCommand::Resume,
             AgentCommand::Stop,
@@ -1996,7 +2801,7 @@ mod tests {
     #[test]
     fn kernel_event_variants() {
         let id = uuid::Uuid::new_v4();
-        let events = vec![
+        let events = [
             KernelEvent::AgentCreated(id),
             KernelEvent::AgentStateChanged {
                 agent_id: id,

@@ -93,7 +93,7 @@ async fn react_loop_executes_tool_then_finalizes_e2e() {
             "choices": [{
                 "message": {
                     "role": "assistant",
-                    "content": "TOOL: read_file {\"path\":\"/tmp/sdk_react.txt\"}"
+                    "content": "TOOL: read_file {\"path\":\"sdk_react.txt\"}"
                 },
                 "finish_reason": "stop"
             }],
@@ -133,7 +133,7 @@ async fn react_loop_executes_tool_then_finalizes_e2e() {
 
     let outcome = ReActLoop::new(DirectiveReasoner::new())
         .max_iterations(5)
-        .run(&mut agent, "What does /tmp/sdk_react.txt contain?")
+        .run(&mut agent, "What does sdk_react.txt contain?")
         .await
         .expect("react run");
 
@@ -174,7 +174,7 @@ async fn react_loop_respects_max_iterations_e2e() {
             "choices": [{
                 "message": {
                     "role": "assistant",
-                    "content": "TOOL: read_file {\"path\":\"/tmp/loop.txt\"}"
+                    "content": "TOOL: read_file {\"path\":\"loop.txt\"}"
                 },
                 "finish_reason": "stop"
             }],
@@ -247,7 +247,7 @@ async fn planner_executor_runs_mixed_plan_e2e() {
         vec![
             Step::Tool {
                 tool: "read_file".into(),
-                args: serde_json::json!({ "path": "/tmp/planned.txt" }),
+                args: serde_json::json!({ "path": "planned.txt" }),
             },
             Step::Prompt(format!("summarize for goal: {goal}")),
         ]

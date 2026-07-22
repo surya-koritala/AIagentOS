@@ -13,7 +13,7 @@ use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
 
 use crate::resources::ResourceType;
-use crate::tools::{ToolBinding, ToolRegistry};
+use crate::tools::{ToolBinding, ToolRegistry, ToolSecurity};
 
 /// MCP server configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -41,6 +41,10 @@ pub struct McpTool {
     pub name: String,
     pub description: String,
     pub input_schema: serde_json::Value,
+    /// AgentOS extension supplied by the local operator/MCP server. Remote MCP
+    /// descriptions without this declaration are discoverable but not executable.
+    #[serde(rename = "agentosSecurity")]
+    pub security: Option<ToolSecurity>,
 }
 
 /// JSON-RPC request.
@@ -125,6 +129,10 @@ impl McpServer {
                             .get("inputSchema")
                             .cloned()
                             .unwrap_or(serde_json::json!({})),
+                        security: t
+                            .get("agentosSecurity")
+                            .cloned()
+                            .and_then(|value| serde_json::from_value(value).ok()),
                     })
                 })
                 .collect();
@@ -173,16 +181,38 @@ impl McpServer {
     }
 
     /// Register this server's tools in a ToolRegistry.
-    pub fn register_tools(&self, registry: &mut ToolRegistry) {
+    pub fn register_tools(&self, registry: &mut ToolRegistry) -> Result<usize, Vec<String>> {
+        let mut bindings = Vec::new();
+        let mut errors = Vec::new();
         for tool in &self.tools {
             let prefixed_name = format!("mcp_{}_{}", self.config.name, tool.name);
-            registry.register(ToolBinding {
+            let Some(security) = tool.security.clone() else {
+                errors.push(format!(
+                    "MCP tool '{prefixed_name}' omitted required agentosSecurity"
+                ));
+                continue;
+            };
+            bindings.push(ToolBinding {
                 name: prefixed_name,
                 description: format!("[MCP:{}] {}", self.config.name, tool.description),
                 parameters_schema: tool.input_schema.clone(),
                 resource_type: ResourceType::Application,
                 operation: "mcp_call".into(),
+                security,
             });
+        }
+        if !errors.is_empty() {
+            return Err(errors);
+        }
+        for binding in bindings {
+            if let Err(error) = registry.register(binding) {
+                errors.push(error.to_string());
+            }
+        }
+        if errors.is_empty() {
+            Ok(self.tools.len())
+        } else {
+            Err(errors)
         }
     }
 

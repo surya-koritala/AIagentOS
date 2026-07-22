@@ -36,3 +36,7 @@ config.toml
 # Frontend build output (regenerated)
 crates/tauri-app/ui/dist/
 .claude/
+
+# Generated Tauri schemas and local coverage output
+crates/tauri-app/gen/schemas/*.json
+lcov.info

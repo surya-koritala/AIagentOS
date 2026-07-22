@@ -279,12 +279,17 @@ impl LlmSession for OnDeviceSession {
             content,
             finish_reason: Some("stop".to_string()),
             tokens_used: tokens,
+            usage: Default::default(),
             tool_calls: vec![],
         })
     }
 
     fn provider_id(&self) -> &ProviderId {
         &self.provider_id
+    }
+
+    fn model_id(&self) -> &str {
+        "on-device"
     }
 }
 

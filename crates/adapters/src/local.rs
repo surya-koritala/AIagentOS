@@ -72,13 +72,26 @@ impl LlmSession for LocalSession {
         Ok(LlmResponse {
             content,
             finish_reason: Some("stop".to_string()),
-            tokens_used: json["eval_count"].as_u64().unwrap_or(0) as u32,
+            tokens_used: json["prompt_eval_count"]
+                .as_u64()
+                .unwrap_or(0)
+                .saturating_add(json["eval_count"].as_u64().unwrap_or(0))
+                .min(u64::from(u32::MAX)) as u32,
+            usage: kernel::connector::LlmUsage::reported(
+                json["prompt_eval_count"].as_u64().unwrap_or(0) as u32,
+                json["eval_count"].as_u64().unwrap_or(0) as u32,
+                0,
+            ),
             tool_calls: vec![],
         })
     }
 
     fn provider_id(&self) -> &ProviderId {
         &self.provider_id
+    }
+
+    fn model_id(&self) -> &str {
+        &self.model
     }
 }
 

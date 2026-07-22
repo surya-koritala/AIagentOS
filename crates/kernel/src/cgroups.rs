@@ -122,7 +122,7 @@ impl CgroupManager {
         while let Some(id) = current {
             if let Some(cg) = self.groups.get(&id) {
                 if cg.limits.tokens_per_min > 0
-                    && cg.usage.tokens_this_min + tokens > cg.limits.tokens_per_min
+                    && cg.usage.tokens_this_min.saturating_add(tokens) > cg.limits.tokens_per_min
                 {
                     return false; // would exceed limit
                 }
@@ -139,12 +139,85 @@ impl CgroupManager {
         let mut current = Some(cgroup_id);
         while let Some(id) = current {
             if let Some(mut cg) = self.groups.get_mut(&id) {
-                cg.usage.tokens_this_min += tokens;
+                cg.usage.tokens_this_min = cg.usage.tokens_this_min.saturating_add(tokens);
                 current = cg.parent;
             } else {
                 break;
             }
         }
+    }
+
+    /// Atomically validate and reserve token capacity across a cgroup's entire
+    /// ancestor chain. If a later ancestor rejects the charge, earlier updates
+    /// are rolled back before this returns.
+    pub fn try_record_tokens(&self, cgroup_id: CgroupId, tokens: u64) -> bool {
+        let mut current = Some(cgroup_id);
+        let mut charged = Vec::new();
+        while let Some(id) = current {
+            let parent = match self.groups.get_mut(&id) {
+                Some(mut cg) => {
+                    let next = cg.usage.tokens_this_min.saturating_add(tokens);
+                    if cg.limits.tokens_per_min > 0 && next > cg.limits.tokens_per_min {
+                        drop(cg);
+                        self.rollback_tokens(&charged, tokens);
+                        return false;
+                    }
+                    cg.usage.tokens_this_min = next;
+                    cg.parent
+                }
+                None => {
+                    self.rollback_tokens(&charged, tokens);
+                    return false;
+                }
+            };
+            charged.push(id);
+            current = parent;
+        }
+        true
+    }
+
+    fn rollback_tokens(&self, cgroups: &[CgroupId], tokens: u64) {
+        for id in cgroups {
+            if let Some(mut cg) = self.groups.get_mut(id) {
+                cg.usage.tokens_this_min = cg.usage.tokens_this_min.saturating_sub(tokens);
+            }
+        }
+    }
+
+    /// Atomically reserve one concurrent tool-call slot across the cgroup's
+    /// full ancestor chain. If any limit is full, already-reserved ancestors
+    /// are rolled back before returning `None`.
+    pub fn try_acquire_tool_call(
+        self: &std::sync::Arc<Self>,
+        cgroup_id: CgroupId,
+    ) -> Option<ToolCallGuard> {
+        let mut current = Some(cgroup_id);
+        let mut acquired = Vec::new();
+        while let Some(id) = current {
+            let parent = {
+                let mut cg = self.groups.get_mut(&id)?;
+                if cg.limits.max_tool_calls > 0
+                    && cg.usage.active_tool_calls >= cg.limits.max_tool_calls
+                {
+                    drop(cg);
+                    for acquired_id in acquired {
+                        if let Some(mut acquired_cg) = self.groups.get_mut(&acquired_id) {
+                            acquired_cg.usage.active_tool_calls =
+                                acquired_cg.usage.active_tool_calls.saturating_sub(1);
+                        }
+                    }
+                    return None;
+                }
+                cg.usage.active_tool_calls = cg.usage.active_tool_calls.saturating_add(1);
+                cg.parent
+            };
+            acquired.push(id);
+            current = parent;
+        }
+        Some(ToolCallGuard {
+            manager: self.clone(),
+            cgroups: acquired,
+        })
     }
 
     /// Reset per-minute counters (called by timer).
@@ -162,6 +235,23 @@ impl CgroupManager {
     /// Get root cgroup ID.
     pub fn root(&self) -> CgroupId {
         self.root
+    }
+}
+
+/// RAII reservation for one active tool call. Dropping it releases every
+/// cgroup/ancestor counter even when provider execution errors or is cancelled.
+pub struct ToolCallGuard {
+    manager: std::sync::Arc<CgroupManager>,
+    cgroups: Vec<CgroupId>,
+}
+
+impl Drop for ToolCallGuard {
+    fn drop(&mut self) {
+        for id in &self.cgroups {
+            if let Some(mut cg) = self.manager.groups.get_mut(id) {
+                cg.usage.active_tool_calls = cg.usage.active_tool_calls.saturating_sub(1);
+            }
+        }
     }
 }
 
@@ -206,6 +296,57 @@ mod tests {
         assert!(mgr.check_token_limit(cg, 50));
         mgr.record_tokens(cg, 80);
         assert!(!mgr.check_token_limit(cg, 30)); // 80 + 30 > 100
+    }
+
+    #[test]
+    fn concurrent_token_reservations_never_exceed_hierarchical_limit() {
+        let mgr = std::sync::Arc::new(CgroupManager::new());
+        let parent = mgr.create(
+            "tenant".into(),
+            mgr.root(),
+            CgroupLimits {
+                tokens_per_min: 50,
+                ..Default::default()
+            },
+        );
+        let child = mgr.create("agent".into(), parent, CgroupLimits::default());
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(100));
+        let mut threads = Vec::new();
+        for _ in 0..100 {
+            let mgr = mgr.clone();
+            let barrier = barrier.clone();
+            threads.push(std::thread::spawn(move || {
+                barrier.wait();
+                mgr.try_record_tokens(child, 1)
+            }));
+        }
+        let admitted = threads
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .filter(|admitted| *admitted)
+            .count();
+        assert_eq!(admitted, 50);
+        assert_eq!(mgr.get(parent).unwrap().usage.tokens_this_min, 50);
+        assert_eq!(mgr.get(child).unwrap().usage.tokens_this_min, 50);
+    }
+
+    #[test]
+    fn tool_call_limit_is_atomic_and_released_on_drop() {
+        let mgr = std::sync::Arc::new(CgroupManager::new());
+        let cg = mgr.create(
+            "tools".into(),
+            mgr.root(),
+            CgroupLimits {
+                max_tool_calls: 1,
+                ..Default::default()
+            },
+        );
+        let first = mgr.try_acquire_tool_call(cg).expect("first call admitted");
+        assert!(mgr.try_acquire_tool_call(cg).is_none());
+        assert_eq!(mgr.get(cg).unwrap().usage.active_tool_calls, 1);
+        drop(first);
+        assert_eq!(mgr.get(cg).unwrap().usage.active_tool_calls, 0);
+        assert!(mgr.try_acquire_tool_call(cg).is_some());
     }
 
     #[test]

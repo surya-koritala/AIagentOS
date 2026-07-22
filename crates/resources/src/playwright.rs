@@ -31,7 +31,7 @@ impl BrowserAutomation {
         })?;
 
         // Spawn the handler in the background
-        tokio::spawn(async move { while let Some(_) = handler.next().await {} });
+        tokio::spawn(async move { while handler.next().await.is_some() {} });
 
         Ok(Self {
             browser: Some(browser),

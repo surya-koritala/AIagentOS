@@ -12,67 +12,78 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
 
 ### Added
 
-- **On-device inference adapter (spike, pure-Rust)** — a new `on-device` LLM
-  provider that loads a quantized **GGUF** model and runs the forward pass
-  *inside the kernel process* via `candle` (CPU). It is the in-process
-  counterpart to the `local` Ollama adapter: no network, no sidecar, no Python,
-  no C++ FFI — the whole inference stack is Rust, so it cross-compiles to
-  `aarch64`/`armv7` and can run headless on a small board. It plugs into the
-  unchanged `LlmProviderAdapter` seam, so the kernel, syscall gate, scheduler and
-  persistence treat it like any other provider. Gated behind a non-default
-  `candle` feature on both `adapters` and `agent-cli`, so the shipped binary and
-  CI footprint are untouched (`cargo build -p agent-cli --features candle`).
-  Model + tokenizer paths come from `AGENTOS_GGUF_MODEL` / `AGENTOS_TOKENIZER`; a
-  missing or unloadable model degrades to a logged warning, leaving the non-LLM
-  syscalls live. Scope is a spike: greedy/temperature sampling, a model-agnostic
-  prompt format, no native tool-calls (the executor's plaintext shim recovers
-  them), and per-turn cache priming. A `#[ignore]`d end-to-end test generates
-  real tokens when a model is provisioned on the box. (#104)
+- **Coordinated lifecycle and durable checkpoints** — public wire/SDK operations
+  now coordinate pause, resume, stop, kill, cleanup, restart rehydration, and
+  versioned generation checkpoints across kernel subsystems. (#112, #113)
+- **Live operator and service APIs** — tenant-safe operator snapshots now power
+  the SDK, `agentctl`, and TUI; the kernel-owned service supervisor validates
+  dependency order and coordinates startup, rollback, and shutdown. (#117,
+  #118)
+- **Context and admission controls** — bounded turn/LLM/tool admission,
+  CFS-inspired fairness, durable context spill references, and explicit
+  backpressure replace unsupported CPU-preemption and OOM claims. (#114, #115)
+- **Validated agent-package loading** — manifests are bounded and fail closed,
+  declared tools resolve against the live registry, tenant privilege is
+  constrained, and partial creation rolls back atomically. Packages remain
+  unsigned; signing and a durable registry are still pending. (#119)
+- **On-device GGUF adapter spike** — feature-gated Candle inference can run a
+  provisioned quantized model locally; it remains experimental and is not part
+  of the production support promise. (#104, #120)
 
 ### Security
 
-- **Enforcement is mandatory by construction** — the syscall gate is now a
-  required dependency of `AgentExecutor` (a constructor argument) rather than an
-  `Option` set after the fact. Previously an executor built without
-  `set_syscall_gate` ran *completely ungoverned* — every tool call skipped the
-  namespace/capability/MAC/cgroup checks — so enforcement held only by
-  convention: any new code path that forgot the setter silently ran unconfined.
-  Now an ungoverned executor cannot be constructed by omission. The single
-  sanctioned bypass is an explicit, greppable `SyscallGate::unconfined()` gate,
-  wired only through the `#[cfg(test)]` `AgentExecutor::new_unconfined` helper, so
-  it can never be reached from production code. `execute_tool` consults the gate
-  unconditionally; an unregistered agent is *denied* (UnknownAgent), not allowed.
-  Regression tests pin both halves: an unregistered agent on a real gate is
-  denied, and an unconfined gate allows. This closes the gap between "governed by
-  convention" and "governed by construction" — the load-bearing property behind
-  calling the gate un-bypassable. (#103)
+- **Tenant authorization** — the wire server retains the authenticated
+  principal, centralizes ownership/RBAC checks, rejects revoked credentials,
+  scopes package-created agents, and audits denials without leaking foreign
+  resources. (#107)
+- **Fail-closed tools** — every registered tool needs a typed security contract;
+  unknown tools/profiles and incomplete declarations are rejected, while
+  capability, MAC, approval, namespace, accounting, and sandbox decisions share
+  one governed path. (#103, #108)
+- **Mandatory sandbox boundary** — resource calls require an unforgeable agent
+  sandbox identity. Filesystem paths are canonicalized inside the workspace
+  before provider dispatch, including regression coverage for traversal and
+  symlink escapes. Full OS/container isolation still requires #111.
 
 ### Governance
 
-- **Declarative policy documents** — MAC policy is now an authorable, validated
-  document instead of stringly-typed rules buried in the kernel config. A
-  `PolicyDocument` (`kernel::policy`) carries metadata (`version`,
-  `description`), an explicit typed `default` (allow/deny/audit), an `enforcing`
-  flag, and named/described rules with a **typed `Decision`** so a misspelled
-  decision (`"alow"`) is rejected at parse time rather than silently collapsing
-  to deny. Documents lower (`compile`) to the unchanged `MacEngine` — a
-  `default = allow` compiles to an explicit terminal catch-all — so enforcement
-  semantics are identical, only authoring changes. `validate` reports hard
-  errors; `lint` flags soft mistakes (an enforcing+empty+deny policy that denies
-  everything; rules shadowed by an earlier `*/*/*` catch-all).
-- **`explain` / dry-run** — given (subject, action, object) a document reports
-  *which rule decided and why*, the authoring feedback loop. `MacEngine` was
-  refactored to expose a single label-based `evaluate` returning the matched
-  rule index, shared by `check` and `explain` so the live decision and the
-  explanation can never drift (proven by a 2000-case property test).
-- **`agent policy` CLI** — `agent policy validate <file>` and `agent policy
-  explain <file> --subject … --action … --object …` validate and dry-run a
-  policy without booting a kernel or touching the database (the SELinux
-  `checkpolicy`/`sesearch` analogue). See [docs/POLICY.md](docs/POLICY.md).
-- **`policy_file` config** — a `policy_file` path, when set, supersedes the
-  inline `mac_enforcing`/`mac_rules`; an unreadable or malformed policy file is
-  a hard startup error (clear message + non-zero exit, never a silent drop to
-  permissive), consistent with the graceful-degradation discipline. (#102)
+- **Evidence-backed capability registry** — one machine-readable inventory now
+  records owners, maturity, runtime paths, tests, limitations, and tracking
+  issues; CI rejects contradictory or unsupported public claims. (#106)
+- **Secondary capability disposition** — disconnected and experimental modules
+  are individually retained, deferred, or excluded from the v1 public runtime
+  instead of being advertised as complete. (#128)
+- **Declarative policy authoring** — typed TOML policy documents, validation,
+  linting, explain/dry-run, and explicit startup loading remain the supported MAC
+  authoring path. (#102)
+
+### Changed
+
+- **Correct accounting and live metrics** — provider/model usage, retries,
+  latency, configurable pricing, hierarchical budgets/quotas, active execution,
+  queue state, and node load now use runtime evidence with atomic concurrency
+  tests. (#109)
+- **Wire protocol v2** — typed error categories and retry hints are served while
+  retaining the released v1 compatibility fixture; SDK negotiation is automatic.
+  The complete v1 compatibility/conformance commitment remains tracked by #121.
+  (#116, #121)
+- **Provider claims** — documentation now distinguishes mock-fixture evidence,
+  live qualification, unsupported tool/usage behavior, and the experimental
+  local/on-device paths. (#120)
+
+### Quality
+
+- CI now treats formatting, Clippy, tests, capability claims, documentation,
+  dependency policy, frontend audit/build, and coverage as blocking; Linux,
+  macOS, and Windows builds are represented, with scheduled Miri, sanitizer, and
+  fuzz smoke jobs. Release jobs add deterministic artifacts, SBOMs, checksums,
+  Sigstore bundles, provenance, and a non-root container smoke test. These gates
+  are not Production-qualified until the remote protected-branch and tagged
+  workflows have run successfully. (#110)
+- Regression coverage expanded across authorization, sandbox escapes, lifecycle
+  cleanup, checkpoints, scheduling, context pressure, accounting, persistence,
+  services, packages, providers, wire compatibility, CLI/TUI state, and claim
+  integrity. Local line coverage is 77.38% with a 60% CI floor.
 
 ## [0.3.0] - 2026-06-04
 

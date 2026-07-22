@@ -80,7 +80,7 @@ mod tests {
     fn image_data_url_format() {
         // Create a tiny test PNG
         let path = "/tmp/test_vision.png";
-        std::fs::write(path, &[0x89, 0x50, 0x4E, 0x47]).unwrap(); // PNG magic bytes
+        std::fs::write(path, [0x89, 0x50, 0x4E, 0x47]).unwrap(); // PNG magic bytes
         let url = image_to_data_url(path).unwrap();
         assert!(url.starts_with("data:image/png;base64,"));
         std::fs::remove_file(path).ok();

@@ -17,9 +17,6 @@ const MAX_ITERATIONS: usize = 10;
 /// Maximum LLM retry attempts on transient failures.
 const LLM_RETRIES: usize = 3;
 
-/// Message count threshold before triggering summarization.
-const MESSAGE_OVERFLOW_THRESHOLD: usize = 20;
-
 /// Events streamed during agent execution.
 #[derive(Debug, Clone)]
 pub enum StreamEvent {
@@ -37,6 +34,14 @@ pub enum StreamEvent {
     /// preserved in a checkpoint (see [`GenerationCheckpoint`]) rather than
     /// discarded. Distinct from `Cancelled`, which drops progress.
     Paused { tool_calls_made: usize },
+    /// The active prompt was compacted without discarding history: omitted
+    /// messages were written to the durable per-agent spill namespace.
+    ContextPressure {
+        active_tokens: u32,
+        budget_tokens: u32,
+        evicted_messages: usize,
+        spill_key: String,
+    },
     /// An error occurred.
     Error(String),
 }
@@ -87,6 +92,9 @@ pub struct GenerationCheckpoint {
     /// Tokens consumed before the pause — carried so the resumed turn's final
     /// `AgentOutput.tokens_used` reflects the whole turn.
     pub tokens_used: u32,
+    /// Detailed request accounting accumulated before the pause.
+    #[serde(default)]
+    pub usage: UsageTelemetry,
 }
 
 /// The result of a pause-aware turn: either it ran to completion, or it stopped
@@ -106,6 +114,49 @@ pub struct AgentOutput {
     pub content: String,
     pub tool_calls_made: usize,
     pub tokens_used: u32,
+    pub provider_id: String,
+    pub model_id: String,
+    pub estimated_cost_usd: f64,
+    pub usage: UsageTelemetry,
+}
+
+/// Detailed per-turn provider accounting. `estimated_requests` is non-zero
+/// when an adapter omitted usage and the executor used its documented
+/// conservative prompt/output estimate.
+#[derive(Debug, Clone, Copy, Default, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct UsageTelemetry {
+    pub input_tokens: u32,
+    pub output_tokens: u32,
+    pub cached_tokens: u32,
+    pub llm_requests: u32,
+    pub retries: u32,
+    pub provider_latency_ms: u64,
+    pub provider_reported_requests: u32,
+    pub estimated_requests: u32,
+}
+
+impl UsageTelemetry {
+    fn record(&mut self, call: &ProviderCall) {
+        self.input_tokens = self.input_tokens.saturating_add(call.usage.input_tokens);
+        self.output_tokens = self.output_tokens.saturating_add(call.usage.output_tokens);
+        self.cached_tokens = self.cached_tokens.saturating_add(call.usage.cached_tokens);
+        self.llm_requests = self.llm_requests.saturating_add(call.attempts);
+        self.retries = self.retries.saturating_add(call.retries);
+        self.provider_latency_ms = self.provider_latency_ms.saturating_add(call.latency_ms);
+        if call.usage.provider_reported {
+            self.provider_reported_requests = self.provider_reported_requests.saturating_add(1);
+        } else {
+            self.estimated_requests = self.estimated_requests.saturating_add(1);
+        }
+    }
+}
+
+struct ProviderCall {
+    response: crate::connector::LlmResponse,
+    usage: crate::connector::LlmUsage,
+    attempts: u32,
+    retries: u32,
+    latency_ms: u64,
 }
 
 /// The agent executor — drives the think→act→observe loop.
@@ -124,6 +175,11 @@ pub struct AgentExecutor {
     /// of one.
     syscall_gate: Arc<crate::syscall_gate::SyscallGate>,
     budget_enforcer: Option<Arc<crate::budget::BudgetEnforcer>>,
+    /// Optional per-request LLM-core scheduler installed by the kernel.
+    llm_scheduler: Option<(Arc<crate::llm_sched::LlmScheduler>, u64, i8)>,
+    /// Shared RPM/TPM/provider-concurrency limiter, acquired for each actual
+    /// provider attempt rather than for the whole agent turn.
+    rate_limiter: Option<Arc<crate::rate_limit::RateLimiter>>,
     /// Max active-context tokens; older non-system messages are paged out (via
     /// the context pager) when exceeded. 0 = disabled (no token bound).
     context_budget_tokens: u32,
@@ -135,6 +191,30 @@ pub struct AgentExecutor {
 }
 
 impl AgentExecutor {
+    fn output(
+        &self,
+        content: String,
+        tool_calls_made: usize,
+        tokens_used: u32,
+        usage: UsageTelemetry,
+    ) -> AgentOutput {
+        let provider_id = self.session.provider_id().clone();
+        let estimated_cost_usd = self
+            .budget_enforcer
+            .as_ref()
+            .map(|budget| budget.cost_of(&provider_id, tokens_used))
+            .unwrap_or(0.0);
+        AgentOutput {
+            content,
+            tool_calls_made,
+            tokens_used,
+            provider_id,
+            model_id: self.session.model_id().to_string(),
+            estimated_cost_usd,
+            usage,
+        }
+    }
+
     pub fn new(
         agent_id: AgentId,
         session: Box<dyn LlmSession>,
@@ -154,6 +234,8 @@ impl AgentExecutor {
             rule_store: None,
             syscall_gate,
             budget_enforcer: None,
+            llm_scheduler: None,
+            rate_limiter: None,
             context_budget_tokens: 0,
             messages: vec![StandardMessage::system(&system_prompt)],
             cancel_token: CancellationToken::new(),
@@ -175,13 +257,20 @@ impl AgentExecutor {
         context_manager: Arc<SqliteContextManager>,
         system_prompt: String,
     ) -> Self {
+        // Tool-call concurrency accounting still needs an agent→cgroup record,
+        // even though the explicit unconfined gate bypasses authorization.
+        // Register the test agent in the unlimited root cgroup so the bypass is
+        // confined to policy checks rather than accidentally disabling resource
+        // lifecycle accounting as well.
+        let gate = Arc::new(crate::syscall_gate::SyscallGate::unconfined());
+        gate.register_agent(agent_id, crate::CapabilitySet::all(), None);
         Self::new(
             agent_id,
             session,
             resource_broker,
             tool_registry,
             context_manager,
-            Arc::new(crate::syscall_gate::SyscallGate::unconfined()),
+            gate,
             system_prompt,
         )
     }
@@ -193,6 +282,22 @@ impl AgentExecutor {
         self.budget_enforcer = Some(enforcer);
     }
 
+    /// Install per-provider-request LLM scheduling metadata. A permit is held
+    /// only while `send_streaming` is in flight, not during tool execution or
+    /// retry backoff.
+    pub fn set_llm_scheduler(
+        &mut self,
+        scheduler: Arc<crate::llm_sched::LlmScheduler>,
+        pid: u64,
+        nice: i8,
+    ) {
+        self.llm_scheduler = Some((scheduler, pid, nice));
+    }
+
+    pub fn set_rate_limiter(&mut self, limiter: Arc<crate::rate_limit::RateLimiter>) {
+        self.rate_limiter = Some(limiter);
+    }
+
     /// Set the active-context token budget. When > 0, the loop pages out the
     /// oldest non-system messages before each LLM call so the working set stays
     /// within the budget (the context-paging / virtual-memory analogue). 0
@@ -201,37 +306,215 @@ impl AgentExecutor {
         self.context_budget_tokens = max_tokens;
     }
 
-    /// Bound the active context window to `context_budget_tokens` using the
-    /// context pager (token budget + LRU page-out). The system prompt (index 0)
-    /// is always retained; older non-system messages are evicted oldest-first
-    /// when over budget. Orphaned tool results left behind are stripped by
-    /// `clean_messages` before the request is sent. No-op when the budget is 0
-    /// or only the system prompt is present.
-    fn compact_to_token_budget(&mut self) {
+    fn estimate_prompt_tokens(&self, messages: &[StandardMessage]) -> u32 {
+        self.session
+            .estimate_prompt_tokens(messages)
+            .unwrap_or_else(|| {
+                // Conservative fallback: UTF-8 bytes / 3 plus per-message framing.
+                // This intentionally overestimates typical English relative to the
+                // old chars/4 heuristic and is deterministic across platforms.
+                messages.iter().fold(0u32, |total, message| {
+                    total.saturating_add(
+                        (message.content.len() as u32)
+                            .saturating_add(2)
+                            .saturating_div(3)
+                            .saturating_add(4),
+                    )
+                })
+            })
+    }
+
+    /// Bound the active prompt without silently discarding state. The root
+    /// system instruction and latest tool-call state are pinned. Evicted
+    /// messages are serialized into the durable agent KV store and replaced by
+    /// a compact reference that can be paged in with `StorageGet`.
+    async fn compact_to_token_budget(&mut self) -> Result<(), KernelError> {
         let budget = self.context_budget_tokens;
         if budget == 0 || self.messages.len() <= 1 {
-            return;
+            return Ok(());
         }
-        let mut pager = crate::context_paging::ContextPager::new(budget);
-        // Feed non-system messages oldest→newest; the pager evicts the LRU
-        // (oldest) when over budget, leaving the most recent that fit active.
-        let page_ids: Vec<u64> = self.messages[1..]
+        let original_tokens = self.estimate_prompt_tokens(&self.messages);
+        if original_tokens <= budget {
+            return Ok(());
+        }
+
+        let latest_tool_state = self
+            .messages
             .iter()
-            .map(|m| pager.add_page(0, m.content.clone()))
+            .rposition(|message| message.tool_calls.is_some());
+        let pinned: Vec<bool> = (0..self.messages.len())
+            .map(|index| index == 0 || latest_tool_state.is_some_and(|start| index >= start))
             .collect();
-        let active: std::collections::HashSet<u64> =
-            pager.active_pages().iter().map(|p| p.id).collect();
-        if active.len() == page_ids.len() {
-            return; // nothing evicted
+        let pinned_messages: Vec<_> = self
+            .messages
+            .iter()
+            .zip(&pinned)
+            .filter(|(_, pinned)| **pinned)
+            .map(|(message, _)| message.clone())
+            .collect();
+        let pinned_tokens = self.estimate_prompt_tokens(&pinned_messages);
+        if pinned_tokens > budget {
+            let message = format!(
+                "context pressure: pinned system/tool state requires {pinned_tokens} tokens but the active budget is {budget}; increase max_context_tokens or shorten required state"
+            );
+            let _ = self.context_manager.record_context_pressure(
+                self.agent_id,
+                original_tokens,
+                budget,
+                0,
+                Some(&message),
+            );
+            return Err(KernelError::Policy(message));
         }
-        let mut kept = Vec::with_capacity(active.len() + 1);
-        kept.push(self.messages[0].clone()); // system prompt, always retained
-        for (msg, id) in self.messages[1..].iter().zip(page_ids.iter()) {
-            if active.contains(id) {
-                kept.push(msg.clone());
+
+        // Reserve room for a compact durable-spill reference, then keep the
+        // newest non-pinned messages that fit.
+        let reference_reserve = 36u32.min(budget.saturating_sub(pinned_tokens));
+        let mut remaining = budget
+            .saturating_sub(pinned_tokens)
+            .saturating_sub(reference_reserve);
+        let mut keep = pinned.clone();
+        for index in (0..self.messages.len()).rev() {
+            if keep[index] {
+                continue;
+            }
+            let tokens = self.estimate_prompt_tokens(std::slice::from_ref(&self.messages[index]));
+            if tokens <= remaining {
+                keep[index] = true;
+                remaining -= tokens;
             }
         }
-        self.messages = kept;
+        if keep.iter().all(|keep| *keep) {
+            let message =
+                "context pressure: active prompt exceeds its budget but no state is safely evictable"
+                    .to_string();
+            let _ = self.context_manager.record_context_pressure(
+                self.agent_id,
+                original_tokens,
+                budget,
+                0,
+                Some(&message),
+            );
+            return Err(KernelError::Policy(message));
+        }
+
+        let key = format!(
+            "context_spill:{}:{}",
+            self.conversation_id,
+            uuid::Uuid::new_v4()
+        );
+
+        // The compact reference itself has a variable size (conversation IDs,
+        // hashes and message counts all contribute). Recompute it while
+        // evicting the oldest safe message until the *actual* active prompt
+        // fits. Nothing is persisted or mutated until a fitting representation
+        // has been found, so a failed compaction cannot leave orphan spills.
+        loop {
+            let evicted: Vec<_> = self
+                .messages
+                .iter()
+                .zip(&keep)
+                .filter(|(_, keep)| !**keep)
+                .map(|(message, _)| message.clone())
+                .collect();
+            let spill_json = match serde_json::to_string(&evicted) {
+                Ok(encoded) => encoded,
+                Err(error) => {
+                    let message = format!("context spill encoding failed: {error}");
+                    let _ = self.context_manager.record_context_pressure(
+                        self.agent_id,
+                        original_tokens,
+                        budget,
+                        0,
+                        Some(&message),
+                    );
+                    return Err(KernelError::Policy(message));
+                }
+            };
+            let digest = ring::digest::digest(&ring::digest::SHA256, spill_json.as_bytes());
+            let digest = digest
+                .as_ref()
+                .iter()
+                .take(8)
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            let roles = evicted
+                .iter()
+                .map(|message| message.role.as_str())
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>()
+                .join(",");
+            let mut reference = StandardMessage::system(format!(
+                "[Durable context spill: key={key}; sha256-prefix={digest}; messages={}; roles={roles}. Page in with StorageGet before relying on omitted detail.]",
+                evicted.len()
+            ));
+            if self.estimate_prompt_tokens(std::slice::from_ref(&reference)) > reference_reserve {
+                reference = StandardMessage::system(format!(
+                    "[Context spill: key={key}; sha256-prefix={digest}; n={}]",
+                    evicted.len()
+                ));
+            }
+
+            let mut compacted = Vec::with_capacity(keep.iter().filter(|keep| **keep).count() + 1);
+            for (index, message) in self.messages.iter().enumerate() {
+                if index == 1 {
+                    compacted.push(reference.clone());
+                }
+                if keep[index] {
+                    compacted.push(message.clone());
+                }
+            }
+            let active_tokens = self.estimate_prompt_tokens(&compacted);
+            if active_tokens <= budget {
+                if let Err(error) = self
+                    .context_manager
+                    .kv_put(self.agent_id, &key, &spill_json)
+                {
+                    let message = format!("context spill persistence failed: {error}");
+                    let _ = self.context_manager.record_context_pressure(
+                        self.agent_id,
+                        original_tokens,
+                        budget,
+                        0,
+                        Some(&message),
+                    );
+                    return Err(KernelError::Context(error));
+                }
+                let _ = self.context_manager.record_context_pressure(
+                    self.agent_id,
+                    active_tokens,
+                    budget,
+                    evicted.len(),
+                    None,
+                );
+                self.messages = compacted;
+                self.emit(StreamEvent::ContextPressure {
+                    active_tokens,
+                    budget_tokens: budget,
+                    evicted_messages: evicted.len(),
+                    spill_key: key,
+                })
+                .await;
+                return Ok(());
+            }
+
+            if let Some(index) = (0..keep.len()).find(|index| keep[*index] && !pinned[*index]) {
+                keep[index] = false;
+                continue;
+            }
+            let message = format!(
+                "context pressure: durable reference plus pinned state requires {active_tokens} tokens but budget is {budget}"
+            );
+            let _ = self.context_manager.record_context_pressure(
+                self.agent_id,
+                original_tokens,
+                budget,
+                0,
+                Some(&message),
+            );
+            return Err(KernelError::Policy(message));
+        }
     }
 
     /// Resume from a saved conversation.
@@ -258,9 +541,23 @@ impl AgentExecutor {
         self.cancel_token.clone()
     }
 
+    pub fn provider_id(&self) -> &str {
+        self.session.provider_id()
+    }
+
+    pub fn model_id(&self) -> &str {
+        self.session.model_id()
+    }
+
     /// Cancel the running execution.
     pub fn cancel(&self) {
         self.cancel_token.cancel();
+    }
+
+    /// Install a fresh token before a new turn after an earlier pause/cancel.
+    pub fn renew_cancel_token(&mut self) -> CancellationToken {
+        self.cancel_token = CancellationToken::new();
+        self.cancel_token.clone()
     }
 
     async fn emit(&self, event: StreamEvent) {
@@ -288,11 +585,12 @@ impl AgentExecutor {
                     tool_calls_made: checkpoint.tool_calls_made,
                 })
                 .await;
-                Ok(AgentOutput {
-                    content: "Cancelled.".into(),
-                    tool_calls_made: checkpoint.tool_calls_made,
-                    tokens_used: checkpoint.tokens_used,
-                })
+                Ok(self.output(
+                    "Cancelled.".into(),
+                    checkpoint.tool_calls_made,
+                    checkpoint.tokens_used,
+                    checkpoint.usage,
+                ))
             }
         }
     }
@@ -330,42 +628,10 @@ impl AgentExecutor {
 
         self.messages.push(StandardMessage::user(user_message));
 
-        // Auto-summarize if messages exceed threshold
-        if self.messages.len() > MESSAGE_OVERFLOW_THRESHOLD {
-            let ctx = crate::context::AgentContext {
-                conversation_history: self
-                    .messages
-                    .iter()
-                    .map(|m| crate::context::Message {
-                        role: m.role.clone(),
-                        content: m.content.clone(),
-                        timestamp: chrono::Utc::now(),
-                    })
-                    .collect(),
-                token_count: self
-                    .messages
-                    .iter()
-                    .map(|m| m.content.len() as u32 / 4 + 1)
-                    .sum(),
-                ..Default::default()
-            };
-            if let Ok(summarized) = self
-                .context_manager
-                .summarize_overflow(&ctx, ctx.token_count / 2)
-                .await
-            {
-                self.messages = summarized
-                    .conversation_history
-                    .iter()
-                    .map(|m| StandardMessage {
-                        role: m.role.clone(),
-                        content: m.content.clone(),
-                        tool_call_id: None,
-                        tool_calls: None,
-                    })
-                    .collect();
-            }
-        }
+        // Message-count-only auto-summarization used to replace old content
+        // with a count placeholder, silently losing semantics. Pressure is now
+        // handled in `compact_to_token_budget`: full evicted messages are durably
+        // spilled and a retrievable reference remains in the active prompt.
     }
 
     /// Pause-aware run of a turn for `user_message`.
@@ -384,7 +650,8 @@ impl AgentExecutor {
     /// turn-boundary granularity across local and hosted backends.
     pub async fn run_resumable(&mut self, user_message: &str) -> Result<TurnResult, KernelError> {
         self.prepare_turn(user_message).await;
-        self.drive_loop(user_message.to_string(), 0, 0).await
+        self.drive_loop(user_message.to_string(), 0, 0, UsageTelemetry::default())
+            .await
     }
 
     /// Resume a turn from a checkpoint and drive it to completion (it can itself
@@ -416,6 +683,7 @@ impl AgentExecutor {
             checkpoint.user_message,
             checkpoint.tool_calls_made,
             checkpoint.tokens_used,
+            checkpoint.usage,
         )
         .await
     }
@@ -431,54 +699,118 @@ impl AgentExecutor {
         user_message: String,
         seed_tool_calls: usize,
         seed_tokens: u32,
+        mut usage: UsageTelemetry,
     ) -> Result<TurnResult, KernelError> {
         let tools = self.tool_registry.definitions();
         let mut total_tokens: u32 = seed_tokens;
         let mut tool_calls_made: usize = seed_tool_calls;
+
+        // A pause can land after an assistant response declared several tool
+        // calls but before all of them ran. Completed results are already in
+        // `messages`; execute only the missing ids before asking the model
+        // again. This is exactly-once within a persisted checkpoint. A process
+        // crash inside an external side effect is necessarily at-least-once
+        // unless that tool implements its own idempotency key.
+        for tool_call in self.pending_tool_calls() {
+            if self.cancel_token.is_cancelled() {
+                return Ok(TurnResult::Paused(
+                    self.checkpoint(
+                        &user_message,
+                        tool_calls_made,
+                        total_tokens,
+                        usage,
+                        String::new(),
+                    )
+                    .await,
+                ));
+            }
+            tool_calls_made += 1;
+            self.emit(StreamEvent::ToolCallStarted {
+                name: tool_call.name.clone(),
+                arguments: tool_call.arguments.to_string(),
+            })
+            .await;
+            let result = self.execute_tool(&tool_call).await;
+            self.emit(StreamEvent::ToolCallResult {
+                name: tool_call.name.clone(),
+                result: result.chars().take(200).collect(),
+            })
+            .await;
+            self.messages
+                .push(StandardMessage::tool_result(&tool_call.id, &result));
+        }
 
         for _ in 0..MAX_ITERATIONS {
             // Pause boundary: between LLM rounds. Capture a checkpoint of the
             // work so far instead of discarding it.
             if self.cancel_token.is_cancelled() {
                 return Ok(TurnResult::Paused(
-                    self.checkpoint(&user_message, tool_calls_made, total_tokens, String::new())
-                        .await,
+                    self.checkpoint(
+                        &user_message,
+                        tool_calls_made,
+                        total_tokens,
+                        usage,
+                        String::new(),
+                    )
+                    .await,
                 ));
             }
 
             // Page out old context to keep the active window within the token
             // budget before each LLM call (no-op when the budget is 0).
-            self.compact_to_token_budget();
+            self.compact_to_token_budget().await?;
 
-            // Budget: refuse a further LLM call once the cumulative USD ceiling
-            // is reached. This is a hard stop — distinct from the cgroup quota,
-            // which only bounds per-minute tokens, not lifetime cost.
-            if let Some(ref budget) = self.budget_enforcer {
-                if let Err(exceeded) = budget.check(self.agent_id) {
-                    let output = AgentOutput {
-                        content: format!("Stopped before LLM call: {}.", exceeded.message()),
-                        tool_calls_made,
-                        tokens_used: total_tokens,
-                    };
-                    self.emit(StreamEvent::Done(output.clone())).await;
-                    self.save_conversation();
-                    return Ok(TurnResult::Completed(output));
+            // Atomically check configured cumulative USD ceilings and hold each
+            // relevant scope through provider accounting. This prevents two
+            // concurrent agents/tenants from both passing the same remaining
+            // budget check.
+            let budget_call = if let Some(ref budget) = self.budget_enforcer {
+                match budget.begin_call(self.agent_id).await {
+                    Ok(guard) => Some(guard),
+                    Err(exceeded) => {
+                        let output = self.output(
+                            format!("Stopped before LLM call: {}.", exceeded.message()),
+                            tool_calls_made,
+                            total_tokens,
+                            usage,
+                        );
+                        self.emit(StreamEvent::Done(output.clone())).await;
+                        self.save_conversation();
+                        return Ok(TurnResult::Completed(output));
+                    }
                 }
-            }
+            } else {
+                None
+            };
 
             // Think: send to LLM with retry
-            let response = self.send_with_retry(&tools).await?;
-
-            total_tokens += response.tokens_used;
+            let call = match self.send_with_retry(&tools).await {
+                Ok(call) => call,
+                Err(_error) if self.cancel_token.is_cancelled() => {
+                    drop(budget_call);
+                    return Ok(TurnResult::Paused(
+                        self.checkpoint(
+                            &user_message,
+                            tool_calls_made,
+                            total_tokens,
+                            usage,
+                            String::new(),
+                        )
+                        .await,
+                    ));
+                }
+                Err(error) => return Err(error),
+            };
+            usage.record(&call);
+            let call_tokens = call.usage.total();
+            let response = call.response;
+            total_tokens = total_tokens.saturating_add(call_tokens);
 
             // Price this response against the agent's provider and accrue spend.
             if let Some(ref budget) = self.budget_enforcer {
-                budget.record(
-                    self.agent_id,
-                    self.session.provider_id(),
-                    response.tokens_used,
-                );
+                budget.record(self.agent_id, self.session.provider_id(), call_tokens);
             }
+            drop(budget_call);
 
             // Function-calling shim: models without native structured
             // tool-calling return their tool requests as plaintext. Only when
@@ -508,11 +840,7 @@ impl AgentExecutor {
                     let _ = self.context_manager.store_fact(self.agent_id, fact).await;
                 }
 
-                let output = AgentOutput {
-                    content: response.content,
-                    tool_calls_made,
-                    tokens_used: total_tokens,
-                };
+                let output = self.output(response.content, tool_calls_made, total_tokens, usage);
                 self.emit(StreamEvent::Done(output.clone())).await;
                 self.save_conversation();
                 return Ok(TurnResult::Completed(output));
@@ -537,6 +865,7 @@ impl AgentExecutor {
                             &user_message,
                             tool_calls_made,
                             total_tokens,
+                            usage,
                             String::new(),
                         )
                         .await,
@@ -560,11 +889,13 @@ impl AgentExecutor {
         }
 
         // Max iterations reached
-        Ok(TurnResult::Completed(AgentOutput {
-            content: "I've reached the maximum number of tool call iterations. Here's what I've done so far.".to_string(),
+        Ok(TurnResult::Completed(self.output(
+            "I've reached the maximum number of tool call iterations. Here's what I've done so far."
+                .to_string(),
             tool_calls_made,
-            tokens_used: total_tokens,
-        }))
+            total_tokens,
+            usage,
+        )))
     }
 
     /// Build a checkpoint of the in-flight turn at a pause boundary and emit a
@@ -575,6 +906,7 @@ impl AgentExecutor {
         user_message: &str,
         tool_calls_made: usize,
         tokens_used: u32,
+        usage: UsageTelemetry,
         partial_content: String,
     ) -> GenerationCheckpoint {
         self.emit(StreamEvent::Paused { tool_calls_made }).await;
@@ -586,7 +918,30 @@ impl AgentExecutor {
             partial_content,
             tool_calls_made,
             tokens_used,
+            usage,
         }
+    }
+
+    /// Return tool calls from the most recent assistant tool-call turn that do
+    /// not yet have a matching tool-result message in the checkpoint.
+    fn pending_tool_calls(&self) -> Vec<crate::connector::ToolCall> {
+        let Some((index, calls)) = self
+            .messages
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(index, message)| message.tool_calls.clone().map(|calls| (index, calls)))
+        else {
+            return Vec::new();
+        };
+        let completed: std::collections::HashSet<&str> = self.messages[index + 1..]
+            .iter()
+            .filter_map(|message| message.tool_call_id.as_deref())
+            .collect();
+        calls
+            .into_iter()
+            .filter(|call| !completed.contains(call.id.as_str()))
+            .collect()
     }
 
     /// Send to LLM with retry (3 attempts, exponential backoff).
@@ -594,21 +949,81 @@ impl AgentExecutor {
     async fn send_with_retry(
         &self,
         tools: &[crate::connector::ToolDefinition],
-    ) -> Result<crate::connector::LlmResponse, KernelError> {
+    ) -> Result<ProviderCall, KernelError> {
         // Filter messages: remove tool results that don't have a preceding tool_calls message
         let clean_messages = self.clean_messages();
+        let estimated_input_tokens = clean_messages
+            .iter()
+            .map(|message| (message.content.len() as u32 / 4).saturating_add(1))
+            .chain(tools.iter().map(|tool| {
+                ((tool.name.len() + tool.description.len() + tool.parameters.to_string().len())
+                    as u32
+                    / 4)
+                .saturating_add(1)
+            }))
+            .fold(0u32, u32::saturating_add);
 
         let mut last_err = None;
+        let mut provider_latency_ms = 0u64;
         for attempt in 0..LLM_RETRIES {
             if attempt > 0 {
                 tokio::time::sleep(tokio::time::Duration::from_millis(500 * (1 << attempt))).await;
             }
-            match self
-                .session
-                .send_streaming(clean_messages.clone(), tools)
-                .await
-            {
-                Ok(response) => return Ok(response),
+            let rate_guard = match &self.rate_limiter {
+                Some(limiter) => Some(
+                    limiter
+                        .acquire_tokens(u64::from(estimated_input_tokens))
+                        .await
+                        .map_err(|error| KernelError::Policy(error.to_string()))?,
+                ),
+                None => None,
+            };
+            let _llm_core = match &self.llm_scheduler {
+                Some((scheduler, pid, nice)) => Some(
+                    scheduler
+                        .acquire_cancellable(*pid, *nice, &self.cancel_token)
+                        .await
+                        .map_err(KernelError::Scheduler)?,
+                ),
+                None => None,
+            };
+            let started = std::time::Instant::now();
+            let result = tokio::select! {
+                _ = self.cancel_token.cancelled() => {
+                    return Err(KernelError::Policy("execution cancelled by lifecycle coordinator".into()));
+                }
+                result = self.session.send_streaming(clean_messages.clone(), tools) => result,
+            };
+            provider_latency_ms = provider_latency_ms
+                .saturating_add(started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64);
+            drop(_llm_core);
+            match result {
+                Ok(response) => {
+                    let usage = if response.usage.provider_reported && response.usage.total() > 0 {
+                        response.usage
+                    } else {
+                        // Conservative fallback: count the full serialized
+                        // request estimate plus the adapter's token count as
+                        // output. This may over-count providers that return only
+                        // a total, which is safer for quota enforcement.
+                        crate::connector::LlmUsage {
+                            input_tokens: estimated_input_tokens,
+                            output_tokens: response.tokens_used,
+                            cached_tokens: 0,
+                            provider_reported: false,
+                        }
+                    };
+                    if let Some(guard) = rate_guard {
+                        guard.reconcile(u64::from(usage.total()));
+                    }
+                    return Ok(ProviderCall {
+                        response,
+                        usage,
+                        attempts: (attempt + 1) as u32,
+                        retries: attempt as u32,
+                        latency_ms: provider_latency_ms,
+                    });
+                }
                 Err(e) => {
                     last_err = Some(e);
                 }
@@ -630,22 +1045,41 @@ impl AgentExecutor {
             .saturating_add(tool_call.name.len() as u64 / 4)
             .saturating_add(10);
 
-        // Pull a representative resource string out of arguments for MAC.
-        let resource = tool_call
-            .arguments
-            .get("path")
-            .or_else(|| tool_call.arguments.get("url"))
-            .or_else(|| tool_call.arguments.get("command"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("*")
-            .to_string();
+        // Resolve action, capabilities, and resource using the binding's
+        // validated declaration. Unknown tools and malformed resource arguments
+        // fail before policy evaluation or provider execution.
+        let (security, resource) = match self
+            .tool_registry
+            .security_context(&tool_call.name, &tool_call.arguments)
+        {
+            Ok(context) => context,
+            Err(error) if error.starts_with("unknown tool") => {
+                return format!(
+                    "Unknown tool '{}'. Available tools: {}",
+                    tool_call.name,
+                    self.tool_registry
+                        .definitions()
+                        .iter()
+                        .map(|tool| tool.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            }
+            Err(error) => return format!("Tool '{}' denied by kernel: {error}", tool_call.name),
+        };
 
         // Mandatory enforcement: every tool call is checked against the gate
         // (namespace → capability → MAC → cgroup). There is no ungoverned path —
         // an unconfined gate is the only bypass and must be requested by name.
         match self
             .syscall_gate
-            .check_tool_call(self.agent_id, &tool_call.name, &resource, est_tokens)
+            .check_tool_call_declared(
+                self.agent_id,
+                &tool_call.name,
+                &resource,
+                est_tokens,
+                &security,
+            )
             .await
         {
             Ok(_) => { /* proceed */ }
@@ -657,6 +1091,17 @@ impl AgentExecutor {
                 );
             }
         }
+
+        let _tool_slot = match self.syscall_gate.acquire_tool_call(self.agent_id) {
+            Ok(slot) => slot,
+            Err(denial) => {
+                return format!(
+                    "Tool '{}' denied by kernel: {}",
+                    tool_call.name,
+                    denial.message()
+                );
+            }
+        };
 
         let result = match self.tool_registry.resolve(self.agent_id, tool_call) {
             Some(request) => match self.resource_broker.execute(request).await {
@@ -686,9 +1131,6 @@ impl AgentExecutor {
                     .join(", ")
             ),
         };
-
-        self.syscall_gate
-            .record_tool_usage(self.agent_id, est_tokens);
 
         result
     }
@@ -735,7 +1177,7 @@ impl AgentExecutor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::connector::{LlmResponse, ToolCall, ToolDefinition};
+    use crate::connector::{LlmResponse, LlmUsage, ToolCall, ToolDefinition};
     use crate::permissions::PermissionManager;
     use crate::resources::ResourceProvider;
     use crate::{ConnectorError, ResourceError};
@@ -770,6 +1212,7 @@ mod tests {
                     content: "".into(),
                     finish_reason: Some("tool_calls".into()),
                     tokens_used: 20,
+                    usage: LlmUsage::reported(0, 20, 0),
                     tool_calls: vec![ToolCall {
                         id: "call_1".into(),
                         name: "read_file".into(),
@@ -781,6 +1224,7 @@ mod tests {
                     content: "The file contains: hello world".into(),
                     finish_reason: Some("stop".into()),
                     tokens_used: 15,
+                    usage: LlmUsage::reported(0, 15, 0),
                     tool_calls: vec![],
                 })
             }
@@ -812,6 +1256,7 @@ mod tests {
                 content: "".into(),
                 finish_reason: Some("tool_calls".into()),
                 tokens_used: 5,
+                usage: LlmUsage::reported(0, 5, 0),
                 tool_calls: vec![ToolCall {
                     id: "call_x".into(),
                     name: "read_file".into(),
@@ -827,7 +1272,7 @@ mod tests {
     fn mock_broker() -> Arc<dyn ResourceBroker> {
         use crate::resources::ResourceBrokerImpl;
         let perms = Arc::new(PermissionManager::new());
-        let broker = ResourceBrokerImpl::new(perms.clone());
+        let broker = ResourceBrokerImpl::new_unconfined(perms.clone());
         // Register a mock filesystem provider
         struct MockFs;
         #[async_trait::async_trait]
@@ -873,7 +1318,7 @@ mod tests {
             call_count: AtomicUsize::new(0),
             id: "mock".into(),
         });
-        let mut executor = AgentExecutor::new(
+        let executor = AgentExecutor::new(
             agent_id,
             session,
             mock_broker(),
@@ -993,24 +1438,28 @@ mod tests {
     // non-system messages are paged out, the system prompt is always retained.
     #[tokio::test]
     async fn context_pager_bounds_active_window_by_tokens() {
+        let agent_id = uuid::Uuid::new_v4();
+        let context = mock_context_manager();
         let mut executor = AgentExecutor::new_unconfined(
-            uuid::Uuid::new_v4(),
+            agent_id,
             Box::new(InfiniteToolSession { id: "x".into() }),
             mock_broker(),
             Arc::new(ToolRegistry::new()),
-            mock_context_manager(),
+            context.clone(),
             "SYSTEM PROMPT".into(),
         );
-        executor.set_context_budget(20); // tiny window (~80 chars active)
+        executor.set_context_budget(100);
+        let (event_tx, mut event_rx) = mpsc::channel(4);
+        executor.set_event_channel(event_tx);
 
         // 10 user messages of ~40 chars each (~11 tokens apiece).
         for _ in 0..10 {
             executor
                 .messages
-                .push(StandardMessage::user(&"x".repeat(40)));
+                .push(StandardMessage::user("x".repeat(40)));
         }
         let before = executor.messages.len();
-        executor.compact_to_token_budget();
+        executor.compact_to_token_budget().await.unwrap();
         let after = executor.messages.len();
 
         assert!(
@@ -1020,19 +1469,76 @@ mod tests {
         // System prompt is always kept at index 0.
         assert_eq!(executor.messages[0].role, "system");
         assert_eq!(executor.messages[0].content, "SYSTEM PROMPT");
-        // Each kept message ~11 tokens, budget 20 → only a couple fit.
-        assert!(after <= 3, "active window should be small, got {after}");
+        assert!(executor.estimate_prompt_tokens(&executor.messages) <= 100);
+        assert!(executor.messages.iter().any(|message| {
+            message.role == "system" && message.content.contains("Context spill")
+        }));
+        let spills = context.kv_list(agent_id).unwrap();
+        assert_eq!(spills.len(), 1);
+        assert!(spills[0].starts_with("context_spill:"));
+        assert!(context
+            .kv_get(agent_id, &spills[0])
+            .unwrap()
+            .unwrap()
+            .contains(&"x".repeat(40)));
+        let stats = context.context_pressure_stats(agent_id).unwrap();
+        assert_eq!(
+            stats.active_tokens,
+            executor.estimate_prompt_tokens(&executor.messages)
+        );
+        assert_eq!(stats.budget_tokens, 100);
+        assert_eq!(stats.spill_count, 1);
+        assert!(stats.evicted_messages > 0);
+        assert_eq!(stats.stored_spills, 1);
+        assert!(stats.stored_spill_bytes > 0);
+        assert_eq!(stats.error_count, 0);
+        assert!(matches!(
+            event_rx.try_recv().unwrap(),
+            StreamEvent::ContextPressure {
+                budget_tokens: 100,
+                ..
+            }
+        ));
 
         // Disabling the budget is a no-op even with a large history.
         executor.set_context_budget(0);
         for _ in 0..5 {
             executor
                 .messages
-                .push(StandardMessage::user(&"y".repeat(40)));
+                .push(StandardMessage::user("y".repeat(40)));
         }
         let n = executor.messages.len();
-        executor.compact_to_token_budget();
+        executor.compact_to_token_budget().await.unwrap();
         assert_eq!(executor.messages.len(), n, "budget 0 must not trim");
+    }
+
+    #[tokio::test]
+    async fn impossible_pinned_budget_fails_closed_without_mutating_context() {
+        let context = mock_context_manager();
+        let agent_id = uuid::Uuid::new_v4();
+        let mut executor = AgentExecutor::new_unconfined(
+            agent_id,
+            Box::new(InfiniteToolSession { id: "x".into() }),
+            mock_broker(),
+            Arc::new(ToolRegistry::new()),
+            context.clone(),
+            "required system instruction that cannot fit".repeat(10),
+        );
+        executor.set_context_budget(5);
+        executor
+            .messages
+            .push(StandardMessage::user("ordinary history"));
+        let before = executor.messages.clone();
+        let error = executor.compact_to_token_budget().await.unwrap_err();
+        assert!(error.to_string().contains("pinned system/tool state"));
+        assert_eq!(executor.messages, before);
+        let stats = context.context_pressure_stats(agent_id).unwrap();
+        assert_eq!(stats.error_count, 1);
+        assert_eq!(stats.stored_spills, 0);
+        assert!(stats
+            .last_error
+            .as_deref()
+            .is_some_and(|error| error.contains("pinned system/tool state")));
     }
 
     #[tokio::test]
@@ -1096,6 +1602,7 @@ mod tests {
                     content: "I'll read it.\n```json\n{\"tool\": \"read_file\", \"arguments\": {\"path\": \"/tmp/test.txt\"}}\n```".into(),
                     finish_reason: Some("stop".into()),
                     tokens_used: 12,
+                    usage: Default::default(),
                     tool_calls: vec![],
                 })
             } else {
@@ -1103,6 +1610,7 @@ mod tests {
                     content: "The file contains: hello world".into(),
                     finish_reason: Some("stop".into()),
                     tokens_used: 8,
+                    usage: Default::default(),
                     tool_calls: vec![],
                 })
             }
@@ -1206,6 +1714,7 @@ mod tests {
                     content: "recovered!".into(),
                     finish_reason: Some("stop".into()),
                     tokens_used: 10,
+                    usage: Default::default(),
                     tool_calls: vec![],
                 })
             }
@@ -1235,6 +1744,12 @@ mod tests {
 
         let output = executor.run("test").await.unwrap();
         assert_eq!(output.content, "recovered!");
+        assert_eq!(output.usage.llm_requests, 3);
+        assert_eq!(output.usage.retries, 2);
+        assert_eq!(output.usage.provider_reported_requests, 0);
+        assert_eq!(output.usage.estimated_requests, 1);
+        assert!(output.usage.input_tokens > 0);
+        assert_eq!(output.usage.output_tokens, 10);
     }
 
     /// Mock session that calls a nonexistent tool — tests error recovery message to LLM.
@@ -1263,6 +1778,7 @@ mod tests {
                     content: "".into(),
                     finish_reason: Some("tool_calls".into()),
                     tokens_used: 10,
+                    usage: Default::default(),
                     tool_calls: vec![ToolCall {
                         id: "c1".into(),
                         name: "nonexistent_tool".into(),
@@ -1279,6 +1795,7 @@ mod tests {
                     content: "Sorry, let me try differently.".into(),
                     finish_reason: Some("stop".into()),
                     tokens_used: 8,
+                    usage: Default::default(),
                     tool_calls: vec![],
                 })
             }
@@ -1355,6 +1872,7 @@ mod tests {
                 content: "This is a very long response that exceeds one hundred characters in length so it will be stored as a fact in long-term memory for future reference.".into(),
                 finish_reason: Some("stop".into()),
                 tokens_used: 30,
+                usage: Default::default(),
                 tool_calls: vec![],
             })
         }
@@ -1414,6 +1932,7 @@ mod tests {
                 content: "ok".into(),
                 finish_reason: Some("stop".into()),
                 tokens_used: 5,
+                usage: Default::default(),
                 tool_calls: vec![],
             })
         }
@@ -1423,7 +1942,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn summarization_triggers_when_messages_exceed_threshold() {
+    async fn pressure_spills_instead_of_message_count_summarization() {
         let ctx_mgr = mock_context_manager();
         let agent_id = uuid::Uuid::new_v4();
         let session = Box::new(SummarizationSession {
@@ -1438,22 +1957,22 @@ mod tests {
             session,
             broker,
             registry,
-            ctx_mgr,
+            ctx_mgr.clone(),
             "test".into(),
         );
+        executor.set_context_budget(120);
 
-        // Manually fill messages to exceed threshold
-        for i in 0..MESSAGE_OVERFLOW_THRESHOLD {
+        // Manually fill enough history to exceed the active prompt budget.
+        for i in 0..30 {
             executor
                 .messages
                 .push(StandardMessage::user(format!("message {}", i)));
         }
 
-        // Run should trigger summarization
+        // Run should durably spill rather than silently count-summarize.
         executor.run("final message").await.unwrap();
-
-        // After summarization, message count should be less than what we started with
-        assert!(executor.messages().len() < MESSAGE_OVERFLOW_THRESHOLD + 3);
+        assert!(executor.messages().len() < 33);
+        assert!(!ctx_mgr.kv_list(agent_id).unwrap().is_empty());
     }
 
     // ---- Mid-generation context switch (#56) ----
@@ -1533,10 +2052,18 @@ mod tests {
     /// *deterministic*: the first tool runs to completion (so `tool_calls_made`
     /// is 1), and by the time the executor reaches iteration 2's top-of-loop
     /// check the token is already set — no event-channel race, no wall clock.
-    fn cancel_on_tool_broker(cancel: CancellationToken) -> Arc<dyn ResourceBroker> {
+    fn cancel_on_tool_broker(
+        agent_id: AgentId,
+        cancel: CancellationToken,
+    ) -> Arc<dyn ResourceBroker> {
         use crate::resources::ResourceBrokerImpl;
         let perms = Arc::new(PermissionManager::new());
-        let broker = ResourceBrokerImpl::new(perms);
+        crate::permissions::PermissionSystem::assign_profile(
+            perms.as_ref(),
+            agent_id,
+            &"full-access".to_string(),
+        );
+        let broker = ResourceBrokerImpl::new_unconfined(perms);
         struct CancelFs {
             cancel: CancellationToken,
         }
@@ -1581,7 +2108,7 @@ mod tests {
                 call_count: AtomicUsize::new(0),
                 id: "phase1".into(),
             }),
-            cancel_on_tool_broker(shared_cancel.clone()),
+            cancel_on_tool_broker(agent_id, shared_cancel.clone()),
             Arc::new(ToolRegistry::new()),
             mock_context_manager(),
             "SYSTEM".into(),
@@ -1646,6 +2173,7 @@ mod tests {
             partial_content: String::new(),
             tool_calls_made: 2,
             tokens_used: 42,
+            usage: UsageTelemetry::default(),
         };
 
         let session = Box::new(InfiniteToolSession { id: "x".into() });
@@ -1694,6 +2222,12 @@ mod tests {
             partial_content: "partial assistant text".into(),
             tool_calls_made: 3,
             tokens_used: 123,
+            usage: UsageTelemetry {
+                input_tokens: 70,
+                output_tokens: 53,
+                llm_requests: 2,
+                ..Default::default()
+            },
         };
 
         let json = serde_json::to_string(&checkpoint).unwrap();

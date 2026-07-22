@@ -8,9 +8,10 @@
 //! admission path the CLI and syscall server use, so a packaged agent is
 //! admitted, gated, and scheduled identically to one created by hand.
 //!
-//! `tools` is the agent's *declared* tool set (intent + documentation); actual
-//! tool access is enforced at runtime by the agent's permission profile through
-//! the syscall gate's capability checks, not by this list.
+//! `tools` is the agent's declared tool set: every name must exist in the live
+//! registry before creation. It does not grant authority or narrow the full
+//! runtime registry; actual access is independently enforced by the agent's
+//! permission profile through the syscall gate's capability checks.
 //!
 //! See `docs/AGENT_PACKAGE.md` for the manifest schema and a worked example.
 
@@ -32,6 +33,7 @@ fn default_priority() -> u8 {
 
 /// A loadable agent package manifest (e.g. `agent.toml`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AgentManifest {
     /// Unique, human-readable package name.
     pub name: String,
@@ -84,6 +86,11 @@ pub enum AgentPackageError {
 impl AgentManifest {
     /// Parse and validate a manifest from a TOML string.
     pub fn from_toml_str(s: &str) -> Result<Self, AgentPackageError> {
+        if s.len() > 1_048_576 {
+            return Err(AgentPackageError::Invalid(
+                "manifest exceeds the 1 MiB input limit".into(),
+            ));
+        }
         let manifest: AgentManifest =
             toml::from_str(s).map_err(|e| AgentPackageError::Parse(e.to_string()))?;
         manifest.validate()?;
@@ -103,10 +110,46 @@ impl AgentManifest {
                 "`name` must not be empty".into(),
             ));
         }
+        if self.name.len() > 128
+            || self
+                .name
+                .chars()
+                .any(|character| !(character.is_ascii_alphanumeric() || "-_.".contains(character)))
+        {
+            return Err(AgentPackageError::Invalid(
+                "`name` must be at most 128 ASCII letters/digits/dot/dash/underscore characters"
+                    .into(),
+            ));
+        }
         if self.task.trim().is_empty() {
             return Err(AgentPackageError::Invalid(
                 "`task` must not be empty".into(),
             ));
+        }
+        if self.task.len() > 65_536
+            || self.description.len() > 65_536
+            || self
+                .entry
+                .as_ref()
+                .is_some_and(|entry| entry.len() > 65_536)
+        {
+            return Err(AgentPackageError::Invalid(
+                "description, task, and entry are each limited to 64 KiB".into(),
+            ));
+        }
+        if self.provider.trim().is_empty() || self.provider.len() > 128 {
+            return Err(AgentPackageError::Invalid(
+                "`provider` must be non-empty and at most 128 bytes".into(),
+            ));
+        }
+        if !matches!(
+            self.profile.as_str(),
+            "read-only" | "standard" | "elevated" | "full-access"
+        ) {
+            return Err(AgentPackageError::Invalid(format!(
+                "unknown permission profile '{}'",
+                self.profile
+            )));
         }
         if !(1..=5).contains(&self.priority) {
             return Err(AgentPackageError::Invalid(format!(
@@ -120,6 +163,37 @@ impl AgentManifest {
                     "`nice` must be -20..=19, got {n}"
                 )));
             }
+        }
+        if self.tools.len() > 256 {
+            return Err(AgentPackageError::Invalid(
+                "at most 256 tools may be declared".into(),
+            ));
+        }
+        let mut unique_tools = std::collections::HashSet::new();
+        for tool in &self.tools {
+            if tool.is_empty()
+                || tool.len() > 128
+                || tool.chars().any(|character| {
+                    !(character.is_ascii_alphanumeric() || "-_.".contains(character))
+                })
+            {
+                return Err(AgentPackageError::Invalid(format!(
+                    "invalid tool name '{tool}'"
+                )));
+            }
+            if !unique_tools.insert(tool) {
+                return Err(AgentPackageError::Invalid(format!(
+                    "duplicate tool declaration '{tool}'"
+                )));
+            }
+        }
+        if self.memory.len() > 128
+            || self.memory.iter().any(|memory| memory.len() > 65_536)
+            || self.memory.iter().map(String::len).sum::<usize>() > 1_048_576
+        {
+            return Err(AgentPackageError::Invalid(
+                "memory seeds are limited to 128 items, 64 KiB each, and 1 MiB total".into(),
+            ));
         }
         Ok(())
     }
@@ -163,17 +237,50 @@ pub async fn load_package(
     kernel: &AgentKernelImpl,
     manifest: &AgentManifest,
 ) -> Result<AgentHandle, AgentPackageError> {
+    load_package_scoped(kernel, manifest, None).await
+}
+
+/// Load a packaged agent into an authenticated tenant boundary. This is the
+/// wire-server path: package creation must not fall back to the un-tenanted
+/// registry merely because the agent came from a manifest.
+pub async fn load_package_for_tenant(
+    kernel: &AgentKernelImpl,
+    tenant_id: &str,
+    manifest: &AgentManifest,
+) -> Result<AgentHandle, AgentPackageError> {
+    if manifest.profile == "full-access" {
+        return Err(AgentPackageError::Invalid(
+            "tenant package manifests cannot request the system-only full-access profile".into(),
+        ));
+    }
+    load_package_scoped(kernel, manifest, Some(tenant_id)).await
+}
+
+async fn load_package_scoped(
+    kernel: &AgentKernelImpl,
+    manifest: &AgentManifest,
+    tenant_id: Option<&str>,
+) -> Result<AgentHandle, AgentPackageError> {
     manifest.validate()?;
-    let handle = kernel
-        .create_agent_full(manifest.to_agent_config())
-        .await
-        .map_err(|e| AgentPackageError::Kernel(e.to_string()))?;
+    for tool in &manifest.tools {
+        if !kernel.tool_registry.has_tool(tool) {
+            return Err(AgentPackageError::Invalid(format!(
+                "declared tool '{tool}' is not registered"
+            )));
+        }
+    }
+    let config = manifest.to_agent_config();
+    let handle = match tenant_id {
+        Some(tenant_id) => kernel.create_agent_for_tenant(tenant_id, config).await,
+        None => kernel.create_agent_full(config).await,
+    }
+    .map_err(|e| AgentPackageError::Kernel(e.to_string()))?;
 
     if let Some(nice) = manifest.nice {
-        kernel
-            .set_nice(handle.id, nice)
-            .await
-            .map_err(|e| AgentPackageError::Kernel(e.to_string()))?;
+        if let Err(error) = kernel.set_nice(handle.id, nice).await {
+            kernel.rollback_created_agent(handle.id).await;
+            return Err(AgentPackageError::Kernel(error.to_string()));
+        }
     }
 
     for content in &manifest.memory {
@@ -186,11 +293,10 @@ pub async fn load_package(
             last_accessed_at: now,
             embedding: None,
         };
-        kernel
-            .context_manager
-            .store_fact(handle.id, fact)
-            .await
-            .map_err(|e| AgentPackageError::Kernel(e.to_string()))?;
+        if let Err(error) = kernel.context_manager.store_fact(handle.id, fact).await {
+            kernel.rollback_created_agent(handle.id).await;
+            return Err(AgentPackageError::Kernel(error.to_string()));
+        }
     }
 
     Ok(handle)
@@ -279,15 +385,57 @@ memory = ["Prefer primary sources.", "Cite everything."]
     }
 
     #[test]
+    fn rejects_unknown_fields_and_unsafe_manifest_shapes() {
+        assert!(matches!(
+            AgentManifest::from_toml_str("name = \"a\"\ntask = \"t\"\nprivileged = true"),
+            Err(AgentPackageError::Parse(_))
+        ));
+        for source in [
+            "name = \"not/a/name\"\ntask = \"t\"",
+            "name = \"a\"\ntask = \"t\"\nprofile = \"root\"",
+            "name = \"a\"\ntask = \"t\"\ntools = [\"read_file\", \"read_file\"]",
+            "name = \"a\"\ntask = \"t\"\ntools = [\"bad/tool\"]",
+        ] {
+            assert!(matches!(
+                AgentManifest::from_toml_str(source),
+                Err(AgentPackageError::Invalid(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn rejects_manifest_larger_than_one_mibibyte() {
+        let oversized = format!("name = \"a\"\ntask = \"{}\"", "x".repeat(1_048_576));
+        assert!(matches!(
+            AgentManifest::from_toml_str(&oversized),
+            Err(AgentPackageError::Invalid(_))
+        ));
+    }
+
+    #[test]
     fn resolve_tools_against_shared_registry() {
         use crate::tool_registry_share::{SharedToolDef, SharedToolRegistry};
 
         let mut registry = SharedToolRegistry::new();
         registry
-            .publish(SharedToolDef::new("read_file", "read a file"))
+            .publish(SharedToolDef::new(
+                "read_file",
+                "read a file",
+                crate::tools::ToolSecurity::constant(
+                    crate::tools::SecurityAction::Read,
+                    "test:file",
+                ),
+            ))
             .unwrap();
         registry
-            .publish(SharedToolDef::new("http_get", "fetch a url"))
+            .publish(SharedToolDef::new(
+                "http_get",
+                "fetch a url",
+                crate::tools::ToolSecurity::constant(
+                    crate::tools::SecurityAction::Network,
+                    "https://example.invalid",
+                ),
+            ))
             .unwrap();
 
         let m = AgentManifest::from_toml_str(SAMPLE).unwrap();
@@ -332,5 +480,57 @@ memory = ["Prefer primary sources.", "Cite everything."]
             .await
             .unwrap();
         assert!(facts.iter().any(|f| f.content.contains("primary sources")));
+    }
+
+    #[tokio::test]
+    async fn tenant_load_rejects_system_profile_without_creating_an_agent() {
+        let kernel = AgentKernelImpl::new().unwrap();
+        let manifest = AgentManifest::from_toml_str(
+            "name = \"rootish\"\ntask = \"t\"\nprofile = \"full-access\"",
+        )
+        .unwrap();
+
+        let error = load_package_for_tenant(&kernel, "tenant-a", &manifest)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("system-only"));
+        assert!(kernel.agent_manager.list_agents(None).is_empty());
+    }
+
+    #[tokio::test]
+    async fn unknown_declared_tool_is_rejected_before_creation() {
+        let kernel = AgentKernelImpl::new().unwrap();
+        let manifest = AgentManifest::from_toml_str(
+            "name = \"ghost-user\"\ntask = \"t\"\ntools = [\"definitely_missing\"]",
+        )
+        .unwrap();
+
+        let error = load_package(&kernel, &manifest).await.unwrap_err();
+        assert!(error.to_string().contains("is not registered"));
+        assert!(kernel.agent_manager.list_agents(None).is_empty());
+    }
+
+    #[tokio::test]
+    async fn creation_rollback_erases_live_and_durable_partial_state() {
+        let kernel = AgentKernelImpl::new().unwrap();
+        let manifest = AgentManifest::from_toml_str(
+            "name = \"rollback-me\"\ntask = \"t\"\nprofile = \"standard\"",
+        )
+        .unwrap();
+        let handle = load_package(&kernel, &manifest).await.unwrap();
+
+        kernel.rollback_created_agent(handle.id).await;
+
+        assert!(kernel.get_agent_status(handle.id).is_err());
+        assert!(!kernel
+            .agent_manager
+            .list_agents(None)
+            .iter()
+            .any(|agent| agent.id == handle.id));
+        assert_eq!(
+            kernel.context_manager.agent_tenant(handle.id).unwrap(),
+            None
+        );
+        assert!(kernel.syscall_gate.agent_info(handle.id).is_none());
     }
 }

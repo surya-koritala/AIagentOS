@@ -49,7 +49,7 @@ impl AgentCtl {
         if init.status(name).is_none() {
             return AgentCtlResult::Error(format!("service '{}' not found", name));
         }
-        init.mark_started(name, 0); // agent_id would come from actual creation
+        init.mark_started(name, uuid::Uuid::nil()); // legacy in-process prototype
         AgentCtlResult::Ok(format!("Started {}", name))
     }
 

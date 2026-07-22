@@ -317,6 +317,32 @@ impl PriorityScheduler {
         }
     }
 
+    /// Mark an admitted agent paused/suspended without requiring it to be
+    /// actively running. Idempotent and releases a running count if necessary.
+    pub fn set_paused(&self, agent_id: AgentId) {
+        if let Some(mut info) = self.agents.get_mut(&agent_id) {
+            if info.state == AgentScheduleState::Running {
+                self.running_count.fetch_sub(1, AtomicOrdering::SeqCst);
+                self.slot_available.notify_one();
+            }
+            info.state = AgentScheduleState::Suspended;
+        }
+    }
+
+    pub fn contains(&self, agent_id: AgentId) -> bool {
+        self.agents.contains_key(&agent_id)
+    }
+
+    /// Live per-agent scheduling state for operator introspection. The string
+    /// vocabulary is stable and intentionally does not expose queue internals.
+    pub fn schedule_state(&self, agent_id: AgentId) -> Option<&'static str> {
+        self.agents.get(&agent_id).map(|info| match info.state {
+            AgentScheduleState::Running => "running",
+            AgentScheduleState::Suspended => "paused",
+            AgentScheduleState::Queued => "queued",
+        })
+    }
+
     /// Remove an agent from the scheduler entirely, freeing its admission slot
     /// if it was running. Called when an agent terminates (stop/shutdown) so the
     /// `MAX_CONCURRENT_AGENTS` gate tracks real liveness — without this,

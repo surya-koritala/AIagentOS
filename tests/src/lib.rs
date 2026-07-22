@@ -7,6 +7,12 @@
 mod agent_lifecycle_props;
 
 #[cfg(test)]
+mod lifecycle_coordinator;
+
+#[cfg(test)]
+mod durable_checkpoints;
+
+#[cfg(test)]
 mod agent_package_e2e;
 
 #[cfg(test)]
@@ -68,3 +74,9 @@ mod tenancy_props;
 
 #[cfg(test)]
 mod policy_props;
+
+#[cfg(test)]
+mod capability_registry;
+
+#[cfg(test)]
+mod service_supervisor;

@@ -9,6 +9,7 @@
 //! can talk without changing either.
 
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
 
 use dashmap::DashMap;
 use tokio::sync::Mutex;
@@ -35,6 +36,8 @@ pub enum GateDenial {
     },
     /// Cgroup token quota would be exceeded.
     CgroupQuota,
+    /// Cgroup concurrent tool-call limit is full.
+    CgroupToolLimit,
     /// Tool is registered in a namespace the agent is not a member of.
     NotInNamespace {
         tool: String,
@@ -52,6 +55,9 @@ impl GateDenial {
                 format!("MAC policy denies {} on {} (EACCES)", action, resource)
             }
             GateDenial::CgroupQuota => "cgroup token quota exceeded (EAGAIN)".to_string(),
+            GateDenial::CgroupToolLimit => {
+                "cgroup concurrent tool-call limit exceeded (EAGAIN)".to_string()
+            }
             GateDenial::NotInNamespace { tool, namespace } => format!(
                 "tool '{}' not visible in agent's namespaces (ns={}, ENOENT)",
                 tool, namespace
@@ -85,10 +91,6 @@ impl ToolAction {
         action: "exec",
         required_cap: Some(CapabilitySet::CAP_EXEC),
     };
-    pub const EXECUTE: Self = Self {
-        action: "execute",
-        required_cap: None,
-    };
     pub const DELETE: Self = Self {
         action: "delete",
         required_cap: Some(CapabilitySet::CAP_FILE_DELETE),
@@ -101,35 +103,21 @@ impl ToolAction {
 
 /// Classify a built-in tool name into an action + required capability.
 ///
-/// Custom tools default to EXECUTE with no capability requirement, deliberately —
-/// they're declared by the operator who is also expected to set a MAC policy for
-/// their label.
+/// Unknown/custom tools fail closed as process execution and require
+/// `CAP_EXEC`. Live registries should pass their explicit declaration instead;
+/// this fallback prevents a new name from bypassing capability enforcement.
 pub fn classify_tool(tool_name: &str) -> ToolAction {
-    match tool_name {
-        // Pure reads
-        "read_file" | "list_directory" | "search_files" | "git_status" | "git_diff" => {
-            ToolAction::READ
-        }
-        // Filesystem mutations
-        "write_file" | "create_directory" | "create_file" | "edit_file" | "git_commit" => {
-            ToolAction::WRITE
-        }
-        // Filesystem deletion — requires CAP_FILE_DELETE (distinct from write).
-        "delete_file" => ToolAction::DELETE,
-        // Network
-        "http_get" | "browse_url" => ToolAction::NET,
-        // Process execution
-        "run_command" => ToolAction::EXEC,
-        // Inter-agent messaging + delegation (namespace isolation + the broker
-        // Ipc profile rule are the real boundaries).
-        "send_agent_message"
-        | "check_inbox"
-        | "delegate_task"
-        | "delegation_status"
-        | "complete_delegation"
-        | "discover_agents" => ToolAction::IPC,
-        _ => ToolAction::EXECUTE,
-    }
+    static CATALOG: OnceLock<std::collections::HashMap<String, crate::tools::ToolSecurity>> =
+        OnceLock::new();
+    let catalog = CATALOG.get_or_init(crate::tools::ToolRegistry::default_security_catalog);
+    catalog
+        .get(tool_name)
+        .map_or(ToolAction::EXEC, |security| ToolAction {
+            action: security.action.as_str(),
+            // Direct legacy callers support one capability. Live public paths use
+            // `check_tool_call_declared`, which enforces the complete vector.
+            required_cap: security.required_capabilities.first().copied(),
+        })
 }
 
 /// Per-agent registration record inside the gate.
@@ -186,7 +174,7 @@ fn capability_names(caps: &CapabilitySet) -> Vec<String> {
 }
 
 /// Counters surfaced for observability and tests.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct GateStats {
     pub allowed: u64,
     pub denied_capability: u64,
@@ -265,6 +253,22 @@ pub struct SyscallGate {
 }
 
 impl SyscallGate {
+    /// Reserve one cgroup tool-call slot for a previously authorized agent.
+    /// The returned guard must be held until provider execution finishes.
+    pub fn acquire_tool_call(
+        &self,
+        kid: uuid::Uuid,
+    ) -> Result<crate::cgroups::ToolCallGuard, GateDenial> {
+        let cgroup = self
+            .records
+            .get(&kid)
+            .map(|record| record.cgroup)
+            .ok_or(GateDenial::UnknownAgent)?;
+        self.cgroups.try_acquire_tool_call(cgroup).ok_or_else(|| {
+            self.denied_cgroup.fetch_add(1, Ordering::Relaxed);
+            GateDenial::CgroupToolLimit
+        })
+    }
     /// Create a new gate. By default MAC is in *permissive* mode (default-allow)
     /// so existing tool calls keep working until a policy is loaded. Switch to
     /// enforcing via `mac().set_enforcing(true)` and load policy rules to
@@ -423,15 +427,56 @@ impl SyscallGate {
         resource: &str,
         est_tokens: u64,
     ) -> Result<Pid, GateDenial> {
+        let action = classify_tool(tool_name);
+        let required_capabilities: Vec<u64> = action.required_cap.into_iter().collect();
+        self.check_tool_call_contract(
+            kid,
+            tool_name,
+            resource,
+            est_tokens,
+            action.action,
+            &required_capabilities,
+        )
+        .await
+    }
+
+    /// Enforce the validated security declaration carried by the live tool
+    /// registry. Public execution paths use this method so capability and MAC
+    /// decisions come from the binding, never from string matching.
+    pub async fn check_tool_call_declared(
+        &self,
+        kid: uuid::Uuid,
+        tool_name: &str,
+        resource: &str,
+        est_tokens: u64,
+        security: &crate::tools::ToolSecurity,
+    ) -> Result<Pid, GateDenial> {
+        self.check_tool_call_contract(
+            kid,
+            tool_name,
+            resource,
+            est_tokens,
+            security.action.as_str(),
+            &security.required_capabilities,
+        )
+        .await
+    }
+
+    async fn check_tool_call_contract(
+        &self,
+        kid: uuid::Uuid,
+        tool_name: &str,
+        resource: &str,
+        est_tokens: u64,
+        action: &'static str,
+        required_capabilities: &[u64],
+    ) -> Result<Pid, GateDenial> {
         // Explicitly-ungoverned gate (test / non-OS contexts only — see
         // `SyscallGate::unconfined`): allow everything without registration.
         if self.unconfined {
             self.allowed.fetch_add(1, Ordering::Relaxed);
             return Ok(0);
         }
-
-        let action = classify_tool(tool_name);
-
         let (pid, caps, cgroup, agent_namespaces) = match self.records.get(&kid) {
             Some(rec) => (
                 rec.pid,
@@ -458,7 +503,7 @@ impl SyscallGate {
         }
 
         // 1. Capability check.
-        if let Some(required) = action.required_cap {
+        for &required in required_capabilities {
             if !caps.has(required) {
                 self.denied_capability.fetch_add(1, Ordering::Relaxed);
                 return Err(GateDenial::MissingCapability(required));
@@ -468,7 +513,7 @@ impl SyscallGate {
         // 2. MAC check.
         let mac_decision = {
             let mac = self.mac.lock().await;
-            mac.check(pid, action.action, resource)
+            mac.check(pid, action, resource)
         };
         match mac_decision {
             MacDecision::Deny => {
@@ -477,12 +522,12 @@ impl SyscallGate {
                     agent: kid,
                     pid,
                     tool: tool_name.to_string(),
-                    action: action.action,
+                    action,
                     resource: resource.to_string(),
                     decision: AuditDecision::Denied,
                 });
                 return Err(GateDenial::MacDeny {
-                    action: action.action,
+                    action,
                     resource: resource.to_string(),
                 });
             }
@@ -494,7 +539,7 @@ impl SyscallGate {
                     agent: kid,
                     pid,
                     tool: tool_name.to_string(),
-                    action: action.action,
+                    action,
                     resource: resource.to_string(),
                     decision: AuditDecision::Allowed,
                 });
@@ -502,8 +547,9 @@ impl SyscallGate {
             MacDecision::Allow => {}
         }
 
-        // 3. Cgroup quota check.
-        if !self.cgroups.check_token_limit(cgroup, est_tokens) {
+        // 3. Atomically reserve quota across the full hierarchy. This is the
+        // charge; callers must not separately record the same estimate later.
+        if !self.cgroups.try_record_tokens(cgroup, est_tokens) {
             self.denied_cgroup.fetch_add(1, Ordering::Relaxed);
             return Err(GateDenial::CgroupQuota);
         }
@@ -512,8 +558,9 @@ impl SyscallGate {
         Ok(pid)
     }
 
-    /// Record actual token usage post-execution. Propagates up the cgroup
-    /// hierarchy so parent budgets are accounted.
+    /// Charge externally observed usage that was not already reserved through
+    /// `check_tool_call`. Normal tool paths reserve at admission and must not
+    /// call this again.
     pub fn record_tool_usage(&self, kid: uuid::Uuid, actual_tokens: u64) {
         if let Some(rec) = self.records.get(&kid) {
             self.cgroups.record_tokens(rec.cgroup, actual_tokens);
@@ -595,7 +642,9 @@ mod tests {
         assert_eq!(classify_tool("write_file").action, "write");
         assert_eq!(classify_tool("http_get").action, "net");
         assert_eq!(classify_tool("run_command").action, "exec");
-        assert_eq!(classify_tool("totally_custom_tool").action, "execute");
+        let custom = classify_tool("totally_custom_tool");
+        assert_eq!(custom.action, "exec");
+        assert_eq!(custom.required_cap, Some(CapabilitySet::CAP_EXEC));
     }
 
     #[test]
@@ -610,6 +659,34 @@ mod tests {
         let d = classify_tool("delete_file");
         assert_eq!(d.action, "delete");
         assert_eq!(d.required_cap, Some(CapabilitySet::CAP_FILE_DELETE));
+    }
+
+    #[tokio::test]
+    async fn declared_security_overrides_name_and_enforces_every_capability() {
+        let (gate, _) = fresh_gate();
+        let kid = uuid::Uuid::new_v4();
+        let mut caps = CapabilitySet::none();
+        caps.grant(CapabilitySet::CAP_EXEC);
+        gate.register_agent(kid, caps, None);
+
+        let security = crate::tools::ToolSecurity::constant(
+            crate::tools::SecurityAction::Execute,
+            "declared:test",
+        )
+        .with_capability(CapabilitySet::CAP_FILE_WRITE)
+        .sandboxed();
+
+        // The deliberately misleading name would be classified as a harmless
+        // read by the compatibility API. The live declared path still requires
+        // both EXEC and FILE_WRITE, proving name matching cannot weaken it.
+        let denial = gate
+            .check_tool_call_declared(kid, "read_file", "declared:test", 1, &security)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            denial,
+            GateDenial::MissingCapability(CapabilitySet::CAP_FILE_WRITE)
+        );
     }
 
     #[tokio::test]

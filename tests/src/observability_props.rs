@@ -12,15 +12,6 @@ use proptest::prelude::*;
 
 use kernel::observability::*;
 
-fn arb_action_type() -> impl Strategy<Value = String> {
-    prop_oneof![
-        Just("tool_call".to_string()),
-        Just("resource_access".to_string()),
-        Just("llm_call".to_string()),
-        Just("file_write".to_string()),
-    ]
-}
-
 proptest! {
     /// Property 22: For any action not matching stated plan, system SHALL flag
     /// deviation and notify user.

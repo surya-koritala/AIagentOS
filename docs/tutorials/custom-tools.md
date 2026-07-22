@@ -11,6 +11,19 @@ description = "Count words in a file"
 command = "wc"
 args_template = ["-w", "{file_path}"]
 
+# Security is mandatory. Command templates execute a process, so they require
+# CAP_EXEC (0x40), user approval, and a sandbox. Omitting this table rejects the
+# tool; it never falls back to an implicit permission.
+[tool.security]
+action = "execute"
+required_capabilities = [64]
+namespace_visibility = "global"
+approval_policy = "user"
+sandbox_requirement = "required"
+[tool.security.resource_extractor]
+kind = "argument"
+value = "file_path"
+
 [tool.parameters]
 file_path = { type = "string", description = "Path to file", required = true }
 
@@ -20,16 +33,30 @@ description = "Search for pattern in source files"
 command = "grep"
 args_template = ["-rn", "{pattern}", "{directory}"]
 
+[tool.security]
+action = "execute"
+required_capabilities = [64]
+namespace_visibility = "global"
+approval_policy = "user"
+sandbox_requirement = "required"
+[tool.security.resource_extractor]
+kind = "argument"
+value = "directory"
+
 [tool.parameters]
 pattern = { type = "string", description = "Search pattern", required = true }
 directory = { type = "string", description = "Directory to search", required = true }
 ```
 
-The agent will automatically discover and use these tools.
+The loader validates the schema and security contract before registering a
+tool. Invalid, incomplete, or contradictory declarations are logged and remain
+unavailable to agents.
 
 ## MCP Server Tools
 
-Connect to any MCP-compatible tool server:
+Connect to an MCP-compatible tool server only after assigning a local security
+contract to each discovered tool. MCP metadata is untrusted: tools without the
+`agentosSecurity` extension are discoverable but registration fails closed.
 
 Create `~/.config/ai-agent-os/mcp_servers.json`:
 ```json

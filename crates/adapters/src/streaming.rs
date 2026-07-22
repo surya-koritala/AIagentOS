@@ -55,6 +55,7 @@ pub async fn parse_azure_sse_stream(
                             content,
                             finish_reason: Some("stop".into()),
                             tokens_used,
+                            usage: Default::default(),
                             tool_calls,
                         });
                     }
@@ -129,6 +130,7 @@ pub async fn parse_azure_sse_stream(
         content,
         finish_reason: Some("stop".into()),
         tokens_used,
+        usage: Default::default(),
         tool_calls,
     })
 }

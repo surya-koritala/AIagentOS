@@ -124,7 +124,7 @@ jobs:
       - name: Enforce workspace line coverage floor
         run: >-
           cargo llvm-cov --workspace --exclude tauri-app --all-targets --locked
-          --lcov --output-path lcov.info --fail-under-lines 60
+          --lcov --output-path lcov.info --fail-under-lines 60 -- --test-threads=1
       - uses: actions/upload-artifact@v4
         with:
           name: rust-lcov

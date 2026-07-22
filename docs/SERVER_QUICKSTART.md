@@ -43,6 +43,10 @@ it is **not** hard-wired to `ollama` becoming healthy.
 
 Requests and replies are newline-delimited JSON. The request enum is internally
 tagged with `"op"` (snake_case); the reply enum is tagged with `"status"`.
+SDK clients send `{"op":"hello","protocol_version":2}` automatically. A raw
+client that skips `hello` stays on the compatible v1 reply shape; v2 errors are
+`typed_error` replies with `code`, `message`, and `retryable` fields. See
+[`ADR-0001-PUBLIC-ABI.md`](ADR-0001-PUBLIC-ABI.md).
 `NodeInfo` is a unit variant, so the request is:
 
 ```json

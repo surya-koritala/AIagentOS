@@ -1,7 +1,8 @@
-//! Tool Mount System — mount tool providers at paths.
+//! Experimental Tool Mount System — mount tool providers at paths.
 //!
-//! Like Linux VFS mount. Tools are mounted at paths, agents access
-//! them through the path hierarchy.
+//! This test-local Linux VFS analogy is not consulted by the supported JSON
+//! syscall/tool path and is excluded from the v1 contract. See
+//! `docs/ADR-0001-PUBLIC-ABI.md`.
 
 use crate::agent_struct::AgentId;
 

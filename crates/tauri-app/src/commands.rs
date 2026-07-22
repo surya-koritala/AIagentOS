@@ -2,10 +2,10 @@
 
 use crate::AppState;
 use kernel::{
-    agent::{AgentInfo, AgentKernel},
+    agent::AgentKernel,
     config::Config,
     observability::{MetricScope, ObservabilityEngine},
-    AgentConfig, AgentKernelImpl, Priority,
+    AgentConfig, Priority,
 };
 use tauri::State;
 
@@ -56,9 +56,9 @@ pub async fn pause_agent(state: State<'_, AppState>, agent_id: String) -> Result
     let id = uuid::Uuid::parse_str(&agent_id).map_err(|e| e.to_string())?;
     state
         .kernel
-        .agent_manager
         .pause_agent(id)
         .await
+        .map(|_| ())
         .map_err(|e| e.to_string())
 }
 
@@ -67,9 +67,9 @@ pub async fn resume_agent(state: State<'_, AppState>, agent_id: String) -> Resul
     let id = uuid::Uuid::parse_str(&agent_id).map_err(|e| e.to_string())?;
     state
         .kernel
-        .agent_manager
         .resume_agent(id)
         .await
+        .map(|_| ())
         .map_err(|e| e.to_string())
 }
 
@@ -78,9 +78,9 @@ pub async fn stop_agent(state: State<'_, AppState>, agent_id: String) -> Result<
     let id = uuid::Uuid::parse_str(&agent_id).map_err(|e| e.to_string())?;
     state
         .kernel
-        .agent_manager
         .stop_agent(id)
         .await
+        .map(|_| ())
         .map_err(|e| e.to_string())
 }
 

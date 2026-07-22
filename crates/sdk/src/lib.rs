@@ -40,7 +40,12 @@ use tokio::net::ToSocketAddrs;
 
 // Re-export the kernel wire types that appear in this crate's public API, so
 // SDK consumers can name them without depending on the kernel directly.
-pub use kernel::syscall_server::{AgentSummary, FactSummary, ProviderSummary};
+pub use kernel::context::ContextPressureStats;
+pub use kernel::init_system::ServiceRuntimeInfo;
+pub use kernel::syscall_server::{
+    AgentSummary, FactSummary, GenerationCheckpointSummary, OperatorAgentSnapshot,
+    OperatorServiceSnapshot, OperatorSnapshot, ProviderSummary, WireErrorCode,
+};
 
 /// The wire-protocol version this SDK build was compiled against. A client
 /// announces it via [`KernelClient::hello`]; a server outside its support
@@ -112,6 +117,17 @@ pub struct MessageResult {
     pub tokens: u32,
 }
 
+/// Result of a durable lifecycle operation. `checkpoint_id` is present when a
+/// pause captured resumable work (or a resumed turn paused again).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LifecycleResult {
+    pub state: String,
+    pub checkpoint_id: Option<String>,
+    pub resumed_content: Option<String>,
+    pub resumed_tool_calls: Option<usize>,
+    pub resumed_tokens: Option<u32>,
+}
+
 /// Snapshot of the syscall gate's enforcement counters.
 #[derive(Debug, Clone, Default)]
 pub struct GateStats {
@@ -131,6 +147,16 @@ pub struct NodeLoad {
     pub agent_count: usize,
     /// Agents currently executing a turn.
     pub running_agents: usize,
+    pub live_agents: usize,
+    pub queued_agents: usize,
+    pub paused_agents: usize,
+    pub stopped_agents: usize,
+    pub active_turns: usize,
+    pub waiting_turns: usize,
+    pub turn_capacity: usize,
+    pub llm_requests_in_flight: usize,
+    pub llm_requests_waiting: usize,
+    pub llm_core_capacity: usize,
 }
 
 /// The server's wire-protocol support window (reply to `hello`).
@@ -170,9 +196,11 @@ pub struct KernelClient {
 impl KernelClient {
     /// Connect to a running syscall server at `addr` (e.g. `"127.0.0.1:7777"`).
     pub async fn connect(addr: impl ToSocketAddrs) -> Result<Self, SdkError> {
-        Ok(Self {
+        let mut client = Self {
             inner: SyscallClient::connect(addr).await?,
-        })
+        };
+        client.hello().await?;
+        Ok(client)
     }
 
     /// Connect to a running syscall server over TLS. Mirrors [`connect`](Self::connect)
@@ -184,9 +212,11 @@ impl KernelClient {
         server_name: impl Into<String>,
         config: rustls::ClientConfig,
     ) -> Result<Self, SdkError> {
-        Ok(Self {
+        let mut client = Self {
             inner: SyscallClient::connect_tls(addr, server_name, config).await?,
-        })
+        };
+        client.hello().await?;
+        Ok(client)
     }
 
     /// Build a [`KernelClient`] from an already-connected [`SyscallClient`].
@@ -225,6 +255,148 @@ impl KernelClient {
         match self.call(Syscall::ListAgents).await? {
             SyscallReply::Agents { agents } => Ok(agents),
             other => Err(unexpected("Agents", &other)),
+        }
+    }
+
+    async fn lifecycle_call(&mut self, call: Syscall) -> Result<LifecycleResult, SdkError> {
+        match self.call(call).await? {
+            SyscallReply::AgentStatus {
+                state,
+                checkpoint_id,
+                resumed_content,
+                resumed_tool_calls,
+                resumed_tokens,
+            } => Ok(LifecycleResult {
+                state,
+                checkpoint_id,
+                resumed_content,
+                resumed_tool_calls,
+                resumed_tokens,
+            }),
+            other => Err(unexpected("AgentStatus", &other)),
+        }
+    }
+
+    /// Durable pause result, including the checkpoint id when an active turn
+    /// reached its cooperative boundary.
+    pub async fn pause_agent_durable(
+        &mut self,
+        agent_id: impl Into<String>,
+    ) -> Result<LifecycleResult, SdkError> {
+        self.lifecycle_call(Syscall::PauseAgent {
+            agent_id: agent_id.into(),
+        })
+        .await
+    }
+
+    /// Pause admission for an agent and cooperatively cancel an active turn.
+    pub async fn pause_agent(&mut self, agent_id: impl Into<String>) -> Result<String, SdkError> {
+        Ok(self.pause_agent_durable(agent_id).await?.state)
+    }
+
+    /// Durable resume result, including completed continuation output.
+    pub async fn resume_agent_durable(
+        &mut self,
+        agent_id: impl Into<String>,
+    ) -> Result<LifecycleResult, SdkError> {
+        self.lifecycle_call(Syscall::ResumeAgent {
+            agent_id: agent_id.into(),
+        })
+        .await
+    }
+
+    /// Resume a paused agent.
+    pub async fn resume_agent(&mut self, agent_id: impl Into<String>) -> Result<String, SdkError> {
+        Ok(self.resume_agent_durable(agent_id).await?.state)
+    }
+
+    /// Gracefully stop an agent and clean up its live resources.
+    pub async fn stop_agent(&mut self, agent_id: impl Into<String>) -> Result<String, SdkError> {
+        Ok(self
+            .lifecycle_call(Syscall::StopAgent {
+                agent_id: agent_id.into(),
+            })
+            .await?
+            .state)
+    }
+
+    /// Force an agent into its terminal state and clean up live resources.
+    pub async fn kill_agent(&mut self, agent_id: impl Into<String>) -> Result<String, SdkError> {
+        Ok(self
+            .lifecycle_call(Syscall::KillAgent {
+                agent_id: agent_id.into(),
+            })
+            .await?
+            .state)
+    }
+
+    /// Return an agent's current lifecycle state.
+    pub async fn agent_status(&mut self, agent_id: impl Into<String>) -> Result<String, SdkError> {
+        Ok(self
+            .lifecycle_call(Syscall::GetAgentStatus {
+                agent_id: agent_id.into(),
+            })
+            .await?
+            .state)
+    }
+
+    /// Wait for an agent to become terminal, bounded by `timeout`.
+    pub async fn wait_agent(
+        &mut self,
+        agent_id: impl Into<String>,
+        timeout: std::time::Duration,
+    ) -> Result<String, SdkError> {
+        let timeout_ms = u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX);
+        Ok(self
+            .lifecycle_call(Syscall::WaitAgent {
+                agent_id: agent_id.into(),
+                timeout_ms,
+            })
+            .await?
+            .state)
+    }
+
+    pub async fn list_generation_checkpoints(
+        &mut self,
+        agent_id: impl Into<String>,
+    ) -> Result<Vec<GenerationCheckpointSummary>, SdkError> {
+        match self
+            .call(Syscall::ListGenerationCheckpoints {
+                agent_id: agent_id.into(),
+            })
+            .await?
+        {
+            SyscallReply::GenerationCheckpoints { checkpoints } => Ok(checkpoints),
+            other => Err(unexpected("GenerationCheckpoints", &other)),
+        }
+    }
+
+    pub async fn resume_generation_checkpoint(
+        &mut self,
+        agent_id: impl Into<String>,
+        checkpoint_id: impl Into<String>,
+    ) -> Result<LifecycleResult, SdkError> {
+        self.lifecycle_call(Syscall::ResumeGenerationCheckpoint {
+            agent_id: agent_id.into(),
+            checkpoint_id: checkpoint_id.into(),
+        })
+        .await
+    }
+
+    pub async fn delete_generation_checkpoint(
+        &mut self,
+        agent_id: impl Into<String>,
+        checkpoint_id: impl Into<String>,
+    ) -> Result<bool, SdkError> {
+        match self
+            .call(Syscall::DeleteGenerationCheckpoint {
+                agent_id: agent_id.into(),
+                checkpoint_id: checkpoint_id.into(),
+            })
+            .await?
+        {
+            SyscallReply::GenerationCheckpointDeleted { existed } => Ok(existed),
+            other => Err(unexpected("GenerationCheckpointDeleted", &other)),
         }
     }
 
@@ -342,6 +514,10 @@ impl KernelClient {
                 client: PROTOCOL_VERSION,
                 server: format!("rejected handshake: {message}"),
             }),
+            SyscallReply::TypedError { message, .. } => Err(SdkError::IncompatibleProtocol {
+                client: PROTOCOL_VERSION,
+                server: format!("rejected handshake: {message}"),
+            }),
             other => Err(unexpected("Hello", &other)),
         }
     }
@@ -353,9 +529,29 @@ impl KernelClient {
             SyscallReply::NodeInfo {
                 agent_count,
                 running_agents,
+                live_agents,
+                queued_agents,
+                paused_agents,
+                stopped_agents,
+                active_turns,
+                waiting_turns,
+                turn_capacity,
+                llm_requests_in_flight,
+                llm_requests_waiting,
+                llm_core_capacity,
             } => Ok(NodeLoad {
                 agent_count,
                 running_agents,
+                live_agents,
+                queued_agents,
+                paused_agents,
+                stopped_agents,
+                active_turns,
+                waiting_turns,
+                turn_capacity,
+                llm_requests_in_flight,
+                llm_requests_waiting,
+                llm_core_capacity,
             }),
             other => Err(unexpected("NodeInfo", &other)),
         }
@@ -471,6 +667,76 @@ impl KernelClient {
         match self.call(call).await? {
             SyscallReply::StorageKeys { keys } => Ok(keys),
             other => Err(unexpected("StorageKeys", &other)),
+        }
+    }
+
+    /// Inspect an agent's active context budget, durable spill usage, and
+    /// fail-closed pressure errors without returning prompt content.
+    pub async fn context_pressure(
+        &mut self,
+        agent_id: impl Into<String>,
+    ) -> Result<ContextPressureStats, SdkError> {
+        let call = Syscall::ContextPressure {
+            agent_id: agent_id.into(),
+        };
+        match self.call(call).await? {
+            SyscallReply::ContextPressure { stats } => Ok(stats),
+            other => Err(unexpected("ContextPressure", &other)),
+        }
+    }
+
+    /// Capture the live, timestamped operations view. Tenant-authenticated
+    /// connections receive only tenant-owned agents and omit global counters.
+    pub async fn operator_snapshot(&mut self) -> Result<OperatorSnapshot, SdkError> {
+        match self.call(Syscall::OperatorSnapshot).await? {
+            SyscallReply::OperatorSnapshot { snapshot } => Ok(*snapshot),
+            other => Err(unexpected("OperatorSnapshot", &other)),
+        }
+    }
+
+    pub async fn list_services(&mut self) -> Result<Vec<ServiceRuntimeInfo>, SdkError> {
+        match self.call(Syscall::ListServices).await? {
+            SyscallReply::Services { services } => Ok(services),
+            other => Err(unexpected("Services", &other)),
+        }
+    }
+
+    pub async fn start_service(
+        &mut self,
+        name: impl Into<String>,
+    ) -> Result<ServiceRuntimeInfo, SdkError> {
+        match self
+            .call(Syscall::StartService { name: name.into() })
+            .await?
+        {
+            SyscallReply::Service { service } => Ok(service),
+            other => Err(unexpected("Service", &other)),
+        }
+    }
+
+    pub async fn stop_service(
+        &mut self,
+        name: impl Into<String>,
+    ) -> Result<ServiceRuntimeInfo, SdkError> {
+        match self
+            .call(Syscall::StopService { name: name.into() })
+            .await?
+        {
+            SyscallReply::Service { service } => Ok(service),
+            other => Err(unexpected("Service", &other)),
+        }
+    }
+
+    pub async fn restart_service(
+        &mut self,
+        name: impl Into<String>,
+    ) -> Result<ServiceRuntimeInfo, SdkError> {
+        match self
+            .call(Syscall::RestartService { name: name.into() })
+            .await?
+        {
+            SyscallReply::Service { service } => Ok(service),
+            other => Err(unexpected("Service", &other)),
         }
     }
 
@@ -591,6 +857,7 @@ impl KernelClient {
     pub async fn call(&mut self, call: Syscall) -> Result<SyscallReply, SdkError> {
         match self.inner.call(call).await? {
             SyscallReply::Error { message } => Err(SdkError::Kernel(message)),
+            SyscallReply::TypedError { message, .. } => Err(SdkError::Kernel(message)),
             reply => Ok(reply),
         }
     }
@@ -715,14 +982,126 @@ impl Agent {
         let id = self.id.clone();
         self.client.call_tool(id, tool, args).await
     }
+
+    /// Pause this agent and cooperatively cancel an active turn.
+    pub async fn pause(&mut self) -> Result<String, SdkError> {
+        self.client.pause_agent(self.id.clone()).await
+    }
+
+    /// Resume this agent after a pause.
+    pub async fn resume(&mut self) -> Result<String, SdkError> {
+        self.client.resume_agent(self.id.clone()).await
+    }
+
+    /// Gracefully stop this agent.
+    pub async fn stop(&mut self) -> Result<String, SdkError> {
+        self.client.stop_agent(self.id.clone()).await
+    }
+
+    /// Force this agent into the terminal state.
+    pub async fn kill(&mut self) -> Result<String, SdkError> {
+        self.client.kill_agent(self.id.clone()).await
+    }
+
+    /// Return this agent's current lifecycle state.
+    pub async fn status(&mut self) -> Result<String, SdkError> {
+        self.client.agent_status(self.id.clone()).await
+    }
+
+    /// Wait for this agent to become terminal.
+    pub async fn wait(&mut self, timeout: std::time::Duration) -> Result<String, SdkError> {
+        self.client.wait_agent(self.id.clone(), timeout).await
+    }
 }
 
 #[cfg(test)]
 mod protocol_tests {
     use super::*;
+    use async_trait::async_trait;
+    use kernel::connector::{
+        LlmProviderAdapter, LlmResponse, LlmSession, ProviderType, StandardMessage, ToolDefinition,
+    };
     use kernel::syscall_server::SyscallServer;
-    use kernel::AgentKernelImpl;
+    use kernel::{AgentKernelImpl, ConnectorError};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+
+    struct PausableAdapter {
+        id: String,
+        calls: Arc<AtomicUsize>,
+        started: Arc<tokio::sync::Notify>,
+    }
+
+    struct PausableSession {
+        id: String,
+        calls: Arc<AtomicUsize>,
+        started: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait]
+    impl LlmSession for PausableSession {
+        async fn send(
+            &self,
+            messages: Vec<StandardMessage>,
+        ) -> Result<LlmResponse, ConnectorError> {
+            self.send_with_tools(messages, &[]).await
+        }
+
+        async fn send_with_tools(
+            &self,
+            _messages: Vec<StandardMessage>,
+            _tools: &[ToolDefinition],
+        ) -> Result<LlmResponse, ConnectorError> {
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                self.started.notify_waiters();
+                std::future::pending::<()>().await;
+            }
+            Ok(LlmResponse {
+                content: "wire resume complete".into(),
+                finish_reason: Some("stop".into()),
+                tokens_used: 5,
+                usage: kernel::connector::LlmUsage::reported(3, 2, 0),
+                tool_calls: Vec::new(),
+            })
+        }
+
+        fn provider_id(&self) -> &String {
+            &self.id
+        }
+
+        fn model_id(&self) -> &str {
+            "wire-checkpoint-model"
+        }
+    }
+
+    #[async_trait]
+    impl LlmProviderAdapter for PausableAdapter {
+        fn id(&self) -> &String {
+            &self.id
+        }
+        fn name(&self) -> &str {
+            "pausable"
+        }
+        fn provider_type(&self) -> ProviderType {
+            ProviderType::Cloud
+        }
+        async fn is_available(&self) -> bool {
+            true
+        }
+        async fn create_session(&self) -> Result<Box<dyn LlmSession>, ConnectorError> {
+            Ok(Box::new(PausableSession {
+                id: self.id.clone(),
+                calls: Arc::clone(&self.calls),
+                started: Arc::clone(&self.started),
+            }))
+        }
+        fn translate_to_provider(&self, message: &StandardMessage) -> serde_json::Value {
+            serde_json::json!({"role": message.role, "content": message.content})
+        }
+        fn translate_from_provider(&self, value: &serde_json::Value) -> Option<StandardMessage> {
+            Some(StandardMessage::assistant(value.get("content")?.as_str()?))
+        }
+    }
 
     /// `hello()` negotiates against a current server and returns its window.
     #[tokio::test]
@@ -737,6 +1116,214 @@ mod protocol_tests {
         assert_eq!(info.protocol_version, PROTOCOL_VERSION);
         assert!(info.min_protocol_version <= PROTOCOL_VERSION);
         assert!(!info.server_version.is_empty());
+    }
+
+    #[tokio::test]
+    async fn sdk_lifecycle_roundtrip_is_typed_idempotent_and_terminal() {
+        let kernel = Arc::new(AgentKernelImpl::new().expect("kernel new"));
+        let server = SyscallServer::bind(kernel, "127.0.0.1:0").await.unwrap();
+        let addr = server.local_addr().unwrap();
+        tokio::spawn(server.serve());
+
+        let mut client = KernelClient::connect(addr).await.expect("connect");
+        let id = client
+            .create_agent("lifecycle-sdk", "test lifecycle", None, None, None)
+            .await
+            .unwrap();
+
+        assert_eq!(client.agent_status(id.clone()).await.unwrap(), "Running");
+        assert_eq!(client.pause_agent(id.clone()).await.unwrap(), "Paused");
+        assert_eq!(client.pause_agent(id.clone()).await.unwrap(), "Paused");
+        assert!(client.send_message(id.clone(), "blocked").await.is_err());
+        assert_eq!(client.resume_agent(id.clone()).await.unwrap(), "Running");
+        assert_eq!(client.stop_agent(id.clone()).await.unwrap(), "Stopped");
+        assert_eq!(client.stop_agent(id.clone()).await.unwrap(), "Stopped");
+        assert_eq!(
+            client
+                .wait_agent(id, std::time::Duration::from_secs(1))
+                .await
+                .unwrap(),
+            "Stopped"
+        );
+    }
+
+    #[tokio::test]
+    async fn sdk_context_pressure_inspection_is_typed_and_content_free() {
+        let kernel = Arc::new(AgentKernelImpl::new().expect("kernel new"));
+        let server = SyscallServer::bind(Arc::clone(&kernel), "127.0.0.1:0")
+            .await
+            .unwrap();
+        let addr = server.local_addr().unwrap();
+        tokio::spawn(server.serve());
+
+        let mut client = KernelClient::connect(addr).await.expect("connect");
+        let id = client
+            .create_agent("pressure-sdk", "inspect pressure", None, None, None)
+            .await
+            .unwrap();
+        let uuid = id.parse::<kernel::AgentId>().unwrap();
+        kernel
+            .context_manager
+            .kv_put(uuid, "context_spill:test:1", "sensitive prompt content")
+            .unwrap();
+        kernel
+            .context_manager
+            .record_context_pressure(uuid, 80, 100, 4, None)
+            .unwrap();
+
+        let stats = client.context_pressure(id).await.unwrap();
+        assert_eq!(stats.active_tokens, 80);
+        assert_eq!(stats.budget_tokens, 100);
+        assert_eq!(stats.evicted_messages, 4);
+        assert_eq!(stats.stored_spills, 1);
+        assert_eq!(stats.stored_spill_bytes, 24);
+        let encoded = serde_json::to_string(&stats).unwrap();
+        assert!(!encoded.contains("sensitive prompt content"));
+
+        let operations = client.operator_snapshot().await.unwrap();
+        assert_eq!(operations.scope, "system");
+        assert!(operations
+            .agents
+            .iter()
+            .any(|agent| agent.id == uuid.to_string()));
+        assert!(operations.system_metrics.is_some());
+        assert!(!serde_json::to_string(&operations)
+            .unwrap()
+            .contains("sensitive prompt content"));
+    }
+
+    #[tokio::test]
+    async fn sdk_service_supervisor_uses_public_coordinated_lifecycle() {
+        use kernel::init_system::{
+            DependencyConfig, ExecConfig, ResourceConfig, RestartPolicy, ServiceConfig, ServiceDef,
+            ServiceStatus, ServiceType,
+        };
+
+        let kernel = Arc::new(AgentKernelImpl::new().expect("kernel new"));
+        kernel
+            .os
+            .init
+            .lock()
+            .await
+            .replace_definitions(vec![ServiceDef {
+                name: "public-service".into(),
+                description: Some("public service test".into()),
+                exec: ExecConfig {
+                    provider: "stub".into(),
+                    system_prompt: "run".into(),
+                    tools: Vec::new(),
+                    model: None,
+                },
+                service: ServiceConfig {
+                    restart: RestartPolicy::OnFailure,
+                    restart_delay_ms: 0,
+                    max_restarts: 2,
+                    service_type: ServiceType::Simple,
+                },
+                dependencies: DependencyConfig::default(),
+                resources: ResourceConfig::default(),
+            }])
+            .unwrap();
+        let server = SyscallServer::bind(Arc::clone(&kernel), "127.0.0.1:0")
+            .await
+            .unwrap();
+        let addr = server.local_addr().unwrap();
+        tokio::spawn(server.serve());
+        let mut client = KernelClient::connect(addr).await.unwrap();
+
+        assert_eq!(client.list_services().await.unwrap().len(), 1);
+        let started = client.start_service("public-service").await.unwrap();
+        assert_eq!(started.status, ServiceStatus::Running);
+        let first_agent = started.agent_id.unwrap();
+
+        let restarted = client.restart_service("public-service").await.unwrap();
+        assert_eq!(restarted.status, ServiceStatus::Running);
+        assert_ne!(restarted.agent_id, Some(first_agent));
+        assert_eq!(
+            client.agent_status(first_agent.to_string()).await.unwrap(),
+            "Stopped"
+        );
+
+        let stopped = client.stop_service("public-service").await.unwrap();
+        assert_eq!(stopped.status, ServiceStatus::Inactive);
+        assert!(stopped.agent_id.is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sdk_public_pause_returns_durable_id_and_resume_returns_output() {
+        let kernel = Arc::new(AgentKernelImpl::new().expect("kernel new"));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let started = Arc::new(tokio::sync::Notify::new());
+        kernel
+            .register_provider(Arc::new(PausableAdapter {
+                id: "wire-checkpoint".into(),
+                calls: Arc::clone(&calls),
+                started: Arc::clone(&started),
+            }))
+            .unwrap();
+        let server = SyscallServer::bind(Arc::clone(&kernel), "127.0.0.1:0")
+            .await
+            .unwrap();
+        let addr = server.local_addr().unwrap();
+        tokio::spawn(server.serve());
+
+        let mut control = KernelClient::connect(addr).await.unwrap();
+        let id = control
+            .create_agent(
+                "public-checkpoint",
+                "pause me",
+                Some("wire-checkpoint".into()),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let mut sender = KernelClient::connect(addr).await.unwrap();
+        let started_wait = started.notified();
+        let sending_id = id.clone();
+        let sending =
+            tokio::spawn(
+                async move { sender.send_message(sending_id, "long hosted request").await },
+            );
+        started_wait.await;
+
+        let paused = control.pause_agent_durable(id.clone()).await.unwrap();
+        let checkpoint_id = paused.checkpoint_id.expect("public checkpoint id");
+        assert_eq!(paused.state, "Paused");
+        assert!(sending
+            .await
+            .unwrap()
+            .unwrap()
+            .content
+            .contains(&checkpoint_id));
+        assert_eq!(
+            control
+                .list_generation_checkpoints(id.clone())
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+
+        let resumed = control
+            .resume_generation_checkpoint(id.clone(), checkpoint_id.clone())
+            .await
+            .unwrap();
+        assert_eq!(resumed.state, "Running");
+        assert_eq!(
+            resumed.resumed_content.as_deref(),
+            Some("wire resume complete")
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert!(control
+            .list_generation_checkpoints(id.clone())
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(control
+            .delete_generation_checkpoint(id, checkpoint_id)
+            .await
+            .unwrap());
     }
 }
 

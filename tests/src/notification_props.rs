@@ -1,7 +1,6 @@
 //! Property test for notification generation (Property 28).
 
-use kernel::agent::AgentKernel;
-use kernel::{AgentConfig, AgentKernelImpl, AgentState, KernelEvent, Priority};
+use kernel::{AgentConfig, AgentKernelImpl, KernelEvent, Priority};
 use proptest::prelude::*;
 
 proptest! {

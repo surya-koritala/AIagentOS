@@ -131,6 +131,12 @@ impl PermissionManager {
         mgr
     }
 
+    /// Remove live authorization state for a terminated agent. Audit entries
+    /// remain append-only according to the retention policy.
+    pub fn purge_agent(&self, agent_id: AgentId) {
+        self.agent_profiles.remove(&agent_id);
+    }
+
     fn register_predefined_profiles(&self) {
         // Read-only: only read operations allowed
         self.profiles.insert(
@@ -338,11 +344,15 @@ impl PermissionSystem for PermissionManager {
         operation: &str,
         target: Option<&str>,
     ) -> AccessDecision {
-        let profile_id = self
+        let Some(profile_id) = self
             .agent_profiles
             .get(&agent_id)
-            .map(|r| r.value().clone())
-            .unwrap_or_else(|| "standard".to_string());
+            .map(|record| record.value().clone())
+        else {
+            // Unknown and terminated identities have no ambient authority.
+            // Every legitimate creation/rehydration path assigns a profile.
+            return AccessDecision::Denied;
+        };
 
         // Full-access bypasses all checks including high-risk
         if profile_id == "full-access" {
@@ -544,17 +554,16 @@ mod tests {
     }
 
     #[test]
-    fn default_profile_is_standard() {
+    fn unassigned_agent_is_denied() {
         let mgr = PermissionManager::new();
         let id = uuid::Uuid::new_v4();
-        // No profile assigned — defaults to standard
         assert_eq!(
             mgr.check_access(id, &ResourceType::Filesystem, "read", None),
-            AccessDecision::Allowed
+            AccessDecision::Denied
         );
         assert_eq!(
             mgr.check_access(id, &ResourceType::Filesystem, "write", None),
-            AccessDecision::Allowed
+            AccessDecision::Denied
         );
     }
 

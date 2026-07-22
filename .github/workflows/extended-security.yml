@@ -1,0 +1,43 @@
+name: Extended security tests
+
+on:
+  schedule:
+    - cron: "17 4 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  miri:
+    name: Miri (unsafe/concurrency smoke)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+      - run: cargo miri setup
+      - run: cargo miri test -p kernel cgroups::tests
+
+  address-sanitizer:
+    name: Address sanitizer
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - name: Run deterministic security-critical tests under ASan
+        env:
+          RUSTFLAGS: -Zsanitizer=address
+        run: >-
+          cargo test -p kernel --target x86_64-unknown-linux-gnu
+          cgroups::tests -- --test-threads=1
+
+  fuzz:
+    name: Wire-protocol fuzz smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: taiki-e/install-action@cargo-fuzz
+      - run: cargo fuzz run wire_syscall -- -max_total_time=60 -max_len=65536

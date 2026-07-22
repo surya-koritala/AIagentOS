@@ -52,7 +52,6 @@
         bind:value={newAgentName}
         placeholder="Agent name..."
         on:keydown={(e) => e.key === 'Enter' && createAgent()}
-        autofocus
       />
       <button on:click={createAgent}>Create</button>
     </div>

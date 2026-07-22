@@ -36,11 +36,12 @@ pub struct Config {
     /// Resource budgets (cgroup token quotas + rate limiter) applied to agents.
     #[serde(default)]
     pub budgets: BudgetConfig,
-    /// Mandatory Access Control: when true, the syscall gate's MAC stage
-    /// enforces `mac_rules` (default-deny on no match). When false (default) the
-    /// MAC stage is permissive, preserving prior behavior. Agents are labelled
+    /// Mandatory Access Control: when true (the production default), the
+    /// syscall gate's MAC stage enforces `mac_rules` (default-deny on no match).
+    /// Setting this false is an explicit local-operator escape hatch and emits
+    /// a startup warning. Agents are labelled
     /// `profile:<permission_profile>` at creation so rules can target them.
-    #[serde(default)]
+    #[serde(default = "default_mac_enforcing")]
     pub mac_enforcing: bool,
     /// MAC policy rules (subject/action/object/decision strings), consulted only
     /// when `mac_enforcing` is true. Operator notes:
@@ -53,7 +54,7 @@ pub struct Config {
     /// - Object matching is exact-or-`*` against a resource's label; until
     ///   per-path resource labels are wired, every resource is `unconfined`, so
     ///   use `object = "*"` (or `"unconfined"`).
-    #[serde(default)]
+    #[serde(default = "default_mac_rules")]
     pub mac_rules: Vec<crate::mac::PolicyRule>,
     /// Path to a declarative policy document (see `docs/POLICY.md`). When set,
     /// it is the source of truth and **supersedes** the inline
@@ -63,6 +64,11 @@ pub struct Config {
     /// fallback to permissive) — see [`Config::resolve_mac`].
     #[serde(default)]
     pub policy_file: Option<PathBuf>,
+    /// Optional directory of declarative `*.toml` agent services. Definitions
+    /// are parsed and dependency-validated atomically during kernel creation;
+    /// the server starts them after provider registration.
+    #[serde(default)]
+    pub service_dir: Option<PathBuf>,
 }
 
 /// Resource budgets applied at agent creation and to the shared rate limiter.
@@ -92,6 +98,10 @@ pub struct BudgetConfig {
     /// Hard cumulative USD ceiling per agent (0.0 = unlimited).
     #[serde(default)]
     pub per_agent_max_usd: f64,
+    /// Hard cumulative USD ceiling per tenant (0.0 = unlimited). Tenant spend
+    /// remains cumulative when an individual agent is deleted or restarted.
+    #[serde(default)]
+    pub per_tenant_max_usd: f64,
     /// Default blended price in USD per 1000 tokens, used to cost LLM responses
     /// (0.0 = free → the USD ceilings never trigger). Per-provider overrides go
     /// in `provider_pricing`.
@@ -113,6 +123,7 @@ impl Default for BudgetConfig {
             max_concurrent: default_max_concurrent(),
             max_usd: 0.0,
             per_agent_max_usd: 0.0,
+            per_tenant_max_usd: 0.0,
             usd_per_1k_tokens: 0.0,
             provider_pricing: HashMap::new(),
         }
@@ -133,9 +144,10 @@ impl Default for Config {
             max_browse_chars: default_max_browse_chars(),
             permission_profile: default_permission_profile(),
             budgets: BudgetConfig::default(),
-            mac_enforcing: false,
-            mac_rules: Vec::new(),
+            mac_enforcing: default_mac_enforcing(),
+            mac_rules: default_mac_rules(),
             policy_file: None,
+            service_dir: None,
         }
     }
 }
@@ -146,6 +158,51 @@ fn default_max_browse_chars() -> usize {
 
 fn default_permission_profile() -> String {
     "standard".to_string()
+}
+
+fn default_mac_enforcing() -> bool {
+    true
+}
+
+/// Baseline enforcing policy. Capabilities remain the first authorization
+/// stage; this MAC policy adds a second, profile-labelled allow-list with a
+/// default-deny fallthrough. Destructive deletion is deliberately limited to
+/// elevated/full-access, and unknown profiles match no rule.
+fn default_mac_rules() -> Vec<crate::mac::PolicyRule> {
+    use crate::mac::PolicyRule;
+
+    let mut rules = Vec::new();
+    for action in ["read", "ipc"] {
+        rules.push(PolicyRule {
+            subject: "profile:read-only".into(),
+            action: action.into(),
+            object: "*".into(),
+            decision: "allow".into(),
+        });
+    }
+    for profile in ["standard", "elevated"] {
+        for action in ["read", "write", "net", "exec", "ipc"] {
+            rules.push(PolicyRule {
+                subject: format!("profile:{profile}"),
+                action: action.into(),
+                object: "*".into(),
+                decision: "allow".into(),
+            });
+        }
+    }
+    rules.push(PolicyRule {
+        subject: "profile:elevated".into(),
+        action: "delete".into(),
+        object: "*".into(),
+        decision: "allow".into(),
+    });
+    rules.push(PolicyRule {
+        subject: "profile:full-access".into(),
+        action: "*".into(),
+        object: "*".into(),
+        decision: "allow".into(),
+    });
+    rules
 }
 
 fn default_agent_tokens_per_min() -> u64 {
@@ -341,22 +398,25 @@ mod tests {
 
     #[test]
     fn mac_fields_default_and_roundtrip() {
-        // MAC is off and rule-less by default; a config without the fields loads.
+        // A config without MAC fields loads the enforcing, default-deny
+        // baseline policy rather than silently becoming permissive.
         let toml =
             "llm_provider = \"local\"\ndefault_model = \"m\"\ndata_dir = \"/tmp/x\"\n[api_keys]\n";
         let cfg: Config = toml::from_str(toml).unwrap();
-        assert!(!cfg.mac_enforcing);
-        assert!(cfg.mac_rules.is_empty());
+        assert!(cfg.mac_enforcing);
+        assert!(!cfg.mac_rules.is_empty());
 
         // Enforcing + a rule round-trips through TOML.
-        let mut cfg = Config::default();
-        cfg.mac_enforcing = true;
-        cfg.mac_rules = vec![crate::mac::PolicyRule {
-            subject: "profile:standard".into(),
-            action: "write".into(),
-            object: "*".into(),
-            decision: "deny".into(),
-        }];
+        let cfg = Config {
+            mac_enforcing: true,
+            mac_rules: vec![crate::mac::PolicyRule {
+                subject: "profile:standard".into(),
+                action: "write".into(),
+                object: "*".into(),
+                decision: "deny".into(),
+            }],
+            ..Config::default()
+        };
         let s = toml::to_string_pretty(&cfg).unwrap();
         let parsed: Config = toml::from_str(&s).unwrap();
         assert!(parsed.mac_enforcing);
@@ -366,14 +426,16 @@ mod tests {
 
     #[test]
     fn resolve_mac_uses_inline_when_no_policy_file() {
-        let mut cfg = Config::default();
-        cfg.mac_enforcing = true;
-        cfg.mac_rules = vec![crate::mac::PolicyRule {
-            subject: "*".into(),
-            action: "read".into(),
-            object: "*".into(),
-            decision: "allow".into(),
-        }];
+        let cfg = Config {
+            mac_enforcing: true,
+            mac_rules: vec![crate::mac::PolicyRule {
+                subject: "*".into(),
+                action: "read".into(),
+                object: "*".into(),
+                decision: "allow".into(),
+            }],
+            ..Config::default()
+        };
         let (enforcing, rules) = cfg.resolve_mac().unwrap();
         assert!(enforcing);
         assert_eq!(rules.len(), 1);
@@ -398,11 +460,13 @@ decision = "deny"
         )
         .unwrap();
 
-        let mut cfg = Config::default();
         // Inline says enforcing=false with no rules; the file must win.
-        cfg.mac_enforcing = false;
-        cfg.mac_rules.clear();
-        cfg.policy_file = Some(path.clone());
+        let cfg = Config {
+            mac_enforcing: false,
+            mac_rules: Vec::new(),
+            policy_file: Some(path.clone()),
+            ..Config::default()
+        };
 
         let (enforcing, rules) = cfg.resolve_mac().unwrap();
         assert!(
@@ -426,8 +490,10 @@ decision = "deny"
         )
         .unwrap();
 
-        let mut cfg = Config::default();
-        cfg.policy_file = Some(path.clone());
+        let cfg = Config {
+            policy_file: Some(path.clone()),
+            ..Config::default()
+        };
         let err = cfg.resolve_mac().unwrap_err();
         assert!(err.contains("invalid policy file"), "got: {err}");
 
@@ -436,10 +502,12 @@ decision = "deny"
 
     #[test]
     fn resolve_mac_missing_policy_file_is_an_error() {
-        let mut cfg = Config::default();
-        cfg.policy_file = Some(std::path::PathBuf::from(
-            "/nonexistent/agentos/policy/does-not-exist.toml",
-        ));
+        let cfg = Config {
+            policy_file: Some(std::path::PathBuf::from(
+                "/nonexistent/agentos/policy/does-not-exist.toml",
+            )),
+            ..Config::default()
+        };
         let err = cfg.resolve_mac().unwrap_err();
         assert!(err.contains("cannot read policy file"), "got: {err}");
     }

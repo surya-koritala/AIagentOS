@@ -2,6 +2,7 @@
 name = "kernel"
 version = "0.3.0"
 edition = "2021"
+license.workspace = true
 
 [dependencies]
 tokio = { workspace = true }
@@ -24,7 +25,6 @@ futures-core = "0.3"
 libc = "0.2"
 tokio-rustls = { workspace = true }
 rustls = { workspace = true }
-rustls-pemfile = { workspace = true }
 ring = { workspace = true }
 
 [dev-dependencies]

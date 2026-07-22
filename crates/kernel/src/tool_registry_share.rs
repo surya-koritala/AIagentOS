@@ -21,7 +21,7 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 
 use crate::resources::ResourceType;
-use crate::tools::{ToolBinding, ToolRegistry};
+use crate::tools::{ToolBinding, ToolRegistry, ToolSecurity};
 
 /// A shareable, self-describing tool definition.
 ///
@@ -43,6 +43,9 @@ pub struct SharedToolDef {
     /// [`SharedToolRegistry::publish_overwrite`]. Starts at 1.
     #[serde(default = "default_version")]
     pub version: u32,
+    /// Required authorization contract; intentionally has no serde default so
+    /// older/incomplete shared definitions fail closed when deserialized.
+    pub security: ToolSecurity,
 }
 
 fn empty_object_schema() -> serde_json::Value {
@@ -55,12 +58,17 @@ fn default_version() -> u32 {
 
 impl SharedToolDef {
     /// Build a definition with an empty-object parameter schema and version 1.
-    pub fn new(name: impl Into<String>, description: impl Into<String>) -> Self {
+    pub fn new(
+        name: impl Into<String>,
+        description: impl Into<String>,
+        security: ToolSecurity,
+    ) -> Self {
         Self {
             name: name.into(),
             description: description.into(),
             parameters: empty_object_schema(),
             version: 1,
+            security,
         }
     }
 
@@ -82,6 +90,7 @@ impl SharedToolDef {
             parameters_schema: self.parameters.clone(),
             resource_type: ResourceType::Application,
             operation: "invoke".to_string(),
+            security: self.security.clone(),
         }
     }
 }
@@ -196,10 +205,7 @@ impl SharedToolRegistry {
     /// real [`ToolBinding`]. Returns `false` if the name is not published.
     pub fn install_into(&self, name: &str, registry: &ToolRegistry) -> bool {
         match self.defs.get(name) {
-            Some(def) => {
-                registry.register(def.to_binding());
-                true
-            }
+            Some(def) => registry.register(def.to_binding()).is_ok(),
             None => false,
         }
     }
@@ -207,10 +213,10 @@ impl SharedToolRegistry {
     /// Install every published definition into a live [`ToolRegistry`].
     /// Returns the number of tools installed.
     pub fn install_all_into(&self, registry: &ToolRegistry) -> usize {
-        for def in self.defs.values() {
-            registry.register(def.to_binding());
-        }
-        self.defs.len()
+        self.defs
+            .values()
+            .filter(|def| registry.register(def.to_binding()).is_ok())
+            .count()
     }
 }
 
@@ -219,7 +225,12 @@ mod tests {
     use super::*;
 
     fn sample(name: &str) -> SharedToolDef {
-        SharedToolDef::new(name, "does a thing").with_parameters(serde_json::json!({
+        SharedToolDef::new(
+            name,
+            "does a thing",
+            ToolSecurity::argument(crate::tools::SecurityAction::Read, "q"),
+        )
+        .with_parameters(serde_json::json!({
             "type": "object",
             "properties": { "q": { "type": "string" } },
             "required": ["q"],
@@ -250,7 +261,11 @@ mod tests {
             Err(ShareError::DuplicateName("dup".into()))
         );
         assert!(matches!(
-            reg.publish(SharedToolDef::new("", "x")),
+            reg.publish(SharedToolDef::new(
+                "",
+                "x",
+                ToolSecurity::constant(crate::tools::SecurityAction::Read, "test"),
+            )),
             Err(ShareError::Invalid(_))
         ));
     }
@@ -287,6 +302,17 @@ mod tests {
     }
 
     #[test]
+    fn shared_definition_without_security_contract_is_rejected() {
+        let missing = r#"{
+            "name":"legacy",
+            "description":"missing security",
+            "parameters":{"type":"object","properties":{}},
+            "version":1
+        }"#;
+        assert!(serde_json::from_str::<SharedToolDef>(missing).is_err());
+    }
+
+    #[test]
     fn published_def_converts_to_usable_tool_binding() {
         // Load-bearing path: a published definition becomes a tool the kernel's
         // ToolRegistry actually recognizes and exposes to the LLM.
@@ -302,7 +328,8 @@ mod tests {
         // It appears in the LLM-facing definitions with its schema preserved.
         let defs = registry.definitions();
         let def = defs.iter().find(|d| d.name == "shared_search").unwrap();
-        assert_eq!(def.description, "does a thing");
+        assert!(def.description.starts_with("does a thing"));
+        assert!(def.description.contains("Security constraints:"));
         assert_eq!(def.parameters["required"][0], "q");
 
         // Installing an unknown name is a no-op that reports failure.

@@ -7,6 +7,13 @@
 - [Getting Started](./getting-started.md)
 - [Concepts](./concepts.md)
   - [Architecture](./architecture.md)
+  - [Scheduler Contract](./scheduler.md)
+  - [Durable Checkpoints](./checkpoints.md)
+  - [Context Pressure](./context-pressure.md)
+  - [Operations API](./operations-api.md)
+  - [Agent Service Supervisor](./services.md)
+  - [Secondary Capability Disposition](./secondary-capabilities.md)
+  - [LLM Provider Support](./providers.md)
   - [The Syscall Gate](./syscall-gate.md)
   - [Agent Package Format](./agent-package.md)
   - [Platform Roadmap](./platform-roadmap.md)
@@ -19,5 +26,6 @@
 # Reference
 
 - [Complete Spec](./complete-spec.md)
+- [ADR 0001: Public ABI](./public-abi.md)
 - [Full Roadmap](./full-roadmap.md)
 - [Operations Runbook](./runbook.md)

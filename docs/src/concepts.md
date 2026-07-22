@@ -12,12 +12,14 @@ semantics are deliberately the same so the OS framing stays load-bearing.
 |---|---|
 | `agent_struct`, `agent`, `agent_syscalls` | `task_struct` + fork/exec/signals |
 | `cfs`, `scheduler` | CFS-style fair scheduling with vruntime / nice |
-| `context`, `context_paging` | Virtual memory: token budgets, LRU eviction, OOM |
-| `tools`, `tool_descriptors`, `mount_table`, `custom_tools` | VFS: tools are files mounted at paths |
+| `context`, `execution` | Context pressure: active token bounds, durable spills, backpressure |
+| `tools`, `custom_tools` | Governed named tools on the live path |
+| `tool_descriptors`, `mount_table` | Experimental VFS analogy, excluded from v1 |
 | `ipc` | Inter-agent messaging + delegation, broker-routed; discovery via the agent directory |
 | `mac`, `permissions`, `namespaces`, `sandbox`, `cgroups` | Security: SELinux-style MAC, capabilities, isolation |
 | `init_system`, `agentctl`, `agentps` | systemd-style service files + dependency ordering |
-| `syscall_interface` | Numbered syscalls with errno + capability checks |
+| `syscall_server` | Canonical versioned JSON public ABI |
+| `syscall_interface` | Experimental numbered-syscall prototype; unsupported calls return ENOSYS |
 | `procfs`, `observability`, `event_loop` | `/proc` filesystem + audit logging |
 | `agentpkg`, `package`, `marketplace` | apt-like package manager |
 | `execution`, `planning`, `editing`, `delegation` | the think → act → observe loop + multi-agent delegation |

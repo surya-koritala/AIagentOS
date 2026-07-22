@@ -45,6 +45,7 @@ proptest! {
         prop_assert!(!openai.id().is_empty());
         prop_assert!(!anthropic.id().is_empty());
         prop_assert!(!local.id().is_empty());
+        prop_assert!(!msg.content.is_empty());
     }
 
     /// Property 14: For any StandardMessage, translate to provider format and back
@@ -136,6 +137,7 @@ mod hardening {
                 content: format!("ok:{}", self.id),
                 finish_reason: Some("stop".into()),
                 tokens_used: 3,
+                usage: Default::default(),
                 tool_calls: vec![],
             })
         }

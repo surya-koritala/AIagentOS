@@ -2,10 +2,15 @@
 name = "agent-cli"
 version = "0.3.0"
 edition = "2021"
+license.workspace = true
 
 [[bin]]
 name = "agent"
 path = "src/main.rs"
+
+[[bin]]
+name = "agentctl"
+path = "src/bin/agentctl.rs"
 
 [features]
 default = []
@@ -15,8 +20,10 @@ candle = ["adapters/candle"]
 
 [dependencies]
 kernel = { path = "../kernel" }
+agent-sdk = { path = "../sdk" }
 adapters = { path = "../adapters" }
 tokio = { version = "1", features = ["full"] }
+serde_json = { workspace = true }
 dirs = "5"
 libc = "0.2"
 tracing = { workspace = true }

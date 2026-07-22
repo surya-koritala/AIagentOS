@@ -11,50 +11,7 @@ pub struct PrerequisiteResult {
 
 /// Check system prerequisites (RAM >= 8GB, disk >= 10GB, internet).
 pub fn check_prerequisites() -> PrerequisiteResult {
-    let mut deficiencies = Vec::new();
-
-    // Check RAM
-    if let Ok(content) = std::fs::read_to_string("/proc/meminfo") {
-        if let Some(line) = content.lines().find(|l| l.starts_with("MemTotal:")) {
-            let kb: u64 = line
-                .split_whitespace()
-                .nth(1)
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(0);
-            if kb < 8 * 1024 * 1024 {
-                deficiencies.push(format!(
-                    "Insufficient RAM: {}GB (need 8GB)",
-                    kb / 1024 / 1024
-                ));
-            }
-        }
-    } else {
-        // Non-Linux: skip RAM check
-    }
-
-    // Check disk space (check /home or /)
-    let check_path = if Path::new("/home").exists() {
-        "/home"
-    } else {
-        "/"
-    };
-    match disk_free_gb(check_path) {
-        Some(gb) if gb < 10 => {
-            deficiencies.push(format!("Insufficient disk: {}GB (need 10GB)", gb))
-        }
-        None => {} // skip if can't determine
-        _ => {}
-    }
-
-    // Check internet (simple DNS resolution test)
-    if std::net::ToSocketAddrs::to_socket_addrs(&("dns.google", 443)).is_err() {
-        deficiencies.push("No internet connectivity".to_string());
-    }
-
-    PrerequisiteResult {
-        passed: deficiencies.is_empty(),
-        deficiencies,
-    }
+    check_with_thresholds(8, 10, true)
 }
 
 /// Check prerequisites with custom thresholds (for testing).
@@ -65,20 +22,17 @@ pub fn check_with_thresholds(
 ) -> PrerequisiteResult {
     let mut deficiencies = Vec::new();
 
-    if let Ok(content) = std::fs::read_to_string("/proc/meminfo") {
-        if let Some(line) = content.lines().find(|l| l.starts_with("MemTotal:")) {
-            let kb: u64 = line
-                .split_whitespace()
-                .nth(1)
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(0);
-            let gb = kb / 1024 / 1024;
-            if gb < min_ram_gb {
-                deficiencies.push(format!(
-                    "Insufficient RAM: {}GB (need {}GB)",
-                    gb, min_ram_gb
-                ));
-            }
+    if min_ram_gb > 0 {
+        match total_memory_gb() {
+            Some(gb) if gb < min_ram_gb => deficiencies.push(format!(
+                "Insufficient RAM: {}GB (need {}GB)",
+                gb, min_ram_gb
+            )),
+            None => deficiencies.push(format!(
+                "Unable to determine RAM (need at least {}GB)",
+                min_ram_gb
+            )),
+            _ => {}
         }
     }
 
@@ -87,12 +41,17 @@ pub fn check_with_thresholds(
     } else {
         "/"
     };
-    if let Some(gb) = disk_free_gb(check_path) {
-        if gb < min_disk_gb {
-            deficiencies.push(format!(
+    if min_disk_gb > 0 {
+        match disk_free_gb(check_path) {
+            Some(gb) if gb < min_disk_gb => deficiencies.push(format!(
                 "Insufficient disk: {}GB (need {}GB)",
                 gb, min_disk_gb
-            ));
+            )),
+            None => deficiencies.push(format!(
+                "Unable to determine free disk space (need at least {}GB)",
+                min_disk_gb
+            )),
+            _ => {}
         }
     }
 
@@ -106,22 +65,62 @@ pub fn check_with_thresholds(
     }
 }
 
-fn disk_free_gb(path: &str) -> Option<u64> {
-    // Use statvfs on Linux
+fn total_memory_gb() -> Option<u64> {
     #[cfg(target_os = "linux")]
+    {
+        let content = std::fs::read_to_string("/proc/meminfo").ok()?;
+        let kb = content
+            .lines()
+            .find(|line| line.starts_with("MemTotal:"))?
+            .split_whitespace()
+            .nth(1)?
+            .parse::<u64>()
+            .ok()?;
+        Some(kb / 1024 / 1024)
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        use std::ffi::CString;
+
+        let name = CString::new("hw.memsize").ok()?;
+        let mut bytes: u64 = 0;
+        let mut size = std::mem::size_of::<u64>();
+        // SAFETY: `bytes` points to a writable u64 and `size` accurately
+        // describes the buffer supplied to the read-only sysctl query.
+        let result = unsafe {
+            libc::sysctlbyname(
+                name.as_ptr(),
+                (&mut bytes as *mut u64).cast(),
+                &mut size,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        (result == 0 && size == std::mem::size_of::<u64>()).then_some(bytes / 1024 / 1024 / 1024)
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        None
+    }
+}
+
+fn disk_free_gb(path: &str) -> Option<u64> {
+    #[cfg(unix)]
     {
         use std::ffi::CString;
         let c_path = CString::new(path).ok()?;
         unsafe {
             let mut stat: libc::statvfs = std::mem::zeroed();
             if libc::statvfs(c_path.as_ptr(), &mut stat) == 0 {
-                let free_bytes = stat.f_bavail * stat.f_frsize;
+                let free_bytes = (stat.f_bavail as u64) * (stat.f_frsize as u64);
                 return Some(free_bytes / 1024 / 1024 / 1024);
             }
         }
         None
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(unix))]
     {
         let _ = path;
         None
@@ -150,5 +149,6 @@ mod tests {
     fn check_with_zero_thresholds_passes() {
         let result = check_with_thresholds(0, 0, false);
         assert!(result.passed);
+        assert!(result.deficiencies.is_empty());
     }
 }

@@ -1,7 +1,7 @@
 //! Custom tool loading from TOML configuration.
 
 use crate::resources::ResourceType;
-use crate::tools::{ToolBinding, ToolRegistry};
+use crate::tools::{ToolBinding, ToolRegistry, ToolSecurity};
 use serde::Deserialize;
 use std::path::Path;
 
@@ -19,6 +19,9 @@ struct CustomToolDef {
     args_template: Vec<String>,
     #[serde(default)]
     parameters: std::collections::HashMap<String, ParamDef>,
+    /// Required, fail-closed authorization contract. Omitting it makes the
+    /// entire declaration invalid rather than silently granting execution.
+    security: ToolSecurity,
 }
 
 #[derive(Debug, Deserialize)]
@@ -69,15 +72,22 @@ pub fn load_custom_tools(registry: &mut ToolRegistry, path: &Path) {
             "required": required,
         });
 
-        registry.register(ToolBinding {
+        let registered = registry.register(ToolBinding {
             name: tool.name.clone(),
             description: tool.description,
             parameters_schema: schema,
             resource_type: ResourceType::Application,
             operation: "launch".into(),
+            security: tool.security,
         });
 
-        // Store the command template for resolution
-        registry.register_command_template(&tool.name, &tool.command, &tool.args_template);
+        match registered {
+            Ok(()) => {
+                // Store the command template only after its security contract
+                // was accepted; otherwise no executable residue is retained.
+                registry.register_command_template(&tool.name, &tool.command, &tool.args_template);
+            }
+            Err(error) => tracing::warn!(tool = %tool.name, %error, "custom tool rejected"),
+        }
     }
 }

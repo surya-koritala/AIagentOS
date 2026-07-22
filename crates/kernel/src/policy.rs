@@ -134,6 +134,13 @@ impl PolicyDocument {
     /// malformed input (including an unknown `decision`/`default` value, thanks
     /// to the typed [`Decision`] enum).
     pub fn from_toml(toml_str: &str) -> Result<Self, String> {
+        let raw: toml::Value = toml::from_str(toml_str).map_err(|e| e.to_string())?;
+        if raw.get("default").is_none() {
+            return Err(
+                "policy must declare an explicit terminal `default = \"deny\"|\"allow\"|\"audit\"`"
+                    .to_string(),
+            );
+        }
         let doc: PolicyDocument = toml::from_str(toml_str).map_err(|e| e.to_string())?;
         doc.validate()?;
         Ok(doc)
@@ -192,9 +199,44 @@ impl PolicyDocument {
                 });
             } else if r.subject == "*" && r.action == "*" && r.object == "*" {
                 catch_all = Some(i);
+                if r.decision != Decision::Deny {
+                    lints.push(Lint {
+                        rule_index: Some(i),
+                        message: "overbroad wildcard allows or audits every subject, action, and resource"
+                            .to_string(),
+                    });
+                }
             }
         }
 
+        lints
+    }
+
+    /// Extend authoring lints with coverage of every tool action in the
+    /// kernel's validated default catalog. An uncovered action falls directly
+    /// to the terminal default and is usually an accidental outage or grant.
+    pub fn lint_with_tool_catalog(&self) -> Vec<Lint> {
+        let mut lints = self.lint();
+        let actions: std::collections::BTreeSet<&'static str> =
+            crate::tools::ToolRegistry::default_security_catalog()
+                .values()
+                .map(|security| security.action.as_str())
+                .collect();
+        for action in actions {
+            if !self
+                .rules
+                .iter()
+                .any(|rule| rule.action == action || rule.action == "*")
+            {
+                lints.push(Lint {
+                    rule_index: None,
+                    message: format!(
+                        "tool action '{action}' is uncovered and falls directly to default {:?}",
+                        self.default
+                    ),
+                });
+            }
+        }
         lints
     }
 
@@ -302,6 +344,7 @@ decision = "audit"
     #[test]
     fn rejects_unknown_decision() {
         let bad = r#"
+default = "deny"
 [[rule]]
 subject = "x"
 action = "read"
@@ -320,18 +363,14 @@ decision = "alow"
 
     #[test]
     fn rejects_unsupported_version() {
-        let bad = r#"version = 99"#;
+        let bad = "version = 99\ndefault = \"deny\"";
         assert!(PolicyDocument::from_toml(bad).is_err());
     }
 
     #[test]
-    fn defaults_fill_in_when_omitted() {
-        // Empty doc => version 1, enforcing true, default deny, no rules.
-        let doc = PolicyDocument::from_toml("").unwrap();
-        assert_eq!(doc.version, 1);
-        assert!(doc.enforcing);
-        assert_eq!(doc.default, Decision::Deny);
-        assert!(doc.rules.is_empty());
+    fn missing_terminal_default_is_rejected() {
+        let error = PolicyDocument::from_toml("").unwrap_err();
+        assert!(error.contains("explicit terminal"));
     }
 
     #[test]
@@ -346,6 +385,7 @@ decision = "alow"
     fn lint_flags_unreachable_rule_after_catch_all() {
         let doc = PolicyDocument::from_toml(
             r#"
+default = "deny"
 [[rule]]
 subject = "*"
 action = "*"
@@ -362,15 +402,33 @@ decision = "deny"
         )
         .unwrap();
         let lints = doc.lint();
-        assert_eq!(lints.len(), 1);
-        assert_eq!(lints[0].rule_index, Some(1));
-        assert!(lints[0].message.contains("unreachable"));
+        assert!(lints
+            .iter()
+            .any(|lint| lint.rule_index == Some(1) && lint.message.contains("unreachable")));
+        assert!(lints
+            .iter()
+            .any(|lint| lint.message.contains("overbroad wildcard")));
     }
 
     #[test]
     fn clean_policy_has_no_lints() {
         let doc = PolicyDocument::from_toml(SAMPLE).unwrap();
         assert!(doc.lint().is_empty());
+    }
+
+    #[test]
+    fn tool_coverage_lint_detects_uncovered_actions() {
+        let doc = PolicyDocument::from_toml(
+            "default = \"deny\"\n[[rule]]\nsubject=\"*\"\naction=\"read\"\nobject=\"*\"\ndecision=\"allow\"\n",
+        )
+        .unwrap();
+        let lints = doc.lint_with_tool_catalog();
+        assert!(lints
+            .iter()
+            .any(|lint| lint.message.contains("tool action 'net' is uncovered")));
+        assert!(lints
+            .iter()
+            .any(|lint| lint.message.contains("tool action 'delete' is uncovered")));
     }
 
     #[test]

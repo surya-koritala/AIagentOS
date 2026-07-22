@@ -9,7 +9,7 @@
 //! with `agent-server`.
 //!
 //! Keys: `j`/`k` (or arrows) move · `r` refresh · `c` create (`name|task`) ·
-//! `m` message the selected agent · `q` quit.
+//! `m` message · `p` pause/resume · `s` stop · `X` kill · `q` quit.
 
 use std::io;
 use std::time::Duration;
@@ -105,6 +105,34 @@ fn perform(
                 }
                 Err(e) => app.status = format!("send failed: {e}"),
             }
+            let _ = rt.block_on(app.refresh(client));
+        }
+        UiAction::PauseAgent { agent_id } => {
+            app.status = match rt.block_on(client.pause_agent(agent_id)) {
+                Ok(state) => format!("agent state: {state}"),
+                Err(error) => format!("pause failed: {error}"),
+            };
+            let _ = rt.block_on(app.refresh(client));
+        }
+        UiAction::ResumeAgent { agent_id } => {
+            app.status = match rt.block_on(client.resume_agent(agent_id)) {
+                Ok(state) => format!("agent state: {state}"),
+                Err(error) => format!("resume failed: {error}"),
+            };
+            let _ = rt.block_on(app.refresh(client));
+        }
+        UiAction::StopAgent { agent_id } => {
+            app.status = match rt.block_on(client.stop_agent(agent_id)) {
+                Ok(state) => format!("agent state: {state}"),
+                Err(error) => format!("stop failed: {error}"),
+            };
+            let _ = rt.block_on(app.refresh(client));
+        }
+        UiAction::KillAgent { agent_id } => {
+            app.status = match rt.block_on(client.kill_agent(agent_id)) {
+                Ok(state) => format!("agent state: {state}"),
+                Err(error) => format!("kill failed: {error}"),
+            };
             let _ = rt.block_on(app.refresh(client));
         }
     }

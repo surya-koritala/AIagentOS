@@ -1,6 +1,7 @@
-//! Remaining Linux kernel equivalents — interrupts, permissions, swap,
-//! block devices, network protocol stack, futex, epoll, device tree,
-//! power management, real-time clock, kernel modules.
+//! Standalone Linux-inspired analogy and test models.
+//!
+//! These types are not wired into [`crate::AgentKernelImpl`] and are not a
+//! Linux ABI, kernel, device, filesystem, or network-stack compatibility claim.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};

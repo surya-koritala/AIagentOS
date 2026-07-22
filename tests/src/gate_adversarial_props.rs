@@ -334,7 +334,7 @@ fn classify_result(r: &Result<u64, GateDenial>) -> Expected {
         Err(GateDenial::NotInNamespace { .. }) => Expected::Namespace,
         Err(GateDenial::MissingCapability(cap)) => Expected::Capability(*cap),
         Err(GateDenial::MacDeny { .. }) => Expected::Mac,
-        Err(GateDenial::CgroupQuota) => Expected::Cgroup,
+        Err(GateDenial::CgroupQuota | GateDenial::CgroupToolLimit) => Expected::Cgroup,
         Err(GateDenial::UnknownAgent) => {
             // Never expected in this suite — the agent is always registered.
             panic!("unexpected UnknownAgent denial for a registered agent");

@@ -1,7 +1,7 @@
-//! Tool Descriptors — the file descriptor equivalent for AI agents.
+//! Experimental Tool Descriptors — the file descriptor equivalent for AI agents.
 //!
-//! Each agent has a table of open tool descriptors. Tools are opened,
-//! used, and closed through this interface.
+//! This table is a unit-tested prototype, not part of the primary runtime or
+//! public v1 ABI. See `docs/ADR-0001-PUBLIC-ABI.md`.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};

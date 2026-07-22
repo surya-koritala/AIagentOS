@@ -6,69 +6,167 @@ on:
   pull_request:
     branches: [main]
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
 
 jobs:
-  test:
+  quality:
+    name: Blocking Rust quality and contract checks
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
-      - name: Install system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache cargo
-        uses: actions/cache@v4
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Run tests (default lean features)
-        run: cargo test --workspace --exclude tauri-app
-
-      - name: Build with all optional features (browser, web)
-        run: cargo build --workspace --exclude tauri-app --all-features
-
-      - name: Check formatting
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Formatting
         run: cargo fmt --all -- --check
+      - name: Clippy (warnings are errors)
+        run: cargo clippy --workspace --exclude tauri-app --all-targets -- -D warnings
+      - name: Capability and public-claim contract
+        run: cargo test -p integration-tests capability_registry --locked
+      - name: Below-production capabilities retain an open tracking issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          awk -F ' = ' '
+            /^maturity = / { maturity=$2; gsub(/"/, "", maturity) }
+            /^tracking_issue = / && maturity != "production-qualified" { print $2 }
+          ' docs/capabilities.toml | while read -r issue; do
+            test "$(gh issue view "$issue" --json state --jq .state)" = "OPEN"
+          done
+      - name: Documentation tests
+        run: cargo test --workspace --exclude tauri-app --doc --locked
+      - name: All-feature compilation
+        run: cargo build --workspace --exclude tauri-app --all-features --locked
 
-      - name: Clippy
-        run: cargo clippy --workspace --exclude tauri-app -- -D warnings
-        continue-on-error: true
-
-  build-app:
-    runs-on: ubuntu-latest
-    needs: test
+  rust-platforms:
+    name: Rust tests (${{ matrix.os }})
+    needs: quality
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Deterministic unit and integration tests
+        run: cargo test --workspace --exclude tauri-app --locked
 
-      - name: Install system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Install Node.js
-        uses: actions/setup-node@v4
+  frontend:
+    name: Frontend build and vulnerability gate
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: crates/tauri-app/ui
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
+          cache: npm
+          cache-dependency-path: crates/tauri-app/ui/package-lock.json
+      - name: Locked dependency install
+        run: npm ci
+      - name: Reject high or critical advisories
+        run: npm audit --audit-level=high
+      - name: Production frontend build
+        run: npm run build
 
-      - name: Install frontend dependencies
-        run: cd crates/tauri-app/ui && npm install
+  rust-supply-chain:
+    name: Rust advisory, license, and source policy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+          command-arguments: advisories licenses sources
 
-      - name: Build frontend
-        run: cd crates/tauri-app/ui && npx vite build
+  coverage:
+    name: Coverage floor
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      - uses: Swatinem/rust-cache@v2
+      - name: Enforce workspace line coverage floor
+        run: >-
+          cargo llvm-cov --workspace --exclude tauri-app --all-targets --locked
+          --lcov --output-path lcov.info --fail-under-lines 60
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rust-lcov
+          path: lcov.info
 
-      - name: Build Tauri app
-        run: cargo build --package tauri-app
+  container-smoke:
+    name: Container startup, health, persistence, and non-root
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image
+        run: docker build --pull -t agentos:ci .
+      - name: Verify configured non-root identity
+        run: test "$(docker image inspect agentos:ci --format '{{.Config.User}}')" = "agentos"
+      - name: Boot and verify syscall health
+        run: |
+          docker volume create agentos-ci-data
+          docker run -d --name agentos-ci -p 7777:7777 -v agentos-ci-data:/data \
+            agentos:ci agent-server 0.0.0.0:7777
+          for i in $(seq 1 30); do
+            if printf '{"op":"node_info"}\n' | nc -w2 127.0.0.1 7777 | grep -q '"status":"node_info"'; then
+              healthy=1
+              break
+            fi
+            sleep 2
+          done
+          test "${healthy:-0}" = "1"
+          test "$(docker exec agentos-ci id -u)" = "10001"
+      - name: Verify persistent data survives restart
+        run: |
+          docker exec agentos-ci sh -c 'printf persistence-proof > /data/persistence-proof'
+          docker restart agentos-ci
+          for i in $(seq 1 30); do
+            if docker exec agentos-ci test -f /data/persistence-proof; then
+              persisted=1
+              break
+            fi
+            sleep 1
+          done
+          test "${persisted:-0}" = "1"
+      - name: Diagnostics
+        if: always()
+        run: |
+          docker logs agentos-ci || true
+          docker rm -f agentos-ci || true
+          docker volume rm agentos-ci-data || true
+
+  required:
+    name: Required release gates
+    if: always()
+    needs:
+      - quality
+      - rust-platforms
+      - frontend
+      - rust-supply-chain
+      - coverage
+      - container-smoke
+    runs-on: ubuntu-latest
+    steps:
+      - name: Reject any failed or skipped gate
+        env:
+          NEEDS_JSON: ${{ toJson(needs) }}
+        run: |
+          test "$(jq -r '[.[] | .result == "success"] | all' <<< "$NEEDS_JSON")" = "true"

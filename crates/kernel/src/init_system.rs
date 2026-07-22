@@ -7,7 +7,7 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use crate::agent_struct::AgentId;
+use crate::AgentId;
 
 /// Agent service definition (like a systemd unit file).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -111,7 +111,16 @@ pub struct ServiceState {
     pub last_exit_code: Option<i32>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ServiceRuntimeInfo {
+    pub name: String,
+    pub status: ServiceStatus,
+    pub agent_id: Option<AgentId>,
+    pub restart_count: u32,
+    pub last_exit_code: Option<i32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ServiceStatus {
     Inactive,
     Starting,
@@ -176,13 +185,83 @@ impl InitSystem {
         }
     }
 
+    /// Parse and validate a service directory as one atomic configuration. A
+    /// malformed file, duplicate name, missing required dependency, or cycle
+    /// rejects the entire reload and leaves the current supervisor unchanged.
+    pub fn load_directory_checked(&mut self, dir: &Path) -> Result<Vec<String>, String> {
+        let entries = std::fs::read_dir(dir)
+            .map_err(|error| format!("cannot read service directory {}: {error}", dir.display()))?;
+        let mut paths = entries
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.extension()
+                    .is_some_and(|extension| extension == "toml")
+            })
+            .collect::<Vec<_>>();
+        paths.sort();
+        let mut definitions = Vec::with_capacity(paths.len());
+        for path in paths {
+            let content = std::fs::read_to_string(&path)
+                .map_err(|error| format!("cannot read service file {}: {error}", path.display()))?;
+            let definition = toml::from_str::<ServiceDef>(&content)
+                .map_err(|error| format!("invalid service file {}: {error}", path.display()))?;
+            definitions.push(definition);
+        }
+        self.replace_definitions(definitions)
+    }
+
+    /// Atomically replace definitions after validating the complete dependency
+    /// graph. Runtime state is retained for services with the same name.
+    pub fn replace_definitions(
+        &mut self,
+        definitions: Vec<ServiceDef>,
+    ) -> Result<Vec<String>, String> {
+        let mut replacement = InitSystem::new();
+        for definition in definitions {
+            if definition.name.trim().is_empty()
+                || definition.name.chars().any(|character| {
+                    !(character.is_ascii_alphanumeric() || "-_.".contains(character))
+                })
+            {
+                return Err(format!("invalid service name '{}'", definition.name));
+            }
+            if replacement.services.contains_key(&definition.name) {
+                return Err(format!("duplicate service '{}'", definition.name));
+            }
+            replacement.load_service(definition);
+        }
+        replacement.resolve_boot_order()?;
+        for (name, state) in &mut replacement.services {
+            if let Some(existing) = self.services.get(name) {
+                state.status = existing.status;
+                state.agent_id = existing.agent_id;
+                state.restart_count = existing.restart_count;
+                state.last_exit_code = existing.last_exit_code;
+            }
+        }
+        let order = replacement.boot_order.clone();
+        *self = replacement;
+        Ok(order)
+    }
+
     /// Resolve boot order (topological sort of dependencies).
     pub fn resolve_boot_order(&mut self) -> Result<(), String> {
         let mut order = Vec::new();
         let mut visited = std::collections::HashSet::new();
         let mut visiting = std::collections::HashSet::new();
 
-        let names: Vec<String> = self.services.keys().cloned().collect();
+        for (name, state) in &self.services {
+            for required in &state.def.dependencies.requires {
+                if !self.services.contains_key(required) {
+                    return Err(format!(
+                        "service '{name}' requires missing service '{required}'"
+                    ));
+                }
+            }
+        }
+        let mut names: Vec<String> = self.services.keys().cloned().collect();
+        names.sort();
         for name in &names {
             self.topo_sort(name, &mut order, &mut visited, &mut visiting)?;
         }
@@ -208,10 +287,22 @@ impl InitSystem {
         visiting.insert(name.to_string());
 
         if let Some(state) = self.services.get(name) {
-            for dep in &state.def.dependencies.requires {
-                self.topo_sort(dep, order, visited, visiting)?;
+            let mut dependencies = state.def.dependencies.requires.clone();
+            dependencies.extend(state.def.dependencies.after.clone());
+            for (candidate, candidate_state) in &self.services {
+                if candidate_state
+                    .def
+                    .dependencies
+                    .before
+                    .iter()
+                    .any(|before| before == name)
+                {
+                    dependencies.push(candidate.clone());
+                }
             }
-            for dep in &state.def.dependencies.after {
+            dependencies.sort();
+            dependencies.dedup();
+            for dep in &dependencies {
                 if self.services.contains_key(dep) {
                     self.topo_sort(dep, order, visited, visiting)?;
                 }
@@ -227,6 +318,23 @@ impl InitSystem {
     /// Get the boot order.
     pub fn boot_order(&self) -> &[String] {
         &self.boot_order
+    }
+
+    pub fn reverse_boot_order(&self) -> Vec<String> {
+        self.boot_order.iter().rev().cloned().collect()
+    }
+
+    pub fn state(&self, name: &str) -> Option<ServiceState> {
+        self.services.get(name).cloned()
+    }
+
+    pub fn mark_starting(&mut self, name: &str) -> bool {
+        if let Some(state) = self.services.get_mut(name) {
+            state.status = ServiceStatus::Starting;
+            true
+        } else {
+            false
+        }
     }
 
     /// Get service status.
@@ -247,6 +355,26 @@ impl InitSystem {
         if let Some(state) = self.services.get_mut(name) {
             state.status = ServiceStatus::Failed;
             state.last_exit_code = Some(exit_code);
+        }
+    }
+
+    pub fn mark_stopping(&mut self, name: &str) -> bool {
+        if let Some(state) = self.services.get_mut(name) {
+            state.status = ServiceStatus::Stopping;
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn mark_stopped(&mut self, name: &str) -> bool {
+        if let Some(state) = self.services.get_mut(name) {
+            state.status = ServiceStatus::Inactive;
+            state.agent_id = None;
+            state.last_exit_code = Some(0);
+            true
+        } else {
+            false
         }
     }
 
@@ -281,9 +409,26 @@ impl InitSystem {
             .map(|(k, v)| (k.as_str(), v.status))
             .collect()
     }
+
+    pub fn list_runtime(&self) -> Vec<ServiceRuntimeInfo> {
+        let mut services = self
+            .services
+            .iter()
+            .map(|(name, state)| ServiceRuntimeInfo {
+                name: name.clone(),
+                status: state.status,
+                agent_id: state.agent_id,
+                restart_count: state.restart_count,
+                last_exit_code: state.last_exit_code,
+            })
+            .collect::<Vec<_>>();
+        services.sort_by(|a, b| a.name.cmp(&b.name));
+        services
+    }
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
 
@@ -336,6 +481,31 @@ mod tests {
         init.load_service(b);
         let result = init.resolve_boot_order();
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn missing_required_dependency_is_rejected_without_mutating_live_config() {
+        let mut init = InitSystem::new();
+        init.load_service(test_service("stable"));
+        init.resolve_boot_order().unwrap();
+        let mut broken = test_service("broken");
+        broken.dependencies.requires = vec!["absent".into()];
+        assert!(init.replace_definitions(vec![broken]).is_err());
+        assert!(init.status("stable").is_some());
+        assert!(init.status("broken").is_none());
+    }
+
+    #[test]
+    fn before_and_after_constraints_are_deterministic() {
+        let mut init = InitSystem::new();
+        let mut database = test_service("database");
+        database.dependencies.before = vec!["api".into()];
+        let mut worker = test_service("worker");
+        worker.dependencies.after = vec!["api".into()];
+        init.replace_definitions(vec![worker, test_service("api"), database])
+            .unwrap();
+        assert_eq!(init.boot_order(), &["database", "api", "worker"]);
+        assert_eq!(init.reverse_boot_order(), vec!["worker", "api", "database"]);
     }
 
     #[test]

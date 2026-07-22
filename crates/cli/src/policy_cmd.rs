@@ -68,7 +68,7 @@ fn validate(path: Option<&String>) -> i32 {
         Ok(d) => d,
         Err(code) => return code,
     };
-    let lints = doc.lint();
+    let lints = doc.lint_with_tool_catalog();
     let mode = if doc.enforcing {
         "enforcing"
     } else {

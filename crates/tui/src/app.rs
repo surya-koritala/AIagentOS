@@ -24,6 +24,10 @@ pub enum UiAction {
     Refresh,
     CreateAgent { name: String, task: String },
     SendMessage { agent_id: String, message: String },
+    PauseAgent { agent_id: String },
+    ResumeAgent { agent_id: String },
+    StopAgent { agent_id: String },
+    KillAgent { agent_id: String },
 }
 
 /// All UI state.
@@ -50,7 +54,8 @@ impl App {
             selected: 0,
             mode: Mode::Normal,
             input: String::new(),
-            status: "r: refresh  c: create  m: message  j/k: move  q: quit".into(),
+            status: "r refresh · c create · m message · p pause/resume · s stop · X kill · q quit"
+                .into(),
             last_output: None,
             should_quit: false,
         }
@@ -58,9 +63,63 @@ impl App {
 
     /// Pull fresh state from the kernel: agent list, gate counters, node load.
     pub async fn refresh(&mut self, client: &mut KernelClient) -> Result<(), SdkError> {
-        self.agents = client.list_agents().await?;
-        self.gate = client.gate_stats().await?;
-        self.node = client.node_info().await?;
+        let snapshot = client.operator_snapshot().await?;
+        self.agents = snapshot
+            .agents
+            .into_iter()
+            .map(|agent| AgentSummary {
+                id: agent.id,
+                name: agent.name,
+                state: agent.state,
+            })
+            .collect();
+        if let Some(metrics) = snapshot.system_metrics {
+            self.gate = GateStats {
+                allowed: metrics.gate.allowed,
+                denied_capability: metrics.gate.denied_capability,
+                denied_mac: metrics.gate.denied_mac,
+                denied_cgroup: metrics.gate.denied_cgroup,
+                denied_namespace: metrics.gate.denied_namespace,
+                denied_unknown: metrics.gate.denied_unknown,
+                audited: metrics.gate.audited,
+            };
+            self.node = NodeLoad {
+                agent_count: metrics.agent_count as usize,
+                running_agents: metrics.running_agents as usize,
+                live_agents: metrics.live_agents as usize,
+                queued_agents: metrics.queued_agents as usize,
+                paused_agents: metrics.paused_agents as usize,
+                stopped_agents: metrics.stopped_agents as usize,
+                active_turns: metrics.active_turns as usize,
+                waiting_turns: metrics.waiting_turns as usize,
+                turn_capacity: metrics.turn_capacity as usize,
+                llm_requests_in_flight: metrics.llm_requests_in_flight as usize,
+                llm_requests_waiting: metrics.llm_requests_waiting as usize,
+                llm_core_capacity: metrics.llm_core_capacity as usize,
+            };
+        } else {
+            // A tenant-scoped snapshot deliberately omits global counters.
+            self.gate = GateStats::default();
+            self.node = NodeLoad {
+                agent_count: self.agents.len(),
+                live_agents: self
+                    .agents
+                    .iter()
+                    .filter(|agent| agent.state != "Stopped")
+                    .count(),
+                paused_agents: self
+                    .agents
+                    .iter()
+                    .filter(|agent| agent.state == "Paused")
+                    .count(),
+                stopped_agents: self
+                    .agents
+                    .iter()
+                    .filter(|agent| agent.state == "Stopped")
+                    .count(),
+                ..NodeLoad::default()
+            };
+        }
         if self.selected >= self.agents.len() {
             self.selected = self.agents.len().saturating_sub(1);
         }
@@ -121,6 +180,23 @@ impl App {
                 }
                 None
             }
+            Key::Char('p') => self.selected_agent().map(|agent| {
+                if agent.state == "Paused" {
+                    UiAction::ResumeAgent {
+                        agent_id: agent.id.clone(),
+                    }
+                } else {
+                    UiAction::PauseAgent {
+                        agent_id: agent.id.clone(),
+                    }
+                }
+            }),
+            Key::Char('s') => self.selected_agent().map(|agent| UiAction::StopAgent {
+                agent_id: agent.id.clone(),
+            }),
+            Key::Char('X') => self.selected_agent().map(|agent| UiAction::KillAgent {
+                agent_id: agent.id.clone(),
+            }),
             _ => None,
         }
     }
@@ -325,5 +401,38 @@ mod tests {
         a.on_key(Key::Char('m'));
         assert_eq!(a.on_key(Key::Enter), None, "empty message is not sent");
         assert_eq!(a.mode, Mode::SendMessage, "stays in edit mode");
+    }
+
+    #[test]
+    fn lifecycle_keys_target_the_selected_agent() {
+        let mut a = app();
+        a.agents = vec![dummy_agent("running", "a"), dummy_agent("paused", "b")];
+        a.agents[1].state = "Paused".into();
+
+        assert_eq!(
+            a.on_key(Key::Char('p')),
+            Some(UiAction::PauseAgent {
+                agent_id: "running".into()
+            })
+        );
+        assert_eq!(
+            a.on_key(Key::Char('s')),
+            Some(UiAction::StopAgent {
+                agent_id: "running".into()
+            })
+        );
+        a.selected = 1;
+        assert_eq!(
+            a.on_key(Key::Char('p')),
+            Some(UiAction::ResumeAgent {
+                agent_id: "paused".into()
+            })
+        );
+        assert_eq!(
+            a.on_key(Key::Char('X')),
+            Some(UiAction::KillAgent {
+                agent_id: "paused".into()
+            })
+        );
     }
 }

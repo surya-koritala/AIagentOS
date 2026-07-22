@@ -1,7 +1,9 @@
-//! System Call Interface — the formal API between agents and kernel.
+//! Experimental numbered-syscall model.
 //!
-//! Like Linux syscalls. Agents interact with the kernel ONLY through
-//! numbered syscalls. This is the ABI contract.
+//! This is a Linux-analogy prototype used by unit tests, **not** the supported
+//! agent ABI. The public ABI is [`crate::syscall_server::Syscall`] over the JSON
+//! service. See `docs/ADR-0001-PUBLIC-ABI.md`. Unregistered calls deliberately
+//! return [`SyscallError::ENOSYS`].
 
 use crate::agent_struct::AgentId;
 

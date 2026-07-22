@@ -174,11 +174,42 @@ pub struct ToolDefinition {
 }
 
 /// Response from an LLM provider.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LlmUsage {
+    /// Provider-reported prompt/input tokens.
+    pub input_tokens: u32,
+    /// Provider-reported completion/output tokens.
+    pub output_tokens: u32,
+    /// Cached input tokens (a subset of input tokens when the provider reports it).
+    pub cached_tokens: u32,
+    /// True only when the provider response supplied usage fields.
+    pub provider_reported: bool,
+}
+
+impl LlmUsage {
+    pub fn reported(input_tokens: u32, output_tokens: u32, cached_tokens: u32) -> Self {
+        Self {
+            input_tokens,
+            output_tokens,
+            cached_tokens: cached_tokens.min(input_tokens),
+            provider_reported: true,
+        }
+    }
+
+    pub fn total(self) -> u32 {
+        self.input_tokens.saturating_add(self.output_tokens)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LlmResponse {
     pub content: String,
     pub finish_reason: Option<String>,
     pub tokens_used: u32,
+    /// Detailed provider usage. Older/custom adapters may leave this at the
+    /// default; the executor records that the conservative fallback was used.
+    #[serde(default)]
+    pub usage: LlmUsage,
     #[serde(default)]
     pub tool_calls: Vec<ToolCall>,
 }
@@ -193,6 +224,20 @@ pub trait LlmSession: Send + Sync {
         tools: &[ToolDefinition],
     ) -> Result<LlmResponse, ConnectorError>;
     fn provider_id(&self) -> &ProviderId;
+
+    /// Concrete model/deployment used by this session. Adapters should
+    /// override this whenever the provider exposes a stable model identifier;
+    /// the fallback is explicit so accounting never invents a model name.
+    fn model_id(&self) -> &str {
+        "unspecified"
+    }
+
+    /// Provider/model-aware token estimate for an already-standardized prompt.
+    /// Adapters with a real tokenizer should override this. `None` selects the
+    /// runtime's documented conservative UTF-8 byte fallback.
+    fn estimate_prompt_tokens(&self, _messages: &[StandardMessage]) -> Option<u32> {
+        None
+    }
 
     /// Send with streaming support. Default falls back to non-streaming.
     async fn send_streaming(
@@ -281,6 +326,28 @@ impl AgentConnectorImpl {
     pub fn with_retry_policy(mut self, policy: RetryPolicy) -> Self {
         self.retry_policy = policy;
         self
+    }
+
+    /// Probe each registered adapter at snapshot time. Unlike
+    /// `list_providers`, this reports actual async health instead of assuming a
+    /// registered provider is reachable.
+    pub async fn probe_providers(&self) -> Vec<ProviderInfo> {
+        let providers: Vec<_> = self
+            .providers
+            .iter()
+            .map(|entry| Arc::clone(entry.value()))
+            .collect();
+        let mut health = Vec::with_capacity(providers.len());
+        for provider in providers {
+            health.push(ProviderInfo {
+                id: provider.id().clone(),
+                name: provider.name().to_string(),
+                provider_type: provider.provider_type(),
+                available: provider.is_available().await,
+            });
+        }
+        health.sort_by(|a, b| a.id.cmp(&b.id));
+        health
     }
 
     /// Inject a custom clock (used by tests to avoid real sleeps).
@@ -515,6 +582,7 @@ mod tests {
                 content: "response".into(),
                 finish_reason: Some("stop".into()),
                 tokens_used: 10,
+                usage: Default::default(),
                 tool_calls: vec![],
             })
         }
@@ -607,6 +675,7 @@ mod tests {
                     content: format!("ok from {}", self.provider_id),
                     finish_reason: Some("stop".into()),
                     tokens_used: 7,
+                    usage: Default::default(),
                     tool_calls: vec![],
                 })
             }

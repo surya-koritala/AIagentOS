@@ -16,7 +16,12 @@ mod tests {
                 "message": {"role": "assistant", "content": "Hello from vLLM!"},
                 "finish_reason": "stop"
             }],
-            "usage": {"total_tokens": 20}
+            "usage": {
+                "prompt_tokens": 13,
+                "completion_tokens": 7,
+                "total_tokens": 20,
+                "prompt_tokens_details": {"cached_tokens": 3}
+            }
         });
 
         Mock::given(method("POST"))
@@ -37,6 +42,7 @@ mod tests {
         assert!(resp.tool_calls.is_empty());
         assert_eq!(resp.finish_reason, Some("stop".to_string()));
         assert_eq!(resp.tokens_used, 20);
+        assert_eq!(resp.usage, LlmUsage::reported(13, 7, 3));
     }
 
     #[tokio::test]

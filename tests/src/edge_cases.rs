@@ -13,7 +13,6 @@ use kernel::production::*;
 use kernel::rate_limit::*;
 use kernel::tools::*;
 use kernel::*;
-use std::sync::Arc;
 
 // ─── Execution Edge Cases ────────────────────────────────────────────────────
 
@@ -146,10 +145,16 @@ fn tools_custom_template_with_missing_param() {
     reg.register(ToolBinding {
         name: "custom".into(),
         description: "test".into(),
-        parameters_schema: serde_json::json!({}),
+        parameters_schema: serde_json::json!({"type": "object", "properties": {}}),
         resource_type: kernel::resources::ResourceType::Application,
         operation: "launch".into(),
-    });
+        security: kernel::tools::ToolSecurity::constant(
+            kernel::tools::SecurityAction::Execute,
+            "test:custom",
+        )
+        .sandboxed(),
+    })
+    .unwrap();
     reg.register_command_template("custom", "echo", &["{missing_param}".into()]);
     let tc = ToolCall {
         id: "1".into(),
@@ -298,7 +303,7 @@ fn indexer_empty_directory() {
 fn indexer_binary_files_skipped() {
     let dir = std::env::temp_dir().join(format!("edge_idx2_{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(dir.join("image.png"), &[0x89, 0x50, 0x4E, 0x47]).unwrap();
+    std::fs::write(dir.join("image.png"), [0x89, 0x50, 0x4E, 0x47]).unwrap();
     std::fs::write(dir.join("code.rs"), "fn main() {}").unwrap();
     let map = RepoMap::build(&dir);
     assert_eq!(map.total_files, 1); // Only .rs, not .png
@@ -323,32 +328,36 @@ fn indexer_deeply_nested() {
 
 #[test]
 fn database_sql_injection_attempt() {
-    let path = "/tmp/edge_db_inject.db";
-    let conn = rusqlite::Connection::open(path).unwrap();
+    let path = std::env::temp_dir().join(format!("edge_db_inject_{}.db", uuid::Uuid::new_v4()));
+    let path_text = path.to_string_lossy().into_owned();
+    let conn = rusqlite::Connection::open(&path).unwrap();
     conn.execute("CREATE TABLE IF NOT EXISTS t (x TEXT)", [])
         .unwrap();
     conn.execute("INSERT INTO t VALUES ('safe')", []).unwrap();
     drop(conn);
 
     // This should not execute the DROP TABLE
-    let result = query_sqlite(
-        path,
+    let _result = query_sqlite(
+        &path_text,
         "SELECT * FROM t WHERE x = 'a'; DROP TABLE t; --'",
         true,
     );
     // SQLite doesn't execute multiple statements in one query_row, so this is safe
     // But it might error — either way, table should still exist
-    let check = query_sqlite(path, "SELECT COUNT(*) FROM t", true);
+    let check = query_sqlite(&path_text, "SELECT COUNT(*) FROM t", true);
     assert!(check.is_ok());
-    std::fs::remove_file(path).ok();
+    std::fs::remove_file(&path).ok();
 }
 
 #[test]
 fn database_nonexistent_file() {
-    let result = query_sqlite("/tmp/nonexistent_db_edge.db", "SELECT 1", true);
+    let path =
+        std::env::temp_dir().join(format!("nonexistent_db_edge_{}.db", uuid::Uuid::new_v4()));
+    let path_text = path.to_string_lossy().into_owned();
+    let result = query_sqlite(&path_text, "SELECT 1", true);
     // Should either create the file or error gracefully
     assert!(result.is_ok() || result.is_err());
-    std::fs::remove_file("/tmp/nonexistent_db_edge.db").ok();
+    std::fs::remove_file(&path).ok();
 }
 
 // ─── Learning Edge Cases ─────────────────────────────────────────────────────
@@ -374,15 +383,19 @@ fn learning_case_insensitive_matching() {
 
 #[test]
 fn vision_nonexistent_file() {
-    let result = kernel::vision::image_to_data_url("/tmp/nonexistent_image.png");
+    let path = std::env::temp_dir().join(format!("nonexistent_image_{}.png", uuid::Uuid::new_v4()));
+    let path_text = path.to_string_lossy().into_owned();
+    let result = kernel::vision::image_to_data_url(&path_text);
     assert!(result.is_err());
 }
 
 #[test]
 fn vision_empty_file() {
-    std::fs::write("/tmp/empty_image.png", &[]).unwrap();
-    let result = kernel::vision::image_to_data_url("/tmp/empty_image.png");
+    let path = std::env::temp_dir().join(format!("empty_image_{}.png", uuid::Uuid::new_v4()));
+    let path_text = path.to_string_lossy().into_owned();
+    std::fs::write(&path, []).unwrap();
+    let result = kernel::vision::image_to_data_url(&path_text);
     assert!(result.is_ok()); // Empty but valid
     assert!(result.unwrap().contains("base64,"));
-    std::fs::remove_file("/tmp/empty_image.png").ok();
+    std::fs::remove_file(&path).ok();
 }

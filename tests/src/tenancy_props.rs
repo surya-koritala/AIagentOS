@@ -104,7 +104,7 @@ async fn cross_tenant_ipc_is_denied() {
 #[tokio::test]
 async fn cross_tenant_namespaced_tool_is_denied() {
     use kernel::syscall_gate::GateDenial;
-    use kernel::tools::ToolBinding;
+    use kernel::tools::{SecurityAction, ToolBinding, ToolSecurity};
 
     let kernel = AgentKernelImpl::new().expect("kernel");
     let t_a = kernel.create_tenant("tenant-a").await.unwrap();
@@ -112,16 +112,19 @@ async fn cross_tenant_namespaced_tool_is_denied() {
 
     // The tenant's namespace group is keyed by its tenant id, so registering a
     // group tool under that id tags it with tenant-A's tool namespace.
-    kernel.register_group_tool(
-        &t_a,
-        ToolBinding {
-            name: "tenant_a_tool".into(),
-            description: "tenant A only".into(),
-            parameters_schema: serde_json::json!({}),
-            resource_type: kernel::resources::ResourceType::Filesystem,
-            operation: "read".into(),
-        },
-    );
+    kernel
+        .register_group_tool(
+            &t_a,
+            ToolBinding {
+                name: "tenant_a_tool".into(),
+                description: "tenant A only".into(),
+                parameters_schema: serde_json::json!({"type": "object", "properties": {}}),
+                resource_type: kernel::resources::ResourceType::Filesystem,
+                operation: "read".into(),
+                security: ToolSecurity::constant(SecurityAction::Read, "tenant-a:tool"),
+            },
+        )
+        .unwrap();
 
     let a1 = kernel
         .create_agent_for_tenant(&t_a, cfg("a1", "full-access"))

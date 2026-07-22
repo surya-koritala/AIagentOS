@@ -143,6 +143,27 @@ impl IpcManager {
         self.receivers.insert(agent_id, Mutex::new(rx));
     }
 
+    /// Remove every live IPC reference to an agent. Delegations involving the
+    /// agent are removed rather than left addressable after termination.
+    pub fn unregister_agent(&self, agent_id: AgentId) {
+        self.mailboxes.remove(&agent_id);
+        self.receivers.remove(&agent_id);
+        self.subscriptions.remove(&agent_id);
+        self.delegations
+            .retain(|_, task| task.from != agent_id && task.to != agent_id);
+        if let Some(pairs) = &self.allowed_pairs {
+            pairs.retain(|(from, to), _| *from != agent_id && *to != agent_id);
+        }
+        self.dead_letters
+            .lock()
+            .unwrap()
+            .retain(|message| message.from != agent_id && message.to != agent_id);
+    }
+
+    pub fn is_registered(&self, agent_id: AgentId) -> bool {
+        self.mailboxes.contains_key(&agent_id)
+    }
+
     /// Enable permission enforcement for IPC.
     pub fn enable_permissions(&mut self) {
         self.allowed_pairs = Some(DashMap::new());

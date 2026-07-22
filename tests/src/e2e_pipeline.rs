@@ -7,14 +7,19 @@ mod tests {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use adapters::azure_openai::AzureOpenAiAdapter;
-    use kernel::connector::LlmProviderAdapter;
-    use kernel::{AgentConfig, AgentKernelImpl, Priority};
+    use kernel::{AgentConfig, AgentKernelImpl, IsolationLevel, Priority, SandboxConfig};
 
     /// Full E2E test: create kernel → register Azure adapter → create agent → send message
     /// → LLM returns tool call → tool executes → LLM responds with final answer.
     #[tokio::test]
     async fn e2e_azure_openai_agent_with_tool_call() {
         let mock_server = MockServer::start().await;
+        let test_path =
+            std::env::temp_dir().join(format!("e2e_test_agent_os_{}.txt", uuid::Uuid::new_v4()));
+        let tool_arguments = serde_json::json!({
+            "path": test_path.to_string_lossy()
+        })
+        .to_string();
 
         // First LLM call: returns a tool call (read_file)
         Mock::given(method("POST"))
@@ -29,13 +34,13 @@ mod tests {
                             "type": "function",
                             "function": {
                                 "name": "read_file",
-                                "arguments": "{\"path\":\"/tmp/e2e_test_agent_os.txt\"}"
+                                "arguments": tool_arguments
                             }
                         }]
                     },
                     "finish_reason": "tool_calls"
                 }],
-                "usage": {"total_tokens": 30}
+                "usage": {"prompt_tokens": 20, "completion_tokens": 10, "total_tokens": 30}
             })))
             .up_to_n_times(1)
             .mount(&mock_server)
@@ -52,13 +57,13 @@ mod tests {
                     },
                     "finish_reason": "stop"
                 }],
-                "usage": {"total_tokens": 25}
+                "usage": {"prompt_tokens": 15, "completion_tokens": 10, "total_tokens": 25}
             })))
             .mount(&mock_server)
             .await;
 
         // Create a real file for the agent to read
-        std::fs::write("/tmp/e2e_test_agent_os.txt", "hello from e2e test").unwrap();
+        std::fs::write(&test_path, "hello from e2e test").unwrap();
 
         // Set up kernel
         let kernel = AgentKernelImpl::new().unwrap();
@@ -109,12 +114,21 @@ mod tests {
             llm_provider: "azure-openai".into(),
             permission_profile: "full-access".into(), // skip permission checks for test
             priority: Priority::default(),
-            sandbox_config: None,
+            // This test intentionally exercises a host fixture provider. Real
+            // wire/package agents cannot select Trusted; they receive a managed
+            // per-agent workspace by default.
+            sandbox_config: Some(SandboxConfig {
+                workspace_dir: std::env::temp_dir(),
+                allowed_network_hosts: None,
+                max_disk_usage_bytes: None,
+                max_memory_bytes: None,
+                isolation_level: IsolationLevel::Trusted,
+            }),
         };
         let handle = kernel.create_agent_full(config).await.unwrap();
 
         // Send message — this triggers the full pipeline:
-        // user msg → LLM → tool_call(read_file) → actually reads /tmp/e2e_test_agent_os.txt → LLM → response
+        // user msg → LLM → tool_call(read_file) → reads the temp fixture → LLM → response
         let output = kernel
             .send_message(handle.id, "Read the test file")
             .await
@@ -124,9 +138,13 @@ mod tests {
         assert!(output.content.contains("hello from e2e test"));
         assert_eq!(output.tool_calls_made, 1);
         assert_eq!(output.tokens_used, 55); // 30 + 25
+        assert_eq!(output.usage.input_tokens, 35);
+        assert_eq!(output.usage.output_tokens, 20);
+        assert_eq!(output.usage.provider_reported_requests, 2);
+        assert_eq!(output.usage.estimated_requests, 0);
 
         // Cleanup
-        std::fs::remove_file("/tmp/e2e_test_agent_os.txt").ok();
+        std::fs::remove_file(&test_path).ok();
     }
 
     /// Test that agent handles LLM returning plain content (no tool calls).
@@ -141,7 +159,7 @@ mod tests {
                     "message": {"role": "assistant", "content": "Hello! I'm your AI assistant."},
                     "finish_reason": "stop"
                 }],
-                "usage": {"total_tokens": 15}
+                "usage": {"prompt_tokens": 8, "completion_tokens": 7, "total_tokens": 15}
             })))
             .mount(&mock_server)
             .await;

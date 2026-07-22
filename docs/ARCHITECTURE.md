@@ -16,7 +16,7 @@ AI Agent OS is a Rust workspace that runs AI agents the way Linux runs
 processes. A single orchestrator — `AgentKernelImpl` — owns every subsystem and
 wires them together. Agents are created, scheduled (CFS-style fair scheduling
 with priorities/nice), and given a token budget that behaves like virtual
-memory (paged, evicted, OOM-killed). Every tool an agent calls passes through
+context (bounded active prompts with durable spill/backpressure). Every tool an agent calls passes through
 one **syscall gate** that enforces namespace visibility, capabilities, MAC
 policy, and per-minute token quotas — first failure wins, before any real work
 happens. The kernel speaks a versioned JSON wire protocol over TCP / Unix
@@ -87,27 +87,35 @@ directly in an entry point** — wire through `AgentKernelImpl::with_context_man
 
 ---
 
-## 4. Linux → Agent OS subsystem map (current status)
+## 4. Linux → Agent OS subsystem map
 
-| Module(s) | Linux analogue | Status |
+The Linux analogy describes module boundaries, not implementation maturity.
+Maturity is authoritative only in [the capability registry](capabilities.toml),
+which CI verifies against every public kernel module.
+
+| Module(s) | Linux analogue | Registry capability |
 |---|---|---|
-| `agent_struct`, `agent`, `agent_syscalls` | `task_struct` + fork/exec/signals | Built |
-| `cfs`, `scheduler`, `llm_sched` | CFS fair scheduling, vruntime/nice, bounded run pool | Built |
-| `context`, `context_paging` | Virtual memory: token budgets, LRU eviction, OOM kill | Built |
-| `memory_manager` | Long-term memory: embeddings + vector ranking | Built (pluggable seam) |
-| `tools`, `tool_descriptors`, `mount_table`, `custom_tools`, `tool_registry_share` | VFS: tools are files, mounted at paths | Built |
-| `ipc` | Inter-agent messaging + delegation, broker-routed, directory discovery | Built |
-| `mac`, `permissions`, `namespaces`, `sandbox`, `docker_sandbox`, `cgroups`, `auth` | SELinux-style MAC, capabilities, isolation, tenancy | Built |
-| `syscall_gate` | The enforcement chokepoint (see §6) | Built + fuzz-proven |
-| `init_system`, `agentctl`, `agentps` | systemd-style service files + dependency ordering | Built |
-| `syscall_interface`, `syscall_server` | Numbered syscalls + JSON wire protocol over TCP/Unix/TLS | Built |
-| `procfs`, `observability`, `event_loop`, `sysctl` | `/proc` + audit logging + tunables | Built |
-| `agentpkg`, `package`, `agent_package`, `marketplace`, `agent_hub` | apt-like packages + versioned hub | Built |
-| `execution`, `planning`, `editing`, `delegation`, `function_calling` | think→act→observe loop + multi-agent delegation | Built |
-| `connector`, `mcp`, `mcp_server`, `github`, `database` | External-system integration + MCP (client & server) | Built |
-| `runtime`, `production`, `config`, `models`, `modules`, `linux_compat` | runtime tasks, prod hardening, config, model registry | Built |
-| `budget` | Cumulative USD spend ceiling on the LLM path | Built |
-| `indexer`, `learning`, `shell`, `vision`, `voice`, `prerequisites` | code index, feedback, shell, multimodal, dep checks | Built (varying depth) |
+| `agent_struct`, `agent`, `agent_syscalls` | `task_struct` + fork/exec/signals | `agent-lifecycle` |
+| `cfs`, `scheduler`, `llm_sched` | CFS-inspired cooperative turn admission (token vruntime/nice; not Linux EEVDF/CPU preemption) | `scheduling-admission` |
+| `context`, `context_paging` | Virtual memory: token budgets, paging, pressure handling | `context-pressure` |
+| `memory_manager` | Long-term memory: embeddings + vector ranking | `llm-memory-backends` |
+| `tools`; experimental `tool_descriptors`, `mount_table` | Governed named tools; VFS prototypes are outside v1 | `syscall-vfs` |
+| `ipc`, `delegation` | Inter-agent messaging + delegation | `agent-lifecycle` |
+| `mac`, `permissions`, `namespaces`, `auth`, `policy` | SELinux-style MAC, capabilities, isolation, tenancy | `tenant-authorization`, `tool-governance` |
+| `sandbox`, `docker_sandbox`, `resources` | Process/container/resource isolation | `sandbox-isolation` |
+| `cgroups`, `budget`, `rate_limit`, `metrics` | Resource control and accounting | `resource-accounting` |
+| `syscall_gate`, `custom_tools` | Tool enforcement chokepoint | `tool-governance` |
+| `init_system`, `runtime` | systemd-style service boot and supervision | `init-supervisor` |
+| `agentctl`, `agentps`, `procfs`, `observability`, `event_loop`, `sysctl` | `/proc`, control, audit, events, tunables | `operator-control` |
+| `syscall_server`, `mcp`, `mcp_server`; experimental `syscall_interface` | Versioned JSON/TLS ABI and MCP; numbered prototype outside v1 | `syscall-vfs`, `wire-protocol` |
+| `agentpkg`, `package`, `agent_package`, `marketplace`, `agent_hub`, `tool_registry_share` | apt-like packages and registry | `package-trust` |
+| `execution` | resumable think→act→observe loop | `turn-checkpoints` |
+| `connector`, `memory_manager`, `models` | LLM/model/retrieval backends | `llm-memory-backends` |
+| `database` | Durable external data access helper | `durable-state` |
+| `github`, `vision`, `voice` | External and multimodal providers | `resource-providers` |
+| `production` | Runtime hardening primitives | `production-operations` |
+| `editing`, `function_calling`, `indexer`, `learning`, `linux_compat`, `modules`, `planning`, `shell` | Supporting utilities with an explicit per-module v1 disposition | `secondary-modules` ([inventory](SECONDARY_CAPABILITIES.md)) |
+| `config`, `prerequisites` | Configuration and host checks | `quality-gates` |
 
 The mapping is not cosmetic: module boundaries, naming, and error semantics
 deliberately echo Linux. A feature with no Linux analogue is a signal to
@@ -129,13 +137,15 @@ reconsider where it belongs.
 **Mid-generation context switch.** A turn is resumable: `run_resumable`/`resume`
 with a `GenerationCheckpoint` let the scheduler pause a turn at a boundary and
 resume it later (`TurnResult::{Completed, Paused}`, `StreamEvent::Paused`). This
-is what makes CFS preemption meaningful for long generations.
+is cooperative checkpointing at safe boundaries, not CPU or arbitrary mid-token
+preemption.
 
 An agent is marked `Running` only for the duration of each turn (`set_running`/
 `set_queued`), so `running_agents` reflects real concurrency. Concurrent
 *execution* is bounded by the rate limiter (`max_concurrent`, default 3) and by
 `turn_admission`; the LLM-request step inside a turn is additionally bounded by
-`llm_scheduler` (a pool of "LLM cores", CFS-ordered under contention).
+`llm_scheduler` (a pool of "LLM cores", ordered by aged nice priority under
+contention and released between provider requests).
 
 ---
 
@@ -171,23 +181,27 @@ the gate from new code paths.
 
 ## 7. Scheduling
 
-- **CFS** (`cfs.rs`) — vruntime + nice, fair share, `pick_next` honors priority.
+- **CFS-inspired admission** (`cfs.rs`) — token vruntime + nice weights over
+  cooperative turn waiters; see [`SCHEDULER.md`](SCHEDULER.md) for EEVDF differences.
 - **PriorityScheduler** (`scheduler.rs`) — admission + run queue. Agent creation
   *admits* to the system (non-blocking) and enqueues into the CFS run queue;
   creation never blocks on the concurrency gate. `wait_for_turn` races a notify
   against a 5ms poll to avoid lost-wakeups.
 - **TurnAdmission** — bounds concurrent *turns* to `max_concurrent`; under
   contention grants the next slot to the CFS-preferred (lowest-vruntime) waiter.
-- **LlmScheduler** (`llm_sched.rs`) — a bounded pool of "LLM cores" gating the
-  LLM-request step inside a turn; freed cores go to the lowest-nice waiter.
+- **LlmScheduler** (`llm_sched.rs`) — a bounded pool of "LLM cores" gating one
+  provider request at a time; freed cores use aged nice priority.
 
 ---
 
 ## 8. Context & memory
 
-- **Context paging** (`context_paging.rs`) — token budget per agent = virtual
-  memory. Old context is summarized (page-out); over-budget triggers eviction;
-  OOM kills the lowest-priority agent. Driven by `max_context_tokens`.
+- **Context pressure** (`execution.rs`, with legacy paging primitives in
+  `context_paging.rs`) — `max_context_tokens` bounds the live provider prompt.
+  Old non-pinned messages are serialized to durable per-agent storage and
+  replaced by a verifiable reference; impossible pinned state fails closed.
+  There is no host-memory OOM-killer claim. See
+  [`CONTEXT_PRESSURE.md`](CONTEXT_PRESSURE.md).
 - **Long-term memory** (`memory_manager.rs`) — a pluggable embedding seam:
   - `Embedder` trait (object-safe, `Arc<dyn Embedder>`); default `BlendedEmbedder`
     (word unigrams + bigrams + char-trigrams in salted hash subspaces, sublinear
@@ -236,7 +250,8 @@ Centralized streaming in `streaming.rs`. The send path supports:
   RPM/TPM windows (closes the TOCTOU race) + a counting semaphore for concurrency
   (no lost wakeups). Streaming and non-streaming share semantics.
 
-Adapter tests use `wiremock` — tests never hit real APIs.
+Adapter tests use `wiremock` — tests never hit real APIs. Exact per-provider
+evidence and unsupported behavior are listed in [PROVIDERS.md](PROVIDERS.md).
 
 ---
 
@@ -278,14 +293,18 @@ for new entry points.*
 
 ---
 
-## 13. Tools/VFS, packages, hub, MCP
+## 13. Tools, packages, hub, MCP
 
-- **Tools as files** — `tools.rs` + `tool_descriptors.rs` mount tool providers at
-  paths (`mount_table.rs`); `custom_tools.rs` + `tool_registry_share.rs` add
-  user-defined and shareable tools.
-- **Packages** — `agent_package.rs` (TOML `AgentManifest`, `load_package`/
-  `run_package`), `agentpkg.rs`/`package.rs`/`marketplace.rs` (apt-like).
-- **Hub** — `agent_hub.rs` versioned publish/fetch.
+- **Governed tools** — `tools.rs` supplies validated security declarations and
+  `custom_tools.rs` + `tool_registry_share.rs` add user-defined/shareable tools.
+  `tool_descriptors.rs` and `mount_table.rs` are disconnected experimental
+  prototypes, not an alternate runtime. See
+  [`ADR-0001-PUBLIC-ABI.md`](ADR-0001-PUBLIC-ABI.md).
+- **Packages** — `agent_package.rs` provides the validated, bounded, unsigned
+  TOML `AgentManifest` public path (`load_package`/`run_package`) with
+  transactional creation rollback. `agentpkg.rs`/`package.rs`/`marketplace.rs`
+  are in-memory apt-like prototypes, not a production supply chain.
+- **Hub** — `agent_hub.rs` is a versioned in-memory publish/fetch prototype.
 - **MCP** — client (`mcp.rs`) and gate-enforced server (`mcp_server.rs`).
 
 ---

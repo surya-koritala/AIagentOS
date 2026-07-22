@@ -28,7 +28,12 @@ mod tests {
                 },
                 "finish_reason": "tool_calls"
             }],
-            "usage": {"total_tokens": 50}
+            "usage": {
+                "prompt_tokens": 30,
+                "completion_tokens": 20,
+                "total_tokens": 50,
+                "prompt_tokens_details": {"cached_tokens": 10}
+            }
         });
 
         Mock::given(method("POST"))
@@ -56,6 +61,7 @@ mod tests {
         assert_eq!(resp.tool_calls[0].name, "read_file");
         assert_eq!(resp.tool_calls[0].arguments["path"], "/tmp/test.txt");
         assert_eq!(resp.tokens_used, 50);
+        assert_eq!(resp.usage, LlmUsage::reported(30, 20, 10));
     }
 
     #[tokio::test]
@@ -67,7 +73,7 @@ mod tests {
                 "message": {"role": "assistant", "content": "Hello! How can I help?"},
                 "finish_reason": "stop"
             }],
-            "usage": {"total_tokens": 20}
+            "usage": {"prompt_tokens": 12, "completion_tokens": 8, "total_tokens": 20}
         });
 
         Mock::given(method("POST"))

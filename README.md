@@ -5,7 +5,14 @@
 
 **An OS kernel for AI agents.** Tool calls go through a real syscall gate — capability checks, MAC policy, and cgroup token quotas enforce on every call, not as scaffolding.
 
-> **Status:** **v0.3.0** — production-shell hardening on top of the v0.2.0 service: startup degrades gracefully instead of panicking, the wire protocol is explicitly versioned with a `Hello` negotiation handshake (toward a 1.0 stability promise), and long-term memory gains a pure-Rust approximate-nearest-neighbor index behind its existing seam — plus the v0.2.0 base (JSON syscall API over TCP/Unix/TLS, embeddable Rust SDK + clients, nine LLM providers, durable state, first-class tenancy, one-command container). The governance wedge is fuzz-proven un-bypassable and demonstrated end-to-end. See [CHANGELOG.md](CHANGELOG.md) for what shipped and [RELEASING.md](RELEASING.md) for how we tag releases.
+> **Status:** **v0.3.0 is the latest stable release.** The current tree contains
+> unreleased security, lifecycle, scheduling, checkpoint, operator, service,
+> package, protocol-v2, and release-pipeline hardening. Local regression evidence
+> is strong, but the changes are not a production-qualified release until the
+> remote review, cross-platform, tagged-release, live-provider, isolation,
+> recovery, and independent-security gates complete. See
+> [CHANGELOG.md](CHANGELOG.md) for the exact shipped/unreleased split and
+> [RELEASING.md](RELEASING.md) for the release process.
 
 ## What Is This?
 
@@ -24,7 +31,7 @@ AI Agent OS is not a chatbot. It's not a coding assistant. It's the **platform l
 │  AgentKernelImpl — the wired root orchestrator (boot → start_runtime)        │
 │                                                                              │
 │  PROCESS/EXEC         SCHEDULING            CONTEXT (virtual memory)          │
-│  agent_manager        cfs (vruntime/nice)   context_paging (summarize·OOM)    │
+│  agent_manager        CFS-inspired turns    durable spill · backpressure      │
 │  agent_struct (PID)   PriorityScheduler     memory_manager (Embedder+Index)   │
 │  execution loop       TurnAdmission                                           │
 │  think→act→observe    LlmScheduler                                            │
@@ -47,7 +54,7 @@ AI Agent OS is not a chatbot. It's not a coding assistant. It's the **platform l
 └───────────────────────────────────┬────────────────────────────────────────┘
 ┌───────────────────────────────────▼────────────────────────────────────────┐
 │  PERSISTENCE  single SqliteContextManager                                    │
-│   conversations · messages · facts(+embeddings) · agent_kv · snapshots       │
+│   conversations · facts(+embeddings) · agent_kv · snapshots · checkpoints    │
 └───────────────────────────────────┬────────────────────────────────────────┘
                   EXTERNAL  LLM APIs · Ollama/vLLM · filesystem · HTTP · GitHub
 ```
@@ -62,13 +69,24 @@ Running one AI agent is easy. Running **ten agents simultaneously** — with dif
 
 AI Agent OS provides:
 - **Process management** — create, clone, signal, kill agents (like fork/exec/kill)
-- **Fair scheduling** — CFS ensures every agent gets proportional resources
-- **Memory management** — context paging, token budgets, OOM killer
+- **Fair scheduling** — cooperative, CFS-inspired weighted turn admission
+- **Context management** — bounded active prompts, durable spill references, explicit backpressure
 - **Isolation** — namespaces, cgroups, sandboxes (agents can't see each other)
 - **Security** — MAC policies, capabilities, audit logging
 - **IPC** — inter-agent messaging, delegation, and discovery (broker-routed via `IpcManager`)
 - **Init system** — service files, dependency ordering, auto-restart
 - **Package manager** — install, version, and distribute agent packages
+
+Durable pause/resume semantics and their hosted-provider limitations are
+documented in [docs/CHECKPOINTS.md](docs/CHECKPOINTS.md).
+The scheduling states, fairness unit, queue bounds, and Linux EEVDF differences
+are documented in [docs/SCHEDULER.md](docs/SCHEDULER.md).
+The token estimate, pinned-state, durable spill, page-in, and backpressure
+contract is documented in [docs/CONTEXT_PRESSURE.md](docs/CONTEXT_PRESSURE.md).
+The tenant-safe live snapshot used by the SDK, `agentctl`, and TUI is documented
+in [docs/OPERATIONS_API.md](docs/OPERATIONS_API.md).
+Declarative service boot ordering and the current supervision boundary are in
+[docs/SERVICES.md](docs/SERVICES.md).
 
 ## Quick Start
 
@@ -124,13 +142,13 @@ cargo run --package agent-cli
 | **Process Mgmt** | `agent_struct`, `agent_syscalls`, `agent` |
 | **Scheduling** | `cfs`, `scheduler` |
 | **Memory** | `context`, `context_paging` |
-| **Tool System (VFS)** | `tools`, `tool_descriptors`, `mount_table`, `custom_tools` |
+| **Tool System** | `tools`, `custom_tools` (descriptor/mount prototypes are experimental) |
 | **Networking** | `ipc` |
 | **Security** | `mac`, `permissions`, `namespaces`, `sandbox` |
 | **Resource Control** | `cgroups`, `rate_limit`, `production` |
 | **Init & Services** | `init_system`, `agentctl`, `agentps` |
 | **Observability** | `observability`, `procfs`, `event_loop` |
-| **Syscall Layer** | `syscall_interface` |
+| **Syscall Layer** | `syscall_server` JSON ABI (`syscall_interface` is experimental) |
 | **Execution** | `execution`, `planning`, `editing`, `delegation` |
 | **Integrations** | `connector`, `mcp`, `github`, `database` |
 | **Platform** | `config`, `sysctl`, `package`, `marketplace`, `auth` |
@@ -139,25 +157,32 @@ cargo run --package agent-cli
 
 ## How It Maps to Linux
 
-We mark each subsystem honestly: **Live** = enforced on the runtime path, **Defined** = exists with logic + tests but not yet on the live path, **Planned** = scheduled in [ROADMAP.md](ROADMAP.md).
+Capability maturity is controlled by the machine-readable
+[capability registry](docs/capabilities.toml), using the five levels Scaffolded,
+Unit-tested, Integrated, Public-API E2E, and Production-qualified. CI verifies
+that every public kernel module is classified and rejects unsupported maturity
+promotions. The table below is a concise registry view, not a separate status
+source. Standalone supporting modules are classified individually in the
+[secondary-capability disposition](docs/SECONDARY_CAPABILITIES.md); their mere
+presence in the Rust crate is not a v1 support claim.
 
 | Linux | AI Agent OS | Status |
 |-------|-------------|--------|
-| Capabilities | 9 capability types — checked on every tool call via `SyscallGate` | **Live** |
-| SELinux / AppArmor | `MacEngine` policy — checked on every tool call | **Live** |
-| cgroups | Token / agent-count quotas — `EAGAIN` returned over-budget | **Live** |
-| `task_struct` | `AgentStruct` (Uuid + u64 PID via gate translation) | **Live** |
-| Signals (SIGKILL, SIGSTOP) | Agent signals stored in agent struct | **Live** |
-| Unix sockets / IPC | Inter-agent messaging + delegation + discovery via `IpcManager` (broker-routed tools) | **Live** |
-| systemd | Init system (service files, deps, supervisor restart) | **Live** |
-| syscall interface | 25 numbered syscalls + `SecureSyscallDispatch` | Defined — gate covers tool-call path |
-| `fork()/clone()` | `agent_clone(flags)` | Defined |
-| CFS scheduler | Each turn's tokens accounted to vruntime; `set_nice` / `next_runnable_agent` make fairness queryable | **Live (observability)** |
-| Virtual memory + paging | `ContextPager` LRU eviction — auto-summarization covers the live path | Defined |
-| Namespaces | Tool-namespace isolation: cross-namespace calls return `NotInNamespace` (≈ ENOENT) | **Live** |
-| VFS + mount | Tool descriptors + mount table | Planned (Phase 3) |
-| /proc filesystem | `ProcFs` snapshot reads (no live agent queries) | Planned (Phase 4) |
-| apt/rpm | `agentpkg` (in-memory mock, no remote registry) | Planned (Phase 4) |
+| Capabilities | Gate checks plus custom-tool declarations | Integrated — [#108](https://github.com/surya-koritala/AIagentOS/issues/108) |
+| SELinux / AppArmor | `MacEngine` and declarative policy | Integrated — [#108](https://github.com/surya-koritala/AIagentOS/issues/108) |
+| cgroups | Token and agent-count accounting/limits | Integrated — [#109](https://github.com/surya-koritala/AIagentOS/issues/109) |
+| `task_struct` | `AgentStruct` (Uuid + u64 PID translation) | Unit-tested — [#112](https://github.com/surya-koritala/AIagentOS/issues/112) |
+| Signals (SIGKILL, SIGSTOP) | Agent signal/state primitives | Unit-tested — [#112](https://github.com/surya-koritala/AIagentOS/issues/112) |
+| Unix sockets / IPC | Messaging, delegation, and discovery | Unit-tested — [#112](https://github.com/surya-koritala/AIagentOS/issues/112) |
+| systemd | Service files, dependency ordering, restart policy | Unit-tested — [#118](https://github.com/surya-koritala/AIagentOS/issues/118) |
+| syscall interface | Versioned JSON wire protocol; numbered table explicitly experimental | Public-API E2E — [#116](https://github.com/surya-koritala/AIagentOS/issues/116) |
+| `fork()/clone()` | `agent_clone(flags)` primitive | Unit-tested — [#112](https://github.com/surya-koritala/AIagentOS/issues/112) |
+| CFS scheduler | Vruntime/nice accounting and admission primitives | Integrated — [#114](https://github.com/surya-koritala/AIagentOS/issues/114) |
+| Virtual memory analogy | Active prompt bound, durable spill, explicit backpressure | Integrated — [#115](https://github.com/surya-koritala/AIagentOS/issues/115) |
+| Namespaces | Tool and IPC visibility primitives | Unit-tested — [#107](https://github.com/surya-koritala/AIagentOS/issues/107) |
+| VFS + mount | Experimental descriptor/mount prototypes, excluded from v1 | Scaffolded — [ADR 0001](docs/ADR-0001-PUBLIC-ABI.md) |
+| /proc filesystem | Snapshot-oriented `ProcFs` helpers | Unit-tested — [#117](https://github.com/surya-koritala/AIagentOS/issues/117) |
+| apt/rpm | Validated unsigned manifest loading; registry/signing remain prototypes | Public-API E2E (not supply-chain qualified) — [#119](https://github.com/surya-koritala/AIagentOS/issues/119) |
 
 ## How enforcement works in practice
 
@@ -171,7 +196,7 @@ agent → AgentExecutor::execute_tool
           2. MAC policy check     (subject/action/object rule match)
           3. cgroup quota check   (token budget per minute)
       → ResourceBroker (only if all four pass)
-      → record_tool_usage  (propagates up cgroup hierarchy)
+      → provider execution (quota was atomically reserved at admission)
 ```
 
 A denial returns a structured error message back to the LLM as a tool failure, so the model can recover gracefully without the kernel trusting it to obey policy. The contract is proven by `tests/src/os_enforcement.rs` — four end-to-end tests that fail loudly if any layer stops enforcing.
@@ -188,7 +213,7 @@ The MAC policy at step 2 is **authorable as a declarative document** — operato
 - Graceful shutdown: all agents stopped, observability + gate state purged
 
 ### Real-World Agent Benchmarks
-Tool-using benchmarks (file ops, git, HTTP, multi-step plans) live in `benchmarks/`. Run `cargo run --package benchmarks --bin os_benchmark` to reproduce.
+Tool-using benchmarks (file ops, git, HTTP, multi-step plans) live in `benchmarks/`. Run `cargo run --package os-benchmark --bin os-benchmark` to reproduce. This command is verified against the canonical capability registry in CI.
 
 ## Architecture Docs
 
@@ -196,24 +221,29 @@ Tool-using benchmarks (file ops, git, HTTP, multi-step plans) live in `benchmark
 - [`CLAUDE.md`](CLAUDE.md) — orientation for AI assistants working in the repo
 - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — Linux kernel → AI Agent OS mapping
 - [`docs/POLICY.md`](docs/POLICY.md) — authoring, validating, and explaining MAC policy
+- [`docs/ACCOUNTING.md`](docs/ACCOUNTING.md) — usage, pricing, quotas, and metrics contract
 - [`docs/COMPLETE_SPEC.md`](docs/COMPLETE_SPEC.md) — long-form implementation spec
 - [`docs/FULL_ROADMAP.md`](docs/FULL_ROADMAP.md) — long-form vision roadmap
 
 ## LLM Providers
 
-All adapters share centralized streaming and run behind a connector with failover, retry/backoff, and rate-limiting under load. Tests use `wiremock` — never real APIs.
+Adapters run behind a connector with failover, retry/backoff, and rate-limiting
+under load. Tests use `wiremock` rather than live vendor APIs, so these statuses
+describe current fixture evidence—not production support. See the complete
+[provider contract matrix](docs/PROVIDERS.md).
 
 | Provider | Status |
 |----------|--------|
-| Azure OpenAI | ✅ Full support (streaming, tool calling) — default |
-| OpenAI | ✅ Full support |
-| Anthropic (Claude) | ✅ Full support |
-| Gemini | ✅ Full support |
-| Groq | ✅ Full support |
-| DeepSeek | ✅ Full support |
-| Hugging Face | ✅ Full support |
-| vLLM | ✅ Full support |
-| Local (Ollama) | ✅ Full support |
+| Azure OpenAI | Public-path E2E with native SSE/tools; live qualification pending — default |
+| OpenAI | Fixture-verified text/tools; live qualification pending |
+| Anthropic (Claude) | Fixture-verified text/tools; live qualification pending |
+| Gemini | Fixture-verified text only; tools not implemented |
+| Groq | Fixture-verified text/tools; live qualification pending |
+| DeepSeek | Fixture-verified text/tools; live qualification pending |
+| Hugging Face | Fixture-verified text only; tools/usage unavailable |
+| vLLM | Fixture-verified OpenAI-compatible text/tools; live qualification pending |
+| Local (Ollama) | Experimental configured local endpoint; no live nightly contract |
+| On-device Candle/GGUF | Feature-gated spike; not production-supported |
 
 ## Contributing
 

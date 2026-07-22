@@ -1,6 +1,9 @@
-//! WASM Module System — manages runtime loading/unloading of WASM extensions.
+//! Experimental WASM module prototype, explicitly deferred from the v1 runtime.
 //!
-//! Uses Wasmtime for sandboxed execution with resource limits and crash isolation.
+//! Fuel-based execution and crash isolation exist, but module inputs are not
+//! signed and host imports are not mediated by the kernel capability/sandbox
+//! pipeline. It is not registered by [`crate::AgentKernelImpl`] and must not be
+//! used for untrusted modules. See `docs/SECONDARY_CAPABILITIES.md`.
 
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;

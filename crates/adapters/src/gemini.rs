@@ -113,6 +113,17 @@ impl LlmSession for GeminiSession {
                         content,
                         finish_reason,
                         tokens_used: tokens,
+                        usage: kernel::connector::LlmUsage::reported(
+                            json["usageMetadata"]["promptTokenCount"]
+                                .as_u64()
+                                .unwrap_or(0) as u32,
+                            json["usageMetadata"]["candidatesTokenCount"]
+                                .as_u64()
+                                .unwrap_or(0) as u32,
+                            json["usageMetadata"]["cachedContentTokenCount"]
+                                .as_u64()
+                                .unwrap_or(0) as u32,
+                        ),
                         tool_calls: vec![],
                     });
                 }
@@ -132,6 +143,10 @@ impl LlmSession for GeminiSession {
 
     fn provider_id(&self) -> &ProviderId {
         &self.provider_id
+    }
+
+    fn model_id(&self) -> &str {
+        &self.model
     }
 }
 

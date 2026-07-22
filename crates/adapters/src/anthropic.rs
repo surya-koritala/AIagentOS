@@ -111,6 +111,13 @@ impl LlmSession for AnthropicSession {
                         content,
                         finish_reason: json["stop_reason"].as_str().map(|s| s.to_string()),
                         tokens_used: (input_tokens + output_tokens) as u32,
+                        usage: kernel::connector::LlmUsage::reported(
+                            input_tokens as u32,
+                            output_tokens as u32,
+                            json["usage"]["cache_read_input_tokens"]
+                                .as_u64()
+                                .unwrap_or(0) as u32,
+                        ),
                         tool_calls,
                     });
                 }
@@ -130,6 +137,10 @@ impl LlmSession for AnthropicSession {
 
     fn provider_id(&self) -> &ProviderId {
         &self.provider_id
+    }
+
+    fn model_id(&self) -> &str {
+        "claude-3-5-sonnet-20241022"
     }
 }
 

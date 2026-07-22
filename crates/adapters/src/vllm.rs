@@ -139,6 +139,13 @@ impl LlmSession for VllmSession {
                             .as_str()
                             .map(|s| s.to_string()),
                         tokens_used: tokens,
+                        usage: kernel::connector::LlmUsage::reported(
+                            json["usage"]["prompt_tokens"].as_u64().unwrap_or(0) as u32,
+                            json["usage"]["completion_tokens"].as_u64().unwrap_or(0) as u32,
+                            json["usage"]["prompt_tokens_details"]["cached_tokens"]
+                                .as_u64()
+                                .unwrap_or(0) as u32,
+                        ),
                         tool_calls,
                     });
                 }
@@ -158,6 +165,10 @@ impl LlmSession for VllmSession {
 
     fn provider_id(&self) -> &ProviderId {
         &self.provider_id
+    }
+
+    fn model_id(&self) -> &str {
+        &self.model
     }
 }
 

@@ -14,7 +14,6 @@ mod tests {
 
     use adapters::azure_openai::AzureOpenAiAdapter;
     use kernel::agent_package::{run_package, AgentManifest};
-    use kernel::connector::LlmProviderAdapter;
     use kernel::context::ContextManager;
     use kernel::AgentKernelImpl;
 

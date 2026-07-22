@@ -133,8 +133,10 @@ mod tests {
 
     #[test]
     fn query_sqlite_select() {
-        let path = "/tmp/test_db_agent_os.db";
-        let conn = rusqlite::Connection::open(path).unwrap();
+        let path =
+            std::env::temp_dir().join(format!("test_db_agent_os_{}.db", uuid::Uuid::new_v4()));
+        let path_text = path.to_string_lossy().into_owned();
+        let conn = rusqlite::Connection::open(&path).unwrap();
         conn.execute(
             "CREATE TABLE IF NOT EXISTS test (id INTEGER, name TEXT)",
             [],
@@ -146,25 +148,26 @@ mod tests {
             .unwrap();
         drop(conn);
 
-        let result = query_sqlite(path, "SELECT * FROM test", true).unwrap();
+        let result = query_sqlite(&path_text, "SELECT * FROM test", true).unwrap();
         assert_eq!(result.columns, vec!["id", "name"]);
         assert_eq!(result.rows.len(), 2);
 
-        std::fs::remove_file(path).ok();
+        std::fs::remove_file(&path).ok();
     }
 
     #[test]
     fn read_only_blocks_writes() {
-        let path = "/tmp/test_db_ro.db";
-        let conn = rusqlite::Connection::open(path).unwrap();
+        let path = std::env::temp_dir().join(format!("test_db_ro_{}.db", uuid::Uuid::new_v4()));
+        let path_text = path.to_string_lossy().into_owned();
+        let conn = rusqlite::Connection::open(&path).unwrap();
         conn.execute("CREATE TABLE IF NOT EXISTS t (x INTEGER)", [])
             .unwrap();
         drop(conn);
 
-        let result = query_sqlite(path, "INSERT INTO t VALUES (1)", true);
+        let result = query_sqlite(&path_text, "INSERT INTO t VALUES (1)", true);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("read-only"));
 
-        std::fs::remove_file(path).ok();
+        std::fs::remove_file(&path).ok();
     }
 }

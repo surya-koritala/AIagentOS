@@ -599,10 +599,17 @@ async fn live_path_extended_tools_edit_and_delete_capability() {
         matches!(denied, Err(GateDenial::MissingCapability(_))),
         "standard agent delete_file should be denied (no CAP_FILE_DELETE), got {denied:?}"
     );
-    let fa = kernel
-        .create_agent_full(cfg("fa", "full-access"))
-        .await
-        .unwrap();
+    let dir = std::env::temp_dir().join(format!("edit_it_{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut fa_config = cfg("fa", "full-access");
+    fa_config.sandbox_config = Some(kernel::SandboxConfig {
+        workspace_dir: dir.clone(),
+        allowed_network_hosts: Some(Vec::new()),
+        max_disk_usage_bytes: Some(1024 * 1024),
+        max_memory_bytes: None,
+        isolation_level: kernel::IsolationLevel::Filesystem,
+    });
+    let fa = kernel.create_agent_full(fa_config).await.unwrap();
     assert!(kernel
         .syscall_gate
         .check_tool_call(fa.id, "delete_file", "/x", 10)
@@ -611,8 +618,6 @@ async fn live_path_extended_tools_edit_and_delete_capability() {
 
     // #15: the edit op rewrites a real file via the transactional EditTransaction
     // engine, through the resource broker (full-access bypasses MAC approval).
-    let dir = std::env::temp_dir().join(format!("edit_it_{}", uuid::Uuid::new_v4()));
-    std::fs::create_dir_all(&dir).unwrap();
     let file = dir.join("f.txt");
     std::fs::write(&file, "hello world").unwrap();
     let resp = kernel
@@ -863,23 +868,25 @@ async fn from_config_enables_mac_enforcement() {
     use kernel::AgentKernelImpl;
 
     let dir = std::env::temp_dir().join(format!("mac_cfg_{}", uuid::Uuid::new_v4()));
-    let mut config = Config::default();
-    config.data_dir = dir.clone();
-    config.mac_enforcing = true;
-    config.mac_rules = vec![
-        PolicyRule {
-            subject: "profile:standard".into(),
-            action: "write".into(),
-            object: "*".into(),
-            decision: "deny".into(),
-        },
-        PolicyRule {
-            subject: "*".into(),
-            action: "*".into(),
-            object: "*".into(),
-            decision: "allow".into(),
-        },
-    ];
+    let config = Config {
+        data_dir: dir.clone(),
+        mac_enforcing: true,
+        mac_rules: vec![
+            PolicyRule {
+                subject: "profile:standard".into(),
+                action: "write".into(),
+                object: "*".into(),
+                decision: "deny".into(),
+            },
+            PolicyRule {
+                subject: "*".into(),
+                action: "*".into(),
+                object: "*".into(),
+                decision: "allow".into(),
+            },
+        ],
+        ..Config::default()
+    };
 
     let kernel = AgentKernelImpl::from_config(&config).expect("from_config");
     let agent = kernel
@@ -1352,22 +1359,25 @@ async fn live_path_namespace_isolation_between_groups() {
 #[tokio::test]
 async fn live_path_group_scoped_tool_isolation() {
     use kernel::resources::ResourceType;
-    use kernel::tools::ToolBinding;
+    use kernel::tools::{SecurityAction, ToolBinding, ToolSecurity};
     use kernel::AgentKernelImpl;
 
     let kernel = AgentKernelImpl::new().expect("kernel new");
 
     // A tool private to team-a.
-    kernel.register_group_tool(
-        "team-a",
-        ToolBinding {
-            name: "team_a_secret".into(),
-            description: "team-a only".into(),
-            parameters_schema: serde_json::json!({"type": "object", "properties": {}}),
-            resource_type: ResourceType::Application,
-            operation: "noop".into(),
-        },
-    );
+    kernel
+        .register_group_tool(
+            "team-a",
+            ToolBinding {
+                name: "team_a_secret".into(),
+                description: "team-a only".into(),
+                parameters_schema: serde_json::json!({"type": "object", "properties": {}}),
+                resource_type: ResourceType::Application,
+                operation: "noop".into(),
+                security: ToolSecurity::constant(SecurityAction::Read, "team-a:secret"),
+            },
+        )
+        .unwrap();
 
     let alice = kernel
         .create_agent_in_namespace(agent_cfg("alice", "standard"), "team-a")

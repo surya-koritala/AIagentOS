@@ -90,6 +90,9 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
   cleanup, checkpoints, scheduling, context pressure, accounting, persistence,
   services, packages, providers, wire compatibility, CLI/TUI state, and claim
   integrity. Local line coverage is 77.45% with a 60% CI floor.
+- Filesystem, SQLite, and vision fixtures now use unique platform-native
+  temporary paths, so the same regression suite runs on Windows as well as
+  Linux and macOS. (#110)
 
 ## [0.3.0] - 2026-06-04
 

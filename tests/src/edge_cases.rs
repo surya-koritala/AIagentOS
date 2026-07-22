@@ -328,8 +328,9 @@ fn indexer_deeply_nested() {
 
 #[test]
 fn database_sql_injection_attempt() {
-    let path = "/tmp/edge_db_inject.db";
-    let conn = rusqlite::Connection::open(path).unwrap();
+    let path = std::env::temp_dir().join(format!("edge_db_inject_{}.db", uuid::Uuid::new_v4()));
+    let path_text = path.to_string_lossy().into_owned();
+    let conn = rusqlite::Connection::open(&path).unwrap();
     conn.execute("CREATE TABLE IF NOT EXISTS t (x TEXT)", [])
         .unwrap();
     conn.execute("INSERT INTO t VALUES ('safe')", []).unwrap();
@@ -337,23 +338,26 @@ fn database_sql_injection_attempt() {
 
     // This should not execute the DROP TABLE
     let _result = query_sqlite(
-        path,
+        &path_text,
         "SELECT * FROM t WHERE x = 'a'; DROP TABLE t; --'",
         true,
     );
     // SQLite doesn't execute multiple statements in one query_row, so this is safe
     // But it might error — either way, table should still exist
-    let check = query_sqlite(path, "SELECT COUNT(*) FROM t", true);
+    let check = query_sqlite(&path_text, "SELECT COUNT(*) FROM t", true);
     assert!(check.is_ok());
-    std::fs::remove_file(path).ok();
+    std::fs::remove_file(&path).ok();
 }
 
 #[test]
 fn database_nonexistent_file() {
-    let result = query_sqlite("/tmp/nonexistent_db_edge.db", "SELECT 1", true);
+    let path =
+        std::env::temp_dir().join(format!("nonexistent_db_edge_{}.db", uuid::Uuid::new_v4()));
+    let path_text = path.to_string_lossy().into_owned();
+    let result = query_sqlite(&path_text, "SELECT 1", true);
     // Should either create the file or error gracefully
     assert!(result.is_ok() || result.is_err());
-    std::fs::remove_file("/tmp/nonexistent_db_edge.db").ok();
+    std::fs::remove_file(&path).ok();
 }
 
 // ─── Learning Edge Cases ─────────────────────────────────────────────────────
@@ -379,15 +383,19 @@ fn learning_case_insensitive_matching() {
 
 #[test]
 fn vision_nonexistent_file() {
-    let result = kernel::vision::image_to_data_url("/tmp/nonexistent_image.png");
+    let path = std::env::temp_dir().join(format!("nonexistent_image_{}.png", uuid::Uuid::new_v4()));
+    let path_text = path.to_string_lossy().into_owned();
+    let result = kernel::vision::image_to_data_url(&path_text);
     assert!(result.is_err());
 }
 
 #[test]
 fn vision_empty_file() {
-    std::fs::write("/tmp/empty_image.png", []).unwrap();
-    let result = kernel::vision::image_to_data_url("/tmp/empty_image.png");
+    let path = std::env::temp_dir().join(format!("empty_image_{}.png", uuid::Uuid::new_v4()));
+    let path_text = path.to_string_lossy().into_owned();
+    std::fs::write(&path, []).unwrap();
+    let result = kernel::vision::image_to_data_url(&path_text);
     assert!(result.is_ok()); // Empty but valid
     assert!(result.unwrap().contains("base64,"));
-    std::fs::remove_file("/tmp/empty_image.png").ok();
+    std::fs::remove_file(&path).ok();
 }

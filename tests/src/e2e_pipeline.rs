@@ -14,6 +14,12 @@ mod tests {
     #[tokio::test]
     async fn e2e_azure_openai_agent_with_tool_call() {
         let mock_server = MockServer::start().await;
+        let test_path =
+            std::env::temp_dir().join(format!("e2e_test_agent_os_{}.txt", uuid::Uuid::new_v4()));
+        let tool_arguments = serde_json::json!({
+            "path": test_path.to_string_lossy()
+        })
+        .to_string();
 
         // First LLM call: returns a tool call (read_file)
         Mock::given(method("POST"))
@@ -28,7 +34,7 @@ mod tests {
                             "type": "function",
                             "function": {
                                 "name": "read_file",
-                                "arguments": "{\"path\":\"/tmp/e2e_test_agent_os.txt\"}"
+                                "arguments": tool_arguments
                             }
                         }]
                     },
@@ -57,7 +63,7 @@ mod tests {
             .await;
 
         // Create a real file for the agent to read
-        std::fs::write("/tmp/e2e_test_agent_os.txt", "hello from e2e test").unwrap();
+        std::fs::write(&test_path, "hello from e2e test").unwrap();
 
         // Set up kernel
         let kernel = AgentKernelImpl::new().unwrap();
@@ -112,7 +118,7 @@ mod tests {
             // wire/package agents cannot select Trusted; they receive a managed
             // per-agent workspace by default.
             sandbox_config: Some(SandboxConfig {
-                workspace_dir: "/".into(),
+                workspace_dir: std::env::temp_dir(),
                 allowed_network_hosts: None,
                 max_disk_usage_bytes: None,
                 max_memory_bytes: None,
@@ -122,7 +128,7 @@ mod tests {
         let handle = kernel.create_agent_full(config).await.unwrap();
 
         // Send message — this triggers the full pipeline:
-        // user msg → LLM → tool_call(read_file) → actually reads /tmp/e2e_test_agent_os.txt → LLM → response
+        // user msg → LLM → tool_call(read_file) → reads the temp fixture → LLM → response
         let output = kernel
             .send_message(handle.id, "Read the test file")
             .await
@@ -138,7 +144,7 @@ mod tests {
         assert_eq!(output.usage.estimated_requests, 0);
 
         // Cleanup
-        std::fs::remove_file("/tmp/e2e_test_agent_os.txt").ok();
+        std::fs::remove_file(&test_path).ok();
     }
 
     /// Test that agent handles LLM returning plain content (no tool calls).

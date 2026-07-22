@@ -332,7 +332,9 @@ mod tests {
 
     fn test_config() -> SandboxConfig {
         SandboxConfig {
-            workspace_dir: PathBuf::from("/tmp/sandbox/agent1"),
+            workspace_dir: std::env::temp_dir()
+                .join("aiagentos-sandbox-tests")
+                .join(uuid::Uuid::new_v4().to_string()),
             allowed_network_hosts: Some(vec!["api.openai.com".to_string()]),
             max_disk_usage_bytes: None,
             max_memory_bytes: None,
@@ -354,10 +356,11 @@ mod tests {
     fn file_access_within_boundary_allowed() {
         let mgr = SandboxManagerImpl::new();
         let agent_id = uuid::Uuid::new_v4();
-        let sid = mgr.create_sandbox(agent_id, &test_config()).unwrap();
+        let config = test_config();
+        let sid = mgr.create_sandbox(agent_id, &config).unwrap();
         let result = mgr.intercept_action(
             sid,
-            &SandboxAction::FileAccess(PathBuf::from("/tmp/sandbox/agent1/file.txt")),
+            &SandboxAction::FileAccess(config.workspace_dir.join("file.txt")),
         );
         assert!(result.is_ok());
     }
@@ -385,11 +388,10 @@ mod tests {
     fn file_access_outside_boundary_blocked() {
         let mgr = SandboxManagerImpl::new();
         let agent_id = uuid::Uuid::new_v4();
-        let sid = mgr.create_sandbox(agent_id, &test_config()).unwrap();
-        let result = mgr.intercept_action(
-            sid,
-            &SandboxAction::FileAccess(PathBuf::from("/etc/passwd")),
-        );
+        let config = test_config();
+        let outside = config.workspace_dir.parent().unwrap().join("outside.txt");
+        let sid = mgr.create_sandbox(agent_id, &config).unwrap();
+        let result = mgr.intercept_action(sid, &SandboxAction::FileAccess(outside));
         assert!(result.is_err());
     }
 
@@ -397,11 +399,10 @@ mod tests {
     fn path_traversal_blocked() {
         let mgr = SandboxManagerImpl::new();
         let agent_id = uuid::Uuid::new_v4();
-        let sid = mgr.create_sandbox(agent_id, &test_config()).unwrap();
-        let result = mgr.intercept_action(
-            sid,
-            &SandboxAction::FileAccess(PathBuf::from("/tmp/sandbox/agent1/../../etc/passwd")),
-        );
+        let config = test_config();
+        let traversal = config.workspace_dir.join("../../outside.txt");
+        let sid = mgr.create_sandbox(agent_id, &config).unwrap();
+        let result = mgr.intercept_action(sid, &SandboxAction::FileAccess(traversal));
         assert!(result.is_err());
     }
 

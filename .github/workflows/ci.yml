@@ -89,7 +89,8 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
-          command: check advisories licenses sources
+          command: check
+          command-arguments: advisories licenses sources
 
   coverage:
     name: Coverage floor

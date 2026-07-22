@@ -25,9 +25,9 @@
 ############################
 # Stage 1 — builder
 ############################
-# rust:1.92 matches the project's local toolchain and is well above the
-# declared MSRV 1.75. bookworm => OpenSSL 3, matching the runtime image.
-FROM rust:1.92-slim-bookworm AS builder
+# rust:1.97 matches the stable toolchain used by CI and satisfies Wasmtime
+# 47's Rust 1.94 MSRV. bookworm => OpenSSL 3, matching the runtime image.
+FROM rust:1.97-slim-bookworm AS builder
 
 # Build-time system deps:
 #   build-essential -> C toolchain (cc) for openssl-sys / wasmtime / ring etc.

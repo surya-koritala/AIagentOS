@@ -30,6 +30,8 @@ struct Capability {
     maturity: String,
     release: String,
     tracking_issue: u64,
+    qualification_issue: Option<u64>,
+    v1_disposition: Option<String>,
     kernel_modules: Vec<String>,
     source_paths: Vec<String>,
     public_entry_points: Vec<String>,
@@ -81,6 +83,24 @@ fn validate_capability(capability: &Capability, root: &Path) -> Vec<String> {
     }
     if capability.tracking_issue < 105 {
         errors.push("pending capabilities must link to the evidence-gated roadmap".to_string());
+    }
+    if capability
+        .qualification_issue
+        .is_some_and(|issue| issue < 105)
+    {
+        errors.push("qualification issues must link to the evidence-gated roadmap".to_string());
+    }
+    let disposition = capability.v1_disposition.as_deref().unwrap_or("retained");
+    if !matches!(disposition, "retained" | "excluded-from-v1") {
+        errors.push(format!("unknown v1 disposition {disposition:?}"));
+    }
+    if disposition == "excluded-from-v1"
+        && !capability
+            .limitations
+            .iter()
+            .any(|item| item.to_ascii_lowercase().contains("excluded from v1"))
+    {
+        errors.push("v1 exclusions must be explained in limitations".to_string());
     }
     if capability.source_paths.is_empty() {
         errors.push("at least one source path is required".to_string());
@@ -239,6 +259,8 @@ fn false_production_claim_is_rejected() {
         maturity: "production-qualified".into(),
         release: "v1.0".into(),
         tracking_issue: 999,
+        qualification_issue: None,
+        v1_disposition: None,
         kernel_modules: Vec::new(),
         source_paths: vec!["README.md".into()],
         public_entry_points: Vec::new(),

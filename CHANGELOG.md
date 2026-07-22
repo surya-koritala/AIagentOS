@@ -59,6 +59,9 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
 - **Secondary capability disposition** — disconnected and experimental modules
   are individually retained, deferred, or excluded from the v1 public runtime
   instead of being advertised as complete. (#128)
+- **Issue-state governance** — completed milestone issues remain attached to
+  their capability evidence while retained below-production work points to an
+  open qualification issue; deliberate v1 exclusions are recorded explicitly.
 - **Declarative policy authoring** — typed TOML policy documents, validation,
   linting, explain/dry-run, and explicit startup loading remain the supported MAC
   authoring path. (#102)

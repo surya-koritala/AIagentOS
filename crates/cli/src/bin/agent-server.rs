@@ -12,6 +12,7 @@
 //!   AGENT_SERVER_TOKEN=secret agent-server      # require auth before any syscall
 //!   AGENT_SERVER_TLS_CERT=cert.pem AGENT_SERVER_TLS_KEY=key.pem agent-server
 //!                                       # terminate TLS (rustls) on the TCP bind
+//!   AGENT_SERVER_ALLOW_INSECURE_REMOTE=1 # explicit development-only override
 
 #[path = "../logging.rs"]
 mod logging;
@@ -38,7 +39,8 @@ async fn main() {
     let token = std::env::var("AGENT_SERVER_TOKEN")
         .ok()
         .filter(|t| !t.is_empty());
-    // TLS is enabled only when both cert and key paths are provided.
+    // TLS is enabled only when both cert and key paths are provided. A partial
+    // configuration is an error; silently falling back to plaintext is unsafe.
     let tls = match (
         std::env::var("AGENT_SERVER_TLS_CERT")
             .ok()
@@ -48,8 +50,25 @@ async fn main() {
             .filter(|s| !s.is_empty()),
     ) {
         (Some(cert), Some(key)) => Some((cert, key)),
-        _ => None,
+        (None, None) => None,
+        _ => {
+            eprintln!(
+                "agent-server: AGENT_SERVER_TLS_CERT and AGENT_SERVER_TLS_KEY must be set together"
+            );
+            std::process::exit(1);
+        }
     };
+    let allow_insecure_remote = std::env::var("AGENT_SERVER_ALLOW_INSECURE_REMOTE")
+        .ok()
+        .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "yes"));
+    if unix_path.is_none() {
+        if let Err(error) =
+            validate_tcp_security(&addr, token.is_some(), tls.is_some(), allow_insecure_remote)
+        {
+            eprintln!("agent-server: {error}");
+            std::process::exit(1);
+        }
+    }
 
     let config = Config::load();
     // Kernel init can fail on a non-writable/locked data dir or a corrupt DB.
@@ -86,6 +105,13 @@ async fn main() {
         .ok()
         .filter(|s| !s.is_empty())
     {
+        if !is_loopback_bind(&metrics_addr) && !allow_insecure_remote {
+            eprintln!(
+                "agent-server: refusing non-loopback metrics bind {metrics_addr}; set \
+                 AGENT_SERVER_ALLOW_INSECURE_REMOTE=1 only behind a trusted network boundary"
+            );
+            std::process::exit(1);
+        }
         match TcpListener::bind(&metrics_addr).await {
             Ok(listener) => {
                 let bound = listener
@@ -179,6 +205,36 @@ async fn main() {
     }
 }
 
+fn is_loopback_bind(addr: &str) -> bool {
+    if let Ok(socket) = addr.parse::<std::net::SocketAddr>() {
+        return socket.ip().is_loopback();
+    }
+    addr.rsplit_once(':')
+        .is_some_and(|(host, _)| host.eq_ignore_ascii_case("localhost"))
+}
+
+fn validate_tcp_security(
+    addr: &str,
+    has_token: bool,
+    has_tls: bool,
+    allow_insecure_remote: bool,
+) -> Result<(), String> {
+    if is_loopback_bind(addr) || allow_insecure_remote {
+        return Ok(());
+    }
+    if !has_token {
+        return Err(format!(
+            "refusing unauthenticated non-loopback bind {addr}; configure AGENT_SERVER_TOKEN and TLS"
+        ));
+    }
+    if !has_tls {
+        return Err(format!(
+            "refusing plaintext non-loopback bind {addr}; configure AGENT_SERVER_TLS_CERT and AGENT_SERVER_TLS_KEY"
+        ));
+    }
+    Ok(())
+}
+
 /// A tiny, dependency-free HTTP `/metrics` endpoint for Prometheus scraping.
 ///
 /// Deliberately minimal: it accepts a connection, reads the request line,
@@ -254,6 +310,20 @@ async fn handle_metrics_conn(
 mod tests {
     use super::*;
     use tokio::net::TcpStream;
+
+    #[test]
+    fn remote_tcp_requires_authentication_and_encryption() {
+        assert!(validate_tcp_security("127.0.0.1:7777", false, false, false).is_ok());
+        assert!(validate_tcp_security("[::1]:7777", false, false, false).is_ok());
+        assert!(validate_tcp_security("localhost:7777", false, false, false).is_ok());
+
+        let open = validate_tcp_security("0.0.0.0:7777", false, false, false).unwrap_err();
+        assert!(open.contains("unauthenticated"));
+        let plaintext = validate_tcp_security("0.0.0.0:7777", true, false, false).unwrap_err();
+        assert!(plaintext.contains("plaintext"));
+        assert!(validate_tcp_security("0.0.0.0:7777", true, true, false).is_ok());
+        assert!(validate_tcp_security("0.0.0.0:7777", false, false, true).is_ok());
+    }
 
     /// Send a raw HTTP request line to `addr` and return (status_line, body).
     async fn http_get(addr: std::net::SocketAddr, path: &str) -> (String, String) {

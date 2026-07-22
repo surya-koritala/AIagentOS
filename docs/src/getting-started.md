@@ -78,7 +78,10 @@ syscalls still work (keyless boot).
 # TCP, default 127.0.0.1:7777
 cargo run --package agent-cli --bin agent-server
 
-# Bind a specific address
+# Remote TCP requires both authentication and TLS
+AGENT_SERVER_TOKEN="replace-with-a-secret" \
+AGENT_SERVER_TLS_CERT=/etc/agentos/server.crt \
+AGENT_SERVER_TLS_KEY=/etc/agentos/server.key \
 cargo run --package agent-cli --bin agent-server -- 0.0.0.0:7777
 
 # Unix-domain socket instead of TCP
@@ -87,6 +90,23 @@ AGENT_SERVER_UNIX=/tmp/agent.sock cargo run --package agent-cli --bin agent-serv
 # Require a shared-secret token before any syscall
 AGENT_SERVER_TOKEN=secret cargo run --package agent-cli --bin agent-server
 ```
+
+The server has three explicit caller modes:
+
+- The default loopback listener and a Unix-domain socket are trusted local
+  system/operator interfaces. Without a configured token they have full system
+  authority, so do not expose or proxy them to untrusted clients.
+- `AGENT_SERVER_TOKEN` is a trusted system/operator shared secret and also has
+  full system authority. On a non-loopback bind, TLS is mandatory so that secret
+  and all requests are encrypted in transit.
+- An issued tenant API key or session resolves to its complete user, tenant,
+  role, and credential identity. Every request is re-authorized; tenant callers
+  cannot use system operations or address another tenant's agents.
+
+`agent-server` refuses open or plaintext non-loopback listeners and non-loopback
+metrics listeners. `AGENT_SERVER_ALLOW_INSECURE_REMOTE=1` exists only for an
+explicit development environment or a separately secured network boundary; it
+turns off that startup guard and is not a production configuration.
 
 ## Drive the kernel from the Rust SDK
 

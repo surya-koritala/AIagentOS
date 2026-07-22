@@ -1695,6 +1695,83 @@ impl SqliteContextManager {
         Ok(())
     }
 
+    /// Permanently revoke a session by its stored hash.
+    pub fn revoke_session_hash(&self, token_hash: &str) -> Result<bool, ContextError> {
+        let conn = self.conn.lock().unwrap();
+        let changed = conn
+            .execute(
+                "DELETE FROM sessions WHERE token_hash = ?1",
+                params![token_hash],
+            )
+            .map_err(|e| ContextError::PersistenceFailed(e.to_string()))?;
+        Ok(changed > 0)
+    }
+
+    /// Permanently revoke an API key by its stored hash.
+    pub fn revoke_api_key_hash(&self, key_hash: &str) -> Result<bool, ContextError> {
+        let conn = self.conn.lock().unwrap();
+        let changed = conn
+            .execute(
+                "DELETE FROM api_keys WHERE key_hash = ?1",
+                params![key_hash],
+            )
+            .map_err(|e| ContextError::PersistenceFailed(e.to_string()))?;
+        Ok(changed > 0)
+    }
+
+    /// Revoke a user and all credentials issued to that user in one durable
+    /// transaction. Agent/data ownership is tenant-scoped and is intentionally
+    /// not deleted by identity revocation.
+    pub fn revoke_user_identity(&self, user_id: &str) -> Result<bool, ContextError> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn
+            .transaction()
+            .map_err(|e| ContextError::PersistenceFailed(e.to_string()))?;
+        let mut changed = tx
+            .execute("DELETE FROM sessions WHERE user_id = ?1", params![user_id])
+            .map_err(|e| ContextError::PersistenceFailed(e.to_string()))?;
+        changed += tx
+            .execute("DELETE FROM api_keys WHERE user_id = ?1", params![user_id])
+            .map_err(|e| ContextError::PersistenceFailed(e.to_string()))?;
+        changed += tx
+            .execute("DELETE FROM users WHERE id = ?1", params![user_id])
+            .map_err(|e| ContextError::PersistenceFailed(e.to_string()))?;
+        tx.commit()
+            .map_err(|e| ContextError::PersistenceFailed(e.to_string()))?;
+        Ok(changed > 0)
+    }
+
+    /// Revoke a tenant, its users, and every issued credential atomically.
+    /// Durable agent data remains present for explicit administrative recovery,
+    /// but no tenant principal can authenticate after this commits.
+    pub fn revoke_tenant_identity(&self, tenant_id: &str) -> Result<bool, ContextError> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn
+            .transaction()
+            .map_err(|e| ContextError::PersistenceFailed(e.to_string()))?;
+        let mut changed = tx
+            .execute(
+                "DELETE FROM sessions WHERE tenant_id = ?1",
+                params![tenant_id],
+            )
+            .map_err(|e| ContextError::PersistenceFailed(e.to_string()))?;
+        changed += tx
+            .execute(
+                "DELETE FROM api_keys WHERE tenant_id = ?1",
+                params![tenant_id],
+            )
+            .map_err(|e| ContextError::PersistenceFailed(e.to_string()))?;
+        changed += tx
+            .execute("DELETE FROM users WHERE tenant_id = ?1", params![tenant_id])
+            .map_err(|e| ContextError::PersistenceFailed(e.to_string()))?;
+        changed += tx
+            .execute("DELETE FROM tenants WHERE id = ?1", params![tenant_id])
+            .map_err(|e| ContextError::PersistenceFailed(e.to_string()))?;
+        tx.commit()
+            .map_err(|e| ContextError::PersistenceFailed(e.to_string()))?;
+        Ok(changed > 0)
+    }
+
     /// Load all persisted tenancy state. Returns `(tenants, users, api_keys,
     /// sessions)` for the kernel to reinsert into a fresh `AuthSystem` on boot.
     /// A malformed row is skipped, never fatal (best-effort rehydration).
@@ -1758,12 +1835,20 @@ impl SqliteContextManager {
                 })
                 .map_err(|e| ContextError::StorageError(e.to_string()))?;
             for r in rows.flatten() {
+                let Some(role) = crate::auth::Role::parse(&r.4) else {
+                    tracing::warn!(
+                        user_id = %r.0,
+                        role = %r.4,
+                        "skipping user with unknown persisted role"
+                    );
+                    continue;
+                };
                 users.push(crate::auth::User {
                     id: r.0,
                     tenant_id: r.1,
                     username: r.2,
                     email: r.3,
-                    role: crate::auth::Role::parse(&r.4),
+                    role,
                     created_at: parse_ts(&r.5),
                 });
             }

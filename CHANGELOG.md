@@ -33,9 +33,13 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
 ### Security
 
 - **Tenant authorization** — the wire server retains the authenticated
-  principal, centralizes ownership/RBAC checks, rejects revoked credentials,
-  scopes package-created agents, and audits denials without leaking foreign
-  resources. (#107)
+  principal and credential identity, centralizes ownership/RBAC checks, rejects
+  unknown or inconsistent identities and roles, durably revokes sessions, API
+  keys, users, and tenants without an in-flight execution window, scopes
+  package-created agents, and audits denials without leaking foreign resources.
+  TCP and TLS regressions cover owner/foreign, role, unauthenticated, and revoked
+  paths. Non-loopback listeners now fail closed unless authentication and TLS
+  are configured. (#107)
 - **Fail-closed tools** — every registered tool needs a typed security contract;
   unknown tools/profiles and incomplete declarations are rejected, while
   capability, MAC, approval, namespace, accounting, and sandbox decisions share

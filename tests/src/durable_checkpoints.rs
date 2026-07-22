@@ -317,6 +317,7 @@ async fn foreign_tenant_cannot_list_resume_or_delete_public_checkpoint() {
         user_id: "user-b".into(),
         tenant_id: "tenant-b".into(),
         role: Role::Admin,
+        credential: None,
     };
 
     for syscall in [

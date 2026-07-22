@@ -4,6 +4,10 @@
 # present, tested, integrated, reachable through the public API, or qualified
 # for production. Documentation may explain capabilities, but must not promote
 # their maturity independently of this registry.
+# `tracking_issue` records the roadmap issue that owns the capability decision.
+# If that milestone issue is complete while production qualification remains,
+# `qualification_issue` points to the open follow-on. A capability deliberately
+# excluded from the v1 promise declares `v1_disposition = "excluded-from-v1"`.
 
 schema_version = 1
 updated = "2026-07-21"
@@ -32,6 +36,7 @@ owner = "release-engineering"
 maturity = "public-api-e2e"
 release = "v0.4"
 tracking_issue = 106
+qualification_issue = 105
 kernel_modules = []
 source_paths = ["docs/capabilities.toml", "tests/src/capability_registry.rs"]
 public_entry_points = ["docs/capabilities.toml"]
@@ -182,6 +187,7 @@ owner = "kernel"
 maturity = "public-api-e2e"
 release = "v0.6"
 tracking_issue = 116
+qualification_issue = 121
 kernel_modules = ["mount_table", "syscall_interface", "tool_descriptors", "tools"]
 source_paths = ["crates/kernel/src/syscall_server.rs", "docs/ADR-0001-PUBLIC-ABI.md"]
 public_entry_points = ["crates/kernel/src/syscall_server.rs::Syscall"]
@@ -347,6 +353,7 @@ owner = "kernel"
 maturity = "unit-tested"
 release = "v0.9"
 tracking_issue = 128
+qualification_issue = 111
 kernel_modules = ["editing", "function_calling", "indexer", "learning", "linux_compat", "modules", "planning", "shell"]
 source_paths = ["crates/kernel/src", "docs/SECONDARY_CAPABILITIES.md"]
 public_entry_points = []

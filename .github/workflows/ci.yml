@@ -29,13 +29,32 @@ jobs:
         run: cargo clippy --workspace --exclude tauri-app --all-targets -- -D warnings
       - name: Capability and public-claim contract
         run: cargo test -p integration-tests capability_registry --locked
-      - name: Below-production capabilities retain an open tracking issue
+      - name: Below-production retained capabilities have open qualification work
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           awk -F ' = ' '
-            /^maturity = / { maturity=$2; gsub(/"/, "", maturity) }
-            /^tracking_issue = / && maturity != "production-qualified" { print $2 }
+            function clean(value) { gsub(/"/, "", value); return value }
+            function emit() {
+              if (seen && maturity != "production-qualified" && disposition != "excluded-from-v1") {
+                if (qualification != "") print qualification
+                else print tracking
+              }
+            }
+            /^\[\[capability\]\]/ {
+              emit()
+              seen=1
+              maturity=""
+              tracking=""
+              qualification=""
+              disposition="retained"
+              next
+            }
+            /^maturity = / { maturity=clean($2) }
+            /^tracking_issue = / { tracking=$2 }
+            /^qualification_issue = / { qualification=$2 }
+            /^v1_disposition = / { disposition=clean($2) }
+            END { emit() }
           ' docs/capabilities.toml | while read -r issue; do
             test "$(gh issue view "$issue" --json state --jq .state)" = "OPEN"
           done
@@ -105,7 +124,7 @@ jobs:
       - name: Enforce workspace line coverage floor
         run: >-
           cargo llvm-cov --workspace --exclude tauri-app --all-targets --locked
-          --lcov --output-path lcov.info --fail-under-lines 60
+          --lcov --output-path lcov.info --fail-under-lines 60 -- --test-threads=1
       - uses: actions/upload-artifact@v4
         with:
           name: rust-lcov

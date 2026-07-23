@@ -63,7 +63,7 @@ pub enum ConfigLoadError {
     Parse {
         path: PathBuf,
         #[source]
-        source: toml::de::Error,
+        source: Box<toml::de::Error>,
     },
     #[error("invalid budget configuration in {path}: {message}")]
     Budget { path: PathBuf, message: String },
@@ -469,7 +469,7 @@ impl Config {
     fn from_toml_at(content: &str, path: &Path) -> Result<Self, ConfigLoadError> {
         let config: Self = toml::from_str(content).map_err(|source| ConfigLoadError::Parse {
             path: path.to_path_buf(),
-            source,
+            source: Box::new(source),
         })?;
         config
             .budgets
@@ -542,6 +542,23 @@ mod tests {
         assert_eq!(cfg.llm_provider, "azure-openai");
         assert!(!cfg.setup_complete);
         assert!(cfg.api_keys.is_empty());
+    }
+
+    #[test]
+    fn config_load_error_stays_compact_and_preserves_parse_details() {
+        assert!(
+            std::mem::size_of::<ConfigLoadError>() <= 64,
+            "configuration errors must stay cheap to return on every supported platform"
+        );
+
+        let error = Config::from_toml("this is = not valid toml ][").unwrap_err();
+        match error {
+            ConfigLoadError::Parse { path, source } => {
+                assert_eq!(path, Path::new("<inline>"));
+                assert!(!source.to_string().is_empty());
+            }
+            other => panic!("expected a parse error, got {other}"),
+        }
     }
 
     #[test]

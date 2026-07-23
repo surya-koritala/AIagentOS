@@ -1,0 +1,476 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AI Agent OS system map</title>
+  <style>
+    :root {
+      --ink: #122033;
+      --muted: #5b6b7d;
+      --line: #c8d2de;
+      --paper: #f5f7fa;
+      --panel: #ffffff;
+      --navy: #14263d;
+      --blue: #1769aa;
+      --blue-soft: #e8f2fb;
+      --green: #087f5b;
+      --green-soft: #e6f5ef;
+      --amber: #9a6200;
+      --amber-soft: #fff3d6;
+    }
+
+    * { box-sizing: border-box; }
+
+    html, body {
+      width: 1600px;
+      height: 920px;
+      margin: 0;
+      overflow: hidden;
+      background: var(--paper);
+      color: var(--ink);
+      font-family: Inter, ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+
+    .canvas {
+      position: relative;
+      width: 1600px;
+      height: 920px;
+      padding: 46px 58px 38px;
+      background-color: var(--paper);
+      background-image:
+        linear-gradient(#e8edf2 1px, transparent 1px),
+        linear-gradient(90deg, #e8edf2 1px, transparent 1px);
+      background-size: 32px 32px;
+    }
+
+    .header {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      height: 116px;
+      border-bottom: 2px solid var(--ink);
+    }
+
+    .eyebrow,
+    .lane-label,
+    .status,
+    .stage-number {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      text-transform: uppercase;
+      letter-spacing: .09em;
+    }
+
+    .eyebrow {
+      margin-bottom: 8px;
+      color: var(--blue);
+      font-size: 16px;
+      font-weight: 750;
+    }
+
+    h1 {
+      margin: 0;
+      font-size: 42px;
+      line-height: 1.05;
+      letter-spacing: -.025em;
+    }
+
+    .subtitle {
+      margin: 10px 0 0;
+      color: var(--muted);
+      font-size: 18px;
+    }
+
+    .statuses {
+      display: flex;
+      gap: 10px;
+      padding-top: 12px;
+    }
+
+    .status {
+      padding: 9px 12px;
+      border: 1.5px solid var(--line);
+      border-radius: 5px;
+      background: var(--panel);
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 750;
+    }
+
+    .status.primary {
+      border-color: var(--green);
+      background: var(--green-soft);
+      color: var(--green);
+    }
+
+    .map {
+      position: relative;
+      height: 700px;
+      margin-top: 20px;
+    }
+
+    .connectors {
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      z-index: 0;
+      pointer-events: none;
+    }
+
+    .lane {
+      position: absolute;
+      left: 0;
+      right: 0;
+      z-index: 1;
+    }
+
+    .lane-label {
+      position: absolute;
+      left: 0;
+      top: 0;
+      width: 112px;
+      padding-top: 9px;
+      color: var(--muted);
+      font-size: 13px;
+      font-weight: 800;
+      line-height: 1.35;
+    }
+
+    .lane-label span {
+      display: block;
+      margin-bottom: 3px;
+      color: var(--blue);
+      font-size: 11px;
+    }
+
+    .entry-lane { top: 0; height: 88px; }
+    .entry-grid {
+      display: grid;
+      grid-template-columns: repeat(5, 1fr);
+      gap: 14px;
+      margin-left: 126px;
+    }
+
+    .card {
+      height: 78px;
+      padding: 14px 16px;
+      border: 1.5px solid var(--line);
+      border-radius: 7px;
+      background: var(--panel);
+    }
+
+    .card strong,
+    .provider strong,
+    .service strong {
+      display: block;
+      margin-bottom: 6px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 15px;
+      line-height: 1.1;
+    }
+
+    .card small,
+    .provider small,
+    .service small {
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.2;
+    }
+
+    .kernel-lane {
+      top: 120px;
+      height: 364px;
+    }
+
+    .kernel {
+      position: relative;
+      height: 364px;
+      margin-left: 126px;
+      border: 2px solid var(--navy);
+      border-radius: 9px;
+      background: var(--panel);
+      box-shadow: 0 5px 0 rgba(20, 38, 61, .09);
+    }
+
+    .kernel-title {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      height: 51px;
+      padding: 0 18px;
+      background: var(--navy);
+      color: #fff;
+    }
+
+    .kernel-title strong {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 17px;
+      letter-spacing: .02em;
+    }
+
+    .kernel-title span {
+      color: #c9d7e7;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 12px;
+      text-transform: uppercase;
+      letter-spacing: .08em;
+    }
+
+    .execution-path {
+      display: grid;
+      grid-template-columns: 245px 1fr 245px;
+      gap: 20px;
+      align-items: stretch;
+      height: 214px;
+      padding: 20px;
+      border-bottom: 1.5px solid var(--line);
+    }
+
+    .module {
+      display: flex;
+      flex-direction: column;
+      justify-content: center;
+      padding: 18px;
+      border: 1.5px solid var(--blue);
+      border-radius: 7px;
+      background: var(--blue-soft);
+    }
+
+    .module strong {
+      margin-bottom: 8px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 17px;
+    }
+
+    .module p {
+      margin: 0;
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.45;
+    }
+
+    .gate {
+      padding: 14px 16px;
+      border: 2px solid var(--green);
+      border-radius: 7px;
+      background: var(--green-soft);
+    }
+
+    .gate-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 12px;
+    }
+
+    .gate-head strong {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 17px;
+    }
+
+    .gate-head span {
+      padding: 5px 8px;
+      border: 1px solid var(--green);
+      border-radius: 4px;
+      background: #fff;
+      color: var(--green);
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 11px;
+      font-weight: 750;
+      text-transform: uppercase;
+    }
+
+    .stages {
+      display: grid;
+      grid-template-columns: repeat(5, 1fr);
+      gap: 8px;
+    }
+
+    .stage {
+      min-height: 104px;
+      padding: 11px 9px;
+      border: 1px solid #9fcdbd;
+      border-radius: 5px;
+      background: #fff;
+    }
+
+    .stage-number {
+      display: block;
+      margin-bottom: 8px;
+      color: var(--green);
+      font-size: 11px;
+      font-weight: 800;
+    }
+
+    .stage strong {
+      display: block;
+      margin-bottom: 5px;
+      font-size: 13px;
+    }
+
+    .stage small {
+      color: var(--muted);
+      font-size: 11px;
+      line-height: 1.25;
+    }
+
+    .service-strip {
+      display: grid;
+      grid-template-columns: repeat(5, 1fr);
+      gap: 0;
+      height: 96px;
+    }
+
+    .service {
+      padding: 17px 15px;
+      border-right: 1px solid var(--line);
+      background: #f9fafc;
+    }
+
+    .service:last-child { border-right: 0; }
+    .service strong { font-size: 13px; }
+    .service small { font-size: 11px; }
+
+    .provider-lane { top: 526px; height: 110px; }
+    .provider-grid {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 14px;
+      margin-left: 126px;
+    }
+
+    .provider {
+      height: 88px;
+      padding: 17px;
+      border: 1.5px solid #d5b15c;
+      border-radius: 7px;
+      background: var(--amber-soft);
+    }
+
+    .provider strong { color: #6f4700; }
+
+    .footer-note {
+      position: absolute;
+      left: 126px;
+      right: 0;
+      bottom: 0;
+      display: flex;
+      justify-content: space-between;
+      padding-top: 13px;
+      border-top: 1px solid var(--line);
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    .footer-note strong { color: var(--ink); }
+  </style>
+</head>
+<body>
+  <main class="canvas" aria-labelledby="map-title">
+    <header class="header">
+      <div>
+        <div class="eyebrow">Runtime architecture / execution path</div>
+        <h1 id="map-title">AI Agent OS system map</h1>
+        <p class="subtitle">A user-space Rust runtime that governs agent actions before host resources are reached.</p>
+      </div>
+      <div class="statuses" aria-label="System properties">
+        <div class="status">user-space runtime</div>
+        <div class="status">host OS required</div>
+        <div class="status primary">fail closed</div>
+      </div>
+    </header>
+
+    <section class="map" aria-label="AgentOS request flow">
+      <svg class="connectors" viewBox="0 0 1484 700" aria-hidden="true">
+        <defs>
+          <marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
+            <path d="M0,0 L8,4 L0,8 Z" fill="#1769aa"/>
+          </marker>
+        </defs>
+        <g fill="none" stroke="#1769aa" stroke-width="2.5">
+          <path d="M256 78 V104 H268"/>
+          <path d="M522 78 V104 H268"/>
+          <path d="M789 78 V104 H268"/>
+          <path d="M1055 78 V104 H268"/>
+          <path d="M1322 78 V104 H268"/>
+          <path d="M268 104 V118" marker-end="url(#arrow)"/>
+          <path d="M393 278 H448" marker-end="url(#arrow)"/>
+          <path d="M1030 278 H1085" marker-end="url(#arrow)"/>
+          <path d="M1341 484 V512 H293"/>
+          <path d="M293 512 V524" marker-end="url(#arrow)"/>
+          <path d="M621 512 V524" marker-end="url(#arrow)"/>
+          <path d="M949 512 V524" marker-end="url(#arrow)"/>
+          <path d="M1277 512 V524" marker-end="url(#arrow)"/>
+        </g>
+      </svg>
+
+      <div class="lane entry-lane">
+        <div class="lane-label"><span>01</span>entry surfaces</div>
+        <div class="entry-grid">
+          <div class="card"><strong>AgentExecutor</strong><small>think → act → observe</small></div>
+          <div class="card"><strong>JSON syscalls</strong><small>TCP · Unix · TLS</small></div>
+          <div class="card"><strong>Rust SDK</strong><small>typed remote client</small></div>
+          <div class="card"><strong>MCP server</strong><small>tools/list · tools/call</small></div>
+          <div class="card"><strong>CLI · TUI</strong><small>operator controls</small></div>
+        </div>
+      </div>
+
+      <div class="lane kernel-lane">
+        <div class="lane-label"><span>02</span>AgentOS kernel</div>
+        <div class="kernel">
+          <div class="kernel-title">
+            <strong>agentos-kernel</strong>
+            <span>single governed execution path</span>
+          </div>
+          <div class="execution-path">
+            <div class="module">
+              <strong>ToolRegistry</strong>
+              <p>Validates declarations, resolves typed resources, and denies unknown or contradictory tools.</p>
+            </div>
+            <div class="gate">
+              <div class="gate-head">
+                <strong>SyscallGate</strong>
+                <span>first failure wins</span>
+              </div>
+              <div class="stages">
+                <div class="stage"><span class="stage-number">00</span><strong>Namespace</strong><small>visibility + tenant boundary</small></div>
+                <div class="stage"><span class="stage-number">01</span><strong>Capability</strong><small>all declared bits required</small></div>
+                <div class="stage"><span class="stage-number">02</span><strong>MAC</strong><small>subject · action · resource</small></div>
+                <div class="stage"><span class="stage-number">03</span><strong>Approval</strong><small>exact, atomic, one-shot</small></div>
+                <div class="stage"><span class="stage-number">04</span><strong>Quota</strong><small>tokens + concurrency</small></div>
+              </div>
+            </div>
+            <div class="module">
+              <strong>ResourceBroker</strong>
+              <p>Applies the permission profile, sandbox identity, canonical resource boundary, and provider admission.</p>
+            </div>
+          </div>
+          <div class="service-strip" aria-label="Kernel-owned support services">
+            <div class="service"><strong>Scheduler</strong><small>weighted turn admission</small></div>
+            <div class="service"><strong>Context</strong><small>bounds · spill · page-in</small></div>
+            <div class="service"><strong>IPC</strong><small>messaging · delegation</small></div>
+            <div class="service"><strong>Audit</strong><small>decisions · metrics</small></div>
+            <div class="service"><strong>Persistence</strong><small>state · checkpoints</small></div>
+          </div>
+        </div>
+      </div>
+
+      <div class="lane provider-lane">
+        <div class="lane-label"><span>03</span>host resources</div>
+        <div class="provider-grid">
+          <div class="provider"><strong>Filesystem</strong><small>workspace-bound paths</small></div>
+          <div class="provider"><strong>Network</strong><small>host policy + quotas</small></div>
+          <div class="provider"><strong>Application</strong><small>sandboxed execution</small></div>
+          <div class="provider"><strong>IPC provider</strong><small>broker-routed messages</small></div>
+        </div>
+      </div>
+
+      <div class="footer-note">
+        <span><strong>Boundary:</strong> Linux, macOS, or Windows still provides the host kernel and isolation primitives.</span>
+        <span>Flow derived from the repository's public authorization path.</span>
+      </div>
+    </section>
+  </main>
+</body>
+</html>

@@ -1,6 +1,8 @@
 <p align="center">
-  <img src="docs/assets/agentos-hero.png" alt="AI Agent OS kernel routing agent actions through one security gateway to governed resources" width="100%">
+  <img src="docs/assets/system-map.jpg" alt="AI Agent OS system map: entry surfaces flow through the ToolRegistry, mandatory SyscallGate checks, ResourceBroker, and then host resources" width="100%">
 </p>
+
+<p align="center"><em>Deterministically rendered from <a href="docs/assets/system-map.html">HTML/CSS source</a>; the flow mirrors the public authorization path in this repository.</em></p>
 
 <h1 align="center">AI Agent OS</h1>
 

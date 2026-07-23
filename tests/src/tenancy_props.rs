@@ -80,7 +80,6 @@ async fn cross_tenant_ipc_is_denied() {
         .create_agent_for_tenant(&t_b, cfg("b1", "full-access"))
         .await
         .unwrap();
-
     // Same tenant: a1 → a2 succeeds.
     kernel
         .ipc
@@ -134,12 +133,13 @@ async fn cross_tenant_namespaced_tool_is_denied() {
         .create_agent_for_tenant(&t_b, cfg("b1", "full-access"))
         .await
         .unwrap();
+    let security = kernel.tool_registry.security("tenant_a_tool").unwrap();
 
     // Tenant-A agent: allowed (it is a member of tenant A's tool namespace).
     assert!(
         kernel
             .syscall_gate
-            .check_tool_call(a1.id, "tenant_a_tool", "/x", 5)
+            .check_tool_call_declared(a1.id, "tenant_a_tool", "/x", 5, &security)
             .await
             .is_ok(),
         "tenant-A agent should see tenant-A's tool"
@@ -148,7 +148,7 @@ async fn cross_tenant_namespaced_tool_is_denied() {
     // Tenant-B agent: denied with NotInNamespace — never learns the tool exists.
     let r = kernel
         .syscall_gate
-        .check_tool_call(b1.id, "tenant_a_tool", "/x", 5)
+        .check_tool_call_declared(b1.id, "tenant_a_tool", "/x", 5, &security)
         .await;
     assert!(
         matches!(r, Err(GateDenial::NotInNamespace { .. })),

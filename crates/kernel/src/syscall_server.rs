@@ -125,7 +125,7 @@ pub enum Syscall {
         message: String,
     },
     /// Invoke a single tool as an agent. Goes through the syscall gate
-    /// (capability / MAC / cgroup / namespace) before the resource broker, so a
+    /// (capability / MAC / approval / cgroup / namespace) before the resource broker, so a
     /// denial is returned as an `Error` — enforcement applies over the wire.
     CallTool {
         agent_id: String,
@@ -452,6 +452,7 @@ pub enum SyscallReply {
         allowed: u64,
         denied_capability: u64,
         denied_mac: u64,
+        denied_approval: u64,
         denied_cgroup: u64,
         denied_namespace: u64,
         denied_unknown: u64,
@@ -816,7 +817,7 @@ where
 
 /// Dispatch a single syscall against the kernel. Pure routing — every call goes
 /// through the same `AgentKernelImpl` methods the in-process paths use, so the
-/// syscall gate's capability/MAC/cgroup/namespace checks still apply.
+/// syscall gate's capability/MAC/approval/cgroup/namespace checks still apply.
 ///
 /// Tenant-agnostic entry point (no bound tenant): equivalent to
 /// [`dispatch_scoped`] with `None`. Used by the MCP server and any caller that
@@ -1104,29 +1105,19 @@ pub async fn dispatch_scoped(
                     }
                 }
             };
-            // Token estimate plus the registry's declared resource extractor,
-            // shared with executor/MCP so policy cannot drift by entry point.
-            let est_tokens = (args.to_string().len() as u64 / 4)
-                .saturating_add(tool.len() as u64 / 4)
-                .saturating_add(10);
-            let (security, resource) = match kernel.tool_registry.security_context(&tool, &args) {
-                Ok(context) => context,
+            // Security preparation is shared with executor/MCP/SDK so action,
+            // resource extraction, and accounting cannot drift by entry point.
+            match kernel
+                .tool_registry
+                .authorize_call(&kernel.syscall_gate, id, &tool, &args)
+                .await
+            {
+                Ok(_) => {}
                 Err(error) => {
                     return SyscallReply::Error {
                         message: format!("tool '{tool}' denied by kernel: {error}"),
                     }
                 }
-            };
-
-            // Enforcement first — a denial never reaches the broker.
-            if let Err(denial) = kernel
-                .syscall_gate
-                .check_tool_call_declared(id, &tool, &resource, est_tokens, &security)
-                .await
-            {
-                return SyscallReply::Error {
-                    message: format!("tool '{tool}' denied by kernel: {}", denial.message()),
-                };
             }
             let _tool_slot = match kernel.syscall_gate.acquire_tool_call(id) {
                 Ok(slot) => slot,
@@ -1167,6 +1158,7 @@ pub async fn dispatch_scoped(
                 allowed: s.allowed,
                 denied_capability: s.denied_capability,
                 denied_mac: s.denied_mac,
+                denied_approval: s.denied_approval,
                 denied_cgroup: s.denied_cgroup,
                 denied_namespace: s.denied_namespace,
                 denied_unknown: s.denied_unknown,

@@ -40,14 +40,34 @@ impl SecurityAction {
         }
     }
 
-    fn minimum_capability(self) -> Option<u64> {
+    fn mandatory_capabilities(self) -> Vec<u64> {
         match self {
-            Self::Read | Self::Ipc => None,
-            Self::Write => Some(CapabilitySet::CAP_FILE_WRITE),
-            Self::Delete => Some(CapabilitySet::CAP_FILE_DELETE),
-            Self::Network | Self::BrowserAutomation => Some(CapabilitySet::CAP_NET_ACCESS),
-            Self::Execute | Self::PackageInstall => Some(CapabilitySet::CAP_EXEC),
-            Self::CredentialAccess => Some(CapabilitySet::CAP_ADMIN),
+            Self::Read | Self::Ipc => Vec::new(),
+            Self::Write => vec![CapabilitySet::CAP_FILE_WRITE],
+            Self::Delete => vec![CapabilitySet::CAP_FILE_DELETE],
+            Self::Network | Self::BrowserAutomation => vec![CapabilitySet::CAP_NET_ACCESS],
+            Self::Execute => vec![CapabilitySet::CAP_EXEC],
+            Self::CredentialAccess => vec![CapabilitySet::CAP_ADMIN],
+            Self::PackageInstall => vec![CapabilitySet::CAP_EXEC, CapabilitySet::CAP_ADMIN],
+        }
+    }
+
+    fn supports_resource(self, resource_type: &ResourceType) -> bool {
+        match resource_type {
+            ResourceType::Filesystem => matches!(self, Self::Read | Self::Write | Self::Delete),
+            ResourceType::Network => self == Self::Network,
+            ResourceType::Browser => self == Self::BrowserAutomation,
+            ResourceType::Application => matches!(
+                self,
+                Self::Execute | Self::CredentialAccess | Self::PackageInstall
+            ),
+            ResourceType::Ipc => self == Self::Ipc,
+            // Peripheral tools can read device state, write device state, or
+            // access a protected credential/device. Their provider still
+            // supplies the concrete operation and sandbox classification.
+            ResourceType::Peripheral => {
+                matches!(self, Self::Read | Self::Write | Self::CredentialAccess)
+            }
         }
     }
 }
@@ -77,6 +97,17 @@ pub enum ApprovalPolicy {
     Administrator,
 }
 
+impl ApprovalPolicy {
+    pub(crate) fn satisfies(self, required: Self) -> bool {
+        matches!(
+            (self, required),
+            (Self::Administrator, Self::Administrator | Self::User)
+                | (Self::User, Self::User)
+                | (_, Self::None)
+        )
+    }
+}
+
 /// Whether provider execution must run inside a configured sandbox boundary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -101,7 +132,7 @@ impl ToolSecurity {
     pub fn new(action: SecurityAction, resource_extractor: ResourceExtractor) -> Self {
         Self {
             action,
-            required_capabilities: action.minimum_capability().into_iter().collect(),
+            required_capabilities: action.mandatory_capabilities(),
             resource_extractor,
             namespace_visibility: NamespaceVisibility::Global,
             approval_policy: ApprovalPolicy::None,
@@ -176,10 +207,27 @@ impl ToolSecurity {
 pub enum ToolRegistrationError {
     #[error("tool name and description are required")]
     MissingIdentity,
+    #[error("tool '{0}' is already registered; unregister it explicitly before replacement")]
+    DuplicateName(String),
     #[error("tool parameters must be an object JSON schema")]
     InvalidSchema,
+    #[error("tool resource operation is required")]
+    MissingOperation,
     #[error("resource extractor argument '{0}' is not declared in the parameter schema")]
     MissingResourceArgument(String),
+    #[error("resource extractor argument '{0}' must be a required string parameter")]
+    InvalidResourceArgument(String),
+    #[error("constant resource cannot be empty")]
+    EmptyConstantResource,
+    #[error("capability 0x{0:x} is unknown, combined, or duplicated")]
+    InvalidCapability(u64),
+    #[error("security action {action} contradicts resource type {resource_type:?}")]
+    ResourceActionMismatch {
+        action: &'static str,
+        resource_type: ResourceType,
+    },
+    #[error("caller-namespace visibility requires an IPC provider or a concrete kernel namespace binding")]
+    UnboundNamespace,
     #[error("security action {action} requires capability 0x{capability:x}")]
     MissingCapability {
         action: &'static str,
@@ -187,6 +235,8 @@ pub enum ToolRegistrationError {
     },
     #[error("{0} requires explicit user or administrator approval")]
     MissingApproval(&'static str),
+    #[error("{0} requires administrator approval")]
+    MissingAdministratorApproval(&'static str),
     #[error("{0} must execute in a sandbox")]
     MissingSandbox(&'static str),
 }
@@ -201,6 +251,33 @@ pub struct ToolBinding {
     pub operation: String,
     pub security: ToolSecurity,
 }
+
+/// Security inputs prepared once for every public execution entry point.
+/// Keeping estimation and resource extraction here prevents the executor,
+/// JSON syscall wire, MCP server, and SDK-backed wire client from drifting.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreparedToolCall {
+    pub security: ToolSecurity,
+    pub resource: String,
+    pub estimated_tokens: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ToolAuthorizationError {
+    InvalidDeclaration(String),
+    Denied(crate::syscall_gate::GateDenial),
+}
+
+impl std::fmt::Display for ToolAuthorizationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidDeclaration(error) => formatter.write_str(error),
+            Self::Denied(denial) => formatter.write_str(&denial.message()),
+        }
+    }
+}
+
+impl std::error::Error for ToolAuthorizationError {}
 
 /// Registry of available tools that agents can use.
 ///
@@ -233,29 +310,126 @@ impl ToolRegistry {
     /// Validate and register a tool binding. Untrusted/custom declarations are
     /// rejected before they become visible to an LLM or executable provider.
     pub fn register(&self, binding: ToolBinding) -> Result<(), ToolRegistrationError> {
-        Self::validate_binding(&binding)?;
-        self.tools.insert(binding.name.clone(), binding);
-        Ok(())
+        Self::validate_binding_with_scope(&binding, false)?;
+        let name = binding.name.clone();
+        match self.tools.entry(name.clone()) {
+            dashmap::mapref::entry::Entry::Vacant(entry) => {
+                entry.insert(binding);
+                Ok(())
+            }
+            dashmap::mapref::entry::Entry::Occupied(_) => {
+                Err(ToolRegistrationError::DuplicateName(name))
+            }
+        }
     }
 
-    fn validate_binding(binding: &ToolBinding) -> Result<(), ToolRegistrationError> {
+    pub fn validate_binding(binding: &ToolBinding) -> Result<(), ToolRegistrationError> {
+        Self::validate_binding_with_scope(binding, false)
+    }
+
+    /// Kernel-only half of atomic namespace registration. The caller must tag
+    /// the same tool name in `SyscallGate` before publishing this binding.
+    pub(crate) fn register_namespace_scoped(
+        &self,
+        binding: ToolBinding,
+    ) -> Result<(), ToolRegistrationError> {
+        Self::validate_binding_with_scope(&binding, true)?;
+        let name = binding.name.clone();
+        match self.tools.entry(name.clone()) {
+            dashmap::mapref::entry::Entry::Vacant(entry) => {
+                entry.insert(binding);
+                Ok(())
+            }
+            dashmap::mapref::entry::Entry::Occupied(_) => {
+                Err(ToolRegistrationError::DuplicateName(name))
+            }
+        }
+    }
+
+    fn validate_binding_with_scope(
+        binding: &ToolBinding,
+        has_concrete_namespace: bool,
+    ) -> Result<(), ToolRegistrationError> {
         if binding.name.trim().is_empty() || binding.description.trim().is_empty() {
             return Err(ToolRegistrationError::MissingIdentity);
         }
-        let properties = binding
+        if binding.operation.trim().is_empty() {
+            return Err(ToolRegistrationError::MissingOperation);
+        }
+        let schema = binding
             .parameters_schema
             .as_object()
-            .and_then(|schema| schema.get("properties"))
+            .filter(|schema| {
+                schema.get("type").and_then(serde_json::Value::as_str) == Some("object")
+            })
+            .ok_or(ToolRegistrationError::InvalidSchema)?;
+        let properties = schema
+            .get("properties")
             .and_then(serde_json::Value::as_object)
             .ok_or(ToolRegistrationError::InvalidSchema)?;
-        if let ResourceExtractor::Argument(argument) = &binding.security.resource_extractor {
-            if argument.trim().is_empty() || !properties.contains_key(argument) {
-                return Err(ToolRegistrationError::MissingResourceArgument(
-                    argument.clone(),
-                ));
+        match &binding.security.resource_extractor {
+            ResourceExtractor::Argument(argument) => {
+                let Some(property) = properties.get(argument) else {
+                    return Err(ToolRegistrationError::MissingResourceArgument(
+                        argument.clone(),
+                    ));
+                };
+                let required = schema
+                    .get("required")
+                    .and_then(serde_json::Value::as_array)
+                    .is_some_and(|required| {
+                        required
+                            .iter()
+                            .any(|value| value.as_str() == Some(argument.as_str()))
+                    });
+                if argument.trim().is_empty()
+                    || property.get("type").and_then(serde_json::Value::as_str) != Some("string")
+                    || !required
+                {
+                    return Err(ToolRegistrationError::InvalidResourceArgument(
+                        argument.clone(),
+                    ));
+                }
+            }
+            ResourceExtractor::Constant(resource) if resource.trim().is_empty() => {
+                return Err(ToolRegistrationError::EmptyConstantResource);
+            }
+            ResourceExtractor::Constant(_) => {}
+        }
+        if !binding
+            .security
+            .action
+            .supports_resource(&binding.resource_type)
+        {
+            return Err(ToolRegistrationError::ResourceActionMismatch {
+                action: binding.security.action.as_str(),
+                resource_type: binding.resource_type.clone(),
+            });
+        }
+        if binding.security.namespace_visibility == NamespaceVisibility::CallerNamespace
+            && binding.resource_type != ResourceType::Ipc
+            && !has_concrete_namespace
+        {
+            return Err(ToolRegistrationError::UnboundNamespace);
+        }
+        let known_capabilities = [
+            CapabilitySet::CAP_TOOL_MOUNT,
+            CapabilitySet::CAP_AGENT_CREATE,
+            CapabilitySet::CAP_AGENT_KILL,
+            CapabilitySet::CAP_NET_ACCESS,
+            CapabilitySet::CAP_FILE_WRITE,
+            CapabilitySet::CAP_FILE_DELETE,
+            CapabilitySet::CAP_EXEC,
+            CapabilitySet::CAP_ADMIN,
+            CapabilitySet::CAP_SYS_RESOURCE,
+        ];
+        let mut seen_capabilities = std::collections::HashSet::new();
+        for capability in &binding.security.required_capabilities {
+            if !known_capabilities.contains(capability) || !seen_capabilities.insert(*capability) {
+                return Err(ToolRegistrationError::InvalidCapability(*capability));
             }
         }
-        if let Some(required) = binding.security.action.minimum_capability() {
+        for required in binding.security.action.mandatory_capabilities() {
             if !binding.security.required_capabilities.contains(&required) {
                 return Err(ToolRegistrationError::MissingCapability {
                     action: binding.security.action.as_str(),
@@ -265,10 +439,16 @@ impl ToolRegistry {
         }
         if matches!(
             binding.security.action,
-            SecurityAction::Delete
-                | SecurityAction::CredentialAccess
-                | SecurityAction::PackageInstall
-                | SecurityAction::BrowserAutomation
+            SecurityAction::CredentialAccess | SecurityAction::PackageInstall
+        ) && binding.security.approval_policy != ApprovalPolicy::Administrator
+        {
+            return Err(ToolRegistrationError::MissingAdministratorApproval(
+                binding.security.action.as_str(),
+            ));
+        }
+        if matches!(
+            binding.security.action,
+            SecurityAction::Delete | SecurityAction::BrowserAutomation
         ) && binding.security.approval_policy == ApprovalPolicy::None
         {
             return Err(ToolRegistrationError::MissingApproval(
@@ -280,6 +460,7 @@ impl ToolRegistry {
             SecurityAction::Execute
                 | SecurityAction::PackageInstall
                 | SecurityAction::BrowserAutomation
+                | SecurityAction::CredentialAccess
         ) && binding.security.sandbox_requirement != SandboxRequirement::Required
         {
             return Err(ToolRegistrationError::MissingSandbox(
@@ -310,8 +491,10 @@ impl ToolRegistry {
             .map(|b| ToolDefinition {
                 name: b.name.clone(),
                 description: format!(
-                    "{}\nSecurity constraints: {}",
+                    "{}\nSecurity constraints: resource={:?}; operation={}; {}",
                     b.description,
+                    b.resource_type,
+                    b.operation,
                     b.security.summary()
                 ),
                 parameters: b.parameters_schema.clone(),
@@ -338,6 +521,48 @@ impl ToolRegistry {
         Ok((security, resource))
     }
 
+    /// Prepare the authorization inputs shared by every live tool-call path.
+    pub fn prepare_call(
+        &self,
+        name: &str,
+        arguments: &serde_json::Value,
+    ) -> Result<PreparedToolCall, String> {
+        let (security, resource) = self.security_context(name, arguments)?;
+        let estimated_tokens = (arguments.to_string().len() as u64 / 4)
+            .saturating_add(name.len() as u64 / 4)
+            .saturating_add(10);
+        Ok(PreparedToolCall {
+            security,
+            resource,
+            estimated_tokens,
+        })
+    }
+
+    /// Canonical authorization entry used by executor, syscall/MCP wire, and
+    /// therefore SDK clients. A new public tool path should call this method,
+    /// not reproduce declaration extraction or gate ordering.
+    pub async fn authorize_call(
+        &self,
+        gate: &crate::syscall_gate::SyscallGate,
+        agent_id: AgentId,
+        name: &str,
+        arguments: &serde_json::Value,
+    ) -> Result<PreparedToolCall, ToolAuthorizationError> {
+        let prepared = self
+            .prepare_call(name, arguments)
+            .map_err(ToolAuthorizationError::InvalidDeclaration)?;
+        gate.check_tool_call_declared(
+            agent_id,
+            name,
+            &prepared.resource,
+            prepared.estimated_tokens,
+            &prepared.security,
+        )
+        .await
+        .map_err(ToolAuthorizationError::Denied)?;
+        Ok(prepared)
+    }
+
     /// Build the validated security catalog shipped by the kernel. This is
     /// also consumed by the legacy direct-gate compatibility API, ensuring its
     /// built-in classifications are generated from the same bindings.
@@ -347,8 +572,14 @@ impl ToolRegistry {
         registry.register_git_tools();
         registry.register_ipc_tools();
         crate::editing::register_edit_tools(&registry);
-        registry
-            .tools
+        registry.security_catalog()
+    }
+
+    /// Snapshot every currently registered validated declaration. Policy
+    /// tooling uses the live registry variant so dynamically installed package,
+    /// MCP, and custom tools cannot disappear from coverage checks.
+    pub fn security_catalog(&self) -> HashMap<String, ToolSecurity> {
+        self.tools
             .iter()
             .map(|binding| (binding.name.clone(), binding.security.clone()))
             .collect()
@@ -416,14 +647,6 @@ impl ToolRegistry {
                     .unwrap_or(".");
                 serde_json::json!({"command": "git", "args": ["-C", dir, "status", "--short"]})
             }
-            "create_directory" => {
-                let path = tool_call
-                    .arguments
-                    .get("path")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                serde_json::json!({"command": "mkdir", "args": ["-p", path]})
-            }
             // IPC tools: inject the caller's id as the sender (the LLM only
             // supplies the recipient / nothing). Recipient is addressed by id.
             "send_agent_message" => serde_json::json!({
@@ -454,16 +677,10 @@ impl ToolRegistry {
             _ => tool_call.arguments.clone(),
         };
 
-        // create_directory uses Application provider (mkdir -p)
-        let (resource_type, operation) = match tool_call.name.as_str() {
-            "create_directory" => (ResourceType::Application, "launch".to_string()),
-            _ => (binding_rt, binding_op),
-        };
-
         Some(ResourceRequest {
             agent_id,
-            resource_type,
-            operation,
+            resource_type: binding_rt,
+            operation: binding_op,
             parameters,
             sandbox_context: None,
         })
@@ -596,9 +813,7 @@ impl ToolRegistry {
             }),
             resource_type: ResourceType::Filesystem,
             operation: "create_dir".into(),
-            security: ToolSecurity::argument(SecurityAction::Write, "path")
-                .with_capability(CapabilitySet::CAP_EXEC)
-                .sandboxed(),
+            security: ToolSecurity::argument(SecurityAction::Write, "path").sandboxed(),
         })
         .expect("built-in create_directory security declaration must be valid");
     }
@@ -620,6 +835,31 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_name_cannot_replace_a_validated_builtin() {
+        let reg = ToolRegistry::new();
+        let original = reg.security("read_file").unwrap();
+        let error = reg
+            .register(ToolBinding {
+                name: "read_file".into(),
+                description: "attempted replacement".into(),
+                parameters_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {"command": {"type": "string"}},
+                    "required": ["command"]
+                }),
+                resource_type: ResourceType::Application,
+                operation: "launch".into(),
+                security: ToolSecurity::argument(SecurityAction::Execute, "command").sandboxed(),
+            })
+            .unwrap_err();
+        assert_eq!(
+            error,
+            ToolRegistrationError::DuplicateName("read_file".into())
+        );
+        assert_eq!(reg.security("read_file").unwrap(), original);
+    }
+
+    #[test]
     fn definitions_generates_valid_tools() {
         let reg = ToolRegistry::new();
         let defs = reg.definitions();
@@ -627,8 +867,36 @@ mod tests {
         let read = defs.iter().find(|d| d.name == "read_file").unwrap();
         assert!(read.description.contains("Read"));
         assert!(read.description.contains("Security constraints:"));
+        assert!(read.description.contains("resource=Filesystem"));
+        assert!(read.description.contains("operation=read"));
         assert!(read.description.contains("action=read"));
         assert!(read.parameters["properties"]["path"].is_object());
+    }
+
+    #[test]
+    fn llm_security_summary_never_exposes_constant_resource_values() {
+        let reg = ToolRegistry::new();
+        reg.register(ToolBinding {
+            name: "secret_target".into(),
+            description: "execute a locally configured target".into(),
+            parameters_schema: serde_json::json!({"type": "object", "properties": {}}),
+            resource_type: ResourceType::Application,
+            operation: "launch".into(),
+            security: ToolSecurity::constant(
+                SecurityAction::Execute,
+                "credential://must-not-reach-the-model",
+            )
+            .sandboxed(),
+        })
+        .unwrap();
+
+        let definition = reg
+            .definitions()
+            .into_iter()
+            .find(|definition| definition.name == "secret_target")
+            .unwrap();
+        assert!(definition.description.contains("action=exec"));
+        assert!(!definition.description.contains("must-not-reach-the-model"));
     }
 
     #[test]
@@ -642,7 +910,8 @@ mod tests {
                 description: "must not register".into(),
                 parameters_schema: serde_json::json!({
                     "type": "object",
-                    "properties": {"url": {"type": "string"}}
+                    "properties": {"url": {"type": "string"}},
+                    "required": ["url"]
                 }),
                 resource_type: ResourceType::Network,
                 operation: "get".into(),
@@ -672,6 +941,72 @@ mod tests {
             error,
             ToolRegistrationError::MissingResourceArgument("undeclared".into())
         );
+
+        let error = reg
+            .register(ToolBinding {
+                name: "disguised_exec".into(),
+                description: "must not register".into(),
+                parameters_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {"path": {"type": "string"}},
+                    "required": ["path"]
+                }),
+                resource_type: ResourceType::Application,
+                operation: "launch".into(),
+                security: ToolSecurity::argument(SecurityAction::Read, "path"),
+            })
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ToolRegistrationError::ResourceActionMismatch { .. }
+        ));
+
+        let error = reg
+            .register(ToolBinding {
+                name: "combined_capability".into(),
+                description: "must not register".into(),
+                parameters_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {"url": {"type": "string"}},
+                    "required": ["url"]
+                }),
+                resource_type: ResourceType::Network,
+                operation: "get".into(),
+                security: ToolSecurity {
+                    required_capabilities: vec![
+                        CapabilitySet::CAP_NET_ACCESS | CapabilitySet::CAP_EXEC,
+                    ],
+                    ..ToolSecurity::argument(SecurityAction::Network, "url")
+                },
+            })
+            .unwrap_err();
+        assert!(matches!(error, ToolRegistrationError::InvalidCapability(_)));
+
+        let error = reg
+            .register(ToolBinding {
+                name: "unbound_scoped_tool".into(),
+                description: "must not register globally".into(),
+                parameters_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {"path": {"type": "string"}},
+                    "required": ["path"]
+                }),
+                resource_type: ResourceType::Filesystem,
+                operation: "read".into(),
+                security: ToolSecurity::argument(SecurityAction::Read, "path").caller_namespace(),
+            })
+            .unwrap_err();
+        assert_eq!(error, ToolRegistrationError::UnboundNamespace);
+
+        let package_security = ToolSecurity::constant(SecurityAction::PackageInstall, "pkg:test")
+            .with_approval(ApprovalPolicy::Administrator)
+            .sandboxed();
+        assert!(package_security
+            .required_capabilities
+            .contains(&CapabilitySet::CAP_EXEC));
+        assert!(package_security
+            .required_capabilities
+            .contains(&CapabilitySet::CAP_ADMIN));
     }
 
     #[test]
@@ -698,6 +1033,45 @@ mod tests {
     }
 
     #[test]
+    fn prepare_call_is_the_single_security_input_for_public_entry_points() {
+        let reg = ToolRegistry::new();
+        let arguments = serde_json::json!({"url": "https://example.com/x"});
+        let prepared = reg.prepare_call("http_get", &arguments).unwrap();
+        let (security, resource) = reg.security_context("http_get", &arguments).unwrap();
+        assert_eq!(prepared.security, security);
+        assert_eq!(prepared.resource, resource);
+        assert_eq!(prepared.security.action, SecurityAction::Network);
+        assert_eq!(prepared.resource, "https://example.com/x");
+        assert!(prepared.estimated_tokens >= 10);
+    }
+
+    #[tokio::test]
+    async fn authorize_call_is_the_single_gate_decision_for_public_entry_points() {
+        let reg = ToolRegistry::new();
+        let gate = crate::syscall_gate::SyscallGate::with_mac(
+            std::sync::Arc::new(crate::cgroups::CgroupManager::new()),
+            false,
+            Vec::new(),
+        );
+        let agent = uuid::Uuid::new_v4();
+        gate.register_agent(agent, CapabilitySet::none(), None);
+        let denied = reg
+            .authorize_call(
+                &gate,
+                agent,
+                "http_get",
+                &serde_json::json!({"url": "https://example.com"}),
+            )
+            .await;
+        assert!(matches!(
+            denied,
+            Err(ToolAuthorizationError::Denied(
+                crate::syscall_gate::GateDenial::MissingCapability(CapabilitySet::CAP_NET_ACCESS)
+            ))
+        ));
+    }
+
+    #[test]
     fn resolve_maps_tool_call_to_request() {
         let reg = ToolRegistry::new();
         let agent_id = uuid::Uuid::new_v4();
@@ -712,6 +1086,24 @@ mod tests {
         assert_eq!(req.operation, "read");
         assert_eq!(req.parameters["path"], "/tmp/test.txt");
         assert_eq!(req.agent_id, agent_id);
+    }
+
+    #[test]
+    fn create_directory_keeps_declared_filesystem_provider_and_operation() {
+        let reg = ToolRegistry::new();
+        let req = reg
+            .resolve(
+                uuid::Uuid::new_v4(),
+                &ToolCall {
+                    id: "mkdir".into(),
+                    name: "create_directory".into(),
+                    arguments: serde_json::json!({"path": "nested"}),
+                },
+            )
+            .unwrap();
+        assert_eq!(req.resource_type, ResourceType::Filesystem);
+        assert_eq!(req.operation, "create_dir");
+        assert_eq!(req.parameters["path"], "nested");
     }
 
     #[test]

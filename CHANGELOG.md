@@ -41,9 +41,15 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
   paths. Non-loopback listeners now fail closed unless authentication and TLS
   are configured. (#107)
 - **Fail-closed tools** — every registered tool needs a typed security contract;
-  unknown tools/profiles and incomplete declarations are rejected, while
-  capability, MAC, approval, namespace, accounting, and sandbox decisions share
-  one governed path. (#103, #108)
+  unknown tools/profiles, combined or unknown capabilities, optional/non-string
+  resource extractors, and provider/action contradictions are rejected. Shared
+  package and MCP definitions now carry resource type + operation explicitly;
+  custom command tools cannot disguise process execution as a read. Executor,
+  syscall, MCP, and SDK-backed calls share one preparation path, while approvals
+  are contract-bound, exact-resource, local-operator, atomically consumed, and
+  single-use. In-memory and low-level gate constructors now default to enforcing
+  MAC; explicit permissive construction is noisy and fully unconfined gates are
+  test-only. (#103, #108)
 - **Mandatory sandbox boundary** — resource calls require an unforgeable agent
   sandbox identity. Filesystem paths are canonicalized inside the workspace
   before provider dispatch, including regression coverage for traversal and
@@ -96,7 +102,7 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
 - Regression coverage expanded across authorization, sandbox escapes, lifecycle
   cleanup, checkpoints, scheduling, context pressure, accounting, persistence,
   services, packages, providers, wire compatibility, CLI/TUI state, and claim
-  integrity. Local line coverage is 77.45% with a 60% CI floor.
+  integrity. Local line coverage is 78.79% with a 60% CI floor.
 - Filesystem, SQLite, and vision fixtures now use unique platform-native
   temporary paths, so the same regression suite runs on Windows as well as
   Linux and macOS. (#110)

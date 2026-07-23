@@ -171,6 +171,8 @@ async fn governed_multi_agent_execution_contains_and_audits_violators() {
     // A privileged tool lives only in the `secure-ops` namespace (id 7000). The
     // intruder never joined it; `compliant` (the "operator") is a member.
     let secure_ns: u64 = 7000;
+    let rotate_security =
+        kernel::tools::ToolSecurity::constant(kernel::tools::SecurityAction::Read, "vault:key");
     kernel
         .syscall_gate
         .register_tool_namespace("rotate_secrets", secure_ns);
@@ -180,7 +182,13 @@ async fn governed_multi_agent_execution_contains_and_audits_violators() {
 
     let r = kernel
         .syscall_gate
-        .check_tool_call(intruder.id, "rotate_secrets", "/vault/key", 5)
+        .check_tool_call_declared(
+            intruder.id,
+            "rotate_secrets",
+            "/vault/key",
+            5,
+            &rotate_security,
+        )
         .await;
     assert!(
         matches!(
@@ -194,7 +202,13 @@ async fn governed_multi_agent_execution_contains_and_audits_violators() {
     // A member of the namespace calls the *same* tool successfully.
     let r = kernel
         .syscall_gate
-        .check_tool_call(compliant.id, "rotate_secrets", "/vault/key", 5)
+        .check_tool_call_declared(
+            compliant.id,
+            "rotate_secrets",
+            "/vault/key",
+            5,
+            &rotate_security,
+        )
         .await;
     assert!(
         r.is_ok(),

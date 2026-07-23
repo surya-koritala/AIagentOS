@@ -11,15 +11,17 @@
 //! agent with a chosen capability profile / cgroup / namespace state, optionally
 //! tag the tool to a namespace, and load a simple-but-real MAC policy. We then
 //! compute the *expected* verdict from an **independent oracle** (re-deriving the
-//! four-layer decision from the inputs, not from the gate) and compare it to the
+//! fail-closed declaration check plus the four-layer decision from the inputs,
+//! not from the gate) and compare it to the
 //! gate's actual return value. The oracle deliberately mirrors the documented
-//! ordering — namespace → capability → MAC → cgroup, first-failure-wins — so any
+//! ordering — known declaration → namespace → capability → MAC → cgroup,
+//! first-failure-wins — so any
 //! divergence (a bypass, a reordering, a miscounted denial) fails the property.
 //!
 //! Everything is deterministic: no wall-clock, no sleeps, fresh gate per case,
 //! proptest's own seeded RNG drives the input space.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use proptest::prelude::*;
 use tokio::runtime::Runtime;
@@ -29,6 +31,7 @@ use kernel::cgroups::{CgroupLimits, CgroupManager};
 use kernel::mac::{MacEngine, PolicyRule};
 use kernel::namespaces::NamespaceId;
 use kernel::syscall_gate::{classify_tool, GateDenial, GateStats, SyscallGate};
+use kernel::tools::{ApprovalPolicy, ToolRegistry};
 
 // ---------------------------------------------------------------------------
 // Input model
@@ -101,7 +104,7 @@ struct Case {
 const TOOLS: &[&str] = &[
     "read_file",          // READ, no cap
     "list_directory",     // READ, no cap
-    "git_status",         // READ, no cap
+    "git_status",         // EXEC, CAP_EXEC
     "write_file",         // WRITE, CAP_FILE_WRITE
     "edit_file",          // WRITE, CAP_FILE_WRITE
     "create_file",        // WRITE, CAP_FILE_WRITE
@@ -111,7 +114,7 @@ const TOOLS: &[&str] = &[
     "run_command",        // EXEC, CAP_EXEC
     "send_agent_message", // IPC, no cap
     "discover_agents",    // IPC, no cap
-    "totally_custom",     // EXECUTE, no cap (default branch)
+    "totally_custom",     // unknown declaration, always denied
 ];
 
 fn arb_profile() -> impl Strategy<Value = Profile> {
@@ -202,16 +205,35 @@ fn arb_case() -> impl Strategy<Value = Case> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Expected {
     Allowed,
+    Unknown,
     Namespace,
     Capability(u64),
     Mac,
+    Approval,
     Cgroup,
 }
 
+fn requires_approval(tool: &str) -> bool {
+    static APPROVAL_TOOLS: OnceLock<std::collections::HashSet<String>> = OnceLock::new();
+    APPROVAL_TOOLS
+        .get_or_init(|| {
+            ToolRegistry::default_security_catalog()
+                .into_iter()
+                .filter_map(|(name, security)| {
+                    (security.approval_policy != ApprovalPolicy::None).then_some(name)
+                })
+                .collect()
+        })
+        .contains(tool)
+}
+
 impl Case {
-    /// Re-derive the four-layer decision from the raw inputs, in the documented
-    /// first-failure-wins order: namespace → capability → MAC → cgroup.
+    /// Re-derive the decision from the raw inputs, in the documented
+    /// first-failure-wins order: declaration → namespace → capability → MAC → approval → cgroup.
     fn oracle(&self) -> Expected {
+        if self.tool == "totally_custom" {
+            return Expected::Unknown;
+        }
         let action = classify_tool(self.tool);
 
         // 0. Namespace visibility. Tagged tool + non-member → denied.
@@ -235,7 +257,13 @@ impl Case {
             return Expected::Mac;
         }
 
-        // 3. Cgroup quota. 0 budget == unlimited (the agent stays in root).
+        // 3. High-risk tools require an exact local approval. These property
+        // cases intentionally do not mint approvals.
+        if requires_approval(self.tool) {
+            return Expected::Approval;
+        }
+
+        // 4. Cgroup quota. 0 budget == unlimited (the agent stays in root).
         if self.cgroup_budget > 0 && self.preused_tokens + self.est_tokens > self.cgroup_budget {
             return Expected::Cgroup;
         }
@@ -335,6 +363,8 @@ fn classify_result(r: &Result<u64, GateDenial>) -> Expected {
         Err(GateDenial::MissingCapability(cap)) => Expected::Capability(*cap),
         Err(GateDenial::MacDeny { .. }) => Expected::Mac,
         Err(GateDenial::CgroupQuota | GateDenial::CgroupToolLimit) => Expected::Cgroup,
+        Err(GateDenial::UnknownTool(_)) => Expected::Unknown,
+        Err(GateDenial::ApprovalRequired { .. }) => Expected::Approval,
         Err(GateDenial::UnknownAgent) => {
             // Never expected in this suite — the agent is always registered.
             panic!("unexpected UnknownAgent denial for a registered agent");
@@ -402,6 +432,7 @@ proptest! {
         let total = stats.allowed
             + stats.denied_capability
             + stats.denied_mac
+            + stats.denied_approval
             + stats.denied_cgroup
             + stats.denied_unknown
             + stats.denied_namespace
@@ -409,9 +440,11 @@ proptest! {
         prop_assert_eq!(total, 1, "exactly one counter must move per call: {:?}", stats);
         match actual {
             Expected::Allowed => prop_assert_eq!(stats.allowed, 1),
+            Expected::Unknown => prop_assert_eq!(stats.denied_unknown, 1),
             Expected::Namespace => prop_assert_eq!(stats.denied_namespace, 1),
             Expected::Capability(_) => prop_assert_eq!(stats.denied_capability, 1),
             Expected::Mac => prop_assert_eq!(stats.denied_mac, 1),
+            Expected::Approval => prop_assert_eq!(stats.denied_approval, 1),
             Expected::Cgroup => prop_assert_eq!(stats.denied_cgroup, 1),
         }
     }
@@ -450,6 +483,10 @@ proptest! {
         let rt = Runtime::new().unwrap();
         let (result, _stats) = run_case(&rt, &case);
         let required = classify_tool(tool).required_cap;
+        if tool == "totally_custom" {
+            prop_assert_eq!(classify_result(&result), Expected::Unknown);
+            return Ok(());
+        }
         match required {
             Some(cap) => prop_assert_eq!(
                 classify_result(&result),
@@ -465,8 +502,8 @@ proptest! {
 
     /// INVARIANT 3 (capability monotonicity, grant side): a full-access agent is
     /// NEVER denied on *capability* grounds — it holds every bit. Under a
-    /// permissive/allow-all MAC and an unlimited cgroup with the tool global, a
-    /// full-access agent is always allowed.
+    /// permissive/allow-all MAC and an unlimited cgroup with the tool global,
+    /// only an explicit approval requirement may still deny it.
     #[test]
     fn full_access_agent_never_capability_denied(
         tool in arb_tool(),
@@ -490,7 +527,13 @@ proptest! {
             "full-access agent must never be capability-denied for {}: {:?}",
             tool, result
         );
-        prop_assert!(result.is_ok(), "expected allow, got {:?}", result);
+        if tool == "totally_custom" {
+            prop_assert_eq!(classify_result(&result), Expected::Unknown);
+        } else if requires_approval(tool) {
+            prop_assert_eq!(classify_result(&result), Expected::Approval);
+        } else {
+            prop_assert!(result.is_ok(), "expected allow, got {:?}", result);
+        }
     }
 
     /// INVARIANT 4 (cgroup quota): with namespace/cap/MAC all satisfied, an
@@ -545,7 +588,7 @@ proptest! {
             cgroups.root(),
             CgroupLimits { tokens_per_min: budget, ..Default::default() },
         );
-        let gate = Arc::new(SyscallGate::new(cgroups));
+        let gate = Arc::new(SyscallGate::with_mac(cgroups, false, Vec::new()));
         let kid = uuid::Uuid::new_v4();
         gate.register_agent(kid, CapabilitySet::all(), Some(cg));
 
@@ -579,7 +622,7 @@ proptest! {
         // the *only* thing that can deny is the namespace layer.
         let rt = Runtime::new().unwrap();
         let cgroups = Arc::new(CgroupManager::new());
-        let gate = Arc::new(SyscallGate::new(cgroups));
+        let gate = Arc::new(SyscallGate::with_mac(cgroups, false, Vec::new()));
         let kid = uuid::Uuid::new_v4();
         gate.register_agent(kid, CapabilitySet::all(), None);
 
@@ -621,7 +664,7 @@ proptest! {
     ) {
         let rt = Runtime::new().unwrap();
         let cgroups = Arc::new(CgroupManager::new());
-        let gate = Arc::new(SyscallGate::new(cgroups));
+        let gate = Arc::new(SyscallGate::with_mac(cgroups, false, Vec::new()));
         let kid = uuid::Uuid::new_v4();
         gate.register_agent(kid, CapabilitySet::none(), None); // lacks the cap
         gate.register_tool_namespace(tool, ns);                // tag the tool

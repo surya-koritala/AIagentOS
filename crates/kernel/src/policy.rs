@@ -216,13 +216,22 @@ impl PolicyDocument {
     /// kernel's validated default catalog. An uncovered action falls directly
     /// to the terminal default and is usually an accidental outage or grant.
     pub fn lint_with_tool_catalog(&self) -> Vec<Lint> {
+        let registry = crate::tools::ToolRegistry::new();
+        registry.register_advanced_tools();
+        registry.register_git_tools();
+        registry.register_ipc_tools();
+        crate::editing::register_edit_tools(&registry);
+        self.lint_with_tool_registry(&registry)
+    }
+
+    /// Lint policy coverage against the actual live registry, including
+    /// dynamically installed package, custom, and MCP declarations.
+    pub fn lint_with_tool_registry(&self, registry: &crate::tools::ToolRegistry) -> Vec<Lint> {
         let mut lints = self.lint();
-        let actions: std::collections::BTreeSet<&'static str> =
-            crate::tools::ToolRegistry::default_security_catalog()
-                .values()
-                .map(|security| security.action.as_str())
-                .collect();
-        for action in actions {
+        let tools: std::collections::BTreeMap<String, crate::tools::ToolSecurity> =
+            registry.security_catalog().into_iter().collect();
+        for (tool, security) in tools {
+            let action = security.action.as_str();
             if !self
                 .rules
                 .iter()
@@ -231,7 +240,7 @@ impl PolicyDocument {
                 lints.push(Lint {
                     rule_index: None,
                     message: format!(
-                        "tool action '{action}' is uncovered and falls directly to default {:?}",
+                        "tool '{tool}' action '{action}' is uncovered and falls directly to default {:?}",
                         self.default
                     ),
                 });
@@ -425,10 +434,68 @@ decision = "deny"
         let lints = doc.lint_with_tool_catalog();
         assert!(lints
             .iter()
-            .any(|lint| lint.message.contains("tool action 'net' is uncovered")));
+            .any(|lint| lint.message.contains("action 'net' is uncovered")));
         assert!(lints
             .iter()
-            .any(|lint| lint.message.contains("tool action 'delete' is uncovered")));
+            .any(|lint| lint.message.contains("action 'delete' is uncovered")));
+    }
+
+    #[test]
+    fn live_registry_coverage_includes_dynamic_tool_actions() {
+        use crate::resources::ResourceType;
+        use crate::tools::{
+            ApprovalPolicy, SecurityAction, ToolBinding, ToolRegistry, ToolSecurity,
+        };
+
+        let registry = ToolRegistry::new();
+        registry
+            .register(ToolBinding {
+                name: "dynamic_browser".into(),
+                description: "browser extension".into(),
+                parameters_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {"url": {"type": "string"}},
+                    "required": ["url"]
+                }),
+                resource_type: ResourceType::Browser,
+                operation: "navigate".into(),
+                security: ToolSecurity::argument(SecurityAction::BrowserAutomation, "url")
+                    .with_approval(ApprovalPolicy::User)
+                    .sandboxed(),
+            })
+            .unwrap();
+        let doc = PolicyDocument::from_toml(
+            "default = \"deny\"\n[[rule]]\nsubject=\"*\"\naction=\"read\"\nobject=\"*\"\ndecision=\"allow\"\n",
+        )
+        .unwrap();
+
+        assert!(doc
+            .lint_with_tool_registry(&registry)
+            .iter()
+            .any(|lint| lint
+                .message
+                .contains("tool 'dynamic_browser' action 'browser' is uncovered")));
+    }
+
+    #[test]
+    fn every_registered_default_tool_has_policy_coverage() {
+        let registry = crate::tools::ToolRegistry::new();
+        let doc = PolicyDocument::from_toml(
+            r#"
+default = "deny"
+[[rule]]
+subject = "profile:full-access"
+action = "*"
+object = "*"
+decision = "allow"
+"#,
+        )
+        .unwrap();
+        let lints = doc.lint_with_tool_registry(&registry);
+        assert!(
+            !lints.iter().any(|lint| lint.message.contains("uncovered")),
+            "all registered tools should be covered: {lints:?}"
+        );
     }
 
     #[test]

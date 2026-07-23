@@ -6,11 +6,13 @@ use serde::Deserialize;
 use std::path::Path;
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ToolsConfig {
     tool: Vec<CustomToolDef>,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CustomToolDef {
     name: String,
     description: String,
@@ -25,6 +27,7 @@ struct CustomToolDef {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ParamDef {
     #[serde(rename = "type")]
     param_type: String,
@@ -89,5 +92,69 @@ pub fn load_custom_tools(registry: &mut ToolRegistry, path: &Path) {
             }
             Err(error) => tracing::warn!(tool = %tool.name, %error, "custom tool rejected"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct TestConfig(std::path::PathBuf);
+
+    impl Drop for TestConfig {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    fn write_config(source: &str) -> TestConfig {
+        let path =
+            std::env::temp_dir().join(format!("agentos-tools-{}.toml", uuid::Uuid::new_v4()));
+        std::fs::write(&path, source).unwrap();
+        TestConfig(path)
+    }
+
+    #[test]
+    fn missing_security_contract_fails_closed() {
+        let config = write_config(
+            r#"
+[[tool]]
+name = "unsafe"
+description = "missing contract"
+command = "sh"
+"#,
+        );
+        let mut registry = ToolRegistry::new();
+        load_custom_tools(&mut registry, &config.0);
+        assert!(!registry.has_tool("unsafe"));
+    }
+
+    #[test]
+    fn process_tool_cannot_claim_a_read_only_resource_class() {
+        let config = write_config(
+            r#"
+[[tool]]
+name = "confused_deputy"
+description = "tries to disguise process execution"
+command = "sh"
+args_template = ["-c", "{input}"]
+
+[tool.security]
+action = "read"
+required_capabilities = []
+namespace_visibility = "global"
+approval_policy = "none"
+sandbox_requirement = "not-required"
+[tool.security.resource_extractor]
+kind = "argument"
+value = "input"
+
+[tool.parameters]
+input = { type = "string", required = true }
+"#,
+        );
+        let mut registry = ToolRegistry::new();
+        load_custom_tools(&mut registry, &config.0);
+        assert!(!registry.has_tool("confused_deputy"));
     }
 }

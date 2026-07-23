@@ -469,6 +469,7 @@ impl ResourceProvider for BuiltinFilesystemProvider {
             "read".into(),
             "write".into(),
             "create".into(),
+            "create_dir".into(),
             "edit".into(),
             "delete".into(),
             "list".into(),
@@ -496,6 +497,12 @@ impl ResourceProvider for BuiltinFilesystemProvider {
                     .await
                     .map_err(|e| ResourceError::OperationFailed(e.to_string()))?;
                 Ok(serde_json::json!({"written": true}))
+            }
+            "create_dir" => {
+                tokio::fs::create_dir_all(path)
+                    .await
+                    .map_err(|e| ResourceError::OperationFailed(e.to_string()))?;
+                Ok(serde_json::json!({"created": true}))
             }
             "edit" => {
                 // Precise find→replace via the transactional editing engine
@@ -940,15 +947,18 @@ pub struct AgentKernelImpl {
 }
 
 impl AgentKernelImpl {
-    /// Create a new kernel with all subsystems wired together (in-memory DB for testing).
+    /// Create an in-memory kernel with the same enforcing security defaults as
+    /// production. Tests that need permissive MAC must use the explicit
+    /// `with_context_manager(..., false, ...)` escape hatch.
     pub fn new() -> Result<Self, KernelError> {
         let context_manager =
             Arc::new(SqliteContextManager::in_memory().map_err(KernelError::Context)?);
+        let security = crate::config::Config::default();
         Self::with_context_manager(
             context_manager,
-            &crate::config::BudgetConfig::default(),
-            false,
-            &[],
+            &security.budgets,
+            security.mac_enforcing,
+            &security.mac_rules,
         )
     }
 
@@ -959,11 +969,12 @@ impl AgentKernelImpl {
         }
         let context_manager =
             Arc::new(SqliteContextManager::new(db_path).map_err(KernelError::Context)?);
+        let security = crate::config::Config::default();
         let kernel = Self::with_context_manager(
             context_manager,
-            &crate::config::BudgetConfig::default(),
-            false,
-            &[],
+            &security.budgets,
+            security.mac_enforcing,
+            &security.mac_rules,
         )?;
         // Bring back any agents persisted by a previous run on this DB so a
         // restart restores the full registry (and re-arms enforcement).
@@ -1220,12 +1231,59 @@ impl AgentKernelImpl {
         mut binding: crate::tools::ToolBinding,
     ) -> Result<(), crate::tools::ToolRegistrationError> {
         let name = binding.name.clone();
+        if self.tool_registry.has_tool(&name) {
+            return Err(crate::tools::ToolRegistrationError::DuplicateName(name));
+        }
         binding.security.namespace_visibility = crate::tools::NamespaceVisibility::CallerNamespace;
-        self.tool_registry.register(binding)?;
-        // Lazily ensures the group's namespaces exist; tag with the Tool ns.
+        // Tag the gate before publishing to the LLM-visible registry so there
+        // is no concurrent window where the scoped tool appears global.
         let (_agent_ns, tool_ns) = self.namespaces_for_group(Some(group));
         if let Some(ns) = tool_ns {
-            self.syscall_gate.register_tool_namespace(name, ns);
+            self.syscall_gate.register_tool_namespace(name.clone(), ns);
+            if let Err(error) = self.tool_registry.register_namespace_scoped(binding) {
+                self.syscall_gate.unregister_tool_namespace(&name);
+                return Err(error);
+            }
+        } else {
+            return Err(crate::tools::ToolRegistrationError::UnboundNamespace);
+        }
+        Ok(())
+    }
+
+    /// Grant one exact, single-use tool approval from a trusted in-process
+    /// operator/UI. This API is deliberately absent from the remote syscall,
+    /// package, SDK-data, and MCP surfaces.
+    pub fn approve_tool_call(
+        &self,
+        agent_id: AgentId,
+        tool_name: &str,
+        arguments: &serde_json::Value,
+        approval: crate::tools::ApprovalPolicy,
+    ) -> Result<(), KernelError> {
+        let prepared = self
+            .tool_registry
+            .prepare_call(tool_name, arguments)
+            .map_err(KernelError::Policy)?;
+        if prepared.security.approval_policy == crate::tools::ApprovalPolicy::None {
+            return Err(KernelError::Policy(format!(
+                "tool '{tool_name}' does not require approval"
+            )));
+        }
+        if !approval.satisfies(prepared.security.approval_policy) {
+            return Err(KernelError::Policy(format!(
+                "{approval:?} approval is insufficient for tool '{tool_name}'"
+            )));
+        }
+        if !self.syscall_gate.grant_tool_approval(
+            agent_id,
+            tool_name,
+            prepared.resource,
+            &prepared.security,
+            approval,
+        ) {
+            return Err(KernelError::Policy(format!(
+                "cannot approve tool '{tool_name}' for an unknown agent"
+            )));
         }
         Ok(())
     }
@@ -1349,12 +1407,13 @@ impl AgentKernelImpl {
         self.ipc.register_agent(agent_id);
 
         // Register with the syscall gate (capabilities derived from the
-        // permission profile; fully-permissive if the profile is unknown).
+        // permission profile; unknown profiles receive no capabilities).
         let caps = caps_for_profile(&config.permission_profile);
         // Choose the cgroup: a tenanted agent goes in its tenant's cgroup so its
         // tokens count against the tenant's budget (and one tenant exhausting its
         // quota can't starve another). Un-tenanted agents fall back to the
-        // permission-profile cgroup (prior behavior); unknown profiles → standard.
+        // permission-profile cgroup (prior behavior). Unknown profiles remain
+        // capability/MAC denied even though they use the standard resource quota.
         let cgroup = self.tenant_cgroup(tenant_id).or_else(|| {
             self.profile_cgroups
                 .get(&config.permission_profile)
@@ -2689,6 +2748,66 @@ pub fn boot_in_memory() -> Result<Arc<AgentKernelImpl>, KernelError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn in_memory_kernel_uses_production_mac_defaults() {
+        let kernel = AgentKernelImpl::new().unwrap();
+        assert!(kernel.syscall_gate.mac.lock().await.is_enforcing());
+    }
+
+    #[tokio::test]
+    async fn trusted_kernel_approval_api_grants_one_exact_registered_call() {
+        let kernel = AgentKernelImpl::new().unwrap();
+        let agent = uuid::Uuid::new_v4();
+        let pid = kernel
+            .syscall_gate
+            .register_agent(agent, CapabilitySet::all(), None);
+        kernel
+            .syscall_gate
+            .mac
+            .lock()
+            .await
+            .label_agent(pid, "profile:full-access".into());
+        let arguments = serde_json::json!({"command": "echo", "args": ["ok"]});
+
+        assert!(matches!(
+            kernel
+                .tool_registry
+                .authorize_call(&kernel.syscall_gate, agent, "run_command", &arguments)
+                .await,
+            Err(crate::tools::ToolAuthorizationError::Denied(
+                crate::syscall_gate::GateDenial::ApprovalRequired { .. }
+            ))
+        ));
+        kernel
+            .approve_tool_call(
+                agent,
+                "run_command",
+                &arguments,
+                crate::tools::ApprovalPolicy::User,
+            )
+            .unwrap();
+        assert!(kernel
+            .tool_registry
+            .authorize_call(&kernel.syscall_gate, agent, "run_command", &arguments)
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn filesystem_provider_creates_directories_without_process_execution() {
+        let path = std::env::temp_dir().join(format!("agentos-mkdir-{}", uuid::Uuid::new_v4()));
+        let result = BuiltinFilesystemProvider
+            .execute(
+                "create_dir",
+                &serde_json::json!({"path": path.to_string_lossy()}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["created"], true);
+        assert!(path.is_dir());
+        std::fs::remove_dir(&path).unwrap();
+    }
 
     #[test]
     fn priority_valid_range() {

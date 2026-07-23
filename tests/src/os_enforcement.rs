@@ -15,7 +15,7 @@ use kernel::syscall_gate::{GateDenial, SyscallGate};
 
 fn fresh_gate() -> (Arc<SyscallGate>, Arc<CgroupManager>) {
     let cgroups = Arc::new(CgroupManager::new());
-    let gate = Arc::new(SyscallGate::new(cgroups.clone()));
+    let gate = Arc::new(SyscallGate::with_mac(cgroups.clone(), false, Vec::new()));
     (gate, cgroups)
 }
 
@@ -261,6 +261,8 @@ async fn unified_kernel_places_agent_in_os_subsystems() {
 /// learns nothing about a tool it cannot see.
 #[tokio::test]
 async fn namespace_isolation_denies_foreign_tool() {
+    use kernel::tools::{SecurityAction, ToolSecurity};
+
     let (gate, _cg) = fresh_gate();
 
     // Two namespaces: "team-a" (id 100) and "team-b" (id 200). The actual ids
@@ -270,13 +272,14 @@ async fn namespace_isolation_denies_foreign_tool() {
 
     // Tool `db_admin` is exclusive to team-a's namespace.
     gate.register_tool_namespace("db_admin", ns_a);
+    let security = ToolSecurity::constant(SecurityAction::Read, "database:users");
 
     // Agent in team-a can call it.
     let alice = uuid::Uuid::new_v4();
     gate.register_agent(alice, CapabilitySet::all(), None);
     gate.set_agent_namespaces(alice, vec![ns_a]);
     let r = gate
-        .check_tool_call(alice, "db_admin", "/db/users", 5)
+        .check_tool_call_declared(alice, "db_admin", "/db/users", 5, &security)
         .await;
     assert!(
         r.is_ok(),
@@ -287,7 +290,9 @@ async fn namespace_isolation_denies_foreign_tool() {
     let bob = uuid::Uuid::new_v4();
     gate.register_agent(bob, CapabilitySet::all(), None);
     gate.set_agent_namespaces(bob, vec![ns_b]);
-    let r = gate.check_tool_call(bob, "db_admin", "/db/users", 5).await;
+    let r = gate
+        .check_tool_call_declared(bob, "db_admin", "/db/users", 5, &security)
+        .await;
     match r {
         Err(GateDenial::NotInNamespace { tool, namespace }) => {
             assert_eq!(tool, "db_admin");
@@ -304,7 +309,9 @@ async fn namespace_isolation_denies_foreign_tool() {
 
     // Adding bob to team-a unblocks db_admin for him without restarting.
     gate.add_agent_namespace(bob, ns_a);
-    let r = gate.check_tool_call(bob, "db_admin", "/db/users", 5).await;
+    let r = gate
+        .check_tool_call_declared(bob, "db_admin", "/db/users", 5, &security)
+        .await;
     assert!(
         r.is_ok(),
         "after joining the namespace bob can resolve the tool"
@@ -610,6 +617,14 @@ async fn live_path_extended_tools_edit_and_delete_capability() {
         isolation_level: kernel::IsolationLevel::Filesystem,
     });
     let fa = kernel.create_agent_full(fa_config).await.unwrap();
+    kernel
+        .approve_tool_call(
+            fa.id,
+            "delete_file",
+            &serde_json::json!({"path": "/x"}),
+            kernel::tools::ApprovalPolicy::User,
+        )
+        .unwrap();
     assert!(kernel
         .syscall_gate
         .check_tool_call(fa.id, "delete_file", "/x", 10)
@@ -1372,8 +1387,8 @@ async fn live_path_group_scoped_tool_isolation() {
                 name: "team_a_secret".into(),
                 description: "team-a only".into(),
                 parameters_schema: serde_json::json!({"type": "object", "properties": {}}),
-                resource_type: ResourceType::Application,
-                operation: "noop".into(),
+                resource_type: ResourceType::Filesystem,
+                operation: "read".into(),
                 security: ToolSecurity::constant(SecurityAction::Read, "team-a:secret"),
             },
         )
@@ -1391,13 +1406,14 @@ async fn live_path_group_scoped_tool_isolation() {
         .create_agent_full(agent_cfg("carol", "standard"))
         .await
         .unwrap();
+    let security = kernel.tool_registry.security("team_a_secret").unwrap();
 
     // Same group → passes the namespace gate (no NotInNamespace).
     assert!(
         !matches!(
             kernel
                 .syscall_gate
-                .check_tool_call(alice.id, "team_a_secret", "x", 5)
+                .check_tool_call_declared(alice.id, "team_a_secret", "x", 5, &security)
                 .await,
             Err(GateDenial::NotInNamespace { .. })
         ),
@@ -1409,7 +1425,7 @@ async fn live_path_group_scoped_tool_isolation() {
         matches!(
             kernel
                 .syscall_gate
-                .check_tool_call(eve.id, "team_a_secret", "x", 5)
+                .check_tool_call_declared(eve.id, "team_a_secret", "x", 5, &security)
                 .await,
             Err(GateDenial::NotInNamespace { .. })
         ),
@@ -1421,7 +1437,7 @@ async fn live_path_group_scoped_tool_isolation() {
         matches!(
             kernel
                 .syscall_gate
-                .check_tool_call(carol.id, "team_a_secret", "x", 5)
+                .check_tool_call_declared(carol.id, "team_a_secret", "x", 5, &security)
                 .await,
             Err(GateDenial::NotInNamespace { .. })
         ),

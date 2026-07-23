@@ -91,7 +91,7 @@ public_entry_points = ["crates/kernel/src/syscall_server.rs::Metrics"]
 runtime_call_paths = ["crates/kernel/src/lib.rs::AgentKernelImpl::send_message"]
 test_evidence = ["crates/kernel/src/budget.rs", "crates/kernel/src/context.rs", "crates/kernel/src/execution.rs", "crates/kernel/src/quota_clock.rs", "crates/kernel/src/rate_limit.rs", "tests/src/observability_props.rs", "tests/src/gate_adversarial_props.rs", "tests/src/persistence_props.rs", "tests/src/tenancy_props.rs"]
 platforms = ["linux", "macos", "windows"]
-limitations = ["Detailed pricing plus provider/root/tenant/profile/agent token scopes use one atomic durable fixed-epoch receipt with restart and membership-race regressions. One SQLite database still requires a single active kernel owner; bounded public per-scope reporting, active-active ownership/leases, live-provider invoice reconciliation, and production high-cardinality concurrency/soak qualification remain outstanding."]
+limitations = ["Detailed pricing plus provider/root/tenant/profile/agent token scopes use one atomic durable fixed-epoch receipt with restart and membership-race regressions. One SQLite database still requires a single active kernel owner; bounded public per-scope reporting, active-active ownership/leases, live-provider invoice reconciliation, and production high-cardinality concurrency/soak qualification remain tracked by #125."]
 
 [[capability]]
 id = "quality-gates"

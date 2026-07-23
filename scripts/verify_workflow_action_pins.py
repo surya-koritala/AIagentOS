@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
-USES_PATTERN = re.compile(r"^\s*-\s*uses:\s*([^\s#]+)")
+USES_PATTERN = re.compile(r"^\s*(?:-\s*)?uses:\s*([^\s#]+)")
 SHA_PATTERN = re.compile(r"^[0-9a-fA-F]{40}$")
 
 

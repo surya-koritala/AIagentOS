@@ -15,7 +15,7 @@ from verify_workflow_action_pins import (
 
 
 class WorkflowActionPinTests(unittest.TestCase):
-    def test_discovers_subpath_actions_and_skips_local_workflows(self):
+    def test_discovers_every_uses_key_and_skips_local_workflows(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             workflow = root / "release.yml"
@@ -24,7 +24,12 @@ class WorkflowActionPinTests(unittest.TestCase):
                     [
                         "steps:",
                         "  - uses: owner/action/subpath@0123456789abcdef0123456789abcdef01234567",
-                        "  - uses: ./.github/workflows/ci.yml",
+                        "  - name: Named action step",
+                        "    uses: second/action@123456789abcdef0123456789abcdef012345678",
+                        "reusable-job:",
+                        "  uses: third/workflows/.github/workflows/ci.yml@23456789abcdef0123456789abcdef0123456789",
+                        "local-job:",
+                        "  uses: ./.github/workflows/ci.yml",
                     ]
                 ),
                 encoding="utf-8",
@@ -39,7 +44,19 @@ class WorkflowActionPinTests(unittest.TestCase):
                     revision="0123456789abcdef0123456789abcdef01234567",
                     workflow=workflow,
                     line=2,
-                )
+                ),
+                ActionPin(
+                    repository="second/action",
+                    revision="123456789abcdef0123456789abcdef012345678",
+                    workflow=workflow,
+                    line=4,
+                ),
+                ActionPin(
+                    repository="third/workflows",
+                    revision="23456789abcdef0123456789abcdef0123456789",
+                    workflow=workflow,
+                    line=6,
+                ),
             ],
         )
 
@@ -51,7 +68,8 @@ class WorkflowActionPinTests(unittest.TestCase):
                     [
                         "steps:",
                         "  - uses: actions/checkout@v7",
-                        "  - uses: actions/setup-node",
+                        "  - name: Setup",
+                        "    uses: actions/setup-node",
                     ]
                 ),
                 encoding="utf-8",

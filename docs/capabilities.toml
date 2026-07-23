@@ -97,16 +97,16 @@ limitations = ["Detailed pricing plus provider/root/tenant/profile/agent token s
 id = "quality-gates"
 title = "Cross-platform CI and release gates"
 owner = "release-engineering"
-maturity = "unit-tested"
+maturity = "production-qualified"
 release = "v0.4"
 tracking_issue = 110
 kernel_modules = ["config", "prerequisites"]
 source_paths = [".github/workflows/ci.yml", ".github/workflows/extended-security.yml", ".github/workflows/live-provider-qualification.yml", ".github/workflows/release.yml", "Dockerfile", "scripts/check_critical_coverage.py"]
-public_entry_points = [".github/workflows/ci.yml"]
-runtime_call_paths = []
+public_entry_points = [".github/workflows/ci.yml::on.workflow_call", ".github/workflows/release.yml::on.workflow_dispatch"]
+runtime_call_paths = [".github/workflows/ci.yml::jobs.required", ".github/workflows/release.yml::jobs.assemble"]
 test_evidence = ["crates/kernel/src/prerequisites.rs", "scripts/tests/test_check_critical_coverage.py", "tests/src/capability_registry.rs"]
 platforms = ["linux", "macos", "windows"]
-limitations = ["The complete gate is implemented and locally validated, but remains unit-tested until protected-branch, cross-platform, scheduled-security, container, and signed qualification workflows succeed remotely."]
+limitations = ["Live-provider qualification is intentionally isolated in a protected manual workflow and is owned by #124; independent product security review and v1 release governance are owned by #127."]
 
 [[capability]]
 id = "sandbox-isolation"

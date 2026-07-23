@@ -20,14 +20,17 @@ Configured `provider_pricing` values are USD per 1,000 total tokens. Separate
 input/output/cache prices are not yet supported; invoice-sensitive deployments
 must configure a conservative blended rate.
 
-USD ceilings are cumulative for the kernel process: global, tenant, and agent.
+USD ceilings are cumulative and durable across process restarts: global, tenant,
+and agent.
 The check-through-record interval is serialized for each configured scope, so
 concurrent requests cannot race through the same remaining budget. Because a
 provider reveals the final charge only after completing a response, the response
 that reaches a ceiling can exceed it by that one response; no subsequent request
-is admitted. Global and tenant totals survive individual agent deletion in the
-running process. Durable usage rows survive restart, but cumulative USD admission
-counters are not yet restored from those rows.
+is admitted. Every response persists the exact integer micro-dollar charge that
+was applied in memory. Startup reconstructs global, tenant, and agent counters
+from those fixed-point rows before admitting work, so a later pricing change
+does not reprice historical usage. Stopping or unregistering an agent releases
+live admission locks but does not erase its cumulative spend.
 
 ## Rate and hierarchy limits
 
@@ -39,15 +42,21 @@ counters are not yet restored from those rows.
 - Turn concurrency: actively executing agent turns, separately CFS-ordered.
 - Context limit: active input context tokens per executor; old non-system pages
   are evicted before a provider request.
-- Tool concurrency: active tool calls across every cgroup ancestor. RAII guards
-  release slots after success, error, panic unwind, or cancellation.
+- Per-turn tool limit: cumulative tool calls across every provider response in
+  one logical user turn, including calls completed before pause/resume. Reaching
+  the limit skips all remaining side effects in the response and records
+  explicit denied tool results. A new user turn starts at zero.
+- Tool concurrency: independently configured active tool calls across every
+  cgroup ancestor. RAII guards release slots after success, error, panic unwind,
+  or cancellation.
 - Cgroup token charge: conservative tool-call estimate, atomically reserved
   across the complete agent-to-tenant/root hierarchy at gate admission.
 
-For RPM, TPM, provider concurrency, cgroup, context, and USD configuration, zero
-means unlimited. Counter arithmetic saturates instead of overflowing. The rolling
-rate-limit window resets deterministically after 60 seconds. Cgroup minute-window
-reset is driven by the kernel timer and is currently process-local.
+For RPM, TPM, provider concurrency, cumulative/concurrent tool limits, cgroup,
+context, and USD configuration, zero means unlimited. Counter arithmetic
+saturates instead of overflowing. The rolling rate-limit window resets
+deterministically after 60 seconds. Cgroup minute-window reset is driven by the
+kernel timer and is currently process-local.
 
 ## Runtime and node-load metrics
 
@@ -69,6 +78,7 @@ node metrics require operator/admin authorization.
 The regression suite covers exact provider parsing and pricing fixtures,
 provider/fallback distinction, retries and latency persistence, concurrent RPM,
 TPM, tool-slot, cgroup, and USD admission, overflow saturation, zero/unlimited
-configuration, lifecycle metrics, and load-aware cluster placement. Live-provider
-invoice comparison remains a separate secret-backed qualification job rather than
-a deterministic pull-request test.
+configuration, cumulative tool-call behavior across pause/resume, exact
+micro-dollar restart rehydration, lifecycle metrics, and load-aware cluster
+placement. Live-provider invoice comparison remains a separate secret-backed
+qualification job rather than a deterministic pull-request test.

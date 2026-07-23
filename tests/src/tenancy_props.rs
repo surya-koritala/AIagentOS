@@ -14,7 +14,10 @@
 //!   (d) tenancy survives a restart,
 //! plus the auth → `(user, tenant, role)` resolution.
 
+use std::sync::atomic::Ordering;
+
 use kernel::auth::Role;
+use kernel::config::Config;
 use kernel::context::{Fact, FactCategory};
 use kernel::{AgentConfig, AgentKernelImpl};
 
@@ -441,5 +444,116 @@ async fn rehydrated_credentials_preserve_authority_and_unknown_roles_fail_closed
     let kernel = AgentKernelImpl::with_db_path(&db).expect("kernel reboot with invalid role");
     assert!(kernel.resolve_principal(&key).await.is_none());
     assert!(kernel.resolve_principal(&session).await.is_none());
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Durable accounting is tenant-scoped: two agents in one tenant contribute to
+/// the same restored ceiling, while an equally active agent in another tenant
+/// retains an independent allowance after restart.
+#[tokio::test(flavor = "multi_thread")]
+async fn tenant_spend_rehydrates_shared_within_tenant_and_isolated_across_tenants() {
+    use kernel::budget::BudgetScope;
+
+    const PROVIDER: &str = "fixed-tenant-accounting";
+    const PER_AGENT_MICROS: u64 = 20_000;
+
+    let dir = std::env::temp_dir().join(format!("tenant-spend-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let mut first_config = Config {
+        data_dir: dir.clone(),
+        ..Config::default()
+    };
+    first_config.budgets.usd_per_1k_tokens = 1.0;
+    first_config.budgets.max_usd = 0.0;
+    first_config.budgets.per_agent_max_usd = 0.0;
+    first_config.budgets.per_tenant_max_usd = 1.0;
+
+    let (tenant_a, tenant_b, a1, a2, b1) = {
+        let kernel = AgentKernelImpl::from_config(&first_config).expect("first boot");
+        let calls =
+            super::persistence_props::register_fixed_usage_provider(&kernel, PROVIDER, 12, 8);
+        let tenant_a = kernel.create_tenant("accounting-a").await.unwrap();
+        let tenant_b = kernel.create_tenant("accounting-b").await.unwrap();
+        let provider_cfg = |name: &str| AgentConfig {
+            name: name.into(),
+            task: "exercise tenant accounting".into(),
+            llm_provider: PROVIDER.into(),
+            permission_profile: "standard".into(),
+            priority: kernel::Priority::default(),
+            sandbox_config: None,
+        };
+        let a1 = kernel
+            .create_agent_for_tenant(&tenant_a, provider_cfg("a1"))
+            .await
+            .unwrap()
+            .id;
+        let a2 = kernel
+            .create_agent_for_tenant(&tenant_a, provider_cfg("a2"))
+            .await
+            .unwrap()
+            .id;
+        let b1 = kernel
+            .create_agent_for_tenant(&tenant_b, provider_cfg("b1"))
+            .await
+            .unwrap()
+            .id;
+
+        for agent in [a1, a2, b1] {
+            let output = kernel
+                .send_message(agent, "record tenant-scoped spend")
+                .await
+                .expect("provider request");
+            assert_eq!(output.usage.charged_cost_micros, PER_AGENT_MICROS);
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        drop(kernel);
+        (tenant_a, tenant_b, a1, a2, b1)
+    };
+
+    // Reboot with a different price and a ceiling exactly equal to tenant A's
+    // prior aggregate. Historical charges remain fixed; both A agents are
+    // denied by their shared restored total, while tenant B remains eligible.
+    let mut restart_config = first_config.clone();
+    restart_config.budgets.usd_per_1k_tokens = 50.0;
+    restart_config.budgets.per_tenant_max_usd = 0.04;
+    let kernel = AgentKernelImpl::from_config(&restart_config).expect("restart");
+    let snapshot = kernel
+        .context_manager
+        .load_budget_usage_snapshot()
+        .expect("load exact usage snapshot");
+    assert_eq!(snapshot.global_micros, PER_AGENT_MICROS * 3);
+    for agent in [a1, a2, b1] {
+        assert_eq!(
+            snapshot.per_agent_micros.get(&agent),
+            Some(&PER_AGENT_MICROS)
+        );
+    }
+    assert_eq!(
+        snapshot.per_tenant_micros.get(&tenant_a),
+        Some(&(PER_AGENT_MICROS * 2))
+    );
+    assert_eq!(
+        snapshot.per_tenant_micros.get(&tenant_b),
+        Some(&PER_AGENT_MICROS)
+    );
+    assert_eq!(kernel.budget_enforcer.tenant_spent_usd(&tenant_a), 0.04);
+    assert_eq!(kernel.budget_enforcer.tenant_spent_usd(&tenant_b), 0.02);
+
+    for agent in [a1, a2] {
+        let denial = kernel
+            .budget_enforcer
+            .check(agent)
+            .expect_err("tenant A must share its restored ceiling");
+        assert_eq!(denial.scope, BudgetScope::Tenant);
+        assert_eq!(denial.spent_usd, 0.04);
+        assert_eq!(denial.limit_usd, 0.04);
+    }
+    kernel
+        .budget_enforcer
+        .check(b1)
+        .expect("tenant B spend must remain isolated from tenant A");
+
+    drop(kernel);
     std::fs::remove_dir_all(&dir).ok();
 }

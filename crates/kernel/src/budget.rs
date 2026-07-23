@@ -17,6 +17,7 @@ use std::sync::Arc;
 
 use dashmap::DashMap;
 
+use crate::context::BudgetUsageSnapshot;
 use crate::AgentId;
 
 /// Spend is accumulated in micro-dollars (1e-6 USD) as `u64` so the global
@@ -287,8 +288,12 @@ impl BudgetEnforcer {
         Ok(())
     }
 
-    /// Record actual spend for an LLM response and return the cost in USD.
-    pub fn record(&self, agent: AgentId, provider: &str, tokens: u32) -> f64 {
+    /// Record actual spend for an LLM response and return both the display USD
+    /// value and the exact integer micro-USD charge applied to every counter.
+    ///
+    /// Persist the returned `u64` alongside the usage row; recalculating it from
+    /// a floating-point USD value after restart can otherwise drift by a micro.
+    pub fn record_charge(&self, agent: AgentId, provider: &str, tokens: u32) -> (f64, u64) {
         let cost_usd = self.cost_of(provider, tokens);
         let micros = usd_to_micros(cost_usd);
         if micros > 0 {
@@ -303,7 +308,36 @@ impl BudgetEnforcer {
                 *tenant_spend = tenant_spend.saturating_add(micros);
             }
         }
-        cost_usd
+        (cost_usd, micros)
+    }
+
+    /// Compatibility wrapper returning only the USD display value.
+    pub fn record(&self, agent: AgentId, provider: &str, tokens: u32) -> f64 {
+        self.record_charge(agent, provider, tokens).0
+    }
+
+    /// Replace in-memory counters with a durable restart snapshot.
+    ///
+    /// Replacement rather than addition makes repeated startup/recovery calls
+    /// idempotent. This is intended to run before request admission begins.
+    pub fn rehydrate(&self, snapshot: &BudgetUsageSnapshot) {
+        self.spent_micros
+            .store(snapshot.global_micros, Ordering::Relaxed);
+
+        self.per_agent_micros.clear();
+        for (agent, micros) in &snapshot.per_agent_micros {
+            self.per_agent_micros.insert(*agent, *micros);
+        }
+
+        self.per_tenant_micros.clear();
+        for (tenant, micros) in &snapshot.per_tenant_micros {
+            self.per_tenant_micros.insert(tenant.clone(), *micros);
+        }
+
+        self.agent_tenants.clear();
+        for (agent, tenant) in &snapshot.agent_tenants {
+            self.agent_tenants.insert(*agent, tenant.clone());
+        }
     }
 
     /// Cumulative global spend in USD.
@@ -331,12 +365,26 @@ impl BudgetEnforcer {
         )
     }
 
-    /// Drop tracking for an agent (call on shutdown / unregister). Global spend
-    /// is intentionally retained — the lifetime ceiling spans agents.
-    pub fn purge_agent(&self, agent: AgentId) {
-        self.per_agent_micros.remove(&agent);
-        self.agent_tenants.remove(&agent);
+    /// Drop only live admission state for an unregistered agent. Cumulative
+    /// global, tenant, and per-agent spend is retained so stop/restart cannot
+    /// reset a lifetime ceiling.
+    pub fn unregister_agent(&self, agent: AgentId) {
+        let tenant = self.agent_tenants.remove(&agent).map(|(_, tenant)| tenant);
         self.agent_call_locks.remove(&agent);
+        if let Some(tenant) = tenant {
+            let still_live = self
+                .agent_tenants
+                .iter()
+                .any(|entry| entry.value() == &tenant);
+            if !still_live {
+                self.tenant_call_locks.remove(&tenant);
+            }
+        }
+    }
+
+    /// Compatibility wrapper for the historical unregister hook.
+    pub fn purge_agent(&self, agent: AgentId) {
+        self.unregister_agent(agent);
     }
 
     // ── Agent-agnostic API (caller supplies USD directly) ────────────────────
@@ -481,14 +529,55 @@ mod tests {
     }
 
     #[test]
-    fn purge_agent_resets_agent_spend_not_global() {
+    fn unregister_agent_retains_cumulative_spend() {
         let b = BudgetEnforcer::with_pricing(1.0, 0.0, 0.05);
         let a = uuid::Uuid::new_v4();
+        b.register_agent_tenant(a, "tenant-a");
         b.record(a, "p", 100); // $0.10
         let global_before = b.global_spent_usd();
+        let agent_before = b.agent_spent_usd(a);
+        let tenant_before = b.tenant_spent_usd("tenant-a");
         b.purge_agent(a);
-        assert_eq!(b.agent_spent_usd(a), 0.0);
         assert_eq!(b.global_spent_usd(), global_before);
+        assert_eq!(b.agent_spent_usd(a), agent_before);
+        assert_eq!(b.tenant_spent_usd("tenant-a"), tenant_before);
+        assert!(!b.agent_tenants.contains_key(&a));
+        assert!(!b.agent_call_locks.contains_key(&a));
+        assert!(!b.tenant_call_locks.contains_key("tenant-a"));
+    }
+
+    #[test]
+    fn record_charge_returns_exact_applied_micros() {
+        let b = BudgetEnforcer::with_pricing(0.0015, 0.0, 0.0);
+        let agent = uuid::Uuid::new_v4();
+        let (usd, micros) = b.record_charge(agent, "p", 1);
+        assert!((usd - 0.0000015).abs() < f64::EPSILON);
+        assert_eq!(micros, 2);
+        assert_eq!(b.spent_micros.load(Ordering::Relaxed), micros);
+        assert_eq!(b.per_agent_micros.get(&agent).map(|v| *v), Some(micros));
+    }
+
+    #[test]
+    fn rehydrate_is_idempotent_and_restores_enforcement() {
+        let agent = uuid::Uuid::new_v4();
+        let mut snapshot = BudgetUsageSnapshot {
+            global_micros: 50_000,
+            ..BudgetUsageSnapshot::default()
+        };
+        snapshot.per_agent_micros.insert(agent, 50_000);
+        snapshot
+            .per_tenant_micros
+            .insert("tenant-a".to_string(), 50_000);
+        snapshot.agent_tenants.insert(agent, "tenant-a".to_string());
+
+        let b = BudgetEnforcer::with_limits(1.0, 0.05, 0.05, 0.05);
+        b.rehydrate(&snapshot);
+        b.rehydrate(&snapshot);
+
+        assert_eq!(b.spent_micros.load(Ordering::Relaxed), 50_000);
+        assert_eq!(b.agent_spent_usd(agent), 0.05);
+        assert_eq!(b.tenant_spent_usd("tenant-a"), 0.05);
+        assert_eq!(b.check(agent).unwrap_err().scope, BudgetScope::Global);
     }
 
     // ── Agent-agnostic simple API (absorbed from the former

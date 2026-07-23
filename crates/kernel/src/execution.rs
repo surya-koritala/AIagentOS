@@ -133,6 +133,11 @@ pub struct UsageTelemetry {
     pub provider_latency_ms: u64,
     pub provider_reported_requests: u32,
     pub estimated_requests: u32,
+    /// Exact micro-USD charged to the durable budget ledger for this turn.
+    /// Stored as an integer so persisted/replayed telemetry reconciles without
+    /// floating-point drift. Older checkpoints deserialize this as zero.
+    #[serde(default)]
+    pub charged_cost_micros: u64,
 }
 
 impl UsageTelemetry {
@@ -183,6 +188,11 @@ pub struct AgentExecutor {
     /// Max active-context tokens; older non-system messages are paged out (via
     /// the context pager) when exceeded. 0 = disabled (no token bound).
     context_budget_tokens: u32,
+    /// Maximum cumulative tool calls in one logical turn. Unlike the cgroup
+    /// slot limit, this is not a concurrency control: it counts calls across
+    /// response batches and LLM rounds, and is carried by checkpoints. 0 means
+    /// unlimited.
+    max_tool_calls_per_turn: usize,
     messages: Vec<StandardMessage>,
     cancel_token: CancellationToken,
     event_tx: Option<mpsc::Sender<StreamEvent>>,
@@ -199,11 +209,7 @@ impl AgentExecutor {
         usage: UsageTelemetry,
     ) -> AgentOutput {
         let provider_id = self.session.provider_id().clone();
-        let estimated_cost_usd = self
-            .budget_enforcer
-            .as_ref()
-            .map(|budget| budget.cost_of(&provider_id, tokens_used))
-            .unwrap_or(0.0);
+        let estimated_cost_usd = usage.charged_cost_micros as f64 / 1_000_000.0;
         AgentOutput {
             content,
             tool_calls_made,
@@ -237,6 +243,7 @@ impl AgentExecutor {
             llm_scheduler: None,
             rate_limiter: None,
             context_budget_tokens: 0,
+            max_tool_calls_per_turn: 0,
             messages: vec![StandardMessage::system(&system_prompt)],
             cancel_token: CancellationToken::new(),
             event_tx: None,
@@ -304,6 +311,17 @@ impl AgentExecutor {
     /// disables it (unbounded — prior behavior).
     pub fn set_context_budget(&mut self, max_tokens: u32) {
         self.context_budget_tokens = max_tokens;
+    }
+
+    /// Set the cumulative tool-call ceiling for each logical user turn.
+    ///
+    /// The count spans every tool call in a response, subsequent LLM rounds,
+    /// and pause/resume continuations. A fresh [`run`](Self::run) or
+    /// [`run_resumable`](Self::run_resumable) starts at zero. `0` disables the
+    /// ceiling. Concurrent tool execution remains independently controlled by
+    /// the cgroup's `max_concurrent_tool_calls` setting.
+    pub fn set_max_tool_calls(&mut self, max_tool_calls: u32) {
+        self.max_tool_calls_per_turn = max_tool_calls as usize;
     }
 
     fn estimate_prompt_tokens(&self, messages: &[StandardMessage]) -> u32 {
@@ -711,7 +729,8 @@ impl AgentExecutor {
         // again. This is exactly-once within a persisted checkpoint. A process
         // crash inside an external side effect is necessarily at-least-once
         // unless that tool implements its own idempotency key.
-        for tool_call in self.pending_tool_calls() {
+        let pending_tool_calls = self.pending_tool_calls();
+        for (index, tool_call) in pending_tool_calls.iter().enumerate() {
             if self.cancel_token.is_cancelled() {
                 return Ok(TurnResult::Paused(
                     self.checkpoint(
@@ -724,13 +743,23 @@ impl AgentExecutor {
                     .await,
                 ));
             }
+            if self.tool_call_limit_reached(tool_calls_made) {
+                return Ok(self
+                    .stop_at_tool_call_limit(
+                        &pending_tool_calls[index..],
+                        tool_calls_made,
+                        total_tokens,
+                        usage,
+                    )
+                    .await);
+            }
             tool_calls_made += 1;
             self.emit(StreamEvent::ToolCallStarted {
                 name: tool_call.name.clone(),
                 arguments: tool_call.arguments.to_string(),
             })
             .await;
-            let result = self.execute_tool(&tool_call).await;
+            let result = self.execute_tool(tool_call).await;
             self.emit(StreamEvent::ToolCallResult {
                 name: tool_call.name.clone(),
                 result: result.chars().take(200).collect(),
@@ -808,7 +837,10 @@ impl AgentExecutor {
 
             // Price this response against the agent's provider and accrue spend.
             if let Some(ref budget) = self.budget_enforcer {
-                budget.record(self.agent_id, self.session.provider_id(), call_tokens);
+                let (_charged_usd, charged_micros) =
+                    budget.record_charge(self.agent_id, self.session.provider_id(), call_tokens);
+                usage.charged_cost_micros =
+                    usage.charged_cost_micros.saturating_add(charged_micros);
             }
             drop(budget_call);
 
@@ -854,7 +886,7 @@ impl AgentExecutor {
             assistant_msg.tool_calls = Some(tool_calls.clone());
             self.messages.push(assistant_msg);
 
-            for tool_call in &tool_calls {
+            for (index, tool_call) in tool_calls.iter().enumerate() {
                 // Pause boundary: between tool iterations. The assistant turn is
                 // already committed to `messages`; the as-yet-unexecuted call is
                 // re-issued on resume (its result simply isn't in `messages`
@@ -870,6 +902,16 @@ impl AgentExecutor {
                         )
                         .await,
                     ));
+                }
+                if self.tool_call_limit_reached(tool_calls_made) {
+                    return Ok(self
+                        .stop_at_tool_call_limit(
+                            &tool_calls[index..],
+                            tool_calls_made,
+                            total_tokens,
+                            usage,
+                        )
+                        .await);
                 }
                 tool_calls_made += 1;
                 self.emit(StreamEvent::ToolCallStarted {
@@ -896,6 +938,37 @@ impl AgentExecutor {
             total_tokens,
             usage,
         )))
+    }
+
+    fn tool_call_limit_reached(&self, tool_calls_made: usize) -> bool {
+        self.max_tool_calls_per_turn > 0 && tool_calls_made >= self.max_tool_calls_per_turn
+    }
+
+    /// Finish a logical turn before any over-limit tool reaches authorization
+    /// or a resource provider. Every skipped call receives an explicit tool
+    /// result so it cannot be mistaken for unfinished checkpoint work and
+    /// executed at the beginning of the next turn.
+    async fn stop_at_tool_call_limit(
+        &mut self,
+        skipped_calls: &[crate::connector::ToolCall],
+        tool_calls_made: usize,
+        tokens_used: u32,
+        usage: UsageTelemetry,
+    ) -> TurnResult {
+        let content = format!(
+            "Stopped before tool call: per-turn tool-call limit of {} reached.",
+            self.max_tool_calls_per_turn
+        );
+        for tool_call in skipped_calls {
+            self.messages.push(StandardMessage::tool_result(
+                &tool_call.id,
+                format!("Tool '{}' was not executed: {content}", tool_call.name),
+            ));
+        }
+        let output = self.output(content, tool_calls_made, tokens_used, usage);
+        self.emit(StreamEvent::Done(output.clone())).await;
+        self.save_conversation();
+        TurnResult::Completed(output)
     }
 
     /// Build a checkpoint of the in-flight turn at a pause boundary and emit a
@@ -1273,6 +1346,101 @@ mod tests {
         Arc::new(broker)
     }
 
+    fn counting_broker(agent_id: AgentId, executions: Arc<AtomicUsize>) -> Arc<dyn ResourceBroker> {
+        use crate::resources::ResourceBrokerImpl;
+        let perms = Arc::new(PermissionManager::new());
+        crate::permissions::PermissionSystem::assign_profile(
+            perms.as_ref(),
+            agent_id,
+            &"full-access".to_string(),
+        );
+        let broker = ResourceBrokerImpl::new_unconfined(perms);
+        struct CountingFs {
+            executions: Arc<AtomicUsize>,
+        }
+        #[async_trait::async_trait]
+        impl ResourceProvider for CountingFs {
+            fn resource_type(&self) -> crate::resources::ResourceType {
+                crate::resources::ResourceType::Filesystem
+            }
+            fn supported_operations(&self) -> Vec<String> {
+                vec!["read".into(), "write".into(), "list".into()]
+            }
+            async fn execute(
+                &self,
+                _op: &str,
+                _params: &serde_json::Value,
+            ) -> Result<serde_json::Value, ResourceError> {
+                self.executions.fetch_add(1, Ordering::SeqCst);
+                Ok(serde_json::json!({"content": "counted"}))
+            }
+        }
+        broker.register_provider(Box::new(CountingFs { executions }));
+        Arc::new(broker)
+    }
+
+    struct SequencedSession {
+        responses: Vec<LlmResponse>,
+        calls: Arc<AtomicUsize>,
+        id: String,
+    }
+
+    #[async_trait::async_trait]
+    impl LlmSession for SequencedSession {
+        async fn send(
+            &self,
+            messages: Vec<StandardMessage>,
+        ) -> Result<LlmResponse, ConnectorError> {
+            self.send_with_tools(messages, &[]).await
+        }
+
+        async fn send_with_tools(
+            &self,
+            _messages: Vec<StandardMessage>,
+            _tools: &[ToolDefinition],
+        ) -> Result<LlmResponse, ConnectorError> {
+            let index = self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(self.responses.get(index).cloned().unwrap_or(LlmResponse {
+                content: "done".into(),
+                finish_reason: Some("stop".into()),
+                tokens_used: 1,
+                usage: LlmUsage::reported(0, 1, 0),
+                tool_calls: Vec::new(),
+            }))
+        }
+
+        fn provider_id(&self) -> &crate::ProviderId {
+            &self.id
+        }
+    }
+
+    fn tool_response(ids: &[&str]) -> LlmResponse {
+        LlmResponse {
+            content: String::new(),
+            finish_reason: Some("tool_calls".into()),
+            tokens_used: 1,
+            usage: LlmUsage::reported(0, 1, 0),
+            tool_calls: ids
+                .iter()
+                .map(|id| ToolCall {
+                    id: (*id).into(),
+                    name: "read_file".into(),
+                    arguments: serde_json::json!({"path": format!("/tmp/{id}")}),
+                })
+                .collect(),
+        }
+    }
+
+    fn content_response(content: &str) -> LlmResponse {
+        LlmResponse {
+            content: content.into(),
+            finish_reason: Some("stop".into()),
+            tokens_used: 1,
+            usage: LlmUsage::reported(0, 1, 0),
+            tool_calls: Vec::new(),
+        }
+    }
+
     // Regression guard for the CLI wiring fix: once a syscall gate is installed
     // on the executor (as the `agent` CLI now does via `set_syscall_gate`), tool
     // calls must be enforced against the agent's capabilities. A tool requiring a
@@ -1647,6 +1815,194 @@ mod tests {
         assert_eq!(output.content, "The file contains: hello world");
         assert_eq!(output.tool_calls_made, 1);
         assert_eq!(output.tokens_used, 35);
+    }
+
+    #[tokio::test]
+    async fn per_turn_limit_stops_multi_call_response_without_extra_side_effects() {
+        let agent_id = uuid::Uuid::new_v4();
+        let provider_calls = Arc::new(AtomicUsize::new(0));
+        let tool_executions = Arc::new(AtomicUsize::new(0));
+        let session = Box::new(SequencedSession {
+            responses: vec![
+                tool_response(&["multi-1", "multi-2"]),
+                content_response("must not be requested"),
+            ],
+            calls: provider_calls.clone(),
+            id: "mock".into(),
+        });
+        let mut executor = AgentExecutor::new_unconfined(
+            agent_id,
+            session,
+            counting_broker(agent_id, tool_executions.clone()),
+            Arc::new(ToolRegistry::new()),
+            mock_context_manager(),
+            "test".into(),
+        );
+        executor.set_max_tool_calls(1);
+
+        let output = executor.run("make two calls").await.unwrap();
+
+        assert_eq!(output.tool_calls_made, 1);
+        assert!(output.content.contains("tool-call limit of 1"));
+        assert_eq!(provider_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(tool_executions.load(Ordering::SeqCst), 1);
+        assert!(executor.messages().iter().any(|message| {
+            message.tool_call_id.as_deref() == Some("multi-2")
+                && message.content.contains("was not executed")
+        }));
+    }
+
+    #[tokio::test]
+    async fn per_turn_limit_accumulates_across_llm_rounds() {
+        let agent_id = uuid::Uuid::new_v4();
+        let provider_calls = Arc::new(AtomicUsize::new(0));
+        let tool_executions = Arc::new(AtomicUsize::new(0));
+        let session = Box::new(SequencedSession {
+            responses: vec![
+                tool_response(&["round-1"]),
+                tool_response(&["round-2"]),
+                content_response("must not be requested"),
+            ],
+            calls: provider_calls.clone(),
+            id: "mock".into(),
+        });
+        let mut executor = AgentExecutor::new_unconfined(
+            agent_id,
+            session,
+            counting_broker(agent_id, tool_executions.clone()),
+            Arc::new(ToolRegistry::new()),
+            mock_context_manager(),
+            "test".into(),
+        );
+        executor.set_max_tool_calls(1);
+
+        let output = executor.run("keep calling").await.unwrap();
+
+        assert_eq!(output.tool_calls_made, 1);
+        assert_eq!(provider_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(tool_executions.load(Ordering::SeqCst), 1);
+        assert!(executor.messages().iter().any(|message| {
+            message.tool_call_id.as_deref() == Some("round-2")
+                && message.content.contains("was not executed")
+        }));
+    }
+
+    #[tokio::test]
+    async fn zero_per_turn_limit_means_unlimited() {
+        let agent_id = uuid::Uuid::new_v4();
+        let provider_calls = Arc::new(AtomicUsize::new(0));
+        let tool_executions = Arc::new(AtomicUsize::new(0));
+        let session = Box::new(SequencedSession {
+            responses: vec![
+                tool_response(&["round-1"]),
+                tool_response(&["round-2"]),
+                content_response("finished"),
+            ],
+            calls: provider_calls.clone(),
+            id: "mock".into(),
+        });
+        let mut executor = AgentExecutor::new_unconfined(
+            agent_id,
+            session,
+            counting_broker(agent_id, tool_executions.clone()),
+            Arc::new(ToolRegistry::new()),
+            mock_context_manager(),
+            "test".into(),
+        );
+        executor.set_max_tool_calls(0);
+
+        let output = executor.run("keep calling").await.unwrap();
+
+        assert_eq!(output.content, "finished");
+        assert_eq!(output.tool_calls_made, 2);
+        assert_eq!(provider_calls.load(Ordering::SeqCst), 3);
+        assert_eq!(tool_executions.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn per_turn_limit_resets_for_each_new_user_turn() {
+        let agent_id = uuid::Uuid::new_v4();
+        let provider_calls = Arc::new(AtomicUsize::new(0));
+        let tool_executions = Arc::new(AtomicUsize::new(0));
+        let session = Box::new(SequencedSession {
+            responses: vec![
+                tool_response(&["turn-1"]),
+                content_response("first done"),
+                tool_response(&["turn-2"]),
+                content_response("second done"),
+            ],
+            calls: provider_calls,
+            id: "mock".into(),
+        });
+        let mut executor = AgentExecutor::new_unconfined(
+            agent_id,
+            session,
+            counting_broker(agent_id, tool_executions.clone()),
+            Arc::new(ToolRegistry::new()),
+            mock_context_manager(),
+            "test".into(),
+        );
+        executor.set_max_tool_calls(1);
+
+        let first = executor.run("first turn").await.unwrap();
+        let second = executor.run("second turn").await.unwrap();
+
+        assert_eq!(first.content, "first done");
+        assert_eq!(first.tool_calls_made, 1);
+        assert_eq!(second.content, "second done");
+        assert_eq!(second.tool_calls_made, 1);
+        assert_eq!(tool_executions.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn checkpoint_resume_preserves_per_turn_tool_count_at_limit() {
+        let agent_id = uuid::Uuid::new_v4();
+        let provider_calls = Arc::new(AtomicUsize::new(0));
+        let tool_executions = Arc::new(AtomicUsize::new(0));
+        let mut assistant = StandardMessage::assistant("another call");
+        assistant.tool_calls = Some(tool_response(&["resume-blocked"]).tool_calls);
+        let checkpoint = GenerationCheckpoint {
+            agent_id,
+            conversation_id: "resume-limit".into(),
+            user_message: "continue".into(),
+            messages: vec![
+                StandardMessage::system("SYSTEM"),
+                StandardMessage::user("continue"),
+                assistant,
+            ],
+            partial_content: String::new(),
+            tool_calls_made: 1,
+            tokens_used: 3,
+            usage: UsageTelemetry::default(),
+        };
+        let session = Box::new(SequencedSession {
+            responses: vec![content_response("must not be requested")],
+            calls: provider_calls.clone(),
+            id: "mock".into(),
+        });
+        let mut executor = AgentExecutor::new_unconfined(
+            agent_id,
+            session,
+            counting_broker(agent_id, tool_executions.clone()),
+            Arc::new(ToolRegistry::new()),
+            mock_context_manager(),
+            "test".into(),
+        );
+        executor.set_max_tool_calls(1);
+
+        let output = match executor.resume(checkpoint).await.unwrap() {
+            TurnResult::Completed(output) => output,
+            TurnResult::Paused(_) => panic!("limit should complete the turn"),
+        };
+
+        assert_eq!(output.tool_calls_made, 1);
+        assert!(output.content.contains("tool-call limit of 1"));
+        assert_eq!(provider_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(tool_executions.load(Ordering::SeqCst), 0);
+        assert!(executor.messages().iter().any(|message| {
+            message.tool_call_id.as_deref() == Some("resume-blocked")
+                && message.content.contains("was not executed")
+        }));
     }
 
     #[tokio::test]

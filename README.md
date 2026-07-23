@@ -19,7 +19,6 @@
 
 <p align="center">
   <a href="#quick-start">Quick start</a> ·
-  <a href="#architecture">Architecture</a> ·
   <a href="ROADMAP.md">Roadmap</a> ·
   <a href="docs/capabilities.toml">Capability evidence</a> ·
   <a href="CONTRIBUTING.md">Contributing</a>
@@ -44,18 +43,6 @@ It is **not** a chatbot, a Linux distribution, a bootable kernel, or a replaceme
 for the host operating system. The Linux analogy describes its responsibility:
 agents are treated like governed processes, while Linux, macOS, or Windows still
 provides the actual host kernel and isolation primitives.
-
-## Architecture
-
-Every public tool-call path uses the same validated declaration and crosses one
-authorization chokepoint before a provider can execute. Unknown or contradictory
-tool declarations fail closed.
-
-<p align="center">
-  <img src="docs/assets/architecture.svg" alt="AI Agent OS architecture: entry points flow through ToolRegistry authorization, namespace, capability, MAC, approval and quota checks, then the sandboxed resource broker and providers" width="100%">
-</p>
-
-<p align="center"><em>The gate runs before filesystem, network, application, or IPC provider execution.</em></p>
 
 ## Why an OS layer?
 

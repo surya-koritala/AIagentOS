@@ -64,7 +64,10 @@ impl AgentSyscalls {
     /// Clone an agent with selective resource sharing.
     pub fn agent_clone(&self, source_id: AgentId, flags: u32) -> Option<AgentId> {
         let source_ref = self.table.get(source_id)?;
-        let _source = source_ref.value();
+        // DashMap write operations may lock the same shard as this read guard.
+        // Release the guard before inserting the child or clone can deadlock
+        // depending on how the source and child IDs hash.
+        drop(source_ref);
 
         // Create new agent
         let parent = if flags & clone_flags::CLONE_PARENT != 0 {
@@ -153,6 +156,9 @@ impl AgentSyscalls {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::Duration;
 
     fn setup() -> AgentSyscalls {
         let table = Arc::new(AgentTable::new());
@@ -185,6 +191,31 @@ mod tests {
         let child = sys.agent_clone(parent, 0);
         assert!(child.is_some());
         assert_eq!(sys.count(), 2);
+    }
+
+    #[test]
+    fn repeated_clone_does_not_deadlock_on_table_shard_collision() {
+        let sys = Arc::new(setup());
+        let parent = sys.agent_create("parent".into(), 0);
+        let worker = Arc::clone(&sys);
+        let (done_tx, done_rx) = mpsc::channel();
+
+        thread::spawn(move || {
+            for _ in 0..512 {
+                if worker.agent_clone(parent, 0).is_none() {
+                    let _ = done_tx.send(false);
+                    return;
+                }
+            }
+            let _ = done_tx.send(true);
+        });
+
+        assert_eq!(
+            done_rx.recv_timeout(Duration::from_secs(5)),
+            Ok(true),
+            "repeated cloning must finish without retaining a DashMap read guard"
+        );
+        assert_eq!(sys.count(), 513);
     }
 
     #[test]

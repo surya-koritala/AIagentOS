@@ -364,6 +364,8 @@ fn release_blocking_workflows_keep_their_security_contract() {
     let extended = read_workspace_file(".github/workflows/extended-security.yml");
     for proof in [
         "schedule:",
+        "RUSTUP_TOOLCHAIN: nightly-2026-07-20",
+        "targets: x86_64-unknown-linux-musl",
         "cargo miri test",
         "-Zsanitizer=address",
         "cargo fuzz build",

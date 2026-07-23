@@ -90,6 +90,13 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
   must add the detailed-pricing fields or use `..BudgetConfig::default()`.
   Existing but unreadable or malformed config files now stop startup; only a
   missing first-run config yields defaults. (#109)
+- **Durable provider quota epochs** — RPM/TPM now use fixed UTC Unix-minute
+  epochs with durable request receipts, restart recovery, monotonic clock-floor
+  protection, pre-invocation cancellation refunds, conservative failed-attempt
+  estimates, and original-admission-epoch usage reconciliation. Production
+  SQLite quota commits require WAL, full synchronization, foreign-key
+  enforcement, and a bounded busy timeout. Legacy non-empty databases are
+  fenced for the unknowable remainder of their first upgraded epoch. (#109)
 - **Wire protocol v2** — typed error categories and retry hints are served while
   retaining the released v1 compatibility fixture; SDK negotiation is automatic.
   The complete v1 compatibility/conformance commitment remains tracked by #121.

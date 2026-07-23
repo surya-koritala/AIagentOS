@@ -3,12 +3,12 @@
 //! Provides SQLite-backed persistence for conversation history, working state,
 //! tasks, results, and long-term facts with retry logic and summarization.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Utc};
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 
 use crate::memory_manager::Embedder;
@@ -95,6 +95,127 @@ pub struct BudgetUsageSnapshot {
     pub per_agent_micros: HashMap<AgentId, u64>,
     pub per_tenant_micros: HashMap<String, u64>,
     pub agent_tenants: HashMap<AgentId, String>,
+}
+
+/// Length of one fixed provider-rate accounting epoch.
+///
+/// Epoch identifiers accepted by the APIs below are Unix-minute numbers
+/// (`unix_seconds / PROVIDER_RATE_EPOCH_SECONDS`), not process-relative
+/// generations. This makes a boundary deterministic and restart-safe.
+pub(crate) const PROVIDER_RATE_EPOCH_SECONDS: u64 = 60;
+
+/// Durable lifecycle of one provider request reservation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProviderRateReceiptState {
+    /// Capacity is committed, but provider I/O has not started.
+    Reserved,
+    /// Provider I/O may have happened, so the estimate must not be refunded.
+    InFlight,
+    /// Completion is unknown; the estimate is retained conservatively.
+    Estimated,
+    /// Provider-reported/derived actual usage replaced the estimate.
+    Reconciled,
+}
+
+impl ProviderRateReceiptState {
+    fn parse(value: &str) -> Result<Self, ContextError> {
+        match value {
+            "reserved" => Ok(Self::Reserved),
+            "in_flight" => Ok(Self::InFlight),
+            "estimated" => Ok(Self::Estimated),
+            "reconciled" => Ok(Self::Reconciled),
+            _ => Err(quota_error(format!(
+                "invalid provider rate receipt state {value:?}"
+            ))),
+        }
+    }
+}
+
+/// Affine identifier for one durable provider-rate reservation.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct ProviderRateReservation {
+    pub id: uuid::Uuid,
+    pub epoch: u64,
+    pub reserved_tokens: u64,
+    pub state: ProviderRateReceiptState,
+}
+
+/// Durable usage and receipt-state counts for one effective provider epoch.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct ProviderRateUsage {
+    pub epoch: u64,
+    pub requests: u64,
+    pub tokens: u64,
+    pub reserved_receipts: u64,
+    pub in_flight_receipts: u64,
+    pub estimated_receipts: u64,
+    pub reconciled_receipts: u64,
+}
+
+/// Dimension that prevented a provider reservation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProviderRateLimitDimension {
+    Requests,
+    Tokens,
+    /// A legacy database had process-local rate state that could not be
+    /// reconstructed. It remains fail-closed for the rest of that one epoch.
+    MigrationFence,
+}
+
+/// Result of an atomic provider-rate reservation attempt.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ProviderRateReserveOutcome {
+    Reserved(ProviderRateReservation),
+    Denied {
+        epoch: u64,
+        dimension: ProviderRateLimitDimension,
+        used: u64,
+        requested: u64,
+        limit: u64,
+    },
+}
+
+/// Actions applied atomically while recovering provider reservations on boot.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct ProviderRateRecovery {
+    pub effective_epoch: u64,
+    pub refunded_reserved: u64,
+    pub retained_in_flight_estimates: u64,
+}
+
+const PROVIDER_QUOTA_SCOPE_KIND: &str = "provider";
+const PROVIDER_QUOTA_SCOPE_ID: &str = "global";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StoredQuotaReceipt {
+    id: uuid::Uuid,
+    epoch: u64,
+    state: ProviderRateReceiptState,
+    reserved_requests: u64,
+    reserved_tokens: u64,
+    actual_requests: Option<u64>,
+    actual_tokens: Option<u64>,
+}
+
+fn quota_error(message: impl Into<String>) -> ContextError {
+    ContextError::StorageError(format!(
+        "durable quota accounting unavailable: {}",
+        message.into()
+    ))
+}
+
+fn u64_blob(value: u64) -> [u8; 8] {
+    value.to_be_bytes()
+}
+
+fn parse_u64_blob(blob: Vec<u8>, field: &str) -> Result<u64, ContextError> {
+    let bytes: [u8; 8] = blob.try_into().map_err(|blob: Vec<u8>| {
+        quota_error(format!(
+            "{field} is malformed: expected 8-byte unsigned integer, got {} bytes",
+            blob.len()
+        ))
+    })?;
+    Ok(u64::from_be_bytes(bytes))
 }
 
 /// The durable identity + config of a created agent, as stored in the `agents`
@@ -242,12 +363,38 @@ impl SqliteContextManager {
             std::fs::set_permissions(db_path, permissions)
                 .map_err(|error| ContextError::StorageError(error.to_string()))?;
         }
-        // WAL so committed transactions survive an abrupt process stop and a
-        // fresh handle on the same file recovers them; NORMAL synchronous is the
-        // recommended durability/throughput tradeoff under WAL (committed txns are
-        // crash-safe). Pragmas are best-effort — an older/locked DB still opens.
-        let _ = conn.pragma_update(None, "journal_mode", "WAL");
-        let _ = conn.pragma_update(None, "synchronous", "NORMAL");
+        // Quota admission is committed before provider I/O. These durability
+        // settings are therefore part of enforcement, not best-effort tuning:
+        // startup fails closed if the filesystem/SQLite build cannot provide
+        // WAL + FULL durability. A bounded busy timeout lets independent
+        // kernel handles serialize BEGIN IMMEDIATE reservations under normal
+        // contention while still surfacing prolonged lock failure.
+        conn.busy_timeout(std::time::Duration::from_secs(5))
+            .map_err(|error| quota_error(format!("failed to set SQLite busy timeout: {error}")))?;
+        conn.pragma_update(None, "journal_mode", "WAL")
+            .map_err(|error| quota_error(format!("failed to enable SQLite WAL: {error}")))?;
+        let journal_mode: String = conn
+            .pragma_query_value(None, "journal_mode", |row| row.get(0))
+            .map_err(|error| quota_error(format!("failed to verify SQLite WAL: {error}")))?;
+        if !journal_mode.eq_ignore_ascii_case("wal") {
+            return Err(quota_error(format!(
+                "SQLite journal_mode is {journal_mode:?}, expected WAL"
+            )));
+        }
+        conn.pragma_update(None, "synchronous", "FULL")
+            .map_err(|error| {
+                quota_error(format!("failed to enable SQLite synchronous=FULL: {error}"))
+            })?;
+        let synchronous: i64 = conn
+            .pragma_query_value(None, "synchronous", |row| row.get(0))
+            .map_err(|error| {
+                quota_error(format!("failed to verify SQLite synchronous mode: {error}"))
+            })?;
+        if synchronous != 2 {
+            return Err(quota_error(format!(
+                "SQLite synchronous mode is {synchronous}, expected FULL (2)"
+            )));
+        }
         let mgr = Self {
             conn: Mutex::new(conn),
             embedder: crate::memory_manager::default_embedder(),
@@ -277,7 +424,120 @@ impl SqliteContextManager {
     }
 
     fn init_schema(&self) -> Result<(), ContextError> {
-        let conn = self.conn.lock().unwrap();
+        let mut conn = self
+            .conn
+            .lock()
+            .map_err(|_| quota_error("SQLite connection mutex is poisoned"))?;
+        conn.pragma_update(None, "foreign_keys", "ON")
+            .map_err(|error| {
+                quota_error(format!("failed to enable SQLite foreign keys: {error}"))
+            })?;
+        let foreign_keys: i64 = conn
+            .pragma_query_value(None, "foreign_keys", |row| row.get(0))
+            .map_err(|error| {
+                quota_error(format!("failed to verify SQLite foreign keys: {error}"))
+            })?;
+        if foreign_keys != 1 {
+            return Err(quota_error(
+                "SQLite foreign-key enforcement did not remain enabled",
+            ));
+        }
+        let quota_schema_exists = conn
+            .query_row(
+                "SELECT 1 FROM sqlite_master
+                 WHERE type = 'table' AND name = 'quota_epochs'",
+                [],
+                |_| Ok(()),
+            )
+            .optional()
+            .map_err(|error| quota_error(format!("failed to inspect quota schema: {error}")))?
+            .is_some();
+        let quota_floor_initialized = if quota_schema_exists {
+            let floor_table_exists = conn
+                .query_row(
+                    "SELECT 1 FROM sqlite_master
+                     WHERE type = 'table' AND name = 'quota_epoch_floor'",
+                    [],
+                    |_| Ok(()),
+                )
+                .optional()
+                .map_err(|error| {
+                    quota_error(format!(
+                        "failed to inspect quota epoch floor schema: {error}"
+                    ))
+                })?
+                .is_some();
+            if floor_table_exists {
+                conn.query_row(
+                    "SELECT 1 FROM quota_epoch_floor WHERE singleton = 1",
+                    [],
+                    |_| Ok(()),
+                )
+                .optional()
+                .map_err(|error| {
+                    quota_error(format!(
+                        "failed to inspect quota epoch floor state: {error}"
+                    ))
+                })?
+                .is_some()
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        let mut legacy_database_has_rows = false;
+        if !quota_schema_exists || !quota_floor_initialized {
+            // This list is deliberately static: table names never come from
+            // persisted/user input, so the existence probes cannot become SQL
+            // injection. A schema-only legacy database has no unknowable usage
+            // to fence; any durable application row does. Recheck application
+            // rows when the quota schema exists without its floor marker: that
+            // is the recoverable signature of a crash between schema creation
+            // and installing the legacy migration fence.
+            for table in [
+                "contexts",
+                "facts",
+                "conversations",
+                "usage_log",
+                "agent_kv",
+                "context_pressure",
+                "context_snapshots",
+                "generation_checkpoints",
+                "agents",
+                "tenants",
+                "users",
+                "api_keys",
+                "sessions",
+            ] {
+                let exists = conn
+                    .query_row(
+                        "SELECT 1 FROM sqlite_master
+                         WHERE type = 'table' AND name = ?1",
+                        [table],
+                        |_| Ok(()),
+                    )
+                    .optional()
+                    .map_err(|error| {
+                        quota_error(format!("failed to inspect legacy table {table}: {error}"))
+                    })?
+                    .is_some();
+                if exists {
+                    let sql = format!("SELECT 1 FROM {table} LIMIT 1");
+                    if conn
+                        .query_row(&sql, [], |_| Ok(()))
+                        .optional()
+                        .map_err(|error| {
+                            quota_error(format!("failed to inspect legacy table {table}: {error}"))
+                        })?
+                        .is_some()
+                    {
+                        legacy_database_has_rows = true;
+                        break;
+                    }
+                }
+            }
+        }
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS contexts (
                 agent_id TEXT PRIMARY KEY,
@@ -406,7 +666,94 @@ impl SqliteContextManager {
                 user_id TEXT NOT NULL,
                 tenant_id TEXT NOT NULL,
                 expires_at TEXT NOT NULL
-            );",
+            );
+            -- Generic durable quota ledger. Unsigned counters and epochs are
+            -- fixed-width big-endian blobs because SQLite INTEGER is signed
+            -- and cannot represent the full u64 range. Equal-width big-endian
+            -- blobs retain numeric ordering for pruning.
+            CREATE TABLE IF NOT EXISTS quota_epoch_floor (
+                singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                epoch BLOB NOT NULL
+                    CHECK (typeof(epoch) = 'blob' AND length(epoch) = 8)
+            );
+            CREATE TABLE IF NOT EXISTS quota_epochs (
+                scope_kind TEXT NOT NULL
+                    CHECK (length(scope_kind) BETWEEN 1 AND 64),
+                scope_id TEXT NOT NULL
+                    CHECK (length(scope_id) BETWEEN 1 AND 1024),
+                epoch BLOB NOT NULL
+                    CHECK (typeof(epoch) = 'blob' AND length(epoch) = 8),
+                requests BLOB NOT NULL
+                    CHECK (typeof(requests) = 'blob' AND length(requests) = 8),
+                tokens BLOB NOT NULL
+                    CHECK (typeof(tokens) = 'blob' AND length(tokens) = 8),
+                PRIMARY KEY (scope_kind, scope_id, epoch)
+            ) WITHOUT ROWID;
+            CREATE INDEX IF NOT EXISTS idx_quota_epochs_prune
+                ON quota_epochs(epoch);
+            CREATE TABLE IF NOT EXISTS quota_receipts (
+                id TEXT PRIMARY KEY CHECK (length(id) = 36),
+                receipt_kind TEXT NOT NULL
+                    CHECK (length(receipt_kind) BETWEEN 1 AND 64),
+                epoch BLOB NOT NULL
+                    CHECK (typeof(epoch) = 'blob' AND length(epoch) = 8),
+                state TEXT NOT NULL
+                    CHECK (state IN ('reserved', 'in_flight', 'estimated', 'reconciled')),
+                reserved_requests BLOB NOT NULL
+                    CHECK (typeof(reserved_requests) = 'blob'
+                           AND length(reserved_requests) = 8),
+                reserved_tokens BLOB NOT NULL
+                    CHECK (typeof(reserved_tokens) = 'blob'
+                           AND length(reserved_tokens) = 8),
+                actual_requests BLOB
+                    CHECK (actual_requests IS NULL
+                           OR (typeof(actual_requests) = 'blob'
+                               AND length(actual_requests) = 8)),
+                actual_tokens BLOB
+                    CHECK (actual_tokens IS NULL
+                           OR (typeof(actual_tokens) = 'blob'
+                               AND length(actual_tokens) = 8))
+            );
+            CREATE INDEX IF NOT EXISTS idx_quota_receipts_epoch_state
+                ON quota_receipts(epoch, state);
+            CREATE TABLE IF NOT EXISTS quota_receipt_scopes (
+                receipt_id TEXT NOT NULL
+                    REFERENCES quota_receipts(id) ON DELETE CASCADE,
+                scope_kind TEXT NOT NULL
+                    CHECK (length(scope_kind) BETWEEN 1 AND 64),
+                scope_id TEXT NOT NULL
+                    CHECK (length(scope_id) BETWEEN 1 AND 1024),
+                reserved_requests BLOB NOT NULL
+                    CHECK (typeof(reserved_requests) = 'blob'
+                           AND length(reserved_requests) = 8),
+                reserved_tokens BLOB NOT NULL
+                    CHECK (typeof(reserved_tokens) = 'blob'
+                           AND length(reserved_tokens) = 8),
+                actual_requests BLOB
+                    CHECK (actual_requests IS NULL
+                           OR (typeof(actual_requests) = 'blob'
+                               AND length(actual_requests) = 8)),
+                actual_tokens BLOB
+                    CHECK (actual_tokens IS NULL
+                           OR (typeof(actual_tokens) = 'blob'
+                               AND length(actual_tokens) = 8)),
+                PRIMARY KEY (receipt_id, scope_kind, scope_id)
+            ) WITHOUT ROWID;
+            CREATE INDEX IF NOT EXISTS idx_quota_receipt_scopes_scope
+                ON quota_receipt_scopes(scope_kind, scope_id, receipt_id);
+            -- Refunded receipts are tombstoned so retries are idempotent and a
+            -- UUID can never be reused for a different external request.
+            CREATE TABLE IF NOT EXISTS quota_refunded_receipts (
+                id TEXT PRIMARY KEY CHECK (length(id) = 36),
+                epoch BLOB NOT NULL
+                    CHECK (typeof(epoch) = 'blob' AND length(epoch) = 8)
+            );
+            CREATE INDEX IF NOT EXISTS idx_quota_refunded_receipts_epoch
+                ON quota_refunded_receipts(epoch);
+            CREATE TABLE IF NOT EXISTS quota_migration_fence (
+                epoch BLOB PRIMARY KEY
+                    CHECK (typeof(epoch) = 'blob' AND length(epoch) = 8)
+            ) WITHOUT ROWID;",
         ).map_err(|e| ContextError::StorageError(e.to_string()))?;
         // Tenant scoping for the agent registry. Added via ALTER so an older DB
         // (created before tenancy) upgrades in place: legacy agents land in the
@@ -465,7 +812,1069 @@ impl SqliteContextManager {
                 params![Utc::now().to_rfc3339()],
             );
         }
+        if legacy_database_has_rows {
+            // The old release kept RPM/TPM only in process memory. There is no
+            // honest backfill after upgrade, so fence just the current fixed
+            // epoch instead of reopening unknown capacity. Fresh/empty
+            // databases do not receive this fence.
+            let now_seconds = Utc::now().timestamp();
+            let current_epoch = u64::try_from(now_seconds)
+                .map_err(|_| quota_error("system clock is before the Unix epoch"))?
+                / PROVIDER_RATE_EPOCH_SECONDS;
+            let current_epoch_blob = u64_blob(current_epoch);
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(|error| {
+                    quota_error(format!(
+                        "failed to start quota migration transaction: {error}"
+                    ))
+                })?;
+            tx.execute(
+                "INSERT OR IGNORE INTO quota_migration_fence(epoch) VALUES (?1)",
+                params![current_epoch_blob.as_slice()],
+            )
+            .map_err(|error| {
+                quota_error(format!("failed to install legacy quota fence: {error}"))
+            })?;
+            tx.execute(
+                "INSERT INTO quota_epoch_floor(singleton, epoch) VALUES (1, ?1)
+                 ON CONFLICT(singleton) DO UPDATE SET epoch = CASE
+                     WHEN quota_epoch_floor.epoch < excluded.epoch
+                     THEN excluded.epoch ELSE quota_epoch_floor.epoch END",
+                params![current_epoch_blob.as_slice()],
+            )
+            .map_err(|error| {
+                quota_error(format!("failed to initialize quota epoch floor: {error}"))
+            })?;
+            tx.commit().map_err(|error| {
+                quota_error(format!("failed to commit quota migration fence: {error}"))
+            })?;
+        }
         Ok(())
+    }
+
+    fn begin_quota_transaction(conn: &mut Connection) -> Result<Transaction<'_>, ContextError> {
+        conn.transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| {
+                quota_error(format!(
+                    "failed to start immediate quota transaction: {error}"
+                ))
+            })
+    }
+
+    fn effective_quota_epoch(
+        tx: &Transaction<'_>,
+        requested_epoch: u64,
+    ) -> Result<u64, ContextError> {
+        let stored = tx
+            .query_row(
+                "SELECT epoch FROM quota_epoch_floor WHERE singleton = 1",
+                [],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .optional()
+            .map_err(|error| quota_error(format!("failed to read quota epoch floor: {error}")))?
+            .map(|blob| parse_u64_blob(blob, "quota epoch floor"))
+            .transpose()?;
+        let effective = stored.unwrap_or(0).max(requested_epoch);
+        let blob = u64_blob(effective);
+        tx.execute(
+            "INSERT INTO quota_epoch_floor(singleton, epoch) VALUES (1, ?1)
+             ON CONFLICT(singleton) DO UPDATE SET epoch = excluded.epoch",
+            params![blob.as_slice()],
+        )
+        .map_err(|error| quota_error(format!("failed to persist quota epoch floor: {error}")))?;
+        Ok(effective)
+    }
+
+    fn load_quota_receipt(
+        tx: &Transaction<'_>,
+        id: uuid::Uuid,
+    ) -> Result<Option<StoredQuotaReceipt>, ContextError> {
+        let raw = tx
+            .query_row(
+                "SELECT id, receipt_kind, epoch, state, reserved_requests, reserved_tokens,
+                        actual_requests, actual_tokens
+                 FROM quota_receipts WHERE id = ?1",
+                [id.to_string()],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Vec<u8>>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, Vec<u8>>(4)?,
+                        row.get::<_, Vec<u8>>(5)?,
+                        row.get::<_, Option<Vec<u8>>>(6)?,
+                        row.get::<_, Option<Vec<u8>>>(7)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|error| quota_error(format!("failed to read quota receipt {id}: {error}")))?;
+        let Some((
+            stored_id,
+            receipt_kind,
+            epoch,
+            state,
+            reserved_requests,
+            reserved_tokens,
+            actual_requests,
+            actual_tokens,
+        )) = raw
+        else {
+            return Ok(None);
+        };
+        let stored_id = uuid::Uuid::parse_str(&stored_id)
+            .map_err(|error| quota_error(format!("malformed quota receipt id: {error}")))?;
+        if stored_id != id {
+            return Err(quota_error("quota receipt primary key mismatch"));
+        }
+        if receipt_kind != "provider_request" {
+            return Err(quota_error(format!(
+                "provider API received incompatible quota receipt kind {receipt_kind:?}"
+            )));
+        }
+        let state = ProviderRateReceiptState::parse(&state)?;
+        let actual_requests = actual_requests
+            .map(|value| parse_u64_blob(value, "quota receipt actual_requests"))
+            .transpose()?;
+        let actual_tokens = actual_tokens
+            .map(|value| parse_u64_blob(value, "quota receipt actual_tokens"))
+            .transpose()?;
+        match state {
+            ProviderRateReceiptState::Reconciled
+                if actual_requests.is_none() || actual_tokens.is_none() =>
+            {
+                return Err(quota_error(
+                    "reconciled quota receipt is missing actual usage",
+                ));
+            }
+            ProviderRateReceiptState::Reserved
+            | ProviderRateReceiptState::InFlight
+            | ProviderRateReceiptState::Estimated
+                if actual_requests.is_some() || actual_tokens.is_some() =>
+            {
+                return Err(quota_error(
+                    "unreconciled quota receipt unexpectedly has actual usage",
+                ));
+            }
+            _ => {}
+        }
+        Ok(Some(StoredQuotaReceipt {
+            id: stored_id,
+            epoch: parse_u64_blob(epoch, "quota receipt epoch")?,
+            state,
+            reserved_requests: parse_u64_blob(
+                reserved_requests,
+                "quota receipt reserved_requests",
+            )?,
+            reserved_tokens: parse_u64_blob(reserved_tokens, "quota receipt reserved_tokens")?,
+            actual_requests,
+            actual_tokens,
+        }))
+    }
+
+    fn provider_scope_usage_for_receipt(
+        tx: &Transaction<'_>,
+        receipt: &StoredQuotaReceipt,
+    ) -> Result<(u64, u64), ContextError> {
+        let raw = tx
+            .query_row(
+                "SELECT reserved_requests, reserved_tokens,
+                        actual_requests, actual_tokens
+                 FROM quota_receipt_scopes
+                 WHERE receipt_id = ?1 AND scope_kind = ?2 AND scope_id = ?3",
+                params![
+                    receipt.id.to_string(),
+                    PROVIDER_QUOTA_SCOPE_KIND,
+                    PROVIDER_QUOTA_SCOPE_ID
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, Vec<u8>>(0)?,
+                        row.get::<_, Vec<u8>>(1)?,
+                        row.get::<_, Option<Vec<u8>>>(2)?,
+                        row.get::<_, Option<Vec<u8>>>(3)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|error| {
+                quota_error(format!(
+                    "failed to read provider scope for receipt {}: {error}",
+                    receipt.id
+                ))
+            })?
+            .ok_or_else(|| {
+                quota_error(format!(
+                    "provider receipt {} has no provider/global scope",
+                    receipt.id
+                ))
+            })?;
+        let reserved_requests = parse_u64_blob(raw.0, "quota scope reserved_requests")?;
+        let reserved_tokens = parse_u64_blob(raw.1, "quota scope reserved_tokens")?;
+        let actual_requests = raw
+            .2
+            .map(|value| parse_u64_blob(value, "quota scope actual_requests"))
+            .transpose()?;
+        let actual_tokens = raw
+            .3
+            .map(|value| parse_u64_blob(value, "quota scope actual_tokens"))
+            .transpose()?;
+        if reserved_requests != receipt.reserved_requests
+            || reserved_tokens != receipt.reserved_tokens
+            || actual_requests != receipt.actual_requests
+            || actual_tokens != receipt.actual_tokens
+        {
+            return Err(quota_error(format!(
+                "provider receipt {} disagrees with its provider/global scope",
+                receipt.id
+            )));
+        }
+        if receipt.state == ProviderRateReceiptState::Reconciled {
+            Ok((
+                actual_requests.expect("validated reconciled actual requests"),
+                actual_tokens.expect("validated reconciled actual tokens"),
+            ))
+        } else {
+            Ok((reserved_requests, reserved_tokens))
+        }
+    }
+
+    fn compute_provider_epoch_usage(
+        tx: &Transaction<'_>,
+        epoch: u64,
+    ) -> Result<ProviderRateUsage, ContextError> {
+        let epoch_blob = u64_blob(epoch);
+        let mut statement = tx
+            .prepare(
+                "SELECT r.id
+                 FROM quota_receipts r
+                 WHERE r.receipt_kind = 'provider_request' AND r.epoch = ?1
+                 ORDER BY r.id",
+            )
+            .map_err(|error| {
+                quota_error(format!("failed to prepare provider usage scan: {error}"))
+            })?;
+        let rows = statement
+            .query_map(params![epoch_blob.as_slice()], |row| {
+                row.get::<_, String>(0)
+            })
+            .map_err(|error| quota_error(format!("failed to scan provider receipts: {error}")))?;
+        let mut ids = Vec::new();
+        for row in rows {
+            let id =
+                row.map_err(|error| quota_error(format!("failed to read receipt id: {error}")))?;
+            ids.push(uuid::Uuid::parse_str(&id).map_err(|error| {
+                quota_error(format!("malformed provider receipt id {id:?}: {error}"))
+            })?);
+        }
+        drop(statement);
+
+        let mut usage = ProviderRateUsage {
+            epoch,
+            ..ProviderRateUsage::default()
+        };
+        for id in ids {
+            let receipt = Self::load_quota_receipt(tx, id)?
+                .ok_or_else(|| quota_error(format!("provider receipt {id} disappeared")))?;
+            if receipt.epoch != epoch {
+                return Err(quota_error(format!(
+                    "provider receipt {id} epoch disagrees with usage scan"
+                )));
+            }
+            let (requests, tokens) = Self::provider_scope_usage_for_receipt(tx, &receipt)?;
+            usage.requests = usage.requests.saturating_add(requests);
+            usage.tokens = usage.tokens.saturating_add(tokens);
+            match receipt.state {
+                ProviderRateReceiptState::Reserved => {
+                    usage.reserved_receipts = usage.reserved_receipts.saturating_add(1);
+                }
+                ProviderRateReceiptState::InFlight => {
+                    usage.in_flight_receipts = usage.in_flight_receipts.saturating_add(1);
+                }
+                ProviderRateReceiptState::Estimated => {
+                    usage.estimated_receipts = usage.estimated_receipts.saturating_add(1);
+                }
+                ProviderRateReceiptState::Reconciled => {
+                    usage.reconciled_receipts = usage.reconciled_receipts.saturating_add(1);
+                }
+            }
+        }
+        Ok(usage)
+    }
+
+    fn load_provider_epoch_aggregate(
+        tx: &Transaction<'_>,
+        epoch: u64,
+    ) -> Result<Option<(u64, u64)>, ContextError> {
+        let epoch_blob = u64_blob(epoch);
+        tx.query_row(
+            "SELECT requests, tokens FROM quota_epochs
+             WHERE scope_kind = ?1 AND scope_id = ?2 AND epoch = ?3",
+            params![
+                PROVIDER_QUOTA_SCOPE_KIND,
+                PROVIDER_QUOTA_SCOPE_ID,
+                epoch_blob.as_slice()
+            ],
+            |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?)),
+        )
+        .optional()
+        .map_err(|error| quota_error(format!("failed to read provider epoch aggregate: {error}")))?
+        .map(|(requests, tokens)| {
+            Ok((
+                parse_u64_blob(requests, "provider epoch requests")?,
+                parse_u64_blob(tokens, "provider epoch tokens")?,
+            ))
+        })
+        .transpose()
+    }
+
+    fn validate_provider_epoch(
+        tx: &Transaction<'_>,
+        epoch: u64,
+    ) -> Result<ProviderRateUsage, ContextError> {
+        let usage = Self::compute_provider_epoch_usage(tx, epoch)?;
+        let stored = Self::load_provider_epoch_aggregate(tx, epoch)?;
+        let expected = (usage.requests, usage.tokens);
+        match stored {
+            Some(value) if value == expected => Ok(usage),
+            None if expected == (0, 0) => Ok(usage),
+            Some(value) => Err(quota_error(format!(
+                "provider epoch {epoch} aggregate {value:?} disagrees with receipts {expected:?}"
+            ))),
+            None => Err(quota_error(format!(
+                "provider epoch {epoch} is missing its aggregate"
+            ))),
+        }
+    }
+
+    fn write_provider_epoch_from_receipts(
+        tx: &Transaction<'_>,
+        epoch: u64,
+    ) -> Result<ProviderRateUsage, ContextError> {
+        let usage = Self::compute_provider_epoch_usage(tx, epoch)?;
+        let epoch_blob = u64_blob(epoch);
+        if usage.requests == 0
+            && usage.tokens == 0
+            && usage.reserved_receipts == 0
+            && usage.in_flight_receipts == 0
+            && usage.estimated_receipts == 0
+            && usage.reconciled_receipts == 0
+        {
+            tx.execute(
+                "DELETE FROM quota_epochs
+                 WHERE scope_kind = ?1 AND scope_id = ?2 AND epoch = ?3",
+                params![
+                    PROVIDER_QUOTA_SCOPE_KIND,
+                    PROVIDER_QUOTA_SCOPE_ID,
+                    epoch_blob.as_slice()
+                ],
+            )
+            .map_err(|error| {
+                quota_error(format!("failed to delete empty provider epoch: {error}"))
+            })?;
+        } else {
+            let requests = u64_blob(usage.requests);
+            let tokens = u64_blob(usage.tokens);
+            tx.execute(
+                "INSERT INTO quota_epochs
+                    (scope_kind, scope_id, epoch, requests, tokens)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(scope_kind, scope_id, epoch) DO UPDATE SET
+                    requests = excluded.requests,
+                    tokens = excluded.tokens",
+                params![
+                    PROVIDER_QUOTA_SCOPE_KIND,
+                    PROVIDER_QUOTA_SCOPE_ID,
+                    epoch_blob.as_slice(),
+                    requests.as_slice(),
+                    tokens.as_slice()
+                ],
+            )
+            .map_err(|error| {
+                quota_error(format!("failed to write provider epoch aggregate: {error}"))
+            })?;
+        }
+        Ok(usage)
+    }
+
+    fn validate_all_provider_epochs(tx: &Transaction<'_>) -> Result<(), ContextError> {
+        let mut statement = tx
+            .prepare(
+                "SELECT epoch FROM quota_epochs
+                 WHERE scope_kind = ?1 AND scope_id = ?2
+                 UNION
+                 SELECT r.epoch
+                 FROM quota_receipts r
+                 WHERE r.receipt_kind = 'provider_request'",
+            )
+            .map_err(|error| {
+                quota_error(format!(
+                    "failed to prepare provider epoch validation: {error}"
+                ))
+            })?;
+        let rows = statement
+            .query_map(
+                params![PROVIDER_QUOTA_SCOPE_KIND, PROVIDER_QUOTA_SCOPE_ID],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .map_err(|error| {
+                quota_error(format!("failed to enumerate provider epochs: {error}"))
+            })?;
+        let mut epochs = BTreeSet::new();
+        for row in rows {
+            epochs.insert(parse_u64_blob(
+                row.map_err(|error| {
+                    quota_error(format!("failed to read provider epoch: {error}"))
+                })?,
+                "provider epoch",
+            )?);
+        }
+        drop(statement);
+        let unexpected_provider_scope = tx
+            .query_row(
+                "SELECT 1
+                 FROM quota_receipt_scopes s
+                 JOIN quota_receipts r ON r.id = s.receipt_id
+                 WHERE s.scope_kind = ?1 AND s.scope_id = ?2
+                   AND r.receipt_kind <> 'provider_request'
+                 LIMIT 1",
+                params![PROVIDER_QUOTA_SCOPE_KIND, PROVIDER_QUOTA_SCOPE_ID],
+                |_| Ok(()),
+            )
+            .optional()
+            .map_err(|error| {
+                quota_error(format!(
+                    "failed to validate provider receipt ownership: {error}"
+                ))
+            })?
+            .is_some();
+        if unexpected_provider_scope {
+            return Err(quota_error(
+                "provider/global scope is attached to a non-provider receipt",
+            ));
+        }
+        for epoch in epochs {
+            Self::validate_provider_epoch(tx, epoch)?;
+        }
+        Ok(())
+    }
+
+    fn quota_receipt_was_refunded(
+        tx: &Transaction<'_>,
+        id: uuid::Uuid,
+    ) -> Result<bool, ContextError> {
+        tx.query_row(
+            "SELECT 1 FROM quota_refunded_receipts WHERE id = ?1",
+            [id.to_string()],
+            |_| Ok(()),
+        )
+        .optional()
+        .map(|value| value.is_some())
+        .map_err(|error| {
+            quota_error(format!(
+                "failed to inspect refunded quota receipt {id}: {error}"
+            ))
+        })
+    }
+
+    fn commit_quota_transaction(tx: Transaction<'_>) -> Result<(), ContextError> {
+        tx.commit()
+            .map_err(|error| quota_error(format!("failed to commit quota transaction: {error}")))
+    }
+
+    /// Atomically reserve one provider request and its token estimate.
+    ///
+    /// Zero RPM/TPM values are unlimited. Reusing the same UUID is idempotent
+    /// when it describes the same estimate, even after the clock advances; a
+    /// conflicting reuse fails closed.
+    pub(crate) fn reserve_provider_rate(
+        &self,
+        receipt_id: uuid::Uuid,
+        requested_epoch: u64,
+        rpm: u32,
+        tpm: u64,
+        estimated_tokens: u64,
+    ) -> Result<ProviderRateReserveOutcome, ContextError> {
+        let mut conn = self
+            .conn
+            .lock()
+            .map_err(|_| quota_error("SQLite connection mutex is poisoned"))?;
+        let tx = Self::begin_quota_transaction(&mut conn)?;
+        let effective_epoch = Self::effective_quota_epoch(&tx, requested_epoch)?;
+
+        if let Some(receipt) = Self::load_quota_receipt(&tx, receipt_id)? {
+            Self::validate_provider_epoch(&tx, receipt.epoch)?;
+            let _ = Self::provider_scope_usage_for_receipt(&tx, &receipt)?;
+            if receipt.reserved_requests != 1 || receipt.reserved_tokens != estimated_tokens {
+                return Err(quota_error(format!(
+                    "quota receipt {receipt_id} was reused with conflicting reservation data"
+                )));
+            }
+            let reservation = ProviderRateReservation {
+                id: receipt.id,
+                epoch: receipt.epoch,
+                reserved_tokens: receipt.reserved_tokens,
+                state: receipt.state,
+            };
+            Self::commit_quota_transaction(tx)?;
+            return Ok(ProviderRateReserveOutcome::Reserved(reservation));
+        }
+        if Self::quota_receipt_was_refunded(&tx, receipt_id)? {
+            return Err(quota_error(format!(
+                "refunded quota receipt {receipt_id} cannot be reused"
+            )));
+        }
+
+        let epoch_blob = u64_blob(effective_epoch);
+        let fenced = tx
+            .query_row(
+                "SELECT 1 FROM quota_migration_fence WHERE epoch = ?1",
+                params![epoch_blob.as_slice()],
+                |_| Ok(()),
+            )
+            .optional()
+            .map_err(|error| {
+                quota_error(format!("failed to inspect quota migration fence: {error}"))
+            })?
+            .is_some();
+        if fenced {
+            let outcome = ProviderRateReserveOutcome::Denied {
+                epoch: effective_epoch,
+                dimension: ProviderRateLimitDimension::MigrationFence,
+                used: 0,
+                requested: 0,
+                limit: 0,
+            };
+            Self::commit_quota_transaction(tx)?;
+            return Ok(outcome);
+        }
+
+        let usage = Self::validate_provider_epoch(&tx, effective_epoch)?;
+        let rpm = u64::from(rpm);
+        if rpm != 0 && usage.requests >= rpm {
+            let outcome = ProviderRateReserveOutcome::Denied {
+                epoch: effective_epoch,
+                dimension: ProviderRateLimitDimension::Requests,
+                used: usage.requests,
+                requested: 1,
+                limit: rpm,
+            };
+            Self::commit_quota_transaction(tx)?;
+            return Ok(outcome);
+        }
+        if tpm != 0 && (usage.tokens > tpm || estimated_tokens > tpm.saturating_sub(usage.tokens)) {
+            let outcome = ProviderRateReserveOutcome::Denied {
+                epoch: effective_epoch,
+                dimension: ProviderRateLimitDimension::Tokens,
+                used: usage.tokens,
+                requested: estimated_tokens,
+                limit: tpm,
+            };
+            Self::commit_quota_transaction(tx)?;
+            return Ok(outcome);
+        }
+
+        let one = u64_blob(1);
+        let estimate = u64_blob(estimated_tokens);
+        tx.execute(
+            "INSERT INTO quota_receipts
+                (id, receipt_kind, epoch, state, reserved_requests, reserved_tokens,
+                 actual_requests, actual_tokens)
+             VALUES (?1, 'provider_request', ?2, 'reserved', ?3, ?4, NULL, NULL)",
+            params![
+                receipt_id.to_string(),
+                epoch_blob.as_slice(),
+                one.as_slice(),
+                estimate.as_slice()
+            ],
+        )
+        .map_err(|error| {
+            quota_error(format!("failed to insert provider quota receipt: {error}"))
+        })?;
+        tx.execute(
+            "INSERT INTO quota_receipt_scopes
+                (receipt_id, scope_kind, scope_id,
+                 reserved_requests, reserved_tokens,
+                 actual_requests, actual_tokens)
+             VALUES (?1, ?2, ?3, ?4, ?5, NULL, NULL)",
+            params![
+                receipt_id.to_string(),
+                PROVIDER_QUOTA_SCOPE_KIND,
+                PROVIDER_QUOTA_SCOPE_ID,
+                one.as_slice(),
+                estimate.as_slice()
+            ],
+        )
+        .map_err(|error| {
+            quota_error(format!(
+                "failed to associate provider quota receipt: {error}"
+            ))
+        })?;
+        Self::write_provider_epoch_from_receipts(&tx, effective_epoch)?;
+        Self::commit_quota_transaction(tx)?;
+        Ok(ProviderRateReserveOutcome::Reserved(
+            ProviderRateReservation {
+                id: receipt_id,
+                epoch: effective_epoch,
+                reserved_tokens: estimated_tokens,
+                state: ProviderRateReceiptState::Reserved,
+            },
+        ))
+    }
+
+    /// Mark that provider I/O may have started. This transition is idempotent;
+    /// after it commits, cancellation/crash must retain at least the estimate.
+    pub(crate) fn mark_provider_rate_invoked(
+        &self,
+        receipt_id: uuid::Uuid,
+    ) -> Result<(), ContextError> {
+        let mut conn = self
+            .conn
+            .lock()
+            .map_err(|_| quota_error("SQLite connection mutex is poisoned"))?;
+        let tx = Self::begin_quota_transaction(&mut conn)?;
+        let receipt = Self::load_quota_receipt(&tx, receipt_id)?
+            .ok_or_else(|| quota_error(format!("unknown quota receipt {receipt_id}")))?;
+        Self::validate_provider_epoch(&tx, receipt.epoch)?;
+        let _ = Self::provider_scope_usage_for_receipt(&tx, &receipt)?;
+        if receipt.state == ProviderRateReceiptState::Reserved {
+            tx.execute(
+                "UPDATE quota_receipts SET state = 'in_flight' WHERE id = ?1",
+                [receipt_id.to_string()],
+            )
+            .map_err(|error| {
+                quota_error(format!(
+                    "failed to mark provider quota receipt in flight: {error}"
+                ))
+            })?;
+        }
+        Self::commit_quota_transaction(tx)
+    }
+
+    /// Refund a reservation only while provider I/O is known not to have
+    /// started. A tombstone makes repeated refunds idempotent.
+    pub(crate) fn refund_provider_rate_before_invocation(
+        &self,
+        receipt_id: uuid::Uuid,
+    ) -> Result<(), ContextError> {
+        let mut conn = self
+            .conn
+            .lock()
+            .map_err(|_| quota_error("SQLite connection mutex is poisoned"))?;
+        let tx = Self::begin_quota_transaction(&mut conn)?;
+        let Some(receipt) = Self::load_quota_receipt(&tx, receipt_id)? else {
+            if Self::quota_receipt_was_refunded(&tx, receipt_id)? {
+                Self::commit_quota_transaction(tx)?;
+                return Ok(());
+            }
+            return Err(quota_error(format!("unknown quota receipt {receipt_id}")));
+        };
+        Self::validate_provider_epoch(&tx, receipt.epoch)?;
+        let _ = Self::provider_scope_usage_for_receipt(&tx, &receipt)?;
+        if receipt.state != ProviderRateReceiptState::Reserved {
+            return Err(quota_error(format!(
+                "quota receipt {receipt_id} cannot be refunded after provider invocation"
+            )));
+        }
+        let epoch_blob = u64_blob(receipt.epoch);
+        tx.execute(
+            "INSERT INTO quota_refunded_receipts(id, epoch) VALUES (?1, ?2)",
+            params![receipt_id.to_string(), epoch_blob.as_slice()],
+        )
+        .map_err(|error| quota_error(format!("failed to tombstone refunded receipt: {error}")))?;
+        tx.execute(
+            "DELETE FROM quota_receipts WHERE id = ?1",
+            [receipt_id.to_string()],
+        )
+        .map_err(|error| quota_error(format!("failed to refund quota receipt: {error}")))?;
+        Self::write_provider_epoch_from_receipts(&tx, receipt.epoch)?;
+        Self::commit_quota_transaction(tx)
+    }
+
+    /// Conservatively retain an in-flight estimate when actual usage is
+    /// unavailable (provider error, cancellation, crash recovery).
+    pub(crate) fn retain_provider_rate_estimate(
+        &self,
+        receipt_id: uuid::Uuid,
+    ) -> Result<(), ContextError> {
+        let mut conn = self
+            .conn
+            .lock()
+            .map_err(|_| quota_error("SQLite connection mutex is poisoned"))?;
+        let tx = Self::begin_quota_transaction(&mut conn)?;
+        let receipt = Self::load_quota_receipt(&tx, receipt_id)?
+            .ok_or_else(|| quota_error(format!("unknown quota receipt {receipt_id}")))?;
+        Self::validate_provider_epoch(&tx, receipt.epoch)?;
+        let _ = Self::provider_scope_usage_for_receipt(&tx, &receipt)?;
+        match receipt.state {
+            ProviderRateReceiptState::InFlight => {
+                tx.execute(
+                    "UPDATE quota_receipts SET state = 'estimated' WHERE id = ?1",
+                    [receipt_id.to_string()],
+                )
+                .map_err(|error| {
+                    quota_error(format!("failed to retain provider quota estimate: {error}"))
+                })?;
+            }
+            ProviderRateReceiptState::Estimated | ProviderRateReceiptState::Reconciled => {}
+            ProviderRateReceiptState::Reserved => {
+                return Err(quota_error(format!(
+                    "quota receipt {receipt_id} was not marked invoked"
+                )));
+            }
+        }
+        Self::commit_quota_transaction(tx)
+    }
+
+    /// Replace the estimate with actual usage in the original admission epoch.
+    ///
+    /// The original epoch is intentional: a long request cannot consume fresh
+    /// capacity merely because its response arrived after a minute boundary.
+    pub(crate) fn reconcile_provider_rate(
+        &self,
+        receipt_id: uuid::Uuid,
+        actual_tokens: u64,
+    ) -> Result<(), ContextError> {
+        let mut conn = self
+            .conn
+            .lock()
+            .map_err(|_| quota_error("SQLite connection mutex is poisoned"))?;
+        let tx = Self::begin_quota_transaction(&mut conn)?;
+        let receipt = Self::load_quota_receipt(&tx, receipt_id)?
+            .ok_or_else(|| quota_error(format!("unknown quota receipt {receipt_id}")))?;
+        Self::validate_provider_epoch(&tx, receipt.epoch)?;
+        let _ = Self::provider_scope_usage_for_receipt(&tx, &receipt)?;
+        match receipt.state {
+            ProviderRateReceiptState::Reconciled => {
+                if receipt.actual_tokens != Some(actual_tokens) {
+                    return Err(quota_error(format!(
+                        "quota receipt {receipt_id} was reconciled with different usage"
+                    )));
+                }
+            }
+            ProviderRateReceiptState::InFlight | ProviderRateReceiptState::Estimated => {
+                let actual_requests = u64_blob(receipt.reserved_requests);
+                let actual_tokens_blob = u64_blob(actual_tokens);
+                tx.execute(
+                    "UPDATE quota_receipts
+                     SET state = 'reconciled',
+                         actual_requests = ?1, actual_tokens = ?2
+                     WHERE id = ?3",
+                    params![
+                        actual_requests.as_slice(),
+                        actual_tokens_blob.as_slice(),
+                        receipt_id.to_string()
+                    ],
+                )
+                .map_err(|error| {
+                    quota_error(format!("failed to reconcile quota receipt: {error}"))
+                })?;
+                tx.execute(
+                    "UPDATE quota_receipt_scopes
+                     SET actual_requests = ?1, actual_tokens = ?2
+                     WHERE receipt_id = ?3
+                       AND scope_kind = ?4 AND scope_id = ?5",
+                    params![
+                        actual_requests.as_slice(),
+                        actual_tokens_blob.as_slice(),
+                        receipt_id.to_string(),
+                        PROVIDER_QUOTA_SCOPE_KIND,
+                        PROVIDER_QUOTA_SCOPE_ID
+                    ],
+                )
+                .map_err(|error| {
+                    quota_error(format!("failed to reconcile provider quota scope: {error}"))
+                })?;
+                Self::write_provider_epoch_from_receipts(&tx, receipt.epoch)?;
+            }
+            ProviderRateReceiptState::Reserved => {
+                return Err(quota_error(format!(
+                    "quota receipt {receipt_id} was not marked invoked"
+                )));
+            }
+        }
+        Self::commit_quota_transaction(tx)
+    }
+
+    /// Charge observed provider tokens without consuming an RPM slot.
+    ///
+    /// The caller supplies a stable UUID so retries cannot double-charge.
+    pub(crate) fn charge_provider_rate_tokens(
+        &self,
+        receipt_id: uuid::Uuid,
+        requested_epoch: u64,
+        tokens: u64,
+    ) -> Result<(), ContextError> {
+        let mut conn = self
+            .conn
+            .lock()
+            .map_err(|_| quota_error("SQLite connection mutex is poisoned"))?;
+        let tx = Self::begin_quota_transaction(&mut conn)?;
+        let effective_epoch = Self::effective_quota_epoch(&tx, requested_epoch)?;
+        if let Some(receipt) = Self::load_quota_receipt(&tx, receipt_id)? {
+            Self::validate_provider_epoch(&tx, receipt.epoch)?;
+            let _ = Self::provider_scope_usage_for_receipt(&tx, &receipt)?;
+            if receipt.reserved_requests == 0
+                && receipt.reserved_tokens == 0
+                && receipt.state == ProviderRateReceiptState::Reconciled
+                && receipt.actual_requests == Some(0)
+                && receipt.actual_tokens == Some(tokens)
+            {
+                Self::commit_quota_transaction(tx)?;
+                return Ok(());
+            }
+            return Err(quota_error(format!(
+                "quota receipt {receipt_id} was reused with conflicting token charge"
+            )));
+        }
+        if Self::quota_receipt_was_refunded(&tx, receipt_id)? {
+            return Err(quota_error(format!(
+                "refunded quota receipt {receipt_id} cannot be reused"
+            )));
+        }
+        Self::validate_provider_epoch(&tx, effective_epoch)?;
+        let epoch_blob = u64_blob(effective_epoch);
+        let zero = u64_blob(0);
+        let token_blob = u64_blob(tokens);
+        tx.execute(
+            "INSERT INTO quota_receipts
+                (id, receipt_kind, epoch, state, reserved_requests, reserved_tokens,
+                 actual_requests, actual_tokens)
+             VALUES (?1, 'provider_request', ?2, 'reconciled', ?3, ?3, ?3, ?4)",
+            params![
+                receipt_id.to_string(),
+                epoch_blob.as_slice(),
+                zero.as_slice(),
+                token_blob.as_slice()
+            ],
+        )
+        .map_err(|error| quota_error(format!("failed to insert direct token charge: {error}")))?;
+        tx.execute(
+            "INSERT INTO quota_receipt_scopes
+                (receipt_id, scope_kind, scope_id,
+                 reserved_requests, reserved_tokens,
+                 actual_requests, actual_tokens)
+             VALUES (?1, ?2, ?3, ?4, ?4, ?4, ?5)",
+            params![
+                receipt_id.to_string(),
+                PROVIDER_QUOTA_SCOPE_KIND,
+                PROVIDER_QUOTA_SCOPE_ID,
+                zero.as_slice(),
+                token_blob.as_slice()
+            ],
+        )
+        .map_err(|error| {
+            quota_error(format!("failed to associate direct token charge: {error}"))
+        })?;
+        Self::write_provider_epoch_from_receipts(&tx, effective_epoch)?;
+        Self::commit_quota_transaction(tx)
+    }
+
+    /// Return durable provider usage for the monotonic effective epoch.
+    pub(crate) fn provider_rate_usage(
+        &self,
+        requested_epoch: u64,
+    ) -> Result<ProviderRateUsage, ContextError> {
+        let mut conn = self
+            .conn
+            .lock()
+            .map_err(|_| quota_error("SQLite connection mutex is poisoned"))?;
+        let tx = Self::begin_quota_transaction(&mut conn)?;
+        let effective_epoch = Self::effective_quota_epoch(&tx, requested_epoch)?;
+        let usage = Self::validate_provider_epoch(&tx, effective_epoch)?;
+        Self::commit_quota_transaction(tx)?;
+        Ok(usage)
+    }
+
+    /// Recover all durable provider receipts before admitting new work.
+    ///
+    /// A merely-reserved request is known not to have reached provider I/O and
+    /// is refunded. In-flight work may have happened, so its estimate becomes
+    /// terminal/conservative. The whole recovery is one IMMEDIATE transaction.
+    pub(crate) fn recover_provider_rate_state(
+        &self,
+        requested_epoch: u64,
+    ) -> Result<ProviderRateRecovery, ContextError> {
+        let mut conn = self
+            .conn
+            .lock()
+            .map_err(|_| quota_error("SQLite connection mutex is poisoned"))?;
+        let tx = Self::begin_quota_transaction(&mut conn)?;
+        let effective_epoch = Self::effective_quota_epoch(&tx, requested_epoch)?;
+        Self::validate_all_provider_epochs(&tx)?;
+
+        let mut statement = tx
+            .prepare(
+                "SELECT r.id
+                 FROM quota_receipts r
+                 WHERE r.receipt_kind = 'provider_request'
+                   AND r.state IN ('reserved', 'in_flight')
+                 ORDER BY r.id",
+            )
+            .map_err(|error| {
+                quota_error(format!("failed to prepare quota recovery scan: {error}"))
+            })?;
+        let rows = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|error| quota_error(format!("failed to scan quota recovery: {error}")))?;
+        let mut ids = Vec::new();
+        for row in rows {
+            let id = row.map_err(|error| {
+                quota_error(format!("failed to read recovery receipt: {error}"))
+            })?;
+            ids.push(uuid::Uuid::parse_str(&id).map_err(|error| {
+                quota_error(format!("malformed recovery receipt id {id:?}: {error}"))
+            })?);
+        }
+        drop(statement);
+
+        let mut recovery = ProviderRateRecovery {
+            effective_epoch,
+            ..ProviderRateRecovery::default()
+        };
+        let mut affected_epochs = BTreeSet::new();
+        for id in ids {
+            let receipt = Self::load_quota_receipt(&tx, id)?
+                .ok_or_else(|| quota_error(format!("recovery receipt {id} disappeared")))?;
+            affected_epochs.insert(receipt.epoch);
+            match receipt.state {
+                ProviderRateReceiptState::Reserved => {
+                    let epoch_blob = u64_blob(receipt.epoch);
+                    tx.execute(
+                        "INSERT INTO quota_refunded_receipts(id, epoch)
+                         VALUES (?1, ?2)",
+                        params![id.to_string(), epoch_blob.as_slice()],
+                    )
+                    .map_err(|error| {
+                        quota_error(format!(
+                            "failed to tombstone recovered reservation: {error}"
+                        ))
+                    })?;
+                    tx.execute("DELETE FROM quota_receipts WHERE id = ?1", [id.to_string()])
+                        .map_err(|error| {
+                            quota_error(format!("failed to refund recovered reservation: {error}"))
+                        })?;
+                    recovery.refunded_reserved = recovery.refunded_reserved.saturating_add(1);
+                }
+                ProviderRateReceiptState::InFlight => {
+                    tx.execute(
+                        "UPDATE quota_receipts SET state = 'estimated' WHERE id = ?1",
+                        [id.to_string()],
+                    )
+                    .map_err(|error| {
+                        quota_error(format!(
+                            "failed to retain recovered in-flight estimate: {error}"
+                        ))
+                    })?;
+                    recovery.retained_in_flight_estimates =
+                        recovery.retained_in_flight_estimates.saturating_add(1);
+                }
+                ProviderRateReceiptState::Estimated | ProviderRateReceiptState::Reconciled => {}
+            }
+        }
+        for epoch in affected_epochs {
+            Self::write_provider_epoch_from_receipts(&tx, epoch)?;
+        }
+        Self::commit_quota_transaction(tx)?;
+        Ok(recovery)
+    }
+
+    /// Prune completed epochs strictly before `before_epoch`.
+    ///
+    /// Any epoch with a reserved or in-flight receipt is retained intact. This
+    /// predicate is global across scopes so a future cgroup mapping cannot be
+    /// orphaned by provider-led pruning.
+    pub(crate) fn prune_provider_rate_epochs(
+        &self,
+        before_epoch: u64,
+    ) -> Result<usize, ContextError> {
+        let mut conn = self
+            .conn
+            .lock()
+            .map_err(|_| quota_error("SQLite connection mutex is poisoned"))?;
+        let tx = Self::begin_quota_transaction(&mut conn)?;
+        Self::validate_all_provider_epochs(&tx)?;
+        let before_blob = u64_blob(before_epoch);
+        let mut statement = tx
+            .prepare(
+                "SELECT epoch FROM quota_epochs
+                 WHERE scope_kind = ?1 AND scope_id = ?2 AND epoch < ?3
+                 UNION
+                 SELECT epoch FROM quota_receipts
+                 WHERE receipt_kind = 'provider_request' AND epoch < ?3
+                 UNION
+                 SELECT epoch FROM quota_refunded_receipts WHERE epoch < ?3
+                 UNION
+                 SELECT epoch FROM quota_migration_fence WHERE epoch < ?3
+                 ORDER BY epoch",
+            )
+            .map_err(|error| quota_error(format!("failed to prepare quota prune: {error}")))?;
+        let rows = statement
+            .query_map(
+                params![
+                    PROVIDER_QUOTA_SCOPE_KIND,
+                    PROVIDER_QUOTA_SCOPE_ID,
+                    before_blob.as_slice()
+                ],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .map_err(|error| quota_error(format!("failed to scan quota prune: {error}")))?;
+        let mut candidates = Vec::new();
+        for row in rows {
+            candidates.push(parse_u64_blob(
+                row.map_err(|error| quota_error(format!("failed to read prune epoch: {error}")))?,
+                "quota prune epoch",
+            )?);
+        }
+        drop(statement);
+
+        let mut pruned = 0usize;
+        for epoch in candidates {
+            let epoch_blob = u64_blob(epoch);
+            let active = tx
+                .query_row(
+                    "SELECT 1 FROM quota_receipts
+                     WHERE epoch = ?1 AND state IN ('reserved', 'in_flight')
+                     LIMIT 1",
+                    params![epoch_blob.as_slice()],
+                    |_| Ok(()),
+                )
+                .optional()
+                .map_err(|error| {
+                    quota_error(format!("failed to inspect live prune receipts: {error}"))
+                })?
+                .is_some();
+            if active {
+                continue;
+            }
+            tx.execute(
+                "DELETE FROM quota_receipts
+                 WHERE epoch = ?1 AND state IN ('estimated', 'reconciled')",
+                params![epoch_blob.as_slice()],
+            )
+            .map_err(|error| quota_error(format!("failed to prune completed receipts: {error}")))?;
+            tx.execute(
+                "DELETE FROM quota_epochs WHERE epoch = ?1",
+                params![epoch_blob.as_slice()],
+            )
+            .map_err(|error| quota_error(format!("failed to prune quota epoch: {error}")))?;
+            tx.execute(
+                "DELETE FROM quota_refunded_receipts WHERE epoch = ?1",
+                params![epoch_blob.as_slice()],
+            )
+            .map_err(|error| quota_error(format!("failed to prune refund tombstones: {error}")))?;
+            tx.execute(
+                "DELETE FROM quota_migration_fence WHERE epoch = ?1",
+                params![epoch_blob.as_slice()],
+            )
+            .map_err(|error| quota_error(format!("failed to prune migration fence: {error}")))?;
+            pruned = pruned.saturating_add(1);
+        }
+        Self::commit_quota_transaction(tx)?;
+        Ok(pruned)
     }
 
     fn persist_with_retry(
@@ -2576,5 +3985,483 @@ mod tests {
             snapshot.agent_tenants.get(&agent).map(String::as_str),
             Some("tenant-a")
         );
+    }
+
+    struct QuotaTestDatabase {
+        path: std::path::PathBuf,
+    }
+
+    impl QuotaTestDatabase {
+        fn new(label: &str) -> Self {
+            Self {
+                path: std::env::temp_dir().join(format!(
+                    "aiagentos-quota-{label}-{}.db",
+                    uuid::Uuid::new_v4()
+                )),
+            }
+        }
+    }
+
+    impl Drop for QuotaTestDatabase {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.path);
+            let mut wal = self.path.as_os_str().to_os_string();
+            wal.push("-wal");
+            let _ = std::fs::remove_file(std::path::PathBuf::from(wal));
+            let mut shm = self.path.as_os_str().to_os_string();
+            shm.push("-shm");
+            let _ = std::fs::remove_file(std::path::PathBuf::from(shm));
+        }
+    }
+
+    fn expect_provider_reservation(outcome: ProviderRateReserveOutcome) -> ProviderRateReservation {
+        match outcome {
+            ProviderRateReserveOutcome::Reserved(reservation) => reservation,
+            ProviderRateReserveOutcome::Denied { dimension, .. } => {
+                panic!("reservation was unexpectedly denied by {dimension:?}")
+            }
+        }
+    }
+
+    #[test]
+    fn provider_rate_epochs_are_fixed_and_floor_never_moves_backwards() {
+        let mgr = SqliteContextManager::in_memory().unwrap();
+        let reservation = expect_provider_reservation(
+            mgr.reserve_provider_rate(uuid::Uuid::new_v4(), 10, 1, 100, 100)
+                .unwrap(),
+        );
+        assert_eq!(reservation.epoch, 10);
+        assert_eq!(mgr.provider_rate_usage(10).unwrap().tokens, 100);
+
+        // The exact next epoch is fresh.
+        let next = mgr.provider_rate_usage(11).unwrap();
+        assert_eq!(next.epoch, 11);
+        assert_eq!((next.requests, next.tokens), (0, 0));
+
+        // A wall-clock rollback cannot reopen the exhausted earlier epoch.
+        let rolled_back = mgr.provider_rate_usage(9).unwrap();
+        assert_eq!(rolled_back.epoch, 11);
+        assert_eq!((rolled_back.requests, rolled_back.tokens), (0, 0));
+        let second = expect_provider_reservation(
+            mgr.reserve_provider_rate(uuid::Uuid::new_v4(), 9, 1, 100, 1)
+                .unwrap(),
+        );
+        assert_eq!(second.epoch, 11);
+    }
+
+    #[test]
+    fn provider_receipt_transitions_refund_retain_and_reconcile_exactly() {
+        let mgr = SqliteContextManager::in_memory().unwrap();
+        let refunded = uuid::Uuid::new_v4();
+        expect_provider_reservation(
+            mgr.reserve_provider_rate(refunded, 20, 10, 1_000, 300)
+                .unwrap(),
+        );
+        mgr.refund_provider_rate_before_invocation(refunded)
+            .unwrap();
+        mgr.refund_provider_rate_before_invocation(refunded)
+            .unwrap();
+        assert_eq!(
+            mgr.provider_rate_usage(20).unwrap(),
+            ProviderRateUsage {
+                epoch: 20,
+                ..ProviderRateUsage::default()
+            }
+        );
+        assert!(mgr
+            .reserve_provider_rate(refunded, 20, 10, 1_000, 300)
+            .is_err());
+
+        let estimated = uuid::Uuid::new_v4();
+        expect_provider_reservation(
+            mgr.reserve_provider_rate(estimated, 20, 10, 1_000, 200)
+                .unwrap(),
+        );
+        mgr.mark_provider_rate_invoked(estimated).unwrap();
+        mgr.mark_provider_rate_invoked(estimated).unwrap();
+        assert!(mgr
+            .refund_provider_rate_before_invocation(estimated)
+            .is_err());
+        mgr.retain_provider_rate_estimate(estimated).unwrap();
+        mgr.retain_provider_rate_estimate(estimated).unwrap();
+
+        let reconciled = uuid::Uuid::new_v4();
+        expect_provider_reservation(
+            mgr.reserve_provider_rate(reconciled, 20, 10, 1_000, 400)
+                .unwrap(),
+        );
+        mgr.mark_provider_rate_invoked(reconciled).unwrap();
+        mgr.reconcile_provider_rate(reconciled, 125).unwrap();
+        mgr.reconcile_provider_rate(reconciled, 125).unwrap();
+        assert!(mgr.reconcile_provider_rate(reconciled, 126).is_err());
+
+        let usage = mgr.provider_rate_usage(20).unwrap();
+        assert_eq!((usage.requests, usage.tokens), (2, 325));
+        assert_eq!(usage.estimated_receipts, 1);
+        assert_eq!(usage.reconciled_receipts, 1);
+    }
+
+    #[test]
+    fn provider_reservation_limits_deny_without_partial_writes() {
+        let mgr = SqliteContextManager::in_memory().unwrap();
+        expect_provider_reservation(
+            mgr.reserve_provider_rate(uuid::Uuid::new_v4(), 25, 1, 100, 60)
+                .unwrap(),
+        );
+        assert!(matches!(
+            mgr.reserve_provider_rate(uuid::Uuid::new_v4(), 25, 1, 100, 1)
+                .unwrap(),
+            ProviderRateReserveOutcome::Denied {
+                dimension: ProviderRateLimitDimension::Requests,
+                used: 1,
+                requested: 1,
+                limit: 1,
+                ..
+            }
+        ));
+        let usage = mgr.provider_rate_usage(25).unwrap();
+        assert_eq!(
+            (usage.requests, usage.tokens, usage.reserved_receipts),
+            (1, 60, 1)
+        );
+
+        assert!(matches!(
+            mgr.reserve_provider_rate(uuid::Uuid::new_v4(), 26, 10, 50, 51)
+                .unwrap(),
+            ProviderRateReserveOutcome::Denied {
+                dimension: ProviderRateLimitDimension::Tokens,
+                used: 0,
+                requested: 51,
+                limit: 50,
+                ..
+            }
+        ));
+        assert_eq!(
+            mgr.provider_rate_usage(26).unwrap(),
+            ProviderRateUsage {
+                epoch: 26,
+                ..ProviderRateUsage::default()
+            }
+        );
+
+        // Zero limits are explicitly unlimited and counters saturate rather
+        // than wrapping when the full u64 domain is exercised.
+        expect_provider_reservation(
+            mgr.reserve_provider_rate(uuid::Uuid::new_v4(), 27, 0, 0, u64::MAX)
+                .unwrap(),
+        );
+        expect_provider_reservation(
+            mgr.reserve_provider_rate(uuid::Uuid::new_v4(), 27, 0, 0, 1)
+                .unwrap(),
+        );
+        let unlimited = mgr.provider_rate_usage(27).unwrap();
+        assert_eq!((unlimited.requests, unlimited.tokens), (2, u64::MAX));
+    }
+
+    #[test]
+    fn reconciliation_updates_the_original_epoch_after_clock_advances() {
+        let mgr = SqliteContextManager::in_memory().unwrap();
+        let id = uuid::Uuid::new_v4();
+        expect_provider_reservation(mgr.reserve_provider_rate(id, 30, 10, 1_000, 500).unwrap());
+        mgr.mark_provider_rate_invoked(id).unwrap();
+        assert_eq!(mgr.provider_rate_usage(31).unwrap().tokens, 0);
+        let duplicate =
+            expect_provider_reservation(mgr.reserve_provider_rate(id, 31, 10, 1_000, 500).unwrap());
+        assert_eq!(duplicate.epoch, 30);
+        assert_eq!(duplicate.state, ProviderRateReceiptState::InFlight);
+        mgr.reconcile_provider_rate(id, 175).unwrap();
+        assert_eq!(mgr.provider_rate_usage(31).unwrap().tokens, 0);
+
+        let conn = mgr.conn.lock().unwrap();
+        let epoch = u64_blob(30);
+        let stored: Vec<u8> = conn
+            .query_row(
+                "SELECT tokens FROM quota_epochs
+                 WHERE scope_kind = 'provider' AND scope_id = 'global'
+                   AND epoch = ?1",
+                params![epoch.as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(parse_u64_blob(stored, "test tokens").unwrap(), 175);
+    }
+
+    #[test]
+    fn restart_recovery_refunds_reserved_and_retains_in_flight_estimate() {
+        let database = QuotaTestDatabase::new("restart");
+        let reserved = uuid::Uuid::new_v4();
+        let in_flight = uuid::Uuid::new_v4();
+        {
+            let mgr = SqliteContextManager::new(&database.path).unwrap();
+            expect_provider_reservation(
+                mgr.reserve_provider_rate(reserved, 40, 10, 1_000, 100)
+                    .unwrap(),
+            );
+            expect_provider_reservation(
+                mgr.reserve_provider_rate(in_flight, 40, 10, 1_000, 250)
+                    .unwrap(),
+            );
+            mgr.mark_provider_rate_invoked(in_flight).unwrap();
+        }
+
+        let mgr = SqliteContextManager::new(&database.path).unwrap();
+        let recovery = mgr.recover_provider_rate_state(40).unwrap();
+        assert_eq!(recovery.effective_epoch, 40);
+        assert_eq!(recovery.refunded_reserved, 1);
+        assert_eq!(recovery.retained_in_flight_estimates, 1);
+        let usage = mgr.provider_rate_usage(40).unwrap();
+        assert_eq!((usage.requests, usage.tokens), (1, 250));
+        assert_eq!(usage.estimated_receipts, 1);
+        assert_eq!(usage.reserved_receipts, 0);
+        assert_eq!(usage.in_flight_receipts, 0);
+
+        // A restart after the fixed boundary selects fresh capacity while the
+        // conservative old estimate remains durable until pruning.
+        let next = mgr.recover_provider_rate_state(41).unwrap();
+        assert_eq!(next.effective_epoch, 41);
+        assert_eq!(mgr.provider_rate_usage(41).unwrap().tokens, 0);
+    }
+
+    #[test]
+    fn provider_usage_preserves_full_u64_and_saturates_without_wrapping() {
+        let mgr = SqliteContextManager::in_memory().unwrap();
+        let max_charge = uuid::Uuid::new_v4();
+        mgr.charge_provider_rate_tokens(max_charge, 50, u64::MAX)
+            .unwrap();
+        // Retry is idempotent.
+        mgr.charge_provider_rate_tokens(max_charge, 50, u64::MAX)
+            .unwrap();
+        mgr.charge_provider_rate_tokens(uuid::Uuid::new_v4(), 50, 1)
+            .unwrap();
+        let usage = mgr.provider_rate_usage(50).unwrap();
+        assert_eq!(usage.requests, 0);
+        assert_eq!(usage.tokens, u64::MAX);
+        assert_eq!(usage.reconciled_receipts, 2);
+    }
+
+    #[test]
+    fn malformed_or_negative_quota_state_fails_closed() {
+        let mgr = SqliteContextManager::in_memory().unwrap();
+        expect_provider_reservation(
+            mgr.reserve_provider_rate(uuid::Uuid::new_v4(), 60, 10, 1_000, 25)
+                .unwrap(),
+        );
+        {
+            let conn = mgr.conn.lock().unwrap();
+            conn.pragma_update(None, "ignore_check_constraints", "ON")
+                .unwrap();
+            conn.execute(
+                "UPDATE quota_epochs SET tokens = -1
+                 WHERE scope_kind = 'provider' AND scope_id = 'global'",
+                [],
+            )
+            .unwrap();
+        }
+        assert!(mgr.provider_rate_usage(60).is_err());
+        assert!(mgr
+            .reserve_provider_rate(uuid::Uuid::new_v4(), 60, 10, 1_000, 1)
+            .is_err());
+    }
+
+    #[test]
+    fn missing_provider_scope_fails_closed() {
+        let mgr = SqliteContextManager::in_memory().unwrap();
+        let id = uuid::Uuid::new_v4();
+        expect_provider_reservation(mgr.reserve_provider_rate(id, 65, 10, 1_000, 25).unwrap());
+        {
+            let conn = mgr.conn.lock().unwrap();
+            conn.execute(
+                "DELETE FROM quota_receipt_scopes WHERE receipt_id = ?1",
+                [id.to_string()],
+            )
+            .unwrap();
+        }
+        assert!(mgr.provider_rate_usage(65).is_err());
+        assert!(mgr.recover_provider_rate_state(65).is_err());
+    }
+
+    #[test]
+    fn pruning_never_removes_a_live_old_epoch_receipt() {
+        let mgr = SqliteContextManager::in_memory().unwrap();
+        let id = uuid::Uuid::new_v4();
+        expect_provider_reservation(mgr.reserve_provider_rate(id, 70, 10, 1_000, 80).unwrap());
+        mgr.mark_provider_rate_invoked(id).unwrap();
+        assert_eq!(mgr.provider_rate_usage(71).unwrap().tokens, 0);
+        assert_eq!(mgr.prune_provider_rate_epochs(71).unwrap(), 0);
+
+        mgr.retain_provider_rate_estimate(id).unwrap();
+        assert_eq!(mgr.prune_provider_rate_epochs(71).unwrap(), 1);
+        let conn = mgr.conn.lock().unwrap();
+        let old_epoch = u64_blob(70);
+        let old_rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM quota_epochs WHERE epoch = ?1",
+                params![old_epoch.as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(old_rows, 0);
+    }
+
+    #[test]
+    fn two_sqlite_handles_reserve_atomically_against_one_limit() {
+        let database = QuotaTestDatabase::new("concurrent");
+        let first = Arc::new(SqliteContextManager::new(&database.path).unwrap());
+        let second = Arc::new(SqliteContextManager::new(&database.path).unwrap());
+        let barrier = Arc::new(std::sync::Barrier::new(20));
+        let mut threads = Vec::new();
+        for index in 0..20 {
+            let manager = if index % 2 == 0 {
+                first.clone()
+            } else {
+                second.clone()
+            };
+            let barrier = barrier.clone();
+            threads.push(std::thread::spawn(move || {
+                barrier.wait();
+                matches!(
+                    manager
+                        .reserve_provider_rate(uuid::Uuid::new_v4(), 80, 10, 10_000, 1)
+                        .unwrap(),
+                    ProviderRateReserveOutcome::Reserved(_)
+                )
+            }));
+        }
+        let admitted = threads
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .filter(|admitted| *admitted)
+            .count();
+        assert_eq!(admitted, 10);
+        assert_eq!(first.provider_rate_usage(80).unwrap().requests, 10);
+    }
+
+    #[test]
+    fn production_sqlite_durability_pragmas_are_verified() {
+        let database = QuotaTestDatabase::new("pragmas");
+        let mgr = SqliteContextManager::new(&database.path).unwrap();
+        let conn = mgr.conn.lock().unwrap();
+        let journal: String = conn
+            .pragma_query_value(None, "journal_mode", |row| row.get(0))
+            .unwrap();
+        let synchronous: i64 = conn
+            .pragma_query_value(None, "synchronous", |row| row.get(0))
+            .unwrap();
+        let foreign_keys: i64 = conn
+            .pragma_query_value(None, "foreign_keys", |row| row.get(0))
+            .unwrap();
+        let busy_timeout: i64 = conn
+            .pragma_query_value(None, "busy_timeout", |row| row.get(0))
+            .unwrap();
+        assert_eq!(journal.to_ascii_lowercase(), "wal");
+        assert_eq!(synchronous, 2);
+        assert_eq!(foreign_keys, 1);
+        assert_eq!(busy_timeout, 5_000);
+    }
+
+    #[test]
+    fn nonempty_legacy_database_is_fenced_for_exactly_its_upgrade_epoch() {
+        let database = QuotaTestDatabase::new("migration");
+        {
+            let conn = Connection::open(&database.path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE usage_log (
+                    id TEXT PRIMARY KEY,
+                    agent_id TEXT NOT NULL,
+                    timestamp TEXT NOT NULL,
+                    tokens_used INTEGER NOT NULL,
+                    model TEXT,
+                    estimated_cost_usd REAL
+                );
+                INSERT INTO usage_log
+                    (id, agent_id, timestamp, tokens_used, model, estimated_cost_usd)
+                VALUES
+                    ('legacy', '00000000-0000-0000-0000-000000000001',
+                     '2026-01-01T00:00:00Z', 1, 'legacy', 0.0);",
+            )
+            .unwrap();
+        }
+        let mgr = SqliteContextManager::new(&database.path).unwrap();
+        let fence = {
+            let conn = mgr.conn.lock().unwrap();
+            let value: Vec<u8> = conn
+                .query_row("SELECT epoch FROM quota_migration_fence", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            parse_u64_blob(value, "migration fence").unwrap()
+        };
+        assert!(matches!(
+            mgr.reserve_provider_rate(uuid::Uuid::new_v4(), fence, 10, 100, 1)
+                .unwrap(),
+            ProviderRateReserveOutcome::Denied {
+                dimension: ProviderRateLimitDimension::MigrationFence,
+                ..
+            }
+        ));
+        assert!(matches!(
+            mgr.reserve_provider_rate(uuid::Uuid::new_v4(), fence + 1, 10, 100, 1)
+                .unwrap(),
+            ProviderRateReserveOutcome::Reserved(_)
+        ));
+    }
+
+    #[test]
+    fn interrupted_legacy_quota_migration_is_fenced_on_retry() {
+        let database = QuotaTestDatabase::new("interrupted-migration");
+        {
+            let conn = Connection::open(&database.path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE usage_log (
+                    id TEXT PRIMARY KEY,
+                    agent_id TEXT NOT NULL,
+                    timestamp TEXT NOT NULL,
+                    tokens_used INTEGER NOT NULL,
+                    model TEXT,
+                    estimated_cost_usd REAL
+                );
+                INSERT INTO usage_log
+                    (id, agent_id, timestamp, tokens_used, model, estimated_cost_usd)
+                VALUES
+                    ('legacy', '00000000-0000-0000-0000-000000000001',
+                     '2026-01-01T00:00:00Z', 1, 'legacy', 0.0);
+                CREATE TABLE quota_epoch_floor (
+                    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                    epoch BLOB NOT NULL
+                        CHECK (typeof(epoch) = 'blob' AND length(epoch) = 8)
+                );
+                CREATE TABLE quota_epochs (
+                    scope_kind TEXT NOT NULL,
+                    scope_id TEXT NOT NULL,
+                    epoch BLOB NOT NULL,
+                    requests BLOB NOT NULL,
+                    tokens BLOB NOT NULL,
+                    PRIMARY KEY (scope_kind, scope_id, epoch)
+                ) WITHOUT ROWID;",
+            )
+            .unwrap();
+        }
+
+        // This shape models a crash after the quota tables committed but
+        // before the legacy fence/floor transaction. Startup must not mistake
+        // table existence for a completed migration and reopen quota.
+        let mgr = SqliteContextManager::new(&database.path).unwrap();
+        let fence = {
+            let conn = mgr.conn.lock().unwrap();
+            let value: Vec<u8> = conn
+                .query_row("SELECT epoch FROM quota_migration_fence", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            parse_u64_blob(value, "interrupted migration fence").unwrap()
+        };
+        assert!(matches!(
+            mgr.reserve_provider_rate(uuid::Uuid::new_v4(), fence, 10, 100, 1)
+                .unwrap(),
+            ProviderRateReserveOutcome::Denied {
+                dimension: ProviderRateLimitDimension::MigrationFence,
+                ..
+            }
+        ));
     }
 }

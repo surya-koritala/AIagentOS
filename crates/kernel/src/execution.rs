@@ -1044,14 +1044,24 @@ impl AgentExecutor {
         let mut provider_latency_ms = 0u64;
         for attempt in 0..LLM_RETRIES {
             if attempt > 0 {
-                tokio::time::sleep(tokio::time::Duration::from_millis(500 * (1 << attempt))).await;
+                let delay = tokio::time::Duration::from_millis(500 * (1 << attempt));
+                tokio::select! {
+                    _ = self.cancel_token.cancelled() => {
+                        return Err(KernelError::Policy(
+                            "execution cancelled during provider retry backoff".into(),
+                        ));
+                    }
+                    _ = tokio::time::sleep(delay) => {}
+                }
             }
-            let rate_guard = match &self.rate_limiter {
+            let mut rate_guard = match &self.rate_limiter {
                 Some(limiter) => Some(
                     limiter
-                        .acquire_tokens(u64::from(estimated_input_tokens))
-                        .await
-                        .map_err(|error| KernelError::Policy(error.to_string()))?,
+                        .acquire_tokens_cancellable(
+                            u64::from(estimated_input_tokens),
+                            &self.cancel_token,
+                        )
+                        .await?,
                 ),
                 None => None,
             };
@@ -1064,12 +1074,29 @@ impl AgentExecutor {
                 ),
                 None => None,
             };
+            if self.cancel_token.is_cancelled() {
+                return Err(KernelError::Policy(
+                    "execution cancelled before provider invocation".into(),
+                ));
+            }
+            if let Some(guard) = rate_guard.as_mut() {
+                // This durable transition is the linearization point: after it
+                // commits, a crash/cancellation conservatively retains the
+                // estimate because provider I/O may have happened.
+                guard.mark_invoked()?;
+            }
             let started = std::time::Instant::now();
             let result = tokio::select! {
-                _ = self.cancel_token.cancelled() => {
-                    return Err(KernelError::Policy("execution cancelled by lifecycle coordinator".into()));
-                }
+                biased;
                 result = self.session.send_streaming(clean_messages.clone(), tools) => result,
+                _ = self.cancel_token.cancelled() => {
+                    if let Some(guard) = rate_guard.take() {
+                        guard.retain_estimate()?;
+                    }
+                    return Err(KernelError::Policy(
+                        "execution cancelled after provider invocation".into(),
+                    ));
+                }
             };
             provider_latency_ms = provider_latency_ms
                 .saturating_add(started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64);
@@ -1091,7 +1118,7 @@ impl AgentExecutor {
                         }
                     };
                     if let Some(guard) = rate_guard {
-                        guard.reconcile(u64::from(usage.total()));
+                        guard.reconcile(u64::from(usage.total()))?;
                     }
                     return Ok(ProviderCall {
                         response,
@@ -1102,6 +1129,9 @@ impl AgentExecutor {
                     });
                 }
                 Err(e) => {
+                    if let Some(guard) = rate_guard {
+                        guard.retain_estimate()?;
+                    }
                     last_err = Some(e);
                 }
             }
@@ -2092,6 +2122,187 @@ mod tests {
         assert_eq!(output.usage.estimated_requests, 1);
         assert!(output.usage.input_tokens > 0);
         assert_eq!(output.usage.output_tokens, 10);
+    }
+
+    struct CountingContentSession {
+        calls: Arc<AtomicUsize>,
+        entered: Option<Arc<tokio::sync::Notify>>,
+        release: Option<Arc<tokio::sync::Notify>>,
+        fail: bool,
+        id: String,
+    }
+
+    #[async_trait::async_trait]
+    impl LlmSession for CountingContentSession {
+        async fn send(
+            &self,
+            messages: Vec<StandardMessage>,
+        ) -> Result<LlmResponse, ConnectorError> {
+            self.send_with_tools(messages, &[]).await
+        }
+
+        async fn send_with_tools(
+            &self,
+            _messages: Vec<StandardMessage>,
+            _tools: &[ToolDefinition],
+        ) -> Result<LlmResponse, ConnectorError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if let Some(entered) = &self.entered {
+                entered.notify_waiters();
+            }
+            if let Some(release) = &self.release {
+                release.notified().await;
+            }
+            if self.fail {
+                Err(ConnectorError::ConnectionFailed(
+                    "deterministic provider failure".into(),
+                ))
+            } else {
+                Ok(LlmResponse {
+                    content: "done".into(),
+                    finish_reason: Some("stop".into()),
+                    tokens_used: 7,
+                    usage: LlmUsage::reported(5, 7, 0),
+                    tool_calls: Vec::new(),
+                })
+            }
+        }
+
+        fn provider_id(&self) -> &crate::ProviderId {
+            &self.id
+        }
+    }
+
+    fn execution_rate_limiter() -> Arc<crate::rate_limit::RateLimiter> {
+        Arc::new(crate::rate_limit::RateLimiter::new(
+            crate::rate_limit::RateLimitConfig {
+                rpm: 100,
+                tpm: 10_000,
+                max_concurrent: 4,
+            },
+        ))
+    }
+
+    #[tokio::test]
+    async fn cancellation_while_waiting_for_llm_core_refunds_quota_without_provider_io() {
+        let scheduler = Arc::new(crate::llm_sched::LlmScheduler::new(1));
+        let held_core = scheduler.acquire(999, 0).await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let limiter = execution_rate_limiter();
+        let mut executor = AgentExecutor::new_unconfined(
+            uuid::Uuid::new_v4(),
+            Box::new(CountingContentSession {
+                calls: calls.clone(),
+                entered: None,
+                release: None,
+                fail: false,
+                id: "mock".into(),
+            }),
+            mock_broker(),
+            Arc::new(ToolRegistry::new()),
+            mock_context_manager(),
+            "test".into(),
+        );
+        executor.set_rate_limiter(limiter.clone());
+        executor.set_llm_scheduler(scheduler.clone(), 1, 0);
+        let cancellation = executor.cancel_token();
+
+        let run = tokio::spawn(async move { executor.run("wait for a core").await });
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while scheduler.waiting() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("executor should wait for the occupied LLM core");
+        cancellation.cancel();
+        let output = run.await.unwrap().unwrap();
+        drop(held_core);
+
+        assert_eq!(output.content, "Cancelled.");
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        let stats = limiter.try_stats().unwrap();
+        assert_eq!(stats.requests_this_minute, 0);
+        assert_eq!(stats.tokens_this_minute, 0);
+        assert_eq!(stats.reserved_receipts, 0);
+        assert_eq!(stats.in_flight_receipts, 0);
+    }
+
+    #[tokio::test]
+    async fn cancellation_after_provider_invocation_retains_estimate() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let limiter = execution_rate_limiter();
+        let mut executor = AgentExecutor::new_unconfined(
+            uuid::Uuid::new_v4(),
+            Box::new(CountingContentSession {
+                calls: calls.clone(),
+                entered: Some(entered.clone()),
+                release: Some(release),
+                fail: false,
+                id: "mock".into(),
+            }),
+            mock_broker(),
+            Arc::new(ToolRegistry::new()),
+            mock_context_manager(),
+            "test".into(),
+        );
+        executor.set_rate_limiter(limiter.clone());
+        let cancellation = executor.cancel_token();
+
+        let run = tokio::spawn(async move { executor.run("cancel after invoke").await });
+        tokio::time::timeout(std::time::Duration::from_secs(1), entered.notified())
+            .await
+            .expect("provider should be invoked");
+        cancellation.cancel();
+        let output = run.await.unwrap().unwrap();
+
+        assert_eq!(output.content, "Cancelled.");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let stats = limiter.try_stats().unwrap();
+        assert_eq!(stats.requests_this_minute, 1);
+        assert!(stats.tokens_this_minute > 0);
+        assert_eq!(stats.in_flight_receipts, 0);
+        assert_eq!(stats.estimated_receipts, 1);
+    }
+
+    #[tokio::test]
+    async fn cancellation_during_retry_backoff_creates_no_second_attempt() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let first_attempt = Arc::new(tokio::sync::Notify::new());
+        let limiter = execution_rate_limiter();
+        let mut executor = AgentExecutor::new_unconfined(
+            uuid::Uuid::new_v4(),
+            Box::new(CountingContentSession {
+                calls: calls.clone(),
+                entered: Some(first_attempt.clone()),
+                release: None,
+                fail: true,
+                id: "mock".into(),
+            }),
+            mock_broker(),
+            Arc::new(ToolRegistry::new()),
+            mock_context_manager(),
+            "test".into(),
+        );
+        executor.set_rate_limiter(limiter.clone());
+        let cancellation = executor.cancel_token();
+
+        let run = tokio::spawn(async move { executor.run("cancel retry").await });
+        tokio::time::timeout(std::time::Duration::from_secs(1), first_attempt.notified())
+            .await
+            .expect("first provider attempt should run");
+        cancellation.cancel();
+        let output = run.await.unwrap().unwrap();
+
+        assert_eq!(output.content, "Cancelled.");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let stats = limiter.try_stats().unwrap();
+        assert_eq!(stats.requests_this_minute, 1);
+        assert_eq!(stats.estimated_receipts, 1);
+        assert_eq!(stats.reserved_receipts, 0);
+        assert_eq!(stats.in_flight_receipts, 0);
     }
 
     /// Mock session that calls a nonexistent tool — tests error recovery message to LLM.

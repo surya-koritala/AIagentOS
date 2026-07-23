@@ -51,6 +51,7 @@ pub mod policy;
 pub mod prerequisites;
 pub mod procfs;
 pub mod production;
+pub mod quota_clock;
 pub mod rate_limit;
 pub mod resources;
 pub mod runtime;
@@ -241,6 +242,9 @@ pub enum KernelError {
 
     #[error("Sandbox error: {0}")]
     Sandbox(#[from] SandboxError),
+
+    #[error("Rate-limit error: {0}")]
+    RateLimit(#[from] crate::rate_limit::RateLimitError),
 
     #[error("Policy error: {0}")]
     Policy(String),
@@ -899,6 +903,9 @@ pub struct AgentKernelImpl {
     pub connector: Arc<AgentConnectorImpl>,
     pub resource_broker: Arc<ResourceBrokerImpl>,
     pub tool_registry: Arc<ToolRegistry>,
+    /// Shared fixed-epoch clock. The cgroup hierarchy uses the same source when
+    /// durable hierarchical quota accounting is enabled.
+    pub quota_clock: Arc<dyn crate::quota_clock::QuotaClock>,
     pub rate_limiter: Arc<RateLimiter>,
     pub cgroups: Arc<CgroupManager>,
     pub syscall_gate: Arc<SyscallGate>,
@@ -1038,9 +1045,39 @@ impl AgentKernelImpl {
         mac_enforcing: bool,
         mac_rules: &[crate::mac::PolicyRule],
     ) -> Result<Self, KernelError> {
+        Self::with_context_manager_and_clock(
+            context_manager,
+            budgets,
+            mac_enforcing,
+            mac_rules,
+            Arc::new(crate::quota_clock::SystemQuotaClock::new()),
+        )
+    }
+
+    /// Build a kernel with an explicit fixed-epoch clock.
+    ///
+    /// Production entry points use [`SystemQuotaClock`](crate::quota_clock::SystemQuotaClock).
+    /// This seam exists so boundary and restart behavior can be proven without
+    /// real minute-long sleeps.
+    pub fn with_context_manager_and_clock(
+        context_manager: Arc<SqliteContextManager>,
+        budgets: &crate::config::BudgetConfig,
+        mac_enforcing: bool,
+        mac_rules: &[crate::mac::PolicyRule],
+        quota_clock: Arc<dyn crate::quota_clock::QuotaClock>,
+    ) -> Result<Self, KernelError> {
         budgets.validate().map_err(|error| {
             KernelError::Policy(format!("invalid budget configuration: {error}"))
         })?;
+        let rate_limiter = Arc::new(RateLimiter::with_store(
+            RateLimitConfig {
+                rpm: budgets.rpm,
+                tpm: budgets.tpm,
+                max_concurrent: budgets.max_concurrent,
+            },
+            context_manager.clone(),
+            quota_clock.clone(),
+        )?);
         let (event_tx, _) = broadcast::channel(256);
         let permission_manager = Arc::new(PermissionManager::new());
         let sandbox_manager = Arc::new(SandboxManagerImpl::new());
@@ -1124,11 +1161,8 @@ impl AgentKernelImpl {
             connector: Arc::new(AgentConnectorImpl::new()),
             resource_broker,
             tool_registry,
-            rate_limiter: Arc::new(RateLimiter::new(RateLimitConfig {
-                rpm: budgets.rpm,
-                tpm: budgets.tpm,
-                max_concurrent: budgets.max_concurrent,
-            })),
+            quota_clock,
+            rate_limiter,
             cgroups,
             syscall_gate,
             budget_enforcer,

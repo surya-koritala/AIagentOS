@@ -65,11 +65,18 @@ live admission locks but does not erase its cumulative spend.
 
 ## Rate and hierarchy limits
 
-- RPM: provider attempts per rolling 60-second process-local window.
-- TPM: input plus output tokens per the same window. Input is reserved before a
-  provider attempt and reconciled to actual/fallback total usage afterward.
+- RPM: provider attempts per fixed, half-open Unix-minute epoch. Epoch `N`
+  covers `[N × 60,000 ms, (N + 1) × 60,000 ms)` in UTC; the exact boundary
+  belongs to the new epoch.
+- TPM: input plus output tokens per the same durable epoch. A conservative input
+  estimate is committed before admission. Cancellation before provider
+  invocation refunds the request and estimate; an invoked failure or unknown
+  crash outcome retains the estimate; a successful response replaces it with
+  actual/fallback usage in the original admission epoch, even if completion
+  crosses the boundary.
 - Provider concurrency: simultaneous provider attempts. Retry backoff and tool
-  execution hold no provider permit.
+  execution hold no provider permit. This live gauge is process-local and
+  correctly starts at zero after restart because no prior work remains active.
 - Turn concurrency: actively executing agent turns, separately CFS-ordered.
 - Context limit: active input context tokens per executor; old non-system pages
   are evicted before a provider request.
@@ -85,9 +92,25 @@ live admission locks but does not erase its cumulative spend.
 
 For RPM, TPM, provider concurrency, cumulative/concurrent tool limits, cgroup,
 context, and USD configuration, zero means unlimited. Counter arithmetic
-saturates instead of overflowing. The rolling rate-limit window resets
-deterministically after 60 seconds. Cgroup minute-window reset is driven by the
-kernel timer and is currently process-local.
+saturates instead of overflowing. Provider RPM/TPM receipts and a monotonic
+epoch floor are persisted before I/O. Restart within the same epoch restores
+terminal/reconciled usage, refunds work proven not invoked, and conservatively
+retains estimates for work that might have reached a provider. A backwards wall
+clock cannot reopen an older epoch. When upgrading a non-empty database from a
+release that had only process-local counters, the unknowable remainder of the
+current epoch is fenced closed; the next fixed boundary opens normally.
+
+The current SQLite runtime assumes one active kernel owner per database file.
+Opening the same file from multiple live kernel processes is not supported:
+startup recovery cannot yet distinguish another process's live reservations
+from receipts left by a crashed owner. Distributed or active-active operation
+requires the ownership/lease protocol tracked by the control-plane and durable
+state roadmap before it can safely share this quota ledger.
+
+Cgroup token accounting remains a separate process-local tool-payload estimate
+with a timer-driven reset in this batch. It is not yet the configured per-agent
+provider-token limit; durable atomic provider+cgroup hierarchy integration
+remains required before the resource-accounting capability can be promoted.
 
 ## Runtime and node-load metrics
 

@@ -53,6 +53,10 @@ pub enum GateDenial {
     /// Membership changed after provider quota was reserved. The reservation
     /// must be refunded and admission retried against a fresh snapshot.
     CgroupMembershipChanged,
+    /// Capabilities, namespaces, cgroup/lifecycle state, tool visibility, or the
+    /// registered PID changed between policy evaluation and final tool-slot
+    /// admission. The caller must retry authorization from a fresh snapshot.
+    AuthorizationStateChanged,
     /// Cgroup concurrent tool-call limit is full.
     CgroupToolLimit,
     /// Tool is registered in a namespace the agent is not a member of.
@@ -83,6 +87,9 @@ impl GateDenial {
             }
             GateDenial::CgroupMembershipChanged => {
                 "cgroup membership changed during provider admission (EAGAIN)".to_string()
+            }
+            GateDenial::AuthorizationStateChanged => {
+                "authorization state changed during tool admission (EAGAIN)".to_string()
             }
             GateDenial::CgroupToolLimit => {
                 "cgroup concurrent tool-call limit exceeded (EAGAIN)".to_string()
@@ -115,6 +122,49 @@ struct ToolCallContract<'a> {
 struct AuthorizedToolCall {
     pid: Pid,
     audited: bool,
+    pending_approval: Option<(ApprovalKey, crate::tools::ApprovalPolicy)>,
+    snapshot: Option<ToolAuthorizationSnapshot>,
+}
+
+type ApprovalKey = (uuid::Uuid, u64, String, String, String);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AgentAuthorizationSnapshot {
+    pid: Pid,
+    caps: CapabilitySet,
+    cgroup: CgroupId,
+    cgroup_revision: u64,
+    accepting_tool_calls: bool,
+    namespaces: Vec<NamespaceId>,
+    registration_revision: u64,
+    authorization_revision: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ToolNamespaceState {
+    namespace: Option<NamespaceId>,
+    revision: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ToolAuthorizationSnapshot {
+    agent: AgentAuthorizationSnapshot,
+    tool_namespace: ToolNamespaceState,
+    mac_revision: u64,
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+struct ApprovalGrantHook {
+    entered: std::sync::Arc<std::sync::Barrier>,
+    release: std::sync::Arc<std::sync::Barrier>,
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+struct MacCheckedHook {
+    entered: tokio::sync::mpsc::UnboundedSender<()>,
+    release: std::sync::Arc<tokio::sync::Notify>,
 }
 
 #[derive(Debug, thiserror::Error, Clone, PartialEq, Eq)]
@@ -200,10 +250,18 @@ struct GateRecord {
     /// an old hierarchy subscribes to this channel and resnapshots immediately
     /// after a successful move instead of sleeping until the epoch boundary.
     cgroup_changes: watch::Sender<u64>,
+    /// Immutable registration generation. Unlike the mutable authorization
+    /// generation below, this binds approvals to one UUID→PID lifetime and
+    /// prevents unregister/re-register ABA from inheriting a stale grant.
+    registration_revision: u64,
     accepting_tool_calls: bool,
     /// Namespaces this agent is a member of. A tool registered in any of these
     /// namespaces is visible. Tools without a namespace are visible to everyone.
     namespaces: Vec<NamespaceId>,
+    /// Monotonic generation for capability, namespace, and lifecycle-admission
+    /// mutations. Exact field comparison catches mismatches; this generation
+    /// additionally catches change-then-restore ABA.
+    authorization_revision: u64,
 }
 
 /// Durable quota constraints paired with the membership revision they were
@@ -292,7 +350,8 @@ pub struct AuditEvent {
     pub tool: String,
     /// Classified action label (read/write/net/exec/...).
     pub action: &'static str,
-    /// Resource string the action targeted (path/url/command).
+    /// Opaque SHA-256 identity of the targeted path/url/command. Authorization
+    /// still compares the raw target, but audit sinks never receive it.
     pub resource: String,
     /// Outcome.
     pub decision: AuditDecision,
@@ -307,7 +366,11 @@ pub trait AuditSink: Send + Sync {
 
 /// The syscall gate.
 pub struct SyscallGate {
-    pub mac: Mutex<MacEngine>,
+    /// Mutable MAC state is private so every production mutation must advance
+    /// `mac_revision`; otherwise a policy/label/enforcing change could race the
+    /// final tool-slot admission and leave an old allow verdict usable.
+    mac: Mutex<MacEngine>,
+    mac_revision: AtomicU64,
     pub cgroups: std::sync::Arc<CgroupManager>,
     /// When `true`, `check_tool_call` short-circuits to `Allow` for every call.
     /// This is the **single, explicit, greppable** way to run ungoverned — built
@@ -324,15 +387,25 @@ pub struct SyscallGate {
     /// Tool namespace assignments. A tool with a namespace is only visible to
     /// agents that are members of that namespace; absence means "global".
     tool_namespaces: DashMap<String, NamespaceId>,
+    /// Global generation for tool namespace assignments. This intentionally
+    /// makes an unrelated retag conservatively stale an in-flight call, avoiding
+    /// unbounded per-tool tombstones while still detecting tag→global→same-tag
+    /// ABA for removed dynamic tool names.
+    tool_namespace_revision: AtomicU64,
     /// Exact, single-use local approvals keyed by
-    /// (agent, tool, resource, serialized validated security contract).
+    /// (agent, registration generation, tool, opaque resource digest, exact
+    /// contract identity/digest).
     /// No wire/package/MCP deserialization path can populate this map.
-    approvals: DashMap<(uuid::Uuid, String, String, String), crate::tools::ApprovalPolicy>,
+    approvals: DashMap<ApprovalKey, crate::tools::ApprovalPolicy>,
     /// Monotonic PID allocator (starts at 1 so 0 stays reserved for "kernel").
     next_pid: AtomicU64,
     /// Global monotonic cgroup-membership revision allocator. Global ordering
     /// prevents unregister/re-register ABA for the same kernel UUID.
     next_cgroup_revision: AtomicU64,
+    /// Global allocator for per-agent and per-tool authorization generations.
+    /// Values are stored on the affected object, so unrelated mutations do not
+    /// invalidate an in-flight authorization snapshot.
+    next_authorization_revision: AtomicU64,
     /// Optional audit sink for MAC `audit` decisions (and denials). Wired to the
     /// observability engine by the kernel; `None` keeps audit events as counters only.
     audit_sink: std::sync::Mutex<Option<std::sync::Arc<dyn AuditSink>>>,
@@ -345,21 +418,52 @@ pub struct SyscallGate {
     denied_unknown: AtomicU64,
     denied_namespace: AtomicU64,
     audited: AtomicU64,
+    #[cfg(test)]
+    authorization_snapshot_hook: std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<()>>>,
+    #[cfg(test)]
+    approval_grant_hook: std::sync::Mutex<Option<ApprovalGrantHook>>,
+    #[cfg(test)]
+    mac_checked_hook: std::sync::Mutex<Option<MacCheckedHook>>,
 }
 
 impl SyscallGate {
-    /// Reserve one cgroup tool-call slot for a previously authorized agent.
-    /// The returned guard must be held until tool execution finishes.
-    pub fn acquire_tool_call(
+    fn tool_namespace_state(&self, tool_name: &str) -> ToolNamespaceState {
+        ToolNamespaceState {
+            namespace: self.tool_namespaces.get(tool_name).map(|state| *state),
+            revision: self.tool_namespace_revision.load(Ordering::SeqCst),
+        }
+    }
+
+    /// Capture one coherent authorization snapshot while relevant mutations are
+    /// excluded by `mutation_lock`.
+    fn authorization_snapshot_locked(
         &self,
         kid: uuid::Uuid,
+        tool_name: &str,
+    ) -> Result<ToolAuthorizationSnapshot, GateDenial> {
+        let record = self.records.get(&kid).ok_or(GateDenial::UnknownAgent)?;
+        Ok(ToolAuthorizationSnapshot {
+            agent: AgentAuthorizationSnapshot {
+                pid: record.pid,
+                caps: record.caps.clone(),
+                cgroup: record.cgroup,
+                cgroup_revision: record.cgroup_revision,
+                accepting_tool_calls: record.accepting_tool_calls,
+                namespaces: record.namespaces.clone(),
+                registration_revision: record.registration_revision,
+                authorization_revision: record.authorization_revision,
+            },
+            tool_namespace: self.tool_namespace_state(tool_name),
+            mac_revision: self.mac_revision.load(Ordering::SeqCst),
+        })
+    }
+
+    fn acquire_tool_call_for_record(
+        &self,
+        cgroup: CgroupId,
+        pid: Pid,
+        accepting_tool_calls: bool,
     ) -> Result<crate::cgroups::ToolCallGuard, GateDenial> {
-        let _mutation = self.mutation_lock.lock().unwrap();
-        let (cgroup, pid, accepting_tool_calls) = self
-            .records
-            .get(&kid)
-            .map(|record| (record.cgroup, record.pid, record.accepting_tool_calls))
-            .ok_or(GateDenial::UnknownAgent)?;
         if !accepting_tool_calls {
             self.denied_cgroup.fetch_add(1, Ordering::Relaxed);
             return Err(GateDenial::CgroupUnavailable(
@@ -375,6 +479,48 @@ impl SyscallGate {
                     other => GateDenial::CgroupUnavailable(other.to_string()),
                 }
             })
+    }
+
+    /// Revalidate the exact pre-MAC agent/tool snapshot and reserve the cgroup
+    /// slot at the same mutation boundary. Any intervening mutation, including a
+    /// change-then-restore or UUID unregister/re-register ABA, fails closed.
+    ///
+    /// MAC mutators do not take `mutation_lock`: they advance `mac_revision`
+    /// before changing protected state. This final sequentially-consistent
+    /// revision read is their authorization linearization boundary. An update
+    /// ordered before it makes the snapshot stale; an update ordered after it
+    /// begins after this call's final admission.
+    fn acquire_tool_call_if_unchanged(
+        &self,
+        kid: uuid::Uuid,
+        tool_name: &str,
+        expected: &ToolAuthorizationSnapshot,
+    ) -> Result<crate::cgroups::ToolCallGuard, GateDenial> {
+        let _mutation = self.mutation_lock.lock().unwrap();
+        let current = self.authorization_snapshot_locked(kid, tool_name)?;
+        if current != *expected {
+            return Err(GateDenial::AuthorizationStateChanged);
+        }
+        self.acquire_tool_call_for_record(
+            current.agent.cgroup,
+            current.agent.pid,
+            current.agent.accepting_tool_calls,
+        )
+    }
+
+    /// Reserve one cgroup tool-call slot for a previously authorized agent.
+    /// The returned guard must be held until tool execution finishes.
+    pub fn acquire_tool_call(
+        &self,
+        kid: uuid::Uuid,
+    ) -> Result<crate::cgroups::ToolCallGuard, GateDenial> {
+        let _mutation = self.mutation_lock.lock().unwrap();
+        let (cgroup, pid, accepting_tool_calls) = self
+            .records
+            .get(&kid)
+            .map(|record| (record.cgroup, record.pid, record.accepting_tool_calls))
+            .ok_or(GateDenial::UnknownAgent)?;
+        self.acquire_tool_call_for_record(cgroup, pid, accepting_tool_calls)
     }
     /// Create a gate with the production baseline: enforcing MAC, profile-based
     /// allow rules, and a default-deny fallthrough. Tests that intentionally
@@ -404,15 +550,18 @@ impl SyscallGate {
         mac.load_policy(mac_rules);
         Self {
             mac: Mutex::new(mac),
+            mac_revision: AtomicU64::new(1),
             cgroups,
             unconfined: false,
             default_cgroup,
             records: DashMap::new(),
             mutation_lock: std::sync::Mutex::new(()),
             tool_namespaces: DashMap::new(),
+            tool_namespace_revision: AtomicU64::new(1),
             approvals: DashMap::new(),
             next_pid: AtomicU64::new(1),
             next_cgroup_revision: AtomicU64::new(1),
+            next_authorization_revision: AtomicU64::new(1),
             audit_sink: std::sync::Mutex::new(None),
             allowed: AtomicU64::new(0),
             denied_capability: AtomicU64::new(0),
@@ -422,6 +571,12 @@ impl SyscallGate {
             denied_unknown: AtomicU64::new(0),
             denied_namespace: AtomicU64::new(0),
             audited: AtomicU64::new(0),
+            #[cfg(test)]
+            authorization_snapshot_hook: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            approval_grant_hook: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            mac_checked_hook: std::sync::Mutex::new(None),
         }
     }
 
@@ -449,6 +604,63 @@ impl SyscallGate {
     /// MAC `audit` decisions are recorded in the agent activity log.
     pub fn set_audit_sink(&self, sink: std::sync::Arc<dyn AuditSink>) {
         *self.audit_sink.lock().unwrap() = Some(sink);
+    }
+
+    /// Return whether mandatory access control is currently enforcing.
+    pub async fn mac_is_enforcing(&self) -> bool {
+        self.mac.lock().await.is_enforcing()
+    }
+
+    /// Replace the live MAC policy and invalidate every authorization snapshot
+    /// evaluated against the previous rules. The revision is advanced before
+    /// mutating state, making that increment the linearization point: a final
+    /// admission that read the old revision is ordered before this update, and
+    /// every later admission observes either a mismatch or the new policy.
+    pub async fn load_mac_policy(&self, rules: Vec<crate::mac::PolicyRule>) {
+        let mut mac = self.mac.lock().await;
+        self.mac_revision.fetch_add(1, Ordering::SeqCst);
+        mac.load_policy(rules);
+    }
+
+    /// Parse and replace the live MAC policy while preserving the previous
+    /// rules on malformed input. Successful replacement invalidates all
+    /// authorization snapshots evaluated against the old policy.
+    pub async fn load_mac_policy_toml(&self, source: &str) -> Result<(), String> {
+        // Parse into a temporary engine first so invalid input cannot advance
+        // the live generation or partially change enforcement state.
+        let mut parsed = MacEngine::new(true);
+        parsed.load_policy_toml(source)?;
+        let mut mac = self.mac.lock().await;
+        self.mac_revision.fetch_add(1, Ordering::SeqCst);
+        mac.load_policy_toml(source)
+    }
+
+    /// Change an agent's MAC subject label and invalidate in-flight verdicts.
+    pub async fn label_mac_agent(&self, pid: Pid, label: crate::mac::SecurityLabel) {
+        let mut mac = self.mac.lock().await;
+        self.mac_revision.fetch_add(1, Ordering::SeqCst);
+        mac.label_agent(pid, label);
+    }
+
+    /// Change a resource's MAC object label and invalidate in-flight verdicts.
+    pub async fn label_mac_resource(&self, resource: String, label: crate::mac::SecurityLabel) {
+        let mut mac = self.mac.lock().await;
+        self.mac_revision.fetch_add(1, Ordering::SeqCst);
+        mac.label_resource(resource, label);
+    }
+
+    /// Toggle MAC enforcement and invalidate in-flight verdicts evaluated
+    /// under the previous mode.
+    pub async fn set_mac_enforcing(&self, enforcing: bool) {
+        if !enforcing {
+            tracing::warn!(
+                target: "agentos::security",
+                "disabling MAC enforcement on a live syscall gate"
+            );
+        }
+        let mut mac = self.mac.lock().await;
+        self.mac_revision.fetch_add(1, Ordering::SeqCst);
+        mac.set_enforcing(enforcing);
     }
 
     /// Emit an audit event to the configured sink, if any.
@@ -496,6 +708,9 @@ impl SyscallGate {
         let cg = cgroup.unwrap_or(self.default_cgroup);
         self.cgroups.add_agent(cg, pid)?;
         let cgroup_revision = self.next_cgroup_revision.fetch_add(1, Ordering::SeqCst);
+        let authorization_revision = self
+            .next_authorization_revision
+            .fetch_add(1, Ordering::SeqCst);
         let (cgroup_changes, _) = watch::channel(cgroup_revision);
         self.records.insert(
             kid,
@@ -506,8 +721,10 @@ impl SyscallGate {
                 managed_cgroup,
                 cgroup_revision,
                 cgroup_changes,
+                registration_revision: authorization_revision,
                 accepting_tool_calls: true,
                 namespaces: Vec::new(),
+                authorization_revision,
             },
         );
         Ok(pid)
@@ -528,26 +745,64 @@ impl SyscallGate {
     /// Tag a tool with a namespace. Once tagged, only agents whose
     /// `set_agent_namespaces` set contains this id will resolve the tool.
     pub fn register_tool_namespace(&self, tool_name: impl Into<String>, ns: NamespaceId) {
+        let _mutation = self.mutation_lock.lock().unwrap();
         self.tool_namespaces.insert(tool_name.into(), ns);
+        self.tool_namespace_revision.fetch_add(1, Ordering::SeqCst);
     }
 
     /// Remove a tool's namespace tag — makes it global again.
     pub fn unregister_tool_namespace(&self, tool_name: &str) {
+        let _mutation = self.mutation_lock.lock().unwrap();
         self.tool_namespaces.remove(tool_name);
+        self.tool_namespace_revision.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Return whether a registered agent may discover a tool declaration.
+    ///
+    /// Namespace-scoped tools must be hidden before an LLM or remote client can
+    /// select them, not merely rejected at execution time. Unknown agents fail
+    /// closed. The explicitly unconfined test gate remains fully visible.
+    pub fn tool_visible_to_agent(&self, kid: uuid::Uuid, tool_name: &str) -> bool {
+        if self.unconfined {
+            return true;
+        }
+        let Some(record) = self.records.get(&kid) else {
+            return false;
+        };
+        self.tool_namespaces
+            .get(tool_name)
+            .is_none_or(|namespace| record.namespaces.contains(namespace.value()))
+    }
+
+    /// Return whether a tool is global or belongs to the supplied tool
+    /// namespace. This supports fail-closed package preflight before an agent
+    /// record exists, without exposing the namespace assignment itself.
+    pub fn tool_visible_in_namespace(&self, tool_name: &str, namespace: NamespaceId) -> bool {
+        self.tool_namespaces
+            .get(tool_name)
+            .is_none_or(|tool_namespace| *tool_namespace.value() == namespace)
     }
 
     /// Replace an agent's namespace memberships.
     pub fn set_agent_namespaces(&self, kid: uuid::Uuid, namespaces: Vec<NamespaceId>) {
+        let _mutation = self.mutation_lock.lock().unwrap();
         if let Some(mut rec) = self.records.get_mut(&kid) {
             rec.namespaces = namespaces;
+            rec.authorization_revision = self
+                .next_authorization_revision
+                .fetch_add(1, Ordering::SeqCst);
         }
     }
 
     /// Add a namespace to an agent's existing memberships.
     pub fn add_agent_namespace(&self, kid: uuid::Uuid, ns: NamespaceId) {
+        let _mutation = self.mutation_lock.lock().unwrap();
         if let Some(mut rec) = self.records.get_mut(&kid) {
             if !rec.namespaces.contains(&ns) {
                 rec.namespaces.push(ns);
+                rec.authorization_revision = self
+                    .next_authorization_revision
+                    .fetch_add(1, Ordering::SeqCst);
             }
         }
     }
@@ -561,7 +816,8 @@ impl SyscallGate {
             .ok_or(GateMutationError::UnknownAgent(kid))?;
         self.cgroups.try_remove_agent(rec.cgroup, rec.pid)?;
         self.records.remove(&kid);
-        self.approvals.retain(|(agent, _, _, _), _| *agent != kid);
+        self.approvals
+            .retain(|(agent, _, _, _, _), _| *agent != kid);
         Ok(())
     }
 
@@ -580,6 +836,9 @@ impl SyscallGate {
                 .get_mut(&kid)
                 .ok_or(GateMutationError::UnknownAgent(kid))?;
             record.accepting_tool_calls = false;
+            record.authorization_revision = self
+                .next_authorization_revision
+                .fetch_add(1, Ordering::SeqCst);
             record.pid
         };
         self.cgroups.wait_for_agent_tool_calls(pid).await;
@@ -593,6 +852,9 @@ impl SyscallGate {
             .get_mut(&kid)
             .ok_or(GateMutationError::UnknownAgent(kid))?;
         record.accepting_tool_calls = true;
+        record.authorization_revision = self
+            .next_authorization_revision
+            .fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
 
@@ -604,8 +866,9 @@ impl SyscallGate {
 
     /// Grant one exact tool call for a local trusted operator/UI. The grant is
     /// bound to agent + tool + extracted resource and consumed only after
-    /// capability and MAC checks succeed. Returning `false` means the agent is
-    /// not currently registered.
+    /// capability, MAC, cgroup hierarchy, and live slot admission all succeed.
+    /// Returning `false` means the agent is not currently registered.
+    #[cfg(test)]
     pub(crate) fn grant_tool_approval(
         &self,
         kid: uuid::Uuid,
@@ -614,14 +877,50 @@ impl SyscallGate {
         security: &crate::tools::ToolSecurity,
         approval: crate::tools::ApprovalPolicy,
     ) -> bool {
-        if approval == crate::tools::ApprovalPolicy::None || !self.records.contains_key(&kid) {
-            return false;
-        }
         let Ok(contract) = serde_json::to_string(security) else {
             return false;
         };
-        self.approvals
-            .insert((kid, tool_name.into(), resource.into(), contract), approval);
+        self.grant_tool_approval_contract(kid, tool_name, resource, &contract, approval)
+    }
+
+    /// Grant approval for a fully materialized registry contract identity. Live
+    /// registry callers pass a SHA-256 digest that covers provider class,
+    /// operation, parameters, and `ToolSecurity`, so secrets are not retained
+    /// in this map and a registry swap cannot reuse an older approval.
+    pub(crate) fn grant_tool_approval_contract(
+        &self,
+        kid: uuid::Uuid,
+        tool_name: impl Into<String>,
+        resource: impl Into<String>,
+        contract: &str,
+        approval: crate::tools::ApprovalPolicy,
+    ) -> bool {
+        if approval == crate::tools::ApprovalPolicy::None {
+            return false;
+        }
+        let _mutation = self.mutation_lock.lock().unwrap();
+        let Some(registration_revision) = self
+            .records
+            .get(&kid)
+            .map(|record| record.registration_revision)
+        else {
+            return false;
+        };
+        #[cfg(test)]
+        if let Some(hook) = self.approval_grant_hook.lock().unwrap().clone() {
+            hook.entered.wait();
+            hook.release.wait();
+        }
+        self.approvals.insert(
+            (
+                kid,
+                registration_revision,
+                tool_name.into(),
+                crate::resources::opaque_identity(resource.into().as_bytes()),
+                contract.to_string(),
+            ),
+            approval,
+        );
         true
     }
 
@@ -801,6 +1100,7 @@ impl SyscallGate {
     /// as one counted gate verdict. Authorization failures increment their
     /// specific bucket; slot failures increment cgroup denial; only a fully
     /// admitted call increments `allowed`.
+    #[cfg(test)]
     pub(crate) async fn authorize_and_acquire_tool_call_declared(
         &self,
         kid: uuid::Uuid,
@@ -810,6 +1110,37 @@ impl SyscallGate {
     ) -> Result<(Pid, crate::cgroups::ToolCallGuard), GateDenial> {
         let approval_contract = serde_json::to_string(security)
             .expect("validated ToolSecurity serialization is infallible");
+        let (pid, guard, _) = self
+            .authorize_and_acquire_tool_call_declared_contract(
+                kid,
+                tool_name,
+                resource,
+                security,
+                &approval_contract,
+                "legacy-test-request",
+            )
+            .await?;
+        Ok((pid, guard))
+    }
+
+    /// Declaration-backed admission using an exact, caller-prepared provider
+    /// contract for approval matching.
+    pub(crate) async fn authorize_and_acquire_tool_call_declared_contract(
+        &self,
+        kid: uuid::Uuid,
+        tool_name: &str,
+        resource: &str,
+        security: &crate::tools::ToolSecurity,
+        approval_contract: &str,
+        request_identity: &str,
+    ) -> Result<
+        (
+            Pid,
+            crate::cgroups::ToolCallGuard,
+            crate::resources::GateAdmissionProof,
+        ),
+        GateDenial,
+    > {
         let authorized = self
             .check_tool_call_contract(
                 kid,
@@ -819,7 +1150,7 @@ impl SyscallGate {
                     action: security.action.as_str(),
                     required_capabilities: &security.required_capabilities,
                     approval_policy: security.approval_policy,
-                    approval_contract: Some(&approval_contract),
+                    approval_contract: Some(approval_contract),
                 },
                 false,
             )
@@ -829,7 +1160,45 @@ impl SyscallGate {
                 .acquire_tool_call_checked(self.cgroups.root())
                 .map_err(|error| GateDenial::CgroupUnavailable(error.to_string()))?
         } else {
-            self.acquire_tool_call(kid)?
+            self.acquire_tool_call_if_unchanged(
+                kid,
+                tool_name,
+                authorized
+                    .snapshot
+                    .as_ref()
+                    .expect("governed authorization carries a state snapshot"),
+            )?
+        };
+        let approval_satisfied = if self.unconfined {
+            true
+        } else if let Some((key, required)) = authorized.pending_approval {
+            let consumed = match self.approvals.entry(key) {
+                dashmap::mapref::entry::Entry::Occupied(entry)
+                    if (*entry.get()).satisfies(required) =>
+                {
+                    entry.remove();
+                    true
+                }
+                _ => false,
+            };
+            if !consumed {
+                self.denied_approval.fetch_add(1, Ordering::Relaxed);
+                self.emit_audit(AuditEvent {
+                    agent: kid,
+                    pid: authorized.pid,
+                    tool: tool_name.to_string(),
+                    action: security.action.as_str(),
+                    resource: crate::resources::opaque_identity(resource.as_bytes()),
+                    decision: AuditDecision::Denied,
+                });
+                return Err(GateDenial::ApprovalRequired {
+                    tool: tool_name.to_string(),
+                    policy: required,
+                });
+            }
+            true
+        } else {
+            false
         };
         self.allowed.fetch_add(1, Ordering::Relaxed);
         if authorized.audited {
@@ -839,11 +1208,16 @@ impl SyscallGate {
                 pid: authorized.pid,
                 tool: tool_name.to_string(),
                 action: security.action.as_str(),
-                resource: resource.to_string(),
+                resource: crate::resources::opaque_identity(resource.as_bytes()),
                 decision: AuditDecision::Allowed,
             });
         }
-        Ok((authorized.pid, guard))
+        let proof = crate::resources::GateAdmissionProof::new(
+            kid,
+            request_identity.to_string(),
+            approval_satisfied,
+        );
+        Ok((authorized.pid, guard, proof))
     }
 
     async fn check_tool_call_contract(
@@ -869,23 +1243,23 @@ impl SyscallGate {
             return Ok(AuthorizedToolCall {
                 pid: 0,
                 audited: false,
+                pending_approval: None,
+                snapshot: None,
             });
         }
-        let (pid, caps, cgroup, accepting_tool_calls, agent_namespaces) =
-            match self.records.get(&kid) {
-                Some(rec) => (
-                    rec.pid,
-                    rec.caps.clone(),
-                    rec.cgroup,
-                    rec.accepting_tool_calls,
-                    rec.namespaces.clone(),
-                ),
-                None => {
+        let snapshot = {
+            let _mutation = self.mutation_lock.lock().unwrap();
+            match self.authorization_snapshot_locked(kid, tool_name) {
+                Ok(snapshot) => snapshot,
+                Err(GateDenial::UnknownAgent) => {
                     self.denied_unknown.fetch_add(1, Ordering::Relaxed);
                     return Err(GateDenial::UnknownAgent);
                 }
-            };
-        if !accepting_tool_calls {
+                Err(other) => return Err(other),
+            }
+        };
+        let agent = &snapshot.agent;
+        if !agent.accepting_tool_calls {
             self.denied_cgroup.fetch_add(1, Ordering::Relaxed);
             return Err(GateDenial::CgroupUnavailable(
                 "agent tool admission is closed for lifecycle cleanup".into(),
@@ -894,8 +1268,8 @@ impl SyscallGate {
 
         // 0. Namespace visibility. If the tool is tagged with a namespace,
         //    the agent must be a member of it. Untagged tools are global.
-        if let Some(tool_ns) = self.tool_namespaces.get(tool_name).map(|r| *r.value()) {
-            if !agent_namespaces.contains(&tool_ns) {
+        if let Some(tool_ns) = snapshot.tool_namespace.namespace {
+            if !agent.namespaces.contains(&tool_ns) {
                 self.denied_namespace.fetch_add(1, Ordering::Relaxed);
                 return Err(GateDenial::NotInNamespace {
                     tool: tool_name.to_string(),
@@ -906,31 +1280,36 @@ impl SyscallGate {
 
         // 1. Capability check.
         for &required in required_capabilities {
-            if !caps.has(required) {
+            if !agent.caps.has(required) {
                 self.denied_capability.fetch_add(1, Ordering::Relaxed);
                 return Err(GateDenial::MissingCapability(required));
             }
         }
 
         // 2. MAC check.
+        #[cfg(test)]
+        if let Some(hook) = self.authorization_snapshot_hook.lock().unwrap().clone() {
+            let _ = hook.send(());
+        }
         let mac_decision = {
             let mac = self.mac.lock().await;
-            mac.check(pid, action, resource)
+            mac.check(agent.pid, action, resource)
         };
         let audited = match mac_decision {
             MacDecision::Deny => {
+                let resource_identity = crate::resources::opaque_identity(resource.as_bytes());
                 self.denied_mac.fetch_add(1, Ordering::Relaxed);
                 self.emit_audit(AuditEvent {
                     agent: kid,
-                    pid,
+                    pid: agent.pid,
                     tool: tool_name.to_string(),
                     action,
-                    resource: resource.to_string(),
+                    resource: resource_identity.clone(),
                     decision: AuditDecision::Denied,
                 });
                 return Err(GateDenial::MacDeny {
                     action,
-                    resource: resource.to_string(),
+                    resource: resource_identity,
                 });
             }
             // "Allow but log": let the call proceed, but record it. Without a
@@ -940,10 +1319,10 @@ impl SyscallGate {
                     self.audited.fetch_add(1, Ordering::Relaxed);
                     self.emit_audit(AuditEvent {
                         agent: kid,
-                        pid,
+                        pid: agent.pid,
                         tool: tool_name.to_string(),
                         action,
-                        resource: resource.to_string(),
+                        resource: crate::resources::opaque_identity(resource.as_bytes()),
                         decision: AuditDecision::Allowed,
                     });
                 }
@@ -952,34 +1331,39 @@ impl SyscallGate {
             MacDecision::Allow => false,
         };
 
-        // 3. Approval is exact and single-use. It is checked after capability
-        // and MAC so a denied request cannot consume a legitimate grant.
-        if approval_policy != crate::tools::ApprovalPolicy::None {
+        #[cfg(test)]
+        let mac_checked_hook = { self.mac_checked_hook.lock().unwrap().clone() };
+        #[cfg(test)]
+        if let Some(hook) = mac_checked_hook {
+            let _ = hook.entered.send(());
+            hook.release.notified().await;
+        }
+
+        // 3. Approval is exact and single-use. Presence is checked after
+        // capability and MAC, but the grant is not consumed until hierarchy
+        // validation and live cgroup slot acquisition both succeed.
+        let pending_approval = if approval_policy != crate::tools::ApprovalPolicy::None {
             let contract = approval_contract
                 .expect("declared approval always carries its validated security contract");
             let key = (
                 kid,
+                agent.registration_revision,
                 tool_name.to_string(),
-                resource.to_string(),
+                crate::resources::opaque_identity(resource.as_bytes()),
                 contract.to_string(),
             );
-            let approved = match self.approvals.entry(key) {
-                dashmap::mapref::entry::Entry::Occupied(entry)
-                    if (*entry.get()).satisfies(approval_policy) =>
-                {
-                    entry.remove();
-                    true
-                }
-                _ => false,
-            };
+            let approved = self
+                .approvals
+                .get(&key)
+                .is_some_and(|entry| (*entry).satisfies(approval_policy));
             if !approved {
                 self.denied_approval.fetch_add(1, Ordering::Relaxed);
                 self.emit_audit(AuditEvent {
                     agent: kid,
-                    pid,
+                    pid: agent.pid,
                     tool: tool_name.to_string(),
                     action,
-                    resource: resource.to_string(),
+                    resource: crate::resources::opaque_identity(resource.as_bytes()),
                     decision: AuditDecision::Denied,
                 });
                 return Err(GateDenial::ApprovalRequired {
@@ -987,21 +1371,34 @@ impl SyscallGate {
                     policy: approval_policy,
                 });
             }
-        }
+            Some((key, approval_policy))
+        } else {
+            None
+        };
 
-        // 4. Validate, but do not charge, cgroup membership and hierarchy.
-        // Provider admission consumes the returned stable constraints later.
-        self.cgroups
-            .quota_constraints_for_agent(cgroup, pid)
-            .map_err(|error| {
-                self.denied_cgroup.fetch_add(1, Ordering::Relaxed);
-                GateDenial::CgroupUnavailable(error.to_string())
-            })?;
+        // 4. Authorization-only callers still need a live cgroup membership
+        // check. Executing callers validate the exact snapshot and reserve their
+        // slot atomically in `acquire_tool_call_if_unchanged`; checking the old
+        // PID here first would obscure unregister/re-register ABA as a generic
+        // hierarchy error.
+        if count_success {
+            self.cgroups
+                .quota_constraints_for_agent(agent.cgroup, agent.pid)
+                .map_err(|error| {
+                    self.denied_cgroup.fetch_add(1, Ordering::Relaxed);
+                    GateDenial::CgroupUnavailable(error.to_string())
+                })?;
+        }
 
         if count_success {
             self.allowed.fetch_add(1, Ordering::Relaxed);
         }
-        Ok(AuthorizedToolCall { pid, audited })
+        Ok(AuthorizedToolCall {
+            pid: agent.pid,
+            audited,
+            pending_approval,
+            snapshot: Some(snapshot),
+        })
     }
 
     /// Compatibility no-op. Provider usage is reserved/reconciled by the
@@ -1056,8 +1453,12 @@ impl SyscallGate {
 
     /// Update an agent's capability set.
     pub fn set_capabilities(&self, kid: uuid::Uuid, caps: CapabilitySet) {
+        let _mutation = self.mutation_lock.lock().unwrap();
         if let Some(mut rec) = self.records.get_mut(&kid) {
             rec.caps = caps;
+            rec.authorization_revision = self
+                .next_authorization_revision
+                .fetch_add(1, Ordering::SeqCst);
         }
     }
 
@@ -1113,6 +1514,37 @@ mod tests {
         let cgroups = std::sync::Arc::new(CgroupManager::new());
         let gate = std::sync::Arc::new(SyscallGate::with_mac(cgroups.clone(), false, Vec::new()));
         (gate, cgroups)
+    }
+
+    fn install_authorization_snapshot_hook(
+        gate: &SyscallGate,
+    ) -> tokio::sync::mpsc::UnboundedReceiver<()> {
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        *gate.authorization_snapshot_hook.lock().unwrap() = Some(sender);
+        receiver
+    }
+
+    fn clear_authorization_snapshot_hook(gate: &SyscallGate) {
+        *gate.authorization_snapshot_hook.lock().unwrap() = None;
+    }
+
+    fn install_mac_checked_hook(
+        gate: &SyscallGate,
+    ) -> (
+        tokio::sync::mpsc::UnboundedReceiver<()>,
+        std::sync::Arc<tokio::sync::Notify>,
+    ) {
+        let (entered, receiver) = tokio::sync::mpsc::unbounded_channel();
+        let release = std::sync::Arc::new(tokio::sync::Notify::new());
+        *gate.mac_checked_hook.lock().unwrap() = Some(MacCheckedHook {
+            entered,
+            release: release.clone(),
+        });
+        (receiver, release)
+    }
+
+    fn clear_mac_checked_hook(gate: &SyscallGate) {
+        *gate.mac_checked_hook.lock().unwrap() = None;
     }
 
     #[test]
@@ -1212,22 +1644,33 @@ mod tests {
             ApprovalPolicy::User
         ));
         assert!(gate
-            .check_tool_call_declared(kid, "deploy", "command:other", 1, &security)
+            .authorize_and_acquire_tool_call_declared(kid, "deploy", "command:other", &security,)
             .await
             .is_err());
         let changed_contract = security.clone().caller_namespace();
         assert!(matches!(
-            gate.check_tool_call_declared(kid, "deploy", "command:deploy", 1, &changed_contract,)
-                .await,
+            gate.authorize_and_acquire_tool_call_declared(
+                kid,
+                "deploy",
+                "command:deploy",
+                &changed_contract,
+            )
+            .await,
             Err(GateDenial::ApprovalRequired { .. })
         ));
-        assert!(gate
-            .check_tool_call_declared(kid, "deploy", "command:deploy", 1, &security)
+        let (_, guard) = gate
+            .authorize_and_acquire_tool_call_declared(kid, "deploy", "command:deploy", &security)
             .await
-            .is_ok());
+            .unwrap();
+        drop(guard);
         assert!(matches!(
-            gate.check_tool_call_declared(kid, "deploy", "command:deploy", 1, &security)
-                .await,
+            gate.authorize_and_acquire_tool_call_declared(
+                kid,
+                "deploy",
+                "command:deploy",
+                &security,
+            )
+            .await,
             Err(GateDenial::ApprovalRequired { .. })
         ));
     }
@@ -1257,21 +1700,436 @@ mod tests {
             let gate = gate.clone();
             let security = security.clone();
             calls.push(tokio::spawn(async move {
-                gate.check_tool_call_declared(kid, "deploy", "command:deploy", 1, &security)
-                    .await
+                gate.authorize_and_acquire_tool_call_declared(
+                    kid,
+                    "deploy",
+                    "command:deploy",
+                    &security,
+                )
+                .await
             }));
         }
         let mut allowed = 0;
         let mut approval_denied = 0;
         for call in calls {
             match call.await.unwrap() {
-                Ok(_) => allowed += 1,
+                Ok((_pid, _guard)) => allowed += 1,
                 Err(GateDenial::ApprovalRequired { .. }) => approval_denied += 1,
-                other => panic!("unexpected approval result: {other:?}"),
+                Err(other) => panic!("unexpected approval denial: {other:?}"),
             }
         }
         assert_eq!(allowed, 1);
         assert_eq!(approval_denied, 15);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn capability_revoke_during_mac_fails_stale_admission_without_consuming_approval() {
+        use crate::tools::{ApprovalPolicy, SecurityAction, ToolSecurity};
+
+        let (gate, cgroups) = fresh_gate();
+        let kid = uuid::Uuid::new_v4();
+        let mut granted_caps = CapabilitySet::none();
+        granted_caps.grant(CapabilitySet::CAP_FILE_DELETE);
+        gate.register_agent(kid, granted_caps.clone(), None);
+        let security = ToolSecurity::constant(SecurityAction::Delete, "file:/tmp/stale")
+            .with_capability(CapabilitySet::CAP_FILE_DELETE)
+            .with_approval(ApprovalPolicy::User)
+            .sandboxed();
+        assert!(gate.grant_tool_approval(
+            kid,
+            "delete_stale",
+            "file:/tmp/stale",
+            &security,
+            ApprovalPolicy::User,
+        ));
+
+        let mac_guard = gate.mac.lock().await;
+        let mut snapshot_ready = install_authorization_snapshot_hook(&gate);
+        let pending_gate = gate.clone();
+        let pending_security = security.clone();
+        let pending = tokio::spawn(async move {
+            pending_gate
+                .authorize_and_acquire_tool_call_declared(
+                    kid,
+                    "delete_stale",
+                    "file:/tmp/stale",
+                    &pending_security,
+                )
+                .await
+        });
+        snapshot_ready
+            .recv()
+            .await
+            .expect("authorization must reach the blocked MAC boundary");
+
+        gate.set_capabilities(kid, CapabilitySet::none());
+        drop(mac_guard);
+        assert!(matches!(
+            pending.await.unwrap(),
+            Err(GateDenial::AuthorizationStateChanged)
+        ));
+        assert_eq!(
+            cgroups.get(cgroups.root()).unwrap().usage.active_tool_calls,
+            0,
+            "stale authorization must not reserve a tool slot"
+        );
+
+        clear_authorization_snapshot_hook(&gate);
+        gate.set_capabilities(kid, granted_caps);
+        let (_, guard) = gate
+            .authorize_and_acquire_tool_call_declared(
+                kid,
+                "delete_stale",
+                "file:/tmp/stale",
+                &security,
+            )
+            .await
+            .expect("stale-state failure must leave the one-shot approval unconsumed");
+        drop(guard);
+        assert!(gate.approvals.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mac_policy_aba_after_allow_fails_final_registry_admission() {
+        let (gate, cgroups) = fresh_gate();
+        let kid = uuid::Uuid::new_v4();
+        gate.register_agent(kid, CapabilitySet::all(), None);
+        gate.set_mac_enforcing(true).await;
+        let allow = vec![PolicyRule {
+            subject: "*".into(),
+            action: "*".into(),
+            object: "*".into(),
+            decision: "allow".into(),
+        }];
+        gate.load_mac_policy(allow.clone()).await;
+        let registry = std::sync::Arc::new(crate::tools::ToolRegistry::new());
+        let (mut mac_checked, release) = install_mac_checked_hook(&gate);
+        let pending_gate = gate.clone();
+        let pending_registry = registry.clone();
+        let pending = tokio::spawn(async move {
+            pending_registry
+                .authorize_and_acquire_call(
+                    &pending_gate,
+                    kid,
+                    "read_file",
+                    &serde_json::json!({"path": "/tmp/mac-policy-aba"}),
+                )
+                .await
+        });
+        mac_checked
+            .recv()
+            .await
+            .expect("authorization must finish its original MAC allow");
+
+        gate.load_mac_policy(vec![PolicyRule {
+            subject: "*".into(),
+            action: "*".into(),
+            object: "*".into(),
+            decision: "deny".into(),
+        }])
+        .await;
+        gate.load_mac_policy(allow).await;
+        release.notify_one();
+
+        assert!(matches!(
+            pending.await.unwrap(),
+            Err(crate::tools::ToolAuthorizationError::Denied(
+                GateDenial::AuthorizationStateChanged
+            ))
+        ));
+        assert_eq!(
+            cgroups.get(cgroups.root()).unwrap().usage.active_tool_calls,
+            0
+        );
+        clear_mac_checked_hook(&gate);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mac_agent_label_aba_after_allow_fails_final_registry_admission() {
+        let (gate, cgroups) = fresh_gate();
+        let kid = uuid::Uuid::new_v4();
+        let pid = gate.register_agent(kid, CapabilitySet::all(), None);
+        gate.set_mac_enforcing(true).await;
+        gate.load_mac_policy(vec![
+            PolicyRule {
+                subject: "trusted".into(),
+                action: "*".into(),
+                object: "*".into(),
+                decision: "allow".into(),
+            },
+            PolicyRule {
+                subject: "*".into(),
+                action: "*".into(),
+                object: "*".into(),
+                decision: "deny".into(),
+            },
+        ])
+        .await;
+        gate.label_mac_agent(pid, "trusted".into()).await;
+        let registry = std::sync::Arc::new(crate::tools::ToolRegistry::new());
+        let (mut mac_checked, release) = install_mac_checked_hook(&gate);
+        let pending_gate = gate.clone();
+        let pending_registry = registry.clone();
+        let pending = tokio::spawn(async move {
+            pending_registry
+                .authorize_and_acquire_call(
+                    &pending_gate,
+                    kid,
+                    "read_file",
+                    &serde_json::json!({"path": "/tmp/mac-label-aba"}),
+                )
+                .await
+        });
+        mac_checked
+            .recv()
+            .await
+            .expect("authorization must finish its original MAC allow");
+
+        gate.label_mac_agent(pid, "blocked".into()).await;
+        gate.label_mac_agent(pid, "trusted".into()).await;
+        release.notify_one();
+
+        assert!(matches!(
+            pending.await.unwrap(),
+            Err(crate::tools::ToolAuthorizationError::Denied(
+                GateDenial::AuthorizationStateChanged
+            ))
+        ));
+        assert_eq!(
+            cgroups.get(cgroups.root()).unwrap().usage.active_tool_calls,
+            0
+        );
+        clear_mac_checked_hook(&gate);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mac_enforcing_aba_after_allow_fails_final_registry_admission() {
+        let (gate, cgroups) = fresh_gate();
+        let kid = uuid::Uuid::new_v4();
+        gate.register_agent(kid, CapabilitySet::all(), None);
+        gate.load_mac_policy(vec![PolicyRule {
+            subject: "*".into(),
+            action: "*".into(),
+            object: "*".into(),
+            decision: "deny".into(),
+        }])
+        .await;
+        let registry = std::sync::Arc::new(crate::tools::ToolRegistry::new());
+        let (mut mac_checked, release) = install_mac_checked_hook(&gate);
+        let pending_gate = gate.clone();
+        let pending_registry = registry.clone();
+        let pending = tokio::spawn(async move {
+            pending_registry
+                .authorize_and_acquire_call(
+                    &pending_gate,
+                    kid,
+                    "read_file",
+                    &serde_json::json!({"path": "/tmp/mac-enforcing-aba"}),
+                )
+                .await
+        });
+        mac_checked
+            .recv()
+            .await
+            .expect("permissive MAC must initially allow the call");
+
+        gate.set_mac_enforcing(true).await;
+        gate.set_mac_enforcing(false).await;
+        release.notify_one();
+
+        assert!(matches!(
+            pending.await.unwrap(),
+            Err(crate::tools::ToolAuthorizationError::Denied(
+                GateDenial::AuthorizationStateChanged
+            ))
+        ));
+        assert_eq!(
+            cgroups.get(cgroups.root()).unwrap().usage.active_tool_calls,
+            0
+        );
+        clear_mac_checked_hook(&gate);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn agent_namespace_revoke_during_mac_fails_public_registry_admission() {
+        let (gate, cgroups) = fresh_gate();
+        let kid = uuid::Uuid::new_v4();
+        gate.register_agent(kid, CapabilitySet::all(), None);
+        gate.set_agent_namespaces(kid, vec![41]);
+        gate.register_tool_namespace("read_file", 41);
+        let registry = std::sync::Arc::new(crate::tools::ToolRegistry::new());
+
+        let mac_guard = gate.mac.lock().await;
+        let mut snapshot_ready = install_authorization_snapshot_hook(&gate);
+        let pending_gate = gate.clone();
+        let pending_registry = registry.clone();
+        let pending = tokio::spawn(async move {
+            pending_registry
+                .authorize_and_acquire_call(
+                    &pending_gate,
+                    kid,
+                    "read_file",
+                    &serde_json::json!({"path": "/tmp/stale"}),
+                )
+                .await
+        });
+        snapshot_ready
+            .recv()
+            .await
+            .expect("authorization must reach the blocked MAC boundary");
+
+        gate.set_agent_namespaces(kid, Vec::new());
+        drop(mac_guard);
+        assert!(matches!(
+            pending.await.unwrap(),
+            Err(crate::tools::ToolAuthorizationError::Denied(
+                GateDenial::AuthorizationStateChanged
+            ))
+        ));
+        assert_eq!(
+            cgroups.get(cgroups.root()).unwrap().usage.active_tool_calls,
+            0
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tool_namespace_tag_aba_during_mac_fails_public_registry_admission() {
+        let (gate, cgroups) = fresh_gate();
+        let kid = uuid::Uuid::new_v4();
+        gate.register_agent(kid, CapabilitySet::all(), None);
+        gate.set_agent_namespaces(kid, vec![41]);
+        gate.register_tool_namespace("read_file", 41);
+        let registry = std::sync::Arc::new(crate::tools::ToolRegistry::new());
+
+        let mac_guard = gate.mac.lock().await;
+        let mut snapshot_ready = install_authorization_snapshot_hook(&gate);
+        let pending_gate = gate.clone();
+        let pending_registry = registry.clone();
+        let pending = tokio::spawn(async move {
+            pending_registry
+                .authorize_and_acquire_call(
+                    &pending_gate,
+                    kid,
+                    "read_file",
+                    &serde_json::json!({"path": "/tmp/stale"}),
+                )
+                .await
+        });
+        snapshot_ready
+            .recv()
+            .await
+            .expect("authorization must reach the blocked MAC boundary");
+
+        // A global generation detects this tag→global→same-tag ABA without
+        // retaining an unbounded tombstone for every dynamic tool name.
+        gate.unregister_tool_namespace("read_file");
+        gate.register_tool_namespace("read_file", 41);
+        drop(mac_guard);
+        assert!(matches!(
+            pending.await.unwrap(),
+            Err(crate::tools::ToolAuthorizationError::Denied(
+                GateDenial::AuthorizationStateChanged
+            ))
+        ));
+        assert_eq!(
+            cgroups.get(cgroups.root()).unwrap().usage.active_tool_calls,
+            0
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unregister_reregister_same_uuid_during_mac_fails_public_registry_admission() {
+        let (gate, cgroups) = fresh_gate();
+        let kid = uuid::Uuid::new_v4();
+        let original_pid = gate.register_agent(kid, CapabilitySet::all(), None);
+        let registry = std::sync::Arc::new(crate::tools::ToolRegistry::new());
+
+        let mac_guard = gate.mac.lock().await;
+        let mut snapshot_ready = install_authorization_snapshot_hook(&gate);
+        let pending_gate = gate.clone();
+        let pending_registry = registry.clone();
+        let pending = tokio::spawn(async move {
+            pending_registry
+                .authorize_and_acquire_call(
+                    &pending_gate,
+                    kid,
+                    "read_file",
+                    &serde_json::json!({"path": "/tmp/stale"}),
+                )
+                .await
+        });
+        snapshot_ready
+            .recv()
+            .await
+            .expect("authorization must reach the blocked MAC boundary");
+
+        gate.try_unregister_agent(kid).unwrap();
+        let replacement_pid = gate.register_agent(kid, CapabilitySet::all(), None);
+        assert_ne!(replacement_pid, original_pid);
+        drop(mac_guard);
+        assert!(matches!(
+            pending.await.unwrap(),
+            Err(crate::tools::ToolAuthorizationError::Denied(
+                GateDenial::AuthorizationStateChanged
+            ))
+        ));
+        assert_eq!(
+            cgroups.get(cgroups.root()).unwrap().usage.active_tool_calls,
+            0
+        );
+    }
+
+    #[test]
+    fn approval_grant_is_serialized_with_unregister_and_bound_to_registration() {
+        use crate::tools::{ApprovalPolicy, SecurityAction, ToolSecurity};
+
+        let (gate, _) = fresh_gate();
+        let kid = uuid::Uuid::new_v4();
+        gate.register_agent(kid, CapabilitySet::all(), None);
+        let security = ToolSecurity::constant(SecurityAction::Execute, "command:deploy")
+            .with_approval(ApprovalPolicy::User)
+            .sandboxed();
+        let entered = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let release = std::sync::Arc::new(std::sync::Barrier::new(2));
+        *gate.approval_grant_hook.lock().unwrap() = Some(ApprovalGrantHook {
+            entered: entered.clone(),
+            release: release.clone(),
+        });
+
+        let grant_gate = gate.clone();
+        let grant_security = security.clone();
+        let grant = std::thread::spawn(move || {
+            grant_gate.grant_tool_approval(
+                kid,
+                "deploy",
+                "command:deploy",
+                &grant_security,
+                ApprovalPolicy::User,
+            )
+        });
+        entered.wait();
+
+        let replace_gate = gate.clone();
+        let (replaced, replacement_done) = std::sync::mpsc::channel();
+        let replacement = std::thread::spawn(move || {
+            replace_gate.try_unregister_agent(kid).unwrap();
+            replace_gate.register_agent(kid, CapabilitySet::all(), None);
+            replaced.send(()).unwrap();
+        });
+        assert!(
+            replacement_done
+                .recv_timeout(std::time::Duration::from_millis(25))
+                .is_err(),
+            "unregister must wait while approval record-check and insert hold mutation_lock"
+        );
+
+        release.wait();
+        assert!(grant.join().unwrap());
+        replacement.join().unwrap();
+        assert!(
+            gate.approvals.is_empty(),
+            "unregister must purge the old registration's newly inserted grant"
+        );
     }
 
     #[tokio::test]
@@ -1654,7 +2512,11 @@ mod tests {
         assert_eq!(events[0].decision, AuditDecision::Allowed);
         assert_eq!(events[0].action, "exec");
         assert_eq!(events[0].tool, "run_command");
-        assert_eq!(events[0].resource, "/bin/ls");
+        assert_eq!(
+            events[0].resource,
+            crate::resources::opaque_identity(b"/bin/ls")
+        );
+        assert!(!events[0].resource.contains("/bin/ls"));
         assert_eq!(events[0].agent, kid);
     }
 
@@ -1710,6 +2572,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cgroup_slot_failure_does_not_consume_one_shot_approval() {
+        let (gate, cgroups) = fresh_gate();
+        let group = cgroups.create(
+            "approval-slot".into(),
+            cgroups.root(),
+            CgroupLimits {
+                max_concurrent_tool_calls: 1,
+                ..Default::default()
+            },
+        );
+        let kid = uuid::Uuid::new_v4();
+        gate.register_agent(kid, CapabilitySet::all(), Some(group));
+        let occupied = gate.acquire_tool_call(kid).unwrap();
+        let security = default_security_catalog().get("run_command").unwrap();
+        assert!(gate.grant_tool_approval(
+            kid,
+            "run_command",
+            "echo",
+            security,
+            crate::tools::ApprovalPolicy::User,
+        ));
+
+        assert!(matches!(
+            gate.authorize_and_acquire_tool_call_declared(kid, "run_command", "echo", security)
+                .await,
+            Err(GateDenial::CgroupToolLimit)
+        ));
+        assert_eq!(
+            gate.approvals.len(),
+            1,
+            "failed slot acquisition must leave the exact grant available"
+        );
+
+        drop(occupied);
+        let (_pid, guard) = gate
+            .authorize_and_acquire_tool_call_declared(kid, "run_command", "echo", security)
+            .await
+            .expect("the retained approval must authorize the retried admission");
+        drop(guard);
+        assert!(gate.approvals.is_empty());
+    }
+
+    #[tokio::test]
     async fn deny_emits_audit_event() {
         use std::sync::Arc;
         use std::sync::Mutex;
@@ -1739,13 +2644,52 @@ mod tests {
             }]);
         }
 
-        let r = gate
-            .check_tool_call(kid, "http_get", "https://x.example", 5)
-            .await;
-        assert!(matches!(r, Err(GateDenial::MacDeny { .. })));
+        let secret = "https://x.example/private?credential=must-not-leak";
+        let denial = gate.check_tool_call(kid, "http_get", secret, 5).await;
+        let Err(GateDenial::MacDeny { resource, .. }) = denial else {
+            panic!("MAC must deny the secret-bearing URL")
+        };
+        assert_eq!(
+            resource,
+            crate::resources::opaque_identity(secret.as_bytes())
+        );
+        assert!(!resource.contains("credential"));
         let events = sink.0.lock().unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].decision, AuditDecision::Denied);
+        assert_eq!(events[0].resource, resource);
+        assert!(!events[0].resource.contains(secret));
+    }
+
+    #[tokio::test]
+    async fn approval_keys_hash_secret_bearing_resources_but_match_raw_targets() {
+        let (gate, _) = fresh_gate();
+        let kid = uuid::Uuid::new_v4();
+        gate.register_agent(kid, CapabilitySet::all(), None);
+        let security = default_security_catalog().get("run_command").unwrap();
+        let secret = "credential://operator-token-that-must-not-be-retained";
+
+        assert!(gate.grant_tool_approval(
+            kid,
+            "run_command",
+            secret,
+            security,
+            crate::tools::ApprovalPolicy::User,
+        ));
+        let stored = gate.approvals.iter().next().unwrap();
+        assert_eq!(
+            stored.key().3,
+            crate::resources::opaque_identity(secret.as_bytes())
+        );
+        assert!(!stored.key().3.contains(secret));
+        drop(stored);
+
+        let (_pid, guard) = gate
+            .authorize_and_acquire_tool_call_declared(kid, "run_command", secret, security)
+            .await
+            .expect("authorization must still compare the caller's raw target");
+        drop(guard);
+        assert!(gate.approvals.is_empty(), "approval remains single-use");
     }
 
     #[tokio::test]

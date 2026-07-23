@@ -368,6 +368,7 @@ fn classify_result(r: &Result<u64, GateDenial>) -> Expected {
         Err(
             GateDenial::CgroupUnavailable(_)
             | GateDenial::CgroupMembershipChanged
+            | GateDenial::AuthorizationStateChanged
             | GateDenial::CgroupToolLimit,
         ) => Expected::Membership,
         Err(GateDenial::CgroupQuota) => {
@@ -388,8 +389,7 @@ fn run_case(rt: &Runtime, case: &Case) -> (Result<u64, GateDenial>, GateStats) {
         // Apply the subject label so EnforcingDenyAction rules bind to the agent.
         if let MacPosture::EnforcingDenyAction(_) = case.mac {
             let pid = built.gate.pid_of(built.kid).expect("registered");
-            let mut mac = built.gate.mac.lock().await;
-            mac.label_agent(pid, "subject".into());
+            built.gate.label_mac_agent(pid, "subject".into()).await;
         }
         // Exercise the legacy compatibility hook. It must not turn serialized
         // tool payload bytes into provider usage.

@@ -766,7 +766,9 @@ impl AgentExecutor {
         seed_tokens: u32,
         mut usage: UsageTelemetry,
     ) -> Result<TurnResult, KernelError> {
-        let tools = self.tool_registry.definitions();
+        let tools = self
+            .tool_registry
+            .definitions_for_agent(&self.syscall_gate, self.agent_id);
         let mut total_tokens: u32 = seed_tokens;
         let mut tool_calls_made: usize = seed_tool_calls;
 
@@ -1335,7 +1337,7 @@ impl AgentExecutor {
         // Resolve action, capabilities, and resource using the binding's
         // validated declaration. Unknown tools and malformed resource arguments
         // fail before policy evaluation or provider execution.
-        let _tool_slot = match self
+        let (prepared_tool, _tool_slot) = match self
             .tool_registry
             .authorize_and_acquire_call(
                 &self.syscall_gate,
@@ -1345,15 +1347,14 @@ impl AgentExecutor {
             )
             .await
         {
-            Ok((_, slot)) => slot,
+            Ok((prepared, slot)) => (prepared, slot),
             Err(crate::tools::ToolAuthorizationError::InvalidDeclaration(error))
-                if error.starts_with("unknown tool") =>
+                if error == crate::tools::TOOL_NOT_FOUND_ERROR =>
             {
                 return format!(
-                    "Unknown tool '{}'. Available tools: {}",
-                    tool_call.name,
+                    "Tool not found. Available tools: {}",
                     self.tool_registry
-                        .definitions()
+                        .definitions_for_agent(&self.syscall_gate, self.agent_id)
                         .iter()
                         .map(|tool| tool.name.as_str())
                         .collect::<Vec<_>>()
@@ -1363,33 +1364,21 @@ impl AgentExecutor {
             Err(error) => return format!("Tool '{}' denied by kernel: {error}", tool_call.name),
         };
 
-        let result = match self.tool_registry.resolve(self.agent_id, tool_call) {
-            Some(request) => match self.resource_broker.execute(request).await {
-                Ok(resp) if resp.success => serde_json::to_string(&resp.data).unwrap_or_default(),
-                Ok(resp) => {
-                    format!(
-                        "Tool '{}' failed: {}. Try a different approach.",
-                        tool_call.name,
-                        resp.error.unwrap_or_default()
-                    )
-                }
-                Err(e) => {
-                    format!(
-                        "Tool '{}' error: {}. Try a different approach or tool.",
-                        tool_call.name, e
-                    )
-                }
-            },
-            None => format!(
-                "Unknown tool '{}'. Available tools: {}",
-                tool_call.name,
-                self.tool_registry
-                    .definitions()
-                    .iter()
-                    .map(|t| t.name.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ),
+        let result = match self.resource_broker.execute(prepared_tool.request).await {
+            Ok(resp) if resp.success => serde_json::to_string(&resp.data).unwrap_or_default(),
+            Ok(resp) => {
+                format!(
+                    "Tool '{}' failed: {}. Try a different approach.",
+                    tool_call.name,
+                    resp.error.unwrap_or_default()
+                )
+            }
+            Err(e) => {
+                format!(
+                    "Tool '{}' error: {}. Try a different approach or tool.",
+                    tool_call.name, e
+                )
+            }
         };
 
         result
@@ -1451,6 +1440,40 @@ mod tests {
     struct MockToolSession {
         call_count: AtomicUsize,
         id: String,
+    }
+
+    struct ToolCatalogSession {
+        seen_tools: Arc<std::sync::Mutex<Vec<String>>>,
+        id: String,
+    }
+
+    #[async_trait::async_trait]
+    impl LlmSession for ToolCatalogSession {
+        async fn send(
+            &self,
+            messages: Vec<StandardMessage>,
+        ) -> Result<LlmResponse, ConnectorError> {
+            self.send_with_tools(messages, &[]).await
+        }
+
+        async fn send_with_tools(
+            &self,
+            _messages: Vec<StandardMessage>,
+            tools: &[ToolDefinition],
+        ) -> Result<LlmResponse, ConnectorError> {
+            *self.seen_tools.lock().unwrap() = tools.iter().map(|tool| tool.name.clone()).collect();
+            Ok(LlmResponse {
+                content: "done".into(),
+                finish_reason: Some("stop".into()),
+                tokens_used: 1,
+                usage: LlmUsage::reported(0, 1, 0),
+                tool_calls: Vec::new(),
+            })
+        }
+
+        fn provider_id(&self) -> &crate::ProviderId {
+            &self.id
+        }
     }
 
     #[async_trait::async_trait]
@@ -1648,6 +1671,99 @@ mod tests {
             usage: LlmUsage::reported(0, 1, 0),
             tool_calls: Vec::new(),
         }
+    }
+
+    #[tokio::test]
+    async fn executor_does_not_advertise_foreign_namespace_tools_to_the_llm() {
+        use crate::agent_struct::CapabilitySet;
+        use crate::cgroups::CgroupManager;
+        use crate::syscall_gate::SyscallGate;
+
+        let agent_id = uuid::Uuid::new_v4();
+        let gate = Arc::new(SyscallGate::with_mac(
+            Arc::new(CgroupManager::new()),
+            false,
+            Vec::new(),
+        ));
+        gate.register_agent(agent_id, CapabilitySet::all(), None);
+        gate.register_tool_namespace("read_file", 42);
+        let seen_tools = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut executor = AgentExecutor::new(
+            agent_id,
+            Box::new(ToolCatalogSession {
+                seen_tools: seen_tools.clone(),
+                id: "catalog".into(),
+            }),
+            mock_broker(),
+            Arc::new(ToolRegistry::new()),
+            mock_context_manager(),
+            gate,
+            "test".into(),
+        );
+
+        let output = executor.run("list visible tools").await.unwrap();
+        assert_eq!(output.content, "done");
+        let seen_tools = seen_tools.lock().unwrap();
+        assert!(!seen_tools.iter().any(|tool| tool == "read_file"));
+        assert!(
+            seen_tools.iter().any(|tool| tool == "write_file"),
+            "global tools should remain visible to the registered agent"
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_and_foreign_tool_errors_are_indistinguishable() {
+        use crate::agent_struct::CapabilitySet;
+        use crate::cgroups::CgroupManager;
+        use crate::syscall_gate::SyscallGate;
+
+        let agent_id = uuid::Uuid::new_v4();
+        let gate = Arc::new(SyscallGate::with_mac(
+            Arc::new(CgroupManager::new()),
+            false,
+            Vec::new(),
+        ));
+        gate.register_agent(agent_id, CapabilitySet::all(), None);
+        gate.register_tool_namespace("read_file", 42);
+        let executor = AgentExecutor::new(
+            agent_id,
+            Box::new(ToolCatalogSession {
+                seen_tools: Arc::new(std::sync::Mutex::new(Vec::new())),
+                id: "catalog".into(),
+            }),
+            mock_broker(),
+            Arc::new(ToolRegistry::new()),
+            mock_context_manager(),
+            gate,
+            "test".into(),
+        );
+
+        let missing = executor
+            .execute_tool(&ToolCall {
+                id: "adversarial-guess".into(),
+                name: "does_not_exist".into(),
+                arguments: serde_json::json!({}),
+            })
+            .await;
+        let foreign = executor
+            .execute_tool(&ToolCall {
+                id: "foreign-exact-guess".into(),
+                name: "read_file".into(),
+                arguments: serde_json::json!({"path": "/tmp/foreign"}),
+            })
+            .await;
+        assert_eq!(missing, foreign);
+        assert!(missing.starts_with("Tool not found."));
+        assert!(
+            !missing.contains("read_file")
+                && !missing.contains("does_not_exist")
+                && !missing.contains("ns="),
+            "tool lookup errors must not reflect guessed or foreign catalog data: {missing}"
+        );
+        assert!(
+            missing.contains("write_file"),
+            "visible global tools should remain useful recovery suggestions: {missing}"
+        );
     }
 
     // Regression guard for the CLI wiring fix: once a syscall gate is installed
@@ -3163,7 +3279,8 @@ mod tests {
                 // Second call: LLM sees the error and responds with content
                 // Verify the error message was passed back
                 let last_msg = messages.last().unwrap();
-                assert!(last_msg.content.contains("Unknown tool"));
+                assert!(last_msg.content.contains("Tool not found."));
+                assert!(!last_msg.content.contains("nonexistent_tool"));
                 assert!(last_msg.content.contains("read_file")); // suggests available tools
                 Ok(LlmResponse {
                     content: "Sorry, let me try differently.".into(),

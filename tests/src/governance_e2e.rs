@@ -197,10 +197,10 @@ async fn governed_multi_agent_execution_contains_and_audits_violators() {
 
     // ── VIOLATION 4: MAC — an enforcing policy denies the intruder's write, ──
     // and the denial is captured by the audit sink (the audit trail).
-    {
-        let mut mac = kernel.syscall_gate.mac.lock().await;
-        mac.set_enforcing(true);
-        mac.load_policy(vec![
+    kernel.syscall_gate.set_mac_enforcing(true).await;
+    kernel
+        .syscall_gate
+        .load_mac_policy(vec![
             // Deny writes under /etc by any subject.
             PolicyRule {
                 subject: "*".into(),
@@ -215,8 +215,8 @@ async fn governed_multi_agent_execution_contains_and_audits_violators() {
                 object: "*".into(),
                 decision: "allow".into(),
             },
-        ]);
-    }
+        ])
+        .await;
     let r = kernel
         .syscall_gate
         .check_tool_call(intruder.id, "write_file", "/etc/passwd", 5)
@@ -265,10 +265,12 @@ async fn governed_multi_agent_execution_contains_and_audits_violators() {
     );
     assert_eq!(stats.denied_mac, 1, "exactly one MAC denial recorded");
 
-    // 2. The MAC denial reached the audit sink as a Denied event with full
-    //    forensic detail (subject, tool, action, resource). Capability/cgroup/
-    //    namespace denials are counter-only by design (they never reach the MAC
-    //    stage), so the sink captures the MAC-layer violation specifically.
+    // 2. The MAC denial reached the audit sink as a Denied event with the
+    //    subject/tool/action and a deterministic opaque resource identity.
+    //    Raw targets may contain secrets and must not enter audit storage.
+    //    Capability/cgroup/namespace denials are counter-only by design (they
+    //    never reach the MAC stage), so the sink captures the MAC-layer
+    //    violation specifically.
     let events = sink.events();
     let deny = events
         .iter()
@@ -277,7 +279,11 @@ async fn governed_multi_agent_execution_contains_and_audits_violators() {
     assert_eq!(deny.agent, intruder.id, "audit names the violating agent");
     assert_eq!(deny.tool, "write_file");
     assert_eq!(deny.action, "write");
-    assert_eq!(deny.resource, "/etc/passwd");
+    assert_eq!(
+        deny.resource,
+        "sha256:74acf31844532670be412c65b8251ee55d072549080b1cffdbea6b1a192230a0"
+    );
+    assert!(!deny.resource.contains("/etc/passwd"));
 
     // 3. Compliant work outnumbered violations and was allowed — containment.
     assert!(

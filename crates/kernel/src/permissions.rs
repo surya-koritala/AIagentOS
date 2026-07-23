@@ -323,11 +323,19 @@ impl PermissionManager {
             {
                 continue;
             }
-            // Check target patterns if specified
-            if let (Some(patterns), Some(t)) = (&rule.targets, target) {
-                if !patterns.iter().any(|p| Self::matches_glob(p, t)) {
+            // A target-scoped rule must never match a request that omitted its
+            // target. Treating `(Some(patterns), None)` as a match would turn a
+            // malformed/confused-deputy request into ambient access.
+            match (&rule.targets, target) {
+                (Some(_), None) => continue,
+                (Some(patterns), Some(target))
+                    if !patterns
+                        .iter()
+                        .any(|pattern| Self::matches_glob(pattern, target)) =>
+                {
                     continue;
                 }
+                _ => {}
             }
             return Some(rule.decision.clone());
         }
@@ -564,6 +572,51 @@ mod tests {
         assert_eq!(
             mgr.check_access(id, &ResourceType::Filesystem, "write", None),
             AccessDecision::Denied
+        );
+    }
+
+    #[test]
+    fn unknown_profile_assignment_is_denied() {
+        let mgr = PermissionManager::new();
+        let id = uuid::Uuid::new_v4();
+        mgr.assign_profile(id, &"typo-full-access".to_string());
+        assert_eq!(
+            mgr.check_access(id, &ResourceType::Filesystem, "read", None),
+            AccessDecision::Denied
+        );
+        assert_eq!(
+            mgr.check_access(id, &ResourceType::Application, "launch", Some("sh")),
+            AccessDecision::Denied
+        );
+    }
+
+    #[test]
+    fn target_scoped_rule_does_not_match_a_missing_target() {
+        let mgr = PermissionManager::new();
+        let profile_id = "target-scoped".to_string();
+        mgr.profiles.insert(
+            profile_id.clone(),
+            PermissionProfile {
+                id: profile_id.clone(),
+                name: "Target scoped".into(),
+                rules: vec![PermissionRule {
+                    resource_type: ResourceType::Filesystem,
+                    operations: vec!["read".into()],
+                    targets: Some(vec!["/safe/*".into()]),
+                    decision: AccessDecision::Allowed,
+                }],
+            },
+        );
+        let id = uuid::Uuid::new_v4();
+        mgr.assign_profile(id, &profile_id);
+
+        assert_eq!(
+            mgr.check_access(id, &ResourceType::Filesystem, "read", None),
+            AccessDecision::Denied
+        );
+        assert_eq!(
+            mgr.check_access(id, &ResourceType::Filesystem, "read", Some("/safe/file")),
+            AccessDecision::Allowed
         );
     }
 

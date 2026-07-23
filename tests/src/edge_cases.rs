@@ -142,20 +142,23 @@ fn tools_resolve_with_null_arguments() {
 #[test]
 fn tools_custom_template_with_missing_param() {
     let reg = ToolRegistry::new();
-    reg.register(ToolBinding {
-        name: "custom".into(),
-        description: "test".into(),
-        parameters_schema: serde_json::json!({"type": "object", "properties": {}}),
-        resource_type: kernel::resources::ResourceType::Application,
-        operation: "launch".into(),
-        security: kernel::tools::ToolSecurity::constant(
-            kernel::tools::SecurityAction::Execute,
-            "test:custom",
-        )
-        .sandboxed(),
-    })
+    reg.register_command_tool(
+        ToolBinding {
+            name: "custom".into(),
+            description: "test".into(),
+            parameters_schema: serde_json::json!({"type": "object", "properties": {}}),
+            resource_type: kernel::resources::ResourceType::Application,
+            operation: "launch".into(),
+            security: kernel::tools::ToolSecurity::constant(
+                kernel::tools::SecurityAction::Execute,
+                "echo",
+            )
+            .sandboxed(),
+        },
+        "echo",
+        &["{missing_param}".into()],
+    )
     .unwrap();
-    reg.register_command_template("custom", "echo", &["{missing_param}".into()]);
     let tc = ToolCall {
         id: "1".into(),
         name: "custom".into(),

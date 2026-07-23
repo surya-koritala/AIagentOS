@@ -2,8 +2,10 @@
 //!
 //! This is the **server** side of MCP, complementing the client in
 //! [`crate::mcp`] (which connects *out* to external tool servers). Here the
-//! kernel speaks MCP itself, so any MCP client can `initialize`, list the
-//! kernel's tools (`tools/list`), and invoke them (`tools/call`).
+//! kernel speaks MCP itself. Any client can negotiate with `initialize`, but it
+//! must bind the connection to an authenticated, tenant-owned agent through
+//! `agentos/authenticate` before it can list (`tools/list`) or invoke
+//! (`tools/call`) tools.
 //!
 //! It is modeled on [`crate::syscall_server`]: a server struct holding an
 //! `Arc<AgentKernelImpl>` that dispatches each request through the *same* kernel
@@ -15,8 +17,11 @@
 //!
 //! Transport is deliberately dependency-light (tokio + serde_json, both already
 //! in the workspace): one JSON-RPC request per line, one JSON-RPC response per
-//! line, over TCP. The protocol is the MCP spec's JSON-RPC 2.0 envelope
-//! (`jsonrpc` / `id` / `method` / `params`, with `result` / `error`).
+//! line, over loopback TCP. Credentials are carried inside the JSON stream, so
+//! this plaintext transport deliberately rejects non-loopback binds; remote MCP
+//! exposure requires a future TLS transport. The protocol is the MCP spec's
+//! JSON-RPC 2.0 envelope (`jsonrpc` / `id` / `method` / `params`, with `result`
+//! / `error`).
 
 use std::sync::Arc;
 
@@ -25,9 +30,9 @@ use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, Lines};
 use tokio::net::{TcpListener, TcpStream, ToSocketAddrs};
 
-use crate::connector::ToolCall;
+use crate::auth::Role;
 use crate::resources::ResourceBroker;
-use crate::AgentKernelImpl;
+use crate::{AgentId, AgentKernelImpl};
 
 /// The MCP protocol version this server implements (the spec revision the
 /// in-tree client also negotiates against; see [`crate::mcp`]).
@@ -47,6 +52,10 @@ pub mod error_codes {
     /// Internal JSON-RPC / server error (used for kernel-side failures,
     /// including a gate denial surfaced as an error).
     pub const INTERNAL_ERROR: i64 = -32603;
+    /// The connection has no currently valid authenticated identity.
+    pub const AUTHENTICATION_REQUIRED: i64 = -32001;
+    /// The authenticated principal cannot act as the requested agent.
+    pub const AUTHORIZATION_DENIED: i64 = -32003;
 }
 
 /// A JSON-RPC 2.0 request. `id` is absent for notifications; we accept it as an
@@ -106,16 +115,34 @@ impl JsonRpcResponse {
     }
 }
 
+#[derive(Debug, Default)]
+enum ConnectionIdentity {
+    #[default]
+    Unauthenticated,
+    Credential {
+        credential: crate::auth::CredentialIdentity,
+        agent_id: AgentId,
+    },
+}
+
 /// Dispatch a single MCP JSON-RPC request against the kernel.
 ///
-/// Pure routing: every method goes through the same `AgentKernelImpl` surfaces
-/// the in-process code uses. `tools/call` in particular runs the syscall gate
-/// before the resource broker, so capability / MAC / approval / cgroup / namespace checks
-/// apply — a denial becomes a JSON-RPC error (never a bypass or a panic).
+/// This stateless entry point starts unauthenticated. The TCP server uses the
+/// same dispatcher with connection-local identity state so a successful
+/// `agentos/authenticate` binds subsequent requests to one agent.
 ///
 /// Returns `None` for a notification (a request with no `id`), which by the
 /// JSON-RPC spec must not produce a response.
 pub async fn dispatch(kernel: &AgentKernelImpl, req: JsonRpcRequest) -> Option<JsonRpcResponse> {
+    let mut identity = ConnectionIdentity::Unauthenticated;
+    dispatch_for_connection(kernel, req, &mut identity).await
+}
+
+async fn dispatch_for_connection(
+    kernel: &AgentKernelImpl,
+    req: JsonRpcRequest,
+    identity: &mut ConnectionIdentity,
+) -> Option<JsonRpcResponse> {
     // A request with no `id` is a notification: act on nothing, answer nothing.
     // (`notifications/initialized` from a client lands here.)
     req.id.as_ref()?;
@@ -131,8 +158,10 @@ pub async fn dispatch(kernel: &AgentKernelImpl, req: JsonRpcRequest) -> Option<J
 
     let resp = match req.method.as_str() {
         "initialize" => handle_initialize(),
-        "tools/list" => handle_tools_list(kernel),
-        "tools/call" => handle_tools_call(kernel, req.params).await,
+        "agentos/authenticate" => handle_authenticate(kernel, identity, req.params).await,
+        "tools/list" | "tools/call" => {
+            handle_authenticated_method(kernel, identity, &req.method, req.params).await
+        }
         other => Err((
             error_codes::METHOD_NOT_FOUND,
             format!("method not found: {other}"),
@@ -143,6 +172,136 @@ pub async fn dispatch(kernel: &AgentKernelImpl, req: JsonRpcRequest) -> Option<J
         Ok(result) => JsonRpcResponse::ok(id, result),
         Err((code, message)) => JsonRpcResponse::err(id, code, message),
     })
+}
+
+async fn handle_authenticate(
+    kernel: &AgentKernelImpl,
+    identity: &mut ConnectionIdentity,
+    params: Option<Value>,
+) -> Result<Value, (i64, String)> {
+    // Every authentication attempt replaces the connection identity. Invalid
+    // parameters or credentials must not leave a previous principal active.
+    *identity = ConnectionIdentity::Unauthenticated;
+    let params = params.unwrap_or(Value::Null);
+    let token = params
+        .get("token")
+        .and_then(Value::as_str)
+        .filter(|token| !token.is_empty())
+        .ok_or_else(|| {
+            (
+                error_codes::INVALID_PARAMS,
+                "missing required 'token'".to_string(),
+            )
+        })?;
+    let agent_id = params
+        .get("agent_id")
+        .and_then(Value::as_str)
+        .filter(|agent_id| !agent_id.is_empty())
+        .ok_or_else(|| {
+            (
+                error_codes::INVALID_PARAMS,
+                "missing required 'agent_id'".to_string(),
+            )
+        })
+        .and_then(|agent_id| {
+            uuid::Uuid::parse_str(agent_id).map_err(|_| {
+                (
+                    error_codes::INVALID_PARAMS,
+                    "invalid 'agent_id'".to_string(),
+                )
+            })
+        })?;
+
+    let Some(principal) = kernel.resolve_principal(token).await else {
+        return Err((
+            error_codes::AUTHENTICATION_REQUIRED,
+            "authentication failed".to_string(),
+        ));
+    };
+    let owns_agent = matches!(
+        kernel.context_manager.agent_tenant(agent_id),
+        Ok(Some(ref tenant_id)) if tenant_id == &principal.tenant_id
+    ) && kernel.syscall_gate.pid_of(agent_id).is_some();
+    if !owns_agent {
+        tracing::warn!(
+            target: "agentos::authorization",
+            user_id = %principal.user_id,
+            tenant_id = %principal.tenant_id,
+            agent_id = %agent_id,
+            "MCP authentication denied for absent or foreign agent"
+        );
+        return Err((
+            error_codes::AUTHORIZATION_DENIED,
+            "authorization denied".to_string(),
+        ));
+    }
+    let credential = principal
+        .credential
+        .clone()
+        .expect("wire-authenticated principals always carry a credential identity");
+
+    *identity = ConnectionIdentity::Credential {
+        credential,
+        agent_id,
+    };
+    Ok(json!({ "authenticated": true, "agent_id": agent_id }))
+}
+
+async fn handle_authenticated_method(
+    kernel: &AgentKernelImpl,
+    identity: &mut ConnectionIdentity,
+    method: &str,
+    params: Option<Value>,
+) -> Result<Value, (i64, String)> {
+    let (credential, agent_id) = match identity {
+        ConnectionIdentity::Credential {
+            credential,
+            agent_id,
+        } => (credential.clone(), *agent_id),
+        ConnectionIdentity::Unauthenticated => {
+            return Err((
+                error_codes::AUTHENTICATION_REQUIRED,
+                "authentication required".to_string(),
+            ))
+        }
+    };
+
+    // Admit this credential and re-resolve its current principal under a short
+    // auth read lock. The per-credential lease, not the global auth lock, stays
+    // alive through dispatch. Revocation closes this identity and waits only for
+    // its admitted calls.
+    let Some((principal, _credential_lease)) =
+        kernel.acquire_credential_principal(&credential).await
+    else {
+        *identity = ConnectionIdentity::Unauthenticated;
+        return Err((
+            error_codes::AUTHENTICATION_REQUIRED,
+            "authentication required".to_string(),
+        ));
+    };
+    let owns_agent = matches!(
+        kernel.context_manager.agent_tenant(agent_id),
+        Ok(Some(ref tenant_id)) if tenant_id == &principal.tenant_id
+    ) && kernel.syscall_gate.pid_of(agent_id).is_some();
+    if !owns_agent {
+        *identity = ConnectionIdentity::Unauthenticated;
+        return Err((
+            error_codes::AUTHORIZATION_DENIED,
+            "authorization denied".to_string(),
+        ));
+    }
+
+    match method {
+        "tools/list" => handle_tools_list(kernel, agent_id),
+        "tools/call" if matches!(principal.role, Role::Admin | Role::User) => {
+            handle_tools_call(kernel, agent_id, params).await
+        }
+        "tools/call" => Err((
+            error_codes::AUTHORIZATION_DENIED,
+            "authorization denied".to_string(),
+        )),
+        _ => unreachable!("only protected MCP methods are routed here"),
+    }
 }
 
 /// `initialize`: announce the protocol version, our tool capability, and server
@@ -157,11 +316,12 @@ fn handle_initialize() -> Result<Value, (i64, String)> {
 
 /// `tools/list`: enumerate the kernel's registered tools as MCP tool
 /// descriptors (`name` / `description` / `inputSchema`). Sourced from the same
-/// `tool_registry` the executor resolves against.
-fn handle_tools_list(kernel: &AgentKernelImpl) -> Result<Value, (i64, String)> {
+/// `tool_registry` the executor resolves against and filtered to the bound
+/// agent's namespace memberships.
+fn handle_tools_list(kernel: &AgentKernelImpl, agent_id: AgentId) -> Result<Value, (i64, String)> {
     let tools: Vec<Value> = kernel
         .tool_registry
-        .definitions()
+        .definitions_for_agent(&kernel.syscall_gate, agent_id)
         .into_iter()
         .map(|d| {
             json!({
@@ -174,23 +334,37 @@ fn handle_tools_list(kernel: &AgentKernelImpl) -> Result<Value, (i64, String)> {
     Ok(json!({ "tools": tools }))
 }
 
-/// `tools/call`: invoke a named tool as a given agent, **through the syscall
+/// `tools/call`: invoke a named tool as the connection-bound agent, **through the syscall
 /// gate then the resource broker** — the exact ordering of
 /// [`crate::syscall_server`]'s `CallTool`. Params:
 ///
 /// - `name` (string, required): the tool to call.
 /// - `arguments` (object, optional): tool arguments.
-/// - `agent_id` (string UUID, required): the calling agent's identity; the gate
-///   resolves its capabilities / namespaces from this.
+/// - `agent_id` (string UUID, optional compatibility assertion): when present,
+///   it must exactly match the identity already bound to this connection.
 ///
 /// A gate denial is returned as an `INTERNAL_ERROR` JSON-RPC error. On success
 /// the result follows the MCP `content` shape (a single `text` block carrying
 /// the tool's JSON output) plus a raw `data` field for structured consumers.
 async fn handle_tools_call(
     kernel: &AgentKernelImpl,
+    agent_id: AgentId,
     params: Option<Value>,
 ) -> Result<Value, (i64, String)> {
     let params = params.unwrap_or(Value::Null);
+
+    if let Some(asserted_agent) = params.get("agent_id") {
+        let matches_bound_agent = asserted_agent
+            .as_str()
+            .and_then(|agent_id| uuid::Uuid::parse_str(agent_id).ok())
+            == Some(agent_id);
+        if !matches_bound_agent {
+            return Err((
+                error_codes::AUTHORIZATION_DENIED,
+                "authorization denied".to_string(),
+            ));
+        }
+    }
 
     let tool = match params.get("name").and_then(|v| v.as_str()) {
         Some(name) if !name.is_empty() => name.to_string(),
@@ -202,34 +376,20 @@ async fn handle_tools_call(
         }
     };
 
-    let agent_id_str = match params.get("agent_id").and_then(|v| v.as_str()) {
-        Some(s) if !s.is_empty() => s,
-        _ => {
-            return Err((
-                error_codes::INVALID_PARAMS,
-                "missing required 'agent_id' (calling agent identity)".to_string(),
-            ))
-        }
-    };
-    let agent_id = match uuid::Uuid::parse_str(agent_id_str) {
-        Ok(id) => id,
-        Err(_) => {
-            return Err((
-                error_codes::INVALID_PARAMS,
-                format!("invalid agent_id: {agent_id_str}"),
-            ))
-        }
-    };
-
     let args = params.get("arguments").cloned().unwrap_or(json!({}));
 
     // Registry-declared security preparation is shared byte-for-byte with the
     // executor, JSON syscall wire, and SDK-backed client path.
-    let (_, _tool_slot) = kernel
+    let (prepared_tool, _tool_slot) = kernel
         .tool_registry
         .authorize_and_acquire_call(&kernel.syscall_gate, agent_id, &tool, &args)
         .await
         .map_err(|error| match error {
+            crate::tools::ToolAuthorizationError::InvalidDeclaration(error)
+                if error == crate::tools::TOOL_NOT_FOUND_ERROR =>
+            {
+                (error_codes::INVALID_PARAMS, error)
+            }
             crate::tools::ToolAuthorizationError::InvalidDeclaration(error) => (
                 error_codes::INVALID_PARAMS,
                 format!("tool '{tool}' denied by kernel: {error}"),
@@ -240,38 +400,26 @@ async fn handle_tools_call(
             ),
         })?;
 
-    let call = ToolCall {
-        id: "mcp".into(),
-        name: tool.clone(),
-        arguments: args,
-    };
-
-    let result = match kernel.tool_registry.resolve(agent_id, &call) {
-        Some(request) => match kernel.resource_broker.execute(request).await {
-            Ok(resp) if resp.success => {
-                let data = resp.data;
-                let text = match &data {
-                    Value::String(s) => s.clone(),
-                    other => other.to_string(),
-                };
-                Ok(json!({
-                    "content": [{ "type": "text", "text": text }],
-                    "isError": false,
-                    "data": data,
-                }))
-            }
-            Ok(resp) => Err((
-                error_codes::INTERNAL_ERROR,
-                format!("tool '{tool}' failed: {}", resp.error.unwrap_or_default()),
-            )),
-            Err(e) => Err((
-                error_codes::INTERNAL_ERROR,
-                format!("tool '{tool}' error: {e}"),
-            )),
-        },
-        None => Err((
-            error_codes::METHOD_NOT_FOUND,
-            format!("unknown tool '{tool}'"),
+    let result = match kernel.resource_broker.execute(prepared_tool.request).await {
+        Ok(resp) if resp.success => {
+            let data = resp.data;
+            let text = match &data {
+                Value::String(s) => s.clone(),
+                other => other.to_string(),
+            };
+            Ok(json!({
+                "content": [{ "type": "text", "text": text }],
+                "isError": false,
+                "data": data,
+            }))
+        }
+        Ok(resp) => Err((
+            error_codes::INTERNAL_ERROR,
+            format!("tool '{tool}' failed: {}", resp.error.unwrap_or_default()),
+        )),
+        Err(e) => Err((
+            error_codes::INTERNAL_ERROR,
+            format!("tool '{tool}' error: {e}"),
         )),
     };
 
@@ -286,15 +434,28 @@ pub struct McpServer {
 }
 
 impl McpServer {
-    /// Bind a TCP listener to `addr` (e.g. `"127.0.0.1:0"` for an ephemeral port).
+    /// Bind a plaintext TCP listener to a loopback address (for example,
+    /// `"127.0.0.1:0"` for an ephemeral port).
+    ///
+    /// API keys/session tokens are presented inside this protocol, so
+    /// unspecified or externally reachable addresses fail closed. Remote MCP
+    /// service must wait for a transport that provides TLS.
     pub async fn bind(
         kernel: Arc<AgentKernelImpl>,
         addr: impl ToSocketAddrs,
     ) -> std::io::Result<Self> {
-        Ok(Self {
-            kernel,
-            listener: TcpListener::bind(addr).await?,
-        })
+        let listener = TcpListener::bind(addr).await?;
+        let local_addr = listener.local_addr()?;
+        if !local_addr.ip().is_loopback() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!(
+                    "plaintext MCP may bind only to loopback addresses, not {}",
+                    local_addr.ip()
+                ),
+            ));
+        }
+        Ok(Self { kernel, listener })
     }
 
     /// The actually-bound TCP address (resolves an ephemeral `:0` port).
@@ -329,12 +490,13 @@ impl McpServer {
         W: AsyncWrite + Unpin,
     {
         let mut lines = BufReader::new(read).lines();
+        let mut identity = ConnectionIdentity::Unauthenticated;
         while let Some(line) = lines.next_line().await? {
             if line.trim().is_empty() {
                 continue;
             }
             let response = match serde_json::from_str::<JsonRpcRequest>(&line) {
-                Ok(req) => dispatch(&kernel, req).await,
+                Ok(req) => dispatch_for_connection(&kernel, req, &mut identity).await,
                 Err(e) => Some(JsonRpcResponse::err(
                     None,
                     error_codes::PARSE_ERROR,
@@ -394,6 +556,24 @@ impl McpClient {
         self.read_response().await
     }
 
+    /// Bind this connection to `agent_id` using an AuthSystem API key or
+    /// session token. The server revalidates the credential and ownership on
+    /// every subsequent protected request.
+    pub async fn authenticate(
+        &mut self,
+        token: impl Into<String>,
+        agent_id: AgentId,
+    ) -> std::io::Result<JsonRpcResponse> {
+        self.request(
+            "agentos/authenticate",
+            Some(json!({
+                "token": token.into(),
+                "agent_id": agent_id,
+            })),
+        )
+        .await
+    }
+
     /// Send a raw JSON value as one line (used by tests to exercise malformed /
     /// notification inputs the typed API can't express).
     pub async fn send_value(&mut self, value: &Value) -> std::io::Result<()> {
@@ -423,6 +603,9 @@ impl McpClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::Role;
+    use crate::resources::ResourceType;
+    use crate::tools::{SecurityAction, ToolBinding, ToolSecurity};
     use crate::{AgentConfig, Priority};
 
     async fn spawn_server() -> (Arc<AgentKernelImpl>, std::net::SocketAddr) {
@@ -435,16 +618,51 @@ mod tests {
         (kernel, addr)
     }
 
-    async fn create_agent(kernel: &AgentKernelImpl, profile: &str) -> uuid::Uuid {
-        let config = AgentConfig {
-            name: "t".into(),
+    fn agent_config(name: &str, profile: &str) -> AgentConfig {
+        AgentConfig {
+            name: name.into(),
             task: "t".into(),
             llm_provider: "stub".into(),
             permission_profile: profile.into(),
             priority: Priority::new(3).unwrap(),
             sandbox_config: None,
-        };
-        kernel.create_agent_full(config).await.expect("create").id
+        }
+    }
+
+    async fn create_identity(
+        kernel: &AgentKernelImpl,
+        tenant_name: &str,
+        profile: &str,
+        role: Role,
+    ) -> (String, String, AgentId) {
+        let tenant = kernel.create_tenant(tenant_name).await.expect("tenant");
+        let user = kernel
+            .register_user(
+                &tenant,
+                &format!("{tenant_name}-user"),
+                &format!("{tenant_name}@example.test"),
+                role,
+            )
+            .await
+            .expect("user");
+        let token = kernel.open_session(&user).await.expect("session");
+        let agent = kernel
+            .create_agent_for_tenant(&tenant, agent_config(tenant_name, profile))
+            .await
+            .expect("create tenant agent");
+        (tenant, token, agent.id)
+    }
+
+    async fn authenticate(client: &mut McpClient, token: &str, agent_id: AgentId) {
+        let response = client
+            .authenticate(token.to_string(), agent_id)
+            .await
+            .expect("authenticate request");
+        assert!(
+            response.error.is_none(),
+            "authentication failed: {:?}",
+            response.error
+        );
     }
 
     #[tokio::test]
@@ -472,9 +690,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn plaintext_server_rejects_non_loopback_bind() {
+        let kernel = Arc::new(AgentKernelImpl::new().expect("kernel new"));
+        let error = match McpServer::bind(kernel, "0.0.0.0:0").await {
+            Ok(_) => panic!("plaintext MCP must not bind beyond loopback"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(error.to_string().contains("loopback"));
+    }
+
+    #[tokio::test]
     async fn tools_list_returns_nonempty() {
-        let (_kernel, addr) = spawn_server().await;
+        let (kernel, addr) = spawn_server().await;
+        let (_tenant, token, agent_id) =
+            create_identity(&kernel, "list-owner", "standard", Role::User).await;
         let mut client = McpClient::connect(addr).await.unwrap();
+        authenticate(&mut client, &token, agent_id).await;
 
         let resp = client.request("tools/list", None).await.unwrap();
         assert!(resp.error.is_none(), "tools/list errored: {:?}", resp.error);
@@ -493,15 +725,16 @@ mod tests {
     async fn tools_call_denied_for_readonly_agent() {
         let (kernel, addr) = spawn_server().await;
         // A read-only agent lacks CAP_FILE_WRITE.
-        let id = create_agent(&kernel, "read-only").await;
+        let (_tenant, token, id) =
+            create_identity(&kernel, "readonly-profile", "read-only", Role::User).await;
         let mut client = McpClient::connect(addr).await.unwrap();
+        authenticate(&mut client, &token, id).await;
 
         let resp = client
             .request(
                 "tools/call",
                 Some(json!({
                     "name": "write_file",
-                    "agent_id": id.to_string(),
                     "arguments": {"path": "/tmp/x", "content": "y"}
                 })),
             )
@@ -523,6 +756,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn readonly_principal_can_list_but_cannot_execute_tools() {
+        let (kernel, addr) = spawn_server().await;
+        let (_tenant, token, agent_id) =
+            create_identity(&kernel, "readonly-principal", "standard", Role::ReadOnly).await;
+        let mut client = McpClient::connect(addr).await.unwrap();
+        authenticate(&mut client, &token, agent_id).await;
+
+        let list = client.request("tools/list", None).await.unwrap();
+        assert!(list.error.is_none());
+        let call = client
+            .request(
+                "tools/call",
+                Some(json!({
+                    "name": "read_file",
+                    "arguments": {"path": "/tmp/x"}
+                })),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            call.error
+                .expect("read-only principal must not execute")
+                .code,
+            error_codes::AUTHORIZATION_DENIED
+        );
+        assert_eq!(kernel.syscall_gate.stats().allowed, 0);
+    }
+
+    #[tokio::test]
     async fn malformed_request_yields_error_not_disconnect() {
         let (_kernel, addr) = spawn_server().await;
         let mut client = McpClient::connect(addr).await.unwrap();
@@ -533,10 +795,10 @@ mod tests {
         let err = resp.error.expect("expected parse error");
         assert_eq!(err.code, error_codes::PARSE_ERROR);
 
-        // The same connection still answers a valid request afterwards.
-        let ok = client.request("tools/list", None).await.unwrap();
+        // The same connection still answers a valid public request afterwards.
+        let ok = client.request("initialize", None).await.unwrap();
         assert!(ok.error.is_none());
-        assert!(ok.result.unwrap()["tools"].as_array().unwrap().len() >= 5);
+        assert_eq!(ok.result.unwrap()["protocolVersion"], PROTOCOL_VERSION);
     }
 
     #[tokio::test]
@@ -550,20 +812,200 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tools_call_missing_agent_id_is_invalid_params() {
+    async fn unauthenticated_clients_cannot_list_or_call_tools() {
         let (_kernel, addr) = spawn_server().await;
         let mut client = McpClient::connect(addr).await.unwrap();
 
-        let resp = client
+        let list = client.request("tools/list", None).await.unwrap();
+        assert_eq!(
+            list.error.expect("tools/list must require auth").code,
+            error_codes::AUTHENTICATION_REQUIRED
+        );
+
+        let call = client
             .request(
                 "tools/call",
                 Some(json!({ "name": "read_file", "arguments": {"path": "/tmp/x"} })),
             )
             .await
             .unwrap();
-        let err = resp.error.expect("expected invalid-params");
-        assert_eq!(err.code, error_codes::INVALID_PARAMS);
-        assert!(err.message.contains("agent_id"));
+        assert_eq!(
+            call.error.expect("tools/call must require auth").code,
+            error_codes::AUTHENTICATION_REQUIRED
+        );
+    }
+
+    #[tokio::test]
+    async fn caller_supplied_agent_id_cannot_override_bound_identity() {
+        let (kernel, addr) = spawn_server().await;
+        let (tenant, token, bound_agent) =
+            create_identity(&kernel, "agent-binding", "standard", Role::User).await;
+        let foreign_agent = kernel
+            .create_agent_for_tenant(&tenant, agent_config("foreign-agent", "standard"))
+            .await
+            .expect("second agent")
+            .id;
+        let mut client = McpClient::connect(addr).await.unwrap();
+        authenticate(&mut client, &token, bound_agent).await;
+
+        let response = client
+            .request(
+                "tools/call",
+                Some(json!({
+                    "name": "read_file",
+                    "agent_id": foreign_agent,
+                    "arguments": {"path": "/tmp/x"}
+                })),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.error.expect("forged agent id must be denied").code,
+            error_codes::AUTHORIZATION_DENIED
+        );
+    }
+
+    #[tokio::test]
+    async fn credential_cannot_bind_to_cross_tenant_agent() {
+        let (kernel, addr) = spawn_server().await;
+        let (_tenant_a, token_a, _agent_a) =
+            create_identity(&kernel, "tenant-a", "standard", Role::User).await;
+        let (_tenant_b, _token_b, agent_b) =
+            create_identity(&kernel, "tenant-b", "standard", Role::User).await;
+        let mut client = McpClient::connect(addr).await.unwrap();
+
+        let response = client.authenticate(token_a, agent_b).await.unwrap();
+        assert_eq!(
+            response
+                .error
+                .expect("cross-tenant bind must be denied")
+                .code,
+            error_codes::AUTHORIZATION_DENIED
+        );
+        let list = client.request("tools/list", None).await.unwrap();
+        assert_eq!(
+            list.error
+                .expect("failed bind must remain unauthenticated")
+                .code,
+            error_codes::AUTHENTICATION_REQUIRED
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_reauthentication_clears_the_previous_mcp_identity() {
+        let (kernel, addr) = spawn_server().await;
+        let (_tenant, token, agent_id) =
+            create_identity(&kernel, "mcp-reauth", "standard", Role::User).await;
+        let mut client = McpClient::connect(addr).await.unwrap();
+        authenticate(&mut client, &token, agent_id).await;
+
+        let failed = client
+            .authenticate("invalid-replacement", agent_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            failed
+                .error
+                .expect("replacement authentication must fail")
+                .code,
+            error_codes::AUTHENTICATION_REQUIRED
+        );
+        let list = client.request("tools/list", None).await.unwrap();
+        assert_eq!(
+            list.error
+                .expect("failed reauthentication must clear identity")
+                .code,
+            error_codes::AUTHENTICATION_REQUIRED
+        );
+    }
+
+    #[tokio::test]
+    async fn revoked_credential_invalidates_an_existing_connection() {
+        let (kernel, addr) = spawn_server().await;
+        let (_tenant, token, agent_id) =
+            create_identity(&kernel, "revoked-mcp", "standard", Role::User).await;
+        let mut client = McpClient::connect(addr).await.unwrap();
+        authenticate(&mut client, &token, agent_id).await;
+        assert!(kernel.revoke_session(&token).await.expect("revoke session"));
+
+        let response = client.request("tools/list", None).await.unwrap();
+        assert_eq!(
+            response.error.expect("revoked session must be denied").code,
+            error_codes::AUTHENTICATION_REQUIRED
+        );
+    }
+
+    #[tokio::test]
+    async fn tools_list_hides_foreign_namespace_tools() {
+        let (kernel, addr) = spawn_server().await;
+        let (tenant_a, token_a, agent_a) =
+            create_identity(&kernel, "visibility-a", "standard", Role::User).await;
+        let (_tenant_b, token_b, agent_b) =
+            create_identity(&kernel, "visibility-b", "standard", Role::User).await;
+        kernel
+            .register_group_tool(
+                &tenant_a,
+                ToolBinding {
+                    name: "tenant_a_notes".into(),
+                    description: "Read tenant A notes".into(),
+                    parameters_schema: json!({
+                        "type": "object",
+                        "properties": {"path": {"type": "string"}},
+                        "required": ["path"]
+                    }),
+                    resource_type: ResourceType::Filesystem,
+                    operation: "read".into(),
+                    security: ToolSecurity::argument(SecurityAction::Read, "path"),
+                },
+            )
+            .expect("register scoped tool");
+
+        let mut client_a = McpClient::connect(addr).await.unwrap();
+        authenticate(&mut client_a, &token_a, agent_a).await;
+        let list_a = client_a.request("tools/list", None).await.unwrap();
+        let tools_a = list_a.result.unwrap()["tools"].as_array().unwrap().clone();
+        assert!(tools_a.iter().any(|tool| tool["name"] == "tenant_a_notes"));
+
+        let mut client_b = McpClient::connect(addr).await.unwrap();
+        authenticate(&mut client_b, &token_b, agent_b).await;
+        let list_b = client_b.request("tools/list", None).await.unwrap();
+        let tools_b = list_b.result.unwrap()["tools"].as_array().unwrap().clone();
+        assert!(!tools_b.iter().any(|tool| tool["name"] == "tenant_a_notes"));
+
+        let foreign = client_b
+            .request(
+                "tools/call",
+                Some(json!({
+                    "name": "tenant_a_notes",
+                    "arguments": {"path": "/tmp/foreign"}
+                })),
+            )
+            .await
+            .unwrap()
+            .error
+            .expect("foreign-scoped tool probe must fail");
+        let missing = client_b
+            .request(
+                "tools/call",
+                Some(json!({
+                    "name": "definitely_missing_tool",
+                    "arguments": {}
+                })),
+            )
+            .await
+            .unwrap()
+            .error
+            .expect("missing tool probe must fail");
+        assert_eq!(foreign.code, missing.code);
+        assert_eq!(foreign.message, missing.message);
+        assert_eq!(foreign.code, error_codes::INVALID_PARAMS);
+        assert!(
+            !foreign.message.contains("tenant_a_notes")
+                && !foreign.message.contains("definitely_missing_tool")
+                && !foreign.message.contains("ns="),
+            "MCP tool lookup must not reflect foreign catalog data: {}",
+            foreign.message
+        );
     }
 
     #[tokio::test]
@@ -579,7 +1021,7 @@ mod tests {
 
         // Follow it with a real request; the only line we read back is its
         // response (proving the notification produced nothing).
-        let resp = client.request("tools/list", None).await.unwrap();
+        let resp = client.request("initialize", None).await.unwrap();
         assert!(resp.error.is_none());
         assert_eq!(resp.id, Some(json!(1)));
     }

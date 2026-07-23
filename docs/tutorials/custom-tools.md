@@ -12,9 +12,9 @@ command = "wc"
 args_template = ["-w", "{file_path}"]
 
 # Security is mandatory. Command templates execute a process, so they require
-# CAP_EXEC (0x40), user approval, and a sandbox. Omitting this table, disguising
-# the Application/launch provider as a read action, or using an optional/non-
-# string resource argument rejects the tool.
+# CAP_EXEC (0x40) and a sandbox. The resource extractor must be the exact,
+# immutable executable from `command`; arguments such as file paths remain
+# untrusted parameters and cannot stand in for the process target.
 [tool.security]
 action = "execute"
 required_capabilities = [64]
@@ -22,8 +22,8 @@ namespace_visibility = "global"
 approval_policy = "user"
 sandbox_requirement = "required"
 [tool.security.resource_extractor]
-kind = "argument"
-value = "file_path"
+kind = "constant"
+value = "wc"
 
 [tool.parameters]
 file_path = { type = "string", description = "Path to file", required = true }
@@ -41,8 +41,8 @@ namespace_visibility = "global"
 approval_policy = "user"
 sandbox_requirement = "required"
 [tool.security.resource_extractor]
-kind = "argument"
-value = "directory"
+kind = "constant"
+value = "grep"
 
 [tool.parameters]
 pattern = { type = "string", description = "Search pattern", required = true }
@@ -50,8 +50,8 @@ directory = { type = "string", description = "Directory to search", required = t
 ```
 
 The loader validates the schema and security contract before registering a
-tool. Invalid, incomplete, or contradictory declarations are logged and remain
-unavailable to agents.
+tool. A declaration whose constant extractor differs from `command` is rejected,
+as are invalid, incomplete, or contradictory declarations.
 
 ## MCP Server Tools
 

@@ -76,7 +76,21 @@ operation, action, required capabilities, typed resource extractor, namespace
 visibility, approval policy, and sandbox requirement. Registration rejects
 missing or contradictory declarations. The compatibility classifier is
 generated from the same validated built-in catalog; do not add a separate name
-matching table.
+matching table. Policy files use the declaration's canonical action labels
+(`exec`, not provider-operation aliases such as `execute` or `launch`) and
+reject unknown labels.
+
+MCP discovery is installed as one validated batch. Conversion errors, duplicate
+discovery names, conflicts with existing bindings, or late publication failures
+leave none of that batch installed; a late failure rolls back only names
+inserted by the batch and preserves pre-existing tools.
+
+LLM definitions are generated from that same binding. Their constraint suffix
+includes the non-secret resource/action/capability/approval/sandbox/visibility
+classes, while deliberately omitting constant resource values, approval grants,
+host sandbox paths, credentials, and policy contents. This suffix helps planning
+but grants no authority; the kernel re-resolves and enforces the declaration for
+every call.
 
 `SyscallGate::new` and `AgentKernelImpl::new` use enforcing/default-deny MAC
 defaults. Permissive MAC requires an explicit local `with_mac(..., false, ...)`

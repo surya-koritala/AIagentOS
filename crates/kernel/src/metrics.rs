@@ -596,10 +596,8 @@ mod tests {
             .register_agent(kid, CapabilitySet::none(), None);
         kernel
             .syscall_gate
-            .mac
-            .lock()
-            .await
-            .label_agent(pid, "profile:read-only".into());
+            .label_mac_agent(pid, "profile:read-only".into())
+            .await;
 
         // read_file requires no capability → allowed.
         let allowed = kernel

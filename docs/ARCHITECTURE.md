@@ -163,8 +163,9 @@ checks in order — **first failure wins:**
 ```
 0. Namespace visibility — tool tagged with a namespace ⇒ caller must be a member,
    else NotInNamespace (≈ ENOENT, the tool is invisible). Untagged tools are global.
-1. Capability check — classify_tool(name) → required cap (e.g. http_get needs
-   CAP_NET_ACCESS); MissingCapability otherwise.
+1. Capability check — resolve the registered tool's typed security declaration
+   and require every declared capability (for example `http_get` requires
+   `CAP_NET_ACCESS`); `MissingCapability` otherwise.
 2. MAC check — MacEngine::check(pid, action, resource); MacDeny on policy Deny.
 3. Exact local approval for declarations that require it.
 4. Cgroup hierarchy/membership validation. Concurrent tool slots are acquired
@@ -185,9 +186,13 @@ Capabilities derive from the `permission_profile` string at creation via
 
 **This contract is locked by tests** (`tests/src/os_enforcement.rs` for ordering
 and isolation; `tests/src/gate_adversarial_props.rs` runs ~2500 proptest cases
-per run with an independent oracle that re-derives the ordered verdict — proving
-no bypass). **When adding a tool, classify it in `classify_tool`.** Don't bypass
-the gate from new code paths.
+per run with an independent oracle that re-derives the ordered verdict). When
+adding a tool, register one complete `ToolBinding`; built-in compatibility
+classification and the LLM-visible constraint summary are derived from that same
+validated declaration. The summary omits constant resource values and other
+secret-bearing policy data. Policy files accept only the declaration's canonical
+action labels (`exec`, not `execute`). Do not add a parallel name matcher or
+bypass the combined declaration/slot gate from a new execution path.
 
 ---
 
@@ -319,6 +324,9 @@ app, and `agent-server` construct from config and then explicitly call
   are in-memory apt-like prototypes, not a production supply chain.
 - **Hub** — `agent_hub.rs` is a versioned in-memory publish/fetch prototype.
 - **MCP** — client (`mcp.rs`) and gate-enforced server (`mcp_server.rs`).
+  Discovered client tools are prevalidated and published all-or-nothing; an
+  invalid/conflicting entry or late publication failure leaves the prior
+  registry intact.
 
 ---
 

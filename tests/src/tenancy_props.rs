@@ -120,10 +120,14 @@ async fn cross_tenant_namespaced_tool_is_denied() {
             ToolBinding {
                 name: "tenant_a_tool".into(),
                 description: "tenant A only".into(),
-                parameters_schema: serde_json::json!({"type": "object", "properties": {}}),
+                parameters_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {"path": {"type": "string"}},
+                    "required": ["path"]
+                }),
                 resource_type: kernel::resources::ResourceType::Filesystem,
                 operation: "read".into(),
-                security: ToolSecurity::constant(SecurityAction::Read, "tenant-a:tool"),
+                security: ToolSecurity::argument(SecurityAction::Read, "path"),
             },
         )
         .unwrap();

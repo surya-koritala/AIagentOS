@@ -58,6 +58,7 @@ impl Decision {
 /// no semantics but make a policy self-explaining (and let `explain` name the
 /// rule that fired).
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Rule {
     /// Optional short identifier, surfaced by `explain`.
     #[serde(default)]
@@ -77,6 +78,7 @@ pub struct Rule {
 
 /// A complete, authorable policy document.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PolicyDocument {
     /// Document format version (operator-facing; currently always 1).
     #[serde(default = "default_version")]
@@ -104,6 +106,60 @@ fn default_enforcing() -> bool {
 }
 fn default_default() -> Decision {
     Decision::Deny
+}
+
+const SUPPORTED_POLICY_PROFILES: [&str; 4] = [
+    "profile:read-only",
+    "profile:standard",
+    "profile:elevated",
+    "profile:full-access",
+];
+
+fn canonical_action_labels() -> Vec<&'static str> {
+    crate::tools::SecurityAction::ALL
+        .into_iter()
+        .map(crate::tools::SecurityAction::as_str)
+        .collect()
+}
+
+fn validate_action_label(index: usize, name: Option<&str>, action: &str) -> Result<(), String> {
+    if action == "*"
+        || crate::tools::SecurityAction::ALL
+            .into_iter()
+            .any(|candidate| candidate.as_str() == action)
+    {
+        return Ok(());
+    }
+    Err(format!(
+        "rule #{index}{} uses unknown action label '{action}'; expected one of: {} (labels come from ToolSecurity, for example `exec`, not `execute`)",
+        name.map(|name| format!(" ({name})")).unwrap_or_default(),
+        canonical_action_labels().join(", ")
+    ))
+}
+
+/// Validate the legacy inline MAC-rule representation before it reaches the
+/// engine. Policy documents get typed decisions from [`Decision`]; inline
+/// configuration is stringly typed and must receive the same fail-loud action
+/// and terminal-decision checks.
+pub(crate) fn validate_engine_rules(rules: &[PolicyRule]) -> Result<(), String> {
+    for (index, rule) in rules.iter().enumerate() {
+        if rule.subject.trim().is_empty()
+            || rule.action.trim().is_empty()
+            || rule.object.trim().is_empty()
+        {
+            return Err(format!(
+                "inline MAC rule #{index} has an empty subject/action/object field"
+            ));
+        }
+        validate_action_label(index, None, &rule.action)?;
+        if !matches!(rule.decision.as_str(), "allow" | "deny" | "audit") {
+            return Err(format!(
+                "inline MAC rule #{index} uses unknown decision '{}'; expected allow, deny, or audit",
+                rule.decision
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// A non-fatal authoring concern surfaced by [`PolicyDocument::lint`].
@@ -156,7 +212,10 @@ impl PolicyDocument {
             ));
         }
         for (i, r) in self.rules.iter().enumerate() {
-            if r.subject.is_empty() || r.action.is_empty() || r.object.is_empty() {
+            if r.subject.trim().is_empty()
+                || r.action.trim().is_empty()
+                || r.object.trim().is_empty()
+            {
                 return Err(format!(
                     "rule #{i}{} has an empty subject/action/object field",
                     r.name
@@ -165,6 +224,7 @@ impl PolicyDocument {
                         .unwrap_or_default()
                 ));
             }
+            validate_action_label(i, r.name.as_deref(), &r.action)?;
         }
         Ok(())
     }
@@ -174,6 +234,25 @@ impl PolicyDocument {
     /// validate` so operators get feedback before deploying a policy.
     pub fn lint(&self) -> Vec<Lint> {
         let mut lints = Vec::new();
+
+        if !self.enforcing {
+            lints.push(Lint {
+                rule_index: None,
+                message: "SECURITY: policy is permissive; deny/audit decisions are logged but \
+                          not enforced"
+                    .to_string(),
+            });
+        }
+
+        if self.default != Decision::Deny {
+            lints.push(Lint {
+                rule_index: None,
+                message: format!(
+                    "SECURITY: terminal default is {:?}; every otherwise-unmatched action is permitted",
+                    self.default
+                ),
+            });
+        }
 
         // Enforcing + no rules + default-deny denies *everything* for confined
         // agents — almost never intended.
@@ -186,26 +265,30 @@ impl PolicyDocument {
             });
         }
 
-        // A `*/*/*` catch-all shadows every rule after it — first match wins,
-        // so anything below it is unreachable.
-        let mut catch_all: Option<usize> = None;
+        // First-match wins. An earlier selector that is at least as broad on all
+        // three axes makes the later rule unreachable. This deliberately proves
+        // only exact/catch-all subsumption; it does not guess whether two
+        // different object globs contain one another.
         for (i, r) in self.rules.iter().enumerate() {
-            if let Some(ci) = catch_all {
+            if let Some(shadowing) = self.rules[..i]
+                .iter()
+                .position(|earlier| rule_selector_covers(earlier, r))
+            {
                 lints.push(Lint {
                     rule_index: Some(i),
                     message: format!(
-                        "rule #{i} is unreachable: catch-all rule #{ci} (*/*/*) matches everything before it"
+                        "rule #{i} is unreachable: earlier rule #{shadowing} matches every subject/action/object it can match"
                     ),
                 });
-            } else if r.subject == "*" && r.action == "*" && r.object == "*" {
-                catch_all = Some(i);
-                if r.decision != Decision::Deny {
-                    lints.push(Lint {
-                        rule_index: Some(i),
-                        message: "overbroad wildcard allows or audits every subject, action, and resource"
-                            .to_string(),
-                    });
-                }
+            }
+
+            if r.decision != Decision::Deny && r.action == "*" {
+                lints.push(Lint {
+                    rule_index: Some(i),
+                    message: "overbroad wildcard allows or audits every action for the matched \
+                              subject and resource"
+                        .to_string(),
+                });
             }
         }
 
@@ -228,20 +311,38 @@ impl PolicyDocument {
     /// dynamically installed package, custom, and MCP declarations.
     pub fn lint_with_tool_registry(&self, registry: &crate::tools::ToolRegistry) -> Vec<Lint> {
         let mut lints = self.lint();
-        let tools: std::collections::BTreeMap<String, crate::tools::ToolSecurity> =
-            registry.security_catalog().into_iter().collect();
-        for (tool, security) in tools {
-            let action = security.action.as_str();
-            if !self
-                .rules
+        let engine = self.to_engine();
+        let tools: std::collections::BTreeMap<String, crate::tools::ToolBinding> =
+            registry.binding_catalog().into_iter().collect();
+        for (tool, binding) in tools {
+            let action = binding.security.action.as_str();
+            let resource_label = canonical_resource_label(&binding.resource_type);
+            let resource = representative_resource(&binding);
+            let uncovered_profiles: Vec<&str> = SUPPORTED_POLICY_PROFILES
                 .iter()
-                .any(|rule| rule.action == action || rule.action == "*")
-            {
+                .copied()
+                .filter(|profile| {
+                    // Check both the current unlabeled-resource behavior and the
+                    // canonical type label. A synthetic terminal rule does not
+                    // count: coverage means an authored rule explicitly handles
+                    // this profile/action/resource class.
+                    ["unconfined", resource_label]
+                        .into_iter()
+                        .all(|object_label| {
+                            !engine
+                                .evaluate(profile, action, object_label, &resource)
+                                .1
+                                .is_some_and(|index| index < self.rules.len())
+                        })
+                })
+                .collect();
+            if !uncovered_profiles.is_empty() {
                 lints.push(Lint {
                     rule_index: None,
                     message: format!(
-                        "tool '{tool}' action '{action}' is uncovered and falls directly to default {:?}",
-                        self.default
+                        "tool '{tool}' action '{action}' resource class '{resource_label}' is uncovered for supported profiles [{}] and falls directly to default {:?}",
+                        uncovered_profiles.join(", "),
+                        self.default,
                     ),
                 });
             }
@@ -307,6 +408,71 @@ impl PolicyDocument {
     }
 }
 
+fn selector_covers(earlier: &str, later: &str) -> bool {
+    earlier == "*" || earlier == later
+}
+
+fn canonical_resource_label(resource_type: &crate::resources::ResourceType) -> &'static str {
+    use crate::resources::ResourceType;
+    match resource_type {
+        ResourceType::Filesystem => "filesystem",
+        ResourceType::Network => "network",
+        ResourceType::Application => "application",
+        ResourceType::Browser => "browser",
+        ResourceType::Peripheral => "peripheral",
+        ResourceType::Ipc => "ipc",
+    }
+}
+
+fn representative_resource(binding: &crate::tools::ToolBinding) -> String {
+    if let crate::tools::ResourceExtractor::Constant(resource) =
+        &binding.security.resource_extractor
+    {
+        return resource.clone();
+    }
+    use crate::resources::ResourceType;
+    match &binding.resource_type {
+        ResourceType::Filesystem => "/__agentos_policy_probe__".to_string(),
+        ResourceType::Network | ResourceType::Browser => {
+            "https://policy-probe.invalid/".to_string()
+        }
+        ResourceType::Application => "__agentos_policy_probe_command__".to_string(),
+        ResourceType::Peripheral => "__agentos_policy_probe_device__".to_string(),
+        ResourceType::Ipc => "__agentos_policy_probe_agent__".to_string(),
+    }
+}
+
+fn object_selector_covers(earlier: &str, later: &str) -> bool {
+    // `*` is the MAC engine's object-label catch-all and also matches every
+    // single-segment raw resource. `**` is the raw-resource universal glob.
+    // Equal patterns trivially cover one another.
+    if earlier == "*" || earlier == "**" || earlier == later {
+        return true;
+    }
+    // If the later selector is a literal, it can match only that exact label or
+    // resource. Ask the real MAC matcher whether the earlier glob matches that
+    // literal, avoiding a second policy-matching implementation here. Two
+    // different glob languages still require a containment proof and are left
+    // unclassified.
+    if later.contains('*') || later.contains('?') {
+        return false;
+    }
+    let mut engine = MacEngine::new(true);
+    engine.load_policy(vec![PolicyRule {
+        subject: "*".to_string(),
+        action: "*".to_string(),
+        object: earlier.to_string(),
+        decision: "allow".to_string(),
+    }]);
+    engine.evaluate("*", "*", later, later).1.is_some()
+}
+
+fn rule_selector_covers(earlier: &Rule, later: &Rule) -> bool {
+    selector_covers(&earlier.subject, &later.subject)
+        && selector_covers(&earlier.action, &later.action)
+        && object_selector_covers(&earlier.object, &later.object)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -335,7 +501,7 @@ decision = "deny"
 [[rule]]
 name = "audit-exec"
 subject = "*"
-action = "execute"
+action = "exec"
 object = "*"
 decision = "audit"
 "#;
@@ -371,15 +537,71 @@ decision = "alow"
     }
 
     #[test]
+    fn rejects_noncanonical_action_labels() {
+        let error = PolicyDocument::from_toml(
+            r#"
+default = "deny"
+[[rule]]
+subject = "*"
+action = "execute"
+object = "*"
+decision = "allow"
+"#,
+        )
+        .unwrap_err();
+        assert!(error.contains("unknown action label 'execute'"), "{error}");
+        assert!(error.contains("`exec`, not `execute`"), "{error}");
+        assert!(canonical_action_labels().contains(&"exec"));
+        assert!(!canonical_action_labels().contains(&"execute"));
+    }
+
+    #[test]
     fn rejects_unsupported_version() {
         let bad = "version = 99\ndefault = \"deny\"";
         assert!(PolicyDocument::from_toml(bad).is_err());
     }
 
     #[test]
+    fn rejects_unknown_document_and_rule_fields() {
+        let unknown_document = "default = \"deny\"\nenforcng = true\n";
+        assert!(PolicyDocument::from_toml(unknown_document)
+            .unwrap_err()
+            .contains("unknown field"));
+
+        let unknown_rule = r#"
+default = "deny"
+[[rule]]
+subject = "*"
+action = "read"
+object = "*"
+decision = "allow"
+sandox = true
+"#;
+        assert!(PolicyDocument::from_toml(unknown_rule)
+            .unwrap_err()
+            .contains("unknown field"));
+    }
+
+    #[test]
     fn missing_terminal_default_is_rejected() {
         let error = PolicyDocument::from_toml("").unwrap_err();
         assert!(error.contains("explicit terminal"));
+    }
+
+    #[test]
+    fn whitespace_only_rule_selectors_are_rejected() {
+        let error = PolicyDocument::from_toml(
+            r#"
+default = "deny"
+[[rule]]
+subject = " "
+action = "read"
+object = "*"
+decision = "allow"
+"#,
+        )
+        .unwrap_err();
+        assert!(error.contains("empty subject/action/object"));
     }
 
     #[test]
@@ -420,6 +642,89 @@ decision = "deny"
     }
 
     #[test]
+    fn lint_flags_partially_shadowed_rules() {
+        let doc = PolicyDocument::from_toml(
+            r#"
+default = "deny"
+[[rule]]
+subject = "*"
+action = "write"
+object = "*"
+decision = "deny"
+
+[[rule]]
+subject = "profile:standard"
+action = "write"
+object = "/tmp/**"
+decision = "allow"
+"#,
+        )
+        .unwrap();
+        assert!(doc.lint().iter().any(|lint| {
+            lint.rule_index == Some(1)
+                && lint.message.contains("unreachable")
+                && lint.message.contains("rule #0")
+        }));
+    }
+
+    #[test]
+    fn lint_uses_runtime_glob_semantics_to_find_shadowed_literal_resources() {
+        let doc = PolicyDocument::from_toml(
+            r#"
+default = "deny"
+[[rule]]
+subject = "*"
+action = "write"
+object = "/etc/**"
+decision = "deny"
+
+[[rule]]
+subject = "profile:standard"
+action = "write"
+object = "/etc/ssl/key"
+decision = "allow"
+"#,
+        )
+        .unwrap();
+        assert!(doc.lint().iter().any(|lint| {
+            lint.rule_index == Some(1)
+                && lint.message.contains("unreachable")
+                && lint.message.contains("rule #0")
+        }));
+    }
+
+    #[test]
+    fn lint_flags_subject_scoped_all_action_grant_as_overbroad() {
+        let doc = PolicyDocument::from_toml(
+            r#"
+default = "deny"
+[[rule]]
+subject = "profile:full-access"
+action = "*"
+object = "*"
+decision = "allow"
+"#,
+        )
+        .unwrap();
+        assert!(doc
+            .lint()
+            .iter()
+            .any(|lint| lint.message.contains("overbroad wildcard")));
+    }
+
+    #[test]
+    fn lint_makes_permissive_and_non_deny_terminal_modes_noisy() {
+        let doc = PolicyDocument::from_toml("enforcing = false\ndefault = \"audit\"").unwrap();
+        let lints = doc.lint();
+        assert!(lints
+            .iter()
+            .any(|lint| lint.message.contains("policy is permissive")));
+        assert!(lints
+            .iter()
+            .any(|lint| lint.message.contains("terminal default is Audit")));
+    }
+
+    #[test]
     fn clean_policy_has_no_lints() {
         let doc = PolicyDocument::from_toml(SAMPLE).unwrap();
         assert!(doc.lint().is_empty());
@@ -432,12 +737,13 @@ decision = "deny"
         )
         .unwrap();
         let lints = doc.lint_with_tool_catalog();
+        assert!(lints.iter().any(
+            |lint| lint.message.contains("action 'net'") && lint.message.contains("uncovered")
+        ));
         assert!(lints
             .iter()
-            .any(|lint| lint.message.contains("action 'net' is uncovered")));
-        assert!(lints
-            .iter()
-            .any(|lint| lint.message.contains("action 'delete' is uncovered")));
+            .any(|lint| lint.message.contains("action 'delete'")
+                && lint.message.contains("uncovered")));
     }
 
     #[test]
@@ -472,30 +778,97 @@ decision = "deny"
         assert!(doc
             .lint_with_tool_registry(&registry)
             .iter()
-            .any(|lint| lint
-                .message
-                .contains("tool 'dynamic_browser' action 'browser' is uncovered")));
+            .any(|lint| lint.message.contains("tool 'dynamic_browser'")
+                && lint.message.contains("action 'browser'")
+                && lint.message.contains("resource class 'browser'")
+                && lint.message.contains("uncovered")));
     }
 
     #[test]
-    fn every_registered_default_tool_has_policy_coverage() {
+    fn every_registered_default_tool_has_non_vacuous_policy_coverage() {
         let registry = crate::tools::ToolRegistry::new();
-        let doc = PolicyDocument::from_toml(
-            r#"
-default = "deny"
-[[rule]]
-subject = "profile:full-access"
-action = "*"
-object = "*"
-decision = "allow"
-"#,
-        )
-        .unwrap();
+        registry.register_advanced_tools();
+        registry.register_git_tools();
+        registry.register_ipc_tools();
+        crate::editing::register_edit_tools(&registry);
+        let bindings = registry.binding_catalog();
+        let pairs: std::collections::BTreeSet<(String, String)> = bindings
+            .values()
+            .map(|binding| {
+                (
+                    binding.security.action.as_str().to_string(),
+                    canonical_resource_label(&binding.resource_type).to_string(),
+                )
+            })
+            .collect();
+        let doc = PolicyDocument {
+            version: 1,
+            description: Some("explicit action/resource coverage fixture".into()),
+            enforcing: true,
+            default: Decision::Deny,
+            rules: pairs
+                .into_iter()
+                .map(|(action, object)| Rule {
+                    name: Some(format!("{action}-{object}")),
+                    description: None,
+                    subject: "*".into(),
+                    action,
+                    object,
+                    decision: Decision::Deny,
+                })
+                .collect(),
+        };
+        doc.validate().unwrap();
+        assert!(
+            doc.rules.len() > 3,
+            "fixture must exercise multiple classes"
+        );
+        assert!(doc
+            .rules
+            .iter()
+            .all(|rule| rule.action != "*" && rule.object != "*"));
         let lints = doc.lint_with_tool_registry(&registry);
         assert!(
             !lints.iter().any(|lint| lint.message.contains("uncovered")),
             "all registered tools should be covered: {lints:?}"
         );
+
+        // Prove the test is sensitive to subject and resource coverage, not just
+        // action-string coincidence.
+        let read_file = bindings.get("read_file").expect("built-in read_file");
+        let mut broken = doc.clone();
+        let rule = broken
+            .rules
+            .iter_mut()
+            .find(|rule| {
+                rule.action == read_file.security.action.as_str()
+                    && rule.object == canonical_resource_label(&read_file.resource_type)
+            })
+            .expect("read/filesystem coverage rule");
+        rule.subject = "profile:not-supported".into();
+        let broken_lints = broken.lint_with_tool_registry(&registry);
+        assert!(broken_lints.iter().any(|lint| {
+            lint.message.contains("tool 'read_file'")
+                && lint.message.contains("resource class 'filesystem'")
+                && lint.message.contains("profile:read-only")
+        }));
+
+        let mut wrong_resource = doc.clone();
+        let rule = wrong_resource
+            .rules
+            .iter_mut()
+            .find(|rule| {
+                rule.action == read_file.security.action.as_str()
+                    && rule.object == canonical_resource_label(&read_file.resource_type)
+            })
+            .expect("read/filesystem coverage rule");
+        rule.object = "network".into();
+        assert!(wrong_resource
+            .lint_with_tool_registry(&registry)
+            .iter()
+            .any(|lint| lint.message.contains("tool 'read_file'")
+                && lint.message.contains("resource class 'filesystem'")
+                && lint.message.contains("uncovered")));
     }
 
     #[test]
@@ -544,8 +917,8 @@ decision = "deny"
         assert_eq!(e.decision, MacDecision::Deny);
         assert_eq!(e.matched_rule, Some(1));
 
-        // execute => audit rule.
-        let e = doc.explain("profile:standard", "execute", "/bin/ls");
+        // exec => audit rule.
+        let e = doc.explain("profile:standard", "exec", "/bin/ls");
         assert_eq!(e.decision, MacDecision::Audit);
         assert_eq!(e.matched_rule, Some(2));
 

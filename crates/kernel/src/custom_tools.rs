@@ -75,21 +75,21 @@ pub fn load_custom_tools(registry: &mut ToolRegistry, path: &Path) {
             "required": required,
         });
 
-        let registered = registry.register(ToolBinding {
-            name: tool.name.clone(),
-            description: tool.description,
-            parameters_schema: schema,
-            resource_type: ResourceType::Application,
-            operation: "launch".into(),
-            security: tool.security,
-        });
+        let registered = registry.register_command_tool(
+            ToolBinding {
+                name: tool.name.clone(),
+                description: tool.description,
+                parameters_schema: schema,
+                resource_type: ResourceType::Application,
+                operation: "launch".into(),
+                security: tool.security,
+            },
+            &tool.command,
+            &tool.args_template,
+        );
 
         match registered {
-            Ok(()) => {
-                // Store the command template only after its security contract
-                // was accepted; otherwise no executable residue is retained.
-                registry.register_command_template(&tool.name, &tool.command, &tool.args_template);
-            }
+            Ok(()) => {}
             Err(error) => tracing::warn!(tool = %tool.name, %error, "custom tool rejected"),
         }
     }
@@ -156,5 +156,79 @@ input = { type = "string", required = true }
         let mut registry = ToolRegistry::new();
         load_custom_tools(&mut registry, &config.0);
         assert!(!registry.has_tool("confused_deputy"));
+    }
+
+    #[test]
+    fn empty_command_leaves_no_advertised_tool_binding() {
+        let config = write_config(
+            r#"
+[[tool]]
+name = "empty_command"
+description = "must remain unavailable"
+command = " "
+
+[tool.security]
+action = "execute"
+required_capabilities = [64]
+namespace_visibility = "global"
+approval_policy = "user"
+sandbox_requirement = "required"
+[tool.security.resource_extractor]
+kind = "constant"
+value = "command:empty"
+"#,
+        );
+        let mut registry = ToolRegistry::new();
+        load_custom_tools(&mut registry, &config.0);
+        assert!(!registry.has_tool("empty_command"));
+        assert!(registry
+            .definitions()
+            .iter()
+            .all(|definition| definition.name != "empty_command"));
+    }
+
+    #[test]
+    fn command_security_must_name_the_exact_immutable_executable() {
+        let config = write_config(
+            r#"
+[[tool]]
+name = "exact_command"
+description = "exact fixed executable"
+command = "echo"
+args_template = ["{input}"]
+
+[tool.security]
+action = "execute"
+required_capabilities = [64]
+namespace_visibility = "global"
+approval_policy = "none"
+sandbox_requirement = "required"
+[tool.security.resource_extractor]
+kind = "constant"
+value = "echo"
+
+[tool.parameters]
+input = { type = "string", required = true }
+
+[[tool]]
+name = "decoy_command"
+description = "MAC checks a decoy executable"
+command = "echo"
+
+[tool.security]
+action = "execute"
+required_capabilities = [64]
+namespace_visibility = "global"
+approval_policy = "none"
+sandbox_requirement = "required"
+[tool.security.resource_extractor]
+kind = "constant"
+value = "harmless-decoy"
+"#,
+        );
+        let mut registry = ToolRegistry::new();
+        load_custom_tools(&mut registry, &config.0);
+        assert!(registry.has_tool("exact_command"));
+        assert!(!registry.has_tool("decoy_command"));
     }
 }

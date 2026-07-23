@@ -68,13 +68,14 @@ owner = "security"
 maturity = "public-api-e2e"
 release = "v0.4"
 tracking_issue = 108
+qualification_issue = 127
 kernel_modules = ["custom_tools", "mac", "policy", "syscall_gate"]
-source_paths = ["crates/kernel/src/tools.rs", "crates/kernel/src/syscall_gate.rs", "crates/kernel/src/execution.rs"]
+source_paths = ["crates/kernel/src/config.rs", "crates/kernel/src/tools.rs", "crates/kernel/src/policy.rs", "crates/kernel/src/mcp.rs", "crates/kernel/src/syscall_gate.rs", "crates/kernel/src/execution.rs", "docs/POLICY.md", "docs/THREAT_MODEL.md"]
 public_entry_points = ["crates/kernel/src/syscall_server.rs::CallTool", "crates/kernel/src/mcp_server.rs::handle_tools_call", "crates/sdk/src/lib.rs::KernelClient::call_tool"]
 runtime_call_paths = ["crates/kernel/src/tools.rs::ToolRegistry::authorize_and_acquire_call", "crates/kernel/src/syscall_gate.rs::SyscallGate::authorize_and_acquire_tool_call_declared", "crates/kernel/src/resources.rs::ResourceBrokerImpl::execute (ToolCallGuard held)"]
-test_evidence = ["crates/kernel/src/tools.rs", "crates/kernel/src/custom_tools.rs", "crates/kernel/src/mcp.rs", "crates/kernel/src/syscall_gate.rs", "tests/src/gate_adversarial_props.rs", "tests/src/os_enforcement.rs"]
+test_evidence = ["crates/kernel/src/config.rs", "crates/kernel/src/tools.rs", "crates/kernel/src/policy.rs", "crates/kernel/src/custom_tools.rs", "crates/kernel/src/mcp.rs", "crates/kernel/src/syscall_gate.rs", "tests/src/gate_adversarial_props.rs", "tests/src/os_enforcement.rs", "tests/src/policy_props.rs"]
 platforms = ["linux", "macos", "windows"]
-limitations = ["Declarations and public call paths fail closed, but production qualification still requires independent security review, cross-platform release evidence, approval UX, and the host-isolation work tracked by #111 and #127."]
+limitations = ["Declarations, policy validation, model-visible non-secret summaries, and public call paths fail closed, but production qualification still requires independent security review, cross-platform release evidence, approval UX, and the host-isolation work tracked by #111, #119, #124, and #127."]
 
 [[capability]]
 id = "resource-accounting"
@@ -119,7 +120,7 @@ public_entry_points = ["crates/kernel/src/lib.rs::SandboxConfig"]
 runtime_call_paths = ["crates/kernel/src/resources.rs::ResourceBrokerImpl::execute", "crates/kernel/src/lib.rs::AgentKernelImpl::create_agent_full"]
 test_evidence = ["tests/src/sandbox_props.rs", "tests/src/e2e_pipeline.rs"]
 platforms = ["linux", "macos", "windows"]
-limitations = ["Sandbox policy is mandatory at the live ResourceBroker boundary and fails closed, but complete cross-platform host/container isolation, DNS rebinding defense, and independent security qualification remain outstanding."]
+limitations = ["Sandbox policy is mandatory at the live ResourceBroker boundary and fails closed. Filesystem request aliases are normalized before MAC, approval, and proof creation, and built-in HTTP providers do not follow redirects; no-follow/dirfd confinement, symlink-swap resistance, complete cross-platform host/container isolation, DNS rebinding defense, and independent security qualification remain outstanding."]
 
 [[capability]]
 id = "agent-lifecycle"
@@ -315,7 +316,7 @@ public_entry_points = ["crates/kernel/src/syscall_server.rs::CallTool"]
 runtime_call_paths = ["crates/kernel/src/lib.rs::BuiltinFilesystemProvider"]
 test_evidence = ["tests/src/os_enforcement.rs", "tests/src/edge_cases.rs"]
 platforms = ["linux", "macos", "windows"]
-limitations = ["Provider isolation and platform support vary; browser is feature-gated and peripheral/computer-use behavior is incomplete or placeholder-only."]
+limitations = ["Provider isolation and platform support vary; browser is feature-gated and peripheral/computer-use behavior is incomplete or placeholder-only. Generic timeout cancellation does not yet prove that every provider side effect has stopped before lifecycle and credential guards drain; that completion contract remains tracked by #124."]
 
 [[capability]]
 id = "production-operations"

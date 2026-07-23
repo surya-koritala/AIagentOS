@@ -8,6 +8,7 @@
 //! planner test proves the plan→execute control flow runs a mix of turns and
 //! direct tool calls in order.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use agent_sdk::patterns::{
@@ -16,9 +17,18 @@ use agent_sdk::patterns::{
 use agent_sdk::{Agent, KernelClient};
 
 use adapters::azure_openai::AzureOpenAiAdapter;
+use kernel::agent_package::{load_package_for_tenant, AgentManifest};
+use kernel::auth::Role;
+use kernel::connector::{
+    LlmResponse, LlmSession, LlmUsage, StandardMessage, ToolCall, ToolDefinition,
+};
+use kernel::execution::AgentExecutor;
+use kernel::mcp_server::{McpClient, McpServer};
 use kernel::resources::{ResourceBroker, ResourceProvider, ResourceType};
-use kernel::syscall_server::SyscallServer;
-use kernel::{AgentKernelImpl, ResourceError};
+use kernel::syscall_server::{Syscall, SyscallClient, SyscallReply, SyscallServer};
+use kernel::tool_registry_share::{SharedToolDef, SharedToolRegistry};
+use kernel::tools::{SecurityAction, ToolSecurity};
+use kernel::{AgentId, AgentKernelImpl, ConnectorError, ProviderId, ResourceError};
 
 use wiremock::matchers::{method, path_regex};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -46,6 +56,72 @@ impl ResourceProvider for FakeFs {
             "read" => Ok(serde_json::json!({ "content": self.content })),
             _ => Ok(serde_json::json!({})),
         }
+    }
+}
+
+/// Deterministic two-response LLM session: request one declared tool, then stop.
+///
+/// The executor intentionally surfaces an authorization denial as a tool
+/// result so the model can recover. Inspecting that tool result lets the parity
+/// regression compare the executor verdict with the wire/MCP/SDK verdicts.
+struct OneToolSession {
+    calls: AtomicUsize,
+    provider: ProviderId,
+    tool: String,
+    args: serde_json::Value,
+}
+
+impl OneToolSession {
+    fn new(tool: &str, args: serde_json::Value) -> Self {
+        Self {
+            calls: AtomicUsize::new(0),
+            provider: "parity-fixture".into(),
+            tool: tool.to_string(),
+            args,
+        }
+    }
+
+    fn next_response(&self) -> LlmResponse {
+        if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            LlmResponse {
+                content: String::new(),
+                finish_reason: Some("tool_calls".into()),
+                tokens_used: 1,
+                usage: LlmUsage::reported(0, 1, 0),
+                tool_calls: vec![ToolCall {
+                    id: "parity-call".into(),
+                    name: self.tool.clone(),
+                    arguments: self.args.clone(),
+                }],
+            }
+        } else {
+            LlmResponse {
+                content: "done".into(),
+                finish_reason: Some("stop".into()),
+                tokens_used: 1,
+                usage: LlmUsage::reported(0, 1, 0),
+                tool_calls: Vec::new(),
+            }
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl LlmSession for OneToolSession {
+    async fn send(&self, _messages: Vec<StandardMessage>) -> Result<LlmResponse, ConnectorError> {
+        Ok(self.next_response())
+    }
+
+    async fn send_with_tools(
+        &self,
+        _messages: Vec<StandardMessage>,
+        _tools: &[ToolDefinition],
+    ) -> Result<LlmResponse, ConnectorError> {
+        Ok(self.next_response())
+    }
+
+    fn provider_id(&self) -> &ProviderId {
+        &self.provider
     }
 }
 
@@ -320,6 +396,267 @@ async fn planner_executor_propagates_gate_denial_e2e() {
         }
         other => panic!("expected Kernel denial, got {other:?}"),
     }
+}
+
+async fn executor_path_allows(
+    kernel: &AgentKernelImpl,
+    agent_id: AgentId,
+    tool: &str,
+    args: &serde_json::Value,
+) -> bool {
+    let mut executor = AgentExecutor::new(
+        agent_id,
+        Box::new(OneToolSession::new(tool, args.clone())),
+        kernel.resource_broker.clone(),
+        kernel.tool_registry.clone(),
+        kernel.context_manager.clone(),
+        kernel.syscall_gate.clone(),
+        "exercise the declared package tool once".into(),
+    );
+    executor
+        .run("run parity fixture")
+        .await
+        .expect("executor run");
+    let result = executor
+        .messages()
+        .iter()
+        .find(|message| message.role == "tool")
+        .expect("executor must record a tool result")
+        .content
+        .as_str();
+    if result.contains("denied by kernel") {
+        return false;
+    }
+    assert!(
+        !result.contains("Unknown tool")
+            && !result.contains(" failed:")
+            && !result.contains(" error:"),
+        "authorization passed but the fixture tool did not execute: {result}"
+    );
+    true
+}
+
+async fn syscall_wire_path_allows(
+    client: &mut SyscallClient,
+    agent_id: AgentId,
+    tool: &str,
+    args: &serde_json::Value,
+) -> bool {
+    match client
+        .call(Syscall::CallTool {
+            agent_id: agent_id.to_string(),
+            tool: tool.to_string(),
+            args: args.clone(),
+        })
+        .await
+        .expect("wire call")
+    {
+        SyscallReply::ToolResult { .. } => true,
+        SyscallReply::Error { message } if message.contains("denied by kernel") => false,
+        other => panic!("unexpected raw CallTool verdict: {other:?}"),
+    }
+}
+
+async fn mcp_path_allows(client: &mut McpClient, tool: &str, args: &serde_json::Value) -> bool {
+    let response = client
+        .request(
+            "tools/call",
+            Some(serde_json::json!({
+                "name": tool,
+                "arguments": args,
+            })),
+        )
+        .await
+        .expect("MCP call");
+    match (response.result, response.error) {
+        (Some(_), None) => true,
+        (None, Some(error)) if error.message.contains("denied by kernel") => false,
+        other => panic!("unexpected MCP tools/call verdict: {other:?}"),
+    }
+}
+
+async fn sdk_pattern_path_allows(
+    addr: std::net::SocketAddr,
+    profile: &str,
+    tool: &str,
+    args: &serde_json::Value,
+) -> bool {
+    let mut agent = Agent::builder()
+        .name(format!("sdk-parity-{profile}"))
+        .task("exercise the declared package tool once")
+        .profile(profile)
+        .connect(addr)
+        .await
+        .expect("SDK agent");
+    let tool = tool.to_string();
+    let args = args.clone();
+    let planner = FnPlanner(move |_: &str| {
+        vec![Step::Tool {
+            tool: tool.clone(),
+            args: args.clone(),
+        }]
+    });
+    match PlannerExecutor::new(planner)
+        .run(&mut agent, "run parity fixture")
+        .await
+    {
+        Ok(run) => {
+            assert!(
+                matches!(run.results.as_slice(), [StepResult::Tool { .. }]),
+                "SDK planner must execute exactly one tool step"
+            );
+            true
+        }
+        Err(agent_sdk::SdkError::Kernel(message)) if message.contains("denied by kernel") => false,
+        Err(other) => panic!("unexpected SDK planner verdict: {other:?}"),
+    }
+}
+
+/// One declaration must produce the same allow/deny decision through every
+/// public execution surface. The binding is published as shared package data,
+/// resolved from each package manifest, installed into the live registry, and
+/// then exercised by package-loaded agents through executor, raw CallTool, MCP,
+/// and the SDK planner pattern.
+#[tokio::test]
+async fn package_tool_security_decisions_are_identical_across_public_paths() {
+    const TOOL: &str = "package_write_note";
+    let args = serde_json::json!({"path": "parity.txt", "content": "same contract"});
+
+    let kernel = Arc::new(AgentKernelImpl::new().expect("kernel new"));
+    kernel.resource_broker.register_provider(Box::new(FakeFs {
+        content: "unused".into(),
+    }));
+
+    let mut shared = SharedToolRegistry::new();
+    shared
+        .publish(
+            SharedToolDef::new(
+                TOOL,
+                "Write a note supplied by an installed agent package",
+                ResourceType::Filesystem,
+                "write",
+                ToolSecurity::argument(SecurityAction::Write, "path").sandboxed(),
+            )
+            .with_parameters(serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "content": {"type": "string"}
+                },
+                "required": ["path", "content"]
+            })),
+        )
+        .expect("publish complete package tool declaration");
+
+    let package_source = |name: &str, profile: &str| {
+        AgentManifest::from_toml_str(&format!(
+            "name = \"{name}\"\ntask = \"parity\"\nprofile = \"{profile}\"\ntools = [\"{TOOL}\"]\n"
+        ))
+        .expect("package manifest")
+    };
+    let denied_manifest = package_source("package-parity-denied", "read-only");
+    let allowed_manifest = package_source("package-parity-allowed", "standard");
+
+    let resolved = denied_manifest
+        .resolve_tools(&shared)
+        .expect("package tool resolution");
+    assert_eq!(resolved.len(), 1);
+    kernel
+        .tool_registry
+        .register(resolved[0].to_binding())
+        .expect("install package-resolved binding");
+    assert_eq!(
+        allowed_manifest.resolve_tools(&shared).expect("resolution"),
+        resolved,
+        "both packages must resolve the exact same security declaration"
+    );
+
+    let tenant = kernel
+        .create_tenant("parity-owner")
+        .await
+        .expect("create parity tenant");
+    let user = kernel
+        .register_user(&tenant, "parity-user", "parity@example.test", Role::User)
+        .await
+        .expect("create parity user");
+    let token = kernel.open_session(&user).await.expect("open MCP session");
+    let denied_agent = load_package_for_tenant(&kernel, &tenant, &denied_manifest)
+        .await
+        .expect("load denied package");
+    let allowed_agent = load_package_for_tenant(&kernel, &tenant, &allowed_manifest)
+        .await
+        .expect("load allowed package");
+
+    let syscall_server = SyscallServer::bind(kernel.clone(), "127.0.0.1:0")
+        .await
+        .expect("bind syscall server");
+    let syscall_addr = syscall_server.local_addr().expect("syscall address");
+    tokio::spawn(syscall_server.serve());
+    let mut syscall_client = SyscallClient::connect(syscall_addr)
+        .await
+        .expect("raw syscall client");
+
+    let mcp_server = McpServer::bind(kernel.clone(), "127.0.0.1:0")
+        .await
+        .expect("bind MCP server");
+    let mcp_addr = mcp_server.local_addr().expect("MCP address");
+    tokio::spawn(mcp_server.serve());
+    let mut denied_mcp_client = McpClient::connect(mcp_addr)
+        .await
+        .expect("denied MCP client");
+    let denied_auth = denied_mcp_client
+        .authenticate(token.clone(), denied_agent.id)
+        .await
+        .expect("authenticate denied-profile MCP client");
+    assert!(
+        denied_auth.error.is_none(),
+        "MCP authentication failed: {:?}",
+        denied_auth.error
+    );
+    let mut allowed_mcp_client = McpClient::connect(mcp_addr)
+        .await
+        .expect("allowed MCP client");
+    let allowed_auth = allowed_mcp_client
+        .authenticate(token, allowed_agent.id)
+        .await
+        .expect("authenticate standard-profile MCP client");
+    assert!(
+        allowed_auth.error.is_none(),
+        "MCP authentication failed: {:?}",
+        allowed_auth.error
+    );
+
+    let denied = [
+        executor_path_allows(&kernel, denied_agent.id, TOOL, &args).await,
+        syscall_wire_path_allows(&mut syscall_client, denied_agent.id, TOOL, &args).await,
+        mcp_path_allows(&mut denied_mcp_client, TOOL, &args).await,
+        sdk_pattern_path_allows(syscall_addr, "read-only", TOOL, &args).await,
+    ];
+    assert_eq!(
+        denied, [false; 4],
+        "read-only must receive the same declaration-backed denial everywhere"
+    );
+
+    let allowed = [
+        executor_path_allows(&kernel, allowed_agent.id, TOOL, &args).await,
+        syscall_wire_path_allows(&mut syscall_client, allowed_agent.id, TOOL, &args).await,
+        mcp_path_allows(&mut allowed_mcp_client, TOOL, &args).await,
+        sdk_pattern_path_allows(syscall_addr, "standard", TOOL, &args).await,
+    ];
+    assert_eq!(
+        allowed, [true; 4],
+        "standard must receive the same declaration-backed allow everywhere"
+    );
+
+    let stats = kernel.syscall_gate.stats();
+    assert_eq!(
+        stats.denied_capability, 4,
+        "each denied public path must record the same missing-capability verdict"
+    );
+    assert_eq!(
+        stats.allowed, 4,
+        "each allowed public path must record one admitted execution"
+    );
 }
 
 /// Sanity: the low-level client the patterns build on still connects (keeps the

@@ -19,6 +19,22 @@ fn fresh_gate() -> (Arc<SyscallGate>, Arc<CgroupManager>) {
     (gate, cgroups)
 }
 
+async fn execute_kernel_tool(
+    kernel: &kernel::AgentKernelImpl,
+    agent: uuid::Uuid,
+    name: &str,
+    arguments: serde_json::Value,
+) -> Result<kernel::resources::ResourceResponse, kernel::ResourceError> {
+    use kernel::resources::ResourceBroker;
+
+    let (prepared, _guard) = kernel
+        .tool_registry
+        .authorize_and_acquire_call(&kernel.syscall_gate, agent, name, &arguments)
+        .await
+        .map_err(|error| kernel::ResourceError::OperationFailed(error.to_string()))?;
+    kernel.resource_broker.execute(prepared.request).await
+}
+
 /// Capability layer: an agent with no CAP_NET_ACCESS is denied a network tool.
 #[tokio::test]
 async fn capability_denies_network_tool_without_cap_net() {
@@ -91,26 +107,24 @@ async fn mac_policy_denies_labelled_agent() {
     let kid = uuid::Uuid::new_v4();
     let pid = gate.register_agent(kid, CapabilitySet::all(), None);
 
-    {
-        let mut mac = gate.mac.lock().await;
-        mac.set_enforcing(true);
-        mac.label_agent(pid, "untrusted".into());
-        // Deny writes; allow everything else.
-        mac.load_policy(vec![
-            PolicyRule {
-                subject: "untrusted".into(),
-                action: "write".into(),
-                object: "*".into(),
-                decision: "deny".into(),
-            },
-            PolicyRule {
-                subject: "untrusted".into(),
-                action: "*".into(),
-                object: "*".into(),
-                decision: "allow".into(),
-            },
-        ]);
-    }
+    gate.set_mac_enforcing(true).await;
+    gate.label_mac_agent(pid, "untrusted".into()).await;
+    // Deny writes; allow everything else.
+    gate.load_mac_policy(vec![
+        PolicyRule {
+            subject: "untrusted".into(),
+            action: "write".into(),
+            object: "*".into(),
+            decision: "deny".into(),
+        },
+        PolicyRule {
+            subject: "untrusted".into(),
+            action: "*".into(),
+            object: "*".into(),
+            decision: "allow".into(),
+        },
+    ])
+    .await;
 
     let result = gate
         .check_tool_call(kid, "write_file", "/tmp/secret", 5)
@@ -150,25 +164,23 @@ async fn enforcement_stacks_capability_mac_and_cgroup_concurrency() {
     // Agent B: has all caps but MAC denies writes.
     let b = uuid::Uuid::new_v4();
     let pid_b = gate.register_agent(b, CapabilitySet::all(), Some(cg));
-    {
-        let mut mac = gate.mac.lock().await;
-        mac.set_enforcing(true);
-        mac.label_agent(pid_b, "ro".into());
-        mac.load_policy(vec![
-            PolicyRule {
-                subject: "ro".into(),
-                action: "write".into(),
-                object: "*".into(),
-                decision: "deny".into(),
-            },
-            PolicyRule {
-                subject: "*".into(),
-                action: "*".into(),
-                object: "*".into(),
-                decision: "allow".into(),
-            },
-        ]);
-    }
+    gate.set_mac_enforcing(true).await;
+    gate.label_mac_agent(pid_b, "ro".into()).await;
+    gate.load_mac_policy(vec![
+        PolicyRule {
+            subject: "ro".into(),
+            action: "write".into(),
+            object: "*".into(),
+            decision: "deny".into(),
+        },
+        PolicyRule {
+            subject: "*".into(),
+            action: "*".into(),
+            object: "*".into(),
+            decision: "allow".into(),
+        },
+    ])
+    .await;
     let r = gate.check_tool_call(b, "write_file", "/tmp/y", 5).await;
     assert!(matches!(r, Err(GateDenial::MacDeny { .. })));
 
@@ -176,11 +188,8 @@ async fn enforcement_stacks_capability_mac_and_cgroup_concurrency() {
     // already held.
     let c = uuid::Uuid::new_v4();
     let pid_c = gate.register_agent(c, CapabilitySet::all(), Some(cg));
-    {
-        let mut mac = gate.mac.lock().await;
-        mac.label_agent(pid_c, "ok".into());
-        // Existing rules already include subject "*" allow which matches "ok".
-    }
+    gate.label_mac_agent(pid_c, "ok".into()).await;
+    // Existing rules already include subject "*" allow which matches "ok".
     let first_slot = gate.acquire_tool_call(c).unwrap();
     let r = gate.acquire_tool_call(c);
     assert!(matches!(r, Err(GateDenial::CgroupToolLimit)));
@@ -336,17 +345,15 @@ async fn namespace_denial_precedes_capability_and_mac() {
     // namespace — namespace must fire first.
     let kid = uuid::Uuid::new_v4();
     let pid = gate.register_agent(kid, CapabilitySet::all(), None);
-    {
-        let mut mac = gate.mac.lock().await;
-        mac.set_enforcing(true);
-        mac.label_agent(pid, "trusted".into());
-        mac.load_policy(vec![PolicyRule {
-            subject: "*".into(),
-            action: "*".into(),
-            object: "*".into(),
-            decision: "allow".into(),
-        }]);
-    }
+    gate.set_mac_enforcing(true).await;
+    gate.label_mac_agent(pid, "trusted".into()).await;
+    gate.load_mac_policy(vec![PolicyRule {
+        subject: "*".into(),
+        action: "*".into(),
+        object: "*".into(),
+        decision: "allow".into(),
+    }])
+    .await;
     // Note: agent intentionally has no namespaces.
     let r = gate.check_tool_call(kid, "write_file", "/tmp/x", 5).await;
     match r {
@@ -605,7 +612,6 @@ async fn shutdown_dequeues_agents_from_cfs() {
 /// the transactional `edit` op actually rewrites a file through the broker.
 #[tokio::test]
 async fn live_path_extended_tools_edit_and_delete_capability() {
-    use kernel::resources::{ResourceBroker, ResourceRequest, ResourceType};
     use kernel::{AgentConfig, AgentKernelImpl};
 
     let kernel = AgentKernelImpl::new().expect("kernel new");
@@ -667,31 +673,34 @@ async fn live_path_extended_tools_edit_and_delete_capability() {
             kernel::tools::ApprovalPolicy::User,
         )
         .unwrap();
-    assert!(kernel
-        .syscall_gate
-        .check_tool_call(fa.id, "delete_file", "/x", 10)
+    let (_prepared, delete_slot) = kernel
+        .tool_registry
+        .authorize_and_acquire_call(
+            &kernel.syscall_gate,
+            fa.id,
+            "delete_file",
+            &serde_json::json!({"path": "/x"}),
+        )
         .await
-        .is_ok());
+        .expect("the exact approved delete declaration should be admitted");
+    drop(delete_slot);
 
     // #15: the edit op rewrites a real file via the transactional EditTransaction
     // engine, through the resource broker (full-access bypasses MAC approval).
     let file = dir.join("f.txt");
     std::fs::write(&file, "hello world").unwrap();
-    let resp = kernel
-        .resource_broker
-        .execute(ResourceRequest {
-            agent_id: fa.id,
-            resource_type: ResourceType::Filesystem,
-            operation: "edit".into(),
-            parameters: serde_json::json!({
-                "path": file.to_str().unwrap(),
-                "search": "world",
-                "replace": "rust"
-            }),
-            sandbox_context: None,
-        })
-        .await
-        .unwrap();
+    let resp = execute_kernel_tool(
+        &kernel,
+        fa.id,
+        "edit_file",
+        serde_json::json!({
+            "path": file.to_str().unwrap(),
+            "search": "world",
+            "replace": "rust"
+        }),
+    )
+    .await
+    .unwrap();
     assert!(resp.success, "edit op should succeed");
     assert_eq!(std::fs::read_to_string(&file).unwrap(), "hello rust");
     std::fs::remove_dir_all(&dir).ok();
@@ -744,10 +753,10 @@ async fn live_path_mac_denies_by_profile_label() {
     use kernel::AgentKernelImpl;
 
     let kernel = AgentKernelImpl::new().expect("kernel new");
-    {
-        let mut mac = kernel.syscall_gate.mac.lock().await;
-        mac.set_enforcing(true);
-        mac.load_policy(vec![
+    kernel.syscall_gate.set_mac_enforcing(true).await;
+    kernel
+        .syscall_gate
+        .load_mac_policy(vec![
             PolicyRule {
                 subject: "profile:standard".into(),
                 action: "write".into(),
@@ -760,8 +769,8 @@ async fn live_path_mac_denies_by_profile_label() {
                 object: "*".into(),
                 decision: "allow".into(),
             },
-        ]);
-    }
+        ])
+        .await;
 
     let agent = kernel
         .create_agent_full(agent_cfg("a", "standard"))
@@ -794,10 +803,10 @@ async fn live_path_mac_denies_by_path_glob() {
     use kernel::AgentKernelImpl;
 
     let kernel = AgentKernelImpl::new().expect("kernel new");
-    {
-        let mut mac = kernel.syscall_gate.mac.lock().await;
-        mac.set_enforcing(true);
-        mac.load_policy(vec![
+    kernel.syscall_gate.set_mac_enforcing(true).await;
+    kernel
+        .syscall_gate
+        .load_mac_policy(vec![
             PolicyRule {
                 subject: "*".into(),
                 action: "write".into(),
@@ -810,8 +819,8 @@ async fn live_path_mac_denies_by_path_glob() {
                 object: "*".into(),
                 decision: "allow".into(),
             },
-        ]);
-    }
+        ])
+        .await;
 
     let agent = kernel
         .create_agent_full(agent_cfg("a", "standard"))
@@ -855,10 +864,10 @@ async fn live_path_audit_decision_lands_in_activity_log() {
     use kernel::AgentKernelImpl;
 
     let kernel = AgentKernelImpl::new().expect("kernel new");
-    {
-        let mut mac = kernel.syscall_gate.mac.lock().await;
-        mac.set_enforcing(true);
-        mac.load_policy(vec![
+    kernel.syscall_gate.set_mac_enforcing(true).await;
+    kernel
+        .syscall_gate
+        .load_mac_policy(vec![
             // Audit (allow + log) every write by a standard-profile agent.
             PolicyRule {
                 subject: "profile:standard".into(),
@@ -879,8 +888,8 @@ async fn live_path_audit_decision_lands_in_activity_log() {
                 object: "*".into(),
                 decision: "allow".into(),
             },
-        ]);
-    }
+        ])
+        .await;
 
     let agent = kernel
         .create_agent_full(agent_cfg("a", "standard"))
@@ -967,8 +976,6 @@ async fn from_config_enables_mac_enforcement() {
 /// the gate's namespace isolation still governs cross-namespace sends).
 #[tokio::test]
 async fn live_path_agents_message_via_ipc_tools() {
-    use kernel::connector::ToolCall;
-    use kernel::resources::{ResourceBroker, ResourceType};
     use kernel::AgentKernelImpl;
 
     let kernel = AgentKernelImpl::new().expect("kernel new");
@@ -983,51 +990,31 @@ async fn live_path_agents_message_via_ipc_tools() {
     assert!(kernel.tool_registry.has_tool("send_agent_message"));
     assert!(kernel.tool_registry.has_tool("check_inbox"));
 
-    // A → B through the tool path (resolve → broker → IpcResourceProvider → IpcManager).
-    let req = kernel
-        .tool_registry
-        .resolve(
+    // A → B through the complete gate → broker → IPC provider path.
+    assert!(
+        execute_kernel_tool(
+            &kernel,
             a.id,
-            &ToolCall {
-                id: "1".into(),
-                name: "send_agent_message".into(),
-                arguments: serde_json::json!({"to": b.id.to_string(), "message": {"hi": "there"}}),
-            },
+            "send_agent_message",
+            serde_json::json!({"to": b.id.to_string(), "message": {"hi": "there"}}),
         )
-        .unwrap();
-    assert_eq!(req.resource_type, ResourceType::Ipc);
-    assert!(kernel.resource_broker.execute(req).await.unwrap().success);
+        .await
+        .unwrap()
+        .success
+    );
 
     // B checks its inbox and receives A's message.
-    let req2 = kernel
-        .tool_registry
-        .resolve(
-            b.id,
-            &ToolCall {
-                id: "2".into(),
-                name: "check_inbox".into(),
-                arguments: serde_json::json!({}),
-            },
-        )
+    let resp2 = execute_kernel_tool(&kernel, b.id, "check_inbox", serde_json::json!({}))
+        .await
         .unwrap();
-    let resp2 = kernel.resource_broker.execute(req2).await.unwrap();
     assert!(resp2.success);
     assert_eq!(resp2.data["from"], a.id.to_string());
     assert_eq!(resp2.data["payload"]["hi"], "there");
 
     // A's own inbox is empty — returns gracefully, not an error.
-    let req3 = kernel
-        .tool_registry
-        .resolve(
-            a.id,
-            &ToolCall {
-                id: "3".into(),
-                name: "check_inbox".into(),
-                arguments: serde_json::json!({}),
-            },
-        )
+    let resp3 = execute_kernel_tool(&kernel, a.id, "check_inbox", serde_json::json!({}))
+        .await
         .unwrap();
-    let resp3 = kernel.resource_broker.execute(req3).await.unwrap();
     assert!(resp3.success);
     assert_eq!(resp3.data["empty"], true);
 }
@@ -1037,8 +1024,6 @@ async fn live_path_agents_message_via_ipc_tools() {
 /// tracks Pending → Completed once B completes it. All through the tool path.
 #[tokio::test]
 async fn live_path_delegation_lifecycle_via_ipc_tools() {
-    use kernel::connector::ToolCall;
-    use kernel::resources::ResourceBroker;
     use kernel::AgentKernelImpl;
 
     let kernel = AgentKernelImpl::new().expect("kernel new");
@@ -1058,18 +1043,9 @@ async fn live_path_delegation_lifecycle_via_ipc_tools() {
         name: &str,
         args: serde_json::Value,
     ) -> kernel::resources::ResourceResponse {
-        let req = kernel
-            .tool_registry
-            .resolve(
-                agent,
-                &ToolCall {
-                    id: "t".into(),
-                    name: name.into(),
-                    arguments: args,
-                },
-            )
-            .unwrap();
-        kernel.resource_broker.execute(req).await.unwrap()
+        execute_kernel_tool(kernel, agent, name, args)
+            .await
+            .unwrap()
     }
 
     // A delegates a task to B.
@@ -1126,8 +1102,6 @@ async fn live_path_delegation_lifecycle_via_ipc_tools() {
 /// may complete.
 #[tokio::test]
 async fn live_path_delegation_authz_rejects_non_parties() {
-    use kernel::connector::ToolCall;
-    use kernel::resources::ResourceBroker;
     use kernel::AgentKernelImpl;
 
     let kernel = AgentKernelImpl::new().expect("kernel new");
@@ -1150,18 +1124,9 @@ async fn live_path_delegation_authz_rejects_non_parties() {
         name: &str,
         args: serde_json::Value,
     ) -> kernel::resources::ResourceResponse {
-        let req = kernel
-            .tool_registry
-            .resolve(
-                agent,
-                &ToolCall {
-                    id: "t".into(),
-                    name: name.into(),
-                    arguments: args,
-                },
-            )
-            .unwrap();
-        kernel.resource_broker.execute(req).await.unwrap()
+        execute_kernel_tool(kernel, agent, name, args)
+            .await
+            .unwrap()
     }
 
     // a → b delegation.
@@ -1224,8 +1189,6 @@ async fn live_path_delegation_authz_rejects_non_parties() {
 /// resolves a peer by NAME (not just UUID) and delivers.
 #[tokio::test]
 async fn live_path_discovery_and_name_addressing() {
-    use kernel::connector::ToolCall;
-    use kernel::resources::ResourceBroker;
     use kernel::AgentKernelImpl;
 
     let kernel = AgentKernelImpl::new().expect("kernel new");
@@ -1244,18 +1207,7 @@ async fn live_path_discovery_and_name_addressing() {
         name: &str,
         args: serde_json::Value,
     ) -> Result<kernel::resources::ResourceResponse, kernel::ResourceError> {
-        let req = kernel
-            .tool_registry
-            .resolve(
-                agent,
-                &ToolCall {
-                    id: "t".into(),
-                    name: name.into(),
-                    arguments: args,
-                },
-            )
-            .unwrap();
-        kernel.resource_broker.execute(req).await
+        execute_kernel_tool(kernel, agent, name, args).await
     }
 
     // discover_agents lists both agents by name.
@@ -1307,8 +1259,6 @@ async fn live_path_discovery_and_name_addressing() {
 /// agent). Ungrouped agents (create_agent_full) still share the default ns.
 #[tokio::test]
 async fn live_path_namespace_isolation_between_groups() {
-    use kernel::connector::ToolCall;
-    use kernel::resources::ResourceBroker;
     use kernel::AgentKernelImpl;
 
     let kernel = AgentKernelImpl::new().expect("kernel new");
@@ -1331,32 +1281,19 @@ async fn live_path_namespace_isolation_between_groups() {
         to: uuid::Uuid,
         body: serde_json::Value,
     ) -> Result<kernel::resources::ResourceResponse, kernel::ResourceError> {
-        let req = kernel
-            .tool_registry
-            .resolve(
-                from,
-                &ToolCall {
-                    id: "s".into(),
-                    name: "send_agent_message".into(),
-                    arguments: serde_json::json!({"to": to.to_string(), "message": body}),
-                },
-            )
-            .unwrap();
-        kernel.resource_broker.execute(req).await
+        execute_kernel_tool(
+            kernel,
+            from,
+            "send_agent_message",
+            serde_json::json!({"to": to.to_string(), "message": body}),
+        )
+        .await
     }
     async fn inbox(kernel: &AgentKernelImpl, who: uuid::Uuid) -> serde_json::Value {
-        let req = kernel
-            .tool_registry
-            .resolve(
-                who,
-                &ToolCall {
-                    id: "i".into(),
-                    name: "check_inbox".into(),
-                    arguments: serde_json::json!({}),
-                },
-            )
-            .unwrap();
-        kernel.resource_broker.execute(req).await.unwrap().data
+        execute_kernel_tool(kernel, who, "check_inbox", serde_json::json!({}))
+            .await
+            .unwrap()
+            .data
     }
 
     // Same group (team-a): alice → bob delivers.
@@ -1378,20 +1315,10 @@ async fn live_path_namespace_isolation_between_groups() {
     assert_eq!(inbox(&kernel, eve.id).await["empty"], true);
 
     // discover_agents is namespace-scoped: alice (team-a) sees bob, not eve.
-    let disc = {
-        let req = kernel
-            .tool_registry
-            .resolve(
-                alice.id,
-                &ToolCall {
-                    id: "d".into(),
-                    name: "discover_agents".into(),
-                    arguments: serde_json::json!({}),
-                },
-            )
-            .unwrap();
-        kernel.resource_broker.execute(req).await.unwrap().data
-    };
+    let disc = execute_kernel_tool(&kernel, alice.id, "discover_agents", serde_json::json!({}))
+        .await
+        .unwrap()
+        .data;
     let names: Vec<String> = disc["agents"]
         .as_array()
         .unwrap()
@@ -1428,10 +1355,14 @@ async fn live_path_group_scoped_tool_isolation() {
             ToolBinding {
                 name: "team_a_secret".into(),
                 description: "team-a only".into(),
-                parameters_schema: serde_json::json!({"type": "object", "properties": {}}),
+                parameters_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {"path": {"type": "string"}},
+                    "required": ["path"]
+                }),
                 resource_type: ResourceType::Filesystem,
                 operation: "read".into(),
-                security: ToolSecurity::constant(SecurityAction::Read, "team-a:secret"),
+                security: ToolSecurity::argument(SecurityAction::Read, "path"),
             },
         )
         .unwrap();

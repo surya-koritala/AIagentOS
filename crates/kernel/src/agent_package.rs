@@ -8,10 +8,10 @@
 //! admission path the CLI and syscall server use, so a packaged agent is
 //! admitted, gated, and scheduled identically to one created by hand.
 //!
-//! `tools` is the agent's declared tool set: every name must exist in the live
-//! registry before creation. It does not grant authority or narrow the full
-//! runtime registry; actual access is independently enforced by the agent's
-//! permission profile through the syscall gate's capability checks.
+//! `tools` is the agent's declared tool set: every name must exist and be
+//! visible in the package tenant's tool namespace before creation. It does not
+//! grant authority; actual access is independently enforced by namespace and
+//! capability checks at the syscall gate.
 //!
 //! See `docs/AGENT_PACKAGE.md` for the manifest schema and a worked example.
 
@@ -262,11 +262,13 @@ async fn load_package_scoped(
     tenant_id: Option<&str>,
 ) -> Result<AgentHandle, AgentPackageError> {
     manifest.validate()?;
+    let namespace_group =
+        tenant_id.filter(|tenant_id| *tenant_id != crate::context::DEFAULT_TENANT);
     for tool in &manifest.tools {
-        if !kernel.tool_registry.has_tool(tool) {
-            return Err(AgentPackageError::Invalid(format!(
-                "declared tool '{tool}' is not registered"
-            )));
+        if !kernel.tool_visible_to_group(namespace_group, tool) {
+            return Err(AgentPackageError::Invalid(
+                "one or more declared tools are unavailable in this namespace".into(),
+            ));
         }
     }
     let config = manifest.to_agent_config();
@@ -418,28 +420,42 @@ memory = ["Prefer primary sources.", "Cite everything."]
 
         let mut registry = SharedToolRegistry::new();
         registry
-            .publish(SharedToolDef::new(
-                "read_file",
-                "read a file",
-                crate::resources::ResourceType::Filesystem,
-                "read",
-                crate::tools::ToolSecurity::constant(
-                    crate::tools::SecurityAction::Read,
-                    "test:file",
-                ),
-            ))
+            .publish(
+                SharedToolDef::new(
+                    "read_file",
+                    "read a file",
+                    crate::resources::ResourceType::Filesystem,
+                    "read",
+                    crate::tools::ToolSecurity::argument(
+                        crate::tools::SecurityAction::Read,
+                        "path",
+                    ),
+                )
+                .with_parameters(serde_json::json!({
+                    "type": "object",
+                    "properties": {"path": {"type": "string"}},
+                    "required": ["path"]
+                })),
+            )
             .unwrap();
         registry
-            .publish(SharedToolDef::new(
-                "http_get",
-                "fetch a url",
-                crate::resources::ResourceType::Network,
-                "get",
-                crate::tools::ToolSecurity::constant(
-                    crate::tools::SecurityAction::Network,
-                    "https://example.invalid",
-                ),
-            ))
+            .publish(
+                SharedToolDef::new(
+                    "http_get",
+                    "fetch a url",
+                    crate::resources::ResourceType::Network,
+                    "get",
+                    crate::tools::ToolSecurity::argument(
+                        crate::tools::SecurityAction::Network,
+                        "url",
+                    ),
+                )
+                .with_parameters(serde_json::json!({
+                    "type": "object",
+                    "properties": {"url": {"type": "string"}},
+                    "required": ["url"]
+                })),
+            )
             .unwrap();
 
         let m = AgentManifest::from_toml_str(SAMPLE).unwrap();
@@ -447,6 +463,19 @@ memory = ["Prefer primary sources.", "Cite everything."]
         assert_eq!(resolved.len(), 2);
         assert_eq!(resolved[0].name, "read_file");
         assert_eq!(resolved[1].name, "http_get");
+        assert_eq!(
+            resolved[0].security.action,
+            crate::tools::SecurityAction::Read
+        );
+        assert_eq!(
+            resolved[1].security.action,
+            crate::tools::SecurityAction::Network
+        );
+        assert_eq!(
+            resolved[0].resource_type,
+            crate::resources::ResourceType::Filesystem
+        );
+        assert_eq!(resolved[0].operation, "read");
 
         // A manifest declaring an unpublished tool fails to resolve.
         let bad = AgentManifest::from_toml_str("name = \"x\"\ntask = \"t\"\ntools = [\"ghost\"]\n")
@@ -510,8 +539,88 @@ memory = ["Prefer primary sources.", "Cite everything."]
         .unwrap();
 
         let error = load_package(&kernel, &manifest).await.unwrap_err();
-        assert!(error.to_string().contains("is not registered"));
+        assert!(error.to_string().contains("unavailable in this namespace"));
+        assert!(!error.to_string().contains("definitely_missing"));
         assert!(kernel.agent_manager.list_agents(None).is_empty());
+    }
+
+    #[tokio::test]
+    async fn tenant_package_tools_are_resolved_only_inside_their_namespace() {
+        let kernel = AgentKernelImpl::new().unwrap();
+        let tenant_a = kernel.create_tenant("package-a").await.unwrap();
+        let tenant_b = kernel.create_tenant("package-b").await.unwrap();
+        kernel
+            .register_group_tool(
+                &tenant_a,
+                crate::tools::ToolBinding {
+                    name: "tenant_a_package_notes".into(),
+                    description: "Read tenant A package notes".into(),
+                    parameters_schema: serde_json::json!({
+                        "type": "object",
+                        "properties": {"path": {"type": "string"}},
+                        "required": ["path"]
+                    }),
+                    resource_type: crate::resources::ResourceType::Filesystem,
+                    operation: "read".into(),
+                    security: crate::tools::ToolSecurity::argument(
+                        crate::tools::SecurityAction::Read,
+                        "path",
+                    ),
+                },
+            )
+            .unwrap();
+        let scoped_manifest = AgentManifest::from_toml_str(
+            "name = \"scoped-package\"\ntask = \"t\"\ntools = [\"tenant_a_package_notes\"]",
+        )
+        .unwrap();
+
+        let missing_manifest = AgentManifest::from_toml_str(
+            "name = \"missing-package\"\ntask = \"t\"\ntools = [\"missing_package_tool\"]",
+        )
+        .unwrap();
+        let missing_error = load_package_for_tenant(&kernel, &tenant_b, &missing_manifest)
+            .await
+            .unwrap_err();
+        assert!(
+            kernel.group_namespaces.contains_key(&tenant_b),
+            "missing and foreign tool probes must perform the same namespace resolution"
+        );
+
+        let foreign_error = load_package_for_tenant(&kernel, &tenant_b, &scoped_manifest)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            foreign_error.to_string(),
+            "invalid manifest: one or more declared tools are unavailable in this namespace"
+        );
+        assert!(
+            !foreign_error.to_string().contains("tenant_a_package_notes"),
+            "foreign namespace validation must not confirm the scoped tool name"
+        );
+        assert!(
+            kernel.agent_manager.list_agents(None).is_empty(),
+            "foreign tool validation must happen before agent creation"
+        );
+
+        assert_eq!(
+            foreign_error.to_string(),
+            missing_error.to_string(),
+            "missing and foreign-scoped tools must be indistinguishable"
+        );
+        assert!(kernel.agent_manager.list_agents(None).is_empty());
+
+        let owned = load_package_for_tenant(&kernel, &tenant_a, &scoped_manifest)
+            .await
+            .expect("the owning namespace must resolve its scoped tool");
+        assert_eq!(
+            kernel.context_manager.agent_tenant(owned.id).unwrap(),
+            Some(tenant_a)
+        );
+        assert!(kernel
+            .tool_registry
+            .definitions_for_agent(&kernel.syscall_gate, owned.id)
+            .iter()
+            .any(|tool| tool.name == "tenant_a_package_notes"));
     }
 
     #[tokio::test]

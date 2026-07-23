@@ -274,10 +274,10 @@ async fn main() {
 
     // ── 4. MAC containment (audited) ────────────────────────────────────────────
     rule("[4] MAC — enforcing policy denies writes under /etc; denial is audited");
-    {
-        let mut mac = kernel.syscall_gate.mac.lock().await;
-        mac.set_enforcing(true);
-        mac.load_policy(vec![
+    kernel.syscall_gate.set_mac_enforcing(true).await;
+    kernel
+        .syscall_gate
+        .load_mac_policy(vec![
             PolicyRule {
                 subject: "*".into(),
                 action: "write".into(),
@@ -290,8 +290,8 @@ async fn main() {
                 object: "*".into(),
                 decision: "allow".into(),
             },
-        ]);
-    }
+        ])
+        .await;
     act("intruder", "write_file /etc/passwd");
     match kernel
         .syscall_gate

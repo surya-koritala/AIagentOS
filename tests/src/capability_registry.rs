@@ -399,6 +399,7 @@ fn release_blocking_workflows_keep_their_security_contract() {
         "workflow_dispatch:",
         "uses: ./.github/workflows/ci.yml",
         "macos-15-intel",
+        "-C link-arg=/Brepro",
         "byte-for-byte reproducible",
         "cyclonedx-json",
         "spdx-json",

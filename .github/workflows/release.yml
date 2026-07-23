@@ -68,17 +68,31 @@ jobs:
       - name: Set deterministic build inputs
         run: |
           echo "SOURCE_DATE_EPOCH=$(git show -s --format=%ct HEAD)" >> "$GITHUB_ENV"
-          echo "RUSTFLAGS=--remap-path-prefix=${GITHUB_WORKSPACE}=." >> "$GITHUB_ENV"
+          rustflags="--remap-path-prefix=${GITHUB_WORKSPACE}=."
+          if [[ "${{ matrix.target }}" == *-pc-windows-msvc ]]; then
+            # link.exe otherwise writes the current time into the PE/COFF header.
+            # /Brepro replaces it with deterministic content derived from the image.
+            rustflags="${rustflags} -C link-arg=/Brepro"
+          fi
+          echo "RUSTFLAGS=${rustflags}" >> "$GITHUB_ENV"
       - name: Build twice from isolated target directories
         run: |
           CARGO_TARGET_DIR=target-a cargo build --release --locked --target "${{ matrix.target }}" -p agent-cli --bins -p agent-tui
           CARGO_TARGET_DIR=target-b cargo build --release --locked --target "${{ matrix.target }}" -p agent-cli --bins -p agent-tui
       - name: Prove binaries are byte-for-byte reproducible
         run: |
+          reproducible=1
           for binary in agent agent-server agent-tui; do
-            cmp "target-a/${{ matrix.target }}/release/${binary}${{ matrix.extension }}" \
-                "target-b/${{ matrix.target }}/release/${binary}${{ matrix.extension }}"
+            first="target-a/${{ matrix.target }}/release/${binary}${{ matrix.extension }}"
+            second="target-b/${{ matrix.target }}/release/${binary}${{ matrix.extension }}"
+            if ! cmp -s "$first" "$second"; then
+              echo "::error title=Non-reproducible release binary::${binary}${{ matrix.extension }} differs between isolated builds"
+              sha256sum "$first" "$second"
+              cmp -l "$first" "$second" | head -n 20 || true
+              reproducible=0
+            fi
           done
+          test "$reproducible" = "1"
       - name: Create deterministic archive
         run: |
           mkdir -p dist/stage

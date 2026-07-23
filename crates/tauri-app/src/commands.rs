@@ -114,7 +114,7 @@ pub fn get_metrics(state: State<'_, AppState>) -> serde_json::Value {
 
 #[tauri::command]
 pub fn load_config() -> Result<serde_json::Value, String> {
-    let config = Config::load();
+    let config = Config::try_load().map_err(|error| error.to_string())?;
     serde_json::to_value(&config).map_err(|e| e.to_string())
 }
 
@@ -124,7 +124,7 @@ pub fn save_config(
     api_key: String,
     default_model: Option<String>,
 ) -> Result<(), String> {
-    let mut config = Config::load();
+    let mut config = Config::try_load().map_err(|error| error.to_string())?;
     config.llm_provider = llm_provider.clone();
     config.set_api_key(&llm_provider, api_key);
     if let Some(model) = default_model {

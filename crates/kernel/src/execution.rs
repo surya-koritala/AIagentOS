@@ -837,8 +837,12 @@ impl AgentExecutor {
 
             // Price this response against the agent's provider and accrue spend.
             if let Some(ref budget) = self.budget_enforcer {
-                let (_charged_usd, charged_micros) =
-                    budget.record_charge(self.agent_id, self.session.provider_id(), call_tokens);
+                let (_charged_usd, charged_micros) = budget.record_usage_charge(
+                    self.agent_id,
+                    self.session.provider_id(),
+                    self.session.model_id(),
+                    call.usage,
+                );
                 usage.charged_cost_micros =
                     usage.charged_cost_micros.saturating_add(charged_micros);
             }

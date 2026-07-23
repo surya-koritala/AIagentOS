@@ -17,6 +17,8 @@ use std::sync::Arc;
 
 use dashmap::DashMap;
 
+use crate::config::TokenPricing;
+use crate::connector::LlmUsage;
 use crate::context::BudgetUsageSnapshot;
 use crate::AgentId;
 
@@ -79,6 +81,13 @@ pub struct BudgetEnforcer {
     pricing: DashMap<String, f64>,
     /// Price used when a provider has no specific entry.
     default_price_per_1k: f64,
+    /// Detailed fallback pricing, lower precedence than legacy per-provider
+    /// scalar prices but higher precedence than the legacy global scalar.
+    default_token_pricing: Option<TokenPricing>,
+    /// Detailed provider pricing.
+    provider_token_pricing: DashMap<String, TokenPricing>,
+    /// Detailed provider+model pricing.
+    provider_model_token_pricing: DashMap<String, std::collections::HashMap<String, TokenPricing>>,
     /// Global ceiling in micro-USD; `0` = unlimited.
     max_micros: u64,
     /// Per-agent ceiling in micro-USD; `0` = unlimited.
@@ -133,6 +142,9 @@ impl BudgetEnforcer {
         Self {
             pricing: DashMap::new(),
             default_price_per_1k: default_price_per_1k.max(0.0),
+            default_token_pricing: None,
+            provider_token_pricing: DashMap::new(),
+            provider_model_token_pricing: DashMap::new(),
             max_micros: usd_to_micros(max_usd),
             per_agent_max_micros: usd_to_micros(per_agent_max_usd),
             per_tenant_max_micros: usd_to_micros(per_tenant_max_usd),
@@ -148,21 +160,80 @@ impl BudgetEnforcer {
 
     /// Build from the operator's budget config.
     pub fn from_config(cfg: &crate::config::BudgetConfig) -> Self {
-        let enforcer = Self::with_limits(
+        Self::try_from_config(cfg)
+            .unwrap_or_else(|error| panic!("invalid budget configuration: {error}"))
+    }
+
+    /// Strictly build from operator budget config.
+    ///
+    /// Kernel startup uses this path so invalid detailed prices cannot be
+    /// silently converted to free pricing.
+    pub fn try_from_config(cfg: &crate::config::BudgetConfig) -> Result<Self, String> {
+        cfg.validate()?;
+        let mut enforcer = Self::with_limits(
             cfg.usd_per_1k_tokens,
             cfg.max_usd,
             cfg.per_agent_max_usd,
             cfg.per_tenant_max_usd,
         );
+        enforcer.default_token_pricing = cfg.default_token_pricing;
         for (provider, price) in &cfg.provider_pricing {
             enforcer.set_provider_price(provider, *price);
         }
-        enforcer
+        for (provider, pricing) in &cfg.provider_token_pricing {
+            enforcer.set_provider_token_pricing(provider, *pricing)?;
+        }
+        for (provider, models) in &cfg.provider_model_token_pricing {
+            for (model, pricing) in models {
+                enforcer.set_provider_model_token_pricing(provider, model, *pricing)?;
+            }
+        }
+        Ok(enforcer)
     }
 
     /// Set a per-provider price (USD per 1000 tokens).
     pub fn set_provider_price(&self, provider: impl Into<String>, usd_per_1k: f64) {
         self.pricing.insert(provider.into(), usd_per_1k.max(0.0));
+    }
+
+    /// Set detailed prices for a provider.
+    pub fn set_provider_token_pricing(
+        &self,
+        provider: impl Into<String>,
+        pricing: TokenPricing,
+    ) -> Result<(), String> {
+        let provider = provider.into();
+        if provider.trim().is_empty() {
+            return Err("provider token pricing requires a non-empty provider id".to_string());
+        }
+        pricing.validate(&format!("provider_token_pricing.{provider}"))?;
+        self.provider_token_pricing.insert(provider, pricing);
+        Ok(())
+    }
+
+    /// Set detailed prices for one model exposed by a provider.
+    pub fn set_provider_model_token_pricing(
+        &self,
+        provider: impl Into<String>,
+        model: impl Into<String>,
+        pricing: TokenPricing,
+    ) -> Result<(), String> {
+        let provider = provider.into();
+        let model = model.into();
+        if provider.trim().is_empty() {
+            return Err(
+                "provider+model token pricing requires a non-empty provider id".to_string(),
+            );
+        }
+        if model.trim().is_empty() {
+            return Err("provider+model token pricing requires a non-empty model id".to_string());
+        }
+        pricing.validate(&format!("provider_model_token_pricing.{provider}.{model}"))?;
+        self.provider_model_token_pricing
+            .entry(provider)
+            .or_default()
+            .insert(model, pricing);
+        Ok(())
     }
 
     /// Price (USD / 1000 tokens) for a provider.
@@ -176,6 +247,38 @@ impl BudgetEnforcer {
     /// Cost in USD of `tokens` for a provider.
     pub fn cost_of(&self, provider: &str, tokens: u32) -> f64 {
         self.price_per_1k(provider) * (tokens as f64 / 1000.0)
+    }
+
+    /// Resolve detailed prices using the documented compatibility precedence:
+    ///
+    /// provider+model detailed → provider detailed → legacy provider scalar →
+    /// detailed default → legacy global scalar.
+    pub fn token_pricing_for(&self, provider: &str, model: &str) -> TokenPricing {
+        if let Some(models) = self.provider_model_token_pricing.get(provider) {
+            if let Some(pricing) = models.get(model) {
+                return *pricing;
+            }
+        }
+        if let Some(pricing) = self.provider_token_pricing.get(provider) {
+            return *pricing.value();
+        }
+        if let Some(price) = self.pricing.get(provider) {
+            return TokenPricing::blended(*price.value());
+        }
+        self.default_token_pricing
+            .unwrap_or_else(|| TokenPricing::blended(self.default_price_per_1k))
+    }
+
+    /// Cost detailed provider usage, charging cached input only at its cached
+    /// rate rather than also charging it as uncached input.
+    pub fn cost_of_usage(&self, provider: &str, model: &str, usage: LlmUsage) -> f64 {
+        let pricing = self.token_pricing_for(provider, model);
+        let cached_input = usage.cached_tokens.min(usage.input_tokens);
+        let uncached_input = usage.input_tokens.saturating_sub(cached_input);
+        (f64::from(uncached_input) * pricing.input_usd_per_1k_tokens
+            + f64::from(cached_input) * pricing.cached_input_usd_per_1k_tokens
+            + f64::from(usage.output_tokens) * pricing.output_usd_per_1k_tokens)
+            / 1000.0
     }
 
     /// Whether any ceiling is configured (otherwise the enforcer is inert).
@@ -295,6 +398,23 @@ impl BudgetEnforcer {
     /// a floating-point USD value after restart can otherwise drift by a micro.
     pub fn record_charge(&self, agent: AgentId, provider: &str, tokens: u32) -> (f64, u64) {
         let cost_usd = self.cost_of(provider, tokens);
+        self.record_calculated_charge(agent, cost_usd)
+    }
+
+    /// Price and record detailed provider usage. The three token-class amounts
+    /// are summed in USD and rounded exactly once to integer micro-USD.
+    pub fn record_usage_charge(
+        &self,
+        agent: AgentId,
+        provider: &str,
+        model: &str,
+        usage: LlmUsage,
+    ) -> (f64, u64) {
+        let cost_usd = self.cost_of_usage(provider, model, usage);
+        self.record_calculated_charge(agent, cost_usd)
+    }
+
+    fn record_calculated_charge(&self, agent: AgentId, cost_usd: f64) -> (f64, u64) {
         let micros = usd_to_micros(cost_usd);
         if micros > 0 {
             atomic_saturating_add(&self.spent_micros, micros);
@@ -445,6 +565,101 @@ mod tests {
         assert!((b.cost_of("openai", 1000) - 2.0).abs() < 1e-9);
         // 2000 tokens at $15/1k = $30.
         assert!((b.cost_of("anthropic", 2000) - 30.0).abs() < 1e-9);
+    }
+
+    fn token_pricing(input: f64, cached: f64, output: f64) -> TokenPricing {
+        TokenPricing {
+            input_usd_per_1k_tokens: input,
+            cached_input_usd_per_1k_tokens: cached,
+            output_usd_per_1k_tokens: output,
+        }
+    }
+
+    #[test]
+    fn detailed_pricing_uses_provider_model_legacy_and_default_precedence() {
+        let mut cfg = crate::config::BudgetConfig {
+            usd_per_1k_tokens: 1.0,
+            default_token_pricing: Some(token_pricing(2.0, 3.0, 4.0)),
+            ..crate::config::BudgetConfig::default()
+        };
+        cfg.provider_pricing.insert("legacy".into(), 5.0);
+        cfg.provider_token_pricing
+            .insert("detailed".into(), token_pricing(6.0, 7.0, 8.0));
+        cfg.provider_token_pricing
+            .insert("modeled".into(), token_pricing(6.0, 7.0, 8.0));
+        cfg.provider_model_token_pricing
+            .entry("modeled".into())
+            .or_default()
+            .insert("special".into(), token_pricing(9.0, 10.0, 11.0));
+        let b = BudgetEnforcer::try_from_config(&cfg).unwrap();
+        let usage = LlmUsage::reported(100, 50, 20);
+
+        let expected = |input: f64, cached: f64, output: f64| {
+            (80.0 * input + 20.0 * cached + 50.0 * output) / 1000.0
+        };
+        assert_eq!(
+            b.cost_of_usage("modeled", "special", usage),
+            expected(9.0, 10.0, 11.0)
+        );
+        assert_eq!(
+            b.cost_of_usage("modeled", "other", usage),
+            expected(6.0, 7.0, 8.0)
+        );
+        assert_eq!(
+            b.cost_of_usage("detailed", "any", usage),
+            expected(6.0, 7.0, 8.0)
+        );
+        assert_eq!(
+            b.cost_of_usage("legacy", "any", usage),
+            expected(5.0, 5.0, 5.0)
+        );
+        assert_eq!(
+            b.cost_of_usage("unknown", "any", usage),
+            expected(2.0, 3.0, 4.0)
+        );
+
+        let without_detailed_default =
+            BudgetEnforcer::with_pricing(cfg.usd_per_1k_tokens, 0.0, 0.0);
+        assert_eq!(
+            without_detailed_default.cost_of_usage("unknown", "any", usage),
+            expected(1.0, 1.0, 1.0)
+        );
+    }
+
+    #[test]
+    fn detailed_usage_prices_cached_input_separately_and_rounds_once() {
+        let mut cfg = crate::config::BudgetConfig {
+            default_token_pricing: Some(token_pricing(0.0004, 9.0, 0.0004)),
+            ..crate::config::BudgetConfig::default()
+        };
+        let b = BudgetEnforcer::try_from_config(&cfg).unwrap();
+        let agent = uuid::Uuid::new_v4();
+        let usage = LlmUsage::reported(1, 1, 0);
+        let (cost, micros) = b.record_usage_charge(agent, "p", "m", usage);
+        assert!((cost - 0.0000008).abs() < f64::EPSILON);
+        assert_eq!(micros, 1, "token classes must be summed before rounding");
+
+        cfg.default_token_pricing = Some(token_pricing(4.0, 0.5, 8.0));
+        let b = BudgetEnforcer::try_from_config(&cfg).unwrap();
+        let cost = b.cost_of_usage("p", "m", LlmUsage::reported(100, 25, 40));
+        assert_eq!(cost, (60.0 * 4.0 + 40.0 * 0.5 + 25.0 * 8.0) / 1000.0);
+    }
+
+    #[test]
+    fn strict_constructor_rejects_invalid_detailed_pricing() {
+        let cfg = crate::config::BudgetConfig {
+            default_token_pricing: Some(token_pricing(f64::INFINITY, 0.0, 0.0)),
+            ..crate::config::BudgetConfig::default()
+        };
+        assert!(BudgetEnforcer::try_from_config(&cfg).is_err());
+
+        let b = BudgetEnforcer::new(1.0);
+        assert!(b
+            .set_provider_token_pricing("p", token_pricing(-1.0, 0.0, 0.0))
+            .is_err());
+        assert!(b
+            .set_provider_model_token_pricing("p", "", token_pricing(1.0, 1.0, 1.0))
+            .is_err());
     }
 
     #[test]

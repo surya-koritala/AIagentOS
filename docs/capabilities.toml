@@ -10,7 +10,7 @@
 # excluded from the v1 promise declares `v1_disposition = "excluded-from-v1"`.
 
 schema_version = 1
-updated = "2026-07-21"
+updated = "2026-07-22"
 model = [
   "scaffolded",
   "unit-tested",
@@ -53,10 +53,10 @@ maturity = "public-api-e2e"
 release = "v0.4"
 tracking_issue = 107
 kernel_modules = ["auth", "namespaces", "permissions"]
-source_paths = ["crates/kernel/src/syscall_server.rs"]
+source_paths = ["crates/kernel/src/auth.rs", "crates/kernel/src/context.rs", "crates/kernel/src/syscall_server.rs", "crates/cli/src/bin/agent-server.rs"]
 public_entry_points = ["crates/kernel/src/syscall_server.rs::Syscall"]
 runtime_call_paths = ["crates/kernel/src/syscall_server.rs::authorize", "crates/kernel/src/syscall_server.rs::dispatch_scoped"]
-test_evidence = ["tests/src/tenancy_props.rs"]
+test_evidence = ["crates/kernel/src/syscall_server.rs", "tests/src/tenancy_props.rs"]
 platforms = ["linux", "macos", "windows"]
 limitations = ["All current ID-addressed wire operations are centrally tenant-authorized; independent penetration testing and cross-platform soak qualification remain outstanding."]
 

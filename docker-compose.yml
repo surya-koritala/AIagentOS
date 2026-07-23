@@ -1,14 +1,15 @@
 # AI Agent OS — local stack: the wire server, Ollama (keyless LLM), + the CLI.
 #
 # One-command bootstrap (the primary entry surface — a running, reachable,
-# persistent kernel exposing the JSON syscall protocol on tcp://localhost:7777):
+# persistent development kernel exposing the JSON syscall protocol only on
+# tcp://localhost:7777):
 #
 #         docker compose up -d --build agentos-server
 #         # or the scripted version that also does a real round-trip:
 #         ./scripts/quickstart.sh
 #
 # Three tiers:
-#   Server (keyless wire service): the `agentos-server` service runs
+#   Server (local-development keyless wire service): `agentos-server` runs
 #     `agent-server 0.0.0.0:7777`. It boots keyless (provider `local`), so the
 #     enforcement / non-LLM syscalls (NodeInfo, CreateAgent, GateStats, ...)
 #     answer with NO API keys and WITHOUT Ollama running. Connect with the SDK
@@ -48,10 +49,13 @@ services:
     # the host; 127.0.0.1 would only be reachable inside the container.
     command: ["agent-server", "0.0.0.0:7777"]
     ports:
-      - "7777:7777"
+      # Host-loopback publication is deliberate: this Compose profile uses the
+      # explicit insecure-development override below and must not be reachable
+      # from another host.
+      - "127.0.0.1:7777:7777"
       # Prometheus scrape endpoint (only live because AGENT_SERVER_METRICS_ADDR
       # is set below). Scrape GET http://localhost:9090/metrics.
-      - "9090:9090"
+      - "127.0.0.1:9090:9090"
     environment:
       # Keyless boot: provider `local` registers the Ollama adapter, but the
       # non-LLM syscalls work with no model at all. No hard dependency on ollama.
@@ -61,6 +65,11 @@ services:
       HOME: "/data"
       XDG_CONFIG_HOME: "/data/config"
       XDG_DATA_HOME: "/data/share"
+      # Docker requires an all-interface bind inside the network namespace for
+      # host port publishing. The host ports above are loopback-only; production
+      # deployments must remove this override and mount TLS credentials plus an
+      # AGENT_SERVER_TOKEN as documented in getting-started.md.
+      AGENT_SERVER_ALLOW_INSECURE_REMOTE: "1"
       # Structured logging: human format at info by default. Set RUST_LOG for
       # finer control (e.g. "kernel=debug,info") and LOG_FORMAT=json to emit
       # JSON log lines for ingestion.

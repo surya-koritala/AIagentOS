@@ -701,11 +701,26 @@ fn audit_authorization_denial(
     let resource = agent_id
         .map(|id| format!("agent:{id}"))
         .unwrap_or_else(|| "system".to_string());
+    let credential_kind = principal
+        .credential
+        .as_ref()
+        .map(|credential| match credential.kind {
+            crate::auth::CredentialKind::ApiKey => "api_key",
+            crate::auth::CredentialKind::Session => "session",
+        })
+        .unwrap_or("synthetic");
+    let credential_id = principal
+        .credential
+        .as_ref()
+        .map(|credential| credential.id.get(..12).unwrap_or(&credential.id))
+        .unwrap_or("none");
     tracing::warn!(
         target: "agentos::authorization",
         user_id = %principal.user_id,
         tenant_id = %principal.tenant_id,
         role = principal.role.as_str(),
+        credential_kind,
+        credential_id,
         action,
         resource,
         reason,
@@ -1922,9 +1937,13 @@ impl SyscallServer {
                 Ok(call) => {
                     // Re-resolve tenant credentials for every request. Revoked,
                     // expired, deleted, or role-changed credentials never keep
-                    // the authority captured at login time.
+                    // the authority captured at login time. Keep the auth read
+                    // lock through dispatch: revocation takes the write lock,
+                    // so once a revoke call returns no previously-authorized
+                    // request can still be executing.
                     if let Some(token) = credential.as_deref() {
-                        match kernel.resolve_principal(token).await {
+                        let auth_guard = kernel.auth.read().await;
+                        let reply = match auth_guard.authenticate(token) {
                             Some(resolved) => dispatch_scoped(&kernel, call, Some(&resolved)).await,
                             None => {
                                 authed = false;
@@ -1933,7 +1952,9 @@ impl SyscallServer {
                                     message: "authentication required".into(),
                                 }
                             }
-                        }
+                        };
+                        drop(auth_guard);
+                        reply
                     } else {
                         dispatch_scoped(&kernel, call, None).await
                     }
@@ -3048,18 +3069,232 @@ memory = ["remember this"]
     }
 
     #[tokio::test]
+    async fn authorization_policy_classifies_every_syscall_and_agent_resource() {
+        let kernel = AgentKernelImpl::new().expect("kernel new");
+        let tenant = kernel.create_tenant("owner").await.unwrap();
+        let admin_id = kernel
+            .register_user(&tenant, "admin", "admin@owner.test", Role::Admin)
+            .await
+            .unwrap();
+        let reader_id = kernel
+            .register_user(&tenant, "reader", "reader@owner.test", Role::ReadOnly)
+            .await
+            .unwrap();
+        let admin = Principal {
+            user_id: admin_id,
+            tenant_id: tenant.clone(),
+            role: Role::Admin,
+            credential: None,
+        };
+        let reader = Principal {
+            user_id: reader_id,
+            tenant_id: tenant.clone(),
+            role: Role::ReadOnly,
+            credential: None,
+        };
+        let agent = kernel
+            .create_agent_for_tenant(
+                &tenant,
+                AgentConfig {
+                    name: "owned".into(),
+                    task: "classification".into(),
+                    llm_provider: "stub".into(),
+                    permission_profile: "standard".into(),
+                    priority: Priority::default(),
+                    sandbox_config: None,
+                },
+            )
+            .await
+            .unwrap();
+        let id = agent.id.to_string();
+        let checkpoint = uuid::Uuid::new_v4().to_string();
+
+        let agent_calls = vec![
+            Syscall::PauseAgent {
+                agent_id: id.clone(),
+            },
+            Syscall::ResumeAgent {
+                agent_id: id.clone(),
+            },
+            Syscall::StopAgent {
+                agent_id: id.clone(),
+            },
+            Syscall::KillAgent {
+                agent_id: id.clone(),
+            },
+            Syscall::GetAgentStatus {
+                agent_id: id.clone(),
+            },
+            Syscall::WaitAgent {
+                agent_id: id.clone(),
+                timeout_ms: 1,
+            },
+            Syscall::ListGenerationCheckpoints {
+                agent_id: id.clone(),
+            },
+            Syscall::ResumeGenerationCheckpoint {
+                agent_id: id.clone(),
+                checkpoint_id: checkpoint.clone(),
+            },
+            Syscall::DeleteGenerationCheckpoint {
+                agent_id: id.clone(),
+                checkpoint_id: checkpoint,
+            },
+            Syscall::SendMessage {
+                agent_id: id.clone(),
+                message: "test".into(),
+            },
+            Syscall::CallTool {
+                agent_id: id.clone(),
+                tool: "read_file".into(),
+                args: serde_json::json!({"path": "/tmp/x"}),
+            },
+            Syscall::AgentInfo {
+                agent_id: id.clone(),
+            },
+            Syscall::MemoryStore {
+                agent_id: id.clone(),
+                content: "test".into(),
+                category: None,
+            },
+            Syscall::MemoryQuery {
+                agent_id: id.clone(),
+                query: "test".into(),
+            },
+            Syscall::StoragePut {
+                agent_id: id.clone(),
+                key: "k".into(),
+                value: "v".into(),
+            },
+            Syscall::StorageGet {
+                agent_id: id.clone(),
+                key: "k".into(),
+            },
+            Syscall::StorageList {
+                agent_id: id.clone(),
+            },
+            Syscall::ContextPressure {
+                agent_id: id.clone(),
+            },
+            Syscall::StorageDelete {
+                agent_id: id.clone(),
+                key: "k".into(),
+            },
+            Syscall::SnapshotContext {
+                agent_id: id.clone(),
+                label: "s".into(),
+            },
+            Syscall::RestoreSnapshot {
+                agent_id: id.clone(),
+                label: "s".into(),
+            },
+            Syscall::ListSnapshots {
+                agent_id: id.clone(),
+            },
+            Syscall::DeleteSnapshot {
+                agent_id: id.clone(),
+                label: "s".into(),
+            },
+        ];
+        for call in &agent_calls {
+            let (required, action, target) = syscall_policy(call);
+            assert_eq!(target, Some(id.as_str()), "unscoped operation: {action}");
+            assert!(!action.is_empty());
+            assert!(authorize(&kernel, Some(&admin), call).await.is_ok());
+            assert_eq!(
+                authorize(&kernel, Some(&reader), call).await.is_ok(),
+                required == AccessLevel::ReadOnly,
+                "unexpected reader classification for {action}"
+            );
+        }
+
+        let unscoped_calls = vec![
+            (
+                Syscall::CreateAgent {
+                    name: "x".into(),
+                    task: "x".into(),
+                    provider: "stub".into(),
+                    profile: "standard".into(),
+                    priority: 3,
+                },
+                AccessLevel::User,
+            ),
+            (Syscall::ListAgents, AccessLevel::ReadOnly),
+            (Syscall::GateStats, AccessLevel::System),
+            (Syscall::ListProviders, AccessLevel::ReadOnly),
+            (
+                Syscall::Hello {
+                    protocol_version: 1,
+                },
+                AccessLevel::ReadOnly,
+            ),
+            (
+                Syscall::Authenticate { token: "x".into() },
+                AccessLevel::ReadOnly,
+            ),
+            (
+                Syscall::LoadPackage {
+                    manifest_toml: "x".into(),
+                },
+                AccessLevel::Admin,
+            ),
+            (Syscall::NodeInfo, AccessLevel::System),
+            (Syscall::Metrics, AccessLevel::System),
+            (Syscall::OperatorSnapshot, AccessLevel::ReadOnly),
+            (Syscall::ListServices, AccessLevel::System),
+            (
+                Syscall::StartService { name: "x".into() },
+                AccessLevel::System,
+            ),
+            (
+                Syscall::StopService { name: "x".into() },
+                AccessLevel::System,
+            ),
+            (
+                Syscall::RestartService { name: "x".into() },
+                AccessLevel::System,
+            ),
+        ];
+        for (call, expected) in &unscoped_calls {
+            let (required, action, target) = syscall_policy(call);
+            assert_eq!(required, *expected, "wrong access level for {action}");
+            assert!(target.is_none(), "unexpected agent target for {action}");
+            assert_eq!(
+                authorize(&kernel, Some(&admin), call).await.is_ok(),
+                *expected != AccessLevel::System,
+                "unexpected admin classification for {action}"
+            );
+            assert_eq!(
+                authorize(&kernel, Some(&reader), call).await.is_ok(),
+                *expected == AccessLevel::ReadOnly,
+                "unexpected reader classification for {action}"
+            );
+            assert!(
+                authorize(&kernel, None, call).await.is_ok(),
+                "trusted-system path must remain explicit for {action}"
+            );
+        }
+
+        // syscall_policy is an exhaustive match. Adding a new enum variant
+        // cannot compile until it receives an authorization classification;
+        // this table then records the expected role/resource behavior.
+        assert_eq!(agent_calls.len() + unscoped_calls.len(), 37);
+    }
+
+    #[tokio::test]
     async fn tenant_authorizer_denies_every_foreign_agent_operation() {
         let kernel = AgentKernelImpl::new().expect("kernel new");
         let tenant_a = kernel.create_tenant("a").await.unwrap();
         let tenant_b = kernel.create_tenant("b").await.unwrap();
         let user_a = kernel
-            .register_user(&tenant_a, "alice", "alice@a.test", Role::User)
+            .register_user(&tenant_a, "alice", "alice@a.test", Role::Admin)
             .await
             .unwrap();
         let principal_a = Principal {
             user_id: user_a,
             tenant_id: tenant_a,
-            role: Role::User,
+            role: Role::Admin,
+            credential: None,
         };
         let foreign = kernel
             .create_agent_for_tenant(
@@ -3078,6 +3313,36 @@ memory = ["remember this"]
         let id = foreign.id.to_string();
 
         let calls = vec![
+            Syscall::PauseAgent {
+                agent_id: id.clone(),
+            },
+            Syscall::ResumeAgent {
+                agent_id: id.clone(),
+            },
+            Syscall::StopAgent {
+                agent_id: id.clone(),
+            },
+            Syscall::KillAgent {
+                agent_id: id.clone(),
+            },
+            Syscall::GetAgentStatus {
+                agent_id: id.clone(),
+            },
+            Syscall::WaitAgent {
+                agent_id: id.clone(),
+                timeout_ms: 1,
+            },
+            Syscall::ListGenerationCheckpoints {
+                agent_id: id.clone(),
+            },
+            Syscall::ResumeGenerationCheckpoint {
+                agent_id: id.clone(),
+                checkpoint_id: uuid::Uuid::new_v4().to_string(),
+            },
+            Syscall::DeleteGenerationCheckpoint {
+                agent_id: id.clone(),
+                checkpoint_id: uuid::Uuid::new_v4().to_string(),
+            },
             Syscall::SendMessage {
                 agent_id: id.clone(),
                 message: "probe".into(),
@@ -3161,6 +3426,7 @@ memory = ["remember this"]
             user_id: user_a,
             tenant_id: tenant_a.clone(),
             role: Role::ReadOnly,
+            credential: None,
         };
         let own = kernel
             .create_agent_for_tenant(
@@ -3251,11 +3517,13 @@ memory = ["remember this"]
             user_id: read_only_id,
             tenant_id: tenant.clone(),
             role: Role::ReadOnly,
+            credential: None,
         };
         let admin = Principal {
             user_id: admin_id,
             tenant_id: tenant.clone(),
             role: Role::Admin,
+            credential: None,
         };
         let agent = kernel
             .create_agent_for_tenant(
@@ -3335,11 +3603,16 @@ profile = "standard"
         let token = kernel.open_session(&user).await.unwrap();
         let server = SyscallServer::bind(kernel.clone(), "127.0.0.1:0")
             .await
-            .expect("bind");
+            .expect("bind")
+            .with_auth_token("system-secret");
         let addr = server.local_addr().unwrap();
         tokio::spawn(server.serve());
         let mut client = SyscallClient::connect(addr).await.unwrap();
 
+        match client.call(Syscall::ListAgents).await.unwrap() {
+            SyscallReply::Error { message } => assert_eq!(message, "authentication required"),
+            other => panic!("unauthenticated tenant connection was accepted: {other:?}"),
+        }
         assert!(matches!(
             client.authenticate(token.clone()).await.unwrap(),
             SyscallReply::Authenticated
@@ -3349,7 +3622,7 @@ profile = "standard"
             SyscallReply::Agents { .. }
         ));
 
-        kernel.auth.write().await.revoke_session(&token);
+        assert!(kernel.revoke_session(&token).await.unwrap());
         match client.call(Syscall::ListAgents).await.unwrap() {
             SyscallReply::Error { message } => assert_eq!(message, "authentication required"),
             other => panic!("revoked session retained authority: {other:?}"),
@@ -3357,6 +3630,132 @@ profile = "standard"
         match client.authenticate(token).await.unwrap() {
             SyscallReply::Error { message } => assert_eq!(message, "authentication failed"),
             other => panic!("revoked token was accepted again: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn revocation_waits_for_in_flight_authorized_requests() {
+        let kernel = Arc::new(AgentKernelImpl::new().expect("kernel new"));
+        let tenant = kernel.create_tenant("linearizable").await.unwrap();
+        let user = kernel
+            .register_user(&tenant, "alice", "alice@linear.test", Role::User)
+            .await
+            .unwrap();
+        let token = kernel.open_session(&user).await.unwrap();
+
+        // The connection handler holds this same read lock from credential
+        // resolution through dispatch. A revocation must wait for it, proving
+        // there is no post-revocation execution window.
+        let in_flight = kernel.auth.read().await;
+        assert!(in_flight.authenticate(&token).is_some());
+        let revoke_kernel = kernel.clone();
+        let revoke_token = token.clone();
+        let revoke = tokio::spawn(async move { revoke_kernel.revoke_session(&revoke_token).await });
+        tokio::task::yield_now().await;
+        assert!(
+            !revoke.is_finished(),
+            "revocation crossed an in-flight authorization boundary"
+        );
+        drop(in_flight);
+
+        assert!(revoke.await.unwrap().unwrap());
+        assert!(kernel.resolve_principal(&token).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn tls_tenant_credentials_enforce_owner_role_and_system_boundaries() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let (server_config, roots) = self_signed_tls();
+        let kernel = Arc::new(AgentKernelImpl::new().expect("kernel new"));
+        let tenant_a = kernel.create_tenant("tls-a").await.unwrap();
+        let tenant_b = kernel.create_tenant("tls-b").await.unwrap();
+        let reader = kernel
+            .register_user(&tenant_a, "reader", "reader@tls.test", Role::ReadOnly)
+            .await
+            .unwrap();
+        let key = kernel.issue_api_key(&reader, "tls-test").await.unwrap();
+        let own = kernel
+            .create_agent_for_tenant(
+                &tenant_a,
+                AgentConfig {
+                    name: "tls-owned".into(),
+                    task: "owned".into(),
+                    llm_provider: "stub".into(),
+                    permission_profile: "standard".into(),
+                    priority: Priority::default(),
+                    sandbox_config: None,
+                },
+            )
+            .await
+            .unwrap();
+        let foreign = kernel
+            .create_agent_for_tenant(
+                &tenant_b,
+                AgentConfig {
+                    name: "tls-foreign".into(),
+                    task: "foreign".into(),
+                    llm_provider: "stub".into(),
+                    permission_profile: "standard".into(),
+                    priority: Priority::default(),
+                    sandbox_config: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        let server = SyscallServer::bind_tls(kernel.clone(), "127.0.0.1:0", server_config)
+            .await
+            .expect("bind tls")
+            .with_auth_token("system-secret");
+        let addr = server.local_addr().unwrap();
+        tokio::spawn(server.serve());
+        let client_config = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let mut client = SyscallClient::connect_tls(addr, "localhost", client_config)
+            .await
+            .expect("connect tls");
+
+        match client.call(Syscall::ListAgents).await.unwrap() {
+            SyscallReply::Error { message } => assert_eq!(message, "authentication required"),
+            other => panic!("unauthenticated TLS call was accepted: {other:?}"),
+        }
+        assert!(matches!(
+            client.authenticate(key.clone()).await.unwrap(),
+            SyscallReply::Authenticated
+        ));
+        assert!(matches!(
+            client
+                .call(Syscall::AgentInfo {
+                    agent_id: own.id.to_string(),
+                })
+                .await
+                .unwrap(),
+            SyscallReply::AgentInfo { .. }
+        ));
+        assert_authorization_denied(
+            client
+                .call(Syscall::AgentInfo {
+                    agent_id: foreign.id.to_string(),
+                })
+                .await
+                .unwrap(),
+        );
+        assert_authorization_denied(
+            client
+                .call(Syscall::StoragePut {
+                    agent_id: own.id.to_string(),
+                    key: "forbidden".into(),
+                    value: "write".into(),
+                })
+                .await
+                .unwrap(),
+        );
+        assert_authorization_denied(client.call(Syscall::Metrics).await.unwrap());
+        assert!(kernel.revoke_api_key(&key).await.unwrap());
+        match client.call(Syscall::ListAgents).await.unwrap() {
+            SyscallReply::Error { message } => assert_eq!(message, "authentication required"),
+            other => panic!("revoked TLS credential retained authority: {other:?}"),
         }
     }
 

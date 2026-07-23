@@ -334,3 +334,112 @@ async fn tenancy_survives_restart() {
 
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// Revocation is durable, not merely a process-local cache mutation. Session
+/// and API-key secrets remain invalid after reopening the same database.
+#[tokio::test]
+async fn credential_revocation_survives_restart() {
+    let dir = std::env::temp_dir().join(format!("auth-restart-{}", uuid::Uuid::new_v4()));
+    let db = dir.join("agent_os.db");
+    let (session, key) = {
+        let kernel = AgentKernelImpl::with_db_path(&db).expect("kernel boot");
+        let tenant = kernel.create_tenant("acme").await.unwrap();
+        let user = kernel
+            .register_user(&tenant, "alice", "alice@acme.test", Role::User)
+            .await
+            .unwrap();
+        let session = kernel.open_session(&user).await.unwrap();
+        let key = kernel.issue_api_key(&user, "automation").await.unwrap();
+        assert!(kernel.revoke_session(&session).await.unwrap());
+        assert!(kernel.revoke_api_key(&key).await.unwrap());
+        (session, key)
+    };
+
+    let kernel = AgentKernelImpl::with_db_path(&db).expect("kernel reboot");
+    assert!(kernel.resolve_principal(&session).await.is_none());
+    assert!(kernel.resolve_principal(&key).await.is_none());
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// User and tenant revocation cascade to all credentials and survive restart.
+#[tokio::test]
+async fn identity_revocation_cascades_and_survives_restart() {
+    let dir = std::env::temp_dir().join(format!("identity-restart-{}", uuid::Uuid::new_v4()));
+    let db = dir.join("agent_os.db");
+    let (user_session, user_key, tenant_session, tenant_key) = {
+        let kernel = AgentKernelImpl::with_db_path(&db).expect("kernel boot");
+        let user_tenant = kernel.create_tenant("user-revoke").await.unwrap();
+        let tenant_to_revoke = kernel.create_tenant("tenant-revoke").await.unwrap();
+        let user = kernel
+            .register_user(&user_tenant, "alice", "alice@test", Role::User)
+            .await
+            .unwrap();
+        let tenant_user = kernel
+            .register_user(&tenant_to_revoke, "bob", "bob@test", Role::Admin)
+            .await
+            .unwrap();
+        let user_session = kernel.open_session(&user).await.unwrap();
+        let user_key = kernel.issue_api_key(&user, "user-key").await.unwrap();
+        let tenant_session = kernel.open_session(&tenant_user).await.unwrap();
+        let tenant_key = kernel
+            .issue_api_key(&tenant_user, "tenant-key")
+            .await
+            .unwrap();
+        assert!(kernel.revoke_user(&user).await.unwrap());
+        assert!(kernel.revoke_tenant(&tenant_to_revoke).await.unwrap());
+        (user_session, user_key, tenant_session, tenant_key)
+    };
+
+    let kernel = AgentKernelImpl::with_db_path(&db).expect("kernel reboot");
+    for revoked in [user_session, user_key, tenant_session, tenant_key] {
+        assert!(
+            kernel.resolve_principal(&revoked).await.is_none(),
+            "revoked credential reappeared after restart"
+        );
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Rehydration preserves the exact tenant and role, while an unknown persisted
+/// role is skipped rather than silently downgraded to a writable default.
+#[tokio::test]
+async fn rehydrated_credentials_preserve_authority_and_unknown_roles_fail_closed() {
+    let dir = std::env::temp_dir().join(format!("role-restart-{}", uuid::Uuid::new_v4()));
+    let db = dir.join("agent_os.db");
+    let (tenant, user, key, session) = {
+        let kernel = AgentKernelImpl::with_db_path(&db).expect("kernel boot");
+        let tenant = kernel.create_tenant("role-test").await.unwrap();
+        let user = kernel
+            .register_user(&tenant, "admin", "admin@test", Role::Admin)
+            .await
+            .unwrap();
+        let key = kernel.issue_api_key(&user, "role-key").await.unwrap();
+        let session = kernel.open_session(&user).await.unwrap();
+        (tenant, user, key, session)
+    };
+
+    {
+        let kernel = AgentKernelImpl::with_db_path(&db).expect("kernel reboot");
+        for credential in [&key, &session] {
+            let principal = kernel
+                .resolve_principal(credential)
+                .await
+                .expect("valid credential must rehydrate");
+            assert_eq!(principal.tenant_id, tenant);
+            assert_eq!(principal.role, Role::Admin);
+        }
+    }
+
+    {
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute(
+            "UPDATE users SET role = 'unknown-owner' WHERE id = ?1",
+            rusqlite::params![user],
+        )
+        .unwrap();
+    }
+    let kernel = AgentKernelImpl::with_db_path(&db).expect("kernel reboot with invalid role");
+    assert!(kernel.resolve_principal(&key).await.is_none());
+    assert!(kernel.resolve_principal(&session).await.is_none());
+    std::fs::remove_dir_all(&dir).ok();
+}

@@ -183,9 +183,10 @@ proptest! {
         })?;
     }
 
-    /// (d) The seam is swappable: injecting an alternate Embedder changes the
-    /// stored embedding (vs. the default) while round-trip retrieval still
-    /// works end-to-end through the same persistence path.
+    /// (d) The seam is swappable: each injected Embedder supplies the stored
+    /// vector while round-trip retrieval still works through the same path.
+    /// Different embedders may legitimately collide for a particular input,
+    /// so swappability is a routing property, not a universal inequality.
     #[test]
     fn prop_seam_is_swappable(content in "[a-zA-Z ]{5,40}") {
         let rt = tokio::runtime::Runtime::new().unwrap();
@@ -198,6 +199,7 @@ proptest! {
             let default_hit = default_mgr.query_memory(agent_id, &content).await.unwrap();
             prop_assert_eq!(default_hit.len(), 1);
             let default_emb = default_hit[0].embedding.clone().unwrap();
+            prop_assert_eq!(&default_emb, &embed(&content));
 
             // Alternate-embedder manager via the injectable seam.
             let alt_mgr = SqliteContextManager::in_memory()
@@ -213,17 +215,52 @@ proptest! {
             // proving the injected seam is actually on the store path.
             prop_assert_eq!(&alt_emb, &LengthBucketEmbedder.embed(&content));
 
-            // And it differs from the default embedder's vector for non-empty
-            // input (the two embedders are genuinely distinct).
-            if content.chars().any(|c| c.is_alphanumeric()) {
-                prop_assert_ne!(
-                    default_emb, alt_emb,
-                    "swapping the embedder must change the stored vector"
-                );
-            }
             Ok(())
         })?;
     }
+}
+
+/// Regression for the CI-generated counterexample that exposed the old
+/// universal-inequality assumption. Both embedders happen to select the same
+/// bucket for this input; the contract is that each configured implementation
+/// is called and persisted correctly, not that their outputs never collide.
+#[test]
+fn embedder_output_collision_still_honors_the_injected_seam() {
+    let content = "   EL";
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let agent_id = uuid::Uuid::new_v4();
+
+        let default_mgr = SqliteContextManager::in_memory().unwrap();
+        default_mgr
+            .store_fact(agent_id, fact_with(content))
+            .await
+            .unwrap();
+        let default_hit = default_mgr.query_memory(agent_id, content).await.unwrap();
+        assert_eq!(default_hit[0].embedding.as_ref().unwrap(), &embed(content));
+
+        let alternate_mgr = SqliteContextManager::in_memory()
+            .unwrap()
+            .with_embedder(Arc::new(LengthBucketEmbedder));
+        alternate_mgr
+            .store_fact(agent_id, fact_with(content))
+            .await
+            .unwrap();
+        let alternate_hit = alternate_mgr.query_memory(agent_id, content).await.unwrap();
+        assert_eq!(
+            alternate_hit[0].embedding.as_ref().unwrap(),
+            &LengthBucketEmbedder.embed(content)
+        );
+    });
+}
+
+/// A deterministic witness proves that the alternate implementation can
+/// produce observably different behavior without requiring every input to do
+/// so.
+#[test]
+fn alternate_embedder_changes_a_known_multitoken_vector() {
+    let content = "the user prefers dark mode";
+    assert_ne!(embed(content), LengthBucketEmbedder.embed(content));
 }
 
 /// (d, fixed): a hand-checked swappability case independent of proptest input,

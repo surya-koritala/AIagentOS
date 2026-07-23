@@ -71,11 +71,14 @@ impl Role {
         }
     }
 
-    pub fn parse(s: &str) -> Role {
+    /// Parse a persisted/public role name. Unknown values fail closed instead
+    /// of silently becoming a writable user.
+    pub fn parse(s: &str) -> Option<Role> {
         match s {
-            "admin" => Role::Admin,
-            "read_only" => Role::ReadOnly,
-            _ => Role::User,
+            "admin" => Some(Role::Admin),
+            "read_only" | "operator" => Some(Role::ReadOnly),
+            "user" => Some(Role::User),
+            _ => None,
         }
     }
 }
@@ -101,6 +104,36 @@ pub struct Session {
     pub expires_at: DateTime<Utc>,
 }
 
+/// The kind of credential that authenticated a tenant-bound connection.
+///
+/// System/open-server and configured shared-secret callers are represented by
+/// the wire server's explicit trusted-system path rather than by a tenant
+/// [`Principal`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CredentialKind {
+    ApiKey,
+    Session,
+}
+
+/// Stable, non-plaintext identity for the credential used to authenticate a
+/// connection. `id` is the SHA-256 digest already stored by the auth subsystem;
+/// it can be compared for revocation without retaining or exposing the secret.
+#[derive(Clone, PartialEq, Eq)]
+pub struct CredentialIdentity {
+    pub kind: CredentialKind,
+    pub id: String,
+}
+
+impl std::fmt::Debug for CredentialIdentity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let short_id = self.id.get(..12).unwrap_or(&self.id);
+        f.debug_struct("CredentialIdentity")
+            .field("kind", &self.kind)
+            .field("id", &format_args!("{short_id}…"))
+            .finish()
+    }
+}
+
 /// The resolved principal a connection acts as: which user, in which tenant,
 /// with which role. Returned by [`AuthSystem::authenticate`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -108,6 +141,10 @@ pub struct Principal {
     pub user_id: String,
     pub tenant_id: String,
     pub role: Role,
+    /// Present for principals resolved from an API key or session. Synthetic
+    /// in-process principals used by trusted embedding/tests may omit it; wire
+    /// connections always preserve it.
+    pub credential: Option<CredentialIdentity>,
 }
 
 /// Authentication / tenancy system. Holds identity in memory; the kernel
@@ -228,8 +265,8 @@ impl AuthSystem {
     }
 
     /// Revoke a session by its plaintext token.
-    pub fn revoke_session(&mut self, token: &str) {
-        self.sessions.remove(&hash_secret(token));
+    pub fn revoke_session(&mut self, token: &str) -> bool {
+        self.sessions.remove(&hash_secret(token)).is_some()
     }
 
     // ----- api keys ------------------------------------------------------
@@ -259,6 +296,33 @@ impl AuthSystem {
         self.api_keys.insert(key.key_hash.clone(), key);
     }
 
+    /// Revoke an API key by its plaintext value.
+    pub fn revoke_api_key(&mut self, key: &str) -> bool {
+        self.api_keys.remove(&hash_secret(key)).is_some()
+    }
+
+    /// Revoke a user and every credential issued to that user. The tenant and
+    /// other users remain active.
+    pub fn revoke_user(&mut self, user_id: &str) -> bool {
+        let existed = self.users.remove(user_id).is_some();
+        self.sessions
+            .retain(|_, session| session.user_id != user_id);
+        self.api_keys.retain(|_, key| key.user_id != user_id);
+        existed
+    }
+
+    /// Revoke a tenant identity boundary and all of its users/credentials.
+    /// Existing agent data remains durable but becomes unreachable through
+    /// tenant credentials until an explicit administrative recovery flow.
+    pub fn revoke_tenant(&mut self, tenant_id: &str) -> bool {
+        let existed = self.tenants.remove(tenant_id).is_some();
+        self.users.retain(|_, user| user.tenant_id != tenant_id);
+        self.sessions
+            .retain(|_, session| session.tenant_id != tenant_id);
+        self.api_keys.retain(|_, key| key.tenant_id != tenant_id);
+        existed
+    }
+
     // ----- resolution / RBAC --------------------------------------------
 
     /// Resolve a presented secret (API key **or** session token) to a
@@ -268,30 +332,36 @@ impl AuthSystem {
     pub fn authenticate(&self, secret: &str) -> Option<Principal> {
         let hash = hash_secret(secret);
         if let Some(k) = self.api_keys.get(&hash) {
-            let role = self
-                .users
-                .get(&k.user_id)
-                .map(|u| u.role)
-                .unwrap_or(Role::User);
+            let user = self.users.get(&k.user_id)?;
+            if user.tenant_id != k.tenant_id || !self.tenants.contains_key(&k.tenant_id) {
+                return None;
+            }
             return Some(Principal {
                 user_id: k.user_id.clone(),
                 tenant_id: k.tenant_id.clone(),
-                role,
+                role: user.role,
+                credential: Some(CredentialIdentity {
+                    kind: CredentialKind::ApiKey,
+                    id: hash,
+                }),
             });
         }
         if let Some(s) = self.sessions.get(&hash) {
             if Utc::now() > s.expires_at {
                 return None;
             }
-            let role = self
-                .users
-                .get(&s.user_id)
-                .map(|u| u.role)
-                .unwrap_or(Role::User);
+            let user = self.users.get(&s.user_id)?;
+            if user.tenant_id != s.tenant_id || !self.tenants.contains_key(&s.tenant_id) {
+                return None;
+            }
             return Some(Principal {
                 user_id: s.user_id.clone(),
                 tenant_id: s.tenant_id.clone(),
-                role,
+                role: user.role,
+                credential: Some(CredentialIdentity {
+                    kind: CredentialKind::Session,
+                    id: hash,
+                }),
             });
         }
         None
@@ -340,6 +410,7 @@ mod tests {
         assert_eq!(p.user_id, user);
         assert_eq!(p.tenant_id, tenant);
         assert_eq!(p.role, Role::User);
+        assert_eq!(p.credential.unwrap().kind, CredentialKind::Session);
     }
 
     #[test]
@@ -349,6 +420,7 @@ mod tests {
         let p = auth.authenticate(&key).unwrap();
         assert_eq!(p.user_id, user);
         assert_eq!(p.tenant_id, tenant);
+        assert_eq!(p.credential.unwrap().kind, CredentialKind::ApiKey);
     }
 
     #[test]
@@ -372,8 +444,50 @@ mod tests {
     fn revoked_session_rejected() {
         let (mut auth, _t, user) = setup();
         let token = auth.create_session(&user).unwrap();
-        auth.revoke_session(&token);
+        assert!(auth.revoke_session(&token));
         assert!(auth.authenticate(&token).is_none());
+    }
+
+    #[test]
+    fn revoked_key_user_and_tenant_fail_closed() {
+        let (mut auth, tenant, user) = setup();
+        let first_key = auth.create_api_key(&user, "first").unwrap();
+        assert!(auth.revoke_api_key(&first_key));
+        assert!(auth.authenticate(&first_key).is_none());
+
+        let user_key = auth.create_api_key(&user, "user").unwrap();
+        let user_session = auth.create_session(&user).unwrap();
+        assert!(auth.revoke_user(&user));
+        assert!(auth.authenticate(&user_key).is_none());
+        assert!(auth.authenticate(&user_session).is_none());
+
+        let second_user = auth
+            .register(&tenant, "bob", "bob@acme.test", Role::User)
+            .unwrap();
+        let tenant_key = auth.create_api_key(&second_user, "tenant").unwrap();
+        assert!(auth.revoke_tenant(&tenant));
+        assert!(auth.authenticate(&tenant_key).is_none());
+    }
+
+    #[test]
+    fn inconsistent_identity_records_never_fall_back_to_default_authority() {
+        let (mut auth, tenant, user) = setup();
+        let key = auth.create_api_key(&user, "ci").unwrap();
+
+        auth.users.remove(&user);
+        assert!(auth.authenticate(&key).is_none());
+
+        let orphan_user = User {
+            id: user,
+            tenant_id: tenant.clone(),
+            username: "orphan".into(),
+            email: "orphan@acme.test".into(),
+            role: Role::Admin,
+            created_at: Utc::now(),
+        };
+        auth.insert_user(orphan_user);
+        auth.tenants.remove(&tenant);
+        assert!(auth.authenticate(&key).is_none());
     }
 
     #[test]
@@ -387,6 +501,14 @@ mod tests {
         assert!(!auth.check_role(&usr, Role::Admin));
         assert!(auth.check_role(&usr, Role::User));
         assert!(!auth.check_role(&ro, Role::User));
+    }
+
+    #[test]
+    fn unknown_role_names_fail_closed() {
+        assert_eq!(Role::parse("admin"), Some(Role::Admin));
+        assert_eq!(Role::parse("operator"), Some(Role::ReadOnly));
+        assert_eq!(Role::parse("owner"), None);
+        assert_eq!(Role::parse(""), None);
     }
 
     #[test]

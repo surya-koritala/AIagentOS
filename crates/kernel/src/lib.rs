@@ -1566,16 +1566,15 @@ impl AgentKernelImpl {
     /// Create a tenant and persist it, returning its id. The tenant's namespace
     /// group + cgroup are created lazily when its first agent is created.
     pub async fn create_tenant(&self, name: &str) -> Result<String, KernelError> {
-        let (id, record) = {
-            let mut auth = self.auth.write().await;
-            let id = auth.create_tenant(name);
-            let record = auth.get_tenant(&id).cloned();
-            (id, record)
-        };
-        if let Some(t) = record {
-            self.context_manager
-                .save_tenant(&t)
-                .map_err(KernelError::Context)?;
+        let mut auth = self.auth.write().await;
+        let id = auth.create_tenant(name);
+        let record = auth
+            .get_tenant(&id)
+            .cloned()
+            .expect("newly-created tenant must be present");
+        if let Err(error) = self.context_manager.save_tenant(&record) {
+            auth.revoke_tenant(&id);
+            return Err(KernelError::Context(error));
         }
         Ok(id)
     }
@@ -1589,23 +1588,22 @@ impl AgentKernelImpl {
         email: &str,
         role: crate::auth::Role,
     ) -> Result<String, KernelError> {
-        let (id, record) = {
-            let mut auth = self.auth.write().await;
-            let id = match auth.register(tenant_id, username, email, role) {
-                Some(id) => id,
-                None => {
-                    return Err(KernelError::Context(crate::ContextError::StorageError(
-                        format!("unknown tenant: {tenant_id}"),
-                    )))
-                }
-            };
-            let record = auth.get_user(&id).cloned();
-            (id, record)
+        let mut auth = self.auth.write().await;
+        let id = match auth.register(tenant_id, username, email, role) {
+            Some(id) => id,
+            None => {
+                return Err(KernelError::Context(crate::ContextError::StorageError(
+                    format!("unknown tenant: {tenant_id}"),
+                )))
+            }
         };
-        if let Some(u) = record {
-            self.context_manager
-                .save_user(&u)
-                .map_err(KernelError::Context)?;
+        let record = auth
+            .get_user(&id)
+            .cloned()
+            .expect("newly-created user must be present");
+        if let Err(error) = self.context_manager.save_user(&record) {
+            auth.revoke_user(&id);
+            return Err(KernelError::Context(error));
         }
         Ok(id)
     }
@@ -1613,30 +1611,29 @@ impl AgentKernelImpl {
     /// Issue an API key for a user and persist it (hashed). Returns the
     /// **plaintext** key (shown once). Errors if the user is unknown.
     pub async fn issue_api_key(&self, user_id: &str, name: &str) -> Result<String, KernelError> {
-        let (key, record) = {
-            let mut auth = self.auth.write().await;
-            let key = match auth.create_api_key(user_id, name) {
-                Some(k) => k,
-                None => {
-                    return Err(KernelError::Context(crate::ContextError::StorageError(
-                        format!("unknown user: {user_id}"),
-                    )))
-                }
-            };
-            // The stored record is keyed by the hash of the returned plaintext.
-            let record = auth.authenticate(&key).map(|p| crate::auth::ApiKey {
-                key_hash: crate::auth::hash_secret(&key),
-                name: name.to_string(),
-                user_id: p.user_id,
-                tenant_id: p.tenant_id,
-                created_at: chrono::Utc::now(),
-            });
-            (key, record)
+        let mut auth = self.auth.write().await;
+        let key = match auth.create_api_key(user_id, name) {
+            Some(k) => k,
+            None => {
+                return Err(KernelError::Context(crate::ContextError::StorageError(
+                    format!("unknown user: {user_id}"),
+                )))
+            }
         };
-        if let Some(k) = record {
-            self.context_manager
-                .save_api_key(&k)
-                .map_err(KernelError::Context)?;
+        // The stored record is keyed by the hash of the returned plaintext.
+        let principal = auth
+            .authenticate(&key)
+            .expect("newly-created API key must authenticate");
+        let record = crate::auth::ApiKey {
+            key_hash: crate::auth::hash_secret(&key),
+            name: name.to_string(),
+            user_id: principal.user_id,
+            tenant_id: principal.tenant_id,
+            created_at: chrono::Utc::now(),
+        };
+        if let Err(error) = self.context_manager.save_api_key(&record) {
+            auth.revoke_api_key(&key);
+            return Err(KernelError::Context(error));
         }
         Ok(key)
     }
@@ -1644,35 +1641,83 @@ impl AgentKernelImpl {
     /// Open a session (login) for a user and persist it (hashed). Returns the
     /// **plaintext** session token (shown once). Errors if the user is unknown.
     pub async fn open_session(&self, user_id: &str) -> Result<String, KernelError> {
-        let (token, record) = {
-            let mut auth = self.auth.write().await;
-            let token = match auth.create_session(user_id) {
-                Some(t) => t,
-                None => {
-                    return Err(KernelError::Context(crate::ContextError::StorageError(
-                        format!("unknown user: {user_id}"),
-                    )))
-                }
-            };
-            let record = auth.authenticate(&token).map(|p| crate::auth::Session {
-                token_hash: crate::auth::hash_secret(&token),
-                user_id: p.user_id,
-                tenant_id: p.tenant_id,
-                expires_at: chrono::Utc::now() + chrono::Duration::hours(24),
-            });
-            (token, record)
+        let mut auth = self.auth.write().await;
+        let token = match auth.create_session(user_id) {
+            Some(t) => t,
+            None => {
+                return Err(KernelError::Context(crate::ContextError::StorageError(
+                    format!("unknown user: {user_id}"),
+                )))
+            }
         };
-        if let Some(s) = record {
-            self.context_manager
-                .save_session(&s)
-                .map_err(KernelError::Context)?;
+        let principal = auth
+            .authenticate(&token)
+            .expect("newly-created session must authenticate");
+        let record = crate::auth::Session {
+            token_hash: crate::auth::hash_secret(&token),
+            user_id: principal.user_id,
+            tenant_id: principal.tenant_id,
+            expires_at: chrono::Utc::now() + chrono::Duration::hours(24),
+        };
+        if let Err(error) = self.context_manager.save_session(&record) {
+            auth.revoke_session(&token);
+            return Err(KernelError::Context(error));
         }
         Ok(token)
     }
 
+    /// Revoke a session durably. The auth write lock is held across the SQLite
+    /// delete and in-memory mutation, so a wire request either completes before
+    /// revocation or observes the revoked state; once this returns there is no
+    /// post-revocation authorization window.
+    pub async fn revoke_session(&self, token: &str) -> Result<bool, KernelError> {
+        let token_hash = crate::auth::hash_secret(token);
+        let mut auth = self.auth.write().await;
+        let persisted = self
+            .context_manager
+            .revoke_session_hash(&token_hash)
+            .map_err(KernelError::Context)?;
+        Ok(auth.revoke_session(token) || persisted)
+    }
+
+    /// Revoke an API key durably with the same linearizable boundary as session
+    /// revocation.
+    pub async fn revoke_api_key(&self, key: &str) -> Result<bool, KernelError> {
+        let key_hash = crate::auth::hash_secret(key);
+        let mut auth = self.auth.write().await;
+        let persisted = self
+            .context_manager
+            .revoke_api_key_hash(&key_hash)
+            .map_err(KernelError::Context)?;
+        Ok(auth.revoke_api_key(key) || persisted)
+    }
+
+    /// Revoke a user and all of that user's credentials atomically and durably.
+    pub async fn revoke_user(&self, user_id: &str) -> Result<bool, KernelError> {
+        let mut auth = self.auth.write().await;
+        let persisted = self
+            .context_manager
+            .revoke_user_identity(user_id)
+            .map_err(KernelError::Context)?;
+        Ok(auth.revoke_user(user_id) || persisted)
+    }
+
+    /// Revoke a tenant identity boundary and all tenant credentials atomically.
+    /// Agent/data records remain durable but inaccessible to tenant callers.
+    pub async fn revoke_tenant(&self, tenant_id: &str) -> Result<bool, KernelError> {
+        let mut auth = self.auth.write().await;
+        let persisted = self
+            .context_manager
+            .revoke_tenant_identity(tenant_id)
+            .map_err(KernelError::Context)?;
+        Ok(auth.revoke_tenant(tenant_id) || persisted)
+    }
+
     /// Resolve a presented secret (API key or session token) to a
-    /// [`Principal`](crate::auth::Principal): the `(user, tenant, role)` the
-    /// connection acts as. `None` if the secret is unknown/expired.
+    /// [`Principal`](crate::auth::Principal): the full
+    /// `(user, tenant, role, credential identity)` the connection acts as.
+    /// `None` if the secret or any referenced tenant/user record is
+    /// unknown, expired, inconsistent, or revoked.
     pub async fn resolve_principal(&self, secret: &str) -> Option<crate::auth::Principal> {
         self.auth.read().await.authenticate(secret)
     }

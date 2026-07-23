@@ -422,6 +422,13 @@ fn release_blocking_workflows_keep_their_security_contract() {
         );
     }
 
+    let windows_icon = std::fs::read(workspace_root().join("crates/tauri-app/icons/icon.ico"))
+        .expect("the Tauri Windows build requires icons/icon.ico");
+    assert!(
+        windows_icon.starts_with(&[0, 0, 1, 0]) && windows_icon.len() > 6,
+        "the Tauri Windows icon must be a non-empty ICO image"
+    );
+
     for workflow in [
         ".github/workflows/ci.yml",
         ".github/workflows/extended-security.yml",

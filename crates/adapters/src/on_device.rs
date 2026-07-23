@@ -153,7 +153,11 @@ impl Engine {
     /// Run a full prompt → completion pass. Returns the decoded text and the
     /// number of tokens generated. Synchronous and CPU-heavy — callers run it
     /// on a blocking thread.
-    fn generate(&self, prompt: &str) -> Result<(String, u32), ConnectorError> {
+    fn generate(
+        &self,
+        prompt: &str,
+        max_output_tokens: Option<usize>,
+    ) -> Result<(String, u32), ConnectorError> {
         let encoding = self
             .tokenizer
             .encode(prompt, true)
@@ -188,7 +192,10 @@ impl Engine {
             .map_err(|e| ConnectorError::ProtocolError(format!("sample: {e}")))?;
 
         let mut generated = Vec::new();
-        for step in 0..self.max_new_tokens {
+        let max_new_tokens = max_output_tokens
+            .unwrap_or(self.max_new_tokens)
+            .min(self.max_new_tokens);
+        for step in 0..max_new_tokens {
             if self.eos_ids.contains(&next) {
                 break;
             }
@@ -209,7 +216,7 @@ impl Engine {
             .tokenizer
             .decode(&generated, true)
             .map_err(|e| ConnectorError::ProtocolError(format!("detokenize: {e}")))?;
-        Ok((text, generated.len() as u32))
+        Ok((text, u32::try_from(generated.len()).unwrap_or(u32::MAX)))
     }
 }
 
@@ -265,15 +272,27 @@ impl LlmSession for OnDeviceSession {
     async fn send_with_tools(
         &self,
         messages: Vec<StandardMessage>,
+        tools: &[ToolDefinition],
+    ) -> Result<LlmResponse, ConnectorError> {
+        self.send_with_options(messages, tools, LlmRequestOptions::default())
+            .await
+    }
+
+    async fn send_with_options(
+        &self,
+        messages: Vec<StandardMessage>,
         _tools: &[ToolDefinition],
+        options: LlmRequestOptions,
     ) -> Result<LlmResponse, ConnectorError> {
         let prompt = build_prompt(&messages);
         let engine = self.engine.clone();
+        let max_output_tokens = options.max_output_tokens.map(|limit| limit as usize);
         // Inference is a long, blocking, CPU-bound computation — keep it off the
         // async runtime's worker threads.
-        let (content, tokens) = tokio::task::spawn_blocking(move || engine.generate(&prompt))
-            .await
-            .map_err(|e| ConnectorError::ConnectionFailed(format!("inference task: {e}")))??;
+        let (content, tokens) =
+            tokio::task::spawn_blocking(move || engine.generate(&prompt, max_output_tokens))
+                .await
+                .map_err(|e| ConnectorError::ConnectionFailed(format!("inference task: {e}")))??;
 
         Ok(LlmResponse {
             content,
@@ -282,6 +301,10 @@ impl LlmSession for OnDeviceSession {
             usage: Default::default(),
             tool_calls: vec![],
         })
+    }
+
+    fn enforces_max_output_tokens(&self) -> bool {
+        true
     }
 
     fn provider_id(&self) -> &ProviderId {

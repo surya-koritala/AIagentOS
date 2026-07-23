@@ -95,33 +95,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn deepseek_retries_on_failure() {
+    async fn deepseek_returns_first_failure_without_hidden_retry() {
         let mock_server = MockServer::start().await;
 
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
             .respond_with(ResponseTemplate::new(500))
-            .up_to_n_times(2)
-            .mount(&mock_server)
-            .await;
-
-        Mock::given(method("POST"))
-            .and(path("/chat/completions"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "choices": [{"message": {"role": "assistant", "content": "recovered"}, "finish_reason": "stop"}],
-                "usage": {"total_tokens": 5}
-            })))
+            .expect(1)
             .mount(&mock_server)
             .await;
 
         let adapter = DeepseekAdapter::new("test-key".to_string()).with_base_url(mock_server.uri());
         let session = adapter.create_session().await.unwrap();
 
-        let resp = session
+        let error = session
             .send(vec![StandardMessage::user("test")])
             .await
-            .unwrap();
-        assert_eq!(resp.content, "recovered");
+            .unwrap_err();
+        assert!(matches!(error, kernel::ConnectorError::ConnectionFailed(_)));
     }
 
     #[tokio::test]

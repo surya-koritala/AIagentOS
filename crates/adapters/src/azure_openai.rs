@@ -66,6 +66,16 @@ impl LlmSession for AzureSession {
         messages: Vec<StandardMessage>,
         tools: &[ToolDefinition],
     ) -> Result<LlmResponse, ConnectorError> {
+        self.send_with_options(messages, tools, LlmRequestOptions::default())
+            .await
+    }
+
+    async fn send_with_options(
+        &self,
+        messages: Vec<StandardMessage>,
+        tools: &[ToolDefinition],
+        options: LlmRequestOptions,
+    ) -> Result<LlmResponse, ConnectorError> {
         let msgs: Vec<serde_json::Value> =
             messages
                 .iter()
@@ -94,80 +104,74 @@ impl LlmSession for AzureSession {
             })).collect();
             body["tools"] = serde_json::json!(tool_defs);
         }
-
-        let mut last_err = None;
-        for attempt in 0..3 {
-            if attempt > 0 {
-                tokio::time::sleep(tokio::time::Duration::from_millis(1000 * (1 << attempt))).await;
-            }
-
-            let result = self
-                .client
-                .post(&self.chat_url)
-                .header("api-key", &self.api_key)
-                .header("Content-Type", "application/json")
-                .json(&body)
-                .send()
-                .await;
-
-            match result {
-                Ok(resp) if resp.status().is_success() => {
-                    let json: serde_json::Value = resp
-                        .json()
-                        .await
-                        .map_err(|e| ConnectorError::ProtocolError(e.to_string()))?;
-                    let content = json["choices"][0]["message"]["content"]
-                        .as_str()
-                        .unwrap_or("")
-                        .to_string();
-                    let tokens = json["usage"]["total_tokens"].as_u64().unwrap_or(0) as u32;
-                    let tool_calls = json["choices"][0]["message"]["tool_calls"]
-                        .as_array()
-                        .map(|arr| {
-                            arr.iter()
-                                .filter_map(|tc| {
-                                    Some(ToolCall {
-                                        id: tc["id"].as_str()?.to_string(),
-                                        name: tc["function"]["name"].as_str()?.to_string(),
-                                        arguments: serde_json::from_str(
-                                            tc["function"]["arguments"].as_str()?,
-                                        )
-                                        .unwrap_or(serde_json::Value::Null),
-                                    })
-                                })
-                                .collect()
-                        })
-                        .unwrap_or_default();
-                    return Ok(LlmResponse {
-                        content,
-                        finish_reason: json["choices"][0]["finish_reason"]
-                            .as_str()
-                            .map(|s| s.to_string()),
-                        tokens_used: tokens,
-                        usage: kernel::connector::LlmUsage::reported(
-                            json["usage"]["prompt_tokens"].as_u64().unwrap_or(0) as u32,
-                            json["usage"]["completion_tokens"].as_u64().unwrap_or(0) as u32,
-                            json["usage"]["prompt_tokens_details"]["cached_tokens"]
-                                .as_u64()
-                                .unwrap_or(0) as u32,
-                        ),
-                        tool_calls,
-                    });
-                }
-                Ok(resp) => {
-                    let status = resp.status();
-                    let body = resp.text().await.unwrap_or_default();
-                    last_err = Some(ConnectorError::ConnectionFailed(format!(
-                        "HTTP {} - {}",
-                        status, body
-                    )));
-                }
-                Err(e) => {
-                    last_err = Some(ConnectorError::ConnectionFailed(e.to_string()));
-                }
-            }
+        if let Some(max_output_tokens) = options.max_output_tokens {
+            body["max_tokens"] = serde_json::json!(max_output_tokens);
         }
-        Err(last_err.unwrap())
+
+        let result = self
+            .client
+            .post(&self.chat_url)
+            .header("api-key", &self.api_key)
+            .header("Content-Type", "application/json")
+            .json(&body)
+            .send()
+            .await;
+
+        match result {
+            Ok(resp) if resp.status().is_success() => {
+                let json: serde_json::Value = resp
+                    .json()
+                    .await
+                    .map_err(|e| ConnectorError::ProtocolError(e.to_string()))?;
+                let content = json["choices"][0]["message"]["content"]
+                    .as_str()
+                    .unwrap_or("")
+                    .to_string();
+                let tokens = crate::json_usage_u32(&json["usage"]["total_tokens"]);
+                let tool_calls = json["choices"][0]["message"]["tool_calls"]
+                    .as_array()
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|tc| {
+                                Some(ToolCall {
+                                    id: tc["id"].as_str()?.to_string(),
+                                    name: tc["function"]["name"].as_str()?.to_string(),
+                                    arguments: serde_json::from_str(
+                                        tc["function"]["arguments"].as_str()?,
+                                    )
+                                    .unwrap_or(serde_json::Value::Null),
+                                })
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                Ok(LlmResponse {
+                    content,
+                    finish_reason: json["choices"][0]["finish_reason"]
+                        .as_str()
+                        .map(|s| s.to_string()),
+                    tokens_used: tokens,
+                    usage: kernel::connector::LlmUsage::reported(
+                        crate::json_usage_u32(&json["usage"]["prompt_tokens"]),
+                        crate::json_usage_u32(&json["usage"]["completion_tokens"]),
+                        crate::json_usage_u32(
+                            &json["usage"]["prompt_tokens_details"]["cached_tokens"],
+                        ),
+                    ),
+                    tool_calls,
+                })
+            }
+            Ok(resp) => {
+                let status = resp.status();
+                let body = resp.text().await.unwrap_or_default();
+                Err(crate::http_status_error(status, Some(&body)))
+            }
+            Err(e) => Err(ConnectorError::ConnectionFailed(e.to_string())),
+        }
+    }
+
+    fn enforces_max_output_tokens(&self) -> bool {
+        true
     }
 
     fn provider_id(&self) -> &ProviderId {
@@ -182,6 +186,16 @@ impl LlmSession for AzureSession {
         &self,
         messages: Vec<StandardMessage>,
         tools: &[ToolDefinition],
+    ) -> Result<LlmResponse, ConnectorError> {
+        self.send_streaming_with_options(messages, tools, LlmRequestOptions::default())
+            .await
+    }
+
+    async fn send_streaming_with_options(
+        &self,
+        messages: Vec<StandardMessage>,
+        tools: &[ToolDefinition],
+        options: LlmRequestOptions,
     ) -> Result<LlmResponse, ConnectorError> {
         let msgs: Vec<serde_json::Value> = messages.iter().map(|m| {
             let mut obj = serde_json::json!({"role": m.role, "content": m.content});
@@ -201,6 +215,9 @@ impl LlmSession for AzureSession {
             })).collect();
             body["tools"] = serde_json::json!(tool_defs);
         }
+        if let Some(max_output_tokens) = options.max_output_tokens {
+            body["max_tokens"] = serde_json::json!(max_output_tokens);
+        }
 
         let resp = self
             .client
@@ -215,10 +232,7 @@ impl LlmSession for AzureSession {
         if !resp.status().is_success() {
             let status = resp.status();
             let text = resp.text().await.unwrap_or_default();
-            return Err(ConnectorError::ConnectionFailed(format!(
-                "HTTP {} - {}",
-                status, text
-            )));
+            return Err(crate::http_status_error(status, Some(&text)));
         }
 
         let full_body = resp
@@ -233,7 +247,7 @@ impl LlmSession for AzureSession {
                     .as_str()
                     .unwrap_or("")
                     .to_string();
-                let tokens = json["usage"]["total_tokens"].as_u64().unwrap_or(0) as u32;
+                let tokens = crate::json_usage_u32(&json["usage"]["total_tokens"]);
                 let tool_calls = json["choices"][0]["message"]["tool_calls"]
                     .as_array()
                     .map(|arr| {
@@ -256,11 +270,11 @@ impl LlmSession for AzureSession {
                     finish_reason: Some("stop".into()),
                     tokens_used: tokens,
                     usage: kernel::connector::LlmUsage::reported(
-                        json["usage"]["prompt_tokens"].as_u64().unwrap_or(0) as u32,
-                        json["usage"]["completion_tokens"].as_u64().unwrap_or(0) as u32,
-                        json["usage"]["prompt_tokens_details"]["cached_tokens"]
-                            .as_u64()
-                            .unwrap_or(0) as u32,
+                        crate::json_usage_u32(&json["usage"]["prompt_tokens"]),
+                        crate::json_usage_u32(&json["usage"]["completion_tokens"]),
+                        crate::json_usage_u32(
+                            &json["usage"]["prompt_tokens_details"]["cached_tokens"],
+                        ),
                     ),
                     tool_calls,
                 });
@@ -304,7 +318,7 @@ impl LlmSession for AzureSession {
                         }
                     }
                     if let Some(usage) = json.get("usage") {
-                        tokens_used = usage["total_tokens"].as_u64().unwrap_or(0) as u32;
+                        tokens_used = crate::json_usage_u32(&usage["total_tokens"]);
                     }
                 }
             }

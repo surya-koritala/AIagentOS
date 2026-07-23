@@ -1,13 +1,13 @@
 //! os-demo — a keyless, LLM-free proof that the AI Agent OS enforcement layer
 //! is load-bearing on the live runtime path.
 //!
-//! Every check below boots a real `AgentKernelImpl` via `kernel::boot_in_memory`
-//! (which also spawns the scheduler observer + cgroup reset timer through
-//! `start_runtime`), creates real agents through `create_agent_full`, and drives
+//! Every check below boots a real in-memory `AgentKernelImpl` and spawns the
+//! scheduler observer through `start_runtime`, creates real agents through
+//! `create_agent_full`, and drives
 //! the *same* `SyscallGate::check_tool_call` chokepoint that `AgentExecutor`
 //! uses in production. No API keys, no network, no LLM provider — the
 //! `llm_provider` is the inert `"stub"`. The denials are produced by the
-//! capability, cgroup, and namespace layers, not by mocks.
+//! capability, cgroup-concurrency, and namespace layers, not by mocks.
 //!
 //! The proven denial patterns are adapted from `tests/src/os_enforcement.rs`.
 //!
@@ -15,7 +15,6 @@
 
 use std::sync::Arc;
 
-use kernel::cgroups::CgroupLimits;
 use kernel::procfs::ProcEntry;
 use kernel::syscall_gate::GateDenial;
 use kernel::tools::{SecurityAction, ToolSecurity};
@@ -76,8 +75,24 @@ async fn main() {
     println!();
 
     // ── 1. BOOT ──────────────────────────────────────────────────────────────
-    println!("[1] BOOT: kernel::boot_in_memory() (spawns scheduler observer + cgroup reset)");
-    let kernel: Arc<AgentKernelImpl> = kernel::boot_in_memory().expect("boot kernel");
+    println!("[1] BOOT: in-memory kernel with managed cgroup limits");
+    let security = kernel::config::Config::default();
+    let budgets = kernel::config::BudgetConfig {
+        max_concurrent_tool_calls: 1,
+        ..security.budgets.clone()
+    };
+    let context =
+        Arc::new(kernel::context::SqliteContextManager::in_memory().expect("context manager"));
+    let kernel = Arc::new(
+        AgentKernelImpl::with_context_manager(
+            context,
+            &budgets,
+            security.mac_enforcing,
+            &security.mac_rules,
+        )
+        .expect("boot kernel"),
+    );
+    let _runtime = kernel.start_runtime();
 
     let full = kernel
         .create_agent_full(agent_config("full-access-agent", "full-access"))
@@ -151,43 +166,27 @@ async fn main() {
     );
     println!();
 
-    // ── 3. CGROUP QUOTA ─────────────────────────────────────────────────────────
-    // Attach the full-access agent to a tight cgroup (100 tokens/min), burn 90,
-    // then a 30-token call breaches the 100-token cap → CgroupQuota (EAGAIN).
-    // Proven approach from os_enforcement.rs::cgroup_quota_blocks_when_over_budget.
-    println!("[3] CGROUP QUOTA: tight cgroup (tokens_per_min=100); burn 90, request 30");
-    let tight = kernel.cgroups.create(
-        "demo-tight".into(),
-        kernel.cgroups.root(),
-        CgroupLimits {
-            tokens_per_min: 100,
-            ..Default::default()
-        },
-    );
-    kernel.syscall_gate.set_cgroup(full.id, tight);
-    kernel.syscall_gate.record_tool_usage(full.id, 90);
-
-    let r = kernel
-        .syscall_gate
-        .check_tool_call(full.id, "read_file", "/etc/hosts", 30)
-        .await;
+    // ── 3. CGROUP CONCURRENCY ──────────────────────────────────────────────────
+    // Provider tokens are enforced on actual LLM calls. Here the syscall gate
+    // demonstrates the separate structural concurrent-tool ceiling.
+    println!("[3] CGROUP CONCURRENCY: managed read-only leaf (one active tool call)");
+    let held = kernel.syscall_gate.acquire_tool_call(readonly.id).unwrap();
+    let r = kernel.syscall_gate.acquire_tool_call(readonly.id);
     board.check(
-        "cgroup/over-budget denied",
-        r == Err(GateDenial::CgroupQuota),
-        &format!("expected Err(CgroupQuota) (90+30 > 100), got {r:?}"),
+        "cgroup/second concurrent call denied",
+        matches!(r, Err(GateDenial::CgroupToolLimit)),
+        "expected Err(CgroupToolLimit)",
     );
 
-    // Resetting the per-minute counter restores headroom.
-    kernel.cgroups.reset_minute_counters();
-    let r = kernel
-        .syscall_gate
-        .check_tool_call(full.id, "read_file", "/etc/hosts", 30)
-        .await;
+    // Releasing the RAII guard restores headroom.
+    drop(held);
+    let r = kernel.syscall_gate.acquire_tool_call(readonly.id);
     board.check(
-        "cgroup/after-reset allowed",
+        "cgroup/after-release allowed",
         r.is_ok(),
-        &format!("expected Ok after reset, got {r:?}"),
+        "expected Ok after release",
     );
+    drop(r);
     println!();
 
     // ── 4. NAMESPACE ISOLATION ───────────────────────────────────────────────────

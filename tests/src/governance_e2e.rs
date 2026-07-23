@@ -12,8 +12,8 @@
 //! The scenario, and what it proves:
 //!  - A read-only agent's `write_file` is denied at the *capability* layer — the
 //!    broker is never reached.
-//!  - A budget-capped agent exhausts a tiny cgroup token quota and is then denied
-//!    at the *cgroup* layer, while a well-funded agent's identical call succeeds.
+//!  - An agent fills its cgroup's concurrent-tool slot and a second call is
+//!    denied, while a peer in an independent cgroup remains available.
 //!  - A namespaced agent is denied a foreign-namespace tool with `NotInNamespace`
 //!    (≈ ENOENT), while a member of that namespace calls the same tool fine.
 //!  - A MAC-policy violator's write is denied at the *MAC* layer and the denial
@@ -21,12 +21,11 @@
 //!  - A compliant agent's allowed calls succeed throughout — one agent's
 //!    violations never take the others down. Containment / isolation holds.
 //!
-//! Patterns (gate construction, profiles, cgroup budgets, namespace tagging,
+//! Patterns (gate construction, profiles, cgroup limits, namespace tagging,
 //! audit sink) are adapted from `tests/src/os_enforcement.rs`.
 
 use std::sync::{Arc, Mutex};
 
-use kernel::cgroups::CgroupLimits;
 use kernel::mac::PolicyRule;
 use kernel::syscall_gate::{AuditDecision, AuditEvent, AuditSink, GateDenial};
 use kernel::{AgentConfig, AgentKernelImpl};
@@ -68,7 +67,14 @@ fn agent_cfg(name: &str, profile: &str) -> AgentConfig {
 /// ones keep working.
 #[tokio::test]
 async fn governed_multi_agent_execution_contains_and_audits_violators() {
-    let kernel = AgentKernelImpl::new().expect("kernel new");
+    let budgets = kernel::config::BudgetConfig {
+        max_concurrent_tool_calls: 1,
+        ..Default::default()
+    };
+    let context =
+        Arc::new(kernel::context::SqliteContextManager::in_memory().expect("context manager"));
+    let kernel =
+        AgentKernelImpl::with_context_manager(context, &budgets, false, &[]).expect("kernel new");
 
     // Wire a recording audit sink so MAC-layer denials/audits are observable as
     // a real audit trail (the production kernel wires observability here).
@@ -123,48 +129,22 @@ async fn governed_multi_agent_execution_contains_and_audits_violators() {
         "read-only write must be denied at capability layer, got {r:?}"
     );
 
-    // ── VIOLATION 2: cgroup quota — exhaust a tiny budget, then deny. ─────────
-    // Attach `frugal` to a 100-token/min cgroup; `funded` to a generous one.
-    let tight = kernel.cgroups.create(
-        "gov-tight".into(),
-        kernel.cgroups.root(),
-        CgroupLimits {
-            tokens_per_min: 100,
-            ..Default::default()
-        },
+    // ── VIOLATION 2: cgroup concurrency — exhaust a tool slot, then deny. ────
+    // Provider tokens are accounted on the LLM path; the syscall gate owns
+    // structural concurrent-tool admission.
+    let held = kernel.syscall_gate.acquire_tool_call(frugal.id).unwrap();
+    let r = kernel.syscall_gate.acquire_tool_call(frugal.id);
+    assert!(
+        matches!(r, Err(GateDenial::CgroupToolLimit)),
+        "frugal's second concurrent tool call must be denied"
     );
-    let generous = kernel.cgroups.create(
-        "gov-generous".into(),
-        kernel.cgroups.root(),
-        CgroupLimits {
-            tokens_per_min: 1_000_000,
-            ..Default::default()
-        },
-    );
-    kernel.syscall_gate.set_cgroup(frugal.id, tight);
-    kernel.syscall_gate.set_cgroup(funded.id, generous);
+    drop(held);
 
-    // Burn 90 of frugal's 100 tokens, then a 30-token call breaches the cap.
-    kernel.syscall_gate.record_tool_usage(frugal.id, 90);
-    let r = kernel
-        .syscall_gate
-        .check_tool_call(frugal.id, "read_file", "/workspace/big.txt", 30)
-        .await;
-    assert_eq!(
-        r,
-        Err(GateDenial::CgroupQuota),
-        "frugal over budget (90+30 > 100) must be denied CgroupQuota"
-    );
-
-    // The *identical* call by the well-funded agent still succeeds — the
-    // over-budget agent is contained without affecting its peer.
-    let r = kernel
-        .syscall_gate
-        .check_tool_call(funded.id, "read_file", "/workspace/big.txt", 30)
-        .await;
+    // The peer has an independent cgroup and remains available.
+    let r = kernel.syscall_gate.acquire_tool_call(funded.id);
     assert!(
         r.is_ok(),
-        "well-funded agent's identical call must still succeed, got {r:?}"
+        "well-funded agent's independent call must still succeed"
     );
 
     // ── VIOLATION 3: namespace — foreign-namespace tool is invisible. ─────────

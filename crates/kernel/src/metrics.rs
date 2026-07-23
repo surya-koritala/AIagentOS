@@ -42,6 +42,7 @@ fn process_start() -> Instant {
 /// Rendering is split from collection so both can be tested in isolation and so
 /// the same snapshot can drive a non-Prometheus consumer later.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct MetricsSnapshot {
     /// Syscall-gate enforcement counters.
     pub gate: GateStats,
@@ -74,6 +75,24 @@ pub struct MetricsSnapshot {
     pub llm_cancelled_total: u64,
     pub llm_wait_ns_total: u64,
     pub llm_run_ns_total: u64,
+    /// Durable provider/global quota state for the current effective fixed
+    /// epoch. These fields use no tenant or agent labels, keeping cardinality
+    /// bounded.
+    pub quota_epoch: u64,
+    pub quota_provider_requests: u64,
+    pub quota_provider_tokens: u64,
+    pub quota_rpm_limit: u64,
+    pub quota_tpm_limit: u64,
+    pub quota_reserved_receipts: u64,
+    pub quota_in_flight_receipts: u64,
+    pub quota_estimated_receipts: u64,
+    pub quota_reconciled_receipts: u64,
+    pub quota_denied_provider_requests: u64,
+    pub quota_denied_provider_tokens: u64,
+    pub quota_denied_cgroup_requests: u64,
+    pub quota_denied_cgroup_tokens: u64,
+    pub quota_denied_migration_fence: u64,
+    pub quota_storage_healthy: bool,
     /// System-wide tokens consumed (sum across agents).
     pub tokens_consumed: u64,
     /// System-wide LLM api calls made (sum across agents).
@@ -112,6 +131,7 @@ impl MetricsSnapshot {
 
         let turns = kernel.turn_admission.metrics();
         let llm = kernel.llm_scheduler.metrics();
+        let quota = kernel.rate_limiter.stats();
         Self {
             gate,
             agent_count,
@@ -135,6 +155,21 @@ impl MetricsSnapshot {
             llm_cancelled_total: llm.cancelled_total,
             llm_wait_ns_total: llm.wait_ns_total,
             llm_run_ns_total: llm.run_ns_total,
+            quota_epoch: quota.epoch,
+            quota_provider_requests: quota.requests_this_minute,
+            quota_provider_tokens: quota.tokens_this_minute,
+            quota_rpm_limit: u64::from(quota.rpm_limit),
+            quota_tpm_limit: quota.tpm_limit,
+            quota_reserved_receipts: quota.reserved_receipts,
+            quota_in_flight_receipts: quota.in_flight_receipts,
+            quota_estimated_receipts: quota.estimated_receipts,
+            quota_reconciled_receipts: quota.reconciled_receipts,
+            quota_denied_provider_requests: quota.denied_provider_requests,
+            quota_denied_provider_tokens: quota.denied_provider_tokens,
+            quota_denied_cgroup_requests: quota.denied_cgroup_requests,
+            quota_denied_cgroup_tokens: quota.denied_cgroup_tokens,
+            quota_denied_migration_fence: quota.denied_migration_fence,
+            quota_storage_healthy: quota.healthy,
             tokens_consumed: sys.tokens_consumed,
             api_calls_made: sys.api_calls_made,
             uptime_seconds: process_start().elapsed().as_secs(),
@@ -327,6 +362,75 @@ impl MetricsSnapshot {
             out.push_str(&format!("agentos_llm_{metric}_nanoseconds_total {value}\n"));
         }
 
+        out.push_str(
+            "# HELP agentos_quota_storage_healthy Whether durable quota accounting is healthy.\n",
+        );
+        out.push_str("# TYPE agentos_quota_storage_healthy gauge\n");
+        out.push_str(&format!(
+            "agentos_quota_storage_healthy {}\n",
+            u8::from(self.quota_storage_healthy)
+        ));
+        out.push_str("# HELP agentos_quota_epoch Current effective fixed Unix-minute epoch.\n");
+        out.push_str("# TYPE agentos_quota_epoch gauge\n");
+        out.push_str(&format!("agentos_quota_epoch {}\n", self.quota_epoch));
+        out.push_str(
+            "# HELP agentos_provider_quota_usage Current provider/global quota usage by dimension.\n",
+        );
+        out.push_str("# TYPE agentos_provider_quota_usage gauge\n");
+        out.push_str(&format!(
+            "agentos_provider_quota_usage{{dimension=\"requests\"}} {}\n",
+            self.quota_provider_requests
+        ));
+        out.push_str(&format!(
+            "agentos_provider_quota_usage{{dimension=\"tokens\"}} {}\n",
+            self.quota_provider_tokens
+        ));
+        out.push_str(
+            "# HELP agentos_provider_quota_limit Configured provider/global quota limit by dimension; zero is unlimited.\n",
+        );
+        out.push_str("# TYPE agentos_provider_quota_limit gauge\n");
+        out.push_str(&format!(
+            "agentos_provider_quota_limit{{dimension=\"requests\"}} {}\n",
+            self.quota_rpm_limit
+        ));
+        out.push_str(&format!(
+            "agentos_provider_quota_limit{{dimension=\"tokens\"}} {}\n",
+            self.quota_tpm_limit
+        ));
+        out.push_str(
+            "# HELP agentos_quota_receipts Current-epoch durable receipts by bounded lifecycle state.\n",
+        );
+        out.push_str("# TYPE agentos_quota_receipts gauge\n");
+        for (state, value) in [
+            ("reserved", self.quota_reserved_receipts),
+            ("in_flight", self.quota_in_flight_receipts),
+            ("estimated", self.quota_estimated_receipts),
+            ("reconciled", self.quota_reconciled_receipts),
+        ] {
+            out.push_str(&format!(
+                "agentos_quota_receipts{{state=\"{state}\"}} {value}\n"
+            ));
+        }
+        out.push_str(
+            "# HELP agentos_quota_denied_total Quota admission denials by bounded scope and dimension.\n",
+        );
+        out.push_str("# TYPE agentos_quota_denied_total counter\n");
+        for (scope, dimension, value) in [
+            ("provider", "requests", self.quota_denied_provider_requests),
+            ("provider", "tokens", self.quota_denied_provider_tokens),
+            ("cgroup", "requests", self.quota_denied_cgroup_requests),
+            ("cgroup", "tokens", self.quota_denied_cgroup_tokens),
+            (
+                "provider",
+                "migration_fence",
+                self.quota_denied_migration_fence,
+            ),
+        ] {
+            out.push_str(&format!(
+                "agentos_quota_denied_total{{scope=\"{scope}\",dimension=\"{dimension}\"}} {value}\n"
+            ));
+        }
+
         // --- LLM usage totals (system scope).
         out.push_str("# HELP agentos_tokens_consumed_total Tokens consumed across all agents.\n");
         out.push_str("# TYPE agentos_tokens_consumed_total counter\n");
@@ -399,6 +503,21 @@ mod tests {
             llm_cancelled_total: 1,
             llm_wait_ns_total: 300,
             llm_run_ns_total: 400,
+            quota_epoch: 42,
+            quota_provider_requests: 3,
+            quota_provider_tokens: 456,
+            quota_rpm_limit: 60,
+            quota_tpm_limit: 100_000,
+            quota_reserved_receipts: 1,
+            quota_in_flight_receipts: 2,
+            quota_estimated_receipts: 3,
+            quota_reconciled_receipts: 4,
+            quota_denied_provider_requests: 5,
+            quota_denied_provider_tokens: 6,
+            quota_denied_cgroup_requests: 7,
+            quota_denied_cgroup_tokens: 8,
+            quota_denied_migration_fence: 9,
+            quota_storage_healthy: true,
             tokens_consumed: 1234,
             api_calls_made: 12,
             uptime_seconds: 99,
@@ -418,6 +537,10 @@ mod tests {
         assert!(text.contains("# TYPE agentos_llm_cores gauge"));
         assert!(text.contains("# TYPE agentos_turn_wait_nanoseconds_total counter"));
         assert!(text.contains("# TYPE agentos_llm_wait_nanoseconds_total counter"));
+        assert!(text.contains("# TYPE agentos_quota_storage_healthy gauge"));
+        assert!(text.contains("# TYPE agentos_provider_quota_usage gauge"));
+        assert!(text.contains("# TYPE agentos_quota_receipts gauge"));
+        assert!(text.contains("# TYPE agentos_quota_denied_total counter"));
         assert!(text.contains("# TYPE agentos_tokens_consumed_total counter"));
         assert!(text.contains("# TYPE agentos_api_calls_total counter"));
         assert!(text.contains("# TYPE agentos_process_uptime_seconds gauge"));
@@ -441,6 +564,13 @@ mod tests {
         assert!(text.contains("agentos_stopped_agents 1"));
         assert!(text.contains("agentos_turn_admission{state=\"active\"} 2"));
         assert!(text.contains("agentos_llm_cores{state=\"in_flight\"} 1"));
+        assert!(text.contains("agentos_quota_storage_healthy 1"));
+        assert!(text.contains("agentos_quota_epoch 42"));
+        assert!(text.contains("agentos_provider_quota_usage{dimension=\"tokens\"} 456"));
+        assert!(text.contains("agentos_quota_receipts{state=\"reconciled\"} 4"));
+        assert!(
+            text.contains("agentos_quota_denied_total{scope=\"cgroup\",dimension=\"tokens\"} 8")
+        );
         assert!(text.contains("agentos_tokens_consumed_total 1234"));
         assert!(text.contains("agentos_api_calls_total 12"));
         assert!(text.contains("agentos_process_uptime_seconds 99"));

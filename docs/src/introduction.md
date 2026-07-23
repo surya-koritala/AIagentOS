@@ -1,8 +1,8 @@
 # AI Agent OS
 
-**An OS kernel for AI agents.** Tool calls go through a real syscall gate —
-capability checks, MAC policy, and cgroup token quotas enforce on *every* call,
-not as scaffolding.
+**An OS kernel for AI agents.** Tool calls go through a real syscall gate for
+namespace, capability, MAC, approval, and cgroup-membership enforcement. LLM
+calls separately cross an atomic durable provider + cgroup quota boundary.
 
 AI Agent OS is not a chatbot and not a coding assistant. It is the **platform
 layer** that sits beneath AI agents and manages them, the same way Linux sits
@@ -46,11 +46,13 @@ each other — is an operating-systems problem. AI Agent OS provides:
 ## What's enforced today
 
 The differentiator is that enforcement is **live on the runtime path**, not
-mocked. Every tool call from an agent flows through `SyscallGate::check_tool_call`,
-which runs a capability check, a MAC policy check, and a cgroup token-quota check
-in order — first failure wins. A denial is returned to the model as a structured
-tool failure, so the kernel never trusts the model to obey policy. See
-[The Syscall Gate](./syscall-gate.md) for how that chokepoint works.
+mocked. Every tool call from an agent flows through `SyscallGate`, which applies
+namespace visibility, capabilities, MAC, exact approval, and valid cgroup
+membership in order. Every provider attempt atomically reserves provider
+RPM/TPM and the stable root → tenant → profile → agent token hierarchy, then
+reconciles actual model usage. A denial is returned to the model as a structured
+failure, so the kernel never trusts the model to obey policy. See [The Syscall
+Gate](./syscall-gate.md) for how the tool chokepoint works.
 
 ## Where to go next
 

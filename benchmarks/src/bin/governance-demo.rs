@@ -1,8 +1,8 @@
 //! governance-demo — a runnable, narrated proof of *governed multi-agent
 //! execution*: several agents run, the ones that violate policy (writing without
-//! the capability, blowing their token budget, or calling a tool in a namespace
-//! they don't belong to) are contained and audited, while the compliant agents
-//! keep working.
+//! the capability, exceeding their concurrent tool capacity, or calling a tool
+//! in a namespace they don't belong to) are contained and audited, while the
+//! compliant agents keep working.
 //!
 //! This is the product thesis made tangible. It boots a real in-memory
 //! `AgentKernelImpl`, creates agents through the live `create_agent_full` path,
@@ -20,7 +20,6 @@
 
 use std::sync::{Arc, Mutex};
 
-use kernel::cgroups::CgroupLimits;
 use kernel::mac::PolicyRule;
 use kernel::syscall_gate::{AuditDecision, AuditEvent, AuditSink, GateDenial};
 use kernel::tools::{SecurityAction, ToolSecurity};
@@ -102,7 +101,20 @@ async fn main() {
     println!("BEFORE any resource broker, and needs no model.");
     println!();
 
-    let kernel: Arc<AgentKernelImpl> = match AgentKernelImpl::new() {
+    let security = kernel::config::Config::default();
+    let budgets = kernel::config::BudgetConfig {
+        max_concurrent_tool_calls: 1,
+        ..security.budgets.clone()
+    };
+    let context = Arc::new(
+        kernel::context::SqliteContextManager::in_memory().expect("create context manager"),
+    );
+    let kernel: Arc<AgentKernelImpl> = match AgentKernelImpl::with_context_manager(
+        context,
+        &budgets,
+        security.mac_enforcing,
+        &security.mac_rules,
+    ) {
         Ok(k) => Arc::new(k),
         Err(e) => {
             eprintln!("failed to boot kernel: {e}");
@@ -179,56 +191,33 @@ async fn main() {
             denied("no CAP_FILE_WRITE — broker never invoked");
             tally.violations_contained += 1;
         }
-        other => println!("      !! unexpected: {other:?}"),
+        Ok(_) => println!("      !! unexpected: capability-denied write was admitted"),
+        Err(other) => println!("      !! unexpected: {other:?}"),
     }
     println!();
 
-    // ── 2. Budget (cgroup) containment ──────────────────────────────────────────
-    rule("[2] BUDGET — frugal agent exhausts a tiny token quota; funded peer unaffected");
-    let tight = kernel.cgroups.create(
-        "demo-tight".into(),
-        kernel.cgroups.root(),
-        CgroupLimits {
-            tokens_per_min: 100,
-            ..Default::default()
-        },
-    );
-    let generous = kernel.cgroups.create(
-        "demo-generous".into(),
-        kernel.cgroups.root(),
-        CgroupLimits {
-            tokens_per_min: 1_000_000,
-            ..Default::default()
-        },
-    );
-    kernel.syscall_gate.set_cgroup(frugal.id, tight);
-    kernel.syscall_gate.set_cgroup(funded.id, generous);
-    kernel.syscall_gate.record_tool_usage(frugal.id, 90);
-    println!("  (frugal budget=100 tok/min, already spent 90)");
+    // ── 2. Cgroup concurrency containment ───────────────────────────────────────
+    rule("[2] CGROUP — frugal agent fills its tool slot; funded peer unaffected");
+    let held = kernel.syscall_gate.acquire_tool_call(frugal.id).unwrap();
+    println!("  (frugal has one tool slot, already occupied)");
 
-    act("frugal", "read_file /workspace/big.txt (est 30 tokens)");
-    match kernel
-        .syscall_gate
-        .check_tool_call(frugal.id, "read_file", "/workspace/big.txt", 30)
-        .await
-    {
-        Err(GateDenial::CgroupQuota) => {
-            denied("90+30 > 100 tok/min — over budget");
+    act("frugal", "start a second concurrent tool call");
+    match kernel.syscall_gate.acquire_tool_call(frugal.id) {
+        Err(GateDenial::CgroupToolLimit) => {
+            denied("one active tool slot is already occupied");
             tally.violations_contained += 1;
         }
-        other => println!("      !! unexpected: {other:?}"),
+        Ok(_) => println!("      !! unexpected: second tool slot was admitted"),
+        Err(other) => println!("      !! unexpected: {other:?}"),
     }
-    act("funded", "read_file /workspace/big.txt (est 30 tokens)");
-    match kernel
-        .syscall_gate
-        .check_tool_call(funded.id, "read_file", "/workspace/big.txt", 30)
-        .await
-    {
+    drop(held);
+    act("funded", "start an independent tool call");
+    match kernel.syscall_gate.acquire_tool_call(funded.id) {
         Ok(_) => {
-            allowed("identical call, generous budget — peer unaffected");
+            allowed("independent cgroup capacity — peer unaffected");
             tally.compliant_succeeded += 1;
         }
-        other => println!("      !! unexpected: {other:?}"),
+        Err(other) => println!("      !! unexpected: {other:?}"),
     }
     println!();
 

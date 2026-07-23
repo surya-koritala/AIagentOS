@@ -25,6 +25,9 @@ turn is actually executing. These are intentionally different.
 2. `TurnAdmission` bounds whole-turn concurrency. Contenders are only actual
    waiters. Normal-class selection chooses lowest virtual runtime. Token usage
    advances vruntime by `tokens * 1024 / weight`, using Linux's weight table.
+   Kernel execution does not sleep in this slot for an exhausted RPM/TPM/cgroup
+   epoch: quota admission returns retryable backpressure immediately, including
+   the next epoch boundary, so independently funded cgroups can still progress.
 3. `LlmScheduler` bounds provider-request concurrency. A permit covers one
    provider attempt and is released before retry backoff, tool work, pause, or
    the next model iteration. Lowest effective nice wins; one point of aging per
@@ -45,11 +48,11 @@ wakeups.
 `set_nice(-20..19)` updates weight in place while preserving accumulated
 vruntime and token usage. Changing priority cannot erase scheduling debt.
 
-The runtime avoids nested scarce permits: same-agent serialization precedes
-turn admission, LLM cores are released before tools/backoff, and resources have
-bounded execution. This bounds shared-resource priority inversion without
-claiming Linux mutex priority inheritance. Providers that ignore cancellation
-must enforce their own timeout.
+The runtime bounds nested-permit waits: same-agent serialization precedes turn
+admission, exhausted quota returns without an epoch wait, LLM cores are released
+before executor retry backoff/tools, and resources have bounded execution. This
+bounds shared-resource priority inversion without claiming Linux mutex priority
+inheritance. Providers that ignore cancellation must enforce their own timeout.
 
 ## Cancellation, starvation, and metrics
 

@@ -193,6 +193,10 @@ pub struct AgentExecutor {
     /// response batches and LLM rounds, and is carried by checkpoints. 0 means
     /// unlimited.
     max_tool_calls_per_turn: usize,
+    /// Provider-enforced completion allowance reserved with each prompt. `0`
+    /// preserves the source-compatible direct-executor behavior; production
+    /// kernel wiring always installs a positive validated value.
+    max_output_tokens_per_request: u32,
     messages: Vec<StandardMessage>,
     cancel_token: CancellationToken,
     event_tx: Option<mpsc::Sender<StreamEvent>>,
@@ -244,6 +248,7 @@ impl AgentExecutor {
             rate_limiter: None,
             context_budget_tokens: 0,
             max_tool_calls_per_turn: 0,
+            max_output_tokens_per_request: 0,
             messages: vec![StandardMessage::system(&system_prompt)],
             cancel_token: CancellationToken::new(),
             event_tx: None,
@@ -324,36 +329,77 @@ impl AgentExecutor {
         self.max_tool_calls_per_turn = max_tool_calls as usize;
     }
 
+    /// Set the provider-enforced completion allowance reserved with each
+    /// prompt before quota admission.
+    pub fn set_max_output_tokens_per_request(&mut self, max_output_tokens: u32) {
+        self.max_output_tokens_per_request = max_output_tokens;
+    }
+
     fn estimate_prompt_tokens(&self, messages: &[StandardMessage]) -> u32 {
+        // Serialize the complete standardized wire shape, not just content.
+        // Assistant tool-call ids/names/arguments, tool result ids, roles, and
+        // framing all become provider input on the next round. The structural
+        // floor prevents an incomplete provider hook from under-reserving a
+        // known prompt; a more accurate provider estimate can only raise it.
+        let structural_floor = Self::conservative_serialized_tokens(messages)
+            .saturating_add((messages.len() as u32).saturating_mul(4));
         self.session
             .estimate_prompt_tokens(messages)
-            .unwrap_or_else(|| {
-                // Conservative fallback: UTF-8 bytes / 3 plus per-message framing.
-                // This intentionally overestimates typical English relative to the
-                // old chars/4 heuristic and is deterministic across platforms.
-                messages.iter().fold(0u32, |total, message| {
-                    total.saturating_add(
-                        (message.content.len() as u32)
-                            .saturating_add(2)
-                            .saturating_div(3)
-                            .saturating_add(4),
-                    )
-                })
-            })
+            .map_or(structural_floor, |estimate| estimate.max(structural_floor))
+    }
+
+    fn conservative_serialized_tokens<T: serde::Serialize + ?Sized>(value: &T) -> u32 {
+        let bytes = serde_json::to_vec(value)
+            .map(|serialized| serialized.len())
+            .unwrap_or(usize::MAX);
+        let bytes = u32::try_from(bytes).unwrap_or(u32::MAX);
+        // One token per serialized UTF-8 byte is a tokenizer-independent
+        // upper bound for byte-backed production tokenizers. It deliberately
+        // over-reserves ordinary prose so adversarial ASCII, identifiers, code,
+        // and structured tool arguments cannot slip below the kernel's local
+        // context/TPM safety floor.
+        bytes
+    }
+
+    fn conservative_tool_tokens(tools: &[crate::connector::ToolDefinition]) -> u32 {
+        if tools.is_empty() {
+            0
+        } else {
+            Self::conservative_serialized_tokens(tools)
+        }
     }
 
     /// Bound the active prompt without silently discarding state. The root
     /// system instruction and latest tool-call state are pinned. Evicted
     /// messages are serialized into the durable agent KV store and replaced by
     /// a compact reference that can be paged in with `StorageGet`.
-    async fn compact_to_token_budget(&mut self) -> Result<(), KernelError> {
+    async fn compact_to_token_budget(
+        &mut self,
+        tools: &[crate::connector::ToolDefinition],
+    ) -> Result<(), KernelError> {
         let budget = self.context_budget_tokens;
-        if budget == 0 || self.messages.len() <= 1 {
+        if budget == 0 {
             return Ok(());
         }
-        let original_tokens = self.estimate_prompt_tokens(&self.messages);
+        let tool_tokens = Self::conservative_tool_tokens(tools);
+        let original_message_tokens = self.estimate_prompt_tokens(&self.messages);
+        let original_tokens = original_message_tokens.saturating_add(tool_tokens);
         if original_tokens <= budget {
             return Ok(());
+        }
+        let message_budget = budget.saturating_sub(tool_tokens);
+        if tool_tokens >= budget {
+            let message = format!(
+                "context pressure: tool definitions require {tool_tokens} tokens but the active budget is {budget}; increase max_context_tokens or reduce registered tool schemas"
+            );
+            let _ = self.context_manager.record_context_pressure(
+                self.agent_id,
+                original_tokens,
+                budget,
+                0,
+                Some(&message),
+            );
+            return Err(KernelError::Policy(message));
         }
 
         let latest_tool_state = self
@@ -371,9 +417,9 @@ impl AgentExecutor {
             .map(|(message, _)| message.clone())
             .collect();
         let pinned_tokens = self.estimate_prompt_tokens(&pinned_messages);
-        if pinned_tokens > budget {
+        if pinned_tokens > message_budget {
             let message = format!(
-                "context pressure: pinned system/tool state requires {pinned_tokens} tokens but the active budget is {budget}; increase max_context_tokens or shorten required state"
+                "context pressure: pinned system/tool state requires {pinned_tokens} tokens plus {tool_tokens} tool-definition tokens but the active budget is {budget}; increase max_context_tokens or shorten required state"
             );
             let _ = self.context_manager.record_context_pressure(
                 self.agent_id,
@@ -387,8 +433,8 @@ impl AgentExecutor {
 
         // Reserve room for a compact durable-spill reference, then keep the
         // newest non-pinned messages that fit.
-        let reference_reserve = 36u32.min(budget.saturating_sub(pinned_tokens));
-        let mut remaining = budget
+        let reference_reserve = 36u32.min(message_budget.saturating_sub(pinned_tokens));
+        let mut remaining = message_budget
             .saturating_sub(pinned_tokens)
             .saturating_sub(reference_reserve);
         let mut keep = pinned.clone();
@@ -483,8 +529,9 @@ impl AgentExecutor {
                     compacted.push(message.clone());
                 }
             }
-            let active_tokens = self.estimate_prompt_tokens(&compacted);
-            if active_tokens <= budget {
+            let active_message_tokens = self.estimate_prompt_tokens(&compacted);
+            let active_tokens = active_message_tokens.saturating_add(tool_tokens);
+            if active_message_tokens <= message_budget {
                 if let Err(error) = self
                     .context_manager
                     .kv_put(self.agent_id, &key, &spill_json)
@@ -522,7 +569,7 @@ impl AgentExecutor {
                 continue;
             }
             let message = format!(
-                "context pressure: durable reference plus pinned state requires {active_tokens} tokens but budget is {budget}"
+                "context pressure: durable reference plus pinned state requires {active_message_tokens} tokens plus {tool_tokens} tool-definition tokens but budget is {budget}"
             );
             let _ = self.context_manager.record_context_pressure(
                 self.agent_id,
@@ -787,7 +834,7 @@ impl AgentExecutor {
 
             // Page out old context to keep the active window within the token
             // budget before each LLM call (no-op when the budget is 0).
-            self.compact_to_token_budget().await?;
+            self.compact_to_token_budget(&tools).await?;
 
             // Atomically check configured cumulative USD ceilings and hold each
             // relevant scope through provider accounting. This prevents two
@@ -1021,24 +1068,27 @@ impl AgentExecutor {
             .collect()
     }
 
-    /// Send to LLM with retry (3 attempts, exponential backoff).
-    /// Send to LLM with retry. Filters orphaned tool messages to prevent API errors.
+    /// Send to the LLM with transient-only retry and filter orphaned tool
+    /// messages before provider I/O.
     async fn send_with_retry(
         &self,
         tools: &[crate::connector::ToolDefinition],
     ) -> Result<ProviderCall, KernelError> {
+        if self.max_output_tokens_per_request > 0 && !self.session.enforces_max_output_tokens() {
+            return Err(KernelError::Policy(format!(
+                "provider session {}/{} does not enforce the configured max_output_tokens_per_request={}; bounded token admission refuses to call it",
+                self.session.provider_id(),
+                self.session.model_id(),
+                self.max_output_tokens_per_request
+            )));
+        }
         // Filter messages: remove tool results that don't have a preceding tool_calls message
         let clean_messages = self.clean_messages();
-        let estimated_input_tokens = clean_messages
-            .iter()
-            .map(|message| (message.content.len() as u32 / 4).saturating_add(1))
-            .chain(tools.iter().map(|tool| {
-                ((tool.name.len() + tool.description.len() + tool.parameters.to_string().len())
-                    as u32
-                    / 4)
-                .saturating_add(1)
-            }))
-            .fold(0u32, u32::saturating_add);
+        let estimated_input_tokens = self
+            .estimate_prompt_tokens(&clean_messages)
+            .saturating_add(Self::conservative_tool_tokens(tools));
+        let estimated_admission_tokens =
+            estimated_input_tokens.saturating_add(self.max_output_tokens_per_request);
 
         let mut last_err = None;
         let mut provider_latency_ms = 0u64;
@@ -1054,41 +1104,154 @@ impl AgentExecutor {
                     _ = tokio::time::sleep(delay) => {}
                 }
             }
-            let mut rate_guard = match &self.rate_limiter {
-                Some(limiter) => Some(
-                    limiter
-                        .acquire_tokens_cancellable(
-                            u64::from(estimated_input_tokens),
+            // A cgroup can be reassigned while quota admission waits. Snapshot,
+            // reserve every stable scope atomically, then verify and mark the
+            // receipt in flight under the gate's membership-mutation lock. A
+            // stale snapshot is fully refunded and retried without consuming a
+            // provider retry attempt.
+            let mut membership_retries = 0u8;
+            let (mut rate_guard, _llm_core) = loop {
+                let (quota_snapshot, mut membership_changes) = match &self.rate_limiter {
+                    Some(_) => {
+                        // Subscribe first. The receiver carries the exact
+                        // per-agent revision, so a move before, during, or
+                        // after the snapshot cannot be lost.
+                        let changes = self
+                            .syscall_gate
+                            .cgroup_quota_changes(self.agent_id)
+                            .map_err(|denial| KernelError::Policy(denial.message()))?;
+                        let snapshot = self
+                            .syscall_gate
+                            .cgroup_quota_constraints(self.agent_id)
+                            .map_err(|denial| KernelError::Policy(denial.message()))?;
+                        (Some(snapshot), Some(changes))
+                    }
+                    None => (None, None),
+                };
+                let admission = match (&self.rate_limiter, quota_snapshot.as_ref()) {
+                    (Some(limiter), Some(snapshot)) => limiter
+                        .try_acquire_tokens_with_cgroups_cancellable(
+                            u64::from(estimated_admission_tokens),
+                            &snapshot.constraints,
+                            Some((
+                                membership_changes
+                                    .as_mut()
+                                    .expect("a quota snapshot always has a revision receiver"),
+                                snapshot.membership_revision,
+                            )),
                             &self.cancel_token,
                         )
-                        .await?,
-                ),
-                None => None,
-            };
-            let _llm_core = match &self.llm_scheduler {
-                Some((scheduler, pid, nice)) => Some(
-                    scheduler
-                        .acquire_cancellable(*pid, *nice, &self.cancel_token)
                         .await
-                        .map_err(KernelError::Scheduler)?,
-                ),
-                None => None,
+                        .map(Some),
+                    _ => Ok(None),
+                };
+                let mut guard = match admission {
+                    Ok(guard) => guard,
+                    Err(crate::rate_limit::RateLimitError::CgroupMembershipChanged) => {
+                        membership_retries = membership_retries.saturating_add(1);
+                        if membership_retries >= 8 {
+                            return Err(KernelError::Policy(
+                                "cgroup membership changed repeatedly during provider admission"
+                                    .into(),
+                            ));
+                        }
+                        continue;
+                    }
+                    Err(error) => return Err(error.into()),
+                };
+                let llm_core = match &self.llm_scheduler {
+                    Some((scheduler, pid, nice)) => {
+                        if let Some(changes) = membership_changes.as_mut() {
+                            let core = tokio::select! {
+                                biased;
+                                changed = changes.changed() => {
+                                    let _ = changed;
+                                    guard
+                                        .expect(
+                                            "membership changes are watched only with a quota guard",
+                                        )
+                                        .refund()?;
+                                    membership_retries = membership_retries.saturating_add(1);
+                                    if membership_retries >= 8 {
+                                        return Err(KernelError::Policy(
+                                            "cgroup membership changed repeatedly during provider admission"
+                                                .into(),
+                                        ));
+                                    }
+                                    continue;
+                                }
+                                core = scheduler.acquire_cancellable(
+                                    *pid,
+                                    *nice,
+                                    &self.cancel_token,
+                                ) => core.map_err(KernelError::Scheduler)?,
+                            };
+                            Some(core)
+                        } else {
+                            Some(
+                                scheduler
+                                    .acquire_cancellable(*pid, *nice, &self.cancel_token)
+                                    .await
+                                    .map_err(KernelError::Scheduler)?,
+                            )
+                        }
+                    }
+                    None => None,
+                };
+                if self.cancel_token.is_cancelled() {
+                    return Err(KernelError::Policy(
+                        "execution cancelled before provider invocation".into(),
+                    ));
+                }
+
+                let Some(snapshot) = quota_snapshot else {
+                    break (guard, llm_core);
+                };
+                let mark_result = self.syscall_gate.with_verified_cgroup_quota_snapshot(
+                    self.agent_id,
+                    snapshot.membership_revision,
+                    || {
+                        guard
+                            .as_mut()
+                            .expect("a quota snapshot always has a rate-limit guard")
+                            .mark_invoked()
+                    },
+                );
+                match mark_result {
+                    Ok(Ok(())) => break (guard, llm_core),
+                    Ok(Err(error)) => return Err(error.into()),
+                    Err(crate::syscall_gate::GateDenial::CgroupMembershipChanged) => {
+                        guard
+                            .expect("a stale quota snapshot always has a rate-limit guard")
+                            .refund()?;
+                        drop(llm_core);
+                        membership_retries = membership_retries.saturating_add(1);
+                        if membership_retries >= 8 {
+                            return Err(KernelError::Policy(
+                                "cgroup membership changed repeatedly during provider admission"
+                                    .into(),
+                            ));
+                        }
+                    }
+                    Err(denial) => {
+                        guard
+                            .expect("a rejected quota snapshot always has a rate-limit guard")
+                            .refund()?;
+                        return Err(KernelError::Policy(denial.message()));
+                    }
+                }
             };
-            if self.cancel_token.is_cancelled() {
-                return Err(KernelError::Policy(
-                    "execution cancelled before provider invocation".into(),
-                ));
-            }
-            if let Some(guard) = rate_guard.as_mut() {
-                // This durable transition is the linearization point: after it
-                // commits, a crash/cancellation conservatively retains the
-                // estimate because provider I/O may have happened.
-                guard.mark_invoked()?;
-            }
             let started = std::time::Instant::now();
             let result = tokio::select! {
                 biased;
-                result = self.session.send_streaming(clean_messages.clone(), tools) => result,
+                result = self.session.send_streaming_with_options(
+                    clean_messages.clone(),
+                    tools,
+                    crate::connector::LlmRequestOptions {
+                        max_output_tokens: (self.max_output_tokens_per_request > 0)
+                            .then_some(self.max_output_tokens_per_request),
+                    },
+                ) => result,
                 _ = self.cancel_token.cancelled() => {
                     if let Some(guard) = rate_guard.take() {
                         guard.retain_estimate()?;
@@ -1104,7 +1267,18 @@ impl AgentExecutor {
             match result {
                 Ok(response) => {
                     let usage = if response.usage.provider_reported && response.usage.total() > 0 {
-                        response.usage
+                        let cached_tokens = response
+                            .usage
+                            .cached_tokens
+                            .min(response.usage.input_tokens);
+                        crate::connector::LlmUsage {
+                            input_tokens: response.usage.input_tokens,
+                            output_tokens: response.usage.output_tokens,
+                            cached_tokens,
+                            // Malformed cached>input data is clamped before
+                            // billing and marked as hybrid estimated usage.
+                            provider_reported: cached_tokens == response.usage.cached_tokens,
+                        }
                     } else {
                         // Conservative fallback: count the full serialized
                         // request estimate plus the adapter's token count as
@@ -1118,7 +1292,15 @@ impl AgentExecutor {
                         }
                     };
                     if let Some(guard) = rate_guard {
-                        guard.reconcile(u64::from(usage.total()))?;
+                        // Quota enforcement is deliberately stricter than
+                        // invoice accounting. A provider cannot refund below
+                        // the kernel's complete serialized-prompt floor, while
+                        // billing and user-facing telemetry retain the
+                        // provider-reported usage used by the invoice.
+                        let quota_tokens = usage
+                            .total()
+                            .max(estimated_input_tokens.saturating_add(usage.output_tokens));
+                        guard.reconcile(u64::from(quota_tokens))?;
                     }
                     return Ok(ProviderCall {
                         response,
@@ -1132,6 +1314,9 @@ impl AgentExecutor {
                     if let Some(guard) = rate_guard {
                         guard.retain_estimate()?;
                     }
+                    if !crate::connector::is_transient(&e) {
+                        return Err(KernelError::Connector(e));
+                    }
                     last_err = Some(e);
                 }
             }
@@ -1141,17 +1326,18 @@ impl AgentExecutor {
 
     /// Execute a tool call, returning the result string (or error message for LLM recovery).
     ///
-    /// When a `SyscallGate` is installed, every call is screened: capability →
-    /// MAC → cgroup quota. A denial is surfaced to the LLM as a tool error so
-    /// the model can recover (try another tool, ask the user, etc.) without
-    /// the kernel trusting the LLM to obey policy.
+    /// When a `SyscallGate` is installed, every call is screened for namespace
+    /// visibility, capabilities, MAC, exact approval, valid cgroup membership,
+    /// and concurrent-tool capacity. A denial is surfaced to the LLM as a tool
+    /// error so the model can recover without the kernel trusting it to obey
+    /// policy.
     async fn execute_tool(&self, tool_call: &crate::connector::ToolCall) -> String {
         // Resolve action, capabilities, and resource using the binding's
         // validated declaration. Unknown tools and malformed resource arguments
         // fail before policy evaluation or provider execution.
-        match self
+        let _tool_slot = match self
             .tool_registry
-            .authorize_call(
+            .authorize_and_acquire_call(
                 &self.syscall_gate,
                 self.agent_id,
                 &tool_call.name,
@@ -1159,7 +1345,7 @@ impl AgentExecutor {
             )
             .await
         {
-            Ok(_) => {}
+            Ok((_, slot)) => slot,
             Err(crate::tools::ToolAuthorizationError::InvalidDeclaration(error))
                 if error.starts_with("unknown tool") =>
             {
@@ -1175,17 +1361,6 @@ impl AgentExecutor {
                 )
             }
             Err(error) => return format!("Tool '{}' denied by kernel: {error}", tool_call.name),
-        }
-
-        let _tool_slot = match self.syscall_gate.acquire_tool_call(self.agent_id) {
-            Ok(slot) => slot,
-            Err(denial) => {
-                return format!(
-                    "Tool '{}' denied by kernel: {}",
-                    tool_call.name,
-                    denial.message()
-                );
-            }
         };
 
         let result = match self.tool_registry.resolve(self.agent_id, tool_call) {
@@ -1620,6 +1795,32 @@ mod tests {
     // *next* LLM call and returns a budget message instead.
     // #4: the context pager bounds the active window by token budget — older
     // non-system messages are paged out, the system prompt is always retained.
+    #[test]
+    fn structural_prompt_floor_never_counts_less_than_serialized_bytes() {
+        let executor = AgentExecutor::new_unconfined(
+            uuid::Uuid::new_v4(),
+            Box::new(InfiniteToolSession { id: "x".into() }),
+            mock_broker(),
+            Arc::new(ToolRegistry::new()),
+            mock_context_manager(),
+            "SYSTEM".into(),
+        );
+        let high_entropy = (0..2_048)
+            .map(|index| {
+                const ASCII: &[u8] =
+                    b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*()[]{}";
+                ASCII[(index * 37 + 11) % ASCII.len()] as char
+            })
+            .collect::<String>();
+        let messages = vec![StandardMessage::user(high_entropy)];
+        let serialized_bytes = u32::try_from(serde_json::to_vec(&messages).unwrap().len()).unwrap();
+
+        assert!(
+            executor.estimate_prompt_tokens(&messages) >= serialized_bytes,
+            "the structural floor must never assume fewer than one token per serialized byte"
+        );
+    }
+
     #[tokio::test]
     async fn context_pager_bounds_active_window_by_tokens() {
         let agent_id = uuid::Uuid::new_v4();
@@ -1632,18 +1833,19 @@ mod tests {
             context.clone(),
             "SYSTEM PROMPT".into(),
         );
-        executor.set_context_budget(100);
+        const CONTEXT_BUDGET: u32 = 300;
+        executor.set_context_budget(CONTEXT_BUDGET);
         let (event_tx, mut event_rx) = mpsc::channel(4);
         executor.set_event_channel(event_tx);
 
-        // 10 user messages of ~40 chars each (~11 tokens apiece).
+        // Ten user messages exceed the byte-conservative structural budget.
         for _ in 0..10 {
             executor
                 .messages
                 .push(StandardMessage::user("x".repeat(40)));
         }
         let before = executor.messages.len();
-        executor.compact_to_token_budget().await.unwrap();
+        executor.compact_to_token_budget(&[]).await.unwrap();
         let after = executor.messages.len();
 
         assert!(
@@ -1653,7 +1855,7 @@ mod tests {
         // System prompt is always kept at index 0.
         assert_eq!(executor.messages[0].role, "system");
         assert_eq!(executor.messages[0].content, "SYSTEM PROMPT");
-        assert!(executor.estimate_prompt_tokens(&executor.messages) <= 100);
+        assert!(executor.estimate_prompt_tokens(&executor.messages) <= CONTEXT_BUDGET);
         assert!(executor.messages.iter().any(|message| {
             message.role == "system" && message.content.contains("Context spill")
         }));
@@ -1670,7 +1872,7 @@ mod tests {
             stats.active_tokens,
             executor.estimate_prompt_tokens(&executor.messages)
         );
-        assert_eq!(stats.budget_tokens, 100);
+        assert_eq!(stats.budget_tokens, CONTEXT_BUDGET);
         assert_eq!(stats.spill_count, 1);
         assert!(stats.evicted_messages > 0);
         assert_eq!(stats.stored_spills, 1);
@@ -1679,7 +1881,7 @@ mod tests {
         assert!(matches!(
             event_rx.try_recv().unwrap(),
             StreamEvent::ContextPressure {
-                budget_tokens: 100,
+                budget_tokens: CONTEXT_BUDGET,
                 ..
             }
         ));
@@ -1692,8 +1894,66 @@ mod tests {
                 .push(StandardMessage::user("y".repeat(40)));
         }
         let n = executor.messages.len();
-        executor.compact_to_token_budget().await.unwrap();
+        executor.compact_to_token_budget(&[]).await.unwrap();
         assert_eq!(executor.messages.len(), n, "budget 0 must not trim");
+    }
+
+    #[tokio::test]
+    async fn context_budget_includes_complete_tool_schema_overhead() {
+        let agent_id = uuid::Uuid::new_v4();
+        let context = mock_context_manager();
+        let mut executor = AgentExecutor::new_unconfined(
+            agent_id,
+            Box::new(InfiniteToolSession { id: "x".into() }),
+            mock_broker(),
+            Arc::new(ToolRegistry::new()),
+            context.clone(),
+            "SYSTEM".into(),
+        );
+        let tools = vec![ToolDefinition {
+            name: "large_schema".into(),
+            description: "d".repeat(90),
+            parameters: serde_json::json!({
+                "type": "object",
+                "description": "s".repeat(120),
+            }),
+        }];
+        let tool_tokens = AgentExecutor::conservative_serialized_tokens(&tools);
+        let budget = tool_tokens.saturating_add(300);
+        executor.set_context_budget(budget);
+        for _ in 0..12 {
+            executor
+                .messages
+                .push(StandardMessage::user("history".repeat(20)));
+        }
+
+        executor.compact_to_token_budget(&tools).await.unwrap();
+        let total = executor
+            .estimate_prompt_tokens(&executor.messages)
+            .saturating_add(tool_tokens);
+        assert!(total <= budget, "{total} must fit within {budget}");
+        assert_eq!(
+            context
+                .context_pressure_stats(agent_id)
+                .unwrap()
+                .active_tokens,
+            total
+        );
+
+        let mut one_message = AgentExecutor::new_unconfined(
+            uuid::Uuid::new_v4(),
+            Box::new(InfiniteToolSession { id: "x".into() }),
+            mock_broker(),
+            Arc::new(ToolRegistry::new()),
+            mock_context_manager(),
+            "SYSTEM".into(),
+        );
+        one_message.set_context_budget(tool_tokens.saturating_sub(1));
+        let error = one_message
+            .compact_to_token_budget(&tools)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("tool definitions require"));
     }
 
     #[tokio::test]
@@ -1713,7 +1973,7 @@ mod tests {
             .messages
             .push(StandardMessage::user("ordinary history"));
         let before = executor.messages.clone();
-        let error = executor.compact_to_token_budget().await.unwrap_err();
+        let error = executor.compact_to_token_budget(&[]).await.unwrap_err();
         assert!(error.to_string().contains("pinned system/tool state"));
         assert_eq!(executor.messages, before);
         let stats = context.context_pressure_stats(agent_id).unwrap();
@@ -1755,8 +2015,11 @@ mod tests {
         );
         // Exactly one LLM round happened (one tool call), not all 10 iterations.
         assert_eq!(output.tool_calls_made, 1);
-        // One response was priced: 5 tokens × $1/1k = $0.005.
-        assert!((budget.global_spent_usd() - 0.005).abs() < 1e-6);
+        // The response is priced from the byte-conservative input floor plus
+        // provider output, so the charged amount is exact but intentionally
+        // larger than the old output-only fixture value.
+        assert!(budget.global_spent_usd() > 0.004);
+        assert!((budget.global_spent_usd() - output.estimated_cost_usd).abs() < f64::EPSILON);
     }
 
     /// Mock session that emits a shim-style plaintext tool call (no native
@@ -1848,7 +2111,14 @@ mod tests {
         let output = executor.run("Read /tmp/test.txt").await.unwrap();
         assert_eq!(output.content, "The file contains: hello world");
         assert_eq!(output.tool_calls_made, 1);
-        assert_eq!(output.tokens_used, 35);
+        assert_eq!(output.usage.output_tokens, 35);
+        assert_eq!(
+            output.tokens_used,
+            output
+                .usage
+                .input_tokens
+                .saturating_add(output.usage.output_tokens)
+        );
     }
 
     #[tokio::test]
@@ -2065,6 +2335,36 @@ mod tests {
         id: String,
     }
 
+    struct PermanentFailSession {
+        call_count: Arc<AtomicUsize>,
+        id: String,
+    }
+
+    #[async_trait::async_trait]
+    impl LlmSession for PermanentFailSession {
+        async fn send(
+            &self,
+            messages: Vec<StandardMessage>,
+        ) -> Result<LlmResponse, ConnectorError> {
+            self.send_with_tools(messages, &[]).await
+        }
+
+        async fn send_with_tools(
+            &self,
+            _messages: Vec<StandardMessage>,
+            _tools: &[ToolDefinition],
+        ) -> Result<LlmResponse, ConnectorError> {
+            self.call_count.fetch_add(1, Ordering::SeqCst);
+            Err(ConnectorError::ProtocolError(
+                "permanent authentication failure".into(),
+            ))
+        }
+
+        fn provider_id(&self) -> &crate::ProviderId {
+            &self.id
+        }
+    }
+
     #[async_trait::async_trait]
     impl LlmSession for FailThenSucceedSession {
         async fn send(
@@ -2113,6 +2413,8 @@ mod tests {
             mock_context_manager(),
             "test".into(),
         );
+        let limiter = execution_rate_limiter();
+        executor.set_rate_limiter(limiter.clone());
 
         let output = executor.run("test").await.unwrap();
         assert_eq!(output.content, "recovered!");
@@ -2122,6 +2424,42 @@ mod tests {
         assert_eq!(output.usage.estimated_requests, 1);
         assert!(output.usage.input_tokens > 0);
         assert_eq!(output.usage.output_tokens, 10);
+        assert_eq!(
+            limiter.try_stats().unwrap().requests_this_minute,
+            3,
+            "one durable request receipt must exist for each outbound attempt"
+        );
+    }
+
+    #[tokio::test]
+    async fn permanent_provider_failure_is_not_retried() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let limiter = execution_rate_limiter();
+        let mut executor = AgentExecutor::new_unconfined(
+            uuid::Uuid::new_v4(),
+            Box::new(PermanentFailSession {
+                call_count: calls.clone(),
+                id: "mock".into(),
+            }),
+            mock_broker(),
+            Arc::new(ToolRegistry::new()),
+            mock_context_manager(),
+            "test".into(),
+        );
+        executor.set_rate_limiter(limiter.clone());
+
+        let error = executor.run("test").await.unwrap_err();
+
+        assert!(matches!(
+            error,
+            KernelError::Connector(ConnectorError::ProtocolError(_))
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            limiter.try_stats().unwrap().requests_this_minute,
+            1,
+            "a permanent failure must burn exactly one durable request receipt"
+        );
     }
 
     struct CountingContentSession {
@@ -2130,6 +2468,93 @@ mod tests {
         release: Option<Arc<tokio::sync::Notify>>,
         fail: bool,
         id: String,
+    }
+
+    struct UnderreportingSession {
+        id: String,
+    }
+
+    #[async_trait::async_trait]
+    impl LlmSession for UnderreportingSession {
+        async fn send(
+            &self,
+            messages: Vec<StandardMessage>,
+        ) -> Result<LlmResponse, ConnectorError> {
+            self.send_with_tools(messages, &[]).await
+        }
+
+        async fn send_with_tools(
+            &self,
+            _messages: Vec<StandardMessage>,
+            _tools: &[ToolDefinition],
+        ) -> Result<LlmResponse, ConnectorError> {
+            Ok(LlmResponse {
+                content: "done".into(),
+                finish_reason: Some("stop".into()),
+                tokens_used: 2,
+                usage: LlmUsage {
+                    input_tokens: 1,
+                    output_tokens: 2,
+                    cached_tokens: 99,
+                    provider_reported: true,
+                },
+                tool_calls: Vec::new(),
+            })
+        }
+
+        fn provider_id(&self) -> &crate::ProviderId {
+            &self.id
+        }
+    }
+
+    struct BoundedOutputSession {
+        id: String,
+        observed_limit: Arc<std::sync::atomic::AtomicU32>,
+    }
+
+    #[async_trait::async_trait]
+    impl LlmSession for BoundedOutputSession {
+        async fn send(
+            &self,
+            messages: Vec<StandardMessage>,
+        ) -> Result<LlmResponse, ConnectorError> {
+            self.send_with_tools(messages, &[]).await
+        }
+
+        async fn send_with_tools(
+            &self,
+            _messages: Vec<StandardMessage>,
+            _tools: &[ToolDefinition],
+        ) -> Result<LlmResponse, ConnectorError> {
+            Ok(LlmResponse {
+                content: "bounded".into(),
+                finish_reason: Some("stop".into()),
+                tokens_used: 2,
+                usage: LlmUsage::reported(1, 2, 0),
+                tool_calls: Vec::new(),
+            })
+        }
+
+        async fn send_with_options(
+            &self,
+            messages: Vec<StandardMessage>,
+            tools: &[ToolDefinition],
+            options: crate::connector::LlmRequestOptions,
+        ) -> Result<LlmResponse, ConnectorError> {
+            self.observed_limit.store(
+                options.max_output_tokens.unwrap_or(0),
+                std::sync::atomic::Ordering::SeqCst,
+            );
+            self.send_with_tools(messages, tools).await
+        }
+
+        fn provider_id(&self) -> &crate::ProviderId {
+            &self.id
+        }
+
+        fn enforces_max_output_tokens(&self) -> bool {
+            true
+        }
     }
 
     #[async_trait::async_trait]
@@ -2184,6 +2609,151 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn provider_usage_cannot_refund_below_the_structural_prompt_floor() {
+        let registry = Arc::new(ToolRegistry::new());
+        let user_message = "high-entropy:".to_string() + &"A1!z9$".repeat(400);
+        let prompt = vec![
+            StandardMessage::system("system"),
+            StandardMessage::user(&user_message),
+        ];
+        let structural_floor = AgentExecutor::conservative_serialized_tokens(&prompt)
+            .saturating_add((prompt.len() as u32).saturating_mul(4))
+            .saturating_add(AgentExecutor::conservative_tool_tokens(
+                &registry.definitions(),
+            ));
+        let limiter = Arc::new(crate::rate_limit::RateLimiter::new(
+            crate::rate_limit::RateLimitConfig {
+                rpm: 10,
+                tpm: 100_000,
+                max_concurrent: 2,
+            },
+        ));
+        let mut executor = AgentExecutor::new_unconfined(
+            uuid::Uuid::new_v4(),
+            Box::new(UnderreportingSession { id: "mock".into() }),
+            mock_broker(),
+            registry,
+            mock_context_manager(),
+            "system".into(),
+        );
+        executor.set_rate_limiter(limiter.clone());
+
+        let output = executor.run(&user_message).await.unwrap();
+
+        assert_eq!(output.usage.input_tokens, 1);
+        assert_eq!(output.usage.output_tokens, 2);
+        assert_eq!(output.usage.cached_tokens, 1);
+        assert_eq!(output.usage.provider_reported_requests, 0);
+        assert_eq!(output.usage.estimated_requests, 1);
+        assert_eq!(
+            limiter.try_stats().unwrap().tokens_this_minute,
+            u64::from(structural_floor.saturating_add(2))
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_execution_rejects_sessions_that_ignore_output_options() {
+        let limiter = execution_rate_limiter();
+        let mut executor = AgentExecutor::new_unconfined(
+            uuid::Uuid::new_v4(),
+            Box::new(UnderreportingSession {
+                id: "custom".into(),
+            }),
+            mock_broker(),
+            Arc::new(ToolRegistry::new()),
+            mock_context_manager(),
+            "system".into(),
+        );
+        executor.set_rate_limiter(limiter.clone());
+        executor.set_max_output_tokens_per_request(32);
+
+        let error = executor
+            .run("must fail before provider admission")
+            .await
+            .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("does not enforce the configured max_output_tokens_per_request"));
+        assert_eq!(limiter.try_stats().unwrap().requests_this_minute, 0);
+    }
+
+    #[tokio::test]
+    async fn output_allowance_is_reserved_before_io_and_forwarded_to_session() {
+        let user_message = "reserve completion room";
+        let registry = Arc::new(ToolRegistry::new());
+        let prompt = vec![
+            StandardMessage::system("system"),
+            StandardMessage::user(user_message),
+        ];
+        let input_floor = AgentExecutor::conservative_serialized_tokens(&prompt)
+            .saturating_add((prompt.len() as u32).saturating_mul(4))
+            .saturating_add(AgentExecutor::conservative_tool_tokens(
+                &registry.definitions(),
+            ));
+        let output_allowance = 50;
+        let observed = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let limiter = Arc::new(crate::rate_limit::RateLimiter::new(
+            crate::rate_limit::RateLimitConfig {
+                rpm: 10,
+                tpm: u64::from(input_floor.saturating_add(output_allowance - 1)),
+                max_concurrent: 1,
+            },
+        ));
+        let mut denied = AgentExecutor::new_unconfined(
+            uuid::Uuid::new_v4(),
+            Box::new(BoundedOutputSession {
+                id: "bounded".into(),
+                observed_limit: observed.clone(),
+            }),
+            mock_broker(),
+            registry.clone(),
+            mock_context_manager(),
+            "system".into(),
+        );
+        denied.set_rate_limiter(limiter);
+        denied.set_max_output_tokens_per_request(output_allowance);
+
+        assert!(matches!(
+            denied.run(user_message).await,
+            Err(KernelError::RateLimit(
+                crate::rate_limit::RateLimitError::RequestExceedsTpm { .. }
+            ))
+        ));
+        assert_eq!(
+            observed.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "provider I/O must not begin when the completion allowance cannot fit"
+        );
+
+        let admitted_limiter = Arc::new(crate::rate_limit::RateLimiter::new(
+            crate::rate_limit::RateLimitConfig {
+                rpm: 10,
+                tpm: u64::from(input_floor.saturating_add(output_allowance)),
+                max_concurrent: 1,
+            },
+        ));
+        let mut admitted = AgentExecutor::new_unconfined(
+            uuid::Uuid::new_v4(),
+            Box::new(BoundedOutputSession {
+                id: "bounded".into(),
+                observed_limit: observed.clone(),
+            }),
+            mock_broker(),
+            registry,
+            mock_context_manager(),
+            "system".into(),
+        );
+        admitted.set_rate_limiter(admitted_limiter);
+        admitted.set_max_output_tokens_per_request(output_allowance);
+        admitted.run(user_message).await.unwrap();
+        assert_eq!(
+            observed.load(std::sync::atomic::Ordering::SeqCst),
+            output_allowance
+        );
+    }
+
+    #[tokio::test]
     async fn cancellation_while_waiting_for_llm_core_refunds_quota_without_provider_io() {
         let scheduler = Arc::new(crate::llm_sched::LlmScheduler::new(1));
         let held_core = scheduler.acquire(999, 0).await;
@@ -2226,6 +2796,257 @@ mod tests {
         assert_eq!(stats.tokens_this_minute, 0);
         assert_eq!(stats.reserved_receipts, 0);
         assert_eq!(stats.in_flight_receipts, 0);
+    }
+
+    #[tokio::test]
+    async fn cgroup_move_after_reservation_refunds_stale_snapshot_before_provider_io() {
+        let scheduler = Arc::new(crate::llm_sched::LlmScheduler::new(1));
+        let held_core = scheduler.acquire(999, 0).await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let context = mock_context_manager();
+        let limiter = Arc::new(
+            crate::rate_limit::RateLimiter::with_store(
+                crate::rate_limit::RateLimitConfig {
+                    rpm: 100,
+                    tpm: 100_000,
+                    max_concurrent: 4,
+                },
+                context.clone(),
+                Arc::new(crate::quota_clock::SystemQuotaClock::new()),
+            )
+            .unwrap(),
+        );
+        let cgroups = Arc::new(crate::cgroups::CgroupManager::new());
+        let first_group = cgroups.create(
+            "first".into(),
+            cgroups.root(),
+            crate::cgroups::CgroupLimits {
+                tokens_per_min: 10_000,
+                ..Default::default()
+            },
+        );
+        let second_group = cgroups.create(
+            "second".into(),
+            cgroups.root(),
+            crate::cgroups::CgroupLimits {
+                tokens_per_min: 10_000,
+                ..Default::default()
+            },
+        );
+        let gate = Arc::new(crate::syscall_gate::SyscallGate::with_mac(
+            cgroups,
+            false,
+            Vec::new(),
+        ));
+        let agent_id = uuid::Uuid::new_v4();
+        gate.try_register_agent(agent_id, crate::CapabilitySet::all(), Some(first_group))
+            .unwrap();
+        let mut executor = AgentExecutor::new(
+            agent_id,
+            Box::new(CountingContentSession {
+                calls: calls.clone(),
+                entered: None,
+                release: None,
+                fail: false,
+                id: "mock".into(),
+            }),
+            mock_broker(),
+            Arc::new(ToolRegistry::new()),
+            context,
+            gate.clone(),
+            "test".into(),
+        );
+        executor.set_rate_limiter(limiter.clone());
+        executor.set_llm_scheduler(scheduler.clone(), 1, 0);
+
+        let run = tokio::spawn(async move { executor.run("move while admitted").await });
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while scheduler.waiting() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("executor should reserve quota before waiting for the core");
+        gate.try_set_cgroup(agent_id, second_group).unwrap();
+        drop(held_core);
+
+        let output = run.await.unwrap().unwrap();
+        assert_eq!(output.content, "done");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let stats = limiter.try_stats().unwrap();
+        assert_eq!(
+            stats.requests_this_minute, 1,
+            "the stale hierarchy reservation must be fully refunded"
+        );
+        assert_eq!(stats.reconciled_receipts, 1);
+        assert_eq!(stats.reserved_receipts, 0);
+        assert_eq!(stats.in_flight_receipts, 0);
+    }
+
+    #[tokio::test]
+    async fn exhausted_cgroup_returns_backpressure_without_epoch_wait_or_provider_io() {
+        let clock = Arc::new(crate::quota_clock::ManualQuotaClock::new(0));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let context = mock_context_manager();
+        let limiter = Arc::new(
+            crate::rate_limit::RateLimiter::with_store(
+                crate::rate_limit::RateLimitConfig {
+                    rpm: 100,
+                    tpm: 100_000,
+                    max_concurrent: 4,
+                },
+                context.clone(),
+                clock.clone(),
+            )
+            .unwrap(),
+        );
+        let cgroups = Arc::new(crate::cgroups::CgroupManager::new());
+        let old_group = cgroups.create(
+            "old".into(),
+            cgroups.root(),
+            crate::cgroups::CgroupLimits {
+                tokens_per_min: 64,
+                ..Default::default()
+            },
+        );
+        let gate = Arc::new(crate::syscall_gate::SyscallGate::with_mac(
+            cgroups,
+            false,
+            Vec::new(),
+        ));
+        let agent_id = uuid::Uuid::new_v4();
+        gate.try_register_agent(agent_id, crate::CapabilitySet::all(), Some(old_group))
+            .unwrap();
+
+        let old_constraints = gate.cgroup_quota_constraints(agent_id).unwrap();
+        let cancellation = CancellationToken::new();
+        let mut fill = limiter
+            .acquire_tokens_with_cgroups_cancellable(
+                64,
+                &old_constraints.constraints,
+                None,
+                &cancellation,
+            )
+            .await
+            .unwrap();
+        fill.mark_invoked().unwrap();
+        fill.reconcile(64).unwrap();
+
+        let mut executor = AgentExecutor::new(
+            agent_id,
+            Box::new(CountingContentSession {
+                calls: calls.clone(),
+                entered: None,
+                release: None,
+                fail: false,
+                id: "mock".into(),
+            }),
+            mock_broker(),
+            Arc::new(ToolRegistry::new()),
+            context,
+            gate.clone(),
+            "test".into(),
+        );
+        executor.set_rate_limiter(limiter.clone());
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            executor.send_with_retry(&[]),
+        )
+        .await
+        .expect("execution admission must return without an epoch wait");
+        let Err(error) = result else {
+            panic!("exhausted cgroup unexpectedly reached the provider");
+        };
+        assert!(matches!(
+            error,
+            KernelError::RateLimit(
+                crate::rate_limit::RateLimitError::QuotaExhausted {
+                    ref scope_id,
+                    ..
+                }
+            ) if scope_id == "/old"
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(clock.advance(0), 0);
+        let stats = limiter.try_stats().unwrap();
+        assert_eq!(stats.requests_this_minute, 1);
+        assert_eq!(stats.reconciled_receipts, 1);
+    }
+
+    #[tokio::test]
+    async fn structured_tool_arguments_are_charged_before_provider_io() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let context = mock_context_manager();
+        let limiter = Arc::new(
+            crate::rate_limit::RateLimiter::with_store(
+                crate::rate_limit::RateLimitConfig {
+                    rpm: 100,
+                    tpm: 100_000,
+                    max_concurrent: 4,
+                },
+                context.clone(),
+                Arc::new(crate::quota_clock::ManualQuotaClock::new(0)),
+            )
+            .unwrap(),
+        );
+        let cgroups = Arc::new(crate::cgroups::CgroupManager::new());
+        let tight_group = cgroups.create(
+            "tight".into(),
+            cgroups.root(),
+            crate::cgroups::CgroupLimits {
+                tokens_per_min: 500,
+                ..Default::default()
+            },
+        );
+        let gate = Arc::new(crate::syscall_gate::SyscallGate::with_mac(
+            cgroups,
+            false,
+            Vec::new(),
+        ));
+        let agent_id = uuid::Uuid::new_v4();
+        gate.try_register_agent(agent_id, crate::CapabilitySet::all(), Some(tight_group))
+            .unwrap();
+        let mut executor = AgentExecutor::new(
+            agent_id,
+            Box::new(CountingContentSession {
+                calls: calls.clone(),
+                entered: None,
+                release: None,
+                fail: false,
+                id: "mock".into(),
+            }),
+            mock_broker(),
+            Arc::new(ToolRegistry::new()),
+            context,
+            gate,
+            "test".into(),
+        );
+        executor.set_rate_limiter(limiter.clone());
+        let mut assistant = StandardMessage::assistant("calling");
+        assistant.tool_calls = Some(vec![ToolCall {
+            id: "large-call".into(),
+            name: "read_file".into(),
+            arguments: serde_json::json!({"payload": "x".repeat(10_000)}),
+        }]);
+        executor.messages.push(assistant);
+        executor
+            .messages
+            .push(StandardMessage::tool_result("large-call", "done"));
+
+        let error = match executor.send_with_retry(&[]).await {
+            Ok(_) => panic!("oversized structured prompt must be denied"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            KernelError::RateLimit(
+                crate::rate_limit::RateLimitError::RequestExceedsCgroupTpm { .. }
+            )
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        let stats = limiter.try_stats().unwrap();
+        assert_eq!(stats.requests_this_minute, 0);
+        assert_eq!(stats.reserved_receipts, 0);
     }
 
     #[tokio::test]
@@ -2504,6 +3325,8 @@ mod tests {
         });
         let broker = mock_broker();
         let registry = Arc::new(ToolRegistry::new());
+        let context_budget =
+            AgentExecutor::conservative_tool_tokens(&registry.definitions()).saturating_add(300);
 
         let mut executor = AgentExecutor::new_unconfined(
             agent_id,
@@ -2513,7 +3336,7 @@ mod tests {
             ctx_mgr.clone(),
             "test".into(),
         );
-        executor.set_context_budget(120);
+        executor.set_context_budget(context_budget);
 
         // Manually fill enough history to exceed the active prompt budget.
         for i in 0..30 {
@@ -2550,7 +3373,14 @@ mod tests {
             TurnResult::Completed(output) => {
                 assert_eq!(output.content, "The file contains: hello world");
                 assert_eq!(output.tool_calls_made, 1);
-                assert_eq!(output.tokens_used, 35);
+                assert_eq!(output.usage.output_tokens, 35);
+                assert_eq!(
+                    output.tokens_used,
+                    output
+                        .usage
+                        .input_tokens
+                        .saturating_add(output.usage.output_tokens)
+                );
             }
             TurnResult::Paused(_) => panic!("should have completed, not paused"),
         }

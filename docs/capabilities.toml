@@ -71,7 +71,7 @@ tracking_issue = 108
 kernel_modules = ["custom_tools", "mac", "policy", "syscall_gate"]
 source_paths = ["crates/kernel/src/tools.rs", "crates/kernel/src/syscall_gate.rs", "crates/kernel/src/execution.rs"]
 public_entry_points = ["crates/kernel/src/syscall_server.rs::CallTool", "crates/kernel/src/mcp_server.rs::handle_tools_call", "crates/sdk/src/lib.rs::KernelClient::call_tool"]
-runtime_call_paths = ["crates/kernel/src/tools.rs::ToolRegistry::authorize_call", "crates/kernel/src/syscall_gate.rs::SyscallGate::check_tool_call_declared", "crates/kernel/src/resources.rs::ResourceBrokerImpl::execute"]
+runtime_call_paths = ["crates/kernel/src/tools.rs::ToolRegistry::authorize_and_acquire_call", "crates/kernel/src/syscall_gate.rs::SyscallGate::authorize_and_acquire_tool_call_declared", "crates/kernel/src/resources.rs::ResourceBrokerImpl::execute (ToolCallGuard held)"]
 test_evidence = ["crates/kernel/src/tools.rs", "crates/kernel/src/custom_tools.rs", "crates/kernel/src/mcp.rs", "crates/kernel/src/syscall_gate.rs", "tests/src/gate_adversarial_props.rs", "tests/src/os_enforcement.rs"]
 platforms = ["linux", "macos", "windows"]
 limitations = ["Declarations and public call paths fail closed, but production qualification still requires independent security review, cross-platform release evidence, approval UX, and the host-isolation work tracked by #111 and #127."]
@@ -89,7 +89,7 @@ public_entry_points = ["crates/kernel/src/syscall_server.rs::Metrics"]
 runtime_call_paths = ["crates/kernel/src/lib.rs::AgentKernelImpl::send_message"]
 test_evidence = ["crates/kernel/src/budget.rs", "crates/kernel/src/context.rs", "crates/kernel/src/execution.rs", "crates/kernel/src/quota_clock.rs", "crates/kernel/src/rate_limit.rs", "tests/src/observability_props.rs", "tests/src/gate_adversarial_props.rs", "tests/src/persistence_props.rs", "tests/src/tenancy_props.rs"]
 platforms = ["linux", "macos", "windows"]
-limitations = ["Detailed pricing and provider-wide RPM/TPM use durable deterministic epochs with restart regressions, but one SQLite database currently requires a single active kernel owner; cgroup hierarchy counters are still process-local and are not yet atomic with provider usage; live-provider invoice reconciliation and production concurrency/soak qualification also remain outstanding."]
+limitations = ["Detailed pricing plus provider/root/tenant/profile/agent token scopes use one atomic durable fixed-epoch receipt with restart and membership-race regressions. One SQLite database still requires a single active kernel owner; bounded public per-scope reporting, active-active ownership/leases, live-provider invoice reconciliation, and production high-cardinality concurrency/soak qualification remain outstanding."]
 
 [[capability]]
 id = "quality-gates"

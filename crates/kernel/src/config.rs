@@ -135,15 +135,21 @@ pub struct Config {
 
 /// Resource budgets applied at agent creation and to the shared rate limiter.
 ///
-/// `agent_tokens_per_min` bounds a non-`full-access` agent's per-minute token
-/// spend via its cgroup (0 = unlimited); `full-access` agents are unlimited and
-/// `elevated` gets a wider budget. `rpm`/`tpm`/`max_concurrent` configure the
-/// shared `RateLimiter`.
+/// `agent_tokens_per_min` bounds a non-`full-access` agent's per-minute provider
+/// token spend (0 = unlimited); `full-access` agents are unlimited and
+/// `elevated` gets a wider budget. `tenant_tokens_per_min` independently bounds
+/// each tenant. `rpm`/`tpm`/`max_concurrent` configure provider-wide limits.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BudgetConfig {
     #[serde(default = "default_agent_tokens_per_min")]
     pub agent_tokens_per_min: u64,
+    /// Maximum provider tokens charged to one tenant in a fixed Unix-minute
+    /// epoch. `0` means unlimited. Kept separate from provider-wide `tpm` so
+    /// tenant isolation remains meaningful when several tenants share a
+    /// kernel.
+    #[serde(default)]
+    pub tenant_tokens_per_min: u64,
     /// Maximum cumulative tool calls in one logical agent turn. This count is
     /// carried through pause/resume checkpoints and resets for the next user
     /// turn. `0` means unlimited.
@@ -156,6 +162,12 @@ pub struct BudgetConfig {
     pub max_concurrent_tool_calls: u32,
     #[serde(default)]
     pub max_context_tokens: u64,
+    /// Provider-enforced maximum completion/new tokens for each LLM attempt.
+    /// The kernel reserves this allowance together with the complete prompt
+    /// estimate before I/O, preventing a conforming built-in provider response
+    /// from crossing a bounded RPM/TPM/cgroup admission ceiling.
+    #[serde(default = "default_max_output_tokens_per_request")]
+    pub max_output_tokens_per_request: u32,
     #[serde(default = "default_rpm")]
     pub rpm: u32,
     #[serde(default = "default_tpm")]
@@ -198,9 +210,11 @@ impl Default for BudgetConfig {
     fn default() -> Self {
         Self {
             agent_tokens_per_min: default_agent_tokens_per_min(),
+            tenant_tokens_per_min: 0,
             max_tool_calls: 0,
             max_concurrent_tool_calls: 0,
             max_context_tokens: 0,
+            max_output_tokens_per_request: default_max_output_tokens_per_request(),
             rpm: default_rpm(),
             tpm: default_tpm(),
             max_concurrent: default_max_concurrent(),
@@ -224,6 +238,12 @@ impl BudgetConfig {
     /// configured USD ceiling. Low-level legacy constructors retain their
     /// historical clamping behavior, but config-backed startup never does.
     pub fn validate(&self) -> Result<(), String> {
+        if self.max_output_tokens_per_request == 0 {
+            return Err(
+                "max_output_tokens_per_request must be greater than zero so bounded token quotas can reserve a provider-enforced completion allowance"
+                    .into(),
+            );
+        }
         for (name, value) in [
             ("max_usd", self.max_usd),
             ("per_agent_max_usd", self.per_agent_max_usd),
@@ -363,6 +383,10 @@ fn default_tpm() -> u64 {
 
 fn default_max_concurrent() -> u32 {
     3
+}
+
+fn default_max_output_tokens_per_request() -> u32 {
+    4_096
 }
 
 impl Config {
@@ -576,18 +600,24 @@ mod tests {
             "llm_provider = \"local\"\ndefault_model = \"m\"\ndata_dir = \"/tmp/x\"\n[api_keys]\n";
         let cfg: Config = toml::from_str(toml).unwrap();
         assert_eq!(cfg.budgets.agent_tokens_per_min, 50_000);
+        assert_eq!(cfg.budgets.tenant_tokens_per_min, 0);
         assert_eq!(cfg.budgets.rpm, 60);
         assert_eq!(cfg.budgets.max_tool_calls, 0);
         assert_eq!(cfg.budgets.max_concurrent_tool_calls, 0);
+        assert_eq!(cfg.budgets.max_output_tokens_per_request, 4_096);
 
         // And an explicit budget round-trips through TOML.
         let mut cfg = Config::default();
         cfg.budgets.agent_tokens_per_min = 12_345;
+        cfg.budgets.tenant_tokens_per_min = 54_321;
         cfg.budgets.max_tool_calls = 7;
         cfg.budgets.max_concurrent_tool_calls = 2;
+        cfg.budgets.max_output_tokens_per_request = 2_048;
         let s = toml::to_string_pretty(&cfg).unwrap();
         let parsed: Config = toml::from_str(&s).unwrap();
         assert_eq!(parsed.budgets.agent_tokens_per_min, 12_345);
+        assert_eq!(parsed.budgets.tenant_tokens_per_min, 54_321);
+        assert_eq!(parsed.budgets.max_output_tokens_per_request, 2_048);
         assert_eq!(parsed.budgets.max_tool_calls, 7);
         assert_eq!(parsed.budgets.max_concurrent_tool_calls, 2);
     }
@@ -656,6 +686,15 @@ openai = 3.5
 
     #[test]
     fn detailed_token_pricing_rejects_invalid_values_and_empty_keys() {
+        let missing_output_bound = BudgetConfig {
+            max_output_tokens_per_request: 0,
+            ..BudgetConfig::default()
+        };
+        assert!(missing_output_bound
+            .validate()
+            .unwrap_err()
+            .contains("max_output_tokens_per_request"));
+
         let mut budgets = BudgetConfig {
             default_token_pricing: Some(TokenPricing {
                 input_usd_per_1k_tokens: f64::NAN,

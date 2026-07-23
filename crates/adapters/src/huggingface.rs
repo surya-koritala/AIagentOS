@@ -1,5 +1,4 @@
-//! HuggingFace adapter (Text Generation Inference / Inference API) with retry and
-//! exponential backoff.
+//! HuggingFace adapter (Text Generation Inference / Inference API).
 //!
 //! Uses the native text-generation shape: POST `{base}/models/{model}` with a
 //! `{"inputs": "...", "parameters": {...}}` body and a Bearer token. The response
@@ -72,62 +71,64 @@ impl LlmSession for HuggingFaceSession {
     async fn send_with_tools(
         &self,
         messages: Vec<StandardMessage>,
-        _tools: &[ToolDefinition],
+        tools: &[ToolDefinition],
     ) -> Result<LlmResponse, ConnectorError> {
-        let body = serde_json::json!({
+        self.send_with_options(messages, tools, LlmRequestOptions::default())
+            .await
+    }
+
+    async fn send_with_options(
+        &self,
+        messages: Vec<StandardMessage>,
+        _tools: &[ToolDefinition],
+        options: LlmRequestOptions,
+    ) -> Result<LlmResponse, ConnectorError> {
+        let mut body = serde_json::json!({
             "inputs": flatten_prompt(&messages),
             "parameters": {
                 "return_full_text": false,
             },
         });
+        if let Some(max_output_tokens) = options.max_output_tokens {
+            body["parameters"]["max_new_tokens"] = serde_json::json!(max_output_tokens);
+        }
 
         let url = format!("{}/models/{}", self.base_url, self.model);
 
-        let mut last_err = None;
-        for attempt in 0..3 {
-            if attempt > 0 {
-                tokio::time::sleep(tokio::time::Duration::from_millis(1000 * (1 << attempt))).await;
-            }
-
-            let mut req = self.client.post(&url).json(&body);
-            if !self.api_key.is_empty() {
-                req = req.header("Authorization", format!("Bearer {}", self.api_key));
-            }
-            let result = req.send().await;
-
-            match result {
-                Ok(resp) if resp.status().is_success() => {
-                    let json: serde_json::Value = resp
-                        .json()
-                        .await
-                        .map_err(|e| ConnectorError::ProtocolError(e.to_string()))?;
-                    // TGI / Inference API returns either an array of
-                    // `{"generated_text": ...}` or a single such object.
-                    let content = json[0]["generated_text"]
-                        .as_str()
-                        .or_else(|| json["generated_text"].as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    return Ok(LlmResponse {
-                        content,
-                        finish_reason: Some("stop".to_string()),
-                        tokens_used: 0,
-                        usage: Default::default(),
-                        tool_calls: vec![],
-                    });
-                }
-                Ok(resp) => {
-                    last_err = Some(ConnectorError::ConnectionFailed(format!(
-                        "HTTP {}",
-                        resp.status()
-                    )));
-                }
-                Err(e) => {
-                    last_err = Some(ConnectorError::ConnectionFailed(e.to_string()));
-                }
-            }
+        let mut req = self.client.post(&url).json(&body);
+        if !self.api_key.is_empty() {
+            req = req.header("Authorization", format!("Bearer {}", self.api_key));
         }
-        Err(last_err.unwrap())
+        let result = req.send().await;
+
+        match result {
+            Ok(resp) if resp.status().is_success() => {
+                let json: serde_json::Value = resp
+                    .json()
+                    .await
+                    .map_err(|e| ConnectorError::ProtocolError(e.to_string()))?;
+                // TGI / Inference API returns either an array of
+                // `{"generated_text": ...}` or a single such object.
+                let content = json[0]["generated_text"]
+                    .as_str()
+                    .or_else(|| json["generated_text"].as_str())
+                    .unwrap_or("")
+                    .to_string();
+                Ok(LlmResponse {
+                    content,
+                    finish_reason: Some("stop".to_string()),
+                    tokens_used: 0,
+                    usage: Default::default(),
+                    tool_calls: vec![],
+                })
+            }
+            Ok(resp) => Err(crate::http_status_error(resp.status(), None)),
+            Err(e) => Err(ConnectorError::ConnectionFailed(e.to_string())),
+        }
+    }
+
+    fn enforces_max_output_tokens(&self) -> bool {
+        true
     }
 
     fn provider_id(&self) -> &ProviderId {

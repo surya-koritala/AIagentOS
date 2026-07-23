@@ -64,9 +64,9 @@ Three documented entry points (in `crates/kernel/src/lib.rs`):
 | `kernel::boot_in_memory()` | in-memory SQLite | **yes** | tests, demos |
 | `AgentKernelImpl::new()` / `with_db_path()` / `from_config()` | varies | **no** | low-level construction |
 
-`boot*` calls `start_runtime()`, which spawns the background tasks: a scheduler
-observer that publishes the CFS pick into procfs as `current_agent`, and a
-per-minute cgroup-counter reset so `tokens_per_min` quotas regenerate.
+`boot*` calls `start_runtime()`, which spawns the scheduler observer that
+publishes the CFS pick into procfs as `current_agent`. Provider and cgroup token
+limits use durable fixed Unix-minute epochs in SQLite and require no reset task.
 
 **`AgentKernelImpl` is the wired root object that owns every subsystem:**
 
@@ -77,7 +77,7 @@ observability        connector (LLM)                 resource_broker
 tool_registry        rate_limiter                    cgroups
 syscall_gate ◀── the chokepoint                       budget_enforcer (USD ceiling)
 turn_admission (CFS-ordered turn gate)                llm_scheduler (bounded "LLM cores")
-profile_cgroups (one cgroup per permission profile)   group_namespaces (per agent group)
+tenant/profile/agent cgroup maps (stable hierarchy)  group_namespaces (per agent group)
 executors (per-agent AgentExecutor)                   event_tx (broadcast KernelEvent)
 os: OsSubsystems { cfs, namespaces, init, procfs, sysctl }
 ```
@@ -130,8 +130,12 @@ reconsider where it belongs.
 1. **Think** — assemble context (history + long-term memory + tools), call the
    LLM through the connector.
 2. **Act** — parse tool calls (`function_calling.rs`; plaintext fallback when a
-   provider lacks native tool-calling). **Every tool call routes through
-   `SyscallGate::check_tool_call` before the resource broker is ever touched.**
+   provider lacks native tool-calling). **Every execution path routes through
+   `ToolRegistry::authorize_and_acquire_call`, which validates the declared
+   security contract and atomically acquires a cgroup tool slot before the
+   resource broker is ever touched.** The older gate `check_*` methods are
+   authorization-only compatibility/introspection helpers and must not be used
+   as execution entry points.
 3. **Observe** — feed results back, loop until the turn completes.
 
 **Mid-generation context switch.** A turn is resumable: `run_resumable`/`resume`
@@ -153,8 +157,8 @@ contention and released between provider requests).
 
 `crates/kernel/src/syscall_gate.rs` is **the chokepoint that makes namespaces,
 capabilities, MAC, and cgroups load-bearing.** Every tool call from
-`AgentExecutor::execute_tool` calls `check_tool_call`, which runs four checks in
-order — **first failure wins:**
+`AgentExecutor::execute_tool` calls the declaration-aware gate, which runs these
+checks in order — **first failure wins:**
 
 ```
 0. Namespace visibility — tool tagged with a namespace ⇒ caller must be a member,
@@ -162,8 +166,16 @@ order — **first failure wins:**
 1. Capability check — classify_tool(name) → required cap (e.g. http_get needs
    CAP_NET_ACCESS); MissingCapability otherwise.
 2. MAC check — MacEngine::check(pid, action, resource); MacDeny on policy Deny.
-3. Cgroup quota — cgroups.check_token_limit(cg, est_tokens); CgroupQuota if over.
+3. Exact local approval for declarations that require it.
+4. Cgroup hierarchy/membership validation. Concurrent tool slots are acquired
+   separately and released by RAII.
 ```
+
+Provider-token admission is a distinct path. It atomically reserves provider
+RPM/TPM and root → tenant → profile → agent token scopes in one SQLite receipt,
+verifies the membership revision while marking the receipt in flight, and
+reconciles provider-reported input + output usage into the original epoch.
+Serialized tool payload size is not provider usage.
 
 The gate maintains a translation table from kernel `Uuid` agent IDs to
 `agent_struct::AgentId` (u64 "PIDs") so the older OS-style subsystems (u64) and
@@ -173,7 +185,7 @@ Capabilities derive from the `permission_profile` string at creation via
 
 **This contract is locked by tests** (`tests/src/os_enforcement.rs` for ordering
 and isolation; `tests/src/gate_adversarial_props.rs` runs ~2500 proptest cases
-per run with an independent oracle that re-derives the 4-layer verdict — proving
+per run with an independent oracle that re-derives the ordered verdict — proving
 no bypass). **When adding a tool, classify it in `classify_tool`.** Don't bypass
 the gate from new code paths.
 
@@ -223,8 +235,9 @@ the gate from new code paths.
   audit sink.
 - **Namespaces** (`namespaces.rs`) — agent + tool namespaces per group; tools
   tagged to a namespace are invisible to non-members. IPC respects namespaces.
-- **Cgroups** (`cgroups.rs`) — per-minute token quotas; one cgroup per permission
-  profile created at boot, reset every minute by the runtime task.
+- **Cgroups** (`cgroups.rs`) — stable root → tenant → profile → agent hierarchy;
+  durable fixed-epoch provider-token quotas plus structural concurrent-tool
+  slots. Numeric cgroup IDs remain process-local.
 - **Budget** (`budget.rs`) — the single `BudgetEnforcer` caps cumulative USD on
   the LLM path (cgroups only bound per-minute tokens, not lifetime cost).
 - **Sandbox** (`sandbox.rs`, `docker_sandbox.rs`) — execution isolation.
@@ -287,9 +300,9 @@ This single protocol is the seam every client speaks to.
 | **MCP server** | `kernel::mcp_server` | JSON-RPC `initialize`/`tools.list`/`tools.call`, gate-enforced |
 
 The chosen **primary entry surface is the service** (`agent-server` + SDK/TUI as
-the lens). *Note: the CLI and Tauri `main.rs` currently call `from_config`
-directly, so they don't yet start the background runtime tasks — prefer `boot()`
-for new entry points.*
+the lens). `boot()` starts the scheduler observer automatically. The CLI, Tauri
+app, and `agent-server` construct from config and then explicitly call
+`start_runtime`; new entry points must follow one of those two complete paths.
 
 ---
 
@@ -345,8 +358,9 @@ AgentExecutor (think → act → observe)
   │  act:    function_calling parses tool calls
   ▼
   ┌──────────────────────────────────────────────────────────┐
-  │ SyscallGate::check_tool_call   (FIRST FAILURE WINS)        │
-  │  0 namespace → 1 capability → 2 MAC → 3 cgroup quota       │
+  │ ToolRegistry::authorize_and_acquire_call (FIRST FAILURE WINS)│
+  │  0 declaration → 1 namespace → 2 capability → 3 MAC        │
+  │  4 approval → 5 membership + concurrent cgroup tool slot    │
   │  audit sink records allow/deny                             │
   └──────────────────────────────────────────────────────────┘
   │  (only on Ok)

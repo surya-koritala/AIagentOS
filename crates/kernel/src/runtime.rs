@@ -17,7 +17,6 @@ use crate::AgentKernelImpl;
 pub struct KernelRuntime {
     kernel: Arc<AgentKernelImpl>,
     scheduler_interval_ms: u64,
-    cgroup_reset_interval_secs: u64,
     running: Arc<std::sync::atomic::AtomicBool>,
 }
 
@@ -26,7 +25,6 @@ impl KernelRuntime {
         Self {
             kernel,
             scheduler_interval_ms: 100,
-            cgroup_reset_interval_secs: 60,
             running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
@@ -36,10 +34,7 @@ impl KernelRuntime {
     pub fn start(&self) -> Vec<tokio::task::JoinHandle<()>> {
         self.running
             .store(true, std::sync::atomic::Ordering::SeqCst);
-        vec![
-            self.spawn_scheduler_observer(),
-            self.spawn_cgroup_reset_timer(),
-        ]
+        vec![self.spawn_scheduler_observer()]
     }
 
     /// Stop all background threads. Loops exit on next tick.
@@ -73,25 +68,6 @@ impl KernelRuntime {
                     let mut procfs = kernel.os.procfs.lock().await;
                     procfs.set_system("current_agent".into(), pid.to_string());
                 }
-            }
-        })
-    }
-
-    /// Cgroup reset timer: every minute, reset per-minute token counters so
-    /// `tokens_per_min` quotas regenerate. Without this, an agent that hits
-    /// quota stays denied forever.
-    fn spawn_cgroup_reset_timer(&self) -> tokio::task::JoinHandle<()> {
-        let kernel = self.kernel.clone();
-        let running = self.running.clone();
-        let interval_secs = self.cgroup_reset_interval_secs;
-
-        tokio::spawn(async move {
-            let mut tick = interval(Duration::from_secs(interval_secs));
-            // Skip first immediate tick.
-            tick.tick().await;
-            while running.load(std::sync::atomic::Ordering::SeqCst) {
-                tick.tick().await;
-                kernel.cgroups.reset_minute_counters();
             }
         })
     }
@@ -330,8 +306,7 @@ mod tests {
         let kernel = Arc::new(crate::AgentKernelImpl::new().unwrap());
         let runtime = kernel.start_runtime();
 
-        // Let the loops tick at least once so we exercise both the scheduler
-        // observer and the cgroup reset timer's first iteration.
+        // Let the scheduler observer tick at least once.
         tokio::time::sleep(Duration::from_millis(150)).await;
 
         runtime.stop();

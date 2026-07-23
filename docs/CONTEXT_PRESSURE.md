@@ -9,8 +9,11 @@ memory and not a process-memory OOM killer.
 
 An adapter may provide a provider/model-specific prompt estimate through the
 `LlmSession` seam. Otherwise the kernel uses a documented conservative fallback:
-UTF-8 bytes divided by three, plus four framing tokens per message. This estimate
-is suitable for enforcing a safe local bound; it is not a billing total.
+one token per serialized UTF-8 byte, plus four framing tokens per message. An
+adapter estimate may raise this structural floor but cannot lower it. This
+deliberately over-reserves normal prose so high-entropy text, code, identifiers,
+and structured tool data remain inside a safe tokenizer-independent local
+bound; it is not a billing total.
 
 ## What can be paged out
 

@@ -1068,12 +1068,29 @@ mod protocol_tests {
             })
         }
 
+        async fn send_with_options(
+            &self,
+            messages: Vec<StandardMessage>,
+            tools: &[ToolDefinition],
+            options: kernel::connector::LlmRequestOptions,
+        ) -> Result<LlmResponse, ConnectorError> {
+            assert!(
+                options.max_output_tokens.is_some_and(|limit| limit > 0),
+                "production kernel execution must forward a positive output bound"
+            );
+            self.send_with_tools(messages, tools).await
+        }
+
         fn provider_id(&self) -> &String {
             &self.id
         }
 
         fn model_id(&self) -> &str {
             "wire-checkpoint-model"
+        }
+
+        fn enforces_max_output_tokens(&self) -> bool {
+            true
         }
     }
 

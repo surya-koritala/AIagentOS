@@ -125,8 +125,9 @@ pub enum Syscall {
         message: String,
     },
     /// Invoke a single tool as an agent. Goes through the syscall gate
-    /// (capability / MAC / approval / cgroup / namespace) before the resource broker, so a
-    /// denial is returned as an `Error` — enforcement applies over the wire.
+    /// (namespace / capability / MAC / approval / cgroup membership) before the
+    /// resource broker, so a denial is returned as an `Error` — enforcement
+    /// applies over the wire.
     CallTool {
         agent_id: String,
         tool: String,
@@ -376,17 +377,40 @@ impl WireErrorCode {
             (Self::InvalidArgument, false)
         } else if message.contains("sandbox") {
             (Self::SandboxDenied, false)
-        } else if message.contains("quota")
-            || message.contains("budget")
-            || message.contains("rate limit")
+        } else if message.contains("unavailable") || message.contains("not registered") {
+            // Check availability before quota/provider keywords: for example,
+            // "durable provider rate-limit accounting is unavailable" is an
+            // infrastructure failure, not proof that a quota was exceeded.
+            (Self::Unavailable, true)
+        } else if message.contains("cancel") {
+            // Rate-limit cancellation messages also contain "admission"; keep
+            // this ahead of quota classification.
+            (Self::Cancelled, false)
+        } else if message.contains("concurrency semaphore closed") {
+            (Self::Unavailable, true)
+        } else if message.contains("cgroup membership changed") {
+            (Self::Conflict, true)
+        } else if message.contains("rate-limit guard")
+            || message.contains("rate-limit reservation cannot")
+        {
+            // Guard lifecycle violations are local programming/invariant
+            // errors, not provider outages or exhausted quota.
+            (Self::Internal, false)
+        } else if message.contains("request estimate") && message.contains("tpm limit") {
+            // Waiting for a new epoch cannot make one request smaller than its
+            // configured ceiling. Retrying unchanged is not useful.
+            (Self::QuotaExceeded, false)
+        } else if message.contains("quota exceeded")
+            || message.contains("quota exhausted")
+            || message.contains("budget exceeded")
+            || message.contains("budget exhausted")
             || message.contains("queue is full")
-            || message.contains("admission")
+            || message.contains("rate limit exceeded")
+            || message.contains("rate-limit exceeded")
         {
             (Self::QuotaExceeded, true)
         } else if message.contains("timeout") || message.contains("timed out") {
             (Self::Timeout, true)
-        } else if message.contains("cancel") {
-            (Self::Cancelled, false)
         } else if message.contains("provider") || message.contains("connector") {
             (Self::Provider, true)
         } else if message.contains("not found") || message.contains("unknown agent") {
@@ -404,8 +428,6 @@ impl WireErrorCode {
             || message.contains("claimed")
         {
             (Self::Conflict, true)
-        } else if message.contains("unavailable") || message.contains("not registered") {
-            (Self::Unavailable, true)
         } else {
             (Self::Internal, false)
         }
@@ -1107,23 +1129,15 @@ pub async fn dispatch_scoped(
             };
             // Security preparation is shared with executor/MCP/SDK so action,
             // resource extraction, and accounting cannot drift by entry point.
-            match kernel
+            let _tool_slot = match kernel
                 .tool_registry
-                .authorize_call(&kernel.syscall_gate, id, &tool, &args)
+                .authorize_and_acquire_call(&kernel.syscall_gate, id, &tool, &args)
                 .await
             {
-                Ok(_) => {}
+                Ok((_, slot)) => slot,
                 Err(error) => {
                     return SyscallReply::Error {
                         message: format!("tool '{tool}' denied by kernel: {error}"),
-                    }
-                }
-            }
-            let _tool_slot = match kernel.syscall_gate.acquire_tool_call(id) {
-                Ok(slot) => slot,
-                Err(denial) => {
-                    return SyscallReply::Error {
-                        message: format!("tool '{tool}' denied by kernel: {}", denial.message()),
                     }
                 }
             };
@@ -2051,6 +2065,86 @@ impl SyscallClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unavailable_quota_storage_is_not_misclassified_as_quota_exhaustion() {
+        assert_eq!(
+            WireErrorCode::classify(
+                "durable provider rate-limit accounting is unavailable: database is locked"
+            ),
+            (WireErrorCode::Unavailable, true)
+        );
+        assert_eq!(
+            WireErrorCode::classify("cgroup enforcement unavailable: missing parent"),
+            (WireErrorCode::Unavailable, true)
+        );
+        assert_eq!(
+            WireErrorCode::classify("cgroup token quota exceeded"),
+            (WireErrorCode::QuotaExceeded, true)
+        );
+    }
+
+    #[test]
+    fn every_rate_limit_error_has_a_stable_public_wire_classification() {
+        use crate::rate_limit::RateLimitError;
+
+        let cases = [
+            (
+                RateLimitError::RequestExceedsTpm {
+                    requested: 101,
+                    limit: 100,
+                },
+                (WireErrorCode::QuotaExceeded, false),
+            ),
+            (
+                RateLimitError::RequestExceedsCgroupTpm {
+                    scope_id: "/tenant/t/profile/p/agent/a".into(),
+                    requested: 101,
+                    limit: 100,
+                },
+                (WireErrorCode::QuotaExceeded, false),
+            ),
+            (
+                RateLimitError::QuotaExhausted {
+                    scope_kind: "cgroup".into(),
+                    scope_id: "/tenant/t/profile/p/agent/a".into(),
+                    dimension: "tokens".into(),
+                    used: 100,
+                    requested: 1,
+                    limit: 100,
+                    retry_at_unix_ms: 60_000,
+                },
+                (WireErrorCode::QuotaExceeded, true),
+            ),
+            (RateLimitError::Cancelled, (WireErrorCode::Cancelled, false)),
+            (
+                RateLimitError::CgroupMembershipChanged,
+                (WireErrorCode::Conflict, true),
+            ),
+            (
+                RateLimitError::ConcurrencyClosed,
+                (WireErrorCode::Unavailable, true),
+            ),
+            (
+                RateLimitError::StorageUnavailable("database is locked".into()),
+                (WireErrorCode::Unavailable, true),
+            ),
+            (RateLimitError::NotInvoked, (WireErrorCode::Internal, false)),
+            (
+                RateLimitError::AlreadyInvoked,
+                (WireErrorCode::Internal, false),
+            ),
+        ];
+
+        for (error, expected) in cases {
+            let message = crate::KernelError::RateLimit(error.clone()).to_string();
+            assert_eq!(
+                WireErrorCode::classify(&message),
+                expected,
+                "{error:?} produced {message:?}"
+            );
+        }
+    }
 
     #[tokio::test]
     async fn v1_error_fixture_and_v2_typed_error_are_both_served() {

@@ -111,7 +111,7 @@ pub async fn parse_azure_sse_stream(
 
                         // Usage (in final chunk)
                         if let Some(usage) = json.get("usage") {
-                            tokens_used = usage["total_tokens"].as_u64().unwrap_or(0) as u32;
+                            tokens_used = crate::json_usage_u32(&usage["total_tokens"]);
                         }
                     }
                 }

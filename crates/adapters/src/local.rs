@@ -37,13 +37,28 @@ impl LlmSession for LocalSession {
     async fn send_with_tools(
         &self,
         messages: Vec<StandardMessage>,
-        _tools: &[ToolDefinition],
+        tools: &[ToolDefinition],
     ) -> Result<LlmResponse, ConnectorError> {
-        let body = serde_json::json!({
+        self.send_with_options(messages, tools, LlmRequestOptions::default())
+            .await
+    }
+
+    async fn send_with_options(
+        &self,
+        messages: Vec<StandardMessage>,
+        _tools: &[ToolDefinition],
+        options: LlmRequestOptions,
+    ) -> Result<LlmResponse, ConnectorError> {
+        let mut body = serde_json::json!({
             "model": self.model,
             "messages": messages.iter().map(|m| serde_json::json!({"role": m.role, "content": m.content})).collect::<Vec<_>>(),
             "stream": false,
         });
+        if let Some(max_output_tokens) = options.max_output_tokens {
+            body["options"] = serde_json::json!({
+                "num_predict": max_output_tokens
+            });
+        }
 
         let resp = self
             .client
@@ -54,10 +69,7 @@ impl LlmSession for LocalSession {
             .map_err(|e| ConnectorError::ConnectionFailed(e.to_string()))?;
 
         if !resp.status().is_success() {
-            return Err(ConnectorError::ConnectionFailed(format!(
-                "HTTP {}",
-                resp.status()
-            )));
+            return Err(crate::http_status_error(resp.status(), None));
         }
 
         let json: serde_json::Value = resp
@@ -68,22 +80,24 @@ impl LlmSession for LocalSession {
             .as_str()
             .unwrap_or("")
             .to_string();
+        let prompt_tokens = json["prompt_eval_count"].as_u64().unwrap_or(0);
+        let output_tokens = json["eval_count"].as_u64().unwrap_or(0);
 
         Ok(LlmResponse {
             content,
             finish_reason: Some("stop".to_string()),
-            tokens_used: json["prompt_eval_count"]
-                .as_u64()
-                .unwrap_or(0)
-                .saturating_add(json["eval_count"].as_u64().unwrap_or(0))
-                .min(u64::from(u32::MAX)) as u32,
+            tokens_used: crate::saturating_usage_sum(prompt_tokens, output_tokens),
             usage: kernel::connector::LlmUsage::reported(
-                json["prompt_eval_count"].as_u64().unwrap_or(0) as u32,
-                json["eval_count"].as_u64().unwrap_or(0) as u32,
+                crate::saturating_usage_u32(prompt_tokens),
+                crate::saturating_usage_u32(output_tokens),
                 0,
             ),
             tool_calls: vec![],
         })
+    }
+
+    fn enforces_max_output_tokens(&self) -> bool {
+        true
     }
 
     fn provider_id(&self) -> &ProviderId {

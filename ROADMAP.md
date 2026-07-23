@@ -13,9 +13,9 @@
 > an embeddable Rust SDK, LLM-core breadth, context management, memory/storage retrieval, and
 > tooling (all Rust) — lives in [docs/PLATFORM_ROADMAP.md](docs/PLATFORM_ROADMAP.md).
 
-## Where we are (May 2026 audit)
+## Historical audit snapshot (May 2026)
 
-Today, ~33% of the Linux-mapped subsystems are load-bearing on the live runtime path; ~67% exist in code but are bypassed. Two parallel orchestrators (`AgentKernelImpl` used by CLI/Tauri, `OsKernel` used only in benchmarks) own different halves of the design — that split is the single biggest reason "OS" is currently naming rather than architecture.
+At the time of this audit, ~33% of the Linux-mapped subsystems were load-bearing on the live runtime path; ~67% existed in code but were bypassed. Two parallel orchestrators (`AgentKernelImpl` used by CLI/Tauri, `OsKernel` used only in benchmarks) owned different halves of the design. The archived plan below records how that split was removed; it is not a description of the current tree.
 
 | Layer | Status today | Becomes load-bearing in |
 |---|---|---|
@@ -34,9 +34,9 @@ Today, ~33% of the Linux-mapped subsystems are load-bearing on the live runtime 
 
 ## Goal
 
-Be the first thing on the internet that earns the name "AI Agent OS": a runtime where **isolation, capability checks, and resource quotas are enforced on every tool call**, not optional scaffolding. The benchmark for "true OS" is one e2e test:
+Be the first thing on the internet that earns the name "AI Agent OS": a runtime where **tool isolation and authorization are enforced on every tool call, and provider resource quotas are enforced at provider admission**, not optional scaffolding. The benchmark for "true OS" is one e2e test:
 
-> An agent without `CAP_NET` is denied a network tool with `EPERM`; an agent over its cgroup quota is denied with `EAGAIN`; an agent in namespace X cannot resolve a tool registered in namespace Y.
+> An agent without `CAP_NET` is denied a network tool with `EPERM`; an agent in namespace X cannot resolve a tool registered in namespace Y; and an LLM request over its durable cgroup token budget is denied before provider invocation.
 
 When that test passes, we ship v0.1.0.
 
@@ -44,15 +44,16 @@ When that test passes, we ship v0.1.0.
 
 ### Phase 1 — Make the OS load-bearing (this PR series)
 
-Goal: every tool call goes through the syscall layer; quotas reject; CI is green; README is honest.
+Goal: every tool call goes through the syscall layer; provider quotas reject at provider admission; CI is green; README is honest.
 
 - [x] Audit + roadmap (this document)
-- [ ] **Fix CI** — 3 failing tests block any honest "tests passing" claim
+- [x] **Fix CI** — the three historical environment-dependent failures were removed
   - `indexer::tests::build_repo_map` uses absolute `/home/surya/...` path
   - `os_kernel::boot_from_service_files` and `boot_respects_dependency_order` assume `/tmp/agent_services` exists with seeded files
   - Switch to `tempfile::tempdir()` + `CARGO_MANIFEST_DIR`
-- [ ] **Wire syscall gate into tool execution** (the critical change)
-  - Add `SyscallGate` in `kernel::syscall_gate` wrapping: `check_capability` → `MacEngine::check` → `cgroups::enforce_limits` → execute → `cgroups::record_tokens` → emit observability event
+- [x] **Wire syscall gate into tool execution** (the critical change)
+  - `SyscallGate` now fails closed in declaration → namespace → capability → MAC → approval → cgroup-membership order; execution separately holds the cgroup concurrent-tool slot.
+  - Provider token budgets are reserved and reconciled on the LLM path. The gate's legacy payload/`est_tokens` input never consumes quota; structured tool-call JSON and results included in a later LLM prompt do.
   - Modify `AgentExecutor::execute_tool` (`crates/kernel/src/execution.rs:255`) to call the gate first; on deny return a structured `EPERM`/`EACCES`/`EAGAIN` to the LLM
   - Wire from `AgentKernelImpl::send_message` (`lib.rs:622`) so every CLI/Tauri call exercises it
   - Each agent gets a default cgroup at create time; default policy is `allow` so existing behaviour is preserved unless a profile asserts otherwise
@@ -72,7 +73,7 @@ Goal: `AgentKernelImpl` owns the OS surface; `OsKernel` is no longer the source 
 - [x] `create_agent_full` now wires every new agent into the default Agent + Tool namespaces, the CFS scheduler, and procfs through the gate's PID translation.
 - [x] `tests/src/os_enforcement.rs::unified_kernel_places_agent_in_os_subsystems` proves the wiring is real.
 - [x] `OsKernel` documented as superseded; retained only for the raw-PID stress benchmark.
-- [x] Migrated `runtime.rs` background loops to `AgentKernelImpl::start_runtime`. Now: scheduler observer (publishes CFS pick to procfs) + cgroup minute-reset timer.
+- [x] Migrated the scheduler observer to `AgentKernelImpl::start_runtime` (publishes the CFS pick to procfs). Durable fixed-epoch token windows require no process-local cgroup reset timer.
 - [x] Added `kernel::boot(config)` and `kernel::boot_in_memory()` as documented top-level entry points; both spawn `KernelRuntime` automatically.
 - [x] `OsKernel` deleted entirely. `benchmarks/stress_test.rs` migrated to `AgentKernelImpl::create_agent_full` + `SyscallGate::check_tool_call`.
 
@@ -88,7 +89,7 @@ Goal: namespaces actually hide resources; scheduler actually decides who runs.
 - [ ] **Host-memory pressure policy** — qualify RSS/cgroup limits and explicit backpressure; the runtime does not currently claim an OOM killer
 - [ ] **VFS for tools** — agents `tool_open()` a path → fd; `tool_call()` takes fd; descriptor table enforces per-agent open limits
 
-**Exit criteria for Phase 3:** Stress test runs 100 agents across 3 namespaces and 5 cgroups; isolation and quota are observable from the outside.
+**Exit criteria for Phase 3:** Stress test runs 100 agents across 3 namespaces and 5 cgroups; isolation and provider-admission quota are observable from the outside.
 
 ### Phase 4 — Package manager, procfs, distribution
 

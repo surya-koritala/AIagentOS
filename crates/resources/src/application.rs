@@ -39,8 +39,9 @@ impl ResourceProvider for ApplicationProvider {
                     .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
                     .unwrap_or_default();
 
-                let output = tokio::process::Command::new(cmd)
-                    .args(&args)
+                let mut command = tokio::process::Command::new(cmd);
+                command.args(&args).kill_on_drop(true);
+                let output = command
                     .output()
                     .await
                     .map_err(|e| ResourceError::OperationFailed(e.to_string()))?;

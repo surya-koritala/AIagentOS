@@ -214,6 +214,22 @@ pub struct LlmResponse {
     pub tool_calls: Vec<ToolCall>,
 }
 
+/// Per-call generation bounds supplied by the kernel.
+///
+/// This is deliberately separate from provider configuration: the execution
+/// path can reduce an output allowance for an individual admitted request
+/// without rebuilding the provider session. Custom adapters remain
+/// source-compatible because [`LlmSession::send_with_options`] has a default
+/// implementation, but adapters that need a hard output bound must override
+/// that method and translate `max_output_tokens` to their provider's wire
+/// format.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LlmRequestOptions {
+    /// Maximum number of new/completion tokens the provider may generate.
+    /// `None` preserves the adapter's configured default.
+    pub max_output_tokens: Option<u32>,
+}
+
 /// An LLM session for an agent.
 #[async_trait::async_trait]
 pub trait LlmSession: Send + Sync {
@@ -223,6 +239,31 @@ pub trait LlmSession: Send + Sync {
         messages: Vec<StandardMessage>,
         tools: &[ToolDefinition],
     ) -> Result<LlmResponse, ConnectorError>;
+
+    /// Send with kernel-supplied per-call generation bounds.
+    ///
+    /// The default preserves compatibility for external adapters. Production
+    /// adapters should override this method before callers rely on a hard
+    /// output-token ceiling.
+    async fn send_with_options(
+        &self,
+        messages: Vec<StandardMessage>,
+        tools: &[ToolDefinition],
+        _options: LlmRequestOptions,
+    ) -> Result<LlmResponse, ConnectorError> {
+        self.send_with_tools(messages, tools).await
+    }
+
+    /// Whether this session translates and enforces
+    /// [`LlmRequestOptions::max_output_tokens`].
+    ///
+    /// The compatibility default is intentionally `false`: a kernel configured
+    /// with a hard per-request output ceiling can fail closed instead of
+    /// silently relying on an external adapter that ignores the option.
+    fn enforces_max_output_tokens(&self) -> bool {
+        false
+    }
+
     fn provider_id(&self) -> &ProviderId;
 
     /// Concrete model/deployment used by this session. Adapters should
@@ -246,6 +287,20 @@ pub trait LlmSession: Send + Sync {
         tools: &[ToolDefinition],
     ) -> Result<LlmResponse, ConnectorError> {
         self.send_with_tools(messages, tools).await
+    }
+
+    /// Streaming counterpart to [`LlmSession::send_with_options`].
+    ///
+    /// Non-streaming adapters inherit the bounded send implementation. A
+    /// streaming adapter must override this when its streaming wire request is
+    /// built independently.
+    async fn send_streaming_with_options(
+        &self,
+        messages: Vec<StandardMessage>,
+        tools: &[ToolDefinition],
+        options: LlmRequestOptions,
+    ) -> Result<LlmResponse, ConnectorError> {
+        self.send_with_options(messages, tools, options).await
     }
 }
 
@@ -1002,6 +1057,10 @@ mod tests {
 
         let agent_id = uuid::Uuid::new_v4();
         let session = connector.connect(agent_id, &"openai".into()).await.unwrap();
+        assert!(
+            !session.enforces_max_output_tokens(),
+            "external adapters must opt in before the kernel trusts a hard bound"
+        );
         let resp = session
             .send(vec![StandardMessage::user("hi")])
             .await

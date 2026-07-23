@@ -98,7 +98,7 @@ jobs:
                   info.compress_type = zipfile.ZIP_DEFLATED
                   archive.writestr(info, path.read_bytes())
           PY
-      - uses: anchore/sbom-action/download-syft@e22cdb60f63e1f740928f3e5d4a9e7e219cd77a9 # v0
+      - uses: anchore/sbom-action/download-syft@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
       - name: Generate CycloneDX SBOM
         run: |
           artifact="agentos-${ARTIFACT_VERSION}-${{ matrix.target }}"
@@ -151,7 +151,7 @@ jobs:
           get_reply="$(printf '{"op":"storage_get","agent_id":"%s","key":"release-proof"}\n' "$agent_id" | nc -w5 127.0.0.1 7777)"
           test "$(jq -r .status <<< "$get_reply")" = "storage_value"
           test "$(jq -r .value <<< "$get_reply")" = "survived"
-      - uses: anchore/sbom-action/download-syft@e22cdb60f63e1f740928f3e5d4a9e7e219cd77a9 # v0
+      - uses: anchore/sbom-action/download-syft@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
       - name: Generate container SPDX SBOM
         run: syft agentos:${ARTIFACT_VERSION} -o spdx-json=agentos-${ARTIFACT_VERSION}-container.spdx.json
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -184,7 +184,7 @@ jobs:
       - name: Generate SHA-256 manifest
         working-directory: dist
         run: sha256sum *.zip *.json > SHA256SUMS
-      - uses: sigstore/cosign-installer@398d4b0eeef75a7bf63e34d76f9d524ffc64980c # v3
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
       - name: Keyless-sign every artifact and checksum manifest
         run: |
           for asset in dist/*.zip dist/*.json dist/SHA256SUMS; do

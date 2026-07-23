@@ -352,6 +352,7 @@ fn release_blocking_workflows_keep_their_security_contract() {
         "npm audit --audit-level=high",
         "npm run check",
         "advisories bans licenses sources",
+        "verify_workflow_action_pins.py --remote",
         "check_critical_coverage.py lcov.info",
         "\"storage_get\"",
     ] {

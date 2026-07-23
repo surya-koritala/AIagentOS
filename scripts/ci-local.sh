@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
 # Reproduce the deterministic, host-compatible release gates from a clean checkout.
-# Cross-platform matrices, GitHub issue-state checks, Sigstore, provenance, and
-# container qualification remain GitHub-hosted gates.
+# Cross-platform matrices, GitHub action/issue-state checks, Sigstore,
+# provenance, and container qualification remain GitHub-hosted gates.
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
 
 cargo fmt --all -- --check
+python3 scripts/verify_workflow_action_pins.py
 cargo clippy --workspace --exclude tauri-app --all-targets --locked -- -D warnings
 cargo test -p integration-tests capability_registry --locked
 python3 -m unittest discover -s scripts/tests -p "test_*.py"

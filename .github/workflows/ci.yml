@@ -28,6 +28,10 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - name: Formatting
         run: cargo fmt --all -- --check
+      - name: Prove pinned workflow actions exist
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python scripts/verify_workflow_action_pins.py --remote
       - name: Clippy (warnings are errors)
         run: cargo clippy --workspace --exclude tauri-app --all-targets -- -D warnings
       - name: Capability and public-claim contract

@@ -29,7 +29,7 @@ use tokio::net::{TcpListener, TcpStream, ToSocketAddrs};
 
 use crate::agent::AgentKernel;
 use crate::auth::{Principal, Role};
-use crate::connector::{AgentConnector, ToolCall};
+use crate::connector::AgentConnector;
 use crate::context::{ContextManager, ContextPressureStats, Fact, FactCategory};
 use crate::observability::{AgentAction, ObservabilityEngine};
 use crate::resources::ResourceBroker;
@@ -49,6 +49,17 @@ pub const PROTOCOL_VERSION: u32 = 2;
 /// The oldest wire-protocol version this server still accepts. Version 1 keeps
 /// the released prose-only error reply; version 2 adds typed public errors.
 pub const MIN_PROTOCOL_VERSION: u32 = 1;
+
+/// Maximum duration accepted from an untrusted wire `WaitAgent` request.
+///
+/// This remains below the production credential-drain bound, leaving time for
+/// dispatch to release its credential lease before revocation reports an
+/// incomplete drain. In-process callers can still choose their own timeout.
+pub const MAX_WIRE_WAIT_AGENT_TIMEOUT_MS: u64 = 25_000;
+
+fn wire_wait_agent_timeout(requested_ms: u64) -> std::time::Duration {
+    std::time::Duration::from_millis(requested_ms.min(MAX_WIRE_WAIT_AGENT_TIMEOUT_MS))
+}
 
 fn default_provider() -> String {
     "stub".to_string()
@@ -99,7 +110,8 @@ pub enum Syscall {
     GetAgentStatus {
         agent_id: String,
     },
-    /// Wait until an agent becomes terminal or the timeout expires.
+    /// Wait until an agent becomes terminal or the timeout expires. The server
+    /// caps this caller-controlled value at [`MAX_WIRE_WAIT_AGENT_TIMEOUT_MS`].
     WaitAgent {
         agent_id: String,
         timeout_ms: u64,
@@ -986,7 +998,7 @@ pub async fn dispatch_scoped(
             timeout_ms,
         } => match uuid::Uuid::parse_str(&agent_id) {
             Ok(id) => match kernel
-                .wait_agent(id, std::time::Duration::from_millis(timeout_ms))
+                .wait_agent(id, wire_wait_agent_timeout(timeout_ms))
                 .await
             {
                 Ok(state) => SyscallReply::AgentStatus {
@@ -1129,12 +1141,17 @@ pub async fn dispatch_scoped(
             };
             // Security preparation is shared with executor/MCP/SDK so action,
             // resource extraction, and accounting cannot drift by entry point.
-            let _tool_slot = match kernel
+            let (prepared_tool, _tool_slot) = match kernel
                 .tool_registry
                 .authorize_and_acquire_call(&kernel.syscall_gate, id, &tool, &args)
                 .await
             {
-                Ok((_, slot)) => slot,
+                Ok((prepared, slot)) => (prepared, slot),
+                Err(crate::tools::ToolAuthorizationError::InvalidDeclaration(error))
+                    if error == crate::tools::TOOL_NOT_FOUND_ERROR =>
+                {
+                    return SyscallReply::Error { message: error }
+                }
                 Err(error) => {
                     return SyscallReply::Error {
                         message: format!("tool '{tool}' denied by kernel: {error}"),
@@ -1142,26 +1159,13 @@ pub async fn dispatch_scoped(
                 }
             };
 
-            let call = ToolCall {
-                id: "syscall".into(),
-                name: tool.clone(),
-                arguments: args,
-            };
-            let reply = match kernel.tool_registry.resolve(id, &call) {
-                Some(request) => match kernel.resource_broker.execute(request).await {
-                    Ok(resp) if resp.success => SyscallReply::ToolResult { data: resp.data },
-                    Ok(resp) => SyscallReply::Error {
-                        message: format!(
-                            "tool '{tool}' failed: {}",
-                            resp.error.unwrap_or_default()
-                        ),
-                    },
-                    Err(e) => SyscallReply::Error {
-                        message: format!("tool '{tool}' error: {e}"),
-                    },
+            let reply = match kernel.resource_broker.execute(prepared_tool.request).await {
+                Ok(resp) if resp.success => SyscallReply::ToolResult { data: resp.data },
+                Ok(resp) => SyscallReply::Error {
+                    message: format!("tool '{tool}' failed: {}", resp.error.unwrap_or_default()),
                 },
-                None => SyscallReply::Error {
-                    message: format!("unknown tool '{tool}'"),
+                Err(e) => SyscallReply::Error {
+                    message: format!("tool '{tool}' error: {e}"),
                 },
             };
             reply
@@ -1876,9 +1880,9 @@ impl SyscallServer {
         // A client that skips Hello receives the released v1 response shape.
         // Negotiation upgrades only this connection, preserving old clients.
         let mut negotiated_version = MIN_PROTOCOL_VERSION;
-        // The presented tenant credential is retained and re-resolved before
-        // every syscall so revocation takes effect without a reconnect window.
-        let mut credential: Option<String> = None;
+        // Connections retain only the credential's SHA-256 identity. The
+        // plaintext presented to Authenticate is dropped with that request.
+        let mut credential: Option<crate::auth::CredentialIdentity> = None;
         while let Some(line) = lines.next_line().await? {
             if line.trim().is_empty() {
                 continue;
@@ -1909,11 +1913,19 @@ impl SyscallServer {
                 //   2. an AuthSystem API key / session token, which additionally
                 //      binds this connection to the credential's tenant.
                 Ok(Syscall::Authenticate { token }) => {
+                    // Authentication is replacement, not an additive operation:
+                    // any failed attempt leaves the connection unauthenticated.
+                    authed = false;
+                    credential = None;
                     // An AuthSystem credential always wins first so that the
                     // connection binds to its tenant — even on an open server.
-                    if kernel.resolve_principal(&token).await.is_some() {
+                    if let Some(principal) = kernel.resolve_principal(&token).await {
                         authed = true;
-                        credential = Some(token);
+                        credential = Some(
+                            principal
+                                .credential
+                                .expect("wire-authenticated principals carry credential identity"),
+                        );
                         SyscallReply::Authenticated
                     } else {
                         // Otherwise fall back to the legacy shared-secret check
@@ -1941,16 +1953,15 @@ impl SyscallServer {
                     message: "authentication required".into(),
                 },
                 Ok(call) => {
-                    // Re-resolve tenant credentials for every request. Revoked,
-                    // expired, deleted, or role-changed credentials never keep
-                    // the authority captured at login time. Keep the auth read
-                    // lock through dispatch: revocation takes the write lock,
-                    // so once a revoke call returns no previously-authorized
-                    // request can still be executing.
-                    if let Some(token) = credential.as_deref() {
-                        let auth_guard = kernel.auth.read().await;
-                        let reply = match auth_guard.authenticate(token) {
-                            Some(resolved) => dispatch_scoped(&kernel, call, Some(&resolved)).await,
+                    // Re-resolve tenant credentials for every request under a
+                    // short auth read lock. A per-credential lease remains alive
+                    // through dispatch, so same-credential revocation is
+                    // linearizable without blocking unrelated auth writes.
+                    if let Some(identity) = credential.as_ref() {
+                        match kernel.acquire_credential_principal(identity).await {
+                            Some((resolved, _credential_lease)) => {
+                                dispatch_scoped(&kernel, call, Some(&resolved)).await
+                            }
                             None => {
                                 authed = false;
                                 credential = None;
@@ -1958,9 +1969,7 @@ impl SyscallServer {
                                     message: "authentication required".into(),
                                 }
                             }
-                        };
-                        drop(auth_guard);
-                        reply
+                        }
                     } else {
                         dispatch_scoped(&kernel, call, None).await
                     }
@@ -2067,6 +2076,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn wire_wait_agent_timeout_is_bounded() {
+        assert_eq!(
+            wire_wait_agent_timeout(u64::MAX),
+            std::time::Duration::from_millis(MAX_WIRE_WAIT_AGENT_TIMEOUT_MS)
+        );
+        assert_eq!(
+            wire_wait_agent_timeout(17),
+            std::time::Duration::from_millis(17)
+        );
+    }
+
+    #[test]
     fn unavailable_quota_storage_is_not_misclassified_as_quota_exhaustion() {
         assert_eq!(
             WireErrorCode::classify(
@@ -2082,6 +2103,94 @@ mod tests {
             WireErrorCode::classify("cgroup token quota exceeded"),
             (WireErrorCode::QuotaExceeded, true)
         );
+    }
+
+    #[tokio::test]
+    async fn raw_syscall_hides_foreign_tool_like_a_missing_tool() {
+        let kernel = AgentKernelImpl::new().expect("kernel new");
+        let config = |name: &str| AgentConfig {
+            name: name.into(),
+            task: "tool visibility probe".into(),
+            llm_provider: "stub".into(),
+            permission_profile: "standard".into(),
+            priority: Priority::default(),
+            sandbox_config: None,
+        };
+        let _owner = kernel
+            .create_agent_in_namespace(config("owner"), "private-tools")
+            .await
+            .unwrap();
+        let caller = kernel
+            .create_agent_in_namespace(config("caller"), "other-tools")
+            .await
+            .unwrap();
+        kernel
+            .register_group_tool(
+                "private-tools",
+                crate::tools::ToolBinding {
+                    name: "private_notes".into(),
+                    description: "Read private notes".into(),
+                    parameters_schema: serde_json::json!({
+                        "type": "object",
+                        "properties": {"path": {"type": "string"}},
+                        "required": ["path"]
+                    }),
+                    resource_type: crate::resources::ResourceType::Filesystem,
+                    operation: "read".into(),
+                    security: crate::tools::ToolSecurity::argument(
+                        crate::tools::SecurityAction::Read,
+                        "path",
+                    ),
+                },
+            )
+            .unwrap();
+
+        let foreign = dispatch(
+            &kernel,
+            Syscall::CallTool {
+                agent_id: caller.id.to_string(),
+                tool: "private_notes".into(),
+                args: serde_json::json!({"path": "/tmp/private"}),
+            },
+        )
+        .await
+        .into_public_wire(PROTOCOL_VERSION);
+        let missing = dispatch(
+            &kernel,
+            Syscall::CallTool {
+                agent_id: caller.id.to_string(),
+                tool: "definitely_missing_tool".into(),
+                args: serde_json::json!({}),
+            },
+        )
+        .await
+        .into_public_wire(PROTOCOL_VERSION);
+
+        match (foreign, missing) {
+            (
+                SyscallReply::TypedError {
+                    code: foreign_code,
+                    message: foreign_message,
+                    ..
+                },
+                SyscallReply::TypedError {
+                    code: missing_code,
+                    message: missing_message,
+                    ..
+                },
+            ) => {
+                assert_eq!(foreign_code, missing_code);
+                assert_eq!(foreign_code, WireErrorCode::NotFound);
+                assert_eq!(foreign_message, missing_message);
+                assert!(
+                    !foreign_message.contains("private_notes")
+                        && !foreign_message.contains("definitely_missing_tool")
+                        && !foreign_message.contains("ns="),
+                    "syscall error reflected foreign catalog data: {foreign_message}"
+                );
+            }
+            replies => panic!("expected matching typed tool errors, got {replies:?}"),
+        }
     }
 
     #[test]
@@ -3720,32 +3829,104 @@ profile = "standard"
     }
 
     #[tokio::test]
-    async fn revocation_waits_for_in_flight_authorized_requests() {
+    async fn failed_reauthentication_clears_the_previous_wire_identity() {
         let kernel = Arc::new(AgentKernelImpl::new().expect("kernel new"));
-        let tenant = kernel.create_tenant("linearizable").await.unwrap();
+        let tenant = kernel.create_tenant("reauth").await.unwrap();
         let user = kernel
-            .register_user(&tenant, "alice", "alice@linear.test", Role::User)
+            .register_user(&tenant, "alice", "alice@reauth.test", Role::User)
             .await
             .unwrap();
         let token = kernel.open_session(&user).await.unwrap();
+        let server = SyscallServer::bind(kernel, "127.0.0.1:0")
+            .await
+            .expect("bind")
+            .with_auth_token("system-secret");
+        let addr = server.local_addr().unwrap();
+        tokio::spawn(server.serve());
+        let mut client = SyscallClient::connect(addr).await.unwrap();
 
-        // The connection handler holds this same read lock from credential
-        // resolution through dispatch. A revocation must wait for it, proving
-        // there is no post-revocation execution window.
-        let in_flight = kernel.auth.read().await;
-        assert!(in_flight.authenticate(&token).is_some());
+        assert!(matches!(
+            client.authenticate(token).await.unwrap(),
+            SyscallReply::Authenticated
+        ));
+        assert!(matches!(
+            client.authenticate("invalid-replacement").await.unwrap(),
+            SyscallReply::Error { message } if message == "authentication failed"
+        ));
+        assert!(matches!(
+            client.call(Syscall::ListAgents).await.unwrap(),
+            SyscallReply::Error { message } if message == "authentication required"
+        ));
+    }
+
+    #[tokio::test]
+    async fn revocation_waits_only_for_the_same_credential_lease() {
+        let kernel = Arc::new(AgentKernelImpl::new().expect("kernel new"));
+        let tenant = kernel.create_tenant("linearizable").await.unwrap();
+        let user_a = kernel
+            .register_user(&tenant, "alice", "alice@linear.test", Role::User)
+            .await
+            .unwrap();
+        let user_b = kernel
+            .register_user(&tenant, "bob", "bob@linear.test", Role::User)
+            .await
+            .unwrap();
+        let token_a = kernel.open_session(&user_a).await.unwrap();
+        let token_b = kernel.open_session(&user_b).await.unwrap();
+        let identity_a = kernel
+            .resolve_principal(&token_a)
+            .await
+            .unwrap()
+            .credential
+            .unwrap();
+        let (_principal, in_flight) = kernel
+            .acquire_credential_principal(&identity_a)
+            .await
+            .expect("first request admitted");
+
         let revoke_kernel = kernel.clone();
-        let revoke_token = token.clone();
+        let revoke_token = token_a.clone();
         let revoke = tokio::spawn(async move { revoke_kernel.revoke_session(&revoke_token).await });
-        tokio::task::yield_now().await;
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while kernel.resolve_principal(&token_a).await.is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("same-credential revocation did not close admission");
         assert!(
             !revoke.is_finished(),
-            "revocation crossed an in-flight authorization boundary"
+            "same-credential revocation crossed an in-flight lease"
         );
-        drop(in_flight);
+        assert!(
+            kernel
+                .acquire_credential_principal(&identity_a)
+                .await
+                .is_none(),
+            "closed credential admitted a post-revocation request"
+        );
 
+        // The long-running A request must not retain a global auth read lock.
+        // Revoking unrelated B performs both a durable and in-memory auth write.
+        assert!(tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            kernel.revoke_session(&token_b)
+        )
+        .await
+        .expect("unrelated credential revocation blocked behind A")
+        .unwrap());
+
+        drop(in_flight);
         assert!(revoke.await.unwrap().unwrap());
-        assert!(kernel.resolve_principal(&token).await.is_none());
+        assert!(kernel.resolve_principal(&token_a).await.is_none());
+        assert!(
+            kernel
+                .acquire_credential_principal(&identity_a)
+                .await
+                .is_none(),
+            "same credential executed after revocation returned"
+        );
     }
 
     #[tokio::test]

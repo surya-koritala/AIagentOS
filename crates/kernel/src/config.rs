@@ -397,8 +397,9 @@ impl Config {
     /// `enforcing` flag + compiled rules are returned — superseding the inline
     /// `mac_enforcing`/`mac_rules`. An unreadable or malformed policy file is a
     /// hard error so startup fails loudly with a clear message rather than
-    /// silently dropping to permissive mode. With no `policy_file`, the inline
-    /// fields are returned unchanged.
+    /// silently dropping to permissive mode. With no `policy_file`, inline rules
+    /// are validated for canonical action/decision labels and non-empty
+    /// selectors before they are returned.
     pub fn resolve_mac(&self) -> Result<(bool, Vec<crate::mac::PolicyRule>), String> {
         match &self.policy_file {
             Some(path) => {
@@ -408,7 +409,10 @@ impl Config {
                     .map_err(|e| format!("invalid policy file {}: {e}", path.display()))?;
                 Ok((doc.enforcing, doc.compile()))
             }
-            None => Ok((self.mac_enforcing, self.mac_rules.clone())),
+            None => {
+                crate::policy::validate_engine_rules(&self.mac_rules)?;
+                Ok((self.mac_enforcing, self.mac_rules.clone()))
+            }
         }
     }
 
@@ -891,6 +895,36 @@ usd_per_1k_tokens = inf
         let (enforcing, rules) = cfg.resolve_mac().unwrap();
         assert!(enforcing);
         assert_eq!(rules.len(), 1);
+    }
+
+    #[test]
+    fn resolve_mac_rejects_noncanonical_inline_action_and_decision_labels() {
+        let mut cfg = Config {
+            mac_rules: vec![crate::mac::PolicyRule {
+                subject: "*".into(),
+                action: "execute".into(),
+                object: "*".into(),
+                decision: "allow".into(),
+            }],
+            ..Config::default()
+        };
+        let action_error = cfg.resolve_mac().unwrap_err();
+        assert!(
+            action_error.contains("unknown action label 'execute'"),
+            "{action_error}"
+        );
+        assert!(
+            action_error.contains("`exec`, not `execute`"),
+            "{action_error}"
+        );
+
+        cfg.mac_rules[0].action = "exec".into();
+        cfg.mac_rules[0].decision = "alow".into();
+        let decision_error = cfg.resolve_mac().unwrap_err();
+        assert!(
+            decision_error.contains("unknown decision 'alow'"),
+            "{decision_error}"
+        );
     }
 
     #[test]

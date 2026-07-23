@@ -224,29 +224,14 @@ impl McpServer {
         }
     }
 
-    /// Register this server's tools in a ToolRegistry.
+    /// Register this server's tools as one all-or-nothing batch.
+    ///
+    /// The exclusive registry borrow makes the short publication loop
+    /// unobservable to safe concurrent callers. Every declaration is converted,
+    /// validated, and checked for conflicts first; an unexpected late registry
+    /// failure rolls back only names inserted by this batch.
     pub fn register_tools(&self, registry: &mut ToolRegistry) -> Result<usize, Vec<String>> {
-        let mut bindings = Vec::new();
-        let mut errors = Vec::new();
-        for tool in &self.tools {
-            match tool.to_binding(&self.config.name) {
-                Ok(binding) => bindings.push(binding),
-                Err(error) => errors.push(error),
-            }
-        }
-        if !errors.is_empty() {
-            return Err(errors);
-        }
-        for binding in bindings {
-            if let Err(error) = registry.register(binding) {
-                errors.push(error.to_string());
-            }
-        }
-        if errors.is_empty() {
-            Ok(self.tools.len())
-        } else {
-            Err(errors)
-        }
+        register_mcp_tools(registry, &self.config.name, &self.tools)
     }
 
     async fn send_request(
@@ -307,6 +292,68 @@ impl McpServer {
     }
 }
 
+fn register_mcp_tools(
+    registry: &mut ToolRegistry,
+    server_name: &str,
+    tools: &[McpTool],
+) -> Result<usize, Vec<String>> {
+    let existing = registry.security_catalog();
+    let mut batch_names = std::collections::HashSet::new();
+    let mut bindings = Vec::with_capacity(tools.len());
+    let mut errors = Vec::new();
+
+    // Convert and validate the complete discovery result before publishing any
+    // binding. MCP metadata is untrusted, and a late invalid declaration must
+    // not leave an executable prefix of the server's catalog installed.
+    for tool in tools {
+        match tool.to_binding(server_name) {
+            Ok(binding) => {
+                if !batch_names.insert(binding.name.clone()) {
+                    errors.push(format!(
+                        "MCP server '{server_name}' returned duplicate tool '{}'",
+                        binding.name
+                    ));
+                } else if existing.contains_key(&binding.name) {
+                    errors.push(format!(
+                        "MCP tool '{}' conflicts with an existing registry binding",
+                        binding.name
+                    ));
+                } else if let Err(error) = ToolRegistry::validate_binding(&binding) {
+                    errors.push(format!("MCP tool '{}': {error}", binding.name));
+                }
+                bindings.push(binding);
+            }
+            Err(error) => errors.push(error),
+        }
+    }
+    if !errors.is_empty() {
+        return Err(errors);
+    }
+
+    register_validated_bindings_atomically(registry, bindings)
+}
+
+fn register_validated_bindings_atomically(
+    registry: &mut ToolRegistry,
+    bindings: Vec<ToolBinding>,
+) -> Result<usize, Vec<String>> {
+    let expected = bindings.len();
+    let mut installed: Vec<String> = Vec::with_capacity(expected);
+    for binding in bindings {
+        let name = binding.name.clone();
+        if let Err(error) = registry.register(binding) {
+            for installed_name in installed.iter().rev() {
+                registry.unregister(installed_name);
+            }
+            return Err(vec![format!(
+                "MCP tool '{name}' could not be published; rolled back the batch: {error}"
+            )]);
+        }
+        installed.push(name);
+    }
+    Ok(expected)
+}
+
 impl Drop for McpServer {
     fn drop(&mut self) {
         let _ = self.process.start_kill();
@@ -328,7 +375,7 @@ pub fn load_mcp_configs() -> Vec<McpServerConfig> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tools::{SecurityAction, ToolSecurity};
+    use crate::tools::{SecurityAction, ToolRegistrationError, ToolSecurity};
 
     fn declared_tool() -> McpTool {
         McpTool {
@@ -378,6 +425,79 @@ mod tests {
         let error = registry
             .register(tool.to_binding("remote").unwrap())
             .unwrap_err();
-        assert!(error.to_string().contains("contradicts resource type"));
+        match error {
+            ToolRegistrationError::ProviderTargetMismatch { .. }
+            | ToolRegistrationError::ResourceActionMismatch { .. }
+            | ToolRegistrationError::OperationActionMismatch { .. }
+            | ToolRegistrationError::UnsupportedOperation { .. } => {}
+            other => panic!("unexpected registration verdict: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mcp_registration_is_all_or_nothing_when_any_declaration_is_invalid() {
+        let mut registry = ToolRegistry::new();
+        let before = registry.security_catalog();
+        let mut invalid = declared_tool();
+        invalid.name = "invalid".into();
+        invalid.security = None;
+
+        let errors =
+            register_mcp_tools(&mut registry, "remote", &[declared_tool(), invalid]).unwrap_err();
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("omitted required agentosSecurity")));
+        assert_eq!(registry.security_catalog(), before);
+        assert!(!registry.security_catalog().contains_key("mcp_remote_fetch"));
+    }
+
+    #[test]
+    fn mcp_registration_rejects_duplicate_discovery_without_publishing() {
+        let mut registry = ToolRegistry::new();
+        let before = registry.security_catalog();
+
+        let errors =
+            register_mcp_tools(&mut registry, "remote", &[declared_tool(), declared_tool()])
+                .unwrap_err();
+        assert!(errors.iter().any(|error| error.contains("duplicate tool")));
+        assert_eq!(registry.security_catalog(), before);
+    }
+
+    #[test]
+    fn mcp_registration_rolls_back_a_late_registry_failure() {
+        let mut registry = ToolRegistry::new();
+        let before = registry.security_catalog();
+        let fresh = {
+            let mut tool = declared_tool();
+            tool.name = "fresh".into();
+            tool.to_binding("remote").unwrap()
+        };
+        let existing = declared_tool().to_binding("remote").unwrap();
+        registry.register(existing.clone()).unwrap();
+
+        let errors = register_validated_bindings_atomically(&mut registry, vec![fresh, existing])
+            .unwrap_err();
+        assert!(errors.iter().any(|error| error.contains("rolled back")));
+        assert!(!registry.security_catalog().contains_key("mcp_remote_fresh"));
+        assert!(registry.security_catalog().contains_key("mcp_remote_fetch"));
+        assert_eq!(registry.security_catalog().len(), before.len() + 1);
+    }
+
+    #[test]
+    fn valid_mcp_catalog_is_published_as_one_complete_batch() {
+        let mut registry = ToolRegistry::new();
+        let before = registry.security_catalog().len();
+        let mut second = declared_tool();
+        second.name = "post".into();
+        second.operation = Some("post".into());
+
+        assert_eq!(
+            register_mcp_tools(&mut registry, "remote", &[declared_tool(), second]).unwrap(),
+            2
+        );
+        let catalog = registry.security_catalog();
+        assert_eq!(catalog.len(), before + 2);
+        assert!(catalog.contains_key("mcp_remote_fetch"));
+        assert!(catalog.contains_key("mcp_remote_post"));
     }
 }

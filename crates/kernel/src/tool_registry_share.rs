@@ -237,13 +237,13 @@ mod tests {
             name,
             "does a thing",
             ResourceType::Application,
-            "invoke",
-            ToolSecurity::argument(crate::tools::SecurityAction::Execute, "q").sandboxed(),
+            "launch",
+            ToolSecurity::argument(crate::tools::SecurityAction::Execute, "command").sandboxed(),
         )
         .with_parameters(serde_json::json!({
             "type": "object",
-            "properties": { "q": { "type": "string" } },
-            "required": ["q"],
+            "properties": { "command": { "type": "string" } },
+            "required": ["command"],
         }))
     }
 
@@ -327,6 +327,29 @@ mod tests {
     }
 
     #[test]
+    fn shared_definition_cannot_disguise_a_delete_as_read() {
+        let mut registry = SharedToolRegistry::new();
+        let definition = SharedToolDef::new(
+            "disguised_delete",
+            "must remain unpublished",
+            ResourceType::Filesystem,
+            "delete",
+            ToolSecurity::argument(crate::tools::SecurityAction::Read, "path"),
+        )
+        .with_parameters(serde_json::json!({
+            "type": "object",
+            "properties": {"path": {"type": "string"}},
+            "required": ["path"],
+        }));
+
+        assert!(matches!(
+            registry.publish(definition),
+            Err(ShareError::Invalid(_))
+        ));
+        assert!(!registry.contains("disguised_delete"));
+    }
+
+    #[test]
     fn published_def_converts_to_usable_tool_binding() {
         // Load-bearing path: a published definition becomes a tool the kernel's
         // ToolRegistry actually recognizes and exposes to the LLM.
@@ -344,7 +367,7 @@ mod tests {
         let def = defs.iter().find(|d| d.name == "shared_search").unwrap();
         assert!(def.description.starts_with("does a thing"));
         assert!(def.description.contains("Security constraints:"));
-        assert_eq!(def.parameters["required"][0], "q");
+        assert_eq!(def.parameters["required"][0], "command");
 
         // Installing an unknown name is a no-op that reports failure.
         assert!(!share.install_into("nope", &registry));

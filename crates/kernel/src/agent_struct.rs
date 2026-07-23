@@ -61,7 +61,7 @@ pub struct AgentCredentials {
 }
 
 /// Capability set (fine-grained permissions).
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CapabilitySet {
     bits: u64,
 }

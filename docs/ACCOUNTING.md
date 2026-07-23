@@ -4,6 +4,12 @@ This document defines the units, scope, reset behavior, and known precision
 limits for runtime accounting. Code and dashboards must not infer different
 semantics from a metric name.
 
+Accounting is an availability and spend boundary, not an authorization grant.
+A successful RPM/TPM, budget, or cgroup reservation never substitutes for
+tenant ownership, a validated tool declaration, capability/MAC/approval checks,
+or sandbox admission. Prompts, providers, packages, MCP metadata, and tool
+arguments cannot modify those controls or select a permissive/unconfined mode.
+
 ## Provider usage and price
 
 Each completed turn records the actual provider ID and model ID, input, output,

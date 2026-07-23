@@ -20,6 +20,7 @@
 
 use chrono::{DateTime, Duration, Utc};
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 /// SHA-256 hash of a secret, hex-encoded. This is what we persist / keep in
 /// memory — never the plaintext.
@@ -109,7 +110,7 @@ pub struct Session {
 /// System/open-server and configured shared-secret callers are represented by
 /// the wire server's explicit trusted-system path rather than by a tenant
 /// [`Principal`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CredentialKind {
     ApiKey,
     Session,
@@ -118,7 +119,7 @@ pub enum CredentialKind {
 /// Stable, non-plaintext identity for the credential used to authenticate a
 /// connection. `id` is the SHA-256 digest already stored by the auth subsystem;
 /// it can be compared for revocation without retaining or exposing the secret.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, Hash)]
 pub struct CredentialIdentity {
     pub kind: CredentialKind,
     pub id: String,
@@ -131,6 +132,265 @@ impl std::fmt::Debug for CredentialIdentity {
             .field("kind", &self.kind)
             .field("id", &format_args!("{short_id}…"))
             .finish()
+    }
+}
+
+#[derive(Debug)]
+struct CredentialLeaseState {
+    accepting: bool,
+    active: usize,
+    owner: Option<CredentialLeaseOwner>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CredentialLeaseOwner {
+    user_id: String,
+    tenant_id: String,
+}
+
+#[derive(Debug)]
+struct CredentialLeaseEntry {
+    state: Mutex<CredentialLeaseState>,
+    active: tokio::sync::watch::Sender<usize>,
+}
+
+impl CredentialLeaseEntry {
+    fn new() -> Self {
+        let (active, _) = tokio::sync::watch::channel(0);
+        Self {
+            state: Mutex::new(CredentialLeaseState {
+                accepting: true,
+                active: 0,
+                owner: None,
+            }),
+            active,
+        }
+    }
+}
+
+/// Per-credential request admission.
+///
+/// A connection retains only [`CredentialIdentity`]. Before each protected
+/// request it acquires a lease from this manager and resolves the identity
+/// against [`AuthSystem`] under a short read lock. Revocation closes only the
+/// affected credential's entry, removes the durable/in-memory credential, and
+/// then waits for that entry to drain. Unrelated credentials and auth writes do
+/// not wait behind provider I/O.
+#[derive(Debug, Default)]
+pub(crate) struct CredentialLeaseManager {
+    entries: Arc<Mutex<HashMap<CredentialIdentity, Arc<CredentialLeaseEntry>>>>,
+}
+
+impl CredentialLeaseManager {
+    pub(crate) fn acquire(&self, identity: &CredentialIdentity) -> Option<CredentialLeaseGuard> {
+        let mut entries = self.entries.lock().unwrap();
+        let entry = Arc::clone(
+            entries
+                .entry(identity.clone())
+                .or_insert_with(|| Arc::new(CredentialLeaseEntry::new())),
+        );
+        {
+            let mut state = entry.state.lock().unwrap();
+            if !state.accepting {
+                return None;
+            }
+            state.active = state.active.checked_add(1)?;
+            entry.active.send_replace(state.active);
+        }
+        drop(entries);
+        Some(CredentialLeaseGuard {
+            identity: identity.clone(),
+            entries: Arc::clone(&self.entries),
+            entry,
+        })
+    }
+
+    pub(crate) fn close(&self, identity: &CredentialIdentity) -> CredentialDrain {
+        let mut entries = self.entries.lock().unwrap();
+        let entry = Arc::clone(
+            entries
+                .entry(identity.clone())
+                .or_insert_with(|| Arc::new(CredentialLeaseEntry::new())),
+        );
+        entry.state.lock().unwrap().accepting = false;
+        drop(entries);
+        CredentialDrain {
+            identity: identity.clone(),
+            entries: Arc::clone(&self.entries),
+            entry,
+        }
+    }
+
+    pub(crate) fn close_many(&self, identities: &[CredentialIdentity]) -> Vec<CredentialDrain> {
+        identities
+            .iter()
+            .map(|identity| self.close(identity))
+            .collect()
+    }
+
+    /// Re-open admission after a durable revocation transaction failed while the
+    /// credential remained live. Successful revocations never call this.
+    pub(crate) fn reopen(&self, identity: &CredentialIdentity) {
+        let mut entries = self.entries.lock().unwrap();
+        let entry = Arc::clone(
+            entries
+                .entry(identity.clone())
+                .or_insert_with(|| Arc::new(CredentialLeaseEntry::new())),
+        );
+        let remove_idle_open_entry = {
+            let mut state = entry.state.lock().unwrap();
+            state.accepting = true;
+            state.active == 0
+        };
+        if remove_idle_open_entry {
+            // An idle live credential needs no resident admission entry.
+            // Future requests recreate it from AuthSystem. The map lock makes
+            // reopening and removing the idle entry one admission boundary.
+            entries.remove(identity);
+        }
+    }
+
+    pub(crate) fn reopen_many(&self, identities: &[CredentialIdentity]) {
+        for identity in identities {
+            self.reopen(identity);
+        }
+    }
+
+    pub(crate) fn credential_identities_for_user(&self, user_id: &str) -> Vec<CredentialIdentity> {
+        let entries = self.entries.lock().unwrap();
+        entries
+            .iter()
+            .filter(|(_, entry)| {
+                entry
+                    .state
+                    .lock()
+                    .unwrap()
+                    .owner
+                    .as_ref()
+                    .is_some_and(|owner| owner.user_id == user_id)
+            })
+            .map(|(identity, _)| identity.clone())
+            .collect()
+    }
+
+    pub(crate) fn credential_identities_for_tenant(
+        &self,
+        tenant_id: &str,
+    ) -> Vec<CredentialIdentity> {
+        let entries = self.entries.lock().unwrap();
+        entries
+            .iter()
+            .filter(|(_, entry)| {
+                entry
+                    .state
+                    .lock()
+                    .unwrap()
+                    .owner
+                    .as_ref()
+                    .is_some_and(|owner| owner.tenant_id == tenant_id)
+            })
+            .map(|(identity, _)| identity.clone())
+            .collect()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn entry_count(&self) -> usize {
+        self.entries.lock().unwrap().len()
+    }
+}
+
+/// Keeps one credential's revocation boundary open for an admitted request.
+#[derive(Debug)]
+pub(crate) struct CredentialLeaseGuard {
+    identity: CredentialIdentity,
+    entries: Arc<Mutex<HashMap<CredentialIdentity, Arc<CredentialLeaseEntry>>>>,
+    entry: Arc<CredentialLeaseEntry>,
+}
+
+impl CredentialLeaseGuard {
+    /// Bind an admitted lease to the principal resolved under the auth read
+    /// lock. Once a protected request can run, broader user/tenant revocation
+    /// can discover this entry even if an overlapping single-credential revoke
+    /// already removed the credential from `AuthSystem`.
+    pub(crate) fn bind_owner(&self, user_id: &str, tenant_id: &str) -> bool {
+        let owner = CredentialLeaseOwner {
+            user_id: user_id.to_string(),
+            tenant_id: tenant_id.to_string(),
+        };
+        let mut state = self.entry.state.lock().unwrap();
+        match &state.owner {
+            Some(existing) => existing == &owner,
+            None => {
+                state.owner = Some(owner);
+                true
+            }
+        }
+    }
+}
+
+impl Drop for CredentialLeaseGuard {
+    fn drop(&mut self) {
+        let remove_idle_open_entry = {
+            let mut state = self.entry.state.lock().unwrap();
+            state.active = state.active.saturating_sub(1);
+            self.entry.active.send_replace(state.active);
+            state.accepting && state.active == 0
+        };
+        if remove_idle_open_entry {
+            // Successful credentials do not need a permanent idle lease entry;
+            // AuthSystem remains the source of truth. Exact-Arc validation keeps
+            // this drop from deleting a replacement created by a concurrent
+            // close/acquire boundary.
+            let mut entries = self.entries.lock().unwrap();
+            let removable = entries.get(&self.identity).is_some_and(|current| {
+                if !Arc::ptr_eq(current, &self.entry) {
+                    return false;
+                }
+                let state = current.state.lock().unwrap();
+                state.accepting && state.active == 0
+            });
+            if removable {
+                entries.remove(&self.identity);
+            }
+        }
+    }
+}
+
+/// Closed per-credential admission paired with a drain waiter.
+#[derive(Debug)]
+pub(crate) struct CredentialDrain {
+    identity: CredentialIdentity,
+    entries: Arc<Mutex<HashMap<CredentialIdentity, Arc<CredentialLeaseEntry>>>>,
+    entry: Arc<CredentialLeaseEntry>,
+}
+
+impl CredentialDrain {
+    pub(crate) async fn wait(self) {
+        let mut active = self.entry.active.subscribe();
+        loop {
+            if *active.borrow_and_update() == 0 {
+                break;
+            }
+            if active.changed().await.is_err() {
+                break;
+            }
+        }
+
+        // Successful revocation no longer needs a per-credential tombstone:
+        // AuthSystem is the durable source of truth and will reject the removed
+        // identity. Remove only this exact closed, idle Arc so a concurrently
+        // reopened/replaced entry can never be deleted by an older drain.
+        let mut entries = self.entries.lock().unwrap();
+        let removable = entries.get(&self.identity).is_some_and(|current| {
+            if !Arc::ptr_eq(current, &self.entry) {
+                return false;
+            }
+            let state = current.state.lock().unwrap();
+            !state.accepting && state.active == 0
+        });
+        if removable {
+            entries.remove(&self.identity);
+        }
     }
 }
 
@@ -331,7 +591,31 @@ impl AuthSystem {
     /// `(user, tenant, role)`.
     pub fn authenticate(&self, secret: &str) -> Option<Principal> {
         let hash = hash_secret(secret);
-        if let Some(k) = self.api_keys.get(&hash) {
+        self.authenticate_identity(&CredentialIdentity {
+            kind: CredentialKind::ApiKey,
+            id: hash.clone(),
+        })
+        .or_else(|| {
+            self.authenticate_identity(&CredentialIdentity {
+                kind: CredentialKind::Session,
+                id: hash,
+            })
+        })
+    }
+
+    /// Resolve an already-authenticated, non-secret credential identity.
+    ///
+    /// Wire connections use this after acquiring a per-credential in-flight
+    /// lease, so neither API keys nor session tokens remain in connection state.
+    pub fn authenticate_identity(&self, identity: &CredentialIdentity) -> Option<Principal> {
+        match identity.kind {
+            CredentialKind::ApiKey => self.authenticate_api_key_identity(identity),
+            CredentialKind::Session => self.authenticate_session_identity(identity),
+        }
+    }
+
+    fn authenticate_api_key_identity(&self, identity: &CredentialIdentity) -> Option<Principal> {
+        if let Some(k) = self.api_keys.get(&identity.id) {
             let user = self.users.get(&k.user_id)?;
             if user.tenant_id != k.tenant_id || !self.tenants.contains_key(&k.tenant_id) {
                 return None;
@@ -342,11 +626,15 @@ impl AuthSystem {
                 role: user.role,
                 credential: Some(CredentialIdentity {
                     kind: CredentialKind::ApiKey,
-                    id: hash,
+                    id: identity.id.clone(),
                 }),
             });
         }
-        if let Some(s) = self.sessions.get(&hash) {
+        None
+    }
+
+    fn authenticate_session_identity(&self, identity: &CredentialIdentity) -> Option<Principal> {
+        if let Some(s) = self.sessions.get(&identity.id) {
             if Utc::now() > s.expires_at {
                 return None;
             }
@@ -360,11 +648,62 @@ impl AuthSystem {
                 role: user.role,
                 credential: Some(CredentialIdentity {
                     kind: CredentialKind::Session,
-                    id: hash,
+                    id: identity.id.clone(),
                 }),
             });
         }
         None
+    }
+
+    pub(crate) fn revoke_session_identity(&mut self, identity: &CredentialIdentity) -> bool {
+        identity.kind == CredentialKind::Session && self.sessions.remove(&identity.id).is_some()
+    }
+
+    pub(crate) fn revoke_api_key_identity(&mut self, identity: &CredentialIdentity) -> bool {
+        identity.kind == CredentialKind::ApiKey && self.api_keys.remove(&identity.id).is_some()
+    }
+
+    pub(crate) fn credential_identities_for_user(&self, user_id: &str) -> Vec<CredentialIdentity> {
+        let sessions = self
+            .sessions
+            .values()
+            .filter(|session| session.user_id == user_id)
+            .map(|session| CredentialIdentity {
+                kind: CredentialKind::Session,
+                id: session.token_hash.clone(),
+            });
+        let api_keys = self
+            .api_keys
+            .values()
+            .filter(|key| key.user_id == user_id)
+            .map(|key| CredentialIdentity {
+                kind: CredentialKind::ApiKey,
+                id: key.key_hash.clone(),
+            });
+        sessions.chain(api_keys).collect()
+    }
+
+    pub(crate) fn credential_identities_for_tenant(
+        &self,
+        tenant_id: &str,
+    ) -> Vec<CredentialIdentity> {
+        let sessions = self
+            .sessions
+            .values()
+            .filter(|session| session.tenant_id == tenant_id)
+            .map(|session| CredentialIdentity {
+                kind: CredentialKind::Session,
+                id: session.token_hash.clone(),
+            });
+        let api_keys = self
+            .api_keys
+            .values()
+            .filter(|key| key.tenant_id == tenant_id)
+            .map(|key| CredentialIdentity {
+                kind: CredentialKind::ApiKey,
+                id: key.key_hash.clone(),
+            });
+        sessions.chain(api_keys).collect()
     }
 
     /// Check whether `user_id` holds at least the `required` role.
@@ -521,5 +860,83 @@ mod tests {
         auth.register(&b, "b1", "b1@t.com", Role::User).unwrap();
         assert_eq!(auth.list_users(&a).len(), 2);
         assert_eq!(auth.list_users(&b).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn credential_lease_churn_is_evicted_after_successful_drain() {
+        let leases = CredentialLeaseManager::default();
+        for index in 0..2_000 {
+            let identity = CredentialIdentity {
+                kind: CredentialKind::Session,
+                id: format!("unknown-session-{index}"),
+            };
+            leases.close(&identity).wait().await;
+        }
+        assert_eq!(
+            leases.entry_count(),
+            0,
+            "unknown revokes and normal credential churn must not grow tombstones"
+        );
+    }
+
+    #[tokio::test]
+    async fn credential_drain_closes_admission_then_evicts_the_exact_idle_entry() {
+        let leases = Arc::new(CredentialLeaseManager::default());
+        let identity = CredentialIdentity {
+            kind: CredentialKind::ApiKey,
+            id: "concurrent-key".into(),
+        };
+        let in_flight = leases.acquire(&identity).expect("initial lease");
+        let drain = leases.close(&identity);
+        assert!(
+            leases.acquire(&identity).is_none(),
+            "close must be linearizable with new admission"
+        );
+
+        let waiter = tokio::spawn(async move {
+            drain.wait().await;
+        });
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished(), "active lease must keep drain open");
+        drop(in_flight);
+        waiter.await.unwrap();
+        assert_eq!(leases.entry_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn rollback_reopens_only_still_live_credentials() {
+        let leases = CredentialLeaseManager::default();
+        let revoked = CredentialIdentity {
+            kind: CredentialKind::Session,
+            id: "already-revoked".into(),
+        };
+        let live = CredentialIdentity {
+            kind: CredentialKind::ApiKey,
+            id: "still-live".into(),
+        };
+        let revoked_guard = leases.acquire(&revoked).expect("revoked lease");
+        assert!(revoked_guard.bind_owner("user", "tenant"));
+        let live_guard = leases.acquire(&live).expect("live lease");
+        assert!(live_guard.bind_owner("user", "tenant"));
+        let revoked_drain = leases.close(&revoked);
+        let live_drain = leases.close(&live);
+
+        // A broader durable-revocation rollback must pass only the identities
+        // that remain in AuthSystem, never owner-tracked credentials whose
+        // narrower revocation already committed.
+        leases.reopen_many(std::slice::from_ref(&live));
+        assert!(
+            leases.acquire(&revoked).is_none(),
+            "rollback reopened a previously committed credential revocation"
+        );
+        assert!(
+            leases.acquire(&live).is_some(),
+            "rollback did not reopen the still-live credential"
+        );
+
+        drop(revoked_guard);
+        drop(live_guard);
+        revoked_drain.wait().await;
+        drop(live_drain);
     }
 }

@@ -20,7 +20,7 @@ A policy is a TOML file:
 # Top-level metadata
 version     = 1            # document format version (currently always 1)
 description = "..."        # free text, optional
-enforcing   = true         # true = enforce; false = permissive (log only)
+enforcing   = true         # true = enforce; false = explicit local permissive mode
 default     = "deny"       # decision when no rule matches: allow | deny | audit
 
 # Rules are evaluated top to bottom; first match wins.
@@ -42,7 +42,7 @@ decision = "deny"
 [[rule]]
 name     = "audit-exec"
 subject  = "*"
-action   = "execute"
+action   = "exec"
 object   = "*"
 decision = "audit"                # allowed, but recorded in the audit log
 ```
@@ -53,10 +53,10 @@ decision = "audit"                # allowed, but recorded in the audit log
 |---|---|
 | `version` | Document format version. This build understands `1`. |
 | `description` | Human note; ignored by the engine. |
-| `enforcing` | `true` enforces decisions; `false` is permissive (everything is allowed, decisions are still computable for logging). |
+| `enforcing` | `true` enforces decisions. `false` is an explicit local-operator permissive mode: everything is allowed and decisions remain available for logging. Validation and startup make this mode noisy. |
 | `default` | The decision when **no** rule matches. Declared explicitly so fallthrough is never a guess. |
 | `[[rule]].subject` | The agent's security label. CLI/kernel agents are labelled `profile:<name>` where `<name>` is `read-only` / `standard` / `elevated` / `full-access`. `*` matches any subject. |
-| `[[rule]].action` | The action label (`read`, `write`, `execute`, `net`, …), or `*`. |
+| `[[rule]].action` | A canonical declaration label: `read`, `write`, `delete`, `net`, `exec`, `ipc`, `browser`, `credential`, `package-install`, or `*`. These labels are generated from `SecurityAction`; use `exec`, not provider-operation names such as `execute` or `launch`. |
 | `[[rule]].object` | Either a resource **label** (matched exactly, like SELinux types) **or** a path/URL **glob** matched against the raw resource. `*` matches any object. |
 | `[[rule]].decision` | `allow`, `deny`, or `audit`. A misspelling is a parse error, not a silent deny. |
 | `[[rule]].name` / `.description` | Documentation only; `name` is surfaced by `explain`. |
@@ -98,12 +98,33 @@ warnings** (legal but probably-mistaken policies):
 [OK] policy is valid - version 1, enforcing, default = Deny, 3 rule(s)
 ```
 
-Lints include an enforcing policy with no rules and `default = deny` (which
-denies *everything* for confined agents) and rules made unreachable by an
-earlier catch-all. Lints are warnings, not failures — a linted policy still
-loads. A genuinely malformed document (bad TOML, unknown `decision`/`default`,
-unsupported `version`, empty subject/action/object) is a hard error with a
-pointed message and a non-zero exit.
+Lints include permissive mode, a non-deny terminal default, an enforcing policy
+with no rules and `default = deny` (which denies *everything* for confined
+agents), overbroad wildcard grants, tools whose typed action is not covered, and
+rules made unreachable by an earlier equal-or-broader selector. Lints are
+warnings, not failures—a linted policy still loads, because an operator may
+intentionally be validating a migration or denial-only policy. Production
+review must resolve or explicitly accept every warning.
+
+A genuinely malformed document (bad TOML, unknown fields, unknown
+`decision`/`default`, unsupported `version`, missing terminal `default`, or
+empty subject/action/object) is a hard error with a pointed message and a
+non-zero exit. Unknown action labels are also hard errors, so a typo such as
+`execute` cannot silently miss the runtime's canonical `exec` decision.
+Shadow detection is deliberately sound and conservative: it detects exact
+selectors, `*`/`**` containment, and a runtime glob that contains a later
+literal resource, but does not guess whether two different complex glob
+languages contain one another.
+
+Tool coverage is checked against each live validated binding, not just against
+a set of action strings. For every tool, the linter probes all supported
+subjects (`read-only`, `standard`, `elevated`, and `full-access`) against both
+the current `unconfined` object label and the binding's canonical resource-class
+label. Constant extractors are also probed with their exact resource; dynamic
+extractors use a non-secret representative of the declared resource class. A
+terminal default does not count as authored coverage. Narrow raw path/URL rules
+can therefore coexist with an explicit resource-class rule instead of
+accidentally making an unrelated tool appear covered.
 
 ## Explaining a decision (dry-run)
 
@@ -142,5 +163,31 @@ compiled rules are used. An unreadable or malformed policy file is a **hard
 startup error** — the kernel refuses to boot with a clear message rather than
 silently falling back to permissive mode.
 
-With no `policy_file`, the inline `mac_enforcing` / `mac_rules` config fields
-are used unchanged, so existing deployments keep working.
+With no `policy_file`, the inline `mac_enforcing` / `mac_rules` fields are used.
+Their production defaults are enforcing with a default-deny baseline allow-list;
+unknown permission profiles match no rule. `Config::default`,
+`AgentKernelImpl::new`, and `SyscallGate::new` therefore do not produce an
+unconfined runtime. Legacy inline rules receive the same canonical action-label,
+non-empty selector, and allow/deny/audit decision validation at startup; a typo
+is an error rather than a silent non-match.
+
+Permissive MAC requires an explicit local configuration or constructor choice
+and emits a security warning during kernel startup. No agent syscall, model
+tool call, package manifest, MCP descriptor, SDK request, or remote tenant
+request can change the MAC mode or mint an unconfined identity. The fully
+unconfined constructor is compiled only for tests and documentation examples.
+
+## What the model can see
+
+LLM tool definitions include an operator-authored description plus a
+kernel-generated summary of the validated declaration: resource type,
+operation, typed action, capability IDs, approval class, sandbox requirement,
+and namespace visibility. This helps the model avoid calls that policy will
+reject, but it is only a usability hint—the registry declaration remains the
+authorization source of truth at execution.
+
+The generated summary intentionally does **not** include a constant resource
+extractor's value, credentials, approval grants, sandbox host paths, policy
+rules, or secret material. Operator-authored tool descriptions and parameter
+schemas are model-visible and must not contain secrets. Tool arguments remain
+untrusted even when the model appears to understand these constraints.

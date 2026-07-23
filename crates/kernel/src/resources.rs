@@ -25,13 +25,226 @@ pub enum ResourceType {
 }
 
 /// A request from an agent to access a resource.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct ResourceRequest {
     pub agent_id: AgentId,
     pub resource_type: ResourceType,
     pub operation: String,
     pub parameters: serde_json::Value,
     pub sandbox_context: Option<SandboxId>,
+    /// Single-use proof issued only after the syscall gate admitted this
+    /// immutable agent request. A trusted broker may subsequently resolve a
+    /// lexically-normalized path inside the agent's sandbox; the proof does not
+    /// claim symlink-safe host-path identity. Production brokers reject `None`;
+    /// external callers cannot construct or clone a valid proof.
+    pub gate_admission: Option<GateAdmissionProof>,
+}
+
+/// Provider target encoded by a validated resource type/operation pair.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProviderTargetSpec {
+    /// The provider consumes a caller-controlled string parameter.
+    Argument(&'static str),
+    /// The provider target is fixed or injected by the kernel.
+    Constant(&'static str),
+}
+
+/// Return the authoritative provider target for every supported operation.
+/// Tool declaration validation and broker permission checks share this table.
+pub(crate) fn provider_target_spec(
+    resource_type: &ResourceType,
+    operation: &str,
+) -> Option<ProviderTargetSpec> {
+    match (resource_type, operation) {
+        (
+            ResourceType::Filesystem,
+            "read" | "write" | "create" | "create_dir" | "edit" | "delete" | "list",
+        ) => Some(ProviderTargetSpec::Argument("path")),
+        (ResourceType::Network, "get" | "post" | "put" | "delete" | "browse") => {
+            Some(ProviderTargetSpec::Argument("url"))
+        }
+        (ResourceType::Browser, "navigate" | "click" | "type" | "read") => {
+            Some(ProviderTargetSpec::Argument("url"))
+        }
+        (ResourceType::Application, "launch") => Some(ProviderTargetSpec::Argument("command")),
+        (ResourceType::Application, "close" | "send_input" | "read_output") => {
+            Some(ProviderTargetSpec::Argument("application"))
+        }
+        (ResourceType::Application, "install" | "uninstall") => {
+            Some(ProviderTargetSpec::Argument("package"))
+        }
+        (ResourceType::Application, "credential" | "credential_access" | "read_credential") => {
+            Some(ProviderTargetSpec::Argument("credential"))
+        }
+        (ResourceType::Ipc, "send" | "delegate") => Some(ProviderTargetSpec::Argument("to")),
+        (ResourceType::Ipc, "delegation_status" | "complete_delegation") => {
+            Some(ProviderTargetSpec::Argument("task_id"))
+        }
+        (ResourceType::Ipc, "receive") => Some(ProviderTargetSpec::Constant("ipc:self")),
+        (ResourceType::Ipc, "discover") => Some(ProviderTargetSpec::Constant("ipc:namespace")),
+        (ResourceType::Peripheral, "capture_image") => {
+            Some(ProviderTargetSpec::Constant("peripheral:capture_image"))
+        }
+        (ResourceType::Peripheral, "record_audio") => {
+            Some(ProviderTargetSpec::Constant("peripheral:record_audio"))
+        }
+        (ResourceType::Peripheral, "play_audio") => {
+            Some(ProviderTargetSpec::Constant("peripheral:play_audio"))
+        }
+        (ResourceType::Peripheral, "print") => {
+            Some(ProviderTargetSpec::Constant("peripheral:print"))
+        }
+        (ResourceType::Peripheral, "credential" | "credential_access" | "read_credential") => {
+            Some(ProviderTargetSpec::Argument("credential"))
+        }
+        _ => None,
+    }
+}
+
+pub(crate) fn provider_target(
+    resource_type: &ResourceType,
+    operation: &str,
+    parameters: &serde_json::Value,
+) -> Result<String, ResourceError> {
+    match provider_target_spec(resource_type, operation) {
+        Some(ProviderTargetSpec::Argument(argument)) => parameters
+            .get(argument)
+            .and_then(serde_json::Value::as_str)
+            .filter(|target| !target.trim().is_empty())
+            .map(str::to_string)
+            .ok_or_else(|| {
+                ResourceError::OperationFailed(format!(
+                    "invalid or missing provider target '{argument}'"
+                ))
+            }),
+        Some(ProviderTargetSpec::Constant(target)) => Ok(target.to_string()),
+        None => Err(ResourceError::OperationFailed(format!(
+            "unsupported provider operation {resource_type:?}/{operation}"
+        ))),
+    }
+}
+
+/// Return one lexical representation for a caller-supplied filesystem target.
+///
+/// This runs before MAC, approval-contract hashing, and gate-proof creation so
+/// those decisions cannot authorize `allowed/../denied` while the provider
+/// reaches a different path. Parent traversal is rejected instead of folded;
+/// `.` and duplicate separators are collapsed. Both slash forms are converted
+/// to `/` so MAC globs, approval identities, and provider parameters have the
+/// same meaning on every supported host. Ambiguous UNC/device and drive-relative
+/// forms are rejected instead of being interpreted differently by each OS.
+/// This is deliberately not a symlink/no-follow isolation primitive — the
+/// sandbox owns host resolution.
+pub(crate) fn normalize_filesystem_target(target: &str) -> Result<String, ResourceError> {
+    if target.trim().is_empty() || target.contains('\0') {
+        return Err(ResourceError::OperationFailed(
+            "invalid filesystem target".into(),
+        ));
+    }
+
+    let portable = target.replace('\\', "/");
+    if portable.starts_with("//") {
+        return Err(ResourceError::OperationFailed(
+            "UNC and device filesystem targets are not supported".into(),
+        ));
+    }
+    let portable_bytes = portable.as_bytes();
+    if portable_bytes.len() >= 2
+        && portable_bytes[0].is_ascii_alphabetic()
+        && portable_bytes[1] == b':'
+        && portable_bytes.get(2) != Some(&b'/')
+    {
+        return Err(ResourceError::OperationFailed(
+            "drive-relative filesystem targets are not supported".into(),
+        ));
+    }
+    let rooted = portable.starts_with('/');
+    let mut segments = Vec::new();
+    for segment in portable.split('/') {
+        match segment {
+            "" | "." => {}
+            ".." => {
+                return Err(ResourceError::OperationFailed(
+                    "filesystem parent traversal is not allowed".into(),
+                ));
+            }
+            segment => segments.push(segment),
+        }
+    }
+
+    let body = segments.join("/");
+    match (rooted, body.is_empty()) {
+        (true, true) => Ok("/".into()),
+        (true, false) => Ok(format!("/{body}")),
+        (false, true) => Ok(".".into()),
+        (false, false) => Ok(body),
+    }
+}
+
+pub(crate) fn opaque_identity(value: &[u8]) -> String {
+    let digest = ring::digest::digest(&ring::digest::SHA256, value);
+    let mut identity = String::with_capacity(7 + digest.as_ref().len() * 2);
+    identity.push_str("sha256:");
+    use std::fmt::Write as _;
+    for byte in digest.as_ref() {
+        write!(&mut identity, "{byte:02x}").expect("writing a digest into a String cannot fail");
+    }
+    identity
+}
+
+pub(crate) fn request_identity(
+    agent_id: AgentId,
+    resource_type: &ResourceType,
+    operation: &str,
+    parameters: &serde_json::Value,
+) -> Result<String, String> {
+    let serialized = serde_json::to_vec(&serde_json::json!({
+        "version": 1,
+        "agent_id": agent_id,
+        "resource_type": resource_type,
+        "operation": operation,
+        "parameters": parameters,
+    }))
+    .map_err(|error| format!("provider request serialization failed: {error}"))?;
+    Ok(opaque_identity(&serialized))
+}
+
+/// Non-cloneable, request-bound evidence of a successful syscall-gate verdict.
+#[derive(Debug)]
+pub struct GateAdmissionProof {
+    agent_id: AgentId,
+    request_identity: String,
+    approval_satisfied: bool,
+}
+
+impl GateAdmissionProof {
+    pub(crate) fn new(
+        agent_id: AgentId,
+        request_identity: String,
+        approval_satisfied: bool,
+    ) -> Self {
+        Self {
+            agent_id,
+            request_identity,
+            approval_satisfied,
+        }
+    }
+
+    fn verify(self, request: &ResourceRequest) -> Result<bool, ResourceError> {
+        let actual = request_identity(
+            request.agent_id,
+            &request.resource_type,
+            &request.operation,
+            &request.parameters,
+        )
+        .map_err(ResourceError::OperationFailed)?;
+        if self.agent_id != request.agent_id || self.request_identity != actual {
+            return Err(ResourceError::OperationFailed(
+                "gate admission proof does not match immutable agent request".into(),
+            ));
+        }
+        Ok(self.approval_satisfied)
+    }
 }
 
 /// Response from a resource operation.
@@ -78,6 +291,7 @@ pub struct ResourceBrokerImpl {
     admission: DashMap<ResourceType, Arc<tokio::sync::Semaphore>>,
     waiting: AtomicUsize,
     max_waiters: usize,
+    require_gate_admission: bool,
 }
 
 impl ResourceBrokerImpl {
@@ -85,12 +299,13 @@ impl ResourceBrokerImpl {
         permission_system: Arc<dyn PermissionSystem>,
         sandbox_manager: Arc<dyn SandboxManager>,
     ) -> Self {
-        Self::build(permission_system, Some(sandbox_manager))
+        Self::build(permission_system, Some(sandbox_manager), true)
     }
 
     fn build(
         permission_system: Arc<dyn PermissionSystem>,
         sandbox_manager: Option<Arc<dyn SandboxManager>>,
+        require_gate_admission: bool,
     ) -> Self {
         let admission = DashMap::new();
         for (resource, permits) in [
@@ -110,39 +325,27 @@ impl ResourceBrokerImpl {
             admission,
             waiting: AtomicUsize::new(0),
             max_waiters: 1024,
+            require_gate_admission,
         }
     }
 
     #[cfg(test)]
     pub fn new_unconfined(permission_system: Arc<dyn PermissionSystem>) -> Self {
-        Self::build(permission_system, None)
+        Self::build(permission_system, None, false)
     }
 
     fn sandbox_action(request: &ResourceRequest) -> Result<SandboxAction, ResourceError> {
-        let string_parameter = |key: &str| {
-            request
-                .parameters
-                .get(key)
-                .and_then(|value| value.as_str())
-                .map(str::to_string)
-                .ok_or_else(|| {
-                    ResourceError::OperationFailed(format!(
-                        "sandbox classification requires string parameter '{key}'"
-                    ))
-                })
-        };
+        let target = provider_target(
+            &request.resource_type,
+            &request.operation,
+            &request.parameters,
+        )?;
         match request.resource_type {
-            ResourceType::Filesystem => {
-                Ok(SandboxAction::FileAccess(string_parameter("path")?.into()))
-            }
-            ResourceType::Network => Ok(SandboxAction::NetworkAccess(string_parameter("url")?)),
-            ResourceType::Browser => Ok(SandboxAction::BrowserAccess(string_parameter("url")?)),
-            ResourceType::Application => {
-                Ok(SandboxAction::ProcessExec(string_parameter("command")?))
-            }
-            ResourceType::Peripheral => {
-                Ok(SandboxAction::PeripheralAccess(request.operation.clone()))
-            }
+            ResourceType::Filesystem => Ok(SandboxAction::FileAccess(target.into())),
+            ResourceType::Network => Ok(SandboxAction::NetworkAccess(target)),
+            ResourceType::Browser => Ok(SandboxAction::BrowserAccess(target)),
+            ResourceType::Application => Ok(SandboxAction::ProcessExec(target)),
+            ResourceType::Peripheral => Ok(SandboxAction::PeripheralAccess(target)),
             ResourceType::Ipc => Ok(SandboxAction::Ipc),
         }
     }
@@ -199,12 +402,27 @@ impl ResourceBroker for ResourceBrokerImpl {
         &self,
         mut request: ResourceRequest,
     ) -> Result<ResourceResponse, ResourceError> {
+        let admission_approved = match request.gate_admission.take() {
+            Some(proof) => Some(proof.verify(&request)?),
+            None if !self.require_gate_admission => None,
+            None => {
+                return Err(ResourceError::OperationFailed(
+                    "syscall gate admission proof required".into(),
+                ));
+            }
+        };
+        let target = provider_target(
+            &request.resource_type,
+            &request.operation,
+            &request.parameters,
+        )?;
+
         // Validate permissions before execution
         let decision = self.permission_system.check_access(
             request.agent_id,
             &request.resource_type,
             &request.operation,
-            None,
+            Some(&target),
         );
 
         match decision {
@@ -221,16 +439,18 @@ impl ResourceBroker for ResourceBrokerImpl {
                 ));
             }
             AccessDecision::RequiresApproval => {
-                self.permission_system.log_action(
-                    request.agent_id,
-                    &request.operation,
-                    &format!("{:?}", request.resource_type),
-                    AccessDecision::RequiresApproval,
-                    ActionOutcome::Pending,
-                );
-                return Err(ResourceError::OperationFailed(
-                    "Requires user approval".to_string(),
-                ));
+                if admission_approved != Some(true) {
+                    self.permission_system.log_action(
+                        request.agent_id,
+                        &request.operation,
+                        &format!("{:?}", request.resource_type),
+                        AccessDecision::RequiresApproval,
+                        ActionOutcome::Pending,
+                    );
+                    return Err(ResourceError::OperationFailed(
+                        "Requires user approval".to_string(),
+                    ));
+                }
             }
             AccessDecision::Allowed => {}
         }
@@ -250,6 +470,16 @@ impl ResourceBroker for ResourceBrokerImpl {
         let provider = self.providers.get(&request.resource_type).ok_or_else(|| {
             ResourceError::ProviderNotFound(format!("{:?}", request.resource_type))
         })?;
+        if !provider
+            .supported_operations()
+            .iter()
+            .any(|operation| operation == &request.operation)
+        {
+            return Err(ResourceError::OperationFailed(format!(
+                "provider does not advertise operation '{}'",
+                request.operation
+            )));
+        }
 
         let registered = self
             .waiting
@@ -368,6 +598,30 @@ mod tests {
     use crate::{IsolationLevel, SandboxConfig};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    #[test]
+    fn filesystem_normalization_is_platform_independent_and_fail_closed() {
+        assert_eq!(
+            normalize_filesystem_target(r"\workspace\\allowed\.\note.txt").unwrap(),
+            "/workspace/allowed/note.txt"
+        );
+        assert_eq!(
+            normalize_filesystem_target("/workspace//allowed/./note.txt").unwrap(),
+            "/workspace/allowed/note.txt"
+        );
+        assert_eq!(
+            normalize_filesystem_target(r"nested\\allowed\file.txt").unwrap(),
+            "nested/allowed/file.txt"
+        );
+        assert!(normalize_filesystem_target(r"allowed\..\denied").is_err());
+        assert!(normalize_filesystem_target(r"\\server\share\secret").is_err());
+        assert!(normalize_filesystem_target("C:relative.txt").is_err());
+        assert!(normalize_filesystem_target("C:").is_err());
+        assert_eq!(
+            normalize_filesystem_target(r"C:\workspace\file.txt").unwrap(),
+            "C:/workspace/file.txt"
+        );
+    }
+
     struct MockProvider;
 
     #[async_trait::async_trait]
@@ -388,6 +642,33 @@ mod tests {
     }
 
     struct CountingProvider(Arc<AtomicUsize>);
+
+    struct DeleteProvider(Arc<AtomicUsize>);
+
+    struct BlindProvider {
+        resource_type: ResourceType,
+        advertised: Vec<String>,
+        calls: Arc<AtomicUsize>,
+    }
+
+    fn with_test_gate_proof(
+        mut request: ResourceRequest,
+        approval_satisfied: bool,
+    ) -> ResourceRequest {
+        let identity = request_identity(
+            request.agent_id,
+            &request.resource_type,
+            &request.operation,
+            &request.parameters,
+        )
+        .unwrap();
+        request.gate_admission = Some(GateAdmissionProof::new(
+            request.agent_id,
+            identity,
+            approval_satisfied,
+        ));
+        request
+    }
 
     struct SlowApplicationProvider {
         current: Arc<AtomicUsize>,
@@ -437,6 +718,46 @@ mod tests {
         }
     }
 
+    #[async_trait::async_trait]
+    impl ResourceProvider for DeleteProvider {
+        fn resource_type(&self) -> ResourceType {
+            ResourceType::Filesystem
+        }
+
+        fn supported_operations(&self) -> Vec<String> {
+            vec!["delete".into()]
+        }
+
+        async fn execute(
+            &self,
+            operation: &str,
+            params: &serde_json::Value,
+        ) -> Result<serde_json::Value, ResourceError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(serde_json::json!({"operation": operation, "path": params["path"]}))
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ResourceProvider for BlindProvider {
+        fn resource_type(&self) -> ResourceType {
+            self.resource_type.clone()
+        }
+
+        fn supported_operations(&self) -> Vec<String> {
+            self.advertised.clone()
+        }
+
+        async fn execute(
+            &self,
+            operation: &str,
+            _params: &serde_json::Value,
+        ) -> Result<serde_json::Value, ResourceError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(serde_json::json!({"operation": operation}))
+        }
+    }
+
     #[tokio::test]
     async fn execute_with_permission() {
         let perms = Arc::new(PermissionManager::new());
@@ -450,8 +771,9 @@ mod tests {
             agent_id,
             resource_type: ResourceType::Filesystem,
             operation: "read".to_string(),
-            parameters: serde_json::json!({}),
+            parameters: serde_json::json!({"path": "/tmp/test"}),
             sandbox_context: None,
+            gate_admission: None,
         };
 
         let resp = broker.execute(req).await.unwrap();
@@ -471,8 +793,9 @@ mod tests {
             agent_id,
             resource_type: ResourceType::Filesystem,
             operation: "write".to_string(),
-            parameters: serde_json::json!({}),
+            parameters: serde_json::json!({"path": "/tmp/test"}),
             sandbox_context: None,
+            gate_admission: None,
         };
 
         let result = broker.execute(req).await;
@@ -501,8 +824,9 @@ mod tests {
             agent_id,
             resource_type: ResourceType::Browser,
             operation: "navigate".to_string(),
-            parameters: serde_json::json!({}),
+            parameters: serde_json::json!({"url": "https://example.invalid"}),
             sandbox_context: None,
+            gate_admission: None,
         };
 
         let result = broker.execute(req).await;
@@ -533,13 +857,17 @@ mod tests {
             .unwrap();
 
         let result = broker
-            .execute(ResourceRequest {
-                agent_id: agent,
-                resource_type: ResourceType::Filesystem,
-                operation: "read".into(),
-                parameters: serde_json::json!({"path": "/etc/passwd"}),
-                sandbox_context: Some(uuid::Uuid::new_v4()),
-            })
+            .execute(with_test_gate_proof(
+                ResourceRequest {
+                    agent_id: agent,
+                    resource_type: ResourceType::Filesystem,
+                    operation: "read".into(),
+                    parameters: serde_json::json!({"path": "/etc/passwd"}),
+                    sandbox_context: Some(uuid::Uuid::new_v4()),
+                    gate_admission: None,
+                },
+                false,
+            ))
             .await;
         assert!(result.is_err());
         assert_eq!(calls.load(Ordering::SeqCst), 0);
@@ -570,13 +898,17 @@ mod tests {
             .unwrap();
 
         let response = broker
-            .execute(ResourceRequest {
-                agent_id: agent,
-                resource_type: ResourceType::Filesystem,
-                operation: "read".into(),
-                parameters: serde_json::json!({"path": "nested/file.txt"}),
-                sandbox_context: Some(sandbox),
-            })
+            .execute(with_test_gate_proof(
+                ResourceRequest {
+                    agent_id: agent,
+                    resource_type: ResourceType::Filesystem,
+                    operation: "read".into(),
+                    parameters: serde_json::json!({"path": "nested/file.txt"}),
+                    sandbox_context: Some(sandbox),
+                    gate_admission: None,
+                },
+                false,
+            ))
             .await
             .unwrap();
 
@@ -600,15 +932,255 @@ mod tests {
         let agent = uuid::Uuid::new_v4();
         perms.assign_profile(agent, &"full-access".to_string());
         let result = broker
-            .execute(ResourceRequest {
-                agent_id: agent,
-                resource_type: ResourceType::Filesystem,
-                operation: "read".into(),
-                parameters: serde_json::json!({"path": "/tmp/file"}),
-                sandbox_context: None,
-            })
+            .execute(with_test_gate_proof(
+                ResourceRequest {
+                    agent_id: agent,
+                    resource_type: ResourceType::Filesystem,
+                    operation: "read".into(),
+                    parameters: serde_json::json!({"path": "/tmp/file"}),
+                    sandbox_context: None,
+                    gate_admission: None,
+                },
+                false,
+            ))
             .await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn production_broker_rejects_proofless_launch_and_forged_ipc() {
+        let permissions = Arc::new(PermissionManager::new());
+        let broker =
+            ResourceBrokerImpl::new(permissions.clone(), Arc::new(SandboxManagerImpl::new()));
+        let application_calls = Arc::new(AtomicUsize::new(0));
+        let ipc_calls = Arc::new(AtomicUsize::new(0));
+        broker.register_provider(Box::new(BlindProvider {
+            resource_type: ResourceType::Application,
+            advertised: vec!["launch".into()],
+            calls: application_calls.clone(),
+        }));
+        broker.register_provider(Box::new(BlindProvider {
+            resource_type: ResourceType::Ipc,
+            advertised: vec!["send".into()],
+            calls: ipc_calls.clone(),
+        }));
+        let attacker = uuid::Uuid::new_v4();
+        let victim = uuid::Uuid::new_v4();
+        permissions.assign_profile(attacker, &"full-access".into());
+
+        let launch = broker
+            .execute(ResourceRequest {
+                agent_id: attacker,
+                resource_type: ResourceType::Application,
+                operation: "launch".into(),
+                parameters: serde_json::json!({"command": "echo"}),
+                sandbox_context: None,
+                gate_admission: None,
+            })
+            .await
+            .unwrap_err();
+        assert!(launch.to_string().contains("gate admission proof"));
+
+        let forged_ipc = broker
+            .execute(ResourceRequest {
+                agent_id: attacker,
+                resource_type: ResourceType::Ipc,
+                operation: "send".into(),
+                parameters: serde_json::json!({
+                    "from": victim.to_string(),
+                    "to": attacker.to_string(),
+                    "payload": {"forged": true}
+                }),
+                sandbox_context: None,
+                gate_admission: None,
+            })
+            .await
+            .unwrap_err();
+        assert!(forged_ipc.to_string().contains("gate admission proof"));
+        assert_eq!(application_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(ipc_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn shared_application_alias_cannot_reach_launch_provider() {
+        use crate::connector::ToolCall;
+        use crate::tool_registry_share::{SharedToolDef, SharedToolRegistry};
+        use crate::tools::{SecurityAction, ToolRegistry, ToolSecurity};
+
+        let permissions = Arc::new(PermissionManager::new());
+        let broker = ResourceBrokerImpl::new_unconfined(permissions.clone());
+        let calls = Arc::new(AtomicUsize::new(0));
+        broker.register_provider(Box::new(BlindProvider {
+            resource_type: ResourceType::Application,
+            advertised: vec!["launch".into()],
+            calls: calls.clone(),
+        }));
+        let agent = uuid::Uuid::new_v4();
+        permissions.assign_profile(agent, &"full-access".into());
+
+        let mut shared = SharedToolRegistry::new();
+        shared
+            .publish(
+                SharedToolDef::new(
+                    "remote_close",
+                    "MCP-like application alias",
+                    ResourceType::Application,
+                    "close",
+                    ToolSecurity::argument(SecurityAction::Execute, "application").sandboxed(),
+                )
+                .with_parameters(serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "application": {"type": "string"},
+                        "command": {"type": "string"}
+                    },
+                    "required": ["application", "command"]
+                })),
+            )
+            .unwrap();
+        let registry = ToolRegistry::new();
+        assert!(shared.install_into("remote_close", &registry));
+        let request = registry
+            .resolve(
+                agent,
+                &ToolCall {
+                    id: "remote".into(),
+                    name: "remote_close".into(),
+                    arguments: serde_json::json!({
+                        "application": "benign-session",
+                        "command": "must-not-execute"
+                    }),
+                },
+            )
+            .unwrap();
+
+        let error = broker.execute(request).await.unwrap_err();
+        assert!(error.to_string().contains("does not advertise operation"));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn consumed_gate_approval_executes_exact_elevated_delete() {
+        use crate::agent_struct::CapabilitySet;
+        use crate::tools::{
+            ApprovalPolicy, SandboxRequirement, SecurityAction, ToolBinding, ToolRegistry,
+            ToolSecurity,
+        };
+
+        let permissions = Arc::new(PermissionManager::new());
+        let sandboxes = Arc::new(SandboxManagerImpl::new());
+        let broker = ResourceBrokerImpl::new(permissions.clone(), sandboxes.clone());
+        let calls = Arc::new(AtomicUsize::new(0));
+        broker.register_provider(Box::new(DeleteProvider(calls.clone())));
+
+        let agent = uuid::Uuid::new_v4();
+        permissions.assign_profile(agent, &"standard".into());
+        let root =
+            std::env::temp_dir().join(format!("agentos-approved-delete-{}", uuid::Uuid::new_v4()));
+        sandboxes
+            .create_sandbox(
+                agent,
+                &SandboxConfig {
+                    workspace_dir: root.clone(),
+                    allowed_network_hosts: Some(Vec::new()),
+                    max_disk_usage_bytes: None,
+                    max_memory_bytes: None,
+                    isolation_level: IsolationLevel::Filesystem,
+                },
+            )
+            .unwrap();
+
+        let registry = ToolRegistry::new();
+        registry
+            .register(ToolBinding {
+                name: "approved_delete".into(),
+                description: "Delete one sandboxed path after approval".into(),
+                parameters_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {"path": {"type": "string"}},
+                    "required": ["path"]
+                }),
+                resource_type: ResourceType::Filesystem,
+                operation: "delete".into(),
+                security: ToolSecurity::argument(SecurityAction::Delete, "path")
+                    .with_approval(ApprovalPolicy::User)
+                    .sandboxed(),
+            })
+            .unwrap();
+        assert_eq!(
+            registry
+                .security("approved_delete")
+                .unwrap()
+                .sandbox_requirement,
+            SandboxRequirement::Required
+        );
+
+        let gate = crate::syscall_gate::SyscallGate::with_mac(
+            Arc::new(crate::cgroups::CgroupManager::new()),
+            false,
+            Vec::new(),
+        );
+        let mut capabilities = CapabilitySet::none();
+        capabilities.grant(CapabilitySet::CAP_FILE_DELETE);
+        gate.register_agent(agent, capabilities, None);
+        let arguments = serde_json::json!({"path": "victim.txt"});
+        let prepared = registry
+            .prepare_execution(agent, "approved_delete", &arguments)
+            .unwrap();
+        let approval_resource = prepared.authorization.resource.clone();
+        let approval_contract = prepared.approval_contract_digest.clone();
+
+        assert!(
+            broker
+                .execute(ResourceRequest {
+                    agent_id: agent,
+                    resource_type: ResourceType::Filesystem,
+                    operation: "delete".into(),
+                    parameters: arguments.clone(),
+                    sandbox_context: None,
+                    gate_admission: None,
+                })
+                .await
+                .is_err(),
+            "the broker must not treat elevated permission as already approved"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+        assert!(gate.grant_tool_approval_contract(
+            agent,
+            "approved_delete",
+            approval_resource.clone(),
+            &approval_contract,
+            ApprovalPolicy::User,
+        ));
+        let (mut tampered, tampered_guard) = registry
+            .authorize_and_acquire_call(&gate, agent, "approved_delete", &arguments)
+            .await
+            .unwrap();
+        tampered.request.parameters["path"] = serde_json::json!("another-victim.txt");
+        assert!(
+            broker.execute(tampered.request).await.is_err(),
+            "a consumed proof must not authorize a mutated provider request"
+        );
+        drop(tampered_guard);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+        assert!(gate.grant_tool_approval_contract(
+            agent,
+            "approved_delete",
+            approval_resource,
+            &approval_contract,
+            ApprovalPolicy::User,
+        ));
+        let (prepared, _guard) = registry
+            .authorize_and_acquire_call(&gate, agent, "approved_delete", &arguments)
+            .await
+            .unwrap();
+        let response = broker.execute(prepared.request).await.unwrap();
+        assert!(response.success);
+        assert_eq!(response.data["operation"], "delete");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -633,8 +1205,9 @@ mod tests {
                         agent_id: agent,
                         resource_type: ResourceType::Application,
                         operation: "launch".into(),
-                        parameters: serde_json::json!({}),
+                        parameters: serde_json::json!({"command": "test"}),
                         sandbox_context: None,
+                        gate_admission: None,
                     })
                     .await
                     .unwrap();

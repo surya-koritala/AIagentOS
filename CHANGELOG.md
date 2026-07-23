@@ -34,26 +34,40 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
 
 - **Tenant authorization** — the wire server retains the authenticated
   principal and credential identity, centralizes ownership/RBAC checks, rejects
-  unknown or inconsistent identities and roles, durably revokes sessions, API
-  keys, users, and tenants without an in-flight execution window, scopes
-  package-created agents, and audits denials without leaking foreign resources.
-  TCP and TLS regressions cover owner/foreign, role, unauthenticated, and revoked
-  paths. Non-loopback listeners now fail closed unless authentication and TLS
-  are configured. (#107)
+  unknown or inconsistent identities and roles, and durably closes sessions,
+  API keys, users, and tenants before draining already-admitted requests.
+  Overlapping credential/user/tenant revocations share that drain boundary;
+  bounded waits return an explicit incomplete result without reopening access.
+  Package-created agents are tenant-scoped, and denials are audited without
+  leaking foreign resources. TCP and TLS regressions cover owner/foreign, role,
+  unauthenticated, and revoked paths. Non-loopback listeners now fail closed
+  unless authentication and TLS are configured. (#107, #108)
 - **Fail-closed tools** — every registered tool needs a typed security contract;
   unknown tools/profiles, combined or unknown capabilities, optional/non-string
-  resource extractors, and provider/action contradictions are rejected. Shared
-  package and MCP definitions now carry resource type + operation explicitly;
-  custom command tools cannot disguise process execution as a read. Executor,
-  syscall, MCP, and SDK-backed calls share one preparation path, while approvals
-  are contract-bound, exact-resource, local-operator, atomically consumed, and
-  single-use. In-memory and low-level gate constructors now default to enforcing
-  MAC; explicit permissive construction is noisy and fully unconfined gates are
-  test-only. (#103, #108)
+  resource extractors, provider/action contradictions, and mismatched or unknown
+  provider operations are rejected. Shared package and MCP definitions now carry
+  resource type + operation explicitly; custom command tools cannot disguise
+  process execution as a read or become visible before their fixed command
+  template is attached. Executor, syscall, MCP, and SDK-backed calls authorize
+  and execute one immutable provider request, preventing a concurrent registry
+  replacement from changing the side effect after admission. Approvals are
+  contract-bound, exact-resource, local-operator, atomically consumed, and
+  single-use. Policy validation now rejects unknown fields and missing terminal
+  behavior and warns on permissive modes, non-deny defaults, overbroad action
+  wildcards, uncovered tools, and shadowed rules. In-memory and low-level gate
+  constructors default to enforcing MAC; explicit permissive construction is
+  noisy and fully unconfined gates are test-only. Package-resolved tools have
+  allow/deny parity regressions across executor, raw wire, MCP, and SDK paths.
+  Final admission revalidates generation-bound agent, capability, cgroup,
+  lifecycle, namespace, tool-tag, and MAC state, including change-and-restore
+  races, before reserving the execution slot.
+  (#103, #108)
 - **Mandatory sandbox boundary** — resource calls require an unforgeable agent
   sandbox identity. Filesystem paths are canonicalized inside the workspace
   before provider dispatch, including regression coverage for traversal and
-  symlink escapes. Full OS/container isolation still requires #111.
+  symlink escapes; lexical aliases are normalized before MAC and built-in HTTP
+  requests do not follow redirects. Full OS/container isolation still requires
+  #111.
 - **Rust supply-chain repair** — upgraded Wasmtime, Tauri, `quick-xml`,
   `crossbeam-epoch`, Ratatui, and `memmap2`; replaced the discontinued direct
   PEM parser with rustls PKI parsing; and added valid AGPL SPDX metadata to

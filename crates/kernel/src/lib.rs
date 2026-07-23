@@ -246,6 +246,11 @@ pub enum KernelError {
     #[error("Rate-limit error: {0}")]
     RateLimit(#[from] crate::rate_limit::RateLimitError),
 
+    #[error(
+        "Credential revocation incomplete after {timeout_ms}ms; the identity remains durably revoked and closed to new requests"
+    )]
+    CredentialRevocationIncomplete { timeout_ms: u64 },
+
     #[error("Policy error: {0}")]
     Policy(String),
 }
@@ -598,7 +603,14 @@ impl ResourceProvider for IpcResourceProvider {
         ResourceType::Ipc
     }
     fn supported_operations(&self) -> Vec<String> {
-        vec!["send".into(), "receive".into()]
+        vec![
+            "send".into(),
+            "receive".into(),
+            "delegate".into(),
+            "delegation_status".into(),
+            "complete_delegation".into(),
+            "discover".into(),
+        ]
     }
     async fn execute(
         &self,
@@ -618,24 +630,37 @@ impl ResourceProvider for IpcResourceProvider {
                 })
         };
         // Resolve a recipient given as either a UUID or a live agent NAME.
-        let resolve_recipient = |key: &str| -> Result<uuid::Uuid, ResourceError> {
-            let s = params.get(key).and_then(|v| v.as_str()).unwrap_or("");
-            if let Ok(id) = uuid::Uuid::parse_str(s) {
-                return Ok(id);
+        // Name lookup is scoped to the caller's namespaces and rejects
+        // ambiguity, so it cannot be used as a foreign directory oracle.
+        let resolve_recipient =
+            |caller: uuid::Uuid, key: &str| -> Result<uuid::Uuid, ResourceError> {
+                let s = params.get(key).and_then(|v| v.as_str()).unwrap_or("");
+                if let Ok(id) = uuid::Uuid::parse_str(s) {
+                    return Ok(id);
+                }
+                let mut matches = self
+                    .agents
+                    .list_agents(None)
+                    .into_iter()
+                    .filter(|agent| agent.name == s && self.gate.allows(caller, agent.id));
+                let Some(agent) = matches.next() else {
+                    return Err(ResourceError::OperationFailed("agent not found".into()));
+                };
+                if matches.next().is_some() {
+                    return Err(ResourceError::OperationFailed("agent not found".into()));
+                }
+                Ok(agent.id)
+            };
+        let hide_absent_recipient = |error: crate::IpcError| match error {
+            crate::IpcError::AgentNotFound(_) => {
+                ResourceError::OperationFailed("agent not found".into())
             }
-            self.agents
-                .list_agents(None)
-                .into_iter()
-                .find(|a| a.name == s)
-                .map(|a| a.id)
-                .ok_or_else(|| {
-                    ResourceError::OperationFailed(format!("no agent with id or name '{s}'"))
-                })
+            other => ResourceError::OperationFailed(other.to_string()),
         };
         match operation {
             "send" => {
                 let from = parse_uuid("from")?;
-                let to = resolve_recipient("to")?;
+                let to = resolve_recipient(from, "to")?;
                 let payload = params
                     .get("payload")
                     .cloned()
@@ -643,7 +668,7 @@ impl ResourceProvider for IpcResourceProvider {
                 self.ipc
                     .send(from, to, payload)
                     .await
-                    .map_err(|e| ResourceError::OperationFailed(e.to_string()))?;
+                    .map_err(hide_absent_recipient)?;
                 Ok(serde_json::json!({"sent": true}))
             }
             "receive" => {
@@ -660,7 +685,7 @@ impl ResourceProvider for IpcResourceProvider {
             }
             "delegate" => {
                 let from = parse_uuid("from")?;
-                let to = resolve_recipient("to")?;
+                let to = resolve_recipient(from, "to")?;
                 let description = params
                     .get("description")
                     .and_then(|v| v.as_str())
@@ -670,7 +695,7 @@ impl ResourceProvider for IpcResourceProvider {
                     .ipc
                     .delegate(from, to, description)
                     .await
-                    .map_err(|e| ResourceError::OperationFailed(e.to_string()))?;
+                    .map_err(hide_absent_recipient)?;
                 Ok(serde_json::json!({"task_id": task_id.to_string()}))
             }
             "delegation_status" => {
@@ -741,7 +766,15 @@ impl ResourceProvider for BuiltinNetworkProvider {
             .get("url")
             .and_then(|v| v.as_str())
             .ok_or_else(|| ResourceError::OperationFailed("Missing 'url'".into()))?;
-        let client = reqwest::Client::new();
+        // Redirects are disabled deliberately. The sandbox validates the
+        // caller-supplied URL before dispatch; automatically following a 3xx
+        // would let an allowlisted host redirect the provider to a private or
+        // otherwise unapproved destination. DNS rebinding remains separate
+        // host-isolation qualification work.
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(|e| ResourceError::OperationFailed(e.to_string()))?;
         match operation {
             "get" => {
                 let resp = client
@@ -822,9 +855,14 @@ impl ResourceProvider for BuiltinAppProvider {
     }
     async fn execute(
         &self,
-        _operation: &str,
+        operation: &str,
         params: &serde_json::Value,
     ) -> Result<serde_json::Value, ResourceError> {
+        if operation != "launch" {
+            return Err(ResourceError::OperationFailed(format!(
+                "Unknown application op: {operation}"
+            )));
+        }
         let cmd = params
             .get("command")
             .and_then(|v| v.as_str())
@@ -962,11 +1000,20 @@ pub struct AgentKernelImpl {
     /// `create_agent_in_namespace` with the same group share these (and can
     /// see/message each other); ungrouped agents use the registry defaults.
     group_namespaces: DashMap<String, (NamespaceId, NamespaceId)>,
+    /// Publishes a namespace tag and its group-scoped tool binding as one
+    /// kernel transaction. Readers may observe the tag before the binding
+    /// exists (safe), but competing group registrations cannot overwrite and
+    /// then roll back another group's winning tag.
+    group_tool_publication_lock: std::sync::Mutex<()>,
     /// Multi-tenant auth/identity. Owned by the kernel (behind a `RwLock` — auth
     /// resolution is read-heavy), persisted + rehydrated through the single
     /// SQLite handle. Resolves an API key / session token to a `(user, tenant,
     /// role)`; the tenant then maps onto the namespace group + cgroup below.
     pub auth: Arc<tokio::sync::RwLock<crate::auth::AuthSystem>>,
+    /// Per-credential in-flight request admission. Revocation closes and drains
+    /// only the affected identity instead of holding the global auth lock across
+    /// syscall, tool, or provider I/O.
+    credential_leases: Arc<crate::auth::CredentialLeaseManager>,
     /// Budget template used when lazily building tenant and per-agent nodes.
     cgroup_budgets: crate::config::BudgetConfig,
     executors: DashMap<AgentId, Arc<tokio::sync::Mutex<AgentExecutor>>>,
@@ -980,6 +1027,10 @@ impl AgentKernelImpl {
     const TOOL_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
     #[cfg(test)]
     const TOOL_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(100);
+    #[cfg(not(test))]
+    const CREDENTIAL_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+    #[cfg(test)]
+    const CREDENTIAL_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
 
     /// Create an in-memory kernel with the same enforcing security defaults as
     /// production. Tests that need permissive MAC must use the explicit
@@ -1190,7 +1241,9 @@ impl AgentKernelImpl {
             agent_cgroups: DashMap::new(),
             cgroup_tree_lock: std::sync::Mutex::new(()),
             group_namespaces: DashMap::new(),
+            group_tool_publication_lock: std::sync::Mutex::new(()),
             auth: Arc::new(tokio::sync::RwLock::new(crate::auth::AuthSystem::new())),
+            credential_leases: Arc::new(crate::auth::CredentialLeaseManager::default()),
             cgroup_budgets: budgets.clone(),
             executors: DashMap::new(),
             lifecycle_locks: DashMap::new(),
@@ -1357,6 +1410,10 @@ impl AgentKernelImpl {
         group: &str,
         mut binding: crate::tools::ToolBinding,
     ) -> Result<(), crate::tools::ToolRegistrationError> {
+        let _publication = self
+            .group_tool_publication_lock
+            .lock()
+            .expect("group tool publication lock poisoned");
         let name = binding.name.clone();
         if self.tool_registry.has_tool(&name) {
             return Err(crate::tools::ToolRegistrationError::DuplicateName(name));
@@ -1377,6 +1434,30 @@ impl AgentKernelImpl {
         Ok(())
     }
 
+    /// Check whether a registered tool is visible inside `group` without
+    /// requiring an agent record to exist yet. Missing and foreign-scoped tools
+    /// deliberately collapse to the same `false` result so package validation
+    /// cannot use this as a cross-namespace registry oracle.
+    pub(crate) fn tool_visible_to_group(&self, group: Option<&str>, tool_name: &str) -> bool {
+        let _publication = self
+            .group_tool_publication_lock
+            .lock()
+            .expect("group tool publication lock poisoned");
+        // Resolve the caller namespaces before looking up the tool.  This keeps
+        // package validation from exposing a side-effect/timing distinction
+        // between a missing name and a name scoped to another group.
+        let (_agent_namespace, tool_namespace) = self.namespaces_for_group(group);
+        let registered = self.tool_registry.has_tool(tool_name);
+        let namespace_visible = tool_namespace.is_some_and(|namespace| {
+            self.syscall_gate
+                .tool_visible_in_namespace(tool_name, namespace)
+        });
+        // Deliberately use non-short-circuit evaluation: both missing and
+        // foreign-scoped names perform registry and gate lookups before the
+        // generic unavailable result is produced.
+        registered & namespace_visible
+    }
+
     /// Grant one exact, single-use tool approval from a trusted in-process
     /// operator/UI. This API is deliberately absent from the remote syscall,
     /// package, SDK-data, and MCP surfaces.
@@ -1389,23 +1470,23 @@ impl AgentKernelImpl {
     ) -> Result<(), KernelError> {
         let prepared = self
             .tool_registry
-            .prepare_call(tool_name, arguments)
+            .prepare_execution(agent_id, tool_name, arguments)
             .map_err(KernelError::Policy)?;
-        if prepared.security.approval_policy == crate::tools::ApprovalPolicy::None {
+        if prepared.authorization.security.approval_policy == crate::tools::ApprovalPolicy::None {
             return Err(KernelError::Policy(format!(
                 "tool '{tool_name}' does not require approval"
             )));
         }
-        if !approval.satisfies(prepared.security.approval_policy) {
+        if !approval.satisfies(prepared.authorization.security.approval_policy) {
             return Err(KernelError::Policy(format!(
                 "{approval:?} approval is insufficient for tool '{tool_name}'"
             )));
         }
-        if !self.syscall_gate.grant_tool_approval(
+        if !self.syscall_gate.grant_tool_approval_contract(
             agent_id,
             tool_name,
-            prepared.resource,
-            &prepared.security,
+            prepared.authorization.resource,
+            &prepared.approval_contract_digest,
             approval,
         ) {
             return Err(KernelError::Policy(format!(
@@ -1556,10 +1637,9 @@ impl AgentKernelImpl {
 
         // MAC: label the agent by its permission profile so an enforcing policy
         // can discriminate by subject (e.g. "profile:read-only").
-        {
-            let mut mac = self.syscall_gate.mac.lock().await;
-            mac.label_agent(pid, format!("profile:{}", config.permission_profile));
-        }
+        self.syscall_gate
+            .label_mac_agent(pid, format!("profile:{}", config.permission_profile))
+            .await;
 
         // Join the Agent + Tool namespaces for this agent's group.
         let (agent_ns, tool_ns) = self.namespaces_for_group(group);
@@ -1884,51 +1964,152 @@ impl AgentKernelImpl {
         Ok(token)
     }
 
-    /// Revoke a session durably. The auth write lock is held across the SQLite
-    /// delete and in-memory mutation, so a wire request either completes before
-    /// revocation or observes the revoked state; once this returns there is no
-    /// post-revocation authorization window.
-    pub async fn revoke_session(&self, token: &str) -> Result<bool, KernelError> {
-        let token_hash = crate::auth::hash_secret(token);
-        let mut auth = self.auth.write().await;
-        let persisted = self
-            .context_manager
-            .revoke_session_hash(&token_hash)
-            .map_err(KernelError::Context)?;
-        Ok(auth.revoke_session(token) || persisted)
+    async fn drain_revoked_credentials(
+        &self,
+        drains: Vec<crate::auth::CredentialDrain>,
+    ) -> Result<(), KernelError> {
+        if drains.is_empty() {
+            return Ok(());
+        }
+        let mut drain_task = tokio::spawn(async move {
+            let mut waiters = tokio::task::JoinSet::new();
+            for drain in drains {
+                waiters.spawn(drain.wait());
+            }
+            let mut completed = true;
+            while let Some(result) = waiters.join_next().await {
+                completed &= result.is_ok();
+            }
+            completed
+        });
+        match tokio::time::timeout(Self::CREDENTIAL_DRAIN_TIMEOUT, &mut drain_task).await {
+            Ok(Ok(true)) => Ok(()),
+            Ok(Ok(false) | Err(_)) => Err(KernelError::CredentialRevocationIncomplete {
+                timeout_ms: u64::try_from(Self::CREDENTIAL_DRAIN_TIMEOUT.as_millis())
+                    .unwrap_or(u64::MAX),
+            }),
+            Err(_) => {
+                // Durable and in-memory revocation committed before this wait.
+                // Never reopen on timeout. Dropping the JoinHandle detaches the
+                // owned drain task and its concurrent per-credential waiters,
+                // so every eventual guard release can evict its exact entry
+                // independently of other stuck credentials.
+                Err(KernelError::CredentialRevocationIncomplete {
+                    timeout_ms: u64::try_from(Self::CREDENTIAL_DRAIN_TIMEOUT.as_millis())
+                        .unwrap_or(u64::MAX),
+                })
+            }
+        }
     }
 
-    /// Revoke an API key durably with the same linearizable boundary as session
+    /// Revoke a session durably. New requests for this credential are closed
+    /// before its durable/in-memory records are removed; a successful return
+    /// means already-admitted requests drained. Unrelated credentials remain
+    /// available.
+    pub async fn revoke_session(&self, token: &str) -> Result<bool, KernelError> {
+        let identity = crate::auth::CredentialIdentity {
+            kind: crate::auth::CredentialKind::Session,
+            id: crate::auth::hash_secret(token),
+        };
+        let (persisted, removed, drain) = {
+            let mut auth = self.auth.write().await;
+            let drain = self.credential_leases.close(&identity);
+            let persisted = match self.context_manager.revoke_session_hash(&identity.id) {
+                Ok(persisted) => persisted,
+                Err(error) => {
+                    self.credential_leases.reopen(&identity);
+                    return Err(KernelError::Context(error));
+                }
+            };
+            let removed = auth.revoke_session_identity(&identity);
+            (persisted, removed, drain)
+        };
+        self.drain_revoked_credentials(vec![drain]).await?;
+        Ok(removed || persisted)
+    }
+
+    /// Revoke an API key with the same per-credential drain boundary as session
     /// revocation.
     pub async fn revoke_api_key(&self, key: &str) -> Result<bool, KernelError> {
-        let key_hash = crate::auth::hash_secret(key);
-        let mut auth = self.auth.write().await;
-        let persisted = self
-            .context_manager
-            .revoke_api_key_hash(&key_hash)
-            .map_err(KernelError::Context)?;
-        Ok(auth.revoke_api_key(key) || persisted)
+        let identity = crate::auth::CredentialIdentity {
+            kind: crate::auth::CredentialKind::ApiKey,
+            id: crate::auth::hash_secret(key),
+        };
+        let (persisted, removed, drain) = {
+            let mut auth = self.auth.write().await;
+            let drain = self.credential_leases.close(&identity);
+            let persisted = match self.context_manager.revoke_api_key_hash(&identity.id) {
+                Ok(persisted) => persisted,
+                Err(error) => {
+                    self.credential_leases.reopen(&identity);
+                    return Err(KernelError::Context(error));
+                }
+            };
+            let removed = auth.revoke_api_key_identity(&identity);
+            (persisted, removed, drain)
+        };
+        self.drain_revoked_credentials(vec![drain]).await?;
+        Ok(removed || persisted)
     }
 
     /// Revoke a user and all of that user's credentials atomically and durably.
     pub async fn revoke_user(&self, user_id: &str) -> Result<bool, KernelError> {
-        let mut auth = self.auth.write().await;
-        let persisted = self
-            .context_manager
-            .revoke_user_identity(user_id)
-            .map_err(KernelError::Context)?;
-        Ok(auth.revoke_user(user_id) || persisted)
+        let (persisted, removed, drains) = {
+            let mut auth = self.auth.write().await;
+            let live_identities = auth.credential_identities_for_user(user_id);
+            let mut identities: std::collections::HashSet<_> =
+                live_identities.iter().cloned().collect();
+            identities.extend(
+                self.credential_leases
+                    .credential_identities_for_user(user_id),
+            );
+            let identities: Vec<_> = identities.into_iter().collect();
+            let drains = self.credential_leases.close_many(&identities);
+            let persisted = match self.context_manager.revoke_user_identity(user_id) {
+                Ok(persisted) => persisted,
+                Err(error) => {
+                    // Only identities still live in AuthSystem may reopen.
+                    // Owner-tracked entries can belong to credentials already
+                    // committed as revoked by an overlapping narrower revoke.
+                    self.credential_leases.reopen_many(&live_identities);
+                    return Err(KernelError::Context(error));
+                }
+            };
+            let removed = auth.revoke_user(user_id);
+            (persisted, removed, drains)
+        };
+        self.drain_revoked_credentials(drains).await?;
+        Ok(removed || persisted)
     }
 
     /// Revoke a tenant identity boundary and all tenant credentials atomically.
     /// Agent/data records remain durable but inaccessible to tenant callers.
     pub async fn revoke_tenant(&self, tenant_id: &str) -> Result<bool, KernelError> {
-        let mut auth = self.auth.write().await;
-        let persisted = self
-            .context_manager
-            .revoke_tenant_identity(tenant_id)
-            .map_err(KernelError::Context)?;
-        Ok(auth.revoke_tenant(tenant_id) || persisted)
+        let (persisted, removed, drains) = {
+            let mut auth = self.auth.write().await;
+            let live_identities = auth.credential_identities_for_tenant(tenant_id);
+            let mut identities: std::collections::HashSet<_> =
+                live_identities.iter().cloned().collect();
+            identities.extend(
+                self.credential_leases
+                    .credential_identities_for_tenant(tenant_id),
+            );
+            let identities: Vec<_> = identities.into_iter().collect();
+            let drains = self.credential_leases.close_many(&identities);
+            let persisted = match self.context_manager.revoke_tenant_identity(tenant_id) {
+                Ok(persisted) => persisted,
+                Err(error) => {
+                    // Never reopen an owner-tracked credential that an earlier
+                    // session/API-key revoke already removed.
+                    self.credential_leases.reopen_many(&live_identities);
+                    return Err(KernelError::Context(error));
+                }
+            };
+            let removed = auth.revoke_tenant(tenant_id);
+            (persisted, removed, drains)
+        };
+        self.drain_revoked_credentials(drains).await?;
+        Ok(removed || persisted)
     }
 
     /// Resolve a presented secret (API key or session token) to a
@@ -1938,6 +2119,23 @@ impl AgentKernelImpl {
     /// unknown, expired, inconsistent, or revoked.
     pub async fn resolve_principal(&self, secret: &str) -> Option<crate::auth::Principal> {
         self.auth.read().await.authenticate(secret)
+    }
+
+    /// Admit one request for a non-secret credential identity, then resolve its
+    /// current tenant/user/role under a short auth read lock. The returned lease
+    /// must remain alive through dispatch.
+    pub(crate) async fn acquire_credential_principal(
+        &self,
+        identity: &crate::auth::CredentialIdentity,
+    ) -> Option<(crate::auth::Principal, crate::auth::CredentialLeaseGuard)> {
+        let lease = self.credential_leases.acquire(identity)?;
+        let auth = self.auth.read().await;
+        let principal = auth.authenticate_identity(identity)?;
+        if !lease.bind_owner(&principal.user_id, &principal.tenant_id) {
+            return None;
+        }
+        drop(auth);
+        Some((principal, lease))
     }
 
     /// Synchronous wrapper around [`rehydrate_agents`](Self::rehydrate_agents)
@@ -3121,7 +3319,518 @@ mod tests {
     #[tokio::test]
     async fn in_memory_kernel_uses_production_mac_defaults() {
         let kernel = AgentKernelImpl::new().unwrap();
-        assert!(kernel.syscall_gate.mac.lock().await.is_enforcing());
+        assert!(kernel.syscall_gate.mac_is_enforcing().await);
+    }
+
+    #[tokio::test]
+    async fn builtin_network_provider_does_not_follow_redirects() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut first, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 2048];
+            let _ = first.read(&mut request).await.unwrap();
+            first
+                .write_all(
+                    format!(
+                        "HTTP/1.1 302 Found\r\nLocation: http://{address}/followed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+
+            match tokio::time::timeout(std::time::Duration::from_millis(250), listener.accept())
+                .await
+            {
+                Ok(Ok((mut followed, _))) => {
+                    let _ = followed.read(&mut request).await.unwrap();
+                    followed
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: close\r\n\r\nfollowed",
+                        )
+                        .await
+                        .unwrap();
+                    true
+                }
+                _ => false,
+            }
+        });
+
+        let response = BuiltinNetworkProvider
+            .execute(
+                "get",
+                &serde_json::json!({"url": format!("http://{address}/start")}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response["status"], 302);
+        assert_eq!(response["body"], "");
+        assert!(
+            !server.await.unwrap(),
+            "provider followed an unapproved redirect target"
+        );
+    }
+
+    #[tokio::test]
+    async fn credential_revocation_timeout_is_explicit_and_never_reopens_admission() {
+        let kernel = Arc::new(AgentKernelImpl::new().unwrap());
+        let tenant = kernel.create_tenant("drain-timeout").await.unwrap();
+        let user = kernel
+            .register_user(
+                &tenant,
+                "alice",
+                "alice@drain-timeout.test",
+                crate::auth::Role::User,
+            )
+            .await
+            .unwrap();
+        let token = kernel.open_session(&user).await.unwrap();
+        let identity = kernel
+            .resolve_principal(&token)
+            .await
+            .unwrap()
+            .credential
+            .unwrap();
+        let (_principal, in_flight) = kernel
+            .acquire_credential_principal(&identity)
+            .await
+            .expect("request lease");
+
+        let revoke_kernel = Arc::clone(&kernel);
+        let revoke_token = token.clone();
+        let revocation =
+            tokio::spawn(async move { revoke_kernel.revoke_session(&revoke_token).await });
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while kernel.resolve_principal(&token).await.is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("revocation did not commit");
+        assert!(
+            kernel
+                .acquire_credential_principal(&identity)
+                .await
+                .is_none(),
+            "closed identity admitted new work while its old lease was active"
+        );
+
+        let error = revocation.await.unwrap().unwrap_err();
+        assert!(matches!(
+            error,
+            KernelError::CredentialRevocationIncomplete { .. }
+        ));
+        assert!(kernel.resolve_principal(&token).await.is_none());
+        assert!(
+            kernel
+                .acquire_credential_principal(&identity)
+                .await
+                .is_none(),
+            "drain timeout reopened a revoked credential"
+        );
+
+        drop(in_flight);
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while kernel.credential_leases.entry_count() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("detached credential drain did not eventually evict its idle entry");
+        assert_eq!(kernel.credential_leases.entry_count(), 0);
+        assert!(kernel.resolve_principal(&token).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn one_stuck_credential_does_not_block_other_drain_cleanup() {
+        let kernel = AgentKernelImpl::new().unwrap();
+        let stuck = crate::auth::CredentialIdentity {
+            kind: crate::auth::CredentialKind::Session,
+            id: "stuck-drain".into(),
+        };
+        let idle = crate::auth::CredentialIdentity {
+            kind: crate::auth::CredentialKind::ApiKey,
+            id: "idle-drain".into(),
+        };
+        let stuck_guard = kernel
+            .credential_leases
+            .acquire(&stuck)
+            .expect("stuck lease");
+        let drains = vec![
+            kernel.credential_leases.close(&stuck),
+            kernel.credential_leases.close(&idle),
+        ];
+
+        let error = kernel.drain_revoked_credentials(drains).await.unwrap_err();
+        assert!(matches!(
+            error,
+            KernelError::CredentialRevocationIncomplete { .. }
+        ));
+        assert_eq!(
+            kernel.credential_leases.entry_count(),
+            1,
+            "an unrelated idle closed entry stayed queued behind a stuck drain"
+        );
+
+        drop(stuck_guard);
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while kernel.credential_leases.entry_count() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("detached stuck drain did not eventually clean up");
+    }
+
+    #[tokio::test]
+    async fn user_revoke_waits_for_a_session_removed_by_an_earlier_timed_out_revoke() {
+        let kernel = Arc::new(AgentKernelImpl::new().unwrap());
+        let tenant = kernel
+            .create_tenant("cross-scope-user-drain")
+            .await
+            .unwrap();
+        let user = kernel
+            .register_user(
+                &tenant,
+                "alice",
+                "alice@cross-scope-user-drain.test",
+                crate::auth::Role::User,
+            )
+            .await
+            .unwrap();
+        let token = kernel.open_session(&user).await.unwrap();
+        let identity = kernel
+            .resolve_principal(&token)
+            .await
+            .unwrap()
+            .credential
+            .unwrap();
+        let (_principal, in_flight) = kernel
+            .acquire_credential_principal(&identity)
+            .await
+            .expect("request lease");
+
+        let first_kernel = Arc::clone(&kernel);
+        let first_token = token.clone();
+        let first_revoke =
+            tokio::spawn(async move { first_kernel.revoke_session(&first_token).await });
+        let first_error = first_revoke.await.unwrap().unwrap_err();
+        assert!(matches!(
+            first_error,
+            KernelError::CredentialRevocationIncomplete { .. }
+        ));
+
+        let user_kernel = Arc::clone(&kernel);
+        let revoked_user = user.clone();
+        let user_revoke = tokio::spawn(async move { user_kernel.revoke_user(&revoked_user).await });
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while kernel.auth.read().await.get_user(&user).is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("user revocation did not commit");
+        assert!(
+            !user_revoke.is_finished(),
+            "user revocation returned before an overlapping removed credential drained"
+        );
+
+        drop(in_flight);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), user_revoke)
+                .await
+                .expect("user revocation did not finish after lease release")
+                .unwrap()
+                .unwrap()
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while kernel.credential_leases.entry_count() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("shared session drain entry was not evicted");
+    }
+
+    #[tokio::test]
+    async fn tenant_revoke_waits_for_session_and_key_removed_by_timed_out_revokes() {
+        let kernel = Arc::new(AgentKernelImpl::new().unwrap());
+        let tenant = kernel
+            .create_tenant("cross-scope-tenant-drain")
+            .await
+            .unwrap();
+        let user = kernel
+            .register_user(
+                &tenant,
+                "alice",
+                "alice@cross-scope-tenant-drain.test",
+                crate::auth::Role::User,
+            )
+            .await
+            .unwrap();
+        let token = kernel.open_session(&user).await.unwrap();
+        let key = kernel.issue_api_key(&user, "in-flight").await.unwrap();
+        let session_identity = kernel
+            .resolve_principal(&token)
+            .await
+            .unwrap()
+            .credential
+            .unwrap();
+        let key_identity = kernel
+            .resolve_principal(&key)
+            .await
+            .unwrap()
+            .credential
+            .unwrap();
+        let (_session_principal, session_in_flight) = kernel
+            .acquire_credential_principal(&session_identity)
+            .await
+            .expect("session request lease");
+        let (_key_principal, key_in_flight) = kernel
+            .acquire_credential_principal(&key_identity)
+            .await
+            .expect("API-key request lease");
+
+        let session_kernel = Arc::clone(&kernel);
+        let revoked_token = token.clone();
+        let session_revoke =
+            tokio::spawn(async move { session_kernel.revoke_session(&revoked_token).await });
+        let key_kernel = Arc::clone(&kernel);
+        let revoked_key = key.clone();
+        let key_revoke = tokio::spawn(async move { key_kernel.revoke_api_key(&revoked_key).await });
+        for revocation in [session_revoke, key_revoke] {
+            let error = revocation.await.unwrap().unwrap_err();
+            assert!(matches!(
+                error,
+                KernelError::CredentialRevocationIncomplete { .. }
+            ));
+        }
+
+        let tenant_kernel = Arc::clone(&kernel);
+        let revoked_tenant = tenant.clone();
+        let tenant_revoke =
+            tokio::spawn(async move { tenant_kernel.revoke_tenant(&revoked_tenant).await });
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while kernel.auth.read().await.get_tenant(&tenant).is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("tenant revocation did not commit");
+        assert!(
+            !tenant_revoke.is_finished(),
+            "tenant revocation returned before removed credentials drained"
+        );
+
+        drop(session_in_flight);
+        tokio::task::yield_now().await;
+        assert!(
+            !tenant_revoke.is_finished(),
+            "tenant revocation ignored the still-active API-key lease"
+        );
+        drop(key_in_flight);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), tenant_revoke)
+                .await
+                .expect("tenant revocation did not finish after both lease releases")
+                .unwrap()
+                .unwrap()
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while kernel.credential_leases.entry_count() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("shared tenant drain entries were not evicted");
+    }
+
+    #[tokio::test]
+    async fn failed_credential_resolution_evicts_its_unbound_idle_lease() {
+        let kernel = AgentKernelImpl::new().unwrap();
+        let unknown = crate::auth::CredentialIdentity {
+            kind: crate::auth::CredentialKind::Session,
+            id: "unknown-credential".into(),
+        };
+        assert!(kernel
+            .acquire_credential_principal(&unknown)
+            .await
+            .is_none());
+        assert_eq!(kernel.credential_leases.entry_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn concurrent_group_tool_registration_keeps_the_winner_scoped() {
+        let kernel = Arc::new(AgentKernelImpl::new().unwrap());
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let binding = || crate::tools::ToolBinding {
+            name: "raced_group_notes".into(),
+            description: "Read group-local notes".into(),
+            parameters_schema: serde_json::json!({
+                "type": "object",
+                "properties": {"path": {"type": "string"}},
+                "required": ["path"]
+            }),
+            resource_type: crate::resources::ResourceType::Filesystem,
+            operation: "read".into(),
+            security: crate::tools::ToolSecurity::argument(
+                crate::tools::SecurityAction::Read,
+                "path",
+            ),
+        };
+
+        let kernel_a = kernel.clone();
+        let barrier_a = barrier.clone();
+        let binding_a = binding();
+        let registration_a = std::thread::spawn(move || {
+            barrier_a.wait();
+            kernel_a.register_group_tool("group-a", binding_a)
+        });
+        let kernel_b = kernel.clone();
+        let barrier_b = barrier;
+        let binding_b = binding();
+        let registration_b = std::thread::spawn(move || {
+            barrier_b.wait();
+            kernel_b.register_group_tool("group-b", binding_b)
+        });
+        let result_a = registration_a.join().unwrap();
+        let result_b = registration_b.join().unwrap();
+        assert_ne!(
+            result_a.is_ok(),
+            result_b.is_ok(),
+            "exactly one competing group registration must win"
+        );
+        let winner_group = if result_a.is_ok() {
+            "group-a"
+        } else {
+            "group-b"
+        };
+        let loser_group = if result_a.is_ok() {
+            "group-b"
+        } else {
+            "group-a"
+        };
+
+        let config = |name: &str| AgentConfig {
+            name: name.into(),
+            task: "namespace race regression".into(),
+            llm_provider: "test".into(),
+            permission_profile: "standard".into(),
+            priority: Priority::default(),
+            sandbox_config: None,
+        };
+        let winner = kernel
+            .create_agent_in_namespace(config("winner"), winner_group)
+            .await
+            .unwrap();
+        let loser = kernel
+            .create_agent_in_namespace(config("loser"), loser_group)
+            .await
+            .unwrap();
+        let ungrouped = kernel.create_agent_full(config("ungrouped")).await.unwrap();
+        let sees_raced_tool = |agent_id| {
+            kernel
+                .tool_registry
+                .definitions_for_agent(&kernel.syscall_gate, agent_id)
+                .iter()
+                .any(|tool| tool.name == "raced_group_notes")
+        };
+
+        assert!(sees_raced_tool(winner.id));
+        assert!(!sees_raced_tool(loser.id));
+        assert!(
+            !sees_raced_tool(ungrouped.id),
+            "loser rollback must never remove the winner's namespace tag"
+        );
+    }
+
+    #[tokio::test]
+    async fn ipc_name_lookup_hides_missing_foreign_and_ambiguous_recipients() {
+        let kernel = AgentKernelImpl::new().unwrap();
+        let config = |name: &str| AgentConfig {
+            name: name.into(),
+            task: "IPC recipient lookup".into(),
+            llm_provider: "stub".into(),
+            permission_profile: "standard".into(),
+            priority: Priority::default(),
+            sandbox_config: None,
+        };
+        let caller = kernel
+            .create_agent_in_namespace(config("caller"), "visible-team")
+            .await
+            .unwrap();
+        let foreign = kernel
+            .create_agent_in_namespace(config("hidden-peer"), "foreign-team")
+            .await
+            .unwrap();
+        kernel
+            .create_agent_in_namespace(config("ambiguous-peer"), "visible-team")
+            .await
+            .unwrap();
+        kernel
+            .create_agent_in_namespace(config("ambiguous-peer"), "visible-team")
+            .await
+            .unwrap();
+        async fn probe(
+            kernel: &AgentKernelImpl,
+            operation: &str,
+            caller: AgentId,
+            recipient: &str,
+        ) -> String {
+            let (tool, arguments) = match operation {
+                "send" => (
+                    "send_agent_message",
+                    serde_json::json!({
+                        "to": recipient,
+                        "message": {"probe": true}
+                    }),
+                ),
+                "delegate" => (
+                    "delegate_task",
+                    serde_json::json!({
+                        "to": recipient,
+                        "task": "probe"
+                    }),
+                ),
+                _ => unreachable!(),
+            };
+            let (prepared, _tool_slot) = kernel
+                .tool_registry
+                .authorize_and_acquire_call(&kernel.syscall_gate, caller, tool, &arguments)
+                .await
+                .expect("IPC probe must pass gate admission");
+            let response = kernel
+                .resource_broker
+                .execute(prepared.request)
+                .await
+                .expect("provider failure is returned as a response");
+            assert!(!response.success);
+            response.error.expect("hidden recipient probe must fail")
+        }
+
+        let missing_id = uuid::Uuid::new_v4();
+        for operation in ["send", "delegate"] {
+            let missing = probe(&kernel, operation, caller.id, "missing-peer").await;
+            let hidden = probe(&kernel, operation, caller.id, "hidden-peer").await;
+            let ambiguous = probe(&kernel, operation, caller.id, "ambiguous-peer").await;
+            let missing_uuid = probe(&kernel, operation, caller.id, &missing_id.to_string()).await;
+            let foreign_uuid = probe(&kernel, operation, caller.id, &foreign.id.to_string()).await;
+            assert_eq!(missing, hidden);
+            assert_eq!(missing, ambiguous);
+            assert_eq!(missing, missing_uuid);
+            assert_eq!(missing, foreign_uuid);
+            assert!(
+                !missing.contains("missing-peer")
+                    && !missing.contains("hidden-peer")
+                    && !missing.contains("ambiguous-peer")
+                    && !missing.contains(&foreign.id.to_string())
+                    && !missing.contains(&missing_id.to_string()),
+                "{operation} reflected hidden recipient identity: {missing}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -3455,10 +4164,8 @@ mod tests {
             .register_agent(agent, CapabilitySet::all(), None);
         kernel
             .syscall_gate
-            .mac
-            .lock()
-            .await
-            .label_agent(pid, "profile:full-access".into());
+            .label_mac_agent(pid, "profile:full-access".into())
+            .await;
         let arguments = serde_json::json!({"command": "echo", "args": ["ok"]});
 
         assert!(matches!(

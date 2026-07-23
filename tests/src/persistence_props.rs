@@ -20,7 +20,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use kernel::agent::AgentKernel;
-use kernel::config::Config;
+use kernel::budget::BudgetEnforcer;
+use kernel::config::{BudgetConfig, Config, TokenPricing};
 use kernel::connector::{
     LlmProviderAdapter, LlmResponse, LlmSession, LlmUsage, ProviderType, StandardMessage,
     ToolDefinition,
@@ -34,15 +35,19 @@ use kernel::{AgentConfig, AgentId, AgentKernelImpl, ConnectorError, Priority, Pr
 /// usage ledger, and boot-time budget rehydration all participate in the test.
 struct FixedUsageAdapter {
     id: ProviderId,
+    model: String,
     input_tokens: u32,
     output_tokens: u32,
+    cached_tokens: u32,
     calls: Arc<AtomicUsize>,
 }
 
 struct FixedUsageSession {
     id: ProviderId,
+    model: String,
     input_tokens: u32,
     output_tokens: u32,
+    cached_tokens: u32,
     calls: Arc<AtomicUsize>,
 }
 
@@ -62,7 +67,7 @@ impl LlmSession for FixedUsageSession {
             content: "deterministic accounting response".into(),
             finish_reason: Some("stop".into()),
             tokens_used: self.input_tokens.saturating_add(self.output_tokens),
-            usage: LlmUsage::reported(self.input_tokens, self.output_tokens, 0),
+            usage: LlmUsage::reported(self.input_tokens, self.output_tokens, self.cached_tokens),
             tool_calls: Vec::new(),
         })
     }
@@ -72,7 +77,7 @@ impl LlmSession for FixedUsageSession {
     }
 
     fn model_id(&self) -> &str {
-        "fixed-accounting-v1"
+        &self.model
     }
 }
 
@@ -97,8 +102,10 @@ impl LlmProviderAdapter for FixedUsageAdapter {
     async fn create_session(&self) -> Result<Box<dyn LlmSession>, ConnectorError> {
         Ok(Box::new(FixedUsageSession {
             id: self.id.clone(),
+            model: self.model.clone(),
             input_tokens: self.input_tokens,
             output_tokens: self.output_tokens,
+            cached_tokens: self.cached_tokens,
             calls: Arc::clone(&self.calls),
         }))
     }
@@ -117,12 +124,30 @@ fn fixed_usage_adapter(
     input_tokens: u32,
     output_tokens: u32,
 ) -> (Arc<FixedUsageAdapter>, Arc<AtomicUsize>) {
+    detailed_usage_adapter(
+        provider,
+        "fixed-accounting-v1",
+        input_tokens,
+        output_tokens,
+        0,
+    )
+}
+
+fn detailed_usage_adapter(
+    provider: &str,
+    model: &str,
+    input_tokens: u32,
+    output_tokens: u32,
+    cached_tokens: u32,
+) -> (Arc<FixedUsageAdapter>, Arc<AtomicUsize>) {
     let calls = Arc::new(AtomicUsize::new(0));
     (
         Arc::new(FixedUsageAdapter {
             id: provider.into(),
+            model: model.into(),
             input_tokens,
             output_tokens,
+            cached_tokens,
             calls: Arc::clone(&calls),
         }),
         calls,
@@ -611,4 +636,223 @@ async fn graceful_restart_restores_exact_global_agent_and_tenant_spend() {
 
     drop(kernel);
     std::fs::remove_dir_all(data_dir).ok();
+}
+
+fn token_pricing(input: f64, cached_input: f64, output: f64) -> TokenPricing {
+    TokenPricing {
+        input_usd_per_1k_tokens: input,
+        cached_input_usd_per_1k_tokens: cached_input,
+        output_usd_per_1k_tokens: output,
+    }
+}
+
+/// Detailed prices resolve deterministically from the most-specific
+/// provider/model entry down through both backwards-compatible scalar
+/// fallbacks. Cached input remains a subset of input and is priced exactly once.
+#[test]
+fn detailed_pricing_precedence_and_zero_cache_rate_are_exact() {
+    let mut budgets = BudgetConfig {
+        usd_per_1k_tokens: 1.0,
+        default_token_pricing: Some(token_pricing(2.0, 0.0, 6.0)),
+        ..BudgetConfig::default()
+    };
+    budgets.provider_pricing.insert("tiered".into(), 3.0);
+    budgets
+        .provider_token_pricing
+        .insert("tiered".into(), token_pricing(4.0, 0.5, 8.0));
+    budgets.provider_model_token_pricing.insert(
+        "tiered".into(),
+        std::collections::HashMap::from([("exact-model".into(), token_pricing(5.0, 0.25, 10.0))]),
+    );
+    budgets
+        .provider_pricing
+        .insert("legacy-provider".into(), 3.0);
+
+    let enforcer = BudgetEnforcer::from_config(&budgets);
+    let usage = LlmUsage::reported(1_000, 500, 600);
+
+    // (400 uncached input × $5 + 600 cached input × $0.25
+    //  + 500 output × $10) / 1000 = $7.15.
+    assert_eq!(enforcer.cost_of_usage("tiered", "exact-model", usage), 7.15);
+    // The provider-level detailed rate outranks the legacy provider scalar.
+    assert_eq!(enforcer.cost_of_usage("tiered", "other-model", usage), 5.9);
+    // A legacy provider scalar still prices total input + output tokens.
+    assert_eq!(
+        enforcer.cost_of_usage("legacy-provider", "any-model", usage),
+        4.5
+    );
+    // Detailed default outranks the legacy global scalar. A zero cache rate is
+    // valid: (400 × $2 + 600 × $0 + 500 × $6) / 1000 = $3.80.
+    assert_eq!(
+        enforcer.cost_of_usage("unconfigured", "any-model", usage),
+        3.8
+    );
+
+    budgets.default_token_pricing = None;
+    let legacy_global = BudgetEnforcer::from_config(&budgets);
+    assert_eq!(
+        legacy_global.cost_of_usage("unconfigured", "any-model", usage),
+        1.5
+    );
+}
+
+/// The full executor and durable ledger must use provider/model-specific
+/// input/output/cache rates and persist the exact rounded micro-dollar charge.
+/// Restart rehydration must consume that immutable charge rather than repricing
+/// the historical token counts with the new live configuration.
+#[tokio::test(flavor = "multi_thread")]
+async fn detailed_provider_model_charge_persists_exactly_without_restart_repricing() {
+    const PROVIDER: &str = "detailed-provider";
+    const MODEL: &str = "priced-model-v2";
+    const CHARGE_MICROS: u64 = 1_850_000;
+
+    let db_path = temp_db_path("detailed_pricing");
+    let data_dir = db_path.parent().unwrap();
+    let mut first_config = accounting_config(data_dir, 99.0, 10.0);
+    first_config
+        .budgets
+        .provider_pricing
+        .insert(PROVIDER.into(), 88.0);
+    first_config
+        .budgets
+        .provider_token_pricing
+        .insert(PROVIDER.into(), token_pricing(77.0, 66.0, 55.0));
+    first_config.budgets.provider_model_token_pricing.insert(
+        PROVIDER.into(),
+        std::collections::HashMap::from([(MODEL.into(), token_pricing(1.5, 0.25, 4.0))]),
+    );
+
+    let agent_id = {
+        let kernel = AgentKernelImpl::from_config(&first_config).expect("first boot");
+        let (adapter, calls) = detailed_usage_adapter(PROVIDER, MODEL, 600, 300, 200);
+        kernel
+            .register_provider(adapter)
+            .expect("register detailed provider");
+        let agent = kernel
+            .create_agent_full(accounting_agent_cfg("detailed-accounting", PROVIDER))
+            .await
+            .expect("create detailed accounting agent");
+
+        let output = kernel
+            .send_message(agent.id, "persist one detailed token charge")
+            .await
+            .expect("priced provider request");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(output.usage.charged_cost_micros, CHARGE_MICROS);
+
+        let durable = kernel
+            .context_manager
+            .latest_usage(agent.id)
+            .expect("durable detailed usage row");
+        assert_eq!(durable.input_tokens, 600);
+        assert_eq!(durable.output_tokens, 300);
+        assert_eq!(durable.cached_tokens, 200);
+        assert_eq!(durable.provider, PROVIDER);
+        assert_eq!(durable.model, MODEL);
+        assert_eq!(durable.cost_micros, CHARGE_MICROS);
+
+        drop(kernel);
+        agent.id
+    };
+
+    let mut restart_config = accounting_config(data_dir, 0.001, 10.0);
+    restart_config.budgets.provider_model_token_pricing.insert(
+        PROVIDER.into(),
+        std::collections::HashMap::from([(MODEL.into(), token_pricing(999.0, 999.0, 999.0))]),
+    );
+    let restarted = AgentKernelImpl::from_config(&restart_config).expect("restart");
+    let snapshot = restarted
+        .context_manager
+        .load_budget_usage_snapshot()
+        .expect("load exact detailed usage snapshot");
+    assert_eq!(snapshot.global_micros, CHARGE_MICROS);
+    assert_eq!(
+        snapshot.per_agent_micros.get(&agent_id),
+        Some(&CHARGE_MICROS)
+    );
+    assert_eq!(restarted.budget_enforcer.global_spent_usd(), 1.85);
+
+    drop(restarted);
+    std::fs::remove_dir_all(data_dir).ok();
+}
+
+/// Existing scalar budget TOML remains accepted and follows its established
+/// total-token formula when none of the new detailed tables are configured.
+#[tokio::test(flavor = "multi_thread")]
+async fn legacy_scalar_pricing_toml_remains_compatible_end_to_end() {
+    const PROVIDER: &str = "legacy-toml-provider";
+    const CHARGE_MICROS: u64 = 4_000_000;
+
+    let budgets: BudgetConfig = toml::from_str(
+        r#"
+usd_per_1k_tokens = 1.0
+max_usd = 10.0
+
+[provider_pricing]
+legacy-toml-provider = 4.0
+"#,
+    )
+    .expect("legacy scalar budget config remains valid");
+    assert!(budgets.default_token_pricing.is_none());
+    assert!(budgets.provider_token_pricing.is_empty());
+    assert!(budgets.provider_model_token_pricing.is_empty());
+
+    let db_path = temp_db_path("legacy_scalar_pricing");
+    let data_dir = db_path.parent().unwrap();
+    let config = Config {
+        data_dir: data_dir.to_path_buf(),
+        budgets,
+        ..Config::default()
+    };
+    let kernel = AgentKernelImpl::from_config(&config).expect("boot from legacy pricing config");
+    let (adapter, calls) = detailed_usage_adapter(PROVIDER, "legacy-model", 600, 400, 500);
+    kernel
+        .register_provider(adapter)
+        .expect("register legacy provider");
+    let agent = kernel
+        .create_agent_full(accounting_agent_cfg("legacy-pricing", PROVIDER))
+        .await
+        .expect("create legacy pricing agent");
+
+    let output = kernel
+        .send_message(agent.id, "charge using legacy blended pricing")
+        .await
+        .expect("legacy priced provider request");
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(output.usage.charged_cost_micros, CHARGE_MICROS);
+    assert_eq!(
+        kernel
+            .context_manager
+            .latest_usage(agent.id)
+            .expect("legacy durable usage row")
+            .cost_micros,
+        CHARGE_MICROS
+    );
+
+    drop(kernel);
+    std::fs::remove_dir_all(data_dir).ok();
+}
+
+/// Operator-supplied detailed prices are a policy boundary. Negative, NaN, and
+/// infinite rates must reject startup rather than silently becoming free or
+/// otherwise weakening a configured USD ceiling.
+#[test]
+fn invalid_detailed_pricing_fails_closed_at_kernel_startup() {
+    for invalid in [-1.0, f64::NAN, f64::INFINITY] {
+        let db_path = temp_db_path("invalid_detailed_pricing");
+        let data_dir = db_path.parent().unwrap();
+        let mut config = Config {
+            data_dir: data_dir.to_path_buf(),
+            ..Config::default()
+        };
+        config.budgets.default_token_pricing = Some(token_pricing(invalid, 0.0, 1.0));
+        let error = AgentKernelImpl::from_config(&config)
+            .err()
+            .expect("invalid detailed pricing must reject startup");
+        assert!(
+            error.to_string().contains("pricing"),
+            "startup error should identify pricing, got {error}"
+        );
+        std::fs::remove_dir_all(data_dir).ok();
+    }
 }

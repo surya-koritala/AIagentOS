@@ -14,11 +14,42 @@ tokens from the complete active message/tool-schema payload at four characters
 per token and treats the adapter's token count as output. The durable record's
 `estimated_requests` and `provider_reported_requests` fields distinguish them.
 
-`tokens_used`, TPM, and blended pricing count input plus output tokens. Cached
-tokens are a labelled subset of input tokens and are not added a second time.
-Configured `provider_pricing` values are USD per 1,000 total tokens. Separate
-input/output/cache prices are not yet supported; invoice-sensitive deployments
-must configure a conservative blended rate.
+`tokens_used` and TPM count input plus output tokens. Cached tokens are a
+labelled subset of input tokens and are not added a second time. Detailed
+pricing calculates:
+
+`(uncached input × input rate + cached input × cache rate + output × output rate) / 1000`
+
+Rates resolve in this order: provider + model detailed pricing, provider
+detailed pricing, the legacy provider blended rate, detailed default pricing,
+then the legacy global blended rate. The first match wins. Existing
+`usd_per_1k_tokens` and `provider_pricing` TOML remains compatible and prices
+input plus output at the blended rate. Detailed tables use
+`input_usd_per_1k_tokens`, `cached_input_usd_per_1k_tokens`, and
+`output_usd_per_1k_tokens`, for example:
+
+```toml
+[budgets.default_token_pricing]
+input_usd_per_1k_tokens = 1.0
+cached_input_usd_per_1k_tokens = 0.1
+output_usd_per_1k_tokens = 4.0
+
+[budgets.provider_token_pricing.openai]
+input_usd_per_1k_tokens = 1.25
+cached_input_usd_per_1k_tokens = 0.125
+output_usd_per_1k_tokens = 5.0
+
+[budgets.provider_model_token_pricing.openai."gpt-4o"]
+input_usd_per_1k_tokens = 2.5
+cached_input_usd_per_1k_tokens = 1.25
+output_usd_per_1k_tokens = 10.0
+```
+
+A zero rate is valid and means that token class is free. Every legacy and
+detailed price or USD ceiling must be finite and non-negative. Invalid values,
+incomplete detailed tables, and unknown budget keys reject configuration
+loading and kernel startup instead of being clamped, ignored, or silently
+weakening a configured ceiling.
 
 USD ceilings are cumulative and durable across process restarts: global, tenant,
 and agent.
@@ -75,10 +106,13 @@ node metrics require operator/admin authorization.
 
 ## Qualification tests
 
-The regression suite covers exact provider parsing and pricing fixtures,
-provider/fallback distinction, retries and latency persistence, concurrent RPM,
-TPM, tool-slot, cgroup, and USD admission, overflow saturation, zero/unlimited
-configuration, cumulative tool-call behavior across pause/resume, exact
-micro-dollar restart rehydration, lifecycle metrics, and load-aware cluster
-placement. Live-provider invoice comparison remains a separate secret-backed
-qualification job rather than a deterministic pull-request test.
+The regression suite covers detailed provider/model pricing precedence,
+input/output/cache formulas including a zero cache rate, legacy blended-config
+compatibility, invalid-price startup rejection, exact provider parsing and
+pricing fixtures, provider/fallback distinction, retries and latency
+persistence, concurrent RPM, TPM, tool-slot, cgroup, and USD admission, overflow
+saturation, zero/unlimited configuration, cumulative tool-call behavior across
+pause/resume, exact micro-dollar restart rehydration without historical
+repricing, lifecycle metrics, and load-aware cluster placement. Live-provider
+invoice comparison remains a separate secret-backed qualification job rather
+than a deterministic pull-request test.

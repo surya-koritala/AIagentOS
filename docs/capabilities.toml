@@ -84,12 +84,12 @@ maturity = "integrated"
 release = "v0.4"
 tracking_issue = 109
 kernel_modules = ["budget", "cgroups", "metrics", "rate_limit"]
-source_paths = ["crates/kernel/src/lib.rs"]
+source_paths = ["crates/kernel/src/budget.rs", "crates/kernel/src/context.rs", "crates/kernel/src/execution.rs", "crates/kernel/src/lib.rs"]
 public_entry_points = ["crates/kernel/src/syscall_server.rs::Metrics"]
 runtime_call_paths = ["crates/kernel/src/lib.rs::AgentKernelImpl::send_message"]
-test_evidence = ["tests/src/observability_props.rs", "tests/src/gate_adversarial_props.rs"]
+test_evidence = ["crates/kernel/src/budget.rs", "crates/kernel/src/execution.rs", "tests/src/observability_props.rs", "tests/src/gate_adversarial_props.rs", "tests/src/persistence_props.rs", "tests/src/tenancy_props.rs"]
 platforms = ["linux", "macos", "windows"]
-limitations = ["Provider/model usage, pricing, active execution metrics, and several configured quota dimensions remain incomplete."]
+limitations = ["Deterministic pricing and durable quota regressions are present, but live-provider invoice reconciliation, production concurrency/soak qualification, and deterministic coverage of every minute-window boundary remain outstanding."]
 
 [[capability]]
 id = "quality-gates"

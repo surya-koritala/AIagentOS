@@ -988,6 +988,9 @@ impl AgentKernelImpl {
     /// Create a kernel from config (uses config.data_dir for persistence and
     /// config.budgets for cgroup/rate-limit quotas).
     pub fn from_config(config: &crate::config::Config) -> Result<Self, KernelError> {
+        config.budgets.validate().map_err(|error| {
+            KernelError::Policy(format!("invalid budget configuration: {error}"))
+        })?;
         set_max_browse_chars(config.max_browse_chars);
         let db_path = config.data_dir.join("agent_os.db");
         if let Some(parent) = db_path.parent() {
@@ -1035,6 +1038,9 @@ impl AgentKernelImpl {
         mac_enforcing: bool,
         mac_rules: &[crate::mac::PolicyRule],
     ) -> Result<Self, KernelError> {
+        budgets.validate().map_err(|error| {
+            KernelError::Policy(format!("invalid budget configuration: {error}"))
+        })?;
         let (event_tx, _) = broadcast::channel(256);
         let permission_manager = Arc::new(PermissionManager::new());
         let sandbox_manager = Arc::new(SandboxManagerImpl::new());
@@ -1072,7 +1078,11 @@ impl AgentKernelImpl {
         // Cumulative USD spend ceiling (inert unless price + ceiling configured).
         // Rehydrate exact fixed-point charges before any agent can be admitted;
         // resetting a configured lifetime ceiling on restart would fail open.
-        let budget_enforcer = Arc::new(crate::budget::BudgetEnforcer::from_config(budgets));
+        let budget_enforcer = Arc::new(
+            crate::budget::BudgetEnforcer::try_from_config(budgets).map_err(|error| {
+                KernelError::Policy(format!("invalid budget configuration: {error}"))
+            })?,
+        );
         let budget_snapshot = context_manager
             .load_budget_usage_snapshot()
             .map_err(KernelError::Context)?;
@@ -2761,6 +2771,33 @@ pub fn boot_in_memory() -> Result<Arc<AgentKernelImpl>, KernelError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn invalid_budget_config_is_rejected_before_creating_the_data_directory() {
+        let root =
+            std::env::temp_dir().join(format!("agentos-invalid-budget-{}", uuid::Uuid::new_v4()));
+        let config = crate::config::Config {
+            data_dir: root.join("nested"),
+            budgets: crate::config::BudgetConfig {
+                default_token_pricing: Some(crate::config::TokenPricing {
+                    input_usd_per_1k_tokens: f64::NAN,
+                    cached_input_usd_per_1k_tokens: 0.0,
+                    output_usd_per_1k_tokens: 1.0,
+                }),
+                ..crate::config::BudgetConfig::default()
+            },
+            ..crate::config::Config::default()
+        };
+
+        let error = AgentKernelImpl::from_config(&config)
+            .err()
+            .expect("invalid pricing must fail startup");
+        assert!(error.to_string().contains("invalid budget configuration"));
+        assert!(
+            !root.exists(),
+            "validation must run before data-directory side effects"
+        );
+    }
 
     #[tokio::test]
     async fn in_memory_kernel_uses_production_mac_defaults() {

@@ -55,7 +55,13 @@ fn register_providers(kernel: &AgentKernelImpl, config: &Config) {
 }
 
 fn main() {
-    let config = Config::load();
+    let config = match Config::try_load() {
+        Ok(config) => config,
+        Err(error) => {
+            eprintln!("Failed to load configuration: {error}");
+            std::process::exit(1);
+        }
+    };
     let kernel =
         Arc::new(AgentKernelImpl::from_config(&config).expect("Failed to initialize kernel"));
 

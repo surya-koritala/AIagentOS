@@ -7,6 +7,68 @@ use serde::{Deserialize, Serialize};
 
 use crate::ProviderId;
 
+/// Per-token-class pricing in USD per 1,000 tokens.
+///
+/// `cached_input_usd_per_1k_tokens` applies only to the cached subset of
+/// provider-reported input tokens. The remaining input tokens use
+/// `input_usd_per_1k_tokens`, and completion tokens use
+/// `output_usd_per_1k_tokens`.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct TokenPricing {
+    pub input_usd_per_1k_tokens: f64,
+    pub cached_input_usd_per_1k_tokens: f64,
+    pub output_usd_per_1k_tokens: f64,
+}
+
+impl TokenPricing {
+    pub(crate) fn blended(usd_per_1k_tokens: f64) -> Self {
+        Self {
+            input_usd_per_1k_tokens: usd_per_1k_tokens,
+            cached_input_usd_per_1k_tokens: usd_per_1k_tokens,
+            output_usd_per_1k_tokens: usd_per_1k_tokens,
+        }
+    }
+
+    pub(crate) fn validate(self, location: &str) -> Result<(), String> {
+        for (name, value) in [
+            ("input_usd_per_1k_tokens", self.input_usd_per_1k_tokens),
+            (
+                "cached_input_usd_per_1k_tokens",
+                self.cached_input_usd_per_1k_tokens,
+            ),
+            ("output_usd_per_1k_tokens", self.output_usd_per_1k_tokens),
+        ] {
+            if !value.is_finite() || value < 0.0 {
+                return Err(format!(
+                    "{location}.{name} must be a finite, non-negative USD price (got {value})"
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Failure to read or validate an operator configuration.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum ConfigLoadError {
+    #[error("cannot read config file {path}: {source}")]
+    Read {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("invalid config file {path}: {source}")]
+    Parse {
+        path: PathBuf,
+        #[source]
+        source: toml::de::Error,
+    },
+    #[error("invalid budget configuration in {path}: {message}")]
+    Budget { path: PathBuf, message: String },
+}
+
 /// Application configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
@@ -78,6 +140,7 @@ pub struct Config {
 /// `elevated` gets a wider budget. `rpm`/`tpm`/`max_concurrent` configure the
 /// shared `RateLimiter`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BudgetConfig {
     #[serde(default = "default_agent_tokens_per_min")]
     pub agent_tokens_per_min: u64,
@@ -118,6 +181,17 @@ pub struct BudgetConfig {
     /// Per-provider price overrides (provider id → USD per 1000 tokens).
     #[serde(default)]
     pub provider_pricing: HashMap<ProviderId, f64>,
+    /// Detailed fallback pricing used when no provider/model or legacy
+    /// provider-specific price exists.
+    #[serde(default)]
+    pub default_token_pricing: Option<TokenPricing>,
+    /// Detailed per-provider prices.
+    #[serde(default)]
+    pub provider_token_pricing: HashMap<ProviderId, TokenPricing>,
+    /// Detailed per-provider, per-model prices. The outer key is the provider
+    /// id and the inner key is the model id reported by its LLM session.
+    #[serde(default)]
+    pub provider_model_token_pricing: HashMap<ProviderId, HashMap<String, TokenPricing>>,
 }
 
 impl Default for BudgetConfig {
@@ -135,7 +209,68 @@ impl Default for BudgetConfig {
             per_tenant_max_usd: 0.0,
             usd_per_1k_tokens: 0.0,
             provider_pricing: HashMap::new(),
+            default_token_pricing: None,
+            provider_token_pricing: HashMap::new(),
+            provider_model_token_pricing: HashMap::new(),
         }
+    }
+}
+
+impl BudgetConfig {
+    /// Validate detailed pricing before a kernel can admit work.
+    ///
+    /// All monetary configuration is strict because accepting a malformed
+    /// entry and treating it as free or unlimited could silently bypass a
+    /// configured USD ceiling. Low-level legacy constructors retain their
+    /// historical clamping behavior, but config-backed startup never does.
+    pub fn validate(&self) -> Result<(), String> {
+        for (name, value) in [
+            ("max_usd", self.max_usd),
+            ("per_agent_max_usd", self.per_agent_max_usd),
+            ("per_tenant_max_usd", self.per_tenant_max_usd),
+            ("usd_per_1k_tokens", self.usd_per_1k_tokens),
+        ] {
+            if !value.is_finite() || value < 0.0 {
+                return Err(format!(
+                    "{name} must be a finite, non-negative USD value (got {value})"
+                ));
+            }
+        }
+        for (provider, price) in &self.provider_pricing {
+            if provider.trim().is_empty() {
+                return Err("provider_pricing contains an empty provider id".to_string());
+            }
+            if !price.is_finite() || *price < 0.0 {
+                return Err(format!(
+                    "provider_pricing.{provider} must be a finite, non-negative USD price (got {price})"
+                ));
+            }
+        }
+        if let Some(pricing) = self.default_token_pricing {
+            pricing.validate("default_token_pricing")?;
+        }
+        for (provider, pricing) in &self.provider_token_pricing {
+            if provider.trim().is_empty() {
+                return Err("provider_token_pricing contains an empty provider id".to_string());
+            }
+            pricing.validate(&format!("provider_token_pricing.{provider}"))?;
+        }
+        for (provider, models) in &self.provider_model_token_pricing {
+            if provider.trim().is_empty() {
+                return Err(
+                    "provider_model_token_pricing contains an empty provider id".to_string()
+                );
+            }
+            for (model, pricing) in models {
+                if model.trim().is_empty() {
+                    return Err(format!(
+                        "provider_model_token_pricing.{provider} contains an empty model id"
+                    ));
+                }
+                pricing.validate(&format!("provider_model_token_pricing.{provider}.{model}"))?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -254,30 +389,68 @@ impl Config {
     }
 
     /// Load config from the default path, or create default if missing.
+    ///
+    /// # Panics
+    ///
+    /// Panics when an existing config cannot be read, parsed, or validated.
+    /// Production entry points should prefer [`Config::try_load`] to surface a
+    /// clean startup error.
     pub fn load() -> Self {
         let path = config_file_path();
         Self::load_from(&path)
     }
 
+    /// Strictly load config from the default path.
+    ///
+    /// A missing file still means first-run defaults. Other I/O failures,
+    /// malformed TOML, and invalid detailed budget pricing are returned to the
+    /// caller so production startup cannot silently fall back to free pricing.
+    pub fn try_load() -> Result<Self, ConfigLoadError> {
+        let path = config_file_path();
+        Self::try_load_from(&path)
+    }
+
     /// Load config from a specific path.
     pub fn load_from(path: &Path) -> Self {
-        match std::fs::read_to_string(path) {
-            // A malformed config is degraded to defaults rather than aborting,
-            // but we warn loudly: silently running with the wrong provider/keys
-            // because of a typo is worse than a visible fallback.
-            Ok(content) => match toml::from_str(&content) {
-                Ok(cfg) => cfg,
-                Err(e) => {
-                    tracing::warn!(
-                        path = %path.display(),
-                        error = %e,
-                        "config file is malformed; falling back to defaults"
-                    );
-                    Self::default()
-                }
-            },
-            Err(_) => Self::default(),
-        }
+        Self::try_load_from(path)
+            .unwrap_or_else(|error| panic!("configuration must be valid: {error}"))
+    }
+
+    /// Parse and validate TOML supplied by an API caller.
+    pub fn from_toml(content: &str) -> Result<Self, ConfigLoadError> {
+        Self::from_toml_at(content, Path::new("<inline>"))
+    }
+
+    /// Strictly load config from `path`; see [`Config::try_load`].
+    pub fn try_load_from(path: &Path) -> Result<Self, ConfigLoadError> {
+        let content = match std::fs::read_to_string(path) {
+            Ok(content) => content,
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Self::default());
+            }
+            Err(source) => {
+                return Err(ConfigLoadError::Read {
+                    path: path.to_path_buf(),
+                    source,
+                });
+            }
+        };
+        Self::from_toml_at(&content, path)
+    }
+
+    fn from_toml_at(content: &str, path: &Path) -> Result<Self, ConfigLoadError> {
+        let config: Self = toml::from_str(content).map_err(|source| ConfigLoadError::Parse {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        config
+            .budgets
+            .validate()
+            .map_err(|message| ConfigLoadError::Budget {
+                path: path.to_path_buf(),
+                message,
+            })?;
+        Ok(config)
     }
 
     /// Save config to the default path.
@@ -288,10 +461,16 @@ impl Config {
 
     /// Save config to a specific path.
     pub fn save_to(&self, path: &Path) -> Result<(), std::io::Error> {
+        self.budgets.validate().map_err(|error| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("invalid budget configuration: {error}"),
+            )
+        })?;
+        let content = toml::to_string_pretty(self).map_err(std::io::Error::other)?;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let content = toml::to_string_pretty(self).map_err(std::io::Error::other)?;
         std::fs::write(path, content)
     }
 
@@ -361,19 +540,21 @@ mod tests {
     }
 
     #[test]
-    fn load_malformed_file_degrades_to_default() {
-        // A corrupt config must not abort startup — it falls back to defaults
-        // (and warns). This pins the graceful-degradation contract.
+    fn compatibility_loader_fails_closed_on_malformed_file() {
         let dir = std::env::temp_dir().join(format!("cfg_bad_{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("config.toml");
         std::fs::write(&path, "this is = not valid toml ][").unwrap();
 
-        let cfg = Config::load_from(&path);
-        assert_eq!(cfg.llm_provider, "azure-openai");
-        assert!(!cfg.setup_complete);
-
+        let result = std::panic::catch_unwind(|| Config::load_from(&path));
         std::fs::remove_dir_all(&dir).ok();
+        let panic = result.expect_err("compatibility loader must fail closed");
+        let message = panic
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| panic.downcast_ref::<&str>().copied())
+            .unwrap_or_default();
+        assert!(message.contains("configuration must be valid"), "{message}");
     }
 
     #[test]
@@ -409,6 +590,223 @@ mod tests {
         assert_eq!(parsed.budgets.agent_tokens_per_min, 12_345);
         assert_eq!(parsed.budgets.max_tool_calls, 7);
         assert_eq!(parsed.budgets.max_concurrent_tool_calls, 2);
+    }
+
+    #[test]
+    fn detailed_token_pricing_roundtrips_and_legacy_toml_stays_compatible() {
+        let mut cfg = Config::default();
+        cfg.budgets.default_token_pricing = Some(TokenPricing {
+            input_usd_per_1k_tokens: 1.0,
+            cached_input_usd_per_1k_tokens: 0.1,
+            output_usd_per_1k_tokens: 2.0,
+        });
+        cfg.budgets.provider_token_pricing.insert(
+            "openai".into(),
+            TokenPricing {
+                input_usd_per_1k_tokens: 3.0,
+                cached_input_usd_per_1k_tokens: 0.3,
+                output_usd_per_1k_tokens: 6.0,
+            },
+        );
+        cfg.budgets
+            .provider_model_token_pricing
+            .entry("openai".into())
+            .or_default()
+            .insert(
+                "gpt-4o".into(),
+                TokenPricing {
+                    input_usd_per_1k_tokens: 4.0,
+                    cached_input_usd_per_1k_tokens: 0.4,
+                    output_usd_per_1k_tokens: 8.0,
+                },
+            );
+
+        let encoded = toml::to_string_pretty(&cfg).unwrap();
+        let parsed: Config = toml::from_str(&encoded).unwrap();
+        assert_eq!(
+            parsed.budgets.default_token_pricing,
+            cfg.budgets.default_token_pricing
+        );
+        assert_eq!(
+            parsed.budgets.provider_token_pricing,
+            cfg.budgets.provider_token_pricing
+        );
+        assert_eq!(
+            parsed.budgets.provider_model_token_pricing,
+            cfg.budgets.provider_model_token_pricing
+        );
+
+        let legacy = r#"
+llm_provider = "local"
+default_model = "m"
+data_dir = "/tmp/x"
+[api_keys]
+[budgets]
+usd_per_1k_tokens = 2.5
+[budgets.provider_pricing]
+openai = 3.5
+"#;
+        let parsed: Config = toml::from_str(legacy).unwrap();
+        assert_eq!(parsed.budgets.usd_per_1k_tokens, 2.5);
+        assert_eq!(parsed.budgets.provider_pricing["openai"], 3.5);
+        assert!(parsed.budgets.default_token_pricing.is_none());
+        assert!(parsed.budgets.provider_token_pricing.is_empty());
+        assert!(parsed.budgets.provider_model_token_pricing.is_empty());
+    }
+
+    #[test]
+    fn detailed_token_pricing_rejects_invalid_values_and_empty_keys() {
+        let mut budgets = BudgetConfig {
+            default_token_pricing: Some(TokenPricing {
+                input_usd_per_1k_tokens: f64::NAN,
+                cached_input_usd_per_1k_tokens: 0.0,
+                output_usd_per_1k_tokens: 0.0,
+            }),
+            ..BudgetConfig::default()
+        };
+        assert!(budgets.validate().unwrap_err().contains("finite"));
+
+        budgets.default_token_pricing = Some(TokenPricing {
+            input_usd_per_1k_tokens: 0.0,
+            cached_input_usd_per_1k_tokens: -0.01,
+            output_usd_per_1k_tokens: 0.0,
+        });
+        assert!(budgets.validate().unwrap_err().contains("non-negative"));
+
+        budgets.default_token_pricing = None;
+        budgets.provider_token_pricing.insert(
+            " ".into(),
+            TokenPricing {
+                input_usd_per_1k_tokens: 0.0,
+                cached_input_usd_per_1k_tokens: 0.0,
+                output_usd_per_1k_tokens: 0.0,
+            },
+        );
+        assert!(budgets.validate().unwrap_err().contains("empty provider"));
+
+        let mut budgets = BudgetConfig {
+            max_usd: f64::INFINITY,
+            ..BudgetConfig::default()
+        };
+        assert!(budgets.validate().unwrap_err().contains("max_usd"));
+        budgets.max_usd = 0.0;
+        budgets.provider_pricing.insert("legacy".into(), -1.0);
+        assert!(budgets
+            .validate()
+            .unwrap_err()
+            .contains("provider_pricing.legacy"));
+        budgets.provider_pricing.clear();
+        budgets.provider_model_token_pricing.insert(
+            "provider".into(),
+            HashMap::from([(
+                " ".into(),
+                TokenPricing {
+                    input_usd_per_1k_tokens: 0.0,
+                    cached_input_usd_per_1k_tokens: 0.0,
+                    output_usd_per_1k_tokens: 0.0,
+                },
+            )]),
+        );
+        assert!(budgets.validate().unwrap_err().contains("empty model"));
+    }
+
+    #[test]
+    fn strict_loader_rejects_malformed_or_invalid_detailed_pricing() {
+        let dir = std::env::temp_dir().join(format!("cfg_pricing_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+llm_provider = "local"
+default_model = "m"
+data_dir = "/tmp/x"
+[api_keys]
+[budgets.default_token_pricing]
+input_usd_per_1k_tokens = -1.0
+cached_input_usd_per_1k_tokens = 0.1
+output_usd_per_1k_tokens = 2.0
+"#,
+        )
+        .unwrap();
+        let error = Config::try_load_from(&path).unwrap_err().to_string();
+        assert!(error.contains("invalid budget configuration"), "{error}");
+
+        std::fs::write(
+            &path,
+            r#"
+llm_provider = "local"
+default_model = "m"
+data_dir = "/tmp/x"
+[api_keys]
+[budgets.default_token_pricing]
+input_usd_per_1k_tokens = 1.0
+"#,
+        )
+        .unwrap();
+        let error = Config::try_load_from(&path).unwrap_err().to_string();
+        assert!(error.contains("invalid config file"), "{error}");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn strict_loader_defaults_only_for_missing_file_and_rejects_unknown_or_infinite_prices() {
+        let missing =
+            std::env::temp_dir().join(format!("cfg_missing_{}/config.toml", uuid::Uuid::new_v4()));
+        let cfg = Config::try_load_from(&missing).unwrap();
+        assert_eq!(cfg.llm_provider, Config::default().llm_provider);
+
+        let unknown = r#"
+llm_provider = "local"
+default_model = "m"
+data_dir = "/tmp/x"
+[api_keys]
+[budgets]
+usd_per_1k_toknes = 1.0
+"#;
+        let error = Config::from_toml(unknown).unwrap_err().to_string();
+        assert!(error.contains("unknown field"), "{error}");
+
+        let unknown_detailed = r#"
+llm_provider = "local"
+default_model = "m"
+data_dir = "/tmp/x"
+[api_keys]
+[budgets.default_token_pricing]
+input_usd_per_1k_tokens = 1.0
+cached_input_usd_per_1k_tokens = 0.1
+output_usd_per_1k_tokens = 2.0
+output_usd_per_million_tokens = 2000.0
+"#;
+        let error = Config::from_toml(unknown_detailed).unwrap_err().to_string();
+        assert!(error.contains("unknown field"), "{error}");
+
+        let infinite = r#"
+llm_provider = "local"
+default_model = "m"
+data_dir = "/tmp/x"
+[api_keys]
+[budgets]
+usd_per_1k_tokens = inf
+"#;
+        let error = Config::from_toml(infinite).unwrap_err().to_string();
+        assert!(error.contains("finite"), "{error}");
+    }
+
+    #[test]
+    fn invalid_budget_config_cannot_overwrite_an_existing_file() {
+        let dir = std::env::temp_dir().join(format!("cfg_save_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(&path, "keep me").unwrap();
+        let mut cfg = Config::default();
+        cfg.budgets.max_usd = f64::NAN;
+
+        let error = cfg.save_to(&path).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "keep me");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

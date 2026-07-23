@@ -109,7 +109,8 @@ async fn main() {
 
     // Install structured logging first so kernel init (persistence/auth) logs emit.
     logging::init_logging();
-    let config = Config::load();
+    let config = Config::try_load()
+        .unwrap_or_else(|error| fail(format!("failed to load configuration: {error}")));
     // Startup failures (unwritable data dir, corrupt DB, unreachable provider)
     // degrade to a clear message + non-zero exit rather than a panic backtrace.
     let kernel = match AgentKernelImpl::from_config(&config) {

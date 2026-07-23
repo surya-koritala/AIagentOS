@@ -70,7 +70,14 @@ async fn main() {
         }
     }
 
-    let config = Config::load();
+    let config = match Config::try_load() {
+        Ok(config) => config,
+        Err(error) => {
+            tracing::error!(error = %error, "failed to load configuration");
+            eprintln!("agent-server: failed to load configuration: {error}");
+            std::process::exit(1);
+        }
+    };
     // Kernel init can fail on a non-writable/locked data dir or a corrupt DB.
     // Degrade to a clear, actionable message and a non-zero exit instead of an
     // un-actionable panic backtrace.

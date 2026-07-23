@@ -1,48 +1,46 @@
-name: release
+name: Release qualification and publication
 
 on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
 
 permissions:
-  contents: write
-  id-token: write
-  attestations: write
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
   CARGO_PROFILE_RELEASE_CODEGEN_UNITS: 1
+  ARTIFACT_VERSION: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || format('qualification-{0}', github.run_number) }}
 
 jobs:
-  gate:
-    name: tagged-commit quality gate
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo fmt --all -- --check
-      - run: cargo clippy --workspace --exclude tauri-app --all-targets --locked -- -D warnings
-      - run: cargo test --workspace --exclude tauri-app --locked
-      - run: cargo test -p integration-tests capability_registry --locked
+  required-ci:
+    name: Full release-blocking CI
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+      checks: write
 
   wedge:
-    name: governed-execution acceptance
-    needs: gate
+    name: Governed-execution acceptance
+    needs: required-ci
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo run --release --locked --package os-benchmark --bin governance-demo
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
+        with:
+          toolchain: 1.97.1
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - name: Reject any unexpected governance result
+        run: cargo run --release --locked --package os-benchmark --bin governance-demo
 
   release-artifacts:
-    name: reproducible binaries (${{ matrix.target }})
-    needs: gate
+    name: Reproducible binaries (${{ matrix.target }})
+    needs: required-ci
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -50,7 +48,7 @@ jobs:
           - runner: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             extension: ""
-          - runner: macos-13
+          - runner: macos-15-intel
             target: x86_64-apple-darwin
             extension: ""
           - runner: windows-latest
@@ -61,11 +59,12 @@ jobs:
       run:
         shell: bash
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
         with:
+          toolchain: 1.97.1
           targets: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - name: Set deterministic build inputs
         run: |
           echo "SOURCE_DATE_EPOCH=$(git show -s --format=%ct HEAD)" >> "$GITHUB_ENV"
@@ -86,7 +85,7 @@ jobs:
           for binary in agent agent-server agent-tui; do
             cp "target-a/${{ matrix.target }}/release/${binary}${{ matrix.extension }}" dist/stage/
           done
-          artifact="agentos-${GITHUB_REF_NAME}-${{ matrix.target }}.zip"
+          artifact="agentos-${ARTIFACT_VERSION}-${{ matrix.target }}.zip"
           python - "$artifact" <<'PY'
           import pathlib, stat, sys, zipfile
           name = sys.argv[1]
@@ -99,12 +98,12 @@ jobs:
                   info.compress_type = zipfile.ZIP_DEFLATED
                   archive.writestr(info, path.read_bytes())
           PY
-      - uses: anchore/sbom-action/download-syft@v0
+      - uses: anchore/sbom-action/download-syft@e22cdb60f63e1f740928f3e5d4a9e7e219cd77a9 # v0
       - name: Generate CycloneDX SBOM
         run: |
-          artifact="agentos-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          artifact="agentos-${ARTIFACT_VERSION}-${{ matrix.target }}"
           syft dir:dist/stage -o "cyclonedx-json=dist/${artifact}.cdx.json"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: release-${{ matrix.target }}
           path: |
@@ -113,19 +112,20 @@ jobs:
           if-no-files-found: error
 
   container:
-    name: container artifact
-    needs: gate
+    name: Container qualification
+    needs: required-ci
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
-      - name: Build agent-server image
-        run: docker build --pull -t agentos:${{ github.ref_name }} .
-      - name: Verify non-root boot and syscall health
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Build pinned-base agent-server image
+        run: docker build --pull -t agentos:${ARTIFACT_VERSION} .
+      - name: Verify non-root boot and durable application data
         run: |
           docker volume create agentos-release-data
           docker run -d --name agentos-release -p 127.0.0.1:7777:7777 \
             -e AGENT_SERVER_ALLOW_INSECURE_REMOTE=1 -v agentos-release-data:/data \
-            agentos:${{ github.ref_name }} agent-server 0.0.0.0:7777
+            agentos:${ARTIFACT_VERSION} agent-server 0.0.0.0:7777
           for i in $(seq 1 30); do
             if printf '{"op":"node_info"}\n' | nc -w2 127.0.0.1 7777 | grep -q '"status":"node_info"'; then
               healthy=1
@@ -135,16 +135,29 @@ jobs:
           done
           test "${healthy:-0}" = "1"
           test "$(docker exec agentos-release id -u)" = "10001"
-          docker exec agentos-release sh -c 'printf persistence-proof > /data/persistence-proof'
+          create_reply="$(printf '{"op":"create_agent","name":"release-persistence","task":"qualification","provider":"stub","profile":"standard","priority":3}\n' | nc -w5 127.0.0.1 7777)"
+          agent_id="$(jq -er 'select(.status == "agent_created") | .id' <<< "$create_reply")"
+          put_reply="$(printf '{"op":"storage_put","agent_id":"%s","key":"release-proof","value":"survived"}\n' "$agent_id" | nc -w5 127.0.0.1 7777)"
+          test "$(jq -r .status <<< "$put_reply")" = "storage_ok"
           docker restart agentos-release
-          docker exec agentos-release test -f /data/persistence-proof
-      - uses: anchore/sbom-action/download-syft@v0
+          for i in $(seq 1 30); do
+            if printf '{"op":"node_info"}\n' | nc -w2 127.0.0.1 7777 | grep -q '"status":"node_info"'; then
+              restarted=1
+              break
+            fi
+            sleep 1
+          done
+          test "${restarted:-0}" = "1"
+          get_reply="$(printf '{"op":"storage_get","agent_id":"%s","key":"release-proof"}\n' "$agent_id" | nc -w5 127.0.0.1 7777)"
+          test "$(jq -r .status <<< "$get_reply")" = "storage_value"
+          test "$(jq -r .value <<< "$get_reply")" = "survived"
+      - uses: anchore/sbom-action/download-syft@e22cdb60f63e1f740928f3e5d4a9e7e219cd77a9 # v0
       - name: Generate container SPDX SBOM
-        run: syft agentos:${{ github.ref_name }} -o spdx-json=agentos-${{ github.ref_name }}-container.spdx.json
-      - uses: actions/upload-artifact@v4
+        run: syft agentos:${ARTIFACT_VERSION} -o spdx-json=agentos-${ARTIFACT_VERSION}-container.spdx.json
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: release-container
-          path: agentos-${{ github.ref_name }}-container.spdx.json
+          path: agentos-${{ env.ARTIFACT_VERSION }}-container.spdx.json
           if-no-files-found: error
       - name: Diagnostics and cleanup
         if: always()
@@ -153,13 +166,17 @@ jobs:
           docker rm -f agentos-release || true
           docker volume rm agentos-release-data || true
 
-  publish:
-    name: attest, sign, and publish release
-    needs: [gate, wedge, release-artifacts, container]
+  assemble:
+    name: Checksums, signatures, and provenance
+    needs: [required-ci, wedge, release-artifacts, container]
     runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           pattern: release-*
           path: dist
@@ -167,18 +184,38 @@ jobs:
       - name: Generate SHA-256 manifest
         working-directory: dist
         run: sha256sum *.zip *.json > SHA256SUMS
-      - uses: sigstore/cosign-installer@v3
+      - uses: sigstore/cosign-installer@398d4b0eeef75a7bf63e34d76f9d524ffc64980c # v3
       - name: Keyless-sign every artifact and checksum manifest
         run: |
           for asset in dist/*.zip dist/*.json dist/SHA256SUMS; do
             cosign sign-blob --yes --bundle "${asset}.sigstore.json" "$asset"
           done
-      - uses: actions/attest-build-provenance@v2
+      - uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
         with:
           subject-path: |
             dist/*.zip
-            dist/*.json
+            dist/*.cdx.json
+            dist/*-container.spdx.json
             dist/SHA256SUMS
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: qualified-release-bundle
+          path: dist
+          if-no-files-found: error
+
+  publish:
+    name: Publish tagged GitHub release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: assemble
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: qualified-release-bundle
+          path: dist
       - name: Extract matching changelog section
         run: |
           version="${GITHUB_REF_NAME#v}"
@@ -188,7 +225,7 @@ jobs:
             grab {print}
           ' CHANGELOG.md > RELEASE_NOTES.md
           test -s RELEASE_NOTES.md
-      - name: Create immutable GitHub release
+      - name: Create GitHub release from the existing tag
         env:
           GH_TOKEN: ${{ github.token }}
         run: |

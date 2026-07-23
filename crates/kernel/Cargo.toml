@@ -3,6 +3,7 @@ name = "kernel"
 version = "0.3.0"
 edition = "2021"
 license.workspace = true
+rust-version.workspace = true
 
 [dependencies]
 tokio = { workspace = true }
@@ -26,6 +27,12 @@ libc = "0.2"
 tokio-rustls = { workspace = true }
 rustls = { workspace = true }
 ring = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Storage_FileSystem",
+    "Win32_System_SystemInformation",
+] }
 
 [dev-dependencies]
 proptest = { workspace = true }

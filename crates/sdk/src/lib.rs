@@ -14,7 +14,7 @@
 //! * [`KernelClient`] — a typed wrapper that maps each [`Syscall`] variant to an
 //!   async method and folds [`SyscallReply::Error`] into a [`Result<_, SdkError>`].
 //! * [`Agent`] — a builder (`Agent::builder()`) that creates an agent on the
-//!   kernel and hands back a [`AgentHandle`] with `.send(..)` / `.call_tool(..)`.
+//!   kernel and exposes `.send(..)` / `.call_tool(..)`.
 //!
 //! ## Example
 //!
@@ -106,7 +106,7 @@ pub enum SdkError {
     },
 }
 
-/// Result of a [`KernelClient::send_message`] / [`AgentHandle::send`] turn.
+/// Result of a [`KernelClient::send_message`] / [`Agent::send`] turn.
 #[derive(Debug, Clone)]
 pub struct MessageResult {
     /// The agent's textual output for the turn.
@@ -526,7 +526,7 @@ impl KernelClient {
     }
 
     /// Read a kernel node's load/health (agent counts) — used by
-    /// [`ClusterClient`](crate::cluster::ClusterClient) for placement.
+    /// [`ClusterClient`] for placement.
     pub async fn node_info(&mut self) -> Result<NodeLoad, SdkError> {
         match self.call(Syscall::NodeInfo).await? {
             SyscallReply::NodeInfo {

@@ -15,6 +15,7 @@ resolver = "2"
 
 [workspace.package]
 license = "AGPL-3.0-only"
+rust-version = "1.97"
 
 [workspace.dependencies]
 tokio = { version = "1", features = ["full"] }

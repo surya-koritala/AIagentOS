@@ -75,7 +75,7 @@
   .sidebar { width: 220px; background: #12121f; border-right: 1px solid #1e1e33; display: flex; flex-direction: column; }
   .logo { display: flex; align-items: center; gap: 0.5rem; padding: 1.25rem 1rem; border-bottom: 1px solid #1e1e33; }
   .logo-icon { font-size: 1.2rem; }
-  .logo-text { font-weight: 700; font-size: 1rem; background: linear-gradient(135deg, #4a90d9, #a855f7); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
+  .logo-text { font-weight: 700; font-size: 1rem; background: linear-gradient(135deg, #4a90d9, #a855f7); background-clip: text; -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
   nav { padding: 0.75rem 0.5rem; }
   .nav-item { display: flex; align-items: center; gap: 0.5rem; width: 100%; padding: 0.5rem 0.75rem; border-radius: 8px; border: none; background: transparent; color: #999; cursor: pointer; font-size: 0.85rem; }
   .nav-item:hover { background: #1a1a2e; color: #ddd; }

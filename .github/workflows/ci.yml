@@ -5,6 +5,7 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  workflow_call:
 
 permissions:
   contents: read
@@ -19,17 +20,20 @@ jobs:
     name: Blocking Rust quality and contract checks
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
         with:
+          toolchain: 1.97.1
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - name: Formatting
         run: cargo fmt --all -- --check
       - name: Clippy (warnings are errors)
         run: cargo clippy --workspace --exclude tauri-app --all-targets -- -D warnings
       - name: Capability and public-claim contract
         run: cargo test -p integration-tests capability_registry --locked
+      - name: Critical coverage verifier regressions
+        run: python -m unittest discover -s scripts/tests -p "test_*.py"
       - name: Below-production retained capabilities have open qualification work
         env:
           GH_TOKEN: ${{ github.token }}
@@ -61,6 +65,15 @@ jobs:
           done
       - name: Documentation tests
         run: cargo test --workspace --exclude tauri-app --doc --locked
+      - name: Rustdoc warnings are errors
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --workspace --exclude tauri-app --no-deps --locked
+      - uses: taiki-e/install-action@c44f6b046f1c29ae5918b1e0bfdbb2f1813836fd
+        with:
+          tool: mdbook@0.4.52
+      - name: Documentation book builds
+        run: mdbook build docs
       - name: All-feature compilation
         run: cargo build --workspace --exclude tauri-app --all-features --locked
 
@@ -73,11 +86,41 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
+        with:
+          toolchain: 1.97.1
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - name: Deterministic unit and integration tests
         run: cargo test --workspace --exclude tauri-app --locked
+
+  desktop-platforms:
+    name: Desktop Rust warnings (${{ matrix.os }})
+    needs: [quality, frontend]
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
+        with:
+          toolchain: 1.97.1
+          components: clippy
+      - name: Install Linux desktop prerequisites
+        if: runner.os == 'Linux'
+        run: >-
+          sudo apt-get update && sudo apt-get install -y
+          libgtk-3-dev libwebkit2gtk-4.1-dev
+          libayatana-appindicator3-dev librsvg2-dev
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: tauri-ui-dist
+          path: crates/tauri-app/ui/dist
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - name: Tauri command and backend warnings are errors
+        run: cargo clippy -p tauri-app --all-targets --locked -- -D warnings
 
   frontend:
     name: Frontend build and vulnerability gate
@@ -86,47 +129,59 @@ jobs:
       run:
         working-directory: crates/tauri-app/ui
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
-          node-version: 22
+          node-version: 22.12.0
           cache: npm
           cache-dependency-path: crates/tauri-app/ui/package-lock.json
       - name: Locked dependency install
         run: npm ci
       - name: Reject high or critical advisories
         run: npm audit --audit-level=high
+      - name: Svelte types and accessibility warnings are errors
+        run: npm run check
       - name: Production frontend build
         run: npm run build
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: tauri-ui-dist
+          path: crates/tauri-app/ui/dist
+          if-no-files-found: error
 
   rust-supply-chain:
     name: Rust advisory, license, and source policy
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: rustsec/audit-check@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-      - uses: EmbarkStudios/cargo-deny-action@v2
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
         with:
           command: check
-          command-arguments: advisories licenses sources
+          command-arguments: advisories bans licenses sources
 
   coverage:
     name: Coverage floor
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
         with:
+          toolchain: 1.97.1
           components: llvm-tools-preview
-      - uses: taiki-e/install-action@cargo-llvm-cov
-      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@c44f6b046f1c29ae5918b1e0bfdbb2f1813836fd
+        with:
+          tool: cargo-llvm-cov@0.8.7
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - name: Enforce workspace line coverage floor
         run: >-
           cargo llvm-cov --workspace --exclude tauri-app --all-targets --locked
           --lcov --output-path lcov.info --fail-under-lines 60 -- --test-threads=1
-      - uses: actions/upload-artifact@v4
+      - name: Enforce release-critical subsystem floors
+        run: python scripts/check_critical_coverage.py lcov.info
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: rust-lcov
           path: lcov.info
@@ -135,7 +190,7 @@ jobs:
     name: Container startup, health, persistence, and non-root
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Build image
         run: docker build --pull -t agentos:ci .
       - name: Verify configured non-root identity
@@ -157,16 +212,24 @@ jobs:
           test "$(docker exec agentos-ci id -u)" = "10001"
       - name: Verify persistent data survives restart
         run: |
-          docker exec agentos-ci sh -c 'printf persistence-proof > /data/persistence-proof'
+          create_reply="$(printf '{"op":"create_agent","name":"persistence","task":"ci","provider":"stub","profile":"standard","priority":3}\n' | nc -w5 127.0.0.1 7777)"
+          agent_id="$(jq -er 'select(.status == "agent_created") | .id' <<< "$create_reply")"
+          put_reply="$(printf '{"op":"storage_put","agent_id":"%s","key":"ci-proof","value":"survived"}\n' "$agent_id" | nc -w5 127.0.0.1 7777)"
+          test "$(jq -r .status <<< "$put_reply")" = "storage_ok"
+          printf '%s' "$agent_id" > /tmp/agentos-ci-agent-id
           docker restart agentos-ci
           for i in $(seq 1 30); do
-            if docker exec agentos-ci test -f /data/persistence-proof; then
-              persisted=1
+            if printf '{"op":"node_info"}\n' | nc -w2 127.0.0.1 7777 | grep -q '"status":"node_info"'; then
+              healthy_after_restart=1
               break
             fi
             sleep 1
           done
-          test "${persisted:-0}" = "1"
+          test "${healthy_after_restart:-0}" = "1"
+          agent_id="$(cat /tmp/agentos-ci-agent-id)"
+          get_reply="$(printf '{"op":"storage_get","agent_id":"%s","key":"ci-proof"}\n' "$agent_id" | nc -w5 127.0.0.1 7777)"
+          test "$(jq -r .status <<< "$get_reply")" = "storage_value"
+          test "$(jq -r .value <<< "$get_reply")" = "survived"
       - name: Diagnostics
         if: always()
         run: |
@@ -180,6 +243,7 @@ jobs:
     needs:
       - quality
       - rust-platforms
+      - desktop-platforms
       - frontend
       - rust-supply-chain
       - coverage

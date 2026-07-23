@@ -8,7 +8,7 @@ Thank you for your interest in contributing! This project is open source and we 
 2. Clone your fork: `git clone https://github.com/YOUR_USERNAME/AIagentOS.git`
 3. Create a branch: `git checkout -b feature/your-feature`
 4. Make your changes
-5. Run tests: `cargo test`
+5. Run the relevant tests, then `./scripts/ci-local.sh` before requesting review
 6. Commit: `git commit -m "feat: your feature description"`
 7. Push: `git push origin feature/your-feature`
 8. Open a Pull Request
@@ -17,8 +17,9 @@ Thank you for your interest in contributing! This project is open source and we 
 
 ### Prerequisites
 
-- Rust 1.75+ (install via [rustup](https://rustup.rs/))
-- Node.js 18+ (for the Svelte frontend)
+- Rust 1.97+ (the repository pins 1.97.1 in `rust-toolchain.toml`)
+- Node.js 22.12+ (required by the current Vite/Svelte frontend)
+- `mdbook`, `cargo-deny`, and `cargo-llvm-cov` for the complete local preflight
 - Linux: `sudo apt install libgtk-3-dev libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev`
 
 ### Building
@@ -27,6 +28,7 @@ Thank you for your interest in contributing! This project is open source and we 
 cargo build                    # Build all crates
 cargo test                     # Run all tests
 cargo test --package kernel    # Test specific crate
+./scripts/ci-local.sh          # Reproduce host-compatible release gates
 ```
 
 ### Project Structure
@@ -115,11 +117,20 @@ We use [Conventional Commits](https://www.conventionalcommits.org/):
 - **Adapter tests**: In `crates/adapters/src/*_tests.rs` — wiremock API mocking
 
 Run specific test suites:
+
 ```bash
 cargo test --package kernel execution    # Execution loop tests
 cargo test --package adapters            # Adapter tests
 cargo test --package integration-tests   # Property + E2E tests
 ```
+
+The deterministic suite never calls a live LLM provider and may bind an
+ephemeral loopback port for mock HTTP/TCP servers. Secret-backed provider
+qualification is deliberately separate from pull-request CI. GitHub Actions
+adds the Linux/macOS/Windows matrices, protected-branch issue-state check,
+container persistence proof, scheduled Miri/ASan/fuzz jobs, and signed release
+qualification. The manual live-provider workflow uses a protected environment
+and is never triggered by an untrusted pull request.
 
 ## Questions?
 

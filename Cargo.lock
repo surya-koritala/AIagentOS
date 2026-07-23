@@ -3332,6 +3332,7 @@ dependencies = [
  "tracing",
  "uuid",
  "wasmtime",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

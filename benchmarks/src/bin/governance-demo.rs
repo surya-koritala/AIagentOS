@@ -78,6 +78,11 @@ fn denied(reason: &str) {
     println!("      → DENIED   ({reason})  [contained]");
 }
 
+fn fail_acceptance(detail: impl std::fmt::Display) -> ! {
+    eprintln!("governed-execution acceptance failed: {detail}");
+    std::process::exit(2);
+}
+
 fn audit_line(e: &AuditEvent) {
     let decision = match e.decision {
         AuditDecision::Allowed => "ALLOW",
@@ -174,7 +179,7 @@ async fn main() {
                 allowed("read needs no capability");
                 tally.compliant_succeeded += 1;
             }
-            Err(e) => denied(&e.message()),
+            Err(error) => fail_acceptance(format!("{name} baseline read was denied: {error:?}")),
         }
     }
     println!();
@@ -191,8 +196,10 @@ async fn main() {
             denied("no CAP_FILE_WRITE — broker never invoked");
             tally.violations_contained += 1;
         }
-        Ok(_) => println!("      !! unexpected: capability-denied write was admitted"),
-        Err(other) => println!("      !! unexpected: {other:?}"),
+        Ok(_) => fail_acceptance("capability-denied write was admitted"),
+        Err(other) => fail_acceptance(format!(
+            "capability containment returned the wrong denial: {other:?}"
+        )),
     }
     println!();
 
@@ -207,8 +214,10 @@ async fn main() {
             denied("one active tool slot is already occupied");
             tally.violations_contained += 1;
         }
-        Ok(_) => println!("      !! unexpected: second tool slot was admitted"),
-        Err(other) => println!("      !! unexpected: {other:?}"),
+        Ok(_) => fail_acceptance("second tool slot was admitted"),
+        Err(other) => fail_acceptance(format!(
+            "cgroup containment returned the wrong denial: {other:?}"
+        )),
     }
     drop(held);
     act("funded", "start an independent tool call");
@@ -217,7 +226,7 @@ async fn main() {
             allowed("independent cgroup capacity — peer unaffected");
             tally.compliant_succeeded += 1;
         }
-        Err(other) => println!("      !! unexpected: {other:?}"),
+        Err(other) => fail_acceptance(format!("independent cgroup capacity was denied: {other:?}")),
     }
     println!();
 
@@ -250,7 +259,9 @@ async fn main() {
             denied("NotInNamespace (≈ ENOENT) — tool is invisible");
             tally.violations_contained += 1;
         }
-        other => println!("      !! unexpected: {other:?}"),
+        other => fail_acceptance(format!(
+            "namespace containment returned an unexpected result: {other:?}"
+        )),
     }
     act("operator", "rotate_secrets /vault/key");
     match kernel
@@ -268,7 +279,7 @@ async fn main() {
             allowed("member of secure-ops — same tool resolves");
             tally.compliant_succeeded += 1;
         }
-        other => println!("      !! unexpected: {other:?}"),
+        other => fail_acceptance(format!("authorized namespace member was denied: {other:?}")),
     }
     println!();
 
@@ -302,7 +313,9 @@ async fn main() {
             denied("MAC policy: write under /etc forbidden");
             tally.violations_contained += 1;
         }
-        other => println!("      !! unexpected: {other:?}"),
+        other => fail_acceptance(format!(
+            "MAC containment returned an unexpected result: {other:?}"
+        )),
     }
     println!();
 
@@ -318,7 +331,9 @@ async fn main() {
             allowed("outside /etc, has the capability");
             tally.compliant_succeeded += 1;
         }
-        other => println!("      !! unexpected: {other:?}"),
+        other => fail_acceptance(format!(
+            "compliant operator write returned an unexpected result: {other:?}"
+        )),
     }
     act("funded", "write_file /workspace/data.txt");
     match kernel
@@ -330,7 +345,9 @@ async fn main() {
             allowed("no global lockout from another agent's violation");
             tally.compliant_succeeded += 1;
         }
-        other => println!("      !! unexpected: {other:?}"),
+        other => fail_acceptance(format!(
+            "compliant funded write returned an unexpected result: {other:?}"
+        )),
     }
     println!();
 
@@ -346,12 +363,38 @@ async fn main() {
         stats.denied_mac,
     );
     let events = sink.events();
-    if events.is_empty() {
-        println!("  (no MAC-stage audit events — cap/cgroup/ns denials are counter-only)");
-    } else {
-        for e in &events {
-            audit_line(e);
-        }
+    for e in &events {
+        audit_line(e);
+    }
+    if stats.allowed != 8
+        || stats.denied_capability != 1
+        || stats.denied_cgroup != 1
+        || stats.denied_namespace != 1
+        || stats.denied_mac != 1
+    {
+        fail_acceptance(format!(
+            "gate counters drifted: allowed={}, capability={}, cgroup={}, namespace={}, mac={}",
+            stats.allowed,
+            stats.denied_capability,
+            stats.denied_cgroup,
+            stats.denied_namespace,
+            stats.denied_mac
+        ));
+    }
+    if events.len() != 1
+        || !matches!(
+            &events[0],
+            AuditEvent {
+                action: "write",
+                tool,
+                decision: AuditDecision::Denied,
+                ..
+            } if tool == "write_file"
+        )
+    {
+        fail_acceptance(format!(
+            "expected one audited MAC write denial, observed {events:?}"
+        ));
     }
     println!();
 
@@ -361,6 +404,12 @@ async fn main() {
     println!();
 
     // ── Summary ─────────────────────────────────────────────────────────────────
+    if tally.violations_contained != 4 || tally.compliant_succeeded != 9 {
+        fail_acceptance(format!(
+            "expected 4 contained violations and 9 compliant successes, observed {} and {}",
+            tally.violations_contained, tally.compliant_succeeded
+        ));
+    }
     rule("════════════════════════════════════════════════════════════════════");
     println!(
         "  SUMMARY: {} violations contained, {} compliant calls succeeded.",
@@ -369,8 +418,8 @@ async fn main() {
     println!("  Isolation held: no agent's violation took the others down.");
     rule("════════════════════════════════════════════════════════════════════");
 
-    if let Err(e) = kernel.shutdown().await {
-        eprintln!("shutdown error: {e}");
+    if let Err(error) = kernel.shutdown().await {
+        fail_acceptance(format!("kernel shutdown failed: {error}"));
     }
 }
 

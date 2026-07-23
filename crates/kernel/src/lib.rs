@@ -3248,9 +3248,10 @@ impl AgentKernelImpl {
 
     /// Spawn the kernel's scheduler observer, which publishes the CFS pick to
     /// procfs as `current_agent`. Durable fixed-epoch quota windows need no
-    /// background reset timer. Returns the [`KernelRuntime`] so the caller can
-    /// `stop()` it on shutdown. Calling twice spawns two observers, so call
-    /// once at startup.
+    /// background reset timer. Returns the
+    /// [`KernelRuntime`](crate::runtime::KernelRuntime) so the caller can
+    /// `stop()` it on shutdown. Calling twice spawns two observers, so call once
+    /// at startup.
     pub fn start_runtime(self: &Arc<Self>) -> crate::runtime::KernelRuntime {
         let runtime = crate::runtime::KernelRuntime::new(self.clone());
         let _handles = runtime.start();

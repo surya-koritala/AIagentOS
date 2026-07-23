@@ -3,6 +3,7 @@ name = "agent-tui"
 version = "0.3.0"
 edition = "2021"
 license.workspace = true
+rust-version.workspace = true
 description = "Rust terminal UI for observing and driving AI Agent OS over the syscall server"
 
 [[bin]]
@@ -10,10 +11,10 @@ name = "agent-tui"
 path = "src/main.rs"
 
 [dependencies]
-agent-sdk = { path = "../sdk" }
+agent-sdk = { path = "../sdk", version = "=0.3.0" }
 tokio = { workspace = true }
 serde_json = { workspace = true }
 ratatui = "0.30.2"
 
 [dev-dependencies]
-kernel = { path = "../kernel" }
+kernel = { path = "../kernel", version = "=0.3.0" }

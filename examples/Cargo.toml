@@ -3,14 +3,15 @@ name = "cli-test"
 version = "0.3.0"
 edition = "2021"
 license.workspace = true
+rust-version.workspace = true
 
 [[bin]]
 name = "cli-test"
 path = "cli_test.rs"
 
 [dependencies]
-kernel = { path = "../crates/kernel" }
-adapters = { path = "../crates/adapters" }
+kernel = { path = "../crates/kernel", version = "=0.3.0" }
+adapters = { path = "../crates/adapters", version = "=0.3.0" }
 tokio = { version = "1", features = ["full"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 dirs = "5"

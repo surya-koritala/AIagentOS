@@ -2,7 +2,8 @@
 
 ## Prerequisites
 
-- **Rust** stable, MSRV 1.75+ (the whole stack is Rust — no other runtimes).
+- **Rust 1.97+**; the repository pins Rust 1.97.1 for reproducible CI.
+- **Node.js 22.12+** when building the Svelte desktop frontend.
 - An **LLM API key** if you want real model turns. Supported providers: Azure
   OpenAI (default), OpenAI, Anthropic, local Ollama, plus Groq, Deepseek, Gemini,
   vLLM, and HuggingFace. Many non-LLM paths work keyless.
@@ -17,11 +18,16 @@ cargo build --release
 
 ## Run the tests
 
-CI runs exactly this (the desktop app is excluded because it needs system libs):
+The main deterministic Rust suite is:
 
 ```bash
-cargo test --workspace --exclude tauri-app
+cargo test --workspace --exclude tauri-app --locked
 ```
+
+It does not call live providers, but mock HTTP/TCP tests bind ephemeral
+loopback ports. Run `./scripts/ci-local.sh` for the full host-compatible
+preflight. GitHub Actions separately proves every supported runner, the
+desktop, dependency policy, critical coverage floors, and the container.
 
 Useful filters:
 

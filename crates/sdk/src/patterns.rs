@@ -1,5 +1,5 @@
-//! Reusable agent **patterns** built on top of [`KernelClient`](crate::KernelClient)
-//! and [`Agent`](crate::Agent) — Rust building blocks for orchestrating agents
+//! Reusable agent **patterns** built on top of [`crate::KernelClient`]
+//! and [`Agent`] — Rust building blocks for orchestrating agents
 //! against the kernel, so you compose agent behaviour in Rust rather than reaching
 //! for an external framework.
 //!

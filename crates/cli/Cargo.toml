@@ -3,6 +3,7 @@ name = "agent-cli"
 version = "0.3.0"
 edition = "2021"
 license.workspace = true
+rust-version.workspace = true
 
 [[bin]]
 name = "agent"
@@ -19,9 +20,9 @@ default = []
 candle = ["adapters/candle"]
 
 [dependencies]
-kernel = { path = "../kernel" }
-agent-sdk = { path = "../sdk" }
-adapters = { path = "../adapters" }
+kernel = { path = "../kernel", version = "=0.3.0" }
+agent-sdk = { path = "../sdk", version = "=0.3.0" }
+adapters = { path = "../adapters", version = "=0.3.0" }
 tokio = { version = "1", features = ["full"] }
 serde_json = { workspace = true }
 dirs = "5"

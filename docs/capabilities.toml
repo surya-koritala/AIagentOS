@@ -101,12 +101,12 @@ maturity = "unit-tested"
 release = "v0.4"
 tracking_issue = 110
 kernel_modules = ["config", "prerequisites"]
-source_paths = [".github/workflows/ci.yml", ".github/workflows/release.yml"]
+source_paths = [".github/workflows/ci.yml", ".github/workflows/extended-security.yml", ".github/workflows/live-provider-qualification.yml", ".github/workflows/release.yml", "Dockerfile", "scripts/check_critical_coverage.py"]
 public_entry_points = [".github/workflows/ci.yml"]
 runtime_call_paths = []
-test_evidence = ["crates/kernel/src/prerequisites.rs"]
+test_evidence = ["crates/kernel/src/prerequisites.rs", "scripts/tests/test_check_critical_coverage.py", "tests/src/capability_registry.rs"]
 platforms = ["linux", "macos", "windows"]
-limitations = ["The repository does not yet have a complete protected cross-platform, dependency, fuzz, artifact, and supply-chain gate."]
+limitations = ["The complete gate is implemented and locally validated, but remains unit-tested until protected-branch, cross-platform, scheduled-security, container, and signed qualification workflows succeed remotely."]
 
 [[capability]]
 id = "sandbox-isolation"

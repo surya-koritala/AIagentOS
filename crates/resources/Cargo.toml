@@ -3,6 +3,7 @@ name = "resources"
 version = "0.3.0"
 edition = "2021"
 license.workspace = true
+rust-version.workspace = true
 
 [features]
 # Default lean: kernel + filesystem + network + application providers.
@@ -14,7 +15,7 @@ browser = ["dep:chromiumoxide", "dep:futures"]
 web = ["dep:scraper"]
 
 [dependencies]
-kernel = { path = "../kernel" }
+kernel = { path = "../kernel", version = "=0.3.0" }
 tokio = { workspace = true }
 async-trait = { workspace = true }
 serde = { workspace = true }

@@ -1,0 +1,6 @@
+paths:
+  .github/workflows/release.yml:
+    # GitHub added this standard Intel label after actionlint 1.7.7's runner
+    # catalog was published.
+    ignore:
+      - 'label "macos-15-intel" is unknown'

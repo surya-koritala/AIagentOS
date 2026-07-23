@@ -2,7 +2,7 @@
 //!
 //! Each kernel runs as its own [`SyscallServer`](kernel::syscall_server::SyscallServer)
 //! (TCP or Unix socket, optionally authenticated). A [`ClusterClient`] holds a
-//! [`KernelClient`](crate::KernelClient) connection to each node, places new
+//! [`KernelClient`] connection to each node, places new
 //! agents across nodes by a [`Placement`] policy, aggregates listings, and
 //! routes per-agent calls (turns, tool calls) back to the node that owns the
 //! agent. A node's identity is the address it was dialed at.

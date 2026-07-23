@@ -21,10 +21,12 @@ All workspace crates share one version number; bump them together.
    group (Kernel/SDK/Providers/Scheduling/Memory/Security/Persistence/IPC/…),
    ending with its PR number. If a PR ships no user-visible change, say so in the
    PR body instead — don't pad the changelog.
-2. **CI must be green** before merge: `cargo fmt --all -- --check`,
-   `cargo clippy --workspace --exclude tauri-app -- -D warnings`,
-   `cargo test --workspace --exclude tauri-app`. This is the "test frequently"
-   floor — it runs on every PR, not just releases.
+2. **The `Required release gates` status must be green** before merge. It
+   aggregates formatting, warning-free Rust/docs/desktop/frontend builds,
+   deterministic tests on Linux/macOS/Windows, dependency policy, global and
+   subsystem coverage floors, capability claims, and container startup,
+   non-root, health, and persistence checks. Run `./scripts/ci-local.sh` for
+   the host-compatible subset before pushing.
 3. Keep the change mapped to a **roadmap item / the product wedge**. If a change
    doesn't serve *governed multi-agent execution* (or the product-shell that
    makes it adoptable), question whether it belongs now.
@@ -34,11 +36,13 @@ All workspace crates share one version number; bump them together.
 1. Pick the version per the rules above.
 2. In `CHANGELOG.md`, move the `## [Unreleased]` content into a new
    `## [X.Y.Z] - YYYY-MM-DD` section (leave a fresh empty `Unreleased`).
-3. Bump the version in every crate's `Cargo.toml` (`crates/*/Cargo.toml`); run
-   `cargo build` so `Cargo.lock` updates.
+3. Bump the version in every workspace crate and the exact `version =
+   "=X.Y.Z"` constraint on each internal path dependency (including
+   `fuzz/Cargo.toml`); run `cargo build` so `Cargo.lock` updates.
 4. Open a `chore/release-vX.Y.Z` PR; merge once green.
 5. Create a signed, annotated tag for the merged commit, verify it locally, and
-   push it. Published tags are immutable; never move or recreate one:
+   push it. Project policy treats published tags as immutable: never move or
+   recreate one:
    ```bash
    git checkout main && git pull
    git tag -s vX.Y.Z -m "AI Agent OS vX.Y.Z"
@@ -49,20 +53,23 @@ All workspace crates share one version number; bump them together.
 
 ## What a release must prove (the gate)
 
-The tag triggers `.github/workflows/release.yml`, which **publishes only if all
-of these pass** against the exact tagged commit:
+Before tagging, manually dispatch `.github/workflows/release.yml` on the release
+branch. This qualification mode creates the complete signed evidence bundle but
+cannot publish a GitHub Release. A `v*` tag runs the same workflow and
+**publishes only if all of these pass** against the exact tagged commit:
 
-1. **Quality gate** — fmt + clippy (`-D warnings`) + the full workspace test
-   suite.
+1. **Full required CI** — the same release-blocking workflow used by protected
+   pull requests, including all three operating systems and the desktop,
+   frontend, supply-chain, coverage, and container gates.
 2. **Wedge acceptance** — the keyless `governance-demo` runs: violators are
    contained and audited, compliant agents keep working. If the product's one
    job regresses, the release is blocked.
 3. **Reproducible platform binaries** — Linux, macOS, and Windows CLI, server,
    and TUI binaries are built twice in isolated target directories and must be
    byte-for-byte identical before deterministic archives are accepted.
-4. **Container artifact** — the non-root `agent-server` image builds, boots,
-   answers a real `{"op":"node_info"}` syscall round-trip, and retains mounted
-   data across restart.
+4. **Container qualification** — the pinned-base, non-root `agent-server` image
+   builds, boots, answers a real `{"op":"node_info"}` syscall round-trip, and
+   retains kernel agent storage across restart.
 5. **Supply-chain evidence** — each platform archive has a CycloneDX SBOM, the
    container has an SPDX SBOM, every asset appears in `SHA256SUMS`, and assets
    are keyless-signed with Sigstore and covered by GitHub build provenance.
@@ -83,6 +90,17 @@ gh attestation verify agentos-vX.Y.Z-x86_64-unknown-linux-gnu.zip \
 
 This is how "are we building the right product?" gets enforced mechanically: a
 release that can't contain a rogue agent or boot a server doesn't ship.
+
+## Repository merge policy
+
+`main` must require pull requests, at least one approving review, conversation
+resolution, and the `Required release gates` status. Force-pushes and branch
+deletion are blocked. Repository administrators retain an emergency bypass;
+using it for an ordinary merge violates release policy and must be documented
+as an incident. Secret-backed provider qualification is not part of
+deterministic PR CI. The manual `Live provider qualification` workflow runs one
+governed OpenAI turn using the protected `provider-qualification` environment;
+the broader provider/tool/streaming matrix remains tracked separately.
 
 ## Toward a stable API (the 1.0 bar)
 

@@ -3,9 +3,10 @@ name = "adapters"
 version = "0.3.0"
 edition = "2021"
 license.workspace = true
+rust-version.workspace = true
 
 [dependencies]
-kernel = { path = "../kernel" }
+kernel = { path = "../kernel", version = "=0.3.0" }
 tokio = { workspace = true }
 async-trait = { workspace = true }
 serde = { workspace = true }

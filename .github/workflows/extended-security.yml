@@ -8,36 +8,67 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: extended-security-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   miri:
     name: Miri (unsafe/concurrency smoke)
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
         with:
+          toolchain: nightly-2026-07-20
           components: miri
       - run: cargo miri setup
-      - run: cargo miri test -p kernel cgroups::tests
+      - name: Exercise in-memory policy and isolation code under Miri
+        run: |
+          cargo miri test -p kernel cgroups::tests
+          cargo miri test -p kernel permissions::tests
 
   address-sanitizer:
     name: Address sanitizer
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
+        with:
+          toolchain: nightly-2026-07-20
       - name: Run deterministic security-critical tests under ASan
         env:
           RUSTFLAGS: -Zsanitizer=address
-        run: >-
-          cargo test -p kernel --target x86_64-unknown-linux-gnu
-          cgroups::tests -- --test-threads=1
+        run: |
+          cargo test -p kernel --target x86_64-unknown-linux-gnu cgroups::tests -- --test-threads=1
+          cargo test -p kernel --target x86_64-unknown-linux-gnu permissions::tests -- --test-threads=1
+          cargo test -p kernel --target x86_64-unknown-linux-gnu auth::tests -- --test-threads=1
+          cargo test -p kernel --target x86_64-unknown-linux-gnu syscall_gate::tests -- --test-threads=1
 
   fuzz:
     name: Wire-protocol fuzz smoke
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@nightly
-      - uses: taiki-e/install-action@cargo-fuzz
-      - run: cargo fuzz run wire_syscall -- -max_total_time=60 -max_len=65536
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
+        with:
+          toolchain: nightly-2026-07-20
+      - uses: taiki-e/install-action@c44f6b046f1c29ae5918b1e0bfdbb2f1813836fd
+        with:
+          tool: cargo-fuzz@0.13.2
+      - name: Build every fuzz target
+        run: cargo fuzz build
+      - name: Exercise untrusted wire input
+        run: cargo fuzz run wire_syscall -- -max_total_time=120 -max_len=65536
+      - name: Preserve newly discovered corpus and crash evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: wire-fuzz-evidence
+          path: |
+            fuzz/corpus/wire_syscall
+            fuzz/artifacts/wire_syscall
+          if-no-files-found: warn

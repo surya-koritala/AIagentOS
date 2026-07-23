@@ -8,15 +8,16 @@
 //! invariants hold across a large, randomized input space.
 //!
 //! Strategy: for each generated case we build a *fresh* gate, register one
-//! agent with a chosen capability profile / cgroup / namespace state, optionally
-//! tag the tool to a namespace, and load a simple-but-real MAC policy. We then
-//! compute the *expected* verdict from an **independent oracle** (re-deriving the
-//! fail-closed declaration check plus the four-layer decision from the inputs,
-//! not from the gate) and compare it to the
-//! gate's actual return value. The oracle deliberately mirrors the documented
-//! ordering — known declaration → namespace → capability → MAC → cgroup,
-//! first-failure-wins — so any
-//! divergence (a bypass, a reordering, a miscounted denial) fails the property.
+//! agent with a chosen capability profile / stable cgroup membership / namespace
+//! state, optionally tag the tool to a namespace, and load a simple-but-real MAC
+//! policy. We then compute the *expected* verdict from an **independent oracle**
+//! (re-deriving the fail-closed checks from the inputs, not from the gate) and
+//! compare it to the gate's actual return value. The oracle deliberately mirrors
+//! the documented first-failure-wins ordering: declaration → namespace →
+//! capability → MAC → approval → membership. The fresh registered membership
+//! succeeds in these cases; provider-token quota is not part of tool
+//! authorization. Any divergence (a bypass, a reordering, or a miscounted
+//! denial) fails the property.
 //!
 //! Everything is deterministic: no wall-clock, no sleeps, fresh gate per case,
 //! proptest's own seeded RNG drives the input space.
@@ -87,9 +88,10 @@ struct Case {
     tool: &'static str,
     resource: String,
     est_tokens: u64,
-    /// `tokens_per_min` for the agent's cgroup. 0 == unlimited (root, no child).
+    /// Durable provider-token limit attached to the cgroup. Tool authorization
+    /// must ignore it because provider usage is accounted on the LLM path.
     cgroup_budget: u64,
-    /// Tokens already consumed in this minute before the call.
+    /// Compatibility tool-usage value, which must remain a no-op.
     preused_tokens: u64,
     mac: MacPosture,
     /// If `Some`, the tool is tagged to this namespace.
@@ -210,7 +212,7 @@ enum Expected {
     Capability(u64),
     Mac,
     Approval,
-    Cgroup,
+    Membership,
 }
 
 fn requires_approval(tool: &str) -> bool {
@@ -229,26 +231,28 @@ fn requires_approval(tool: &str) -> bool {
 
 impl Case {
     /// Re-derive the decision from the raw inputs, in the documented
-    /// first-failure-wins order: declaration → namespace → capability → MAC → approval → cgroup.
+    /// first-failure-wins order: declaration → namespace → capability → MAC →
+    /// approval → membership. Membership is stable for generated cases.
     fn oracle(&self) -> Expected {
+        // 0. Validated declaration.
         if self.tool == "totally_custom" {
             return Expected::Unknown;
         }
         let action = classify_tool(self.tool);
 
-        // 0. Namespace visibility. Tagged tool + non-member → denied.
+        // 1. Namespace visibility. Tagged tool + non-member → denied.
         if self.tool_namespace.is_some() && !self.member_of_tool_ns {
             return Expected::Namespace;
         }
 
-        // 1. Capability.
+        // 2. Capability.
         if let Some(required) = action.required_cap {
             if !self.profile.caps().has(required) {
                 return Expected::Capability(required);
             }
         }
 
-        // 2. MAC.
+        // 3. MAC.
         let mac_denies = match self.mac {
             MacPosture::Permissive | MacPosture::EnforcingAllowAll => false,
             MacPosture::EnforcingDenyAction(denied) => denied == action.action,
@@ -257,17 +261,13 @@ impl Case {
             return Expected::Mac;
         }
 
-        // 3. High-risk tools require an exact local approval. These property
+        // 4. High-risk tools require an exact local approval. These property
         // cases intentionally do not mint approvals.
         if requires_approval(self.tool) {
             return Expected::Approval;
         }
 
-        // 4. Cgroup quota. 0 budget == unlimited (the agent stays in root).
-        if self.cgroup_budget > 0 && self.preused_tokens + self.est_tokens > self.cgroup_budget {
-            return Expected::Cgroup;
-        }
-
+        // 5. The fresh registered cgroup membership is valid.
         Expected::Allowed
     }
 }
@@ -283,12 +283,13 @@ struct Built {
 
 impl Case {
     /// Materialize this case into a live gate with the agent registered exactly
-    /// as the oracle assumes. MAC labelling and cgroup pre-usage are applied in
-    /// the async body of [`run_case`] (the engine sits behind an async mutex).
+    /// as the oracle assumes. MAC labelling and the legacy accounting no-op are
+    /// applied in [`run_case`] (the MAC engine sits behind an async mutex).
     fn build(&self) -> Built {
         let cgroups = Arc::new(CgroupManager::new());
 
-        // Choose the cgroup: a bounded child when a budget is set, else root.
+        // Attach a durable provider-token limit when requested. The tool gate
+        // must validate membership without charging or enforcing this budget.
         let cg = if self.cgroup_budget > 0 {
             Some(cgroups.create(
                 "case".into(),
@@ -362,9 +363,16 @@ fn classify_result(r: &Result<u64, GateDenial>) -> Expected {
         Err(GateDenial::NotInNamespace { .. }) => Expected::Namespace,
         Err(GateDenial::MissingCapability(cap)) => Expected::Capability(*cap),
         Err(GateDenial::MacDeny { .. }) => Expected::Mac,
-        Err(GateDenial::CgroupQuota | GateDenial::CgroupToolLimit) => Expected::Cgroup,
         Err(GateDenial::UnknownTool(_)) => Expected::Unknown,
         Err(GateDenial::ApprovalRequired { .. }) => Expected::Approval,
+        Err(
+            GateDenial::CgroupUnavailable(_)
+            | GateDenial::CgroupMembershipChanged
+            | GateDenial::CgroupToolLimit,
+        ) => Expected::Membership,
+        Err(GateDenial::CgroupQuota) => {
+            panic!("tool authorization must never deny provider-token quota")
+        }
         Err(GateDenial::UnknownAgent) => {
             // Never expected in this suite — the agent is always registered.
             panic!("unexpected UnknownAgent denial for a registered agent");
@@ -373,7 +381,7 @@ fn classify_result(r: &Result<u64, GateDenial>) -> Expected {
 }
 
 /// Run a case end-to-end on the given runtime: build the gate, apply the MAC
-/// label (async), preload cgroup usage, then check the call.
+/// label (async), exercise the legacy accounting no-op, then check the call.
 fn run_case(rt: &Runtime, case: &Case) -> (Result<u64, GateDenial>, GateStats) {
     let built = case.build();
     rt.block_on(async {
@@ -383,7 +391,8 @@ fn run_case(rt: &Runtime, case: &Case) -> (Result<u64, GateDenial>, GateStats) {
             let mut mac = built.gate.mac.lock().await;
             mac.label_agent(pid, "subject".into());
         }
-        // Preload cgroup usage *before* the call (only meaningful with a budget).
+        // Exercise the legacy compatibility hook. It must not turn serialized
+        // tool payload bytes into provider usage.
         if case.cgroup_budget > 0 && case.preused_tokens > 0 {
             built.gate.record_tool_usage(built.kid, case.preused_tokens);
         }
@@ -445,7 +454,7 @@ proptest! {
             Expected::Capability(_) => prop_assert_eq!(stats.denied_capability, 1),
             Expected::Mac => prop_assert_eq!(stats.denied_mac, 1),
             Expected::Approval => prop_assert_eq!(stats.denied_approval, 1),
-            Expected::Cgroup => prop_assert_eq!(stats.denied_cgroup, 1),
+            Expected::Membership => prop_assert_eq!(stats.denied_cgroup, 1),
         }
     }
 }
@@ -455,8 +464,8 @@ proptest! {
 
     /// INVARIANT 3 (capability monotonicity, deny side): a no-caps agent is
     /// NEVER granted any tool whose action carries a required capability —
-    /// regardless of MAC posture or cgroup budget. The only way such a tool
-    /// passes is if it requires no capability.
+    /// regardless of MAC posture or attached provider-budget metadata. The only
+    /// way such a tool passes is if it requires no capability.
     #[test]
     fn no_caps_agent_never_gets_privileged_tool(
         tool in arb_tool(),
@@ -502,8 +511,8 @@ proptest! {
 
     /// INVARIANT 3 (capability monotonicity, grant side): a full-access agent is
     /// NEVER denied on *capability* grounds — it holds every bit. Under a
-    /// permissive/allow-all MAC and an unlimited cgroup with the tool global,
-    /// only an explicit approval requirement may still deny it.
+    /// permissive/allow-all MAC with stable membership and a globally visible
+    /// tool, only an explicit approval requirement may still deny it.
     #[test]
     fn full_access_agent_never_capability_denied(
         tool in arb_tool(),
@@ -514,7 +523,7 @@ proptest! {
             tool,
             resource,
             est_tokens: 1,
-            cgroup_budget: 0,      // unlimited
+            cgroup_budget: 0,
             preused_tokens: 0,
             mac: MacPosture::EnforcingAllowAll,
             tool_namespace: None,
@@ -536,12 +545,10 @@ proptest! {
         }
     }
 
-    /// INVARIANT 4 (cgroup quota): with namespace/cap/MAC all satisfied, an
-    /// under-budget call passes the cgroup check and an over-budget call is
-    /// ALWAYS denied with the quota reason. Uses a no-cap tool (read_file) so
-    /// capability never interferes.
+    /// INVARIANT 4: serialized tool payload size and compatibility usage never
+    /// consume provider/cgroup token quota.
     #[test]
-    fn cgroup_quota_boundary(
+    fn tool_payload_never_consumes_provider_quota(
         budget in 100u64..5_000u64,
         preused in 0u64..6_000u64,
         est in 0u64..6_000u64,
@@ -559,25 +566,15 @@ proptest! {
         };
         let rt = Runtime::new().unwrap();
         let (result, _stats) = run_case(&rt, &case);
-        let over = preused + est > budget;
-        if over {
-            prop_assert_eq!(
-                classify_result(&result), Expected::Cgroup,
-                "over-budget ({}+{}>{}) must be CgroupQuota", preused, est, budget
-            );
-        } else {
-            prop_assert!(
-                result.is_ok(),
-                "under-budget ({}+{}<={}) must pass, got {:?}",
-                preused, est, budget, result
-            );
-        }
+        prop_assert!(
+            result.is_ok(),
+            "tool authorization must ignore payload/provider quota values ({preused}+{est}, limit {budget}), got {result:?}"
+        );
     }
 
-    /// INVARIANT 4 (accounting moves the needle): recording usage that crosses
-    /// the budget flips an otherwise-allowed call into a CgroupQuota denial.
+    /// INVARIANT 4: the removed process-local accounting hook stays a no-op.
     #[test]
-    fn record_usage_changes_verdict(
+    fn record_tool_usage_is_compatibility_noop(
         (budget, est) in (100u64..2_000u64)
             .prop_flat_map(|b| (Just(b), 1u64..=b)),
     ) {
@@ -596,14 +593,10 @@ proptest! {
             // Fresh budget: a small call is allowed.
             let r0 = gate.check_tool_call(kid, "read_file", "/x", est).await;
             prop_assert!(r0.is_ok(), "initial under-budget call should pass: {:?}", r0);
-            // Burn the whole budget.
+            // This compatibility call must not burn provider quota.
             gate.record_tool_usage(kid, budget);
-            // Now even a 1-token call exceeds it.
             let r1 = gate.check_tool_call(kid, "read_file", "/x", 1).await;
-            prop_assert_eq!(
-                classify_result(&r1), Expected::Cgroup,
-                "after recording the full budget, the next call must be denied"
-            );
+            prop_assert!(r1.is_ok(), "compatibility accounting changed the verdict: {r1:?}");
             Ok(())
         })?;
     }
@@ -704,21 +697,22 @@ proptest! {
         );
     }
 
-    /// INVARIANT 2 (ordering, focused): MAC precedes cgroup. A capable agent
-    /// whose action MAC denies, in a cgroup that is ALSO over budget, must be
-    /// reported as MacDeny (MAC fires before the quota check).
+    /// INVARIANT 2 (ordering, focused): MAC precedes approval. A capable agent
+    /// calling a tool that MAC denies and that also requires approval must be
+    /// reported as MacDeny without consuming or requesting a grant.
     #[test]
-    fn mac_wins_over_cgroup(_seed in 0u64..64u64) {
-        // read_file needs no cap, so capability never interferes; MAC denies
-        // "read" while the cgroup is simultaneously exhausted.
+    fn mac_wins_over_approval(_seed in 0u64..64u64) {
+        let tool = "run_command";
+        prop_assert!(requires_approval(tool));
+        let action = classify_tool(tool).action;
         let case = Case {
             profile: Profile::FullAccess,
-            tool: "read_file",
+            tool,
             resource: "/x".to_string(),
-            est_tokens: 1_000,
-            cgroup_budget: 100,  // tiny budget
-            preused_tokens: 100, // already at the cap → cgroup would deny
-            mac: MacPosture::EnforcingDenyAction("read"),
+            est_tokens: 1,
+            cgroup_budget: 0,
+            preused_tokens: 0,
+            mac: MacPosture::EnforcingDenyAction(action),
             tool_namespace: None,
             member_of_tool_ns: true,
         };
@@ -726,7 +720,7 @@ proptest! {
         let (result, _stats) = run_case(&rt, &case);
         prop_assert!(
             matches!(result, Err(GateDenial::MacDeny { .. })),
-            "MAC must precede cgroup, got {:?}", result
+            "MAC must precede approval, got {:?}", result
         );
     }
 }

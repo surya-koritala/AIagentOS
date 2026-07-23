@@ -52,7 +52,7 @@ Expected output (exit code 0, `10 passed, 0 failed`):
   AI Agent OS — load-bearing enforcement demo (keyless, no LLM)
 ════════════════════════════════════════════════════════════
 
-[1] BOOT: kernel::boot_in_memory() (spawns scheduler observer + cgroup reset)
+[1] BOOT: kernel::boot_in_memory() (spawns scheduler observer)
     booted; full-access agent uuid=... pid=1
     booted; read-only  agent uuid=... pid=2
   [PASS] boot — two agents registered with distinct PIDs on the syscall gate
@@ -63,9 +63,9 @@ Expected output (exit code 0, `10 passed, 0 failed`):
   [PASS] capability/read-only run_command denied — Err(MissingCapability(64))
   [PASS] capability/read-only read_file allowed ...
 
-[3] CGROUP QUOTA: tight cgroup (tokens_per_min=100); burn 90, request 30
-  [PASS] cgroup/over-budget denied — Err(CgroupQuota)
-  [PASS] cgroup/after-reset allowed — Ok(1)
+[3] CGROUP CONCURRENCY: tight cgroup (one active tool call)
+  [PASS] cgroup/second concurrent call denied — Err(CgroupToolLimit)
+  [PASS] cgroup/after-release allowed — Ok(...)
 
 [4] NAMESPACE: tool registered in a namespace the agent is NOT a member of
   [PASS] namespace/foreign tool denied — Err(NotInNamespace{...})
@@ -81,8 +81,10 @@ Expected output (exit code 0, `10 passed, 0 failed`):
 ```
 
 **What it proves:** capability checks (read-only agents can't write or run
-commands), cgroup token-budget enforcement, namespace isolation of tools, and
+commands), cgroup concurrent-tool enforcement, namespace isolation of tools, and
 the scheduler observer publishing live PIDs into procfs — all without any LLM.
+Durable provider/cgroup token accounting is exercised by the provider-backed
+restart regressions rather than this keyless demo.
 
 ### Optional: the kernel benchmarks (also keyless)
 

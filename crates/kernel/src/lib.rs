@@ -439,13 +439,22 @@ fn caps_for_profile(profile: &str) -> CapabilitySet {
     caps
 }
 
-/// Per-profile cgroup limits, derived from the operator's budget config.
-/// `full-access` (and the empty profile) is unlimited; every other profile —
-/// including unknown/custom ones — is bounded so that `CgroupQuota` actually
-/// fires on the live agent-creation path. `elevated` gets a wider budget.
-fn cgroup_for_profile(profile: &str, budgets: &crate::config::BudgetConfig) -> CgroupLimits {
+/// Per-agent durable/provider and concurrent-tool limits derived from the
+/// permission profile. Aggregate tenant and profile nodes are separate: this
+/// leaf prevents one agent from consuming another agent's allowance.
+fn agent_cgroup_limits(profile: &str, budgets: &crate::config::BudgetConfig) -> CgroupLimits {
     match profile {
-        "full-access" | "" => CgroupLimits::default(), // all zeros = unlimited
+        // Unlimited resources are an explicit privilege. An absent, misspelled,
+        // or custom profile follows the bounded managed default.
+        "full-access" => CgroupLimits {
+            // Full access removes the per-agent provider-token and concurrent
+            // tool ceilings, but the kernel's active-context bound is applied
+            // uniformly by every executor and must remain truthful here.
+            tokens_per_min: 0,
+            max_concurrent_tool_calls: 0,
+            max_context_tokens: budgets.max_context_tokens,
+            max_agents: 0,
+        },
         "elevated" => CgroupLimits {
             tokens_per_min: budgets.agent_tokens_per_min.saturating_mul(4),
             max_concurrent_tool_calls: budgets.max_concurrent_tool_calls,
@@ -459,6 +468,12 @@ fn cgroup_for_profile(profile: &str, budgets: &crate::config::BudgetConfig) -> C
             max_agents: 0,
         },
     }
+}
+
+/// Encode one user-controlled path component without collisions. This is the
+/// JSON Pointer escaping rule and is stable across processes and platforms.
+fn quota_scope_segment(value: &str) -> String {
+    value.replace('~', "~0").replace('/', "~1")
 }
 
 struct BuiltinFilesystemProvider;
@@ -819,8 +834,9 @@ impl ResourceProvider for BuiltinAppProvider {
             .and_then(|v| v.as_array())
             .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
             .unwrap_or_default();
-        let output = tokio::process::Command::new(cmd)
-            .args(&args)
+        let mut command = tokio::process::Command::new(cmd);
+        command.args(&args).kill_on_drop(true);
+        let output = command
             .output()
             .await
             .map_err(|e| ResourceError::OperationFailed(e.to_string()))?;
@@ -919,6 +935,8 @@ pub struct AgentKernelImpl {
     /// Cumulative tool-call ceiling for one logical turn, including calls made
     /// before a durable pause/resume boundary. `0` means unlimited.
     max_tool_calls_per_turn: u32,
+    /// Provider-enforced completion allowance reserved with every prompt.
+    max_output_tokens_per_request: u32,
     /// CFS-ordered turn admission: bounds concurrent turns to
     /// `budgets.max_concurrent` and, under contention, grants the next slot to
     /// the CFS-preferred (lowest-vruntime / highest-priority) waiting agent.
@@ -929,11 +947,17 @@ pub struct AgentKernelImpl {
     /// the highest-priority (lowest-nice) waiter — mirroring CFS ordering.
     llm_scheduler: Arc<LlmScheduler>,
     pub os: Arc<OsSubsystems>,
-    /// One cgroup per permission profile, created at boot with budget-derived
-    /// limits. Agents are placed into their profile's cgroup at creation so
-    /// `CgroupQuota` enforcement is live on the real agent-creation path
-    /// (rather than every agent landing in the unlimited root cgroup).
-    profile_cgroups: std::collections::HashMap<String, CgroupId>,
+    /// Stable tenant/profile aggregate nodes in the uniform
+    /// root→tenant→profile→agent hierarchy. The key is the canonical durable
+    /// scope, not the process-local numeric cgroup id.
+    tenant_cgroups: DashMap<String, CgroupId>,
+    profile_cgroups: DashMap<String, CgroupId>,
+    /// Per-agent leaf nodes, rebuilt with the same canonical scope after a
+    /// restart even though numeric cgroup ids change.
+    agent_cgroups: DashMap<AgentId, CgroupId>,
+    /// Serializes structural get-or-create operations. Cgroup membership has a
+    /// separate mutation lock in the syscall gate.
+    cgroup_tree_lock: std::sync::Mutex<()>,
     /// Agent+Tool namespaces per agent group, created lazily. Agents created via
     /// `create_agent_in_namespace` with the same group share these (and can
     /// see/message each other); ungrouped agents use the registry defaults.
@@ -943,13 +967,8 @@ pub struct AgentKernelImpl {
     /// SQLite handle. Resolves an API key / session token to a `(user, tenant,
     /// role)`; the tenant then maps onto the namespace group + cgroup below.
     pub auth: Arc<tokio::sync::RwLock<crate::auth::AuthSystem>>,
-    /// One cgroup per tenant (token budget), created lazily so one tenant can't
-    /// exhaust another's per-minute quota. Sibling to `profile_cgroups` under the
-    /// root; a tenant's agents are placed in *its tenant's* cgroup.
-    tenant_cgroups: DashMap<String, CgroupId>,
-    /// Per-minute token budget applied to each tenant's cgroup at creation,
-    /// derived from the kernel's `BudgetConfig` (`tokens_per_min`).
-    tenant_budget: CgroupLimits,
+    /// Budget template used when lazily building tenant and per-agent nodes.
+    cgroup_budgets: crate::config::BudgetConfig,
     executors: DashMap<AgentId, Arc<tokio::sync::Mutex<AgentExecutor>>>,
     lifecycle_locks: DashMap<AgentId, Arc<tokio::sync::Mutex<()>>>,
     active_cancellations: DashMap<AgentId, tokio_util::sync::CancellationToken>,
@@ -957,6 +976,11 @@ pub struct AgentKernelImpl {
 }
 
 impl AgentKernelImpl {
+    #[cfg(not(test))]
+    const TOOL_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+    #[cfg(test)]
+    const TOOL_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(100);
+
     /// Create an in-memory kernel with the same enforcing security defaults as
     /// production. Tests that need permissive MAC must use the explicit
     /// `with_context_manager(..., false, ...)` escape hatch.
@@ -1092,17 +1116,6 @@ impl AgentKernelImpl {
         resource_broker.register_provider(Box::new(BuiltinAppProvider));
 
         let cgroups = Arc::new(CgroupManager::new());
-        // One child cgroup per permission profile with budget-derived limits,
-        // so agents created through the live path inherit a real token quota.
-        let mut profile_cgroups = std::collections::HashMap::new();
-        for profile in ["read-only", "standard", "elevated", "full-access"] {
-            let cg = cgroups.create(
-                format!("profile/{profile}"),
-                cgroups.root(),
-                cgroup_for_profile(profile, budgets),
-            );
-            profile_cgroups.insert(profile.to_string(), cg);
-        }
         let syscall_gate = Arc::new(SyscallGate::with_mac(
             cgroups.clone(),
             mac_enforcing,
@@ -1168,22 +1181,17 @@ impl AgentKernelImpl {
             budget_enforcer,
             context_budget_tokens: budgets.max_context_tokens.min(u32::MAX as u64) as u32,
             max_tool_calls_per_turn: budgets.max_tool_calls,
+            max_output_tokens_per_request: budgets.max_output_tokens_per_request,
             turn_admission: Arc::new(TurnAdmission::new(budgets.max_concurrent as usize)),
             llm_scheduler: Arc::new(LlmScheduler::new(DEFAULT_LLM_CORES)),
             os,
-            profile_cgroups,
+            tenant_cgroups: DashMap::new(),
+            profile_cgroups: DashMap::new(),
+            agent_cgroups: DashMap::new(),
+            cgroup_tree_lock: std::sync::Mutex::new(()),
             group_namespaces: DashMap::new(),
             auth: Arc::new(tokio::sync::RwLock::new(crate::auth::AuthSystem::new())),
-            tenant_cgroups: DashMap::new(),
-            // Each tenant's cgroup caps per-minute tokens at the configured TPM so
-            // one tenant exhausting its budget can't starve another (whose cgroup
-            // is independent). 0 = unlimited, matching the rest of the budget model.
-            tenant_budget: CgroupLimits {
-                tokens_per_min: budgets.tpm,
-                max_concurrent_tool_calls: budgets.max_concurrent_tool_calls,
-                max_context_tokens: budgets.max_context_tokens,
-                ..Default::default()
-            },
+            cgroup_budgets: budgets.clone(),
             executors: DashMap::new(),
             lifecycle_locks: DashMap::new(),
             active_cancellations: DashMap::new(),
@@ -1233,24 +1241,88 @@ impl AgentKernelImpl {
         self.create_agent_grouped(config, group, tenant_id).await
     }
 
-    /// Get-or-create the cgroup that bounds a tenant's per-minute token budget.
-    /// `DEFAULT_TENANT` keeps the prior behavior (profile cgroups); every other
-    /// tenant gets its own sibling cgroup under the root so budgets are isolated.
-    fn tenant_cgroup(&self, tenant_id: &str) -> Option<CgroupId> {
-        if tenant_id == crate::context::DEFAULT_TENANT {
-            return None;
-        }
-        let entry = self
-            .tenant_cgroups
-            .entry(tenant_id.to_string())
-            .or_insert_with(|| {
-                self.cgroups.create(
-                    format!("tenant/{tenant_id}"),
+    /// Get or build the stable root→tenant→profile→agent hierarchy used for
+    /// both durable provider-token accounting and concurrent tool-call limits.
+    fn cgroup_for_agent(
+        &self,
+        tenant_id: &str,
+        profile: &str,
+        agent_id: AgentId,
+    ) -> Result<CgroupId, KernelError> {
+        let _tree = self
+            .cgroup_tree_lock
+            .lock()
+            .map_err(|_| KernelError::Policy("cgroup hierarchy lock is poisoned".into()))?;
+        let tenant_scope = format!("/tenant/{}", quota_scope_segment(tenant_id));
+        let tenant_cgroup = if let Some(id) = self.tenant_cgroups.get(&tenant_scope) {
+            *id
+        } else {
+            let id = self
+                .cgroups
+                .create_scoped(
+                    format!("tenant:{tenant_id}"),
                     self.cgroups.root(),
-                    self.tenant_budget.clone(),
+                    tenant_scope.clone(),
+                    CgroupLimits {
+                        tokens_per_min: self.cgroup_budgets.tenant_tokens_per_min,
+                        ..CgroupLimits::default()
+                    },
                 )
-            });
-        Some(*entry)
+                .map_err(|error| {
+                    KernelError::Policy(format!("cannot create tenant cgroup: {error}"))
+                })?;
+            self.tenant_cgroups.insert(tenant_scope.clone(), id);
+            id
+        };
+
+        let profile_scope = format!("{tenant_scope}/profile/{}", quota_scope_segment(profile));
+        let profile_cgroup = if let Some(id) = self.profile_cgroups.get(&profile_scope) {
+            *id
+        } else {
+            let id = self
+                .cgroups
+                .create_scoped(
+                    format!("profile:{profile}"),
+                    tenant_cgroup,
+                    profile_scope.clone(),
+                    CgroupLimits::default(),
+                )
+                .map_err(|error| {
+                    KernelError::Policy(format!("cannot create profile cgroup: {error}"))
+                })?;
+            self.profile_cgroups.insert(profile_scope.clone(), id);
+            id
+        };
+
+        let agent_scope = format!("{profile_scope}/agent/{agent_id}");
+        if let Some(id) = self.agent_cgroups.get(&agent_id) {
+            let group = self.cgroups.get(*id).ok_or_else(|| {
+                KernelError::Policy(format!(
+                    "agent {agent_id} references missing cgroup {}",
+                    *id
+                ))
+            })?;
+            if group.quota_scope != agent_scope {
+                return Err(KernelError::Policy(format!(
+                    "agent {agent_id} cgroup identity changed from {:?} to {agent_scope:?}",
+                    group.quota_scope
+                )));
+            }
+            return Ok(*id);
+        }
+        let id = self
+            .cgroups
+            .create_scoped(
+                format!("agent:{agent_id}"),
+                profile_cgroup,
+                agent_scope,
+                agent_cgroup_limits(profile, &self.cgroup_budgets),
+            )
+            .map_err(|error| {
+                KernelError::Policy(format!("cannot create per-agent cgroup: {error}"))
+            })?;
+        self.agent_cgroups.insert(agent_id, id);
+        Ok(id)
     }
 
     /// Create an agent placed in a named namespace `group`. Agents in the same
@@ -1431,13 +1503,21 @@ impl AgentKernelImpl {
 
         // 6–8. Place the agent in IPC / syscall gate / namespaces / CFS / procfs,
         //       in its tenant's cgroup + namespace group.
-        self.place_agent_in_subsystems(agent_id, &config, group, tenant_id)
-            .await;
+        if let Err(error) = self
+            .place_agent_in_subsystems(agent_id, &config, group, tenant_id)
+            .await
+        {
+            self.rollback_created_agent(agent_id).await;
+            return Err(error);
+        }
 
         // 9. Persist the agent's durable identity (incl. tenant) so it survives a
         //    restart, then broadcast the creation event. Persistence commits
         //    immediately, so even an abrupt stop recovers this agent + its tenant.
-        self.persist_agent_registry(agent_id, &config, tenant_id);
+        if let Err(error) = self.persist_agent_registry(agent_id, &config, tenant_id) {
+            self.rollback_created_agent(agent_id).await;
+            return Err(error);
+        }
         let _ = self.event_tx.send(KernelEvent::AgentCreated(agent_id));
 
         Ok(handle)
@@ -1454,28 +1534,25 @@ impl AgentKernelImpl {
         config: &AgentConfig,
         group: Option<&str>,
         tenant_id: &str,
-    ) {
+    ) -> Result<(), KernelError> {
+        // Build and validate the complete hierarchy before publishing any gate
+        // record or ancillary subsystem state.
+        let cgroup = self.cgroup_for_agent(tenant_id, &config.permission_profile, agent_id)?;
+        let caps = caps_for_profile(&config.permission_profile);
+        let pid = self
+            .syscall_gate
+            .try_register_managed_agent(agent_id, caps, cgroup)
+            .map_err(|error| {
+                KernelError::Policy(format!(
+                    "cannot register agent {agent_id} with syscall gate: {error}"
+                ))
+            })?;
+
         self.budget_enforcer
             .register_agent_tenant(agent_id, tenant_id);
 
         // Register IPC mailbox.
         self.ipc.register_agent(agent_id);
-
-        // Register with the syscall gate (capabilities derived from the
-        // permission profile; unknown profiles receive no capabilities).
-        let caps = caps_for_profile(&config.permission_profile);
-        // Choose the cgroup: a tenanted agent goes in its tenant's cgroup so its
-        // tokens count against the tenant's budget (and one tenant exhausting its
-        // quota can't starve another). Un-tenanted agents fall back to the
-        // permission-profile cgroup (prior behavior). Unknown profiles remain
-        // capability/MAC denied even though they use the standard resource quota.
-        let cgroup = self.tenant_cgroup(tenant_id).or_else(|| {
-            self.profile_cgroups
-                .get(&config.permission_profile)
-                .or_else(|| self.profile_cgroups.get("standard"))
-                .copied()
-        });
-        let pid = self.syscall_gate.register_agent(agent_id, caps, cgroup);
 
         // MAC: label the agent by its permission profile so an enforcing policy
         // can discriminate by subject (e.g. "profile:read-only").
@@ -1509,22 +1586,39 @@ impl AgentKernelImpl {
             procfs.set_agent_info(pid, "uuid".into(), agent_id.to_string());
             procfs.set_agent_info(pid, "state".into(), "running".into());
         }
+        Ok(())
     }
 
-    /// Write the agent's durable identity + config to the `agents` table via the
-    /// single SQLite handle. Best-effort: a persistence failure is logged but
-    /// does not fail agent creation (the in-memory agent is still live).
-    fn persist_agent_registry(&self, agent_id: AgentId, config: &AgentConfig, tenant_id: &str) {
+    /// Write the agent's durable identity + config to the `agents` table via
+    /// the single SQLite handle. Creation cannot succeed until this commit
+    /// succeeds; otherwise the caller would receive a live identity that
+    /// disappears after restart.
+    fn persist_agent_registry(
+        &self,
+        agent_id: AgentId,
+        config: &AgentConfig,
+        tenant_id: &str,
+    ) -> Result<(), KernelError> {
         let state = self
             .agent_manager
             .get_agent_state(agent_id)
-            .unwrap_or(AgentState::Running);
-        let status = serde_json::to_string(&state).unwrap_or_else(|_| "\"Running\"".to_string());
+            .ok_or(AgentError::NotFound(agent_id))?;
+        let status = serde_json::to_string(&state).map_err(|error| {
+            KernelError::Policy(format!(
+                "cannot serialize durable state for agent {agent_id}: {error}"
+            ))
+        })?;
         let now = chrono::Utc::now();
         let sandbox_config_json = config
             .sandbox_config
             .as_ref()
-            .and_then(|s| serde_json::to_string(s).ok());
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|error| {
+                KernelError::Policy(format!(
+                    "cannot serialize durable sandbox config for agent {agent_id}: {error}"
+                ))
+            })?;
         let record = crate::context::PersistedAgent {
             id: agent_id,
             session_id: self
@@ -1533,7 +1627,7 @@ impl AgentKernelImpl {
                 .into_iter()
                 .find(|a| a.id == agent_id)
                 .and_then(|a| a.session_id)
-                .unwrap_or(agent_id),
+                .ok_or(AgentError::NotFound(agent_id))?,
             tenant_id: tenant_id.to_string(),
             name: config.name.clone(),
             task: config.task.clone(),
@@ -1545,9 +1639,8 @@ impl AgentKernelImpl {
             created_at: now,
             last_activity_at: now,
         };
-        if let Err(e) = self.context_manager.save_agent(&record) {
-            tracing::warn!("Failed to persist agent {agent_id} to registry: {e}");
-        }
+        self.context_manager.save_agent(&record)?;
+        Ok(())
     }
 
     /// Rehydrate the agent registry from the persistent DB on boot.
@@ -1638,8 +1731,19 @@ impl AgentKernelImpl {
             } else {
                 Some(p.tenant_id.as_str())
             };
-            self.place_agent_in_subsystems(p.id, &config, group, &p.tenant_id)
-                .await;
+            if let Err(error) = self
+                .place_agent_in_subsystems(p.id, &config, group, &p.tenant_id)
+                .await
+            {
+                tracing::warn!(
+                    "Skipping persisted agent {} because enforcement could not be restored: {}",
+                    p.id,
+                    error
+                );
+                self.cleanup_agent_resources(p.id).await;
+                self.agent_manager.purge_agent(p.id);
+                continue;
+            }
             if state == AgentState::Paused {
                 self.scheduler.set_paused(p.id);
             }
@@ -1881,8 +1985,119 @@ impl AgentKernelImpl {
             .clone()
     }
 
+    /// Reclaim the process-local per-agent cgroup after gate membership has
+    /// been removed (or when registration never succeeded). Durable quota rows
+    /// are keyed by the stable scope and intentionally remain in SQLite.
+    fn reclaim_agent_cgroup(&self, agent_id: AgentId) {
+        // Lock order is kernel tree lock → CgroupManager tree lock, matching
+        // cgroup_for_agent. Gate mutation/membership removal has already
+        // completed before this method is called.
+        let _tree = match self.cgroup_tree_lock.lock() {
+            Ok(tree) => tree,
+            Err(_) => {
+                tracing::warn!(
+                    "cannot reclaim per-agent cgroup for {agent_id}: hierarchy lock is poisoned"
+                );
+                return;
+            }
+        };
+        let cgroup_id = match self.agent_cgroups.remove(&agent_id) {
+            Some((_, cgroup_id)) => cgroup_id,
+            None => return,
+        };
+        let profile_id = self.cgroups.get(cgroup_id).and_then(|leaf| leaf.parent);
+
+        match self.cgroups.try_remove_empty_leaf(cgroup_id) {
+            Ok(()) => {
+                if let Some(profile_id) = profile_id {
+                    self.reclaim_empty_owned_profile(profile_id);
+                }
+            }
+            Err(crate::cgroups::CgroupError::GroupNotFound(_)) => {}
+            Err(error) => {
+                // Preserve the lookup if the leaf still exists so a later
+                // idempotent cleanup can retry without orphaning the node.
+                self.agent_cgroups.insert(agent_id, cgroup_id);
+                tracing::warn!("per-agent cgroup cleanup failed for {agent_id}: {error}");
+            }
+        }
+    }
+
+    /// Reclaim empty aggregate nodes created by `cgroup_for_agent`. Exact map
+    /// ownership checks ensure arbitrary operator-created cgroups are never
+    /// deleted merely because they happen to be empty.
+    ///
+    /// The caller holds `cgroup_tree_lock`, so aggregate maps and manager
+    /// structure cannot race another kernel create/cleanup transaction.
+    fn reclaim_empty_owned_profile(&self, profile_id: CgroupId) {
+        let Some(profile) = self.cgroups.get(profile_id) else {
+            return;
+        };
+        if self
+            .profile_cgroups
+            .get(&profile.quota_scope)
+            .map(|mapped| *mapped)
+            != Some(profile_id)
+        {
+            return;
+        }
+        let tenant_id = profile.parent;
+        match self.cgroups.try_remove_empty_leaf(profile_id) {
+            Ok(()) => {
+                self.profile_cgroups.remove(&profile.quota_scope);
+            }
+            Err(crate::cgroups::CgroupError::GroupNotEmpty(_)) => return,
+            Err(error) => {
+                tracing::warn!(
+                    "profile cgroup cleanup failed for {}: {error}",
+                    profile.quota_scope
+                );
+                return;
+            }
+        }
+
+        let Some(tenant_id) = tenant_id else {
+            return;
+        };
+        let Some(tenant) = self.cgroups.get(tenant_id) else {
+            return;
+        };
+        if self
+            .tenant_cgroups
+            .get(&tenant.quota_scope)
+            .map(|mapped| *mapped)
+            != Some(tenant_id)
+        {
+            return;
+        }
+        match self.cgroups.try_remove_empty_leaf(tenant_id) {
+            Ok(()) => {
+                self.tenant_cgroups.remove(&tenant.quota_scope);
+            }
+            Err(crate::cgroups::CgroupError::GroupNotEmpty(_)) => {}
+            Err(error) => {
+                tracing::warn!(
+                    "tenant cgroup cleanup failed for {}: {error}",
+                    tenant.quota_scope
+                );
+            }
+        }
+    }
+
     async fn cleanup_agent_resources(&self, agent_id: AgentId) {
         let gate_info = self.syscall_gate.agent_info(agent_id);
+        let gate_registered = gate_info.is_some();
+        if gate_registered {
+            if let Err(error) = self
+                .syscall_gate
+                .close_tool_admission_and_wait(agent_id)
+                .await
+            {
+                tracing::warn!(
+                    "cannot quiesce syscall-gate tool admission for {agent_id}: {error}"
+                );
+            }
+        }
         self.scheduler.deschedule(agent_id);
         self.scheduler.release_resource_access(agent_id);
         self.ipc.unregister_agent(agent_id);
@@ -1905,7 +2120,25 @@ impl AgentKernelImpl {
         }
         self.observability.purge_agent(agent_id);
         self.budget_enforcer.unregister_agent(agent_id);
-        self.syscall_gate.unregister_agent(agent_id);
+        let cgroup_membership_released = if gate_registered {
+            if let Err(error) = self.syscall_gate.try_unregister_agent(agent_id) {
+                tracing::warn!("syscall-gate cleanup failed for {agent_id}: {error}");
+                false
+            } else {
+                true
+            }
+        } else {
+            // Creation can fail after the leaf is allocated but before gate
+            // registration. Such a leaf has no membership to release.
+            true
+        };
+        if cgroup_membership_released {
+            // `agent_cgroups` always names the private leaf allocated at
+            // creation. The gate may now name a shared/custom destination
+            // after a move; unregister releases that membership, while only
+            // the original private leaf is structurally reclaimed here.
+            self.reclaim_agent_cgroup(agent_id);
+        }
     }
 
     /// Roll back a creation that failed after the AgentManager allocated an
@@ -1917,7 +2150,7 @@ impl AgentKernelImpl {
         if self.agent_manager.get_agent_state(agent_id).is_some() {
             let _ = self.agent_manager.force_stopped(agent_id);
         }
-        self.quiesce_agent(agent_id).await;
+        let _ = self.quiesce_agent(agent_id).await;
         self.cleanup_agent_resources(agent_id).await;
         self.agent_manager.purge_agent(agent_id);
         let _ = self.context_manager.purge_agent_data(agent_id);
@@ -2097,7 +2330,7 @@ impl AgentKernelImpl {
     /// Cancel an active turn and wait until the per-agent executor is idle.
     /// Callers hold the lifecycle lock, which prevents resume or new admission;
     /// `send_message` never waits for that lock while holding the executor.
-    async fn quiesce_agent(&self, agent_id: AgentId) {
+    async fn quiesce_agent(&self, agent_id: AgentId) -> Result<(), KernelError> {
         if let Some(token) = self.active_cancellations.get(&agent_id) {
             token.cancel();
         }
@@ -2106,7 +2339,42 @@ impl AgentKernelImpl {
             .get(&agent_id)
             .map(|entry| Arc::clone(entry.value()));
         if let Some(executor) = executor {
-            let _idle = executor.lock().await;
+            let idle = tokio::time::timeout(Self::TOOL_DRAIN_TIMEOUT, executor.lock())
+                .await
+                .map_err(|_| {
+                    KernelError::Policy(format!(
+                        "timed out waiting for active agent turn to quiesce for agent {agent_id}"
+                    ))
+                })?;
+            drop(idle);
+        }
+        Ok(())
+    }
+
+    /// Stop new external tool admission and wait a bounded interval for
+    /// already-running syscall/MCP/resource bindings. On timeout the lifecycle
+    /// transition is not committed and admission is reopened; an operator can
+    /// retry after the binding returns without leaking its cgroup hierarchy.
+    async fn drain_agent_tool_calls(&self, agent_id: AgentId) -> Result<(), KernelError> {
+        if self.syscall_gate.agent_info(agent_id).is_none() {
+            return Ok(());
+        }
+        let drain = tokio::time::timeout(
+            Self::TOOL_DRAIN_TIMEOUT,
+            self.syscall_gate.close_tool_admission_and_wait(agent_id),
+        )
+        .await;
+        match drain {
+            Ok(result) => result.map_err(|error| KernelError::Policy(error.to_string())),
+            Err(_) => {
+                // The lifecycle transition did not commit. Restore the live
+                // agent's admission state so a timed-out stop/kill attempt does
+                // not leave it half-disabled; a later retry closes it again.
+                let _ = self.syscall_gate.reopen_tool_admission(agent_id);
+                Err(KernelError::Policy(format!(
+                    "timed out draining active external tool calls for agent {agent_id}"
+                )))
+            }
         }
     }
 
@@ -2133,7 +2401,7 @@ impl AgentKernelImpl {
         self.scheduler.set_paused(agent_id);
         self.context_manager
             .update_agent_status(agent_id, &AgentState::Paused)?;
-        self.quiesce_agent(agent_id).await;
+        self.quiesce_agent(agent_id).await?;
         Ok(AgentState::Paused)
     }
 
@@ -2167,13 +2435,21 @@ impl AgentKernelImpl {
             .get_agent_state(agent_id)
             .ok_or(AgentError::NotFound(agent_id))?;
         if state == AgentState::Stopped {
+            let persisted = self
+                .context_manager
+                .update_agent_status(agent_id, &AgentState::Stopped);
+            self.cleanup_agent_resources(agent_id).await;
+            persisted?;
             return Ok(state);
         }
+        self.quiesce_agent(agent_id).await?;
+        self.drain_agent_tool_calls(agent_id).await?;
         self.agent_manager.stop_agent(agent_id).await?;
-        self.context_manager
-            .update_agent_status(agent_id, &AgentState::Stopped)?;
-        self.quiesce_agent(agent_id).await;
+        let persisted = self
+            .context_manager
+            .update_agent_status(agent_id, &AgentState::Stopped);
         self.cleanup_agent_resources(agent_id).await;
+        persisted?;
         Ok(AgentState::Stopped)
     }
 
@@ -2187,13 +2463,21 @@ impl AgentKernelImpl {
             .get_agent_state(agent_id)
             .ok_or(AgentError::NotFound(agent_id))?;
         if state == AgentState::Stopped {
+            let persisted = self
+                .context_manager
+                .update_agent_status(agent_id, &AgentState::Stopped);
+            self.cleanup_agent_resources(agent_id).await;
+            persisted?;
             return Ok(state);
         }
+        self.quiesce_agent(agent_id).await?;
+        self.drain_agent_tool_calls(agent_id).await?;
         self.agent_manager.force_stopped(agent_id)?;
-        self.context_manager
-            .update_agent_status(agent_id, &AgentState::Stopped)?;
-        self.quiesce_agent(agent_id).await;
+        let persisted = self
+            .context_manager
+            .update_agent_status(agent_id, &AgentState::Stopped);
         self.cleanup_agent_resources(agent_id).await;
+        persisted?;
         Ok(AgentState::Stopped)
     }
 
@@ -2441,6 +2725,7 @@ impl AgentKernelImpl {
         executor.set_rate_limiter(self.rate_limiter.clone());
         executor.set_context_budget(self.context_budget_tokens);
         executor.set_max_tool_calls(self.max_tool_calls_per_turn);
+        executor.set_max_output_tokens_per_request(self.max_output_tokens_per_request);
         if let Some(pid) = self.syscall_gate.pid_of(agent_id) {
             let nice = self.os.cfs.lock().await.nice_of(pid).unwrap_or(0);
             executor.set_llm_scheduler(self.llm_scheduler.clone(), pid, nice);
@@ -2763,10 +3048,10 @@ impl AgentKernelImpl {
         self.event_tx.subscribe()
     }
 
-    /// Spawn the kernel's background tasks: scheduler observer (publishes the
-    /// CFS pick to procfs as `current_agent`) and the cgroup minute-counter
-    /// reset timer. Returns the [`KernelRuntime`] so the caller can `stop()`
-    /// it on shutdown. Idempotent — calling twice spawns two sets, so call
+    /// Spawn the kernel's scheduler observer, which publishes the CFS pick to
+    /// procfs as `current_agent`. Durable fixed-epoch quota windows need no
+    /// background reset timer. Returns the [`KernelRuntime`] so the caller can
+    /// `stop()` it on shutdown. Calling twice spawns two observers, so call
     /// once at startup.
     pub fn start_runtime(self: &Arc<Self>) -> crate::runtime::KernelRuntime {
         let runtime = crate::runtime::KernelRuntime::new(self.clone());
@@ -2840,6 +3125,328 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn agent_registry_commit_failure_rolls_back_every_live_subsystem() {
+        let context = Arc::new(SqliteContextManager::in_memory().unwrap());
+        let kernel = AgentKernelImpl::with_context_manager(
+            context.clone(),
+            &crate::config::BudgetConfig::default(),
+            true,
+            &[],
+        )
+        .unwrap();
+        context.fail_next_agent_save_for_test();
+
+        let error = kernel
+            .create_agent_full(AgentConfig {
+                name: "must-not-escape".into(),
+                task: "persistence fault injection".into(),
+                llm_provider: "test".into(),
+                permission_profile: "standard".into(),
+                priority: Priority::default(),
+                sandbox_config: None,
+            })
+            .await
+            .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("injected agent-registry save failure"));
+        assert!(kernel.agent_manager.list_agents(None).is_empty());
+        assert!(context.load_all_agents().unwrap().is_empty());
+        assert!(kernel.agent_cgroups.is_empty());
+        assert!(kernel.profile_cgroups.is_empty());
+        assert!(kernel.tenant_cgroups.is_empty());
+        assert_eq!(kernel.cgroups.structural_counts(), (1, 1));
+        assert_eq!(kernel.sandbox_manager.structural_counts(), (0, 0));
+    }
+
+    #[test]
+    fn only_explicit_full_access_has_unlimited_token_and_tool_limits() {
+        let budgets = crate::config::BudgetConfig {
+            agent_tokens_per_min: 100,
+            max_concurrent_tool_calls: 3,
+            max_context_tokens: 4_096,
+            ..crate::config::BudgetConfig::default()
+        };
+        let managed = CgroupLimits {
+            tokens_per_min: 100,
+            max_concurrent_tool_calls: 3,
+            max_context_tokens: 4_096,
+            max_agents: 0,
+        };
+
+        assert_eq!(agent_cgroup_limits("", &budgets), managed);
+        assert_eq!(agent_cgroup_limits("custom-profile", &budgets), managed);
+        assert_eq!(
+            agent_cgroup_limits("full-access", &budgets),
+            CgroupLimits {
+                tokens_per_min: 0,
+                max_concurrent_tool_calls: 0,
+                max_context_tokens: 4_096,
+                max_agents: 0,
+            }
+        );
+        assert_eq!(
+            agent_cgroup_limits("elevated", &budgets),
+            CgroupLimits {
+                tokens_per_min: 400,
+                max_concurrent_tool_calls: 3,
+                max_context_tokens: 4_096,
+                max_agents: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn zero_max_concurrent_is_unlimited_in_both_kernel_admission_layers() {
+        let budgets = crate::config::BudgetConfig {
+            max_concurrent: 0,
+            ..crate::config::BudgetConfig::default()
+        };
+        let kernel = AgentKernelImpl::with_context_manager(
+            Arc::new(SqliteContextManager::in_memory().unwrap()),
+            &budgets,
+            true,
+            &[],
+        )
+        .unwrap();
+
+        assert_eq!(kernel.turn_admission.capacity(), usize::MAX);
+        assert_eq!(kernel.rate_limiter.stats().max_concurrent, 0);
+        assert_eq!(kernel.rate_limiter.stats().concurrent_available, 0);
+    }
+
+    #[tokio::test]
+    async fn stopped_and_rolled_back_agents_do_not_leak_cgroup_leaves() {
+        let kernel = AgentKernelImpl::new().unwrap();
+        let config = |name: String| AgentConfig {
+            name,
+            task: "cgroup lifecycle regression".into(),
+            llm_provider: "test".into(),
+            permission_profile: "standard".into(),
+            priority: Priority::default(),
+            sandbox_config: None,
+        };
+
+        // A live agent creates tenant/profile/leaf nodes. Once the last agent
+        // stops, all three kernel-owned nodes are reclaimed.
+        for index in 0..4 {
+            let handle = kernel
+                .create_agent_full(config(format!("cleanup-{index}")))
+                .await
+                .unwrap();
+            assert_eq!(kernel.agent_cgroups.len(), 1);
+            assert_eq!(kernel.cgroups.structural_counts(), (4, 4));
+            kernel.stop_agent(handle.id).await.unwrap();
+            assert!(kernel.agent_cgroups.is_empty());
+            assert!(kernel.profile_cgroups.is_empty());
+            assert!(kernel.tenant_cgroups.is_empty());
+            assert_eq!(kernel.cgroups.structural_counts(), (1, 1));
+        }
+
+        // Model failure after hierarchy allocation but before syscall-gate
+        // registration. Rollback must reclaim the empty leaf as well.
+        for _ in 0..4 {
+            let agent_id = uuid::Uuid::new_v4();
+            kernel
+                .cgroup_for_agent(crate::context::DEFAULT_TENANT, "standard", agent_id)
+                .unwrap();
+            assert_eq!(kernel.agent_cgroups.len(), 1);
+            assert_eq!(kernel.cgroups.structural_counts(), (4, 4));
+            kernel.rollback_created_agent(agent_id).await;
+            assert!(kernel.agent_cgroups.is_empty());
+            assert!(kernel.profile_cgroups.is_empty());
+            assert!(kernel.tenant_cgroups.is_empty());
+            assert_eq!(kernel.cgroups.structural_counts(), (1, 1));
+        }
+
+        // Accepted custom profile names remain unbounded in variety without
+        // leaking one aggregate node/map entry per historical profile.
+        for index in 0..12 {
+            let mut custom = config(format!("custom-{index}"));
+            custom.permission_profile = format!("custom-profile-{index}");
+            let handle = kernel.create_agent_full(custom).await.unwrap();
+            assert_eq!(kernel.profile_cgroups.len(), 1);
+            assert_eq!(kernel.cgroups.structural_counts(), (4, 4));
+            kernel.stop_agent(handle.id).await.unwrap();
+            assert!(kernel.agent_cgroups.is_empty());
+            assert!(kernel.profile_cgroups.is_empty());
+            assert!(kernel.tenant_cgroups.is_empty());
+            assert_eq!(kernel.cgroups.structural_counts(), (1, 1));
+        }
+
+        // A raw gate move must not let a kernel-managed agent discard its
+        // root→tenant→profile→private-agent quota chain. The unrelated custom
+        // destination remains untouched when the agent is later reclaimed.
+        let shared = kernel
+            .cgroups
+            .create_scoped(
+                "shared-custom".into(),
+                kernel.cgroups.root(),
+                "/shared-custom".into(),
+                CgroupLimits::default(),
+            )
+            .unwrap();
+        let moved = kernel
+            .create_agent_full(config("moved-agent".into()))
+            .await
+            .unwrap();
+        let original_leaf = *kernel.agent_cgroups.get(&moved.id).unwrap();
+        let original_snapshot = kernel
+            .syscall_gate
+            .cgroup_quota_constraints(moved.id)
+            .unwrap();
+        assert!(matches!(
+            kernel.syscall_gate.try_set_cgroup(moved.id, shared),
+            Err(crate::syscall_gate::GateMutationError::ManagedCgroupImmutable(id))
+                if id == moved.id
+        ));
+        assert_eq!(
+            kernel.syscall_gate.agent_info(moved.id).unwrap().cgroup,
+            original_leaf
+        );
+        assert_eq!(
+            kernel
+                .syscall_gate
+                .cgroup_quota_constraints(moved.id)
+                .unwrap(),
+            original_snapshot
+        );
+        assert_eq!(original_snapshot.constraints.len(), 4);
+        assert!(kernel.cgroups.get(original_leaf).is_some());
+        kernel.stop_agent(moved.id).await.unwrap();
+        assert!(kernel.agent_cgroups.is_empty());
+        assert!(kernel.cgroups.get(original_leaf).is_none());
+        assert!(kernel.cgroups.get(shared).is_some());
+        assert!(kernel.profile_cgroups.is_empty());
+        assert!(kernel.tenant_cgroups.is_empty());
+        assert_eq!(kernel.cgroups.structural_counts(), (2, 2));
+    }
+
+    #[tokio::test]
+    async fn terminal_lifecycle_drains_external_tool_guards_without_leaks_or_hangs() {
+        let kernel = Arc::new(AgentKernelImpl::new().unwrap());
+        let config = |name: &str| AgentConfig {
+            name: name.into(),
+            task: "external tool drain".into(),
+            llm_provider: "test".into(),
+            permission_profile: "standard".into(),
+            priority: Priority::default(),
+            sandbox_config: None,
+        };
+
+        let agent = kernel.create_agent_full(config("drain")).await.unwrap();
+        let guard = kernel.syscall_gate.acquire_tool_call(agent.id).unwrap();
+        let stopping_kernel = kernel.clone();
+        let stopping = tokio::spawn(async move { stopping_kernel.stop_agent(agent.id).await });
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert!(
+            !stopping.is_finished(),
+            "stop must wait for an admitted external binding"
+        );
+        drop(guard);
+        tokio::time::timeout(std::time::Duration::from_secs(1), stopping)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(kernel.cgroups.structural_counts(), (1, 1));
+
+        let hung = kernel.create_agent_full(config("timeout")).await.unwrap();
+        let original_state = kernel.get_agent_status(hung.id).unwrap();
+        let hung_guard = kernel.syscall_gate.acquire_tool_call(hung.id).unwrap();
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            kernel.kill_agent(hung.id),
+        )
+        .await
+        .expect("kill has a finite external-tool drain contract")
+        .unwrap_err();
+        assert!(error.to_string().contains("timed out draining"));
+        assert_eq!(kernel.get_agent_status(hung.id).unwrap(), original_state);
+        let reopened = kernel
+            .syscall_gate
+            .acquire_tool_call(hung.id)
+            .expect("failed terminal transition must restore admission");
+        drop(reopened);
+        drop(hung_guard);
+        kernel.kill_agent(hung.id).await.unwrap();
+        assert_eq!(kernel.cgroups.structural_counts(), (1, 1));
+    }
+
+    #[tokio::test]
+    async fn terminal_lifecycle_times_out_when_an_active_turn_cannot_quiesce() {
+        struct IdleSession {
+            id: ProviderId,
+        }
+
+        #[async_trait::async_trait]
+        impl crate::connector::LlmSession for IdleSession {
+            async fn send(
+                &self,
+                _messages: Vec<crate::connector::StandardMessage>,
+            ) -> Result<crate::connector::LlmResponse, ConnectorError> {
+                unreachable!("the regression holds the executor lock directly")
+            }
+
+            async fn send_with_tools(
+                &self,
+                _messages: Vec<crate::connector::StandardMessage>,
+                _tools: &[crate::connector::ToolDefinition],
+            ) -> Result<crate::connector::LlmResponse, ConnectorError> {
+                unreachable!("the regression holds the executor lock directly")
+            }
+
+            fn provider_id(&self) -> &ProviderId {
+                &self.id
+            }
+        }
+
+        let kernel = AgentKernelImpl::new().unwrap();
+        let agent = kernel
+            .create_agent_full(AgentConfig {
+                name: "hung-turn".into(),
+                task: "quiesce timeout regression".into(),
+                llm_provider: "test".into(),
+                permission_profile: "standard".into(),
+                priority: Priority::default(),
+                sandbox_config: None,
+            })
+            .await
+            .unwrap();
+        let executor = Arc::new(tokio::sync::Mutex::new(
+            crate::execution::AgentExecutor::new(
+                agent.id,
+                Box::new(IdleSession { id: "test".into() }),
+                kernel.resource_broker.clone(),
+                kernel.tool_registry.clone(),
+                kernel.context_manager.clone(),
+                kernel.syscall_gate.clone(),
+                "system".into(),
+            ),
+        ));
+        kernel.executors.insert(agent.id, executor.clone());
+        let held = executor.lock().await;
+        let original_state = kernel.get_agent_status(agent.id).unwrap();
+
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            kernel.kill_agent(agent.id),
+        )
+        .await
+        .expect("terminal quiesce must have a finite bound")
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("timed out waiting for active agent turn"));
+        assert_eq!(kernel.get_agent_status(agent.id).unwrap(), original_state);
+
+        drop(held);
+        kernel.kill_agent(agent.id).await.unwrap();
+        assert_eq!(kernel.cgroups.structural_counts(), (1, 1));
+    }
+
+    #[tokio::test]
     async fn trusted_kernel_approval_api_grants_one_exact_registered_call() {
         let kernel = AgentKernelImpl::new().unwrap();
         let agent = uuid::Uuid::new_v4();
@@ -2857,7 +3464,7 @@ mod tests {
         assert!(matches!(
             kernel
                 .tool_registry
-                .authorize_call(&kernel.syscall_gate, agent, "run_command", &arguments)
+                .authorize_and_acquire_call(&kernel.syscall_gate, agent, "run_command", &arguments,)
                 .await,
             Err(crate::tools::ToolAuthorizationError::Denied(
                 crate::syscall_gate::GateDenial::ApprovalRequired { .. }
@@ -2871,11 +3478,12 @@ mod tests {
                 crate::tools::ApprovalPolicy::User,
             )
             .unwrap();
-        assert!(kernel
+        let (_, guard) = kernel
             .tool_registry
-            .authorize_call(&kernel.syscall_gate, agent, "run_command", &arguments)
+            .authorize_and_acquire_call(&kernel.syscall_gate, agent, "run_command", &arguments)
             .await
-            .is_ok());
+            .unwrap();
+        drop(guard);
     }
 
     #[tokio::test]
@@ -2891,6 +3499,33 @@ mod tests {
         assert_eq!(result["created"], true);
         assert!(path.is_dir());
         std::fs::remove_dir(&path).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dropping_application_provider_kills_child_before_delayed_side_effect() {
+        let marker =
+            std::env::temp_dir().join(format!("agentos-kill-on-drop-{}", uuid::Uuid::new_v4()));
+        let parameters = serde_json::json!({
+            "command": "/bin/sh",
+            "args": [
+                "-c",
+                "sleep 0.3; touch \"$1\"",
+                "agentos-child",
+                marker.to_string_lossy()
+            ]
+        });
+        let task =
+            tokio::spawn(async move { BuiltinAppProvider.execute("launch", &parameters).await });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        task.abort();
+        let _ = task.await;
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        assert!(
+            !marker.exists(),
+            "a dropped process tool must not continue to a delayed side effect"
+        );
     }
 
     #[test]

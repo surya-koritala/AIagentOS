@@ -225,9 +225,9 @@ async fn handle_tools_call(
 
     // Registry-declared security preparation is shared byte-for-byte with the
     // executor, JSON syscall wire, and SDK-backed client path.
-    kernel
+    let (_, _tool_slot) = kernel
         .tool_registry
-        .authorize_call(&kernel.syscall_gate, agent_id, &tool, &args)
+        .authorize_and_acquire_call(&kernel.syscall_gate, agent_id, &tool, &args)
         .await
         .map_err(|error| match error {
             crate::tools::ToolAuthorizationError::InvalidDeclaration(error) => (
@@ -238,16 +238,6 @@ async fn handle_tools_call(
                 error_codes::INTERNAL_ERROR,
                 format!("tool '{tool}' denied by kernel: {}", denial.message()),
             ),
-        })?;
-
-    let _tool_slot = kernel
-        .syscall_gate
-        .acquire_tool_call(agent_id)
-        .map_err(|denial| {
-            (
-                error_codes::INTERNAL_ERROR,
-                format!("tool '{tool}' denied by kernel: {}", denial.message()),
-            )
         })?;
 
     let call = ToolCall {

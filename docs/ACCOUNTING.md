@@ -8,11 +8,20 @@ semantics from a metric name.
 
 Each completed turn records the actual provider ID and model ID, input, output,
 and cached-input tokens, provider requests, retries, provider-wait latency,
-tool-call count, and calculated USD price. Provider-reported usage is preferred.
-If an adapter omits usable details, the executor conservatively estimates input
-tokens from the complete active message/tool-schema payload at four characters
-per token and treats the adapter's token count as output. The durable record's
-`estimated_requests` and `provider_reported_requests` fields distinguish them.
+tool-call count, and calculated USD price. Trusted provider-reported usage is
+retained for invoice-aligned billing and user-facing telemetry. Separately, TPM
+and cgroup enforcement apply a conservative input floor computed from the
+complete serialized message/tool-schema payload at one token per serialized
+UTF-8 byte, plus message framing. Roles, tool-call IDs, tool names/arguments,
+and tool-result IDs are included. This deliberately separates the safety
+ledger from the invoice ledger: a provider cannot refund quota below the local
+prompt floor, while the local floor does not inflate an exact provider bill.
+A provider/model tokenizer hook may raise the safety floor but cannot lower it.
+
+If an adapter omits usable usage, the same structural input estimate and the
+adapter's output token count are used for both ledgers. The durable record's
+`estimated_requests` and `provider_reported_requests` fields distinguish
+estimated from provider-reported billable usage.
 
 `tokens_used` and TPM count input plus output tokens. Cached tokens are a
 labelled subset of input tokens and are not added a second time. Detailed
@@ -68,18 +77,26 @@ live admission locks but does not erase its cumulative spend.
 - RPM: provider attempts per fixed, half-open Unix-minute epoch. Epoch `N`
   covers `[N × 60,000 ms, (N + 1) × 60,000 ms)` in UTC; the exact boundary
   belongs to the new epoch.
-- TPM: input plus output tokens per the same durable epoch. A conservative input
-  estimate is committed before admission. Cancellation before provider
-  invocation refunds the request and estimate; an invoked failure or unknown
-  crash outcome retains the estimate; a successful response replaces it with
-  actual/fallback usage in the original admission epoch, even if completion
-  crosses the boundary.
+- TPM: input plus output tokens per the same durable epoch. The complete
+  structural input floor plus `max_output_tokens_per_request` is committed
+  before admission. Cancellation before provider invocation refunds the request
+  and estimate; an invoked failure or unknown crash outcome retains it. A
+  successful response reconciles to the larger of provider total usage and the
+  structural prompt floor plus reported/fallback output, in the original
+  admission epoch even when completion crosses the wall-clock boundary.
+- Output bound: `max_output_tokens_per_request` defaults to 4,096 and must be
+  positive in validated configuration. Built-in adapters translate it to the
+  provider's completion/new-token field. A custom session is rejected before
+  quota admission unless it explicitly declares that it enforces the option.
+  This contract assumes a declaring provider/session honors the bound; such a
+  declaration is part of the trusted adapter boundary.
 - Provider concurrency: simultaneous provider attempts. Retry backoff and tool
   execution hold no provider permit. This live gauge is process-local and
   correctly starts at zero after restart because no prior work remains active.
 - Turn concurrency: actively executing agent turns, separately CFS-ordered.
-- Context limit: active input context tokens per executor; old non-system pages
-  are evicted before a provider request.
+- Context limit: complete active provider-input tokens per executor, including
+  tool-definition schemas; old non-system pages are evicted before a provider
+  request, and an irreducible pinned/schema payload fails closed.
 - Per-turn tool limit: cumulative tool calls across every provider response in
   one logical user turn, including calls completed before pause/resume. Reaching
   the limit skips all remaining side effects in the response and records
@@ -87,18 +104,35 @@ live admission locks but does not erase its cumulative spend.
 - Tool concurrency: independently configured active tool calls across every
   cgroup ancestor. RAII guards release slots after success, error, panic unwind,
   or cancellation.
-- Cgroup token charge: conservative tool-call estimate, atomically reserved
-  across the complete agent-to-tenant/root hierarchy at gate admission.
+- Cgroup token charge: the provider input estimate is atomically reserved across
+  root → tenant → profile → agent together with provider/global RPM/TPM. Cgroup
+  scopes consume tokens but do not multiply the provider request count.
+  Successful calls reconcile provider-reported input + output usage across
+  every scope in the original admission epoch. Gate-time tool payload estimates
+  do not consume quota. Once assistant tool-call JSON, IDs, or tool results are
+  included in a later provider prompt, they are real provider input and are
+  estimated and charged there.
+- Cgroup membership races: admission snapshots a monotonic membership revision.
+  The gate excludes low-level reassignment while it verifies that revision and
+  marks the receipt in flight. A stale reservation is fully refunded and retried
+  against the new hierarchy before any provider I/O. Kernel-created agents
+  cannot use the raw move API; their root → tenant → profile → private-agent
+  hierarchy is immutable for the agent lifetime.
+- Execution-path quota exhaustion returns retryable backpressure immediately,
+  with the next fixed-epoch boundary in the error. It does not sleep while
+  holding a global whole-turn slot. The lower-level `RateLimiter` compatibility
+  API retains cancellable wait-until-capacity behavior for direct embedders.
 
 For RPM, TPM, provider concurrency, cumulative/concurrent tool limits, cgroup,
-context, and USD configuration, zero means unlimited. Counter arithmetic
-saturates instead of overflowing. Provider RPM/TPM receipts and a monotonic
-epoch floor are persisted before I/O. Restart within the same epoch restores
-terminal/reconciled usage, refunds work proven not invoked, and conservatively
-retains estimates for work that might have reached a provider. A backwards wall
-clock cannot reopen an older epoch. When upgrading a non-empty database from a
-release that had only process-local counters, the unknowable remainder of the
-current epoch is fenced closed; the next fixed boundary opens normally.
+context, and USD configuration, zero means unlimited. The output bound is the
+exception and must be positive. Counter arithmetic saturates instead of
+overflowing. Provider RPM/TPM receipts and a monotonic epoch floor are persisted
+before I/O. Restart within the same epoch restores terminal/reconciled usage,
+refunds work proven not invoked, and conservatively retains estimates for work
+that might have reached a provider. A backwards wall clock cannot reopen an
+older epoch. When upgrading a non-empty database from a release that had only
+process-local counters, the unknowable remainder of the current epoch is fenced
+closed; the next fixed boundary opens normally.
 
 The current SQLite runtime assumes one active kernel owner per database file.
 Opening the same file from multiple live kernel processes is not supported:
@@ -107,10 +141,14 @@ from receipts left by a crashed owner. Distributed or active-active operation
 requires the ownership/lease protocol tracked by the control-plane and durable
 state roadmap before it can safely share this quota ledger.
 
-Cgroup token accounting remains a separate process-local tool-payload estimate
-with a timer-driven reset in this batch. It is not yet the configured per-agent
-provider-token limit; durable atomic provider+cgroup hierarchy integration
-remains required before the resource-accounting capability can be promoted.
+`tenant_tokens_per_min` independently limits each tenant;
+`agent_tokens_per_min` limits each non-`full-access` agent (`elevated` receives
+the documented wider allowance). Profile aggregate nodes are currently
+unlimited but still accounted, and `0` means unlimited at every level. Admission
+reserves the full structural prompt floor and provider-enforced output allowance
+at every bounded scope, so a conforming built-in provider response cannot cross
+a scope limit. Runtime numeric cgroup IDs are never persisted—canonical
+semantic scopes are.
 
 ## Runtime and node-load metrics
 

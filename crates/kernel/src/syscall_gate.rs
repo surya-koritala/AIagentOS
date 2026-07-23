@@ -1,7 +1,9 @@
 //! Syscall Gate — the chokepoint every tool call passes through.
 //!
-//! Wires together capabilities, MAC, and cgroup quotas so that the OS-style
-//! enforcement subsystems are actually consulted on the live runtime path.
+//! Wires together namespace visibility, capabilities, MAC, approvals, cgroup
+//! membership, and concurrent-tool limits on the live runtime path. Provider
+//! token quota uses a separate durable snapshot/reservation handshake exposed
+//! by this gate.
 //!
 //! Translation layer: kernel agents are identified by `uuid::Uuid`, while the
 //! OS-level subsystems (MacEngine, CgroupManager) use `agent_struct::AgentId`
@@ -12,10 +14,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 
 use dashmap::DashMap;
-use tokio::sync::Mutex;
+use tokio::sync::{watch, Mutex};
 
 use crate::agent_struct::CapabilitySet;
-use crate::cgroups::{CgroupId, CgroupManager};
+use crate::cgroups::{CgroupError, CgroupId, CgroupManager};
 use crate::mac::{MacDecision, MacEngine};
 use crate::namespaces::NamespaceId;
 
@@ -43,8 +45,14 @@ pub enum GateDenial {
         action: &'static str,
         resource: String,
     },
-    /// Cgroup token quota would be exceeded.
+    /// Legacy token-quota denial. Tool payload size no longer consumes provider
+    /// quota, so current authorization paths do not emit this variant.
     CgroupQuota,
+    /// Cgroup hierarchy or membership state is unavailable/corrupt.
+    CgroupUnavailable(String),
+    /// Membership changed after provider quota was reserved. The reservation
+    /// must be refunded and admission retried against a fresh snapshot.
+    CgroupMembershipChanged,
     /// Cgroup concurrent tool-call limit is full.
     CgroupToolLimit,
     /// Tool is registered in a namespace the agent is not a member of.
@@ -70,6 +78,12 @@ impl GateDenial {
                 format!("MAC policy denies {} on {} (EACCES)", action, resource)
             }
             GateDenial::CgroupQuota => "cgroup token quota exceeded (EAGAIN)".to_string(),
+            GateDenial::CgroupUnavailable(reason) => {
+                format!("cgroup enforcement unavailable: {reason} (EIO)")
+            }
+            GateDenial::CgroupMembershipChanged => {
+                "cgroup membership changed during provider admission (EAGAIN)".to_string()
+            }
             GateDenial::CgroupToolLimit => {
                 "cgroup concurrent tool-call limit exceeded (EAGAIN)".to_string()
             }
@@ -92,11 +106,32 @@ pub struct ToolAction {
 struct ToolCallContract<'a> {
     tool_name: &'a str,
     resource: &'a str,
-    estimated_tokens: u64,
     action: &'static str,
     required_capabilities: &'a [u64],
     approval_policy: crate::tools::ApprovalPolicy,
     approval_contract: Option<&'a str>,
+}
+
+struct AuthorizedToolCall {
+    pid: Pid,
+    audited: bool,
+}
+
+#[derive(Debug, thiserror::Error, Clone, PartialEq, Eq)]
+pub enum GateMutationError {
+    #[error("agent {0} is already registered with the syscall gate")]
+    AlreadyRegistered(uuid::Uuid),
+
+    #[error("agent {0} is not registered with the syscall gate")]
+    UnknownAgent(uuid::Uuid),
+
+    #[error(
+        "kernel-managed agent {0} cannot be reassigned through the raw syscall-gate cgroup API"
+    )]
+    ManagedCgroupImmutable(uuid::Uuid),
+
+    #[error(transparent)]
+    Cgroup(#[from] CgroupError),
 }
 
 impl ToolAction {
@@ -156,9 +191,28 @@ struct GateRecord {
     pid: Pid,
     caps: CapabilitySet,
     cgroup: CgroupId,
+    /// Kernel-created agents are pinned to their managed
+    /// root→tenant→profile→private-agent hierarchy. A raw gate reassignment
+    /// must not discard those durable quota scopes.
+    managed_cgroup: bool,
+    cgroup_revision: u64,
+    /// Per-agent revision notifier. A provider request waiting on capacity for
+    /// an old hierarchy subscribes to this channel and resnapshots immediately
+    /// after a successful move instead of sleeping until the epoch boundary.
+    cgroup_changes: watch::Sender<u64>,
+    accepting_tool_calls: bool,
     /// Namespaces this agent is a member of. A tool registered in any of these
     /// namespaces is visible. Tools without a namespace are visible to everyone.
     namespaces: Vec<NamespaceId>,
+}
+
+/// Durable quota constraints paired with the membership revision they were
+/// derived from. Execution re-verifies the revision immediately before provider
+/// I/O and refunds/retries if reassignment raced admission.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CgroupQuotaSnapshot {
+    pub constraints: Vec<crate::context::CgroupQuotaConstraint>,
+    pub membership_revision: u64,
 }
 
 /// Read-only snapshot of an agent's enforcement state inside the gate.
@@ -265,6 +319,8 @@ pub struct SyscallGate {
     default_cgroup: CgroupId,
     /// Kernel UUID → OS PID record.
     records: DashMap<uuid::Uuid, GateRecord>,
+    /// Serializes multi-map registration and reassignment transactions.
+    mutation_lock: std::sync::Mutex<()>,
     /// Tool namespace assignments. A tool with a namespace is only visible to
     /// agents that are members of that namespace; absence means "global".
     tool_namespaces: DashMap<String, NamespaceId>,
@@ -274,6 +330,9 @@ pub struct SyscallGate {
     approvals: DashMap<(uuid::Uuid, String, String, String), crate::tools::ApprovalPolicy>,
     /// Monotonic PID allocator (starts at 1 so 0 stays reserved for "kernel").
     next_pid: AtomicU64,
+    /// Global monotonic cgroup-membership revision allocator. Global ordering
+    /// prevents unregister/re-register ABA for the same kernel UUID.
+    next_cgroup_revision: AtomicU64,
     /// Optional audit sink for MAC `audit` decisions (and denials). Wired to the
     /// observability engine by the kernel; `None` keeps audit events as counters only.
     audit_sink: std::sync::Mutex<Option<std::sync::Arc<dyn AuditSink>>>,
@@ -290,20 +349,32 @@ pub struct SyscallGate {
 
 impl SyscallGate {
     /// Reserve one cgroup tool-call slot for a previously authorized agent.
-    /// The returned guard must be held until provider execution finishes.
+    /// The returned guard must be held until tool execution finishes.
     pub fn acquire_tool_call(
         &self,
         kid: uuid::Uuid,
     ) -> Result<crate::cgroups::ToolCallGuard, GateDenial> {
-        let cgroup = self
+        let _mutation = self.mutation_lock.lock().unwrap();
+        let (cgroup, pid, accepting_tool_calls) = self
             .records
             .get(&kid)
-            .map(|record| record.cgroup)
+            .map(|record| (record.cgroup, record.pid, record.accepting_tool_calls))
             .ok_or(GateDenial::UnknownAgent)?;
-        self.cgroups.try_acquire_tool_call(cgroup).ok_or_else(|| {
+        if !accepting_tool_calls {
             self.denied_cgroup.fetch_add(1, Ordering::Relaxed);
-            GateDenial::CgroupToolLimit
-        })
+            return Err(GateDenial::CgroupUnavailable(
+                "agent tool admission is closed for lifecycle cleanup".into(),
+            ));
+        }
+        self.cgroups
+            .acquire_tool_call_for_agent(cgroup, pid)
+            .map_err(|error| {
+                self.denied_cgroup.fetch_add(1, Ordering::Relaxed);
+                match error {
+                    CgroupError::ToolCallLimit { .. } => GateDenial::CgroupToolLimit,
+                    other => GateDenial::CgroupUnavailable(other.to_string()),
+                }
+            })
     }
     /// Create a gate with the production baseline: enforcing MAC, profile-based
     /// allow rules, and a default-deny fallthrough. Tests that intentionally
@@ -337,9 +408,11 @@ impl SyscallGate {
             unconfined: false,
             default_cgroup,
             records: DashMap::new(),
+            mutation_lock: std::sync::Mutex::new(()),
             tool_namespaces: DashMap::new(),
             approvals: DashMap::new(),
             next_pid: AtomicU64::new(1),
+            next_cgroup_revision: AtomicU64::new(1),
             audit_sink: std::sync::Mutex::new(None),
             allowed: AtomicU64::new(0),
             denied_capability: AtomicU64::new(0),
@@ -386,27 +459,70 @@ impl SyscallGate {
         }
     }
 
-    /// Register an agent with the gate, allocating it a PID and placing it in
-    /// the given cgroup (or the default if `None`). Returns the assigned PID.
-    pub fn register_agent(
+    /// Fallibly register an agent and its cgroup membership as one serialized
+    /// mutation. No gate record is published unless membership succeeds.
+    pub fn try_register_agent(
         &self,
         kid: uuid::Uuid,
         caps: CapabilitySet,
         cgroup: Option<CgroupId>,
-    ) -> Pid {
+    ) -> Result<Pid, GateMutationError> {
+        self.try_register_agent_with_cgroup_policy(kid, caps, cgroup, false)
+    }
+
+    /// Register a kernel-owned agent whose durable quota hierarchy must remain
+    /// intact for its lifetime.
+    pub(crate) fn try_register_managed_agent(
+        &self,
+        kid: uuid::Uuid,
+        caps: CapabilitySet,
+        cgroup: CgroupId,
+    ) -> Result<Pid, GateMutationError> {
+        self.try_register_agent_with_cgroup_policy(kid, caps, Some(cgroup), true)
+    }
+
+    fn try_register_agent_with_cgroup_policy(
+        &self,
+        kid: uuid::Uuid,
+        caps: CapabilitySet,
+        cgroup: Option<CgroupId>,
+        managed_cgroup: bool,
+    ) -> Result<Pid, GateMutationError> {
+        let _mutation = self.mutation_lock.lock().unwrap();
+        if self.records.contains_key(&kid) {
+            return Err(GateMutationError::AlreadyRegistered(kid));
+        }
         let pid = self.next_pid.fetch_add(1, Ordering::SeqCst);
         let cg = cgroup.unwrap_or(self.default_cgroup);
-        let _ = self.cgroups.add_agent(cg, pid);
+        self.cgroups.add_agent(cg, pid)?;
+        let cgroup_revision = self.next_cgroup_revision.fetch_add(1, Ordering::SeqCst);
+        let (cgroup_changes, _) = watch::channel(cgroup_revision);
         self.records.insert(
             kid,
             GateRecord {
                 pid,
                 caps,
                 cgroup: cg,
+                managed_cgroup,
+                cgroup_revision,
+                cgroup_changes,
+                accepting_tool_calls: true,
                 namespaces: Vec::new(),
             },
         );
-        pid
+        Ok(pid)
+    }
+
+    /// Backwards-compatible registration. Invalid cgroup state fails closed
+    /// instead of publishing an unenforced agent record.
+    pub fn register_agent(
+        &self,
+        kid: uuid::Uuid,
+        caps: CapabilitySet,
+        cgroup: Option<CgroupId>,
+    ) -> Pid {
+        self.try_register_agent(kid, caps, cgroup)
+            .expect("syscall-gate registration failed")
     }
 
     /// Tag a tool with a namespace. Once tagged, only agents whose
@@ -436,12 +552,54 @@ impl SyscallGate {
         }
     }
 
-    /// Remove an agent from the gate.
-    pub fn unregister_agent(&self, kid: uuid::Uuid) {
-        if let Some((_, rec)) = self.records.remove(&kid) {
-            self.cgroups.remove_agent(rec.cgroup, rec.pid);
-        }
+    pub fn try_unregister_agent(&self, kid: uuid::Uuid) -> Result<(), GateMutationError> {
+        let _mutation = self.mutation_lock.lock().unwrap();
+        let rec = self
+            .records
+            .get(&kid)
+            .map(|record| record.clone())
+            .ok_or(GateMutationError::UnknownAgent(kid))?;
+        self.cgroups.try_remove_agent(rec.cgroup, rec.pid)?;
+        self.records.remove(&kid);
         self.approvals.retain(|(agent, _, _, _), _| *agent != kid);
+        Ok(())
+    }
+
+    /// Close the lifecycle admission gate and wait for already-admitted tool
+    /// bindings to release their per-agent cgroup guards. Closing and tool-slot
+    /// acquisition share `mutation_lock`, so no new guard can appear after the
+    /// close becomes visible.
+    pub(crate) async fn close_tool_admission_and_wait(
+        &self,
+        kid: uuid::Uuid,
+    ) -> Result<(), GateMutationError> {
+        let pid = {
+            let _mutation = self.mutation_lock.lock().unwrap();
+            let mut record = self
+                .records
+                .get_mut(&kid)
+                .ok_or(GateMutationError::UnknownAgent(kid))?;
+            record.accepting_tool_calls = false;
+            record.pid
+        };
+        self.cgroups.wait_for_agent_tool_calls(pid).await;
+        Ok(())
+    }
+
+    pub(crate) fn reopen_tool_admission(&self, kid: uuid::Uuid) -> Result<(), GateMutationError> {
+        let _mutation = self.mutation_lock.lock().unwrap();
+        let mut record = self
+            .records
+            .get_mut(&kid)
+            .ok_or(GateMutationError::UnknownAgent(kid))?;
+        record.accepting_tool_calls = true;
+        Ok(())
+    }
+
+    /// Backwards-compatible fail-closed removal.
+    pub fn unregister_agent(&self, kid: uuid::Uuid) {
+        self.try_unregister_agent(kid)
+            .expect("syscall-gate unregistration failed");
     }
 
     /// Grant one exact tool call for a local trusted operator/UI. The grant is
@@ -472,6 +630,80 @@ impl SyscallGate {
         self.records.get(&kid).map(|r| r.pid)
     }
 
+    /// Snapshot the agent's stable root-to-leaf durable quota constraints.
+    pub(crate) fn cgroup_quota_constraints(
+        &self,
+        kid: uuid::Uuid,
+    ) -> Result<CgroupQuotaSnapshot, GateDenial> {
+        let _mutation = self.mutation_lock.lock().unwrap();
+        let record = self.records.get(&kid).ok_or(GateDenial::UnknownAgent)?;
+        let constraints = self
+            .cgroups
+            .quota_constraints_for_agent(record.cgroup, record.pid)
+            .map_err(|error| GateDenial::CgroupUnavailable(error.to_string()))?;
+        Ok(CgroupQuotaSnapshot {
+            constraints,
+            membership_revision: record.cgroup_revision,
+        })
+    }
+
+    /// Subscribe to this agent's cgroup-membership revision before taking a
+    /// quota snapshot. The receiver's value is the exact membership revision,
+    /// so subscribe-then-snapshot is race-safe: a move on either side of the
+    /// snapshot is either incorporated or observed as a changed value.
+    pub(crate) fn cgroup_quota_changes(
+        &self,
+        kid: uuid::Uuid,
+    ) -> Result<watch::Receiver<u64>, GateDenial> {
+        self.records
+            .get(&kid)
+            .map(|record| record.cgroup_changes.subscribe())
+            .ok_or(GateDenial::UnknownAgent)
+    }
+
+    /// Verify that a previously reserved quota snapshot still describes the
+    /// agent immediately before provider invocation.
+    #[cfg(test)]
+    pub(crate) fn verify_cgroup_quota_snapshot(
+        &self,
+        kid: uuid::Uuid,
+        membership_revision: u64,
+    ) -> Result<(), GateDenial> {
+        let _mutation = self.mutation_lock.lock().unwrap();
+        let record = self.records.get(&kid).ok_or(GateDenial::UnknownAgent)?;
+        if record.cgroup_revision != membership_revision {
+            return Err(GateDenial::CgroupMembershipChanged);
+        }
+        self.cgroups
+            .quota_constraints_for_agent(record.cgroup, record.pid)
+            .map(|_| ())
+            .map_err(|error| GateDenial::CgroupUnavailable(error.to_string()))
+    }
+
+    /// Run the final synchronous provider-admission transition while cgroup
+    /// membership mutations are excluded.
+    ///
+    /// A separate `verify` followed by marking the durable receipt in flight
+    /// would leave a small reassignment race between those two operations.
+    /// Keeping the mutation lock through the callback makes the snapshot check
+    /// and caller-supplied linearization point one atomic handshake.
+    pub(crate) fn with_verified_cgroup_quota_snapshot<T, E>(
+        &self,
+        kid: uuid::Uuid,
+        membership_revision: u64,
+        operation: impl FnOnce() -> Result<T, E>,
+    ) -> Result<Result<T, E>, GateDenial> {
+        let _mutation = self.mutation_lock.lock().unwrap();
+        let record = self.records.get(&kid).ok_or(GateDenial::UnknownAgent)?;
+        if record.cgroup_revision != membership_revision {
+            return Err(GateDenial::CgroupMembershipChanged);
+        }
+        self.cgroups
+            .quota_constraints_for_agent(record.cgroup, record.pid)
+            .map_err(|error| GateDenial::CgroupUnavailable(error.to_string()))?;
+        Ok(operation())
+    }
+
     /// Read-only introspection: report the agent's enforcement state (PID,
     /// granted capabilities, cgroup, namespaces) so an SDK/agent can answer
     /// "what am I allowed to do?". Returns `None` if the agent is unknown.
@@ -489,17 +721,22 @@ impl SyscallGate {
 
     /// Check whether an agent may make this tool call.
     ///
-    /// Order: namespace visibility → capability → MAC → approval → cgroup quota. If all
-    /// pass, returns `Ok(pid)` so the caller can record actual usage afterwards.
+    /// Order: namespace visibility → capability → MAC → approval. Tool payload
+    /// size is not provider token usage and is never charged here.
     /// Namespace runs first because the LLM should not learn anything about
     /// tools it cannot see (an attacker probing a denied resource gets ENOENT,
     /// not EACCES).
+    ///
+    /// This is an authorization-only compatibility/introspection precheck. It
+    /// does not reserve a concurrent tool slot and is therefore not a safe
+    /// execution entry point. Execute through
+    /// [`ToolRegistry::authorize_and_acquire_call`](crate::tools::ToolRegistry::authorize_and_acquire_call).
     pub async fn check_tool_call(
         &self,
         kid: uuid::Uuid,
         tool_name: &str,
         resource: &str,
-        est_tokens: u64,
+        _est_tokens: u64,
     ) -> Result<Pid, GateDenial> {
         if !self.unconfined {
             let Some(security) = default_security_catalog().get(tool_name) else {
@@ -507,7 +744,7 @@ impl SyscallGate {
                 return Err(GateDenial::UnknownTool(tool_name.to_string()));
             };
             return self
-                .check_tool_call_declared(kid, tool_name, resource, est_tokens, security)
+                .check_tool_call_declared(kid, tool_name, resource, _est_tokens, security)
                 .await;
         }
 
@@ -518,25 +755,28 @@ impl SyscallGate {
             ToolCallContract {
                 tool_name,
                 resource,
-                estimated_tokens: est_tokens,
                 action: action.action,
                 required_capabilities: &required_capabilities,
                 approval_policy: crate::tools::ApprovalPolicy::None,
                 approval_contract: None,
             },
+            true,
         )
         .await
+        .map(|authorized| authorized.pid)
     }
 
     /// Enforce the validated security declaration carried by the live tool
-    /// registry. Public execution paths use this method so capability and MAC
-    /// decisions come from the binding, never from string matching.
+    /// registry without acquiring a tool slot. This remains public for
+    /// compatibility and policy introspection; execution paths must use
+    /// [`ToolRegistry::authorize_and_acquire_call`](crate::tools::ToolRegistry::authorize_and_acquire_call)
+    /// so admission and authorization are one operation.
     pub async fn check_tool_call_declared(
         &self,
         kid: uuid::Uuid,
         tool_name: &str,
         resource: &str,
-        est_tokens: u64,
+        _est_tokens: u64,
         security: &crate::tools::ToolSecurity,
     ) -> Result<Pid, GateDenial> {
         let contract = serde_json::to_string(security)
@@ -546,25 +786,75 @@ impl SyscallGate {
             ToolCallContract {
                 tool_name,
                 resource,
-                estimated_tokens: est_tokens,
                 action: security.action.as_str(),
                 required_capabilities: &security.required_capabilities,
                 approval_policy: security.approval_policy,
                 approval_contract: Some(&contract),
             },
+            true,
         )
         .await
+        .map(|authorized| authorized.pid)
+    }
+
+    /// Perform declaration-backed authorization and concurrent-tool admission
+    /// as one counted gate verdict. Authorization failures increment their
+    /// specific bucket; slot failures increment cgroup denial; only a fully
+    /// admitted call increments `allowed`.
+    pub(crate) async fn authorize_and_acquire_tool_call_declared(
+        &self,
+        kid: uuid::Uuid,
+        tool_name: &str,
+        resource: &str,
+        security: &crate::tools::ToolSecurity,
+    ) -> Result<(Pid, crate::cgroups::ToolCallGuard), GateDenial> {
+        let approval_contract = serde_json::to_string(security)
+            .expect("validated ToolSecurity serialization is infallible");
+        let authorized = self
+            .check_tool_call_contract(
+                kid,
+                ToolCallContract {
+                    tool_name,
+                    resource,
+                    action: security.action.as_str(),
+                    required_capabilities: &security.required_capabilities,
+                    approval_policy: security.approval_policy,
+                    approval_contract: Some(&approval_contract),
+                },
+                false,
+            )
+            .await?;
+        let guard = if self.unconfined {
+            self.cgroups
+                .acquire_tool_call_checked(self.cgroups.root())
+                .map_err(|error| GateDenial::CgroupUnavailable(error.to_string()))?
+        } else {
+            self.acquire_tool_call(kid)?
+        };
+        self.allowed.fetch_add(1, Ordering::Relaxed);
+        if authorized.audited {
+            self.audited.fetch_add(1, Ordering::Relaxed);
+            self.emit_audit(AuditEvent {
+                agent: kid,
+                pid: authorized.pid,
+                tool: tool_name.to_string(),
+                action: security.action.as_str(),
+                resource: resource.to_string(),
+                decision: AuditDecision::Allowed,
+            });
+        }
+        Ok((authorized.pid, guard))
     }
 
     async fn check_tool_call_contract(
         &self,
         kid: uuid::Uuid,
         contract: ToolCallContract<'_>,
-    ) -> Result<Pid, GateDenial> {
+        count_success: bool,
+    ) -> Result<AuthorizedToolCall, GateDenial> {
         let ToolCallContract {
             tool_name,
             resource,
-            estimated_tokens,
             action,
             required_capabilities,
             approval_policy,
@@ -573,21 +863,34 @@ impl SyscallGate {
         // Explicitly-ungoverned gate (test / non-OS contexts only — see
         // `SyscallGate::unconfined`): allow everything without registration.
         if self.unconfined {
-            self.allowed.fetch_add(1, Ordering::Relaxed);
-            return Ok(0);
-        }
-        let (pid, caps, cgroup, agent_namespaces) = match self.records.get(&kid) {
-            Some(rec) => (
-                rec.pid,
-                rec.caps.clone(),
-                rec.cgroup,
-                rec.namespaces.clone(),
-            ),
-            None => {
-                self.denied_unknown.fetch_add(1, Ordering::Relaxed);
-                return Err(GateDenial::UnknownAgent);
+            if count_success {
+                self.allowed.fetch_add(1, Ordering::Relaxed);
             }
-        };
+            return Ok(AuthorizedToolCall {
+                pid: 0,
+                audited: false,
+            });
+        }
+        let (pid, caps, cgroup, accepting_tool_calls, agent_namespaces) =
+            match self.records.get(&kid) {
+                Some(rec) => (
+                    rec.pid,
+                    rec.caps.clone(),
+                    rec.cgroup,
+                    rec.accepting_tool_calls,
+                    rec.namespaces.clone(),
+                ),
+                None => {
+                    self.denied_unknown.fetch_add(1, Ordering::Relaxed);
+                    return Err(GateDenial::UnknownAgent);
+                }
+            };
+        if !accepting_tool_calls {
+            self.denied_cgroup.fetch_add(1, Ordering::Relaxed);
+            return Err(GateDenial::CgroupUnavailable(
+                "agent tool admission is closed for lifecycle cleanup".into(),
+            ));
+        }
 
         // 0. Namespace visibility. If the tool is tagged with a namespace,
         //    the agent must be a member of it. Untagged tools are global.
@@ -614,7 +917,7 @@ impl SyscallGate {
             let mac = self.mac.lock().await;
             mac.check(pid, action, resource)
         };
-        match mac_decision {
+        let audited = match mac_decision {
             MacDecision::Deny => {
                 self.denied_mac.fetch_add(1, Ordering::Relaxed);
                 self.emit_audit(AuditEvent {
@@ -633,18 +936,21 @@ impl SyscallGate {
             // "Allow but log": let the call proceed, but record it. Without a
             // sink this is just a counter; with one wired it lands in the audit log.
             MacDecision::Audit => {
-                self.audited.fetch_add(1, Ordering::Relaxed);
-                self.emit_audit(AuditEvent {
-                    agent: kid,
-                    pid,
-                    tool: tool_name.to_string(),
-                    action,
-                    resource: resource.to_string(),
-                    decision: AuditDecision::Allowed,
-                });
+                if count_success {
+                    self.audited.fetch_add(1, Ordering::Relaxed);
+                    self.emit_audit(AuditEvent {
+                        agent: kid,
+                        pid,
+                        tool: tool_name.to_string(),
+                        action,
+                        resource: resource.to_string(),
+                        decision: AuditDecision::Allowed,
+                    });
+                }
+                true
             }
-            MacDecision::Allow => {}
-        }
+            MacDecision::Allow => false,
+        };
 
         // 3. Approval is exact and single-use. It is checked after capability
         // and MAC so a denied request cannot consume a legitimate grant.
@@ -683,33 +989,69 @@ impl SyscallGate {
             }
         }
 
-        // 4. Atomically reserve quota across the full hierarchy. This is the
-        // charge; callers must not separately record the same estimate later.
-        if !self.cgroups.try_record_tokens(cgroup, estimated_tokens) {
-            self.denied_cgroup.fetch_add(1, Ordering::Relaxed);
-            return Err(GateDenial::CgroupQuota);
-        }
+        // 4. Validate, but do not charge, cgroup membership and hierarchy.
+        // Provider admission consumes the returned stable constraints later.
+        self.cgroups
+            .quota_constraints_for_agent(cgroup, pid)
+            .map_err(|error| {
+                self.denied_cgroup.fetch_add(1, Ordering::Relaxed);
+                GateDenial::CgroupUnavailable(error.to_string())
+            })?;
 
-        self.allowed.fetch_add(1, Ordering::Relaxed);
-        Ok(pid)
+        if count_success {
+            self.allowed.fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(AuthorizedToolCall { pid, audited })
     }
 
-    /// Charge externally observed usage that was not already reserved through
-    /// `check_tool_call`. Normal tool paths reserve at admission and must not
-    /// call this again.
-    pub fn record_tool_usage(&self, kid: uuid::Uuid, actual_tokens: u64) {
-        if let Some(rec) = self.records.get(&kid) {
-            self.cgroups.record_tokens(rec.cgroup, actual_tokens);
+    /// Compatibility no-op. Provider usage is reserved/reconciled by the
+    /// durable rate limiter; tool argument length must never burn that quota.
+    pub fn record_tool_usage(&self, _kid: uuid::Uuid, _actual_tokens: u64) {}
+
+    /// Atomically reassign a low-level gate registration's cgroup. A failed
+    /// destination admission leaves the old membership and revision unchanged.
+    ///
+    /// Kernel-created agents are deliberately immutable here: moving them
+    /// directly would drop their tenant/profile/private-agent durable quota
+    /// scopes. A future managed reassignment API must rebuild and validate that
+    /// complete hierarchy instead.
+    pub fn try_set_cgroup(
+        &self,
+        kid: uuid::Uuid,
+        cgroup: CgroupId,
+    ) -> Result<(), GateMutationError> {
+        let _mutation = self.mutation_lock.lock().unwrap();
+        let current = self
+            .records
+            .get(&kid)
+            .map(|record| record.clone())
+            .ok_or(GateMutationError::UnknownAgent(kid))?;
+        if current.cgroup == cgroup {
+            self.cgroups
+                .quota_constraints_for_agent(cgroup, current.pid)?;
+            return Ok(());
         }
+        if current.managed_cgroup {
+            return Err(GateMutationError::ManagedCgroupImmutable(kid));
+        }
+
+        self.cgroups
+            .try_move_agent(current.cgroup, cgroup, current.pid)?;
+        let revision = self.next_cgroup_revision.fetch_add(1, Ordering::SeqCst);
+        let mut record = self
+            .records
+            .get_mut(&kid)
+            .expect("mutation lock keeps registered agent stable");
+        record.cgroup = cgroup;
+        record.cgroup_revision = revision;
+        record.cgroup_changes.send_replace(revision);
+        Ok(())
     }
 
-    /// Set the cgroup an agent belongs to (e.g. when applying a profile).
+    /// Backwards-compatible fail-closed reassignment.
     pub fn set_cgroup(&self, kid: uuid::Uuid, cgroup: CgroupId) {
-        if let Some(mut rec) = self.records.get_mut(&kid) {
-            self.cgroups.remove_agent(rec.cgroup, rec.pid);
-            let _ = self.cgroups.add_agent(cgroup, rec.pid);
-            rec.cgroup = cgroup;
-        }
+        self.try_set_cgroup(kid, cgroup)
+            .expect("syscall-gate cgroup reassignment failed");
     }
 
     /// Update an agent's capability set.
@@ -1007,30 +1349,250 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn denies_over_cgroup_quota() {
+    async fn tool_payload_size_never_burns_provider_quota() {
         let (gate, cgroups) = fresh_gate();
         let cg = cgroups.create(
             "tight".into(),
             cgroups.root(),
             CgroupLimits {
-                tokens_per_min: 100,
+                tokens_per_min: 1,
                 ..Default::default()
             },
         );
         let kid = uuid::Uuid::new_v4();
         gate.register_agent(kid, CapabilitySet::all(), Some(cg));
 
-        // Use most of the budget.
-        gate.record_tool_usage(kid, 90);
+        for payload_size in [1, 1_000_000, u64::MAX] {
+            assert!(gate
+                .check_tool_call(kid, "read_file", "/x", payload_size)
+                .await
+                .is_ok());
+            gate.record_tool_usage(kid, payload_size);
+        }
+        let snapshot = gate.cgroup_quota_constraints(kid).unwrap();
+        assert_eq!(snapshot.constraints.last().unwrap().token_limit, 1);
+        assert_eq!(cgroups.get(cg).unwrap().usage.tokens_this_min, 0);
+        assert_eq!(gate.stats().denied_cgroup, 0);
+    }
 
-        // Asking for 30 more would push to 120 > 100 → denied.
-        let r = gate.check_tool_call(kid, "read_file", "/x", 30).await;
-        assert_eq!(r, Err(GateDenial::CgroupQuota));
-        assert_eq!(gate.stats().denied_cgroup, 1);
+    #[test]
+    fn quota_snapshot_revision_detects_successful_move_only() {
+        let (gate, cgroups) = fresh_gate();
+        let first = cgroups.create("first".into(), cgroups.root(), CgroupLimits::default());
+        let second = cgroups.create("second".into(), cgroups.root(), CgroupLimits::default());
+        let kid = uuid::Uuid::new_v4();
+        gate.try_register_agent(kid, CapabilitySet::all(), Some(first))
+            .unwrap();
+        let before = gate.cgroup_quota_constraints(kid).unwrap();
+        gate.verify_cgroup_quota_snapshot(kid, before.membership_revision)
+            .unwrap();
 
-        // 5 more is under budget.
-        let r = gate.check_tool_call(kid, "read_file", "/x", 5).await;
-        assert!(r.is_ok());
+        gate.try_set_cgroup(kid, second).unwrap();
+        assert_eq!(
+            gate.verify_cgroup_quota_snapshot(kid, before.membership_revision),
+            Err(GateDenial::CgroupMembershipChanged)
+        );
+        let after = gate.cgroup_quota_constraints(kid).unwrap();
+        assert_ne!(after.membership_revision, before.membership_revision);
+        assert_eq!(after.constraints.last().unwrap().scope_id, "/second");
+
+        let full = cgroups.create(
+            "full".into(),
+            cgroups.root(),
+            CgroupLimits {
+                max_agents: 1,
+                ..Default::default()
+            },
+        );
+        gate.try_register_agent(uuid::Uuid::new_v4(), CapabilitySet::all(), Some(full))
+            .unwrap();
+        assert!(matches!(
+            gate.try_set_cgroup(kid, full),
+            Err(GateMutationError::Cgroup(CgroupError::MaxAgentsReached(_)))
+        ));
+        gate.verify_cgroup_quota_snapshot(kid, after.membership_revision)
+            .unwrap();
+        assert_eq!(
+            gate.cgroup_quota_constraints(kid)
+                .unwrap()
+                .constraints
+                .last()
+                .unwrap()
+                .scope_id,
+            "/second"
+        );
+    }
+
+    #[test]
+    fn active_tool_guard_rejects_gate_move_without_membership_or_revision_change() {
+        let (gate, cgroups) = fresh_gate();
+        let source = cgroups.create(
+            "move-source".into(),
+            cgroups.root(),
+            CgroupLimits {
+                max_concurrent_tool_calls: 1,
+                ..Default::default()
+            },
+        );
+        let destination = cgroups.create(
+            "move-destination".into(),
+            cgroups.root(),
+            CgroupLimits::default(),
+        );
+        let kid = uuid::Uuid::new_v4();
+        gate.try_register_agent(kid, CapabilitySet::all(), Some(source))
+            .unwrap();
+        let before = gate.cgroup_quota_constraints(kid).unwrap();
+        let guard = gate.acquire_tool_call(kid).unwrap();
+
+        assert!(matches!(
+            gate.try_set_cgroup(kid, destination),
+            Err(GateMutationError::Cgroup(
+                CgroupError::ActiveToolReservations(_)
+            ))
+        ));
+        let unchanged = gate.cgroup_quota_constraints(kid).unwrap();
+        assert_eq!(unchanged, before);
+        assert_eq!(gate.agent_info(kid).unwrap().cgroup, source);
+        assert!(matches!(
+            gate.acquire_tool_call(kid),
+            Err(GateDenial::CgroupToolLimit)
+        ));
+
+        drop(guard);
+        gate.try_set_cgroup(kid, destination).unwrap();
+        assert_eq!(gate.agent_info(kid).unwrap().cgroup, destination);
+        assert_ne!(
+            gate.cgroup_quota_constraints(kid)
+                .unwrap()
+                .membership_revision,
+            before.membership_revision
+        );
+    }
+
+    #[tokio::test]
+    async fn combined_tool_admission_records_exactly_one_outcome_per_attempt() {
+        let (gate, cgroups) = fresh_gate();
+        let group = cgroups.create(
+            "counted-admission".into(),
+            cgroups.root(),
+            CgroupLimits {
+                max_concurrent_tool_calls: 1,
+                ..Default::default()
+            },
+        );
+        let kid = uuid::Uuid::new_v4();
+        gate.try_register_agent(kid, CapabilitySet::all(), Some(group))
+            .unwrap();
+        let security = crate::tools::ToolRegistry::default_security_catalog()
+            .remove("read_file")
+            .unwrap();
+
+        let (_, first) = gate
+            .authorize_and_acquire_tool_call_declared(kid, "read_file", "/x", &security)
+            .await
+            .unwrap();
+        assert_eq!(gate.stats().allowed, 1);
+        assert!(matches!(
+            gate.authorize_and_acquire_tool_call_declared(kid, "read_file", "/x", &security)
+                .await,
+            Err(GateDenial::CgroupToolLimit)
+        ));
+        let denied = gate.stats();
+        assert_eq!(denied.allowed, 1);
+        assert_eq!(denied.denied_cgroup, 1);
+
+        drop(first);
+        let (_, second) = gate
+            .authorize_and_acquire_tool_call_declared(kid, "read_file", "/x", &security)
+            .await
+            .unwrap();
+        drop(second);
+        let final_stats = gate.stats();
+        assert_eq!(final_stats.allowed, 2);
+        assert_eq!(final_stats.denied_cgroup, 1);
+    }
+
+    #[tokio::test]
+    async fn lifecycle_close_blocks_new_calls_and_waits_for_existing_guard() {
+        let (gate, _) = fresh_gate();
+        let kid = uuid::Uuid::new_v4();
+        gate.try_register_agent(kid, CapabilitySet::all(), None)
+            .unwrap();
+        let guard = gate.acquire_tool_call(kid).unwrap();
+        assert!(matches!(
+            gate.try_unregister_agent(kid),
+            Err(GateMutationError::Cgroup(
+                CgroupError::ActiveToolReservations(_)
+            ))
+        ));
+
+        let waiting_gate = gate.clone();
+        let waiter =
+            tokio::spawn(async move { waiting_gate.close_tool_admission_and_wait(kid).await });
+        tokio::task::yield_now().await;
+        assert!(matches!(
+            gate.acquire_tool_call(kid),
+            Err(GateDenial::CgroupUnavailable(_))
+        ));
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert!(
+            !waiter.is_finished(),
+            "cleanup must wait while the admitted binding is active"
+        );
+
+        drop(guard);
+        tokio::time::timeout(std::time::Duration::from_secs(1), waiter)
+            .await
+            .expect("final guard drop must wake cleanup")
+            .unwrap()
+            .unwrap();
+        gate.try_unregister_agent(kid).unwrap();
+    }
+
+    #[tokio::test]
+    async fn missing_membership_fails_closed_without_tool_slot_bump() {
+        let (gate, cgroups) = fresh_gate();
+        let group = cgroups.create("member".into(), cgroups.root(), CgroupLimits::default());
+        let kid = uuid::Uuid::new_v4();
+        let pid = gate.register_agent(kid, CapabilitySet::all(), Some(group));
+        cgroups.try_remove_agent(group, pid).unwrap();
+
+        assert!(matches!(
+            gate.check_tool_call(kid, "read_file", "/x", 1).await,
+            Err(GateDenial::CgroupUnavailable(_))
+        ));
+        assert!(matches!(
+            gate.cgroup_quota_constraints(kid),
+            Err(GateDenial::CgroupUnavailable(_))
+        ));
+        assert!(matches!(
+            gate.acquire_tool_call(kid),
+            Err(GateDenial::CgroupUnavailable(_))
+        ));
+        assert_eq!(cgroups.get(group).unwrap().usage.active_tool_calls, 0);
+    }
+
+    #[test]
+    fn gate_concurrent_tool_slots_are_raii_scoped() {
+        let (gate, cgroups) = fresh_gate();
+        let group = cgroups.create(
+            "tool-limit".into(),
+            cgroups.root(),
+            CgroupLimits {
+                max_concurrent_tool_calls: 1,
+                ..Default::default()
+            },
+        );
+        let kid = uuid::Uuid::new_v4();
+        gate.register_agent(kid, CapabilitySet::all(), Some(group));
+        let first = gate.acquire_tool_call(kid).unwrap();
+        assert!(matches!(
+            gate.acquire_tool_call(kid),
+            Err(GateDenial::CgroupToolLimit)
+        ));
+        drop(first);
+        assert!(gate.acquire_tool_call(kid).is_ok());
     }
 
     #[tokio::test]
@@ -1094,6 +1656,57 @@ mod tests {
         assert_eq!(events[0].tool, "run_command");
         assert_eq!(events[0].resource, "/bin/ls");
         assert_eq!(events[0].agent, kid);
+    }
+
+    #[tokio::test]
+    async fn audited_call_is_not_logged_as_allowed_when_slot_admission_fails() {
+        use std::sync::{Arc, Mutex};
+
+        struct RecordingSink(Mutex<Vec<AuditEvent>>);
+        impl AuditSink for RecordingSink {
+            fn audit(&self, event: AuditEvent) {
+                self.0.lock().unwrap().push(event);
+            }
+        }
+
+        let (gate, cgroups) = fresh_gate();
+        let group = cgroups.create(
+            "audited-limit".into(),
+            cgroups.root(),
+            CgroupLimits {
+                max_concurrent_tool_calls: 1,
+                ..Default::default()
+            },
+        );
+        let sink = Arc::new(RecordingSink(Mutex::new(Vec::new())));
+        gate.set_audit_sink(sink.clone());
+        let kid = uuid::Uuid::new_v4();
+        let pid = gate.register_agent(kid, CapabilitySet::all(), Some(group));
+        {
+            let mut mac = gate.mac.lock().await;
+            mac.set_enforcing(true);
+            mac.label_agent(pid, "watched".into());
+            mac.load_policy(vec![PolicyRule {
+                subject: "watched".into(),
+                action: "read".into(),
+                object: "*".into(),
+                decision: "audit".into(),
+            }]);
+        }
+        let occupied = gate.acquire_tool_call(kid).unwrap();
+        let security = default_security_catalog().get("read_file").unwrap();
+
+        assert!(matches!(
+            gate.authorize_and_acquire_tool_call_declared(kid, "read_file", "/x", security)
+                .await,
+            Err(GateDenial::CgroupToolLimit)
+        ));
+        let stats = gate.stats();
+        assert_eq!(stats.allowed, 0);
+        assert_eq!(stats.audited, 0);
+        assert_eq!(stats.denied_cgroup, 1);
+        assert!(sink.0.lock().unwrap().is_empty());
+        drop(occupied);
     }
 
     #[tokio::test]
@@ -1225,5 +1838,18 @@ mod tests {
         assert_eq!(res, Ok(0));
         assert_eq!(gate.stats().allowed, 1);
         assert_eq!(gate.stats().denied_unknown, 0);
+
+        let security = default_security_catalog().get("write_file").unwrap();
+        let (_, guard) = gate
+            .authorize_and_acquire_tool_call_declared(
+                uuid::Uuid::new_v4(),
+                "write_file",
+                "/etc/passwd",
+                security,
+            )
+            .await
+            .expect("combined unconfined admission must not require registration");
+        drop(guard);
+        assert_eq!(gate.stats().allowed, 2);
     }
 }

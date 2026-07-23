@@ -120,10 +120,9 @@ async fn main() {
             config.data_dir.display()
         )),
     };
-    // Start the kernel's background runtime on the live path: the scheduler
-    // observer (publishes the CFS pick into procfs `current_agent`) and the
-    // per-minute cgroup-counter reset that regenerates token quotas. Held for
-    // the process lifetime; graceful stop()/signal handling is a follow-up.
+    // Start the scheduler observer that publishes the CFS pick into procfs
+    // `current_agent`. Fixed-epoch provider/cgroup quotas are durable and need
+    // no background reset task. Held for the process lifetime.
     let _runtime = kernel.start_runtime();
     register_providers(&kernel, &config);
 

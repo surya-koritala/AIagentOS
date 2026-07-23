@@ -57,9 +57,10 @@ async fn capability_denies_network_tool_without_cap_net() {
     assert!(result.is_ok(), "http_get should pass with CAP_NET_ACCESS");
 }
 
-/// Cgroup layer: an agent over its cgroup token quota is denied with quota error.
+/// Tool payload sizes are not provider usage and therefore never mutate or
+/// exhaust durable cgroup token quota.
 #[tokio::test]
-async fn cgroup_quota_blocks_when_over_budget() {
+async fn tool_payload_size_does_not_consume_cgroup_token_quota() {
     let (gate, cgroups) = fresh_gate();
     let cg = cgroups.create(
         "tight".into(),
@@ -73,19 +74,14 @@ async fn cgroup_quota_blocks_when_over_budget() {
     let kid = uuid::Uuid::new_v4();
     gate.register_agent(kid, CapabilitySet::all(), Some(cg));
 
-    // Burn 90 tokens; now 30 more would breach the 100-token-per-minute cap.
+    // Compatibility accounting is deliberately a no-op. Only actual LLM
+    // provider usage is reserved and reconciled by the durable rate limiter.
     gate.record_tool_usage(kid, 90);
     let result = gate
-        .check_tool_call(kid, "read_file", "/etc/hosts", 30)
+        .check_tool_call(kid, "read_file", "/etc/hosts", u64::MAX)
         .await;
-    assert_eq!(result, Err(GateDenial::CgroupQuota));
-
-    // Resetting the per-minute counter restores headroom.
-    cgroups.reset_minute_counters();
-    let result = gate
-        .check_tool_call(kid, "read_file", "/etc/hosts", 30)
-        .await;
-    assert!(result.is_ok(), "after reset the call should succeed");
+    assert!(result.is_ok(), "tool payload size must not burn LLM quota");
+    assert_eq!(cgroups.get(cg).unwrap().usage.tokens_this_min, 0);
 }
 
 /// MAC layer: an enforcing MAC policy denies a labelled agent's tool action.
@@ -134,13 +130,13 @@ async fn mac_policy_denies_labelled_agent() {
 /// Three layers stack: the gate hits whichever fires first, but counters
 /// reflect the actual layer denied.
 #[tokio::test]
-async fn enforcement_stacks_in_order_capability_then_mac_then_cgroup() {
+async fn enforcement_stacks_capability_mac_and_cgroup_concurrency() {
     let (gate, cgroups) = fresh_gate();
     let cg = cgroups.create(
         "stacked".into(),
         cgroups.root(),
         CgroupLimits {
-            tokens_per_min: 50,
+            max_concurrent_tool_calls: 1,
             ..Default::default()
         },
     );
@@ -176,7 +172,8 @@ async fn enforcement_stacks_in_order_capability_then_mac_then_cgroup() {
     let r = gate.check_tool_call(b, "write_file", "/tmp/y", 5).await;
     assert!(matches!(r, Err(GateDenial::MacDeny { .. })));
 
-    // Agent C: has caps, MAC allows, but the cgroup is already at quota.
+    // Agent C: has caps and MAC allows, but its one structural tool slot is
+    // already held.
     let c = uuid::Uuid::new_v4();
     let pid_c = gate.register_agent(c, CapabilitySet::all(), Some(cg));
     {
@@ -184,9 +181,10 @@ async fn enforcement_stacks_in_order_capability_then_mac_then_cgroup() {
         mac.label_agent(pid_c, "ok".into());
         // Existing rules already include subject "*" allow which matches "ok".
     }
-    gate.record_tool_usage(c, 49);
-    let r = gate.check_tool_call(c, "read_file", "/tmp/z", 5).await;
-    assert_eq!(r, Err(GateDenial::CgroupQuota));
+    let first_slot = gate.acquire_tool_call(c).unwrap();
+    let r = gate.acquire_tool_call(c);
+    assert!(matches!(r, Err(GateDenial::CgroupToolLimit)));
+    drop(first_slot);
 
     let stats = gate.stats();
     assert_eq!(stats.denied_capability, 1);
@@ -472,16 +470,19 @@ async fn namespace_isolation_blocks_cross_namespace_ipc() {
         .expect("after joining team-b, alice → carol should succeed");
 }
 
-/// LIVE-PATH cgroup enforcement: an agent created via `create_agent_full` now
-/// lands in a bounded per-profile cgroup, so `CgroupQuota` fires for a
-/// non-`full-access` profile while `full-access` stays unlimited. (The existing
-/// `cgroup_quota_blocks_when_over_budget` only exercises a hand-built cgroup;
-/// this covers the real agent-creation path the CLI/Tauri use.)
+/// LIVE-PATH cgroup enforcement: a standard agent gets its configured
+/// per-agent concurrent-tool limit while `full-access` remains unlimited.
 #[tokio::test]
-async fn live_create_path_enforces_cgroup_quota() {
+async fn live_create_path_enforces_per_agent_tool_concurrency() {
     use kernel::{AgentConfig, AgentKernelImpl};
 
-    let kernel = AgentKernelImpl::new().expect("kernel new");
+    let budgets = kernel::config::BudgetConfig {
+        max_concurrent_tool_calls: 1,
+        ..Default::default()
+    };
+    let context = std::sync::Arc::new(kernel::context::SqliteContextManager::in_memory().unwrap());
+    let kernel =
+        AgentKernelImpl::with_context_manager(context, &budgets, false, &[]).expect("kernel new");
     let cfg = |name: &str, profile: &str| AgentConfig {
         name: name.into(),
         task: "test".into(),
@@ -491,40 +492,81 @@ async fn live_create_path_enforces_cgroup_quota() {
         sandbox_config: None,
     };
 
-    // "standard" → bounded cgroup (default 50_000 tok/min). A single call
-    // estimating more than the per-minute budget is denied with CgroupQuota.
+    // "standard" receives one per-agent slot.
     let std_agent = kernel
         .create_agent_full(cfg("std", "standard"))
         .await
         .unwrap();
-    let denied = kernel
-        .syscall_gate
-        .check_tool_call(std_agent.id, "read_file", "/x", 60_000)
-        .await;
+    let held = kernel.syscall_gate.acquire_tool_call(std_agent.id).unwrap();
+    let denied = kernel.syscall_gate.acquire_tool_call(std_agent.id);
     assert!(
-        matches!(denied, Err(GateDenial::CgroupQuota)),
-        "standard agent over budget should be denied CgroupQuota, got {denied:?}"
+        matches!(denied, Err(GateDenial::CgroupToolLimit)),
+        "standard agent's second concurrent tool call must be denied"
     );
-    // A small call stays within budget.
-    assert!(kernel
-        .syscall_gate
-        .check_tool_call(std_agent.id, "read_file", "/x", 10)
-        .await
-        .is_ok());
+    drop(held);
 
-    // "full-access" → unlimited cgroup: the same large call is allowed.
+    // "full-access" has no structural concurrency ceiling.
     let fa = kernel
         .create_agent_full(cfg("fa", "full-access"))
         .await
         .unwrap();
-    assert!(
-        kernel
-            .syscall_gate
-            .check_tool_call(fa.id, "read_file", "/x", 60_000)
-            .await
-            .is_ok(),
-        "full-access agent should be unlimited"
-    );
+    let first = kernel.syscall_gate.acquire_tool_call(fa.id).unwrap();
+    let second = kernel.syscall_gate.acquire_tool_call(fa.id).unwrap();
+    drop((first, second));
+}
+
+#[tokio::test]
+async fn live_cgroup_hierarchy_applies_default_elevated_full_and_custom_profiles() {
+    use kernel::{AgentConfig, AgentKernelImpl};
+
+    let budgets = kernel::config::BudgetConfig {
+        agent_tokens_per_min: 100,
+        tenant_tokens_per_min: 200,
+        max_concurrent_tool_calls: 3,
+        ..Default::default()
+    };
+    let context = std::sync::Arc::new(kernel::context::SqliteContextManager::in_memory().unwrap());
+    let kernel =
+        AgentKernelImpl::with_context_manager(context, &budgets, false, &[]).expect("kernel");
+    let cfg = |profile: &str| AgentConfig {
+        name: profile.into(),
+        task: "inspect hierarchy".into(),
+        llm_provider: "stub".into(),
+        permission_profile: profile.into(),
+        priority: kernel::Priority::default(),
+        sandbox_config: None,
+    };
+
+    for (profile, token_limit, tool_limit) in [
+        ("standard", 100, 3),
+        ("elevated", 400, 3),
+        ("full-access", 0, 0),
+        ("custom/profile~x", 100, 3),
+    ] {
+        let agent = kernel.create_agent_full(cfg(profile)).await.unwrap();
+        let leaf_id = kernel.syscall_gate.agent_info(agent.id).unwrap().cgroup;
+        let leaf = kernel.cgroups.get(leaf_id).unwrap();
+        assert_eq!(leaf.limits.tokens_per_min, token_limit);
+        assert_eq!(leaf.limits.max_concurrent_tool_calls, tool_limit);
+        assert!(leaf.quota_scope.ends_with(&format!("/agent/{}", agent.id)));
+
+        let profile_group = kernel.cgroups.get(leaf.parent.unwrap()).unwrap();
+        assert_eq!(profile_group.limits.tokens_per_min, 0);
+        assert!(profile_group.quota_scope.contains("/profile/"));
+        if profile == "custom/profile~x" {
+            assert!(
+                profile_group
+                    .quota_scope
+                    .ends_with("/profile/custom~1profile~0x"),
+                "custom profile segments must be collision-safe"
+            );
+        }
+
+        let tenant_group = kernel.cgroups.get(profile_group.parent.unwrap()).unwrap();
+        assert_eq!(tenant_group.quota_scope, "/tenant/default");
+        assert_eq!(tenant_group.limits.tokens_per_min, 200);
+        assert_eq!(tenant_group.parent, Some(kernel.cgroups.root()));
+    }
 }
 
 /// Shutdown frees CFS run-queue entries — previously `runnable_count` only ever

@@ -63,7 +63,7 @@ examples/      # CLI usage examples
 - `AgentKernelImpl::with_db_path(path)` — persistent SQLite at a chosen path
 - `AgentKernelImpl::from_config(&config)` — reads `config.data_dir` and persists to `agent_os.db`
 
-The documented top-level entry points are the free functions `kernel::boot(&config)` and `kernel::boot_in_memory()` (lib.rs): they build the kernel **and** call `AgentKernelImpl::start_runtime()`, which spawns the background tasks — a scheduler observer that publishes the CFS pick into procfs as `current_agent`, and a per-minute cgroup-counter reset so `tokens_per_min` quotas regenerate. `from_config`/`new` do *not* start the runtime. Prefer `boot()` for new entry points — note the CLI and Tauri `main.rs` currently call `from_config` directly, so the background tasks don't run in those binaries yet.
+The documented top-level entry points are the free functions `kernel::boot(&config)` and `kernel::boot_in_memory()` (lib.rs): they build the kernel **and** call `AgentKernelImpl::start_runtime()`, which spawns the scheduler observer that publishes the CFS pick into procfs as `current_agent`. Token-rate windows use durable fixed epochs and therefore do not need an in-process reset timer. `from_config`/`new` do *not* start the runtime themselves. The CLI, Tauri app, and `agent-server` intentionally construct from config and then call `start_runtime`; new entry points must use `boot()` or perform that same explicit startup.
 
 Agent creation flows through `create_agent_full`, which *admits* the agent to the priority `scheduler` (non-blocking — `scheduler.admit`) and enqueues it into the CFS run queue. Admission is to the *system*, not the CPU: a freshly-created agent isn't executing, so creation never blocks on the concurrency gate (this is the #38 fix — previously creation called the blocking `schedule()`, so the 11th live agent stalled ~10s then failed with `QueueFull`). The agent is marked `Running` only for the duration of each turn in `send_message` (`set_running`/`set_queued`), so `running_agents` reflects real concurrency; concurrent *execution* is bounded by the `rate_limiter` (`budgets.max_concurrent`, default 3). The blocking `AgentScheduler::schedule` / `MAX_CONCURRENT_AGENTS = 10` machinery remains as a standalone primitive but is no longer on the creation path.
 
@@ -71,14 +71,20 @@ When adding a new subsystem, wire it through `AgentKernelImpl::with_context_mana
 
 ### The syscall gate (load-bearing OS layer)
 
-`crates/kernel/src/syscall_gate.rs` is the **chokepoint that makes namespaces, capabilities, MAC, and cgroups load-bearing**. Every tool call from `AgentExecutor::execute_tool` (`crates/kernel/src/execution.rs:321`) consults `SyscallGate::check_tool_call`, which runs these in order (first failure wins):
+`crates/kernel/src/syscall_gate.rs` is the **chokepoint that makes declarations, namespaces, capabilities, MAC, approvals, and cgroup membership load-bearing**. Every executable tool call from `AgentExecutor`, the syscall wire, and MCP passes through `ToolRegistry::authorize_and_acquire_call` into the combined declaration-aware gate, which runs these checks in order (first failure wins):
 
-0. **Namespace visibility** — if the tool is tagged with a namespace, the calling agent must be a member; `NotInNamespace` otherwise. Untagged tools are global. (Phase 3 — runs *before* capability/MAC.)
-1. **Capability check** — `classify_tool(name)` → required cap (e.g. `http_get` requires `CAP_NET_ACCESS`); `MissingCapability` denial otherwise.
-2. **MAC check** — `MacEngine::check(pid, action, resource)`; `MacDeny` if the policy returns Deny.
-3. **Cgroup quota check** — `cgroups.check_token_limit(cg, est_tokens)`; `CgroupQuota` if over budget.
+0. **Declaration check** — the tool must have a validated security declaration; unknown or undeclared tools fail closed.
+1. **Namespace visibility** — if the tool is tagged with a namespace, the calling agent must be a member; `NotInNamespace` otherwise. Untagged tools are global.
+2. **Capability check** — the validated declaration supplies the required capabilities (for example, `http_get` requires `CAP_NET_ACCESS`); `MissingCapability` otherwise.
+3. **MAC check** — `MacEngine::check(pid, action, resource)`; `MacDeny` if the policy returns Deny.
+4. **Approval check** — tools with a non-`None` approval policy require an exact, single-use grant.
+5. **Cgroup membership and concurrent-slot admission** — the registered hierarchy must be available and consistent; the returned RAII guard is held through binding execution.
 
-The gate maintains a translation table from kernel `Uuid` agent IDs to `agent_struct::AgentId` (u64 "PIDs") so the older OS-style subsystems (which use u64) can talk to the newer kernel orchestrator (which uses Uuid) without either side changing. Capabilities are derived from the `permission_profile` string at agent creation via `caps_for_profile` in `lib.rs`. The contract is locked by the `tests/src/os_enforcement.rs` suite (capability/MAC/cgroup ordering, namespace isolation for both tools and IPC, scheduler `pick_next` honoring nice values) — if those tests fail, the OS framing is broken.
+Tool authorization does **not** charge provider tokens: its payload estimate is compatibility input only. Durable cgroup token reservations and reconciliation happen on the LLM-provider path.
+
+`ToolRegistry::authorize_call` and `SyscallGate::check_tool_call_declared` are authorization-only compatibility APIs. They do not reserve concurrent capacity and must not be used as execution entry points.
+
+The gate maintains a translation table from kernel `Uuid` agent IDs to `agent_struct::AgentId` (u64 "PIDs") so the older OS-style subsystems (which use u64) can talk to the newer kernel orchestrator (which uses Uuid) without either side changing. Capabilities are derived from the `permission_profile` string at agent creation via `caps_for_profile` in `lib.rs`. The contract is locked by the `tests/src/os_enforcement.rs` and `tests/src/gate_adversarial_props.rs` suites (declaration/namespace/capability/MAC/approval/membership ordering, namespace isolation for both tools and IPC, provider-quota separation, and scheduler `pick_next` honoring nice values) — if those tests fail, the OS framing is broken.
 
 When adding a new tool, **classify it in `syscall_gate::classify_tool`** so it inherits the right action label and capability requirement. Don't bypass the gate from new code paths.
 

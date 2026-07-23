@@ -195,21 +195,35 @@ presence in the Rust crate is not a v1 support claim.
 ## How enforcement works in practice
 
 Every executor, JSON syscall, MCP, and SDK-backed tool call uses
-`ToolRegistry::authorize_call` and the declaration-aware syscall gate:
+`ToolRegistry::authorize_and_acquire_call` and the declaration-aware syscall
+gate:
 
 ```
 agent → AgentExecutor::execute_tool
-      → ToolRegistry::authorize_call
+      → ToolRegistry::authorize_and_acquire_call
           declaration validation + typed resource extraction
-      → SyscallGate::check_tool_call_declared   (first failure wins)
+      → SyscallGate::authorize_and_acquire_tool_call_declared
+                                                (first failure wins)
           0. namespace visibility (tool tagged to a namespace ⇒ caller must be a member)
           1. capability checks    (every declared capability is required)
           2. MAC policy check     (subject/action/resource rule match)
           3. approval check       (exact contract + resource, atomically one-shot)
-          4. cgroup quota check   (hierarchical token budget)
+          4. cgroup membership validation
+          5. concurrent tool slot (guard returned)
       → ResourceBroker            (permission + sandbox boundary)
-      → provider execution        (filesystem, network, application, or IPC)
+      → binding execution         (guard held through filesystem/network/app/IPC)
 ```
+
+A separate LLM admission path snapshots the agent's stable
+root → tenant → profile → agent cgroup hierarchy, atomically reserves provider
+RPM/TPM plus every hierarchical token scope and a provider-enforced output
+allowance in SQLite, verifies that membership did not change, and then invokes
+the model. A successful response reconciles quota to the larger of provider
+total usage and the serialized prompt floor plus output, in the original fixed
+Unix-minute epoch. Provider-reported usage remains the separate invoice/billing
+record. The tool gate's payload-size compatibility field is never charged.
+Tool-call JSON and results that later become part of an LLM prompt are counted
+as real provider input.
 
 A denial returns a structured tool failure, so the model can recover without the
 kernel trusting it to obey policy. Registration, adversarial ordering, approval

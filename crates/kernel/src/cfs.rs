@@ -346,8 +346,17 @@ pub struct TurnAdmissionMetrics {
 
 impl TurnAdmission {
     pub fn new(max_concurrent: usize) -> Self {
-        let max_concurrent = max_concurrent.max(1);
-        Self::with_queue_limit(max_concurrent, max_concurrent.saturating_mul(64).max(64))
+        let max_concurrent = if max_concurrent == 0 {
+            usize::MAX
+        } else {
+            max_concurrent
+        };
+        let max_waiters = if max_concurrent == usize::MAX {
+            usize::MAX
+        } else {
+            max_concurrent.saturating_mul(64).max(64)
+        };
+        Self::with_queue_limit(max_concurrent, max_waiters)
     }
 
     pub fn with_queue_limit(max_concurrent: usize, max_waiters: usize) -> Self {
@@ -712,6 +721,30 @@ mod tests {
         let slot = adm.acquire(1, &cfs).await.unwrap();
         assert_eq!(adm.running(), 1);
         drop(slot);
+        assert_eq!(adm.running(), 0);
+    }
+
+    #[tokio::test]
+    async fn zero_turn_capacity_means_unlimited() {
+        let cfs = tokio::sync::Mutex::new(CfsScheduler::new(1000));
+        let adm = TurnAdmission::new(0);
+        assert_eq!(adm.capacity(), usize::MAX);
+        let mut slots = Vec::new();
+        for agent in 1..=32 {
+            cfs.lock().await.enqueue(agent, 0, SchedClass::Normal);
+            slots.push(
+                tokio::time::timeout(
+                    std::time::Duration::from_millis(100),
+                    adm.acquire(agent, &cfs),
+                )
+                .await
+                .expect("unlimited admission must never queue")
+                .unwrap(),
+            );
+        }
+        assert_eq!(adm.running(), 32);
+        assert_eq!(adm.waiting(), 0);
+        drop(slots);
         assert_eq!(adm.running(), 0);
     }
 

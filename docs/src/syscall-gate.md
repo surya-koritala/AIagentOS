@@ -3,10 +3,12 @@
 `crates/kernel/src/syscall_gate.rs` is the **chokepoint that makes namespaces,
 capabilities, MAC, and cgroups load-bearing**. Every tool call from an agent —
 `AgentExecutor::execute_tool` in `crates/kernel/src/execution.rs` — consults
-the registry's validated declaration and `SyscallGate::check_tool_call_declared`
+the registry's validated declaration and the combined declaration/slot gate
 before the call reaches the resource broker. The executor, JSON syscall server,
-MCP server, and SDK-backed wire client all use `ToolRegistry::authorize_call`
-for the same action, resource extraction, gate decision, and token estimate.
+MCP server, and SDK-backed wire client all use
+`ToolRegistry::authorize_and_acquire_call`; its RAII slot guard is held through
+binding execution. The older `authorize_call`/`check_tool_call_declared` APIs
+are authorization-only compatibility helpers, not execution entry points.
 
 ## What it checks (first failure wins)
 
@@ -26,9 +28,9 @@ The gate runs these in order:
    the complete validated declaration. Trusted in-process operator/UI code uses
    `AgentKernelImpl::approve_tool_call`; wire, package, SDK payload, and MCP
    metadata cannot create approvals.
-4. **Cgroup quota check** — the estimate is atomically charged through the
-   cgroup hierarchy; a
-   `CgroupQuota` (≈ `EAGAIN`) if the call would go over budget.
+4. **Cgroup membership validation** — the agent must still be a valid member of
+   a complete root-to-leaf hierarchy. Concurrent tool-call slots are reserved
+   separately with an RAII guard.
 
 ```text
 agent → AgentExecutor::execute_tool
@@ -37,7 +39,7 @@ agent → AgentExecutor::execute_tool
           1. capability check
           2. MAC policy check
           3. exact one-shot approval
-          4. cgroup quota check
+          4. cgroup membership validation
       → ResourceBroker (only if all pass)
           → permission profile
           → mandatory sandbox identity and resource interception
@@ -46,6 +48,18 @@ agent → AgentExecutor::execute_tool
 
 A denial is returned to the LLM as a structured tool failure, so the model can
 recover gracefully — the kernel never trusts the model to obey policy.
+
+Provider-token quota is deliberately not charged here. Before each LLM attempt,
+the executor snapshots root → tenant → profile → agent constraints and the
+membership revision. The durable limiter atomically reserves provider RPM/TPM
+and all cgroup token scopes, then the gate verifies the revision while the
+receipt is marked in flight. A raced low-level gate reassignment refunds and
+retries. Kernel-created agents are pinned to their managed root → tenant →
+profile → private-agent hierarchy; the raw gate move API rejects them so it
+cannot discard configured quota scopes. Actual provider input + output usage
+reconciles every scope. Gate-time serialized
+argument estimates consume no quota; assistant tool-call JSON and tool results
+included in the next provider prompt are counted as real provider input.
 
 ## The Uuid ↔ PID translation table
 
@@ -74,5 +88,7 @@ in test/documentation builds.
 The behavior is locked by kernel registration tests plus
 `tests/src/os_enforcement.rs` and `tests/src/gate_adversarial_props.rs`:
 declaration completeness, confused-deputy provider mismatches, exact resource
-approval, capability/MAC/cgroup ordering, adversarial resources, and namespace
-isolation. If those tests fail, the OS framing is broken.
+approval, capability/MAC/approval ordering, cgroup membership and concurrent
+slots, adversarial resources, and namespace isolation. Provider hierarchy
+accounting has separate restart and race regressions. If those tests fail, the
+OS framing is broken.

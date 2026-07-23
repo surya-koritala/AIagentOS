@@ -67,9 +67,9 @@ fn main() {
 
     register_providers(&kernel, &config);
 
-    // Start the kernel's background tasks (scheduler observer publishing the CFS
-    // pick into procfs + the per-minute cgroup counter reset), matching the CLI
-    // and agent-server. Held for the app's lifetime; dropped at shutdown.
+    // Start the scheduler observer that publishes the CFS pick into procfs,
+    // matching the CLI and agent-server. Durable quota uses fixed SQLite epochs
+    // and needs no reset task. Held for the app's lifetime.
     let _runtime = kernel.start_runtime();
 
     tauri::Builder::default()

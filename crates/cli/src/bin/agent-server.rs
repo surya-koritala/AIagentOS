@@ -102,7 +102,7 @@ async fn main() {
             std::process::exit(1);
         }
     }
-    // Background tasks (scheduler observer + cgroup minute-reset).
+    // Background scheduler observer. Durable fixed-epoch quota needs no timer.
     let _runtime = kernel.start_runtime();
 
     // Optional Prometheus scrape endpoint. Only started when explicitly

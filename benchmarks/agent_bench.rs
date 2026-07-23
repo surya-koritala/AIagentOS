@@ -9,9 +9,9 @@
 //! creation, tool calls through the `SyscallGate` chokepoint (the same gate
 //! `AgentExecutor` uses in production), and shutdown. The `llm_provider` field
 //! is the inert `"stub"`. There is no LLM-driven turn in this benchmark, so the
-//! "tokens" reported are the *estimated* token counts passed into the gate's
-//! cgroup accounting, NOT real model tokens — this is logged explicitly so the
-//! numbers aren't misread.
+//! payload-estimate values are passed through the compatibility gate parameter
+//! but are deliberately not charged as model tokens. Provider-token accounting
+//! requires a real LLM attempt and is covered by separate regressions.
 //!
 //! Run: `cargo run --package os-benchmark --bin agent-bench`
 //! Smoke-tested in CI via the `#[tokio::test]` at the bottom of this file
@@ -32,9 +32,8 @@ struct BenchConfig {
     /// Tool calls driven through the syscall gate, spread round-robin over the
     /// created agents.
     tool_calls: usize,
-    /// Estimated tokens charged per tool call (fed to the gate's cgroup
-    /// accounting — NOT real model tokens).
-    tokens_per_call: u64,
+    /// Compatibility payload estimate passed through the authorization API.
+    payload_estimate_per_call: u64,
 }
 
 impl BenchConfig {
@@ -42,7 +41,7 @@ impl BenchConfig {
         Self {
             agents: 50,
             tool_calls: 5_000,
-            tokens_per_call: 8,
+            payload_estimate_per_call: 8,
         }
     }
 
@@ -52,7 +51,7 @@ impl BenchConfig {
         Self {
             agents: 4,
             tool_calls: 40,
-            tokens_per_call: 4,
+            payload_estimate_per_call: 4,
         }
     }
 }
@@ -66,7 +65,7 @@ struct BenchReport {
     tool_calls_denied: usize,
     tool_call_elapsed: Duration,
     tool_latencies: Vec<Duration>,
-    est_tokens_charged: u64,
+    payload_estimate_exercised: u64,
 }
 
 impl BenchReport {
@@ -115,8 +114,8 @@ impl BenchReport {
             self.latency_pct(0.99).as_secs_f64() * 1e6,
         );
         println!(
-            "  est. tokens charged : {} (cgroup accounting estimate, NOT real LLM tokens)",
-            self.est_tokens_charged,
+            "  payload estimate    : {} (authorization input only; not model usage)",
+            self.payload_estimate_exercised,
         );
     }
 }
@@ -160,13 +159,13 @@ async fn run_benchmark(kernel: &Arc<AgentKernelImpl>, cfg: BenchConfig) -> Bench
     let agent_create_elapsed = start.elapsed();
 
     // ── Phase 2: tool calls through the SyscallGate chokepoint ───────────────
-    // Rotate over a small menu of read-class tools so every call is admitted by
-    // the capability + MAC layers and stays under the (default) cgroup quota.
+    // Rotate over a small menu of declared tools so the benchmark exercises
+    // authorization without treating payload estimates as provider usage.
     let tools = ["read_file", "list_directory", "http_get"];
     let mut tool_latencies = Vec::with_capacity(cfg.tool_calls);
     let mut tool_calls_ok = 0usize;
     let mut tool_calls_denied = 0usize;
-    let mut est_tokens_charged = 0u64;
+    let mut payload_estimate_exercised = 0u64;
 
     let tool_start = Instant::now();
     for i in 0..cfg.tool_calls {
@@ -175,13 +174,13 @@ async fn run_benchmark(kernel: &Arc<AgentKernelImpl>, cfg: BenchConfig) -> Bench
         let call_start = Instant::now();
         let res = kernel
             .syscall_gate
-            .check_tool_call(agent, tool, "/tmp/bench", cfg.tokens_per_call)
+            .check_tool_call(agent, tool, "/tmp/bench", cfg.payload_estimate_per_call)
             .await;
         tool_latencies.push(call_start.elapsed());
         match res {
             Ok(_) => {
                 tool_calls_ok += 1;
-                est_tokens_charged += cfg.tokens_per_call;
+                payload_estimate_exercised += cfg.payload_estimate_per_call;
             }
             Err(_) => tool_calls_denied += 1,
         }
@@ -195,7 +194,7 @@ async fn run_benchmark(kernel: &Arc<AgentKernelImpl>, cfg: BenchConfig) -> Bench
         tool_calls_denied,
         tool_call_elapsed,
         tool_latencies,
-        est_tokens_charged,
+        payload_estimate_exercised,
     }
 }
 
@@ -416,11 +415,11 @@ mod tests {
         // Percentiles are ordered and non-zero given real samples.
         assert!(report.latency_pct(0.50) <= report.latency_pct(0.95));
         assert!(report.latency_pct(0.95) <= report.latency_pct(0.99));
-        // Token accounting matches admitted calls.
+        // Payload-estimate exercise count matches admitted calls.
         assert_eq!(
-            report.est_tokens_charged,
-            report.tool_calls_ok as u64 * cfg.tokens_per_call,
-            "token accounting mismatch",
+            report.payload_estimate_exercised,
+            report.tool_calls_ok as u64 * cfg.payload_estimate_per_call,
+            "payload-estimate accumulation mismatch",
         );
 
         kernel.shutdown().await.expect("shutdown");

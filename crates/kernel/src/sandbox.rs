@@ -105,6 +105,11 @@ impl SandboxManagerImpl {
             && config.isolation_level == IsolationLevel::Filesystem
     }
 
+    #[cfg(test)]
+    pub(crate) fn structural_counts(&self) -> (usize, usize) {
+        (self.sandboxes.len(), self.agent_sandboxes.len())
+    }
+
     pub fn create_managed_sandbox(
         &self,
         agent_id: AgentId,

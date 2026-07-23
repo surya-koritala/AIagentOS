@@ -1,4 +1,4 @@
-//! Groq API adapter (OpenAI-compatible chat completions) with retry and exponential backoff.
+//! Groq API adapter (OpenAI-compatible chat completions).
 
 use kernel::connector::*;
 use kernel::{ConnectorError, ProviderId};
@@ -55,6 +55,16 @@ impl LlmSession for GroqSession {
         messages: Vec<StandardMessage>,
         tools: &[ToolDefinition],
     ) -> Result<LlmResponse, ConnectorError> {
+        self.send_with_options(messages, tools, LlmRequestOptions::default())
+            .await
+    }
+
+    async fn send_with_options(
+        &self,
+        messages: Vec<StandardMessage>,
+        tools: &[ToolDefinition],
+        options: LlmRequestOptions,
+    ) -> Result<LlmResponse, ConnectorError> {
         let msgs: Vec<serde_json::Value> =
             messages
                 .iter()
@@ -86,77 +96,69 @@ impl LlmSession for GroqSession {
             })).collect();
             body["tools"] = serde_json::json!(tool_defs);
         }
-
-        let mut last_err = None;
-        for attempt in 0..3 {
-            if attempt > 0 {
-                tokio::time::sleep(tokio::time::Duration::from_millis(1000 * (1 << attempt))).await;
-            }
-
-            let result = self
-                .client
-                .post(format!("{}/chat/completions", self.base_url))
-                .header("Authorization", format!("Bearer {}", self.api_key))
-                .json(&body)
-                .send()
-                .await;
-
-            match result {
-                Ok(resp) if resp.status().is_success() => {
-                    let json: serde_json::Value = resp
-                        .json()
-                        .await
-                        .map_err(|e| ConnectorError::ProtocolError(e.to_string()))?;
-                    let content = json["choices"][0]["message"]["content"]
-                        .as_str()
-                        .unwrap_or("")
-                        .to_string();
-                    let tokens = json["usage"]["total_tokens"].as_u64().unwrap_or(0) as u32;
-                    let tool_calls = json["choices"][0]["message"]["tool_calls"]
-                        .as_array()
-                        .map(|arr| {
-                            arr.iter()
-                                .filter_map(|tc| {
-                                    Some(ToolCall {
-                                        id: tc["id"].as_str()?.to_string(),
-                                        name: tc["function"]["name"].as_str()?.to_string(),
-                                        arguments: serde_json::from_str(
-                                            tc["function"]["arguments"].as_str()?,
-                                        )
-                                        .unwrap_or(serde_json::Value::Null),
-                                    })
-                                })
-                                .collect()
-                        })
-                        .unwrap_or_default();
-                    return Ok(LlmResponse {
-                        content,
-                        finish_reason: json["choices"][0]["finish_reason"]
-                            .as_str()
-                            .map(|s| s.to_string()),
-                        tokens_used: tokens,
-                        usage: kernel::connector::LlmUsage::reported(
-                            json["usage"]["prompt_tokens"].as_u64().unwrap_or(0) as u32,
-                            json["usage"]["completion_tokens"].as_u64().unwrap_or(0) as u32,
-                            json["usage"]["prompt_tokens_details"]["cached_tokens"]
-                                .as_u64()
-                                .unwrap_or(0) as u32,
-                        ),
-                        tool_calls,
-                    });
-                }
-                Ok(resp) => {
-                    last_err = Some(ConnectorError::ConnectionFailed(format!(
-                        "HTTP {}",
-                        resp.status()
-                    )));
-                }
-                Err(e) => {
-                    last_err = Some(ConnectorError::ConnectionFailed(e.to_string()));
-                }
-            }
+        if let Some(max_output_tokens) = options.max_output_tokens {
+            body["max_tokens"] = serde_json::json!(max_output_tokens);
         }
-        Err(last_err.unwrap())
+
+        let result = self
+            .client
+            .post(format!("{}/chat/completions", self.base_url))
+            .header("Authorization", format!("Bearer {}", self.api_key))
+            .json(&body)
+            .send()
+            .await;
+
+        match result {
+            Ok(resp) if resp.status().is_success() => {
+                let json: serde_json::Value = resp
+                    .json()
+                    .await
+                    .map_err(|e| ConnectorError::ProtocolError(e.to_string()))?;
+                let content = json["choices"][0]["message"]["content"]
+                    .as_str()
+                    .unwrap_or("")
+                    .to_string();
+                let tokens = crate::json_usage_u32(&json["usage"]["total_tokens"]);
+                let tool_calls = json["choices"][0]["message"]["tool_calls"]
+                    .as_array()
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|tc| {
+                                Some(ToolCall {
+                                    id: tc["id"].as_str()?.to_string(),
+                                    name: tc["function"]["name"].as_str()?.to_string(),
+                                    arguments: serde_json::from_str(
+                                        tc["function"]["arguments"].as_str()?,
+                                    )
+                                    .unwrap_or(serde_json::Value::Null),
+                                })
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                Ok(LlmResponse {
+                    content,
+                    finish_reason: json["choices"][0]["finish_reason"]
+                        .as_str()
+                        .map(|s| s.to_string()),
+                    tokens_used: tokens,
+                    usage: kernel::connector::LlmUsage::reported(
+                        crate::json_usage_u32(&json["usage"]["prompt_tokens"]),
+                        crate::json_usage_u32(&json["usage"]["completion_tokens"]),
+                        crate::json_usage_u32(
+                            &json["usage"]["prompt_tokens_details"]["cached_tokens"],
+                        ),
+                    ),
+                    tool_calls,
+                })
+            }
+            Ok(resp) => Err(crate::http_status_error(resp.status(), None)),
+            Err(e) => Err(ConnectorError::ConnectionFailed(e.to_string())),
+        }
+    }
+
+    fn enforces_max_output_tokens(&self) -> bool {
+        true
     }
 
     fn provider_id(&self) -> &ProviderId {

@@ -282,12 +282,25 @@ impl ResourceBroker for ResourceBrokerImpl {
         .map_err(|_| ResourceError::OperationFailed("resource admission closed".into()))?;
         drop(waiting);
 
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(30),
-            provider.execute(&request.operation, &request.parameters),
-        )
-        .await
-        .unwrap_or(Err(ResourceError::Timeout));
+        // Transactional filesystem edits run on a blocking worker internally.
+        // Dropping that worker future on the generic timeout does not stop the
+        // underlying file mutation, which could let lifecycle cleanup release
+        // its tool guard while a side effect still runs. Keep ownership until
+        // the edit transaction finishes. Other provider operations retain the
+        // bounded 30-second execution contract.
+        let result =
+            if request.resource_type == ResourceType::Filesystem && request.operation == "edit" {
+                provider
+                    .execute(&request.operation, &request.parameters)
+                    .await
+            } else {
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(30),
+                    provider.execute(&request.operation, &request.parameters),
+                )
+                .await
+                .unwrap_or(Err(ResourceError::Timeout))
+            };
         drop(permit);
 
         match result {

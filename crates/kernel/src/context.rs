@@ -5,6 +5,8 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
+#[cfg(test)]
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Utc};
@@ -138,6 +140,8 @@ pub(crate) struct ProviderRateReservation {
     pub epoch: u64,
     pub reserved_tokens: u64,
     pub state: ProviderRateReceiptState,
+    /// Stable cgroup scope paths in root-to-leaf reservation order.
+    pub cgroup_scopes: Vec<String>,
 }
 
 /// Durable usage and receipt-state counts for one effective provider epoch.
@@ -162,12 +166,81 @@ pub(crate) enum ProviderRateLimitDimension {
     MigrationFence,
 }
 
+/// Stable durable quota namespace. Runtime cgroup ids must never be persisted:
+/// only canonical semantic paths belong in [`QuotaScopeKind::Cgroup`].
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub(crate) enum QuotaScopeKind {
+    Provider,
+    Cgroup,
+}
+
+impl QuotaScopeKind {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Provider => "provider",
+            Self::Cgroup => "cgroup",
+        }
+    }
+
+    fn parse(value: &str) -> Result<Self, ContextError> {
+        match value {
+            "provider" => Ok(Self::Provider),
+            "cgroup" => Ok(Self::Cgroup),
+            _ => Err(quota_error(format!("invalid quota scope kind {value:?}"))),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub(crate) struct QuotaScopeKey {
+    pub kind: QuotaScopeKind,
+    pub id: String,
+}
+
+impl QuotaScopeKey {
+    fn provider_global() -> Self {
+        Self {
+            kind: QuotaScopeKind::Provider,
+            id: PROVIDER_QUOTA_SCOPE_ID.to_string(),
+        }
+    }
+
+    fn cgroup(scope_id: &str) -> Self {
+        Self {
+            kind: QuotaScopeKind::Cgroup,
+            id: scope_id.to_string(),
+        }
+    }
+}
+
+/// One root-to-leaf cgroup token constraint for a provider request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CgroupQuotaConstraint {
+    pub scope_id: String,
+    /// Zero means unlimited.
+    pub token_limit: u64,
+}
+
+/// Durable aggregate and receipt states for one quota scope.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct QuotaScopeUsage {
+    pub epoch: u64,
+    pub scope: QuotaScopeKey,
+    pub requests: u64,
+    pub tokens: u64,
+    pub reserved_receipts: u64,
+    pub in_flight_receipts: u64,
+    pub estimated_receipts: u64,
+    pub reconciled_receipts: u64,
+}
+
 /// Result of an atomic provider-rate reservation attempt.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum ProviderRateReserveOutcome {
     Reserved(ProviderRateReservation),
     Denied {
         epoch: u64,
+        scope: QuotaScopeKey,
         dimension: ProviderRateLimitDimension,
         used: u64,
         requested: u64,
@@ -186,11 +259,31 @@ pub(crate) struct ProviderRateRecovery {
 const PROVIDER_QUOTA_SCOPE_KIND: &str = "provider";
 const PROVIDER_QUOTA_SCOPE_ID: &str = "global";
 
+#[cfg(test)]
+thread_local! {
+    /// Counts deliberate full receipt-ledger scans on the current test thread.
+    /// Hot-path quota operations must stay at zero; recovery and integrity
+    /// inspection intentionally increment it.
+    static QUOTA_FULL_RECEIPT_SCANS: std::cell::Cell<u64> = const {
+        std::cell::Cell::new(0)
+    };
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct StoredQuotaReceipt {
     id: uuid::Uuid,
     epoch: u64,
     state: ProviderRateReceiptState,
+    reserved_requests: u64,
+    reserved_tokens: u64,
+    actual_requests: Option<u64>,
+    actual_tokens: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StoredQuotaScope {
+    key: QuotaScopeKey,
+    order: u32,
     reserved_requests: u64,
     reserved_tokens: u64,
     actual_requests: Option<u64>,
@@ -216,6 +309,24 @@ fn parse_u64_blob(blob: Vec<u8>, field: &str) -> Result<u64, ContextError> {
         ))
     })?;
     Ok(u64::from_be_bytes(bytes))
+}
+
+fn validate_quota_scope_key(scope: &QuotaScopeKey) -> Result<(), ContextError> {
+    if scope.id.is_empty() || scope.id.len() > 1024 || scope.id.contains('\0') {
+        return Err(quota_error(format!(
+            "invalid {:?} quota scope id",
+            scope.kind
+        )));
+    }
+    match scope.kind {
+        QuotaScopeKind::Provider if scope.id != PROVIDER_QUOTA_SCOPE_ID => {
+            Err(quota_error("only the provider/global scope is supported"))
+        }
+        QuotaScopeKind::Cgroup if !scope.id.starts_with('/') => Err(quota_error(
+            "stable cgroup quota scopes must be absolute canonical paths",
+        )),
+        _ => Ok(()),
+    }
 }
 
 /// The durable identity + config of a created agent, as stored in the `agents`
@@ -347,6 +458,8 @@ pub struct SqliteContextManager {
     /// via [`SqliteContextManager::with_embedder`] to change embedding strategy
     /// without touching persistence.
     embedder: Arc<dyn Embedder>,
+    #[cfg(test)]
+    fail_next_agent_save: AtomicBool,
 }
 
 impl SqliteContextManager {
@@ -398,6 +511,8 @@ impl SqliteContextManager {
         let mgr = Self {
             conn: Mutex::new(conn),
             embedder: crate::memory_manager::default_embedder(),
+            #[cfg(test)]
+            fail_next_agent_save: AtomicBool::new(false),
         };
         mgr.init_schema()?;
         Ok(mgr)
@@ -410,6 +525,8 @@ impl SqliteContextManager {
         let mgr = Self {
             conn: Mutex::new(conn),
             embedder: crate::memory_manager::default_embedder(),
+            #[cfg(test)]
+            fail_next_agent_save: AtomicBool::new(false),
         };
         mgr.init_schema()?;
         Ok(mgr)
@@ -486,8 +603,52 @@ impl SqliteContextManager {
         } else {
             false
         };
+        let quota_receipt_scopes_exists = conn
+            .query_row(
+                "SELECT 1 FROM sqlite_master
+                 WHERE type = 'table' AND name = 'quota_receipt_scopes'",
+                [],
+                |_| Ok(()),
+            )
+            .optional()
+            .map_err(|error| {
+                quota_error(format!(
+                    "failed to inspect quota receipt-scope schema: {error}"
+                ))
+            })?
+            .is_some();
+        let hierarchy_schema_upgrade_needed = if quota_receipt_scopes_exists {
+            let mut statement = conn
+                .prepare("PRAGMA table_info(quota_receipt_scopes)")
+                .map_err(|error| {
+                    quota_error(format!(
+                        "failed to inspect quota receipt scope schema: {error}"
+                    ))
+                })?;
+            let rows = statement
+                .query_map([], |row| row.get::<_, String>(1))
+                .map_err(|error| {
+                    quota_error(format!(
+                        "failed to enumerate quota receipt scope columns: {error}"
+                    ))
+                })?;
+            let mut has_scope_order = false;
+            for row in rows {
+                if row.map_err(|error| {
+                    quota_error(format!(
+                        "failed to read quota receipt scope column: {error}"
+                    ))
+                })? == "scope_order"
+                {
+                    has_scope_order = true;
+                }
+            }
+            !has_scope_order
+        } else {
+            false
+        };
         let mut legacy_database_has_rows = false;
-        if !quota_schema_exists || !quota_floor_initialized {
+        if !quota_schema_exists || !quota_floor_initialized || hierarchy_schema_upgrade_needed {
             // This list is deliberately static: table names never come from
             // persisted/user input, so the existence probes cannot become SQL
             // injection. A schema-only legacy database has no unknowable usage
@@ -533,6 +694,41 @@ impl SqliteContextManager {
                         .is_some()
                     {
                         legacy_database_has_rows = true;
+                        break;
+                    }
+                }
+            }
+        }
+        let mut hierarchy_database_has_rows = legacy_database_has_rows;
+        if hierarchy_schema_upgrade_needed && !hierarchy_database_has_rows {
+            // A PR140-era database can contain durable provider quota state
+            // even if no application row remains. Its process-local cgroup
+            // usage is still unattributable, so any quota row makes the
+            // hierarchy migration live and requires a one-epoch fence.
+            for table in ["quota_epochs", "quota_receipts", "quota_receipt_scopes"] {
+                let exists = conn
+                    .query_row(
+                        "SELECT 1 FROM sqlite_master
+                         WHERE type = 'table' AND name = ?1",
+                        [table],
+                        |_| Ok(()),
+                    )
+                    .optional()
+                    .map_err(|error| {
+                        quota_error(format!("failed to inspect quota table {table}: {error}"))
+                    })?
+                    .is_some();
+                if exists {
+                    let sql = format!("SELECT 1 FROM {table} LIMIT 1");
+                    if conn
+                        .query_row(&sql, [], |_| Ok(()))
+                        .optional()
+                        .map_err(|error| {
+                            quota_error(format!("failed to inspect quota table {table}: {error}"))
+                        })?
+                        .is_some()
+                    {
+                        hierarchy_database_has_rows = true;
                         break;
                     }
                 }
@@ -719,6 +915,8 @@ impl SqliteContextManager {
             CREATE TABLE IF NOT EXISTS quota_receipt_scopes (
                 receipt_id TEXT NOT NULL
                     REFERENCES quota_receipts(id) ON DELETE CASCADE,
+                scope_order INTEGER NOT NULL DEFAULT 0
+                    CHECK (scope_order >= 0),
                 scope_kind TEXT NOT NULL
                     CHECK (length(scope_kind) BETWEEN 1 AND 64),
                 scope_id TEXT NOT NULL
@@ -755,11 +953,44 @@ impl SqliteContextManager {
                     CHECK (typeof(epoch) = 'blob' AND length(epoch) = 8)
             ) WITHOUT ROWID;",
         ).map_err(|e| ContextError::StorageError(e.to_string()))?;
+        if hierarchy_schema_upgrade_needed && hierarchy_database_has_rows {
+            // Commit the fence before changing the schema. If the process dies
+            // after ALTER TABLE (or a later index migration fails), the next
+            // startup sees the durable fence even though `scope_order` now
+            // exists and cannot mistake the migration for complete.
+            Self::install_current_quota_migration_fence(&mut conn)?;
+        }
         // Tenant scoping for the agent registry. Added via ALTER so an older DB
         // (created before tenancy) upgrades in place: legacy agents land in the
         // implicit "default" tenant. A duplicate-column error on a DB that
         // already has the column is expected and ignored.
         {
+            // Quota receipt scopes gained a stable root-to-leaf order when
+            // hierarchical cgroup accounting was introduced. Existing
+            // provider-only rows become order zero.
+            if hierarchy_schema_upgrade_needed {
+                conn.execute(
+                    "ALTER TABLE quota_receipt_scopes
+                     ADD COLUMN scope_order INTEGER NOT NULL DEFAULT 0
+                         CHECK (scope_order >= 0)",
+                    [],
+                )
+                .map_err(|error| {
+                    quota_error(format!(
+                        "failed to add quota receipt scope-order column: {error}"
+                    ))
+                })?;
+            }
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_quota_receipt_scope_order
+                 ON quota_receipt_scopes(receipt_id, scope_order)",
+                [],
+            )
+            .map_err(|error| {
+                quota_error(format!(
+                    "failed to create quota receipt scope-order index: {error}"
+                ))
+            })?;
             let _ = conn.execute(
                 "ALTER TABLE agents ADD COLUMN tenant_id TEXT NOT NULL DEFAULT 'default'",
                 [],
@@ -817,39 +1048,58 @@ impl SqliteContextManager {
             // honest backfill after upgrade, so fence just the current fixed
             // epoch instead of reopening unknown capacity. Fresh/empty
             // databases do not receive this fence.
-            let now_seconds = Utc::now().timestamp();
-            let current_epoch = u64::try_from(now_seconds)
-                .map_err(|_| quota_error("system clock is before the Unix epoch"))?
-                / PROVIDER_RATE_EPOCH_SECONDS;
-            let current_epoch_blob = u64_blob(current_epoch);
-            let tx = conn
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(|error| {
-                    quota_error(format!(
-                        "failed to start quota migration transaction: {error}"
-                    ))
-                })?;
-            tx.execute(
-                "INSERT OR IGNORE INTO quota_migration_fence(epoch) VALUES (?1)",
-                params![current_epoch_blob.as_slice()],
-            )
-            .map_err(|error| {
-                quota_error(format!("failed to install legacy quota fence: {error}"))
-            })?;
-            tx.execute(
-                "INSERT INTO quota_epoch_floor(singleton, epoch) VALUES (1, ?1)
-                 ON CONFLICT(singleton) DO UPDATE SET epoch = CASE
-                     WHEN quota_epoch_floor.epoch < excluded.epoch
-                     THEN excluded.epoch ELSE quota_epoch_floor.epoch END",
-                params![current_epoch_blob.as_slice()],
-            )
-            .map_err(|error| {
-                quota_error(format!("failed to initialize quota epoch floor: {error}"))
-            })?;
-            tx.commit().map_err(|error| {
-                quota_error(format!("failed to commit quota migration fence: {error}"))
-            })?;
+            Self::install_current_quota_migration_fence(&mut conn)?;
         }
+        Ok(())
+    }
+
+    fn install_current_quota_migration_fence(conn: &mut Connection) -> Result<(), ContextError> {
+        let now_seconds = Utc::now().timestamp();
+        let current_epoch = u64::try_from(now_seconds)
+            .map_err(|_| quota_error("system clock is before the Unix epoch"))?
+            / PROVIDER_RATE_EPOCH_SECONDS;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| {
+                quota_error(format!(
+                    "failed to start quota migration transaction: {error}"
+                ))
+            })?;
+        let stored_floor = tx
+            .query_row(
+                "SELECT epoch FROM quota_epoch_floor WHERE singleton = 1",
+                [],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .optional()
+            .map_err(|error| {
+                quota_error(format!(
+                    "failed to read quota floor during migration: {error}"
+                ))
+            })?
+            .map(|blob| parse_u64_blob(blob, "quota migration epoch floor"))
+            .transpose()?;
+        // A prior run can have advanced the monotonic floor beyond wall time.
+        // Fence the epoch admissions will actually use, otherwise a backwards
+        // clock step would make the lower wall-clock fence irrelevant.
+        let effective_epoch = stored_floor.unwrap_or(0).max(current_epoch);
+        let effective_epoch_blob = u64_blob(effective_epoch);
+        tx.execute(
+            "INSERT OR IGNORE INTO quota_migration_fence(epoch) VALUES (?1)",
+            params![effective_epoch_blob.as_slice()],
+        )
+        .map_err(|error| quota_error(format!("failed to install legacy quota fence: {error}")))?;
+        tx.execute(
+            "INSERT INTO quota_epoch_floor(singleton, epoch) VALUES (1, ?1)
+             ON CONFLICT(singleton) DO UPDATE SET epoch = CASE
+                 WHEN quota_epoch_floor.epoch < excluded.epoch
+                 THEN excluded.epoch ELSE quota_epoch_floor.epoch END",
+            params![effective_epoch_blob.as_slice()],
+        )
+        .map_err(|error| quota_error(format!("failed to initialize quota epoch floor: {error}")))?;
+        tx.commit().map_err(|error| {
+            quota_error(format!("failed to commit quota migration fence: {error}"))
+        })?;
         Ok(())
     }
 
@@ -975,93 +1225,175 @@ impl SqliteContextManager {
         }))
     }
 
-    fn provider_scope_usage_for_receipt(
+    fn load_receipt_scopes(
         tx: &Transaction<'_>,
         receipt: &StoredQuotaReceipt,
-    ) -> Result<(u64, u64), ContextError> {
-        let raw = tx
-            .query_row(
-                "SELECT reserved_requests, reserved_tokens,
+    ) -> Result<Vec<StoredQuotaScope>, ContextError> {
+        let mut statement = tx
+            .prepare(
+                "SELECT scope_order, scope_kind, scope_id,
+                        reserved_requests, reserved_tokens,
                         actual_requests, actual_tokens
                  FROM quota_receipt_scopes
-                 WHERE receipt_id = ?1 AND scope_kind = ?2 AND scope_id = ?3",
-                params![
-                    receipt.id.to_string(),
-                    PROVIDER_QUOTA_SCOPE_KIND,
-                    PROVIDER_QUOTA_SCOPE_ID
-                ],
-                |row| {
-                    Ok((
-                        row.get::<_, Vec<u8>>(0)?,
-                        row.get::<_, Vec<u8>>(1)?,
-                        row.get::<_, Option<Vec<u8>>>(2)?,
-                        row.get::<_, Option<Vec<u8>>>(3)?,
-                    ))
-                },
+                 WHERE receipt_id = ?1
+                 ORDER BY scope_order",
             )
-            .optional()
             .map_err(|error| {
                 quota_error(format!(
-                    "failed to read provider scope for receipt {}: {error}",
-                    receipt.id
-                ))
-            })?
-            .ok_or_else(|| {
-                quota_error(format!(
-                    "provider receipt {} has no provider/global scope",
+                    "failed to prepare receipt scope scan for {}: {error}",
                     receipt.id
                 ))
             })?;
-        let reserved_requests = parse_u64_blob(raw.0, "quota scope reserved_requests")?;
-        let reserved_tokens = parse_u64_blob(raw.1, "quota scope reserved_tokens")?;
-        let actual_requests = raw
-            .2
-            .map(|value| parse_u64_blob(value, "quota scope actual_requests"))
-            .transpose()?;
-        let actual_tokens = raw
-            .3
-            .map(|value| parse_u64_blob(value, "quota scope actual_tokens"))
-            .transpose()?;
-        if reserved_requests != receipt.reserved_requests
-            || reserved_tokens != receipt.reserved_tokens
-            || actual_requests != receipt.actual_requests
-            || actual_tokens != receipt.actual_tokens
-        {
+        let rows = statement
+            .query_map([receipt.id.to_string()], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Vec<u8>>(3)?,
+                    row.get::<_, Vec<u8>>(4)?,
+                    row.get::<_, Option<Vec<u8>>>(5)?,
+                    row.get::<_, Option<Vec<u8>>>(6)?,
+                ))
+            })
+            .map_err(|error| {
+                quota_error(format!(
+                    "failed to scan receipt scopes for {}: {error}",
+                    receipt.id
+                ))
+            })?;
+        let mut scopes = Vec::new();
+        for row in rows {
+            let (
+                order,
+                kind,
+                id,
+                reserved_requests,
+                reserved_tokens,
+                actual_requests,
+                actual_tokens,
+            ) = row.map_err(|error| {
+                quota_error(format!(
+                    "failed to read receipt scope for {}: {error}",
+                    receipt.id
+                ))
+            })?;
+            let order = u32::try_from(order)
+                .map_err(|_| quota_error("quota receipt scope order is negative or oversized"))?;
+            let key = QuotaScopeKey {
+                kind: QuotaScopeKind::parse(&kind)?,
+                id,
+            };
+            validate_quota_scope_key(&key)?;
+            let scope = StoredQuotaScope {
+                key,
+                order,
+                reserved_requests: parse_u64_blob(
+                    reserved_requests,
+                    "quota scope reserved_requests",
+                )?,
+                reserved_tokens: parse_u64_blob(reserved_tokens, "quota scope reserved_tokens")?,
+                actual_requests: actual_requests
+                    .map(|value| parse_u64_blob(value, "quota scope actual_requests"))
+                    .transpose()?,
+                actual_tokens: actual_tokens
+                    .map(|value| parse_u64_blob(value, "quota scope actual_tokens"))
+                    .transpose()?,
+            };
+            let expected_requests = if scope.key.kind == QuotaScopeKind::Provider {
+                receipt.reserved_requests
+            } else {
+                0
+            };
+            let expected_actual_requests = receipt.actual_requests.map(|_| expected_requests);
+            if scope.reserved_requests != expected_requests
+                || scope.reserved_tokens != receipt.reserved_tokens
+                || scope.actual_requests != expected_actual_requests
+                || scope.actual_tokens != receipt.actual_tokens
+            {
+                return Err(quota_error(format!(
+                    "receipt {} disagrees with associated scope {:?}",
+                    receipt.id, scope.key
+                )));
+            }
+            scopes.push(scope);
+        }
+        drop(statement);
+        if scopes.is_empty() {
             return Err(quota_error(format!(
-                "provider receipt {} disagrees with its provider/global scope",
+                "provider receipt {} has no quota scopes",
                 receipt.id
             )));
         }
+        for (expected_order, scope) in scopes.iter().enumerate() {
+            let expected_order = u32::try_from(expected_order)
+                .map_err(|_| quota_error("too many quota scopes on one receipt"))?;
+            if scope.order != expected_order {
+                return Err(quota_error(format!(
+                    "receipt {} has non-contiguous scope ordering",
+                    receipt.id
+                )));
+            }
+            if expected_order == 0 {
+                if scope.key != QuotaScopeKey::provider_global() {
+                    return Err(quota_error(format!(
+                        "receipt {} scope zero is not provider/global",
+                        receipt.id
+                    )));
+                }
+            } else if scope.key.kind != QuotaScopeKind::Cgroup {
+                return Err(quota_error(format!(
+                    "receipt {} has a non-cgroup scope after provider/global",
+                    receipt.id
+                )));
+            }
+        }
+        Ok(scopes)
+    }
+
+    fn scope_contribution(receipt: &StoredQuotaReceipt, scope: &StoredQuotaScope) -> (u64, u64) {
         if receipt.state == ProviderRateReceiptState::Reconciled {
-            Ok((
-                actual_requests.expect("validated reconciled actual requests"),
-                actual_tokens.expect("validated reconciled actual tokens"),
-            ))
+            (
+                scope
+                    .actual_requests
+                    .expect("validated reconciled actual requests"),
+                scope
+                    .actual_tokens
+                    .expect("validated reconciled actual tokens"),
+            )
         } else {
-            Ok((reserved_requests, reserved_tokens))
+            (scope.reserved_requests, scope.reserved_tokens)
         }
     }
 
-    fn compute_provider_epoch_usage(
+    fn compute_scope_epoch_usage(
         tx: &Transaction<'_>,
+        scope: &QuotaScopeKey,
         epoch: u64,
-    ) -> Result<ProviderRateUsage, ContextError> {
+    ) -> Result<QuotaScopeUsage, ContextError> {
+        #[cfg(test)]
+        QUOTA_FULL_RECEIPT_SCANS.with(|count| count.set(count.get().saturating_add(1)));
+        validate_quota_scope_key(scope)?;
         let epoch_blob = u64_blob(epoch);
         let mut statement = tx
             .prepare(
                 "SELECT r.id
                  FROM quota_receipts r
-                 WHERE r.receipt_kind = 'provider_request' AND r.epoch = ?1
+                 JOIN quota_receipt_scopes s ON s.receipt_id = r.id
+                 WHERE r.receipt_kind = 'provider_request'
+                   AND r.epoch = ?1
+                   AND s.scope_kind = ?2 AND s.scope_id = ?3
                  ORDER BY r.id",
             )
             .map_err(|error| {
-                quota_error(format!("failed to prepare provider usage scan: {error}"))
+                quota_error(format!("failed to prepare quota scope usage scan: {error}"))
             })?;
         let rows = statement
-            .query_map(params![epoch_blob.as_slice()], |row| {
-                row.get::<_, String>(0)
-            })
-            .map_err(|error| quota_error(format!("failed to scan provider receipts: {error}")))?;
+            .query_map(
+                params![epoch_blob.as_slice(), scope.kind.as_str(), scope.id],
+                |row| row.get::<_, String>(0),
+            )
+            .map_err(|error| quota_error(format!("failed to scan quota scope usage: {error}")))?;
         let mut ids = Vec::new();
         for row in rows {
             let id =
@@ -1072,19 +1404,35 @@ impl SqliteContextManager {
         }
         drop(statement);
 
-        let mut usage = ProviderRateUsage {
+        let mut usage = QuotaScopeUsage {
             epoch,
-            ..ProviderRateUsage::default()
+            scope: scope.clone(),
+            requests: 0,
+            tokens: 0,
+            reserved_receipts: 0,
+            in_flight_receipts: 0,
+            estimated_receipts: 0,
+            reconciled_receipts: 0,
         };
         for id in ids {
             let receipt = Self::load_quota_receipt(tx, id)?
-                .ok_or_else(|| quota_error(format!("provider receipt {id} disappeared")))?;
+                .ok_or_else(|| quota_error(format!("quota receipt {id} disappeared")))?;
             if receipt.epoch != epoch {
                 return Err(quota_error(format!(
-                    "provider receipt {id} epoch disagrees with usage scan"
+                    "quota receipt {id} epoch disagrees with usage scan"
                 )));
             }
-            let (requests, tokens) = Self::provider_scope_usage_for_receipt(tx, &receipt)?;
+            let scopes = Self::load_receipt_scopes(tx, &receipt)?;
+            let stored_scope = scopes
+                .iter()
+                .find(|candidate| &candidate.key == scope)
+                .ok_or_else(|| {
+                    quota_error(format!(
+                        "quota receipt {id} disappeared from scope {:?}",
+                        scope
+                    ))
+                })?;
+            let (requests, tokens) = Self::scope_contribution(&receipt, stored_scope);
             usage.requests = usage.requests.saturating_add(requests);
             usage.tokens = usage.tokens.saturating_add(tokens);
             match receipt.state {
@@ -1105,56 +1453,177 @@ impl SqliteContextManager {
         Ok(usage)
     }
 
-    fn load_provider_epoch_aggregate(
+    fn load_scope_epoch_aggregate(
         tx: &Transaction<'_>,
+        scope: &QuotaScopeKey,
         epoch: u64,
     ) -> Result<Option<(u64, u64)>, ContextError> {
         let epoch_blob = u64_blob(epoch);
         tx.query_row(
             "SELECT requests, tokens FROM quota_epochs
              WHERE scope_kind = ?1 AND scope_id = ?2 AND epoch = ?3",
-            params![
-                PROVIDER_QUOTA_SCOPE_KIND,
-                PROVIDER_QUOTA_SCOPE_ID,
-                epoch_blob.as_slice()
-            ],
+            params![scope.kind.as_str(), scope.id, epoch_blob.as_slice()],
             |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?)),
         )
         .optional()
-        .map_err(|error| quota_error(format!("failed to read provider epoch aggregate: {error}")))?
+        .map_err(|error| quota_error(format!("failed to read quota scope aggregate: {error}")))?
         .map(|(requests, tokens)| {
             Ok((
-                parse_u64_blob(requests, "provider epoch requests")?,
-                parse_u64_blob(tokens, "provider epoch tokens")?,
+                parse_u64_blob(requests, "quota scope epoch requests")?,
+                parse_u64_blob(tokens, "quota scope epoch tokens")?,
             ))
         })
         .transpose()
     }
 
-    fn validate_provider_epoch(
+    /// Load the aggregate trusted by the steady-state admission path.
+    ///
+    /// Recovery validates every aggregate against its receipts before the rate
+    /// limiter admits work. From then on, `BEGIN IMMEDIATE` serializes writers
+    /// and each receipt mutation updates this row in the same transaction.
+    /// A missing row therefore means zero only for a new scope/epoch.
+    fn trusted_scope_epoch_aggregate(
         tx: &Transaction<'_>,
+        scope: &QuotaScopeKey,
         epoch: u64,
-    ) -> Result<ProviderRateUsage, ContextError> {
-        let usage = Self::compute_provider_epoch_usage(tx, epoch)?;
-        let stored = Self::load_provider_epoch_aggregate(tx, epoch)?;
+    ) -> Result<(u64, u64), ContextError> {
+        validate_quota_scope_key(scope)?;
+        Ok(Self::load_scope_epoch_aggregate(tx, scope, epoch)?.unwrap_or((0, 0)))
+    }
+
+    /// Existing receipts must always have an aggregate, including receipts
+    /// whose contribution is zero. This cheap primary-key lookup preserves
+    /// fail-closed behavior without rescanning historical receipts.
+    fn required_scope_epoch_aggregate(
+        tx: &Transaction<'_>,
+        scope: &QuotaScopeKey,
+        epoch: u64,
+    ) -> Result<(u64, u64), ContextError> {
+        validate_quota_scope_key(scope)?;
+        Self::load_scope_epoch_aggregate(tx, scope, epoch)?.ok_or_else(|| {
+            quota_error(format!(
+                "quota scope {:?} epoch {epoch} is missing its aggregate",
+                scope
+            ))
+        })
+    }
+
+    fn write_scope_epoch_aggregate(
+        tx: &Transaction<'_>,
+        scope: &QuotaScopeKey,
+        epoch: u64,
+        requests: u64,
+        tokens: u64,
+    ) -> Result<(), ContextError> {
+        validate_quota_scope_key(scope)?;
+        let epoch_blob = u64_blob(epoch);
+        let requests = u64_blob(requests);
+        let tokens = u64_blob(tokens);
+        tx.execute(
+            "INSERT INTO quota_epochs
+                (scope_kind, scope_id, epoch, requests, tokens)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(scope_kind, scope_id, epoch) DO UPDATE SET
+                requests = excluded.requests,
+                tokens = excluded.tokens",
+            params![
+                scope.kind.as_str(),
+                scope.id,
+                epoch_blob.as_slice(),
+                requests.as_slice(),
+                tokens.as_slice()
+            ],
+        )
+        .map_err(|error| {
+            quota_error(format!(
+                "failed to update trusted quota scope aggregate: {error}"
+            ))
+        })?;
+        Ok(())
+    }
+
+    /// Replace one receipt's contribution in the trusted aggregate.
+    ///
+    /// Saturating sums are not invertible once they reach `u64::MAX`. A
+    /// decrement from a saturated dimension therefore takes the rare,
+    /// correctness-first full-recompute path; ordinary operations remain O(1)
+    /// per associated scope.
+    fn replace_scope_epoch_contribution(
+        tx: &Transaction<'_>,
+        scope: &QuotaScopeKey,
+        epoch: u64,
+        old: (u64, u64),
+        new: (u64, u64),
+    ) -> Result<(), ContextError> {
+        let current = Self::required_scope_epoch_aggregate(tx, scope, epoch)?;
+        let saturated_decrement =
+            (new.0 < old.0 && current.0 == u64::MAX) || (new.1 < old.1 && current.1 == u64::MAX);
+        if saturated_decrement {
+            Self::write_scope_epoch_from_receipts(tx, scope, epoch)?;
+            return Ok(());
+        }
+        let replace = |value: u64, previous: u64, replacement: u64, dimension: &str| {
+            if replacement >= previous {
+                Ok(value.saturating_add(replacement - previous))
+            } else {
+                value.checked_sub(previous - replacement).ok_or_else(|| {
+                    quota_error(format!(
+                        "quota scope {:?} epoch {epoch} {dimension} aggregate underflow",
+                        scope
+                    ))
+                })
+            }
+        };
+        let requests = replace(current.0, old.0, new.0, "request")?;
+        let tokens = replace(current.1, old.1, new.1, "token")?;
+        Self::write_scope_epoch_aggregate(tx, scope, epoch, requests, tokens)
+    }
+
+    #[cfg(test)]
+    fn reset_quota_full_receipt_scan_count() {
+        QUOTA_FULL_RECEIPT_SCANS.with(|count| count.set(0));
+    }
+
+    #[cfg(test)]
+    fn quota_full_receipt_scan_count() -> u64 {
+        QUOTA_FULL_RECEIPT_SCANS.with(std::cell::Cell::get)
+    }
+
+    fn validate_scope_epoch(
+        tx: &Transaction<'_>,
+        scope: &QuotaScopeKey,
+        epoch: u64,
+    ) -> Result<QuotaScopeUsage, ContextError> {
+        let usage = Self::compute_scope_epoch_usage(tx, scope, epoch)?;
+        let stored = Self::load_scope_epoch_aggregate(tx, scope, epoch)?;
         let expected = (usage.requests, usage.tokens);
         match stored {
             Some(value) if value == expected => Ok(usage),
-            None if expected == (0, 0) => Ok(usage),
+            None if expected == (0, 0)
+                && usage.reserved_receipts == 0
+                && usage.in_flight_receipts == 0
+                && usage.estimated_receipts == 0
+                && usage.reconciled_receipts == 0 =>
+            {
+                Ok(usage)
+            }
             Some(value) => Err(quota_error(format!(
-                "provider epoch {epoch} aggregate {value:?} disagrees with receipts {expected:?}"
+                "quota scope {:?} epoch {epoch} aggregate {value:?} disagrees with receipts {expected:?}",
+                scope
             ))),
             None => Err(quota_error(format!(
-                "provider epoch {epoch} is missing its aggregate"
+                "quota scope {:?} epoch {epoch} is missing its aggregate",
+                scope
             ))),
         }
     }
 
-    fn write_provider_epoch_from_receipts(
+    fn write_scope_epoch_from_receipts(
         tx: &Transaction<'_>,
+        scope: &QuotaScopeKey,
         epoch: u64,
-    ) -> Result<ProviderRateUsage, ContextError> {
-        let usage = Self::compute_provider_epoch_usage(tx, epoch)?;
+    ) -> Result<QuotaScopeUsage, ContextError> {
+        let usage = Self::compute_scope_epoch_usage(tx, scope, epoch)?;
         let epoch_blob = u64_blob(epoch);
         if usage.requests == 0
             && usage.tokens == 0
@@ -1166,14 +1635,10 @@ impl SqliteContextManager {
             tx.execute(
                 "DELETE FROM quota_epochs
                  WHERE scope_kind = ?1 AND scope_id = ?2 AND epoch = ?3",
-                params![
-                    PROVIDER_QUOTA_SCOPE_KIND,
-                    PROVIDER_QUOTA_SCOPE_ID,
-                    epoch_blob.as_slice()
-                ],
+                params![scope.kind.as_str(), scope.id, epoch_blob.as_slice()],
             )
             .map_err(|error| {
-                quota_error(format!("failed to delete empty provider epoch: {error}"))
+                quota_error(format!("failed to delete empty quota scope epoch: {error}"))
             })?;
         } else {
             let requests = u64_blob(usage.requests);
@@ -1186,78 +1651,155 @@ impl SqliteContextManager {
                     requests = excluded.requests,
                     tokens = excluded.tokens",
                 params![
-                    PROVIDER_QUOTA_SCOPE_KIND,
-                    PROVIDER_QUOTA_SCOPE_ID,
+                    scope.kind.as_str(),
+                    scope.id,
                     epoch_blob.as_slice(),
                     requests.as_slice(),
                     tokens.as_slice()
                 ],
             )
             .map_err(|error| {
-                quota_error(format!("failed to write provider epoch aggregate: {error}"))
+                quota_error(format!("failed to write quota scope aggregate: {error}"))
             })?;
         }
         Ok(usage)
     }
 
+    fn receipt_scope_keys(
+        tx: &Transaction<'_>,
+        receipt: &StoredQuotaReceipt,
+    ) -> Result<Vec<QuotaScopeKey>, ContextError> {
+        Ok(Self::load_receipt_scopes(tx, receipt)?
+            .into_iter()
+            .map(|scope| scope.key)
+            .collect())
+    }
+
+    fn validate_provider_epoch(
+        tx: &Transaction<'_>,
+        epoch: u64,
+    ) -> Result<ProviderRateUsage, ContextError> {
+        let usage = Self::validate_scope_epoch(tx, &QuotaScopeKey::provider_global(), epoch)?;
+        Ok(ProviderRateUsage {
+            epoch: usage.epoch,
+            requests: usage.requests,
+            tokens: usage.tokens,
+            reserved_receipts: usage.reserved_receipts,
+            in_flight_receipts: usage.in_flight_receipts,
+            estimated_receipts: usage.estimated_receipts,
+            reconciled_receipts: usage.reconciled_receipts,
+        })
+    }
+
     fn validate_all_provider_epochs(tx: &Transaction<'_>) -> Result<(), ContextError> {
-        let mut statement = tx
-            .prepare(
-                "SELECT epoch FROM quota_epochs
-                 WHERE scope_kind = ?1 AND scope_id = ?2
-                 UNION
-                 SELECT r.epoch
-                 FROM quota_receipts r
-                 WHERE r.receipt_kind = 'provider_request'",
-            )
-            .map_err(|error| {
-                quota_error(format!(
-                    "failed to prepare provider epoch validation: {error}"
-                ))
-            })?;
-        let rows = statement
-            .query_map(
-                params![PROVIDER_QUOTA_SCOPE_KIND, PROVIDER_QUOTA_SCOPE_ID],
-                |row| row.get::<_, Vec<u8>>(0),
-            )
-            .map_err(|error| {
-                quota_error(format!("failed to enumerate provider epochs: {error}"))
-            })?;
-        let mut epochs = BTreeSet::new();
-        for row in rows {
-            epochs.insert(parse_u64_blob(
-                row.map_err(|error| {
-                    quota_error(format!("failed to read provider epoch: {error}"))
-                })?,
-                "provider epoch",
-            )?);
-        }
-        drop(statement);
-        let unexpected_provider_scope = tx
+        let dangling_scope = tx
             .query_row(
                 "SELECT 1
                  FROM quota_receipt_scopes s
-                 JOIN quota_receipts r ON r.id = s.receipt_id
-                 WHERE s.scope_kind = ?1 AND s.scope_id = ?2
-                   AND r.receipt_kind <> 'provider_request'
-                 LIMIT 1",
-                params![PROVIDER_QUOTA_SCOPE_KIND, PROVIDER_QUOTA_SCOPE_ID],
+                 LEFT JOIN quota_receipts r ON r.id = s.receipt_id
+                 WHERE r.id IS NULL LIMIT 1",
+                [],
                 |_| Ok(()),
             )
             .optional()
             .map_err(|error| {
-                quota_error(format!(
-                    "failed to validate provider receipt ownership: {error}"
-                ))
+                quota_error(format!("failed to validate quota scope ownership: {error}"))
             })?
             .is_some();
-        if unexpected_provider_scope {
-            return Err(quota_error(
-                "provider/global scope is attached to a non-provider receipt",
-            ));
+        if dangling_scope {
+            return Err(quota_error("quota scope association has no receipt"));
         }
-        for epoch in epochs {
-            Self::validate_provider_epoch(tx, epoch)?;
+
+        let mut receipt_statement = tx
+            .prepare("SELECT id FROM quota_receipts ORDER BY id")
+            .map_err(|error| {
+                quota_error(format!(
+                    "failed to prepare quota receipt validation: {error}"
+                ))
+            })?;
+        let receipt_rows = receipt_statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|error| quota_error(format!("failed to enumerate quota receipts: {error}")))?;
+        let mut receipt_ids = Vec::new();
+        for row in receipt_rows {
+            let id = row.map_err(|error| {
+                quota_error(format!("failed to read quota receipt id: {error}"))
+            })?;
+            receipt_ids.push(uuid::Uuid::parse_str(&id).map_err(|error| {
+                quota_error(format!("malformed quota receipt id {id:?}: {error}"))
+            })?);
+        }
+        drop(receipt_statement);
+        for id in receipt_ids {
+            let receipt = Self::load_quota_receipt(tx, id)?
+                .ok_or_else(|| quota_error(format!("quota receipt {id} disappeared")))?;
+            let _ = Self::load_receipt_scopes(tx, &receipt)?;
+        }
+
+        let mut scopes = BTreeSet::new();
+        let mut epoch_statement = tx
+            .prepare("SELECT scope_kind, scope_id, epoch FROM quota_epochs")
+            .map_err(|error| {
+                quota_error(format!("failed to prepare quota epoch validation: {error}"))
+            })?;
+        let epoch_rows = epoch_statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                ))
+            })
+            .map_err(|error| quota_error(format!("failed to enumerate quota epochs: {error}")))?;
+        for row in epoch_rows {
+            let (kind, id, epoch) =
+                row.map_err(|error| quota_error(format!("failed to read quota epoch: {error}")))?;
+            let scope = QuotaScopeKey {
+                kind: QuotaScopeKind::parse(&kind)?,
+                id,
+            };
+            validate_quota_scope_key(&scope)?;
+            scopes.insert((scope, parse_u64_blob(epoch, "quota epoch")?));
+        }
+        drop(epoch_statement);
+
+        let mut association_statement = tx
+            .prepare(
+                "SELECT s.scope_kind, s.scope_id, r.epoch
+                 FROM quota_receipt_scopes s
+                 JOIN quota_receipts r ON r.id = s.receipt_id",
+            )
+            .map_err(|error| {
+                quota_error(format!(
+                    "failed to prepare quota association validation: {error}"
+                ))
+            })?;
+        let association_rows = association_statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                ))
+            })
+            .map_err(|error| {
+                quota_error(format!("failed to enumerate quota associations: {error}"))
+            })?;
+        for row in association_rows {
+            let (kind, id, epoch) = row.map_err(|error| {
+                quota_error(format!("failed to read quota association: {error}"))
+            })?;
+            let scope = QuotaScopeKey {
+                kind: QuotaScopeKind::parse(&kind)?,
+                id,
+            };
+            validate_quota_scope_key(&scope)?;
+            scopes.insert((scope, parse_u64_blob(epoch, "quota association epoch")?));
+        }
+        drop(association_statement);
+
+        for (scope, epoch) in scopes {
+            Self::validate_scope_epoch(tx, &scope, epoch)?;
         }
         Ok(())
     }
@@ -1290,6 +1832,7 @@ impl SqliteContextManager {
     /// Zero RPM/TPM values are unlimited. Reusing the same UUID is idempotent
     /// when it describes the same estimate, even after the clock advances; a
     /// conflicting reuse fails closed.
+    #[cfg(test)]
     pub(crate) fn reserve_provider_rate(
         &self,
         receipt_id: uuid::Uuid,
@@ -1298,6 +1841,44 @@ impl SqliteContextManager {
         tpm: u64,
         estimated_tokens: u64,
     ) -> Result<ProviderRateReserveOutcome, ContextError> {
+        self.reserve_provider_rate_with_cgroups(
+            receipt_id,
+            requested_epoch,
+            rpm,
+            tpm,
+            estimated_tokens,
+            &[],
+        )
+    }
+
+    /// Atomically reserve provider/global and an ordered root-to-leaf set of
+    /// stable cgroup scopes. Provider/global records one request plus the token
+    /// estimate; cgroup scopes record only the same token estimate and enforce
+    /// only their token limit.
+    pub(crate) fn reserve_provider_rate_with_cgroups(
+        &self,
+        receipt_id: uuid::Uuid,
+        requested_epoch: u64,
+        rpm: u32,
+        tpm: u64,
+        estimated_tokens: u64,
+        cgroups: &[CgroupQuotaConstraint],
+    ) -> Result<ProviderRateReserveOutcome, ContextError> {
+        let mut seen = BTreeSet::new();
+        for constraint in cgroups {
+            let key = QuotaScopeKey::cgroup(&constraint.scope_id);
+            validate_quota_scope_key(&key)?;
+            if !seen.insert(constraint.scope_id.as_str()) {
+                return Err(quota_error(format!(
+                    "duplicate cgroup quota scope {:?}",
+                    constraint.scope_id
+                )));
+            }
+        }
+        if cgroups.len() >= u32::MAX as usize {
+            return Err(quota_error("too many cgroup quota scopes"));
+        }
+
         let mut conn = self
             .conn
             .lock()
@@ -1306,11 +1887,27 @@ impl SqliteContextManager {
         let effective_epoch = Self::effective_quota_epoch(&tx, requested_epoch)?;
 
         if let Some(receipt) = Self::load_quota_receipt(&tx, receipt_id)? {
-            Self::validate_provider_epoch(&tx, receipt.epoch)?;
-            let _ = Self::provider_scope_usage_for_receipt(&tx, &receipt)?;
+            let scopes = Self::load_receipt_scopes(&tx, &receipt)?;
+            for scope in &scopes {
+                Self::required_scope_epoch_aggregate(&tx, &scope.key, receipt.epoch)?;
+            }
+            let stored_cgroups: Vec<&str> = scopes
+                .iter()
+                .skip(1)
+                .map(|scope| scope.key.id.as_str())
+                .collect();
+            let requested_cgroups: Vec<&str> = cgroups
+                .iter()
+                .map(|constraint| constraint.scope_id.as_str())
+                .collect();
             if receipt.reserved_requests != 1 || receipt.reserved_tokens != estimated_tokens {
                 return Err(quota_error(format!(
                     "quota receipt {receipt_id} was reused with conflicting reservation data"
+                )));
+            }
+            if stored_cgroups != requested_cgroups {
+                return Err(quota_error(format!(
+                    "quota receipt {receipt_id} was reused with different cgroup scopes"
                 )));
             }
             let reservation = ProviderRateReservation {
@@ -1318,6 +1915,7 @@ impl SqliteContextManager {
                 epoch: receipt.epoch,
                 reserved_tokens: receipt.reserved_tokens,
                 state: receipt.state,
+                cgroup_scopes: stored_cgroups.into_iter().map(str::to_string).collect(),
             };
             Self::commit_quota_transaction(tx)?;
             return Ok(ProviderRateReserveOutcome::Reserved(reservation));
@@ -1343,6 +1941,7 @@ impl SqliteContextManager {
         if fenced {
             let outcome = ProviderRateReserveOutcome::Denied {
                 epoch: effective_epoch,
+                scope: QuotaScopeKey::provider_global(),
                 dimension: ProviderRateLimitDimension::MigrationFence,
                 used: 0,
                 requested: 0,
@@ -1352,32 +1951,59 @@ impl SqliteContextManager {
             return Ok(outcome);
         }
 
-        let usage = Self::validate_provider_epoch(&tx, effective_epoch)?;
+        let provider_scope = QuotaScopeKey::provider_global();
+        let usage = Self::trusted_scope_epoch_aggregate(&tx, &provider_scope, effective_epoch)?;
+        let mut cgroup_usages = Vec::with_capacity(cgroups.len());
+        for constraint in cgroups {
+            let scope = QuotaScopeKey::cgroup(&constraint.scope_id);
+            let usage = Self::trusted_scope_epoch_aggregate(&tx, &scope, effective_epoch)?;
+            cgroup_usages.push((constraint, scope, usage));
+        }
         let rpm = u64::from(rpm);
-        if rpm != 0 && usage.requests >= rpm {
+        if rpm != 0 && usage.0 >= rpm {
             let outcome = ProviderRateReserveOutcome::Denied {
                 epoch: effective_epoch,
+                scope: provider_scope.clone(),
                 dimension: ProviderRateLimitDimension::Requests,
-                used: usage.requests,
+                used: usage.0,
                 requested: 1,
                 limit: rpm,
             };
             Self::commit_quota_transaction(tx)?;
             return Ok(outcome);
         }
-        if tpm != 0 && (usage.tokens > tpm || estimated_tokens > tpm.saturating_sub(usage.tokens)) {
+        if tpm != 0 && (usage.1 > tpm || estimated_tokens > tpm.saturating_sub(usage.1)) {
             let outcome = ProviderRateReserveOutcome::Denied {
                 epoch: effective_epoch,
+                scope: provider_scope.clone(),
                 dimension: ProviderRateLimitDimension::Tokens,
-                used: usage.tokens,
+                used: usage.1,
                 requested: estimated_tokens,
                 limit: tpm,
             };
             Self::commit_quota_transaction(tx)?;
             return Ok(outcome);
         }
+        for (constraint, scope, usage) in &cgroup_usages {
+            if constraint.token_limit != 0
+                && (usage.1 > constraint.token_limit
+                    || estimated_tokens > constraint.token_limit.saturating_sub(usage.1))
+            {
+                let outcome = ProviderRateReserveOutcome::Denied {
+                    epoch: effective_epoch,
+                    scope: scope.clone(),
+                    dimension: ProviderRateLimitDimension::Tokens,
+                    used: usage.1,
+                    requested: estimated_tokens,
+                    limit: constraint.token_limit,
+                };
+                Self::commit_quota_transaction(tx)?;
+                return Ok(outcome);
+            }
+        }
 
         let one = u64_blob(1);
+        let zero = u64_blob(0);
         let estimate = u64_blob(estimated_tokens);
         tx.execute(
             "INSERT INTO quota_receipts
@@ -1396,10 +2022,10 @@ impl SqliteContextManager {
         })?;
         tx.execute(
             "INSERT INTO quota_receipt_scopes
-                (receipt_id, scope_kind, scope_id,
+                (receipt_id, scope_order, scope_kind, scope_id,
                  reserved_requests, reserved_tokens,
                  actual_requests, actual_tokens)
-             VALUES (?1, ?2, ?3, ?4, ?5, NULL, NULL)",
+             VALUES (?1, 0, ?2, ?3, ?4, ?5, NULL, NULL)",
             params![
                 receipt_id.to_string(),
                 PROVIDER_QUOTA_SCOPE_KIND,
@@ -1413,7 +2039,46 @@ impl SqliteContextManager {
                 "failed to associate provider quota receipt: {error}"
             ))
         })?;
-        Self::write_provider_epoch_from_receipts(&tx, effective_epoch)?;
+        for (index, constraint) in cgroups.iter().enumerate() {
+            let scope_order = i64::try_from(index + 1)
+                .map_err(|_| quota_error("too many cgroup quota scopes"))?;
+            tx.execute(
+                "INSERT INTO quota_receipt_scopes
+                    (receipt_id, scope_order, scope_kind, scope_id,
+                     reserved_requests, reserved_tokens,
+                     actual_requests, actual_tokens)
+                 VALUES (?1, ?2, 'cgroup', ?3, ?4, ?5, NULL, NULL)",
+                params![
+                    receipt_id.to_string(),
+                    scope_order,
+                    constraint.scope_id,
+                    zero.as_slice(),
+                    estimate.as_slice()
+                ],
+            )
+            .map_err(|error| {
+                quota_error(format!(
+                    "failed to associate cgroup quota receipt scope {:?}: {error}",
+                    constraint.scope_id
+                ))
+            })?;
+        }
+        Self::write_scope_epoch_aggregate(
+            &tx,
+            &provider_scope,
+            effective_epoch,
+            usage.0.saturating_add(1),
+            usage.1.saturating_add(estimated_tokens),
+        )?;
+        for (_, scope, aggregate) in cgroup_usages {
+            Self::write_scope_epoch_aggregate(
+                &tx,
+                &scope,
+                effective_epoch,
+                aggregate.0,
+                aggregate.1.saturating_add(estimated_tokens),
+            )?;
+        }
         Self::commit_quota_transaction(tx)?;
         Ok(ProviderRateReserveOutcome::Reserved(
             ProviderRateReservation {
@@ -1421,6 +2086,10 @@ impl SqliteContextManager {
                 epoch: effective_epoch,
                 reserved_tokens: estimated_tokens,
                 state: ProviderRateReceiptState::Reserved,
+                cgroup_scopes: cgroups
+                    .iter()
+                    .map(|constraint| constraint.scope_id.clone())
+                    .collect(),
             },
         ))
     }
@@ -1438,8 +2107,10 @@ impl SqliteContextManager {
         let tx = Self::begin_quota_transaction(&mut conn)?;
         let receipt = Self::load_quota_receipt(&tx, receipt_id)?
             .ok_or_else(|| quota_error(format!("unknown quota receipt {receipt_id}")))?;
-        Self::validate_provider_epoch(&tx, receipt.epoch)?;
-        let _ = Self::provider_scope_usage_for_receipt(&tx, &receipt)?;
+        let scopes = Self::receipt_scope_keys(&tx, &receipt)?;
+        for scope in &scopes {
+            Self::required_scope_epoch_aggregate(&tx, scope, receipt.epoch)?;
+        }
         if receipt.state == ProviderRateReceiptState::Reserved {
             tx.execute(
                 "UPDATE quota_receipts SET state = 'in_flight' WHERE id = ?1",
@@ -1472,8 +2143,10 @@ impl SqliteContextManager {
             }
             return Err(quota_error(format!("unknown quota receipt {receipt_id}")));
         };
-        Self::validate_provider_epoch(&tx, receipt.epoch)?;
-        let _ = Self::provider_scope_usage_for_receipt(&tx, &receipt)?;
+        let scopes = Self::load_receipt_scopes(&tx, &receipt)?;
+        for scope in &scopes {
+            Self::required_scope_epoch_aggregate(&tx, &scope.key, receipt.epoch)?;
+        }
         if receipt.state != ProviderRateReceiptState::Reserved {
             return Err(quota_error(format!(
                 "quota receipt {receipt_id} cannot be refunded after provider invocation"
@@ -1490,7 +2163,15 @@ impl SqliteContextManager {
             [receipt_id.to_string()],
         )
         .map_err(|error| quota_error(format!("failed to refund quota receipt: {error}")))?;
-        Self::write_provider_epoch_from_receipts(&tx, receipt.epoch)?;
+        for scope in &scopes {
+            Self::replace_scope_epoch_contribution(
+                &tx,
+                &scope.key,
+                receipt.epoch,
+                Self::scope_contribution(&receipt, scope),
+                (0, 0),
+            )?;
+        }
         Self::commit_quota_transaction(tx)
     }
 
@@ -1507,8 +2188,10 @@ impl SqliteContextManager {
         let tx = Self::begin_quota_transaction(&mut conn)?;
         let receipt = Self::load_quota_receipt(&tx, receipt_id)?
             .ok_or_else(|| quota_error(format!("unknown quota receipt {receipt_id}")))?;
-        Self::validate_provider_epoch(&tx, receipt.epoch)?;
-        let _ = Self::provider_scope_usage_for_receipt(&tx, &receipt)?;
+        let scopes = Self::receipt_scope_keys(&tx, &receipt)?;
+        for scope in &scopes {
+            Self::required_scope_epoch_aggregate(&tx, scope, receipt.epoch)?;
+        }
         match receipt.state {
             ProviderRateReceiptState::InFlight => {
                 tx.execute(
@@ -1545,8 +2228,10 @@ impl SqliteContextManager {
         let tx = Self::begin_quota_transaction(&mut conn)?;
         let receipt = Self::load_quota_receipt(&tx, receipt_id)?
             .ok_or_else(|| quota_error(format!("unknown quota receipt {receipt_id}")))?;
-        Self::validate_provider_epoch(&tx, receipt.epoch)?;
-        let _ = Self::provider_scope_usage_for_receipt(&tx, &receipt)?;
+        let scopes = Self::load_receipt_scopes(&tx, &receipt)?;
+        for scope in &scopes {
+            Self::required_scope_epoch_aggregate(&tx, &scope.key, receipt.epoch)?;
+        }
         match receipt.state {
             ProviderRateReceiptState::Reconciled => {
                 if receipt.actual_tokens != Some(actual_tokens) {
@@ -1574,21 +2259,23 @@ impl SqliteContextManager {
                 })?;
                 tx.execute(
                     "UPDATE quota_receipt_scopes
-                     SET actual_requests = ?1, actual_tokens = ?2
-                     WHERE receipt_id = ?3
-                       AND scope_kind = ?4 AND scope_id = ?5",
-                    params![
-                        actual_requests.as_slice(),
-                        actual_tokens_blob.as_slice(),
-                        receipt_id.to_string(),
-                        PROVIDER_QUOTA_SCOPE_KIND,
-                        PROVIDER_QUOTA_SCOPE_ID
-                    ],
+                     SET actual_requests = reserved_requests,
+                         actual_tokens = ?1
+                     WHERE receipt_id = ?2",
+                    params![actual_tokens_blob.as_slice(), receipt_id.to_string()],
                 )
                 .map_err(|error| {
                     quota_error(format!("failed to reconcile provider quota scope: {error}"))
                 })?;
-                Self::write_provider_epoch_from_receipts(&tx, receipt.epoch)?;
+                for scope in &scopes {
+                    Self::replace_scope_epoch_contribution(
+                        &tx,
+                        &scope.key,
+                        receipt.epoch,
+                        Self::scope_contribution(&receipt, scope),
+                        (scope.reserved_requests, actual_tokens),
+                    )?;
+                }
             }
             ProviderRateReceiptState::Reserved => {
                 return Err(quota_error(format!(
@@ -1615,13 +2302,17 @@ impl SqliteContextManager {
         let tx = Self::begin_quota_transaction(&mut conn)?;
         let effective_epoch = Self::effective_quota_epoch(&tx, requested_epoch)?;
         if let Some(receipt) = Self::load_quota_receipt(&tx, receipt_id)? {
-            Self::validate_provider_epoch(&tx, receipt.epoch)?;
-            let _ = Self::provider_scope_usage_for_receipt(&tx, &receipt)?;
+            let scopes = Self::load_receipt_scopes(&tx, &receipt)?;
+            for scope in &scopes {
+                Self::required_scope_epoch_aggregate(&tx, &scope.key, receipt.epoch)?;
+            }
             if receipt.reserved_requests == 0
                 && receipt.reserved_tokens == 0
                 && receipt.state == ProviderRateReceiptState::Reconciled
                 && receipt.actual_requests == Some(0)
                 && receipt.actual_tokens == Some(tokens)
+                && scopes.len() == 1
+                && scopes[0].key == QuotaScopeKey::provider_global()
             {
                 Self::commit_quota_transaction(tx)?;
                 return Ok(());
@@ -1635,7 +2326,8 @@ impl SqliteContextManager {
                 "refunded quota receipt {receipt_id} cannot be reused"
             )));
         }
-        Self::validate_provider_epoch(&tx, effective_epoch)?;
+        let provider_scope = QuotaScopeKey::provider_global();
+        let aggregate = Self::trusted_scope_epoch_aggregate(&tx, &provider_scope, effective_epoch)?;
         let epoch_blob = u64_blob(effective_epoch);
         let zero = u64_blob(0);
         let token_blob = u64_blob(tokens);
@@ -1654,10 +2346,10 @@ impl SqliteContextManager {
         .map_err(|error| quota_error(format!("failed to insert direct token charge: {error}")))?;
         tx.execute(
             "INSERT INTO quota_receipt_scopes
-                (receipt_id, scope_kind, scope_id,
+                (receipt_id, scope_order, scope_kind, scope_id,
                  reserved_requests, reserved_tokens,
                  actual_requests, actual_tokens)
-             VALUES (?1, ?2, ?3, ?4, ?4, ?4, ?5)",
+             VALUES (?1, 0, ?2, ?3, ?4, ?4, ?4, ?5)",
             params![
                 receipt_id.to_string(),
                 PROVIDER_QUOTA_SCOPE_KIND,
@@ -1669,7 +2361,13 @@ impl SqliteContextManager {
         .map_err(|error| {
             quota_error(format!("failed to associate direct token charge: {error}"))
         })?;
-        Self::write_provider_epoch_from_receipts(&tx, effective_epoch)?;
+        Self::write_scope_epoch_aggregate(
+            &tx,
+            &provider_scope,
+            effective_epoch,
+            aggregate.0,
+            aggregate.1.saturating_add(tokens),
+        )?;
         Self::commit_quota_transaction(tx)
     }
 
@@ -1685,6 +2383,26 @@ impl SqliteContextManager {
         let tx = Self::begin_quota_transaction(&mut conn)?;
         let effective_epoch = Self::effective_quota_epoch(&tx, requested_epoch)?;
         let usage = Self::validate_provider_epoch(&tx, effective_epoch)?;
+        Self::commit_quota_transaction(tx)?;
+        Ok(usage)
+    }
+
+    /// Return durable usage for one stable provider or cgroup scope in the
+    /// monotonic effective epoch.
+    #[cfg(test)]
+    pub(crate) fn quota_scope_usage(
+        &self,
+        requested_epoch: u64,
+        scope: &QuotaScopeKey,
+    ) -> Result<QuotaScopeUsage, ContextError> {
+        validate_quota_scope_key(scope)?;
+        let mut conn = self
+            .conn
+            .lock()
+            .map_err(|_| quota_error("SQLite connection mutex is poisoned"))?;
+        let tx = Self::begin_quota_transaction(&mut conn)?;
+        let effective_epoch = Self::effective_quota_epoch(&tx, requested_epoch)?;
+        let usage = Self::validate_scope_epoch(&tx, scope, effective_epoch)?;
         Self::commit_quota_transaction(tx)?;
         Ok(usage)
     }
@@ -1735,11 +2453,13 @@ impl SqliteContextManager {
             effective_epoch,
             ..ProviderRateRecovery::default()
         };
-        let mut affected_epochs = BTreeSet::new();
+        let mut affected_scopes = BTreeSet::new();
         for id in ids {
             let receipt = Self::load_quota_receipt(&tx, id)?
                 .ok_or_else(|| quota_error(format!("recovery receipt {id} disappeared")))?;
-            affected_epochs.insert(receipt.epoch);
+            for scope in Self::receipt_scope_keys(&tx, &receipt)? {
+                affected_scopes.insert((scope, receipt.epoch));
+            }
             match receipt.state {
                 ProviderRateReceiptState::Reserved => {
                     let epoch_blob = u64_blob(receipt.epoch);
@@ -1775,8 +2495,8 @@ impl SqliteContextManager {
                 ProviderRateReceiptState::Estimated | ProviderRateReceiptState::Reconciled => {}
             }
         }
-        for epoch in affected_epochs {
-            Self::write_provider_epoch_from_receipts(&tx, epoch)?;
+        for (scope, epoch) in affected_scopes {
+            Self::write_scope_epoch_from_receipts(&tx, &scope, epoch)?;
         }
         Self::commit_quota_transaction(tx)?;
         Ok(recovery)
@@ -1801,26 +2521,21 @@ impl SqliteContextManager {
         let mut statement = tx
             .prepare(
                 "SELECT epoch FROM quota_epochs
-                 WHERE scope_kind = ?1 AND scope_id = ?2 AND epoch < ?3
+                 WHERE epoch < ?1
                  UNION
                  SELECT epoch FROM quota_receipts
-                 WHERE receipt_kind = 'provider_request' AND epoch < ?3
+                 WHERE receipt_kind = 'provider_request' AND epoch < ?1
                  UNION
-                 SELECT epoch FROM quota_refunded_receipts WHERE epoch < ?3
+                 SELECT epoch FROM quota_refunded_receipts WHERE epoch < ?1
                  UNION
-                 SELECT epoch FROM quota_migration_fence WHERE epoch < ?3
+                 SELECT epoch FROM quota_migration_fence WHERE epoch < ?1
                  ORDER BY epoch",
             )
             .map_err(|error| quota_error(format!("failed to prepare quota prune: {error}")))?;
         let rows = statement
-            .query_map(
-                params![
-                    PROVIDER_QUOTA_SCOPE_KIND,
-                    PROVIDER_QUOTA_SCOPE_ID,
-                    before_blob.as_slice()
-                ],
-                |row| row.get::<_, Vec<u8>>(0),
-            )
+            .query_map(params![before_blob.as_slice()], |row| {
+                row.get::<_, Vec<u8>>(0)
+            })
             .map_err(|error| quota_error(format!("failed to scan quota prune: {error}")))?;
         let mut candidates = Vec::new();
         for row in rows {
@@ -2673,8 +3388,23 @@ impl SqliteContextManager {
 /// db). Writes commit immediately, so a crash (drop without graceful shutdown)
 /// still leaves committed agents recoverable.
 impl SqliteContextManager {
+    #[cfg(test)]
+    pub(crate) fn fail_next_agent_save_for_test(&self) {
+        self.fail_next_agent_save
+            .store(true, AtomicOrdering::Release);
+    }
+
     /// Insert-or-update an agent's durable identity + config.
     pub fn save_agent(&self, agent: &PersistedAgent) -> Result<(), ContextError> {
+        #[cfg(test)]
+        if self
+            .fail_next_agent_save
+            .swap(false, AtomicOrdering::AcqRel)
+        {
+            return Err(ContextError::PersistenceFailed(
+                "injected agent-registry save failure".into(),
+            ));
+        }
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "INSERT OR REPLACE INTO agents
@@ -3926,6 +4656,7 @@ mod tests {
         let mgr = SqliteContextManager {
             conn: Mutex::new(conn),
             embedder: crate::memory_manager::default_embedder(),
+            fail_next_agent_save: AtomicBool::new(false),
         };
         mgr.init_schema().unwrap();
 
@@ -4264,6 +4995,26 @@ mod tests {
     }
 
     #[test]
+    fn recovery_detects_valid_but_inconsistent_aggregate() {
+        let mgr = SqliteContextManager::in_memory().unwrap();
+        expect_provider_reservation(
+            mgr.reserve_provider_rate(uuid::Uuid::new_v4(), 62, 10, 1_000, 25)
+                .unwrap(),
+        );
+        {
+            let conn = mgr.conn.lock().unwrap();
+            let wrong = u64_blob(24);
+            conn.execute(
+                "UPDATE quota_epochs SET tokens = ?1
+                 WHERE scope_kind = 'provider' AND scope_id = 'global'",
+                params![wrong.as_slice()],
+            )
+            .unwrap();
+        }
+        assert!(mgr.recover_provider_rate_state(62).is_err());
+    }
+
+    #[test]
     fn missing_provider_scope_fails_closed() {
         let mgr = SqliteContextManager::in_memory().unwrap();
         let id = uuid::Uuid::new_v4();
@@ -4463,5 +5214,733 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    fn create_pr140_quota_schema(conn: &Connection, duplicate_receipt_scopes: bool) {
+        conn.execute_batch(
+            "CREATE TABLE quota_epoch_floor (
+                singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                epoch BLOB NOT NULL
+                    CHECK (typeof(epoch) = 'blob' AND length(epoch) = 8)
+            );
+            INSERT INTO quota_epoch_floor(singleton, epoch)
+                VALUES (1, x'0000000000000001');
+            CREATE TABLE quota_epochs (
+                scope_kind TEXT NOT NULL,
+                scope_id TEXT NOT NULL,
+                epoch BLOB NOT NULL,
+                requests BLOB NOT NULL,
+                tokens BLOB NOT NULL,
+                PRIMARY KEY (scope_kind, scope_id, epoch)
+            ) WITHOUT ROWID;
+            INSERT INTO quota_epochs
+                (scope_kind, scope_id, epoch, requests, tokens)
+            VALUES
+                ('provider', 'global', x'0000000000000001',
+                 x'0000000000000001', x'0000000000000001');
+            CREATE TABLE quota_receipts (
+                id TEXT PRIMARY KEY,
+                receipt_kind TEXT NOT NULL,
+                epoch BLOB NOT NULL,
+                state TEXT NOT NULL,
+                reserved_requests BLOB NOT NULL,
+                reserved_tokens BLOB NOT NULL,
+                actual_requests BLOB,
+                actual_tokens BLOB
+            );
+            CREATE TABLE quota_receipt_scopes (
+                receipt_id TEXT NOT NULL
+                    REFERENCES quota_receipts(id) ON DELETE CASCADE,
+                scope_kind TEXT NOT NULL,
+                scope_id TEXT NOT NULL,
+                reserved_requests BLOB NOT NULL,
+                reserved_tokens BLOB NOT NULL,
+                actual_requests BLOB,
+                actual_tokens BLOB,
+                PRIMARY KEY (receipt_id, scope_kind, scope_id)
+            ) WITHOUT ROWID;
+            INSERT INTO quota_receipts
+                (id, receipt_kind, epoch, state, reserved_requests,
+                 reserved_tokens, actual_requests, actual_tokens)
+            VALUES
+                ('00000000-0000-0000-0000-000000000001', 'provider_request',
+                 x'0000000000000001', 'estimated',
+                 x'0000000000000001', x'0000000000000001', NULL, NULL);
+            INSERT INTO quota_receipt_scopes
+                (receipt_id, scope_kind, scope_id, reserved_requests,
+                 reserved_tokens, actual_requests, actual_tokens)
+            VALUES
+                ('00000000-0000-0000-0000-000000000001',
+                 'provider', 'global',
+                 x'0000000000000001', x'0000000000000001', NULL, NULL);",
+        )
+        .unwrap();
+        if duplicate_receipt_scopes {
+            // PR140 only wrote the provider scope. This extra structurally
+            // valid row is a failure-injection fixture: after both rows receive
+            // the default order zero, creating the new unique order index
+            // fails, simulating an interruption after ALTER TABLE.
+            conn.execute(
+                "INSERT INTO quota_receipt_scopes
+                    (receipt_id, scope_kind, scope_id, reserved_requests,
+                     reserved_tokens, actual_requests, actual_tokens)
+                 VALUES (?1, 'cgroup', '/injected',
+                         ?2, ?2, NULL, NULL)",
+                params![
+                    "00000000-0000-0000-0000-000000000001",
+                    u64_blob(1).as_slice()
+                ],
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn pr140_quota_schema_upgrade_fences_unknown_cgroup_usage() {
+        let database = QuotaTestDatabase::new("pr140-hierarchy-migration");
+        {
+            let conn = Connection::open(&database.path).unwrap();
+            create_pr140_quota_schema(&conn, false);
+        }
+
+        let manager = SqliteContextManager::new(&database.path).unwrap();
+        let conn = manager.conn.lock().unwrap();
+        let has_scope_order = conn
+            .prepare("PRAGMA table_info(quota_receipt_scopes)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .map(Result::unwrap)
+            .any(|column| column == "scope_order");
+        assert!(has_scope_order);
+        let fence: Vec<u8> = conn
+            .query_row("SELECT epoch FROM quota_migration_fence", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let fence = parse_u64_blob(fence, "PR140 migration fence").unwrap();
+        drop(conn);
+        assert!(matches!(
+            manager
+                .reserve_provider_rate(uuid::Uuid::new_v4(), fence, 10, 100, 1)
+                .unwrap(),
+            ProviderRateReserveOutcome::Denied {
+                dimension: ProviderRateLimitDimension::MigrationFence,
+                ..
+            }
+        ));
+        manager
+            .recover_provider_rate_state(fence.saturating_add(1))
+            .expect("the migrated PR140 provider receipt must remain readable");
+    }
+
+    #[test]
+    fn pr140_hierarchy_migration_fences_ahead_of_rolled_back_wall_clock() {
+        let database = QuotaTestDatabase::new("pr140-ahead-floor");
+        let ahead_floor = u64::MAX - 1;
+        {
+            let conn = Connection::open(&database.path).unwrap();
+            create_pr140_quota_schema(&conn, false);
+            conn.execute(
+                "UPDATE quota_epoch_floor SET epoch = ?1 WHERE singleton = 1",
+                params![u64_blob(ahead_floor).as_slice()],
+            )
+            .unwrap();
+        }
+
+        let manager = SqliteContextManager::new(&database.path).unwrap();
+        let fence = {
+            let conn = manager.conn.lock().unwrap();
+            let value: Vec<u8> = conn
+                .query_row(
+                    "SELECT epoch FROM quota_migration_fence WHERE epoch = ?1",
+                    params![u64_blob(ahead_floor).as_slice()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            parse_u64_blob(value, "ahead-floor migration fence").unwrap()
+        };
+        assert_eq!(fence, ahead_floor);
+        assert!(matches!(
+            manager
+                .reserve_provider_rate(uuid::Uuid::new_v4(), 1, 10, 100, 1)
+                .unwrap(),
+            ProviderRateReserveOutcome::Denied {
+                epoch,
+                dimension: ProviderRateLimitDimension::MigrationFence,
+                ..
+            } if epoch == ahead_floor
+        ));
+    }
+
+    #[test]
+    fn pr140_hierarchy_fence_survives_failure_after_scope_order_alter() {
+        let database = QuotaTestDatabase::new("pr140-interrupted-hierarchy");
+        {
+            let conn = Connection::open(&database.path).unwrap();
+            create_pr140_quota_schema(&conn, true);
+        }
+
+        let error = SqliteContextManager::new(&database.path)
+            .err()
+            .expect("duplicate scope orders must fail the index migration");
+        assert!(error.to_string().contains("scope-order index"));
+
+        let durable_fence = {
+            let conn = Connection::open(&database.path).unwrap();
+            let has_scope_order = conn
+                .prepare("PRAGMA table_info(quota_receipt_scopes)")
+                .unwrap()
+                .query_map([], |row| row.get::<_, String>(1))
+                .unwrap()
+                .map(Result::unwrap)
+                .any(|column| column == "scope_order");
+            assert!(has_scope_order, "failure must happen after ALTER TABLE");
+            let value: Vec<u8> = conn
+                .query_row("SELECT epoch FROM quota_migration_fence", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            conn.execute(
+                "DELETE FROM quota_receipt_scopes WHERE scope_kind = 'cgroup'",
+                [],
+            )
+            .unwrap();
+            parse_u64_blob(value, "interrupted PR140 migration fence").unwrap()
+        };
+
+        let manager = SqliteContextManager::new(&database.path).unwrap();
+        assert!(matches!(
+            manager
+                .reserve_provider_rate(uuid::Uuid::new_v4(), durable_fence, 10, 100, 1)
+                .unwrap(),
+            ProviderRateReserveOutcome::Denied {
+                dimension: ProviderRateLimitDimension::MigrationFence,
+                ..
+            }
+        ));
+    }
+
+    fn cgroup_constraint(scope_id: &str, token_limit: u64) -> CgroupQuotaConstraint {
+        CgroupQuotaConstraint {
+            scope_id: scope_id.to_string(),
+            token_limit,
+        }
+    }
+
+    fn cgroup_usage(manager: &SqliteContextManager, epoch: u64, scope_id: &str) -> QuotaScopeUsage {
+        manager
+            .quota_scope_usage(epoch, &QuotaScopeKey::cgroup(scope_id))
+            .unwrap()
+    }
+
+    #[test]
+    fn hierarchical_parent_denial_leaves_every_scope_unchanged() {
+        let manager = SqliteContextManager::in_memory().unwrap();
+        let first = [
+            cgroup_constraint("/", 100),
+            cgroup_constraint("/agent/a", 100),
+        ];
+        expect_provider_reservation(
+            manager
+                .reserve_provider_rate_with_cgroups(
+                    uuid::Uuid::new_v4(),
+                    100,
+                    10,
+                    1_000,
+                    80,
+                    &first,
+                )
+                .unwrap(),
+        );
+
+        let second = [
+            cgroup_constraint("/", 100),
+            cgroup_constraint("/agent/b", 100),
+        ];
+        let outcome = manager
+            .reserve_provider_rate_with_cgroups(uuid::Uuid::new_v4(), 100, 10, 1_000, 30, &second)
+            .unwrap();
+        assert!(matches!(
+            outcome,
+            ProviderRateReserveOutcome::Denied {
+                scope: QuotaScopeKey {
+                    kind: QuotaScopeKind::Cgroup,
+                    ref id
+                },
+                dimension: ProviderRateLimitDimension::Tokens,
+                used: 80,
+                requested: 30,
+                limit: 100,
+                ..
+            } if id == "/"
+        ));
+        assert_eq!(
+            (
+                manager.provider_rate_usage(100).unwrap().requests,
+                manager.provider_rate_usage(100).unwrap().tokens,
+            ),
+            (1, 80)
+        );
+        assert_eq!(
+            (
+                cgroup_usage(&manager, 100, "/").requests,
+                cgroup_usage(&manager, 100, "/").tokens
+            ),
+            (0, 80)
+        );
+        assert_eq!(
+            (
+                cgroup_usage(&manager, 100, "/agent/a").requests,
+                cgroup_usage(&manager, 100, "/agent/a").tokens,
+            ),
+            (0, 80)
+        );
+        assert_eq!(
+            (
+                cgroup_usage(&manager, 100, "/agent/b").requests,
+                cgroup_usage(&manager, 100, "/agent/b").tokens,
+            ),
+            (0, 0)
+        );
+    }
+
+    #[test]
+    fn hierarchical_scope_order_and_stable_paths_survive_restart() {
+        let database = QuotaTestDatabase::new("stable-cgroup-scopes");
+        let paths = [
+            "/",
+            "/profile/read~0only",
+            "/tenant/a~1b/%/雪",
+            "/tenant/a~1b/%/雪/agent/stable",
+        ];
+        let receipt = uuid::Uuid::new_v4();
+        {
+            let manager = SqliteContextManager::new(&database.path).unwrap();
+            let constraints: Vec<_> = paths
+                .iter()
+                .map(|path| cgroup_constraint(path, 1_000))
+                .collect();
+            let reservation = expect_provider_reservation(
+                manager
+                    .reserve_provider_rate_with_cgroups(receipt, 110, 10, 10_000, 42, &constraints)
+                    .unwrap(),
+            );
+            assert_eq!(
+                reservation.cgroup_scopes,
+                paths
+                    .iter()
+                    .map(|path| path.to_string())
+                    .collect::<Vec<_>>()
+            );
+            manager.mark_provider_rate_invoked(receipt).unwrap();
+            manager.retain_provider_rate_estimate(receipt).unwrap();
+        }
+
+        let manager = SqliteContextManager::new(&database.path).unwrap();
+        manager.recover_provider_rate_state(110).unwrap();
+        for path in paths {
+            let usage = cgroup_usage(&manager, 110, path);
+            assert_eq!((usage.requests, usage.tokens), (0, 42));
+            assert_eq!(usage.estimated_receipts, 1);
+        }
+        let conn = manager.conn.lock().unwrap();
+        let stored: Vec<(i64, String)> = {
+            let mut statement = conn
+                .prepare(
+                    "SELECT scope_order, scope_id FROM quota_receipt_scopes
+                     WHERE receipt_id = ?1 ORDER BY scope_order",
+                )
+                .unwrap();
+            statement
+                .query_map([receipt.to_string()], |row| Ok((row.get(0)?, row.get(1)?)))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect()
+        };
+        assert_eq!(stored[0], (0, "global".to_string()));
+        assert_eq!(
+            stored[1..],
+            paths
+                .iter()
+                .enumerate()
+                .map(|(index, path)| ((index + 1) as i64, path.to_string()))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn hierarchical_restart_refunds_reserved_and_retains_all_in_flight_scopes() {
+        let database = QuotaTestDatabase::new("cgroup-recovery");
+        let scopes = [
+            cgroup_constraint("/", 1_000),
+            cgroup_constraint("/tenant/a", 1_000),
+        ];
+        let reserved = uuid::Uuid::new_v4();
+        let invoked = uuid::Uuid::new_v4();
+        {
+            let manager = SqliteContextManager::new(&database.path).unwrap();
+            expect_provider_reservation(
+                manager
+                    .reserve_provider_rate_with_cgroups(reserved, 120, 10, 10_000, 30, &scopes)
+                    .unwrap(),
+            );
+            expect_provider_reservation(
+                manager
+                    .reserve_provider_rate_with_cgroups(invoked, 120, 10, 10_000, 70, &scopes)
+                    .unwrap(),
+            );
+            manager.mark_provider_rate_invoked(invoked).unwrap();
+        }
+
+        let manager = SqliteContextManager::new(&database.path).unwrap();
+        let recovery = manager.recover_provider_rate_state(120).unwrap();
+        assert_eq!(recovery.refunded_reserved, 1);
+        assert_eq!(recovery.retained_in_flight_estimates, 1);
+        for scope in ["/", "/tenant/a"] {
+            let usage = cgroup_usage(&manager, 120, scope);
+            assert_eq!((usage.requests, usage.tokens), (0, 70));
+            assert_eq!(usage.estimated_receipts, 1);
+        }
+        let provider = manager.provider_rate_usage(120).unwrap();
+        assert_eq!((provider.requests, provider.tokens), (1, 70));
+    }
+
+    #[test]
+    fn hierarchical_reconciliation_updates_all_original_epoch_scopes() {
+        let manager = SqliteContextManager::in_memory().unwrap();
+        let receipt = uuid::Uuid::new_v4();
+        let scopes = [
+            cgroup_constraint("/", 1_000),
+            cgroup_constraint("/profile/standard", 1_000),
+        ];
+        expect_provider_reservation(
+            manager
+                .reserve_provider_rate_with_cgroups(receipt, 130, 10, 10_000, 500, &scopes)
+                .unwrap(),
+        );
+        manager.mark_provider_rate_invoked(receipt).unwrap();
+        assert_eq!(cgroup_usage(&manager, 131, "/").tokens, 0);
+        manager.reconcile_provider_rate(receipt, 175).unwrap();
+        assert_eq!(manager.provider_rate_usage(131).unwrap().tokens, 0);
+        assert_eq!(cgroup_usage(&manager, 131, "/").tokens, 0);
+
+        let conn = manager.conn.lock().unwrap();
+        let old_epoch = u64_blob(130);
+        for (kind, id) in [
+            ("provider", "global"),
+            ("cgroup", "/"),
+            ("cgroup", "/profile/standard"),
+        ] {
+            let tokens: Vec<u8> = conn
+                .query_row(
+                    "SELECT tokens FROM quota_epochs
+                     WHERE scope_kind = ?1 AND scope_id = ?2 AND epoch = ?3",
+                    params![kind, id, old_epoch.as_slice()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(parse_u64_blob(tokens, "old scope tokens").unwrap(), 175);
+        }
+    }
+
+    #[test]
+    fn hierarchical_zero_limits_and_full_u64_never_wrap() {
+        let manager = SqliteContextManager::in_memory().unwrap();
+        let scopes = [cgroup_constraint("/", 0)];
+        expect_provider_reservation(
+            manager
+                .reserve_provider_rate_with_cgroups(
+                    uuid::Uuid::new_v4(),
+                    140,
+                    0,
+                    0,
+                    u64::MAX,
+                    &scopes,
+                )
+                .unwrap(),
+        );
+        expect_provider_reservation(
+            manager
+                .reserve_provider_rate_with_cgroups(uuid::Uuid::new_v4(), 140, 0, 0, 1, &scopes)
+                .unwrap(),
+        );
+        let provider = manager.provider_rate_usage(140).unwrap();
+        let root = cgroup_usage(&manager, 140, "/");
+        assert_eq!((provider.requests, provider.tokens), (2, u64::MAX));
+        assert_eq!((root.requests, root.tokens), (0, u64::MAX));
+    }
+
+    #[test]
+    fn saturated_aggregate_decrements_recompute_exact_usage() {
+        let manager = SqliteContextManager::in_memory().unwrap();
+        let scopes = [cgroup_constraint("/", 0)];
+
+        let refundable = uuid::Uuid::new_v4();
+        expect_provider_reservation(
+            manager
+                .reserve_provider_rate_with_cgroups(refundable, 145, 0, 0, u64::MAX, &scopes)
+                .unwrap(),
+        );
+        expect_provider_reservation(
+            manager
+                .reserve_provider_rate_with_cgroups(uuid::Uuid::new_v4(), 145, 0, 0, 1, &scopes)
+                .unwrap(),
+        );
+        manager
+            .refund_provider_rate_before_invocation(refundable)
+            .unwrap();
+        let provider = manager.provider_rate_usage(145).unwrap();
+        assert_eq!((provider.requests, provider.tokens), (1, 1));
+        assert_eq!(cgroup_usage(&manager, 145, "/").tokens, 1);
+
+        let reconciled = uuid::Uuid::new_v4();
+        expect_provider_reservation(
+            manager
+                .reserve_provider_rate_with_cgroups(reconciled, 146, 0, 0, u64::MAX, &scopes)
+                .unwrap(),
+        );
+        expect_provider_reservation(
+            manager
+                .reserve_provider_rate_with_cgroups(uuid::Uuid::new_v4(), 146, 0, 0, 1, &scopes)
+                .unwrap(),
+        );
+        manager.mark_provider_rate_invoked(reconciled).unwrap();
+        manager.reconcile_provider_rate(reconciled, 2).unwrap();
+        let provider = manager.provider_rate_usage(146).unwrap();
+        assert_eq!((provider.requests, provider.tokens), (2, 3));
+        assert_eq!(cgroup_usage(&manager, 146, "/").tokens, 3);
+    }
+
+    #[test]
+    fn provider_only_and_hierarchical_receipts_coexist_without_cgroup_crosstalk() {
+        let manager = SqliteContextManager::in_memory().unwrap();
+        let scopes = [cgroup_constraint("/", 1_000)];
+        expect_provider_reservation(
+            manager
+                .reserve_provider_rate_with_cgroups(
+                    uuid::Uuid::new_v4(),
+                    150,
+                    10,
+                    10_000,
+                    100,
+                    &scopes,
+                )
+                .unwrap(),
+        );
+        expect_provider_reservation(
+            manager
+                .reserve_provider_rate(uuid::Uuid::new_v4(), 150, 10, 10_000, 50)
+                .unwrap(),
+        );
+        manager
+            .charge_provider_rate_tokens(uuid::Uuid::new_v4(), 150, 25)
+            .unwrap();
+
+        let provider = manager.provider_rate_usage(150).unwrap();
+        let root = cgroup_usage(&manager, 150, "/");
+        assert_eq!((provider.requests, provider.tokens), (2, 175));
+        assert_eq!((root.requests, root.tokens), (0, 100));
+    }
+
+    #[test]
+    fn hierarchical_constraints_reject_invalid_or_duplicate_stable_scopes() {
+        let manager = SqliteContextManager::in_memory().unwrap();
+        for invalid in ["", "relative", "bad\0scope"] {
+            assert!(manager
+                .reserve_provider_rate_with_cgroups(
+                    uuid::Uuid::new_v4(),
+                    160,
+                    10,
+                    1_000,
+                    1,
+                    &[cgroup_constraint(invalid, 10)],
+                )
+                .is_err());
+        }
+        let oversized = format!("/{}", "x".repeat(1024));
+        assert!(manager
+            .reserve_provider_rate_with_cgroups(
+                uuid::Uuid::new_v4(),
+                160,
+                10,
+                1_000,
+                1,
+                &[cgroup_constraint(&oversized, 10)],
+            )
+            .is_err());
+        assert!(manager
+            .reserve_provider_rate_with_cgroups(
+                uuid::Uuid::new_v4(),
+                160,
+                10,
+                1_000,
+                1,
+                &[cgroup_constraint("/", 10), cgroup_constraint("/", 20),],
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn concurrent_siblings_cannot_race_past_shared_parent_limit() {
+        let database = QuotaTestDatabase::new("cgroup-siblings");
+        let first = Arc::new(SqliteContextManager::new(&database.path).unwrap());
+        let second = Arc::new(SqliteContextManager::new(&database.path).unwrap());
+        let barrier = Arc::new(std::sync::Barrier::new(20));
+        let mut threads = Vec::new();
+        for index in 0..20 {
+            let manager = if index % 2 == 0 {
+                first.clone()
+            } else {
+                second.clone()
+            };
+            let barrier = barrier.clone();
+            threads.push(std::thread::spawn(move || {
+                let constraints = [
+                    cgroup_constraint("/", 10),
+                    cgroup_constraint(&format!("/sibling/{index}"), 10),
+                ];
+                barrier.wait();
+                matches!(
+                    manager
+                        .reserve_provider_rate_with_cgroups(
+                            uuid::Uuid::new_v4(),
+                            170,
+                            100,
+                            1_000,
+                            1,
+                            &constraints,
+                        )
+                        .unwrap(),
+                    ProviderRateReserveOutcome::Reserved(_)
+                )
+            }));
+        }
+        let admitted = threads
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .filter(|admitted| *admitted)
+            .count();
+        assert_eq!(admitted, 10);
+        let parent = cgroup_usage(&first, 170, "/");
+        assert_eq!((parent.requests, parent.tokens), (0, 10));
+        assert_eq!(first.provider_rate_usage(170).unwrap().requests, 10);
+    }
+
+    #[test]
+    fn hierarchical_refund_updates_every_associated_scope() {
+        let manager = SqliteContextManager::in_memory().unwrap();
+        let receipt = uuid::Uuid::new_v4();
+        let scopes = [
+            cgroup_constraint("/", 100),
+            cgroup_constraint("/tenant/refund", 100),
+        ];
+        expect_provider_reservation(
+            manager
+                .reserve_provider_rate_with_cgroups(receipt, 180, 10, 1_000, 75, &scopes)
+                .unwrap(),
+        );
+        manager
+            .refund_provider_rate_before_invocation(receipt)
+            .unwrap();
+        let provider = manager.provider_rate_usage(180).unwrap();
+        assert_eq!((provider.requests, provider.tokens), (0, 0));
+        for scope in ["/", "/tenant/refund"] {
+            let usage = cgroup_usage(&manager, 180, scope);
+            assert_eq!((usage.requests, usage.tokens), (0, 0));
+            assert_eq!(usage.reserved_receipts, 0);
+        }
+    }
+
+    #[test]
+    fn quota_hot_path_does_not_rescan_prior_receipts() {
+        let manager = SqliteContextManager::in_memory().unwrap();
+        let scopes = [
+            cgroup_constraint("/", 0),
+            cgroup_constraint("/tenant/hot-path", 0),
+        ];
+        for _ in 0..128 {
+            expect_provider_reservation(
+                manager
+                    .reserve_provider_rate_with_cgroups(uuid::Uuid::new_v4(), 185, 0, 0, 1, &scopes)
+                    .unwrap(),
+            );
+        }
+
+        // This counter is deterministic: unlike a latency assertion it records
+        // entry into the receipt-ledger scan used only by integrity/recovery
+        // paths. Historical receipt count must not affect routine work.
+        SqliteContextManager::reset_quota_full_receipt_scan_count();
+        let reconciled = uuid::Uuid::new_v4();
+        expect_provider_reservation(
+            manager
+                .reserve_provider_rate_with_cgroups(reconciled, 185, 0, 0, 7, &scopes)
+                .unwrap(),
+        );
+        manager.mark_provider_rate_invoked(reconciled).unwrap();
+        manager.reconcile_provider_rate(reconciled, 3).unwrap();
+
+        let refunded = uuid::Uuid::new_v4();
+        expect_provider_reservation(
+            manager
+                .reserve_provider_rate_with_cgroups(refunded, 185, 0, 0, 11, &scopes)
+                .unwrap(),
+        );
+        manager
+            .refund_provider_rate_before_invocation(refunded)
+            .unwrap();
+        assert_eq!(
+            SqliteContextManager::quota_full_receipt_scan_count(),
+            0,
+            "reserve/reconcile/refund must use trusted aggregates, not receipt scans"
+        );
+
+        // The independent audit path still scans and proves the incrementally
+        // maintained rows agree with every durable receipt.
+        let provider = manager.provider_rate_usage(185).unwrap();
+        assert_eq!((provider.requests, provider.tokens), (129, 131));
+        for scope in ["/", "/tenant/hot-path"] {
+            let usage = cgroup_usage(&manager, 185, scope);
+            assert_eq!((usage.requests, usage.tokens), (0, 131));
+        }
+        assert!(
+            SqliteContextManager::quota_full_receipt_scan_count() > 0,
+            "integrity inspection must retain full receipt-ledger validation"
+        );
+    }
+
+    #[test]
+    fn corrupted_cgroup_aggregate_fails_closed_before_any_new_reservation() {
+        let manager = SqliteContextManager::in_memory().unwrap();
+        let scopes = [cgroup_constraint("/", 100)];
+        expect_provider_reservation(
+            manager
+                .reserve_provider_rate_with_cgroups(
+                    uuid::Uuid::new_v4(),
+                    190,
+                    10,
+                    1_000,
+                    25,
+                    &scopes,
+                )
+                .unwrap(),
+        );
+        {
+            let conn = manager.conn.lock().unwrap();
+            conn.pragma_update(None, "ignore_check_constraints", "ON")
+                .unwrap();
+            conn.execute(
+                "UPDATE quota_epochs SET tokens = -1
+                 WHERE scope_kind = 'cgroup' AND scope_id = '/'",
+                [],
+            )
+            .unwrap();
+        }
+        assert!(manager
+            .quota_scope_usage(190, &QuotaScopeKey::cgroup("/"))
+            .is_err());
+        assert!(manager
+            .reserve_provider_rate_with_cgroups(uuid::Uuid::new_v4(), 190, 10, 1_000, 1, &scopes,)
+            .is_err());
     }
 }

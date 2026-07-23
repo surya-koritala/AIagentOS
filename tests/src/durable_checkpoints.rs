@@ -6,7 +6,8 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use kernel::connector::{
-    LlmProviderAdapter, LlmResponse, LlmSession, ProviderType, StandardMessage, ToolDefinition,
+    LlmProviderAdapter, LlmRequestOptions, LlmResponse, LlmSession, ProviderType, StandardMessage,
+    ToolDefinition,
 };
 use kernel::context::{SqliteContextManager, DEFAULT_TENANT};
 use kernel::execution::{GenerationCheckpoint, UsageTelemetry};
@@ -53,8 +54,22 @@ impl LlmSession for BoundarySession {
         })
     }
 
+    async fn send_with_options(
+        &self,
+        messages: Vec<StandardMessage>,
+        tools: &[ToolDefinition],
+        options: LlmRequestOptions,
+    ) -> Result<LlmResponse, ConnectorError> {
+        assert!(options.max_output_tokens.is_none_or(|limit| limit >= 3));
+        self.send_with_tools(messages, tools).await
+    }
+
     fn provider_id(&self) -> &String {
         &self.id
+    }
+
+    fn enforces_max_output_tokens(&self) -> bool {
+        true
     }
 
     fn model_id(&self) -> &str {

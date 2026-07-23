@@ -23,8 +23,8 @@ use kernel::agent::AgentKernel;
 use kernel::budget::BudgetEnforcer;
 use kernel::config::{BudgetConfig, Config, TokenPricing};
 use kernel::connector::{
-    LlmProviderAdapter, LlmResponse, LlmSession, LlmUsage, ProviderType, StandardMessage,
-    ToolDefinition,
+    LlmProviderAdapter, LlmRequestOptions, LlmResponse, LlmSession, LlmUsage, ProviderType,
+    StandardMessage, ToolDefinition,
 };
 use kernel::context::{ContextManager, Fact, FactCategory, SqliteContextManager, DEFAULT_TENANT};
 use kernel::quota_clock::ManualQuotaClock;
@@ -74,8 +74,27 @@ impl LlmSession for FixedUsageSession {
         })
     }
 
+    async fn send_with_options(
+        &self,
+        messages: Vec<StandardMessage>,
+        tools: &[ToolDefinition],
+        options: LlmRequestOptions,
+    ) -> Result<LlmResponse, ConnectorError> {
+        if let Some(limit) = options.max_output_tokens {
+            assert!(
+                self.output_tokens <= limit,
+                "fixed test adapter output exceeds its declared kernel bound"
+            );
+        }
+        self.send_with_tools(messages, tools).await
+    }
+
     fn provider_id(&self) -> &ProviderId {
         &self.id
+    }
+
+    fn enforces_max_output_tokens(&self) -> bool {
+        true
     }
 
     fn model_id(&self) -> &str {
@@ -198,6 +217,22 @@ fn temp_db_path(tag: &str) -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!("persist_{tag}_{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&dir).unwrap();
     dir.join("agent_os.db")
+}
+
+fn durable_cgroup_tokens(db_path: &std::path::Path, epoch: u64, scope_id: &str) -> u64 {
+    let connection = rusqlite::Connection::open(db_path).expect("open quota database for audit");
+    let bytes: Vec<u8> = connection
+        .query_row(
+            "SELECT tokens FROM quota_epochs
+             WHERE scope_kind = 'cgroup' AND scope_id = ?1 AND epoch = ?2",
+            rusqlite::params![scope_id, epoch.to_be_bytes().as_slice()],
+            |row| row.get(0),
+        )
+        .unwrap_or_else(|error| panic!("read quota scope {scope_id:?}: {error}"));
+    let bytes: [u8; 8] = bytes
+        .try_into()
+        .unwrap_or_else(|bytes: Vec<u8>| panic!("quota token blob has {} bytes", bytes.len()));
+    u64::from_be_bytes(bytes)
 }
 
 fn agent_cfg(name: &str, profile: &str) -> AgentConfig {
@@ -571,9 +606,9 @@ async fn abrupt_restart_restores_exact_spend_without_repricing_and_blocks_next_r
 
 /// Provider RPM is a durable fixed-epoch quota, not a process-local timer.
 /// Restarting in the same Unix-minute epoch must restore the exhausted request
-/// count and keep the provider untouched. Advancing the injected clock to the
-/// exact next boundary must admit the waiting request without a real-time
-/// minute-long sleep.
+/// count, keep the provider untouched, and return immediate retryable
+/// backpressure. Advancing the injected clock to the exact next boundary must
+/// admit the caller's retry without a real-time minute-long sleep.
 #[tokio::test(flavor = "multi_thread")]
 async fn abrupt_restart_restores_rpm_and_blocks_provider_until_exact_next_epoch() {
     const PROVIDER: &str = "fixed-rpm-restart";
@@ -647,28 +682,28 @@ async fn abrupt_restart_restores_rpm_and_blocks_provider_until_exact_next_epoch(
         .register_provider(adapter)
         .expect("register provider after restart");
 
-    let waiting = {
-        let kernel = Arc::clone(&kernel);
-        tokio::spawn(async move {
-            kernel
-                .send_message(agent_id, "wait for the next quota epoch")
-                .await
-        })
-    };
-    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    let error = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        kernel.send_message(agent_id, "retry after quota backpressure"),
+    )
+    .await
+    .expect("execution admission must not sleep until the boundary")
+    .unwrap_err();
+    assert!(error.to_string().contains("quota exhausted"));
     assert_eq!(
         restart_calls.load(Ordering::SeqCst),
         0,
         "same-epoch restart must block before provider I/O"
     );
-    assert!(!waiting.is_finished(), "request must wait for the boundary");
 
     clock.set(180_000);
-    let output = tokio::time::timeout(std::time::Duration::from_secs(2), waiting)
-        .await
-        .expect("boundary wake must be prompt")
-        .expect("request task")
-        .expect("request after boundary");
+    let output = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        kernel.send_message(agent_id, "request after exact quota boundary"),
+    )
+    .await
+    .expect("boundary wake must be prompt")
+    .expect("request after boundary");
     assert_eq!(output.tokens_used, 25);
     assert_eq!(restart_calls.load(Ordering::SeqCst), 1);
     let stats = kernel.rate_limiter.try_stats().unwrap();
@@ -725,6 +760,271 @@ async fn abrupt_restart_restores_exhausted_tpm_until_exact_next_epoch() {
         .expect("reconcile next-epoch test admission");
 
     drop(limiter);
+    std::fs::remove_dir_all(data_dir).ok();
+}
+
+/// An agent that exceeds its own provider-token allowance cannot make another
+/// provider call in the same epoch, while a sibling in the same tenant remains
+/// usable. Every aggregate receives the provider-reported actual total.
+#[tokio::test(flavor = "multi_thread")]
+async fn provider_usage_enforces_per_agent_leaf_without_blocking_sibling() {
+    const PROVIDER: &str = "fixed-agent-quota";
+    const ACTUAL_TOKENS: u32 = 60_000;
+
+    let db_path = temp_db_path("agent_leaf_quota");
+    let data_dir = db_path.parent().unwrap();
+    let clock = Arc::new(ManualQuotaClock::new(600_000));
+    let budgets = BudgetConfig {
+        agent_tokens_per_min: 50_000,
+        tenant_tokens_per_min: 0,
+        rpm: 0,
+        tpm: 1_000_000,
+        max_concurrent: 3,
+        max_output_tokens_per_request: 10_000,
+        ..BudgetConfig::default()
+    };
+    let context = Arc::new(SqliteContextManager::new(&db_path).expect("create durable store"));
+    let kernel = Arc::new(
+        AgentKernelImpl::with_context_manager_and_clock(context, &budgets, false, &[], clock)
+            .expect("kernel"),
+    );
+    let (adapter, calls) =
+        detailed_usage_adapter(PROVIDER, "cached-agent-quota", 50_000, 10_000, 40_000);
+    kernel
+        .register_provider(adapter)
+        .expect("register provider");
+    let tenant = kernel.create_tenant("shared-agent-quota").await.unwrap();
+    let first = kernel
+        .create_agent_for_tenant(&tenant, accounting_agent_cfg("first", PROVIDER))
+        .await
+        .unwrap();
+    let sibling = kernel
+        .create_agent_for_tenant(&tenant, accounting_agent_cfg("sibling", PROVIDER))
+        .await
+        .unwrap();
+
+    kernel
+        .send_message(first.id, "consume the first agent leaf")
+        .await
+        .expect("first provider call");
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+    let blocked_error = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        kernel.send_message(first.id, "must stop at the exhausted agent leaf"),
+    )
+    .await
+    .expect("execution quota backpressure must not hold turn admission")
+    .unwrap_err();
+    assert!(blocked_error.to_string().contains("quota exhausted"));
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "exhausted agent must be stopped before provider I/O"
+    );
+
+    kernel
+        .send_message(sibling.id, "sibling remains independently admitted")
+        .await
+        .expect("sibling provider call");
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+
+    let tenant_scope = format!("/tenant/{tenant}");
+    let profile_scope = format!("{tenant_scope}/profile/standard");
+    assert_eq!(
+        durable_cgroup_tokens(&db_path, 10, "/"),
+        u64::from(ACTUAL_TOKENS) * 2
+    );
+    assert_eq!(
+        durable_cgroup_tokens(&db_path, 10, &tenant_scope),
+        u64::from(ACTUAL_TOKENS) * 2
+    );
+    assert_eq!(
+        durable_cgroup_tokens(&db_path, 10, &profile_scope),
+        u64::from(ACTUAL_TOKENS) * 2
+    );
+    assert_eq!(
+        durable_cgroup_tokens(&db_path, 10, &format!("{profile_scope}/agent/{}", first.id)),
+        u64::from(ACTUAL_TOKENS)
+    );
+    assert_eq!(
+        durable_cgroup_tokens(
+            &db_path,
+            10,
+            &format!("{profile_scope}/agent/{}", sibling.id)
+        ),
+        u64::from(ACTUAL_TOKENS)
+    );
+
+    drop(kernel);
+    std::fs::remove_dir_all(data_dir).ok();
+}
+
+/// Exhausted leaves return backpressure instead of occupying every global turn
+/// slot. Three exhausted agents must not starve a fourth funded agent, even
+/// when global turn admission has exactly three slots.
+#[tokio::test(flavor = "multi_thread")]
+async fn exhausted_leaf_backpressure_cannot_starve_an_independent_fourth_agent() {
+    const PROVIDER: &str = "fixed-turn-isolation";
+
+    let db_path = temp_db_path("turn_isolation");
+    let data_dir = db_path.parent().unwrap();
+    let clock = Arc::new(ManualQuotaClock::new(720_000));
+    let budgets = BudgetConfig {
+        agent_tokens_per_min: 50_000,
+        tenant_tokens_per_min: 0,
+        rpm: 0,
+        tpm: 1_000_000,
+        max_concurrent: 3,
+        max_output_tokens_per_request: 10_000,
+        ..BudgetConfig::default()
+    };
+    let context = Arc::new(SqliteContextManager::new(&db_path).expect("create durable store"));
+    let kernel =
+        AgentKernelImpl::with_context_manager_and_clock(context, &budgets, false, &[], clock)
+            .expect("kernel");
+    let calls = register_fixed_usage_provider(&kernel, PROVIDER, 50_000, 10_000);
+    let tenant = kernel.create_tenant("turn-isolation").await.unwrap();
+    let mut agents = Vec::new();
+    for name in ["exhausted-a", "exhausted-b", "exhausted-c", "funded"] {
+        agents.push(
+            kernel
+                .create_agent_for_tenant(&tenant, accounting_agent_cfg(name, PROVIDER))
+                .await
+                .unwrap(),
+        );
+    }
+    for agent in &agents[..3] {
+        kernel
+            .send_message(agent.id, "consume this private leaf")
+            .await
+            .unwrap();
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 3);
+
+    let (first, second, third, funded) = tokio::join!(
+        kernel.send_message(agents[0].id, "exhausted retry"),
+        kernel.send_message(agents[1].id, "exhausted retry"),
+        kernel.send_message(agents[2].id, "exhausted retry"),
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            kernel.send_message(agents[3].id, "independently funded request")
+        )
+    );
+    for result in [first, second, third] {
+        assert!(result.unwrap_err().to_string().contains("quota exhausted"));
+    }
+    funded
+        .expect("funded leaf must not wait for an epoch change")
+        .expect("funded leaf provider call");
+    assert_eq!(calls.load(Ordering::SeqCst), 4);
+
+    drop(kernel);
+    std::fs::remove_dir_all(data_dir).ok();
+}
+
+/// Tenant quota survives an abrupt restart in the same fixed epoch. Immediate
+/// retryable backpressure for the exhausted tenant never reaches the provider,
+/// while another tenant remains independently usable.
+#[tokio::test(flavor = "multi_thread")]
+async fn tenant_provider_quota_survives_restart_and_isolates_peer_tenant() {
+    const PROVIDER: &str = "fixed-tenant-quota";
+    const ACTUAL_TOKENS: u32 = 60_000;
+
+    let db_path = temp_db_path("tenant_quota_restart");
+    let data_dir = db_path.parent().unwrap();
+    let clock = Arc::new(ManualQuotaClock::new(660_000));
+    let budgets = BudgetConfig {
+        agent_tokens_per_min: 0,
+        tenant_tokens_per_min: 50_000,
+        rpm: 0,
+        tpm: 1_000_000,
+        max_concurrent: 3,
+        max_output_tokens_per_request: 10_000,
+        ..BudgetConfig::default()
+    };
+
+    let (tenant_a, tenant_b, agent_a, agent_b) = {
+        let context = Arc::new(SqliteContextManager::new(&db_path).expect("create durable store"));
+        let kernel = AgentKernelImpl::with_context_manager_and_clock(
+            context,
+            &budgets,
+            false,
+            &[],
+            clock.clone(),
+        )
+        .expect("first kernel");
+        let (adapter, calls) = fixed_usage_adapter(PROVIDER, 50_000, 10_000);
+        kernel
+            .register_provider(adapter)
+            .expect("register provider");
+        let tenant_a = kernel.create_tenant("quota-a").await.unwrap();
+        let tenant_b = kernel.create_tenant("quota-b").await.unwrap();
+        let agent_a = kernel
+            .create_agent_for_tenant(
+                &tenant_a,
+                AgentConfig {
+                    permission_profile: "full-access".into(),
+                    ..accounting_agent_cfg("tenant-a", PROVIDER)
+                },
+            )
+            .await
+            .unwrap();
+        let agent_b = kernel
+            .create_agent_for_tenant(
+                &tenant_b,
+                AgentConfig {
+                    permission_profile: "full-access".into(),
+                    ..accounting_agent_cfg("tenant-b", PROVIDER)
+                },
+            )
+            .await
+            .unwrap();
+        kernel
+            .send_message(agent_a.id, "exhaust tenant A")
+            .await
+            .expect("tenant A provider call");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        (tenant_a, tenant_b, agent_a.id, agent_b.id)
+    };
+
+    let context = Arc::new(SqliteContextManager::new(&db_path).expect("reopen durable store"));
+    let kernel = Arc::new(
+        AgentKernelImpl::with_context_manager_and_clock(context, &budgets, false, &[], clock)
+            .expect("restart kernel"),
+    );
+    kernel.rehydrate_agents().await.expect("rehydrate agents");
+    let (adapter, calls) = fixed_usage_adapter(PROVIDER, 50_000, 10_000);
+    kernel
+        .register_provider(adapter)
+        .expect("register provider after restart");
+
+    let blocked_error = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        kernel.send_message(agent_a, "same-epoch tenant quota must remain exhausted"),
+    )
+    .await
+    .expect("tenant quota backpressure must not occupy turn admission")
+    .unwrap_err();
+    assert!(blocked_error.to_string().contains("quota exhausted"));
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+    kernel
+        .send_message(agent_b, "tenant B remains independent")
+        .await
+        .expect("tenant B provider call");
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+    assert_eq!(
+        durable_cgroup_tokens(&db_path, 11, &format!("/tenant/{tenant_a}")),
+        u64::from(ACTUAL_TOKENS)
+    );
+    assert_eq!(
+        durable_cgroup_tokens(&db_path, 11, &format!("/tenant/{tenant_b}")),
+        u64::from(ACTUAL_TOKENS)
+    );
+
+    drop(kernel);
     std::fs::remove_dir_all(data_dir).ok();
 }
 

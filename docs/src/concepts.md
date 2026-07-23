@@ -34,9 +34,9 @@ The full subsystem-by-subsystem blueprint is in [Architecture](./architecture.md
 `sandbox_manager`, `ipc`, `observability`, `connector`, `resource_broker`,
 `tool_registry`, `rate_limiter`, `cgroups`, `syscall_gate`). The documented
 entry points are `kernel::boot(&config)` and `kernel::boot_in_memory()`, which
-build the kernel and start its background runtime tasks (a scheduler observer
-that publishes the CFS pick into procfs, and a per-minute cgroup-counter reset so
-`tokens_per_min` quotas regenerate).
+build the kernel and start its scheduler observer, which publishes the CFS pick
+into procfs. Token quotas use durable fixed Unix-minute epochs in SQLite; no
+reset timer can erase or extend quota.
 
 Agent creation flows through `create_agent_full`, which *admits* the agent to the
 priority scheduler and enqueues it into the CFS run queue without blocking on the

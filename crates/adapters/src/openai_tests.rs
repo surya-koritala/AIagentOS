@@ -4,7 +4,7 @@
 mod tests {
     use crate::openai::OpenAiAdapter;
     use kernel::connector::*;
-    use wiremock::matchers::{method, path};
+    use wiremock::matchers::{body_partial_json, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     #[tokio::test]
@@ -96,34 +96,91 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn openai_retries_on_failure() {
+    async fn openai_oversized_usage_saturates_instead_of_wrapping() {
         let mock_server = MockServer::start().await;
+        let oversized = u64::from(u32::MAX) + 1;
+        let response_body = serde_json::json!({
+            "choices": [{
+                "message": {"role": "assistant", "content": "large usage"},
+                "finish_reason": "stop"
+            }],
+            "usage": {
+                "prompt_tokens": oversized,
+                "completion_tokens": u64::MAX,
+                "total_tokens": u64::MAX,
+                "prompt_tokens_details": {"cached_tokens": oversized}
+            }
+        });
 
-        // First two calls fail, third succeeds
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
-            .respond_with(ResponseTemplate::new(500))
-            .up_to_n_times(2)
+            .respond_with(ResponseTemplate::new(200).set_body_json(response_body))
             .mount(&mock_server)
             .await;
 
+        let adapter = OpenAiAdapter::new("test-key".to_string()).with_base_url(mock_server.uri());
+        let session = adapter.create_session().await.unwrap();
+        let response = session
+            .send(vec![StandardMessage::user("report usage")])
+            .await
+            .unwrap();
+
+        assert_eq!(response.tokens_used, u32::MAX);
+        assert_eq!(
+            response.usage,
+            LlmUsage::reported(u32::MAX, u32::MAX, u32::MAX)
+        );
+    }
+
+    #[tokio::test]
+    async fn openai_returns_first_failure_without_hidden_retry() {
+        let mock_server = MockServer::start().await;
+
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "choices": [{"message": {"role": "assistant", "content": "recovered"}, "finish_reason": "stop"}],
-                "usage": {"total_tokens": 5}
-            })))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(1)
             .mount(&mock_server)
             .await;
 
         let adapter = OpenAiAdapter::new("test-key".to_string()).with_base_url(mock_server.uri());
         let session = adapter.create_session().await.unwrap();
 
-        let resp = session
+        let error = session
             .send(vec![StandardMessage::user("test")])
             .await
+            .unwrap_err();
+        assert!(matches!(error, kernel::ConnectorError::ConnectionFailed(_)));
+    }
+
+    #[tokio::test]
+    async fn openai_applies_per_call_output_bound() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .and(body_partial_json(serde_json::json!({"max_tokens": 37})))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{"message": {"role": "assistant", "content": "bounded"}, "finish_reason": "stop"}],
+                "usage": {"total_tokens": 1}
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let adapter = OpenAiAdapter::new("test-key".to_string()).with_base_url(mock_server.uri());
+        let session = adapter.create_session().await.unwrap();
+        assert!(session.enforces_max_output_tokens());
+        let response = session
+            .send_with_options(
+                vec![StandardMessage::user("test")],
+                &[],
+                LlmRequestOptions {
+                    max_output_tokens: Some(37),
+                },
+            )
+            .await
             .unwrap();
-        assert_eq!(resp.content, "recovered");
+        assert_eq!(response.content, "bounded");
     }
 
     #[tokio::test]

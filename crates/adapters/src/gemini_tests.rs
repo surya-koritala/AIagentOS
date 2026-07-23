@@ -97,31 +97,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn gemini_retries_on_failure() {
+    async fn gemini_returns_first_failure_without_hidden_retry() {
         let mock_server = MockServer::start().await;
 
         Mock::given(method("POST"))
             .and(path("/v1beta/models/gemini-1.5-flash:generateContent"))
             .respond_with(ResponseTemplate::new(503))
-            .up_to_n_times(2)
-            .mount(&mock_server)
-            .await;
-
-        Mock::given(method("POST"))
-            .and(path("/v1beta/models/gemini-1.5-flash:generateContent"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "candidates": [{"content": {"role": "model", "parts": [{"text": "recovered"}]}}]
-            })))
+            .expect(1)
             .mount(&mock_server)
             .await;
 
         let adapter = GeminiAdapter::new("test-key".to_string()).with_base_url(mock_server.uri());
         let session = adapter.create_session().await.unwrap();
 
-        let resp = session
+        let error = session
             .send(vec![StandardMessage::user("test")])
             .await
-            .unwrap();
-        assert_eq!(resp.content, "recovered");
+            .unwrap_err();
+        assert!(matches!(error, kernel::ConnectorError::ConnectionFailed(_)));
     }
 }

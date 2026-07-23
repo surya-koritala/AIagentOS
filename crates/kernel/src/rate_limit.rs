@@ -16,8 +16,8 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::context::{
-    ProviderRateReceiptState, ProviderRateReservation, ProviderRateReserveOutcome,
-    SqliteContextManager,
+    CgroupQuotaConstraint, ProviderRateLimitDimension, ProviderRateReceiptState,
+    ProviderRateReservation, ProviderRateReserveOutcome, QuotaScopeKind, SqliteContextManager,
 };
 use crate::quota_clock::{quota_epoch, QuotaClock, SystemQuotaClock, QUOTA_EPOCH_MILLIS};
 use crate::ContextError;
@@ -49,8 +49,33 @@ pub enum RateLimitError {
     #[error("request estimate {requested} tokens exceeds configured TPM limit {limit}")]
     RequestExceedsTpm { requested: u64, limit: u64 },
 
+    #[error(
+        "request estimate {requested} tokens exceeds cgroup scope {scope_id:?} TPM limit {limit}"
+    )]
+    RequestExceedsCgroupTpm {
+        scope_id: String,
+        requested: u64,
+        limit: u64,
+    },
+
+    #[error(
+        "{scope_kind} quota exhausted for scope {scope_id:?} ({dimension}): used {used}, requested {requested}, limit {limit}; retry at Unix millisecond {retry_at_unix_ms}"
+    )]
+    QuotaExhausted {
+        scope_kind: String,
+        scope_id: String,
+        dimension: String,
+        used: u64,
+        requested: u64,
+        limit: u64,
+        retry_at_unix_ms: u64,
+    },
+
     #[error("provider rate-limit admission was cancelled")]
     Cancelled,
+
+    #[error("cgroup membership changed during provider rate-limit admission")]
+    CgroupMembershipChanged,
 
     #[error("provider rate-limit concurrency semaphore closed")]
     ConcurrencyClosed,
@@ -74,6 +99,11 @@ pub struct RateLimiter {
     healthy: Arc<AtomicBool>,
     capacity_changed: watch::Sender<u64>,
     last_pruned_epoch: AtomicU64,
+    denied_provider_requests: AtomicU64,
+    denied_provider_tokens: AtomicU64,
+    denied_cgroup_requests: AtomicU64,
+    denied_cgroup_tokens: AtomicU64,
+    denied_migration_fence: AtomicU64,
 }
 
 impl RateLimiter {
@@ -122,6 +152,11 @@ impl RateLimiter {
             healthy: Arc::new(AtomicBool::new(true)),
             capacity_changed,
             last_pruned_epoch: AtomicU64::new(recovery.effective_epoch),
+            denied_provider_requests: AtomicU64::new(0),
+            denied_provider_tokens: AtomicU64::new(0),
+            denied_cgroup_requests: AtomicU64::new(0),
+            denied_cgroup_tokens: AtomicU64::new(0),
+            denied_migration_fence: AtomicU64::new(0),
         })
     }
 
@@ -155,6 +190,25 @@ impl RateLimiter {
         self.last_pruned_epoch
             .fetch_max(effective_epoch, Ordering::AcqRel);
         Ok(())
+    }
+
+    fn record_denial(&self, scope_kind: QuotaScopeKind, dimension: ProviderRateLimitDimension) {
+        let counter = match (scope_kind, dimension) {
+            (QuotaScopeKind::Provider, ProviderRateLimitDimension::Requests) => {
+                &self.denied_provider_requests
+            }
+            (QuotaScopeKind::Provider, ProviderRateLimitDimension::Tokens) => {
+                &self.denied_provider_tokens
+            }
+            (QuotaScopeKind::Cgroup, ProviderRateLimitDimension::Tokens) => {
+                &self.denied_cgroup_tokens
+            }
+            (_, ProviderRateLimitDimension::MigrationFence) => &self.denied_migration_fence,
+            (QuotaScopeKind::Cgroup, ProviderRateLimitDimension::Requests) => {
+                &self.denied_cgroup_requests
+            }
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Backwards-compatible admitted request.
@@ -193,10 +247,83 @@ impl RateLimiter {
         estimated_tokens: u64,
         cancellation: &CancellationToken,
     ) -> Result<RateLimitGuard, RateLimitError> {
+        self.acquire_tokens_with_cgroups_cancellable(estimated_tokens, &[], None, cancellation)
+            .await
+    }
+
+    /// Atomically reserve provider/global capacity and every stable root-to-leaf
+    /// cgroup token scope for this provider attempt.
+    ///
+    /// A cgroup consumes tokens but not an additional request count. The
+    /// returned affine guard refunds, retains, and reconciles all scopes as one
+    /// durable receipt.
+    pub(crate) async fn acquire_tokens_with_cgroups_cancellable(
+        &self,
+        estimated_tokens: u64,
+        cgroups: &[CgroupQuotaConstraint],
+        membership_changes: Option<(&mut watch::Receiver<u64>, u64)>,
+        cancellation: &CancellationToken,
+    ) -> Result<RateLimitGuard, RateLimitError> {
+        self.acquire_tokens_with_cgroups_cancellable_inner(
+            estimated_tokens,
+            cgroups,
+            membership_changes,
+            cancellation,
+            true,
+        )
+        .await
+    }
+
+    /// Attempt one execution-path admission without waiting for the next quota
+    /// epoch. Exhaustion returns retryable structured backpressure immediately,
+    /// so a quota-blocked turn cannot occupy global turn admission and starve
+    /// an independently funded cgroup.
+    pub(crate) async fn try_acquire_tokens_with_cgroups_cancellable(
+        &self,
+        estimated_tokens: u64,
+        cgroups: &[CgroupQuotaConstraint],
+        membership_changes: Option<(&mut watch::Receiver<u64>, u64)>,
+        cancellation: &CancellationToken,
+    ) -> Result<RateLimitGuard, RateLimitError> {
+        self.acquire_tokens_with_cgroups_cancellable_inner(
+            estimated_tokens,
+            cgroups,
+            membership_changes,
+            cancellation,
+            false,
+        )
+        .await
+    }
+
+    async fn acquire_tokens_with_cgroups_cancellable_inner(
+        &self,
+        estimated_tokens: u64,
+        cgroups: &[CgroupQuotaConstraint],
+        mut membership_changes: Option<(&mut watch::Receiver<u64>, u64)>,
+        cancellation: &CancellationToken,
+        wait_for_capacity: bool,
+    ) -> Result<RateLimitGuard, RateLimitError> {
+        if Self::cgroup_membership_changed(&membership_changes) {
+            return Err(RateLimitError::CgroupMembershipChanged);
+        }
         if self.config.tpm > 0 && estimated_tokens > self.config.tpm {
+            self.denied_provider_tokens.fetch_add(1, Ordering::Relaxed);
             return Err(RateLimitError::RequestExceedsTpm {
                 requested: estimated_tokens,
                 limit: self.config.tpm,
+            });
+        }
+        if let Some(constraint) = cgroups.iter().find(|constraint| {
+            constraint.token_limit > 0 && estimated_tokens > constraint.token_limit
+        }) {
+            if Self::cgroup_membership_changed(&membership_changes) {
+                return Err(RateLimitError::CgroupMembershipChanged);
+            }
+            self.denied_cgroup_tokens.fetch_add(1, Ordering::Relaxed);
+            return Err(RateLimitError::RequestExceedsCgroupTpm {
+                scope_id: constraint.scope_id.clone(),
+                requested: estimated_tokens,
+                limit: constraint.token_limit,
             });
         }
         if cancellation.is_cancelled() {
@@ -212,31 +339,53 @@ impl RateLimiter {
             if cancellation.is_cancelled() {
                 return Err(RateLimitError::Cancelled);
             }
+            if Self::cgroup_membership_changed(&membership_changes) {
+                return Err(RateLimitError::CgroupMembershipChanged);
+            }
 
             // Acquire concurrency first. If cancellation wins, no durable
             // receipt exists and therefore nothing can leak.
-            let permit = tokio::select! {
-                biased;
-                _ = cancellation.cancelled() => return Err(RateLimitError::Cancelled),
-                permit = self.concurrency.clone().acquire_owned() => {
-                    permit.map_err(|_| RateLimitError::ConcurrencyClosed)?
+            let permit = if let Some((receiver, _)) = membership_changes.as_mut() {
+                tokio::select! {
+                    biased;
+                    _ = cancellation.cancelled() => return Err(RateLimitError::Cancelled),
+                    changed = receiver.changed() => {
+                        let _ = changed;
+                        return Err(RateLimitError::CgroupMembershipChanged);
+                    }
+                    permit = self.concurrency.clone().acquire_owned() => {
+                        permit.map_err(|_| RateLimitError::ConcurrencyClosed)?
+                    }
+                }
+            } else {
+                tokio::select! {
+                    biased;
+                    _ = cancellation.cancelled() => return Err(RateLimitError::Cancelled),
+                    permit = self.concurrency.clone().acquire_owned() => {
+                        permit.map_err(|_| RateLimitError::ConcurrencyClosed)?
+                    }
                 }
             };
             if cancellation.is_cancelled() {
                 drop(permit);
                 return Err(RateLimitError::Cancelled);
             }
+            if Self::cgroup_membership_changed(&membership_changes) {
+                drop(permit);
+                return Err(RateLimitError::CgroupMembershipChanged);
+            }
 
             let requested_epoch = quota_epoch(self.clock.now_unix_millis());
             let receipt_id = Uuid::new_v4();
             let outcome = self
                 .store
-                .reserve_provider_rate(
+                .reserve_provider_rate_with_cgroups(
                     receipt_id,
                     requested_epoch,
                     self.config.rpm,
                     self.config.tpm,
                     estimated_tokens,
+                    cgroups,
                 )
                 .map_err(|error| self.poison(error))?;
 
@@ -255,29 +404,94 @@ impl RateLimiter {
                         guard.refund()?;
                         return Err(RateLimitError::Cancelled);
                     }
+                    if Self::cgroup_membership_changed(&membership_changes) {
+                        guard.refund()?;
+                        return Err(RateLimitError::CgroupMembershipChanged);
+                    }
                     return Ok(guard);
                 }
-                ProviderRateReserveOutcome::Denied { epoch, .. } => {
+                ProviderRateReserveOutcome::Denied {
+                    epoch,
+                    scope,
+                    dimension,
+                    used,
+                    requested,
+                    limit,
+                } => {
+                    self.record_denial(scope.kind.clone(), dimension);
                     self.prune_if_epoch_advanced(epoch)?;
                     // Quota denial has no receipt. Release concurrency while
                     // waiting so admitted work in other epochs cannot starve.
                     drop(permit);
                     let deadline = epoch.saturating_add(1).saturating_mul(QUOTA_EPOCH_MILLIS);
-                    tokio::select! {
-                        biased;
-                        _ = cancellation.cancelled() => return Err(RateLimitError::Cancelled),
-                        _ = self.clock.sleep_until(deadline) => {}
-                        changed = capacity_changed.changed() => {
-                            if changed.is_err() {
-                                return Err(RateLimitError::StorageUnavailable(
-                                    "provider rate-limit capacity notifier closed".into(),
-                                ));
+                    if !wait_for_capacity {
+                        let scope_kind = match scope.kind {
+                            QuotaScopeKind::Provider => "provider",
+                            QuotaScopeKind::Cgroup => "cgroup",
+                        };
+                        let dimension = match dimension {
+                            ProviderRateLimitDimension::Requests => "requests",
+                            ProviderRateLimitDimension::Tokens => "tokens",
+                            ProviderRateLimitDimension::MigrationFence => "migration_fence",
+                        };
+                        return Err(RateLimitError::QuotaExhausted {
+                            scope_kind: scope_kind.into(),
+                            scope_id: scope.id,
+                            dimension: dimension.into(),
+                            used,
+                            requested,
+                            limit,
+                            retry_at_unix_ms: deadline,
+                        });
+                    }
+                    if let Some((receiver, _)) = membership_changes.as_mut() {
+                        tokio::select! {
+                            biased;
+                            _ = cancellation.cancelled() => {
+                                return Err(RateLimitError::Cancelled);
+                            }
+                            changed = receiver.changed() => {
+                                let _ = changed;
+                                return Err(RateLimitError::CgroupMembershipChanged);
+                            }
+                            _ = self.clock.sleep_until(deadline) => {}
+                            changed = capacity_changed.changed() => {
+                                if changed.is_err() {
+                                    return Err(RateLimitError::StorageUnavailable(
+                                        "provider rate-limit capacity notifier closed".into(),
+                                    ));
+                                }
+                            }
+                        }
+                    } else {
+                        tokio::select! {
+                            biased;
+                            _ = cancellation.cancelled() => {
+                                return Err(RateLimitError::Cancelled);
+                            }
+                            _ = self.clock.sleep_until(deadline) => {}
+                            changed = capacity_changed.changed() => {
+                                if changed.is_err() {
+                                    return Err(RateLimitError::StorageUnavailable(
+                                        "provider rate-limit capacity notifier closed".into(),
+                                    ));
+                                }
                             }
                         }
                     }
                 }
             }
         }
+    }
+
+    fn cgroup_membership_changed(
+        membership_changes: &Option<(&mut watch::Receiver<u64>, u64)>,
+    ) -> bool {
+        membership_changes
+            .as_ref()
+            .is_some_and(|(receiver, expected)| {
+                receiver.has_changed().is_err() || *receiver.borrow() != *expected
+            })
     }
 
     /// Fallible current usage. The store rolls stale reads into the effective
@@ -306,6 +520,11 @@ impl RateLimiter {
             in_flight_receipts: usage.in_flight_receipts,
             estimated_receipts: usage.estimated_receipts,
             reconciled_receipts: usage.reconciled_receipts,
+            denied_provider_requests: self.denied_provider_requests.load(Ordering::Relaxed),
+            denied_provider_tokens: self.denied_provider_tokens.load(Ordering::Relaxed),
+            denied_cgroup_requests: self.denied_cgroup_requests.load(Ordering::Relaxed),
+            denied_cgroup_tokens: self.denied_cgroup_tokens.load(Ordering::Relaxed),
+            denied_migration_fence: self.denied_migration_fence.load(Ordering::Relaxed),
             healthy: true,
         })
     }
@@ -325,6 +544,11 @@ impl RateLimiter {
             in_flight_receipts: 0,
             estimated_receipts: 0,
             reconciled_receipts: 0,
+            denied_provider_requests: self.denied_provider_requests.load(Ordering::Relaxed),
+            denied_provider_tokens: self.denied_provider_tokens.load(Ordering::Relaxed),
+            denied_cgroup_requests: self.denied_cgroup_requests.load(Ordering::Relaxed),
+            denied_cgroup_tokens: self.denied_cgroup_tokens.load(Ordering::Relaxed),
+            denied_migration_fence: self.denied_migration_fence.load(Ordering::Relaxed),
             healthy: false,
         })
     }
@@ -505,6 +729,11 @@ pub struct RateLimitStats {
     pub in_flight_receipts: u64,
     pub estimated_receipts: u64,
     pub reconciled_receipts: u64,
+    pub denied_provider_requests: u64,
+    pub denied_provider_tokens: u64,
+    pub denied_cgroup_requests: u64,
+    pub denied_cgroup_tokens: u64,
+    pub denied_migration_fence: u64,
     pub healthy: bool,
 }
 
@@ -602,6 +831,93 @@ mod tests {
         assert!(!limiter.is_limited());
     }
 
+    #[tokio::test]
+    async fn request_larger_than_cgroup_limit_fails_without_waiting_or_receipt() {
+        let clock = Arc::new(ManualQuotaClock::new(0));
+        let limiter = deterministic_limiter(
+            RateLimitConfig {
+                rpm: 0,
+                tpm: 1_000,
+                max_concurrent: 1,
+            },
+            clock,
+        );
+        let cancellation = CancellationToken::new();
+        let result = limiter
+            .acquire_tokens_with_cgroups_cancellable(
+                101,
+                &[CgroupQuotaConstraint {
+                    scope_id: "/tenant/tight".into(),
+                    token_limit: 100,
+                }],
+                None,
+                &cancellation,
+            )
+            .await;
+        assert!(matches!(
+            result,
+            Err(RateLimitError::RequestExceedsCgroupTpm {
+                ref scope_id,
+                requested: 101,
+                limit: 100,
+            }) if scope_id == "/tenant/tight"
+        ));
+        let stats = limiter.try_stats().unwrap();
+        assert_eq!(stats.requests_this_minute, 0);
+        assert_eq!(stats.tokens_this_minute, 0);
+        assert_eq!(stats.reserved_receipts, 0);
+        assert_eq!(stats.denied_cgroup_tokens, 1);
+    }
+
+    #[tokio::test]
+    async fn execution_admission_returns_retryable_backpressure_without_epoch_wait() {
+        let clock = Arc::new(ManualQuotaClock::new(0));
+        let limiter = deterministic_limiter(
+            RateLimitConfig {
+                rpm: 0,
+                tpm: 1_000,
+                max_concurrent: 1,
+            },
+            clock.clone(),
+        );
+        let scope = [CgroupQuotaConstraint {
+            scope_id: "/tenant/funded/profile/standard/agent/exhausted".into(),
+            token_limit: 5,
+        }];
+        let cancellation = CancellationToken::new();
+        let mut fill = limiter
+            .acquire_tokens_with_cgroups_cancellable(5, &scope, None, &cancellation)
+            .await
+            .unwrap();
+        fill.mark_invoked().unwrap();
+        fill.reconcile(5).unwrap();
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            limiter.try_acquire_tokens_with_cgroups_cancellable(1, &scope, None, &cancellation),
+        )
+        .await
+        .expect("execution admission must not wait for an exhausted epoch");
+        let Err(error) = result else {
+            panic!("exhausted execution admission unexpectedly succeeded");
+        };
+        assert!(matches!(
+            error,
+            RateLimitError::QuotaExhausted {
+                ref scope_kind,
+                ref scope_id,
+                ref dimension,
+                used: 5,
+                requested: 1,
+                limit: 5,
+                retry_at_unix_ms: QUOTA_EPOCH_MILLIS,
+            } if scope_kind == "cgroup"
+                && scope_id == "/tenant/funded/profile/standard/agent/exhausted"
+                && dimension == "tokens"
+        ));
+        assert_eq!(clock.now_unix_millis(), 0);
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrency_bound_holds_under_load() {
         let max_concurrent = 3;
@@ -672,6 +988,57 @@ mod tests {
         assert_eq!(stats.requests_this_minute, 0);
         assert_eq!(stats.tokens_this_minute, 0);
         assert_eq!(stats.reserved_receipts, 0);
+    }
+
+    #[tokio::test]
+    async fn denied_old_cgroup_scope_wakes_immediately_on_membership_change() {
+        let clock = Arc::new(ManualQuotaClock::new(0));
+        let limiter = deterministic_limiter(
+            RateLimitConfig {
+                rpm: 100,
+                tpm: 10_000,
+                max_concurrent: 2,
+            },
+            clock.clone(),
+        );
+        let old_scope = [CgroupQuotaConstraint {
+            scope_id: "/tenant/a/agent/old".into(),
+            token_limit: 5,
+        }];
+        let cancellation = CancellationToken::new();
+        let mut fill = limiter
+            .acquire_tokens_with_cgroups_cancellable(5, &old_scope, None, &cancellation)
+            .await
+            .unwrap();
+        fill.mark_invoked().unwrap();
+        fill.reconcile(5).unwrap();
+
+        let (membership, mut changes) = watch::channel(1u64);
+        let waiter = limiter.acquire_tokens_with_cgroups_cancellable(
+            1,
+            &old_scope,
+            Some((&mut changes, 1)),
+            &cancellation,
+        );
+        tokio::pin!(waiter);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), &mut waiter)
+                .await
+                .is_err(),
+            "the exhausted old scope should initially wait"
+        );
+
+        membership.send_replace(2);
+        assert!(matches!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), &mut waiter)
+                .await
+                .expect("membership notification must wake admission"),
+            Err(RateLimitError::CgroupMembershipChanged)
+        ));
+        assert_eq!(clock.now_unix_millis(), 0, "the epoch did not advance");
+        let stats = limiter.try_stats().unwrap();
+        assert_eq!(stats.requests_this_minute, 1);
+        assert_eq!(stats.reconciled_receipts, 1);
     }
 
     #[tokio::test]

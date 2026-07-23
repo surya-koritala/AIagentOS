@@ -10,7 +10,7 @@
 //! These tests prove, against the real `AgentKernelImpl`:
 //!   (a) cross-tenant tool/IPC denial at the gate,
 //!   (b) no cross-tenant reads of agents / memory facts / KV,
-//!   (c) per-tenant cgroup budget isolation,
+//!   (c) cgroup resource isolation across tenants,
 //!   (d) tenancy survives a restart,
 //! plus the auth → `(user, tenant, role)` resolution.
 
@@ -168,11 +168,11 @@ async fn cross_tenant_state_reads_are_impossible() {
     let t_b = kernel.create_tenant("tenant-b").await.unwrap();
 
     let a1 = kernel
-        .create_agent_for_tenant(&t_a, cfg("a1", "standard"))
+        .create_agent_for_tenant(&t_a, cfg("a1", "full-access"))
         .await
         .unwrap();
     let b1 = kernel
-        .create_agent_for_tenant(&t_b, cfg("b1", "standard"))
+        .create_agent_for_tenant(&t_b, cfg("b1", "full-access"))
         .await
         .unwrap();
 
@@ -228,15 +228,14 @@ async fn cross_tenant_state_reads_are_impossible() {
     );
 }
 
-/// (c) Per-tenant cgroup budget: tenant A exhausting its per-minute token quota
-/// does NOT block tenant B — their cgroups are independent.
+/// (c) Cgroup resource isolation: tenant A filling its agent's concurrent-tool
+/// slot does not block tenant B.
 #[tokio::test]
-async fn per_tenant_cgroup_budget_is_isolated() {
+async fn per_tenant_cgroup_tool_capacity_is_isolated() {
     use kernel::syscall_gate::GateDenial;
 
-    // A tiny per-minute token budget makes the quota easy to exhaust.
     let budgets = kernel::config::BudgetConfig {
-        tpm: 1_000,
+        max_concurrent_tool_calls: 1,
         ..Default::default()
     };
     let cm = std::sync::Arc::new(kernel::context::SqliteContextManager::in_memory().unwrap());
@@ -245,40 +244,25 @@ async fn per_tenant_cgroup_budget_is_isolated() {
     let t_a = kernel.create_tenant("tenant-a").await.unwrap();
     let t_b = kernel.create_tenant("tenant-b").await.unwrap();
     let a1 = kernel
-        .create_agent_for_tenant(&t_a, cfg("a1", "full-access"))
+        .create_agent_for_tenant(&t_a, cfg("a1", "standard"))
         .await
         .unwrap();
     let b1 = kernel
-        .create_agent_for_tenant(&t_b, cfg("b1", "full-access"))
+        .create_agent_for_tenant(&t_b, cfg("b1", "standard"))
         .await
         .unwrap();
 
-    // Tenant A spends its whole budget on a tool call (record usage against its
-    // cgroup), then a further call over budget is denied with CgroupQuota.
-    assert!(kernel
-        .syscall_gate
-        .check_tool_call(a1.id, "read_file", "/x", 900)
-        .await
-        .is_ok());
-    kernel.syscall_gate.record_tool_usage(a1.id, 900);
-    let denied = kernel
-        .syscall_gate
-        .check_tool_call(a1.id, "read_file", "/x", 900)
-        .await;
+    let held = kernel.syscall_gate.acquire_tool_call(a1.id).unwrap();
+    let denied = kernel.syscall_gate.acquire_tool_call(a1.id);
     assert!(
-        matches!(denied, Err(GateDenial::CgroupQuota)),
-        "tenant A over its own budget should be denied, got {denied:?}"
+        matches!(denied, Err(GateDenial::CgroupToolLimit)),
+        "tenant A's second concurrent call should be denied"
     );
 
-    // Tenant B is unaffected — its cgroup still has the full budget.
-    assert!(
-        kernel
-            .syscall_gate
-            .check_tool_call(b1.id, "read_file", "/y", 900)
-            .await
-            .is_ok(),
-        "tenant B must not be blocked by tenant A exhausting its quota"
-    );
+    // Tenant B is unaffected because it has an independent hierarchy.
+    let peer = kernel.syscall_gate.acquire_tool_call(b1.id);
+    assert!(peer.is_ok(), "tenant B must retain independent capacity");
+    drop((held, peer));
 }
 
 /// (d) Tenancy survives a restart: after dropping and reopening the kernel on the

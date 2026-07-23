@@ -1,4 +1,4 @@
-//! Anthropic API adapter with retry and exponential backoff.
+//! Anthropic API adapter.
 
 use kernel::connector::*;
 use kernel::{ConnectorError, ProviderId};
@@ -44,9 +44,20 @@ impl LlmSession for AnthropicSession {
         messages: Vec<StandardMessage>,
         tools: &[ToolDefinition],
     ) -> Result<LlmResponse, ConnectorError> {
+        self.send_with_options(messages, tools, LlmRequestOptions::default())
+            .await
+    }
+
+    async fn send_with_options(
+        &self,
+        messages: Vec<StandardMessage>,
+        tools: &[ToolDefinition],
+        options: LlmRequestOptions,
+    ) -> Result<LlmResponse, ConnectorError> {
+        let max_output_tokens = options.max_output_tokens.unwrap_or(4096).min(4096);
         let mut body = serde_json::json!({
             "model": "claude-3-5-sonnet-20241022",
-            "max_tokens": 4096,
+            "max_tokens": max_output_tokens,
             "messages": messages.iter().map(|m| serde_json::json!({"role": m.role, "content": m.content})).collect::<Vec<_>>(),
         });
 
@@ -62,77 +73,64 @@ impl LlmSession for AnthropicSession {
             body["tools"] = serde_json::json!(tool_defs);
         }
 
-        let mut last_err = None;
-        for attempt in 0..3 {
-            if attempt > 0 {
-                tokio::time::sleep(tokio::time::Duration::from_millis(1000 * (1 << attempt))).await;
-            }
+        let result = self
+            .client
+            .post(format!("{}/messages", self.base_url))
+            .header("x-api-key", &self.api_key)
+            .header("anthropic-version", "2023-06-01")
+            .json(&body)
+            .send()
+            .await;
 
-            let result = self
-                .client
-                .post(format!("{}/messages", self.base_url))
-                .header("x-api-key", &self.api_key)
-                .header("anthropic-version", "2023-06-01")
-                .json(&body)
-                .send()
-                .await;
-
-            match result {
-                Ok(resp) if resp.status().is_success() => {
-                    let json: serde_json::Value = resp
-                        .json()
-                        .await
-                        .map_err(|e| ConnectorError::ProtocolError(e.to_string()))?;
-                    let content = json["content"][0]["text"]
-                        .as_str()
-                        .unwrap_or("")
-                        .to_string();
-                    let input_tokens = json["usage"]["input_tokens"].as_u64().unwrap_or(0);
-                    let output_tokens = json["usage"]["output_tokens"].as_u64().unwrap_or(0);
-                    let tool_calls = json["content"]
-                        .as_array()
-                        .map(|arr| {
-                            arr.iter()
-                                .filter_map(|block| {
-                                    if block["type"].as_str()? == "tool_use" {
-                                        Some(ToolCall {
-                                            id: block["id"].as_str()?.to_string(),
-                                            name: block["name"].as_str()?.to_string(),
-                                            arguments: block["input"].clone(),
-                                        })
-                                    } else {
-                                        None
-                                    }
-                                })
-                                .collect()
-                        })
-                        .unwrap_or_default();
-                    return Ok(LlmResponse {
-                        content,
-                        finish_reason: json["stop_reason"].as_str().map(|s| s.to_string()),
-                        tokens_used: (input_tokens + output_tokens) as u32,
-                        usage: kernel::connector::LlmUsage::reported(
-                            input_tokens as u32,
-                            output_tokens as u32,
-                            json["usage"]["cache_read_input_tokens"]
-                                .as_u64()
-                                .unwrap_or(0) as u32,
-                        ),
-                        tool_calls,
-                    });
-                }
-                Ok(resp) => {
-                    last_err = Some(ConnectorError::ConnectionFailed(format!(
-                        "HTTP {}",
-                        resp.status()
-                    )));
-                }
-                Err(e) => {
-                    last_err = Some(ConnectorError::ConnectionFailed(e.to_string()));
-                }
+        match result {
+            Ok(resp) if resp.status().is_success() => {
+                let json: serde_json::Value = resp
+                    .json()
+                    .await
+                    .map_err(|e| ConnectorError::ProtocolError(e.to_string()))?;
+                let content = json["content"][0]["text"]
+                    .as_str()
+                    .unwrap_or("")
+                    .to_string();
+                let input_tokens = json["usage"]["input_tokens"].as_u64().unwrap_or(0);
+                let output_tokens = json["usage"]["output_tokens"].as_u64().unwrap_or(0);
+                let tool_calls = json["content"]
+                    .as_array()
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|block| {
+                                if block["type"].as_str()? == "tool_use" {
+                                    Some(ToolCall {
+                                        id: block["id"].as_str()?.to_string(),
+                                        name: block["name"].as_str()?.to_string(),
+                                        arguments: block["input"].clone(),
+                                    })
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                Ok(LlmResponse {
+                    content,
+                    finish_reason: json["stop_reason"].as_str().map(|s| s.to_string()),
+                    tokens_used: crate::saturating_usage_sum(input_tokens, output_tokens),
+                    usage: kernel::connector::LlmUsage::reported(
+                        crate::saturating_usage_u32(input_tokens),
+                        crate::saturating_usage_u32(output_tokens),
+                        crate::json_usage_u32(&json["usage"]["cache_read_input_tokens"]),
+                    ),
+                    tool_calls,
+                })
             }
+            Ok(resp) => Err(crate::http_status_error(resp.status(), None)),
+            Err(e) => Err(ConnectorError::ConnectionFailed(e.to_string())),
         }
-        Err(last_err.unwrap())
+    }
+
+    fn enforces_max_output_tokens(&self) -> bool {
+        true
     }
 
     fn provider_id(&self) -> &ProviderId {

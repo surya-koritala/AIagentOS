@@ -1,4 +1,4 @@
-//! Google Gemini (Generative Language API) adapter with retry and exponential backoff.
+//! Google Gemini (Generative Language API) adapter.
 //!
 //! Uses Gemini's native `generateContent` shape rather than an OpenAI-compatible
 //! surface: requests carry a `contents` array of role-tagged `parts`, and the
@@ -66,7 +66,17 @@ impl LlmSession for GeminiSession {
     async fn send_with_tools(
         &self,
         messages: Vec<StandardMessage>,
+        tools: &[ToolDefinition],
+    ) -> Result<LlmResponse, ConnectorError> {
+        self.send_with_options(messages, tools, LlmRequestOptions::default())
+            .await
+    }
+
+    async fn send_with_options(
+        &self,
+        messages: Vec<StandardMessage>,
         _tools: &[ToolDefinition],
+        options: LlmRequestOptions,
     ) -> Result<LlmResponse, ConnectorError> {
         let contents: Vec<serde_json::Value> = messages
             .iter()
@@ -78,67 +88,53 @@ impl LlmSession for GeminiSession {
             })
             .collect();
 
-        let body = serde_json::json!({ "contents": contents });
+        let mut body = serde_json::json!({ "contents": contents });
+        if let Some(max_output_tokens) = options.max_output_tokens {
+            body["generationConfig"] = serde_json::json!({
+                "maxOutputTokens": max_output_tokens
+            });
+        }
 
         let url = format!(
             "{}/v1beta/models/{}:generateContent?key={}",
             self.base_url, self.model, self.api_key
         );
 
-        let mut last_err = None;
-        for attempt in 0..3 {
-            if attempt > 0 {
-                tokio::time::sleep(tokio::time::Duration::from_millis(1000 * (1 << attempt))).await;
-            }
+        let result = self.client.post(&url).json(&body).send().await;
 
-            let result = self.client.post(&url).json(&body).send().await;
-
-            match result {
-                Ok(resp) if resp.status().is_success() => {
-                    let json: serde_json::Value = resp
-                        .json()
-                        .await
-                        .map_err(|e| ConnectorError::ProtocolError(e.to_string()))?;
-                    let content = json["candidates"][0]["content"]["parts"][0]["text"]
-                        .as_str()
-                        .unwrap_or("")
-                        .to_string();
-                    let tokens = json["usageMetadata"]["totalTokenCount"]
-                        .as_u64()
-                        .unwrap_or(0) as u32;
-                    let finish_reason = json["candidates"][0]["finishReason"]
-                        .as_str()
-                        .map(|s| s.to_string());
-                    return Ok(LlmResponse {
-                        content,
-                        finish_reason,
-                        tokens_used: tokens,
-                        usage: kernel::connector::LlmUsage::reported(
-                            json["usageMetadata"]["promptTokenCount"]
-                                .as_u64()
-                                .unwrap_or(0) as u32,
-                            json["usageMetadata"]["candidatesTokenCount"]
-                                .as_u64()
-                                .unwrap_or(0) as u32,
-                            json["usageMetadata"]["cachedContentTokenCount"]
-                                .as_u64()
-                                .unwrap_or(0) as u32,
-                        ),
-                        tool_calls: vec![],
-                    });
-                }
-                Ok(resp) => {
-                    last_err = Some(ConnectorError::ConnectionFailed(format!(
-                        "HTTP {}",
-                        resp.status()
-                    )));
-                }
-                Err(e) => {
-                    last_err = Some(ConnectorError::ConnectionFailed(e.to_string()));
-                }
+        match result {
+            Ok(resp) if resp.status().is_success() => {
+                let json: serde_json::Value = resp
+                    .json()
+                    .await
+                    .map_err(|e| ConnectorError::ProtocolError(e.to_string()))?;
+                let content = json["candidates"][0]["content"]["parts"][0]["text"]
+                    .as_str()
+                    .unwrap_or("")
+                    .to_string();
+                let tokens = crate::json_usage_u32(&json["usageMetadata"]["totalTokenCount"]);
+                let finish_reason = json["candidates"][0]["finishReason"]
+                    .as_str()
+                    .map(|s| s.to_string());
+                Ok(LlmResponse {
+                    content,
+                    finish_reason,
+                    tokens_used: tokens,
+                    usage: kernel::connector::LlmUsage::reported(
+                        crate::json_usage_u32(&json["usageMetadata"]["promptTokenCount"]),
+                        crate::json_usage_u32(&json["usageMetadata"]["candidatesTokenCount"]),
+                        crate::json_usage_u32(&json["usageMetadata"]["cachedContentTokenCount"]),
+                    ),
+                    tool_calls: vec![],
+                })
             }
+            Ok(resp) => Err(crate::http_status_error(resp.status(), None)),
+            Err(e) => Err(ConnectorError::ConnectionFailed(e.to_string())),
         }
-        Err(last_err.unwrap())
+    }
+
+    fn enforces_max_output_tokens(&self) -> bool {
+        true
     }
 
     fn provider_id(&self) -> &ProviderId {

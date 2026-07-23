@@ -326,10 +326,10 @@ This is the exhaustive list of everything that needs to exist for AI Agent OS to
 - [ ] Audit alerts (on suspicious patterns)
 
 ### 7.5 Resource Controls (cgroups)
-- [ ] Token cgroup (limit tokens per group)
-- [ ] Tool cgroup (limit concurrent tool calls)
+- [x] Token cgroup (durable fixed-epoch provider tokens per stable scope)
+- [x] Tool cgroup (hierarchical concurrent tool calls with RAII release)
 - [ ] Context cgroup (limit context size)
-- [ ] Hierarchical limits (parent limits children)
+- [x] Hierarchical limits (root → tenant → profile → agent)
 - [ ] Soft vs hard limits
 - [ ] Usage reporting per cgroup
 

@@ -87,7 +87,10 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
   restart without repricing history. Cumulative per-turn tool limits are now
   distinct from concurrent tool slots and persist across pause/resume. Existing
   TOML remains compatible; Rust callers with exhaustive `BudgetConfig` literals
-  must add the detailed-pricing fields or use `..BudgetConfig::default()`.
+  must add the detailed-pricing fields, `tenant_tokens_per_min`, and the
+  per-turn/concurrent-tool fields, plus
+  `max_output_tokens_per_request`, or use
+  `..BudgetConfig::default()`.
   Existing but unreadable or malformed config files now stop startup; only a
   missing first-run config yields defaults. (#109)
 - **Durable provider quota epochs** — RPM/TPM now use fixed UTC Unix-minute
@@ -97,6 +100,30 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
   SQLite quota commits require WAL, full synchronization, foreign-key
   enforcement, and a bounded busy timeout. Legacy non-empty databases are
   fenced for the unknowable remainder of their first upgraded epoch. (#109)
+- **Atomic durable cgroup hierarchy** — every LLM attempt now reserves
+  provider/global plus stable root → tenant → profile → agent token scopes in
+  one SQLite transaction. The serialized prompt floor and a provider-enforced
+  output allowance are reserved before I/O; successful calls reconcile every
+  scope in the original epoch without replacing provider-reported invoice
+  usage used for billing. Hosted adapters make one outbound attempt and the
+  executor is the transient-only retry owner, so durable RPM receipts map
+  one-to-one to provider attempts. Restart, cancellation, overflow, sibling
+  races, tenant/per-agent isolation, low-level membership reassignment races,
+  and managed-hierarchy immutability are covered.
+  Exhausted execution-path quotas now return retryable epoch-boundary
+  backpressure immediately instead of occupying global turn slots while they
+  wait, preserving progress for independently funded scopes.
+  Agent creation now fails and rolls back every live subsystem if its durable
+  registry commit fails, so a returned identity cannot disappear on restart.
+  Gate-time tool payload bytes no longer masquerade as model usage; structured
+  tool-call JSON/results are charged when they become provider input. The
+  obsolete timer reset is gone. `tenant_tokens_per_min` independently
+  configures tenant capacity. Deprecated `CgroupManager` token/reset methods
+  and `cgroups::enforce_limits` remain source shims but are explicitly
+  non-authoritative; their token checks fail closed for any bounded hierarchy,
+  and durable admission must use the kernel provider path.
+  `add_agent` now returns typed
+  `CgroupError`, a permitted pre-1.0 minor-version Rust API break. (#109)
 - **Wire protocol v2** — typed error categories and retry hints are served while
   retaining the released v1 compatibility fixture; SDK negotiation is automatic.
   The complete v1 compatibility/conformance commitment remains tracked by #121.

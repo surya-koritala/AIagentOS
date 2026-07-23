@@ -253,12 +253,15 @@ pub struct ToolBinding {
 }
 
 /// Security inputs prepared once for every public execution entry point.
-/// Keeping estimation and resource extraction here prevents the executor,
-/// JSON syscall wire, MCP server, and SDK-backed wire client from drifting.
+/// Resource extraction is authoritative. `estimated_tokens` is retained only
+/// for source compatibility and diagnostics; authorization deliberately ignores
+/// it because serialized tool payload is not provider usage.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PreparedToolCall {
     pub security: ToolSecurity,
     pub resource: String,
+    /// Compatibility-only serialized-payload estimate. Never charged to
+    /// provider or cgroup token quota.
     pub estimated_tokens: u64,
 }
 
@@ -538,9 +541,16 @@ impl ToolRegistry {
         })
     }
 
-    /// Canonical authorization entry used by executor, syscall/MCP wire, and
-    /// therefore SDK clients. A new public tool path should call this method,
-    /// not reproduce declaration extraction or gate ordering.
+    /// Authorization-only compatibility entry.
+    ///
+    /// This validates declarations and policy but does **not** reserve a
+    /// concurrent cgroup tool slot. New execution paths must call
+    /// [`authorize_and_acquire_call`](Self::authorize_and_acquire_call) and
+    /// hold its guard through binding execution.
+    #[deprecated(
+        since = "0.3.0",
+        note = "authorization only; use authorize_and_acquire_call for execution"
+    )]
     pub async fn authorize_call(
         &self,
         gate: &crate::syscall_gate::SyscallGate,
@@ -561,6 +571,32 @@ impl ToolRegistry {
         .await
         .map_err(ToolAuthorizationError::Denied)?;
         Ok(prepared)
+    }
+
+    /// Canonical live tool admission: validate the declaration, authorize the
+    /// exact resource, and reserve hierarchical concurrent-tool capacity as one
+    /// counted gate verdict. The returned guard must live through binding
+    /// execution.
+    pub async fn authorize_and_acquire_call(
+        &self,
+        gate: &crate::syscall_gate::SyscallGate,
+        agent_id: AgentId,
+        name: &str,
+        arguments: &serde_json::Value,
+    ) -> Result<(PreparedToolCall, crate::cgroups::ToolCallGuard), ToolAuthorizationError> {
+        let prepared = self
+            .prepare_call(name, arguments)
+            .map_err(ToolAuthorizationError::InvalidDeclaration)?;
+        let (_, guard) = gate
+            .authorize_and_acquire_tool_call_declared(
+                agent_id,
+                name,
+                &prepared.resource,
+                &prepared.security,
+            )
+            .await
+            .map_err(ToolAuthorizationError::Denied)?;
+        Ok((prepared, guard))
     }
 
     /// Build the validated security catalog shipped by the kernel. This is
@@ -1046,7 +1082,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn authorize_call_is_the_single_gate_decision_for_public_entry_points() {
+    async fn combined_admission_is_the_single_gate_decision_for_public_entry_points() {
         let reg = ToolRegistry::new();
         let gate = crate::syscall_gate::SyscallGate::with_mac(
             std::sync::Arc::new(crate::cgroups::CgroupManager::new()),
@@ -1056,7 +1092,7 @@ mod tests {
         let agent = uuid::Uuid::new_v4();
         gate.register_agent(agent, CapabilitySet::none(), None);
         let denied = reg
-            .authorize_call(
+            .authorize_and_acquire_call(
                 &gate,
                 agent,
                 "http_get",

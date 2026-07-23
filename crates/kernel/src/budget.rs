@@ -1,9 +1,9 @@
 //! Budget Enforcer — a hard cumulative USD spend ceiling on the LLM path.
 //!
-//! The cgroup token quota (see [`crate::cgroups`] / [`crate::syscall_gate`])
-//! bounds an agent's *per-minute* token throughput. It does **not** bound
-//! lifetime cost: an agent can run for hours and spend unboundedly as long as
-//! it stays under the per-minute rate. The `BudgetEnforcer` closes that gap by
+//! The durable provider/cgroup quota (see [`crate::rate_limit`] and
+//! [`crate::cgroups`]) bounds an agent's *per-minute* token throughput. It does
+//! **not** bound lifetime cost: an agent can run for hours and spend unboundedly
+//! as long as it stays under the per-minute rate. The `BudgetEnforcer` closes that gap by
 //! pricing every LLM response in USD and refusing further LLM calls once a
 //! cumulative ceiling is reached — globally and/or per agent.
 //!

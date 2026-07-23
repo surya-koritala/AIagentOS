@@ -129,38 +129,56 @@ pub(crate) fn provider_target(
 /// This runs before MAC, approval-contract hashing, and gate-proof creation so
 /// those decisions cannot authorize `allowed/../denied` while the provider
 /// reaches a different path. Parent traversal is rejected instead of folded;
-/// `.` and duplicate separators are collapsed. This is deliberately not a
-/// symlink/no-follow isolation primitive — the sandbox owns host resolution.
+/// `.` and duplicate separators are collapsed. Both slash forms are converted
+/// to `/` so MAC globs, approval identities, and provider parameters have the
+/// same meaning on every supported host. Ambiguous UNC/device and drive-relative
+/// forms are rejected instead of being interpreted differently by each OS.
+/// This is deliberately not a symlink/no-follow isolation primitive — the
+/// sandbox owns host resolution.
 pub(crate) fn normalize_filesystem_target(target: &str) -> Result<String, ResourceError> {
-    use std::path::{Component, Path, PathBuf};
-
     if target.trim().is_empty() || target.contains('\0') {
         return Err(ResourceError::OperationFailed(
             "invalid filesystem target".into(),
         ));
     }
 
-    let mut normalized = PathBuf::new();
-    for component in Path::new(target).components() {
-        match component {
-            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
-            Component::RootDir => normalized.push(component.as_os_str()),
-            Component::CurDir => {}
-            Component::ParentDir => {
+    let portable = target.replace('\\', "/");
+    if portable.starts_with("//") {
+        return Err(ResourceError::OperationFailed(
+            "UNC and device filesystem targets are not supported".into(),
+        ));
+    }
+    let portable_bytes = portable.as_bytes();
+    if portable_bytes.len() >= 2
+        && portable_bytes[0].is_ascii_alphabetic()
+        && portable_bytes[1] == b':'
+        && portable_bytes.get(2) != Some(&b'/')
+    {
+        return Err(ResourceError::OperationFailed(
+            "drive-relative filesystem targets are not supported".into(),
+        ));
+    }
+    let rooted = portable.starts_with('/');
+    let mut segments = Vec::new();
+    for segment in portable.split('/') {
+        match segment {
+            "" | "." => {}
+            ".." => {
                 return Err(ResourceError::OperationFailed(
                     "filesystem parent traversal is not allowed".into(),
                 ));
             }
-            Component::Normal(segment) => normalized.push(segment),
+            segment => segments.push(segment),
         }
     }
 
-    if normalized.as_os_str().is_empty() {
-        normalized.push(".");
+    let body = segments.join("/");
+    match (rooted, body.is_empty()) {
+        (true, true) => Ok("/".into()),
+        (true, false) => Ok(format!("/{body}")),
+        (false, true) => Ok(".".into()),
+        (false, false) => Ok(body),
     }
-    normalized.to_str().map(str::to_string).ok_or_else(|| {
-        ResourceError::OperationFailed("filesystem target is not valid UTF-8".into())
-    })
 }
 
 pub(crate) fn opaque_identity(value: &[u8]) -> String {
@@ -579,6 +597,30 @@ mod tests {
     use crate::sandbox::SandboxManagerImpl;
     use crate::{IsolationLevel, SandboxConfig};
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn filesystem_normalization_is_platform_independent_and_fail_closed() {
+        assert_eq!(
+            normalize_filesystem_target(r"\workspace\\allowed\.\note.txt").unwrap(),
+            "/workspace/allowed/note.txt"
+        );
+        assert_eq!(
+            normalize_filesystem_target("/workspace//allowed/./note.txt").unwrap(),
+            "/workspace/allowed/note.txt"
+        );
+        assert_eq!(
+            normalize_filesystem_target(r"nested\\allowed\file.txt").unwrap(),
+            "nested/allowed/file.txt"
+        );
+        assert!(normalize_filesystem_target(r"allowed\..\denied").is_err());
+        assert!(normalize_filesystem_target(r"\\server\share\secret").is_err());
+        assert!(normalize_filesystem_target("C:relative.txt").is_err());
+        assert!(normalize_filesystem_target("C:").is_err());
+        assert_eq!(
+            normalize_filesystem_target(r"C:\workspace\file.txt").unwrap(),
+            "C:/workspace/file.txt"
+        );
+    }
 
     struct MockProvider;
 

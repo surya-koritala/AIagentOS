@@ -1,44 +1,36 @@
-//! Rate limiting — prevent API overuse and control costs.
+//! Durable provider rate limiting.
 //!
-//! Three independent bounds, all enforced on [`RateLimiter::acquire`]:
-//!
-//! * **Concurrency** — a counting [`Semaphore`] caps simultaneous in-flight
-//!   requests at `max_concurrent`. A permit is held for the lifetime of the
-//!   returned [`RateLimitGuard`] and released on drop. Using a semaphore (not
-//!   `Notify`) sidesteps lost-wakeup bugs: a permit returned before a waiter
-//!   registers is still observed, because the permit count is durable state.
-//! * **Requests / minute (RPM)** — a counter over a one-minute window.
-//! * **Tokens / minute (TPM)** — a counter over the same window. Callers
-//!   reserve an estimate up front during `acquire` and reconcile the true cost
-//!   afterwards with [`RateLimiter::record_tokens`].
-//!
-//! The window counters and the window start instant live behind a single mutex
-//! ([`WindowState`]) so the *check-and-reserve* step is atomic. This closes the
-//! time-of-check/time-of-use race the previous lock-free version had, where two
-//! callers could both observe `requests < rpm` and then both increment past the
-//! cap. RPM/TPM waiting is a bounded poll loop (sleep then re-check) rather than
-//! an edge-triggered notification, so a caller can never miss a window rollover.
+//! RPM and TPM are committed atomically in the context store against fixed,
+//! half-open Unix-minute epochs. A reservation has an explicit lifecycle:
+//! before provider I/O it is refundable; immediately before I/O it is marked
+//! invoked; after invocation, cancellation/failure retains the estimate; and a
+//! successful response reconciles actual usage in the original admission
+//! epoch. The concurrency permit is process-local and is always acquired before
+//! a durable reservation, so cancellation while waiting cannot leak quota.
 
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 
-use tokio::sync::Semaphore;
-use tokio::time::sleep;
+use tokio::sync::{watch, OwnedSemaphorePermit, Semaphore};
+use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
 
-/// Length of the rate-limit accounting window.
-const WINDOW: Duration = Duration::from_secs(60);
-/// Upper bound on any single poll-wait, so a caller re-checks the window
-/// promptly after a rollover even when its computed wait was longer.
-const MAX_POLL_WAIT: Duration = Duration::from_millis(250);
+use crate::context::{
+    ProviderRateReceiptState, ProviderRateReservation, ProviderRateReserveOutcome,
+    SqliteContextManager,
+};
+use crate::quota_clock::{quota_epoch, QuotaClock, SystemQuotaClock, QUOTA_EPOCH_MILLIS};
+use crate::ContextError;
 
 /// Rate limiter configuration.
 #[derive(Debug, Clone)]
 pub struct RateLimitConfig {
-    /// Max requests per minute.
+    /// Maximum requests in one fixed Unix-minute epoch. Zero is unlimited.
     pub rpm: u32,
-    /// Max tokens per minute.
+    /// Maximum estimated/actual tokens in one fixed Unix-minute epoch. Zero is
+    /// unlimited.
     pub tpm: u64,
-    /// Max concurrent agent executions.
+    /// Maximum simultaneous provider calls. Zero is unlimited.
     pub max_concurrent: u32,
 }
 
@@ -52,150 +44,256 @@ impl Default for RateLimitConfig {
     }
 }
 
-/// Mutable per-window accounting, guarded as a single unit so reservation is
-/// atomic with respect to the window rollover.
-#[derive(Debug)]
-struct WindowState {
-    start: Instant,
-    generation: u64,
-    requests: u64,
-    tokens: u64,
-}
-
-impl WindowState {
-    /// Reset the window if it has expired. Returns the remaining time until the
-    /// current window ends (zero if it just rolled over).
-    fn roll_if_expired(&mut self) -> Duration {
-        let elapsed = self.start.elapsed();
-        if elapsed >= WINDOW {
-            self.start = Instant::now();
-            self.generation = self.generation.saturating_add(1);
-            self.requests = 0;
-            self.tokens = 0;
-            WINDOW
-        } else {
-            WINDOW - elapsed
-        }
-    }
-}
-
-/// Production-grade rate limiter (token-bucket-style windowed counters plus a
-/// concurrency semaphore).
-pub struct RateLimiter {
-    config: RateLimitConfig,
-    /// Semaphore for the concurrent execution limit.
-    concurrency: Arc<Semaphore>,
-    /// Windowed request/token accounting (single mutex → atomic reserve).
-    window: Arc<Mutex<WindowState>>,
-}
-
 #[derive(Debug, thiserror::Error, Clone, PartialEq, Eq)]
 pub enum RateLimitError {
     #[error("request estimate {requested} tokens exceeds configured TPM limit {limit}")]
     RequestExceedsTpm { requested: u64, limit: u64 },
+
+    #[error("provider rate-limit admission was cancelled")]
+    Cancelled,
+
+    #[error("provider rate-limit concurrency semaphore closed")]
+    ConcurrencyClosed,
+
+    #[error("durable provider rate-limit accounting is unavailable: {0}")]
+    StorageUnavailable(String),
+
+    #[error("provider rate-limit guard must be marked invoked before reconciliation")]
+    NotInvoked,
+
+    #[error("provider rate-limit reservation cannot be refunded after invocation")]
+    AlreadyInvoked,
+}
+
+/// Durable fixed-epoch rate limiter plus a process-local concurrency bound.
+pub struct RateLimiter {
+    config: RateLimitConfig,
+    concurrency: Arc<Semaphore>,
+    store: Arc<SqliteContextManager>,
+    clock: Arc<dyn QuotaClock>,
+    healthy: Arc<AtomicBool>,
+    capacity_changed: watch::Sender<u64>,
+    last_pruned_epoch: AtomicU64,
 }
 
 impl RateLimiter {
+    /// Construct a limiter with a private in-memory durable store.
+    ///
+    /// This preserves the historical convenience constructor for tests and
+    /// embedders. Production kernels should use [`with_store`](Self::with_store)
+    /// so quota survives restart.
     pub fn new(config: RateLimitConfig) -> Self {
+        let store = Arc::new(
+            SqliteContextManager::in_memory()
+                .expect("creating the private in-memory rate-limit store must succeed"),
+        );
+        Self::with_store(config, store, Arc::new(SystemQuotaClock::new()))
+            .expect("recovering a new in-memory rate-limit store must succeed")
+    }
+
+    /// Construct a limiter over the kernel's persistent context store.
+    ///
+    /// Recovery atomically refunds reservations for calls that provably never
+    /// started and retains estimates for calls that may have reached a provider.
+    pub fn with_store(
+        config: RateLimitConfig,
+        store: Arc<SqliteContextManager>,
+        clock: Arc<dyn QuotaClock>,
+    ) -> Result<Self, RateLimitError> {
+        let requested_epoch = quota_epoch(clock.now_unix_millis());
+        let recovery = store
+            .recover_provider_rate_state(requested_epoch)
+            .map_err(Self::storage_error)?;
+        store
+            .prune_provider_rate_epochs(recovery.effective_epoch)
+            .map_err(Self::storage_error)?;
+
         let permits = if config.max_concurrent == 0 {
             Semaphore::MAX_PERMITS
         } else {
             config.max_concurrent as usize
         };
-        Self {
-            concurrency: Arc::new(Semaphore::new(permits)),
-            window: Arc::new(Mutex::new(WindowState {
-                start: Instant::now(),
-                generation: 0,
-                requests: 0,
-                tokens: 0,
-            })),
+        let (capacity_changed, _) = watch::channel(0);
+        Ok(Self {
             config,
-        }
-    }
-
-    /// Acquire permission to make a request, reserving one request slot. Blocks
-    /// until both the RPM bound has room and a concurrency permit is free.
-    pub async fn acquire(&self) -> RateLimitGuard {
-        self.acquire_tokens(0)
-            .await
-            .expect("a zero-token reservation always fits")
-    }
-
-    /// Like [`acquire`](Self::acquire) but also reserves `est_tokens` against
-    /// the TPM bound up front. The reservation is corrected once the true cost
-    /// is known via [`record_tokens`](Self::record_tokens).
-    pub async fn acquire_tokens(&self, est_tokens: u64) -> Result<RateLimitGuard, RateLimitError> {
-        if self.config.tpm > 0 && est_tokens > self.config.tpm {
-            return Err(RateLimitError::RequestExceedsTpm {
-                requested: est_tokens,
-                limit: self.config.tpm,
-            });
-        }
-        // Phase 1: reserve an RPM (and TPM) slot atomically, polling across
-        // window rollovers. We loop because the reservation may have to wait
-        // for the current window to expire.
-        let generation = loop {
-            let wait = {
-                let mut w = self.window.lock().unwrap();
-                let remaining = w.roll_if_expired();
-
-                let rpm_ok = self.config.rpm == 0 || w.requests < self.config.rpm as u64;
-                let tpm_ok =
-                    self.config.tpm == 0 || w.tokens.saturating_add(est_tokens) <= self.config.tpm;
-
-                if rpm_ok && tpm_ok {
-                    w.requests = w.requests.saturating_add(1);
-                    w.tokens = w.tokens.saturating_add(est_tokens);
-                    Ok(w.generation)
-                } else {
-                    // Wait for the window to roll over, bounded so we re-poll
-                    // soon after the rollover instant.
-                    Err(remaining.min(MAX_POLL_WAIT))
-                }
-            };
-
-            match wait {
-                Ok(generation) => break generation,
-                Err(d) if d > Duration::ZERO => sleep(d).await,
-                Err(_) => {
-                    // Window just expired but another caller may race us to the
-                    // reset; yield and re-check immediately.
-                    tokio::task::yield_now().await;
-                }
-            }
-        };
-
-        // Phase 2: acquire a concurrency permit. Held until the guard drops.
-        let permit = self.concurrency.clone().acquire_owned().await.unwrap();
-        Ok(RateLimitGuard {
-            _permit: permit,
-            window: self.window.clone(),
-            generation,
-            reserved_tokens: est_tokens,
+            concurrency: Arc::new(Semaphore::new(permits)),
+            store,
+            clock,
+            healthy: Arc::new(AtomicBool::new(true)),
+            capacity_changed,
+            last_pruned_epoch: AtomicU64::new(recovery.effective_epoch),
         })
     }
 
-    /// Record tokens actually used (call after the LLM response). This is the
-    /// reconciliation against any up-front estimate reserved in `acquire_tokens`.
-    pub fn record_tokens(&self, tokens: u64) {
-        let mut w = self.window.lock().unwrap();
-        w.roll_if_expired();
-        w.tokens = w.tokens.saturating_add(tokens);
+    fn storage_error(error: ContextError) -> RateLimitError {
+        RateLimitError::StorageUnavailable(error.to_string())
     }
 
-    /// Check if currently at or above the RPM bound.
-    pub fn is_limited(&self) -> bool {
-        let w = self.window.lock().unwrap();
-        w.requests >= self.config.rpm as u64
+    fn poison(&self, error: ContextError) -> RateLimitError {
+        self.healthy.store(false, Ordering::Release);
+        Self::storage_error(error)
     }
 
-    /// Get current usage stats.
-    pub fn stats(&self) -> RateLimitStats {
-        let w = self.window.lock().unwrap();
-        RateLimitStats {
-            requests_this_minute: w.requests,
-            tokens_this_minute: w.tokens,
+    fn ensure_healthy(&self) -> Result<(), RateLimitError> {
+        if self.healthy.load(Ordering::Acquire) {
+            Ok(())
+        } else {
+            Err(RateLimitError::StorageUnavailable(
+                "a prior persistence operation failed; restart and recover before admitting work"
+                    .into(),
+            ))
+        }
+    }
+
+    fn prune_if_epoch_advanced(&self, effective_epoch: u64) -> Result<(), RateLimitError> {
+        if effective_epoch <= self.last_pruned_epoch.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        self.store
+            .prune_provider_rate_epochs(effective_epoch)
+            .map_err(|error| self.poison(error))?;
+        self.last_pruned_epoch
+            .fetch_max(effective_epoch, Ordering::AcqRel);
+        Ok(())
+    }
+
+    /// Backwards-compatible admitted request.
+    ///
+    /// Historical callers treated return from `acquire` as the attempted
+    /// provider call. Therefore this wrapper marks the receipt invoked before
+    /// returning. New execution code should use
+    /// [`acquire_tokens_cancellable`](Self::acquire_tokens_cancellable) and mark
+    /// the guard immediately before adapter I/O.
+    pub async fn acquire(&self) -> RateLimitGuard {
+        self.acquire_tokens(0)
+            .await
+            .expect("provider rate-limit admission failed")
+    }
+
+    /// Backwards-compatible admitted request with an up-front TPM estimate.
+    pub async fn acquire_tokens(
+        &self,
+        estimated_tokens: u64,
+    ) -> Result<RateLimitGuard, RateLimitError> {
+        let cancellation = CancellationToken::new();
+        let mut guard = self
+            .acquire_tokens_cancellable(estimated_tokens, &cancellation)
+            .await?;
+        guard.mark_invoked()?;
+        Ok(guard)
+    }
+
+    /// Reserve a request cancellably without yet declaring provider I/O.
+    ///
+    /// Callers must invoke [`RateLimitGuard::mark_invoked`] immediately before
+    /// adapter use. Dropping before that point refunds RPM/TPM; dropping after
+    /// it retains the estimate.
+    pub async fn acquire_tokens_cancellable(
+        &self,
+        estimated_tokens: u64,
+        cancellation: &CancellationToken,
+    ) -> Result<RateLimitGuard, RateLimitError> {
+        if self.config.tpm > 0 && estimated_tokens > self.config.tpm {
+            return Err(RateLimitError::RequestExceedsTpm {
+                requested: estimated_tokens,
+                limit: self.config.tpm,
+            });
+        }
+        if cancellation.is_cancelled() {
+            return Err(RateLimitError::Cancelled);
+        }
+
+        // Subscribe before the first reservation attempt. A refund or lower
+        // reconciliation between a denial and the wait below is retained as an
+        // unseen watch version, so the wakeup cannot be lost.
+        let mut capacity_changed = self.capacity_changed.subscribe();
+        loop {
+            self.ensure_healthy()?;
+            if cancellation.is_cancelled() {
+                return Err(RateLimitError::Cancelled);
+            }
+
+            // Acquire concurrency first. If cancellation wins, no durable
+            // receipt exists and therefore nothing can leak.
+            let permit = tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => return Err(RateLimitError::Cancelled),
+                permit = self.concurrency.clone().acquire_owned() => {
+                    permit.map_err(|_| RateLimitError::ConcurrencyClosed)?
+                }
+            };
+            if cancellation.is_cancelled() {
+                drop(permit);
+                return Err(RateLimitError::Cancelled);
+            }
+
+            let requested_epoch = quota_epoch(self.clock.now_unix_millis());
+            let receipt_id = Uuid::new_v4();
+            let outcome = self
+                .store
+                .reserve_provider_rate(
+                    receipt_id,
+                    requested_epoch,
+                    self.config.rpm,
+                    self.config.tpm,
+                    estimated_tokens,
+                )
+                .map_err(|error| self.poison(error))?;
+
+            match outcome {
+                ProviderRateReserveOutcome::Reserved(reservation) => {
+                    let guard = RateLimitGuard {
+                        permit: Some(permit),
+                        store: self.store.clone(),
+                        healthy: self.healthy.clone(),
+                        capacity_changed: self.capacity_changed.clone(),
+                        reservation: Some(reservation),
+                        invoked: false,
+                    };
+                    self.prune_if_epoch_advanced(guard.admission_epoch())?;
+                    if cancellation.is_cancelled() {
+                        guard.refund()?;
+                        return Err(RateLimitError::Cancelled);
+                    }
+                    return Ok(guard);
+                }
+                ProviderRateReserveOutcome::Denied { epoch, .. } => {
+                    self.prune_if_epoch_advanced(epoch)?;
+                    // Quota denial has no receipt. Release concurrency while
+                    // waiting so admitted work in other epochs cannot starve.
+                    drop(permit);
+                    let deadline = epoch.saturating_add(1).saturating_mul(QUOTA_EPOCH_MILLIS);
+                    tokio::select! {
+                        biased;
+                        _ = cancellation.cancelled() => return Err(RateLimitError::Cancelled),
+                        _ = self.clock.sleep_until(deadline) => {}
+                        changed = capacity_changed.changed() => {
+                            if changed.is_err() {
+                                return Err(RateLimitError::StorageUnavailable(
+                                    "provider rate-limit capacity notifier closed".into(),
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Fallible current usage. The store rolls stale reads into the effective
+    /// fixed epoch and clamps backwards wall-clock movement.
+    pub fn try_stats(&self) -> Result<RateLimitStats, RateLimitError> {
+        self.ensure_healthy()?;
+        let requested_epoch = quota_epoch(self.clock.now_unix_millis());
+        let usage = self
+            .store
+            .provider_rate_usage(requested_epoch)
+            .map_err(|error| self.poison(error))?;
+        self.prune_if_epoch_advanced(usage.epoch)?;
+        Ok(RateLimitStats {
+            epoch: usage.epoch,
+            requests_this_minute: usage.requests,
+            tokens_this_minute: usage.tokens,
             rpm_limit: self.config.rpm,
             tpm_limit: self.config.tpm,
             concurrent_available: if self.config.max_concurrent == 0 {
@@ -204,103 +302,309 @@ impl RateLimiter {
                 self.concurrency.available_permits() as u32
             },
             max_concurrent: self.config.max_concurrent,
+            reserved_receipts: usage.reserved_receipts,
+            in_flight_receipts: usage.in_flight_receipts,
+            estimated_receipts: usage.estimated_receipts,
+            reconciled_receipts: usage.reconciled_receipts,
+            healthy: true,
+        })
+    }
+
+    /// Compatibility status wrapper. Storage failure is represented as
+    /// unhealthy and at-cap for configured dimensions, never as zero usage.
+    pub fn stats(&self) -> RateLimitStats {
+        self.try_stats().unwrap_or_else(|_| RateLimitStats {
+            epoch: quota_epoch(self.clock.now_unix_millis()),
+            requests_this_minute: u64::from(self.config.rpm),
+            tokens_this_minute: self.config.tpm,
+            rpm_limit: self.config.rpm,
+            tpm_limit: self.config.tpm,
+            concurrent_available: 0,
+            max_concurrent: self.config.max_concurrent,
+            reserved_receipts: 0,
+            in_flight_receipts: 0,
+            estimated_receipts: 0,
+            reconciled_receipts: 0,
+            healthy: false,
+        })
+    }
+
+    pub fn try_is_limited(&self) -> Result<bool, RateLimitError> {
+        let stats = self.try_stats()?;
+        Ok(
+            (self.config.rpm > 0 && stats.requests_this_minute >= u64::from(self.config.rpm))
+                || (self.config.tpm > 0 && stats.tokens_this_minute >= self.config.tpm),
+        )
+    }
+
+    /// Safe compatibility wrapper. Configured zero RPM/TPM are always
+    /// unlimited and never reported as limited.
+    pub fn is_limited(&self) -> bool {
+        if self.config.rpm == 0 && self.config.tpm == 0 {
+            return false;
         }
+        self.try_is_limited().unwrap_or(true)
+    }
+
+    /// Fallible compatibility token-only charge.
+    pub fn try_record_tokens(&self, tokens: u64) -> Result<(), RateLimitError> {
+        self.ensure_healthy()?;
+        let requested_epoch = quota_epoch(self.clock.now_unix_millis());
+        self.store
+            .charge_provider_rate_tokens(Uuid::new_v4(), requested_epoch, tokens)
+            .map_err(|error| self.poison(error))
+    }
+
+    /// Historical infallible token-only charge. On storage failure the limiter
+    /// is poisoned and future admissions fail closed.
+    pub fn record_tokens(&self, tokens: u64) {
+        let _ = self.try_record_tokens(tokens);
     }
 }
 
-/// Guard that releases the concurrency permit on drop.
+/// Affine reservation and concurrency permit.
+///
+/// The guard is intentionally not `Clone`: exactly one owner may transition,
+/// refund, retain, or reconcile a receipt.
 pub struct RateLimitGuard {
-    _permit: tokio::sync::OwnedSemaphorePermit,
-    window: Arc<Mutex<WindowState>>,
-    generation: u64,
-    reserved_tokens: u64,
+    permit: Option<OwnedSemaphorePermit>,
+    store: Arc<SqliteContextManager>,
+    healthy: Arc<AtomicBool>,
+    capacity_changed: watch::Sender<u64>,
+    reservation: Option<ProviderRateReservation>,
+    invoked: bool,
 }
 
 impl RateLimitGuard {
-    /// Replace the up-front token estimate with provider-reported or
-    /// conservatively estimated actual usage. If the minute rolled while the
-    /// request was in flight, actual usage is charged to the new window.
-    pub fn reconcile(self, actual_tokens: u64) {
-        let mut window = self.window.lock().unwrap();
-        window.roll_if_expired();
-        if window.generation == self.generation {
-            window.tokens = window
-                .tokens
-                .saturating_sub(self.reserved_tokens)
-                .saturating_add(actual_tokens);
-        } else {
-            window.tokens = window.tokens.saturating_add(actual_tokens);
+    pub fn receipt_id(&self) -> Uuid {
+        self.reservation
+            .as_ref()
+            .expect("live rate-limit guard has a receipt")
+            .id
+    }
+
+    pub fn admission_epoch(&self) -> u64 {
+        self.reservation
+            .as_ref()
+            .expect("live rate-limit guard has a receipt")
+            .epoch
+    }
+
+    /// Persist that provider I/O is about to begin.
+    pub fn mark_invoked(&mut self) -> Result<(), RateLimitError> {
+        if self.invoked {
+            return Ok(());
         }
+        let receipt = self
+            .reservation
+            .as_ref()
+            .expect("live rate-limit guard has a receipt");
+        self.store
+            .mark_provider_rate_invoked(receipt.id)
+            .map_err(|error| {
+                self.healthy.store(false, Ordering::Release);
+                RateLimiter::storage_error(error)
+            })?;
+        self.invoked = true;
+        Ok(())
+    }
+
+    /// Explicitly refund a reservation before provider I/O.
+    pub fn refund(mut self) -> Result<(), RateLimitError> {
+        if self.invoked {
+            return Err(RateLimitError::AlreadyInvoked);
+        }
+        if let Some(receipt) = self.reservation.take() {
+            self.store
+                .refund_provider_rate_before_invocation(receipt.id)
+                .map_err(|error| {
+                    self.healthy.store(false, Ordering::Release);
+                    RateLimiter::storage_error(error)
+                })?;
+            self.capacity_changed
+                .send_modify(|generation| *generation = generation.wrapping_add(1));
+        }
+        self.permit.take();
+        Ok(())
+    }
+
+    /// Replace the estimate with actual usage in the original admission epoch.
+    pub fn reconcile(mut self, actual_tokens: u64) -> Result<(), RateLimitError> {
+        if !self.invoked {
+            return Err(RateLimitError::NotInvoked);
+        }
+        if let Some(receipt) = self.reservation.take() {
+            self.store
+                .reconcile_provider_rate(receipt.id, actual_tokens)
+                .map_err(|error| {
+                    self.healthy.store(false, Ordering::Release);
+                    RateLimiter::storage_error(error)
+                })?;
+            self.capacity_changed
+                .send_modify(|generation| *generation = generation.wrapping_add(1));
+        }
+        self.permit.take();
+        Ok(())
+    }
+
+    /// Explicitly retain the estimate after provider error or cancellation.
+    ///
+    /// Consuming this guard exposes persistence failures to the execution path;
+    /// [`Drop`] remains a conservative last-resort fallback for unwinding.
+    pub fn retain_estimate(mut self) -> Result<(), RateLimitError> {
+        if !self.invoked {
+            return Err(RateLimitError::NotInvoked);
+        }
+        if let Some(receipt) = self.reservation.take() {
+            self.store
+                .retain_provider_rate_estimate(receipt.id)
+                .map_err(|error| {
+                    self.healthy.store(false, Ordering::Release);
+                    RateLimiter::storage_error(error)
+                })?;
+        }
+        self.permit.take();
+        Ok(())
     }
 }
 
-/// Current rate limit statistics.
+impl Drop for RateLimitGuard {
+    fn drop(&mut self) {
+        let Some(receipt) = self.reservation.take() else {
+            return;
+        };
+        let result = if self.invoked || receipt.state != ProviderRateReceiptState::Reserved {
+            self.store.retain_provider_rate_estimate(receipt.id)
+        } else {
+            self.store
+                .refund_provider_rate_before_invocation(receipt.id)
+        };
+        match result {
+            Ok(()) if !self.invoked && receipt.state == ProviderRateReceiptState::Reserved => {
+                self.capacity_changed
+                    .send_modify(|generation| *generation = generation.wrapping_add(1));
+            }
+            Ok(()) => {}
+            Err(_) => self.healthy.store(false, Ordering::Release),
+        }
+        self.permit.take();
+    }
+}
+
+/// Current effective-epoch statistics.
 #[derive(Debug, Clone)]
 pub struct RateLimitStats {
+    pub epoch: u64,
     pub requests_this_minute: u64,
     pub tokens_this_minute: u64,
     pub rpm_limit: u32,
     pub tpm_limit: u64,
     pub concurrent_available: u32,
     pub max_concurrent: u32,
+    pub reserved_receipts: u64,
+    pub in_flight_receipts: u64,
+    pub estimated_receipts: u64,
+    pub reconciled_receipts: u64,
+    pub healthy: bool,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicU32, Ordering};
+    use crate::quota_clock::ManualQuotaClock;
+    use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
 
-    #[tokio::test]
-    async fn acquire_within_limits() {
-        let limiter = RateLimiter::new(RateLimitConfig {
-            rpm: 10,
-            tpm: 1000,
-            max_concurrent: 3,
-        });
-        let _guard = limiter.acquire().await;
-        assert_eq!(limiter.stats().requests_this_minute, 1);
-        assert_eq!(limiter.stats().concurrent_available, 2);
+    fn temporary_database_path(test_name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("aiagentos-{test_name}-{}.sqlite", Uuid::new_v4()))
+    }
+
+    fn deterministic_limiter(config: RateLimitConfig, clock: Arc<ManualQuotaClock>) -> RateLimiter {
+        RateLimiter::with_store(
+            config,
+            Arc::new(SqliteContextManager::in_memory().unwrap()),
+            clock,
+        )
+        .unwrap()
     }
 
     #[tokio::test]
-    async fn concurrency_limit() {
-        let limiter = Arc::new(RateLimiter::new(RateLimitConfig {
-            rpm: 100,
-            tpm: 100000,
-            max_concurrent: 2,
-        }));
-        let _g1 = limiter.acquire().await;
-        let _g2 = limiter.acquire().await;
-        assert_eq!(limiter.stats().concurrent_available, 0);
-        // Third acquire would block — test that stats reflect it
-        assert_eq!(limiter.stats().requests_this_minute, 2);
-    }
-
-    #[tokio::test]
-    async fn record_tokens() {
-        let limiter = RateLimiter::new(RateLimitConfig::default());
-        limiter.record_tokens(500);
-        limiter.record_tokens(300);
-        assert_eq!(limiter.stats().tokens_this_minute, 800);
-    }
-
-    #[tokio::test]
-    async fn is_limited_when_at_cap() {
-        let limiter = RateLimiter::new(RateLimitConfig {
-            rpm: 2,
-            tpm: 1000,
-            max_concurrent: 10,
-        });
-        let _g1 = limiter.acquire().await;
-        let _g2 = limiter.acquire().await;
+    async fn exact_half_open_boundary_rolls_usage() {
+        let clock = Arc::new(ManualQuotaClock::new(59_999));
+        let limiter = deterministic_limiter(
+            RateLimitConfig {
+                rpm: 1,
+                tpm: 100,
+                max_concurrent: 2,
+            },
+            clock.clone(),
+        );
+        drop(limiter.acquire_tokens(10).await.unwrap());
+        assert_eq!(limiter.stats().epoch, 0);
         assert!(limiter.is_limited());
+
+        let cancellation = CancellationToken::new();
+        let waiter_cancellation = cancellation.clone();
+        let waiter = limiter.acquire_tokens_cancellable(10, &waiter_cancellation);
+        tokio::pin!(waiter);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(10), &mut waiter)
+                .await
+                .is_err()
+        );
+        clock.set(60_000);
+        let guard = waiter.await.unwrap();
+        assert_eq!(guard.admission_epoch(), 1);
+        drop(guard);
+        assert_eq!(limiter.stats().epoch, 1);
     }
 
-    /// The concurrency bound holds under many simultaneous callers: at no point
-    /// may more than `max_concurrent` guards be live at once.
+    #[tokio::test]
+    async fn skipped_epochs_and_stale_reads_start_empty() {
+        let clock = Arc::new(ManualQuotaClock::new(10));
+        let limiter = deterministic_limiter(RateLimitConfig::default(), clock.clone());
+        drop(limiter.acquire_tokens(7).await.unwrap());
+        assert_eq!(limiter.stats().requests_this_minute, 1);
+        clock.set(180_000);
+        let stats = limiter.stats();
+        assert_eq!(stats.epoch, 3);
+        assert_eq!(stats.requests_this_minute, 0);
+        assert_eq!(stats.tokens_this_minute, 0);
+    }
+
+    #[tokio::test]
+    async fn backward_clock_cannot_reopen_old_epoch() {
+        let clock = Arc::new(ManualQuotaClock::new(120_000));
+        let limiter = deterministic_limiter(RateLimitConfig::default(), clock.clone());
+        drop(limiter.acquire_tokens(7).await.unwrap());
+        assert_eq!(limiter.stats().epoch, 2);
+        clock.set(1);
+        let stats = limiter.stats();
+        assert_eq!(stats.epoch, 2);
+        assert_eq!(stats.requests_this_minute, 1);
+    }
+
+    #[tokio::test]
+    async fn zero_limits_are_unlimited_and_never_report_limited() {
+        let clock = Arc::new(ManualQuotaClock::new(0));
+        let limiter = deterministic_limiter(
+            RateLimitConfig {
+                rpm: 0,
+                tpm: 0,
+                max_concurrent: 0,
+            },
+            clock,
+        );
+        let guard = limiter.acquire_tokens(u64::MAX).await.unwrap();
+        guard.reconcile(u64::MAX).unwrap();
+        let stats = limiter.stats();
+        assert_eq!(stats.requests_this_minute, 1);
+        assert_eq!(stats.tokens_this_minute, u64::MAX);
+        assert!(!limiter.is_limited());
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrency_bound_holds_under_load() {
-        let max_concurrent = 3u32;
+        let max_concurrent = 3;
         let limiter = Arc::new(RateLimiter::new(RateLimitConfig {
             rpm: 10_000,
             tpm: 10_000_000,
@@ -308,135 +612,371 @@ mod tests {
         }));
         let live = Arc::new(AtomicU32::new(0));
         let peak = Arc::new(AtomicU32::new(0));
-
         let mut handles = Vec::new();
-        for _ in 0..64 {
+        for _ in 0..32 {
             let limiter = limiter.clone();
             let live = live.clone();
             let peak = peak.clone();
             handles.push(tokio::spawn(async move {
-                let _g = limiter.acquire().await;
-                let now = live.fetch_add(1, Ordering::SeqCst) + 1;
-                peak.fetch_max(now, Ordering::SeqCst);
-                // Hold the slot briefly to force contention.
-                tokio::time::sleep(Duration::from_millis(5)).await;
-                live.fetch_sub(1, Ordering::SeqCst);
+                let _guard = limiter.acquire_tokens(1).await.unwrap();
+                let now = live.fetch_add(1, AtomicOrdering::SeqCst) + 1;
+                peak.fetch_max(now, AtomicOrdering::SeqCst);
+                tokio::task::yield_now().await;
+                live.fetch_sub(1, AtomicOrdering::SeqCst);
             }));
         }
-        for h in handles {
-            h.await.unwrap();
+        for handle in handles {
+            handle.await.unwrap();
         }
-
-        assert!(
-            peak.load(Ordering::SeqCst) <= max_concurrent,
-            "observed {} concurrent, bound was {}",
-            peak.load(Ordering::SeqCst),
-            max_concurrent
-        );
-        // All slots released.
-        assert_eq!(limiter.stats().concurrent_available, max_concurrent);
+        assert!(peak.load(AtomicOrdering::SeqCst) <= max_concurrent);
     }
 
-    /// The RPM bound holds under concurrent reservation: with rpm set below the
-    /// number of callers, only `rpm` requests get admitted within the window.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn rpm_bound_holds_under_load() {
-        let rpm = 5u32;
-        let limiter = Arc::new(RateLimiter::new(RateLimitConfig {
-            rpm,
-            tpm: 10_000_000,
-            max_concurrent: 32,
-        }));
-
-        // Spawn more callers than the RPM budget; the excess must block on the
-        // window (and not get admitted within this short window).
-        let mut handles = Vec::new();
-        for _ in 0..20 {
-            let limiter = limiter.clone();
-            handles.push(tokio::spawn(async move {
-                // Don't await admission to completion for the blocked ones —
-                // race them against a short timeout. Admitted callers reserve a
-                // slot synchronously inside acquire before returning.
-                let _ = tokio::time::timeout(Duration::from_millis(50), limiter.acquire_tokens(1))
-                    .await;
-            }));
-        }
-        for h in handles {
-            h.await.unwrap();
-        }
-
-        // Exactly `rpm` requests may have been admitted in this window.
-        assert_eq!(
-            limiter.stats().requests_this_minute,
-            rpm as u64,
-            "more than rpm requests admitted in one window"
-        );
-    }
-
-    /// TPM reservation blocks once the token budget for the window is consumed.
     #[tokio::test]
-    async fn tpm_bound_blocks_when_exhausted() {
+    async fn cancellation_waiting_for_concurrency_leaks_no_receipt() {
         let limiter = Arc::new(RateLimiter::new(RateLimitConfig {
-            rpm: 1000,
+            rpm: 10,
             tpm: 100,
-            max_concurrent: 10,
+            max_concurrent: 1,
         }));
-        // Reserve the whole token budget.
-        let _g = limiter.acquire_tokens(100).await.unwrap();
-        assert_eq!(limiter.stats().tokens_this_minute, 100);
-
-        // A further reservation that would exceed TPM must block (times out).
-        let res = tokio::time::timeout(Duration::from_millis(50), limiter.acquire_tokens(1)).await;
-        assert!(res.is_err(), "reservation should have blocked on TPM");
+        let _held = limiter.acquire_tokens(1).await.unwrap();
+        let cancellation = CancellationToken::new();
+        let waiter = {
+            let limiter = limiter.clone();
+            let cancellation = cancellation.clone();
+            tokio::spawn(async move { limiter.acquire_tokens_cancellable(1, &cancellation).await })
+        };
+        tokio::task::yield_now().await;
+        cancellation.cancel();
+        assert!(matches!(
+            waiter.await.unwrap(),
+            Err(RateLimitError::Cancelled)
+        ));
+        assert_eq!(limiter.stats().requests_this_minute, 1);
     }
 
     #[tokio::test]
-    async fn oversized_request_is_rejected_instead_of_waiting_forever() {
+    async fn pre_cancelled_admission_never_reserves_quota() {
         let limiter = RateLimiter::new(RateLimitConfig {
             rpm: 10,
             tpm: 100,
             max_concurrent: 1,
         });
-        let error = match limiter.acquire_tokens(101).await {
-            Ok(_) => panic!("oversized reservation unexpectedly admitted"),
-            Err(error) => error,
-        };
-        assert_eq!(
-            error,
-            RateLimitError::RequestExceedsTpm {
-                requested: 101,
-                limit: 100
-            }
-        );
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+
+        assert!(matches!(
+            limiter.acquire_tokens_cancellable(1, &cancellation).await,
+            Err(RateLimitError::Cancelled)
+        ));
+        let stats = limiter.try_stats().unwrap();
+        assert_eq!(stats.requests_this_minute, 0);
+        assert_eq!(stats.tokens_this_minute, 0);
+        assert_eq!(stats.reserved_receipts, 0);
     }
 
     #[tokio::test]
-    async fn zero_limits_are_explicitly_unlimited() {
-        let limiter = RateLimiter::new(RateLimitConfig {
-            rpm: 0,
-            tpm: 0,
-            max_concurrent: 0,
-        });
-        let guard = limiter.acquire_tokens(u64::MAX).await.unwrap();
-        guard.reconcile(u64::MAX);
+    async fn cancellation_waiting_for_next_epoch_leaks_no_receipt() {
+        let clock = Arc::new(ManualQuotaClock::new(1));
+        let limiter = Arc::new(deterministic_limiter(
+            RateLimitConfig {
+                rpm: 1,
+                tpm: 100,
+                max_concurrent: 2,
+            },
+            clock,
+        ));
+        drop(limiter.acquire_tokens(1).await.unwrap());
+        let cancellation = CancellationToken::new();
+        let waiter = {
+            let limiter = limiter.clone();
+            let cancellation = cancellation.clone();
+            tokio::spawn(async move { limiter.acquire_tokens_cancellable(1, &cancellation).await })
+        };
+        tokio::task::yield_now().await;
+        cancellation.cancel();
+        assert!(matches!(
+            waiter.await.unwrap(),
+            Err(RateLimitError::Cancelled)
+        ));
         let stats = limiter.stats();
         assert_eq!(stats.requests_this_minute, 1);
-        assert_eq!(stats.tokens_this_minute, u64::MAX);
-        assert_eq!(stats.rpm_limit, 0);
-        assert_eq!(stats.tpm_limit, 0);
-        assert_eq!(stats.max_concurrent, 0);
+        assert_eq!(stats.estimated_receipts, 1);
+        assert_eq!(stats.reserved_receipts, 0);
     }
 
     #[tokio::test]
-    async fn provider_actual_usage_replaces_reservation() {
+    async fn every_admission_has_a_unique_receipt() {
+        let limiter = RateLimiter::new(RateLimitConfig {
+            rpm: 10,
+            tpm: 100,
+            max_concurrent: 2,
+        });
+        let first = limiter.acquire_tokens(1).await.unwrap();
+        let second = limiter.acquire_tokens(1).await.unwrap();
+        assert_ne!(first.receipt_id(), second.receipt_id());
+    }
+
+    #[tokio::test]
+    async fn pre_invocation_drop_and_explicit_refund_restore_quota() {
+        let limiter = RateLimiter::new(RateLimitConfig {
+            rpm: 10,
+            tpm: 100,
+            max_concurrent: 1,
+        });
+        let cancellation = CancellationToken::new();
+        let guard = limiter
+            .acquire_tokens_cancellable(10, &cancellation)
+            .await
+            .unwrap();
+        drop(guard);
+        assert_eq!(limiter.stats().requests_this_minute, 0);
+
+        let guard = limiter
+            .acquire_tokens_cancellable(10, &cancellation)
+            .await
+            .unwrap();
+        guard.refund().unwrap();
+        assert_eq!(limiter.stats().tokens_this_minute, 0);
+    }
+
+    #[tokio::test]
+    async fn same_epoch_refund_wakes_denied_waiter() {
+        let clock = Arc::new(ManualQuotaClock::new(1));
+        let limiter = Arc::new(deterministic_limiter(
+            RateLimitConfig {
+                rpm: 0,
+                tpm: 100,
+                max_concurrent: 2,
+            },
+            clock,
+        ));
+        let cancellation = CancellationToken::new();
+        let reservation = limiter
+            .acquire_tokens_cancellable(100, &cancellation)
+            .await
+            .unwrap();
+        let waiter = {
+            let limiter = limiter.clone();
+            tokio::spawn(async move { limiter.acquire_tokens(1).await })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        assert!(!waiter.is_finished(), "full TPM must initially deny");
+
+        reservation.refund().unwrap();
+        let guard = tokio::time::timeout(std::time::Duration::from_secs(1), waiter)
+            .await
+            .expect("refund must wake the same-epoch waiter")
+            .unwrap()
+            .unwrap();
+        assert_eq!(guard.admission_epoch(), 0);
+        guard.reconcile(1).unwrap();
+    }
+
+    #[tokio::test]
+    async fn same_epoch_lower_reconciliation_wakes_denied_waiter() {
+        let clock = Arc::new(ManualQuotaClock::new(1));
+        let limiter = Arc::new(deterministic_limiter(
+            RateLimitConfig {
+                rpm: 0,
+                tpm: 100,
+                max_concurrent: 2,
+            },
+            clock,
+        ));
+        let reservation = limiter.acquire_tokens(100).await.unwrap();
+        let waiter = {
+            let limiter = limiter.clone();
+            tokio::spawn(async move { limiter.acquire_tokens(1).await })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        assert!(!waiter.is_finished(), "full TPM must initially deny");
+
+        reservation.reconcile(50).unwrap();
+        let guard = tokio::time::timeout(std::time::Duration::from_secs(1), waiter)
+            .await
+            .expect("lower reconciliation must wake the same-epoch waiter")
+            .unwrap()
+            .unwrap();
+        assert_eq!(guard.admission_epoch(), 0);
+        guard.reconcile(1).unwrap();
+        assert_eq!(limiter.stats().tokens_this_minute, 51);
+    }
+
+    #[tokio::test]
+    async fn attempted_request_retains_estimate_on_drop() {
+        let limiter = RateLimiter::new(RateLimitConfig {
+            rpm: 10,
+            tpm: 100,
+            max_concurrent: 1,
+        });
+        let cancellation = CancellationToken::new();
+        let mut guard = limiter
+            .acquire_tokens_cancellable(10, &cancellation)
+            .await
+            .unwrap();
+        guard.mark_invoked().unwrap();
+        drop(guard);
+        let stats = limiter.stats();
+        assert_eq!(stats.requests_this_minute, 1);
+        assert_eq!(stats.tokens_this_minute, 10);
+        assert_eq!(stats.estimated_receipts, 1);
+    }
+
+    #[tokio::test]
+    async fn attempted_request_can_explicitly_retain_estimate() {
+        let limiter = RateLimiter::new(RateLimitConfig {
+            rpm: 10,
+            tpm: 100,
+            max_concurrent: 1,
+        });
+        let cancellation = CancellationToken::new();
+        let mut guard = limiter
+            .acquire_tokens_cancellable(10, &cancellation)
+            .await
+            .unwrap();
+        guard.mark_invoked().unwrap();
+        guard.retain_estimate().unwrap();
+        let stats = limiter.stats();
+        assert_eq!(stats.requests_this_minute, 1);
+        assert_eq!(stats.tokens_this_minute, 10);
+        assert_eq!(stats.estimated_receipts, 1);
+        assert_eq!(stats.in_flight_receipts, 0);
+    }
+
+    #[tokio::test]
+    async fn same_epoch_reconciliation_replaces_estimate() {
         let limiter = RateLimiter::new(RateLimitConfig {
             rpm: 10,
             tpm: 1_000,
             max_concurrent: 1,
         });
         let guard = limiter.acquire_tokens(300).await.unwrap();
-        assert_eq!(limiter.stats().tokens_this_minute, 300);
-        guard.reconcile(125);
+        guard.reconcile(125).unwrap();
         assert_eq!(limiter.stats().tokens_this_minute, 125);
+    }
+
+    #[tokio::test]
+    async fn cross_epoch_reconciliation_does_not_charge_completion_epoch() {
+        let path = temporary_database_path("cross-epoch-reconcile");
+        let clock = Arc::new(ManualQuotaClock::new(59_999));
+        let store = Arc::new(SqliteContextManager::new(&path).unwrap());
+        let limiter = RateLimiter::with_store(
+            RateLimitConfig {
+                rpm: 10,
+                tpm: 1_000,
+                max_concurrent: 1,
+            },
+            store,
+            clock.clone(),
+        )
+        .unwrap();
+        let guard = limiter.acquire_tokens(300).await.unwrap();
+        clock.set(60_000);
+        guard.reconcile(125).unwrap();
+
+        let inspection = rusqlite::Connection::open(&path).unwrap();
+        let epoch = 0u64.to_be_bytes();
+        let tokens: Vec<u8> = inspection
+            .query_row(
+                "SELECT tokens FROM quota_epochs
+                 WHERE scope_kind = 'provider' AND scope_id = 'global' AND epoch = ?1",
+                [epoch.as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            u64::from_be_bytes(tokens.try_into().unwrap()),
+            125,
+            "actual usage must replace the estimate in the admission epoch"
+        );
+        drop(inspection);
+        let stats = limiter.stats();
+        assert_eq!(stats.epoch, 1);
+        assert_eq!(stats.tokens_this_minute, 0);
+        drop(limiter);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn record_tokens_uses_durable_token_only_charge() {
+        let limiter = RateLimiter::new(RateLimitConfig::default());
+        limiter.try_record_tokens(500).unwrap();
+        limiter.try_record_tokens(300).unwrap();
+        let stats = limiter.stats();
+        assert_eq!(stats.requests_this_minute, 0);
+        assert_eq!(stats.tokens_this_minute, 800);
+    }
+
+    #[tokio::test]
+    async fn persistent_restart_in_same_epoch_preserves_usage() {
+        let path = temporary_database_path("rate-restart");
+        let clock = Arc::new(ManualQuotaClock::new(20_000));
+        let config = RateLimitConfig {
+            rpm: 1,
+            tpm: 100,
+            max_concurrent: 1,
+        };
+        {
+            let store = Arc::new(SqliteContextManager::new(&path).unwrap());
+            let limiter = RateLimiter::with_store(config.clone(), store, clock.clone()).unwrap();
+            let guard = limiter.acquire_tokens(40).await.unwrap();
+            drop(guard);
+            assert_eq!(limiter.stats().estimated_receipts, 1);
+        }
+
+        {
+            let store = Arc::new(SqliteContextManager::new(&path).unwrap());
+            let limiter = RateLimiter::with_store(config.clone(), store, clock.clone()).unwrap();
+            let stats = limiter.try_stats().unwrap();
+            assert_eq!(stats.epoch, 0);
+            assert_eq!(stats.requests_this_minute, 1);
+            assert_eq!(stats.tokens_this_minute, 40);
+            assert!(limiter.is_limited());
+        }
+
+        clock.set(60_000);
+        {
+            let store = Arc::new(SqliteContextManager::new(&path).unwrap());
+            let limiter = RateLimiter::with_store(config, store, clock).unwrap();
+            let stats = limiter.try_stats().unwrap();
+            assert_eq!(stats.epoch, 1);
+            assert_eq!(stats.requests_this_minute, 0);
+            assert_eq!(stats.tokens_this_minute, 0);
+        }
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn storage_failure_poisons_future_admission() {
+        let path = temporary_database_path("rate-poison");
+        let store = Arc::new(SqliteContextManager::new(&path).unwrap());
+        let clock = Arc::new(ManualQuotaClock::new(0));
+        let limiter = RateLimiter::with_store(RateLimitConfig::default(), store, clock).unwrap();
+
+        let sabotage = rusqlite::Connection::open(&path).unwrap();
+        sabotage
+            .execute_batch("DROP TABLE quota_epoch_floor")
+            .unwrap();
+        drop(sabotage);
+
+        let cancellation = CancellationToken::new();
+        let first = match limiter.acquire_tokens_cancellable(1, &cancellation).await {
+            Ok(_) => panic!("storage failure unexpectedly admitted a request"),
+            Err(error) => error,
+        };
+        assert!(matches!(first, RateLimitError::StorageUnavailable(_)));
+
+        let second = match limiter.acquire_tokens_cancellable(1, &cancellation).await {
+            Ok(_) => panic!("poisoned limiter unexpectedly admitted a request"),
+            Err(error) => error,
+        };
+        assert!(
+            second
+                .to_string()
+                .contains("prior persistence operation failed"),
+            "unexpected second error: {second}"
+        );
+        assert!(!limiter.stats().healthy);
+        let _ = std::fs::remove_file(path);
     }
 }

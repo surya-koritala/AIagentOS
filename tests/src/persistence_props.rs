@@ -26,7 +26,9 @@ use kernel::connector::{
     LlmProviderAdapter, LlmResponse, LlmSession, LlmUsage, ProviderType, StandardMessage,
     ToolDefinition,
 };
-use kernel::context::{ContextManager, Fact, FactCategory, DEFAULT_TENANT};
+use kernel::context::{ContextManager, Fact, FactCategory, SqliteContextManager, DEFAULT_TENANT};
+use kernel::quota_clock::ManualQuotaClock;
+use kernel::rate_limit::{RateLimitConfig, RateLimiter};
 use kernel::syscall_gate::GateDenial;
 use kernel::{AgentConfig, AgentId, AgentKernelImpl, ConnectorError, Priority, ProviderId};
 
@@ -564,6 +566,165 @@ async fn abrupt_restart_restores_exact_spend_without_repricing_and_blocks_next_r
     );
 
     drop(kernel);
+    std::fs::remove_dir_all(data_dir).ok();
+}
+
+/// Provider RPM is a durable fixed-epoch quota, not a process-local timer.
+/// Restarting in the same Unix-minute epoch must restore the exhausted request
+/// count and keep the provider untouched. Advancing the injected clock to the
+/// exact next boundary must admit the waiting request without a real-time
+/// minute-long sleep.
+#[tokio::test(flavor = "multi_thread")]
+async fn abrupt_restart_restores_rpm_and_blocks_provider_until_exact_next_epoch() {
+    const PROVIDER: &str = "fixed-rpm-restart";
+
+    let db_path = temp_db_path("provider_rpm_restart");
+    let data_dir = db_path.parent().unwrap();
+    let clock = Arc::new(ManualQuotaClock::new(120_000));
+    let budgets = BudgetConfig {
+        rpm: 1,
+        tpm: 100_000,
+        max_concurrent: 1,
+        ..BudgetConfig::default()
+    };
+
+    let agent_id = {
+        let context = Arc::new(SqliteContextManager::new(&db_path).expect("create durable store"));
+        let kernel = AgentKernelImpl::with_context_manager_and_clock(
+            context,
+            &budgets,
+            false,
+            &[],
+            clock.clone(),
+        )
+        .expect("first boot");
+        let (adapter, calls) = fixed_usage_adapter(PROVIDER, 20, 5);
+        kernel
+            .register_provider(adapter)
+            .expect("register provider");
+        let agent = kernel
+            .create_agent_full(accounting_agent_cfg("rpm-restart", PROVIDER))
+            .await
+            .expect("create agent");
+
+        kernel
+            .send_message(agent.id, "consume this fixed epoch")
+            .await
+            .expect("first request");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(kernel.rate_limiter.try_stats().unwrap().epoch, 2);
+        assert_eq!(
+            kernel
+                .rate_limiter
+                .try_stats()
+                .unwrap()
+                .requests_this_minute,
+            1
+        );
+
+        // No graceful shutdown: the reconciled receipt must already be durable.
+        drop(kernel);
+        agent.id
+    };
+
+    let context = Arc::new(SqliteContextManager::new(&db_path).expect("reopen durable store"));
+    let kernel = Arc::new(
+        AgentKernelImpl::with_context_manager_and_clock(
+            context,
+            &budgets,
+            false,
+            &[],
+            clock.clone(),
+        )
+        .expect("restart"),
+    );
+    kernel
+        .rehydrate_agents()
+        .await
+        .expect("rehydrate persisted agent");
+    let (adapter, restart_calls) = fixed_usage_adapter(PROVIDER, 20, 5);
+    kernel
+        .register_provider(adapter)
+        .expect("register provider after restart");
+
+    let waiting = {
+        let kernel = Arc::clone(&kernel);
+        tokio::spawn(async move {
+            kernel
+                .send_message(agent_id, "wait for the next quota epoch")
+                .await
+        })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    assert_eq!(
+        restart_calls.load(Ordering::SeqCst),
+        0,
+        "same-epoch restart must block before provider I/O"
+    );
+    assert!(!waiting.is_finished(), "request must wait for the boundary");
+
+    clock.set(180_000);
+    let output = tokio::time::timeout(std::time::Duration::from_secs(2), waiting)
+        .await
+        .expect("boundary wake must be prompt")
+        .expect("request task")
+        .expect("request after boundary");
+    assert_eq!(output.tokens_used, 25);
+    assert_eq!(restart_calls.load(Ordering::SeqCst), 1);
+    let stats = kernel.rate_limiter.try_stats().unwrap();
+    assert_eq!(stats.epoch, 3);
+    assert_eq!(stats.requests_this_minute, 1);
+
+    drop(kernel);
+    std::fs::remove_dir_all(data_dir).ok();
+}
+
+/// TPM follows the same restart and boundary semantics independently of RPM.
+/// This lower-level integration test uses the public limiter API so the exact
+/// up-front estimate and reconciliation values are under test control.
+#[tokio::test(flavor = "multi_thread")]
+async fn abrupt_restart_restores_exhausted_tpm_until_exact_next_epoch() {
+    let db_path = temp_db_path("provider_tpm_restart");
+    let data_dir = db_path.parent().unwrap();
+    let clock = Arc::new(ManualQuotaClock::new(240_000));
+    let config = RateLimitConfig {
+        rpm: 0,
+        tpm: 100,
+        max_concurrent: 1,
+    };
+
+    {
+        let store = Arc::new(SqliteContextManager::new(&db_path).expect("create durable store"));
+        let limiter =
+            RateLimiter::with_store(config.clone(), store, clock.clone()).expect("create limiter");
+        let guard = limiter.acquire_tokens(100).await.expect("reserve all TPM");
+        guard.reconcile(100).expect("persist actual usage");
+        assert_eq!(limiter.try_stats().unwrap().tokens_this_minute, 100);
+    }
+
+    let store = Arc::new(SqliteContextManager::new(&db_path).expect("reopen durable store"));
+    let limiter =
+        Arc::new(RateLimiter::with_store(config, store, clock.clone()).expect("recover limiter"));
+    let waiting = {
+        let limiter = Arc::clone(&limiter);
+        tokio::spawn(async move { limiter.acquire_tokens(1).await })
+    };
+    tokio::task::yield_now().await;
+    assert_eq!(limiter.try_stats().unwrap().tokens_this_minute, 100);
+    assert!(!waiting.is_finished(), "restored TPM must block admission");
+
+    clock.set(300_000);
+    let guard = tokio::time::timeout(std::time::Duration::from_secs(2), waiting)
+        .await
+        .expect("boundary wake must be prompt")
+        .expect("admission task")
+        .expect("next epoch admission");
+    assert_eq!(guard.admission_epoch(), 5);
+    guard
+        .reconcile(1)
+        .expect("reconcile next-epoch test admission");
+
+    drop(limiter);
     std::fs::remove_dir_all(data_dir).ok();
 }
 

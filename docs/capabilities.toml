@@ -84,6 +84,7 @@ owner = "runtime"
 maturity = "integrated"
 release = "v0.4"
 tracking_issue = 109
+qualification_issue = 125
 kernel_modules = ["budget", "cgroups", "metrics", "quota_clock", "rate_limit"]
 source_paths = ["crates/kernel/src/budget.rs", "crates/kernel/src/context.rs", "crates/kernel/src/execution.rs", "crates/kernel/src/lib.rs", "crates/kernel/src/quota_clock.rs", "crates/kernel/src/rate_limit.rs"]
 public_entry_points = ["crates/kernel/src/syscall_server.rs::Metrics"]

@@ -444,13 +444,13 @@ fn cgroup_for_profile(profile: &str, budgets: &crate::config::BudgetConfig) -> C
         "full-access" | "" => CgroupLimits::default(), // all zeros = unlimited
         "elevated" => CgroupLimits {
             tokens_per_min: budgets.agent_tokens_per_min.saturating_mul(4),
-            max_tool_calls: budgets.max_tool_calls,
+            max_concurrent_tool_calls: budgets.max_concurrent_tool_calls,
             max_context_tokens: budgets.max_context_tokens,
             max_agents: 0,
         },
         _ => CgroupLimits {
             tokens_per_min: budgets.agent_tokens_per_min,
-            max_tool_calls: budgets.max_tool_calls,
+            max_concurrent_tool_calls: budgets.max_concurrent_tool_calls,
             max_context_tokens: budgets.max_context_tokens,
             max_agents: 0,
         },
@@ -909,6 +909,9 @@ pub struct AgentKernelImpl {
     /// Active-context token budget applied to each executor (from
     /// `budgets.max_context_tokens`; 0 = unbounded). Drives context paging.
     context_budget_tokens: u32,
+    /// Cumulative tool-call ceiling for one logical turn, including calls made
+    /// before a durable pause/resume boundary. `0` means unlimited.
+    max_tool_calls_per_turn: u32,
     /// CFS-ordered turn admission: bounds concurrent turns to
     /// `budgets.max_concurrent` and, under contention, grants the next slot to
     /// the CFS-preferred (lowest-vruntime / highest-priority) waiting agent.
@@ -1067,7 +1070,13 @@ impl AgentKernelImpl {
         let observability = Arc::new(ObservabilityEngineImpl::new());
         syscall_gate.set_audit_sink(observability.clone());
         // Cumulative USD spend ceiling (inert unless price + ceiling configured).
+        // Rehydrate exact fixed-point charges before any agent can be admitted;
+        // resetting a configured lifetime ceiling on restart would fail open.
         let budget_enforcer = Arc::new(crate::budget::BudgetEnforcer::from_config(budgets));
+        let budget_snapshot = context_manager
+            .load_budget_usage_snapshot()
+            .map_err(KernelError::Context)?;
+        budget_enforcer.rehydrate(&budget_snapshot);
         let os = Arc::new(OsSubsystems::new());
 
         let ipc = Arc::new(IpcManager::new());
@@ -1114,6 +1123,7 @@ impl AgentKernelImpl {
             syscall_gate,
             budget_enforcer,
             context_budget_tokens: budgets.max_context_tokens.min(u32::MAX as u64) as u32,
+            max_tool_calls_per_turn: budgets.max_tool_calls,
             turn_admission: Arc::new(TurnAdmission::new(budgets.max_concurrent as usize)),
             llm_scheduler: Arc::new(LlmScheduler::new(DEFAULT_LLM_CORES)),
             os,
@@ -1126,6 +1136,7 @@ impl AgentKernelImpl {
             // is independent). 0 = unlimited, matching the rest of the budget model.
             tenant_budget: CgroupLimits {
                 tokens_per_min: budgets.tpm,
+                max_concurrent_tool_calls: budgets.max_concurrent_tool_calls,
                 max_context_tokens: budgets.max_context_tokens,
                 ..Default::default()
             },
@@ -1849,7 +1860,7 @@ impl AgentKernelImpl {
             }
         }
         self.observability.purge_agent(agent_id);
-        self.budget_enforcer.purge_agent(agent_id);
+        self.budget_enforcer.unregister_agent(agent_id);
         self.syscall_gate.unregister_agent(agent_id);
     }
 
@@ -2302,7 +2313,7 @@ impl AgentKernelImpl {
                     baseline.tool_calls_made,
                     baseline.usage,
                 )
-                .await;
+                .await?;
                 Ok((self.get_agent_status(agent_id)?, Some(output), None))
             }
             Ok(TurnResult::Paused(checkpoint)) => {
@@ -2325,9 +2336,7 @@ impl AgentKernelImpl {
                     tokens_used: checkpoint.tokens_used,
                     provider_id: executor.provider_id().to_string(),
                     model_id: executor.model_id().to_string(),
-                    estimated_cost_usd: self
-                        .budget_enforcer
-                        .cost_of(executor.provider_id(), checkpoint.tokens_used),
+                    estimated_cost_usd: checkpoint.usage.charged_cost_micros as f64 / 1_000_000.0,
                     usage: checkpoint.usage,
                 };
                 drop(executor);
@@ -2340,7 +2349,7 @@ impl AgentKernelImpl {
                     baseline.tool_calls_made,
                     baseline.usage,
                 )
-                .await;
+                .await?;
                 Ok((AgentState::Paused, Some(output), Some(new_id)))
             }
             Err(error) => {
@@ -2387,6 +2396,7 @@ impl AgentKernelImpl {
         executor.set_budget_enforcer(self.budget_enforcer.clone());
         executor.set_rate_limiter(self.rate_limiter.clone());
         executor.set_context_budget(self.context_budget_tokens);
+        executor.set_max_tool_calls(self.max_tool_calls_per_turn);
         if let Some(pid) = self.syscall_gate.pid_of(agent_id) {
             let nice = self.os.cfs.lock().await.nice_of(pid).unwrap_or(0);
             executor.set_llm_scheduler(self.llm_scheduler.clone(), pid, nice);
@@ -2403,7 +2413,7 @@ impl AgentKernelImpl {
         baseline_tokens: u32,
         baseline_tools: usize,
         baseline_usage: crate::execution::UsageTelemetry,
-    ) {
+    ) -> Result<(), KernelError> {
         let tokens = output.tokens_used.saturating_sub(baseline_tokens);
         let tools = output.tool_calls_made.saturating_sub(baseline_tools);
         let usage = crate::execution::UsageTelemetry {
@@ -2436,6 +2446,10 @@ impl AgentKernelImpl {
                 .usage
                 .estimated_requests
                 .saturating_sub(baseline_usage.estimated_requests),
+            charged_cost_micros: output
+                .usage
+                .charged_cost_micros
+                .saturating_sub(baseline_usage.charged_cost_micros),
         };
         self.agent_manager.record_activity(agent_id);
         ObservabilityEngine::record_metrics(
@@ -2444,9 +2458,6 @@ impl AgentKernelImpl {
             u64::from(tokens),
             u64::from(usage.llm_requests),
         );
-        let baseline_cost = self
-            .budget_enforcer
-            .cost_of(&output.provider_id, baseline_tokens);
         self.context_manager.log_usage(
             agent_id,
             &UsageRecord {
@@ -2462,9 +2473,10 @@ impl AgentKernelImpl {
                 provider: output.provider_id.clone(),
                 model: output.model_id.clone(),
                 tool_calls: tools,
-                estimated_cost_usd: (output.estimated_cost_usd - baseline_cost).max(0.0),
+                estimated_cost_usd: usage.charged_cost_micros as f64 / 1_000_000.0,
+                cost_micros: usage.charged_cost_micros,
             },
-        );
+        )?;
         if let Some(pid) = self.syscall_gate.pid_of(agent_id) {
             self.os
                 .cfs
@@ -2472,6 +2484,7 @@ impl AgentKernelImpl {
                 .await
                 .account_tokens(pid, u64::from(tokens));
         }
+        Ok(())
     }
 
     /// Send a message to an agent and get a response.
@@ -2588,7 +2601,7 @@ impl AgentKernelImpl {
                     tokens_used: checkpoint.tokens_used,
                     provider_id: executor.provider_id().to_string(),
                     model_id: executor.model_id().to_string(),
-                    estimated_cost_usd: 0.0,
+                    estimated_cost_usd: checkpoint.usage.charged_cost_micros as f64 / 1_000_000.0,
                     usage: checkpoint.usage,
                 }
             }
@@ -2601,7 +2614,7 @@ impl AgentKernelImpl {
             0,
             crate::execution::UsageTelemetry::default(),
         )
-        .await;
+        .await?;
 
         Ok(output)
     }

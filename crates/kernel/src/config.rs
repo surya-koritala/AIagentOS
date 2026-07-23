@@ -81,8 +81,16 @@ pub struct Config {
 pub struct BudgetConfig {
     #[serde(default = "default_agent_tokens_per_min")]
     pub agent_tokens_per_min: u64,
+    /// Maximum cumulative tool calls in one logical agent turn. This count is
+    /// carried through pause/resume checkpoints and resets for the next user
+    /// turn. `0` means unlimited.
     #[serde(default)]
     pub max_tool_calls: u32,
+    /// Maximum tool calls that may execute concurrently for one agent's
+    /// cgroup. This is independent from the cumulative per-turn limit above;
+    /// `0` means unlimited.
+    #[serde(default)]
+    pub max_concurrent_tool_calls: u32,
     #[serde(default)]
     pub max_context_tokens: u64,
     #[serde(default = "default_rpm")]
@@ -117,6 +125,7 @@ impl Default for BudgetConfig {
         Self {
             agent_tokens_per_min: default_agent_tokens_per_min(),
             max_tool_calls: 0,
+            max_concurrent_tool_calls: 0,
             max_context_tokens: 0,
             rpm: default_rpm(),
             tpm: default_tpm(),
@@ -387,13 +396,19 @@ mod tests {
         let cfg: Config = toml::from_str(toml).unwrap();
         assert_eq!(cfg.budgets.agent_tokens_per_min, 50_000);
         assert_eq!(cfg.budgets.rpm, 60);
+        assert_eq!(cfg.budgets.max_tool_calls, 0);
+        assert_eq!(cfg.budgets.max_concurrent_tool_calls, 0);
 
         // And an explicit budget round-trips through TOML.
         let mut cfg = Config::default();
         cfg.budgets.agent_tokens_per_min = 12_345;
+        cfg.budgets.max_tool_calls = 7;
+        cfg.budgets.max_concurrent_tool_calls = 2;
         let s = toml::to_string_pretty(&cfg).unwrap();
         let parsed: Config = toml::from_str(&s).unwrap();
         assert_eq!(parsed.budgets.agent_tokens_per_min, 12_345);
+        assert_eq!(parsed.budgets.max_tool_calls, 7);
+        assert_eq!(parsed.budgets.max_concurrent_tool_calls, 2);
     }
 
     #[test]

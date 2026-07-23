@@ -18,7 +18,7 @@ pub struct CgroupLimits {
     /// Max tokens per minute (0 = unlimited).
     pub tokens_per_min: u64,
     /// Max concurrent tool calls (0 = unlimited).
-    pub max_tool_calls: u32,
+    pub max_concurrent_tool_calls: u32,
     /// Max context size in tokens (0 = unlimited).
     pub max_context_tokens: u64,
     /// Max agents in this group (0 = unlimited).
@@ -196,8 +196,8 @@ impl CgroupManager {
         while let Some(id) = current {
             let parent = {
                 let mut cg = self.groups.get_mut(&id)?;
-                if cg.limits.max_tool_calls > 0
-                    && cg.usage.active_tool_calls >= cg.limits.max_tool_calls
+                if cg.limits.max_concurrent_tool_calls > 0
+                    && cg.usage.active_tool_calls >= cg.limits.max_concurrent_tool_calls
                 {
                     drop(cg);
                     for acquired_id in acquired {
@@ -331,13 +331,13 @@ mod tests {
     }
 
     #[test]
-    fn tool_call_limit_is_atomic_and_released_on_drop() {
+    fn concurrent_tool_call_limit_is_atomic_and_released_on_drop() {
         let mgr = std::sync::Arc::new(CgroupManager::new());
         let cg = mgr.create(
             "tools".into(),
             mgr.root(),
             CgroupLimits {
-                max_tool_calls: 1,
+                max_concurrent_tool_calls: 1,
                 ..Default::default()
             },
         );
@@ -347,6 +347,25 @@ mod tests {
         drop(first);
         assert_eq!(mgr.get(cg).unwrap().usage.active_tool_calls, 0);
         assert!(mgr.try_acquire_tool_call(cg).is_some());
+    }
+
+    #[test]
+    fn zero_concurrent_tool_call_limit_is_unlimited_and_slot_scoped() {
+        let mgr = std::sync::Arc::new(CgroupManager::new());
+        let unlimited = mgr.create("unlimited".into(), mgr.root(), CgroupLimits::default());
+
+        let first = mgr
+            .try_acquire_tool_call(unlimited)
+            .expect("first concurrent call admitted");
+        let second = mgr
+            .try_acquire_tool_call(unlimited)
+            .expect("zero means concurrent calls are unlimited");
+        assert_eq!(mgr.get(unlimited).unwrap().usage.active_tool_calls, 2);
+
+        drop(first);
+        assert_eq!(mgr.get(unlimited).unwrap().usage.active_tool_calls, 1);
+        drop(second);
+        assert_eq!(mgr.get(unlimited).unwrap().usage.active_tool_calls, 0);
     }
 
     #[test]

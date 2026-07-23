@@ -81,7 +81,10 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
 - **Correct accounting and live metrics** — provider/model usage, retries,
   latency, configurable pricing, hierarchical budgets/quotas, active execution,
   queue state, and node load now use runtime evidence with atomic concurrency
-  tests. (#109)
+  tests. Exact micro-dollar charges rehydrate global, tenant, and agent ceilings
+  across restart without repricing history. Cumulative per-turn tool limits are
+  now distinct from concurrent tool slots and persist across pause/resume.
+  (#109)
 - **Wire protocol v2** — typed error categories and retry hints are served while
   retaining the released v1 compatibility fixture; SDK negotiation is automatic.
   The complete v1 compatibility/conformance commitment remains tracked by #121.

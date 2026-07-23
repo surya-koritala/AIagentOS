@@ -3,6 +3,7 @@
 //! Provides SQLite-backed persistence for conversation history, working state,
 //! tasks, results, and long-term facts with retry logic and summarization.
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
@@ -76,6 +77,24 @@ pub struct UsageRecord {
     pub model: String,
     pub tool_calls: usize,
     pub estimated_cost_usd: f64,
+    /// Exact charge applied by the budget enforcer, in micro-USD. This is the
+    /// durable accounting source of truth; `estimated_cost_usd` is retained for
+    /// operator display and backwards compatibility only.
+    pub cost_micros: u64,
+}
+
+/// Restart-safe cumulative budget state reconstructed from durable usage rows.
+///
+/// Costs are summed row-by-row with saturating arithmetic so a corrupt or
+/// extremely long-lived log cannot wrap a ceiling back to an apparently lower
+/// spend. Agent-to-tenant mappings include zero-spend persisted agents as well
+/// as legacy/orphaned usage rows (which map to [`DEFAULT_TENANT`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BudgetUsageSnapshot {
+    pub global_micros: u64,
+    pub per_agent_micros: HashMap<AgentId, u64>,
+    pub per_tenant_micros: HashMap<String, u64>,
+    pub agent_tenants: HashMap<AgentId, String>,
 }
 
 /// The durable identity + config of a created agent, as stored in the `agents`
@@ -299,7 +318,8 @@ impl SqliteContextManager {
                 provider_reported_requests INTEGER NOT NULL DEFAULT 0,
                 estimated_requests INTEGER NOT NULL DEFAULT 0,
                 model TEXT,
-                estimated_cost_usd REAL
+                estimated_cost_usd REAL,
+                cost_micros INTEGER NOT NULL DEFAULT 0
             );
             CREATE VIRTUAL TABLE IF NOT EXISTS conversations_fts USING fts5(conversation_id, content);
             CREATE TABLE IF NOT EXISTS agent_kv (
@@ -411,9 +431,26 @@ impl SqliteContextManager {
                 "provider_latency_ms INTEGER NOT NULL DEFAULT 0",
                 "provider_reported_requests INTEGER NOT NULL DEFAULT 0",
                 "estimated_requests INTEGER NOT NULL DEFAULT 0",
+                "cost_micros INTEGER NOT NULL DEFAULT 0",
             ] {
                 let _ = conn.execute(&format!("ALTER TABLE usage_log ADD COLUMN {column}"), []);
             }
+            // Older rows only stored a floating-point USD estimate. Backfill
+            // once into the exact integer unit used by enforcement. New rows
+            // write this field directly and therefore need no conversion.
+            conn.execute(
+                "UPDATE usage_log
+                 SET cost_micros = CASE
+                     WHEN estimated_cost_usd IS NULL OR estimated_cost_usd <= 0.0 THEN 0
+                     WHEN estimated_cost_usd >= 9223372036854.775807
+                         THEN 9223372036854775807
+                     ELSE CAST(ROUND(estimated_cost_usd * 1000000.0) AS INTEGER)
+                 END
+                 WHERE cost_micros = 0
+                   AND COALESCE(estimated_cost_usd, 0.0) > 0.0",
+                [],
+            )
+            .map_err(|error| ContextError::StorageError(error.to_string()))?;
             // A process can die after atomically claiming a checkpoint. Re-arm
             // that claim on boot: external side effects therefore have the
             // documented at-least-once crash semantics unless the tool uses its
@@ -789,12 +826,76 @@ impl SqliteContextManager {
         Ok(id)
     }
 
-    pub fn log_usage(&self, agent_id: AgentId, record: &UsageRecord) {
+    pub fn log_usage(&self, agent_id: AgentId, record: &UsageRecord) -> Result<(), ContextError> {
+        let cost_micros = i64::try_from(record.cost_micros).map_err(|_| {
+            ContextError::PersistenceFailed(format!(
+                "cost_micros {} exceeds SQLite INTEGER range",
+                record.cost_micros
+            ))
+        })?;
         let conn = self.conn.lock().unwrap();
-        let _ = conn.execute(
-            "INSERT INTO usage_log (id, agent_id, timestamp, tokens_used, input_tokens, output_tokens, cached_tokens, llm_requests, retries, provider_latency_ms, provider_reported_requests, estimated_requests, provider, model, tool_calls, estimated_cost_usd) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
-            rusqlite::params![uuid::Uuid::new_v4().to_string(), agent_id.to_string(), chrono::Utc::now().to_rfc3339(), record.tokens_used, record.input_tokens, record.output_tokens, record.cached_tokens, record.llm_requests, record.retries, record.provider_latency_ms, record.provider_reported_requests, record.estimated_requests, record.provider, record.model, record.tool_calls as i64, record.estimated_cost_usd.max(0.0)],
-        );
+        conn.execute(
+            "INSERT INTO usage_log (id, agent_id, timestamp, tokens_used, input_tokens, output_tokens, cached_tokens, llm_requests, retries, provider_latency_ms, provider_reported_requests, estimated_requests, provider, model, tool_calls, estimated_cost_usd, cost_micros) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+            rusqlite::params![uuid::Uuid::new_v4().to_string(), agent_id.to_string(), chrono::Utc::now().to_rfc3339(), record.tokens_used, record.input_tokens, record.output_tokens, record.cached_tokens, record.llm_requests, record.retries, record.provider_latency_ms, record.provider_reported_requests, record.estimated_requests, record.provider, record.model, record.tool_calls as i64, record.estimated_cost_usd.max(0.0), cost_micros],
+        )
+        .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
+        Ok(())
+    }
+
+    /// Reconstruct exact cumulative budget state from durable usage rows.
+    ///
+    /// SQLite's `SUM(INTEGER)` can overflow before Rust sees the result, so
+    /// every row is accumulated in Rust with `u64::saturating_add`.
+    pub fn load_budget_usage_snapshot(&self) -> Result<BudgetUsageSnapshot, ContextError> {
+        let conn = self.conn.lock().unwrap();
+        let mut snapshot = BudgetUsageSnapshot::default();
+
+        {
+            let mut stmt = conn
+                .prepare("SELECT id, tenant_id FROM agents")
+                .map_err(|error| ContextError::StorageError(error.to_string()))?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })
+                .map_err(|error| ContextError::StorageError(error.to_string()))?;
+            for row in rows {
+                let (agent, tenant) =
+                    row.map_err(|error| ContextError::StorageError(error.to_string()))?;
+                let agent = uuid::Uuid::parse_str(&agent)
+                    .map_err(|error| ContextError::StorageError(error.to_string()))?;
+                snapshot.agent_tenants.insert(agent, tenant);
+            }
+        }
+
+        let mut stmt = conn
+            .prepare("SELECT agent_id, cost_micros FROM usage_log ORDER BY rowid ASC")
+            .map_err(|error| ContextError::StorageError(error.to_string()))?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })
+            .map_err(|error| ContextError::StorageError(error.to_string()))?;
+        for row in rows {
+            let (agent, cost_micros) =
+                row.map_err(|error| ContextError::StorageError(error.to_string()))?;
+            let agent = uuid::Uuid::parse_str(&agent)
+                .map_err(|error| ContextError::StorageError(error.to_string()))?;
+            let cost_micros = u64::try_from(cost_micros)
+                .map_err(|error| ContextError::StorageError(error.to_string()))?;
+            let tenant = snapshot
+                .agent_tenants
+                .entry(agent)
+                .or_insert_with(|| DEFAULT_TENANT.to_string())
+                .clone();
+
+            snapshot.global_micros = snapshot.global_micros.saturating_add(cost_micros);
+            let agent_total = snapshot.per_agent_micros.entry(agent).or_insert(0);
+            *agent_total = agent_total.saturating_add(cost_micros);
+            let tenant_total = snapshot.per_tenant_micros.entry(tenant).or_insert(0);
+            *tenant_total = tenant_total.saturating_add(cost_micros);
+        }
+        Ok(snapshot)
     }
 
     pub fn get_total_usage(&self) -> (u64, f64) {
@@ -808,7 +909,7 @@ impl SqliteContextManager {
     pub fn latest_usage(&self, agent_id: AgentId) -> Option<UsageRecord> {
         let conn = self.conn.lock().unwrap();
         conn.query_row(
-            "SELECT tokens_used, input_tokens, output_tokens, cached_tokens, llm_requests, retries, provider_latency_ms, provider_reported_requests, estimated_requests, COALESCE(provider, ''), COALESCE(model, ''), tool_calls, COALESCE(estimated_cost_usd, 0.0) FROM usage_log WHERE agent_id = ?1 ORDER BY rowid DESC LIMIT 1",
+            "SELECT tokens_used, input_tokens, output_tokens, cached_tokens, llm_requests, retries, provider_latency_ms, provider_reported_requests, estimated_requests, COALESCE(provider, ''), COALESCE(model, ''), tool_calls, COALESCE(estimated_cost_usd, 0.0), cost_micros FROM usage_log WHERE agent_id = ?1 ORDER BY rowid DESC LIMIT 1",
             [agent_id.to_string()],
             |row| {
                 Ok(UsageRecord {
@@ -825,6 +926,7 @@ impl SqliteContextManager {
                     model: row.get(10)?,
                     tool_calls: row.get::<_, i64>(11)? as usize,
                     estimated_cost_usd: row.get(12)?,
+                    cost_micros: row.get::<_, i64>(13)? as u64,
                 })
             },
         )
@@ -2384,11 +2486,95 @@ mod tests {
             provider: "openai".into(),
             model: "gpt-test".into(),
             tool_calls: 3,
-            estimated_cost_usd: 0.0045,
+            estimated_cost_usd: 0.004501,
+            cost_micros: 4_501,
         };
-        mgr.log_usage(agent, &expected);
+        mgr.log_usage(agent, &expected).unwrap();
 
         let record = mgr.latest_usage(agent).expect("usage row");
         assert_eq!(record, expected);
+    }
+
+    #[test]
+    fn legacy_usage_cost_is_backfilled_to_exact_micros() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE usage_log (
+                id TEXT PRIMARY KEY,
+                agent_id TEXT NOT NULL,
+                timestamp TEXT NOT NULL,
+                tokens_used INTEGER NOT NULL,
+                model TEXT,
+                estimated_cost_usd REAL
+            );
+            INSERT INTO usage_log
+                (id, agent_id, timestamp, tokens_used, model, estimated_cost_usd)
+            VALUES
+                ('legacy', '00000000-0000-0000-0000-000000000001',
+                 '2026-01-01T00:00:00Z', 1, 'legacy-model', 0.0045006);",
+        )
+        .unwrap();
+        let mgr = SqliteContextManager {
+            conn: Mutex::new(conn),
+            embedder: crate::memory_manager::default_embedder(),
+        };
+        mgr.init_schema().unwrap();
+
+        let record = mgr
+            .latest_usage(uuid::Uuid::from_u128(1))
+            .expect("migrated usage row");
+        assert_eq!(record.cost_micros, 4_501);
+        assert!((record.estimated_cost_usd - 0.0045006).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn budget_snapshot_saturates_and_preserves_tenant_mapping() {
+        let mgr = SqliteContextManager::in_memory().unwrap();
+        let agent = uuid::Uuid::new_v4();
+        let now = Utc::now();
+        mgr.save_agent(&PersistedAgent {
+            id: agent,
+            session_id: uuid::Uuid::new_v4(),
+            tenant_id: "tenant-a".to_string(),
+            name: "budget-agent".to_string(),
+            task: "test saturation".to_string(),
+            llm_provider: "stub".to_string(),
+            permission_profile: "default".to_string(),
+            priority: 3,
+            status: "\"Stopped\"".to_string(),
+            sandbox_config_json: None,
+            created_at: now,
+            last_activity_at: now,
+        })
+        .unwrap();
+
+        let usage = |cost_micros| UsageRecord {
+            tokens_used: 0,
+            input_tokens: 0,
+            output_tokens: 0,
+            cached_tokens: 0,
+            llm_requests: 0,
+            retries: 0,
+            provider_latency_ms: 0,
+            provider_reported_requests: 0,
+            estimated_requests: 0,
+            provider: "stub".to_string(),
+            model: "stub".to_string(),
+            tool_calls: 0,
+            estimated_cost_usd: 0.0,
+            cost_micros,
+        };
+        mgr.log_usage(agent, &usage(i64::MAX as u64)).unwrap();
+        mgr.log_usage(agent, &usage(i64::MAX as u64)).unwrap();
+        mgr.log_usage(agent, &usage(1)).unwrap();
+
+        let snapshot = mgr.load_budget_usage_snapshot().unwrap();
+        assert_eq!(snapshot.global_micros, u64::MAX);
+        assert_eq!(snapshot.per_agent_micros.get(&agent), Some(&u64::MAX));
+        assert_eq!(snapshot.per_tenant_micros.get("tenant-a"), Some(&u64::MAX));
+        assert_eq!(
+            snapshot.agent_tenants.get(&agent).map(String::as_str),
+            Some("tenant-a")
+        );
     }
 }

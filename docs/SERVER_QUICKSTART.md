@@ -137,6 +137,7 @@ agentos_syscall_gate_total{result="denied_mac"} 0
 agentos_syscall_gate_total{result="denied_cgroup"} 0
 agentos_syscall_gate_total{result="denied_namespace"} 1
 agentos_syscall_gate_total{result="denied_unknown"} 0
+agentos_syscall_gate_total{result="denied_approval"} 0
 # HELP agentos_syscall_gate_audited_total Allowed tool calls that also matched a MAC audit rule.
 # TYPE agentos_syscall_gate_audited_total counter
 agentos_syscall_gate_audited_total 0

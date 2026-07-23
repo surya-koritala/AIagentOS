@@ -166,6 +166,10 @@ impl MetricsSnapshot {
             g.denied_mac
         ));
         out.push_str(&format!(
+            "agentos_syscall_gate_total{{result=\"denied_approval\"}} {}\n",
+            g.denied_approval
+        ));
+        out.push_str(&format!(
             "agentos_syscall_gate_total{{result=\"denied_cgroup\"}} {}\n",
             g.denied_cgroup
         ));
@@ -368,6 +372,7 @@ mod tests {
                 allowed: 5,
                 denied_capability: 2,
                 denied_mac: 1,
+                denied_approval: 6,
                 denied_cgroup: 0,
                 denied_namespace: 3,
                 denied_unknown: 4,
@@ -424,6 +429,7 @@ mod tests {
         assert!(text.contains("agentos_syscall_gate_total{result=\"allowed\"} 5"));
         assert!(text.contains("agentos_syscall_gate_total{result=\"denied_capability\"} 2"));
         assert!(text.contains("agentos_syscall_gate_total{result=\"denied_mac\"} 1"));
+        assert!(text.contains("agentos_syscall_gate_total{result=\"denied_approval\"} 6"));
         assert!(text.contains("agentos_syscall_gate_total{result=\"denied_namespace\"} 3"));
         assert!(text.contains("agentos_syscall_gate_total{result=\"denied_unknown\"} 4"));
         assert!(text.contains("agentos_syscall_gate_audited_total 1"));
@@ -455,9 +461,15 @@ mod tests {
         // Register an agent directly with the gate and drive real check_tool_call
         // decisions: an allowed read, and a denied write (no CAP_FILE_WRITE).
         let kid = uuid::Uuid::new_v4();
-        kernel
+        let pid = kernel
             .syscall_gate
             .register_agent(kid, CapabilitySet::none(), None);
+        kernel
+            .syscall_gate
+            .mac
+            .lock()
+            .await
+            .label_agent(pid, "profile:read-only".into());
 
         // read_file requires no capability → allowed.
         let allowed = kernel

@@ -183,8 +183,10 @@ fn render_header(f: &mut Frame, area: Rect, app: &App) {
                 app.gate.allowed,
                 app.gate.denied_capability
                     + app.gate.denied_mac
+                    + app.gate.denied_approval
                     + app.gate.denied_cgroup
                     + app.gate.denied_namespace
+                    + app.gate.denied_unknown
             ),
             Style::default().fg(Color::Green),
         ),

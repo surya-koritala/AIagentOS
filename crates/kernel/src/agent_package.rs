@@ -421,6 +421,8 @@ memory = ["Prefer primary sources.", "Cite everything."]
             .publish(SharedToolDef::new(
                 "read_file",
                 "read a file",
+                crate::resources::ResourceType::Filesystem,
+                "read",
                 crate::tools::ToolSecurity::constant(
                     crate::tools::SecurityAction::Read,
                     "test:file",
@@ -431,6 +433,8 @@ memory = ["Prefer primary sources.", "Cite everything."]
             .publish(SharedToolDef::new(
                 "http_get",
                 "fetch a url",
+                crate::resources::ResourceType::Network,
+                "get",
                 crate::tools::ToolSecurity::constant(
                     crate::tools::SecurityAction::Network,
                     "https://example.invalid",

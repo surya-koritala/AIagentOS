@@ -1039,21 +1039,23 @@ impl AgentExecutor {
     /// the model can recover (try another tool, ask the user, etc.) without
     /// the kernel trusting the LLM to obey policy.
     async fn execute_tool(&self, tool_call: &crate::connector::ToolCall) -> String {
-        // Estimate token cost: arguments + tool name. Conservative ratio of 4
-        // chars per token plus a 10-token floor so trivial calls still count.
-        let est_tokens: u64 = (tool_call.arguments.to_string().len() as u64 / 4)
-            .saturating_add(tool_call.name.len() as u64 / 4)
-            .saturating_add(10);
-
         // Resolve action, capabilities, and resource using the binding's
         // validated declaration. Unknown tools and malformed resource arguments
         // fail before policy evaluation or provider execution.
-        let (security, resource) = match self
+        match self
             .tool_registry
-            .security_context(&tool_call.name, &tool_call.arguments)
+            .authorize_call(
+                &self.syscall_gate,
+                self.agent_id,
+                &tool_call.name,
+                &tool_call.arguments,
+            )
+            .await
         {
-            Ok(context) => context,
-            Err(error) if error.starts_with("unknown tool") => {
+            Ok(_) => {}
+            Err(crate::tools::ToolAuthorizationError::InvalidDeclaration(error))
+                if error.starts_with("unknown tool") =>
+            {
                 return format!(
                     "Unknown tool '{}'. Available tools: {}",
                     tool_call.name,
@@ -1066,30 +1068,6 @@ impl AgentExecutor {
                 )
             }
             Err(error) => return format!("Tool '{}' denied by kernel: {error}", tool_call.name),
-        };
-
-        // Mandatory enforcement: every tool call is checked against the gate
-        // (namespace → capability → MAC → cgroup). There is no ungoverned path —
-        // an unconfined gate is the only bypass and must be requested by name.
-        match self
-            .syscall_gate
-            .check_tool_call_declared(
-                self.agent_id,
-                &tool_call.name,
-                &resource,
-                est_tokens,
-                &security,
-            )
-            .await
-        {
-            Ok(_) => { /* proceed */ }
-            Err(denial) => {
-                return format!(
-                    "Tool '{}' denied by kernel: {}",
-                    tool_call.name,
-                    denial.message()
-                );
-            }
         }
 
         let _tool_slot = match self.syscall_gate.acquire_tool_call(self.agent_id) {
@@ -1309,7 +1287,11 @@ mod tests {
 
         // Register the agent with the gate WITHOUT CAP_FILE_WRITE (net only),
         // mirroring a restricted permission profile rather than full-access.
-        let gate = Arc::new(SyscallGate::new(Arc::new(CgroupManager::new())));
+        let gate = Arc::new(SyscallGate::with_mac(
+            Arc::new(CgroupManager::new()),
+            false,
+            Vec::new(),
+        ));
         let mut caps = CapabilitySet::none();
         caps.grant(CapabilitySet::CAP_NET_ACCESS);
         gate.register_agent(agent_id, caps, None);

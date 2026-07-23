@@ -8,8 +8,8 @@
 //! It is modeled on [`crate::syscall_server`]: a server struct holding an
 //! `Arc<AgentKernelImpl>` that dispatches each request through the *same* kernel
 //! paths the in-process code uses. In particular, `tools/call` runs through the
-//! [`SyscallGate`](crate::syscall_gate::SyscallGate) (capability / MAC / cgroup /
-//! namespace) **before** the [`ResourceBroker`], exactly like
+//! [`SyscallGate`](crate::syscall_gate::SyscallGate) (capability / MAC / approval /
+//! cgroup / namespace) **before** the [`ResourceBroker`], exactly like
 //! [`crate::syscall_server`]'s `CallTool` — so a gate denial comes back as a
 //! JSON-RPC error, not a bypass. Enforcement holds over the wire.
 //!
@@ -110,7 +110,7 @@ impl JsonRpcResponse {
 ///
 /// Pure routing: every method goes through the same `AgentKernelImpl` surfaces
 /// the in-process code uses. `tools/call` in particular runs the syscall gate
-/// before the resource broker, so capability / MAC / cgroup / namespace checks
+/// before the resource broker, so capability / MAC / approval / cgroup / namespace checks
 /// apply — a denial becomes a JSON-RPC error (never a bypass or a panic).
 ///
 /// Returns `None` for a notification (a request with no `id`), which by the
@@ -223,32 +223,22 @@ async fn handle_tools_call(
 
     let args = params.get("arguments").cloned().unwrap_or(json!({}));
 
-    // Token estimate + registry-declared resource extractor, mirroring the
-    // executor and syscall paths exactly.
-    let est_tokens = (args.to_string().len() as u64 / 4)
-        .saturating_add(tool.len() as u64 / 4)
-        .saturating_add(10);
-    let (security, resource) = kernel
+    // Registry-declared security preparation is shared byte-for-byte with the
+    // executor, JSON syscall wire, and SDK-backed client path.
+    kernel
         .tool_registry
-        .security_context(&tool, &args)
-        .map_err(|error| {
-            (
+        .authorize_call(&kernel.syscall_gate, agent_id, &tool, &args)
+        .await
+        .map_err(|error| match error {
+            crate::tools::ToolAuthorizationError::InvalidDeclaration(error) => (
                 error_codes::INVALID_PARAMS,
                 format!("tool '{tool}' denied by kernel: {error}"),
-            )
+            ),
+            crate::tools::ToolAuthorizationError::Denied(denial) => (
+                error_codes::INTERNAL_ERROR,
+                format!("tool '{tool}' denied by kernel: {}", denial.message()),
+            ),
         })?;
-
-    // Enforcement first — a denial never reaches the broker.
-    if let Err(denial) = kernel
-        .syscall_gate
-        .check_tool_call_declared(agent_id, &tool, &resource, est_tokens, &security)
-        .await
-    {
-        return Err((
-            error_codes::INTERNAL_ERROR,
-            format!("tool '{tool}' denied by kernel: {}", denial.message()),
-        ));
-    }
 
     let _tool_slot = kernel
         .syscall_gate

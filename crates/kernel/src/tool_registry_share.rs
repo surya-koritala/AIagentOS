@@ -3,7 +3,8 @@
 //! In the Linux mental model tools are files (VFS); a *shared* tool registry is
 //! the package repository those files can be published to and pulled from. The
 //! platform is Rust-only with no dynamic code loading, so the shareable artifact
-//! is **data**: a [`SharedToolDef`] (name + description + JSON-Schema parameters)
+//! is **data**: a [`SharedToolDef`] containing identity, JSON-Schema, provider
+//! operation, and a complete security declaration
 //! that is `serde`-serializable, so a tool definition can be authored once,
 //! stored, transported as plain JSON/TOML, and referenced by name from many
 //! agent packages.
@@ -30,6 +31,7 @@ use crate::tools::{ToolBinding, ToolRegistry, ToolSecurity};
 /// `parameters` is a JSON-Schema object describing the tool's arguments (the same
 /// shape the kernel's [`ToolBinding::parameters_schema`] expects).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SharedToolDef {
     /// Unique tool name (the key it is published/fetched under).
     pub name: String,
@@ -43,6 +45,11 @@ pub struct SharedToolDef {
     /// [`SharedToolRegistry::publish_overwrite`]. Starts at 1.
     #[serde(default = "default_version")]
     pub version: u32,
+    /// Provider resource class. Required so packages cannot silently fall back
+    /// to process execution.
+    pub resource_type: ResourceType,
+    /// Provider operation within `resource_type`.
+    pub operation: String,
     /// Required authorization contract; intentionally has no serde default so
     /// older/incomplete shared definitions fail closed when deserialized.
     pub security: ToolSecurity,
@@ -61,6 +68,8 @@ impl SharedToolDef {
     pub fn new(
         name: impl Into<String>,
         description: impl Into<String>,
+        resource_type: ResourceType,
+        operation: impl Into<String>,
         security: ToolSecurity,
     ) -> Self {
         Self {
@@ -68,6 +77,8 @@ impl SharedToolDef {
             description: description.into(),
             parameters: empty_object_schema(),
             version: 1,
+            resource_type,
+            operation: operation.into(),
             security,
         }
     }
@@ -80,16 +91,15 @@ impl SharedToolDef {
 
     /// Convert this shared definition into a kernel-usable [`ToolBinding`].
     ///
-    /// Shared tools are pure declarations, so they bind to the generic
-    /// `Application`/`invoke` resource operation — the same surface custom tools
-    /// use. The syscall gate still governs whether a given agent may call it.
+    /// The resource class and operation are part of the signed/shareable data;
+    /// conversion never substitutes a more privileged provider implicitly.
     pub fn to_binding(&self) -> ToolBinding {
         ToolBinding {
             name: self.name.clone(),
             description: self.description.clone(),
             parameters_schema: self.parameters.clone(),
-            resource_type: ResourceType::Application,
-            operation: "invoke".to_string(),
+            resource_type: self.resource_type.clone(),
+            operation: self.operation.clone(),
             security: self.security.clone(),
         }
     }
@@ -127,9 +137,8 @@ impl SharedToolRegistry {
     /// Publish a new definition. Rejects a duplicate name with
     /// [`ShareError::DuplicateName`].
     pub fn publish(&mut self, mut def: SharedToolDef) -> Result<(), ShareError> {
-        if def.name.trim().is_empty() {
-            return Err(ShareError::Invalid("`name` must not be empty".into()));
-        }
+        ToolRegistry::validate_binding(&def.to_binding())
+            .map_err(|error| ShareError::Invalid(error.to_string()))?;
         if self.defs.contains_key(&def.name) {
             return Err(ShareError::DuplicateName(def.name));
         }
@@ -143,9 +152,8 @@ impl SharedToolRegistry {
     /// Publish a definition, overwriting any existing one of the same name and
     /// bumping the stored `version` to `previous + 1`. Returns the new version.
     pub fn publish_overwrite(&mut self, mut def: SharedToolDef) -> Result<u32, ShareError> {
-        if def.name.trim().is_empty() {
-            return Err(ShareError::Invalid("`name` must not be empty".into()));
-        }
+        ToolRegistry::validate_binding(&def.to_binding())
+            .map_err(|error| ShareError::Invalid(error.to_string()))?;
         let next = match self.defs.get(&def.name) {
             Some(existing) => existing.version + 1,
             None => def.version.max(1),
@@ -228,7 +236,9 @@ mod tests {
         SharedToolDef::new(
             name,
             "does a thing",
-            ToolSecurity::argument(crate::tools::SecurityAction::Read, "q"),
+            ResourceType::Application,
+            "invoke",
+            ToolSecurity::argument(crate::tools::SecurityAction::Execute, "q").sandboxed(),
         )
         .with_parameters(serde_json::json!({
             "type": "object",
@@ -264,6 +274,8 @@ mod tests {
             reg.publish(SharedToolDef::new(
                 "",
                 "x",
+                ResourceType::Filesystem,
+                "read",
                 ToolSecurity::constant(crate::tools::SecurityAction::Read, "test"),
             )),
             Err(ShareError::Invalid(_))
@@ -307,7 +319,9 @@ mod tests {
             "name":"legacy",
             "description":"missing security",
             "parameters":{"type":"object","properties":{}},
-            "version":1
+            "version":1,
+            "resource_type":"Filesystem",
+            "operation":"read"
         }"#;
         assert!(serde_json::from_str::<SharedToolDef>(missing).is_err());
     }

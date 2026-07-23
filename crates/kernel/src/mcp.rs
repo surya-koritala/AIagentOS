@@ -17,6 +17,7 @@ use crate::tools::{ToolBinding, ToolRegistry, ToolSecurity};
 
 /// MCP server configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct McpServerConfig {
     pub name: String,
     pub command: String,
@@ -37,6 +38,7 @@ pub struct McpServer {
 
 /// A tool discovered from an MCP server.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct McpTool {
     pub name: String,
     pub description: String,
@@ -45,6 +47,40 @@ pub struct McpTool {
     /// descriptions without this declaration are discoverable but not executable.
     #[serde(rename = "agentosSecurity")]
     pub security: Option<ToolSecurity>,
+    /// AgentOS extension naming the provider class. Remote data cannot choose
+    /// an implicit process-execution fallback by omitting this field.
+    #[serde(rename = "agentosResourceType")]
+    pub resource_type: Option<ResourceType>,
+    /// AgentOS extension naming the provider operation.
+    #[serde(rename = "agentosOperation")]
+    pub operation: Option<String>,
+}
+
+impl McpTool {
+    fn to_binding(&self, server_name: &str) -> Result<ToolBinding, String> {
+        let prefixed_name = format!("mcp_{server_name}_{}", self.name);
+        let security = self.security.clone().ok_or_else(|| {
+            format!("MCP tool '{prefixed_name}' omitted required agentosSecurity")
+        })?;
+        let resource_type = self.resource_type.clone().ok_or_else(|| {
+            format!("MCP tool '{prefixed_name}' omitted required agentosResourceType")
+        })?;
+        let operation = self
+            .operation
+            .clone()
+            .filter(|operation| !operation.trim().is_empty())
+            .ok_or_else(|| {
+                format!("MCP tool '{prefixed_name}' omitted required agentosOperation")
+            })?;
+        Ok(ToolBinding {
+            name: prefixed_name,
+            description: format!("[MCP:{server_name}] {}", self.description),
+            parameters_schema: self.input_schema.clone(),
+            resource_type,
+            operation,
+            security,
+        })
+    }
 }
 
 /// JSON-RPC request.
@@ -133,6 +169,14 @@ impl McpServer {
                             .get("agentosSecurity")
                             .cloned()
                             .and_then(|value| serde_json::from_value(value).ok()),
+                        resource_type: t
+                            .get("agentosResourceType")
+                            .cloned()
+                            .and_then(|value| serde_json::from_value(value).ok()),
+                        operation: t
+                            .get("agentosOperation")
+                            .and_then(|value| value.as_str())
+                            .map(str::to_string),
                     })
                 })
                 .collect();
@@ -185,21 +229,10 @@ impl McpServer {
         let mut bindings = Vec::new();
         let mut errors = Vec::new();
         for tool in &self.tools {
-            let prefixed_name = format!("mcp_{}_{}", self.config.name, tool.name);
-            let Some(security) = tool.security.clone() else {
-                errors.push(format!(
-                    "MCP tool '{prefixed_name}' omitted required agentosSecurity"
-                ));
-                continue;
-            };
-            bindings.push(ToolBinding {
-                name: prefixed_name,
-                description: format!("[MCP:{}] {}", self.config.name, tool.description),
-                parameters_schema: tool.input_schema.clone(),
-                resource_type: ResourceType::Application,
-                operation: "mcp_call".into(),
-                security,
-            });
+            match tool.to_binding(&self.config.name) {
+                Ok(binding) => bindings.push(binding),
+                Err(error) => errors.push(error),
+            }
         }
         if !errors.is_empty() {
             return Err(errors);
@@ -290,4 +323,61 @@ pub fn load_mcp_configs() -> Vec<McpServerConfig> {
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tools::{SecurityAction, ToolSecurity};
+
+    fn declared_tool() -> McpTool {
+        McpTool {
+            name: "fetch".into(),
+            description: "fetch a URL".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {"url": {"type": "string"}},
+                "required": ["url"]
+            }),
+            security: Some(ToolSecurity::argument(SecurityAction::Network, "url")),
+            resource_type: Some(ResourceType::Network),
+            operation: Some("get".into()),
+        }
+    }
+
+    #[test]
+    fn mcp_binding_requires_every_local_security_extension() {
+        let mut tool = declared_tool();
+        assert!(tool.to_binding("remote").is_ok());
+
+        tool.resource_type = None;
+        assert!(tool
+            .to_binding("remote")
+            .unwrap_err()
+            .contains("agentosResourceType"));
+        tool = declared_tool();
+        tool.operation = None;
+        assert!(tool
+            .to_binding("remote")
+            .unwrap_err()
+            .contains("agentosOperation"));
+        tool = declared_tool();
+        tool.security = None;
+        assert!(tool
+            .to_binding("remote")
+            .unwrap_err()
+            .contains("agentosSecurity"));
+    }
+
+    #[test]
+    fn mcp_binding_cannot_disguise_network_as_filesystem_read() {
+        let mut tool = declared_tool();
+        tool.resource_type = Some(ResourceType::Application);
+        tool.security = Some(ToolSecurity::argument(SecurityAction::Read, "url"));
+        let registry = ToolRegistry::new();
+        let error = registry
+            .register(tool.to_binding("remote").unwrap())
+            .unwrap_err();
+        assert!(error.to_string().contains("contradicts resource type"));
+    }
 }

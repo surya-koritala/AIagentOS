@@ -27,6 +27,15 @@ pub type Pid = u64;
 pub enum GateDenial {
     /// Agent is not registered with the gate.
     UnknownAgent,
+    /// Tool name has no validated built-in declaration on the compatibility
+    /// path. Live registries reject it even earlier.
+    UnknownTool(String),
+    /// A validated tool declaration requires an exact, one-shot local
+    /// operator approval that has not been granted.
+    ApprovalRequired {
+        tool: String,
+        policy: crate::tools::ApprovalPolicy,
+    },
     /// Required capability missing.
     MissingCapability(u64),
     /// MAC policy denied this action.
@@ -50,6 +59,12 @@ impl GateDenial {
     pub fn message(&self) -> String {
         match self {
             GateDenial::UnknownAgent => "agent not registered with kernel (ESRCH)".to_string(),
+            GateDenial::UnknownTool(tool) => {
+                format!("tool '{tool}' has no validated security declaration (ENOENT)")
+            }
+            GateDenial::ApprovalRequired { tool, policy } => {
+                format!("tool '{tool}' requires {policy:?} approval (EACCES)")
+            }
             GateDenial::MissingCapability(cap) => format!("missing capability 0x{:x} (EPERM)", cap),
             GateDenial::MacDeny { action, resource } => {
                 format!("MAC policy denies {} on {} (EACCES)", action, resource)
@@ -72,6 +87,16 @@ impl GateDenial {
 pub struct ToolAction {
     pub action: &'static str,
     pub required_cap: Option<u64>,
+}
+
+struct ToolCallContract<'a> {
+    tool_name: &'a str,
+    resource: &'a str,
+    estimated_tokens: u64,
+    action: &'static str,
+    required_capabilities: &'a [u64],
+    approval_policy: crate::tools::ApprovalPolicy,
+    approval_contract: Option<&'a str>,
 }
 
 impl ToolAction {
@@ -103,14 +128,19 @@ impl ToolAction {
 
 /// Classify a built-in tool name into an action + required capability.
 ///
-/// Unknown/custom tools fail closed as process execution and require
-/// `CAP_EXEC`. Live registries should pass their explicit declaration instead;
-/// this fallback prevents a new name from bypassing capability enforcement.
-pub fn classify_tool(tool_name: &str) -> ToolAction {
+/// This informational classifier returns the conservative `EXEC` class for an
+/// unknown name. Authorization does not use that fallback: `check_tool_call`
+/// rejects names missing from the built-in catalog, and live registries pass a
+/// validated declaration to `check_tool_call_declared`.
+fn default_security_catalog(
+) -> &'static std::collections::HashMap<String, crate::tools::ToolSecurity> {
     static CATALOG: OnceLock<std::collections::HashMap<String, crate::tools::ToolSecurity>> =
         OnceLock::new();
-    let catalog = CATALOG.get_or_init(crate::tools::ToolRegistry::default_security_catalog);
-    catalog
+    CATALOG.get_or_init(crate::tools::ToolRegistry::default_security_catalog)
+}
+
+pub fn classify_tool(tool_name: &str) -> ToolAction {
+    default_security_catalog()
         .get(tool_name)
         .map_or(ToolAction::EXEC, |security| ToolAction {
             action: security.action.as_str(),
@@ -179,6 +209,7 @@ pub struct GateStats {
     pub allowed: u64,
     pub denied_capability: u64,
     pub denied_mac: u64,
+    pub denied_approval: u64,
     pub denied_cgroup: u64,
     pub denied_unknown: u64,
     pub denied_namespace: u64,
@@ -237,6 +268,10 @@ pub struct SyscallGate {
     /// Tool namespace assignments. A tool with a namespace is only visible to
     /// agents that are members of that namespace; absence means "global".
     tool_namespaces: DashMap<String, NamespaceId>,
+    /// Exact, single-use local approvals keyed by
+    /// (agent, tool, resource, serialized validated security contract).
+    /// No wire/package/MCP deserialization path can populate this map.
+    approvals: DashMap<(uuid::Uuid, String, String, String), crate::tools::ApprovalPolicy>,
     /// Monotonic PID allocator (starts at 1 so 0 stays reserved for "kernel").
     next_pid: AtomicU64,
     /// Optional audit sink for MAC `audit` decisions (and denials). Wired to the
@@ -246,6 +281,7 @@ pub struct SyscallGate {
     allowed: AtomicU64,
     denied_capability: AtomicU64,
     denied_mac: AtomicU64,
+    denied_approval: AtomicU64,
     denied_cgroup: AtomicU64,
     denied_unknown: AtomicU64,
     denied_namespace: AtomicU64,
@@ -269,22 +305,29 @@ impl SyscallGate {
             GateDenial::CgroupToolLimit
         })
     }
-    /// Create a new gate. By default MAC is in *permissive* mode (default-allow)
-    /// so existing tool calls keep working until a policy is loaded. Switch to
-    /// enforcing via `mac().set_enforcing(true)` and load policy rules to
-    /// activate denial.
+    /// Create a gate with the production baseline: enforcing MAC, profile-based
+    /// allow rules, and a default-deny fallthrough. Tests that intentionally
+    /// need permissive MAC must say so through [`Self::with_mac`].
     pub fn new(cgroups: std::sync::Arc<CgroupManager>) -> Self {
-        Self::with_mac(cgroups, false, Vec::new())
+        let config = crate::config::Config::default();
+        Self::with_mac(cgroups, config.mac_enforcing, config.mac_rules)
     }
 
     /// Create a gate with an explicit MAC configuration: `mac_enforcing` mode
     /// and an initial policy. The kernel uses this to wire operator MAC settings
-    /// from config; `new` is the permissive (default-allow, no rules) shortcut.
+    /// from config. Disabling enforcement is an explicit local escape hatch and
+    /// emits a security warning.
     pub fn with_mac(
         cgroups: std::sync::Arc<CgroupManager>,
         mac_enforcing: bool,
         mac_rules: Vec<crate::mac::PolicyRule>,
     ) -> Self {
+        if !mac_enforcing {
+            tracing::warn!(
+                target: "agentos::security",
+                "constructing a syscall gate with MAC enforcement DISABLED"
+            );
+        }
         let default_cgroup = cgroups.root();
         let mut mac = MacEngine::new(mac_enforcing);
         mac.load_policy(mac_rules);
@@ -295,11 +338,13 @@ impl SyscallGate {
             default_cgroup,
             records: DashMap::new(),
             tool_namespaces: DashMap::new(),
+            approvals: DashMap::new(),
             next_pid: AtomicU64::new(1),
             audit_sink: std::sync::Mutex::new(None),
             allowed: AtomicU64::new(0),
             denied_capability: AtomicU64::new(0),
             denied_mac: AtomicU64::new(0),
+            denied_approval: AtomicU64::new(0),
             denied_cgroup: AtomicU64::new(0),
             denied_unknown: AtomicU64::new(0),
             denied_namespace: AtomicU64::new(0),
@@ -316,7 +361,12 @@ impl SyscallGate {
     /// having no gate ran unconfined by default: enforcement is now mandatory by
     /// construction (the gate is a required executor dependency), and bypassing it
     /// is possible only through this one clearly-labelled door.
+    #[cfg(any(test, doc))]
     pub fn unconfined() -> Self {
+        tracing::warn!(
+            target: "agentos::security",
+            "constructing an UNCONFINED syscall gate; all tool security checks are bypassed"
+        );
         let mut gate = Self::new(std::sync::Arc::new(CgroupManager::new()));
         gate.unconfined = true;
         gate
@@ -391,6 +441,30 @@ impl SyscallGate {
         if let Some((_, rec)) = self.records.remove(&kid) {
             self.cgroups.remove_agent(rec.cgroup, rec.pid);
         }
+        self.approvals.retain(|(agent, _, _, _), _| *agent != kid);
+    }
+
+    /// Grant one exact tool call for a local trusted operator/UI. The grant is
+    /// bound to agent + tool + extracted resource and consumed only after
+    /// capability and MAC checks succeed. Returning `false` means the agent is
+    /// not currently registered.
+    pub(crate) fn grant_tool_approval(
+        &self,
+        kid: uuid::Uuid,
+        tool_name: impl Into<String>,
+        resource: impl Into<String>,
+        security: &crate::tools::ToolSecurity,
+        approval: crate::tools::ApprovalPolicy,
+    ) -> bool {
+        if approval == crate::tools::ApprovalPolicy::None || !self.records.contains_key(&kid) {
+            return false;
+        }
+        let Ok(contract) = serde_json::to_string(security) else {
+            return false;
+        };
+        self.approvals
+            .insert((kid, tool_name.into(), resource.into(), contract), approval);
+        true
     }
 
     /// Look up the OS PID for a kernel UUID (useful for MAC labelling).
@@ -415,7 +489,7 @@ impl SyscallGate {
 
     /// Check whether an agent may make this tool call.
     ///
-    /// Order: namespace visibility → capability → MAC → cgroup quota. If all
+    /// Order: namespace visibility → capability → MAC → approval → cgroup quota. If all
     /// pass, returns `Ok(pid)` so the caller can record actual usage afterwards.
     /// Namespace runs first because the LLM should not learn anything about
     /// tools it cannot see (an attacker probing a denied resource gets ENOENT,
@@ -427,15 +501,29 @@ impl SyscallGate {
         resource: &str,
         est_tokens: u64,
     ) -> Result<Pid, GateDenial> {
+        if !self.unconfined {
+            let Some(security) = default_security_catalog().get(tool_name) else {
+                self.denied_unknown.fetch_add(1, Ordering::Relaxed);
+                return Err(GateDenial::UnknownTool(tool_name.to_string()));
+            };
+            return self
+                .check_tool_call_declared(kid, tool_name, resource, est_tokens, security)
+                .await;
+        }
+
         let action = classify_tool(tool_name);
         let required_capabilities: Vec<u64> = action.required_cap.into_iter().collect();
         self.check_tool_call_contract(
             kid,
-            tool_name,
-            resource,
-            est_tokens,
-            action.action,
-            &required_capabilities,
+            ToolCallContract {
+                tool_name,
+                resource,
+                estimated_tokens: est_tokens,
+                action: action.action,
+                required_capabilities: &required_capabilities,
+                approval_policy: crate::tools::ApprovalPolicy::None,
+                approval_contract: None,
+            },
         )
         .await
     }
@@ -451,13 +539,19 @@ impl SyscallGate {
         est_tokens: u64,
         security: &crate::tools::ToolSecurity,
     ) -> Result<Pid, GateDenial> {
+        let contract = serde_json::to_string(security)
+            .expect("validated ToolSecurity serialization is infallible");
         self.check_tool_call_contract(
             kid,
-            tool_name,
-            resource,
-            est_tokens,
-            security.action.as_str(),
-            &security.required_capabilities,
+            ToolCallContract {
+                tool_name,
+                resource,
+                estimated_tokens: est_tokens,
+                action: security.action.as_str(),
+                required_capabilities: &security.required_capabilities,
+                approval_policy: security.approval_policy,
+                approval_contract: Some(&contract),
+            },
         )
         .await
     }
@@ -465,12 +559,17 @@ impl SyscallGate {
     async fn check_tool_call_contract(
         &self,
         kid: uuid::Uuid,
-        tool_name: &str,
-        resource: &str,
-        est_tokens: u64,
-        action: &'static str,
-        required_capabilities: &[u64],
+        contract: ToolCallContract<'_>,
     ) -> Result<Pid, GateDenial> {
+        let ToolCallContract {
+            tool_name,
+            resource,
+            estimated_tokens,
+            action,
+            required_capabilities,
+            approval_policy,
+            approval_contract,
+        } = contract;
         // Explicitly-ungoverned gate (test / non-OS contexts only — see
         // `SyscallGate::unconfined`): allow everything without registration.
         if self.unconfined {
@@ -547,9 +646,46 @@ impl SyscallGate {
             MacDecision::Allow => {}
         }
 
-        // 3. Atomically reserve quota across the full hierarchy. This is the
+        // 3. Approval is exact and single-use. It is checked after capability
+        // and MAC so a denied request cannot consume a legitimate grant.
+        if approval_policy != crate::tools::ApprovalPolicy::None {
+            let contract = approval_contract
+                .expect("declared approval always carries its validated security contract");
+            let key = (
+                kid,
+                tool_name.to_string(),
+                resource.to_string(),
+                contract.to_string(),
+            );
+            let approved = match self.approvals.entry(key) {
+                dashmap::mapref::entry::Entry::Occupied(entry)
+                    if (*entry.get()).satisfies(approval_policy) =>
+                {
+                    entry.remove();
+                    true
+                }
+                _ => false,
+            };
+            if !approved {
+                self.denied_approval.fetch_add(1, Ordering::Relaxed);
+                self.emit_audit(AuditEvent {
+                    agent: kid,
+                    pid,
+                    tool: tool_name.to_string(),
+                    action,
+                    resource: resource.to_string(),
+                    decision: AuditDecision::Denied,
+                });
+                return Err(GateDenial::ApprovalRequired {
+                    tool: tool_name.to_string(),
+                    policy: approval_policy,
+                });
+            }
+        }
+
+        // 4. Atomically reserve quota across the full hierarchy. This is the
         // charge; callers must not separately record the same estimate later.
-        if !self.cgroups.try_record_tokens(cgroup, est_tokens) {
+        if !self.cgroups.try_record_tokens(cgroup, estimated_tokens) {
             self.denied_cgroup.fetch_add(1, Ordering::Relaxed);
             return Err(GateDenial::CgroupQuota);
         }
@@ -589,6 +725,7 @@ impl SyscallGate {
             allowed: self.allowed.load(Ordering::Relaxed),
             denied_capability: self.denied_capability.load(Ordering::Relaxed),
             denied_mac: self.denied_mac.load(Ordering::Relaxed),
+            denied_approval: self.denied_approval.load(Ordering::Relaxed),
             denied_cgroup: self.denied_cgroup.load(Ordering::Relaxed),
             denied_unknown: self.denied_unknown.load(Ordering::Relaxed),
             denied_namespace: self.denied_namespace.load(Ordering::Relaxed),
@@ -632,7 +769,7 @@ mod tests {
 
     fn fresh_gate() -> (std::sync::Arc<SyscallGate>, std::sync::Arc<CgroupManager>) {
         let cgroups = std::sync::Arc::new(CgroupManager::new());
-        let gate = std::sync::Arc::new(SyscallGate::new(cgroups.clone()));
+        let gate = std::sync::Arc::new(SyscallGate::with_mac(cgroups.clone(), false, Vec::new()));
         (gate, cgroups)
     }
 
@@ -662,6 +799,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn default_gate_is_enforcing_and_unknown_tools_fail_closed() {
+        let cgroups = std::sync::Arc::new(CgroupManager::new());
+        let gate = SyscallGate::new(cgroups);
+        let kid = uuid::Uuid::new_v4();
+        gate.register_agent(kid, CapabilitySet::all(), None);
+
+        assert!(matches!(
+            gate.check_tool_call(kid, "read_file", "/tmp/x", 1).await,
+            Err(GateDenial::MacDeny { .. })
+        ));
+        assert_eq!(
+            gate.check_tool_call(kid, "not_registered", "/tmp/x", 1)
+                .await,
+            Err(GateDenial::UnknownTool("not_registered".into()))
+        );
+    }
+
+    #[tokio::test]
     async fn declared_security_overrides_name_and_enforces_every_capability() {
         let (gate, _) = fresh_gate();
         let kid = uuid::Uuid::new_v4();
@@ -687,6 +842,94 @@ mod tests {
             denial,
             GateDenial::MissingCapability(CapabilitySet::CAP_FILE_WRITE)
         );
+    }
+
+    #[tokio::test]
+    async fn declared_approval_is_exact_local_and_single_use() {
+        use crate::tools::{ApprovalPolicy, SecurityAction, ToolSecurity};
+
+        let (gate, _) = fresh_gate();
+        let kid = uuid::Uuid::new_v4();
+        let mut caps = CapabilitySet::none();
+        caps.grant(CapabilitySet::CAP_EXEC);
+        gate.register_agent(kid, caps, None);
+        let security = ToolSecurity::constant(SecurityAction::Execute, "command:deploy")
+            .with_approval(ApprovalPolicy::User)
+            .sandboxed();
+
+        let denied = gate
+            .check_tool_call_declared(kid, "deploy", "command:deploy", 1, &security)
+            .await;
+        assert!(matches!(denied, Err(GateDenial::ApprovalRequired { .. })));
+
+        assert!(gate.grant_tool_approval(
+            kid,
+            "deploy",
+            "command:deploy",
+            &security,
+            ApprovalPolicy::User
+        ));
+        assert!(gate
+            .check_tool_call_declared(kid, "deploy", "command:other", 1, &security)
+            .await
+            .is_err());
+        let changed_contract = security.clone().caller_namespace();
+        assert!(matches!(
+            gate.check_tool_call_declared(kid, "deploy", "command:deploy", 1, &changed_contract,)
+                .await,
+            Err(GateDenial::ApprovalRequired { .. })
+        ));
+        assert!(gate
+            .check_tool_call_declared(kid, "deploy", "command:deploy", 1, &security)
+            .await
+            .is_ok());
+        assert!(matches!(
+            gate.check_tool_call_declared(kid, "deploy", "command:deploy", 1, &security)
+                .await,
+            Err(GateDenial::ApprovalRequired { .. })
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn one_shot_approval_cannot_be_replayed_concurrently() {
+        use crate::tools::{ApprovalPolicy, SecurityAction, ToolSecurity};
+
+        let (gate, _) = fresh_gate();
+        let kid = uuid::Uuid::new_v4();
+        let mut caps = CapabilitySet::none();
+        caps.grant(CapabilitySet::CAP_EXEC);
+        gate.register_agent(kid, caps, None);
+        let security = ToolSecurity::constant(SecurityAction::Execute, "command:deploy")
+            .with_approval(ApprovalPolicy::User)
+            .sandboxed();
+        assert!(gate.grant_tool_approval(
+            kid,
+            "deploy",
+            "command:deploy",
+            &security,
+            ApprovalPolicy::User
+        ));
+
+        let mut calls = Vec::new();
+        for _ in 0..16 {
+            let gate = gate.clone();
+            let security = security.clone();
+            calls.push(tokio::spawn(async move {
+                gate.check_tool_call_declared(kid, "deploy", "command:deploy", 1, &security)
+                    .await
+            }));
+        }
+        let mut allowed = 0;
+        let mut approval_denied = 0;
+        for call in calls {
+            match call.await.unwrap() {
+                Ok(_) => allowed += 1,
+                Err(GateDenial::ApprovalRequired { .. }) => approval_denied += 1,
+                other => panic!("unexpected approval result: {other:?}"),
+            }
+        }
+        assert_eq!(allowed, 1);
+        assert_eq!(approval_denied, 15);
     }
 
     #[tokio::test]
@@ -829,7 +1072,16 @@ mod tests {
             ]);
         }
 
-        // run_command is an `exec` action → audit rule → allowed *and* logged.
+        // run_command is an `exec` action → audit rule → approval → allowed
+        // and logged.
+        let security = default_security_catalog().get("run_command").unwrap();
+        assert!(gate.grant_tool_approval(
+            kid,
+            "run_command",
+            "/bin/ls",
+            security,
+            crate::tools::ApprovalPolicy::User,
+        ));
         let r = gate.check_tool_call(kid, "run_command", "/bin/ls", 5).await;
         assert!(r.is_ok(), "audit decision must allow the call");
         assert_eq!(gate.stats().audited, 1);

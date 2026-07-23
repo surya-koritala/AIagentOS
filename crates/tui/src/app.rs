@@ -78,6 +78,7 @@ impl App {
                 allowed: metrics.gate.allowed,
                 denied_capability: metrics.gate.denied_capability,
                 denied_mac: metrics.gate.denied_mac,
+                denied_approval: metrics.gate.denied_approval,
                 denied_cgroup: metrics.gate.denied_cgroup,
                 denied_namespace: metrics.gate.denied_namespace,
                 denied_unknown: metrics.gate.denied_unknown,

@@ -18,6 +18,7 @@ use std::sync::Arc;
 use kernel::cgroups::CgroupLimits;
 use kernel::procfs::ProcEntry;
 use kernel::syscall_gate::GateDenial;
+use kernel::tools::{SecurityAction, ToolSecurity};
 use kernel::{AgentConfig, AgentKernelImpl};
 
 /// Tracks PASS/FAIL across all checks so the process can exit non-zero if the
@@ -199,10 +200,18 @@ async fn main() {
     kernel
         .syscall_gate
         .register_tool_namespace("secret_admin_tool", foreign_ns);
+    let secret_security =
+        ToolSecurity::constant(SecurityAction::Read, "/db/users").caller_namespace();
 
     let r = kernel
         .syscall_gate
-        .check_tool_call(full.id, "secret_admin_tool", "/db/users", 5)
+        .check_tool_call_declared(
+            full.id,
+            "secret_admin_tool",
+            "/db/users",
+            5,
+            &secret_security,
+        )
         .await;
     board.check(
         "namespace/foreign tool denied",
@@ -218,7 +227,13 @@ async fn main() {
     kernel.syscall_gate.add_agent_namespace(full.id, foreign_ns);
     let r = kernel
         .syscall_gate
-        .check_tool_call(full.id, "secret_admin_tool", "/db/users", 5)
+        .check_tool_call_declared(
+            full.id,
+            "secret_admin_tool",
+            "/db/users",
+            5,
+            &secret_security,
+        )
         .await;
     board.check(
         "namespace/after-join tool resolves",

@@ -23,6 +23,7 @@ use std::sync::{Arc, Mutex};
 use kernel::cgroups::CgroupLimits;
 use kernel::mac::PolicyRule;
 use kernel::syscall_gate::{AuditDecision, AuditEvent, AuditSink, GateDenial};
+use kernel::tools::{SecurityAction, ToolSecurity};
 use kernel::{AgentConfig, AgentKernelImpl};
 
 /// Records every audit event the gate emits (MAC audit/deny) so the demo can
@@ -240,12 +241,20 @@ async fn main() {
     kernel
         .syscall_gate
         .add_agent_namespace(operator.id, secure_ns);
+    let rotate_security =
+        ToolSecurity::constant(SecurityAction::Read, "/vault/key").caller_namespace();
     println!("  (operator is a member of secure-ops; intruder is not)");
 
     act("intruder", "rotate_secrets /vault/key");
     match kernel
         .syscall_gate
-        .check_tool_call(intruder.id, "rotate_secrets", "/vault/key", 5)
+        .check_tool_call_declared(
+            intruder.id,
+            "rotate_secrets",
+            "/vault/key",
+            5,
+            &rotate_security,
+        )
         .await
     {
         Err(GateDenial::NotInNamespace { .. }) => {
@@ -257,7 +266,13 @@ async fn main() {
     act("operator", "rotate_secrets /vault/key");
     match kernel
         .syscall_gate
-        .check_tool_call(operator.id, "rotate_secrets", "/vault/key", 5)
+        .check_tool_call_declared(
+            operator.id,
+            "rotate_secrets",
+            "/vault/key",
+            5,
+            &rotate_security,
+        )
         .await
     {
         Ok(_) => {

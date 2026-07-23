@@ -1,81 +1,97 @@
-# AI Agent OS
+<p align="center">
+  <img src="docs/assets/agentos-hero.png" alt="AI Agent OS kernel routing agent actions through one security gateway to governed resources" width="100%">
+</p>
 
-[![Build Status](https://github.com/surya-koritala/AIagentOS/actions/workflows/ci.yml/badge.svg)](https://github.com/surya-koritala/AIagentOS/actions)
-[![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL%20v3-blue.svg)](LICENSE)
+<h1 align="center">AI Agent OS</h1>
 
-**An OS kernel for AI agents.** Tool calls go through a real syscall gate — capability checks, MAC policy, and cgroup token quotas enforce on every call, not as scaffolding.
+<p align="center">
+  <strong>A Rust runtime that governs AI agents like an operating system governs processes.</strong>
+</p>
 
-> **Status:** **v0.3.0 is the latest stable release.** The current tree contains
-> unreleased security, lifecycle, scheduling, checkpoint, operator, service,
-> package, protocol-v2, and release-pipeline hardening. Local regression evidence
-> is strong, but the changes are not a production-qualified release until the
-> remote review, cross-platform, tagged-release, live-provider, isolation,
-> recovery, and independent-security gates complete. See
-> [CHANGELOG.md](CHANGELOG.md) for the exact shipped/unreleased split and
-> [RELEASING.md](RELEASING.md) for the release process.
+<p align="center">
+  <a href="https://github.com/surya-koritala/AIagentOS/actions"><img src="https://github.com/surya-koritala/AIagentOS/actions/workflows/ci.yml/badge.svg" alt="CI status"></a>
+  <a href="https://github.com/surya-koritala/AIagentOS/releases/latest"><img src="https://img.shields.io/github/v/release/surya-koritala/AIagentOS?display_name=tag" alt="Latest release"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-AGPL%20v3-blue.svg" alt="AGPL-3.0 license"></a>
+  <img src="https://img.shields.io/badge/Rust-workspace-f46623?logo=rust" alt="Rust workspace">
+</p>
 
-## What Is This?
+<p align="center">
+  <a href="#quick-start">Quick start</a> ·
+  <a href="#architecture">Architecture</a> ·
+  <a href="ROADMAP.md">Roadmap</a> ·
+  <a href="docs/capabilities.toml">Capability evidence</a> ·
+  <a href="CONTRIBUTING.md">Contributing</a>
+</p>
 
-AI Agent OS is not a chatbot. It's not a coding assistant. It's the **platform layer** that sits beneath AI agents and manages them — the same way Linux sits beneath applications.
+> [!IMPORTANT]
+> **v0.3.0 is the latest stable release. The development tree is not yet a
+> production-qualified v1.0 application.** Its remaining security, isolation,
+> recovery, provider, UX, and release-governance work is tracked in the
+> [production roadmap](https://github.com/surya-koritala/AIagentOS/issues/105).
+> Use [CHANGELOG.md](CHANGELOG.md) to distinguish released behavior from
+> unreleased work.
 
-```
-┌──────────────────────────────────────────────────────────────────────────┐
-│  CLIENTS   agent CLI · Rust SDK · ClusterClient · TUI · desktop · MCP       │
-└───────────────────────────────────┬────────────────────────────────────────┘
-              Syscall / SyscallReply (newline-JSON over TCP · Unix · TLS, auth)
-┌───────────────────────────────────▼────────────────────────────────────────┐
-│  WIRE LAYER  syscall_server — kernel as a service (CreateAgent, SendMessage, │
-│  CallTool, Memory*, Storage*, Snapshot*, LoadPackage, NodeInfo, …)           │
-└───────────────────────────────────┬────────────────────────────────────────┘
-┌───────────────────────────────────▼────────────────────────────────────────┐
-│  AgentKernelImpl — the wired root orchestrator (boot → start_runtime)        │
-│                                                                              │
-│  PROCESS/EXEC         SCHEDULING            CONTEXT (virtual memory)          │
-│  agent_manager        CFS-inspired turns    durable spill · backpressure      │
-│  agent_struct (PID)   PriorityScheduler     memory_manager (Embedder+Index)   │
-│  execution loop       TurnAdmission                                           │
-│  think→act→observe    LlmScheduler                                            │
-│  mid-gen pause/resume                                                         │
-│         │ every tool call                                                    │
-│         ▼                                                                    │
-│  ╔════════════════════════════════════════════════════════════════════════╗ │
-│  ║  SYSCALL GATE  —  THE CHOKEPOINT, first-failure-wins                      ║ │
-│  ║   0 namespace → 1 capability → 2 MAC → 3 cgroup quota → AuditSink         ║ │
-│  ╚════════════════════════════════════════════════════════════════════════╝ │
-│         │ (only on Ok)                                                       │
-│  SECURITY/TENANCY     INTEGRATION           RESOURCES (VFS)                   │
-│  permissions·mac      connector (9 LLMs,    resource_broker                   │
-│  namespaces·cgroups    failover·retry·rate)  filesystem·network·application   │
-│  budget($)·sandbox    mcp · github · db     tools · mount_table · registry    │
-│  auth                 IpcManager (broker)                                     │
-│                                                                              │
-│  OS SERVICES  init_system·agentctl·procfs·sysctl·observability/audit          │
-│  PLATFORM     agent_package·agentpkg·marketplace·agent_hub                    │
-└───────────────────────────────────┬────────────────────────────────────────┘
-┌───────────────────────────────────▼────────────────────────────────────────┐
-│  PERSISTENCE  single SqliteContextManager                                    │
-│   conversations · facts(+embeddings) · agent_kv · snapshots · checkpoints    │
-└───────────────────────────────────┬────────────────────────────────────────┘
-                  EXTERNAL  LLM APIs · Ollama/vLLM · filesystem · HTTP · GitHub
-```
+## What is AI Agent OS?
 
-> **The one thing this diagram says:** every tool call from every agent crosses
-> *one* gate, and the gate runs *before* the resource broker. That's the product
-> thesis in a single box — agents governed like Linux processes.
+AI Agent OS is a user-space control plane and runtime for long-lived AI agents.
+It creates agents, schedules their work, bounds context and resource use,
+brokers communication, persists state, and authorizes tool calls outside the
+language model.
 
-## Why?
+It is **not** a chatbot, a Linux distribution, a bootable kernel, or a replacement
+for the host operating system. The Linux analogy describes its responsibility:
+agents are treated like governed processes, while Linux, macOS, or Windows still
+provides the actual host kernel and isolation primitives.
 
-Running one AI agent is easy. Running **ten agents simultaneously** — with different permissions, resource budgets, isolated workspaces, and the ability to communicate — requires an operating system.
+## Architecture
+
+Every public tool-call path uses the same validated declaration and crosses one
+authorization chokepoint before a provider can execute. Unknown or contradictory
+tool declarations fail closed.
+
+<p align="center">
+  <img src="docs/assets/architecture.svg" alt="AI Agent OS architecture: entry points flow through ToolRegistry authorization, namespace, capability, MAC, approval and quota checks, then the sandboxed resource broker and providers" width="100%">
+</p>
+
+<p align="center"><em>The gate runs before filesystem, network, application, or IPC provider execution.</em></p>
+
+## Why an OS layer?
+
+Running one agent is straightforward. Running many agents with different
+permissions, budgets, workspaces, lifecycles, and communication boundaries
+requires a shared governance layer.
 
 AI Agent OS provides:
+
 - **Process management** — create, clone, signal, kill agents (like fork/exec/kill)
 - **Fair scheduling** — cooperative, CFS-inspired weighted turn admission
 - **Context management** — bounded active prompts, durable spill references, explicit backpressure
-- **Isolation** — namespaces, cgroups, sandboxes (agents can't see each other)
-- **Security** — MAC policies, capabilities, audit logging
+- **Logical isolation** — tenant ownership, namespaces, cgroup-style quotas, and sandbox identities
+- **Security** — fail-closed tool declarations, MAC policies, capabilities, approvals, and audit logging
 - **IPC** — inter-agent messaging, delegation, and discovery (broker-routed via `IpcManager`)
-- **Init system** — service files, dependency ordering, auto-restart
-- **Package manager** — install, version, and distribute agent packages
+- **Service supervision** — dependency ordering, coordinated lifecycle, and restart policy
+- **Packages** — bounded, validated manifests and registry-backed tool resolution
+
+> [!CAUTION]
+> Logical isolation is implemented, but production-grade host/container isolation
+> is still tracked by [#111](https://github.com/surya-koritala/AIagentOS/issues/111).
+> Package signing and durable supply-chain qualification remain tracked by
+> [#119](https://github.com/surya-koritala/AIagentOS/issues/119).
+
+## See governance in action
+
+<p align="center">
+  <img src="docs/assets/governance-demo.gif" alt="Real AI Agent OS terminal demo showing capability, quota, namespace and MAC enforcement with four violations contained" width="100%">
+</p>
+
+The animation is generated from the real keyless demo—not a mocked interface.
+It boots the kernel, creates five agents, contains capability, quota, namespace,
+and MAC violations, records the audit decision, and proves compliant agents keep
+running. Reproduce it without an API key, model, or network connection:
+
+```bash
+cargo run --package os-benchmark --bin governance-demo --locked
+```
 
 Durable pause/resume semantics and their hosted-provider limitations are
 documented in [docs/CHECKPOINTS.md](docs/CHECKPOINTS.md).
@@ -124,8 +140,11 @@ See [docs/SERVER_QUICKSTART.md](docs/SERVER_QUICKSTART.md) for details.
 git clone https://github.com/surya-koritala/AIagentOS.git
 cd AIagentOS
 
-# Run tests (kernel 441 + integration-tests 102, across the workspace)
-cargo test --workspace --exclude tauri-app
+# Run the complete locked workspace regression suite
+cargo test --workspace --exclude tauri-app --locked
+
+# Run the deterministic enforcement demo (no API key or model)
+cargo run --package os-benchmark --bin governance-demo --locked
 
 # Run the CLI agent (requires Azure OpenAI or OpenAI API key)
 export AZURE_OPENAI_API_KEY="your-key"
@@ -135,7 +154,7 @@ export AZURE_OPENAI_API_VERSION="2024-08-01-preview"
 cargo run --package agent-cli
 ```
 
-## Kernel Modules (53)
+## Kernel modules
 
 | Category | Modules |
 |----------|---------|
@@ -168,8 +187,8 @@ presence in the Rust crate is not a v1 support claim.
 
 | Linux | AI Agent OS | Status |
 |-------|-------------|--------|
-| Capabilities | Gate checks plus custom-tool declarations | Integrated — [#108](https://github.com/surya-koritala/AIagentOS/issues/108) |
-| SELinux / AppArmor | `MacEngine` and declarative policy | Integrated — [#108](https://github.com/surya-koritala/AIagentOS/issues/108) |
+| Capabilities | Validated declarations plus gate checks on every public tool path | Public-API E2E — [#108](https://github.com/surya-koritala/AIagentOS/issues/108) |
+| SELinux / AppArmor | `MacEngine` and declarative policy | Public-API E2E — [#108](https://github.com/surya-koritala/AIagentOS/issues/108) |
 | cgroups | Token and agent-count accounting/limits | Integrated — [#109](https://github.com/surya-koritala/AIagentOS/issues/109) |
 | `task_struct` | `AgentStruct` (Uuid + u64 PID translation) | Unit-tested — [#112](https://github.com/surya-koritala/AIagentOS/issues/112) |
 | Signals (SIGKILL, SIGSTOP) | Agent signal/state primitives | Unit-tested — [#112](https://github.com/surya-koritala/AIagentOS/issues/112) |
@@ -186,34 +205,49 @@ presence in the Rust crate is not a v1 support claim.
 
 ## How enforcement works in practice
 
-Every tool call from an agent goes through `SyscallGate::check_tool_call`:
+Every executor, JSON syscall, MCP, and SDK-backed tool call uses
+`ToolRegistry::authorize_call` and the declaration-aware syscall gate:
 
 ```
 agent → AgentExecutor::execute_tool
-      → SyscallGate::check_tool_call   (first failure wins)
+      → ToolRegistry::authorize_call
+          declaration validation + typed resource extraction
+      → SyscallGate::check_tool_call_declared   (first failure wins)
           0. namespace visibility (tool tagged to a namespace ⇒ caller must be a member)
-          1. capability check     (e.g. http_get requires CAP_NET_ACCESS)
-          2. MAC policy check     (subject/action/object rule match)
-          3. cgroup quota check   (token budget per minute)
-      → ResourceBroker (only if all four pass)
-      → provider execution (quota was atomically reserved at admission)
+          1. capability checks    (every declared capability is required)
+          2. MAC policy check     (subject/action/resource rule match)
+          3. approval check       (exact contract + resource, atomically one-shot)
+          4. cgroup quota check   (hierarchical token budget)
+      → ResourceBroker            (permission + sandbox boundary)
+      → provider execution        (filesystem, network, application, or IPC)
 ```
 
-A denial returns a structured error message back to the LLM as a tool failure, so the model can recover gracefully without the kernel trusting it to obey policy. The contract is proven by `tests/src/os_enforcement.rs` — four end-to-end tests that fail loudly if any layer stops enforcing.
+A denial returns a structured tool failure, so the model can recover without the
+kernel trusting it to obey policy. Registration, adversarial ordering, approval
+replay, namespace/tenant isolation, and public-path behavior are covered by
+`crates/kernel/src/tools.rs`, `crates/kernel/src/syscall_gate.rs`,
+`tests/src/gate_adversarial_props.rs`, and `tests/src/os_enforcement.rs`.
 
 The MAC policy at step 2 is **authorable as a declarative document** — operators write rules in TOML, validate and dry-run them with `agent policy validate` / `agent policy explain`, and point the kernel at a `policy_file`. See [docs/POLICY.md](docs/POLICY.md).
 
-## Benchmarks
+## Demos and benchmarks
 
-### OS Kernel Benchmarks
-- Agent creation: 10 agents in 2ms
-- IPC throughput: ~200,000 msg/s (in-process)
-- Permission checks: ~1M checks/sec
-- Fault tolerance: supervisor restarts crashed agents per service policy
-- Graceful shutdown: all agents stopped, observability + gate state purged
+The repository keeps demonstrations reproducible instead of publishing hardware-
+independent performance claims without a qualification run:
 
-### Real-World Agent Benchmarks
-Tool-using benchmarks (file ops, git, HTTP, multi-step plans) live in `benchmarks/`. Run `cargo run --package os-benchmark --bin os-benchmark` to reproduce. This command is verified against the canonical capability registry in CI.
+```bash
+# Keyless proof of capability, quota, namespace, MAC, audit, and containment
+cargo run --package os-benchmark --bin governance-demo --locked
+
+# Keyless enforcement, scheduler, and procfs checks with a pass/fail result
+cargo run --package os-benchmark --bin os-demo --locked
+
+# Broader benchmark suite; results depend on the host and provider configuration
+cargo run --package os-benchmark --bin os-benchmark --locked
+```
+
+Sustained-load methodology, SLOs, chaos testing, and publishable performance
+qualification remain tracked by [#125](https://github.com/surya-koritala/AIagentOS/issues/125).
 
 ## Architecture Docs
 

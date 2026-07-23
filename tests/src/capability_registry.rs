@@ -365,11 +365,11 @@ fn release_blocking_workflows_keep_their_security_contract() {
     for proof in [
         "schedule:",
         "RUSTUP_TOOLCHAIN: nightly-2026-07-20",
-        "targets: x86_64-unknown-linux-musl",
+        "MIRIFLAGS: -Zmiri-disable-isolation",
         "cargo miri test",
         "-Zsanitizer=address",
-        "cargo fuzz build",
-        "cargo fuzz run wire_syscall",
+        "cargo fuzz build --target x86_64-unknown-linux-gnu",
+        "cargo fuzz run wire_syscall --target x86_64-unknown-linux-gnu",
     ] {
         assert!(
             extended.contains(proof),

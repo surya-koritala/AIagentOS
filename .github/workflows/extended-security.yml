@@ -30,6 +30,10 @@ jobs:
           components: miri
       - run: cargo miri setup
       - name: Exercise in-memory policy and isolation code under Miri
+        env:
+          # These audit tests read wall-clock time; Miri still checks memory
+          # safety and concurrency while allowing that deterministic host call.
+          MIRIFLAGS: -Zmiri-disable-isolation
         run: |
           cargo miri test -p kernel cgroups::tests
           cargo miri test -p kernel permissions::tests
@@ -61,14 +65,13 @@ jobs:
       - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
         with:
           toolchain: nightly-2026-07-20
-          targets: x86_64-unknown-linux-musl
       - uses: taiki-e/install-action@c44f6b046f1c29ae5918b1e0bfdbb2f1813836fd
         with:
           tool: cargo-fuzz@0.13.2
       - name: Build every fuzz target
-        run: cargo fuzz build
+        run: cargo fuzz build --target x86_64-unknown-linux-gnu
       - name: Exercise untrusted wire input
-        run: cargo fuzz run wire_syscall -- -max_total_time=120 -max_len=65536
+        run: cargo fuzz run wire_syscall --target x86_64-unknown-linux-gnu -- -max_total_time=120 -max_len=65536
       - name: Preserve newly discovered corpus and crash evidence
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

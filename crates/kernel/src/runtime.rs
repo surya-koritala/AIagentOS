@@ -18,6 +18,7 @@ pub struct KernelRuntime {
     kernel: Arc<AgentKernelImpl>,
     scheduler_interval_ms: u64,
     running: Arc<std::sync::atomic::AtomicBool>,
+    generation: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl KernelRuntime {
@@ -26,21 +27,33 @@ impl KernelRuntime {
             kernel,
             scheduler_interval_ms: 100,
             running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
     }
 
     /// Start all kernel background threads. Returns the join handles so the
     /// caller can await them on shutdown if desired.
     pub fn start(&self) -> Vec<tokio::task::JoinHandle<()>> {
-        self.running
-            .store(true, std::sync::atomic::Ordering::SeqCst);
-        vec![self.spawn_scheduler_observer(), self.spawn_agent_watchdog()]
+        if self.running.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            return Vec::new();
+        }
+        let generation = self
+            .generation
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            .saturating_add(1);
+        vec![
+            self.spawn_scheduler_observer(generation),
+            self.spawn_agent_watchdog(generation),
+            self.spawn_service_supervisor(generation),
+        ]
     }
 
     /// Stop all background threads. Loops exit on next tick.
     pub fn stop(&self) {
         self.running
             .store(false, std::sync::atomic::Ordering::SeqCst);
+        self.generation
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
 
     #[allow(dead_code)]
@@ -51,14 +64,17 @@ impl KernelRuntime {
     /// Scheduler observer: every tick, ask CFS who would run next and
     /// publish that into procfs as `current_agent`. The actual turn execution
     /// is still driven by `send_message`; this loop just keeps procfs honest.
-    fn spawn_scheduler_observer(&self) -> tokio::task::JoinHandle<()> {
+    fn spawn_scheduler_observer(&self, generation: u64) -> tokio::task::JoinHandle<()> {
         let kernel = self.kernel.clone();
         let running = self.running.clone();
+        let active_generation = self.generation.clone();
         let interval_ms = self.scheduler_interval_ms;
 
         tokio::spawn(async move {
             let mut tick = interval(Duration::from_millis(interval_ms));
-            while running.load(std::sync::atomic::Ordering::SeqCst) {
+            while running.load(std::sync::atomic::Ordering::SeqCst)
+                && active_generation.load(std::sync::atomic::Ordering::SeqCst) == generation
+            {
                 tick.tick().await;
                 let next = {
                     let mut sched = kernel.os.cfs.lock().await;
@@ -75,15 +91,39 @@ impl KernelRuntime {
     /// Active-turn watchdog. The kernel sweep performs detection and invokes
     /// the public forced lifecycle coordinator, so watchdog termination cannot
     /// bypass persistence, sandbox, gate, cgroup, IPC, or scheduler cleanup.
-    fn spawn_agent_watchdog(&self) -> tokio::task::JoinHandle<()> {
+    fn spawn_agent_watchdog(&self, generation: u64) -> tokio::task::JoinHandle<()> {
         let kernel = self.kernel.clone();
         let running = self.running.clone();
+        let active_generation = self.generation.clone();
 
         tokio::spawn(async move {
             let mut tick = interval(Duration::from_secs(1));
-            while running.load(std::sync::atomic::Ordering::SeqCst) {
+            while running.load(std::sync::atomic::Ordering::SeqCst)
+                && active_generation.load(std::sync::atomic::Ordering::SeqCst) == generation
+            {
                 tick.tick().await;
                 let _ = kernel.watchdog_sweep().await;
+            }
+        })
+    }
+
+    /// Kernel-owned service health and restart loop. A short interval is safe:
+    /// each sweep is serialized with public service operations and performs no
+    /// work for healthy services beyond bounded state reads.
+    fn spawn_service_supervisor(&self, generation: u64) -> tokio::task::JoinHandle<()> {
+        let kernel = self.kernel.clone();
+        let running = self.running.clone();
+        let active_generation = self.generation.clone();
+
+        tokio::spawn(async move {
+            let mut tick = interval(Duration::from_millis(100));
+            while running.load(std::sync::atomic::Ordering::SeqCst)
+                && active_generation.load(std::sync::atomic::Ordering::SeqCst) == generation
+            {
+                tick.tick().await;
+                if let Err(error) = kernel.service_supervisor_sweep().await {
+                    tracing::error!(error = %error, "service supervisor sweep failed");
+                }
             }
         })
     }

@@ -943,6 +943,35 @@ impl SqliteContextManager {
             );
             CREATE INDEX IF NOT EXISTS idx_operator_tunable_audit_name
                 ON operator_tunable_audit(name, id DESC);
+            CREATE TABLE IF NOT EXISTS service_runtime (
+                name TEXT PRIMARY KEY,
+                definition_revision TEXT NOT NULL,
+                status TEXT NOT NULL,
+                agent_id TEXT,
+                restart_count INTEGER NOT NULL CHECK (restart_count >= 0),
+                restart_attempts_total INTEGER NOT NULL CHECK (restart_attempts_total >= 0),
+                last_exit_code INTEGER,
+                desired_running INTEGER NOT NULL CHECK (desired_running IN (0, 1)),
+                ready INTEGER NOT NULL CHECK (ready IN (0, 1)),
+                healthy INTEGER NOT NULL CHECK (healthy IN (0, 1)),
+                restart_exhausted INTEGER NOT NULL CHECK (restart_exhausted IN (0, 1)),
+                last_failure TEXT,
+                next_restart_at TEXT,
+                restart_window_started_at TEXT,
+                last_transition_at TEXT NOT NULL,
+                dependency_blocks INTEGER NOT NULL CHECK (dependency_blocks >= 0)
+            );
+            CREATE TABLE IF NOT EXISTS service_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                event TEXT NOT NULL,
+                status TEXT NOT NULL,
+                agent_id TEXT,
+                reason TEXT,
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_service_history_name
+                ON service_history(name, id DESC);
             -- Tenancy: tenants are the top-level isolation unit; users/sessions/
             -- api-keys are scoped to a tenant. Secrets are stored hashed (the
             -- *_hash columns), never in plaintext (see auth.rs).
@@ -4969,6 +4998,263 @@ impl SqliteContextManager {
             }
         }
         Ok(packages)
+    }
+}
+
+/// Durable init-supervisor ownership and bounded transition history.
+impl SqliteContextManager {
+    pub fn save_service_runtime(
+        &self,
+        runtime: &crate::init_system::ServiceRuntimeInfo,
+        event: &str,
+        reason: Option<&str>,
+    ) -> Result<(), ContextError> {
+        let status = serde_json::to_string(&runtime.status)
+            .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
+        let restart_count = i64::from(runtime.restart_count);
+        let restart_attempts_total =
+            i64::try_from(runtime.restart_attempts_total).map_err(|_| {
+                ContextError::PersistenceFailed("service restart counter overflow".into())
+            })?;
+        let dependency_blocks = i64::try_from(runtime.dependency_blocks).map_err(|_| {
+            ContextError::PersistenceFailed("service dependency block counter overflow".into())
+        })?;
+        let mut conn = self.conn.lock().unwrap();
+        let transaction = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
+        transaction
+            .execute(
+                "INSERT INTO service_runtime
+                 (name, definition_revision, status, agent_id, restart_count,
+                  restart_attempts_total, last_exit_code, desired_running, ready, healthy,
+                  restart_exhausted, last_failure, next_restart_at,
+                  restart_window_started_at, last_transition_at, dependency_blocks)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
+                 ON CONFLICT(name) DO UPDATE SET
+                   definition_revision = excluded.definition_revision,
+                   status = excluded.status,
+                   agent_id = excluded.agent_id,
+                   restart_count = excluded.restart_count,
+                   restart_attempts_total = excluded.restart_attempts_total,
+                   last_exit_code = excluded.last_exit_code,
+                   desired_running = excluded.desired_running,
+                   ready = excluded.ready,
+                   healthy = excluded.healthy,
+                   restart_exhausted = excluded.restart_exhausted,
+                   last_failure = excluded.last_failure,
+                   next_restart_at = excluded.next_restart_at,
+                   restart_window_started_at = excluded.restart_window_started_at,
+                   last_transition_at = excluded.last_transition_at,
+                   dependency_blocks = excluded.dependency_blocks",
+                params![
+                    runtime.name,
+                    runtime.definition_revision,
+                    status,
+                    runtime.agent_id.map(|id| id.to_string()),
+                    restart_count,
+                    restart_attempts_total,
+                    runtime.last_exit_code,
+                    i64::from(runtime.desired_running),
+                    i64::from(runtime.ready),
+                    i64::from(runtime.healthy),
+                    i64::from(runtime.restart_exhausted),
+                    runtime.last_failure,
+                    runtime.next_restart_at,
+                    runtime.restart_window_started_at,
+                    runtime.last_transition_at,
+                    dependency_blocks
+                ],
+            )
+            .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
+        transaction
+            .execute(
+                "INSERT INTO service_history
+                 (name, event, status, agent_id, reason, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    runtime.name,
+                    event,
+                    status,
+                    runtime.agent_id.map(|id| id.to_string()),
+                    reason,
+                    Utc::now().to_rfc3339()
+                ],
+            )
+            .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
+        transaction
+            .execute(
+                "DELETE FROM service_history
+                 WHERE name = ?1
+                   AND id NOT IN (
+                     SELECT id FROM service_history
+                     WHERE name = ?1 ORDER BY id DESC LIMIT 1000
+                   )",
+                params![runtime.name],
+            )
+            .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
+        transaction
+            .commit()
+            .map_err(|error| ContextError::PersistenceFailed(error.to_string()))
+    }
+
+    pub fn load_service_runtime(
+        &self,
+    ) -> Result<Vec<crate::init_system::ServiceRuntimeInfo>, ContextError> {
+        let conn = self.conn.lock().unwrap();
+        let mut statement = conn
+            .prepare(
+                "SELECT name, definition_revision, status, agent_id,
+                        restart_count, restart_attempts_total, last_exit_code, desired_running, ready,
+                        healthy, restart_exhausted, last_failure,
+                        next_restart_at, restart_window_started_at,
+                        last_transition_at, dependency_blocks
+                 FROM service_runtime ORDER BY name",
+            )
+            .map_err(|error| ContextError::StorageError(error.to_string()))?;
+        let rows = statement
+            .query_map([], |row| {
+                let status: String = row.get(2)?;
+                let status = serde_json::from_str::<crate::init_system::ServiceStatus>(&status)
+                    .map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            2,
+                            rusqlite::types::Type::Text,
+                            Box::new(error),
+                        )
+                    })?;
+                let agent_id = row
+                    .get::<_, Option<String>>(3)?
+                    .map(|id| {
+                        uuid::Uuid::parse_str(&id).map_err(|error| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                3,
+                                rusqlite::types::Type::Text,
+                                Box::new(error),
+                            )
+                        })
+                    })
+                    .transpose()?;
+                Ok(crate::init_system::ServiceRuntimeInfo {
+                    name: row.get(0)?,
+                    definition_revision: row.get(1)?,
+                    status,
+                    agent_id,
+                    restart_count: u32::try_from(row.get::<_, i64>(4)?.max(0)).unwrap_or(u32::MAX),
+                    restart_attempts_total: row.get::<_, i64>(5)?.max(0) as u64,
+                    last_exit_code: row.get(6)?,
+                    desired_running: row.get::<_, i64>(7)? != 0,
+                    ready: row.get::<_, i64>(8)? != 0,
+                    healthy: row.get::<_, i64>(9)? != 0,
+                    restart_exhausted: row.get::<_, i64>(10)? != 0,
+                    last_failure: row.get(11)?,
+                    next_restart_at: row.get(12)?,
+                    restart_window_started_at: row.get(13)?,
+                    last_transition_at: row.get(14)?,
+                    dependency_blocks: row.get::<_, i64>(15)?.max(0) as u64,
+                })
+            })
+            .map_err(|error| ContextError::StorageError(error.to_string()))?;
+        let mut runtime = Vec::new();
+        for row in rows {
+            runtime.push(row.map_err(|error| ContextError::StorageError(error.to_string()))?);
+        }
+        Ok(runtime)
+    }
+
+    pub fn remove_service_runtime(&self, name: &str, reason: &str) -> Result<(), ContextError> {
+        let mut conn = self.conn.lock().unwrap();
+        let transaction = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
+        transaction
+            .execute("DELETE FROM service_runtime WHERE name = ?1", params![name])
+            .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
+        transaction
+            .execute(
+                "INSERT INTO service_history
+                 (name, event, status, agent_id, reason, created_at)
+                 VALUES (?1, 'definition_removed', ?2, NULL, ?3, ?4)",
+                params![
+                    name,
+                    serde_json::to_string(&crate::init_system::ServiceStatus::Inactive)
+                        .unwrap_or_else(|_| "\"Inactive\"".into()),
+                    reason,
+                    Utc::now().to_rfc3339()
+                ],
+            )
+            .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
+        transaction
+            .commit()
+            .map_err(|error| ContextError::PersistenceFailed(error.to_string()))
+    }
+
+    pub fn list_service_history(
+        &self,
+        name: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<crate::init_system::ServiceHistoryEntry>, ContextError> {
+        let limit = i64::try_from(limit.clamp(1, 1_000)).unwrap_or(1_000);
+        let conn = self.conn.lock().unwrap();
+        let sql = if name.is_some() {
+            "SELECT id, name, event, status, agent_id, reason, created_at
+             FROM service_history WHERE name = ?1 ORDER BY id DESC LIMIT ?2"
+        } else {
+            "SELECT id, name, event, status, agent_id, reason, created_at
+             FROM service_history ORDER BY id DESC LIMIT ?1"
+        };
+        let mut statement = conn
+            .prepare(sql)
+            .map_err(|error| ContextError::StorageError(error.to_string()))?;
+        let map_row = |row: &rusqlite::Row<'_>| {
+            let status: String = row.get(3)?;
+            let status = serde_json::from_str::<crate::init_system::ServiceStatus>(&status)
+                .map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        3,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })?;
+            let agent_id = row
+                .get::<_, Option<String>>(4)?
+                .map(|id| {
+                    uuid::Uuid::parse_str(&id).map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            4,
+                            rusqlite::types::Type::Text,
+                            Box::new(error),
+                        )
+                    })
+                })
+                .transpose()?;
+            Ok(crate::init_system::ServiceHistoryEntry {
+                id: row.get::<_, i64>(0)?.max(0) as u64,
+                name: row.get(1)?,
+                event: row.get(2)?,
+                status,
+                agent_id,
+                reason: row.get(5)?,
+                created_at: row.get(6)?,
+            })
+        };
+        let mut entries = Vec::new();
+        if let Some(name) = name {
+            let rows = statement
+                .query_map(params![name, limit], map_row)
+                .map_err(|error| ContextError::StorageError(error.to_string()))?;
+            for row in rows {
+                entries.push(row.map_err(|error| ContextError::StorageError(error.to_string()))?);
+            }
+        } else {
+            let rows = statement
+                .query_map(params![limit], map_row)
+                .map_err(|error| ContextError::StorageError(error.to_string()))?;
+            for row in rows {
+                entries.push(row.map_err(|error| ContextError::StorageError(error.to_string()))?);
+            }
+        }
+        Ok(entries)
     }
 }
 

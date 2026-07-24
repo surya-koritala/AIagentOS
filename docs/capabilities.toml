@@ -206,7 +206,7 @@ owner = "operations"
 maturity = "production-qualified"
 release = "v0.6"
 tracking_issue = 117
-kernel_modules = ["agentctl", "agentps", "event_loop", "observability", "operator_control", "procfs", "sysctl"]
+kernel_modules = ["agentps", "event_loop", "observability", "operator_control", "procfs", "sysctl"]
 source_paths = ["crates/kernel/src/operator_control.rs", "crates/kernel/src/syscall_server.rs", "crates/kernel/src/context.rs", "docs/OPERATIONS_API.md"]
 public_entry_points = ["crates/kernel/src/syscall_server.rs::Syscall::OperatorSnapshot", "crates/kernel/src/syscall_server.rs::Syscall::SetOperatorTunable", "crates/sdk/src/lib.rs::KernelClient::operator_snapshot", "crates/sdk/src/lib.rs::KernelClient::set_operator_tunable", "crates/cli/src/bin/agentctl.rs"]
 runtime_call_paths = ["crates/kernel/src/syscall_server.rs::dispatch_scoped", "crates/kernel/src/operator_control.rs::OperatorControl::set", "crates/kernel/src/metrics.rs::MetricsSnapshot::collect"]
@@ -216,18 +216,18 @@ limitations = ["The package view is durable loaded-manifest instance metadata, n
 
 [[capability]]
 id = "init-supervisor"
-title = "Coordinated service boot and lifecycle"
+title = "Durable init and service supervision"
 owner = "kernel"
-maturity = "public-api-e2e"
+maturity = "production-qualified"
 release = "v0.6"
 tracking_issue = 118
 kernel_modules = ["init_system", "runtime"]
-source_paths = ["crates/kernel/src/lib.rs", "crates/kernel/src/init_system.rs", "docs/SERVICES.md"]
-public_entry_points = ["crates/kernel/src/syscall_server.rs::Syscall::StartService", "crates/sdk/src/lib.rs::KernelClient::start_service", "crates/cli/src/bin/agentctl.rs"]
-runtime_call_paths = ["crates/cli/src/bin/agent-server.rs", "crates/kernel/src/lib.rs::AgentKernelImpl::start_service", "crates/kernel/src/lib.rs::AgentKernelImpl::stop_service"]
-test_evidence = ["crates/kernel/src/init_system.rs", "tests/src/service_supervisor.rs", "crates/sdk/src/lib.rs"]
+source_paths = ["crates/kernel/src/lib.rs", "crates/kernel/src/init_system.rs", "crates/kernel/src/context.rs", "crates/kernel/src/runtime.rs", "docs/SERVICES.md"]
+public_entry_points = ["crates/kernel/src/syscall_server.rs::Syscall::StartService", "crates/kernel/src/syscall_server.rs::Syscall::ReloadServices", "crates/sdk/src/lib.rs::KernelClient::start_service", "crates/sdk/src/lib.rs::KernelClient::reload_services", "crates/cli/src/bin/agentctl.rs", "crates/tui/src/app.rs"]
+runtime_call_paths = ["crates/cli/src/bin/agent-server.rs", "crates/kernel/src/runtime.rs::KernelRuntime::spawn_service_supervisor", "crates/kernel/src/lib.rs::AgentKernelImpl::service_supervisor_sweep", "crates/kernel/src/lib.rs::AgentKernelImpl::reload_service_directory"]
+test_evidence = ["crates/kernel/src/init_system.rs", "tests/src/service_supervisor.rs", "crates/sdk/src/lib.rs", "crates/tui/src/app.rs"]
 platforms = ["linux", "macos", "windows"]
-limitations = ["Validated boot order, rollback, reverse shutdown and public system-only lifecycle are live. Automatic readiness/liveness, crash-loop backoff/jitter/windows, durable service state, tenant/profile/secret/tool ownership, oneshot/notify behavior, and rolling live reload remain outstanding; restart policy is not yet an automatic monitor."]
+limitations = ["Health is the kernel-owned agent lifecycle state plus a bounded readiness delay, not an arbitrary HTTP/command probe. Supervision is single-kernel rather than a distributed lease protocol. Only Simple services are accepted; unsupported Oneshot/Notify, per-service model overrides, and per-service tool allow-lists fail validation instead of being silently ignored."]
 
 [[capability]]
 id = "package-trust"

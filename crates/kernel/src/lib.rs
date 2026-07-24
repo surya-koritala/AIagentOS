@@ -7,7 +7,6 @@ pub mod agent_hub;
 pub mod agent_package;
 pub mod agent_struct;
 pub mod agent_syscalls;
-pub mod agentctl;
 pub mod agentpkg;
 pub mod agentps;
 pub mod auth;
@@ -136,7 +135,7 @@ impl Default for Priority {
 // ─── Sandbox Config ──────────────────────────────────────────────────────────
 
 /// Sandbox configuration for agent isolation.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SandboxConfig {
     pub workspace_dir: std::path::PathBuf,
     pub allowed_network_hosts: Option<Vec<String>>,
@@ -241,6 +240,11 @@ pub enum KernelEvent {
         agent_id: AgentId,
         resource: String,
         operation: String,
+    },
+    ServiceStateChanged {
+        name: String,
+        status: crate::init_system::ServiceStatus,
+        reason: Option<String>,
     },
     ShutdownInitiated,
 }
@@ -1125,6 +1129,14 @@ pub struct AgentKernelImpl {
     lifecycle_locks: DashMap<AgentId, Arc<tokio::sync::Mutex<()>>>,
     active_cancellations: DashMap<AgentId, tokio_util::sync::CancellationToken>,
     pub(crate) lifecycle_counters: crate::metrics::LifecycleCounters,
+    /// Serializes public service lifecycle, rolling reload, and supervisor
+    /// recovery so two control paths cannot create duplicate live instances.
+    service_operation_lock: tokio::sync::Mutex<()>,
+    /// Monotonic per-service liveness cadence. Durable service state stores
+    /// outcomes; monotonic process time is intentionally rebuilt after boot.
+    service_health_checks: DashMap<String, std::time::Instant>,
+    /// Explicit operator-configured definition source used by remote reload.
+    service_directory: std::sync::RwLock<Option<std::path::PathBuf>>,
     event_tx: broadcast::Sender<KernelEvent>,
 }
 
@@ -1204,15 +1216,23 @@ impl AgentKernelImpl {
             &mac_rules,
         )?;
         if let Some(service_dir) = &config.service_dir {
+            *kernel
+                .service_directory
+                .write()
+                .map_err(|_| KernelError::Policy("service directory lock is poisoned".into()))? =
+                Some(service_dir.clone());
             let mut init = kernel.os.init.try_lock().map_err(|_| {
                 KernelError::Policy("service supervisor was unexpectedly busy during boot".into())
             })?;
+            init.set_allowed_secret_refs(config.api_keys.keys().cloned())
+                .map_err(KernelError::Policy)?;
             init.load_directory_checked(service_dir)
                 .map_err(KernelError::Policy)?;
         }
         // Bring back any agents persisted by a previous run on this DB so a
         // restart restores the full registry (and re-arms enforcement).
         kernel.rehydrate_agents_blocking();
+        kernel.restore_service_runtime_from_store()?;
         Ok(kernel)
     }
 
@@ -1373,6 +1393,9 @@ impl AgentKernelImpl {
             lifecycle_locks: DashMap::new(),
             active_cancellations: DashMap::new(),
             lifecycle_counters: crate::metrics::LifecycleCounters::default(),
+            service_operation_lock: tokio::sync::Mutex::new(()),
+            service_health_checks: DashMap::new(),
+            service_directory: std::sync::RwLock::new(None),
             event_tx,
         })
     }
@@ -2356,6 +2379,134 @@ impl AgentKernelImpl {
         }
     }
 
+    /// Rebind durable service ownership only after agent rehydration. A live
+    /// persisted instance is reused; a missing/terminal instance is marked for
+    /// supervised recovery, preventing duplicate agents after a crash.
+    fn restore_service_runtime_from_store(&self) -> Result<(), KernelError> {
+        let mut runtime = self
+            .context_manager
+            .load_service_runtime()
+            .map_err(KernelError::Context)?;
+        let configured = self
+            .os
+            .init
+            .try_lock()
+            .map_err(|_| {
+                KernelError::Policy(
+                    "service supervisor was unexpectedly busy during recovery".into(),
+                )
+            })?
+            .definitions()
+            .into_iter()
+            .map(|definition| definition.name)
+            .collect::<std::collections::HashSet<_>>();
+        let removed = runtime
+            .iter()
+            .filter(|service| !configured.contains(&service.name))
+            .cloned()
+            .collect::<Vec<_>>();
+        if !removed.is_empty() {
+            std::thread::scope(|scope| {
+                scope
+                    .spawn(|| {
+                        let runtime = tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()
+                            .map_err(|error| {
+                                KernelError::Context(crate::ContextError::StorageError(format!(
+                                    "runtime build for removed-service cleanup failed: {error}"
+                                )))
+                            })?;
+                        runtime.block_on(async {
+                            for service in &removed {
+                                if let Some(agent_id) = service.agent_id {
+                                    if !matches!(
+                                        self.agent_manager.get_agent_state(agent_id),
+                                        None | Some(AgentState::Stopped)
+                                    ) {
+                                        self.stop_agent(agent_id).await?;
+                                    }
+                                }
+                            }
+                            Ok::<_, KernelError>(())
+                        })
+                    })
+                    .join()
+            })
+            .map_err(|_| {
+                KernelError::LifecycleCleanup(
+                    "removed-service recovery cleanup thread panicked".into(),
+                )
+            })??;
+            for service in &removed {
+                self.context_manager
+                    .remove_service_runtime(
+                        &service.name,
+                        "definition was removed while the supervisor was offline",
+                    )
+                    .map_err(KernelError::Context)?;
+            }
+            runtime.retain(|service| configured.contains(&service.name));
+        }
+        for service in &mut runtime {
+            let Some(agent_id) = service.agent_id else {
+                if service.desired_running {
+                    service.status = ServiceStatus::Failed;
+                    service.ready = false;
+                    service.healthy = false;
+                    service.last_failure =
+                        Some("service had no durable owner after process restart".into());
+                }
+                continue;
+            };
+            match self.agent_manager.get_agent_state(agent_id) {
+                Some(AgentState::Running) => {
+                    service.status = ServiceStatus::Running;
+                    service.healthy = true;
+                }
+                Some(AgentState::Paused) => {
+                    service.status = ServiceStatus::Running;
+                    service.ready = false;
+                    service.healthy = false;
+                    service.last_failure =
+                        Some("service owner recovered paused; liveness recovery required".into());
+                }
+                Some(AgentState::Stopped | AgentState::Error(_)) | None => {
+                    service.status = ServiceStatus::Failed;
+                    service.ready = false;
+                    service.healthy = false;
+                    service.last_failure =
+                        Some("service owner was terminal after process restart".into());
+                }
+                Some(AgentState::Initializing | AgentState::Stopping) => {
+                    service.status = ServiceStatus::Failed;
+                    service.ready = false;
+                    service.healthy = false;
+                    service.last_failure =
+                        Some("service owner had an incomplete lifecycle after restart".into());
+                }
+            }
+        }
+        let mut init = self.os.init.try_lock().map_err(|_| {
+            KernelError::Policy("service supervisor was unexpectedly busy during recovery".into())
+        })?;
+        init.restore_runtime(&runtime);
+        let recovered = init.list_runtime();
+        drop(init);
+        for service in &recovered {
+            if runtime.iter().any(|stored| stored.name == service.name) {
+                self.context_manager
+                    .save_service_runtime(
+                        service,
+                        "process_recovered",
+                        service.last_failure.as_deref(),
+                    )
+                    .map_err(KernelError::Context)?;
+            }
+        }
+        Ok(())
+    }
+
     fn lifecycle_lock(&self, agent_id: AgentId) -> Arc<tokio::sync::Mutex<()>> {
         self.lifecycle_locks
             .entry(agent_id)
@@ -2597,27 +2748,199 @@ impl AgentKernelImpl {
         self.lifecycle_locks.remove(&agent_id);
     }
 
-    /// Reload a complete service directory atomically. This validates parsing,
-    /// duplicate names, required dependencies, ordering, and cycles before the
-    /// live definition set is replaced.
+    async fn persist_service_transition(
+        &self,
+        name: &str,
+        event: &str,
+        reason: Option<&str>,
+    ) -> Result<(), KernelError> {
+        let runtime = self
+            .os
+            .init
+            .lock()
+            .await
+            .list_runtime()
+            .into_iter()
+            .find(|service| service.name == name)
+            .ok_or_else(|| KernelError::Policy(format!("service '{name}' not found")))?;
+        self.context_manager
+            .save_service_runtime(&runtime, event, reason)
+            .map_err(KernelError::Context)?;
+        let _ = self.event_tx.send(KernelEvent::ServiceStateChanged {
+            name: name.to_string(),
+            status: runtime.status,
+            reason: reason.map(str::to_string),
+        });
+        Ok(())
+    }
+
+    pub fn list_service_history(
+        &self,
+        name: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<crate::init_system::ServiceHistoryEntry>, KernelError> {
+        self.context_manager
+            .list_service_history(name, limit)
+            .map_err(KernelError::Context)
+    }
+
+    /// Reload the explicitly configured service directory. The complete graph
+    /// is parsed and validated before any live state changes. Changed/removed
+    /// services stop in reverse dependency order, new definitions publish as
+    /// one replacement, and affected desired services start in the new order.
+    /// A failed rollout restores the prior graph and desired instances.
+    pub async fn reload_configured_services(&self) -> Result<Vec<String>, KernelError> {
+        let path = self
+            .service_directory
+            .read()
+            .map_err(|_| KernelError::Policy("service directory lock is poisoned".into()))?
+            .clone()
+            .ok_or_else(|| {
+                KernelError::Policy("no service directory is configured for reload".into())
+            })?;
+        self.reload_service_directory(&path).await
+    }
+
     pub async fn reload_service_directory(
         &self,
         path: &std::path::Path,
     ) -> Result<Vec<String>, KernelError> {
-        let mut init = self.os.init.lock().await;
-        if init.list_runtime().iter().any(|service| {
-            !matches!(
-                service.status,
-                ServiceStatus::Inactive | ServiceStatus::Failed
+        let definitions = InitSystem::read_directory_checked(path).map_err(KernelError::Policy)?;
+        let _operation = self.service_operation_lock.lock().await;
+        let (old_definitions, old_order, old_runtime, new_order) = {
+            let init = self.os.init.lock().await;
+            let new_order = init
+                .validate_replacement(definitions.clone())
+                .map_err(KernelError::Policy)?;
+            (
+                init.definitions(),
+                init.boot_order().to_vec(),
+                init.list_runtime(),
+                new_order,
             )
-        }) {
-            return Err(KernelError::Policy(
-                "service reload requires all services to be inactive or failed; stop them before retrying"
-                    .into(),
-            ));
+        };
+        let old_by_name = old_definitions
+            .iter()
+            .map(|definition| (definition.name.clone(), definition.clone()))
+            .collect::<std::collections::HashMap<_, _>>();
+        let new_by_name = definitions
+            .iter()
+            .map(|definition| (definition.name.clone(), definition.clone()))
+            .collect::<std::collections::HashMap<_, _>>();
+        let directly_changed = old_by_name
+            .iter()
+            .filter(|(name, definition)| new_by_name.get(*name) != Some(*definition))
+            .map(|(name, _)| name.clone())
+            .collect::<std::collections::HashSet<_>>();
+        let mut affected = directly_changed;
+        loop {
+            let before = affected.len();
+            for (name, definition) in old_by_name.iter().chain(new_by_name.iter()) {
+                if definition
+                    .dependencies
+                    .requires
+                    .iter()
+                    .any(|required| affected.contains(required))
+                {
+                    affected.insert(name.clone());
+                }
+            }
+            if affected.len() == before {
+                break;
+            }
         }
-        init.load_directory_checked(path)
-            .map_err(KernelError::Policy)
+        let old_desired = old_runtime
+            .iter()
+            .filter(|runtime| runtime.desired_running)
+            .map(|runtime| runtime.name.as_str())
+            .collect::<std::collections::HashSet<_>>();
+        let old_active = old_runtime
+            .iter()
+            .filter(|runtime| runtime.status == ServiceStatus::Running)
+            .map(|runtime| runtime.name.as_str())
+            .collect::<std::collections::HashSet<_>>();
+        let changed_or_removed = old_order
+            .iter()
+            .rev()
+            .filter(|name| affected.contains(*name))
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut stopped = Vec::new();
+        for name in &changed_or_removed {
+            if let Err(error) = self.stop_service_inner(name, false).await {
+                for old_name in &old_order {
+                    if stopped.contains(old_name) && old_active.contains(old_name.as_str()) {
+                        let _ = self.start_service_inner(old_name).await;
+                    }
+                }
+                return Err(KernelError::Policy(format!(
+                    "rolling service reload could not quiesce '{name}' and restored stopped services: {error}"
+                )));
+            }
+            stopped.push(name.clone());
+        }
+        {
+            let mut init = self.os.init.lock().await;
+            init.replace_definitions(definitions)
+                .map_err(KernelError::Policy)?;
+        }
+        let mut started = Vec::new();
+        for name in &new_order {
+            let is_added = !old_by_name.contains_key(name);
+            let should_roll = affected.contains(name) && old_desired.contains(name.as_str());
+            if is_added || should_roll {
+                match self.start_service_inner(name).await {
+                    Ok(_) => started.push(name.clone()),
+                    Err(error) => {
+                        for started_name in started.iter().rev() {
+                            let _ = self.stop_service_inner(started_name, false).await;
+                        }
+                        {
+                            let mut init = self.os.init.lock().await;
+                            let _ = init.replace_definitions(old_definitions.clone());
+                            init.restore_runtime(&old_runtime);
+                        }
+                        for added_name in new_by_name.keys() {
+                            if !old_by_name.contains_key(added_name) {
+                                let _ = self.context_manager.remove_service_runtime(
+                                    added_name,
+                                    "removed by rolling reload rollback",
+                                );
+                            }
+                        }
+                        for old_name in &old_order {
+                            if old_active.contains(old_name.as_str()) {
+                                let _ = self.start_service_inner(old_name).await;
+                            }
+                        }
+                        return Err(KernelError::Policy(format!(
+                            "rolling service reload failed at '{name}' and restored the previous graph: {error}"
+                        )));
+                    }
+                }
+            }
+        }
+        for name in old_by_name.keys() {
+            if !new_by_name.contains_key(name) {
+                self.context_manager
+                    .remove_service_runtime(name, "removed by validated rolling reload")
+                    .map_err(KernelError::Context)?;
+            }
+        }
+        *self
+            .service_directory
+            .write()
+            .map_err(|_| KernelError::Policy("service directory lock is poisoned".into()))? =
+            Some(path.to_path_buf());
+        for service in self.list_services().await {
+            self.persist_service_transition(
+                &service.name,
+                "configuration_reloaded",
+                Some("validated rolling configuration published"),
+            )
+            .await?;
+        }
+        Ok(new_order)
     }
 
     pub async fn list_services(&self) -> Vec<ServiceRuntimeInfo> {
@@ -2625,8 +2948,22 @@ impl AgentKernelImpl {
     }
 
     /// Start one validated service through the same full agent admission path
-    /// as every other agent. Required dependencies must already be running.
+    /// as every other agent. Required dependencies must be running and ready.
     pub async fn start_service(&self, name: &str) -> Result<AgentId, KernelError> {
+        let _operation = self.service_operation_lock.lock().await;
+        {
+            let mut init = self.os.init.lock().await;
+            let state = init
+                .state(name)
+                .ok_or_else(|| KernelError::Policy(format!("service '{name}' not found")))?;
+            if state.status == ServiceStatus::Failed || state.restart_exhausted {
+                init.reset_restart_budget(name);
+            }
+        }
+        self.start_service_inner(name).await
+    }
+
+    async fn start_service_inner(&self, name: &str) -> Result<AgentId, KernelError> {
         let state = self
             .os
             .init
@@ -2634,32 +2971,94 @@ impl AgentKernelImpl {
             .await
             .state(name)
             .ok_or_else(|| KernelError::Policy(format!("service '{name}' not found")))?;
-        if state.status == ServiceStatus::Running {
-            if let Some(agent_id) = state.agent_id {
-                if let Ok(agent_state) = self.get_agent_status(agent_id) {
-                    if !matches!(agent_state, AgentState::Stopped | AgentState::Error(_)) {
-                        return Ok(agent_id);
-                    }
-                }
-            }
-        }
         {
-            let init = self.os.init.lock().await;
+            let mut init = self.os.init.lock().await;
             for required in &state.def.dependencies.requires {
-                if init.status(required) != Some(ServiceStatus::Running) {
+                let dependency = init.state(required);
+                if !dependency.is_some_and(|dependency| {
+                    dependency.status == ServiceStatus::Running
+                        && dependency.ready
+                        && dependency.healthy
+                }) {
+                    let reason = format!("required service '{required}' is not running and ready");
+                    init.record_dependency_block(name, reason.clone());
+                    drop(init);
+                    self.persist_service_transition(name, "dependency_blocked", Some(&reason))
+                        .await?;
                     return Err(KernelError::Policy(format!(
                         "service '{name}' is blocked by required service '{required}'"
                     )));
                 }
             }
         }
+        if state.status == ServiceStatus::Running {
+            if let Some(agent_id) = state.agent_id {
+                if let Ok(agent_state) = self.get_agent_status(agent_id) {
+                    if agent_state == AgentState::Running && state.ready && state.healthy {
+                        return Ok(agent_id);
+                    }
+                }
+            }
+        }
+        if let Some(stale_agent_id) = state.agent_id {
+            if !matches!(
+                self.agent_manager.get_agent_state(stale_agent_id),
+                Some(AgentState::Stopped)
+            ) {
+                self.stop_agent(stale_agent_id).await?;
+            }
+            self.os.init.lock().await.clear_instance_for_restart(name);
+            self.persist_service_transition(
+                name,
+                "stale_owner_cleaned",
+                Some("previous service owner was terminal or no longer healthy"),
+            )
+            .await?;
+        }
         self.os.init.lock().await.mark_starting(name);
+        self.persist_service_transition(name, "starting", None)
+            .await?;
 
         let provider = if state.def.exec.provider.trim().is_empty() {
             "stub".to_string()
         } else {
             state.def.exec.provider.clone()
         };
+        if provider != "stub"
+            && !self
+                .connector
+                .list_providers()
+                .iter()
+                .any(|registered| registered.id == provider)
+        {
+            let reason = format!("provider '{provider}' is not registered");
+            self.os
+                .init
+                .lock()
+                .await
+                .mark_failed_reason(name, 1, reason.clone());
+            self.persist_service_transition(name, "startup_failed", Some(&reason))
+                .await?;
+            return Err(KernelError::Policy(format!("service '{name}' {reason}")));
+        }
+        if state.def.policy.tenant_id != crate::context::DEFAULT_TENANT
+            && self
+                .auth
+                .read()
+                .await
+                .get_tenant(&state.def.policy.tenant_id)
+                .is_none()
+        {
+            let reason = format!("tenant '{}' is not registered", state.def.policy.tenant_id);
+            self.os
+                .init
+                .lock()
+                .await
+                .mark_failed_reason(name, 1, reason.clone());
+            self.persist_service_transition(name, "startup_failed", Some(&reason))
+                .await?;
+            return Err(KernelError::Policy(format!("service '{name}' {reason}")));
+        }
         let task = state
             .def
             .description
@@ -2672,7 +3071,7 @@ impl AgentKernelImpl {
                     state.def.exec.system_prompt.clone()
                 }
             });
-        let nice = state.def.resources.nice.unwrap_or(0).clamp(-20, 19);
+        let nice = state.def.resources.nice.unwrap_or(0);
         let priority_value = match nice {
             -20..=-12 => 1,
             -11..=-4 => 2,
@@ -2680,36 +3079,204 @@ impl AgentKernelImpl {
             5..=12 => 4,
             _ => 5,
         };
-        let created = self
-            .create_agent_full(AgentConfig {
+        let namespace_group = state.def.policy.namespace.as_ref().map(|namespace| {
+            format!(
+                "service:{}:{namespace}",
+                quota_scope_segment(&state.def.policy.tenant_id)
+            )
+        });
+        let tenant_group = if state.def.policy.tenant_id == crate::context::DEFAULT_TENANT {
+            None
+        } else {
+            Some(state.def.policy.tenant_id.clone())
+        };
+        let group = namespace_group.as_deref().or(tenant_group.as_deref());
+        let startup_started = std::time::Instant::now();
+        let startup_timeout = std::time::Duration::from_millis(state.def.health.startup_timeout_ms);
+        let create = self.create_agent_grouped(
+            AgentConfig {
                 name: format!("service:{name}"),
                 task,
                 llm_provider: provider,
-                permission_profile: "standard".into(),
+                permission_profile: state.def.policy.profile.clone(),
                 priority: Priority::new(priority_value).unwrap_or_default(),
-                sandbox_config: None,
-            })
-            .await;
+                sandbox_config: state.def.policy.sandbox.clone(),
+            },
+            group,
+            &state.def.policy.tenant_id,
+        );
+        let created = tokio::time::timeout(startup_timeout, create).await;
         match created {
-            Ok(handle) => {
+            Ok(Ok(handle)) => {
+                let policy = (|| {
+                    let gate_info = self.syscall_gate.agent_info(handle.id).ok_or_else(|| {
+                        KernelError::Policy(format!(
+                            "service '{name}' disappeared from the syscall gate"
+                        ))
+                    })?;
+                    let mut limits = self
+                        .cgroups
+                        .get(gate_info.cgroup)
+                        .map(|group| group.limits)
+                        .ok_or_else(|| {
+                            KernelError::Policy(format!(
+                                "service '{name}' has no enforceable cgroup after creation"
+                            ))
+                        })?;
+                    if let Some(tokens_per_min) = state
+                        .def
+                        .token_budget_per_minute()
+                        .map_err(|error| KernelError::Policy(format!("service '{name}' {error}")))?
+                    {
+                        limits.tokens_per_min = tokens_per_min;
+                    }
+                    if let Some(max_context) = state.def.resources.max_context {
+                        limits.max_context_tokens = max_context;
+                    }
+                    if let Some(max_tools) = state.def.resources.max_concurrent_tool_calls {
+                        limits.max_concurrent_tool_calls = max_tools;
+                    }
+                    Ok::<_, KernelError>((gate_info.cgroup, limits))
+                })();
+                let (cgroup_id, limits) = match policy {
+                    Ok(policy) => policy,
+                    Err(error) => {
+                        let reason = error.to_string();
+                        self.fail_service_start(name, handle.id, "startup_failed", &reason)
+                            .await?;
+                        return Err(error);
+                    }
+                };
+                if let Err(error) = self.cgroups.update_limits(cgroup_id, limits) {
+                    let reason = format!("resource policy could not be enforced: {error}");
+                    self.fail_service_start(name, handle.id, "startup_failed", &reason)
+                        .await?;
+                    return Err(KernelError::Policy(format!("service '{name}' {reason}")));
+                }
                 if state.def.resources.nice.is_some() {
                     if let Err(error) = self.set_nice(handle.id, nice).await {
-                        let _ = self.kill_agent(handle.id).await;
-                        self.os.init.lock().await.mark_failed(name, 1);
+                        self.fail_service_start(
+                            name,
+                            handle.id,
+                            "startup_failed",
+                            &error.to_string(),
+                        )
+                        .await?;
                         return Err(error);
                     }
                 }
                 self.os.init.lock().await.mark_started(name, handle.id);
+                self.persist_service_transition(name, "started", None)
+                    .await?;
+                let remaining = startup_timeout.saturating_sub(startup_started.elapsed());
+                let readiness = tokio::time::timeout(remaining, async {
+                    if state.def.health.readiness_delay_ms > 0 {
+                        tokio::time::sleep(std::time::Duration::from_millis(
+                            state.def.health.readiness_delay_ms,
+                        ))
+                        .await;
+                    }
+                    self.get_agent_status(handle.id)
+                })
+                .await;
+                let agent_state = match readiness {
+                    Ok(Ok(agent_state)) => agent_state,
+                    Ok(Err(error)) => {
+                        self.fail_service_start(
+                            name,
+                            handle.id,
+                            "readiness_failed",
+                            &error.to_string(),
+                        )
+                        .await?;
+                        return Err(error);
+                    }
+                    Err(_) => {
+                        let reason =
+                            format!("startup exceeded {}ms", state.def.health.startup_timeout_ms);
+                        self.fail_service_start(name, handle.id, "startup_timeout", &reason)
+                            .await?;
+                        return Err(KernelError::LifecycleTimeout(format!(
+                            "service '{name}' {reason}"
+                        )));
+                    }
+                };
+                if agent_state != AgentState::Running {
+                    let reason = format!("service owner was {agent_state:?} at readiness check");
+                    self.fail_service_start(name, handle.id, "readiness_failed", &reason)
+                        .await?;
+                    return Err(KernelError::Policy(format!(
+                        "service '{name}' readiness failed"
+                    )));
+                }
+                self.os.init.lock().await.mark_ready(name);
+                self.service_health_checks
+                    .insert(name.to_string(), std::time::Instant::now());
+                self.persist_service_transition(name, "ready", None).await?;
                 Ok(handle.id)
             }
-            Err(error) => {
-                self.os.init.lock().await.mark_failed(name, 1);
+            Ok(Err(error)) => {
+                self.os
+                    .init
+                    .lock()
+                    .await
+                    .mark_failed_reason(name, 1, error.to_string());
+                self.persist_service_transition(name, "startup_failed", Some(&error.to_string()))
+                    .await?;
                 Err(error)
+            }
+            Err(_) => {
+                let reason = format!("startup exceeded {}ms", state.def.health.startup_timeout_ms);
+                self.os
+                    .init
+                    .lock()
+                    .await
+                    .mark_failed_reason(name, 1, reason.clone());
+                self.persist_service_transition(name, "startup_timeout", Some(&reason))
+                    .await?;
+                Err(KernelError::LifecycleTimeout(format!(
+                    "service '{name}' {reason}"
+                )))
             }
         }
     }
 
+    async fn fail_service_start(
+        &self,
+        name: &str,
+        agent_id: AgentId,
+        event: &str,
+        reason: &str,
+    ) -> Result<(), KernelError> {
+        let cleanup = self.kill_agent(agent_id).await;
+        self.os
+            .init
+            .lock()
+            .await
+            .mark_failed_reason(name, 1, reason.to_string());
+        self.os.init.lock().await.clear_instance(name);
+        self.persist_service_transition(name, event, Some(reason))
+            .await?;
+        cleanup.map(|_| ())
+    }
+
     pub async fn stop_service(&self, name: &str) -> Result<(), KernelError> {
+        let _operation = self.service_operation_lock.lock().await;
+        let order = self.os.init.lock().await.dependents_of(name);
+        if order.is_empty() {
+            return Err(KernelError::Policy(format!("service '{name}' not found")));
+        }
+        for service in order {
+            self.stop_service_inner(&service, false).await?;
+        }
+        Ok(())
+    }
+
+    async fn stop_service_inner(
+        &self,
+        name: &str,
+        desired_running: bool,
+    ) -> Result<(), KernelError> {
         let state = self
             .os
             .init
@@ -2718,53 +3285,357 @@ impl AgentKernelImpl {
             .state(name)
             .ok_or_else(|| KernelError::Policy(format!("service '{name}' not found")))?;
         if state.status == ServiceStatus::Inactive {
+            self.os
+                .init
+                .lock()
+                .await
+                .mark_stopped_with_desired(name, desired_running);
+            self.persist_service_transition(name, "stopped", None)
+                .await?;
             return Ok(());
         }
         self.os.init.lock().await.mark_stopping(name);
+        self.persist_service_transition(name, "stopping", None)
+            .await?;
         if let Some(agent_id) = state.agent_id {
-            if let Err(error) = self.stop_agent(agent_id).await {
-                self.os.init.lock().await.mark_failed(name, 1);
-                return Err(error);
+            let graceful = tokio::time::timeout(
+                std::time::Duration::from_millis(state.def.health.shutdown_timeout_ms),
+                self.stop_agent(agent_id),
+            )
+            .await;
+            match graceful {
+                Ok(Ok(_)) => {}
+                Ok(Err(error)) => {
+                    self.os
+                        .init
+                        .lock()
+                        .await
+                        .mark_failed_reason(name, 1, error.to_string());
+                    self.persist_service_transition(
+                        name,
+                        "shutdown_failed",
+                        Some(&error.to_string()),
+                    )
+                    .await?;
+                    return Err(error);
+                }
+                Err(_) => {
+                    self.kill_agent(agent_id).await?;
+                    self.persist_service_transition(
+                        name,
+                        "shutdown_forced",
+                        Some("graceful shutdown deadline exceeded"),
+                    )
+                    .await?;
+                }
             }
         }
-        self.os.init.lock().await.mark_stopped(name);
+        self.os
+            .init
+            .lock()
+            .await
+            .mark_stopped_with_desired(name, desired_running);
+        self.service_health_checks.remove(name);
+        self.persist_service_transition(name, "stopped", None)
+            .await?;
         Ok(())
     }
 
     pub async fn restart_service(&self, name: &str) -> Result<AgentId, KernelError> {
-        let state = self
-            .os
-            .init
-            .lock()
-            .await
-            .state(name)
-            .ok_or_else(|| KernelError::Policy(format!("service '{name}' not found")))?;
-        self.stop_service(name).await?;
-        self.os.init.lock().await.record_restart(name);
+        let _operation = self.service_operation_lock.lock().await;
+        let (state, reverse_order, desired) = {
+            let init = self.os.init.lock().await;
+            let state = init
+                .state(name)
+                .ok_or_else(|| KernelError::Policy(format!("service '{name}' not found")))?;
+            let reverse_order = init.dependents_of(name);
+            let desired = reverse_order
+                .iter()
+                .filter_map(|service| {
+                    init.state(service)
+                        .map(|state| (service.clone(), state.desired_running))
+                })
+                .collect::<std::collections::HashMap<_, _>>();
+            (state, reverse_order, desired)
+        };
+        for service in &reverse_order {
+            let keep_desired = service == name || desired.get(service).copied().unwrap_or(false);
+            self.stop_service_inner(service, keep_desired).await?;
+        }
+        for service in &reverse_order {
+            if service == name || desired.get(service).copied().unwrap_or(false) {
+                let mut init = self.os.init.lock().await;
+                init.reset_restart_budget(service);
+                init.record_restart(service);
+                drop(init);
+                let reason = if service == name {
+                    "operator requested restart"
+                } else {
+                    "required dependency was manually restarted"
+                };
+                self.persist_service_transition(service, "manual_restart", Some(reason))
+                    .await?;
+            }
+        }
         tokio::time::sleep(std::time::Duration::from_millis(
-            state.def.service.restart_delay_ms.min(30_000),
+            state
+                .def
+                .service
+                .restart_delay_ms
+                .min(state.def.service.restart_max_delay_ms),
         ))
         .await;
-        self.start_service(name).await
+        let mut target = None;
+        for service in reverse_order.iter().rev() {
+            if service == name || desired.get(service).copied().unwrap_or(false) {
+                let agent_id = self.start_service_inner(service).await?;
+                if service == name {
+                    target = Some(agent_id);
+                }
+            }
+        }
+        target.ok_or_else(|| KernelError::Policy(format!("service '{name}' restart was skipped")))
     }
 
     /// Start all services in validated dependency order. A failure rolls back
     /// services started by this attempt in reverse order.
     pub async fn boot_services(&self) -> Result<Vec<AgentId>, KernelError> {
+        let _operation = self.service_operation_lock.lock().await;
         let order = self.os.init.lock().await.boot_order().to_vec();
-        let mut started = Vec::new();
+        let mut active = Vec::new();
+        let mut started_by_attempt = Vec::new();
         for name in order {
-            match self.start_service(&name).await {
-                Ok(agent_id) => started.push((name, agent_id)),
+            let recovered = self
+                .os
+                .init
+                .lock()
+                .await
+                .state(&name)
+                .expect("boot order only contains configured services");
+            if recovered.desired_running {
+                let dependencies_ready = {
+                    let init = self.os.init.lock().await;
+                    recovered.def.dependencies.requires.iter().all(|required| {
+                        init.state(required).is_some_and(|dependency| {
+                            dependency.status == ServiceStatus::Running
+                                && dependency.ready
+                                && dependency.healthy
+                        })
+                    })
+                };
+                if recovered.status == ServiceStatus::Running
+                    && recovered.ready
+                    && recovered.healthy
+                    && dependencies_ready
+                {
+                    if let Some(agent_id) = recovered.agent_id {
+                        active.push(agent_id);
+                    }
+                }
+                // Any other desired state is crash-recovery work. Preserve its
+                // durable delay/exhaustion and let the runtime supervisor
+                // reconcile it instead of bypassing policy during boot.
+                continue;
+            }
+            match self.start_service_inner(&name).await {
+                Ok(agent_id) => {
+                    active.push(agent_id);
+                    started_by_attempt.push(name);
+                }
                 Err(error) => {
-                    for (started_name, _) in started.iter().rev() {
-                        let _ = self.stop_service(started_name).await;
+                    for started_name in started_by_attempt.iter().rev() {
+                        let _ = self.stop_service_inner(started_name, false).await;
                     }
                     return Err(error);
                 }
             }
         }
-        Ok(started.into_iter().map(|(_, agent_id)| agent_id).collect())
+        Ok(active)
+    }
+
+    /// One liveness/restart reconciliation pass. The runtime calls this on a
+    /// bounded interval; the global operation lock prevents overlap with
+    /// operator lifecycle and rolling reload.
+    pub(crate) async fn service_supervisor_sweep(&self) -> Result<(), KernelError> {
+        let Ok(_operation) = self.service_operation_lock.try_lock() else {
+            return Ok(());
+        };
+        let now = chrono::Utc::now();
+        let names = self.os.init.lock().await.boot_order().to_vec();
+
+        // Required-dependency failure propagates from dependents backwards.
+        for name in names.iter().rev() {
+            let Some(state) = self.os.init.lock().await.state(name) else {
+                continue;
+            };
+            if !state.desired_running || state.status != ServiceStatus::Running {
+                continue;
+            }
+            let dependency_failure = {
+                let init = self.os.init.lock().await;
+                state.def.dependencies.requires.iter().find_map(|required| {
+                    let dependency = init.state(required)?;
+                    (!(dependency.status == ServiceStatus::Running
+                        && dependency.ready
+                        && dependency.healthy))
+                        .then(|| required.clone())
+                })
+            };
+            if let Some(required) = dependency_failure {
+                let reason = format!("required service '{required}' became unavailable");
+                self.stop_service_inner(name, true).await?;
+                {
+                    let mut init = self.os.init.lock().await;
+                    init.mark_failed_reason(name, 1, reason.clone());
+                    init.record_dependency_block(name, reason.clone());
+                    let _ = init.schedule_restart(name, now);
+                }
+                self.persist_service_transition(name, "dependency_failed", Some(&reason))
+                    .await?;
+            }
+        }
+
+        for name in names {
+            let Some(state) = self.os.init.lock().await.state(&name) else {
+                continue;
+            };
+            if !state.desired_running {
+                continue;
+            }
+            if state.status == ServiceStatus::Running {
+                let liveness_interval =
+                    std::time::Duration::from_millis(state.def.health.liveness_interval_ms);
+                if self
+                    .service_health_checks
+                    .get(&name)
+                    .is_some_and(|last_check| last_check.elapsed() < liveness_interval)
+                {
+                    continue;
+                }
+                self.service_health_checks
+                    .insert(name.clone(), std::time::Instant::now());
+                let live = state.agent_id.and_then(|agent_id| {
+                    self.agent_manager
+                        .get_agent_state(agent_id)
+                        .map(|agent_state| (agent_id, agent_state))
+                });
+                match live {
+                    Some((_, AgentState::Running)) if state.ready && state.healthy => continue,
+                    Some((_, AgentState::Running)) => {
+                        self.os.init.lock().await.mark_ready(&name);
+                        self.persist_service_transition(&name, "health_recovered", None)
+                            .await?;
+                        continue;
+                    }
+                    Some((agent_id, agent_state)) => {
+                        let reason = format!("liveness failed: owner state is {agent_state:?}");
+                        let mut init = self.os.init.lock().await;
+                        init.mark_failed_reason(&name, 1, reason.clone());
+                        let _ = init.schedule_restart(&name, now);
+                        drop(init);
+                        if !matches!(agent_state, AgentState::Stopped) {
+                            self.stop_agent(agent_id).await?;
+                        }
+                        self.os.init.lock().await.clear_instance(&name);
+                        self.persist_service_transition(&name, "liveness_failed", Some(&reason))
+                            .await?;
+                    }
+                    None => {
+                        let reason = "liveness failed: durable owner is missing".to_string();
+                        let mut init = self.os.init.lock().await;
+                        init.mark_failed_reason(&name, 1, reason.clone());
+                        let _ = init.schedule_restart(&name, now);
+                        drop(init);
+                        self.persist_service_transition(&name, "liveness_failed", Some(&reason))
+                            .await?;
+                    }
+                }
+            } else if state.status == ServiceStatus::Failed && state.next_restart_at.is_none() {
+                let mut init = self.os.init.lock().await;
+                let scheduled = init.schedule_restart(&name, now);
+                drop(init);
+                if scheduled.is_some() {
+                    self.persist_service_transition(
+                        &name,
+                        "restart_scheduled",
+                        state.last_failure.as_deref(),
+                    )
+                    .await?;
+                }
+            }
+
+            let due = self.os.init.lock().await.restart_due(&name, now);
+            if !due {
+                continue;
+            }
+            let required_ready = {
+                let init = self.os.init.lock().await;
+                let state = init.state(&name).expect("service exists during sweep");
+                state.def.dependencies.requires.iter().all(|required| {
+                    init.state(required).is_some_and(|dependency| {
+                        dependency.status == ServiceStatus::Running
+                            && dependency.ready
+                            && dependency.healthy
+                    })
+                })
+            };
+            if !required_ready {
+                let reason = "restart deferred until required dependencies are ready".to_string();
+                self.os.init.lock().await.defer_restart(
+                    &name,
+                    std::time::Duration::from_millis(state.def.health.liveness_interval_ms.max(50)),
+                    reason.clone(),
+                );
+                self.persist_service_transition(&name, "restart_deferred", Some(&reason))
+                    .await?;
+                continue;
+            }
+            if let Some(agent_id) = state.agent_id {
+                if !matches!(
+                    self.agent_manager.get_agent_state(agent_id),
+                    Some(AgentState::Stopped)
+                ) {
+                    let cleanup = self.stop_agent(agent_id).await;
+                    if let Err(error) = cleanup {
+                        self.os.init.lock().await.defer_restart(
+                            &name,
+                            std::time::Duration::from_millis(
+                                state.def.health.liveness_interval_ms.max(50),
+                            ),
+                            format!("restart cleanup failed: {error}"),
+                        );
+                        self.persist_service_transition(
+                            &name,
+                            "restart_cleanup_failed",
+                            Some(&error.to_string()),
+                        )
+                        .await?;
+                        continue;
+                    }
+                }
+            }
+            {
+                let mut init = self.os.init.lock().await;
+                init.clear_instance_for_restart(&name);
+                init.record_restart(&name);
+            }
+            self.persist_service_transition(
+                &name,
+                "restart_attempt",
+                state.last_failure.as_deref(),
+            )
+            .await?;
+            if let Err(error) = self.start_service_inner(&name).await {
+                let reason = format!("restart attempt failed: {error}");
+                let mut init = self.os.init.lock().await;
+                init.mark_failed_reason(&name, 1, reason.clone());
+                let _ = init.schedule_restart(&name, chrono::Utc::now());
+                drop(init);
+                self.persist_service_transition(&name, "restart_failed", Some(&reason))
+                    .await?;
+            }
+        }
+        Ok(())
     }
 
     /// Cancel an active turn and wait until the per-agent executor is idle.
@@ -3622,26 +4493,29 @@ impl AgentKernelImpl {
         // Coordinated services stop first in reverse dependency order. Their
         // agents become terminal through `stop_agent`, so the general pass
         // below naturally skips them.
-        let service_shutdown_order = {
-            let init = self.os.init.lock().await;
-            init.reverse_boot_order()
-        };
-        for service in service_shutdown_order {
-            let agent_id = self
-                .os
-                .init
-                .lock()
-                .await
-                .state(&service)
-                .and_then(|state| state.agent_id);
-            match self.stop_service(&service).await {
-                Ok(()) => {
-                    if let Some(agent_id) = agent_id {
-                        stopped.push(agent_id);
+        {
+            let _operation = self.service_operation_lock.lock().await;
+            let service_shutdown_order = {
+                let init = self.os.init.lock().await;
+                init.reverse_boot_order()
+            };
+            for service in service_shutdown_order {
+                let agent_id = self
+                    .os
+                    .init
+                    .lock()
+                    .await
+                    .state(&service)
+                    .and_then(|state| state.agent_id);
+                match self.stop_service_inner(&service, false).await {
+                    Ok(()) => {
+                        if let Some(agent_id) = agent_id {
+                            stopped.push(agent_id);
+                        }
                     }
-                }
-                Err(error) => {
-                    failures.push(format!("service {service}: {error}"));
+                    Err(error) => {
+                        failures.push(format!("service {service}: {error}"));
+                    }
                 }
             }
         }
@@ -3700,8 +4574,8 @@ impl AgentKernelImpl {
     /// procfs as `current_agent`. Durable fixed-epoch quota windows need no
     /// background reset timer. Returns the
     /// [`KernelRuntime`](crate::runtime::KernelRuntime) so the caller can
-    /// `stop()` it on shutdown. Calling twice spawns two observers, so call once
-    /// at startup.
+    /// `stop()` it on shutdown. Starting the returned runtime more than once is
+    /// idempotent and does not create duplicate background loops.
     pub fn start_runtime(self: &Arc<Self>) -> crate::runtime::KernelRuntime {
         let runtime = crate::runtime::KernelRuntime::new(self.clone());
         let _handles = runtime.start();

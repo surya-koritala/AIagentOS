@@ -41,7 +41,7 @@ use tokio::net::ToSocketAddrs;
 // Re-export the kernel wire types that appear in this crate's public API, so
 // SDK consumers can name them without depending on the kernel directly.
 pub use kernel::context::ContextPressureStats;
-pub use kernel::init_system::ServiceRuntimeInfo;
+pub use kernel::init_system::{ServiceHistoryEntry, ServiceRuntimeInfo};
 pub use kernel::operator_control::{OperatorTunable, OperatorTunableAudit};
 pub use kernel::syscall_server::{
     AgentSummary, FactSummary, GenerationCheckpointSummary, OperatorAgentSnapshot,
@@ -804,6 +804,27 @@ impl KernelClient {
         }
     }
 
+    pub async fn reload_services(&mut self) -> Result<Vec<String>, SdkError> {
+        match self.call(Syscall::ReloadServices).await? {
+            SyscallReply::ServiceConfigurationReloaded { boot_order } => Ok(boot_order),
+            other => Err(unexpected("ServiceConfigurationReloaded", &other)),
+        }
+    }
+
+    pub async fn service_history(
+        &mut self,
+        name: Option<String>,
+        limit: usize,
+    ) -> Result<Vec<ServiceHistoryEntry>, SdkError> {
+        match self
+            .call(Syscall::ListServiceHistory { name, limit })
+            .await?
+        {
+            SyscallReply::ServiceHistory { entries } => Ok(entries),
+            other => Err(unexpected("ServiceHistory", &other)),
+        }
+    }
+
     /// Delete a key from an agent's key/value store. Returns `true` if the key
     /// existed, `false` otherwise.
     pub async fn storage_delete(
@@ -1398,36 +1419,20 @@ mod protocol_tests {
 
     #[tokio::test]
     async fn sdk_service_supervisor_uses_public_coordinated_lifecycle() {
-        use kernel::init_system::{
-            DependencyConfig, ExecConfig, ResourceConfig, RestartPolicy, ServiceConfig, ServiceDef,
-            ServiceStatus, ServiceType,
-        };
+        use kernel::init_system::ServiceStatus;
 
         let kernel = Arc::new(AgentKernelImpl::new().expect("kernel new"));
-        kernel
-            .os
-            .init
-            .lock()
-            .await
-            .replace_definitions(vec![ServiceDef {
-                name: "public-service".into(),
-                description: Some("public service test".into()),
-                exec: ExecConfig {
-                    provider: "stub".into(),
-                    system_prompt: "run".into(),
-                    tools: Vec::new(),
-                    model: None,
-                },
-                service: ServiceConfig {
-                    restart: RestartPolicy::OnFailure,
-                    restart_delay_ms: 0,
-                    max_restarts: 2,
-                    service_type: ServiceType::Simple,
-                },
-                dependencies: DependencyConfig::default(),
-                resources: ResourceConfig::default(),
-            }])
-            .unwrap();
+        let directory =
+            std::env::temp_dir().join(format!("agentos-sdk-service-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let definition_path = directory.join("public-service.toml");
+        std::fs::write(
+            &definition_path,
+            "name = \"public-service\"\ndescription = \"public service test\"\n\
+             [exec]\nprovider = \"stub\"\nsystem_prompt = \"run\"\n",
+        )
+        .unwrap();
+        kernel.reload_service_directory(&directory).await.unwrap();
         let server = SyscallServer::bind(Arc::clone(&kernel), "127.0.0.1:0")
             .await
             .unwrap();
@@ -1440,17 +1445,49 @@ mod protocol_tests {
         assert_eq!(started.status, ServiceStatus::Running);
         let first_agent = started.agent_id.unwrap();
 
-        let restarted = client.restart_service("public-service").await.unwrap();
-        assert_eq!(restarted.status, ServiceStatus::Running);
-        assert_ne!(restarted.agent_id, Some(first_agent));
+        std::fs::write(
+            &definition_path,
+            "name = \"public-service\"\ndescription = \"reloaded public service\"\n\
+             [exec]\nprovider = \"stub\"\nsystem_prompt = \"run\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            client.reload_services().await.unwrap(),
+            vec!["public-service"]
+        );
+        let reloaded = client.list_services().await.unwrap().remove(0);
+        assert_ne!(reloaded.agent_id, Some(first_agent));
+        let reloaded_agent = reloaded.agent_id.unwrap();
         assert_eq!(
             client.agent_status(first_agent.to_string()).await.unwrap(),
+            "Stopped"
+        );
+
+        let restarted = client.restart_service("public-service").await.unwrap();
+        assert_eq!(restarted.status, ServiceStatus::Running);
+        assert_ne!(restarted.agent_id, Some(reloaded_agent));
+        assert_eq!(
+            client
+                .agent_status(reloaded_agent.to_string())
+                .await
+                .unwrap(),
             "Stopped"
         );
 
         let stopped = client.stop_service("public-service").await.unwrap();
         assert_eq!(stopped.status, ServiceStatus::Inactive);
         assert!(stopped.agent_id.is_none());
+        let history = client
+            .service_history(Some("public-service".into()), 100)
+            .await
+            .unwrap();
+        assert!(history.iter().any(|entry| entry.event == "ready"));
+        assert!(history.iter().any(|entry| entry.event == "manual_restart"));
+        assert!(history
+            .iter()
+            .any(|entry| entry.event == "configuration_reloaded"));
+        assert!(history.iter().any(|entry| entry.event == "stopped"));
+        let _ = std::fs::remove_dir_all(directory);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -296,6 +296,15 @@ pub enum Syscall {
     RestartService {
         name: String,
     },
+    /// Re-parse and roll out the explicit configured service directory.
+    ReloadServices,
+    /// Durable service transition/restart history.
+    ListServiceHistory {
+        #[serde(default)]
+        name: Option<String>,
+        #[serde(default = "default_tunable_audit_limit")]
+        limit: usize,
+    },
 }
 
 /// A short, serializable view of an agent.
@@ -399,6 +408,20 @@ pub struct OperatorServiceSnapshot {
     pub agent_id: Option<String>,
     pub restart_count: u32,
     pub last_exit_code: Option<i32>,
+    #[serde(default)]
+    pub desired_running: bool,
+    #[serde(default)]
+    pub ready: bool,
+    #[serde(default)]
+    pub healthy: bool,
+    #[serde(default)]
+    pub restart_exhausted: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_failure: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_restart_at: Option<String>,
+    #[serde(default)]
+    pub last_transition_at: String,
 }
 
 /// Timestamped remote operations view. `system_metrics` and `services` are
@@ -680,6 +703,12 @@ pub enum SyscallReply {
     Service {
         service: crate::init_system::ServiceRuntimeInfo,
     },
+    ServiceConfigurationReloaded {
+        boot_order: Vec<String>,
+    },
+    ServiceHistory {
+        entries: Vec<crate::init_system::ServiceHistoryEntry>,
+    },
     /// Any error is surfaced to the caller rather than dropping the connection.
     Error {
         message: String,
@@ -813,6 +842,8 @@ fn syscall_policy(call: &Syscall) -> (AccessLevel, &'static str, Option<&str>) {
         Syscall::StartService { .. } => (AccessLevel::System, "service.start", None),
         Syscall::StopService { .. } => (AccessLevel::System, "service.stop", None),
         Syscall::RestartService { .. } => (AccessLevel::System, "service.restart", None),
+        Syscall::ReloadServices => (AccessLevel::System, "service.reload", None),
+        Syscall::ListServiceHistory { .. } => (AccessLevel::System, "service.history", None),
     }
 }
 
@@ -1775,6 +1806,13 @@ pub async fn dispatch_scoped(
                         agent_id: service.agent_id.map(|id| id.to_string()),
                         restart_count: service.restart_count,
                         last_exit_code: service.last_exit_code,
+                        desired_running: service.desired_running,
+                        ready: service.ready,
+                        healthy: service.healthy,
+                        restart_exhausted: service.restart_exhausted,
+                        last_failure: service.last_failure,
+                        next_restart_at: service.next_restart_at,
+                        last_transition_at: service.last_transition_at,
                     })
                     .collect::<Vec<_>>();
                 services.sort_by(|a, b| a.name.cmp(&b.name));
@@ -2002,6 +2040,20 @@ pub async fn dispatch_scoped(
                 message: error.to_string(),
             },
         },
+        Syscall::ReloadServices => match kernel.reload_configured_services().await {
+            Ok(boot_order) => SyscallReply::ServiceConfigurationReloaded { boot_order },
+            Err(error) => SyscallReply::Error {
+                message: error.to_string(),
+            },
+        },
+        Syscall::ListServiceHistory { name, limit } => {
+            match kernel.list_service_history(name.as_deref(), limit) {
+                Ok(entries) => SyscallReply::ServiceHistory { entries },
+                Err(error) => SyscallReply::Error {
+                    message: error.to_string(),
+                },
+            }
+        }
     }
 }
 
@@ -3853,6 +3905,14 @@ memory = ["remember this"]
                 Syscall::RestartService { name: "x".into() },
                 AccessLevel::System,
             ),
+            (Syscall::ReloadServices, AccessLevel::System),
+            (
+                Syscall::ListServiceHistory {
+                    name: None,
+                    limit: 10,
+                },
+                AccessLevel::System,
+            ),
         ];
         for (call, expected) in &unscoped_calls {
             let (required, action, target) = syscall_policy(call);
@@ -3877,7 +3937,7 @@ memory = ["remember this"]
         // syscall_policy is an exhaustive match. Adding a new enum variant
         // cannot compile until it receives an authorization classification;
         // this table then records the expected role/resource behavior.
-        assert_eq!(agent_calls.len() + unscoped_calls.len(), 41);
+        assert_eq!(agent_calls.len() + unscoped_calls.len(), 43);
     }
 
     #[tokio::test]

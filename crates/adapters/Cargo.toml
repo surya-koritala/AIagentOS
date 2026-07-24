@@ -23,7 +23,7 @@ tracing = { workspace = true }
 # build and CI footprint are untouched — these pull a large ML stack and long
 # compile times. Enable with `--features candle`. See src/on_device.rs.
 candle-core = { version = "0.11", optional = true }
-candle-transformers = { version = "0.10", optional = true }
+candle-transformers = { version = "0.11", optional = true }
 tokenizers = { version = "0.21", optional = true }
 
 [features]

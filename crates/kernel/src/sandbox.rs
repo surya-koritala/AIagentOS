@@ -5,6 +5,8 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use cap_std::ambient_authority;
@@ -104,6 +106,8 @@ struct SandboxState {
 pub struct SandboxManagerImpl {
     sandboxes: DashMap<SandboxId, SandboxState>,
     agent_sandboxes: DashMap<AgentId, SandboxId>,
+    #[cfg(test)]
+    fail_next_destroy: AtomicBool,
 }
 
 impl Default for SandboxManagerImpl {
@@ -124,7 +128,14 @@ impl SandboxManagerImpl {
         Self {
             sandboxes: DashMap::new(),
             agent_sandboxes: DashMap::new(),
+            #[cfg(test)]
+            fail_next_destroy: AtomicBool::new(false),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_destroy_for_test(&self) {
+        self.fail_next_destroy.store(true, Ordering::Release);
     }
 
     /// Secure default used by all production agent-creation paths that do not
@@ -898,6 +909,12 @@ impl SandboxManager for SandboxManagerImpl {
     }
 
     fn destroy_sandbox(&self, sandbox_id: SandboxId) -> Result<(), SandboxError> {
+        #[cfg(test)]
+        if self.fail_next_destroy.swap(false, Ordering::AcqRel) {
+            return Err(SandboxError::DestructionFailed(
+                "injected sandbox destruction failure".into(),
+            ));
+        }
         let state = self
             .sandboxes
             .get(&sandbox_id)

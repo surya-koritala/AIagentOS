@@ -9,7 +9,8 @@
 //! with `agent-server`.
 //!
 //! Keys: `j`/`k` (or arrows) move · `r` refresh · `c` create (`name|task`) ·
-//! `m` message · `p` pause/resume · `s` stop · `X` kill · `q` quit.
+//! `m` message · `p` pause/resume · `s` stop · `X` kill · `[`/`]` select
+//! service · `u` start · `d` stop · `R` restart · `L` reload · `q` quit.
 
 use std::io;
 use std::time::Duration;
@@ -135,6 +136,34 @@ fn perform(
             };
             let _ = rt.block_on(app.refresh(client));
         }
+        UiAction::StartService { name } => {
+            app.status = match rt.block_on(client.start_service(name.clone())) {
+                Ok(service) => format!("service {}: {:?}", service.name, service.status),
+                Err(error) => format!("service start failed: {error}"),
+            };
+            let _ = rt.block_on(app.refresh(client));
+        }
+        UiAction::StopService { name } => {
+            app.status = match rt.block_on(client.stop_service(name.clone())) {
+                Ok(service) => format!("service {}: {:?}", service.name, service.status),
+                Err(error) => format!("service stop failed: {error}"),
+            };
+            let _ = rt.block_on(app.refresh(client));
+        }
+        UiAction::RestartService { name } => {
+            app.status = match rt.block_on(client.restart_service(name.clone())) {
+                Ok(service) => format!("service {}: {:?}", service.name, service.status),
+                Err(error) => format!("service restart failed: {error}"),
+            };
+            let _ = rt.block_on(app.refresh(client));
+        }
+        UiAction::ReloadServices => {
+            app.status = match rt.block_on(client.reload_services()) {
+                Ok(order) => format!("services reloaded: {}", order.join(" → ")),
+                Err(error) => format!("service reload failed: {error}"),
+            };
+            let _ = rt.block_on(app.refresh(client));
+        }
     }
 }
 
@@ -175,6 +204,22 @@ fn render_header(f: &mut Frame, area: Rect, app: &App) {
                 app.node.agent_count, app.node.running_agents
             ),
             Style::default().fg(Color::Cyan),
+        ),
+        Span::raw("   "),
+        Span::styled(
+            format!(
+                "services:{} ready:{} failed:{}",
+                app.services.len(),
+                app.services
+                    .iter()
+                    .filter(|service| service.ready && service.healthy)
+                    .count(),
+                app.services
+                    .iter()
+                    .filter(|service| service.state == "Failed")
+                    .count()
+            ),
+            Style::default().fg(Color::Magenta),
         ),
         Span::raw("   "),
         Span::styled(
@@ -257,9 +302,46 @@ fn render_body(f: &mut Frame, area: Rect, app: &App) {
                 )));
                 lines.push(Line::from(out.clone()));
             }
+            if let Some(service) = app.selected_service() {
+                lines.push(Line::from(""));
+                lines.push(Line::from(Span::styled(
+                    format!(
+                        "service [{}/{}]",
+                        app.selected_service + 1,
+                        app.services.len()
+                    ),
+                    Style::default().add_modifier(Modifier::BOLD),
+                )));
+                lines.push(Line::from(format!(
+                    "{} · {} · ready={} · healthy={} · restarts={}",
+                    service.name,
+                    service.state,
+                    service.ready,
+                    service.healthy,
+                    service.restart_count
+                )));
+                if let Some(failure) = &service.last_failure {
+                    lines.push(Line::from(format!("last failure: {failure}")));
+                }
+            }
             lines
         }
-        None => vec![Line::from("no agents — press `c` to create one")],
+        None => {
+            let mut lines = vec![Line::from("no agents — press `c` to create one")];
+            if let Some(service) = app.selected_service() {
+                lines.push(Line::from(""));
+                lines.push(Line::from(format!(
+                    "service [{}/{}] {} · {} · ready={} · healthy={}",
+                    app.selected_service + 1,
+                    app.services.len(),
+                    service.name,
+                    service.state,
+                    service.ready,
+                    service.healthy
+                )));
+            }
+            lines
+        }
     };
     f.render_widget(
         Paragraph::new(detail)

@@ -7,7 +7,7 @@ use agent_sdk::KernelClient;
 fn usage() -> ! {
     eprintln!(
         "usage: agentctl [--addr HOST:PORT] [--token TOKEN] \
-         <list|inspect|pressure|tunables|tunable-set|tunable-rollback|tunable-history|status|pause|resume|stop|kill|wait|services|service-start|service-stop|service-restart> [ARGS...]"
+         <list|inspect|pressure|tunables|tunable-set|tunable-rollback|tunable-history|status|pause|resume|stop|kill|wait|services|service-start|service-stop|service-restart|service-reload|service-history> [ARGS...]"
     );
     std::process::exit(2);
 }
@@ -175,14 +175,17 @@ async fn main() {
                 .unwrap_or_else(|error| fail(error))
             {
                 println!(
-                    "{}\t{:?}\t{}\trestarts={}",
+                    "{}\t{:?}\t{}\tready={}\thealthy={}\trestarts={}\tdesired={}",
                     service.name,
                     service.status,
                     service
                         .agent_id
                         .map(|id| id.to_string())
                         .unwrap_or_else(|| "-".into()),
-                    service.restart_count
+                    service.ready,
+                    service.healthy,
+                    service.restart_count,
+                    service.desired_running,
                 );
             }
             return;
@@ -209,6 +212,36 @@ async fn main() {
                 .await
                 .unwrap_or_else(|error| fail(error));
             println!("{}\t{:?}", service.name, service.status);
+            return;
+        }
+        "service-reload" => {
+            let order = client
+                .reload_services()
+                .await
+                .unwrap_or_else(|error| fail(error));
+            println!("{}", order.join("\n"));
+            return;
+        }
+        "service-history" => {
+            let name = args.next();
+            let limit = args
+                .next()
+                .as_deref()
+                .unwrap_or("100")
+                .parse::<usize>()
+                .unwrap_or_else(|_| usage());
+            let history = client
+                .service_history(name, limit)
+                .await
+                .unwrap_or_else(|error| fail(error));
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&history).unwrap_or_else(|error| {
+                    fail(agent_sdk::SdkError::Kernel(format!(
+                        "service history encoding failed: {error}"
+                    )))
+                })
+            );
             return;
         }
         "status" => {

@@ -107,7 +107,7 @@ which CI verifies against every public kernel module.
 | `cgroups`, `budget`, `rate_limit`, `metrics` | Resource control and accounting | `resource-accounting` |
 | `syscall_gate`, `custom_tools` | Tool enforcement chokepoint | `tool-governance` |
 | `init_system`, `runtime` | systemd-style service boot and supervision | `init-supervisor` |
-| `agentctl`, `agentps`, `procfs`, `observability`, `event_loop`, `sysctl` | `/proc`, control, audit, events, tunables | `operator-control` |
+| SDK-backed `crates/cli/src/bin/agentctl.rs`, `agentps`, `procfs`, `observability`, `event_loop`, `sysctl` | typed control, audit, events, tunables | `operator-control` |
 | `syscall_server`, `mcp`, `mcp_server`; experimental `syscall_interface` | Versioned JSON/TLS ABI and MCP; numbered prototype outside v1 | `syscall-vfs`, `wire-protocol` |
 | `agentpkg`, `package`, `agent_package`, `marketplace`, `agent_hub`, `tool_registry_share` | apt-like packages and registry | `package-trust` |
 | `execution` | resumable think→act→observe loop | `turn-checkpoints` |

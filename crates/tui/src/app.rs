@@ -3,7 +3,9 @@
 //! loop, and the [`KernelClient`] calls; this module owns *what the UI shows and
 //! how keys mutate it*.
 
-use agent_sdk::{AgentSummary, GateStats, KernelClient, NodeLoad, SdkError};
+use agent_sdk::{
+    AgentSummary, GateStats, KernelClient, NodeLoad, OperatorServiceSnapshot, SdkError,
+};
 
 /// Input modes — the UI is modal (vim-ish): Normal navigates, the others edit a
 /// single-line buffer until Enter (submit) or Esc (cancel).
@@ -28,6 +30,10 @@ pub enum UiAction {
     ResumeAgent { agent_id: String },
     StopAgent { agent_id: String },
     KillAgent { agent_id: String },
+    StartService { name: String },
+    StopService { name: String },
+    RestartService { name: String },
+    ReloadServices,
 }
 
 /// All UI state.
@@ -36,7 +42,9 @@ pub struct App {
     pub agents: Vec<AgentSummary>,
     pub gate: GateStats,
     pub node: NodeLoad,
+    pub services: Vec<OperatorServiceSnapshot>,
     pub selected: usize,
+    pub selected_service: usize,
     pub mode: Mode,
     pub input: String,
     pub status: String,
@@ -51,11 +59,12 @@ impl App {
             agents: Vec::new(),
             gate: GateStats::default(),
             node: NodeLoad::default(),
+            services: Vec::new(),
             selected: 0,
+            selected_service: 0,
             mode: Mode::Normal,
             input: String::new(),
-            status: "r refresh · c create · m message · p pause/resume · s stop · X kill · q quit"
-                .into(),
+            status: "r refresh · c/m/p/s/X agents · [/ ] service · u start · d stop · R restart · L reload · q quit".into(),
             last_output: None,
             should_quit: false,
         }
@@ -64,6 +73,7 @@ impl App {
     /// Pull fresh state from the kernel: agent list, gate counters, node load.
     pub async fn refresh(&mut self, client: &mut KernelClient) -> Result<(), SdkError> {
         let snapshot = client.operator_snapshot().await?;
+        self.services = snapshot.services.clone().unwrap_or_default();
         self.agents = snapshot
             .agents
             .into_iter()
@@ -124,11 +134,18 @@ impl App {
         if self.selected >= self.agents.len() {
             self.selected = self.agents.len().saturating_sub(1);
         }
+        if self.selected_service >= self.services.len() {
+            self.selected_service = self.services.len().saturating_sub(1);
+        }
         Ok(())
     }
 
     pub fn selected_agent(&self) -> Option<&AgentSummary> {
         self.agents.get(self.selected)
+    }
+
+    pub fn selected_service(&self) -> Option<&OperatorServiceSnapshot> {
+        self.services.get(self.selected_service)
     }
 
     fn move_selection(&mut self, delta: isize) {
@@ -138,6 +155,15 @@ impl App {
         let len = self.agents.len() as isize;
         let next = (self.selected as isize + delta).clamp(0, len - 1);
         self.selected = next as usize;
+    }
+
+    fn move_service_selection(&mut self, delta: isize) {
+        if self.services.is_empty() {
+            return;
+        }
+        let len = self.services.len() as isize;
+        let next = (self.selected_service as isize + delta).clamp(0, len - 1);
+        self.selected_service = next as usize;
     }
 
     /// Handle a key press. Returns an action for the event loop to run, or
@@ -198,6 +224,30 @@ impl App {
             Key::Char('X') => self.selected_agent().map(|agent| UiAction::KillAgent {
                 agent_id: agent.id.clone(),
             }),
+            Key::Char('[') => {
+                self.move_service_selection(-1);
+                None
+            }
+            Key::Char(']') => {
+                self.move_service_selection(1);
+                None
+            }
+            Key::Char('u') => self
+                .selected_service()
+                .map(|service| UiAction::StartService {
+                    name: service.name.clone(),
+                }),
+            Key::Char('d') => self
+                .selected_service()
+                .map(|service| UiAction::StopService {
+                    name: service.name.clone(),
+                }),
+            Key::Char('R') => self
+                .selected_service()
+                .map(|service| UiAction::RestartService {
+                    name: service.name.clone(),
+                }),
+            Key::Char('L') => Some(UiAction::ReloadServices),
             _ => None,
         }
     }
@@ -285,6 +335,23 @@ mod tests {
             id: id.into(),
             name: name.into(),
             state: "Queued".into(),
+        }
+    }
+
+    fn dummy_service(name: &str) -> OperatorServiceSnapshot {
+        OperatorServiceSnapshot {
+            name: name.into(),
+            state: "Running".into(),
+            agent_id: None,
+            restart_count: 0,
+            last_exit_code: None,
+            desired_running: true,
+            ready: true,
+            healthy: true,
+            restart_exhausted: false,
+            last_failure: None,
+            next_restart_at: None,
+            last_transition_at: String::new(),
         }
     }
 
@@ -435,5 +502,32 @@ mod tests {
                 agent_id: "paused".into()
             })
         );
+    }
+
+    #[test]
+    fn service_keys_target_the_selected_kernel_supervisor_service() {
+        let mut a = app();
+        a.services = vec![dummy_service("database"), dummy_service("worker")];
+        a.on_key(Key::Char(']'));
+        assert_eq!(a.selected_service, 1);
+        assert_eq!(
+            a.on_key(Key::Char('u')),
+            Some(UiAction::StartService {
+                name: "worker".into()
+            })
+        );
+        assert_eq!(
+            a.on_key(Key::Char('d')),
+            Some(UiAction::StopService {
+                name: "worker".into()
+            })
+        );
+        assert_eq!(
+            a.on_key(Key::Char('R')),
+            Some(UiAction::RestartService {
+                name: "worker".into()
+            })
+        );
+        assert_eq!(a.on_key(Key::Char('L')), Some(UiAction::ReloadServices));
     }
 }

@@ -231,6 +231,15 @@ pub struct MetricsSnapshot {
     pub quota_storage_healthy: bool,
     /// Lifecycle requests and bounded outcomes by operation.
     pub lifecycle: LifecycleMetricsSnapshot,
+    /// Kernel-owned service-supervisor state and bounded counters.
+    pub service_configured: u64,
+    pub service_desired: u64,
+    pub service_running: u64,
+    pub service_ready: u64,
+    pub service_healthy: u64,
+    pub service_failed: u64,
+    pub service_restarts_total: u64,
+    pub service_dependency_blocks_total: u64,
     /// System-wide tokens consumed (sum across agents).
     pub tokens_consumed: u64,
     /// System-wide LLM api calls made (sum across agents).
@@ -270,6 +279,12 @@ impl MetricsSnapshot {
         let turns = kernel.turn_admission.metrics();
         let llm = kernel.llm_scheduler.metrics();
         let quota = kernel.rate_limiter.stats();
+        let services = kernel
+            .os
+            .init
+            .try_lock()
+            .map(|init| init.metrics())
+            .unwrap_or_default();
         Self {
             gate,
             agent_count,
@@ -314,6 +329,14 @@ impl MetricsSnapshot {
             quota_denied_migration_fence: quota.denied_migration_fence,
             quota_storage_healthy: quota.healthy,
             lifecycle: kernel.lifecycle_counters.snapshot(),
+            service_configured: services.configured,
+            service_desired: services.desired,
+            service_running: services.running,
+            service_ready: services.ready,
+            service_healthy: services.healthy,
+            service_failed: services.failed,
+            service_restarts_total: services.restarts_total,
+            service_dependency_blocks_total: services.dependency_blocks_total,
             tokens_consumed: sys.tokens_consumed,
             api_calls_made: sys.api_calls_made,
             uptime_seconds: process_start().elapsed().as_secs(),
@@ -397,6 +420,35 @@ impl MetricsSnapshot {
             out.push_str(&format!("# TYPE agentos_{name}_agents gauge\n"));
             out.push_str(&format!("agentos_{name}_agents {value}\n"));
         }
+
+        out.push_str("# HELP agentos_services Service supervisor units by bounded state.\n");
+        out.push_str("# TYPE agentos_services gauge\n");
+        for (state, value) in [
+            ("configured", self.service_configured),
+            ("desired", self.service_desired),
+            ("running", self.service_running),
+            ("ready", self.service_ready),
+            ("healthy", self.service_healthy),
+            ("failed", self.service_failed),
+        ] {
+            out.push_str(&format!("agentos_services{{state=\"{state}\"}} {value}\n"));
+        }
+        out.push_str(
+            "# HELP agentos_service_restarts_total Service restart attempts in durable runtime history.\n",
+        );
+        out.push_str("# TYPE agentos_service_restarts_total counter\n");
+        out.push_str(&format!(
+            "agentos_service_restarts_total {}\n",
+            self.service_restarts_total
+        ));
+        out.push_str(
+            "# HELP agentos_service_dependency_blocks_total Service starts or restarts blocked by required dependencies.\n",
+        );
+        out.push_str("# TYPE agentos_service_dependency_blocks_total counter\n");
+        out.push_str(&format!(
+            "agentos_service_dependency_blocks_total {}\n",
+            self.service_dependency_blocks_total
+        ));
 
         out.push_str("# HELP agentos_turn_admission Turn admission slots by state.\n");
         out.push_str("# TYPE agentos_turn_admission gauge\n");
@@ -752,6 +804,14 @@ mod tests {
                 },
                 ..Default::default()
             },
+            service_configured: 4,
+            service_desired: 3,
+            service_running: 2,
+            service_ready: 2,
+            service_healthy: 2,
+            service_failed: 1,
+            service_restarts_total: 5,
+            service_dependency_blocks_total: 2,
             tokens_consumed: 1234,
             api_calls_made: 12,
             uptime_seconds: 99,
@@ -767,6 +827,8 @@ mod tests {
         assert!(text.contains("# TYPE agentos_agents gauge"));
         assert!(text.contains("# TYPE agentos_running_agents gauge"));
         assert!(text.contains("# TYPE agentos_live_agents gauge"));
+        assert!(text.contains("# TYPE agentos_services gauge"));
+        assert!(text.contains("# TYPE agentos_service_restarts_total counter"));
         assert!(text.contains("# TYPE agentos_turn_admission gauge"));
         assert!(text.contains("# TYPE agentos_turn_class_admitted_total counter"));
         assert!(text.contains("# TYPE agentos_turn_cooperative_yields_total counter"));

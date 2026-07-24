@@ -115,6 +115,14 @@ pub enum CgroupError {
 
     #[error("cgroup {0} has active tool-call reservations")]
     ActiveToolReservations(CgroupId),
+
+    #[error("cgroup {cgroup_id} limit {dimension}={limit} is below current usage {usage}")]
+    LimitBelowUsage {
+        cgroup_id: CgroupId,
+        dimension: &'static str,
+        limit: u64,
+        usage: u64,
+    },
 }
 
 /// The cgroup hierarchy manager.
@@ -819,6 +827,45 @@ impl CgroupManager {
     pub fn get(&self, id: CgroupId) -> Option<Cgroup> {
         let _tree = self.lock_tree().ok()?;
         self.groups.get(&id).map(|group| group.clone())
+    }
+
+    /// Atomically replace one leaf's limits after proving current membership,
+    /// tool reservations, and context usage fit. Service policy uses this only
+    /// on a freshly-created per-agent leaf.
+    pub fn update_limits(&self, id: CgroupId, limits: CgroupLimits) -> Result<(), CgroupError> {
+        let _tree = self.lock_tree()?;
+        let mut group = self
+            .groups
+            .get_mut(&id)
+            .ok_or(CgroupError::GroupNotFound(id))?;
+        for (dimension, limit, usage) in [
+            (
+                "agents",
+                u64::from(limits.max_agents),
+                u64::from(group.usage.agent_count),
+            ),
+            (
+                "tool_calls",
+                u64::from(limits.max_concurrent_tool_calls),
+                u64::from(group.usage.active_tool_calls),
+            ),
+            (
+                "context_tokens",
+                limits.max_context_tokens,
+                group.usage.context_tokens,
+            ),
+        ] {
+            if limit > 0 && usage > limit {
+                return Err(CgroupError::LimitBelowUsage {
+                    cgroup_id: id,
+                    dimension,
+                    limit,
+                    usage,
+                });
+            }
+        }
+        group.limits = limits;
+        Ok(())
     }
 
     #[cfg(test)]

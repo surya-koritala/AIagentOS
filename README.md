@@ -58,7 +58,7 @@ AI Agent OS provides:
 - **Logical isolation** — tenant ownership, namespaces, cgroup-style quotas, and sandbox identities
 - **Security** — fail-closed tool declarations, MAC policies, capabilities, approvals, and audit logging
 - **IPC** — inter-agent messaging, delegation, and discovery (broker-routed via `IpcManager`)
-- **Service supervision** — dependency ordering, coordinated lifecycle, and restart policy
+- **Service supervision** — validated dependency graphs, durable ownership/history, health-driven restart/backoff, and atomic rolling reload
 - **Packages** — bounded, validated manifests and registry-backed tool resolution
 
 > [!CAUTION]
@@ -156,7 +156,7 @@ cargo run --package agent-cli
 | **Networking** | `ipc` |
 | **Security** | `mac`, `permissions`, `namespaces`, `sandbox` |
 | **Resource Control** | `cgroups`, `rate_limit`, `production` |
-| **Init & Services** | `init_system`, `agentctl`, `agentps` |
+| **Init & Services** | `init_system`, `agentps` (the `agentctl` operator is an SDK-backed CLI binary) |
 | **Observability** | `observability`, `procfs`, `event_loop` |
 | **Syscall Layer** | `syscall_server` JSON ABI (`syscall_interface` is experimental) |
 | **Execution** | `execution`, `planning`, `editing`, `delegation` |
@@ -184,7 +184,7 @@ presence in the Rust crate is not a v1 support claim.
 | `task_struct` | `AgentStruct` (Uuid + u64 PID translation) | Unit-tested — [#112](https://github.com/surya-koritala/AIagentOS/issues/112) |
 | Signals (SIGKILL, SIGSTOP) | Agent signal/state primitives | Unit-tested — [#112](https://github.com/surya-koritala/AIagentOS/issues/112) |
 | Unix sockets / IPC | Messaging, delegation, and discovery | Unit-tested — [#112](https://github.com/surya-koritala/AIagentOS/issues/112) |
-| systemd | Service files, dependency ordering, restart policy | Unit-tested — [#118](https://github.com/surya-koritala/AIagentOS/issues/118) |
+| systemd | Validated service files, dependencies, durable health/restart supervision, and rolling reload | Production-qualified — [#118](https://github.com/surya-koritala/AIagentOS/issues/118) |
 | syscall interface | Versioned JSON wire protocol; numbered table explicitly experimental | Public-API E2E — [#116](https://github.com/surya-koritala/AIagentOS/issues/116) |
 | `fork()/clone()` | `agent_clone(flags)` primitive | Unit-tested — [#112](https://github.com/surya-koritala/AIagentOS/issues/112) |
 | CFS-inspired scheduler | Cooperative weighted turn/provider admission, bounded aging, priority inheritance, and metrics | Production-qualified — [#114](https://github.com/surya-koritala/AIagentOS/issues/114) |

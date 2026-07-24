@@ -26,6 +26,14 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
   and durable applied/denied audit history. The kernel-owned service supervisor
   validates dependency order and coordinates startup, rollback, and shutdown.
   (#117, #118)
+- **Durable init supervisor** — configured services now carry tenant, permission
+  profile, namespace, sandbox, resource-budget, and secret-reference policy.
+  Kernel health sweeps enforce readiness/startup deadlines, dependency failure
+  propagation, bounded exponential restart with deterministic jitter/windows,
+  exhaustion, and cleanup. SQLite ownership/history prevents duplicate agents
+  after a process crash; validated rolling reload restarts the dependency
+  closure atomically or restores the previous graph. SDK, `agentctl`, TUI, and
+  Prometheus service views use that same kernel-owned state. (#118)
 - **Context and admission controls** — bounded turn/LLM/tool admission,
   CFS-inspired fairness, exclusive shared-resource priority inheritance,
   starvation escape, and per-class/yield metrics. Context pressure now enforces

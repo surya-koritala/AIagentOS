@@ -197,6 +197,29 @@ pub enum AgentCommand {
     Execute(String),
 }
 
+/// Bounded lifecycle operation labels used by events and metrics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LifecycleOperation {
+    Pause,
+    Resume,
+    Stop,
+    Kill,
+    Wait,
+}
+
+/// Bounded lifecycle outcomes. `forced` is the successful terminal outcome of
+/// `kill`; the other operations complete cooperatively.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LifecycleOutcome {
+    Requested,
+    Completed,
+    TimedOut,
+    Forced,
+    Failed,
+}
+
 // ─── Kernel Event ────────────────────────────────────────────────────────────
 
 /// Events broadcast by the kernel to subsystems.
@@ -207,6 +230,11 @@ pub enum KernelEvent {
         agent_id: AgentId,
         old: AgentState,
         new: AgentState,
+    },
+    AgentLifecycle {
+        agent_id: AgentId,
+        operation: LifecycleOperation,
+        outcome: LifecycleOutcome,
     },
     ResourceRequested {
         agent_id: AgentId,
@@ -255,6 +283,9 @@ pub enum KernelError {
         "Credential revocation incomplete after {timeout_ms}ms; the identity remains durably revoked and closed to new requests"
     )]
     CredentialRevocationIncomplete { timeout_ms: u64 },
+
+    #[error("Lifecycle operation timed out: {0}")]
+    LifecycleTimeout(String),
 
     #[error("Policy error: {0}")]
     Policy(String),
@@ -1024,10 +1055,12 @@ pub struct AgentKernelImpl {
     executors: DashMap<AgentId, Arc<tokio::sync::Mutex<AgentExecutor>>>,
     lifecycle_locks: DashMap<AgentId, Arc<tokio::sync::Mutex<()>>>,
     active_cancellations: DashMap<AgentId, tokio_util::sync::CancellationToken>,
+    pub(crate) lifecycle_counters: crate::metrics::LifecycleCounters,
     event_tx: broadcast::Sender<KernelEvent>,
 }
 
 impl AgentKernelImpl {
+    const WATCHDOG_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
     #[cfg(not(test))]
     const TOOL_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
     #[cfg(test)]
@@ -1253,6 +1286,7 @@ impl AgentKernelImpl {
             executors: DashMap::new(),
             lifecycle_locks: DashMap::new(),
             active_cancellations: DashMap::new(),
+            lifecycle_counters: crate::metrics::LifecycleCounters::default(),
             event_tx,
         })
     }
@@ -2233,6 +2267,35 @@ impl AgentKernelImpl {
             .clone()
     }
 
+    fn record_lifecycle(
+        &self,
+        agent_id: AgentId,
+        operation: LifecycleOperation,
+        outcome: LifecycleOutcome,
+    ) {
+        self.lifecycle_counters.record(operation, outcome);
+        let _ = self.event_tx.send(KernelEvent::AgentLifecycle {
+            agent_id,
+            operation,
+            outcome,
+        });
+    }
+
+    fn record_lifecycle_result<T>(
+        &self,
+        agent_id: AgentId,
+        operation: LifecycleOperation,
+        result: &Result<T, KernelError>,
+    ) {
+        let outcome = match result {
+            Ok(_) if operation == LifecycleOperation::Kill => LifecycleOutcome::Forced,
+            Ok(_) => LifecycleOutcome::Completed,
+            Err(KernelError::LifecycleTimeout(_)) => LifecycleOutcome::TimedOut,
+            Err(_) => LifecycleOutcome::Failed,
+        };
+        self.record_lifecycle(agent_id, operation, outcome);
+    }
+
     /// Reclaim the process-local per-agent cgroup after gate membership has
     /// been removed (or when registration never succeeded). Durable quota rows
     /// are keyed by the stable scope and intentionally remain in SQLite.
@@ -2606,7 +2669,7 @@ impl AgentKernelImpl {
             let idle = tokio::time::timeout(Self::TOOL_DRAIN_TIMEOUT, executor.lock())
                 .await
                 .map_err(|_| {
-                    KernelError::Policy(format!(
+                    KernelError::LifecycleTimeout(format!(
                         "timed out waiting for active agent turn to quiesce for agent {agent_id}"
                     ))
                 })?;
@@ -2635,7 +2698,7 @@ impl AgentKernelImpl {
                 // agent's admission state so a timed-out stop/kill attempt does
                 // not leave it half-disabled; a later retry closes it again.
                 let _ = self.syscall_gate.reopen_tool_admission(agent_id);
-                Err(KernelError::Policy(format!(
+                Err(KernelError::LifecycleTimeout(format!(
                     "timed out draining active external tool calls for agent {agent_id}"
                 )))
             }
@@ -2645,6 +2708,17 @@ impl AgentKernelImpl {
     /// Pause admission for an agent and cooperatively cancel any active turn.
     /// Repeating a pause is idempotent.
     pub async fn pause_agent(&self, agent_id: AgentId) -> Result<AgentState, KernelError> {
+        self.record_lifecycle(
+            agent_id,
+            LifecycleOperation::Pause,
+            LifecycleOutcome::Requested,
+        );
+        let result = self.pause_agent_inner(agent_id).await;
+        self.record_lifecycle_result(agent_id, LifecycleOperation::Pause, &result);
+        result
+    }
+
+    async fn pause_agent_inner(&self, agent_id: AgentId) -> Result<AgentState, KernelError> {
         let lock = self.lifecycle_lock(agent_id);
         let _guard = lock.lock().await;
         let state = self
@@ -2672,6 +2746,17 @@ impl AgentKernelImpl {
     /// Resume admission for a paused agent. The next turn receives a fresh
     /// cancellation token; repeating resume on Running is idempotent.
     pub async fn resume_agent(&self, agent_id: AgentId) -> Result<AgentState, KernelError> {
+        self.record_lifecycle(
+            agent_id,
+            LifecycleOperation::Resume,
+            LifecycleOutcome::Requested,
+        );
+        let result = self.resume_agent_inner(agent_id).await;
+        self.record_lifecycle_result(agent_id, LifecycleOperation::Resume, &result);
+        result
+    }
+
+    async fn resume_agent_inner(&self, agent_id: AgentId) -> Result<AgentState, KernelError> {
         let lock = self.lifecycle_lock(agent_id);
         let _guard = lock.lock().await;
         let state = self
@@ -2692,6 +2777,17 @@ impl AgentKernelImpl {
     /// Durable conversations, facts, usage, and the terminal registry row are
     /// retained; repeating stop is idempotent.
     pub async fn stop_agent(&self, agent_id: AgentId) -> Result<AgentState, KernelError> {
+        self.record_lifecycle(
+            agent_id,
+            LifecycleOperation::Stop,
+            LifecycleOutcome::Requested,
+        );
+        let result = self.stop_agent_inner(agent_id).await;
+        self.record_lifecycle_result(agent_id, LifecycleOperation::Stop, &result);
+        result
+    }
+
+    async fn stop_agent_inner(&self, agent_id: AgentId) -> Result<AgentState, KernelError> {
         let lock = self.lifecycle_lock(agent_id);
         let _guard = lock.lock().await;
         let state = self
@@ -2722,6 +2818,17 @@ impl AgentKernelImpl {
     /// binding: it cancels execution, revokes admitted tool guards, and tears
     /// down every live subsystem immediately.
     pub async fn kill_agent(&self, agent_id: AgentId) -> Result<AgentState, KernelError> {
+        self.record_lifecycle(
+            agent_id,
+            LifecycleOperation::Kill,
+            LifecycleOutcome::Requested,
+        );
+        let result = self.kill_agent_inner(agent_id).await;
+        self.record_lifecycle_result(agent_id, LifecycleOperation::Kill, &result);
+        result
+    }
+
+    async fn kill_agent_inner(&self, agent_id: AgentId) -> Result<AgentState, KernelError> {
         let lock = self.lifecycle_lock(agent_id);
         let _guard = lock.lock().await;
         let state = self
@@ -2759,6 +2866,21 @@ impl AgentKernelImpl {
         agent_id: AgentId,
         timeout: std::time::Duration,
     ) -> Result<AgentState, KernelError> {
+        self.record_lifecycle(
+            agent_id,
+            LifecycleOperation::Wait,
+            LifecycleOutcome::Requested,
+        );
+        let result = self.wait_agent_inner(agent_id, timeout).await;
+        self.record_lifecycle_result(agent_id, LifecycleOperation::Wait, &result);
+        result
+    }
+
+    async fn wait_agent_inner(
+        &self,
+        agent_id: AgentId,
+        timeout: std::time::Duration,
+    ) -> Result<AgentState, KernelError> {
         tokio::time::timeout(timeout, async {
             loop {
                 let state = self.get_agent_status(agent_id)?;
@@ -2769,7 +2891,36 @@ impl AgentKernelImpl {
             }
         })
         .await
-        .map_err(|_| KernelError::Policy("wait_agent timed out".into()))?
+        .map_err(|_| KernelError::LifecycleTimeout("wait_agent timed out".into()))?
+    }
+
+    /// Force-clean active turns that have made no recorded progress within the
+    /// watchdog bound. Idle runnable agents are deliberately excluded: only an
+    /// agent with a live cancellation token can be classified as unresponsive.
+    pub(crate) async fn watchdog_sweep(&self) -> Vec<AgentId> {
+        let cutoff = chrono::Utc::now()
+            - chrono::Duration::from_std(Self::WATCHDOG_TIMEOUT)
+                .expect("fixed watchdog timeout is representable");
+        let candidates = self
+            .agent_manager
+            .list_agents(None)
+            .into_iter()
+            .filter(|agent| self.active_cancellations.contains_key(&agent.id))
+            .filter(|agent| self.agent_manager.is_unresponsive_since(agent.id, cutoff))
+            .map(|agent| agent.id)
+            .collect::<Vec<_>>();
+        let mut terminated = Vec::new();
+        for agent_id in candidates {
+            // Recheck active membership immediately before the coordinator
+            // call. A turn that completed while the sweep was being assembled
+            // must not be killed merely because its previous timestamp aged.
+            if self.active_cancellations.contains_key(&agent_id)
+                && self.kill_agent(agent_id).await.is_ok()
+            {
+                terminated.push(agent_id);
+            }
+        }
+        terminated
     }
 
     /// Latest active durable turn checkpoint for an agent, if any.
@@ -2792,6 +2943,23 @@ impl AgentKernelImpl {
     /// holding lifecycle admission. Returns the completed output, or a new
     /// checkpoint id if another pause interrupted the continuation.
     pub async fn resume_agent_from_checkpoint(
+        &self,
+        agent_id: AgentId,
+        checkpoint_id: Option<uuid::Uuid>,
+    ) -> Result<(AgentState, Option<AgentOutput>, Option<uuid::Uuid>), KernelError> {
+        self.record_lifecycle(
+            agent_id,
+            LifecycleOperation::Resume,
+            LifecycleOutcome::Requested,
+        );
+        let result = self
+            .resume_agent_from_checkpoint_inner(agent_id, checkpoint_id)
+            .await;
+        self.record_lifecycle_result(agent_id, LifecycleOperation::Resume, &result);
+        result
+    }
+
+    async fn resume_agent_from_checkpoint_inner(
         &self,
         agent_id: AgentId,
         checkpoint_id: Option<uuid::Uuid>,
@@ -2866,6 +3034,7 @@ impl AgentKernelImpl {
         self.context_manager
             .update_agent_status(agent_id, &AgentState::Running)?;
         let cancellation = executor.renew_cancel_token();
+        self.agent_manager.record_activity(agent_id);
         self.active_cancellations.insert(agent_id, cancellation);
         drop(lifecycle_guard);
 
@@ -3127,6 +3296,7 @@ impl AgentKernelImpl {
             match executor.try_lock() {
                 Ok(mut executor_guard) => {
                     let cancellation = executor_guard.renew_cancel_token();
+                    self.agent_manager.record_activity(agent_id);
                     self.active_cancellations.insert(agent_id, cancellation);
                     drop(lifecycle_guard);
                     break executor_guard;
@@ -4236,6 +4406,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn watchdog_uses_forced_coordinator_and_ignores_idle_agents() {
+        let kernel = AgentKernelImpl::new().unwrap();
+        let active = kernel
+            .create_agent_full(AgentConfig {
+                name: "watchdog-active".into(),
+                task: "watchdog cleanup regression".into(),
+                llm_provider: "test".into(),
+                permission_profile: "standard".into(),
+                priority: Priority::default(),
+                sandbox_config: None,
+            })
+            .await
+            .unwrap();
+        let idle = kernel
+            .create_agent_full(AgentConfig {
+                name: "watchdog-idle".into(),
+                task: "idle agents are not hung".into(),
+                llm_provider: "test".into(),
+                permission_profile: "standard".into(),
+                priority: Priority::default(),
+                sandbox_config: None,
+            })
+            .await
+            .unwrap();
+        let active_guard = kernel.syscall_gate.acquire_tool_call(active.id).unwrap();
+        kernel
+            .active_cancellations
+            .insert(active.id, tokio_util::sync::CancellationToken::new());
+        let stale = chrono::Utc::now() - chrono::Duration::seconds(31);
+        kernel
+            .agent_manager
+            .set_last_activity_for_test(active.id, stale);
+        kernel
+            .agent_manager
+            .set_last_activity_for_test(idle.id, stale);
+
+        assert_eq!(kernel.watchdog_sweep().await, vec![active.id]);
+        assert_eq!(
+            kernel.get_agent_status(active.id).unwrap(),
+            AgentState::Stopped
+        );
+        assert_eq!(
+            kernel.get_agent_status(idle.id).unwrap(),
+            AgentState::Running,
+            "a runnable agent with no active turn is intentionally idle"
+        );
+        assert!(!kernel.scheduler.contains(active.id));
+        assert!(!kernel.ipc.is_registered(active.id));
+        assert!(kernel.syscall_gate.agent_info(active.id).is_none());
+        assert!(kernel
+            .sandbox_manager
+            .get_sandbox_for_agent(active.id)
+            .is_none());
+        drop(active_guard);
+        assert_eq!(
+            kernel
+                .cgroups
+                .get(kernel.cgroups.root())
+                .unwrap()
+                .usage
+                .active_tool_calls,
+            0
+        );
+    }
+
+    #[tokio::test]
     async fn trusted_kernel_approval_api_grants_one_exact_registered_call() {
         let kernel = AgentKernelImpl::new().unwrap();
         let agent = uuid::Uuid::new_v4();
@@ -4478,6 +4714,11 @@ mod tests {
                 old: AgentState::Initializing,
                 new: AgentState::Running,
             },
+            KernelEvent::AgentLifecycle {
+                agent_id: id,
+                operation: LifecycleOperation::Stop,
+                outcome: LifecycleOutcome::Completed,
+            },
             KernelEvent::ResourceRequested {
                 agent_id: id,
                 resource: "filesystem".to_string(),
@@ -4485,6 +4726,6 @@ mod tests {
             },
             KernelEvent::ShutdownInitiated,
         ];
-        assert_eq!(events.len(), 4);
+        assert_eq!(events.len(), 5);
     }
 }

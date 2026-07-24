@@ -18,6 +18,7 @@
 //!   * an optional raw-`tokio` HTTP `/metrics` endpoint (in `agent-server`) for
 //!     a real Prometheus scraper.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 use std::time::Instant;
 
@@ -25,6 +26,99 @@ use crate::agent::AgentKernel;
 use crate::observability::{MetricScope, ObservabilityEngine};
 use crate::syscall_gate::GateStats;
 use crate::AgentKernelImpl;
+
+/// Bounded lifecycle outcomes for one operation. These counters are
+/// process-local and monotonic; no agent id appears as a metric label.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct LifecycleOperationMetrics {
+    pub requested: u64,
+    pub completed: u64,
+    pub timed_out: u64,
+    pub forced: u64,
+    pub failed: u64,
+}
+
+/// Lifecycle counters grouped by the fixed public operation set.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct LifecycleMetricsSnapshot {
+    pub pause: LifecycleOperationMetrics,
+    pub resume: LifecycleOperationMetrics,
+    pub stop: LifecycleOperationMetrics,
+    pub kill: LifecycleOperationMetrics,
+    pub wait: LifecycleOperationMetrics,
+}
+
+#[derive(Debug, Default)]
+struct LifecycleOperationCounters {
+    requested: AtomicU64,
+    completed: AtomicU64,
+    timed_out: AtomicU64,
+    forced: AtomicU64,
+    failed: AtomicU64,
+}
+
+impl LifecycleOperationCounters {
+    fn record(&self, outcome: crate::LifecycleOutcome) {
+        let counter = match outcome {
+            crate::LifecycleOutcome::Requested => &self.requested,
+            crate::LifecycleOutcome::Completed => &self.completed,
+            crate::LifecycleOutcome::TimedOut => &self.timed_out,
+            crate::LifecycleOutcome::Forced => &self.forced,
+            crate::LifecycleOutcome::Failed => &self.failed,
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> LifecycleOperationMetrics {
+        LifecycleOperationMetrics {
+            requested: self.requested.load(Ordering::Relaxed),
+            completed: self.completed.load(Ordering::Relaxed),
+            timed_out: self.timed_out.load(Ordering::Relaxed),
+            forced: self.forced.load(Ordering::Relaxed),
+            failed: self.failed.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// Process-local lifecycle telemetry shared by the kernel coordinator and
+/// operator metrics exporter.
+#[derive(Debug, Default)]
+pub(crate) struct LifecycleCounters {
+    pause: LifecycleOperationCounters,
+    resume: LifecycleOperationCounters,
+    stop: LifecycleOperationCounters,
+    kill: LifecycleOperationCounters,
+    wait: LifecycleOperationCounters,
+}
+
+impl LifecycleCounters {
+    pub(crate) fn record(
+        &self,
+        operation: crate::LifecycleOperation,
+        outcome: crate::LifecycleOutcome,
+    ) {
+        let counters = match operation {
+            crate::LifecycleOperation::Pause => &self.pause,
+            crate::LifecycleOperation::Resume => &self.resume,
+            crate::LifecycleOperation::Stop => &self.stop,
+            crate::LifecycleOperation::Kill => &self.kill,
+            crate::LifecycleOperation::Wait => &self.wait,
+        };
+        counters.record(outcome);
+    }
+
+    pub(crate) fn snapshot(&self) -> LifecycleMetricsSnapshot {
+        LifecycleMetricsSnapshot {
+            pause: self.pause.snapshot(),
+            resume: self.resume.snapshot(),
+            stop: self.stop.snapshot(),
+            kill: self.kill.snapshot(),
+            wait: self.wait.snapshot(),
+        }
+    }
+}
 
 /// The Prometheus exposition content type, including the format version. Use
 /// this for the `Content-Type` header of an HTTP `/metrics` response.
@@ -93,6 +187,8 @@ pub struct MetricsSnapshot {
     pub quota_denied_cgroup_tokens: u64,
     pub quota_denied_migration_fence: u64,
     pub quota_storage_healthy: bool,
+    /// Lifecycle requests and bounded outcomes by operation.
+    pub lifecycle: LifecycleMetricsSnapshot,
     /// System-wide tokens consumed (sum across agents).
     pub tokens_consumed: u64,
     /// System-wide LLM api calls made (sum across agents).
@@ -170,6 +266,7 @@ impl MetricsSnapshot {
             quota_denied_cgroup_tokens: quota.denied_cgroup_tokens,
             quota_denied_migration_fence: quota.denied_migration_fence,
             quota_storage_healthy: quota.healthy,
+            lifecycle: kernel.lifecycle_counters.snapshot(),
             tokens_consumed: sys.tokens_consumed,
             api_calls_made: sys.api_calls_made,
             uptime_seconds: process_start().elapsed().as_secs(),
@@ -431,6 +528,30 @@ impl MetricsSnapshot {
             ));
         }
 
+        out.push_str(
+            "# HELP agentos_lifecycle_operations_total Agent lifecycle operations by operation and bounded outcome.\n",
+        );
+        out.push_str("# TYPE agentos_lifecycle_operations_total counter\n");
+        for (operation, counters) in [
+            ("pause", self.lifecycle.pause),
+            ("resume", self.lifecycle.resume),
+            ("stop", self.lifecycle.stop),
+            ("kill", self.lifecycle.kill),
+            ("wait", self.lifecycle.wait),
+        ] {
+            for (outcome, value) in [
+                ("requested", counters.requested),
+                ("completed", counters.completed),
+                ("timed_out", counters.timed_out),
+                ("forced", counters.forced),
+                ("failed", counters.failed),
+            ] {
+                out.push_str(&format!(
+                    "agentos_lifecycle_operations_total{{operation=\"{operation}\",outcome=\"{outcome}\"}} {value}\n"
+                ));
+            }
+        }
+
         // --- LLM usage totals (system scope).
         out.push_str("# HELP agentos_tokens_consumed_total Tokens consumed across all agents.\n");
         out.push_str("# TYPE agentos_tokens_consumed_total counter\n");
@@ -518,6 +639,23 @@ mod tests {
             quota_denied_cgroup_tokens: 8,
             quota_denied_migration_fence: 9,
             quota_storage_healthy: true,
+            lifecycle: LifecycleMetricsSnapshot {
+                pause: LifecycleOperationMetrics {
+                    requested: 3,
+                    completed: 2,
+                    timed_out: 1,
+                    forced: 0,
+                    failed: 0,
+                },
+                kill: LifecycleOperationMetrics {
+                    requested: 1,
+                    completed: 0,
+                    timed_out: 0,
+                    forced: 1,
+                    failed: 0,
+                },
+                ..Default::default()
+            },
             tokens_consumed: 1234,
             api_calls_made: 12,
             uptime_seconds: 99,
@@ -541,6 +679,7 @@ mod tests {
         assert!(text.contains("# TYPE agentos_provider_quota_usage gauge"));
         assert!(text.contains("# TYPE agentos_quota_receipts gauge"));
         assert!(text.contains("# TYPE agentos_quota_denied_total counter"));
+        assert!(text.contains("# TYPE agentos_lifecycle_operations_total counter"));
         assert!(text.contains("# TYPE agentos_tokens_consumed_total counter"));
         assert!(text.contains("# TYPE agentos_api_calls_total counter"));
         assert!(text.contains("# TYPE agentos_process_uptime_seconds gauge"));
@@ -571,6 +710,12 @@ mod tests {
         assert!(
             text.contains("agentos_quota_denied_total{scope=\"cgroup\",dimension=\"tokens\"} 8")
         );
+        assert!(text.contains(
+            "agentos_lifecycle_operations_total{operation=\"pause\",outcome=\"timed_out\"} 1"
+        ));
+        assert!(text.contains(
+            "agentos_lifecycle_operations_total{operation=\"kill\",outcome=\"forced\"} 1"
+        ));
         assert!(text.contains("agentos_tokens_consumed_total 1234"));
         assert!(text.contains("agentos_api_calls_total 12"));
         assert!(text.contains("agentos_process_uptime_seconds 99"));

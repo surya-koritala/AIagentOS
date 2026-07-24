@@ -7,7 +7,10 @@ use kernel::permissions::{AccessDecision, PermissionSystem};
 use kernel::resources::ResourceType;
 use kernel::sandbox::SandboxManager;
 use kernel::sandbox::SandboxManagerImpl;
-use kernel::{AgentConfig, AgentKernelImpl, AgentState, IsolationLevel, Priority, SandboxConfig};
+use kernel::{
+    AgentConfig, AgentKernelImpl, AgentState, IsolationLevel, KernelEvent, LifecycleOperation,
+    LifecycleOutcome, Priority, SandboxConfig,
+};
 
 fn config(name: &str) -> AgentConfig {
     AgentConfig {
@@ -87,6 +90,84 @@ async fn pause_blocks_work_resume_rearms_and_wait_observes_terminal_state() {
     assert_eq!(
         kernel.wait_agent(id, Duration::from_secs(1)).await.unwrap(),
         AgentState::Stopped
+    );
+}
+
+#[tokio::test]
+async fn lifecycle_events_and_metrics_report_bounded_outcomes() {
+    let kernel = AgentKernelImpl::new().expect("kernel");
+    let mut events = kernel.subscribe_events();
+    let id = kernel
+        .create_agent_full(config("lifecycle-telemetry"))
+        .await
+        .unwrap()
+        .id;
+
+    kernel.pause_agent(id).await.unwrap();
+    kernel.resume_agent(id).await.unwrap();
+    assert!(kernel
+        .wait_agent(id, Duration::from_millis(10))
+        .await
+        .is_err());
+    kernel.kill_agent(id).await.unwrap();
+    let missing = uuid::Uuid::new_v4();
+    assert!(kernel.pause_agent(missing).await.is_err());
+
+    let snapshot = kernel::metrics::MetricsSnapshot::collect(&kernel);
+    assert_eq!(snapshot.lifecycle.pause.requested, 2);
+    assert_eq!(snapshot.lifecycle.pause.completed, 1);
+    assert_eq!(snapshot.lifecycle.pause.failed, 1);
+    assert_eq!(snapshot.lifecycle.resume.requested, 1);
+    assert_eq!(snapshot.lifecycle.resume.completed, 1);
+    assert_eq!(snapshot.lifecycle.wait.requested, 1);
+    assert_eq!(snapshot.lifecycle.wait.timed_out, 1);
+    assert_eq!(snapshot.lifecycle.kill.requested, 1);
+    assert_eq!(snapshot.lifecycle.kill.forced, 1);
+    assert_eq!(
+        snapshot.lifecycle.kill.requested,
+        snapshot.lifecycle.kill.forced
+            + snapshot.lifecycle.kill.completed
+            + snapshot.lifecycle.kill.timed_out
+            + snapshot.lifecycle.kill.failed
+    );
+
+    let mut observed = Vec::new();
+    let mut missing_failed = false;
+    while let Ok(event) = events.try_recv() {
+        if let KernelEvent::AgentLifecycle {
+            agent_id,
+            operation,
+            outcome,
+        } = event
+        {
+            if agent_id == id {
+                observed.push((operation, outcome));
+            } else if agent_id == missing
+                && operation == LifecycleOperation::Pause
+                && outcome == LifecycleOutcome::Failed
+            {
+                missing_failed = true;
+            }
+        }
+    }
+    for expected in [
+        (LifecycleOperation::Pause, LifecycleOutcome::Requested),
+        (LifecycleOperation::Pause, LifecycleOutcome::Completed),
+        (LifecycleOperation::Resume, LifecycleOutcome::Requested),
+        (LifecycleOperation::Resume, LifecycleOutcome::Completed),
+        (LifecycleOperation::Wait, LifecycleOutcome::Requested),
+        (LifecycleOperation::Wait, LifecycleOutcome::TimedOut),
+        (LifecycleOperation::Kill, LifecycleOutcome::Requested),
+        (LifecycleOperation::Kill, LifecycleOutcome::Forced),
+    ] {
+        assert!(
+            observed.contains(&expected),
+            "missing lifecycle event {expected:?}: {observed:?}"
+        );
+    }
+    assert!(
+        missing_failed,
+        "failed lifecycle calls must emit an outcome"
     );
 }
 

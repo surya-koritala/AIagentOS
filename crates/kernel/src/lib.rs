@@ -287,6 +287,9 @@ pub enum KernelError {
     #[error("Lifecycle operation timed out: {0}")]
     LifecycleTimeout(String),
 
+    #[error("Lifecycle cleanup incomplete: {0}")]
+    LifecycleCleanup(String),
+
     #[error("Policy error: {0}")]
     Policy(String),
 }
@@ -1904,7 +1907,7 @@ impl AgentKernelImpl {
                     p.id,
                     error
                 );
-                self.cleanup_agent_resources(p.id).await;
+                let _ = self.cleanup_agent_resources(p.id).await;
                 self.agent_manager.purge_agent(p.id);
                 continue;
             }
@@ -2299,22 +2302,16 @@ impl AgentKernelImpl {
     /// Reclaim the process-local per-agent cgroup after gate membership has
     /// been removed (or when registration never succeeded). Durable quota rows
     /// are keyed by the stable scope and intentionally remain in SQLite.
-    fn reclaim_agent_cgroup(&self, agent_id: AgentId) {
+    fn reclaim_agent_cgroup(&self, agent_id: AgentId) -> Result<(), String> {
         // Lock order is kernel tree lock → CgroupManager tree lock, matching
         // cgroup_for_agent. Gate mutation/membership removal has already
         // completed before this method is called.
-        let _tree = match self.cgroup_tree_lock.lock() {
-            Ok(tree) => tree,
-            Err(_) => {
-                tracing::warn!(
-                    "cannot reclaim per-agent cgroup for {agent_id}: hierarchy lock is poisoned"
-                );
-                return;
-            }
-        };
+        let _tree = self.cgroup_tree_lock.lock().map_err(|_| {
+            format!("cannot reclaim per-agent cgroup for {agent_id}: hierarchy lock is poisoned")
+        })?;
         let cgroup_id = match self.agent_cgroups.remove(&agent_id) {
             Some((_, cgroup_id)) => cgroup_id,
-            None => return,
+            None => return Ok(()),
         };
         let profile_id = self.cgroups.get(cgroup_id).and_then(|leaf| leaf.parent);
 
@@ -2329,9 +2326,12 @@ impl AgentKernelImpl {
                 // Preserve the lookup if the leaf still exists so a later
                 // idempotent cleanup can retry without orphaning the node.
                 self.agent_cgroups.insert(agent_id, cgroup_id);
-                tracing::warn!("per-agent cgroup cleanup failed for {agent_id}: {error}");
+                return Err(format!(
+                    "per-agent cgroup cleanup failed for {agent_id}: {error}"
+                ));
             }
         }
+        Ok(())
     }
 
     /// Reclaim empty aggregate nodes created by `cgroup_for_agent`. Exact map
@@ -2395,20 +2395,25 @@ impl AgentKernelImpl {
         }
     }
 
-    async fn cleanup_agent_resources(&self, agent_id: AgentId) {
+    async fn cleanup_agent_resources(&self, agent_id: AgentId) -> Result<(), KernelError> {
         self.cleanup_agent_resources_with_mode(agent_id, false)
-            .await;
+            .await
     }
 
     /// Forced cleanup revokes already-admitted tool reservations before
     /// tearing down the remaining subsystems. Cooperative work is cancelled by
     /// the lifecycle caller; any stale reservation guard that eventually drops
     /// is inert and cannot corrupt cgroup accounting.
-    async fn force_cleanup_agent_resources(&self, agent_id: AgentId) {
-        self.cleanup_agent_resources_with_mode(agent_id, true).await;
+    async fn force_cleanup_agent_resources(&self, agent_id: AgentId) -> Result<(), KernelError> {
+        self.cleanup_agent_resources_with_mode(agent_id, true).await
     }
 
-    async fn cleanup_agent_resources_with_mode(&self, agent_id: AgentId, forced: bool) {
+    async fn cleanup_agent_resources_with_mode(
+        &self,
+        agent_id: AgentId,
+        forced: bool,
+    ) -> Result<(), KernelError> {
+        let mut failures = Vec::new();
         let gate_info = self.syscall_gate.agent_info(agent_id);
         let gate_registered = gate_info.is_some();
         let mut cgroup_membership_released = !gate_registered;
@@ -2416,7 +2421,9 @@ impl AgentKernelImpl {
             match self.syscall_gate.force_unregister_agent(agent_id) {
                 Ok(()) => cgroup_membership_released = true,
                 Err(error) => {
-                    tracing::warn!("forced syscall-gate cleanup failed for {agent_id}: {error}");
+                    failures.push(format!(
+                        "forced syscall-gate cleanup failed for {agent_id}: {error}"
+                    ));
                 }
             }
         } else if gate_registered {
@@ -2425,9 +2432,9 @@ impl AgentKernelImpl {
                 .close_tool_admission_and_wait(agent_id)
                 .await
             {
-                tracing::warn!(
+                failures.push(format!(
                     "cannot quiesce syscall-gate tool admission for {agent_id}: {error}"
-                );
+                ));
             }
         }
         self.scheduler.deschedule(agent_id);
@@ -2447,14 +2454,16 @@ impl AgentKernelImpl {
 
         if let Some(sandbox_id) = self.sandbox_manager.get_sandbox_for_agent(agent_id) {
             if let Err(error) = self.sandbox_manager.destroy_sandbox(sandbox_id) {
-                tracing::warn!("sandbox cleanup failed for {agent_id}: {error}");
+                failures.push(format!("sandbox cleanup failed for {agent_id}: {error}"));
             }
         }
         self.observability.purge_agent(agent_id);
         self.budget_enforcer.unregister_agent(agent_id);
         if gate_registered && !forced {
             if let Err(error) = self.syscall_gate.try_unregister_agent(agent_id) {
-                tracing::warn!("syscall-gate cleanup failed for {agent_id}: {error}");
+                failures.push(format!(
+                    "syscall-gate cleanup failed for {agent_id}: {error}"
+                ));
             } else {
                 cgroup_membership_released = true;
             }
@@ -2464,7 +2473,14 @@ impl AgentKernelImpl {
             // creation. The gate may now name a shared/custom destination
             // after a move; unregister releases that membership, while only
             // the original private leaf is structurally reclaimed here.
-            self.reclaim_agent_cgroup(agent_id);
+            if let Err(error) = self.reclaim_agent_cgroup(agent_id) {
+                failures.push(error);
+            }
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(KernelError::LifecycleCleanup(failures.join("; ")))
         }
     }
 
@@ -2478,7 +2494,7 @@ impl AgentKernelImpl {
             let _ = self.agent_manager.force_stopped(agent_id);
         }
         let _ = self.quiesce_agent(agent_id).await;
-        self.cleanup_agent_resources(agent_id).await;
+        let _ = self.cleanup_agent_resources(agent_id).await;
         self.agent_manager.purge_agent(agent_id);
         let _ = self.context_manager.purge_agent_data(agent_id);
         self.lifecycle_locks.remove(&agent_id);
@@ -2795,21 +2811,40 @@ impl AgentKernelImpl {
             .get_agent_state(agent_id)
             .ok_or(AgentError::NotFound(agent_id))?;
         if state == AgentState::Stopped {
-            let persisted = self
-                .context_manager
-                .update_agent_status(agent_id, &AgentState::Stopped);
-            self.cleanup_agent_resources(agent_id).await;
-            persisted?;
+            self.cleanup_agent_resources(agent_id).await?;
+            self.context_manager
+                .update_agent_status(agent_id, &AgentState::Stopped)?;
             return Ok(state);
         }
-        self.quiesce_agent(agent_id).await?;
-        self.drain_agent_tool_calls(agent_id).await?;
-        self.agent_manager.stop_agent(agent_id).await?;
-        let persisted = self
-            .context_manager
-            .update_agent_status(agent_id, &AgentState::Stopped);
-        self.cleanup_agent_resources(agent_id).await;
-        persisted?;
+        if state != AgentState::Stopping {
+            if !matches!(
+                state,
+                AgentState::Running | AgentState::Paused | AgentState::Error(_)
+            ) {
+                return Err(AgentError::InvalidTransition {
+                    from: state,
+                    to: AgentState::Stopping,
+                }
+                .into());
+            }
+            self.quiesce_agent(agent_id).await?;
+            self.drain_agent_tool_calls(agent_id).await?;
+            if let Err(error) = self
+                .context_manager
+                .update_agent_status(agent_id, &AgentState::Stopping)
+            {
+                // A successful drain closes admission. If durable staging
+                // fails, the in-memory agent is still runnable, so restore
+                // admission before returning the persistence error.
+                let _ = self.syscall_gate.reopen_tool_admission(agent_id);
+                return Err(error.into());
+            }
+            self.agent_manager.force_stopping(agent_id)?;
+        }
+        self.cleanup_agent_resources(agent_id).await?;
+        self.context_manager
+            .update_agent_status(agent_id, &AgentState::Stopped)?;
+        self.agent_manager.force_stopped(agent_id)?;
         Ok(AgentState::Stopped)
     }
 
@@ -2836,22 +2871,25 @@ impl AgentKernelImpl {
             .get_agent_state(agent_id)
             .ok_or(AgentError::NotFound(agent_id))?;
         if state == AgentState::Stopped {
-            let persisted = self
-                .context_manager
-                .update_agent_status(agent_id, &AgentState::Stopped);
-            self.force_cleanup_agent_resources(agent_id).await;
-            persisted?;
+            self.force_cleanup_agent_resources(agent_id).await?;
+            self.context_manager
+                .update_agent_status(agent_id, &AgentState::Stopped)?;
             return Ok(state);
+        }
+        if state != AgentState::Stopping {
+            // The durable non-runnable marker commits before forced revocation.
+            // A crash can therefore never re-admit a partially killed agent.
+            self.context_manager
+                .update_agent_status(agent_id, &AgentState::Stopping)?;
+            self.agent_manager.force_stopping(agent_id)?;
         }
         if let Some(token) = self.active_cancellations.get(&agent_id) {
             token.cancel();
         }
+        self.force_cleanup_agent_resources(agent_id).await?;
+        self.context_manager
+            .update_agent_status(agent_id, &AgentState::Stopped)?;
         self.agent_manager.force_stopped(agent_id)?;
-        let persisted = self
-            .context_manager
-            .update_agent_status(agent_id, &AgentState::Stopped);
-        self.force_cleanup_agent_resources(agent_id).await;
-        persisted?;
         Ok(AgentState::Stopped)
     }
 
@@ -3529,6 +3567,27 @@ pub fn boot_in_memory() -> Result<Arc<AgentKernelImpl>, KernelError> {
 mod tests {
     use super::*;
 
+    fn lifecycle_test_config(name: &str) -> AgentConfig {
+        AgentConfig {
+            name: name.into(),
+            task: "lifecycle atomicity regression".into(),
+            llm_provider: "test".into(),
+            permission_profile: "standard".into(),
+            priority: Priority::default(),
+            sandbox_config: None,
+        }
+    }
+
+    fn durable_agent_status(context: &SqliteContextManager, agent_id: AgentId) -> AgentState {
+        let persisted = context
+            .load_all_agents()
+            .unwrap()
+            .into_iter()
+            .find(|agent| agent.id == agent_id)
+            .expect("agent registry row");
+        serde_json::from_str(&persisted.status).expect("typed durable lifecycle state")
+    }
+
     #[test]
     fn invalid_budget_config_is_rejected_before_creating_the_data_directory() {
         let root =
@@ -4107,6 +4166,156 @@ mod tests {
         assert!(kernel.tenant_cgroups.is_empty());
         assert_eq!(kernel.cgroups.structural_counts(), (1, 1));
         assert_eq!(kernel.sandbox_manager.structural_counts(), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn stopping_persistence_failure_restores_live_admission_before_retry() {
+        let context = Arc::new(SqliteContextManager::in_memory().unwrap());
+        let kernel = AgentKernelImpl::with_context_manager(
+            context.clone(),
+            &crate::config::BudgetConfig::default(),
+            true,
+            &[],
+        )
+        .unwrap();
+        let agent = kernel
+            .create_agent_full(lifecycle_test_config("staging-failure"))
+            .await
+            .unwrap();
+        context.fail_agent_status_update_on_nth_call_for_test(1);
+
+        let error = kernel.stop_agent(agent.id).await.unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("injected agent-status update failure"));
+        assert_eq!(
+            kernel.get_agent_status(agent.id).unwrap(),
+            AgentState::Running
+        );
+        assert_eq!(
+            durable_agent_status(&context, agent.id),
+            AgentState::Running
+        );
+        assert!(kernel.scheduler.contains(agent.id));
+        assert!(kernel.ipc.is_registered(agent.id));
+        assert!(kernel.syscall_gate.agent_info(agent.id).is_some());
+        assert!(kernel
+            .sandbox_manager
+            .get_sandbox_for_agent(agent.id)
+            .is_some());
+        drop(
+            kernel
+                .syscall_gate
+                .acquire_tool_call(agent.id)
+                .expect("failed staging must reopen tool admission"),
+        );
+
+        assert_eq!(
+            kernel.stop_agent(agent.id).await.unwrap(),
+            AgentState::Stopped
+        );
+        assert_eq!(
+            durable_agent_status(&context, agent.id),
+            AgentState::Stopped
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_persistence_failure_stays_non_runnable_until_retry() {
+        let context = Arc::new(SqliteContextManager::in_memory().unwrap());
+        let kernel = AgentKernelImpl::with_context_manager(
+            context.clone(),
+            &crate::config::BudgetConfig::default(),
+            true,
+            &[],
+        )
+        .unwrap();
+        let agent = kernel
+            .create_agent_full(lifecycle_test_config("terminal-failure"))
+            .await
+            .unwrap();
+        context.fail_agent_status_update_on_nth_call_for_test(2);
+
+        let error = kernel.kill_agent(agent.id).await.unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("injected agent-status update failure"));
+        assert_eq!(
+            kernel.get_agent_status(agent.id).unwrap(),
+            AgentState::Stopping
+        );
+        assert_eq!(
+            durable_agent_status(&context, agent.id),
+            AgentState::Stopping
+        );
+        assert!(!kernel.scheduler.contains(agent.id));
+        assert!(!kernel.ipc.is_registered(agent.id));
+        assert!(kernel.syscall_gate.agent_info(agent.id).is_none());
+        assert!(kernel
+            .sandbox_manager
+            .get_sandbox_for_agent(agent.id)
+            .is_none());
+        assert!(!kernel.agent_cgroups.contains_key(&agent.id));
+
+        assert_eq!(
+            kernel.kill_agent(agent.id).await.unwrap(),
+            AgentState::Stopped
+        );
+        assert_eq!(
+            durable_agent_status(&context, agent.id),
+            AgentState::Stopped
+        );
+    }
+
+    #[tokio::test]
+    async fn sandbox_cleanup_failure_is_reported_and_retryable() {
+        let context = Arc::new(SqliteContextManager::in_memory().unwrap());
+        let kernel = AgentKernelImpl::with_context_manager(
+            context.clone(),
+            &crate::config::BudgetConfig::default(),
+            true,
+            &[],
+        )
+        .unwrap();
+        let agent = kernel
+            .create_agent_full(lifecycle_test_config("sandbox-failure"))
+            .await
+            .unwrap();
+        kernel.sandbox_manager.fail_next_destroy_for_test();
+
+        let error = kernel.stop_agent(agent.id).await.unwrap_err();
+        assert!(matches!(error, KernelError::LifecycleCleanup(_)));
+        assert!(error
+            .to_string()
+            .contains("injected sandbox destruction failure"));
+        assert_eq!(
+            kernel.get_agent_status(agent.id).unwrap(),
+            AgentState::Stopping
+        );
+        assert_eq!(
+            durable_agent_status(&context, agent.id),
+            AgentState::Stopping
+        );
+        assert!(!kernel.scheduler.contains(agent.id));
+        assert!(!kernel.ipc.is_registered(agent.id));
+        assert!(kernel.syscall_gate.agent_info(agent.id).is_none());
+        assert!(kernel
+            .sandbox_manager
+            .get_sandbox_for_agent(agent.id)
+            .is_some());
+
+        assert_eq!(
+            kernel.stop_agent(agent.id).await.unwrap(),
+            AgentState::Stopped
+        );
+        assert_eq!(
+            durable_agent_status(&context, agent.id),
+            AgentState::Stopped
+        );
+        assert!(kernel
+            .sandbox_manager
+            .get_sandbox_for_agent(agent.id)
+            .is_none());
     }
 
     #[test]

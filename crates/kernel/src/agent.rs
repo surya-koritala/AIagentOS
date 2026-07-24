@@ -209,8 +209,30 @@ impl AgentManager {
         self.agents.get(&agent_id).map(|agent| agent.config.clone())
     }
 
+    /// Enter the non-runnable cleanup state from any non-terminal state. Forced
+    /// kill uses this after durably staging `Stopping`, before revoking live
+    /// subsystem state.
+    pub(crate) fn force_stopping(&self, agent_id: AgentId) -> Result<(), KernelError> {
+        let mut agent = self
+            .agents
+            .get_mut(&agent_id)
+            .ok_or(AgentError::NotFound(agent_id))?;
+        let old = agent.state.clone();
+        if matches!(old, AgentState::Stopping | AgentState::Stopped) {
+            return Ok(());
+        }
+        agent.state = AgentState::Stopping;
+        agent.last_activity_at = Utc::now();
+        let _ = self.event_tx.send(KernelEvent::AgentStateChanged {
+            agent_id,
+            old,
+            new: AgentState::Stopping,
+        });
+        Ok(())
+    }
+
     /// Forced terminal transition used only by the kernel lifecycle coordinator
-    /// after it has cancelled execution and begun subsystem cleanup.
+    /// after every mandatory subsystem cleanup step has completed.
     pub fn force_stopped(&self, agent_id: AgentId) -> Result<(), KernelError> {
         let mut agent = self
             .agents

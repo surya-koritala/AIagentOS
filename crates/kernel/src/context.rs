@@ -6,7 +6,7 @@
 use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
 #[cfg(test)]
-use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Utc};
@@ -460,6 +460,8 @@ pub struct SqliteContextManager {
     embedder: Arc<dyn Embedder>,
     #[cfg(test)]
     fail_next_agent_save: AtomicBool,
+    #[cfg(test)]
+    fail_agent_status_update_after: AtomicUsize,
 }
 
 impl SqliteContextManager {
@@ -513,6 +515,8 @@ impl SqliteContextManager {
             embedder: crate::memory_manager::default_embedder(),
             #[cfg(test)]
             fail_next_agent_save: AtomicBool::new(false),
+            #[cfg(test)]
+            fail_agent_status_update_after: AtomicUsize::new(0),
         };
         mgr.init_schema()?;
         Ok(mgr)
@@ -527,6 +531,8 @@ impl SqliteContextManager {
             embedder: crate::memory_manager::default_embedder(),
             #[cfg(test)]
             fail_next_agent_save: AtomicBool::new(false),
+            #[cfg(test)]
+            fail_agent_status_update_after: AtomicUsize::new(0),
         };
         mgr.init_schema()?;
         Ok(mgr)
@@ -3064,6 +3070,28 @@ impl SqliteContextManager {
         agent_id: AgentId,
         status: &crate::AgentState,
     ) -> Result<(), ContextError> {
+        #[cfg(test)]
+        {
+            let prior = self
+                .fail_agent_status_update_after
+                .fetch_update(
+                    AtomicOrdering::AcqRel,
+                    AtomicOrdering::Acquire,
+                    |countdown| {
+                        if countdown > 0 {
+                            Some(countdown - 1)
+                        } else {
+                            None
+                        }
+                    },
+                )
+                .ok();
+            if prior == Some(1) {
+                return Err(ContextError::PersistenceFailed(
+                    "injected agent-status update failure".into(),
+                ));
+            }
+        }
         let status = serde_json::to_string(status)
             .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
         let conn = self.conn.lock().unwrap();
@@ -3392,6 +3420,16 @@ impl SqliteContextManager {
     pub(crate) fn fail_next_agent_save_for_test(&self) {
         self.fail_next_agent_save
             .store(true, AtomicOrdering::Release);
+    }
+
+    /// Fail the Nth subsequent lifecycle-status update. A value of one fails
+    /// the next update; two lets the durable `Stopping` write commit and fails
+    /// the following terminal `Stopped` write.
+    #[cfg(test)]
+    pub(crate) fn fail_agent_status_update_on_nth_call_for_test(&self, nth: usize) {
+        assert!(nth > 0, "status-update failure index must be positive");
+        self.fail_agent_status_update_after
+            .store(nth, AtomicOrdering::Release);
     }
 
     /// Insert-or-update an agent's durable identity + config.
@@ -4657,6 +4695,7 @@ mod tests {
             conn: Mutex::new(conn),
             embedder: crate::memory_manager::default_embedder(),
             fail_next_agent_save: AtomicBool::new(false),
+            fail_agent_status_update_after: AtomicUsize::new(0),
         };
         mgr.init_schema().unwrap();
 

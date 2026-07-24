@@ -1,6 +1,5 @@
 //! Multi-agent delegation — agents can delegate tasks to other agents.
 
-use crate::agent::AgentKernel;
 use crate::execution::AgentOutput;
 use crate::{AgentConfig, AgentId, AgentKernelImpl, KernelError, Priority};
 
@@ -48,13 +47,21 @@ pub async fn delegate_to_agent(
 
     let handle = kernel.create_agent_full(config).await?;
 
-    // Send the task
-    let output = kernel.send_message(handle.id, task).await?;
-
-    // Stop the sub-agent after completion
-    let _ = kernel.agent_manager.stop_agent(handle.id).await;
-
-    Ok(output)
+    // Delegates use the same coordinated cleanup path as every public
+    // lifecycle entry surface, including when their turn fails.
+    let output = kernel.send_message(handle.id, task).await;
+    let cleanup = kernel.stop_agent(handle.id).await;
+    match (output, cleanup) {
+        (Ok(output), Ok(_)) => Ok(output),
+        (Ok(_), Err(cleanup_error)) => Err(cleanup_error),
+        (Err(turn_error), Ok(_)) => Err(turn_error),
+        (Err(turn_error), Err(_)) => {
+            // A graceful cleanup fault is retryable. Make one forced attempt
+            // before preserving the original turn error for the caller.
+            let _ = kernel.kill_agent(handle.id).await;
+            Err(turn_error)
+        }
+    }
 }
 
 /// Predefined specialist agent types.

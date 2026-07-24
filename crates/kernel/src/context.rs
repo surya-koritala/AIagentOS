@@ -4263,6 +4263,138 @@ impl SqliteContextManager {
 mod tests {
     use super::*;
 
+    fn sample_generation_checkpoint(agent_id: AgentId) -> crate::execution::GenerationCheckpoint {
+        crate::execution::GenerationCheckpoint {
+            agent_id,
+            conversation_id: "checkpoint-conversation".into(),
+            user_message: "sensitive prompt".into(),
+            messages: vec![crate::connector::StandardMessage::user("sensitive prompt")],
+            partial_content: String::new(),
+            tool_calls_made: 0,
+            tokens_used: 0,
+            usage: crate::execution::UsageTelemetry::default(),
+        }
+    }
+
+    #[test]
+    fn generation_checkpoint_retention_version_and_corruption_fail_closed() {
+        let manager = SqliteContextManager::in_memory().unwrap();
+        let retention_agent = uuid::Uuid::new_v4();
+        let retention_checkpoint = sample_generation_checkpoint(retention_agent);
+        for _ in 0..(MAX_GENERATION_CHECKPOINTS_PER_AGENT + 3) {
+            manager
+                .save_generation_checkpoint(
+                    DEFAULT_TENANT,
+                    "provider",
+                    "model",
+                    &retention_checkpoint,
+                    std::time::Duration::from_secs(60),
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            manager
+                .list_generation_checkpoints(DEFAULT_TENANT, Some(retention_agent))
+                .unwrap()
+                .len(),
+            MAX_GENERATION_CHECKPOINTS_PER_AGENT
+        );
+
+        let incompatible_agent = uuid::Uuid::new_v4();
+        let incompatible = manager
+            .save_generation_checkpoint(
+                DEFAULT_TENANT,
+                "provider",
+                "model",
+                &sample_generation_checkpoint(incompatible_agent),
+                std::time::Duration::from_secs(60),
+            )
+            .unwrap();
+        manager
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE generation_checkpoints SET version = ?1 WHERE id = ?2",
+                params![
+                    i64::from(GENERATION_CHECKPOINT_VERSION) + 1,
+                    incompatible.to_string()
+                ],
+            )
+            .unwrap();
+        let incompatible_error = manager
+            .claim_generation_checkpoint(incompatible, incompatible_agent, DEFAULT_TENANT)
+            .unwrap_err();
+        assert!(incompatible_error.to_string().contains("incompatible"));
+
+        let corrupt_agent = uuid::Uuid::new_v4();
+        let corrupt = manager
+            .save_generation_checkpoint(
+                DEFAULT_TENANT,
+                "provider",
+                "model",
+                &sample_generation_checkpoint(corrupt_agent),
+                std::time::Duration::from_secs(60),
+            )
+            .unwrap();
+        manager
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE generation_checkpoints SET checkpoint_json = '{' WHERE id = ?1",
+                params![corrupt.to_string()],
+            )
+            .unwrap();
+        let corrupt_error = manager
+            .claim_generation_checkpoint(corrupt, corrupt_agent, DEFAULT_TENANT)
+            .unwrap_err();
+        assert!(corrupt_error.to_string().contains("corrupt"));
+
+        let statuses = manager.conn.lock().unwrap();
+        for (id, expected) in [(incompatible, "incompatible"), (corrupt, "corrupt")] {
+            let status = statuses
+                .query_row(
+                    "SELECT status FROM generation_checkpoints WHERE id = ?1",
+                    params![id.to_string()],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap();
+            assert_eq!(status, expected);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn persistent_checkpoint_store_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!(
+            "aiagentos-checkpoint-permissions-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let db = root.join("kernel.sqlite");
+        let manager = SqliteContextManager::new(&db).unwrap();
+        let agent_id = uuid::Uuid::new_v4();
+        manager
+            .save_generation_checkpoint(
+                DEFAULT_TENANT,
+                "provider",
+                "model",
+                &sample_generation_checkpoint(agent_id),
+                std::time::Duration::from_secs(60),
+            )
+            .unwrap();
+        assert_eq!(
+            std::fs::metadata(&db).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+
+        drop(manager);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[tokio::test]
     async fn create_and_get_context() {
         let mgr = SqliteContextManager::in_memory().unwrap();

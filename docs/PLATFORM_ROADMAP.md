@@ -57,7 +57,7 @@ Sizes: **S** ≈ days, **M** ≈ 1–2 weeks, **L** ≈ 3–6 weeks, **XL** ≈ 
 | ID | Title | Size | Deps | Notes |
 |----|-------|------|------|-------|
 | **B2.1** | Context snapshot / restore (persist + restore an agent's in-flight context so a turn can pause/resume) | L | — | **Done** (`context_snapshots` table + `snapshot/restore/list/delete` methods; `Snapshot*`/`RestoreSnapshot` syscalls + SDK) |
-| **B2.2** | Mid-generation context switch (pause/resume LLM decoding; feasible with local/vLLM, checkpoint-at-token-boundary for hosted APIs) | XL | B2.1, B1.1 | **Public-API E2E implemented** (versioned/tenant-scoped durable checkpoints, lifecycle pause/resume, restart recovery, pending-tool reconstruction; hosted APIs remain request-boundary and crash-window side effects are documented at-least-once). Production qualification remains open in #113. |
+| **B2.2** | Mid-generation context switch (pause/resume LLM decoding; feasible with local/vLLM, checkpoint-at-token-boundary for hosted APIs) | XL | B2.1, B1.1 | **Production-qualified** (versioned/tenant-scoped durable checkpoints, lifecycle pause/resume, restart recovery, pending-tool reconstruction, expiry/corruption/incompatibility behavior, latency metrics, completion-race handling, and repeated multi-agent qualification; hosted APIs remain request-boundary and crash-window side effects are documented at-least-once). |
 
 ## Phase 3 — Memory & storage
 

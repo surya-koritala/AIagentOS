@@ -14,7 +14,10 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
 
 - **Coordinated lifecycle and durable checkpoints** — public wire/SDK operations
   now coordinate pause, resume, stop, kill, cleanup, restart rehydration, and
-  versioned generation checkpoints across kernel subsystems. (#112, #113)
+  versioned generation checkpoints across kernel subsystems. Checkpoint
+  retention, corruption/incompatibility handling, completion races, restart
+  side-effect replay protection, multi-agent permit release, and lifecycle
+  latency metrics are regression-qualified. (#112, #113)
 - **Live operator and service APIs** — tenant-safe operator snapshots now power
   the SDK, `agentctl`, and TUI; the kernel-owned service supervisor validates
   dependency order and coordinates startup, rollback, and shutdown. (#117,

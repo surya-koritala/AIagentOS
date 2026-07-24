@@ -802,6 +802,7 @@ impl PackageRegistry {
         input: &PackageTrustInput,
     ) -> Result<(), PackageError> {
         validate_scope(tenant_id, actor)?;
+        self.admit_request(tenant_id, actor)?;
         validate_identity("publisher", &input.publisher)?;
         validate_identity("key id", &input.key_id)?;
         if input.public_key.len() != 32 {
@@ -825,7 +826,6 @@ impl PackageRegistry {
         let transaction = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(persistence)?;
-        check_rate_limit(&transaction, tenant_id, actor)?;
         if let Some(old) = input.supersedes.as_deref() {
             let updated = transaction
                 .execute(
@@ -882,6 +882,7 @@ impl PackageRegistry {
         key_id: &str,
     ) -> Result<(), PackageError> {
         validate_scope(tenant_id, actor)?;
+        self.admit_request(tenant_id, actor)?;
         let mut conn = self
             .store
             .conn
@@ -890,7 +891,6 @@ impl PackageRegistry {
         let transaction = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(persistence)?;
-        check_rate_limit(&transaction, tenant_id, actor)?;
         let updated = transaction
             .execute(
                 "UPDATE package_trust_keys SET status = 'revoked'
@@ -924,6 +924,7 @@ impl PackageRegistry {
         archive: &[u8],
     ) -> Result<PackageSummary, PackageError> {
         validate_scope(tenant_id, actor)?;
+        self.admit_request(tenant_id, actor)?;
         let (key_id, publisher) = PackageArchive::identity(archive)?;
         if actor != publisher && actor != "system" {
             return Err(PackageError::AccessDenied);
@@ -936,7 +937,6 @@ impl PackageRegistry {
         let transaction = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(persistence)?;
-        check_rate_limit(&transaction, tenant_id, actor)?;
         let trust = read_trust_key(&transaction, tenant_id, key_id)?;
         let verified = PackageArchive::verify(archive, &trust, Utc::now())?;
         let manifest_json = serde_json::to_string(&verified.payload)
@@ -1007,6 +1007,7 @@ impl PackageRegistry {
         version: &Version,
     ) -> Result<(), PackageError> {
         validate_scope(tenant_id, actor)?;
+        self.admit_request(tenant_id, actor)?;
         let mut conn = self
             .store
             .conn
@@ -1015,7 +1016,6 @@ impl PackageRegistry {
         let transaction = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(persistence)?;
-        check_rate_limit(&transaction, tenant_id, actor)?;
         let row: Option<(String, String)> = transaction
             .query_row(
                 "SELECT publisher, digest FROM package_artifacts
@@ -1069,6 +1069,7 @@ impl PackageRegistry {
         version: &Version,
     ) -> Result<Vec<u8>, PackageError> {
         validate_scope(tenant_id, actor)?;
+        self.admit_request(tenant_id, actor)?;
         let mut conn = self
             .store
             .conn
@@ -1077,7 +1078,6 @@ impl PackageRegistry {
         let transaction = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(persistence)?;
-        check_rate_limit(&transaction, tenant_id, actor)?;
         let archive: Vec<u8> = transaction
             .query_row(
                 "SELECT archive FROM package_artifacts
@@ -1113,6 +1113,7 @@ impl PackageRegistry {
         query: &str,
     ) -> Result<Vec<PackageSummary>, PackageError> {
         validate_scope(tenant_id, actor)?;
+        self.admit_request(tenant_id, actor)?;
         if query.len() > 256 {
             return Err(PackageError::Invalid("search query is too long".into()));
         }
@@ -1124,7 +1125,6 @@ impl PackageRegistry {
         let transaction = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(persistence)?;
-        check_rate_limit(&transaction, tenant_id, actor)?;
         let mut statement = transaction
             .prepare(
                 "SELECT name, version, publisher, digest, manifest_json, yanked, published_at
@@ -1221,6 +1221,7 @@ impl PackageRegistry {
         fail_before_commit: bool,
     ) -> Result<InstalledPackage, PackageError> {
         validate_scope(tenant_id, actor)?;
+        self.admit_request(tenant_id, actor)?;
         let mut conn = self
             .store
             .conn
@@ -1229,7 +1230,6 @@ impl PackageRegistry {
         let transaction = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(persistence)?;
-        check_rate_limit(&transaction, tenant_id, actor)?;
         let lock = resolve_locked(&transaction, tenant_id, name, requirement)?;
         let mut root = None;
         for locked in &lock.packages {
@@ -1345,6 +1345,7 @@ impl PackageRegistry {
         name: &str,
     ) -> Result<InstalledPackage, PackageError> {
         validate_scope(tenant_id, actor)?;
+        self.admit_request(tenant_id, actor)?;
         let mut conn = self
             .store
             .conn
@@ -1353,7 +1354,6 @@ impl PackageRegistry {
         let transaction = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(persistence)?;
-        check_rate_limit(&transaction, tenant_id, actor)?;
         let row: Option<(i64, String)> = transaction
             .query_row(
                 "SELECT id, snapshot_json FROM package_install_history
@@ -1425,6 +1425,7 @@ impl PackageRegistry {
 
     pub fn remove(&self, tenant_id: &str, actor: &str, name: &str) -> Result<(), PackageError> {
         validate_scope(tenant_id, actor)?;
+        self.admit_request(tenant_id, actor)?;
         let mut conn = self
             .store
             .conn
@@ -1433,7 +1434,6 @@ impl PackageRegistry {
         let transaction = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(persistence)?;
-        check_rate_limit(&transaction, tenant_id, actor)?;
         let installed =
             read_installed(&transaction, tenant_id, name)?.ok_or(PackageError::NotFound)?;
         let mut statement = transaction
@@ -1541,6 +1541,19 @@ impl PackageRegistry {
         let (key_id, _) = PackageArchive::identity(&archive)?;
         let trust = read_trust_key(transaction, tenant_id, key_id)?;
         Ok(PackageArchive::verify(&archive, &trust, Utc::now())?.payload)
+    }
+
+    fn admit_request(&self, tenant_id: &str, actor: &str) -> Result<(), PackageError> {
+        let mut conn = self
+            .store
+            .conn
+            .lock()
+            .map_err(|_| PackageError::Persistence("database lock poisoned".into()))?;
+        let transaction = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(persistence)?;
+        check_rate_limit(&transaction, tenant_id, actor)?;
+        transaction.commit().map_err(persistence)
     }
 }
 
@@ -2397,6 +2410,18 @@ mod tests {
         drop(connection);
         assert!(matches!(
             registry.search("tenant-a", "flooder", "logged"),
+            Err(PackageError::RateLimited)
+        ));
+
+        let rejected = PackageRegistry::new();
+        for _ in 0..REGISTRY_REQUESTS_PER_MINUTE {
+            assert!(matches!(
+                rejected.publish("tenant-a", "attacker", b"not-an-archive"),
+                Err(PackageError::Invalid(_))
+            ));
+        }
+        assert!(matches!(
+            rejected.publish("tenant-a", "attacker", b"not-an-archive"),
             Err(PackageError::RateLimited)
         ));
     }

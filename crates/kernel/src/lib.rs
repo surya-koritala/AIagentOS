@@ -1747,9 +1747,9 @@ impl AgentKernelImpl {
         let active_managed_workspaces = persisted
             .iter()
             .filter(|record| {
-                !matches!(
+                matches!(
                     serde_json::from_str::<AgentState>(&record.status),
-                    Ok(AgentState::Stopped | AgentState::Error(_))
+                    Ok(AgentState::Running | AgentState::Paused)
                 )
             })
             .filter_map(|record| record.sandbox_config_json.as_deref())
@@ -1784,7 +1784,36 @@ impl AgentKernelImpl {
                 priority,
                 sandbox_config: Some(sandbox_config.clone()),
             };
-            let state: AgentState = serde_json::from_str(&p.status).unwrap_or(AgentState::Running);
+            let persisted_state = match serde_json::from_str::<AgentState>(&p.status) {
+                Ok(state) => state,
+                Err(error) => {
+                    // A corrupt lifecycle row must never become runnable. Keep
+                    // it durable for operator repair while omitting it from all
+                    // live kernel registries.
+                    tracing::warn!(
+                        "Skipping persisted agent {} because lifecycle state is invalid: {}",
+                        p.id,
+                        error
+                    );
+                    continue;
+                }
+            };
+            // A process restart is the recovery boundary for incomplete
+            // lifecycle transitions. Creation never committed, so preserve the
+            // identity as terminal error history. A requested stop wins across
+            // a crash and completes as Stopped. Neither state is re-admitted.
+            let state = match persisted_state.clone() {
+                AgentState::Initializing => {
+                    AgentState::Error("initialization interrupted by process restart".into())
+                }
+                AgentState::Stopping => AgentState::Stopped,
+                state => state,
+            };
+            if state != persisted_state {
+                self.context_manager
+                    .update_agent_status(p.id, &state)
+                    .map_err(KernelError::Context)?;
+            }
             let terminal = matches!(state, AgentState::Stopped | AgentState::Error(_));
             if terminal {
                 // Terminal registry rows are durable history, not live kernel
@@ -2304,9 +2333,30 @@ impl AgentKernelImpl {
     }
 
     async fn cleanup_agent_resources(&self, agent_id: AgentId) {
+        self.cleanup_agent_resources_with_mode(agent_id, false)
+            .await;
+    }
+
+    /// Forced cleanup revokes already-admitted tool reservations before
+    /// tearing down the remaining subsystems. Cooperative work is cancelled by
+    /// the lifecycle caller; any stale reservation guard that eventually drops
+    /// is inert and cannot corrupt cgroup accounting.
+    async fn force_cleanup_agent_resources(&self, agent_id: AgentId) {
+        self.cleanup_agent_resources_with_mode(agent_id, true).await;
+    }
+
+    async fn cleanup_agent_resources_with_mode(&self, agent_id: AgentId, forced: bool) {
         let gate_info = self.syscall_gate.agent_info(agent_id);
         let gate_registered = gate_info.is_some();
-        if gate_registered {
+        let mut cgroup_membership_released = !gate_registered;
+        if forced && gate_registered {
+            match self.syscall_gate.force_unregister_agent(agent_id) {
+                Ok(()) => cgroup_membership_released = true,
+                Err(error) => {
+                    tracing::warn!("forced syscall-gate cleanup failed for {agent_id}: {error}");
+                }
+            }
+        } else if gate_registered {
             if let Err(error) = self
                 .syscall_gate
                 .close_tool_admission_and_wait(agent_id)
@@ -2339,18 +2389,13 @@ impl AgentKernelImpl {
         }
         self.observability.purge_agent(agent_id);
         self.budget_enforcer.unregister_agent(agent_id);
-        let cgroup_membership_released = if gate_registered {
+        if gate_registered && !forced {
             if let Err(error) = self.syscall_gate.try_unregister_agent(agent_id) {
                 tracing::warn!("syscall-gate cleanup failed for {agent_id}: {error}");
-                false
             } else {
-                true
+                cgroup_membership_released = true;
             }
-        } else {
-            // Creation can fail after the leaf is allocated but before gate
-            // registration. Such a leaf has no membership to release.
-            true
-        };
+        }
         if cgroup_membership_released {
             // `agent_cgroups` always names the private leaf allocated at
             // creation. The gate may now name a shared/custom destination
@@ -2672,8 +2717,10 @@ impl AgentKernelImpl {
         Ok(AgentState::Stopped)
     }
 
-    /// Force a terminal state from any non-terminal lifecycle state, then run
-    /// the exact same cleanup invariant as graceful stop.
+    /// Force a terminal state from any non-terminal lifecycle state. Unlike
+    /// graceful stop, kill does not wait for an uncooperative turn or external
+    /// binding: it cancels execution, revokes admitted tool guards, and tears
+    /// down every live subsystem immediately.
     pub async fn kill_agent(&self, agent_id: AgentId) -> Result<AgentState, KernelError> {
         let lock = self.lifecycle_lock(agent_id);
         let _guard = lock.lock().await;
@@ -2685,17 +2732,18 @@ impl AgentKernelImpl {
             let persisted = self
                 .context_manager
                 .update_agent_status(agent_id, &AgentState::Stopped);
-            self.cleanup_agent_resources(agent_id).await;
+            self.force_cleanup_agent_resources(agent_id).await;
             persisted?;
             return Ok(state);
         }
-        self.quiesce_agent(agent_id).await?;
-        self.drain_agent_tool_calls(agent_id).await?;
+        if let Some(token) = self.active_cancellations.get(&agent_id) {
+            token.cancel();
+        }
         self.agent_manager.force_stopped(agent_id)?;
         let persisted = self
             .context_manager
             .update_agent_status(agent_id, &AgentState::Stopped);
-        self.cleanup_agent_resources(agent_id).await;
+        self.force_cleanup_agent_resources(agent_id).await;
         persisted?;
         Ok(AgentState::Stopped)
     }
@@ -4088,10 +4136,10 @@ mod tests {
         let hung_guard = kernel.syscall_gate.acquire_tool_call(hung.id).unwrap();
         let error = tokio::time::timeout(
             std::time::Duration::from_secs(1),
-            kernel.kill_agent(hung.id),
+            kernel.stop_agent(hung.id),
         )
         .await
-        .expect("kill has a finite external-tool drain contract")
+        .expect("stop has a finite external-tool drain contract")
         .unwrap_err();
         assert!(error.to_string().contains("timed out draining"));
         assert_eq!(kernel.get_agent_status(hung.id).unwrap(), original_state);
@@ -4100,9 +4148,19 @@ mod tests {
             .acquire_tool_call(hung.id)
             .expect("failed terminal transition must restore admission");
         drop(reopened);
-        drop(hung_guard);
         kernel.kill_agent(hung.id).await.unwrap();
         assert_eq!(kernel.cgroups.structural_counts(), (1, 1));
+        drop(hung_guard);
+        assert_eq!(
+            kernel
+                .cgroups
+                .get(kernel.cgroups.root())
+                .unwrap()
+                .usage
+                .active_tool_calls,
+            0,
+            "late guard drop after forced kill must not double-decrement accounting"
+        );
     }
 
     #[tokio::test]
@@ -4162,7 +4220,7 @@ mod tests {
 
         let error = tokio::time::timeout(
             std::time::Duration::from_secs(1),
-            kernel.kill_agent(agent.id),
+            kernel.stop_agent(agent.id),
         )
         .await
         .expect("terminal quiesce must have a finite bound")
@@ -4172,9 +4230,9 @@ mod tests {
             .contains("timed out waiting for active agent turn"));
         assert_eq!(kernel.get_agent_status(agent.id).unwrap(), original_state);
 
-        drop(held);
         kernel.kill_agent(agent.id).await.unwrap();
         assert_eq!(kernel.cgroups.structural_counts(), (1, 1));
+        drop(held);
     }
 
     #[tokio::test]

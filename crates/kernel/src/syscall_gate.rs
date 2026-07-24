@@ -821,6 +821,24 @@ impl SyscallGate {
         Ok(())
     }
 
+    /// Revoke lifecycle admission and remove an agent even when a binding has
+    /// not cooperatively released its tool-call guard. The cgroup manager
+    /// invalidates those exact guards before removing membership, so their
+    /// eventual drops are accounting no-ops.
+    pub(crate) fn force_unregister_agent(&self, kid: uuid::Uuid) -> Result<(), GateMutationError> {
+        let _mutation = self.mutation_lock.lock().unwrap();
+        let rec = self
+            .records
+            .get(&kid)
+            .map(|record| record.clone())
+            .ok_or(GateMutationError::UnknownAgent(kid))?;
+        self.cgroups.force_remove_agent(rec.cgroup, rec.pid)?;
+        self.records.remove(&kid);
+        self.approvals
+            .retain(|(agent, _, _, _, _), _| *agent != kid);
+        Ok(())
+    }
+
     /// Close the lifecycle admission gate and wait for already-admitted tool
     /// bindings to release their per-agent cgroup guards. Closing and tool-slot
     /// acquisition share `mutation_lock`, so no new guard can appear after the
@@ -2406,6 +2424,38 @@ mod tests {
             .unwrap()
             .unwrap();
         gate.try_unregister_agent(kid).unwrap();
+    }
+
+    #[test]
+    fn forced_unregister_revokes_only_the_target_agents_reservations() {
+        let (gate, cgroups) = fresh_gate();
+        let group = cgroups.create(
+            "shared-force-cleanup".into(),
+            cgroups.root(),
+            CgroupLimits::default(),
+        );
+        let killed = uuid::Uuid::new_v4();
+        let survivor = uuid::Uuid::new_v4();
+        gate.register_agent(killed, CapabilitySet::all(), Some(group));
+        gate.register_agent(survivor, CapabilitySet::all(), Some(group));
+        let killed_guard = gate.acquire_tool_call(killed).unwrap();
+        let survivor_guard = gate.acquire_tool_call(survivor).unwrap();
+        assert_eq!(cgroups.get(group).unwrap().usage.active_tool_calls, 2);
+
+        gate.force_unregister_agent(killed).unwrap();
+        assert_eq!(cgroups.get(group).unwrap().usage.active_tool_calls, 1);
+        assert!(gate.agent_info(killed).is_none());
+        assert!(gate.agent_info(survivor).is_some());
+
+        drop(killed_guard);
+        assert_eq!(
+            cgroups.get(group).unwrap().usage.active_tool_calls,
+            1,
+            "revoked guard must not consume the survivor's reservation"
+        );
+        drop(survivor_guard);
+        assert_eq!(cgroups.get(group).unwrap().usage.active_tool_calls, 0);
+        gate.try_unregister_agent(survivor).unwrap();
     }
 
     #[tokio::test]

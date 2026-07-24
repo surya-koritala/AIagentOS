@@ -2,10 +2,12 @@
 
 use std::time::Duration;
 
+use kernel::context::{PersistedAgent, SqliteContextManager, DEFAULT_TENANT};
 use kernel::permissions::{AccessDecision, PermissionSystem};
 use kernel::resources::ResourceType;
 use kernel::sandbox::SandboxManager;
-use kernel::{AgentConfig, AgentKernelImpl, AgentState, Priority};
+use kernel::sandbox::SandboxManagerImpl;
+use kernel::{AgentConfig, AgentKernelImpl, AgentState, IsolationLevel, Priority, SandboxConfig};
 
 fn config(name: &str) -> AgentConfig {
     AgentConfig {
@@ -137,6 +139,115 @@ fn paused_state_survives_restart_but_terminal_agents_are_not_readmitted() {
         .sandbox_manager
         .get_sandbox_for_agent(stopped_id)
         .is_none());
+
+    drop(kernel);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn restart_resolves_interrupted_lifecycle_states_without_readmission() {
+    let root = std::env::temp_dir().join(format!(
+        "aiagentos-lifecycle-interrupted-{}",
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::create_dir_all(&root).unwrap();
+    let db = root.join("kernel.sqlite");
+    let context = SqliteContextManager::new(&db).expect("seed database");
+    let now = chrono::Utc::now();
+
+    let initializing_id = uuid::Uuid::new_v4();
+    let stopping_id = uuid::Uuid::new_v4();
+    let malformed_id = uuid::Uuid::new_v4();
+    let interrupted_workspace =
+        SandboxManagerImpl::managed_root().join(uuid::Uuid::new_v4().to_string());
+    std::fs::create_dir_all(&interrupted_workspace).unwrap();
+    std::fs::write(
+        interrupted_workspace.join(".aiagentos-managed"),
+        b"managed-by=aiagentos\n",
+    )
+    .unwrap();
+    let interrupted_sandbox = serde_json::to_string(&SandboxConfig {
+        workspace_dir: interrupted_workspace.clone(),
+        allowed_network_hosts: Some(Vec::new()),
+        max_disk_usage_bytes: Some(1024),
+        max_memory_bytes: Some(1024),
+        isolation_level: IsolationLevel::Filesystem,
+        container_image: None,
+    })
+    .unwrap();
+
+    let record = |id, status: &str, sandbox_config_json| PersistedAgent {
+        id,
+        session_id: uuid::Uuid::new_v4(),
+        tenant_id: DEFAULT_TENANT.to_string(),
+        name: format!("interrupted-{id}"),
+        task: "restart recovery regression".into(),
+        llm_provider: "stub".into(),
+        permission_profile: "standard".into(),
+        priority: Priority::default().value(),
+        status: status.into(),
+        sandbox_config_json,
+        created_at: now,
+        last_activity_at: now,
+    };
+    context
+        .save_agent(&record(
+            initializing_id,
+            &serde_json::to_string(&AgentState::Initializing).unwrap(),
+            None,
+        ))
+        .unwrap();
+    context
+        .save_agent(&record(
+            stopping_id,
+            &serde_json::to_string(&AgentState::Stopping).unwrap(),
+            Some(interrupted_sandbox),
+        ))
+        .unwrap();
+    context
+        .save_agent(&record(malformed_id, "{\"unknown\":\"state\"}", None))
+        .unwrap();
+    drop(context);
+
+    let kernel = AgentKernelImpl::with_db_path(&db).expect("restart");
+    assert_eq!(
+        kernel.get_agent_status(initializing_id).unwrap(),
+        AgentState::Error("initialization interrupted by process restart".into())
+    );
+    assert_eq!(
+        kernel.get_agent_status(stopping_id).unwrap(),
+        AgentState::Stopped
+    );
+    assert!(
+        kernel.get_agent_status(malformed_id).is_err(),
+        "corrupt lifecycle state must fail closed instead of becoming Running"
+    );
+    for id in [initializing_id, stopping_id, malformed_id] {
+        assert!(!kernel.scheduler.contains(id));
+        assert!(!kernel.ipc.is_registered(id));
+        assert!(kernel.syscall_gate.agent_info(id).is_none());
+        assert!(kernel.sandbox_manager.get_sandbox_for_agent(id).is_none());
+    }
+    assert!(
+        !interrupted_workspace.exists(),
+        "interrupted terminal workspace must be reconciled"
+    );
+
+    let persisted = kernel.context_manager.load_all_agents().unwrap();
+    let state_for = |id| {
+        let status = &persisted
+            .iter()
+            .find(|record| record.id == id)
+            .unwrap()
+            .status;
+        serde_json::from_str::<AgentState>(status)
+    };
+    assert_eq!(
+        state_for(initializing_id).unwrap(),
+        AgentState::Error("initialization interrupted by process restart".into())
+    );
+    assert_eq!(state_for(stopping_id).unwrap(), AgentState::Stopped);
+    assert!(state_for(malformed_id).is_err());
 
     drop(kernel);
     std::fs::remove_dir_all(root).unwrap();

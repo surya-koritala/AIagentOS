@@ -22,11 +22,18 @@ We will respond within 48 hours and work with you on a fix.
   are CI/review requirements, not an independently audited guarantee yet.
 
 ### Agent Sandbox
-- Every live agent receives a mandatory sandbox policy. Filesystem paths are
-  canonicalized against a per-agent workspace and network hosts are allowlisted.
-- This is a load-bearing policy boundary, not complete OS-level process or
-  container isolation on every platform. Host process/peripheral operations
-  fail closed for untrusted sandbox levels.
+- Every live agent receives a mandatory sandbox identity. Non-trusted
+  filesystem operations execute relative to a kernel-owned workspace directory
+  capability with private ownership and byte quotas; providers do not reopen
+  authorized host path strings.
+- HTTP egress is allowlisted, DNS answers are rejected if any address is
+  non-public, validated addresses are pinned for the connection, ambient
+  proxies and redirects are disabled, and only default HTTP(S) ports are used.
+- Native process mode, direct host MCP launch, and unisolated browser execution
+  fail closed. Linux container mode requires a rootless daemon and a locally
+  verified digest-pinned image with hardened run flags. Linux live-breakout
+  qualification and macOS/Windows process/container backends remain open #111
+  work, so the project does not yet claim complete cross-platform host isolation.
 - High-risk operations require the capabilities/approval declared by the tool
   contract; an explicitly trusted operator profile can carry broader authority.
 

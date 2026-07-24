@@ -41,7 +41,11 @@ revoked credential cannot fall back to system authority.
 | Malicious or injected prompt asks for a dangerous tool | The LLM can request but cannot grant capabilities. The binding's typed action/capabilities, MAC policy, approval requirement, and sandbox are enforced outside the model. |
 | Malicious package or custom/MCP tool understates its risk | Registration requires resource type, operation, action, individual known capabilities, a required string/constant extractor, namespace visibility, approval, and sandbox policy. Provider/action contradictions are rejected; remote MCP metadata has no implicit trust, and one invalid or conflicting discovery entry prevents the entire MCP batch from being published. |
 | Compromised provider fabricates a tool name or arguments | Unknown names fail closed. The registered declaration, not the name supplied by the provider, drives authorization. |
-| Path/URL tricks, alternate keys, non-string values, traversal, encoded separators | Each declaration names one typed resource extractor. Missing/wrong-type fields are denied; filesystem `.`/separator aliases are normalized and parent traversal is rejected before MAC, approval, and proof creation. The downstream sandbox/provider remains responsible for host-path boundaries. |
+| Path/URL tricks, alternate keys, non-string values, traversal, encoded separators | Each declaration names one typed resource extractor. Missing/wrong-type fields are denied; filesystem `.`/separator aliases are normalized and parent traversal is rejected before MAC, approval, and proof creation. Non-trusted filesystem operations are then executed relative to a kernel-owned directory capability, rather than reopening the authorized host pathname in a provider. |
+| Symlink or rename changes a filesystem target after authorization | Non-trusted read/write/create/edit/delete/list operations use the retained workspace directory capability. Capability-relative resolution rejects escapes even when an ancestor is replaced after the broker's policy decision. |
+| Allowlisted hostname resolves to local infrastructure or changes between policy and connect | The sandbox resolves all A/AAAA answers, rejects the request if any address is non-public, pins the validated addresses into a no-proxy HTTP client, permits only the scheme's default port, and disables redirects. |
+| Untrusted command escapes into the server process | Filesystem sandboxes deny commands. Native `Process` mode is rejected as unsupported. Linux `Container` mode requires a rootless daemon and locally verified digest-pinned image, and applies network-none, read-only root, capability drop, `no-new-privileges`, PID/memory/CPU/output limits, and label-scoped cleanup. macOS and Windows reject container mode. |
+| Outbound MCP configuration launches an ambient-authority host child | Direct host MCP launch is disabled. MCP tool declarations may still be published only through the validated registry; an outbound child must wait for an agent-bound isolated backend. |
 | Confused deputy calls another agent's ID or tenant resource | The authenticated principal is retained for every wire request; tenant ownership is checked before dispatch and namespace/IPC checks apply again at the tool boundary. |
 | Revoked or inconsistent identity retains authority | Credentials are re-resolved on every request against existing tenant/user records; unknown roles fail closed, and an owner-bound per-credential admission lease is held through dispatch. Session/key and overlapping user/tenant revocations share the same pending drain boundary. Revocation durably removes and closes the identity, then reports success only after every relevant admitted lease drains; a bounded timeout returns an explicit incomplete result without reopening the credential. |
 | Remote listener exposes system authority or secrets in plaintext | Non-loopback TCP requires the system token plus TLS; the metrics listener is loopback-only unless an explicit insecure-development override is set. |
@@ -76,10 +80,12 @@ MAC evaluates the declaration's typed extractor; filesystem targets first
 receive platform lexical normalization and reject parent traversal so the gate,
 approval contract, and immutable agent-request proof share one identity. It does
 not treat model-supplied alternate keys, non-string values, or an MCP server's
-claimed classification as equivalent. Lexical normalization is not host
-isolation: no-follow/dirfd confinement, symlink-swap resistance, encoded
-separators, platform-specific aliases, and DNS rebinding defense remain #111
-qualification work. Built-in HTTP providers do not follow redirects.
+claimed classification as equivalent. For non-trusted agents, the broker does
+not delegate filesystem or HTTP authority to a provider: filesystem operations
+use a retained directory capability, and HTTP uses validated, pinned DNS answers
+with proxies and redirects disabled. Browser subresources, WebSockets, an
+isolated outbound MCP runtime, Linux live-container qualification, and native
+macOS/Windows process isolation remain #111 work.
 
 Package code, MCP servers, and resource providers are potential deputies, not
 authorization authorities. They receive only a call that already passed tenant
@@ -89,11 +95,14 @@ for the kernel-owned context.
 
 ## Residual risks and qualification work
 
-The declaration contract does not by itself prove host isolation. Mandatory
-host-enforced sandboxes, approval lifecycle UX, complete cross-platform
-canonical path/URL validation, credential brokering, package signatures,
-provider isolation, side-effect cancellation/drain guarantees, audit retention,
-and penetration testing remain tracked by the canonical
+The declaration contract does not by itself prove complete host isolation.
+Capability-mediated filesystem/HTTP I/O and the hardened Linux rootless
+container contract are implemented, while native process mode and direct host
+MCP launch fail closed. Linux live-container breakout/crash qualification,
+macOS/Windows process backends, approval lifecycle UX, credential brokering,
+package signatures, browser/provider isolation, side-effect cancellation/drain
+guarantees, audit retention, and independent penetration testing remain tracked
+by the canonical
 [capability registry](capabilities.toml) and issues #111, #115, #119, #121,
 #124, and #127. A capability must not be promoted beyond its evidence while any
 of those limitations apply.

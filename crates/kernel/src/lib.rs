@@ -1744,6 +1744,22 @@ impl AgentKernelImpl {
             .context_manager
             .load_all_agents()
             .map_err(KernelError::Context)?;
+        let active_managed_workspaces = persisted
+            .iter()
+            .filter(|record| {
+                !matches!(
+                    serde_json::from_str::<AgentState>(&record.status),
+                    Ok(AgentState::Stopped | AgentState::Error(_))
+                )
+            })
+            .filter_map(|record| record.sandbox_config_json.as_deref())
+            .filter_map(|serialized| serde_json::from_str::<SandboxConfig>(serialized).ok())
+            .filter(SandboxManagerImpl::is_managed_config)
+            .map(|config| config.workspace_dir)
+            .collect::<std::collections::HashSet<_>>();
+        self.sandbox_manager
+            .reconcile_managed_workspaces(&active_managed_workspaces)
+            .map_err(KernelError::Sandbox)?;
         let mut restored = Vec::new();
         for p in persisted {
             // An explicit reconciliation pass may run after boot. Treat an

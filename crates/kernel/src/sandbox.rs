@@ -87,6 +87,7 @@ pub enum SandboxAction {
 struct SandboxState {
     id: SandboxId,
     agent_id: AgentId,
+    workspace_alias: PathBuf,
     workspace_dir: PathBuf,
     allowed_network_hosts: HashSet<String>,
     isolation_level: IsolationLevel,
@@ -112,6 +113,8 @@ impl Default for SandboxManagerImpl {
 }
 
 impl SandboxManagerImpl {
+    const MANAGED_MARKER: &'static str = ".aiagentos-managed";
+
     pub fn new() -> Self {
         #[cfg(target_os = "linux")]
         {
@@ -129,9 +132,7 @@ impl SandboxManagerImpl {
     /// denied; the workspace is unique and owned by the sandbox manager.
     pub fn default_config() -> SandboxConfig {
         SandboxConfig {
-            workspace_dir: std::env::temp_dir()
-                .join("aiagentos-workspaces")
-                .join(uuid::Uuid::new_v4().to_string()),
+            workspace_dir: Self::managed_root().join(uuid::Uuid::new_v4().to_string()),
             allowed_network_hosts: Some(Vec::new()),
             max_disk_usage_bytes: Some(100 * 1024 * 1024),
             max_memory_bytes: Some(256 * 1024 * 1024),
@@ -140,11 +141,113 @@ impl SandboxManagerImpl {
         }
     }
 
+    pub fn managed_root() -> PathBuf {
+        std::env::temp_dir().join("aiagentos-workspaces")
+    }
+
+    fn live_managed_workspaces() -> &'static Mutex<HashSet<PathBuf>> {
+        static LIVE: std::sync::OnceLock<Mutex<HashSet<PathBuf>>> = std::sync::OnceLock::new();
+        LIVE.get_or_init(|| Mutex::new(HashSet::new()))
+    }
+
     pub fn is_managed_config(config: &SandboxConfig) -> bool {
-        config
-            .workspace_dir
-            .starts_with(std::env::temp_dir().join("aiagentos-workspaces"))
-            && config.isolation_level == IsolationLevel::Filesystem
+        if !config.workspace_dir.starts_with(Self::managed_root())
+            || config.isolation_level != IsolationLevel::Filesystem
+            || !config
+                .workspace_dir
+                .file_name()
+                .and_then(|leaf| leaf.to_str())
+                .is_some_and(|leaf| uuid::Uuid::parse_str(leaf).is_ok())
+        {
+            return false;
+        }
+        if config.workspace_dir.join(Self::MANAGED_MARKER).is_file() {
+            return true;
+        }
+        // Compatibility for managed workspaces created before the durable
+        // marker existed. The internal root is reserved, the leaf is a UUID,
+        // and strict ownership/mode must still prove it was service-managed.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{MetadataExt, PermissionsExt};
+            std::fs::metadata(&config.workspace_dir).is_ok_and(|metadata| {
+                metadata.uid() == unsafe { libc::geteuid() }
+                    && metadata.permissions().mode() & 0o077 == 0
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            false
+        }
+    }
+
+    fn ensure_managed_root() -> Result<PathBuf, SandboxError> {
+        let root = Self::managed_root();
+        std::fs::create_dir_all(&root)
+            .map_err(|error| SandboxError::CreationFailed(error.to_string()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+            std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700))
+                .map_err(|error| SandboxError::CreationFailed(error.to_string()))?;
+            let metadata = std::fs::metadata(&root)
+                .map_err(|error| SandboxError::CreationFailed(error.to_string()))?;
+            if metadata.uid() != unsafe { libc::geteuid() } || metadata.mode() & 0o077 != 0 {
+                return Err(SandboxError::CreationFailed(
+                    "managed workspace root must be private to the service user".into(),
+                ));
+            }
+        }
+        std::fs::canonicalize(root).map_err(|error| SandboxError::CreationFailed(error.to_string()))
+    }
+
+    /// Remove UUID-scoped managed workspaces that have no live persisted
+    /// agent. A crash may occur before the marker is written, so ownership by
+    /// the private managed root plus a UUID leaf is the cleanup authority.
+    pub fn reconcile_managed_workspaces(
+        &self,
+        active_workspaces: &HashSet<PathBuf>,
+    ) -> Result<usize, SandboxError> {
+        let root = Self::ensure_managed_root()?;
+        let mut active = active_workspaces
+            .iter()
+            .filter_map(|path| std::fs::canonicalize(path).ok())
+            .collect::<HashSet<_>>();
+        active.extend(
+            Self::live_managed_workspaces()
+                .lock()
+                .map_err(|_| {
+                    SandboxError::DestructionFailed("managed workspace registry unavailable".into())
+                })?
+                .iter()
+                .cloned(),
+        );
+        let mut removed = 0;
+        for entry in std::fs::read_dir(&root)
+            .map_err(|error| SandboxError::DestructionFailed(error.to_string()))?
+        {
+            let entry =
+                entry.map_err(|error| SandboxError::DestructionFailed(error.to_string()))?;
+            let file_type = entry
+                .file_type()
+                .map_err(|error| SandboxError::DestructionFailed(error.to_string()))?;
+            if !file_type.is_dir()
+                || uuid::Uuid::parse_str(&entry.file_name().to_string_lossy()).is_err()
+            {
+                continue;
+            }
+            let path = entry.path();
+            let canonical = std::fs::canonicalize(&path)
+                .map_err(|error| SandboxError::DestructionFailed(error.to_string()))?;
+            if canonical.parent() != Some(root.as_path()) || active.contains(&canonical) {
+                continue;
+            }
+            std::fs::remove_dir_all(&canonical)
+                .map_err(|error| SandboxError::DestructionFailed(error.to_string()))?;
+            removed += 1;
+        }
+        Ok(removed)
     }
 
     #[cfg(test)]
@@ -195,6 +298,27 @@ impl SandboxManagerImpl {
                     .map_err(SandboxError::CreationFailed)?;
             }
         }
+        let managed_root = if managed_workspace {
+            let root = Self::ensure_managed_root()?;
+            let parent = config.workspace_dir.parent().ok_or_else(|| {
+                SandboxError::CreationFailed("managed workspace path is invalid".into())
+            })?;
+            let parent = std::fs::canonicalize(parent)
+                .map_err(|error| SandboxError::CreationFailed(error.to_string()))?;
+            let valid_leaf = config
+                .workspace_dir
+                .file_name()
+                .and_then(|leaf| leaf.to_str())
+                .is_some_and(|leaf| uuid::Uuid::parse_str(leaf).is_ok());
+            if parent != root || !valid_leaf {
+                return Err(SandboxError::CreationFailed(
+                    "managed workspace must be a UUID leaf of the private managed root".into(),
+                ));
+            }
+            Some(root)
+        } else {
+            None
+        };
         let workspace_dir = if config.isolation_level == IsolationLevel::Trusted {
             config.workspace_dir.clone()
         } else {
@@ -204,31 +328,58 @@ impl SandboxManagerImpl {
                 ));
             }
             let existed = config.workspace_dir.exists();
+            if managed_workspace
+                && std::fs::symlink_metadata(&config.workspace_dir)
+                    .is_ok_and(|metadata| metadata.file_type().is_symlink())
+            {
+                return Err(SandboxError::CreationFailed(
+                    "managed workspace cannot be a symbolic link".into(),
+                ));
+            }
             std::fs::create_dir_all(&config.workspace_dir)
                 .map_err(|error| SandboxError::CreationFailed(error.to_string()))?;
             #[cfg(unix)]
             {
                 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
-                if !existed || managed_workspace {
+                let metadata = std::fs::metadata(&config.workspace_dir)
+                    .map_err(|error| SandboxError::CreationFailed(error.to_string()))?;
+                if metadata.uid() != unsafe { libc::geteuid() } {
+                    return Err(SandboxError::CreationFailed(
+                        "untrusted sandbox workspace must be owned by the service user".into(),
+                    ));
+                }
+                if !existed || metadata.mode() & 0o077 != 0 {
                     std::fs::set_permissions(
                         &config.workspace_dir,
                         std::fs::Permissions::from_mode(0o700),
                     )
                     .map_err(|error| SandboxError::CreationFailed(error.to_string()))?;
                 }
-                let metadata = std::fs::metadata(&config.workspace_dir)
-                    .map_err(|error| SandboxError::CreationFailed(error.to_string()))?;
-                if metadata.uid() != unsafe { libc::geteuid() } || metadata.mode() & 0o077 != 0 {
-                    return Err(SandboxError::CreationFailed(
-                        "untrusted sandbox workspace must be owned by the service user and mode 0700"
-                            .into(),
-                    ));
-                }
             }
-            std::fs::canonicalize(&config.workspace_dir)
-                .map_err(|error| SandboxError::CreationFailed(error.to_string()))?
+            let workspace = std::fs::canonicalize(&config.workspace_dir)
+                .map_err(|error| SandboxError::CreationFailed(error.to_string()))?;
+            if managed_root
+                .as_ref()
+                .is_some_and(|root| workspace.parent() != Some(root.as_path()))
+            {
+                return Err(SandboxError::CreationFailed(
+                    "managed workspace escaped the private managed root".into(),
+                ));
+            }
+            workspace
         };
+        if managed_root.is_some() {
+            let marker = workspace_dir.join(Self::MANAGED_MARKER);
+            std::fs::write(&marker, [])
+                .map_err(|error| SandboxError::CreationFailed(error.to_string()))?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&marker, std::fs::Permissions::from_mode(0o600))
+                    .map_err(|error| SandboxError::CreationFailed(error.to_string()))?;
+            }
+        }
         let workspace = if config.isolation_level == IsolationLevel::Trusted {
             None
         } else {
@@ -246,7 +397,8 @@ impl SandboxManagerImpl {
         let state = SandboxState {
             id: sandbox_id,
             agent_id,
-            workspace_dir,
+            workspace_alias: config.workspace_dir.clone(),
+            workspace_dir: workspace_dir.clone(),
             allowed_network_hosts: allowed_hosts,
             isolation_level: config.isolation_level.clone(),
             managed_workspace,
@@ -257,6 +409,14 @@ impl SandboxManagerImpl {
             operation_lock: Arc::new(Mutex::new(())),
             process_lock: Arc::new(tokio::sync::Semaphore::new(1)),
         };
+        if managed_workspace {
+            Self::live_managed_workspaces()
+                .lock()
+                .map_err(|_| {
+                    SandboxError::CreationFailed("managed workspace registry unavailable".into())
+                })?
+                .insert(workspace_dir.clone());
+        }
         self.sandboxes.insert(sandbox_id, state);
         self.agent_sandboxes.insert(agent_id, sandbox_id);
         Ok(sandbox_id)
@@ -311,6 +471,7 @@ impl SandboxManagerImpl {
     ) -> Result<PathBuf, SandboxError> {
         let relative = if path.is_absolute() {
             path.strip_prefix(&state.workspace_dir)
+                .or_else(|_| path.strip_prefix(&state.workspace_alias))
                 .map_err(|_| SandboxError::BoundaryViolation("filesystem target denied".into()))?
                 .to_path_buf()
         } else {
@@ -738,6 +899,9 @@ impl SandboxManager for SandboxManagerImpl {
         if state.managed_workspace {
             std::fs::remove_dir_all(&state.workspace_dir)
                 .map_err(|error| SandboxError::DestructionFailed(error.to_string()))?;
+            if let Ok(mut live) = Self::live_managed_workspaces().lock() {
+                live.remove(&state.workspace_dir);
+            }
         }
         self.sandboxes.remove(&sandbox_id);
         self.agent_sandboxes.remove(&state.agent_id);
@@ -1185,5 +1349,77 @@ mod tests {
 
         std::fs::remove_dir_all(first_root).unwrap();
         std::fs::remove_dir_all(second_root).unwrap();
+    }
+
+    #[test]
+    fn managed_workspace_marker_and_orphan_reconciliation_are_durable() {
+        let mgr = SandboxManagerImpl::new();
+        let config = SandboxManagerImpl::default_config();
+        let workspace = config.workspace_dir.clone();
+        let sid = mgr
+            .create_managed_sandbox(uuid::Uuid::new_v4(), &config)
+            .unwrap();
+        assert!(SandboxManagerImpl::is_managed_config(&config));
+
+        let orphan = SandboxManagerImpl::managed_root().join(uuid::Uuid::new_v4().to_string());
+        let unrelated = SandboxManagerImpl::managed_root().join("operator-owned");
+        std::fs::create_dir_all(&orphan).unwrap();
+        std::fs::create_dir_all(&unrelated).unwrap();
+        let active = HashSet::from([workspace.clone()]);
+        assert!(
+            mgr.reconcile_managed_workspaces(&active).unwrap() >= 1,
+            "the injected orphan and any older crash leftovers must be removed"
+        );
+        assert!(workspace.exists());
+        assert!(!orphan.exists());
+        assert!(unrelated.exists());
+
+        mgr.destroy_sandbox(sid).unwrap();
+        assert!(!workspace.exists());
+        std::fs::remove_dir_all(unrelated).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn existing_owned_workspace_is_hardened_before_use() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mgr = SandboxManagerImpl::new();
+        let config = test_config();
+        std::fs::create_dir_all(&config.workspace_dir).unwrap();
+        std::fs::set_permissions(
+            &config.workspace_dir,
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+
+        let sid = mgr.create_sandbox(uuid::Uuid::new_v4(), &config).unwrap();
+        let mode = std::fs::metadata(&config.workspace_dir)
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o077, 0);
+
+        mgr.destroy_sandbox(sid).unwrap();
+        std::fs::remove_dir_all(config.workspace_dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_workspace_symlink_is_rejected() {
+        let mgr = SandboxManagerImpl::new();
+        let config = SandboxManagerImpl::default_config();
+        let target =
+            std::env::temp_dir().join(format!("aiagentos-symlink-target-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&target).unwrap();
+        SandboxManagerImpl::ensure_managed_root().unwrap();
+        std::os::unix::fs::symlink(&target, &config.workspace_dir).unwrap();
+
+        let result = mgr.create_managed_sandbox(uuid::Uuid::new_v4(), &config);
+        assert!(matches!(result, Err(SandboxError::CreationFailed(_))));
+        assert!(!target.join(SandboxManagerImpl::MANAGED_MARKER).exists());
+
+        std::fs::remove_file(config.workspace_dir).unwrap();
+        std::fs::remove_dir_all(target).unwrap();
     }
 }

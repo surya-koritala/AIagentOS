@@ -702,7 +702,11 @@ async fn live_path_extended_tools_edit_and_delete_capability() {
     )
     .await
     .unwrap();
-    assert!(resp.success, "edit op should succeed");
+    assert!(
+        resp.success,
+        "edit op should succeed: {:?}",
+        resp.error.as_deref()
+    );
     assert_eq!(std::fs::read_to_string(&file).unwrap(), "hello rust");
     std::fs::remove_dir_all(&dir).ok();
 }

@@ -157,16 +157,16 @@ limitations = ["Hosted providers pause at request boundaries, token-level stream
 id = "scheduling-admission"
 title = "Scheduling and resource admission"
 owner = "kernel"
-maturity = "integrated"
+maturity = "production-qualified"
 release = "v0.5"
 tracking_issue = 114
 kernel_modules = ["cfs", "llm_sched", "scheduler"]
-source_paths = ["crates/kernel/src/lib.rs"]
+source_paths = ["crates/kernel/src/cfs.rs", "crates/kernel/src/llm_sched.rs", "crates/kernel/src/scheduler.rs", "crates/kernel/src/metrics.rs", "crates/kernel/src/lib.rs", "docs/SCHEDULER.md"]
 public_entry_points = ["crates/kernel/src/lib.rs::AgentKernelImpl::send_message"]
 runtime_call_paths = ["crates/kernel/src/lib.rs::AgentKernelImpl::send_message"]
-test_evidence = ["tests/src/scheduler_props.rs", "tests/src/os_enforcement.rs"]
+test_evidence = ["crates/kernel/src/cfs.rs", "crates/kernel/src/llm_sched.rs", "crates/kernel/src/scheduler.rs", "crates/kernel/src/lib.rs", "tests/src/scheduler_props.rs", "tests/src/os_enforcement.rs", "benchmarks/os_benchmark.rs"]
 platforms = ["linux", "macos", "windows"]
-limitations = ["Turn scheduling is cooperative/token-accounted rather than CPU preemption or Linux EEVDF; real-time/background classes remain experimental and independent long-soak qualification is outstanding."]
+limitations = ["Turn scheduling is cooperative and token-accounted at completed-turn, provider-request, and tool boundaries; it is not CPU preemption or Linux EEVDF. Real-time, deadline, and background classes are experimental and excluded from the public v1 scheduling guarantee."]
 
 [[capability]]
 id = "context-pressure"

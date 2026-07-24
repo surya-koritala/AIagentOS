@@ -84,17 +84,26 @@ enum AgentScheduleState {
 #[derive(Debug, Clone)]
 struct AgentScheduleInfo {
     priority: Priority,
+    /// Temporary boost while a higher-priority agent waits on a resource held
+    /// by this agent. The configured priority remains unchanged.
+    inherited_priority: Option<Priority>,
     state: AgentScheduleState,
     /// Throttle delay in ms (increases for lower-priority agents under pressure).
     throttle_delay_ms: u64,
+}
+
+#[derive(Default)]
+struct ResourceAccessState {
+    holder: Option<AgentId>,
+    waiters: BinaryHeap<PriorityEntry>,
 }
 
 /// Concrete priority-based scheduler implementation.
 pub struct PriorityScheduler {
     /// Per-agent scheduling info.
     agents: DashMap<AgentId, AgentScheduleInfo>,
-    /// Priority queue for resource access ordering.
-    resource_queue: Mutex<BinaryHeap<PriorityEntry>>,
+    /// One atomic holder/waiter state for exclusive shared-resource access.
+    resource_access: Mutex<ResourceAccessState>,
     /// Sequence counter for FIFO ordering within same priority.
     sequence: AtomicUsize,
     /// Number of currently running agents.
@@ -115,7 +124,7 @@ impl PriorityScheduler {
     pub fn new() -> Self {
         Self {
             agents: DashMap::new(),
-            resource_queue: Mutex::new(BinaryHeap::new()),
+            resource_access: Mutex::new(ResourceAccessState::default()),
             sequence: AtomicUsize::new(0),
             running_count: AtomicUsize::new(0),
             slot_available: Notify::new(),
@@ -141,8 +150,64 @@ impl PriorityScheduler {
             .unwrap_or(0)
     }
 
-    /// Request resource access in priority order. Returns when access is granted.
-    /// Implements deadlock detection via timeout.
+    /// Effective priority after any temporary shared-resource inheritance.
+    pub fn effective_priority(&self, agent_id: AgentId) -> Option<Priority> {
+        self.agents
+            .get(&agent_id)
+            .map(|info| Self::effective_priority_for(&info))
+    }
+
+    fn effective_priority_for(info: &AgentScheduleInfo) -> Priority {
+        info.inherited_priority
+            .filter(|inherited| inherited.value() < info.priority.value())
+            .unwrap_or(info.priority)
+    }
+
+    fn throttle_delay(priority: Priority) -> u64 {
+        match priority.value() {
+            1 => 0,
+            2 => 50,
+            3 => 150,
+            4 => 300,
+            5 => 500,
+            _ => 0,
+        }
+    }
+
+    fn refresh_agent_throttle(&self, agent_id: AgentId) {
+        if let Some(mut info) = self.agents.get_mut(&agent_id) {
+            info.throttle_delay_ms = if self.under_pressure.load(AtomicOrdering::SeqCst) {
+                Self::throttle_delay(Self::effective_priority_for(&info))
+            } else {
+                0
+            };
+        }
+    }
+
+    fn set_inherited_priority(&self, agent_id: AgentId, inherited: Option<Priority>) {
+        if let Some(mut info) = self.agents.get_mut(&agent_id) {
+            info.inherited_priority = inherited;
+        }
+        self.refresh_agent_throttle(agent_id);
+    }
+
+    fn refresh_holder_inheritance(&self) {
+        let (holder, inherited) = {
+            let state = self.resource_access.lock().unwrap();
+            (
+                state.holder,
+                state.waiters.peek().map(|waiter| waiter.priority),
+            )
+        };
+        if let Some(holder) = holder {
+            self.set_inherited_priority(holder, inherited);
+        }
+    }
+
+    /// Request exclusive resource access in priority order. A higher-priority
+    /// waiter temporarily boosts a lower-priority holder so resource-pressure
+    /// throttling cannot extend the inversion. The configured priority is
+    /// restored on release. Waits are bounded by the deadlock timeout.
     pub async fn request_resource_access(&self, agent_id: AgentId) -> Result<(), SchedulerError> {
         let priority = self
             .agents
@@ -152,13 +217,22 @@ impl PriorityScheduler {
 
         let seq = self.sequence.fetch_add(1, AtomicOrdering::SeqCst) as u64;
         {
-            let mut queue = self.resource_queue.lock().unwrap();
-            queue.push(PriorityEntry {
+            let mut state = self.resource_access.lock().unwrap();
+            if state.holder == Some(agent_id) {
+                return Ok(());
+            }
+            state.waiters.push(PriorityEntry {
                 agent_id,
                 priority,
                 sequence: seq,
             });
         }
+        let mut registration = ResourceWaitRegistration {
+            scheduler: self,
+            agent_id,
+            acquired: false,
+        };
+        self.refresh_holder_inheritance();
 
         // Wait until this agent is at the front of the queue (highest priority)
         let result = tokio::time::timeout(
@@ -168,50 +242,46 @@ impl PriorityScheduler {
         .await;
 
         match result {
-            Ok(()) => Ok(()),
-            Err(_) => {
-                // Deadlock detected — remove from queue
-                self.remove_from_queue(agent_id);
-                Err(SchedulerError::DeadlockDetected)
+            Ok(()) => {
+                registration.acquired = true;
+                Ok(())
             }
+            Err(_) => Err(SchedulerError::DeadlockDetected),
         }
     }
 
     /// Release resource access, allowing next agent in queue to proceed.
     pub fn release_resource_access(&self, agent_id: AgentId) {
-        // Remove this agent's entry from the queue
-        let mut queue = self.resource_queue.lock().unwrap();
-        let entries: Vec<_> = std::iter::from_fn(|| queue.pop())
-            .filter(|e| e.agent_id != agent_id)
-            .collect();
-        for e in entries {
-            queue.push(e);
+        let released = {
+            let mut state = self.resource_access.lock().unwrap();
+            if state.holder == Some(agent_id) {
+                state.holder = None;
+                true
+            } else {
+                false
+            }
+        };
+        self.remove_from_queue(agent_id);
+        self.set_inherited_priority(agent_id, None);
+        if released {
+            self.slot_available.notify_waiters();
         }
-        drop(queue);
-        self.slot_available.notify_waiters();
     }
 
-    /// Check if the given agent is at the front of the resource queue.
+    /// Check if the agent holds the resource or is next to acquire it.
     pub fn is_next_in_queue(&self, agent_id: AgentId) -> bool {
-        let queue = self.resource_queue.lock().unwrap();
-        queue
-            .peek()
-            .map(|e| e.agent_id == agent_id)
-            .unwrap_or(false)
+        let state = self.resource_access.lock().unwrap();
+        state.holder == Some(agent_id)
+            || (state.holder.is_none()
+                && state
+                    .waiters
+                    .peek()
+                    .is_some_and(|entry| entry.agent_id == agent_id))
     }
 
     fn apply_throttling(&self) {
         for mut entry in self.agents.iter_mut() {
-            // Higher priority value = lower priority = more throttling
-            let p = entry.priority.value();
-            entry.throttle_delay_ms = match p {
-                1 => 0,
-                2 => 50,
-                3 => 150,
-                4 => 300,
-                5 => 500,
-                _ => 0,
-            };
+            entry.throttle_delay_ms = Self::throttle_delay(Self::effective_priority_for(&entry));
         }
     }
 
@@ -223,7 +293,7 @@ impl PriorityScheduler {
 
     async fn wait_for_turn(&self, agent_id: AgentId) {
         loop {
-            if self.is_next_in_queue(agent_id) {
+            if self.try_acquire_resource(agent_id) {
                 return;
             }
             // `release_resource_access` signals via `Notify::notify_waiters`,
@@ -241,13 +311,37 @@ impl PriorityScheduler {
         }
     }
 
+    fn try_acquire_resource(&self, agent_id: AgentId) -> bool {
+        let acquired = {
+            let mut state = self.resource_access.lock().unwrap();
+            if state.holder == Some(agent_id) {
+                true
+            } else if state.holder.is_none()
+                && state
+                    .waiters
+                    .peek()
+                    .is_some_and(|entry| entry.agent_id == agent_id)
+            {
+                state.waiters.pop();
+                state.holder = Some(agent_id);
+                true
+            } else {
+                false
+            }
+        };
+        if acquired {
+            self.refresh_holder_inheritance();
+        }
+        acquired
+    }
+
     fn remove_from_queue(&self, agent_id: AgentId) {
-        let mut queue = self.resource_queue.lock().unwrap();
-        let entries: Vec<_> = std::iter::from_fn(|| queue.pop())
+        let mut state = self.resource_access.lock().unwrap();
+        let entries: Vec<_> = std::iter::from_fn(|| state.waiters.pop())
             .filter(|e| e.agent_id != agent_id)
             .collect();
         for e in entries {
-            queue.push(e);
+            state.waiters.push(e);
         }
     }
 
@@ -275,6 +369,7 @@ impl PriorityScheduler {
             agent_id,
             AgentScheduleInfo {
                 priority: Priority::default(),
+                inherited_priority: None,
                 state: AgentScheduleState::Queued,
                 throttle_delay_ms: 0,
             },
@@ -297,6 +392,7 @@ impl PriorityScheduler {
             agent_id,
             AgentScheduleInfo {
                 priority: Priority::default(),
+                inherited_priority: None,
                 state: AgentScheduleState::Running,
                 throttle_delay_ms: 0,
             },
@@ -359,6 +455,23 @@ impl PriorityScheduler {
     }
 }
 
+struct ResourceWaitRegistration<'a> {
+    scheduler: &'a PriorityScheduler,
+    agent_id: AgentId,
+    acquired: bool,
+}
+
+impl Drop for ResourceWaitRegistration<'_> {
+    fn drop(&mut self) {
+        if self.acquired {
+            return;
+        }
+        self.scheduler.remove_from_queue(self.agent_id);
+        self.scheduler.refresh_holder_inheritance();
+        self.scheduler.slot_available.notify_waiters();
+    }
+}
+
 #[async_trait::async_trait]
 impl AgentScheduler for PriorityScheduler {
     async fn schedule(&self, agent: &AgentHandle) -> Result<(), SchedulerError> {
@@ -369,6 +482,7 @@ impl AgentScheduler for PriorityScheduler {
                 agent.id,
                 AgentScheduleInfo {
                     priority: Priority::default(),
+                    inherited_priority: None,
                     state: AgentScheduleState::Queued,
                     throttle_delay_ms: 0,
                 },
@@ -390,6 +504,7 @@ impl AgentScheduler for PriorityScheduler {
             agent.id,
             AgentScheduleInfo {
                 priority: Priority::default(),
+                inherited_priority: None,
                 state: AgentScheduleState::Running,
                 throttle_delay_ms: 0,
             },
@@ -429,19 +544,9 @@ impl AgentScheduler for PriorityScheduler {
     fn set_priority(&self, agent_id: AgentId, priority: Priority) {
         if let Some(mut info) = self.agents.get_mut(&agent_id) {
             info.priority = priority;
-            // Re-apply throttling if under pressure
-            if self.under_pressure.load(AtomicOrdering::SeqCst) {
-                let p = priority.value();
-                info.throttle_delay_ms = match p {
-                    1 => 0,
-                    2 => 50,
-                    3 => 150,
-                    4 => 300,
-                    5 => 500,
-                    _ => 0,
-                };
-            }
         }
+        self.refresh_holder_inheritance();
+        self.refresh_agent_throttle(agent_id);
     }
 
     fn get_queue_status(&self) -> SchedulerStatus {
@@ -593,22 +698,123 @@ mod tests {
 
     #[tokio::test]
     async fn resource_access_priority_order() {
-        let sched = PriorityScheduler::new();
-        let id1 = uuid::Uuid::new_v4();
-        let id2 = uuid::Uuid::new_v4();
-        sched.schedule(&make_handle(id1)).await.unwrap();
-        sched.schedule(&make_handle(id2)).await.unwrap();
-        sched.set_priority(id1, Priority::new(3).unwrap());
-        sched.set_priority(id2, Priority::new(1).unwrap());
+        let sched = std::sync::Arc::new(PriorityScheduler::new());
+        let holder = uuid::Uuid::new_v4();
+        let low = uuid::Uuid::new_v4();
+        let high = uuid::Uuid::new_v4();
+        for id in [holder, low, high] {
+            sched.schedule(&make_handle(id)).await.unwrap();
+        }
+        sched.set_priority(holder, Priority::new(3).unwrap());
+        sched.set_priority(low, Priority::new(5).unwrap());
+        sched.set_priority(high, Priority::new(1).unwrap());
+        sched.request_resource_access(holder).await.unwrap();
 
-        // Both request access — id2 (priority 1) should be first
-        sched.request_resource_access(id1).await.unwrap();
-        sched.request_resource_access(id2).await.unwrap();
-        // id2 has higher priority, should be at front after both are queued
-        // But since id1 was first and alone, it got front. Let's test ordering differently.
-        // Clear and test fresh
-        sched.release_resource_access(id1);
-        sched.release_resource_access(id2);
+        let order = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let mut tasks = Vec::new();
+        for id in [low, high] {
+            let sched = std::sync::Arc::clone(&sched);
+            let order = std::sync::Arc::clone(&order);
+            tasks.push(tokio::spawn(async move {
+                sched.request_resource_access(id).await.unwrap();
+                order.lock().await.push(id);
+                sched.release_resource_access(id);
+            }));
+        }
+        while sched.effective_priority(holder) != Some(Priority::new(1).unwrap()) {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            order.lock().await.is_empty(),
+            "waiters must not overtake the active holder"
+        );
+        sched.release_resource_access(holder);
+        for task in tasks {
+            task.await.unwrap();
+        }
+        assert_eq!(*order.lock().await, vec![high, low]);
+    }
+
+    #[tokio::test]
+    async fn resource_holder_inherits_waiter_priority_until_release() {
+        let sched = std::sync::Arc::new(PriorityScheduler::new());
+        let holder = uuid::Uuid::new_v4();
+        let waiter = uuid::Uuid::new_v4();
+        for id in [holder, waiter] {
+            sched.schedule(&make_handle(id)).await.unwrap();
+        }
+        sched.set_priority(holder, Priority::new(5).unwrap());
+        sched.set_priority(waiter, Priority::new(1).unwrap());
+        sched.set_resource_pressure(true);
+        assert_eq!(sched.get_throttle_delay_ms(holder), 500);
+        sched.request_resource_access(holder).await.unwrap();
+
+        let acquired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let waiting = {
+            let sched = std::sync::Arc::clone(&sched);
+            let acquired = std::sync::Arc::clone(&acquired);
+            tokio::spawn(async move {
+                sched.request_resource_access(waiter).await.unwrap();
+                acquired.store(true, std::sync::atomic::Ordering::SeqCst);
+                sched.release_resource_access(waiter);
+            })
+        };
+        while sched.effective_priority(holder) != Some(Priority::new(1).unwrap()) {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(sched.get_throttle_delay_ms(holder), 0);
+        assert!(!acquired.load(std::sync::atomic::Ordering::SeqCst));
+
+        sched.release_resource_access(holder);
+        waiting.await.unwrap();
+        assert_eq!(
+            sched.effective_priority(holder),
+            Some(Priority::new(5).unwrap())
+        );
+        assert_eq!(sched.get_throttle_delay_ms(holder), 500);
+    }
+
+    #[tokio::test]
+    async fn cancelled_resource_waiter_is_removed_and_inheritance_is_restored() {
+        let sched = std::sync::Arc::new(PriorityScheduler::new());
+        let holder = uuid::Uuid::new_v4();
+        let cancelled = uuid::Uuid::new_v4();
+        let survivor = uuid::Uuid::new_v4();
+        for id in [holder, cancelled, survivor] {
+            sched.schedule(&make_handle(id)).await.unwrap();
+        }
+        sched.set_priority(holder, Priority::new(5).unwrap());
+        sched.set_priority(cancelled, Priority::new(1).unwrap());
+        sched.set_priority(survivor, Priority::new(3).unwrap());
+        sched.request_resource_access(holder).await.unwrap();
+
+        let waiting = {
+            let sched = std::sync::Arc::clone(&sched);
+            tokio::spawn(async move {
+                let _ = sched.request_resource_access(cancelled).await;
+            })
+        };
+        while sched.effective_priority(holder) != Some(Priority::new(1).unwrap()) {
+            tokio::task::yield_now().await;
+        }
+        waiting.abort();
+        let _ = waiting.await;
+        while sched.effective_priority(holder) != Some(Priority::new(5).unwrap()) {
+            tokio::task::yield_now().await;
+        }
+
+        let survivor_wait = {
+            let sched = std::sync::Arc::clone(&sched);
+            tokio::spawn(async move {
+                sched.request_resource_access(survivor).await.unwrap();
+                sched.release_resource_access(survivor);
+            })
+        };
+        while sched.effective_priority(holder) != Some(Priority::new(3).unwrap()) {
+            tokio::task::yield_now().await;
+        }
+        sched.release_resource_access(holder);
+        survivor_wait.await.unwrap();
     }
 
     #[tokio::test]

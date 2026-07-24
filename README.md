@@ -187,7 +187,7 @@ presence in the Rust crate is not a v1 support claim.
 | systemd | Service files, dependency ordering, restart policy | Unit-tested — [#118](https://github.com/surya-koritala/AIagentOS/issues/118) |
 | syscall interface | Versioned JSON wire protocol; numbered table explicitly experimental | Public-API E2E — [#116](https://github.com/surya-koritala/AIagentOS/issues/116) |
 | `fork()/clone()` | `agent_clone(flags)` primitive | Unit-tested — [#112](https://github.com/surya-koritala/AIagentOS/issues/112) |
-| CFS scheduler | Vruntime/nice accounting and admission primitives | Integrated — [#114](https://github.com/surya-koritala/AIagentOS/issues/114) |
+| CFS-inspired scheduler | Cooperative weighted turn/provider admission, bounded aging, priority inheritance, and metrics | Production-qualified — [#114](https://github.com/surya-koritala/AIagentOS/issues/114) |
 | Virtual memory analogy | Active prompt bound, durable spill, explicit backpressure | Integrated — [#115](https://github.com/surya-koritala/AIagentOS/issues/115) |
 | Namespaces | Tool and IPC visibility primitives | Unit-tested — [#107](https://github.com/surya-koritala/AIagentOS/issues/107) |
 | VFS + mount | Experimental descriptor/mount prototypes, excluded from v1 | Scaffolded — [ADR 0001](docs/ADR-0001-PUBLIC-ABI.md) |

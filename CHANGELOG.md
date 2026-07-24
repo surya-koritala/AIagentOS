@@ -23,8 +23,10 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
   dependency order and coordinates startup, rollback, and shutdown. (#117,
   #118)
 - **Context and admission controls** — bounded turn/LLM/tool admission,
-  CFS-inspired fairness, durable context spill references, and explicit
-  backpressure replace unsupported CPU-preemption and OOM claims. (#114, #115)
+  CFS-inspired fairness, exclusive shared-resource priority inheritance,
+  starvation escape, per-class/yield metrics, durable context spill references,
+  and explicit backpressure replace unsupported CPU-preemption and OOM claims.
+  (#114, #115)
 - **Validated agent-package loading** — manifests are bounded and fail closed,
   declared tools resolve against the live registry, tenant privilege is
   constrained, and partial creation rolls back atomically. Packages remain

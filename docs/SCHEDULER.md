@@ -48,11 +48,21 @@ wakeups.
 `set_nice(-20..19)` updates weight in place while preserving accumulated
 vruntime and token usage. Changing priority cannot erase scheduling debt.
 
-The runtime bounds nested-permit waits: same-agent serialization precedes turn
-admission, exhausted quota returns without an epoch wait, LLM cores are released
-before executor retry backoff/tools, and resources have bounded execution. This
-bounds shared-resource priority inversion without claiming Linux mutex priority
-inheritance. Providers that ignore cancellation must enforce their own timeout.
+Shared-resource access has one atomic exclusive holder/waiter state. A
+higher-priority waiter temporarily raises a lower-priority holder's effective
+priority, removing resource-pressure throttling until release; the configured
+priority is restored afterward. Access waits fail after 10 seconds instead of
+allowing an unbounded inversion.
+
+Turn admission adds a starvation escape to normal vruntime ordering: after 30
+seconds, the oldest overdue waiter receives the next released slot. LLM
+admission uses the one-nice-point-per-second aging described above. These are
+cooperative queue/holder mitigations, not Linux CPU or mutex preemption.
+
+The runtime also bounds nested-permit waits: same-agent serialization precedes
+turn admission, exhausted quota returns without an epoch wait, LLM cores are
+released before executor retry backoff/tools, and resource-provider execution
+is bounded. Providers that ignore cancellation must enforce their own timeout.
 
 ## Cancellation, starvation, and metrics
 
@@ -61,13 +71,16 @@ request boundaries, and between tool calls. Hosted APIs are not mid-token
 preempted. See [CHECKPOINTS.md](CHECKPOINTS.md).
 
 There is no wall-clock completion bound without a provider-latency bound. The
-scheduler guarantees progress after permit release and records a turn wait over
-30 seconds as starvation. Prometheus exposes active/waiting/capacity gauges,
-admitted/cancelled counters, cumulative wait/run nanoseconds, a starvation
-counter, and lifecycle state gauges.
+scheduler guarantees progress after permit release and records every activation
+of the 30-second starvation escape. Prometheus exposes
+active/waiting/capacity gauges, admitted/cancelled counters, cumulative wait/run
+nanoseconds, starvation escapes, per-class admission share, and completed turns
+that exhausted their token slice and cooperatively yielded at the public turn
+boundary. A cooperative yield is not a claim of mid-future preemption.
 
-Real-time/background classes remain low-level experiments; public creation uses
-`Normal`. No production guarantee is made for those experimental classes.
+Real-time, deadline, and background classes remain low-level experiments;
+public creation uses `Normal`. No production guarantee is made for those
+experimental classes.
 
 ## Difference from Linux EEVDF
 
@@ -75,3 +88,12 @@ Linux EEVDF uses eligible virtual deadlines, lag, CPU runtime, and kernel
 preemption. AI Agent OS chooses lowest vruntime over token-accounted cooperative
 turn waiters. The weight table is reused; the execution contract is not. We call
 this `CFS-inspired turn admission`, never a CPU scheduler.
+
+## Qualification
+
+`tests/src/scheduler_props.rs` sustains mixed-class contention and verifies that
+configured concurrency is never exceeded or leaked. Kernel unit tests cover
+long weighted workloads, cancellation, lost wakeups, queue overload, priority
+inheritance/restoration, starvation escape, and per-class counters.
+`cargo run --package os-benchmark --bin os-benchmark --locked` reports direct
+turn-admission nanoseconds per slot separately from syscall-gate throughput.

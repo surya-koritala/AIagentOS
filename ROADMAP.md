@@ -26,7 +26,7 @@ At the time of this audit, ~33% of the Linux-mapped subsystems were load-bearing
 | **Syscall interface (MAC + caps + cgroup gate)** | **Defined, never called** | **Phase 1** |
 | **Cgroups (token / call quotas)** | **Counts, never rejects** | **Phase 1** |
 | **Context paging (LRU eviction)** | **Tested, never invoked** | **Phase 2** |
-| CFS scheduler (vruntime, nice) | Logic real, runtime ignores it | Phase 3 |
+| CFS-inspired scheduler (vruntime, nice) | Production-qualified cooperative turn/provider admission; not CPU preemption or EEVDF | Phase 3 |
 | Namespaces (resource hiding) | Membership tags only | Phase 3 |
 | VFS / tool descriptors | Allocated, never used | Phase 3 |
 | Package manager / marketplace | Mock in-memory | Phase 4 |
@@ -85,7 +85,7 @@ Goal: namespaces actually hide resources; scheduler actually decides who runs.
 
 - [x] **Namespace enforcement in tool resolution** — `SyscallGate` now consults a `tool_namespaces` table and per-agent `namespaces: Vec<NamespaceId>` membership; tools tagged with a namespace return `GateDenial::NotInNamespace` (≈ ENOENT) for non-members. The check runs first so foreign tools look indistinguishable from non-existent ones (no MAC-probe leak). Proven by `tests/src/os_enforcement.rs::namespace_isolation_denies_foreign_tool` and `namespace_denial_precedes_capability_and_mac`.
 - [x] **Per-namespace IPC** — `IpcManager` consults a `NamespaceVisibility` trait (impl by `SyscallGate::shares_namespace`) on every `send` and `publish`. Cross-namespace sends fail as `AgentNotFound` so a sender cannot probe for foreign mailboxes. Proven by `tests/src/os_enforcement.rs::namespace_isolation_blocks_cross_namespace_ipc`.
-- [x] **Scheduler observability + accounting** — `AgentKernelImpl::send_message` accounts each turn's tokens against the agent's CFS vruntime; new `kernel.set_nice(agent_id, nice)` and `kernel.next_runnable_agent()` make fairness inspectable. Proven by `tests/src/os_enforcement.rs::nice_values_change_scheduler_pick_next` — equal token spend with different nice values produces ordered `pick_next()` outcomes. Strict admission gating (block `send_message` until the agent's CFS turn) is a follow-up.
+- [x] **Scheduler admission, observability + accounting** — `AgentKernelImpl::send_message` serializes each agent before bounded CFS-inspired turn admission, acquires LLM cores per provider request, accounts tokens against vruntime, and exposes queue, wait/run, cancellation, starvation, class-share, and cooperative-yield metrics. `set_nice` preserves accumulated debt; shared-resource holders inherit waiting priority until release. This is cooperative scheduling, not CPU preemption or EEVDF.
 - [ ] **Host-memory pressure policy** — qualify RSS/cgroup limits and explicit backpressure; the runtime does not currently claim an OOM killer
 - [ ] **VFS for tools** — agents `tool_open()` a path → fd; `tool_call()` takes fd; descriptor table enforces per-agent open limits
 

@@ -923,7 +923,13 @@ async fn repeated_multi_agent_pause_resume_releases_permits_and_checkpoints() {
         block_requests.store(true, Ordering::SeqCst);
         let blocked_before = blocked_requests.load(Ordering::SeqCst);
         let mut sends = Vec::with_capacity(AGENTS);
-        for agent_id in &agents {
+        let llm_cores = kernel::llm_sched::DEFAULT_LLM_CORES.min(AGENTS);
+
+        // Occupy every LLM core with a known first cohort before enqueueing the
+        // remaining agents. This makes the cancellation coverage deterministic:
+        // the second cohort is definitely waiting for a core rather than racing
+        // the pause tasks on fast or instrumented CI runners.
+        for agent_id in agents.iter().take(llm_cores) {
             let turn_kernel = Arc::clone(&kernel);
             let agent_id = *agent_id;
             sends.push(tokio::spawn(async move {
@@ -935,8 +941,8 @@ async fn repeated_multi_agent_pause_resume_releases_permits_and_checkpoints() {
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {
                 let metrics = kernel::metrics::MetricsSnapshot::collect(&kernel);
-                if blocked_requests.load(Ordering::SeqCst) > blocked_before
-                    && metrics.active_turns + metrics.waiting_turns == expected_agents
+                if blocked_requests.load(Ordering::SeqCst) - blocked_before == llm_cores
+                    && metrics.llm_requests_in_flight == llm_cores as u64
                 {
                     break;
                 }
@@ -944,10 +950,33 @@ async fn repeated_multi_agent_pause_resume_releases_permits_and_checkpoints() {
             }
         })
         .await
-        .expect("all provider requests should reach the cancellable boundary");
+        .expect("the first cohort should occupy every LLM core");
+
+        for agent_id in agents.iter().skip(llm_cores) {
+            let turn_kernel = Arc::clone(&kernel);
+            let agent_id = *agent_id;
+            sends.push(tokio::spawn(async move {
+                turn_kernel
+                    .send_message(agent_id, &format!("cycle {cycle}"))
+                    .await
+            }));
+        }
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let metrics = kernel::metrics::MetricsSnapshot::collect(&kernel);
+                if metrics.active_turns + metrics.waiting_turns == expected_agents
+                    && metrics.llm_requests_waiting == (AGENTS - llm_cores) as u64
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the second cohort should wait behind the occupied LLM cores");
 
         let mut pauses = Vec::with_capacity(AGENTS);
-        for agent_id in &agents {
+        for agent_id in agents.iter().skip(llm_cores) {
             let pause_kernel = Arc::clone(&kernel);
             let agent_id = *agent_id;
             pauses.push(tokio::spawn(async move {
@@ -955,6 +984,23 @@ async fn repeated_multi_agent_pause_resume_releases_permits_and_checkpoints() {
             }));
         }
         for pause in pauses {
+            assert_eq!(pause.await.unwrap().unwrap(), AgentState::Paused);
+        }
+        assert_eq!(
+            blocked_requests.load(Ordering::SeqCst) - blocked_before,
+            llm_cores,
+            "waiting turns must pause before provider invocation"
+        );
+
+        let mut active_pauses = Vec::with_capacity(llm_cores);
+        for agent_id in agents.iter().take(llm_cores) {
+            let pause_kernel = Arc::clone(&kernel);
+            let agent_id = *agent_id;
+            active_pauses.push(tokio::spawn(async move {
+                pause_kernel.pause_agent(agent_id).await
+            }));
+        }
+        for pause in active_pauses {
             assert_eq!(pause.await.unwrap().unwrap(), AgentState::Paused);
         }
         for send in sends {
@@ -966,10 +1012,7 @@ async fn repeated_multi_agent_pause_resume_releases_permits_and_checkpoints() {
                 .contains("durable checkpoint"));
         }
         let provider_requests_started = blocked_requests.load(Ordering::SeqCst) - blocked_before;
-        assert!(
-            provider_requests_started < AGENTS,
-            "bounded LLM cores must leave some turns pausable before provider invocation"
-        );
+        assert_eq!(provider_requests_started, llm_cores);
 
         let paused_metrics = kernel::metrics::MetricsSnapshot::collect(&kernel);
         assert_eq!(paused_metrics.active_turns, 0);

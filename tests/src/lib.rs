@@ -31,6 +31,9 @@ mod permission_props;
 mod sandbox_props;
 
 #[cfg(test)]
+mod sandbox_surfaces;
+
+#[cfg(test)]
 mod connector_props;
 
 #[cfg(test)]

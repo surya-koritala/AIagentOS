@@ -3164,6 +3164,7 @@ name = "integration-tests"
 version = "0.3.0"
 dependencies = [
  "adapters",
+ "agent-sdk",
  "anyhow",
  "async-trait",
  "chrono",

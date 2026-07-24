@@ -1112,6 +1112,152 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn host_authority_surfaces_are_fail_closed_unless_explicitly_trusted() {
+        let permissions = Arc::new(PermissionManager::new());
+        let sandboxes = Arc::new(SandboxManagerImpl::new());
+        let broker = ResourceBrokerImpl::new(permissions.clone(), sandboxes.clone());
+        let calls = Arc::new(AtomicUsize::new(0));
+        for (resource_type, operation) in [
+            (ResourceType::Application, "launch"),
+            (ResourceType::Browser, "navigate"),
+            (ResourceType::Peripheral, "capture_image"),
+        ] {
+            broker.register_provider(Box::new(BlindProvider {
+                resource_type,
+                advertised: vec![operation.into()],
+                calls: calls.clone(),
+            }));
+        }
+
+        let untrusted = uuid::Uuid::new_v4();
+        permissions.assign_profile(untrusted, &"full-access".into());
+        let untrusted_root = std::env::temp_dir().join(format!(
+            "agentos-untrusted-surfaces-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let untrusted_sandbox = sandboxes
+            .create_sandbox(
+                untrusted,
+                &SandboxConfig {
+                    workspace_dir: untrusted_root.clone(),
+                    allowed_network_hosts: Some(vec!["example.com".into()]),
+                    max_disk_usage_bytes: None,
+                    max_memory_bytes: None,
+                    isolation_level: IsolationLevel::Filesystem,
+                    container_image: None,
+                },
+            )
+            .unwrap();
+        for (resource_type, operation, parameters) in [
+            (
+                ResourceType::Application,
+                "launch",
+                serde_json::json!({"command": "echo"}),
+            ),
+            (
+                ResourceType::Browser,
+                "navigate",
+                serde_json::json!({"url": "https://example.com"}),
+            ),
+            (
+                ResourceType::Peripheral,
+                "capture_image",
+                serde_json::json!({}),
+            ),
+        ] {
+            let denied = broker
+                .execute(with_test_gate_proof(
+                    ResourceRequest {
+                        agent_id: untrusted,
+                        resource_type,
+                        operation: operation.into(),
+                        parameters,
+                        sandbox_context: None,
+                        gate_admission: None,
+                    },
+                    false,
+                ))
+                .await;
+            assert!(denied.is_err(), "{operation} must fail closed");
+        }
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "untrusted application, browser, and peripheral requests must not reach providers"
+        );
+        let audit = permissions.get_audit_log(None);
+        assert_eq!(audit.len(), 3);
+        assert!(audit.iter().all(|entry| {
+            entry.agent_id == untrusted
+                && entry.decision == AccessDecision::Denied
+                && entry.outcome == ActionOutcome::Failure
+                && matches!(
+                    entry.resource.as_str(),
+                    "Application" | "Browser" | "Peripheral"
+                )
+                && !entry.resource.contains("example.com")
+                && !entry.resource.contains("echo")
+        }));
+
+        let trusted = uuid::Uuid::new_v4();
+        permissions.assign_profile(trusted, &"full-access".into());
+        let trusted_root =
+            std::env::temp_dir().join(format!("agentos-trusted-surfaces-{}", uuid::Uuid::new_v4()));
+        let trusted_sandbox = sandboxes
+            .create_sandbox(
+                trusted,
+                &SandboxConfig {
+                    workspace_dir: trusted_root.clone(),
+                    allowed_network_hosts: Some(Vec::new()),
+                    max_disk_usage_bytes: None,
+                    max_memory_bytes: None,
+                    isolation_level: IsolationLevel::Trusted,
+                    container_image: None,
+                },
+            )
+            .unwrap();
+        for (resource_type, operation, parameters) in [
+            (
+                ResourceType::Application,
+                "launch",
+                serde_json::json!({"command": "operator-approved"}),
+            ),
+            (
+                ResourceType::Browser,
+                "navigate",
+                serde_json::json!({"url": "https://operator.example"}),
+            ),
+            (
+                ResourceType::Peripheral,
+                "capture_image",
+                serde_json::json!({}),
+            ),
+        ] {
+            let response = broker
+                .execute(with_test_gate_proof(
+                    ResourceRequest {
+                        agent_id: trusted,
+                        resource_type,
+                        operation: operation.into(),
+                        parameters,
+                        sandbox_context: Some(trusted_sandbox),
+                        gate_admission: None,
+                    },
+                    false,
+                ))
+                .await
+                .unwrap();
+            assert!(response.success, "{operation} trusted operator call");
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+
+        sandboxes.destroy_sandbox(untrusted_sandbox).unwrap();
+        sandboxes.destroy_sandbox(trusted_sandbox).unwrap();
+        std::fs::remove_dir_all(untrusted_root).ok();
+        std::fs::remove_dir_all(trusted_root).ok();
+    }
+
+    #[tokio::test]
     async fn production_broker_rejects_proofless_launch_and_forged_ipc() {
         let permissions = Arc::new(PermissionManager::new());
         let broker =

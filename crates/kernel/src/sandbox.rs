@@ -728,6 +728,24 @@ impl SandboxManagerImpl {
         Ok((url, host, port))
     }
 
+    fn pinned_http_client(
+        host: &str,
+        addresses: &[std::net::SocketAddr],
+    ) -> Result<reqwest::Client, SandboxError> {
+        let mut builder = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .no_proxy();
+        if host.parse::<std::net::IpAddr>().is_err() {
+            // The complete, policy-checked answer set is retained by this
+            // client. Redirects cannot trigger a second resolution and a DNS
+            // change after admission cannot redirect the connection.
+            builder = builder.resolve_to_addrs(host, addresses);
+        }
+        builder
+            .build()
+            .map_err(|_| SandboxError::BoundaryViolation("network client unavailable".into()))
+    }
+
     async fn execute_network_inner(
         state: &SandboxState,
         operation: &str,
@@ -762,15 +780,7 @@ impl SandboxManagerImpl {
             ));
         }
 
-        let mut builder = reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .no_proxy();
-        if host.parse::<std::net::IpAddr>().is_err() {
-            builder = builder.resolve_to_addrs(&host, &addresses);
-        }
-        let client = builder
-            .build()
-            .map_err(|_| SandboxError::BoundaryViolation("network client unavailable".into()))?;
+        let client = Self::pinned_http_client(&host, &addresses)?;
 
         let request = match operation {
             "get" | "browse" => client.get(url),
@@ -1083,24 +1093,35 @@ impl SandboxManager for SandboxManagerImpl {
 fn is_public_ip(ip: std::net::IpAddr) -> bool {
     match ip {
         std::net::IpAddr::V4(ip) => {
+            let octets = ip.octets();
+            let special_use = (octets[0] == 100 && (64..=127).contains(&octets[1]))
+                || (octets[0] == 192 && octets[1] == 0 && octets[2] == 0)
+                || (octets[0] == 192 && octets[1] == 0 && octets[2] == 2)
+                || (octets[0] == 198 && matches!(octets[1], 18 | 19))
+                || (octets[0] == 198 && octets[1] == 51 && octets[2] == 100)
+                || (octets[0] == 203 && octets[1] == 0 && octets[2] == 113)
+                || octets[0] >= 224;
             !(ip.is_private()
                 || ip.is_loopback()
                 || ip.is_link_local()
                 || ip.is_unspecified()
                 || ip.is_multicast()
                 || ip.is_broadcast()
-                || ip.octets()[0] == 0)
+                || octets[0] == 0
+                || special_use)
         }
         std::net::IpAddr::V6(ip) => {
             if let Some(mapped) = ip.to_ipv4_mapped() {
                 return is_public_ip(std::net::IpAddr::V4(mapped));
             }
             let segments = ip.segments();
+            let documentation = segments[0] == 0x2001 && segments[1] == 0x0db8;
             !(ip.is_loopback()
                 || ip.is_unspecified()
                 || ip.is_multicast()
                 || (segments[0] & 0xfe00) == 0xfc00
-                || (segments[0] & 0xffc0) == 0xfe80)
+                || (segments[0] & 0xffc0) == 0xfe80
+                || documentation)
         }
     }
 }
@@ -1277,6 +1298,77 @@ mod tests {
                     .is_err(),
                 "{target} must be denied"
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn pinned_network_client_does_not_reresolve_or_follow_redirects() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let requests = Arc::new(AtomicUsize::new(0));
+        let observed = requests.clone();
+        let server = tokio::spawn(async move {
+            while let Ok(Ok((mut stream, _))) =
+                tokio::time::timeout(std::time::Duration::from_millis(250), listener.accept()).await
+            {
+                observed.fetch_add(1, Ordering::SeqCst);
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut request = [0_u8; 1024];
+                let _ = stream.read(&mut request).await;
+                stream
+                    .write_all(
+                        b"HTTP/1.1 302 Found\r\nLocation: http://pinned.test/private\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .await
+                    .unwrap();
+            }
+        });
+
+        let client = SandboxManagerImpl::pinned_http_client("pinned.test", &[address]).unwrap();
+        let response = client.get("http://pinned.test/").send().await.unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::FOUND);
+        server.await.unwrap();
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            1,
+            "a redirect must not cause a second request or DNS resolution"
+        );
+    }
+
+    #[test]
+    fn private_link_local_and_special_use_addresses_are_not_public() {
+        for address in [
+            "0.0.0.0",
+            "10.0.0.1",
+            "100.64.0.1",
+            "127.0.0.1",
+            "169.254.169.254",
+            "172.16.0.1",
+            "192.0.0.1",
+            "192.0.2.1",
+            "192.168.0.1",
+            "198.18.0.1",
+            "198.51.100.1",
+            "203.0.113.1",
+            "224.0.0.1",
+            "240.0.0.1",
+            "::",
+            "::1",
+            "::ffff:169.254.169.254",
+            "fc00::1",
+            "fe80::1",
+            "ff02::1",
+            "2001:db8::1",
+        ] {
+            let ip = address.parse().unwrap();
+            assert!(!is_public_ip(ip), "{address} must not be treated as public");
+        }
+        for address in ["1.1.1.1", "8.8.8.8", "2606:4700:4700::1111"] {
+            let ip = address.parse().unwrap();
+            assert!(is_public_ip(ip), "{address} should be treated as public");
         }
     }
 

@@ -127,16 +127,16 @@ limitations = ["Sandbox identity is mandatory at the live ResourceBroker boundar
 id = "agent-lifecycle"
 title = "Coordinated agent lifecycle and cleanup"
 owner = "kernel"
-maturity = "public-api-e2e"
+maturity = "production-qualified"
 release = "v0.5"
 tracking_issue = 112
 kernel_modules = ["agent", "agent_struct", "agent_syscalls", "delegation", "ipc"]
 source_paths = ["crates/kernel/src/lib.rs"]
 public_entry_points = ["crates/kernel/src/syscall_server.rs::Syscall"]
 runtime_call_paths = ["crates/kernel/src/lib.rs::AgentKernelImpl::pause_agent", "crates/kernel/src/lib.rs::AgentKernelImpl::stop_agent", "crates/kernel/src/syscall_server.rs::Syscall::PauseAgent"]
-test_evidence = ["tests/src/agent_lifecycle_props.rs", "tests/src/lifecycle_coordinator.rs", "crates/sdk/src/lib.rs"]
+test_evidence = ["tests/src/agent_lifecycle_props.rs", "tests/src/lifecycle_coordinator.rs", "crates/kernel/src/lib.rs", "crates/sdk/src/lib.rs"]
 platforms = ["linux", "macos", "windows"]
-limitations = ["Public stop/pause/resume/kill coordinate live subsystem cleanup and restart state, but independent cross-platform soak/fault qualification remains outstanding."]
+limitations = ["Lifecycle coordination is authoritative within one kernel owner; cluster-wide ownership transfer and cross-node lifecycle orchestration are separate capabilities."]
 
 [[capability]]
 id = "turn-checkpoints"

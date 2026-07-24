@@ -123,6 +123,7 @@ mod tests {
                 max_disk_usage_bytes: None,
                 max_memory_bytes: None,
                 isolation_level: IsolationLevel::Trusted,
+                container_image: None,
             }),
         };
         let handle = kernel.create_agent_full(config).await.unwrap();

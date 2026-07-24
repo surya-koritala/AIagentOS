@@ -142,6 +142,11 @@ pub struct SandboxConfig {
     pub max_disk_usage_bytes: Option<u64>,
     pub max_memory_bytes: Option<u64>,
     pub isolation_level: IsolationLevel,
+    /// Operator-selected OCI image for `Container` isolation. It must be an
+    /// immutable digest reference (`name@sha256:<64 hex>`); packages and wire
+    /// creation cannot populate this field.
+    #[serde(default)]
+    pub container_image: Option<String>,
 }
 
 /// Level of isolation for the sandbox.

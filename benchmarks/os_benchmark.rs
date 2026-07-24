@@ -92,6 +92,7 @@ async fn main() {
                 max_disk_usage_bytes: None,
                 max_memory_bytes: None,
                 isolation_level: IsolationLevel::Filesystem,
+                container_image: None,
             },
         )
         .unwrap();
@@ -104,6 +105,7 @@ async fn main() {
                 max_disk_usage_bytes: None,
                 max_memory_bytes: None,
                 isolation_level: IsolationLevel::Filesystem,
+                container_image: None,
             },
         )
         .unwrap();

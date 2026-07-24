@@ -52,6 +52,14 @@ pub trait SandboxManager: Send + Sync {
         operation: &str,
         parameters: &serde_json::Value,
     ) -> Result<serde_json::Value, SandboxError>;
+    /// Execute an application command in the configured host-isolation
+    /// backend. `Process` is rejected until a native backend is qualified;
+    /// `Container` uses the hardened rootless OCI backend on Linux.
+    async fn execute_process(
+        &self,
+        sandbox_id: SandboxId,
+        parameters: &serde_json::Value,
+    ) -> Result<serde_json::Value, SandboxError>;
     fn isolation_level(&self, sandbox_id: SandboxId) -> Result<IsolationLevel, SandboxError>;
     fn get_sandbox_for_agent(&self, agent_id: AgentId) -> Option<SandboxId>;
 }
@@ -85,7 +93,10 @@ struct SandboxState {
     managed_workspace: bool,
     workspace: Option<Arc<Dir>>,
     max_disk_usage_bytes: Option<u64>,
+    max_memory_bytes: Option<u64>,
+    container_image: Option<String>,
     operation_lock: Arc<Mutex<()>>,
+    process_lock: Arc<tokio::sync::Semaphore>,
 }
 
 /// Concrete sandbox manager implementation.
@@ -102,6 +113,11 @@ impl Default for SandboxManagerImpl {
 
 impl SandboxManagerImpl {
     pub fn new() -> Self {
+        #[cfg(target_os = "linux")]
+        {
+            static ORPHAN_CLEANUP: std::sync::Once = std::sync::Once::new();
+            ORPHAN_CLEANUP.call_once(crate::docker_sandbox::cleanup_orphans_best_effort);
+        }
         Self {
             sandboxes: DashMap::new(),
             agent_sandboxes: DashMap::new(),
@@ -120,6 +136,7 @@ impl SandboxManagerImpl {
             max_disk_usage_bytes: Some(100 * 1024 * 1024),
             max_memory_bytes: Some(256 * 1024 * 1024),
             isolation_level: IsolationLevel::Filesystem,
+            container_image: None,
         }
     }
 
@@ -153,6 +170,30 @@ impl SandboxManagerImpl {
             return Err(SandboxError::CreationFailed(
                 "agent already has a sandbox".into(),
             ));
+        }
+        if config.isolation_level == IsolationLevel::Process {
+            return Err(SandboxError::CreationFailed(
+                "native process isolation is not supported; use a qualified container backend"
+                    .into(),
+            ));
+        }
+        if config.isolation_level == IsolationLevel::Container {
+            #[cfg(not(target_os = "linux"))]
+            {
+                return Err(SandboxError::CreationFailed(
+                    "container isolation is unsupported on this platform".into(),
+                ));
+            }
+            #[cfg(target_os = "linux")]
+            {
+                let image = config.container_image.as_deref().ok_or_else(|| {
+                    SandboxError::CreationFailed(
+                        "container isolation requires a digest-pinned image".into(),
+                    )
+                })?;
+                crate::docker_sandbox::validate_digest_image(image)
+                    .map_err(SandboxError::CreationFailed)?;
+            }
         }
         let workspace_dir = if config.isolation_level == IsolationLevel::Trusted {
             config.workspace_dir.clone()
@@ -211,7 +252,10 @@ impl SandboxManagerImpl {
             managed_workspace,
             workspace,
             max_disk_usage_bytes: config.max_disk_usage_bytes,
+            max_memory_bytes: config.max_memory_bytes,
+            container_image: config.container_image.clone(),
             operation_lock: Arc::new(Mutex::new(())),
+            process_lock: Arc::new(tokio::sync::Semaphore::new(1)),
         };
         self.sandboxes.insert(sandbox_id, state);
         self.agent_sandboxes.insert(agent_id, sandbox_id);
@@ -607,6 +651,68 @@ impl SandboxManagerImpl {
             Ok(serde_json::json!({"status": status, "body": text}))
         }
     }
+
+    async fn execute_process_inner(
+        state: &SandboxState,
+        parameters: &serde_json::Value,
+    ) -> Result<serde_json::Value, SandboxError> {
+        if state.isolation_level != IsolationLevel::Container {
+            return Err(SandboxError::BoundaryViolation(
+                "isolated process backend unavailable".into(),
+            ));
+        }
+        let program = parameters
+            .get("command")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| SandboxError::BoundaryViolation("process command denied".into()))?;
+        let arguments = parameters
+            .get("args")
+            .and_then(serde_json::Value::as_array)
+            .map(|arguments| {
+                arguments
+                    .iter()
+                    .map(|argument| {
+                        argument.as_str().map(str::to_string).ok_or_else(|| {
+                            SandboxError::BoundaryViolation(
+                                "process arguments must be strings".into(),
+                            )
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .transpose()?
+            .unwrap_or_default();
+        let image = state
+            .container_image
+            .as_deref()
+            .ok_or_else(|| SandboxError::BoundaryViolation("container image unavailable".into()))?;
+        let _permit = state
+            .process_lock
+            .acquire()
+            .await
+            .map_err(|_| SandboxError::BoundaryViolation("process sandbox closed".into()))?;
+
+        #[cfg(target_os = "linux")]
+        {
+            crate::docker_sandbox::execute_hardened(
+                state.agent_id,
+                &state.workspace_dir,
+                image,
+                state.max_memory_bytes,
+                program,
+                &arguments,
+            )
+            .await
+            .map_err(SandboxError::BoundaryViolation)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (image, program, arguments);
+            Err(SandboxError::BoundaryViolation(
+                "container isolation is unsupported on this platform".into(),
+            ))
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -622,13 +728,19 @@ impl SandboxManager for SandboxManagerImpl {
     fn destroy_sandbox(&self, sandbox_id: SandboxId) -> Result<(), SandboxError> {
         let state = self
             .sandboxes
-            .remove(&sandbox_id)
+            .get(&sandbox_id)
+            .map(|state| state.clone())
             .ok_or_else(|| SandboxError::DestructionFailed("Sandbox not found".to_string()))?;
-        self.agent_sandboxes.remove(&state.1.agent_id);
-        if state.1.managed_workspace {
-            std::fs::remove_dir_all(&state.1.workspace_dir)
+        #[cfg(target_os = "linux")]
+        if state.isolation_level == IsolationLevel::Container {
+            crate::docker_sandbox::cleanup_agent_best_effort(state.agent_id);
+        }
+        if state.managed_workspace {
+            std::fs::remove_dir_all(&state.workspace_dir)
                 .map_err(|error| SandboxError::DestructionFailed(error.to_string()))?;
         }
+        self.sandboxes.remove(&sandbox_id);
+        self.agent_sandboxes.remove(&state.agent_id);
         Ok(())
     }
 
@@ -656,9 +768,11 @@ impl SandboxManager for SandboxManagerImpl {
                 if state.isolation_level == IsolationLevel::Trusted {
                     return Ok(());
                 }
-                return Err(SandboxError::BoundaryViolation(
-                    "host process execution is unavailable for untrusted sandboxes".into(),
-                ));
+                if state.isolation_level != IsolationLevel::Container {
+                    return Err(SandboxError::BoundaryViolation(
+                        "host process execution is unavailable for untrusted sandboxes".into(),
+                    ));
+                }
             }
             SandboxAction::PeripheralAccess(_) => {
                 if state.isolation_level == IsolationLevel::Trusted {
@@ -713,6 +827,19 @@ impl SandboxManager for SandboxManagerImpl {
         Self::execute_network_inner(&state, operation, parameters).await
     }
 
+    async fn execute_process(
+        &self,
+        sandbox_id: SandboxId,
+        parameters: &serde_json::Value,
+    ) -> Result<serde_json::Value, SandboxError> {
+        let state = self
+            .sandboxes
+            .get(&sandbox_id)
+            .map(|state| state.clone())
+            .ok_or_else(|| SandboxError::BoundaryViolation("Sandbox not found".to_string()))?;
+        Self::execute_process_inner(&state, parameters).await
+    }
+
     fn isolation_level(&self, sandbox_id: SandboxId) -> Result<IsolationLevel, SandboxError> {
         self.sandboxes
             .get(&sandbox_id)
@@ -763,6 +890,7 @@ mod tests {
             max_disk_usage_bytes: None,
             max_memory_bytes: None,
             isolation_level: IsolationLevel::Filesystem,
+            container_image: None,
         }
     }
 
@@ -864,16 +992,21 @@ mod tests {
     }
 
     #[test]
-    fn container_declaration_does_not_fall_back_to_host_execution() {
+    fn unavailable_isolation_levels_fail_at_creation_instead_of_falling_back() {
         let mgr = SandboxManagerImpl::new();
-        let agent_id = uuid::Uuid::new_v4();
-        let config = SandboxConfig {
+        let process = SandboxConfig {
+            isolation_level: IsolationLevel::Process,
+            ..test_config()
+        };
+        assert!(mgr.create_sandbox(uuid::Uuid::new_v4(), &process).is_err());
+
+        let container_without_image = SandboxConfig {
             isolation_level: IsolationLevel::Container,
             ..test_config()
         };
-        let sid = mgr.create_sandbox(agent_id, &config).unwrap();
-        let result = mgr.intercept_action(sid, &SandboxAction::ProcessExec("ls".to_string()));
-        assert!(result.is_err());
+        assert!(mgr
+            .create_sandbox(uuid::Uuid::new_v4(), &container_without_image)
+            .is_err());
     }
 
     #[test]
@@ -937,6 +1070,7 @@ mod tests {
                     max_disk_usage_bytes: None,
                     max_memory_bytes: None,
                     isolation_level: IsolationLevel::Filesystem,
+                    container_image: None,
                 },
             )
             .unwrap();
@@ -969,6 +1103,7 @@ mod tests {
                     max_disk_usage_bytes: None,
                     max_memory_bytes: None,
                     isolation_level: IsolationLevel::Filesystem,
+                    container_image: None,
                 },
             )
             .unwrap();

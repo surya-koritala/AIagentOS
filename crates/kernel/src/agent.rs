@@ -806,6 +806,7 @@ mod tests {
             max_disk_usage_bytes: None,
             max_memory_bytes: None,
             isolation_level: crate::IsolationLevel::Filesystem,
+            container_image: None,
         });
 
         let manager = AgentManager::new(16);

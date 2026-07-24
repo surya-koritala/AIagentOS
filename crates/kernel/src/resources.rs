@@ -566,6 +566,14 @@ impl ResourceBroker for ResourceBrokerImpl {
             }
             _ => None,
         };
+        let isolated_process = match sandbox {
+            Some((sandbox_id, IsolationLevel::Container))
+                if request.resource_type == ResourceType::Application =>
+            {
+                Some(sandbox_id)
+            }
+            _ => None,
+        };
         let result = if let Some(sandbox_id) = capability_filesystem {
             let manager = Arc::clone(
                 self.sandbox_manager
@@ -594,6 +602,21 @@ impl ResourceBroker for ResourceBrokerImpl {
             .await
             .unwrap_or(Err(crate::SandboxError::BoundaryViolation(
                 "network request timed out".into(),
+            )))
+            .map_err(|error| ResourceError::OperationFailed(error.to_string()))
+        } else if let Some(sandbox_id) = isolated_process {
+            let manager = Arc::clone(
+                self.sandbox_manager
+                    .as_ref()
+                    .expect("sandbox identity came from a sandbox manager"),
+            );
+            tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                manager.execute_process(sandbox_id, &request.parameters),
+            )
+            .await
+            .unwrap_or(Err(crate::SandboxError::BoundaryViolation(
+                "container execution timed out".into(),
             )))
             .map_err(|error| ResourceError::OperationFailed(error.to_string()))
         } else if request.resource_type == ResourceType::Filesystem && request.operation == "edit" {
@@ -929,6 +952,7 @@ mod tests {
                     max_disk_usage_bytes: None,
                     max_memory_bytes: None,
                     isolation_level: IsolationLevel::Filesystem,
+                    container_image: None,
                 },
             )
             .unwrap();
@@ -971,6 +995,7 @@ mod tests {
                     max_disk_usage_bytes: None,
                     max_memory_bytes: None,
                     isolation_level: IsolationLevel::Filesystem,
+                    container_image: None,
                 },
             )
             .unwrap();
@@ -1051,6 +1076,7 @@ mod tests {
                     max_disk_usage_bytes: None,
                     max_memory_bytes: None,
                     isolation_level: IsolationLevel::Filesystem,
+                    container_image: None,
                 },
             )
             .unwrap();
@@ -1221,6 +1247,7 @@ mod tests {
                     max_disk_usage_bytes: None,
                     max_memory_bytes: None,
                     isolation_level: IsolationLevel::Filesystem,
+                    container_image: None,
                 },
             )
             .unwrap();

@@ -61,6 +61,7 @@ fn arb_sandbox_config() -> impl Strategy<Value = Option<SandboxConfig>> {
             max_disk_usage_bytes: Some(1024 * 1024 * 100),
             max_memory_bytes: Some(1024 * 1024 * 256),
             isolation_level: IsolationLevel::Filesystem,
+            container_image: None,
         })),
         Just(Some(SandboxConfig {
             workspace_dir: std::path::PathBuf::from("/tmp/agent-workspace"),
@@ -68,6 +69,7 @@ fn arb_sandbox_config() -> impl Strategy<Value = Option<SandboxConfig>> {
             max_disk_usage_bytes: None,
             max_memory_bytes: None,
             isolation_level: IsolationLevel::Process,
+            container_image: None,
         })),
     ]
 }

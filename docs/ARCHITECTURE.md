@@ -214,10 +214,12 @@ bypass the combined declaration/slot gate from a new execution path.
 ## 8. Context & memory
 
 - **Context pressure** (`execution.rs`, with legacy paging primitives in
-  `context_paging.rs`) — `max_context_tokens` bounds the live provider prompt.
-  Old non-pinned messages are serialized to durable per-agent storage and
-  replaced by a verifiable reference; impossible pinned state fails closed.
-  There is no host-memory OOM-killer claim. See
+  `context_paging.rs`) — agent, tenant, and kernel limits atomically bound
+  active provider prompts, while durable-byte limits cover conversations,
+  spills, embeddings, snapshots, and checkpoints. Old non-pinned messages are
+  serialized to retained per-agent storage and replaced by a digest-verified
+  reference; impossible pinned or storage state fails closed. There is no
+  host-memory OOM-killer claim. See
   [`CONTEXT_PRESSURE.md`](CONTEXT_PRESSURE.md).
 - **Long-term memory** (`memory_manager.rs`) — a pluggable embedding seam:
   - `Embedder` trait (object-safe, `Arc<dyn Embedder>`); default `BlendedEmbedder`

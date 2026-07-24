@@ -24,9 +24,12 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
   #118)
 - **Context and admission controls** — bounded turn/LLM/tool admission,
   CFS-inspired fairness, exclusive shared-resource priority inheritance,
-  starvation escape, per-class/yield metrics, durable context spill references,
-  and explicit backpressure replace unsupported CPU-preemption and OOM claims.
-  (#114, #115)
+  starvation escape, and per-class/yield metrics. Context pressure now enforces
+  per-agent/tenant/kernel active-prompt and durable-byte ceilings; retains and
+  verifies lossless spill payloads; counts conversations, embeddings,
+  snapshots, and checkpoints; and exposes content-free usage/rejection
+  telemetry. Explicit backpressure replaces unsupported CPU-preemption,
+  virtual-memory, and OOM-killer claims. (#114, #115)
 - **Validated agent-package loading** — manifests are bounded and fail closed,
   declared tools resolve against the live registry, tenant privilege is
   constrained, and partial creation rolls back atomically. Packages remain

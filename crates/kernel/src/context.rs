@@ -7,7 +7,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
 #[cfg(test)]
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
 use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
@@ -385,15 +385,71 @@ pub struct StoredGenerationCheckpoint {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContextPressureStats {
     pub agent_id: AgentId,
+    #[serde(default)]
+    pub tenant_id: String,
     pub active_tokens: u32,
     pub budget_tokens: u32,
+    #[serde(default)]
+    pub agent_active_tokens: u64,
+    #[serde(default)]
+    pub agent_active_limit: u64,
+    #[serde(default)]
+    pub tenant_active_tokens: u64,
+    #[serde(default)]
+    pub tenant_active_limit: u64,
+    #[serde(default)]
+    pub global_active_tokens: u64,
+    #[serde(default)]
+    pub global_active_limit: u64,
+    #[serde(default)]
+    pub active_rejection_count: u64,
     pub spill_count: u64,
     pub evicted_messages: u64,
     pub stored_spills: u64,
     pub stored_spill_bytes: u64,
+    #[serde(default)]
+    pub agent_stored_bytes: u64,
+    #[serde(default)]
+    pub agent_storage_limit: u64,
+    #[serde(default)]
+    pub tenant_stored_bytes: u64,
+    #[serde(default)]
+    pub tenant_storage_limit: u64,
+    #[serde(default)]
+    pub global_stored_bytes: u64,
+    #[serde(default)]
+    pub global_storage_limit: u64,
+    #[serde(default)]
+    pub spill_retention_seconds: u64,
     pub error_count: u64,
     pub last_error: Option<String>,
     pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContextStorageLimits {
+    pub per_agent_bytes: u64,
+    pub per_tenant_bytes: u64,
+    pub global_bytes: u64,
+    pub spill_retention_seconds: u64,
+}
+
+impl Default for ContextStorageLimits {
+    fn default() -> Self {
+        Self {
+            per_agent_bytes: 0,
+            per_tenant_bytes: 0,
+            global_bytes: 0,
+            spill_retention_seconds: 30 * 24 * 60 * 60,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct ContextStorageUsage {
+    agent_bytes: u64,
+    tenant_bytes: u64,
+    global_bytes: u64,
 }
 
 pub const GENERATION_CHECKPOINT_VERSION: u32 = 1;
@@ -453,6 +509,7 @@ pub const DEFAULT_TENANT: &str = "default";
 /// SQLite-backed context manager implementation.
 pub struct SqliteContextManager {
     conn: Mutex<Connection>,
+    storage_limits: RwLock<ContextStorageLimits>,
     /// Pluggable embedder used for the long-term-memory store/query/ranking
     /// path. Defaults to [`crate::memory_manager::default_embedder`]; swap it
     /// via [`SqliteContextManager::with_embedder`] to change embedding strategy
@@ -512,6 +569,7 @@ impl SqliteContextManager {
         }
         let mgr = Self {
             conn: Mutex::new(conn),
+            storage_limits: RwLock::new(ContextStorageLimits::default()),
             embedder: crate::memory_manager::default_embedder(),
             #[cfg(test)]
             fail_next_agent_save: AtomicBool::new(false),
@@ -528,6 +586,7 @@ impl SqliteContextManager {
             Connection::open_in_memory().map_err(|e| ContextError::StorageError(e.to_string()))?;
         let mgr = Self {
             conn: Mutex::new(conn),
+            storage_limits: RwLock::new(ContextStorageLimits::default()),
             embedder: crate::memory_manager::default_embedder(),
             #[cfg(test)]
             fail_next_agent_save: AtomicBool::new(false),
@@ -668,6 +727,7 @@ impl SqliteContextManager {
                 "conversations",
                 "usage_log",
                 "agent_kv",
+                "context_spills",
                 "context_pressure",
                 "context_snapshots",
                 "generation_checkpoints",
@@ -792,6 +852,18 @@ impl SqliteContextManager {
                 PRIMARY KEY(agent_id, key)
             );
             CREATE INDEX IF NOT EXISTS idx_agent_kv_agent ON agent_kv(agent_id);
+            CREATE TABLE IF NOT EXISTS context_spills (
+                agent_id TEXT NOT NULL,
+                key TEXT NOT NULL,
+                tenant_id TEXT NOT NULL,
+                sha256 TEXT NOT NULL,
+                byte_count INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                PRIMARY KEY(agent_id, key)
+            );
+            CREATE INDEX IF NOT EXISTS idx_context_spills_tenant
+                ON context_spills(tenant_id, expires_at);
             CREATE TABLE IF NOT EXISTS context_pressure (
                 agent_id TEXT PRIMARY KEY,
                 active_tokens INTEGER NOT NULL,
@@ -1049,6 +1121,81 @@ impl SqliteContextManager {
                 params![Utc::now().to_rfc3339()],
             );
         }
+        // PR129 stored context spills in agent_kv before digest/retention
+        // metadata existed. Upgrade them in place so restart-safe references
+        // remain usable without creating an unretained privacy bypass.
+        let legacy_spills = {
+            let mut statement = conn
+                .prepare(
+                    "SELECT kv.agent_id, kv.key, kv.value, kv.updated_at,
+                            COALESCE(a.tenant_id, 'default')
+                     FROM agent_kv kv
+                     LEFT JOIN agents a ON a.id = kv.agent_id
+                     LEFT JOIN context_spills spill
+                       ON spill.agent_id = kv.agent_id AND spill.key = kv.key
+                     WHERE kv.key LIKE 'context_spill:%' AND spill.key IS NULL",
+                )
+                .map_err(|error| ContextError::StorageError(error.to_string()))?;
+            let rows = statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                    ))
+                })
+                .map_err(|error| ContextError::StorageError(error.to_string()))?;
+            let mut spills = Vec::new();
+            for row in rows {
+                spills.push(row.map_err(|error| ContextError::StorageError(error.to_string()))?);
+            }
+            spills
+        };
+        for (agent_id, key, value, updated_at, tenant_id) in legacy_spills {
+            let digest = ring::digest::digest(&ring::digest::SHA256, value.as_bytes())
+                .as_ref()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            let created_at = DateTime::parse_from_rfc3339(&updated_at)
+                .map(|value| value.with_timezone(&Utc))
+                .unwrap_or_else(|_| Utc::now() - chrono::Duration::days(30));
+            let expires_at = created_at + chrono::Duration::days(30);
+            conn.execute(
+                "INSERT INTO context_spills
+                 (agent_id, key, tenant_id, sha256, byte_count, created_at, expires_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    agent_id,
+                    key,
+                    tenant_id,
+                    digest,
+                    value.len() as u64,
+                    created_at.to_rfc3339(),
+                    expires_at.to_rfc3339()
+                ],
+            )
+            .map_err(|error| ContextError::StorageError(error.to_string()))?;
+        }
+        let now = Utc::now().to_rfc3339();
+        conn.execute(
+            "DELETE FROM agent_kv
+             WHERE EXISTS (
+                SELECT 1 FROM context_spills
+                WHERE context_spills.agent_id = agent_kv.agent_id
+                  AND context_spills.key = agent_kv.key
+                  AND context_spills.expires_at <= ?1
+             )",
+            params![now],
+        )
+        .map_err(|error| ContextError::StorageError(error.to_string()))?;
+        conn.execute(
+            "DELETE FROM context_spills WHERE expires_at <= ?1",
+            params![now],
+        )
+        .map_err(|error| ContextError::StorageError(error.to_string()))?;
         if legacy_database_has_rows {
             // The old release kept RPM/TPM only in process memory. There is no
             // honest backfill after upgrade, so fence just the current fixed
@@ -2609,13 +2756,45 @@ impl SqliteContextManager {
         let id_str = agent_id.to_string();
 
         for attempt in 0..MAX_RETRIES {
-            let conn = self.conn.lock().unwrap();
-            let result = conn.execute(
-                "INSERT OR REPLACE INTO contexts (agent_id, context_json, updated_at) VALUES (?1, ?2, ?3)",
-                params![id_str, json, now],
-            );
+            let mut conn = self.conn.lock().unwrap();
+            let transaction = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
+            let tenant_id = transaction
+                .query_row(
+                    "SELECT tenant_id FROM agents WHERE id = ?1",
+                    params![id_str],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+                .map_err(|error| ContextError::StorageError(error.to_string()))?
+                .unwrap_or_else(|| DEFAULT_TENANT.to_string());
+            let replaced_bytes = transaction
+                .query_row(
+                    "SELECT LENGTH(context_json) FROM contexts WHERE agent_id = ?1",
+                    params![id_str],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()
+                .map_err(|error| ContextError::StorageError(error.to_string()))?
+                .unwrap_or(0)
+                .max(0) as u64;
+            self.enforce_context_storage_locked(
+                &transaction,
+                agent_id,
+                &tenant_id,
+                json.len() as u64,
+                replaced_bytes,
+            )?;
+            let result = (|| {
+                transaction.execute(
+                    "INSERT OR REPLACE INTO contexts (agent_id, context_json, updated_at) VALUES (?1, ?2, ?3)",
+                    params![id_str, json, now],
+                )?;
+                transaction.commit()
+            })();
             match result {
-                Ok(_) => return Ok(()),
+                Ok(()) => return Ok(()),
                 Err(e) if attempt < MAX_RETRIES - 1 => {
                     tracing::warn!("Persist attempt {} failed: {}", attempt + 1, e);
                     continue;
@@ -2715,7 +2894,10 @@ impl ContextManager for SqliteContextManager {
     }
 
     async fn store_fact(&self, agent_id: AgentId, fact: Fact) -> Result<(), ContextError> {
-        let conn = self.conn.lock().unwrap();
+        let mut conn = self.conn.lock().unwrap();
+        let transaction = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| ContextError::StorageError(error.to_string()))?;
         // Every stored fact gets a deterministic embedding. If the caller didn't
         // supply one, compute it from the content via the Memory Manager so
         // query_memory can rank by semantic (cosine) similarity later.
@@ -2726,8 +2908,47 @@ impl ContextManager for SqliteContextManager {
         let embedding_json = Some(serde_json::to_string(&embedding).unwrap_or_default());
         let category_str = serde_json::to_string(&fact.category)
             .map_err(|e| ContextError::StorageError(e.to_string()))?;
+        let tenant_id = transaction
+            .query_row(
+                "SELECT tenant_id FROM agents WHERE id = ?1",
+                params![agent_id.to_string()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| ContextError::StorageError(error.to_string()))?
+            .unwrap_or_else(|| DEFAULT_TENANT.to_string());
+        let existing = transaction
+            .query_row(
+                "SELECT agent_id,
+                        LENGTH(content) + COALESCE(LENGTH(embedding_json), 0)
+                 FROM facts WHERE id = ?1",
+                params![fact.id.to_string()],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .optional()
+            .map_err(|error| ContextError::StorageError(error.to_string()))?;
+        if existing
+            .as_ref()
+            .is_some_and(|(owner, _)| owner != &agent_id.to_string())
+        {
+            return Err(ContextError::StorageError(
+                "fact id is already owned by another agent".into(),
+            ));
+        }
+        let replaced_bytes = existing.map_or(0, |(_, bytes)| bytes.max(0) as u64);
+        let incoming_bytes =
+            fact.content
+                .len()
+                .saturating_add(embedding_json.as_deref().map_or(0, str::len)) as u64;
+        self.enforce_context_storage_locked(
+            &transaction,
+            agent_id,
+            &tenant_id,
+            incoming_bytes,
+            replaced_bytes,
+        )?;
 
-        conn.execute(
+        transaction.execute(
             "INSERT OR REPLACE INTO facts (id, agent_id, content, category, created_at, last_accessed_at, embedding_json)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
@@ -2740,6 +2961,9 @@ impl ContextManager for SqliteContextManager {
                 embedding_json,
             ],
         ).map_err(|e| ContextError::StorageError(e.to_string()))?;
+        transaction
+            .commit()
+            .map_err(|error| ContextError::StorageError(error.to_string()))?;
         Ok(())
     }
 
@@ -2867,8 +3091,44 @@ impl SqliteContextManager {
         let json = serde_json::to_string(messages)
             .map_err(|e| ContextError::PersistenceFailed(e.to_string()))?;
         let now = chrono::Utc::now().to_rfc3339();
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
+        let mut conn = self.conn.lock().unwrap();
+        let transaction = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
+        let tenant_id = transaction
+            .query_row(
+                "SELECT tenant_id FROM agents WHERE id = ?1",
+                params![agent_id.to_string()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| ContextError::StorageError(error.to_string()))?
+            .unwrap_or_else(|| DEFAULT_TENANT.to_string());
+        let existing = transaction
+            .query_row(
+                "SELECT agent_id, LENGTH(messages_json) FROM conversations WHERE id = ?1",
+                params![id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .optional()
+            .map_err(|error| ContextError::StorageError(error.to_string()))?;
+        if existing
+            .as_ref()
+            .is_some_and(|(owner, _)| owner != &agent_id.to_string())
+        {
+            return Err(ContextError::PersistenceFailed(
+                "conversation id is already owned by another agent".into(),
+            ));
+        }
+        let replaced_bytes = existing.map_or(0, |(_, bytes)| bytes.max(0) as u64);
+        self.enforce_context_storage_locked(
+            &transaction,
+            agent_id,
+            &tenant_id,
+            json.len() as u64,
+            replaced_bytes,
+        )?;
+        transaction.execute(
             "INSERT OR REPLACE INTO conversations (id, agent_id, messages_json, created_at, updated_at) VALUES (?1, ?2, ?3, COALESCE((SELECT created_at FROM conversations WHERE id=?1), ?4), ?4)",
             rusqlite::params![id, agent_id.to_string(), json, now],
         ).map_err(|e| ContextError::PersistenceFailed(e.to_string()))?;
@@ -2877,11 +3137,14 @@ impl SqliteContextManager {
             .map(|m| m.content.as_str())
             .collect::<Vec<_>>()
             .join(" ");
-        conn.execute(
+        transaction.execute(
             "INSERT OR REPLACE INTO conversations_fts (conversation_id, content) VALUES (?1, ?2)",
             rusqlite::params![id, text_content],
         )
         .ok();
+        transaction
+            .commit()
+            .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
         Ok(())
     }
 
@@ -3134,8 +3397,268 @@ impl SqliteContextManager {
 /// opaque strings (callers may JSON-encode structured data). Backed by the same
 /// single SQLite handle as the rest of the context manager (no separate db).
 impl SqliteContextManager {
+    pub fn set_context_storage_limits(
+        &self,
+        limits: ContextStorageLimits,
+    ) -> Result<(), ContextError> {
+        if limits.spill_retention_seconds == 0 {
+            return Err(ContextError::PersistenceFailed(
+                "context spill retention must be greater than zero".into(),
+            ));
+        }
+        let mut conn = self.conn.lock().unwrap();
+        let spills = {
+            let mut statement = conn
+                .prepare("SELECT agent_id, key, created_at, expires_at FROM context_spills")
+                .map_err(|error| ContextError::StorageError(error.to_string()))?;
+            let rows = statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                })
+                .map_err(|error| ContextError::StorageError(error.to_string()))?;
+            let mut values = Vec::new();
+            for row in rows {
+                values.push(row.map_err(|error| ContextError::StorageError(error.to_string()))?);
+            }
+            values
+        };
+        for (agent_id, key, created_at, current_expiry) in spills {
+            let created_at = DateTime::parse_from_rfc3339(&created_at)
+                .map_err(|error| ContextError::StorageError(error.to_string()))?
+                .with_timezone(&Utc);
+            let current_expiry = DateTime::parse_from_rfc3339(&current_expiry)
+                .map_err(|error| ContextError::StorageError(error.to_string()))?
+                .with_timezone(&Utc);
+            let configured_expiry = created_at
+                + chrono::Duration::seconds(
+                    limits.spill_retention_seconds.min(i64::MAX as u64) as i64
+                );
+            if configured_expiry < current_expiry {
+                conn.execute(
+                    "UPDATE context_spills SET expires_at = ?1
+                     WHERE agent_id = ?2 AND key = ?3",
+                    params![configured_expiry.to_rfc3339(), agent_id, key],
+                )
+                .map_err(|error| ContextError::StorageError(error.to_string()))?;
+            }
+        }
+        Self::purge_expired_spills_locked(&mut conn)?;
+        drop(conn);
+        if let Ok(mut configured) = self.storage_limits.write() {
+            *configured = limits;
+            Ok(())
+        } else {
+            Err(ContextError::StorageError(
+                "context storage limit lock is poisoned".into(),
+            ))
+        }
+    }
+
+    fn context_storage_usage_locked(
+        conn: &Connection,
+        agent_id: AgentId,
+        tenant_id: &str,
+    ) -> Result<ContextStorageUsage, ContextError> {
+        let (agent, tenant, global) = conn
+            .query_row(
+                "WITH context_bytes(agent_id, byte_count) AS (
+                    SELECT agent_id, LENGTH(context_json) FROM contexts
+                    UNION ALL
+                    SELECT agent_id, LENGTH(content) + COALESCE(LENGTH(embedding_json), 0) FROM facts
+                    UNION ALL
+                    SELECT agent_id, LENGTH(messages_json) FROM conversations
+                    UNION ALL
+                    SELECT agent_id, LENGTH(value) FROM agent_kv
+                        WHERE key LIKE 'context_spill:%'
+                    UNION ALL
+                    SELECT agent_id, LENGTH(context_json) FROM context_snapshots
+                    UNION ALL
+                    SELECT agent_id, LENGTH(checkpoint_json) FROM generation_checkpoints
+                        WHERE status IN ('active', 'resuming')
+                )
+                SELECT
+                    COALESCE(SUM(CASE WHEN agent_id = ?1 THEN byte_count ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN COALESCE(
+                        (SELECT tenant_id FROM agents WHERE id = context_bytes.agent_id),
+                        'default'
+                    ) = ?2 THEN byte_count ELSE 0 END), 0),
+                    COALESCE(SUM(byte_count), 0)
+                FROM context_bytes",
+                params![agent_id.to_string(), tenant_id],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                },
+            )
+            .map_err(|error| ContextError::StorageError(error.to_string()))?;
+        Ok(ContextStorageUsage {
+            agent_bytes: agent.max(0) as u64,
+            tenant_bytes: tenant.max(0) as u64,
+            global_bytes: global.max(0) as u64,
+        })
+    }
+
+    fn enforce_context_storage_locked(
+        &self,
+        conn: &Connection,
+        agent_id: AgentId,
+        tenant_id: &str,
+        incoming_bytes: u64,
+        replaced_bytes: u64,
+    ) -> Result<(), ContextError> {
+        let limits = self
+            .storage_limits
+            .read()
+            .map(|limits| *limits)
+            .unwrap_or_default();
+        let usage = Self::context_storage_usage_locked(conn, agent_id, tenant_id)?;
+        let delta = incoming_bytes.saturating_sub(replaced_bytes);
+        for (scope, used, limit) in [
+            ("agent", usage.agent_bytes, limits.per_agent_bytes),
+            ("tenant", usage.tenant_bytes, limits.per_tenant_bytes),
+            ("global", usage.global_bytes, limits.global_bytes),
+        ] {
+            if limit > 0 && used.saturating_add(delta) > limit {
+                return Err(ContextError::PersistenceFailed(format!(
+                    "context storage pressure: {scope} would use {} bytes above limit {limit}; delete retained context or retry after retention cleanup",
+                    used.saturating_add(delta)
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn purge_expired_spills_locked(conn: &mut Connection) -> Result<u64, ContextError> {
+        let transaction = conn
+            .transaction()
+            .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
+        let now = Utc::now().to_rfc3339();
+        let removed = transaction
+            .execute(
+                "DELETE FROM agent_kv
+                 WHERE EXISTS (
+                    SELECT 1 FROM context_spills
+                    WHERE context_spills.agent_id = agent_kv.agent_id
+                      AND context_spills.key = agent_kv.key
+                      AND context_spills.expires_at <= ?1
+                 )",
+                params![now],
+            )
+            .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
+        transaction
+            .execute(
+                "DELETE FROM context_spills WHERE expires_at <= ?1",
+                params![now],
+            )
+            .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
+        transaction
+            .commit()
+            .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
+        Ok(removed as u64)
+    }
+
+    /// Persist a spill with a verifiable digest, bounded retention, and atomic
+    /// per-agent/tenant/global durable-byte admission.
+    pub fn store_context_spill(
+        &self,
+        agent_id: AgentId,
+        key: &str,
+        value: &str,
+        sha256: &str,
+    ) -> Result<(), ContextError> {
+        if !key.starts_with("context_spill:") {
+            return Err(ContextError::PersistenceFailed(
+                "context spill key must start with context_spill:".into(),
+            ));
+        }
+        let mut conn = self.conn.lock().unwrap();
+        Self::purge_expired_spills_locked(&mut conn)?;
+        let transaction = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
+        let tenant_id = transaction
+            .query_row(
+                "SELECT tenant_id FROM agents WHERE id = ?1",
+                params![agent_id.to_string()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| ContextError::StorageError(error.to_string()))?
+            .unwrap_or_else(|| DEFAULT_TENANT.to_string());
+        let replaced_bytes = transaction
+            .query_row(
+                "SELECT LENGTH(value) FROM agent_kv WHERE agent_id = ?1 AND key = ?2",
+                params![agent_id.to_string(), key],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(|error| ContextError::StorageError(error.to_string()))?
+            .unwrap_or(0)
+            .max(0) as u64;
+        self.enforce_context_storage_locked(
+            &transaction,
+            agent_id,
+            &tenant_id,
+            value.len() as u64,
+            replaced_bytes,
+        )?;
+        let retention_seconds = self
+            .storage_limits
+            .read()
+            .map(|limits| limits.spill_retention_seconds)
+            .unwrap_or(0);
+        if retention_seconds == 0 {
+            return Err(ContextError::PersistenceFailed(
+                "context spill retention must be greater than zero".into(),
+            ));
+        }
+        let now = Utc::now();
+        let expires_at =
+            now + chrono::Duration::seconds(retention_seconds.min(i64::MAX as u64) as i64);
+        transaction
+            .execute(
+                "INSERT OR REPLACE INTO agent_kv
+                 (agent_id, key, value, updated_at) VALUES (?1, ?2, ?3, ?4)",
+                params![agent_id.to_string(), key, value, now.to_rfc3339()],
+            )
+            .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
+        transaction
+            .execute(
+                "INSERT OR REPLACE INTO context_spills
+                 (agent_id, key, tenant_id, sha256, byte_count, created_at, expires_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    agent_id.to_string(),
+                    key,
+                    tenant_id,
+                    sha256,
+                    value.len() as u64,
+                    now.to_rfc3339(),
+                    expires_at.to_rfc3339()
+                ],
+            )
+            .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
+        transaction
+            .commit()
+            .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
+        Ok(())
+    }
+
     /// Put (insert-or-overwrite) a value for `key` under `agent_id`.
     pub fn kv_put(&self, agent_id: AgentId, key: &str, value: &str) -> Result<(), ContextError> {
+        if key.starts_with("context_spill:") {
+            return Err(ContextError::PersistenceFailed(
+                "context spills require verified store_context_spill admission".into(),
+            ));
+        }
         let now = Utc::now().to_rfc3339();
         let conn = self.conn.lock().unwrap();
         conn.execute(
@@ -3148,13 +3671,41 @@ impl SqliteContextManager {
 
     /// Get the value for `key` under `agent_id`, or `None` if absent.
     pub fn kv_get(&self, agent_id: AgentId, key: &str) -> Result<Option<String>, ContextError> {
-        let conn = self.conn.lock().unwrap();
+        let mut conn = self.conn.lock().unwrap();
+        Self::purge_expired_spills_locked(&mut conn)?;
         let result = conn.query_row(
             "SELECT value FROM agent_kv WHERE agent_id = ?1 AND key = ?2",
             params![agent_id.to_string(), key],
             |row| row.get::<_, String>(0),
         );
         match result {
+            Ok(value) if key.starts_with("context_spill:") => {
+                let expected = conn
+                    .query_row(
+                        "SELECT sha256 FROM context_spills
+                         WHERE agent_id = ?1 AND key = ?2",
+                        params![agent_id.to_string(), key],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()
+                    .map_err(|error| ContextError::StorageError(error.to_string()))?
+                    .ok_or_else(|| {
+                        ContextError::RestoreFailed(
+                            "context spill metadata is missing; page-in fails closed".into(),
+                        )
+                    })?;
+                let actual = ring::digest::digest(&ring::digest::SHA256, value.as_bytes())
+                    .as_ref()
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<String>();
+                if actual != expected {
+                    return Err(ContextError::RestoreFailed(
+                        "context spill digest mismatch; page-in fails closed".into(),
+                    ));
+                }
+                Ok(Some(value))
+            }
             Ok(value) => Ok(Some(value)),
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(e) => Err(ContextError::StorageError(e.to_string())),
@@ -3163,7 +3714,8 @@ impl SqliteContextManager {
 
     /// List the keys stored under `agent_id` (sorted ascending).
     pub fn kv_list(&self, agent_id: AgentId) -> Result<Vec<String>, ContextError> {
-        let conn = self.conn.lock().unwrap();
+        let mut conn = self.conn.lock().unwrap();
+        Self::purge_expired_spills_locked(&mut conn)?;
         let mut stmt = conn
             .prepare("SELECT key FROM agent_kv WHERE agent_id = ?1 ORDER BY key ASC")
             .map_err(|e| ContextError::StorageError(e.to_string()))?;
@@ -3180,12 +3732,24 @@ impl SqliteContextManager {
     /// Delete the value for `key` under `agent_id`. Returns `true` if a row was
     /// removed, `false` if no such key existed.
     pub fn kv_delete(&self, agent_id: AgentId, key: &str) -> Result<bool, ContextError> {
-        let conn = self.conn.lock().unwrap();
-        let affected = conn
+        let mut conn = self.conn.lock().unwrap();
+        let transaction = conn
+            .transaction()
+            .map_err(|e| ContextError::PersistenceFailed(e.to_string()))?;
+        transaction
+            .execute(
+                "DELETE FROM context_spills WHERE agent_id = ?1 AND key = ?2",
+                params![agent_id.to_string(), key],
+            )
+            .map_err(|e| ContextError::PersistenceFailed(e.to_string()))?;
+        let affected = transaction
             .execute(
                 "DELETE FROM agent_kv WHERE agent_id = ?1 AND key = ?2",
                 params![agent_id.to_string(), key],
             )
+            .map_err(|e| ContextError::PersistenceFailed(e.to_string()))?;
+        transaction
+            .commit()
             .map_err(|e| ContextError::PersistenceFailed(e.to_string()))?;
         Ok(affected > 0)
     }
@@ -3239,7 +3803,17 @@ impl SqliteContextManager {
         &self,
         agent_id: AgentId,
     ) -> Result<ContextPressureStats, ContextError> {
-        let conn = self.conn.lock().unwrap();
+        let mut conn = self.conn.lock().unwrap();
+        Self::purge_expired_spills_locked(&mut conn)?;
+        let tenant_id = conn
+            .query_row(
+                "SELECT tenant_id FROM agents WHERE id = ?1",
+                params![agent_id.to_string()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| ContextError::StorageError(error.to_string()))?
+            .unwrap_or_else(|| DEFAULT_TENANT.to_string());
         let recorded = conn.query_row(
             "SELECT active_tokens, budget_tokens, spill_count, evicted_messages,
                     error_count, last_error, updated_at
@@ -3284,14 +3858,35 @@ impl SqliteContextManager {
         let updated_at = DateTime::parse_from_rfc3339(&updated_at)
             .map_err(|error| ContextError::StorageError(error.to_string()))?
             .with_timezone(&Utc);
+        let storage = Self::context_storage_usage_locked(&conn, agent_id, &tenant_id)?;
+        let limits = self
+            .storage_limits
+            .read()
+            .map(|limits| *limits)
+            .unwrap_or_default();
         Ok(ContextPressureStats {
             agent_id,
+            tenant_id,
             active_tokens,
             budget_tokens,
+            agent_active_tokens: 0,
+            agent_active_limit: 0,
+            tenant_active_tokens: 0,
+            tenant_active_limit: 0,
+            global_active_tokens: 0,
+            global_active_limit: 0,
+            active_rejection_count: 0,
             spill_count,
             evicted_messages,
             stored_spills,
             stored_spill_bytes,
+            agent_stored_bytes: storage.agent_bytes,
+            agent_storage_limit: limits.per_agent_bytes,
+            tenant_stored_bytes: storage.tenant_bytes,
+            tenant_storage_limit: limits.per_tenant_bytes,
+            global_stored_bytes: storage.global_bytes,
+            global_storage_limit: limits.global_bytes,
+            spill_retention_seconds: limits.spill_retention_seconds,
             error_count,
             last_error,
             updated_at,
@@ -3314,10 +3909,13 @@ impl SqliteContextManager {
     /// `(agent_id, label)`. Errors with [`ContextError::RestoreFailed`] if the
     /// agent has no current context to snapshot.
     pub fn snapshot_context(&self, agent_id: AgentId, label: &str) -> Result<(), ContextError> {
-        let conn = self.conn.lock().unwrap();
+        let mut conn = self.conn.lock().unwrap();
+        let transaction = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
         let id_str = agent_id.to_string();
         // Read the agent's current context (mirrors get_context's query path).
-        let json = match conn.query_row(
+        let json = match transaction.query_row(
             "SELECT context_json FROM contexts WHERE agent_id = ?1",
             params![id_str],
             |row| row.get::<_, String>(0),
@@ -3332,11 +3930,41 @@ impl SqliteContextManager {
             Err(e) => return Err(ContextError::StorageError(e.to_string())),
         };
         let now = Utc::now().to_rfc3339();
-        conn.execute(
+        let tenant_id = transaction
+            .query_row(
+                "SELECT tenant_id FROM agents WHERE id = ?1",
+                params![id_str],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| ContextError::StorageError(error.to_string()))?
+            .unwrap_or_else(|| DEFAULT_TENANT.to_string());
+        let replaced_bytes = transaction
+            .query_row(
+                "SELECT LENGTH(context_json) FROM context_snapshots
+                 WHERE agent_id = ?1 AND label = ?2",
+                params![id_str, label],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(|error| ContextError::StorageError(error.to_string()))?
+            .unwrap_or(0)
+            .max(0) as u64;
+        self.enforce_context_storage_locked(
+            &transaction,
+            agent_id,
+            &tenant_id,
+            json.len() as u64,
+            replaced_bytes,
+        )?;
+        transaction.execute(
             "INSERT OR REPLACE INTO context_snapshots (agent_id, label, context_json, created_at) VALUES (?1, ?2, ?3, ?4)",
             params![id_str, label, json, now],
         )
         .map_err(|e| ContextError::PersistenceFailed(e.to_string()))?;
+        transaction
+            .commit()
+            .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
         Ok(())
     }
 
@@ -3579,7 +4207,7 @@ impl SqliteContextManager {
             .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
         let mut conn = self.conn.lock().unwrap();
         let transaction = conn
-            .transaction()
+            .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
         transaction
             .execute(
@@ -3587,6 +4215,28 @@ impl SqliteContextManager {
                 params![now.to_rfc3339()],
             )
             .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
+        let replaced_bytes = transaction
+            .query_row(
+                "SELECT LENGTH(checkpoint_json) FROM generation_checkpoints
+                 WHERE agent_id = ?1 AND status = 'active'
+                 ORDER BY created_at DESC LIMIT 1 OFFSET ?2",
+                params![
+                    checkpoint.agent_id.to_string(),
+                    (MAX_GENERATION_CHECKPOINTS_PER_AGENT - 1) as i64
+                ],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(|error| ContextError::StorageError(error.to_string()))?
+            .unwrap_or(0)
+            .max(0) as u64;
+        self.enforce_context_storage_locked(
+            &transaction,
+            checkpoint.agent_id,
+            tenant_id,
+            json.len() as u64,
+            replaced_bytes,
+        )?;
         transaction
             .execute(
                 "INSERT INTO generation_checkpoints (id, agent_id, tenant_id, version, provider_id, model_id, checkpoint_json, status, created_at, expires_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'active', ?8, ?9)",
@@ -4825,6 +5475,7 @@ mod tests {
         .unwrap();
         let mgr = SqliteContextManager {
             conn: Mutex::new(conn),
+            storage_limits: RwLock::new(ContextStorageLimits::default()),
             embedder: crate::memory_manager::default_embedder(),
             fail_next_agent_save: AtomicBool::new(false),
             fail_agent_status_update_after: AtomicUsize::new(0),
@@ -6113,5 +6764,320 @@ mod tests {
         assert!(manager
             .reserve_provider_rate_with_cgroups(uuid::Uuid::new_v4(), 190, 10, 1_000, 1, &scopes,)
             .is_err());
+    }
+
+    fn sha256(value: &str) -> String {
+        ring::digest::digest(&ring::digest::SHA256, value.as_bytes())
+            .as_ref()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    }
+
+    #[test]
+    fn context_spill_quota_restart_integrity_and_retention_fail_closed() {
+        let database = QuotaTestDatabase::new("context-pressure");
+        let agent = uuid::Uuid::new_v4();
+        let legacy_agent = uuid::Uuid::new_v4();
+        let first_value = "a".repeat(80);
+        let first_key = "context_spill:conversation:first";
+        {
+            let manager = SqliteContextManager::new(&database.path).unwrap();
+            manager
+                .set_context_storage_limits(ContextStorageLimits {
+                    per_agent_bytes: 120,
+                    per_tenant_bytes: 200,
+                    global_bytes: 240,
+                    spill_retention_seconds: 60,
+                })
+                .unwrap();
+            manager
+                .store_context_spill(agent, first_key, &first_value, &sha256(&first_value))
+                .unwrap();
+            let error = manager
+                .store_context_spill(
+                    agent,
+                    "context_spill:conversation:second",
+                    &"b".repeat(80),
+                    &sha256(&"b".repeat(80)),
+                )
+                .unwrap_err();
+            assert!(error.to_string().contains("agent would use 160 bytes"));
+            manager
+                .conn
+                .lock()
+                .unwrap()
+                .execute(
+                    "INSERT INTO agent_kv (agent_id, key, value, updated_at)
+                     VALUES (?1, 'context_spill:legacy:1', 'legacy-value', ?2)",
+                    params![legacy_agent.to_string(), Utc::now().to_rfc3339()],
+                )
+                .unwrap();
+        }
+
+        let manager = SqliteContextManager::new(&database.path).unwrap();
+        manager
+            .set_context_storage_limits(ContextStorageLimits {
+                per_agent_bytes: 120,
+                per_tenant_bytes: 200,
+                global_bytes: 240,
+                spill_retention_seconds: 60,
+            })
+            .unwrap();
+        assert_eq!(
+            manager.kv_get(agent, first_key).unwrap().as_deref(),
+            Some(first_value.as_str())
+        );
+        assert_eq!(
+            manager
+                .kv_get(legacy_agent, "context_spill:legacy:1")
+                .unwrap()
+                .as_deref(),
+            Some("legacy-value"),
+            "legacy spills must gain digest/retention metadata during restart migration"
+        );
+        manager
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE agent_kv SET value = 'corrupt'
+                 WHERE agent_id = ?1 AND key = ?2",
+                params![agent.to_string(), first_key],
+            )
+            .unwrap();
+        assert!(manager
+            .kv_get(agent, first_key)
+            .unwrap_err()
+            .to_string()
+            .contains("digest mismatch"));
+        manager
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE context_spills SET expires_at = ?1
+                 WHERE agent_id = ?2 AND key = ?3",
+                params![
+                    (Utc::now() - chrono::Duration::seconds(1)).to_rfc3339(),
+                    agent.to_string(),
+                    first_key
+                ],
+            )
+            .unwrap();
+        assert_eq!(manager.kv_get(agent, first_key).unwrap(), None);
+        assert_eq!(
+            manager.context_pressure_stats(agent).unwrap().stored_spills,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn durable_context_quota_covers_conversations_embeddings_and_checkpoints() {
+        let manager = SqliteContextManager::in_memory().unwrap();
+        manager
+            .set_context_storage_limits(ContextStorageLimits {
+                per_agent_bytes: 128,
+                per_tenant_bytes: 0,
+                global_bytes: 0,
+                spill_retention_seconds: 60,
+            })
+            .unwrap();
+
+        let conversation_agent = uuid::Uuid::new_v4();
+        let conversation = vec![crate::connector::StandardMessage::user("x".repeat(256))];
+        assert!(manager
+            .save_conversation("oversized", conversation_agent, &conversation)
+            .unwrap_err()
+            .to_string()
+            .contains("context storage pressure"));
+
+        let fact_agent = uuid::Uuid::new_v4();
+        let fact = Fact {
+            id: uuid::Uuid::new_v4(),
+            content: "memory".repeat(40),
+            category: FactCategory::Fact,
+            created_at: Utc::now(),
+            last_accessed_at: Utc::now(),
+            embedding: None,
+        };
+        assert!(manager
+            .store_fact(fact_agent, fact)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("context storage pressure"));
+
+        let checkpoint_agent = uuid::Uuid::new_v4();
+        assert!(manager
+            .save_generation_checkpoint(
+                DEFAULT_TENANT,
+                "provider",
+                "model",
+                &sample_generation_checkpoint(checkpoint_agent),
+                std::time::Duration::from_secs(60),
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("context storage pressure"));
+    }
+
+    #[test]
+    fn durable_storage_admission_is_tenant_and_global_isolated() {
+        let manager = SqliteContextManager::in_memory().unwrap();
+        manager
+            .set_context_storage_limits(ContextStorageLimits {
+                per_agent_bytes: 200,
+                per_tenant_bytes: 150,
+                global_bytes: 220,
+                spill_retention_seconds: 60,
+            })
+            .unwrap();
+        let a = uuid::Uuid::new_v4();
+        let b = uuid::Uuid::new_v4();
+        let c = uuid::Uuid::new_v4();
+        {
+            let conn = manager.conn.lock().unwrap();
+            for (agent, tenant) in [(a, "tenant-a"), (b, "tenant-a"), (c, "tenant-b")] {
+                conn.execute(
+                    "INSERT INTO agents
+                     (id, session_id, name, task, llm_provider, permission_profile,
+                      priority, status, created_at, last_activity_at, tenant_id)
+                     VALUES (?1, ?2, 'agent', 'task', 'provider', 'standard',
+                             3, '\"Running\"', ?3, ?3, ?4)",
+                    params![
+                        agent.to_string(),
+                        uuid::Uuid::new_v4().to_string(),
+                        Utc::now().to_rfc3339(),
+                        tenant
+                    ],
+                )
+                .unwrap();
+            }
+        }
+        let value = "x".repeat(80);
+        manager
+            .store_context_spill(a, "context_spill:a:1", &value, &sha256(&value))
+            .unwrap();
+        let tenant_error = manager
+            .store_context_spill(b, "context_spill:b:1", &value, &sha256(&value))
+            .unwrap_err();
+        assert!(tenant_error
+            .to_string()
+            .contains("tenant would use 160 bytes"));
+
+        manager
+            .store_context_spill(c, "context_spill:c:1", &value, &sha256(&value))
+            .unwrap();
+        let global_error = manager
+            .store_context_spill(
+                c,
+                "context_spill:c:2",
+                &"y".repeat(70),
+                &sha256(&"y".repeat(70)),
+            )
+            .unwrap_err();
+        assert!(global_error
+            .to_string()
+            .contains("global would use 230 bytes"));
+        assert_eq!(
+            manager
+                .context_pressure_stats(a)
+                .unwrap()
+                .tenant_stored_bytes,
+            80
+        );
+        assert_eq!(
+            manager
+                .context_pressure_stats(c)
+                .unwrap()
+                .global_stored_bytes,
+            160
+        );
+    }
+
+    #[test]
+    fn independent_sqlite_handles_cannot_race_past_context_storage_limit() {
+        let database = QuotaTestDatabase::new("context-storage-race");
+        let first = Arc::new(SqliteContextManager::new(&database.path).unwrap());
+        let second = Arc::new(SqliteContextManager::new(&database.path).unwrap());
+        let limits = ContextStorageLimits {
+            per_agent_bytes: 0,
+            per_tenant_bytes: 100,
+            global_bytes: 100,
+            spill_retention_seconds: 60,
+        };
+        first.set_context_storage_limits(limits).unwrap();
+        second.set_context_storage_limits(limits).unwrap();
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let attempts = [
+            (first, uuid::Uuid::new_v4()),
+            (second, uuid::Uuid::new_v4()),
+        ]
+        .into_iter()
+        .map(|(manager, agent)| {
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                let value = "r".repeat(80);
+                barrier.wait();
+                manager.store_context_spill(
+                    agent,
+                    &format!("context_spill:race:{agent}"),
+                    &value,
+                    &sha256(&value),
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+        let results = attempts
+            .into_iter()
+            .map(|attempt| attempt.join().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(results.iter().filter(|result| result.is_err()).count(), 1);
+        assert!(results
+            .iter()
+            .filter_map(|result| result.as_ref().err())
+            .any(|error| error.to_string().contains("context storage pressure")));
+    }
+
+    #[tokio::test]
+    async fn durable_context_ids_cannot_be_reassigned_across_agents() {
+        let manager = SqliteContextManager::in_memory().unwrap();
+        let owner = uuid::Uuid::new_v4();
+        let foreign = uuid::Uuid::new_v4();
+        manager
+            .save_conversation(
+                "owned-conversation",
+                owner,
+                &[crate::connector::StandardMessage::user("owner")],
+            )
+            .unwrap();
+        assert!(manager
+            .save_conversation(
+                "owned-conversation",
+                foreign,
+                &[crate::connector::StandardMessage::user("foreign")],
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("owned by another agent"));
+
+        let fact_id = uuid::Uuid::new_v4();
+        let fact = Fact {
+            id: fact_id,
+            content: "owner fact".into(),
+            category: FactCategory::Fact,
+            created_at: Utc::now(),
+            last_accessed_at: Utc::now(),
+            embedding: None,
+        };
+        manager.store_fact(owner, fact.clone()).await.unwrap();
+        assert!(manager
+            .store_fact(foreign, fact)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("owned by another agent"));
     }
 }

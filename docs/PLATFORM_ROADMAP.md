@@ -19,7 +19,9 @@ Rust kernel into a complete, usable agent platform.
 - **Strong — OS-grade enforcement & isolation.** SELinux-style MAC (label + path/URL
   glob), Linux capabilities, cgroup token quotas, a cumulative-USD budget ceiling,
   namespace isolation across agents/IPC/delegation/discovery/tools, an audit trail,
-  and CFS fairness driving turn admission. This is the differentiator; keep it.
+  CFS-inspired fairness driving turn admission, and hierarchical active/durable
+  context backpressure with verified spill retention. This is the
+  differentiator; keep it.
 - **Thin — the platform surface.** No way yet for *external* agents to drive the
   kernel (no SDK / server until now); narrow LLM-backend coverage; no context
   snapshot/restore; basic memory (no retrieval); small tool ecosystem.

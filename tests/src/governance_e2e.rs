@@ -146,6 +146,7 @@ async fn governed_multi_agent_execution_contains_and_audits_violators() {
         r.is_ok(),
         "well-funded agent's independent call must still succeed"
     );
+    drop(r.unwrap());
 
     // ── VIOLATION 3: namespace — foreign-namespace tool is invisible. ─────────
     // A privileged tool lives only in the `secure-ops` namespace (id 7000). The

@@ -433,7 +433,11 @@ mod tests {
         )
         .await
         .expect("hardened container execution");
-        assert_eq!(result["exit_code"], 0);
+        assert_eq!(
+            result["exit_code"], 0,
+            "qualification command failed: stdout={} stderr={}",
+            result["stdout"], result["stderr"]
+        );
         assert_eq!(
             std::fs::read_to_string(workspace.join("qualification.txt")).unwrap(),
             "qualified"

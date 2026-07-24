@@ -185,6 +185,9 @@ pub struct AgentExecutor {
     /// Shared RPM/TPM/provider-concurrency limiter, acquired for each actual
     /// provider attempt rather than for the whole agent turn.
     rate_limiter: Option<Arc<crate::rate_limit::RateLimiter>>,
+    /// Shared active-prompt admission. The tenant id is immutable for the
+    /// executor lifetime and restored with the owning agent.
+    context_admission: Option<(Arc<crate::context_paging::ActiveContextManager>, String)>,
     /// Max active-context tokens; older non-system messages are paged out (via
     /// the context pager) when exceeded. 0 = disabled (no token bound).
     context_budget_tokens: u32,
@@ -246,6 +249,7 @@ impl AgentExecutor {
             budget_enforcer: None,
             llm_scheduler: None,
             rate_limiter: None,
+            context_admission: None,
             context_budget_tokens: 0,
             max_tool_calls_per_turn: 0,
             max_output_tokens_per_request: 0,
@@ -308,6 +312,14 @@ impl AgentExecutor {
 
     pub fn set_rate_limiter(&mut self, limiter: Arc<crate::rate_limit::RateLimiter>) {
         self.rate_limiter = Some(limiter);
+    }
+
+    pub fn set_context_admission(
+        &mut self,
+        manager: Arc<crate::context_paging::ActiveContextManager>,
+        tenant_id: impl Into<String>,
+    ) {
+        self.context_admission = Some((manager, tenant_id.into()));
     }
 
     /// Set the active-context token budget. When > 0, the loop pages out the
@@ -407,7 +419,13 @@ impl AgentExecutor {
             .iter()
             .rposition(|message| message.tool_calls.is_some());
         let pinned: Vec<bool> = (0..self.messages.len())
-            .map(|index| index == 0 || latest_tool_state.is_some_and(|start| index >= start))
+            .map(|index| {
+                let message = &self.messages[index];
+                let required_system = message.role == "system"
+                    && !message.content.starts_with("[Durable context spill:")
+                    && !message.content.starts_with("[Context spill:");
+                required_system || latest_tool_state.is_some_and(|start| index >= start)
+            })
             .collect();
         let pinned_messages: Vec<_> = self
             .messages
@@ -495,13 +513,12 @@ impl AgentExecutor {
                     return Err(KernelError::Policy(message));
                 }
             };
-            let digest = ring::digest::digest(&ring::digest::SHA256, spill_json.as_bytes());
-            let digest = digest
+            let digest = ring::digest::digest(&ring::digest::SHA256, spill_json.as_bytes())
                 .as_ref()
                 .iter()
-                .take(8)
                 .map(|byte| format!("{byte:02x}"))
                 .collect::<String>();
+            let digest_prefix = &digest[..16];
             let roles = evicted
                 .iter()
                 .map(|message| message.role.as_str())
@@ -510,12 +527,12 @@ impl AgentExecutor {
                 .collect::<Vec<_>>()
                 .join(",");
             let mut reference = StandardMessage::system(format!(
-                "[Durable context spill: key={key}; sha256-prefix={digest}; messages={}; roles={roles}. Page in with StorageGet before relying on omitted detail.]",
+                "[Durable context spill: key={key}; sha256-prefix={digest_prefix}; messages={}; roles={roles}. Page in with StorageGet before relying on omitted detail.]",
                 evicted.len()
             ));
             if self.estimate_prompt_tokens(std::slice::from_ref(&reference)) > reference_reserve {
                 reference = StandardMessage::system(format!(
-                    "[Context spill: key={key}; sha256-prefix={digest}; n={}]",
+                    "[Context spill: key={key}; sha256-prefix={digest_prefix}; n={}]",
                     evicted.len()
                 ));
             }
@@ -532,10 +549,12 @@ impl AgentExecutor {
             let active_message_tokens = self.estimate_prompt_tokens(&compacted);
             let active_tokens = active_message_tokens.saturating_add(tool_tokens);
             if active_message_tokens <= message_budget {
-                if let Err(error) = self
-                    .context_manager
-                    .kv_put(self.agent_id, &key, &spill_json)
-                {
+                if let Err(error) = self.context_manager.store_context_spill(
+                    self.agent_id,
+                    &key,
+                    &spill_json,
+                    &digest,
+                ) {
                     let message = format!("context spill persistence failed: {error}");
                     let _ = self.context_manager.record_context_pressure(
                         self.agent_id,
@@ -793,14 +812,14 @@ impl AgentExecutor {
                 ));
             }
             if self.tool_call_limit_reached(tool_calls_made) {
-                return Ok(self
+                return self
                     .stop_at_tool_call_limit(
                         &pending_tool_calls[index..],
                         tool_calls_made,
                         total_tokens,
                         usage,
                     )
-                    .await);
+                    .await;
             }
             tool_calls_made += 1;
             self.emit(StreamEvent::ToolCallStarted {
@@ -853,7 +872,7 @@ impl AgentExecutor {
                             usage,
                         );
                         self.emit(StreamEvent::Done(output.clone())).await;
-                        self.save_conversation();
+                        self.save_conversation()?;
                         return Ok(TurnResult::Completed(output));
                     }
                 }
@@ -927,7 +946,7 @@ impl AgentExecutor {
 
                 let output = self.output(response.content, tool_calls_made, total_tokens, usage);
                 self.emit(StreamEvent::Done(output.clone())).await;
-                self.save_conversation();
+                self.save_conversation()?;
                 return Ok(TurnResult::Completed(output));
             }
 
@@ -957,14 +976,14 @@ impl AgentExecutor {
                     ));
                 }
                 if self.tool_call_limit_reached(tool_calls_made) {
-                    return Ok(self
+                    return self
                         .stop_at_tool_call_limit(
                             &tool_calls[index..],
                             tool_calls_made,
                             total_tokens,
                             usage,
                         )
-                        .await);
+                        .await;
                 }
                 tool_calls_made += 1;
                 self.emit(StreamEvent::ToolCallStarted {
@@ -1007,7 +1026,7 @@ impl AgentExecutor {
         tool_calls_made: usize,
         tokens_used: u32,
         usage: UsageTelemetry,
-    ) -> TurnResult {
+    ) -> Result<TurnResult, KernelError> {
         let content = format!(
             "Stopped before tool call: per-turn tool-call limit of {} reached.",
             self.max_tool_calls_per_turn
@@ -1020,8 +1039,8 @@ impl AgentExecutor {
         }
         let output = self.output(content, tool_calls_made, tokens_used, usage);
         self.emit(StreamEvent::Done(output.clone())).await;
-        self.save_conversation();
-        TurnResult::Completed(output)
+        self.save_conversation()?;
+        Ok(TurnResult::Completed(output))
     }
 
     /// Build a checkpoint of the in-flight turn at a pause boundary and emit a
@@ -1106,6 +1125,26 @@ impl AgentExecutor {
                     _ = tokio::time::sleep(delay) => {}
                 }
             }
+            let _context_admission = match &self.context_admission {
+                Some((manager, tenant_id)) => match manager.try_admit(
+                    self.agent_id,
+                    tenant_id,
+                    u64::from(estimated_input_tokens),
+                ) {
+                    Ok(admission) => Some(admission),
+                    Err(message) => {
+                        let _ = self.context_manager.record_context_pressure(
+                            self.agent_id,
+                            estimated_input_tokens,
+                            self.context_budget_tokens,
+                            0,
+                            Some(&message),
+                        );
+                        return Err(KernelError::Policy(message));
+                    }
+                },
+                None => None,
+            };
             // A cgroup can be reassigned while quota admission waits. Snapshot,
             // reserve every stable scope atomically, then verify and mark the
             // receipt in flight under the gate's membership-mutation lock. A
@@ -1390,12 +1429,10 @@ impl AgentExecutor {
     }
 
     /// Save the current conversation to SQLite.
-    fn save_conversation(&self) {
-        let _ = self.context_manager.save_conversation(
-            &self.conversation_id,
-            self.agent_id,
-            &self.messages,
-        );
+    fn save_conversation(&self) -> Result<(), KernelError> {
+        self.context_manager
+            .save_conversation(&self.conversation_id, self.agent_id, &self.messages)
+            .map_err(KernelError::Context)
     }
 
     /// Clean messages: remove orphaned tool results (tool messages without preceding tool_calls).
@@ -2099,6 +2136,198 @@ mod tests {
             .last_error
             .as_deref()
             .is_some_and(|error| error.contains("pinned system/tool state")));
+    }
+
+    #[tokio::test]
+    async fn compaction_is_lossless_and_keeps_required_system_and_tool_state_active() {
+        let context = mock_context_manager();
+        let agent_id = uuid::Uuid::new_v4();
+        let mut executor = AgentExecutor::new_unconfined(
+            agent_id,
+            Box::new(InfiniteToolSession { id: "x".into() }),
+            mock_broker(),
+            Arc::new(ToolRegistry::new()),
+            context.clone(),
+            "ROOT INSTRUCTION".into(),
+        );
+        executor
+            .messages
+            .push(StandardMessage::system("REQUIRED POLICY"));
+        executor.messages.push(StandardMessage {
+            role: "assistant".into(),
+            content: "earlier tool transaction".into(),
+            tool_call_id: None,
+            tool_calls: Some(vec![ToolCall {
+                id: "earlier-call".into(),
+                name: "search".into(),
+                arguments: serde_json::json!({"query": "history"}),
+            }]),
+        });
+        executor.messages.push(StandardMessage::tool_result(
+            "earlier-call",
+            "earlier-result",
+        ));
+        for index in 0..20 {
+            executor.messages.push(StandardMessage::user(format!(
+                "historical-message-{index}-{}",
+                "x".repeat(80)
+            )));
+        }
+        executor.messages.push(StandardMessage {
+            role: "assistant".into(),
+            content: "calling tool".into(),
+            tool_call_id: None,
+            tool_calls: Some(vec![ToolCall {
+                id: "required-call".into(),
+                name: "read_file".into(),
+                arguments: serde_json::json!({"path": "/required"}),
+            }]),
+        });
+        executor.messages.push(StandardMessage::tool_result(
+            "required-call",
+            "required-result",
+        ));
+        let original = executor.messages.clone();
+        executor.set_context_budget(900);
+        executor.compact_to_token_budget(&[]).await.unwrap();
+
+        assert!(executor
+            .messages
+            .iter()
+            .any(|message| message.content == "ROOT INSTRUCTION"));
+        assert!(executor
+            .messages
+            .iter()
+            .any(|message| message.content == "REQUIRED POLICY"));
+        assert!(executor.messages.iter().any(|message| {
+            message
+                .tool_calls
+                .as_ref()
+                .is_some_and(|calls| calls.iter().any(|call| call.id == "required-call"))
+        }));
+        assert!(executor.messages.iter().any(|message| {
+            message.tool_call_id.as_deref() == Some("required-call")
+                && message.content == "required-result"
+        }));
+
+        let key = context
+            .kv_list(agent_id)
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        let spilled: Vec<StandardMessage> =
+            serde_json::from_str(&context.kv_get(agent_id, &key).unwrap().unwrap()).unwrap();
+        let active_without_reference = executor
+            .messages
+            .iter()
+            .filter(|message| !message.content.starts_with("[Durable context spill:"))
+            .filter(|message| !message.content.starts_with("[Context spill:"))
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(
+            active_without_reference.len() + spilled.len(),
+            original.len(),
+            "compaction must not drop or synthesize source messages"
+        );
+        for message in original {
+            assert!(
+                active_without_reference.contains(&message) || spilled.contains(&message),
+                "every source message must remain active or round-trip from the durable spill"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn compaction_quality_regression_measures_recall_loss_and_page_in_recovery() {
+        const REQUIRED_FACT: &str = "deployment-codeword=ORCHID-731";
+        let context = mock_context_manager();
+        let agent_id = uuid::Uuid::new_v4();
+        let mut executor = AgentExecutor::new_unconfined(
+            agent_id,
+            Box::new(InfiniteToolSession { id: "x".into() }),
+            mock_broker(),
+            Arc::new(ToolRegistry::new()),
+            context.clone(),
+            "ROOT".into(),
+        );
+        executor.messages.push(StandardMessage::user(REQUIRED_FACT));
+        for index in 0..20 {
+            executor.messages.push(StandardMessage::user(format!(
+                "later-history-{index}-{}",
+                "x".repeat(80)
+            )));
+        }
+        let recalls_fact = |messages: &[StandardMessage]| {
+            u64::from(
+                messages
+                    .iter()
+                    .any(|message| message.content.contains(REQUIRED_FACT)),
+            )
+        };
+        let baseline_score = recalls_fact(&executor.messages);
+        executor.set_context_budget(300);
+        executor.compact_to_token_budget(&[]).await.unwrap();
+        let active_score = recalls_fact(&executor.messages);
+        let key = context.kv_list(agent_id).unwrap().remove(0);
+        let paged_in: Vec<StandardMessage> =
+            serde_json::from_str(&context.kv_get(agent_id, &key).unwrap().unwrap()).unwrap();
+        let page_in_score = recalls_fact(&paged_in);
+
+        assert_eq!(baseline_score, 1);
+        assert_eq!(
+            active_score, 0,
+            "the suite must detect the known active-recall penalty of explicit compaction"
+        );
+        assert_eq!(
+            page_in_score, 1,
+            "verified page-in must restore exact recall for the evicted fact"
+        );
+    }
+
+    #[tokio::test]
+    async fn live_provider_path_applies_and_releases_active_prompt_admission() {
+        let agent_id = uuid::Uuid::new_v4();
+        let manager = Arc::new(crate::context_paging::ActiveContextManager::new(
+            crate::context_paging::ActiveContextLimits {
+                per_agent_tokens: 1,
+                per_tenant_tokens: 0,
+                global_tokens: 0,
+            },
+        ));
+        let mut executor = AgentExecutor::new_unconfined(
+            agent_id,
+            Box::new(InfiniteToolSession { id: "x".into() }),
+            mock_broker(),
+            Arc::new(ToolRegistry::new()),
+            mock_context_manager(),
+            "required system prompt".into(),
+        );
+        executor.set_context_admission(manager.clone(), "tenant-a");
+        let error = match executor.send_with_retry(&[]).await {
+            Ok(_) => panic!("oversized active prompt must be rejected"),
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("active prompt admission would use"));
+        let rejected = manager.usage(agent_id, "tenant-a");
+        assert_eq!(rejected.agent_tokens, 0);
+        assert_eq!(rejected.rejection_count, 1);
+
+        let permissive = Arc::new(crate::context_paging::ActiveContextManager::new(
+            crate::context_paging::ActiveContextLimits {
+                per_agent_tokens: 10_000,
+                per_tenant_tokens: 10_000,
+                global_tokens: 10_000,
+            },
+        ));
+        executor.set_context_admission(permissive.clone(), "tenant-a");
+        executor.send_with_retry(&[]).await.unwrap();
+        let released = permissive.usage(agent_id, "tenant-a");
+        assert_eq!(released.agent_tokens, 0);
+        assert_eq!(released.tenant_tokens, 0);
+        assert_eq!(released.global_tokens, 0);
     }
 
     #[tokio::test]

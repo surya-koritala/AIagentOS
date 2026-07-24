@@ -160,8 +160,31 @@ pub struct BudgetConfig {
     /// `0` means unlimited.
     #[serde(default)]
     pub max_concurrent_tool_calls: u32,
-    #[serde(default)]
+    #[serde(default = "default_max_context_tokens")]
     pub max_context_tokens: u64,
+    /// Maximum concurrently admitted active-prompt tokens for one tenant.
+    /// This is independent from the durable per-agent prompt compaction bound.
+    /// `0` means unlimited.
+    #[serde(default = "default_tenant_max_context_tokens")]
+    pub tenant_max_context_tokens: u64,
+    /// Maximum concurrently admitted active-prompt tokens across the kernel.
+    /// `0` means unlimited.
+    #[serde(default = "default_global_max_context_tokens")]
+    pub global_max_context_tokens: u64,
+    /// Maximum durable context bytes owned by one agent across conversations,
+    /// spills, embeddings, snapshots, and generation checkpoints.
+    #[serde(default = "default_max_context_storage_bytes")]
+    pub max_context_storage_bytes: u64,
+    /// Maximum durable context bytes owned by one tenant. `0` means unlimited.
+    #[serde(default = "default_tenant_max_context_storage_bytes")]
+    pub tenant_max_context_storage_bytes: u64,
+    /// Maximum durable context bytes across the kernel. `0` means unlimited.
+    #[serde(default = "default_global_max_context_storage_bytes")]
+    pub global_max_context_storage_bytes: u64,
+    /// Retention window for durable context spills. Expired spills are removed
+    /// before quota accounting and cannot be paged in.
+    #[serde(default = "default_context_spill_retention_seconds")]
+    pub context_spill_retention_seconds: u64,
     /// Provider-enforced maximum completion/new tokens for each LLM attempt.
     /// The kernel reserves this allowance together with the complete prompt
     /// estimate before I/O, preventing a conforming built-in provider response
@@ -213,7 +236,13 @@ impl Default for BudgetConfig {
             tenant_tokens_per_min: 0,
             max_tool_calls: 0,
             max_concurrent_tool_calls: 0,
-            max_context_tokens: 0,
+            max_context_tokens: default_max_context_tokens(),
+            tenant_max_context_tokens: default_tenant_max_context_tokens(),
+            global_max_context_tokens: default_global_max_context_tokens(),
+            max_context_storage_bytes: default_max_context_storage_bytes(),
+            tenant_max_context_storage_bytes: default_tenant_max_context_storage_bytes(),
+            global_max_context_storage_bytes: default_global_max_context_storage_bytes(),
+            context_spill_retention_seconds: default_context_spill_retention_seconds(),
             max_output_tokens_per_request: default_max_output_tokens_per_request(),
             rpm: default_rpm(),
             tpm: default_tpm(),
@@ -241,6 +270,12 @@ impl BudgetConfig {
         if self.max_output_tokens_per_request == 0 {
             return Err(
                 "max_output_tokens_per_request must be greater than zero so bounded token quotas can reserve a provider-enforced completion allowance"
+                    .into(),
+            );
+        }
+        if self.context_spill_retention_seconds == 0 {
+            return Err(
+                "context_spill_retention_seconds must be greater than zero; use storage limits and explicit deletion instead of disabling retention"
                     .into(),
             );
         }
@@ -371,6 +406,34 @@ fn default_mac_rules() -> Vec<crate::mac::PolicyRule> {
 
 fn default_agent_tokens_per_min() -> u64 {
     50_000
+}
+
+fn default_max_context_tokens() -> u64 {
+    65_536
+}
+
+fn default_tenant_max_context_tokens() -> u64 {
+    262_144
+}
+
+fn default_global_max_context_tokens() -> u64 {
+    1_048_576
+}
+
+fn default_max_context_storage_bytes() -> u64 {
+    64 * 1024 * 1024
+}
+
+fn default_tenant_max_context_storage_bytes() -> u64 {
+    512 * 1024 * 1024
+}
+
+fn default_global_max_context_storage_bytes() -> u64 {
+    2 * 1024 * 1024 * 1024
+}
+
+fn default_context_spill_retention_seconds() -> u64 {
+    30 * 24 * 60 * 60
 }
 
 fn default_rpm() -> u32 {

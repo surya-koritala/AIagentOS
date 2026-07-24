@@ -1333,7 +1333,7 @@ pub async fn dispatch_scoped(
                     }
                 }
             };
-            match kernel.context_manager.context_pressure_stats(id) {
+            match kernel.context_pressure_stats(id) {
                 Ok(stats) => SyscallReply::ContextPressure { stats },
                 Err(error) => SyscallReply::Error {
                     message: format!("context pressure inspection failed: {error}"),
@@ -1517,20 +1517,35 @@ pub async fn dispatch_scoped(
                             .ok()
                     })
                     .map_or(0, |checkpoints| checkpoints.len());
-                let context_pressure = kernel
-                    .context_manager
-                    .context_pressure_stats(agent.id)
-                    .unwrap_or_else(|_| ContextPressureStats {
-                        agent_id: agent.id,
-                        active_tokens: 0,
-                        budget_tokens: 0,
-                        spill_count: 0,
-                        evicted_messages: 0,
-                        stored_spills: 0,
-                        stored_spill_bytes: 0,
-                        error_count: 0,
-                        last_error: Some("pressure statistics unavailable".into()),
-                        updated_at: chrono::Utc::now(),
+                let context_pressure =
+                    kernel.context_pressure_stats(agent.id).unwrap_or_else(|_| {
+                        ContextPressureStats {
+                            agent_id: agent.id,
+                            tenant_id: String::new(),
+                            active_tokens: 0,
+                            budget_tokens: 0,
+                            agent_active_tokens: 0,
+                            agent_active_limit: 0,
+                            tenant_active_tokens: 0,
+                            tenant_active_limit: 0,
+                            global_active_tokens: 0,
+                            global_active_limit: 0,
+                            active_rejection_count: 0,
+                            spill_count: 0,
+                            evicted_messages: 0,
+                            stored_spills: 0,
+                            stored_spill_bytes: 0,
+                            agent_stored_bytes: 0,
+                            agent_storage_limit: 0,
+                            tenant_stored_bytes: 0,
+                            tenant_storage_limit: 0,
+                            global_stored_bytes: 0,
+                            global_storage_limit: 0,
+                            spill_retention_seconds: 0,
+                            error_count: 0,
+                            last_error: Some("pressure statistics unavailable".into()),
+                            updated_at: chrono::Utc::now(),
+                        }
                     });
                 agents.push(OperatorAgentSnapshot {
                     id: agent.id.to_string(),

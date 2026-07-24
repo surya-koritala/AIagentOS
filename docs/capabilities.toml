@@ -172,16 +172,16 @@ limitations = ["Turn scheduling is cooperative and token-accounted at completed-
 id = "context-pressure"
 title = "Durable context spill and pressure handling"
 owner = "runtime"
-maturity = "integrated"
+maturity = "production-qualified"
 release = "v0.5"
 tracking_issue = 115
 kernel_modules = ["context", "context_paging"]
-source_paths = ["crates/kernel/src/execution.rs"]
+source_paths = ["crates/kernel/src/context.rs", "crates/kernel/src/context_paging.rs", "crates/kernel/src/execution.rs", "crates/kernel/src/config.rs", "docs/CONTEXT_PRESSURE.md"]
 public_entry_points = ["crates/kernel/src/syscall_server.rs::Syscall::ContextPressure", "crates/sdk/src/lib.rs::KernelClient::context_pressure"]
-runtime_call_paths = ["crates/kernel/src/execution.rs::AgentExecutor::compact_to_token_budget"]
-test_evidence = ["tests/src/context_props.rs", "crates/kernel/src/execution.rs", "crates/sdk/src/lib.rs"]
+runtime_call_paths = ["crates/kernel/src/execution.rs::AgentExecutor::compact_to_token_budget", "crates/kernel/src/execution.rs::AgentExecutor::send_with_retry", "crates/kernel/src/context.rs::SqliteContextManager::store_context_spill"]
+test_evidence = ["crates/kernel/src/context.rs", "crates/kernel/src/context_paging.rs", "crates/kernel/src/execution.rs", "tests/src/context_props.rs", "crates/sdk/src/lib.rs"]
 platforms = ["linux", "macos", "windows"]
-limitations = ["Per-agent active prompts are bounded with durable spill or fail-closed rejection; tenant/global active pools, stored-byte/embedding/RSS quotas, automatic page-in, quality qualification, and a host-memory OOM policy remain outstanding."]
+limitations = ["Active prompt and durable context limits use explicit backpressure, not Linux virtual memory. Host RSS and external provider/vector-store caches are outside these counters and remain governed by process/container policy; there is intentionally no OOM victim killer. Page-in is explicit rather than automatic, and lossless storage tests do not claim zero model-quality impact from an immediately compacted prompt."]
 
 [[capability]]
 id = "syscall-vfs"

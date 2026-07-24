@@ -1302,7 +1302,12 @@ mod protocol_tests {
         let uuid = id.parse::<kernel::AgentId>().unwrap();
         kernel
             .context_manager
-            .kv_put(uuid, "context_spill:test:1", "sensitive prompt content")
+            .store_context_spill(
+                uuid,
+                "context_spill:test:1",
+                "sensitive prompt content",
+                "d53a2e0e81dc3fddd58698ee6aaa79e0e885f0e52d510b91ecd127ddc91e1058",
+            )
             .unwrap();
         kernel
             .context_manager

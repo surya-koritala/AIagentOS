@@ -58,7 +58,8 @@ Goal: every tool call goes through the syscall layer; provider quotas reject at 
   - Wire from `AgentKernelImpl::send_message` (`lib.rs:622`) so every CLI/Tauri call exercises it
   - Each agent gets a default cgroup at create time; default policy is `allow` so existing behaviour is preserved unless a profile asserts otherwise
 - [x] **Wire context pressure into live execution**
-  - Before each provider call, enforce the active token budget; serialize evicted messages to a durable per-agent spill and fail closed when pinned state cannot fit. See `docs/CONTEXT_PRESSURE.md`.
+  - Before each provider attempt, enforce atomic per-agent/tenant/kernel active-token admission; serialize evicted messages to a quota-bound, retained, SHA-256-verified spill and fail closed when pinned state or durable storage cannot fit.
+  - Conversations, embeddings, snapshots, active checkpoints, and spills share per-agent/tenant/kernel durable-byte ceilings. See `docs/CONTEXT_PRESSURE.md`.
 - [ ] **Observability retention** — bounded ring buffer (default 10k events) + per-agent purge on shutdown
 - [ ] **Honest README** — replace "368 tests passing" badge with live CI badge; replace the Linux-mapping table with a "load-bearing today / planned" table; link to this roadmap
 - [ ] **OS-ness e2e test** — `tests/src/os_enforcement.rs` exercising the three denials above
@@ -86,7 +87,7 @@ Goal: namespaces actually hide resources; scheduler actually decides who runs.
 - [x] **Namespace enforcement in tool resolution** — `SyscallGate` now consults a `tool_namespaces` table and per-agent `namespaces: Vec<NamespaceId>` membership; tools tagged with a namespace return `GateDenial::NotInNamespace` (≈ ENOENT) for non-members. The check runs first so foreign tools look indistinguishable from non-existent ones (no MAC-probe leak). Proven by `tests/src/os_enforcement.rs::namespace_isolation_denies_foreign_tool` and `namespace_denial_precedes_capability_and_mac`.
 - [x] **Per-namespace IPC** — `IpcManager` consults a `NamespaceVisibility` trait (impl by `SyscallGate::shares_namespace`) on every `send` and `publish`. Cross-namespace sends fail as `AgentNotFound` so a sender cannot probe for foreign mailboxes. Proven by `tests/src/os_enforcement.rs::namespace_isolation_blocks_cross_namespace_ipc`.
 - [x] **Scheduler admission, observability + accounting** — `AgentKernelImpl::send_message` serializes each agent before bounded CFS-inspired turn admission, acquires LLM cores per provider request, accounts tokens against vruntime, and exposes queue, wait/run, cancellation, starvation, class-share, and cooperative-yield metrics. `set_nice` preserves accumulated debt; shared-resource holders inherit waiting priority until release. This is cooperative scheduling, not CPU preemption or EEVDF.
-- [ ] **Host-memory pressure policy** — qualify RSS/cgroup limits and explicit backpressure; the runtime does not currently claim an OOM killer
+- [x] **Honest context-pressure policy** — prompt/storage pressure uses explicit backpressure and never advertises an OOM victim killer; host RSS remains the sandbox/container isolation boundary
 - [ ] **VFS for tools** — agents `tool_open()` a path → fd; `tool_call()` takes fd; descriptor table enforces per-agent open limits
 
 **Exit criteria for Phase 3:** Stress test runs 100 agents across 3 namespaces and 5 cgroups; isolation and provider-admission quota are observable from the outside.

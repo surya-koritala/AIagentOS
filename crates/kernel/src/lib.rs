@@ -1069,6 +1069,8 @@ pub struct AgentKernelImpl {
     /// Active-context token budget applied to each executor (from
     /// `budgets.max_context_tokens`; 0 = unbounded). Drives context paging.
     context_budget_tokens: u32,
+    /// Atomic per-agent/tenant/global admission for active provider prompts.
+    context_admission: Arc<crate::context_paging::ActiveContextManager>,
     /// Cumulative tool-call ceiling for one logical turn, including calls made
     /// before a durable pause/resume boundary. `0` means unlimited.
     max_tool_calls_per_turn: u32,
@@ -1245,6 +1247,12 @@ impl AgentKernelImpl {
         budgets.validate().map_err(|error| {
             KernelError::Policy(format!("invalid budget configuration: {error}"))
         })?;
+        context_manager.set_context_storage_limits(crate::context::ContextStorageLimits {
+            per_agent_bytes: budgets.max_context_storage_bytes,
+            per_tenant_bytes: budgets.tenant_max_context_storage_bytes,
+            global_bytes: budgets.global_max_context_storage_bytes,
+            spill_retention_seconds: budgets.context_spill_retention_seconds,
+        })?;
         let rate_limiter = Arc::new(RateLimiter::with_store(
             RateLimitConfig {
                 rpm: budgets.rpm,
@@ -1332,6 +1340,13 @@ impl AgentKernelImpl {
             syscall_gate,
             budget_enforcer,
             context_budget_tokens: budgets.max_context_tokens.min(u32::MAX as u64) as u32,
+            context_admission: Arc::new(crate::context_paging::ActiveContextManager::new(
+                crate::context_paging::ActiveContextLimits {
+                    per_agent_tokens: budgets.max_context_tokens,
+                    per_tenant_tokens: budgets.tenant_max_context_tokens,
+                    global_tokens: budgets.global_max_context_tokens,
+                },
+            )),
             max_tool_calls_per_turn: budgets.max_tool_calls,
             max_output_tokens_per_request: budgets.max_output_tokens_per_request,
             turn_admission: Arc::new(TurnAdmission::new(budgets.max_concurrent as usize)),
@@ -3045,6 +3060,23 @@ impl AgentKernelImpl {
             .next())
     }
 
+    /// Content-free durable and live context-pressure usage for one agent.
+    pub fn context_pressure_stats(
+        &self,
+        agent_id: AgentId,
+    ) -> Result<crate::context::ContextPressureStats, KernelError> {
+        let mut stats = self.context_manager.context_pressure_stats(agent_id)?;
+        let active = self.context_admission.usage(agent_id, &stats.tenant_id);
+        stats.agent_active_tokens = active.agent_tokens;
+        stats.agent_active_limit = active.per_agent_limit;
+        stats.tenant_active_tokens = active.tenant_tokens;
+        stats.tenant_active_limit = active.per_tenant_limit;
+        stats.global_active_tokens = active.global_tokens;
+        stats.global_active_limit = active.global_limit;
+        stats.active_rejection_count = active.rejection_count;
+        Ok(stats)
+    }
+
     /// Resume the newest (or explicitly selected) durable in-flight turn while
     /// holding lifecycle admission. Returns the completed output, or a new
     /// checkpoint id if another pause interrupted the continuation.
@@ -3274,6 +3306,11 @@ impl AgentKernelImpl {
         executor.set_budget_enforcer(self.budget_enforcer.clone());
         executor.set_rate_limiter(self.rate_limiter.clone());
         executor.set_context_budget(self.context_budget_tokens);
+        let tenant_id = self
+            .context_manager
+            .agent_tenant(agent_id)?
+            .unwrap_or_else(|| crate::context::DEFAULT_TENANT.to_string());
+        executor.set_context_admission(self.context_admission.clone(), tenant_id);
         executor.set_max_tool_calls(self.max_tool_calls_per_turn);
         executor.set_max_output_tokens_per_request(self.max_output_tokens_per_request);
         if let Some(pid) = self.syscall_gate.pid_of(agent_id) {

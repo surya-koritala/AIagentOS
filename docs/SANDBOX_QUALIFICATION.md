@@ -33,8 +33,8 @@ not a package or remote-agent option.
 ## Live Linux qualification
 
 The protected extended-security workflow starts an exact Docker Engine version
-in rootless mode and pulls an immutable Alpine index digest. Its ignored-by-
-default live test then:
+in rootless mode with the `cgroupfs` driver and pulls an immutable Alpine index
+digest. Its ignored-by-default live test then:
 
 1. verifies rootless daemon and local image digest checks;
 2. checks zero effective capabilities, `NoNewPrivs`, read-only root, network

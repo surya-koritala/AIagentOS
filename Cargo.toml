@@ -49,3 +49,4 @@ rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"]
 # in the dependency tree via rustls/rcgen (the "ring" feature above), so this
 # adds no new transitive weight — it just exposes `ring::digest` to the kernel.
 ring = "0.17"
+cap-std = "4.0.2"

@@ -5,12 +5,16 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
+use cap_std::ambient_authority;
+use cap_std::fs::Dir;
 use dashmap::DashMap;
 
 use crate::{AgentId, IsolationLevel, SandboxConfig, SandboxError, SandboxId};
 
 /// The Sandbox Manager trait.
+#[async_trait::async_trait]
 pub trait SandboxManager: Send + Sync {
     fn create_sandbox(
         &self,
@@ -31,6 +35,24 @@ pub trait SandboxManager: Send + Sync {
         sandbox_id: SandboxId,
         path: &Path,
     ) -> Result<PathBuf, SandboxError>;
+    /// Execute a filesystem operation through the sandbox's directory
+    /// capability. Providers never reopen an authorized host pathname for
+    /// non-trusted agents.
+    fn execute_filesystem(
+        &self,
+        sandbox_id: SandboxId,
+        operation: &str,
+        parameters: &serde_json::Value,
+    ) -> Result<serde_json::Value, SandboxError>;
+    /// Execute HTTP through a client bound to the policy-validated DNS answers.
+    /// Redirects and ambient proxy configuration are disabled.
+    async fn execute_network(
+        &self,
+        sandbox_id: SandboxId,
+        operation: &str,
+        parameters: &serde_json::Value,
+    ) -> Result<serde_json::Value, SandboxError>;
+    fn isolation_level(&self, sandbox_id: SandboxId) -> Result<IsolationLevel, SandboxError>;
     fn get_sandbox_for_agent(&self, agent_id: AgentId) -> Option<SandboxId>;
 }
 
@@ -61,6 +83,9 @@ struct SandboxState {
     allowed_network_hosts: HashSet<String>,
     isolation_level: IsolationLevel,
     managed_workspace: bool,
+    workspace: Option<Arc<Dir>>,
+    max_disk_usage_bytes: Option<u64>,
+    operation_lock: Arc<Mutex<()>>,
 }
 
 /// Concrete sandbox manager implementation.
@@ -137,10 +162,39 @@ impl SandboxManagerImpl {
                     "sandbox workspace must be an absolute path".into(),
                 ));
             }
+            let existed = config.workspace_dir.exists();
             std::fs::create_dir_all(&config.workspace_dir)
                 .map_err(|error| SandboxError::CreationFailed(error.to_string()))?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+                if !existed || managed_workspace {
+                    std::fs::set_permissions(
+                        &config.workspace_dir,
+                        std::fs::Permissions::from_mode(0o700),
+                    )
+                    .map_err(|error| SandboxError::CreationFailed(error.to_string()))?;
+                }
+                let metadata = std::fs::metadata(&config.workspace_dir)
+                    .map_err(|error| SandboxError::CreationFailed(error.to_string()))?;
+                if metadata.uid() != unsafe { libc::geteuid() } || metadata.mode() & 0o077 != 0 {
+                    return Err(SandboxError::CreationFailed(
+                        "untrusted sandbox workspace must be owned by the service user and mode 0700"
+                            .into(),
+                    ));
+                }
+            }
             std::fs::canonicalize(&config.workspace_dir)
                 .map_err(|error| SandboxError::CreationFailed(error.to_string()))?
+        };
+        let workspace = if config.isolation_level == IsolationLevel::Trusted {
+            None
+        } else {
+            Some(Arc::new(
+                Dir::open_ambient_dir(&workspace_dir, ambient_authority())
+                    .map_err(|error| SandboxError::CreationFailed(error.to_string()))?,
+            ))
         };
         let sandbox_id = uuid::Uuid::new_v4();
         let allowed_hosts = config
@@ -155,6 +209,9 @@ impl SandboxManagerImpl {
             allowed_network_hosts: allowed_hosts,
             isolation_level: config.isolation_level.clone(),
             managed_workspace,
+            workspace,
+            max_disk_usage_bytes: config.max_disk_usage_bytes,
+            operation_lock: Arc::new(Mutex::new(())),
         };
         self.sandboxes.insert(sandbox_id, state);
         self.agent_sandboxes.insert(agent_id, sandbox_id);
@@ -203,8 +260,356 @@ impl SandboxManagerImpl {
         }
         Ok(target)
     }
+
+    fn relative_capability_path(
+        state: &SandboxState,
+        path: &Path,
+    ) -> Result<PathBuf, SandboxError> {
+        let relative = if path.is_absolute() {
+            path.strip_prefix(&state.workspace_dir)
+                .map_err(|_| SandboxError::BoundaryViolation("filesystem target denied".into()))?
+                .to_path_buf()
+        } else {
+            path.to_path_buf()
+        };
+        if relative.as_os_str().is_empty() {
+            return Ok(PathBuf::from("."));
+        }
+        if relative.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::ParentDir
+                    | std::path::Component::RootDir
+                    | std::path::Component::Prefix(_)
+            )
+        }) {
+            return Err(SandboxError::BoundaryViolation(
+                "filesystem target denied".into(),
+            ));
+        }
+        Ok(relative)
+    }
+
+    fn filesystem_error(operation: &str, error: std::io::Error) -> SandboxError {
+        SandboxError::BoundaryViolation(format!(
+            "sandbox filesystem {operation} failed ({:?})",
+            error.kind()
+        ))
+    }
+
+    fn directory_usage(dir: &Dir) -> Result<u64, SandboxError> {
+        let mut usage = 0_u64;
+        let entries = dir
+            .entries()
+            .map_err(|error| Self::filesystem_error("quota scan", error))?;
+        for entry in entries {
+            let entry = entry.map_err(|error| Self::filesystem_error("quota scan", error))?;
+            let file_type = entry
+                .file_type()
+                .map_err(|error| Self::filesystem_error("quota scan", error))?;
+            if file_type.is_symlink() {
+                continue;
+            }
+            if file_type.is_dir() {
+                let child = dir
+                    .open_dir(entry.file_name())
+                    .map_err(|error| Self::filesystem_error("quota scan", error))?;
+                usage = usage.saturating_add(Self::directory_usage(&child)?);
+            } else if file_type.is_file() {
+                usage = usage.saturating_add(
+                    entry
+                        .metadata()
+                        .map_err(|error| Self::filesystem_error("quota scan", error))?
+                        .len(),
+                );
+            }
+        }
+        Ok(usage)
+    }
+
+    fn enforce_write_quota(
+        state: &SandboxState,
+        workspace: &Dir,
+        relative: &Path,
+        new_len: u64,
+    ) -> Result<(), SandboxError> {
+        let Some(limit) = state.max_disk_usage_bytes else {
+            return Ok(());
+        };
+        let current = Self::directory_usage(workspace)?;
+        let replaced_len = workspace
+            .metadata(relative)
+            .ok()
+            .filter(|metadata| metadata.is_file())
+            .map(|metadata| metadata.len())
+            .unwrap_or(0);
+        if current.saturating_sub(replaced_len).saturating_add(new_len) > limit {
+            return Err(SandboxError::BoundaryViolation(
+                "sandbox disk quota exceeded".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn execute_filesystem_inner(
+        state: &SandboxState,
+        operation: &str,
+        parameters: &serde_json::Value,
+    ) -> Result<serde_json::Value, SandboxError> {
+        if state.isolation_level == IsolationLevel::Trusted {
+            return Err(SandboxError::BoundaryViolation(
+                "trusted filesystem requests must use an operator provider".into(),
+            ));
+        }
+        let workspace = state.workspace.as_ref().ok_or_else(|| {
+            SandboxError::BoundaryViolation("sandbox filesystem unavailable".into())
+        })?;
+        let supplied = parameters
+            .get("path")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| {
+                SandboxError::BoundaryViolation("sandbox filesystem target denied".into())
+            })?;
+        let relative = Self::relative_capability_path(state, Path::new(supplied))?;
+        let _operation = state.operation_lock.lock().map_err(|_| {
+            SandboxError::BoundaryViolation("sandbox filesystem unavailable".into())
+        })?;
+
+        match operation {
+            "read" => {
+                let content = workspace
+                    .read_to_string(&relative)
+                    .map_err(|error| Self::filesystem_error("read", error))?;
+                Ok(serde_json::json!({"content": content}))
+            }
+            "write" | "create" => {
+                let content = parameters
+                    .get("content")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("");
+                Self::enforce_write_quota(state, workspace, &relative, content.len() as u64)?;
+                workspace
+                    .write(&relative, content)
+                    .map_err(|error| Self::filesystem_error("write", error))?;
+                Ok(serde_json::json!({"written": true}))
+            }
+            "create_dir" => {
+                workspace
+                    .create_dir_all(&relative)
+                    .map_err(|error| Self::filesystem_error("create directory", error))?;
+                Ok(serde_json::json!({"created": true}))
+            }
+            "edit" => {
+                let search = parameters
+                    .get("search")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| {
+                        SandboxError::BoundaryViolation(
+                            "sandbox edit search value is required".into(),
+                        )
+                    })?;
+                let replace = parameters
+                    .get("replace")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("");
+                let content = workspace
+                    .read_to_string(&relative)
+                    .map_err(|error| Self::filesystem_error("edit read", error))?;
+                if !content.contains(search) {
+                    return Err(SandboxError::BoundaryViolation(
+                        "sandbox edit search text was not found".into(),
+                    ));
+                }
+                let updated = content.replacen(search, replace, 1);
+                Self::enforce_write_quota(state, workspace, &relative, updated.len() as u64)?;
+
+                let parent = relative.parent().unwrap_or_else(|| Path::new(""));
+                let temporary = parent.join(format!(".aiagentos-edit-{}", uuid::Uuid::new_v4()));
+                workspace
+                    .write(&temporary, &updated)
+                    .map_err(|error| Self::filesystem_error("edit write", error))?;
+                if let Err(error) = workspace.rename(&temporary, workspace, &relative) {
+                    let _ = workspace.remove_file(&temporary);
+                    return Err(Self::filesystem_error("edit commit", error));
+                }
+                Ok(serde_json::json!({"edited": true}))
+            }
+            "delete" => {
+                workspace
+                    .remove_file(&relative)
+                    .map_err(|error| Self::filesystem_error("delete", error))?;
+                Ok(serde_json::json!({"deleted": true}))
+            }
+            "list" => {
+                let entries = workspace
+                    .read_dir(&relative)
+                    .map_err(|error| Self::filesystem_error("list", error))?
+                    .map(|entry| {
+                        entry
+                            .map(|entry| entry.file_name().to_string_lossy().to_string())
+                            .map_err(|error| Self::filesystem_error("list", error))
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(serde_json::json!({"entries": entries}))
+            }
+            _ => Err(SandboxError::BoundaryViolation(
+                "unsupported sandbox filesystem operation".into(),
+            )),
+        }
+    }
+
+    fn network_target(
+        state: &SandboxState,
+        target: &str,
+    ) -> Result<(reqwest::Url, String, u16), SandboxError> {
+        let url = reqwest::Url::parse(target)
+            .map_err(|_| SandboxError::BoundaryViolation("invalid network target".into()))?;
+        if !matches!(url.scheme(), "http" | "https")
+            || !url.username().is_empty()
+            || url.password().is_some()
+        {
+            return Err(SandboxError::BoundaryViolation(
+                "network target scheme or credentials denied".into(),
+            ));
+        }
+        let host = url
+            .host_str()
+            .ok_or_else(|| SandboxError::BoundaryViolation("missing network host".into()))?
+            .trim_end_matches('.')
+            .to_ascii_lowercase();
+        let port = url
+            .port_or_known_default()
+            .ok_or_else(|| SandboxError::BoundaryViolation("network port denied".into()))?;
+        let required_port = if url.scheme() == "https" { 443 } else { 80 };
+        if port != required_port {
+            return Err(SandboxError::BoundaryViolation(
+                "network port denied".into(),
+            ));
+        }
+        if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+            if !is_public_ip(ip) {
+                return Err(SandboxError::BoundaryViolation(
+                    "private or local network targets are denied".into(),
+                ));
+            }
+        }
+        if !state.allowed_network_hosts.contains(&host) {
+            return Err(SandboxError::BoundaryViolation(
+                "network host is not in the sandbox allowlist".into(),
+            ));
+        }
+        Ok((url, host, port))
+    }
+
+    async fn execute_network_inner(
+        state: &SandboxState,
+        operation: &str,
+        parameters: &serde_json::Value,
+    ) -> Result<serde_json::Value, SandboxError> {
+        if state.isolation_level == IsolationLevel::Trusted {
+            return Err(SandboxError::BoundaryViolation(
+                "trusted network requests must use an operator provider".into(),
+            ));
+        }
+        let target = parameters
+            .get("url")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| SandboxError::BoundaryViolation("network target denied".into()))?;
+        let (url, host, port) = Self::network_target(state, target)?;
+
+        let mut addresses = if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+            vec![std::net::SocketAddr::new(ip, port)]
+        } else {
+            tokio::net::lookup_host((host.as_str(), port))
+                .await
+                .map_err(|_| {
+                    SandboxError::BoundaryViolation("network name resolution denied".into())
+                })?
+                .collect::<Vec<_>>()
+        };
+        addresses.sort_unstable();
+        addresses.dedup();
+        if addresses.is_empty() || addresses.iter().any(|address| !is_public_ip(address.ip())) {
+            return Err(SandboxError::BoundaryViolation(
+                "network name resolved to a denied address".into(),
+            ));
+        }
+
+        let mut builder = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .no_proxy();
+        if host.parse::<std::net::IpAddr>().is_err() {
+            builder = builder.resolve_to_addrs(&host, &addresses);
+        }
+        let client = builder
+            .build()
+            .map_err(|_| SandboxError::BoundaryViolation("network client unavailable".into()))?;
+
+        let request = match operation {
+            "get" | "browse" => client.get(url),
+            "post" => client.post(url).json(
+                &parameters
+                    .get("body")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null),
+            ),
+            "put" => client.put(url).json(
+                &parameters
+                    .get("body")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null),
+            ),
+            "delete" => client.delete(url),
+            _ => {
+                return Err(SandboxError::BoundaryViolation(
+                    "unsupported sandbox network operation".into(),
+                ))
+            }
+        };
+        let mut response = request
+            .send()
+            .await
+            .map_err(|_| SandboxError::BoundaryViolation("network request failed".into()))?;
+        let status = response.status().as_u16();
+        const MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
+        let mut body = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|_| SandboxError::BoundaryViolation("network response failed".into()))?
+        {
+            if body.len().saturating_add(chunk.len()) > MAX_RESPONSE_BYTES {
+                return Err(SandboxError::BoundaryViolation(
+                    "network response exceeded sandbox limit".into(),
+                ));
+            }
+            body.extend_from_slice(&chunk);
+        }
+        let text = String::from_utf8_lossy(&body).to_string();
+        if operation == "browse" {
+            let mut in_tag = false;
+            let mut visible = String::new();
+            for character in text.chars() {
+                match character {
+                    '<' => in_tag = true,
+                    '>' => in_tag = false,
+                    _ if !in_tag => visible.push(character),
+                    _ => {}
+                }
+            }
+            let clean = visible.split_whitespace().collect::<Vec<_>>().join(" ");
+            let content = clean
+                .chars()
+                .take(crate::MAX_BROWSE_CHARS.load(std::sync::atomic::Ordering::Relaxed))
+                .collect::<String>();
+            Ok(serde_json::json!({"status": status, "content": content}))
+        } else {
+            Ok(serde_json::json!({"status": status, "body": text}))
+        }
+    }
 }
 
+#[async_trait::async_trait]
 impl SandboxManager for SandboxManagerImpl {
     fn create_sandbox(
         &self,
@@ -245,30 +650,7 @@ impl SandboxManager for SandboxManagerImpl {
                 if state.isolation_level == IsolationLevel::Trusted {
                     return Ok(());
                 }
-                let url = reqwest::Url::parse(target).map_err(|_| {
-                    SandboxError::BoundaryViolation("invalid network target".into())
-                })?;
-                if !matches!(url.scheme(), "http" | "https") {
-                    return Err(SandboxError::BoundaryViolation(
-                        "only http/https network targets are allowed".into(),
-                    ));
-                }
-                let host = url
-                    .host_str()
-                    .ok_or_else(|| SandboxError::BoundaryViolation("missing network host".into()))?
-                    .to_ascii_lowercase();
-                if let Ok(ip) = host.parse::<std::net::IpAddr>() {
-                    if !is_public_ip(ip) {
-                        return Err(SandboxError::BoundaryViolation(
-                            "private or local network targets are denied".into(),
-                        ));
-                    }
-                }
-                if !state.allowed_network_hosts.contains(&host) {
-                    return Err(SandboxError::BoundaryViolation(
-                        "network host is not in the sandbox allowlist".into(),
-                    ));
-                }
+                Self::network_target(&state, target)?;
             }
             SandboxAction::ProcessExec(_) => {
                 if state.isolation_level == IsolationLevel::Trusted {
@@ -304,6 +686,40 @@ impl SandboxManager for SandboxManagerImpl {
         Self::resolve_against_state(&state, path)
     }
 
+    fn execute_filesystem(
+        &self,
+        sandbox_id: SandboxId,
+        operation: &str,
+        parameters: &serde_json::Value,
+    ) -> Result<serde_json::Value, SandboxError> {
+        let state = self
+            .sandboxes
+            .get(&sandbox_id)
+            .ok_or_else(|| SandboxError::BoundaryViolation("Sandbox not found".to_string()))?;
+        Self::execute_filesystem_inner(&state, operation, parameters)
+    }
+
+    async fn execute_network(
+        &self,
+        sandbox_id: SandboxId,
+        operation: &str,
+        parameters: &serde_json::Value,
+    ) -> Result<serde_json::Value, SandboxError> {
+        let state = self
+            .sandboxes
+            .get(&sandbox_id)
+            .map(|state| state.clone())
+            .ok_or_else(|| SandboxError::BoundaryViolation("Sandbox not found".to_string()))?;
+        Self::execute_network_inner(&state, operation, parameters).await
+    }
+
+    fn isolation_level(&self, sandbox_id: SandboxId) -> Result<IsolationLevel, SandboxError> {
+        self.sandboxes
+            .get(&sandbox_id)
+            .map(|state| state.isolation_level.clone())
+            .ok_or_else(|| SandboxError::BoundaryViolation("Sandbox not found".to_string()))
+    }
+
     fn get_sandbox_for_agent(&self, agent_id: AgentId) -> Option<SandboxId> {
         self.agent_sandboxes.get(&agent_id).map(|r| *r.value())
     }
@@ -321,6 +737,9 @@ fn is_public_ip(ip: std::net::IpAddr) -> bool {
                 || ip.octets()[0] == 0)
         }
         std::net::IpAddr::V6(ip) => {
+            if let Some(mapped) = ip.to_ipv4_mapped() {
+                return is_public_ip(std::net::IpAddr::V4(mapped));
+            }
             let segments = ip.segments();
             !(ip.is_loopback()
                 || ip.is_unspecified()
@@ -474,13 +893,39 @@ mod tests {
             .is_err());
     }
 
+    #[test]
+    fn mapped_private_ip_credentials_and_nonstandard_ports_are_denied() {
+        let mgr = SandboxManagerImpl::new();
+        let agent_id = uuid::Uuid::new_v4();
+        let config = SandboxConfig {
+            allowed_network_hosts: Some(vec!["::ffff:127.0.0.1".into(), "api.openai.com".into()]),
+            ..test_config()
+        };
+        let sid = mgr.create_sandbox(agent_id, &config).unwrap();
+
+        for target in [
+            "http://[::ffff:127.0.0.1]/",
+            "https://user:secret@api.openai.com/",
+            "https://api.openai.com:8443/",
+            "http://api.openai.com:443/",
+        ] {
+            assert!(
+                mgr.intercept_action(sid, &SandboxAction::NetworkAccess(target.into()))
+                    .is_err(),
+                "{target} must be denied"
+            );
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn existing_symlink_escape_is_denied() {
         use std::os::unix::fs::symlink;
+        use std::os::unix::fs::PermissionsExt;
 
         let root = std::env::temp_dir().join(format!("agentos-symlink-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
         symlink("/etc", root.join("escape")).unwrap();
         let mgr = SandboxManagerImpl::new();
         let sid = mgr
@@ -499,5 +944,111 @@ mod tests {
             .intercept_action(sid, &SandboxAction::FileAccess(root.join("escape/passwd")))
             .is_err());
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn capability_io_blocks_a_symlink_swap_after_authorization() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let root = std::env::temp_dir().join(format!("agentos-cap-race-{}", uuid::Uuid::new_v4()));
+        let outside =
+            std::env::temp_dir().join(format!("agentos-cap-outside-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("slot")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::write(outside.join("target.txt"), "outside sentinel").unwrap();
+
+        let mgr = SandboxManagerImpl::new();
+        let sid = mgr
+            .create_sandbox(
+                uuid::Uuid::new_v4(),
+                &SandboxConfig {
+                    workspace_dir: root.clone(),
+                    allowed_network_hosts: Some(Vec::new()),
+                    max_disk_usage_bytes: None,
+                    max_memory_bytes: None,
+                    isolation_level: IsolationLevel::Filesystem,
+                },
+            )
+            .unwrap();
+
+        let authorized = mgr
+            .resolve_file_path(sid, Path::new("slot/target.txt"))
+            .unwrap();
+        std::fs::rename(root.join("slot"), root.join("original")).unwrap();
+        symlink(&outside, root.join("slot")).unwrap();
+
+        let result = mgr.execute_filesystem(
+            sid,
+            "write",
+            &serde_json::json!({
+                "path": authorized.to_str().unwrap(),
+                "content": "must stay inside"
+            }),
+        );
+        assert!(result.is_err());
+        assert_eq!(
+            std::fs::read_to_string(outside.join("target.txt")).unwrap(),
+            "outside sentinel"
+        );
+
+        std::fs::remove_dir_all(root).unwrap();
+        std::fs::remove_dir_all(outside).unwrap();
+    }
+
+    #[test]
+    fn capability_io_enforces_disk_quota_before_mutation() {
+        let mgr = SandboxManagerImpl::new();
+        let config = SandboxConfig {
+            max_disk_usage_bytes: Some(4),
+            ..test_config()
+        };
+        let root = config.workspace_dir.clone();
+        let sid = mgr.create_sandbox(uuid::Uuid::new_v4(), &config).unwrap();
+
+        assert!(mgr
+            .execute_filesystem(
+                sid,
+                "write",
+                &serde_json::json!({"path": "too-large.txt", "content": "12345"}),
+            )
+            .is_err());
+        assert!(!root.join("too-large.txt").exists());
+        assert!(mgr
+            .execute_filesystem(
+                sid,
+                "write",
+                &serde_json::json!({"path": "fits.txt", "content": "1234"}),
+            )
+            .is_ok());
+        assert_eq!(
+            std::fs::read_to_string(root.join("fits.txt")).unwrap(),
+            "1234"
+        );
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn capability_io_rejects_cross_agent_workspace_access() {
+        let mgr = SandboxManagerImpl::new();
+        let first = test_config();
+        let second = test_config();
+        let first_root = first.workspace_dir.clone();
+        let second_root = second.workspace_dir.clone();
+        let first_id = mgr.create_sandbox(uuid::Uuid::new_v4(), &first).unwrap();
+        mgr.create_sandbox(uuid::Uuid::new_v4(), &second).unwrap();
+        std::fs::write(second_root.join("secret.txt"), "other agent").unwrap();
+
+        let result = mgr.execute_filesystem(
+            first_id,
+            "read",
+            &serde_json::json!({"path": second_root.join("secret.txt")}),
+        );
+        assert!(result.is_err());
+
+        std::fs::remove_dir_all(first_root).unwrap();
+        std::fs::remove_dir_all(second_root).unwrap();
     }
 }

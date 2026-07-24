@@ -18,6 +18,32 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  rootless-container-sandbox:
+    name: Rootless container sandbox breakout and cleanup
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
+        with:
+          toolchain: 1.97.1
+      - uses: docker/setup-docker-action@77e84dbf09b47d1e29270283c22f16145aa85ca1 # v5
+        with:
+          version: v29.6.2
+          rootless: true
+      - name: Verify rootless daemon and pull immutable qualification image
+        env:
+          QUALIFICATION_IMAGE: alpine@sha256:14358309a308569c32bdc37e2e0e9694be33a9d99e68afb0f5ff33cc1f695dce
+        run: |
+          docker info --format '{{json .SecurityOptions}}' | grep -qi rootless
+          docker pull "${QUALIFICATION_IMAGE}"
+          echo "AGENTOS_SANDBOX_TEST_IMAGE=${QUALIFICATION_IMAGE}" >> "$GITHUB_ENV"
+      - name: Exercise live breakout, cancellation, and crash cleanup
+        run: >-
+          cargo test -p kernel
+          docker_sandbox::tests::live_rootless_container_blocks_escape_and_cleans_cancellation_and_crash
+          --locked -- --ignored --exact --nocapture
+
   miri:
     name: Miri (unsafe/concurrency smoke)
     runs-on: ubuntu-latest

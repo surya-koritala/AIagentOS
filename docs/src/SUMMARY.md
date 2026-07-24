@@ -13,6 +13,7 @@
   - [Operations API](./operations-api.md)
   - [Agent Service Supervisor](./services.md)
   - [Secondary Capability Disposition](./secondary-capabilities.md)
+  - [Sandbox Qualification](./sandbox-qualification.md)
   - [LLM Provider Support](./providers.md)
   - [The Syscall Gate](./syscall-gate.md)
   - [Agent Package Format](./agent-package.md)

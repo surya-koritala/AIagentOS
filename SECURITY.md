@@ -31,9 +31,15 @@ We will respond within 48 hours and work with you on a fix.
   proxies and redirects are disabled, and only default HTTP(S) ports are used.
 - Native process mode, direct host MCP launch, and unisolated browser execution
   fail closed. Linux container mode requires a rootless daemon and a locally
-  verified digest-pinned image with hardened run flags. Linux live-breakout
-  qualification and macOS/Windows process/container backends remain open #111
-  work, so the project does not yet claim complete cross-platform host isolation.
+  verified digest-pinned image with hardened run flags. The protected extended
+  security workflow exercises capability removal, read-only root, network
+  denial, cancellation cleanup, and crash-orphan reconciliation against a live
+  rootless daemon.
+- macOS and Windows process/container isolation, untrusted browser/peripheral
+  execution, and outbound MCP children are explicitly unsupported and fail
+  closed. The project claims the narrower support contract documented in
+  [docs/SANDBOX_QUALIFICATION.md](docs/SANDBOX_QUALIFICATION.md), not universal
+  host isolation. Independent penetration testing remains a v1 gate in #127.
 - High-risk operations require the capabilities/approval declared by the tool
   contract; an explicitly trusted operator profile can carry broader authority.
 

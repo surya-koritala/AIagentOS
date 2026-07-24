@@ -3357,11 +3357,20 @@ impl AgentKernelImpl {
             },
         )?;
         if let Some(pid) = self.syscall_gate.pid_of(agent_id) {
-            self.os
-                .cfs
-                .lock()
-                .await
-                .account_tokens(pid, u64::from(tokens));
+            let yielded = {
+                let mut scheduler = self.os.cfs.lock().await;
+                scheduler.account_tokens(pid, u64::from(tokens));
+                let yielded = scheduler.time_slice_expired(pid);
+                if yielded {
+                    // The live contract yields only at a completed turn
+                    // boundary; this is not CPU or mid-future preemption.
+                    scheduler.reset_slice(pid);
+                }
+                yielded
+            };
+            if yielded {
+                self.turn_admission.record_cooperative_yield();
+            }
         }
         Ok(())
     }
@@ -5290,5 +5299,41 @@ mod tests {
             KernelEvent::ShutdownInitiated,
         ];
         assert_eq!(events.len(), 5);
+    }
+
+    #[tokio::test]
+    async fn completed_turn_slice_exhaustion_records_a_cooperative_yield() {
+        let kernel = AgentKernelImpl::new().unwrap();
+        let agent = kernel
+            .create_agent_full(lifecycle_test_config("cooperative-yield"))
+            .await
+            .unwrap();
+        let output = AgentOutput {
+            content: "completed at a turn boundary".into(),
+            tool_calls_made: 0,
+            tokens_used: 1_001,
+            provider_id: "test".into(),
+            model_id: "test-model".into(),
+            estimated_cost_usd: 0.0,
+            usage: crate::execution::UsageTelemetry {
+                output_tokens: 1_001,
+                ..crate::execution::UsageTelemetry::default()
+            },
+        };
+
+        kernel
+            .record_output_since(
+                agent.id,
+                &output,
+                0,
+                0,
+                crate::execution::UsageTelemetry::default(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(kernel.turn_admission.metrics().cooperative_yields_total, 1);
+        let pid = kernel.syscall_gate.pid_of(agent.id).unwrap();
+        assert_eq!(kernel.os.cfs.lock().await.tokens_used_of(pid), Some(0));
     }
 }

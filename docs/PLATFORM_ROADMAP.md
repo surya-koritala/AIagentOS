@@ -49,7 +49,7 @@ Sizes: **S** ≈ days, **M** ≈ 1–2 weeks, **L** ≈ 3–6 weeks, **XL** ≈ 
 | ID | Title | Size | Deps | Notes |
 |----|-------|------|------|-------|
 | **B1.1** | LLM backend breadth: add more `LlmProviderAdapter`s — 4 → 9+ | M | — | **Done** (9 providers: azure-openai, openai, anthropic, local, groq, deepseek, gemini, vllm, huggingface; routing/failover via the connector) |
-| **B1.2** | LLM-request scheduling: scheduler dispatches queued LLM *requests* to LLM cores (today CFS/TurnAdmission gates agent *turns*) | L | B0.1 | **Done** (`llm_sched::LlmScheduler`: bounded LLM cores + priority-ordered RAII admission, wired into `send_message`) |
+| **B1.2** | LLM-request scheduling: scheduler dispatches queued LLM *requests* to LLM cores (CFS-inspired `TurnAdmission` gates agent *turns*) | L | B0.1 | **Production-qualified** (bounded per-request LLM cores, priority aging, cancellation-safe RAII admission, starvation escape, shared-resource priority inheritance, class/yield metrics, and sustained contention tests; scheduling remains cooperative rather than CPU preemption). |
 | **B1.3** | Function-calling shim for open-source models (structured tool-calling for models without native support) | M | — | **Done** (`function_calling`: render_tools_prompt + parse_tool_calls; executor plaintext-fallback path) |
 
 ## Phase 2 — Context management

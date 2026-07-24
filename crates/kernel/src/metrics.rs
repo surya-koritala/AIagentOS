@@ -194,7 +194,12 @@ pub struct MetricsSnapshot {
     pub waiting_turns: u64,
     pub turn_capacity: u64,
     pub turn_admitted_total: u64,
+    pub turn_admitted_realtime_total: u64,
+    pub turn_admitted_normal_total: u64,
+    pub turn_admitted_background_total: u64,
+    pub turn_admitted_deadline_total: u64,
     pub turn_cancelled_total: u64,
+    pub turn_cooperative_yields_total: u64,
     pub turn_starvation_total: u64,
     pub turn_wait_ns_total: u64,
     pub turn_run_ns_total: u64,
@@ -277,7 +282,12 @@ impl MetricsSnapshot {
             waiting_turns: turns.waiting as u64,
             turn_capacity: turns.capacity as u64,
             turn_admitted_total: turns.admitted_total,
+            turn_admitted_realtime_total: turns.admitted_realtime_total,
+            turn_admitted_normal_total: turns.admitted_normal_total,
+            turn_admitted_background_total: turns.admitted_background_total,
+            turn_admitted_deadline_total: turns.admitted_deadline_total,
             turn_cancelled_total: turns.cancelled_total,
+            turn_cooperative_yields_total: turns.cooperative_yields_total,
             turn_starvation_total: turns.starvation_total,
             turn_wait_ns_total: turns.wait_ns_total,
             turn_run_ns_total: turns.run_ns_total,
@@ -409,12 +419,32 @@ impl MetricsSnapshot {
             self.turn_admitted_total
         ));
         out.push_str(
+            "# HELP agentos_turn_class_admitted_total Agent turns admitted by bounded scheduling class.\n",
+        );
+        out.push_str("# TYPE agentos_turn_class_admitted_total counter\n");
+        for (class, value) in [
+            ("realtime", self.turn_admitted_realtime_total),
+            ("normal", self.turn_admitted_normal_total),
+            ("background", self.turn_admitted_background_total),
+            ("deadline", self.turn_admitted_deadline_total),
+        ] {
+            out.push_str(&format!(
+                "agentos_turn_class_admitted_total{{class=\"{class}\"}} {value}\n"
+            ));
+        }
+        out.push_str(
             "# HELP agentos_turn_cancelled_total Turn waiters cancelled before admission.\n",
         );
         out.push_str("# TYPE agentos_turn_cancelled_total counter\n");
         out.push_str(&format!(
             "agentos_turn_cancelled_total {}\n",
             self.turn_cancelled_total
+        ));
+        out.push_str("# HELP agentos_turn_cooperative_yields_total Completed turns that exhausted their token slice and yielded at the public turn boundary.\n");
+        out.push_str("# TYPE agentos_turn_cooperative_yields_total counter\n");
+        out.push_str(&format!(
+            "agentos_turn_cooperative_yields_total {}\n",
+            self.turn_cooperative_yields_total
         ));
         out.push_str("# HELP agentos_turn_starvation_total Admitted turns whose wait exceeded the 30-second starvation threshold.\n");
         out.push_str("# TYPE agentos_turn_starvation_total counter\n");
@@ -670,7 +700,12 @@ mod tests {
             waiting_turns: 1,
             turn_capacity: 3,
             turn_admitted_total: 9,
+            turn_admitted_realtime_total: 1,
+            turn_admitted_normal_total: 6,
+            turn_admitted_background_total: 1,
+            turn_admitted_deadline_total: 1,
             turn_cancelled_total: 2,
+            turn_cooperative_yields_total: 4,
             turn_starvation_total: 1,
             turn_wait_ns_total: 100,
             turn_run_ns_total: 200,
@@ -733,6 +768,8 @@ mod tests {
         assert!(text.contains("# TYPE agentos_running_agents gauge"));
         assert!(text.contains("# TYPE agentos_live_agents gauge"));
         assert!(text.contains("# TYPE agentos_turn_admission gauge"));
+        assert!(text.contains("# TYPE agentos_turn_class_admitted_total counter"));
+        assert!(text.contains("# TYPE agentos_turn_cooperative_yields_total counter"));
         assert!(text.contains("# TYPE agentos_llm_cores gauge"));
         assert!(text.contains("# TYPE agentos_turn_wait_nanoseconds_total counter"));
         assert!(text.contains("# TYPE agentos_llm_wait_nanoseconds_total counter"));
@@ -764,6 +801,8 @@ mod tests {
         assert!(text.contains("agentos_paused_agents 1"));
         assert!(text.contains("agentos_stopped_agents 1"));
         assert!(text.contains("agentos_turn_admission{state=\"active\"} 2"));
+        assert!(text.contains("agentos_turn_class_admitted_total{class=\"normal\"} 6"));
+        assert!(text.contains("agentos_turn_cooperative_yields_total 4"));
         assert!(text.contains("agentos_llm_cores{state=\"in_flight\"} 1"));
         assert!(text.contains("agentos_quota_storage_healthy 1"));
         assert!(text.contains("agentos_quota_epoch 42"));

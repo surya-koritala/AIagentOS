@@ -30,7 +30,6 @@ struct CfsEntry {
     vruntime: u64,
     weight: u64,
     nice: i8,
-    #[allow(dead_code)]
     class: SchedClass,
     tokens_used: u64,
 }
@@ -273,6 +272,18 @@ impl CfsScheduler {
         None
     }
 
+    /// Read an agent's scheduling class for bounded per-class admission
+    /// metrics. Deadline entries currently share the normal runqueue but retain
+    /// their declared class so the experimental traffic remains observable.
+    pub fn class_of(&self, agent_id: AgentId) -> Option<SchedClass> {
+        self.rt_queue
+            .iter()
+            .chain(self.runqueue.values())
+            .chain(&self.bg_queue)
+            .find(|entry| entry.agent_id == agent_id)
+            .map(|entry| entry.class)
+    }
+
     /// Get the number of runnable agents.
     pub fn runnable_count(&self) -> usize {
         self.runqueue.len() + self.rt_queue.len() + self.bg_queue.len()
@@ -309,8 +320,14 @@ impl CfsScheduler {
 pub struct TurnAdmission {
     state: std::sync::Mutex<AdmissionInner>,
     notify: tokio::sync::Notify,
+    starvation_threshold: std::time::Duration,
     admitted_total: std::sync::atomic::AtomicU64,
+    admitted_realtime_total: std::sync::atomic::AtomicU64,
+    admitted_normal_total: std::sync::atomic::AtomicU64,
+    admitted_background_total: std::sync::atomic::AtomicU64,
+    admitted_deadline_total: std::sync::atomic::AtomicU64,
     cancelled_total: std::sync::atomic::AtomicU64,
+    cooperative_yields_total: std::sync::atomic::AtomicU64,
     wait_ns_total: std::sync::atomic::AtomicU64,
     run_ns_total: std::sync::atomic::AtomicU64,
     starvation_total: std::sync::atomic::AtomicU64,
@@ -319,6 +336,7 @@ pub struct TurnAdmission {
 #[derive(Clone)]
 struct TurnWaiter {
     agent_id: AgentId,
+    class: SchedClass,
     seq: u64,
     enqueued_at: std::time::Instant,
 }
@@ -338,7 +356,12 @@ pub struct TurnAdmissionMetrics {
     pub capacity: usize,
     pub queue_capacity: usize,
     pub admitted_total: u64,
+    pub admitted_realtime_total: u64,
+    pub admitted_normal_total: u64,
+    pub admitted_background_total: u64,
+    pub admitted_deadline_total: u64,
     pub cancelled_total: u64,
+    pub cooperative_yields_total: u64,
     pub wait_ns_total: u64,
     pub run_ns_total: u64,
     pub starvation_total: u64,
@@ -360,6 +383,18 @@ impl TurnAdmission {
     }
 
     pub fn with_queue_limit(max_concurrent: usize, max_waiters: usize) -> Self {
+        Self::with_queue_limit_and_starvation_threshold(
+            max_concurrent,
+            max_waiters,
+            std::time::Duration::from_secs(30),
+        )
+    }
+
+    fn with_queue_limit_and_starvation_threshold(
+        max_concurrent: usize,
+        max_waiters: usize,
+        starvation_threshold: std::time::Duration,
+    ) -> Self {
         let max_concurrent = max_concurrent.max(1);
         Self {
             state: std::sync::Mutex::new(AdmissionInner {
@@ -370,8 +405,14 @@ impl TurnAdmission {
                 waiters: Vec::new(),
             }),
             notify: tokio::sync::Notify::new(),
+            starvation_threshold,
             admitted_total: std::sync::atomic::AtomicU64::new(0),
+            admitted_realtime_total: std::sync::atomic::AtomicU64::new(0),
+            admitted_normal_total: std::sync::atomic::AtomicU64::new(0),
+            admitted_background_total: std::sync::atomic::AtomicU64::new(0),
+            admitted_deadline_total: std::sync::atomic::AtomicU64::new(0),
             cancelled_total: std::sync::atomic::AtomicU64::new(0),
+            cooperative_yields_total: std::sync::atomic::AtomicU64::new(0),
             wait_ns_total: std::sync::atomic::AtomicU64::new(0),
             run_ns_total: std::sync::atomic::AtomicU64::new(0),
             starvation_total: std::sync::atomic::AtomicU64::new(0),
@@ -402,7 +443,12 @@ impl TurnAdmission {
             capacity: state.max_concurrent,
             queue_capacity: state.max_waiters,
             admitted_total: self.admitted_total.load(Ordering::Relaxed),
+            admitted_realtime_total: self.admitted_realtime_total.load(Ordering::Relaxed),
+            admitted_normal_total: self.admitted_normal_total.load(Ordering::Relaxed),
+            admitted_background_total: self.admitted_background_total.load(Ordering::Relaxed),
+            admitted_deadline_total: self.admitted_deadline_total.load(Ordering::Relaxed),
             cancelled_total: self.cancelled_total.load(Ordering::Relaxed),
+            cooperative_yields_total: self.cooperative_yields_total.load(Ordering::Relaxed),
             wait_ns_total: self.wait_ns_total.load(Ordering::Relaxed),
             run_ns_total: self.run_ns_total.load(Ordering::Relaxed),
             starvation_total: self.starvation_total.load(Ordering::Relaxed),
@@ -436,6 +482,11 @@ impl TurnAdmission {
         cfs: &tokio::sync::Mutex<CfsScheduler>,
         cancellation: Option<&tokio_util::sync::CancellationToken>,
     ) -> Result<TurnSlot<'a>, crate::SchedulerError> {
+        let class = cfs
+            .lock()
+            .await
+            .class_of(agent_id)
+            .unwrap_or(SchedClass::Normal);
         // Register as a contender exactly once. The registration guard removes
         // it if this future is cancelled or dropped before admission.
         let seq = {
@@ -449,6 +500,7 @@ impl TurnAdmission {
             st.next_seq = st.next_seq.wrapping_add(1);
             st.waiters.push(TurnWaiter {
                 agent_id,
+                class,
                 seq,
                 enqueued_at: std::time::Instant::now(),
             });
@@ -467,22 +519,34 @@ impl TurnAdmission {
                 (st.running < st.max_concurrent).then(|| st.waiters.clone())
             };
             if let Some(waiters) = waiters {
-                let candidates: Vec<_> = waiters.iter().map(|waiter| waiter.agent_id).collect();
-                let chosen = {
-                    let cfs = cfs.lock().await;
-                    cfs.pick_among(&candidates)
+                // Once a waiter reaches the explicit starvation threshold, the
+                // oldest overdue request wins the next released slot. This is
+                // bounded queue aging, not CPU priority inheritance.
+                let overdue_seq = waiters
+                    .iter()
+                    .filter(|waiter| waiter.enqueued_at.elapsed() >= self.starvation_threshold)
+                    .min_by_key(|waiter| waiter.seq)
+                    .map(|waiter| waiter.seq);
+                let preferred_seq = if overdue_seq.is_some() {
+                    overdue_seq
+                } else {
+                    let candidates: Vec<_> = waiters.iter().map(|waiter| waiter.agent_id).collect();
+                    let chosen = {
+                        let cfs = cfs.lock().await;
+                        cfs.pick_among(&candidates)
+                    };
+                    // For equal/unknown CFS rank, sequence gives deterministic
+                    // FIFO instead of a race-dependent fallback.
+                    chosen
+                        .and_then(|chosen| {
+                            waiters
+                                .iter()
+                                .filter(|waiter| waiter.agent_id == chosen)
+                                .map(|waiter| waiter.seq)
+                                .min()
+                        })
+                        .or_else(|| waiters.iter().map(|waiter| waiter.seq).min())
                 };
-                // For equal/unknown CFS rank, sequence gives deterministic FIFO
-                // instead of a race-dependent fallback.
-                let preferred_seq = chosen
-                    .and_then(|chosen| {
-                        waiters
-                            .iter()
-                            .filter(|waiter| waiter.agent_id == chosen)
-                            .map(|waiter| waiter.seq)
-                            .min()
-                    })
-                    .or_else(|| waiters.iter().map(|waiter| waiter.seq).min());
                 if preferred_seq == Some(seq) {
                     let mut st = self.state.lock().unwrap();
                     if st.running < st.max_concurrent {
@@ -497,11 +561,26 @@ impl TurnAdmission {
                         let waited = waiter.enqueued_at.elapsed();
                         use std::sync::atomic::Ordering;
                         self.admitted_total.fetch_add(1, Ordering::Relaxed);
+                        match waiter.class {
+                            SchedClass::RealTime => {
+                                self.admitted_realtime_total.fetch_add(1, Ordering::Relaxed);
+                            }
+                            SchedClass::Normal => {
+                                self.admitted_normal_total.fetch_add(1, Ordering::Relaxed);
+                            }
+                            SchedClass::Background => {
+                                self.admitted_background_total
+                                    .fetch_add(1, Ordering::Relaxed);
+                            }
+                            SchedClass::Deadline { .. } => {
+                                self.admitted_deadline_total.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
                         self.wait_ns_total.fetch_add(
                             waited.as_nanos().min(u128::from(u64::MAX)) as u64,
                             Ordering::Relaxed,
                         );
-                        if waited >= std::time::Duration::from_secs(30) {
+                        if waited >= self.starvation_threshold {
                             self.starvation_total.fetch_add(1, Ordering::Relaxed);
                         }
                         return Ok(TurnSlot {
@@ -529,6 +608,12 @@ impl TurnAdmission {
                 .await;
             }
         }
+    }
+
+    pub(crate) fn record_cooperative_yield(&self) {
+        use std::sync::atomic::Ordering;
+        self.cooperative_yields_total
+            .fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -786,6 +871,84 @@ mod tests {
         }
         // Agent 2 (lower vruntime) must be admitted before agent 3.
         assert_eq!(*order.lock().await, vec![2, 3]);
+    }
+
+    #[tokio::test]
+    async fn overdue_turn_waiter_escapes_priority_inversion() {
+        use std::sync::Arc;
+
+        let cfs = Arc::new(tokio::sync::Mutex::new(CfsScheduler::new(10_000)));
+        {
+            let mut scheduler = cfs.lock().await;
+            scheduler.enqueue(1, 0, SchedClass::Normal);
+            scheduler.enqueue(2, 10, SchedClass::Normal);
+            scheduler.enqueue(3, -10, SchedClass::Normal);
+            scheduler.account_tokens(2, 10_000);
+        }
+        let admission = Arc::new(TurnAdmission::with_queue_limit_and_starvation_threshold(
+            1,
+            8,
+            std::time::Duration::from_millis(200),
+        ));
+        let holder = admission.acquire(1, &cfs).await.unwrap();
+        let order = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+
+        let overdue = {
+            let admission = Arc::clone(&admission);
+            let cfs = Arc::clone(&cfs);
+            let order = Arc::clone(&order);
+            tokio::spawn(async move {
+                let _slot = admission.acquire(2, &cfs).await.unwrap();
+                order.lock().await.push(2);
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            })
+        };
+        while admission.waiting() != 1 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(220)).await;
+
+        let preferred_by_vruntime = {
+            let admission = Arc::clone(&admission);
+            let cfs = Arc::clone(&cfs);
+            let order = Arc::clone(&order);
+            tokio::spawn(async move {
+                let _slot = admission.acquire(3, &cfs).await.unwrap();
+                order.lock().await.push(3);
+            })
+        };
+        while admission.waiting() != 2 {
+            tokio::task::yield_now().await;
+        }
+        drop(holder);
+        overdue.await.unwrap();
+        preferred_by_vruntime.await.unwrap();
+
+        assert_eq!(*order.lock().await, vec![2, 3]);
+        assert_eq!(admission.metrics().starvation_total, 1);
+    }
+
+    #[tokio::test]
+    async fn turn_admission_reports_bounded_class_share() {
+        let cfs = tokio::sync::Mutex::new(CfsScheduler::new(1000));
+        for (id, class) in [
+            (1, SchedClass::RealTime),
+            (2, SchedClass::Normal),
+            (3, SchedClass::Background),
+            (4, SchedClass::Deadline { deadline_ms: 500 }),
+        ] {
+            cfs.lock().await.enqueue(id, 0, class);
+        }
+        let admission = TurnAdmission::new(1);
+        for id in 1..=4 {
+            drop(admission.acquire(id, &cfs).await.unwrap());
+        }
+        let metrics = admission.metrics();
+        assert_eq!(metrics.admitted_total, 4);
+        assert_eq!(metrics.admitted_realtime_total, 1);
+        assert_eq!(metrics.admitted_normal_total, 1);
+        assert_eq!(metrics.admitted_background_total, 1);
+        assert_eq!(metrics.admitted_deadline_total, 1);
     }
 
     #[tokio::test]

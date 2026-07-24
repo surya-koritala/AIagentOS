@@ -194,12 +194,16 @@ async fn lifecycle_events_and_metrics_report_bounded_outcomes() {
     assert_eq!(snapshot.lifecycle.pause.requested, 2);
     assert_eq!(snapshot.lifecycle.pause.completed, 1);
     assert_eq!(snapshot.lifecycle.pause.failed, 1);
+    assert_eq!(snapshot.lifecycle.pause.duration_samples, 2);
     assert_eq!(snapshot.lifecycle.resume.requested, 1);
     assert_eq!(snapshot.lifecycle.resume.completed, 1);
+    assert_eq!(snapshot.lifecycle.resume.duration_samples, 1);
     assert_eq!(snapshot.lifecycle.wait.requested, 1);
     assert_eq!(snapshot.lifecycle.wait.timed_out, 1);
+    assert_eq!(snapshot.lifecycle.wait.duration_samples, 1);
     assert_eq!(snapshot.lifecycle.kill.requested, 1);
     assert_eq!(snapshot.lifecycle.kill.forced, 1);
+    assert_eq!(snapshot.lifecycle.kill.duration_samples, 1);
     assert_eq!(
         snapshot.lifecycle.kill.requested,
         snapshot.lifecycle.kill.forced
@@ -207,6 +211,9 @@ async fn lifecycle_events_and_metrics_report_bounded_outcomes() {
             + snapshot.lifecycle.kill.timed_out
             + snapshot.lifecycle.kill.failed
     );
+    let prometheus = snapshot.render_prometheus();
+    assert!(prometheus.contains("agentos_lifecycle_duration_seconds_count{operation=\"pause\"} 2"));
+    assert!(prometheus.contains("agentos_lifecycle_duration_seconds_count{operation=\"resume\"} 1"));
 
     let mut observed = Vec::new();
     let mut missing_failed = false;

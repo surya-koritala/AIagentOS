@@ -2349,6 +2349,7 @@ impl AgentKernelImpl {
         agent_id: AgentId,
         operation: LifecycleOperation,
         result: &Result<T, KernelError>,
+        started: std::time::Instant,
     ) {
         let outcome = match result {
             Ok(_) if operation == LifecycleOperation::Kill => LifecycleOutcome::Forced,
@@ -2356,6 +2357,8 @@ impl AgentKernelImpl {
             Err(KernelError::LifecycleTimeout(_)) => LifecycleOutcome::TimedOut,
             Err(_) => LifecycleOutcome::Failed,
         };
+        self.lifecycle_counters
+            .record_duration(operation, started.elapsed());
         self.record_lifecycle(agent_id, operation, outcome);
     }
 
@@ -2784,13 +2787,14 @@ impl AgentKernelImpl {
     /// Pause admission for an agent and cooperatively cancel any active turn.
     /// Repeating a pause is idempotent.
     pub async fn pause_agent(&self, agent_id: AgentId) -> Result<AgentState, KernelError> {
+        let started = std::time::Instant::now();
         self.record_lifecycle(
             agent_id,
             LifecycleOperation::Pause,
             LifecycleOutcome::Requested,
         );
         let result = self.pause_agent_inner(agent_id).await;
-        self.record_lifecycle_result(agent_id, LifecycleOperation::Pause, &result);
+        self.record_lifecycle_result(agent_id, LifecycleOperation::Pause, &result, started);
         result
     }
 
@@ -2822,13 +2826,14 @@ impl AgentKernelImpl {
     /// Resume admission for a paused agent. The next turn receives a fresh
     /// cancellation token; repeating resume on Running is idempotent.
     pub async fn resume_agent(&self, agent_id: AgentId) -> Result<AgentState, KernelError> {
+        let started = std::time::Instant::now();
         self.record_lifecycle(
             agent_id,
             LifecycleOperation::Resume,
             LifecycleOutcome::Requested,
         );
         let result = self.resume_agent_inner(agent_id).await;
-        self.record_lifecycle_result(agent_id, LifecycleOperation::Resume, &result);
+        self.record_lifecycle_result(agent_id, LifecycleOperation::Resume, &result, started);
         result
     }
 
@@ -2853,13 +2858,14 @@ impl AgentKernelImpl {
     /// Durable conversations, facts, usage, and the terminal registry row are
     /// retained; repeating stop is idempotent.
     pub async fn stop_agent(&self, agent_id: AgentId) -> Result<AgentState, KernelError> {
+        let started = std::time::Instant::now();
         self.record_lifecycle(
             agent_id,
             LifecycleOperation::Stop,
             LifecycleOutcome::Requested,
         );
         let result = self.stop_agent_inner(agent_id).await;
-        self.record_lifecycle_result(agent_id, LifecycleOperation::Stop, &result);
+        self.record_lifecycle_result(agent_id, LifecycleOperation::Stop, &result, started);
         result
     }
 
@@ -2913,13 +2919,14 @@ impl AgentKernelImpl {
     /// binding: it cancels execution, revokes admitted tool guards, and tears
     /// down every live subsystem immediately.
     pub async fn kill_agent(&self, agent_id: AgentId) -> Result<AgentState, KernelError> {
+        let started = std::time::Instant::now();
         self.record_lifecycle(
             agent_id,
             LifecycleOperation::Kill,
             LifecycleOutcome::Requested,
         );
         let result = self.kill_agent_inner(agent_id).await;
-        self.record_lifecycle_result(agent_id, LifecycleOperation::Kill, &result);
+        self.record_lifecycle_result(agent_id, LifecycleOperation::Kill, &result, started);
         result
     }
 
@@ -2964,13 +2971,14 @@ impl AgentKernelImpl {
         agent_id: AgentId,
         timeout: std::time::Duration,
     ) -> Result<AgentState, KernelError> {
+        let started = std::time::Instant::now();
         self.record_lifecycle(
             agent_id,
             LifecycleOperation::Wait,
             LifecycleOutcome::Requested,
         );
         let result = self.wait_agent_inner(agent_id, timeout).await;
-        self.record_lifecycle_result(agent_id, LifecycleOperation::Wait, &result);
+        self.record_lifecycle_result(agent_id, LifecycleOperation::Wait, &result, started);
         result
     }
 
@@ -3045,6 +3053,7 @@ impl AgentKernelImpl {
         agent_id: AgentId,
         checkpoint_id: Option<uuid::Uuid>,
     ) -> Result<(AgentState, Option<AgentOutput>, Option<uuid::Uuid>), KernelError> {
+        let started = std::time::Instant::now();
         self.record_lifecycle(
             agent_id,
             LifecycleOperation::Resume,
@@ -3053,7 +3062,7 @@ impl AgentKernelImpl {
         let result = self
             .resume_agent_from_checkpoint_inner(agent_id, checkpoint_id)
             .await;
-        self.record_lifecycle_result(agent_id, LifecycleOperation::Resume, &result);
+        self.record_lifecycle_result(agent_id, LifecycleOperation::Resume, &result, started);
         result
     }
 

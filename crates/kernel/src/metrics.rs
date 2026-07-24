@@ -37,6 +37,10 @@ pub struct LifecycleOperationMetrics {
     pub timed_out: u64,
     pub forced: u64,
     pub failed: u64,
+    /// Cumulative wall-clock time for completed attempts, in microseconds.
+    pub duration_microseconds_total: u64,
+    /// Number of attempts represented by `duration_microseconds_total`.
+    pub duration_samples: u64,
 }
 
 /// Lifecycle counters grouped by the fixed public operation set.
@@ -57,6 +61,8 @@ struct LifecycleOperationCounters {
     timed_out: AtomicU64,
     forced: AtomicU64,
     failed: AtomicU64,
+    duration_microseconds_total: AtomicU64,
+    duration_samples: AtomicU64,
 }
 
 impl LifecycleOperationCounters {
@@ -71,6 +77,20 @@ impl LifecycleOperationCounters {
         counter.fetch_add(1, Ordering::Relaxed);
     }
 
+    fn record_duration(&self, duration: std::time::Duration) {
+        let micros = u64::try_from(duration.as_micros()).unwrap_or(u64::MAX);
+        let _ = self.duration_microseconds_total.fetch_update(
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+            |current| Some(current.saturating_add(micros)),
+        );
+        let _ =
+            self.duration_samples
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                    Some(current.saturating_add(1))
+                });
+    }
+
     fn snapshot(&self) -> LifecycleOperationMetrics {
         LifecycleOperationMetrics {
             requested: self.requested.load(Ordering::Relaxed),
@@ -78,6 +98,8 @@ impl LifecycleOperationCounters {
             timed_out: self.timed_out.load(Ordering::Relaxed),
             forced: self.forced.load(Ordering::Relaxed),
             failed: self.failed.load(Ordering::Relaxed),
+            duration_microseconds_total: self.duration_microseconds_total.load(Ordering::Relaxed),
+            duration_samples: self.duration_samples.load(Ordering::Relaxed),
         }
     }
 }
@@ -107,6 +129,21 @@ impl LifecycleCounters {
             crate::LifecycleOperation::Wait => &self.wait,
         };
         counters.record(outcome);
+    }
+
+    pub(crate) fn record_duration(
+        &self,
+        operation: crate::LifecycleOperation,
+        duration: std::time::Duration,
+    ) {
+        let counters = match operation {
+            crate::LifecycleOperation::Pause => &self.pause,
+            crate::LifecycleOperation::Resume => &self.resume,
+            crate::LifecycleOperation::Stop => &self.stop,
+            crate::LifecycleOperation::Kill => &self.kill,
+            crate::LifecycleOperation::Wait => &self.wait,
+        };
+        counters.record_duration(duration);
     }
 
     pub(crate) fn snapshot(&self) -> LifecycleMetricsSnapshot {
@@ -551,6 +588,26 @@ impl MetricsSnapshot {
                 ));
             }
         }
+        out.push_str(
+            "# HELP agentos_lifecycle_duration_seconds Wall-clock lifecycle operation latency.\n",
+        );
+        out.push_str("# TYPE agentos_lifecycle_duration_seconds summary\n");
+        for (operation, counters) in [
+            ("pause", self.lifecycle.pause),
+            ("resume", self.lifecycle.resume),
+            ("stop", self.lifecycle.stop),
+            ("kill", self.lifecycle.kill),
+            ("wait", self.lifecycle.wait),
+        ] {
+            out.push_str(&format!(
+                "agentos_lifecycle_duration_seconds_sum{{operation=\"{operation}\"}} {:.6}\n",
+                counters.duration_microseconds_total as f64 / 1_000_000.0
+            ));
+            out.push_str(&format!(
+                "agentos_lifecycle_duration_seconds_count{{operation=\"{operation}\"}} {}\n",
+                counters.duration_samples
+            ));
+        }
 
         // --- LLM usage totals (system scope).
         out.push_str("# HELP agentos_tokens_consumed_total Tokens consumed across all agents.\n");
@@ -646,6 +703,8 @@ mod tests {
                     timed_out: 1,
                     forced: 0,
                     failed: 0,
+                    duration_microseconds_total: 125_000,
+                    duration_samples: 3,
                 },
                 kill: LifecycleOperationMetrics {
                     requested: 1,
@@ -653,6 +712,8 @@ mod tests {
                     timed_out: 0,
                     forced: 1,
                     failed: 0,
+                    duration_microseconds_total: 5_000,
+                    duration_samples: 1,
                 },
                 ..Default::default()
             },
@@ -680,6 +741,7 @@ mod tests {
         assert!(text.contains("# TYPE agentos_quota_receipts gauge"));
         assert!(text.contains("# TYPE agentos_quota_denied_total counter"));
         assert!(text.contains("# TYPE agentos_lifecycle_operations_total counter"));
+        assert!(text.contains("# TYPE agentos_lifecycle_duration_seconds summary"));
         assert!(text.contains("# TYPE agentos_tokens_consumed_total counter"));
         assert!(text.contains("# TYPE agentos_api_calls_total counter"));
         assert!(text.contains("# TYPE agentos_process_uptime_seconds gauge"));
@@ -716,6 +778,10 @@ mod tests {
         assert!(text.contains(
             "agentos_lifecycle_operations_total{operation=\"kill\",outcome=\"forced\"} 1"
         ));
+        assert!(
+            text.contains("agentos_lifecycle_duration_seconds_sum{operation=\"pause\"} 0.125000")
+        );
+        assert!(text.contains("agentos_lifecycle_duration_seconds_count{operation=\"pause\"} 3"));
         assert!(text.contains("agentos_tokens_consumed_total 1234"));
         assert!(text.contains("agentos_api_calls_total 12"));
         assert!(text.contains("agentos_process_uptime_seconds 99"));

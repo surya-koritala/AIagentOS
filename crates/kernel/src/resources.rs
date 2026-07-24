@@ -943,7 +943,7 @@ mod tests {
         let agent = uuid::Uuid::new_v4();
         perms.assign_profile(agent, &"full-access".to_string());
         let root = std::env::temp_dir().join(format!("agentos-broker-{}", uuid::Uuid::new_v4()));
-        sandboxes
+        let sandbox = sandboxes
             .create_sandbox(
                 agent,
                 &SandboxConfig {
@@ -972,6 +972,7 @@ mod tests {
             .await;
         assert!(result.is_err());
         assert_eq!(calls.load(Ordering::SeqCst), 0);
+        sandboxes.destroy_sandbox(sandbox).unwrap();
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -1024,6 +1025,7 @@ mod tests {
             0,
             "untrusted filesystem I/O must not reopen a host path in a provider"
         );
+        sandboxes.destroy_sandbox(sandbox).unwrap();
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -1067,7 +1069,7 @@ mod tests {
         permissions.assign_profile(agent, &"full-access".into());
         let root =
             std::env::temp_dir().join(format!("agentos-private-dns-{}", uuid::Uuid::new_v4()));
-        sandboxes
+        let sandbox = sandboxes
             .create_sandbox(
                 agent,
                 &SandboxConfig {
@@ -1105,6 +1107,7 @@ mod tests {
             0,
             "a provider must never see a target whose DNS answer is private"
         );
+        sandboxes.destroy_sandbox(sandbox).unwrap();
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -1238,7 +1241,7 @@ mod tests {
         permissions.assign_profile(agent, &"standard".into());
         let root =
             std::env::temp_dir().join(format!("agentos-approved-delete-{}", uuid::Uuid::new_v4()));
-        sandboxes
+        let sandbox = sandboxes
             .create_sandbox(
                 agent,
                 &SandboxConfig {
@@ -1348,6 +1351,7 @@ mod tests {
             0,
             "untrusted delete must be capability-mediated, not provider-mediated"
         );
+        sandboxes.destroy_sandbox(sandbox).unwrap();
         std::fs::remove_dir_all(root).unwrap();
     }
 

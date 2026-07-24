@@ -914,18 +914,21 @@ impl SandboxManager for SandboxManagerImpl {
         if state.isolation_level == IsolationLevel::Container {
             crate::docker_sandbox::cleanup_agent_best_effort(state.agent_id);
         }
+        // Quiesce every filesystem sandbox and revoke its shared directory
+        // capability before publishing destruction. This is required for
+        // Windows, which will not allow callers to remove the workspace while
+        // the directory handle is open, and prevents already-cloned state from
+        // performing filesystem work after this method returns.
+        let _operation = state.operation_lock.lock().map_err(|_| {
+            SandboxError::DestructionFailed("sandbox filesystem unavailable".into())
+        })?;
+        let workspace = state
+            .workspace
+            .lock()
+            .map_err(|_| SandboxError::DestructionFailed("sandbox filesystem unavailable".into()))?
+            .take();
+        drop(workspace);
         if state.managed_workspace {
-            let _operation = state.operation_lock.lock().map_err(|_| {
-                SandboxError::DestructionFailed("sandbox filesystem unavailable".into())
-            })?;
-            let workspace = state
-                .workspace
-                .lock()
-                .map_err(|_| {
-                    SandboxError::DestructionFailed("sandbox filesystem unavailable".into())
-                })?
-                .take();
-            drop(workspace);
             if let Err(error) = std::fs::remove_dir_all(&state.workspace_dir) {
                 let reopened = Dir::open_ambient_dir(&state.workspace_dir, ambient_authority())
                     .map_err(|reopen_error| {
@@ -1106,10 +1109,12 @@ mod tests {
     fn create_and_destroy_sandbox() {
         let mgr = SandboxManagerImpl::new();
         let agent_id = uuid::Uuid::new_v4();
-        let sid = mgr.create_sandbox(agent_id, &test_config()).unwrap();
+        let config = test_config();
+        let sid = mgr.create_sandbox(agent_id, &config).unwrap();
         assert!(mgr.get_sandbox_for_agent(agent_id).is_some());
         mgr.destroy_sandbox(sid).unwrap();
         assert!(mgr.get_sandbox_for_agent(agent_id).is_none());
+        std::fs::remove_dir_all(config.workspace_dir).unwrap();
     }
 
     #[test]
@@ -1370,6 +1375,7 @@ mod tests {
             "1234"
         );
 
+        mgr.destroy_sandbox(sid).unwrap();
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -1381,7 +1387,7 @@ mod tests {
         let first_root = first.workspace_dir.clone();
         let second_root = second.workspace_dir.clone();
         let first_id = mgr.create_sandbox(uuid::Uuid::new_v4(), &first).unwrap();
-        mgr.create_sandbox(uuid::Uuid::new_v4(), &second).unwrap();
+        let second_id = mgr.create_sandbox(uuid::Uuid::new_v4(), &second).unwrap();
         std::fs::write(second_root.join("secret.txt"), "other agent").unwrap();
 
         let result = mgr.execute_filesystem(
@@ -1391,6 +1397,8 @@ mod tests {
         );
         assert!(result.is_err());
 
+        mgr.destroy_sandbox(first_id).unwrap();
+        mgr.destroy_sandbox(second_id).unwrap();
         std::fs::remove_dir_all(first_root).unwrap();
         std::fs::remove_dir_all(second_root).unwrap();
     }
@@ -1486,6 +1494,7 @@ mod tests {
         );
         assert!(!root.join("nested/note.txt").exists());
 
+        mgr.destroy_sandbox(sid).unwrap();
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -1552,6 +1561,8 @@ mod tests {
             .await
             .is_err());
 
+        mgr.destroy_sandbox(trusted_id).unwrap();
+        mgr.destroy_sandbox(sid).unwrap();
         std::fs::remove_dir_all(root).unwrap();
     }
 

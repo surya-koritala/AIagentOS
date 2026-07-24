@@ -92,7 +92,7 @@ struct SandboxState {
     allowed_network_hosts: HashSet<String>,
     isolation_level: IsolationLevel,
     managed_workspace: bool,
-    workspace: Option<Arc<Dir>>,
+    workspace: Arc<Mutex<Option<Dir>>>,
     max_disk_usage_bytes: Option<u64>,
     max_memory_bytes: Option<u64>,
     container_image: Option<String>,
@@ -327,6 +327,7 @@ impl SandboxManagerImpl {
                     "sandbox workspace must be an absolute path".into(),
                 ));
             }
+            #[cfg(unix)]
             let existed = config.workspace_dir.exists();
             if managed_workspace
                 && std::fs::symlink_metadata(&config.workspace_dir)
@@ -383,10 +384,10 @@ impl SandboxManagerImpl {
         let workspace = if config.isolation_level == IsolationLevel::Trusted {
             None
         } else {
-            Some(Arc::new(
+            Some(
                 Dir::open_ambient_dir(&workspace_dir, ambient_authority())
                     .map_err(|error| SandboxError::CreationFailed(error.to_string()))?,
-            ))
+            )
         };
         let sandbox_id = uuid::Uuid::new_v4();
         let allowed_hosts = config
@@ -402,7 +403,7 @@ impl SandboxManagerImpl {
             allowed_network_hosts: allowed_hosts,
             isolation_level: config.isolation_level.clone(),
             managed_workspace,
-            workspace,
+            workspace: Arc::new(Mutex::new(workspace)),
             max_disk_usage_bytes: config.max_disk_usage_bytes,
             max_memory_bytes: config.max_memory_bytes,
             container_image: config.container_image.clone(),
@@ -566,7 +567,13 @@ impl SandboxManagerImpl {
                 "trusted filesystem requests must use an operator provider".into(),
             ));
         }
-        let workspace = state.workspace.as_ref().ok_or_else(|| {
+        let _operation = state.operation_lock.lock().map_err(|_| {
+            SandboxError::BoundaryViolation("sandbox filesystem unavailable".into())
+        })?;
+        let workspace = state.workspace.lock().map_err(|_| {
+            SandboxError::BoundaryViolation("sandbox filesystem unavailable".into())
+        })?;
+        let workspace = workspace.as_ref().ok_or_else(|| {
             SandboxError::BoundaryViolation("sandbox filesystem unavailable".into())
         })?;
         let supplied = parameters
@@ -576,10 +583,6 @@ impl SandboxManagerImpl {
                 SandboxError::BoundaryViolation("sandbox filesystem target denied".into())
             })?;
         let relative = Self::relative_capability_path(state, Path::new(supplied))?;
-        let _operation = state.operation_lock.lock().map_err(|_| {
-            SandboxError::BoundaryViolation("sandbox filesystem unavailable".into())
-        })?;
-
         match operation {
             "read" => {
                 let content = workspace
@@ -897,8 +900,31 @@ impl SandboxManager for SandboxManagerImpl {
             crate::docker_sandbox::cleanup_agent_best_effort(state.agent_id);
         }
         if state.managed_workspace {
-            std::fs::remove_dir_all(&state.workspace_dir)
-                .map_err(|error| SandboxError::DestructionFailed(error.to_string()))?;
+            let _operation = state.operation_lock.lock().map_err(|_| {
+                SandboxError::DestructionFailed("sandbox filesystem unavailable".into())
+            })?;
+            let workspace = state
+                .workspace
+                .lock()
+                .map_err(|_| {
+                    SandboxError::DestructionFailed("sandbox filesystem unavailable".into())
+                })?
+                .take();
+            drop(workspace);
+            if let Err(error) = std::fs::remove_dir_all(&state.workspace_dir) {
+                let reopened = Dir::open_ambient_dir(&state.workspace_dir, ambient_authority())
+                    .map_err(|reopen_error| {
+                        SandboxError::DestructionFailed(format!(
+                            "{error}; sandbox capability could not be restored: {reopen_error}"
+                        ))
+                    })?;
+                *state.workspace.lock().map_err(|_| {
+                    SandboxError::DestructionFailed(
+                        "sandbox capability could not be restored".into(),
+                    )
+                })? = Some(reopened);
+                return Err(SandboxError::DestructionFailed(error.to_string()));
+            }
             if let Ok(mut live) = Self::live_managed_workspaces().lock() {
                 live.remove(&state.workspace_dir);
             }

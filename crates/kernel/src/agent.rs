@@ -258,8 +258,10 @@ impl AgentManager {
     /// bypassing the create/init state machine (the agent already existed across
     /// the restart). Used by the kernel's boot-time registry rehydration to bring
     /// agents back with their original id, session, config, and timestamps. A
-    /// restored agent that was mid-flight is brought up `Running` so it is
-    /// schedulable again; terminal states are preserved as-is.
+    /// The caller must resolve interrupted transitional states before invoking
+    /// this method. The supplied state is restored exactly so this low-level
+    /// primitive can never turn an incomplete initialization or shutdown into
+    /// runnable work.
     pub fn restore_agent(
         &self,
         id: AgentId,
@@ -269,21 +271,12 @@ impl AgentManager {
         created_at: DateTime<Utc>,
         last_activity_at: DateTime<Utc>,
     ) {
-        // Map only transient states to Running so interrupted initialization or
-        // stopping can recover. A deliberate pause must survive restart, while
-        // terminal states remain terminal and are not re-admitted by the kernel.
-        let restored_state = match state {
-            AgentState::Paused => AgentState::Paused,
-            AgentState::Stopped => AgentState::Stopped,
-            AgentState::Error(e) => AgentState::Error(e),
-            _ => AgentState::Running,
-        };
         let sandbox_id = config.sandbox_config.as_ref().map(|_| uuid::Uuid::new_v4());
         let agent = Agent {
             id,
             session_id,
             name: config.name.clone(),
-            state: restored_state,
+            state,
             config,
             sandbox_id,
             created_at,

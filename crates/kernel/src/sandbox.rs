@@ -209,20 +209,18 @@ impl SandboxManagerImpl {
         &self,
         active_workspaces: &HashSet<PathBuf>,
     ) -> Result<usize, SandboxError> {
+        // Keep discovery and deletion atomic with managed-workspace creation
+        // and destruction. Without this guard, reconciliation can observe a
+        // newly created directory before its live registration is published.
+        let live = Self::live_managed_workspaces().lock().map_err(|_| {
+            SandboxError::DestructionFailed("managed workspace registry unavailable".into())
+        })?;
         let root = Self::ensure_managed_root()?;
         let mut active = active_workspaces
             .iter()
             .filter_map(|path| std::fs::canonicalize(path).ok())
             .collect::<HashSet<_>>();
-        active.extend(
-            Self::live_managed_workspaces()
-                .lock()
-                .map_err(|_| {
-                    SandboxError::DestructionFailed("managed workspace registry unavailable".into())
-                })?
-                .iter()
-                .cloned(),
-        );
+        active.extend(live.iter().cloned());
         let mut removed = 0;
         for entry in std::fs::read_dir(&root)
             .map_err(|error| SandboxError::DestructionFailed(error.to_string()))?
@@ -298,6 +296,16 @@ impl SandboxManagerImpl {
                     .map_err(SandboxError::CreationFailed)?;
             }
         }
+        // Hold the registry guard before touching a managed directory so
+        // reconciliation cannot mistake an in-progress creation for an
+        // orphan. The guard stays held until the path is published below.
+        let mut managed_registry = if managed_workspace {
+            Some(Self::live_managed_workspaces().lock().map_err(|_| {
+                SandboxError::CreationFailed("managed workspace registry unavailable".into())
+            })?)
+        } else {
+            None
+        };
         let managed_root = if managed_workspace {
             let root = Self::ensure_managed_root()?;
             let parent = config.workspace_dir.parent().ok_or_else(|| {
@@ -411,9 +419,9 @@ impl SandboxManagerImpl {
             process_lock: Arc::new(tokio::sync::Semaphore::new(1)),
         };
         if managed_workspace {
-            Self::live_managed_workspaces()
-                .lock()
-                .map_err(|_| {
+            managed_registry
+                .as_mut()
+                .ok_or_else(|| {
                     SandboxError::CreationFailed("managed workspace registry unavailable".into())
                 })?
                 .insert(workspace_dir.clone());
@@ -895,6 +903,13 @@ impl SandboxManager for SandboxManagerImpl {
             .get(&sandbox_id)
             .map(|state| state.clone())
             .ok_or_else(|| SandboxError::DestructionFailed("Sandbox not found".to_string()))?;
+        let mut managed_registry = if state.managed_workspace {
+            Some(Self::live_managed_workspaces().lock().map_err(|_| {
+                SandboxError::DestructionFailed("managed workspace registry unavailable".into())
+            })?)
+        } else {
+            None
+        };
         #[cfg(target_os = "linux")]
         if state.isolation_level == IsolationLevel::Container {
             crate::docker_sandbox::cleanup_agent_best_effort(state.agent_id);
@@ -925,9 +940,12 @@ impl SandboxManager for SandboxManagerImpl {
                 })? = Some(reopened);
                 return Err(SandboxError::DestructionFailed(error.to_string()));
             }
-            if let Ok(mut live) = Self::live_managed_workspaces().lock() {
-                live.remove(&state.workspace_dir);
-            }
+            managed_registry
+                .as_mut()
+                .ok_or_else(|| {
+                    SandboxError::DestructionFailed("managed workspace registry unavailable".into())
+                })?
+                .remove(&state.workspace_dir);
         }
         self.sandboxes.remove(&sandbox_id);
         self.agent_sandboxes.remove(&state.agent_id);

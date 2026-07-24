@@ -1352,6 +1352,166 @@ mod tests {
     }
 
     #[test]
+    fn capability_filesystem_operations_and_denials_are_complete() {
+        let mgr = SandboxManagerImpl::new();
+        let config = SandboxConfig {
+            max_disk_usage_bytes: Some(1024),
+            ..test_config()
+        };
+        let root = config.workspace_dir.clone();
+        let sid = mgr.create_sandbox(uuid::Uuid::new_v4(), &config).unwrap();
+
+        assert_eq!(
+            mgr.execute_filesystem(sid, "create_dir", &serde_json::json!({"path": "nested"}),)
+                .unwrap(),
+            serde_json::json!({"created": true})
+        );
+        assert_eq!(
+            mgr.execute_filesystem(
+                sid,
+                "create",
+                &serde_json::json!({"path": "nested/note.txt", "content": "hello world"}),
+            )
+            .unwrap(),
+            serde_json::json!({"written": true})
+        );
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("nested/note.txt", root.join("note-link")).unwrap();
+        assert_eq!(
+            mgr.execute_filesystem(
+                sid,
+                "edit",
+                &serde_json::json!({
+                    "path": "nested/note.txt",
+                    "search": "world",
+                    "replace": "sandbox"
+                }),
+            )
+            .unwrap(),
+            serde_json::json!({"edited": true})
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("nested/note.txt")).unwrap(),
+            "hello sandbox"
+        );
+
+        let listing = mgr
+            .execute_filesystem(sid, "list", &serde_json::json!({"path": "nested"}))
+            .unwrap();
+        assert_eq!(
+            listing["entries"],
+            serde_json::json!(["note.txt"]),
+            "directory listing must stay capability-relative"
+        );
+        assert!(mgr
+            .execute_filesystem(
+                sid,
+                "edit",
+                &serde_json::json!({"path": "nested/note.txt", "replace": "missing search"}),
+            )
+            .is_err());
+        assert!(mgr
+            .execute_filesystem(
+                sid,
+                "edit",
+                &serde_json::json!({
+                    "path": "nested/note.txt",
+                    "search": "not present",
+                    "replace": "x"
+                }),
+            )
+            .is_err());
+        assert!(mgr
+            .execute_filesystem(sid, "read", &serde_json::json!({}))
+            .is_err());
+        assert!(mgr
+            .execute_filesystem(
+                sid,
+                "chmod",
+                &serde_json::json!({"path": "nested/note.txt"})
+            )
+            .is_err());
+        assert_eq!(
+            mgr.execute_filesystem(
+                sid,
+                "delete",
+                &serde_json::json!({"path": "nested/note.txt"}),
+            )
+            .unwrap(),
+            serde_json::json!({"deleted": true})
+        );
+        assert!(!root.join("nested/note.txt").exists());
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn non_io_and_trusted_execution_paths_fail_closed() {
+        let mgr = SandboxManagerImpl::new();
+        let config = SandboxConfig {
+            allowed_network_hosts: Some(vec!["93.184.216.34".into()]),
+            ..test_config()
+        };
+        let root = config.workspace_dir.clone();
+        let sid = mgr.create_sandbox(uuid::Uuid::new_v4(), &config).unwrap();
+
+        assert!(mgr
+            .execute_network(
+                sid,
+                "patch",
+                &serde_json::json!({"url": "http://93.184.216.34"}),
+            )
+            .await
+            .is_err());
+        assert!(mgr
+            .execute_network(sid, "get", &serde_json::json!({}))
+            .await
+            .is_err());
+        assert!(mgr
+            .execute_process(sid, &serde_json::json!({"command": "echo"}))
+            .await
+            .is_err());
+
+        let missing = uuid::Uuid::new_v4();
+        assert!(mgr
+            .execute_network(
+                missing,
+                "get",
+                &serde_json::json!({"url": "http://93.184.216.34"}),
+            )
+            .await
+            .is_err());
+        assert!(mgr
+            .execute_process(missing, &serde_json::json!({"command": "echo"}))
+            .await
+            .is_err());
+        assert!(mgr
+            .execute_filesystem(missing, "read", &serde_json::json!({"path": "x"}))
+            .is_err());
+        assert!(mgr.isolation_level(missing).is_err());
+
+        let trusted = SandboxConfig {
+            workspace_dir: root.join("trusted"),
+            isolation_level: IsolationLevel::Trusted,
+            ..test_config()
+        };
+        let trusted_id = mgr.create_sandbox(uuid::Uuid::new_v4(), &trusted).unwrap();
+        assert!(mgr
+            .execute_filesystem(trusted_id, "read", &serde_json::json!({"path": "anything"}),)
+            .is_err());
+        assert!(mgr
+            .execute_network(
+                trusted_id,
+                "get",
+                &serde_json::json!({"url": "https://example.com"}),
+            )
+            .await
+            .is_err());
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn managed_workspace_marker_and_orphan_reconciliation_are_durable() {
         let mgr = SandboxManagerImpl::new();
         let config = SandboxManagerImpl::default_config();

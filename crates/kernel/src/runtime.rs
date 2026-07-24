@@ -34,7 +34,7 @@ impl KernelRuntime {
     pub fn start(&self) -> Vec<tokio::task::JoinHandle<()>> {
         self.running
             .store(true, std::sync::atomic::Ordering::SeqCst);
-        vec![self.spawn_scheduler_observer()]
+        vec![self.spawn_scheduler_observer(), self.spawn_agent_watchdog()]
     }
 
     /// Stop all background threads. Loops exit on next tick.
@@ -68,6 +68,22 @@ impl KernelRuntime {
                     let mut procfs = kernel.os.procfs.lock().await;
                     procfs.set_system("current_agent".into(), pid.to_string());
                 }
+            }
+        })
+    }
+
+    /// Active-turn watchdog. The kernel sweep performs detection and invokes
+    /// the public forced lifecycle coordinator, so watchdog termination cannot
+    /// bypass persistence, sandbox, gate, cgroup, IPC, or scheduler cleanup.
+    fn spawn_agent_watchdog(&self) -> tokio::task::JoinHandle<()> {
+        let kernel = self.kernel.clone();
+        let running = self.running.clone();
+
+        tokio::spawn(async move {
+            let mut tick = interval(Duration::from_secs(1));
+            while running.load(std::sync::atomic::Ordering::SeqCst) {
+                tick.tick().await;
+                let _ = kernel.watchdog_sweep().await;
             }
         })
     }

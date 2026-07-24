@@ -3,6 +3,7 @@
 use std::time::Duration;
 
 use kernel::context::{PersistedAgent, SqliteContextManager, DEFAULT_TENANT};
+use kernel::ipc::{AgentIpc, DelegationStatus};
 use kernel::permissions::{AccessDecision, PermissionSystem};
 use kernel::resources::ResourceType;
 use kernel::sandbox::SandboxManager;
@@ -91,6 +92,82 @@ async fn pause_blocks_work_resume_rearms_and_wait_observes_terminal_state() {
         kernel.wait_agent(id, Duration::from_secs(1)).await.unwrap(),
         AgentState::Stopped
     );
+}
+
+#[tokio::test]
+async fn kill_during_pending_ipc_delegation_removes_task_and_only_target_mailbox() {
+    let kernel = AgentKernelImpl::new().expect("kernel");
+    let delegator = kernel
+        .create_agent_full(config("delegator"))
+        .await
+        .unwrap()
+        .id;
+    let assignee = kernel
+        .create_agent_full(config("assignee"))
+        .await
+        .unwrap()
+        .id;
+
+    let task_id = kernel
+        .ipc
+        .delegate(delegator, assignee, "pending lifecycle work".into())
+        .await
+        .unwrap();
+    assert_eq!(
+        kernel.ipc.get_delegation_status(delegator, task_id),
+        Some(DelegationStatus::Pending)
+    );
+
+    assert_eq!(
+        kernel.kill_agent(assignee).await.unwrap(),
+        AgentState::Stopped
+    );
+    assert_eq!(
+        kernel.ipc.get_delegation_status(delegator, task_id),
+        None,
+        "killing either party must remove its pending delegation"
+    );
+    assert!(
+        kernel.ipc.is_registered(delegator),
+        "the surviving peer mailbox must remain registered"
+    );
+    assert!(!kernel.ipc.is_registered(assignee));
+    assert!(kernel
+        .ipc
+        .send(delegator, assignee, serde_json::json!({"after": "kill"}),)
+        .await
+        .is_err());
+
+    let second_assignee = kernel
+        .create_agent_full(config("second-assignee"))
+        .await
+        .unwrap()
+        .id;
+    let second_task = kernel
+        .ipc
+        .delegate(delegator, second_assignee, "kill delegator".into())
+        .await
+        .unwrap();
+    assert_eq!(
+        kernel
+            .ipc
+            .get_delegation_status(second_assignee, second_task),
+        Some(DelegationStatus::Pending)
+    );
+
+    assert_eq!(
+        kernel.kill_agent(delegator).await.unwrap(),
+        AgentState::Stopped
+    );
+    assert_eq!(
+        kernel
+            .ipc
+            .get_delegation_status(second_assignee, second_task),
+        None,
+        "killing the delegator must remove the pending task"
+    );
+    assert!(kernel.ipc.is_registered(second_assignee));
+    assert!(!kernel.ipc.is_registered(delegator));
 }
 
 #[tokio::test]

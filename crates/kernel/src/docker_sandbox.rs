@@ -98,7 +98,9 @@ fn hardened_run_args(
         "--workdir".into(),
         "/workspace".into(),
         "--mount".into(),
-        format!("type=bind,src={workspace},dst=/workspace,rw"),
+        // Bind mounts are read-write by default. Docker's structured
+        // `--mount` syntax rejects a standalone `rw` field.
+        format!("type=bind,src={workspace},dst=/workspace"),
         "--tmpfs".into(),
         "/tmp:rw,noexec,nosuid,nodev,size=67108864,mode=700".into(),
         image.into(),
@@ -357,7 +359,7 @@ mod tests {
             "--init",
             "--user 0:0",
             "--workdir /workspace",
-            "type=bind,src=/private/workspace,dst=/workspace,rw",
+            "type=bind,src=/private/workspace,dst=/workspace",
             "/tmp:rw,noexec,nosuid,nodev",
             PINNED,
             "/bin/echo",

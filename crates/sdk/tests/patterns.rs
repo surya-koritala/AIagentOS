@@ -24,40 +24,14 @@ use kernel::connector::{
 };
 use kernel::execution::AgentExecutor;
 use kernel::mcp_server::{McpClient, McpServer};
-use kernel::resources::{ResourceBroker, ResourceProvider, ResourceType};
+use kernel::resources::ResourceType;
 use kernel::syscall_server::{Syscall, SyscallClient, SyscallReply, SyscallServer};
 use kernel::tool_registry_share::{SharedToolDef, SharedToolRegistry};
 use kernel::tools::{SecurityAction, ToolSecurity};
-use kernel::{AgentId, AgentKernelImpl, ConnectorError, ProviderId, ResourceError};
+use kernel::{AgentId, AgentKernelImpl, ConnectorError, ProviderId};
 
 use wiremock::matchers::{method, path_regex};
 use wiremock::{Mock, MockServer, ResponseTemplate};
-
-/// A tiny in-memory filesystem provider so `read_file` returns a known payload
-/// without touching the real disk.
-struct FakeFs {
-    content: String,
-}
-
-#[async_trait::async_trait]
-impl ResourceProvider for FakeFs {
-    fn resource_type(&self) -> ResourceType {
-        ResourceType::Filesystem
-    }
-    fn supported_operations(&self) -> Vec<String> {
-        vec!["read".into(), "write".into(), "list".into()]
-    }
-    async fn execute(
-        &self,
-        operation: &str,
-        _params: &serde_json::Value,
-    ) -> Result<serde_json::Value, ResourceError> {
-        match operation {
-            "read" => Ok(serde_json::json!({ "content": self.content })),
-            _ => Ok(serde_json::json!({})),
-        }
-    }
-}
 
 /// Deterministic two-response LLM session: request one declared tool, then stop.
 ///
@@ -125,13 +99,9 @@ impl LlmSession for OneToolSession {
     }
 }
 
-/// Boot an in-memory kernel with a wiremock Azure adapter + a fake-fs provider,
-/// wrap it in a `SyscallServer`, and return the bound addr. `mock_content` is
-/// what `read_file` will return.
-async fn spawn_kernel_with_mock(
-    mock_server: &MockServer,
-    mock_content: &str,
-) -> std::net::SocketAddr {
+/// Boot an in-memory kernel with a wiremock Azure adapter, wrap it in a
+/// `SyscallServer`, and return the bound address.
+async fn spawn_kernel_with_mock(mock_server: &MockServer) -> std::net::SocketAddr {
     let kernel = AgentKernelImpl::new().expect("kernel new");
 
     let adapter = AzureOpenAiAdapter::new(
@@ -142,10 +112,6 @@ async fn spawn_kernel_with_mock(
     kernel
         .register_provider(Arc::new(adapter))
         .expect("register adapter");
-    kernel.resource_broker.register_provider(Box::new(FakeFs {
-        content: mock_content.to_string(),
-    }));
-
     let kernel = Arc::new(kernel);
     let server = SyscallServer::bind(kernel, "127.0.0.1:0")
         .await
@@ -153,6 +119,18 @@ async fn spawn_kernel_with_mock(
     let addr = server.local_addr().expect("local_addr");
     tokio::spawn(server.serve());
     addr
+}
+
+/// Seed a fixture through the public tool path so the test exercises the same
+/// private, capability-mediated workspace used by the subsequent read.
+async fn seed_agent_file(agent: &mut Agent, path: &str, content: &str) {
+    agent
+        .call_tool(
+            "write_file",
+            serde_json::json!({"path": path, "content": content}),
+        )
+        .await
+        .expect("seed sandbox fixture through write_file");
 }
 
 /// End-to-end ReAct loop: the mock LLM first emits a `TOOL:` directive, the SDK
@@ -195,7 +173,7 @@ async fn react_loop_executes_tool_then_finalizes_e2e() {
         .mount(&mock_server)
         .await;
 
-    let addr = spawn_kernel_with_mock(&mock_server, "hello from the sdk react test").await;
+    let addr = spawn_kernel_with_mock(&mock_server).await;
 
     // full-access so the read_file tool clears the gate's capability check.
     let mut agent = Agent::builder()
@@ -206,6 +184,7 @@ async fn react_loop_executes_tool_then_finalizes_e2e() {
         .connect(addr)
         .await
         .expect("builder connect");
+    seed_agent_file(&mut agent, "sdk_react.txt", "hello from the sdk react test").await;
 
     let outcome = ReActLoop::new(DirectiveReasoner::new())
         .max_iterations(5)
@@ -259,7 +238,7 @@ async fn react_loop_respects_max_iterations_e2e() {
         .mount(&mock_server)
         .await;
 
-    let addr = spawn_kernel_with_mock(&mock_server, "never satisfied").await;
+    let addr = spawn_kernel_with_mock(&mock_server).await;
 
     let mut agent = Agent::builder()
         .name("looper")
@@ -269,6 +248,7 @@ async fn react_loop_respects_max_iterations_e2e() {
         .connect(addr)
         .await
         .expect("builder connect");
+    seed_agent_file(&mut agent, "loop.txt", "never satisfied").await;
 
     let outcome = ReActLoop::new(DirectiveReasoner::new())
         .max_iterations(3)
@@ -307,7 +287,7 @@ async fn planner_executor_runs_mixed_plan_e2e() {
         .mount(&mock_server)
         .await;
 
-    let addr = spawn_kernel_with_mock(&mock_server, "planned payload").await;
+    let addr = spawn_kernel_with_mock(&mock_server).await;
 
     let mut agent = Agent::builder()
         .name("planner")
@@ -317,6 +297,7 @@ async fn planner_executor_runs_mixed_plan_e2e() {
         .connect(addr)
         .await
         .expect("builder connect");
+    seed_agent_file(&mut agent, "planned.txt", "planned payload").await;
 
     // Fixed recipe: read a file, then ask the agent to summarize.
     let planner = FnPlanner(|goal: &str| {
@@ -364,7 +345,7 @@ async fn planner_executor_propagates_gate_denial_e2e() {
         .mount(&mock_server)
         .await;
 
-    let addr = spawn_kernel_with_mock(&mock_server, "x").await;
+    let addr = spawn_kernel_with_mock(&mock_server).await;
 
     // read-only lacks CAP_FILE_WRITE.
     let mut agent = Agent::builder()
@@ -523,10 +504,6 @@ async fn package_tool_security_decisions_are_identical_across_public_paths() {
     let args = serde_json::json!({"path": "parity.txt", "content": "same contract"});
 
     let kernel = Arc::new(AgentKernelImpl::new().expect("kernel new"));
-    kernel.resource_broker.register_provider(Box::new(FakeFs {
-        content: "unused".into(),
-    }));
-
     let mut shared = SharedToolRegistry::new();
     shared
         .publish(
@@ -664,7 +641,7 @@ async fn package_tool_security_decisions_are_identical_across_public_paths() {
 #[tokio::test]
 async fn kernel_client_connects_for_patterns() {
     let mock_server = MockServer::start().await;
-    let addr = spawn_kernel_with_mock(&mock_server, "x").await;
+    let addr = spawn_kernel_with_mock(&mock_server).await;
     let mut client = KernelClient::connect(addr).await.expect("connect");
     assert!(client.list_agents().await.expect("list").is_empty());
 }

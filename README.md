@@ -62,8 +62,10 @@ AI Agent OS provides:
 - **Packages** — bounded, validated manifests and registry-backed tool resolution
 
 > [!CAUTION]
-> Logical isolation is implemented, but production-grade host/container isolation
-> is still tracked by [#111](https://github.com/surya-koritala/AIagentOS/issues/111).
+> Capability-mediated workspace and HTTP isolation is implemented. Linux
+> container execution now has a hardened rootless, digest-pinned contract, but
+> live breakout/crash qualification and macOS/Windows process backends are still
+> tracked by [#111](https://github.com/surya-koritala/AIagentOS/issues/111).
 > Package signing and durable supply-chain qualification remain tracked by
 > [#119](https://github.com/surya-koritala/AIagentOS/issues/119).
 

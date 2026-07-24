@@ -4,12 +4,11 @@
 //! and call tools from external MCP servers.
 
 use std::collections::HashMap;
-use std::process::Stdio;
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, Command};
+use tokio::process::Child;
 use tokio::sync::Mutex;
 
 use crate::resources::ResourceType;
@@ -103,86 +102,12 @@ struct JsonRpcResponse {
 }
 
 impl McpServer {
-    /// Start an MCP server process and initialize the connection.
-    pub async fn connect(config: McpServerConfig) -> Result<Self, String> {
-        let mut cmd = Command::new(&config.command);
-        cmd.args(&config.args)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null());
-
-        for (k, v) in &config.env {
-            cmd.env(k, v);
-        }
-
-        let mut process = cmd
-            .spawn()
-            .map_err(|e| format!("Failed to start MCP server '{}': {}", config.name, e))?;
-
-        let stdin = process.stdin.take().ok_or("No stdin")?;
-        let stdout = process.stdout.take().ok_or("No stdout")?;
-
-        let mut server = Self {
-            config,
-            process,
-            stdin: Arc::new(Mutex::new(stdin)),
-            stdout: Arc::new(Mutex::new(BufReader::new(stdout))),
-            tools: Vec::new(),
-            next_id: 1,
-        };
-
-        // Initialize
-        server
-            .send_request(
-                "initialize",
-                Some(serde_json::json!({
-                    "protocolVersion": "2024-11-05",
-                    "capabilities": {},
-                    "clientInfo": {"name": "ai-agent-os", "version": "0.1.0"}
-                })),
-            )
-            .await?;
-
-        // Send initialized notification
-        server
-            .send_notification("notifications/initialized")
-            .await?;
-
-        // Discover tools
-        let tools_response = server.send_request("tools/list", None).await?;
-        if let Some(tools_arr) = tools_response.get("tools").and_then(|t| t.as_array()) {
-            server.tools = tools_arr
-                .iter()
-                .filter_map(|t| {
-                    Some(McpTool {
-                        name: t.get("name")?.as_str()?.to_string(),
-                        description: t
-                            .get("description")
-                            .and_then(|d| d.as_str())
-                            .unwrap_or("")
-                            .to_string(),
-                        input_schema: t
-                            .get("inputSchema")
-                            .cloned()
-                            .unwrap_or(serde_json::json!({})),
-                        security: t
-                            .get("agentosSecurity")
-                            .cloned()
-                            .and_then(|value| serde_json::from_value(value).ok()),
-                        resource_type: t
-                            .get("agentosResourceType")
-                            .cloned()
-                            .and_then(|value| serde_json::from_value(value).ok()),
-                        operation: t
-                            .get("agentosOperation")
-                            .and_then(|value| value.as_str())
-                            .map(str::to_string),
-                    })
-                })
-                .collect();
-        }
-
-        Ok(server)
+    /// Direct host-process MCP launch is disabled. Outbound MCP servers must be
+    /// attached to an agent's qualified container backend before this API can
+    /// be enabled; otherwise the MCP child would inherit the kernel's ambient
+    /// filesystem, process, network, and credential authority.
+    pub async fn connect(_config: McpServerConfig) -> Result<Self, String> {
+        Err("direct host MCP launch is disabled; an isolated MCP backend is required".into())
     }
 
     /// Get discovered tools.
@@ -275,20 +200,6 @@ impl McpServer {
         }
 
         Ok(response.result.unwrap_or(serde_json::Value::Null))
-    }
-
-    async fn send_notification(&mut self, method: &str) -> Result<(), String> {
-        let notification = serde_json::json!({"jsonrpc": "2.0", "method": method});
-        let mut payload = serde_json::to_string(&notification).map_err(|e| e.to_string())?;
-        payload.push('\n');
-
-        let mut stdin = self.stdin.lock().await;
-        stdin
-            .write_all(payload.as_bytes())
-            .await
-            .map_err(|e| e.to_string())?;
-        stdin.flush().await.map_err(|e| e.to_string())?;
-        Ok(())
     }
 }
 
@@ -390,6 +301,21 @@ mod tests {
             resource_type: Some(ResourceType::Network),
             operation: Some("get".into()),
         }
+    }
+
+    #[tokio::test]
+    async fn direct_host_mcp_launch_is_fail_closed() {
+        let result = McpServer::connect(McpServerConfig {
+            name: "unsafe-host-child".into(),
+            command: "/bin/echo".into(),
+            args: vec!["must-not-run".into()],
+            env: HashMap::new(),
+        })
+        .await;
+        let Err(error) = result else {
+            panic!("direct host MCP launch unexpectedly succeeded");
+        };
+        assert!(error.contains("isolated MCP backend"));
     }
 
     #[test]

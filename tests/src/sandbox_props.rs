@@ -35,6 +35,7 @@ proptest! {
             max_disk_usage_bytes: None,
             max_memory_bytes: None,
             isolation_level: IsolationLevel::Filesystem,
+            container_image: None,
         };
         let sid = mgr.create_sandbox(agent_id, &config).unwrap();
 
@@ -78,6 +79,7 @@ proptest! {
             max_disk_usage_bytes: None,
             max_memory_bytes: None,
             isolation_level: IsolationLevel::Filesystem,
+            container_image: None,
         };
 
         // Creating a sandbox for a new agent should always succeed
@@ -110,6 +112,7 @@ proptest! {
             max_disk_usage_bytes: None,
             max_memory_bytes: None,
             isolation_level: IsolationLevel::Filesystem,
+            container_image: None,
         };
         let config2 = SandboxConfig {
             workspace_dir: ws2.clone(),
@@ -117,6 +120,7 @@ proptest! {
             max_disk_usage_bytes: None,
             max_memory_bytes: None,
             isolation_level: IsolationLevel::Filesystem,
+            container_image: None,
         };
 
         let sid1 = mgr.create_sandbox(agent1, &config1).unwrap();

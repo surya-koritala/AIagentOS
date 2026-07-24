@@ -1061,6 +1061,9 @@ pub struct AgentKernelImpl {
     pub connector: Arc<AgentConnectorImpl>,
     pub resource_broker: Arc<ResourceBrokerImpl>,
     pub tool_registry: Arc<ToolRegistry>,
+    /// Signed, tenant-scoped package supply chain backed by the same durable
+    /// SQLite boundary as agents, auth, quotas, and operator state.
+    pub package_registry: Arc<crate::package::PackageRegistry>,
     /// Shared fixed-epoch clock. The cgroup hierarchy uses the same source when
     /// durable hierarchical quota accounting is enabled.
     pub quota_clock: Arc<dyn crate::quota_clock::QuotaClock>,
@@ -1324,6 +1327,9 @@ impl AgentKernelImpl {
         let operator_control = Arc::new(crate::operator_control::OperatorControl::new(
             context_manager.clone(),
         )?);
+        let package_registry = Arc::new(crate::package::PackageRegistry::from_store(
+            context_manager.clone(),
+        ));
         let os = Arc::new(OsSubsystems::new());
 
         let ipc = Arc::new(IpcManager::new());
@@ -1361,6 +1367,7 @@ impl AgentKernelImpl {
             connector: Arc::new(AgentConnectorImpl::new()),
             resource_broker,
             tool_registry,
+            package_registry,
             quota_clock,
             rate_limiter,
             cgroups,

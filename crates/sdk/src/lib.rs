@@ -43,6 +43,11 @@ use tokio::net::ToSocketAddrs;
 pub use kernel::context::ContextPressureStats;
 pub use kernel::init_system::{ServiceHistoryEntry, ServiceRuntimeInfo};
 pub use kernel::operator_control::{OperatorTunable, OperatorTunableAudit};
+pub use kernel::package::{
+    InstallPolicy, InstalledPackage, LockedPackage, PackageArchive, PackageDep, PackageFile,
+    PackageFileKind, PackageLock, PackageManifest, PackagePayload, PackageSbom, PackageSigningKey,
+    PackageSummary, PackageTrustInput, PackageTrustKey, SbomComponent, VerifiedPackage,
+};
 pub use kernel::syscall_server::{
     AgentSummary, FactSummary, GenerationCheckpointSummary, OperatorAgentSnapshot,
     OperatorCgroupSnapshot, OperatorNamespaceSnapshot, OperatorPackageSnapshot,
@@ -918,6 +923,177 @@ impl KernelClient {
             manifest_toml: manifest_toml.into(),
         };
         match self.call(call).await? {
+            SyscallReply::AgentCreated { id } => Ok(id),
+            other => Err(unexpected("AgentCreated", &other)),
+        }
+    }
+
+    /// Add or rotate an Ed25519 package trust root in this connection's tenant.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn trust_package_key(
+        &mut self,
+        publisher: impl Into<String>,
+        key_id: impl Into<String>,
+        public_key: &[u8],
+        valid_from: impl Into<String>,
+        valid_until: Option<String>,
+        supersedes: Option<String>,
+    ) -> Result<(), SdkError> {
+        let call = Syscall::TrustPackageKey {
+            publisher: publisher.into(),
+            key_id: key_id.into(),
+            public_key_hex: kernel::package::archive_to_hex(public_key),
+            valid_from: valid_from.into(),
+            valid_until,
+            supersedes,
+        };
+        match self.call(call).await? {
+            SyscallReply::PackageKeyUpdated => Ok(()),
+            other => Err(unexpected("PackageKeyUpdated", &other)),
+        }
+    }
+
+    /// Revoke a package publisher key for this tenant.
+    pub async fn revoke_package_key(&mut self, key_id: impl Into<String>) -> Result<(), SdkError> {
+        match self
+            .call(Syscall::RevokePackageKey {
+                key_id: key_id.into(),
+            })
+            .await?
+        {
+            SyscallReply::PackageKeyUpdated => Ok(()),
+            other => Err(unexpected("PackageKeyUpdated", &other)),
+        }
+    }
+
+    /// Publish a signed `.agent` archive.
+    pub async fn publish_package(&mut self, archive: &[u8]) -> Result<PackageSummary, SdkError> {
+        match self
+            .call(Syscall::PublishPackage {
+                archive_hex: kernel::package::archive_to_hex(archive),
+            })
+            .await?
+        {
+            SyscallReply::PackagePublished { package } => Ok(package),
+            other => Err(unexpected("PackagePublished", &other)),
+        }
+    }
+
+    /// Yank a package version from future fetch and dependency resolution.
+    pub async fn yank_package(
+        &mut self,
+        name: impl Into<String>,
+        version: impl Into<String>,
+    ) -> Result<(), SdkError> {
+        match self
+            .call(Syscall::YankPackage {
+                name: name.into(),
+                version: version.into(),
+            })
+            .await?
+        {
+            SyscallReply::PackageMutationComplete => Ok(()),
+            other => Err(unexpected("PackageMutationComplete", &other)),
+        }
+    }
+
+    /// Fetch and re-verify a non-yanked package archive.
+    pub async fn fetch_package(
+        &mut self,
+        name: impl Into<String>,
+        version: impl Into<String>,
+    ) -> Result<Vec<u8>, SdkError> {
+        match self
+            .call(Syscall::FetchPackage {
+                name: name.into(),
+                version: version.into(),
+            })
+            .await?
+        {
+            SyscallReply::PackageArchive { archive_hex } => {
+                kernel::package::archive_from_hex(&archive_hex)
+                    .map_err(|error| SdkError::Kernel(error.to_string()))
+            }
+            other => Err(unexpected("PackageArchive", &other)),
+        }
+    }
+
+    /// Search signed package metadata inside the authenticated tenant.
+    pub async fn search_packages(
+        &mut self,
+        query: impl Into<String>,
+    ) -> Result<Vec<PackageSummary>, SdkError> {
+        match self
+            .call(Syscall::SearchPackages {
+                query: query.into(),
+            })
+            .await?
+        {
+            SyscallReply::Packages { packages } => Ok(packages),
+            other => Err(unexpected("Packages", &other)),
+        }
+    }
+
+    /// Resolve and atomically install or upgrade a package.
+    pub async fn install_package(
+        &mut self,
+        name: impl Into<String>,
+        requirement: impl Into<String>,
+    ) -> Result<InstalledPackage, SdkError> {
+        match self
+            .call(Syscall::InstallPackage {
+                name: name.into(),
+                requirement: requirement.into(),
+            })
+            .await?
+        {
+            SyscallReply::PackageInstalled { package } => Ok(package),
+            other => Err(unexpected("PackageInstalled", &other)),
+        }
+    }
+
+    /// Roll an installed package back to its previous committed version.
+    pub async fn rollback_package(
+        &mut self,
+        name: impl Into<String>,
+    ) -> Result<InstalledPackage, SdkError> {
+        match self
+            .call(Syscall::RollbackPackage { name: name.into() })
+            .await?
+        {
+            SyscallReply::PackageInstalled { package } => Ok(package),
+            other => Err(unexpected("PackageInstalled", &other)),
+        }
+    }
+
+    /// Remove an installed package if it has no installed dependents.
+    pub async fn remove_package(&mut self, name: impl Into<String>) -> Result<(), SdkError> {
+        match self
+            .call(Syscall::RemovePackage { name: name.into() })
+            .await?
+        {
+            SyscallReply::PackageMutationComplete => Ok(()),
+            other => Err(unexpected("PackageMutationComplete", &other)),
+        }
+    }
+
+    /// List exact installed versions and lockfile digests.
+    pub async fn list_installed_packages(&mut self) -> Result<Vec<InstalledPackage>, SdkError> {
+        match self.call(Syscall::ListInstalledPackages).await? {
+            SyscallReply::InstalledPackages { packages } => Ok(packages),
+            other => Err(unexpected("InstalledPackages", &other)),
+        }
+    }
+
+    /// Re-verify and load an installed package as a tenant-owned agent.
+    pub async fn run_installed_package(
+        &mut self,
+        name: impl Into<String>,
+    ) -> Result<String, SdkError> {
+        match self
+            .call(Syscall::RunInstalledPackage { name: name.into() })
+            .await?
+        {
             SyscallReply::AgentCreated { id } => Ok(id),
             other => Err(unexpected("AgentCreated", &other)),
         }

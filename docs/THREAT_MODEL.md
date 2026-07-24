@@ -105,6 +105,6 @@ execution, and macOS/Windows process/container backends fail closed instead of
 silently weakening the boundary. Approval lifecycle UX, credential brokering,
 package signatures, broader provider isolation, side-effect cancellation/drain
 guarantees, audit retention, and independent penetration testing remain tracked
-by the canonical [capability registry](capabilities.toml) and issues #115, #119,
-#121, #124, and #127. A capability must not be promoted beyond its evidence
+by the canonical [capability registry](capabilities.toml) and issues #121,
+#124, and #127. A capability must not be promoted beyond its evidence
 while any of those limitations apply.

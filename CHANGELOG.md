@@ -42,10 +42,16 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
   snapshots, and checkpoints; and exposes content-free usage/rejection
   telemetry. Explicit backpressure replaces unsupported CPU-preemption,
   virtual-memory, and OOM-killer claims. (#114, #115)
-- **Validated agent-package loading** — manifests are bounded and fail closed,
-  declared tools resolve against the live registry, tenant privilege is
-  constrained, and partial creation rolls back atomically. Packages remain
-  unsigned; signing and a durable registry are still pending. (#119)
+- **Signed agent-package supply chain** — deterministic bounded `.agent`
+  archives carry manifests, prompts/assets/policy files, dependencies, tool and
+  capability declarations, and SPDX SBOM data. Ed25519 signatures are verified
+  before payload parsing against durable tenant trust roots with rotation and
+  revocation. The authenticated wire/SDK registry provides immutable publish,
+  verified fetch/search, yanking, tenant-scoped deterministic semver lockfiles,
+  policy admission, and atomic install/upgrade/rollback/remove. Registry,
+  installed state, audit, rate limits, and hash-chained transparency records
+  survive restart and backup/restore. Marketplace ratings/download counters are
+  excluded from the v1 surface. (#119)
 - **On-device GGUF adapter spike** — feature-gated Candle inference can run a
   provisioned quantized model locally; it remains experimental and is not part
   of the production support promise. (#104, #120)

@@ -321,11 +321,13 @@ app, and `agent-server` construct from config and then explicitly call
   `tool_descriptors.rs` and `mount_table.rs` are disconnected experimental
   prototypes, not an alternate runtime. See
   [`ADR-0001-PUBLIC-ABI.md`](ADR-0001-PUBLIC-ABI.md).
-- **Packages** — `agent_package.rs` provides the validated, bounded, unsigned
-  TOML `AgentManifest` public path (`load_package`/`run_package`) with
-  transactional creation rollback. `agentpkg.rs`/`package.rs`/`marketplace.rs`
-  are in-memory apt-like prototypes, not a production supply chain.
-- **Hub** — `agent_hub.rs` is a versioned in-memory publish/fetch prototype.
+- **Packages** — `package.rs` provides deterministic signed `.agent` archives,
+  durable tenant trust/revocation, immutable publish/yank records, semver
+  dependency locks, policy admission, and transactional
+  install/upgrade/rollback/remove. `agent_package.rs` maps verified manifests
+  through normal tenant admission; its unsigned TOML loader remains a
+  trusted-local compatibility path. `marketplace.rs` and `agent_hub.rs` are
+  non-public experiments and are not used by the v1 supply chain.
 - **MCP** — client (`mcp.rs`) and gate-enforced server (`mcp_server.rs`).
   Discovered client tools are prevalidated and published all-or-nothing; an
   invalid/conflicting entry or late publication failure leaves the prior

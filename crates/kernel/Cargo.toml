@@ -28,6 +28,7 @@ tokio-rustls = { workspace = true }
 rustls = { workspace = true }
 ring = { workspace = true }
 cap-std = { workspace = true }
+semver = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [

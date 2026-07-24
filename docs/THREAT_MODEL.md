@@ -83,9 +83,10 @@ not treat model-supplied alternate keys, non-string values, or an MCP server's
 claimed classification as equivalent. For non-trusted agents, the broker does
 not delegate filesystem or HTTP authority to a provider: filesystem operations
 use a retained directory capability, and HTTP uses validated, pinned DNS answers
-with proxies and redirects disabled. Browser subresources, WebSockets, an
-isolated outbound MCP runtime, Linux live-container qualification, and native
-macOS/Windows process isolation remain #111 work.
+with proxies and redirects disabled. Browser subresources, WebSockets, outbound
+MCP children, untrusted peripherals, native process execution, and
+macOS/Windows process/container isolation are outside the supported untrusted
+runtime and fail closed.
 
 Package code, MCP servers, and resource providers are potential deputies, not
 authorization authorities. They receive only a call that already passed tenant
@@ -95,14 +96,15 @@ for the kernel-owned context.
 
 ## Residual risks and qualification work
 
-The declaration contract does not by itself prove complete host isolation.
+The declaration contract does not by itself prove universal host isolation.
 Capability-mediated filesystem/HTTP I/O and the hardened Linux rootless
-container contract are implemented, while native process mode and direct host
-MCP launch fail closed. Linux live-container breakout/crash qualification,
-macOS/Windows process backends, approval lifecycle UX, credential brokering,
-package signatures, browser/provider isolation, side-effect cancellation/drain
+container contract are implemented and public-API E2E qualified, including a
+protected live rootless-container breakout/cancellation/crash-cleanup job.
+Native process mode, direct host MCP launch, unisolated browser/peripheral
+execution, and macOS/Windows process/container backends fail closed instead of
+silently weakening the boundary. Approval lifecycle UX, credential brokering,
+package signatures, broader provider isolation, side-effect cancellation/drain
 guarantees, audit retention, and independent penetration testing remain tracked
-by the canonical
-[capability registry](capabilities.toml) and issues #111, #115, #119, #121,
-#124, and #127. A capability must not be promoted beyond its evidence while any
-of those limitations apply.
+by the canonical [capability registry](capabilities.toml) and issues #115, #119,
+#121, #124, and #127. A capability must not be promoted beyond its evidence
+while any of those limitations apply.

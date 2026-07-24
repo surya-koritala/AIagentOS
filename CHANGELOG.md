@@ -83,11 +83,19 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
   races, before reserving the execution slot.
   (#103, #108)
 - **Mandatory sandbox boundary** — resource calls require an unforgeable agent
-  sandbox identity. Filesystem paths are canonicalized inside the workspace
-  before provider dispatch, including regression coverage for traversal and
-  symlink escapes; lexical aliases are normalized before MAC and built-in HTTP
-  requests do not follow redirects. Full OS/container isolation still requires
-  #111.
+  sandbox identity. Non-trusted filesystem I/O is capability-relative and
+  regression-tested against traversal, symlink/rename races, quota escape, and
+  cross-agent access. HTTP resolves and pins public-only answers with no proxy,
+  redirects, credentials, or non-default ports. Digest-pinned Linux containers
+  require a rootless daemon and enforce read-only root, no network, no
+  capabilities, no-new-privileges, PID/CPU/memory/swap/file-descriptor/output
+  limits, bounded temporary storage, and cancellation/crash cleanup. A protected
+  live qualification job covers breakout prerequisites and teardown; raw wire,
+  SDK, package, custom-tool, and MCP calls share the same fail-closed boundary.
+  Native process mode, outbound host MCP, unisolated browser/peripheral access,
+  and macOS/Windows process/container isolation are explicitly unsupported for
+  untrusted agents. Independent penetration testing remains a v1 gate. (#111,
+  #127)
 - **Rust supply-chain repair** — upgraded Wasmtime, Tauri, `quick-xml`,
   `crossbeam-epoch`, Ratatui, and `memmap2`; replaced the discontinued direct
   PEM parser with rustls PKI parsing; and added valid AGPL SPDX metadata to

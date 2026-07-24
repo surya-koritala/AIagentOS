@@ -38,7 +38,7 @@ struct ParamDef {
 }
 
 /// Load custom tools from a TOML file and register them in the registry.
-pub fn load_custom_tools(registry: &mut ToolRegistry, path: &Path) {
+pub fn load_custom_tools(registry: &ToolRegistry, path: &Path) {
     let content = match std::fs::read_to_string(path) {
         Ok(c) => c,
         Err(_) => return, // File doesn't exist — that's fine
@@ -124,8 +124,8 @@ description = "missing contract"
 command = "sh"
 "#,
         );
-        let mut registry = ToolRegistry::new();
-        load_custom_tools(&mut registry, &config.0);
+        let registry = ToolRegistry::new();
+        load_custom_tools(&registry, &config.0);
         assert!(!registry.has_tool("unsafe"));
     }
 
@@ -153,8 +153,8 @@ value = "input"
 input = { type = "string", required = true }
 "#,
         );
-        let mut registry = ToolRegistry::new();
-        load_custom_tools(&mut registry, &config.0);
+        let registry = ToolRegistry::new();
+        load_custom_tools(&registry, &config.0);
         assert!(!registry.has_tool("confused_deputy"));
     }
 
@@ -178,8 +178,8 @@ kind = "constant"
 value = "command:empty"
 "#,
         );
-        let mut registry = ToolRegistry::new();
-        load_custom_tools(&mut registry, &config.0);
+        let registry = ToolRegistry::new();
+        load_custom_tools(&registry, &config.0);
         assert!(!registry.has_tool("empty_command"));
         assert!(registry
             .definitions()
@@ -226,8 +226,8 @@ kind = "constant"
 value = "harmless-decoy"
 "#,
         );
-        let mut registry = ToolRegistry::new();
-        load_custom_tools(&mut registry, &config.0);
+        let registry = ToolRegistry::new();
+        load_custom_tools(&registry, &config.0);
         assert!(registry.has_tool("exact_command"));
         assert!(!registry.has_tool("decoy_command"));
     }

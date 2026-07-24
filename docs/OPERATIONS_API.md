@@ -79,11 +79,13 @@ rollback, invalid, stale, and unauthorized attempts are durable audit entries.
 
 ## Package view and limitations
 
-The package view records non-sensitive instances successfully created from
-validated manifests and survives restart. It does not claim that the package
-supply chain is complete: signed archives, publishers, revocation, dependency
-resolution, install transactions, and a durable registry remain tracked by
-issue #119.
+The package view records non-sensitive loaded instances. The signed package
+registry separately persists tenant trust roots, immutable artifacts, yanks,
+exact dependency locks, installed versions, rate-limit windows, mutation audit,
+and a hash-chained transparency log. Authenticated wire/SDK operations cover
+trust/revocation, publish/fetch/search, install/upgrade/rollback/remove, and
+verified run. Marketplace ratings/download counters are not part of the v1
+surface.
 
 Provider health is currently availability plus timeout evidence; provider
 error taxonomies, circuit breakers, model discovery, and external contract

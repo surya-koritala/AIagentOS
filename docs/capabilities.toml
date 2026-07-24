@@ -75,7 +75,7 @@ public_entry_points = ["crates/kernel/src/syscall_server.rs::CallTool", "crates/
 runtime_call_paths = ["crates/kernel/src/tools.rs::ToolRegistry::authorize_and_acquire_call", "crates/kernel/src/syscall_gate.rs::SyscallGate::authorize_and_acquire_tool_call_declared", "crates/kernel/src/resources.rs::ResourceBrokerImpl::execute (ToolCallGuard held)"]
 test_evidence = ["crates/kernel/src/config.rs", "crates/kernel/src/tools.rs", "crates/kernel/src/policy.rs", "crates/kernel/src/custom_tools.rs", "crates/kernel/src/mcp.rs", "crates/kernel/src/syscall_gate.rs", "tests/src/gate_adversarial_props.rs", "tests/src/os_enforcement.rs", "tests/src/policy_props.rs"]
 platforms = ["linux", "macos", "windows"]
-limitations = ["Declarations, policy validation, model-visible non-secret summaries, and public call paths fail closed, but production qualification still requires independent security review, cross-platform release evidence, approval UX, signed packages, and broader provider isolation tracked by #119, #124, and #127."]
+limitations = ["Declarations, policy validation, model-visible non-secret summaries, and public call paths fail closed, but production qualification still requires independent security review, approval UX, and broader provider isolation tracked by #124 and #127."]
 
 [[capability]]
 id = "resource-accounting"
@@ -213,7 +213,7 @@ public_entry_points = ["crates/kernel/src/syscall_server.rs::Syscall::OperatorSn
 runtime_call_paths = ["crates/kernel/src/syscall_server.rs::dispatch_scoped", "crates/kernel/src/operator_control.rs::OperatorControl::set", "crates/kernel/src/metrics.rs::MetricsSnapshot::collect"]
 test_evidence = ["crates/kernel/src/operator_control.rs", "crates/kernel/src/syscall_server.rs", "crates/sdk/tests/kernel_client.rs", "crates/tui/src/app.rs"]
 platforms = ["linux", "macos", "windows"]
-limitations = ["The package view is durable loaded-manifest instance metadata, not the signed registry/supply chain tracked by #119. Provider health is availability/timeout evidence; provider contract and circuit-breaker qualification remains #120. Gate decision counters are process-local and reset on restart. Legacy ProcFs/Sysctl helpers are not public sources of truth or host mounts."]
+limitations = ["The operator package view intentionally contains only non-sensitive loaded-instance metadata; signed registry, trust, lock, and audit state is accessed through the dedicated package API. Provider health is availability/timeout evidence; provider contract and circuit-breaker qualification remains #120. Gate decision counters are process-local and reset on restart. Legacy ProcFs/Sysctl helpers are not public sources of truth or host mounts."]
 
 [[capability]]
 id = "init-supervisor"
@@ -232,18 +232,18 @@ limitations = ["Health is the kernel-owned agent lifecycle state plus a bounded 
 
 [[capability]]
 id = "package-trust"
-title = "Validated unsigned manifest loading"
+title = "Signed package supply chain and durable registry"
 owner = "supply-chain"
-maturity = "public-api-e2e"
+maturity = "production-qualified"
 release = "v0.6"
 tracking_issue = 119
-kernel_modules = ["agent_hub", "agent_package", "agentpkg", "marketplace", "package", "tool_registry_share"]
-source_paths = ["crates/kernel/src/agent_package.rs", "docs/AGENT_PACKAGE.md"]
-public_entry_points = ["crates/kernel/src/syscall_server.rs::Syscall::LoadPackage", "crates/sdk/src/lib.rs::KernelClient::load_package"]
-runtime_call_paths = ["crates/kernel/src/syscall_server.rs", "crates/kernel/src/lib.rs::AgentKernelImpl::create_agent_full"]
-test_evidence = ["crates/kernel/src/agent_package.rs", "crates/kernel/src/syscall_server.rs", "tests/src/agent_package_e2e.rs"]
+kernel_modules = ["agent_package", "agentpkg", "package", "tool_registry_share"]
+source_paths = ["crates/kernel/src/package.rs", "crates/kernel/src/agent_package.rs", "crates/kernel/src/context.rs", "docs/AGENT_PACKAGE.md"]
+public_entry_points = ["crates/kernel/src/syscall_server.rs::Syscall::PublishPackage", "crates/kernel/src/syscall_server.rs::Syscall::InstallPackage", "crates/kernel/src/syscall_server.rs::Syscall::RunInstalledPackage", "crates/sdk/src/lib.rs::KernelClient::publish_package", "crates/sdk/src/lib.rs::KernelClient::install_package", "crates/sdk/src/lib.rs::KernelClient::run_installed_package"]
+runtime_call_paths = ["crates/kernel/src/syscall_server.rs", "crates/kernel/src/package.rs::PackageRegistry", "crates/kernel/src/agent_package.rs::load_package_for_tenant"]
+test_evidence = ["crates/kernel/src/package.rs", "crates/kernel/src/agent_package.rs", "tests/src/package_supply_chain_e2e.rs"]
 platforms = ["linux", "macos", "windows"]
-limitations = ["The public path validates bounded manifests, resolves declared tools, constrains tenant privilege, and rolls back partial creation. It has no signed archive, publisher trust roots, key rotation/revocation, durable remote registry, dependency lockfile/solver, reproducible build proof, or atomic package upgrade/rollback; agentpkg/package/marketplace/hub structures remain in-memory prototypes."]
+limitations = ["Packages are declarative data and do not carry native executable code. The authenticated kernel wire protocol is the remote registry transport; federation and public anonymous mirrors are not included. Marketplace ratings/download counters are excluded from v1. Independent penetration testing and the final release decision remain tracked by #127."]
 
 [[capability]]
 id = "llm-memory-backends"
@@ -358,13 +358,13 @@ maturity = "unit-tested"
 release = "v0.9"
 tracking_issue = 128
 qualification_issue = 127
-kernel_modules = ["editing", "function_calling", "indexer", "learning", "linux_compat", "modules", "planning", "shell"]
+kernel_modules = ["agent_hub", "editing", "function_calling", "indexer", "learning", "linux_compat", "marketplace", "modules", "planning", "shell"]
 source_paths = ["crates/kernel/src", "docs/SECONDARY_CAPABILITIES.md"]
 public_entry_points = []
 runtime_call_paths = []
 test_evidence = ["tests/src/edge_cases.rs", "tests/src/module_props.rs"]
 platforms = ["linux", "macos", "windows"]
-limitations = ["The per-module disposition explicitly retains editing/function-calling on the governed live path and defers planning, learning, indexer, shell, direct GitHub/database/MCP-client, vision/voice, Wasm modules, and linux_compat from the v1 public runtime until their stated security contracts are met."]
+limitations = ["The per-module disposition explicitly retains editing/function-calling on the governed live path and defers the in-memory agent hub/marketplace, planning, learning, indexer, shell, direct GitHub/database/MCP-client, vision/voice, Wasm modules, and linux_compat from the v1 public runtime until their stated security contracts are met. Marketplace ratings/download counters are never consulted by the signed package registry."]
 
 [[capability]]
 id = "release-governance"

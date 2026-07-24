@@ -59,7 +59,7 @@ AI Agent OS provides:
 - **Security** — fail-closed tool declarations, MAC policies, capabilities, approvals, and audit logging
 - **IPC** — inter-agent messaging, delegation, and discovery (broker-routed via `IpcManager`)
 - **Service supervision** — validated dependency graphs, durable ownership/history, health-driven restart/backoff, and atomic rolling reload
-- **Packages** — bounded, validated manifests and registry-backed tool resolution
+- **Packages** — signed archives, tenant trust roots, deterministic dependency locks, and transactional installs
 
 > [!CAUTION]
 > Capability-mediated workspace and HTTP isolation is public-API E2E tested.
@@ -71,8 +71,9 @@ AI Agent OS provides:
 > [sandbox qualification contract](docs/SANDBOX_QUALIFICATION.md); independent
 > penetration testing remains tracked by
 > [#127](https://github.com/surya-koritala/AIagentOS/issues/127).
-> Package signing and durable supply-chain qualification remain tracked by
-> [#119](https://github.com/surya-koritala/AIagentOS/issues/119).
+> Signed packages are engineering-qualified; the project-wide independent
+> penetration test and v1 release decision remain tracked by
+> [#127](https://github.com/surya-koritala/AIagentOS/issues/127).
 
 ## See governance in action
 
@@ -197,7 +198,7 @@ presence in the Rust crate is not a v1 support claim.
 | Namespaces | Tool and IPC visibility primitives | Unit-tested — [#107](https://github.com/surya-koritala/AIagentOS/issues/107) |
 | VFS + mount | Experimental descriptor/mount prototypes, excluded from v1 | Scaffolded — [ADR 0001](docs/ADR-0001-PUBLIC-ABI.md) |
 | `/proc` + sysctl analogue | Remote tenant-safe typed snapshot, scoped gate/package views, and durable audited tunables | Production-qualified — [#117](https://github.com/surya-koritala/AIagentOS/issues/117) |
-| apt/rpm | Validated unsigned manifest loading; registry/signing remain prototypes | Public-API E2E (not supply-chain qualified) — [#119](https://github.com/surya-koritala/AIagentOS/issues/119) |
+| apt/rpm | Signed data archives, tenant trust/revocation, semver lockfiles, durable registry, and transactional install/upgrade/rollback/remove | Production-qualified engineering path — [#119](https://github.com/surya-koritala/AIagentOS/issues/119) |
 
 ## How enforcement works in practice
 

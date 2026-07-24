@@ -88,9 +88,9 @@ pub struct OperatorTunableAudit {
 
 /// Non-sensitive record of an agent created from a package manifest.
 ///
-/// This is intentionally an instance view, not the signed package registry
-/// promised by issue #119. It lets operators distinguish package-created
-/// workloads without exposing prompts, memory seeds, or manifest contents.
+/// This is intentionally an instance view, separate from the signed package
+/// registry. It lets operators distinguish package-created workloads without
+/// exposing prompts, memory seeds, manifest contents, trust roots, or archives.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LoadedPackageInstance {
     pub agent_id: String,

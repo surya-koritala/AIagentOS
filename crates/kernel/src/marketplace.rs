@@ -1,4 +1,8 @@
-//! Plugin marketplace — discover, rate, and install community plugins.
+//! Experimental marketplace metadata.
+//!
+//! This module is explicitly excluded from the v1 public package surface.
+//! In-memory ratings and download counters are not trustworthy ranking signals
+//! and are never consulted by the signed registry in [`crate::package`].
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;

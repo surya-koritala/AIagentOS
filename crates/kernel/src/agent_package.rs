@@ -32,7 +32,7 @@ fn default_priority() -> u8 {
 }
 
 /// A loadable agent package manifest (e.g. `agent.toml`).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentManifest {
     /// Unique, human-readable package name.

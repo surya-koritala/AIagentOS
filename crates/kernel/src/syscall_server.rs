@@ -74,6 +74,10 @@ fn default_tunable_audit_limit() -> usize {
     100
 }
 
+fn default_package_requirement() -> String {
+    "*".to_string()
+}
+
 /// A syscall request from an agent / SDK to the kernel.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
@@ -246,6 +250,60 @@ pub enum Syscall {
     /// Running the package's entry prompt is left to the in-process runner.
     LoadPackage {
         manifest_toml: String,
+    },
+    /// Add or rotate a tenant package publisher's Ed25519 trust root.
+    TrustPackageKey {
+        publisher: String,
+        key_id: String,
+        public_key_hex: String,
+        valid_from: String,
+        #[serde(default)]
+        valid_until: Option<String>,
+        #[serde(default)]
+        supersedes: Option<String>,
+    },
+    /// Revoke a package trust root. Previously installed artifacts remain
+    /// recorded, but fetch, install, and run re-verification fail closed.
+    RevokePackageKey {
+        key_id: String,
+    },
+    /// Publish a signed `.agent` archive to the caller's tenant registry.
+    PublishPackage {
+        archive_hex: String,
+    },
+    /// Yank a compromised or obsolete package version from resolution.
+    YankPackage {
+        name: String,
+        version: String,
+    },
+    /// Fetch one non-yanked signed archive.
+    FetchPackage {
+        name: String,
+        version: String,
+    },
+    /// Search package metadata inside the caller's tenant.
+    SearchPackages {
+        query: String,
+    },
+    /// Resolve and transactionally install or upgrade a signed package.
+    InstallPackage {
+        name: String,
+        #[serde(default = "default_package_requirement")]
+        requirement: String,
+    },
+    /// Restore the previous committed version of an installed package.
+    RollbackPackage {
+        name: String,
+    },
+    /// Remove an installed package when no installed package depends on it.
+    RemovePackage {
+        name: String,
+    },
+    /// List the caller tenant's installed package lock state.
+    ListInstalledPackages,
+    /// Re-verify and load the installed agent through normal tenant admission.
+    RunInstalledPackage {
+        name: String,
     },
     /// Read-only node load/health, for distributed placement. Reports how many
     /// agents this kernel node hosts (total + currently running) so a cluster
@@ -659,6 +717,30 @@ pub enum SyscallReply {
     },
     /// The connection is authenticated (reply to [`Syscall::Authenticate`]).
     Authenticated,
+    /// A trust root was added, rotated, or revoked.
+    PackageKeyUpdated,
+    /// A signed artifact was published.
+    PackagePublished {
+        package: crate::package::PackageSummary,
+    },
+    /// A signed artifact fetched from the tenant registry.
+    PackageArchive {
+        archive_hex: String,
+    },
+    /// Tenant-scoped package search results.
+    Packages {
+        packages: Vec<crate::package::PackageSummary>,
+    },
+    /// Transactional install, upgrade, or rollback result.
+    PackageInstalled {
+        package: crate::package::InstalledPackage,
+    },
+    /// Installed package state.
+    InstalledPackages {
+        packages: Vec<crate::package::InstalledPackage>,
+    },
+    /// A package version was yanked or an installation was removed.
+    PackageMutationComplete,
     /// Node load/health (reply to [`Syscall::NodeInfo`]).
     NodeInfo {
         agent_count: usize,
@@ -827,6 +909,17 @@ fn syscall_policy(call: &Syscall) -> (AccessLevel, &'static str, Option<&str>) {
         Syscall::Hello { .. } => (AccessLevel::ReadOnly, "protocol.hello", None),
         Syscall::Authenticate { .. } => (AccessLevel::ReadOnly, "auth.authenticate", None),
         Syscall::LoadPackage { .. } => (AccessLevel::Admin, "package.load", None),
+        Syscall::TrustPackageKey { .. } => (AccessLevel::Admin, "package.trust_key", None),
+        Syscall::RevokePackageKey { .. } => (AccessLevel::Admin, "package.revoke_key", None),
+        Syscall::PublishPackage { .. } => (AccessLevel::Admin, "package.publish", None),
+        Syscall::YankPackage { .. } => (AccessLevel::Admin, "package.yank", None),
+        Syscall::FetchPackage { .. } => (AccessLevel::ReadOnly, "package.fetch", None),
+        Syscall::SearchPackages { .. } => (AccessLevel::ReadOnly, "package.search", None),
+        Syscall::InstallPackage { .. } => (AccessLevel::Admin, "package.install", None),
+        Syscall::RollbackPackage { .. } => (AccessLevel::Admin, "package.rollback", None),
+        Syscall::RemovePackage { .. } => (AccessLevel::Admin, "package.remove", None),
+        Syscall::ListInstalledPackages => (AccessLevel::ReadOnly, "package.installed.list", None),
+        Syscall::RunInstalledPackage { .. } => (AccessLevel::Admin, "package.run", None),
         Syscall::NodeInfo => (AccessLevel::System, "system.node_info", None),
         Syscall::Metrics => (AccessLevel::System, "system.metrics", None),
         Syscall::OperatorSnapshot => (AccessLevel::ReadOnly, "operator.snapshot", None),
@@ -1028,6 +1121,10 @@ pub async fn dispatch_scoped(
         return reply;
     }
     let tenant = principal.map(|principal| principal.tenant_id.as_str());
+    let package_scope = tenant.unwrap_or(crate::context::DEFAULT_TENANT);
+    let package_actor = principal
+        .map(|principal| principal.user_id.as_str())
+        .unwrap_or("system");
     match call {
         Syscall::CreateAgent {
             name,
@@ -1615,6 +1712,220 @@ pub async fn dispatch_scoped(
                 }
                 Err(e) => SyscallReply::Error {
                     message: format!("invalid package: {e}"),
+                },
+            }
+        }
+        Syscall::TrustPackageKey {
+            publisher,
+            key_id,
+            public_key_hex,
+            valid_from,
+            valid_until,
+            supersedes,
+        } => {
+            let public_key = match crate::package::archive_from_hex(&public_key_hex) {
+                Ok(public_key) => public_key,
+                Err(error) => {
+                    return SyscallReply::Error {
+                        message: error.to_string(),
+                    }
+                }
+            };
+            let valid_from = match chrono::DateTime::parse_from_rfc3339(&valid_from) {
+                Ok(value) => value.with_timezone(&chrono::Utc),
+                Err(_) => {
+                    return SyscallReply::Error {
+                        message: "invalid package key valid_from timestamp".into(),
+                    }
+                }
+            };
+            let valid_until = match valid_until {
+                Some(value) => match chrono::DateTime::parse_from_rfc3339(&value) {
+                    Ok(value) => Some(value.with_timezone(&chrono::Utc)),
+                    Err(_) => {
+                        return SyscallReply::Error {
+                            message: "invalid package key valid_until timestamp".into(),
+                        }
+                    }
+                },
+                None => None,
+            };
+            match kernel.package_registry.trust_key(
+                package_scope,
+                package_actor,
+                &crate::package::PackageTrustInput {
+                    publisher,
+                    key_id,
+                    public_key,
+                    valid_from,
+                    valid_until,
+                    supersedes,
+                },
+            ) {
+                Ok(()) => SyscallReply::PackageKeyUpdated,
+                Err(error) => SyscallReply::Error {
+                    message: error.to_string(),
+                },
+            }
+        }
+        Syscall::RevokePackageKey { key_id } => {
+            match kernel
+                .package_registry
+                .revoke_key(package_scope, package_actor, &key_id)
+            {
+                Ok(()) => SyscallReply::PackageKeyUpdated,
+                Err(error) => SyscallReply::Error {
+                    message: error.to_string(),
+                },
+            }
+        }
+        Syscall::PublishPackage { archive_hex } => {
+            let archive = match crate::package::archive_from_hex(&archive_hex) {
+                Ok(archive) => archive,
+                Err(error) => {
+                    return SyscallReply::Error {
+                        message: error.to_string(),
+                    }
+                }
+            };
+            match kernel
+                .package_registry
+                .publish(package_scope, package_actor, &archive)
+            {
+                Ok(package) => SyscallReply::PackagePublished { package },
+                Err(error) => SyscallReply::Error {
+                    message: error.to_string(),
+                },
+            }
+        }
+        Syscall::YankPackage { name, version } => {
+            let version = match semver::Version::parse(&version) {
+                Ok(version) => version,
+                Err(error) => {
+                    return SyscallReply::Error {
+                        message: format!("invalid package version: {error}"),
+                    }
+                }
+            };
+            match kernel
+                .package_registry
+                .yank(package_scope, package_actor, &name, &version)
+            {
+                Ok(()) => SyscallReply::PackageMutationComplete,
+                Err(error) => SyscallReply::Error {
+                    message: error.to_string(),
+                },
+            }
+        }
+        Syscall::FetchPackage { name, version } => {
+            let version = match semver::Version::parse(&version) {
+                Ok(version) => version,
+                Err(error) => {
+                    return SyscallReply::Error {
+                        message: format!("invalid package version: {error}"),
+                    }
+                }
+            };
+            match kernel
+                .package_registry
+                .fetch(package_scope, package_actor, &name, &version)
+            {
+                Ok(archive) => SyscallReply::PackageArchive {
+                    archive_hex: crate::package::archive_to_hex(&archive),
+                },
+                Err(error) => SyscallReply::Error {
+                    message: error.to_string(),
+                },
+            }
+        }
+        Syscall::SearchPackages { query } => {
+            match kernel
+                .package_registry
+                .search(package_scope, package_actor, &query)
+            {
+                Ok(packages) => SyscallReply::Packages { packages },
+                Err(error) => SyscallReply::Error {
+                    message: error.to_string(),
+                },
+            }
+        }
+        Syscall::InstallPackage { name, requirement } => {
+            let requirement = match semver::VersionReq::parse(&requirement) {
+                Ok(requirement) => requirement,
+                Err(error) => {
+                    return SyscallReply::Error {
+                        message: format!("invalid package requirement: {error}"),
+                    }
+                }
+            };
+            let policy = if tenant.is_some() {
+                crate::package::InstallPolicy::tenant_default()
+            } else {
+                crate::package::InstallPolicy::system_default()
+            };
+            match kernel.package_registry.install(
+                package_scope,
+                package_actor,
+                &name,
+                &requirement,
+                &policy,
+            ) {
+                Ok(package) => SyscallReply::PackageInstalled { package },
+                Err(error) => SyscallReply::Error {
+                    message: error.to_string(),
+                },
+            }
+        }
+        Syscall::RollbackPackage { name } => {
+            match kernel
+                .package_registry
+                .rollback(package_scope, package_actor, &name)
+            {
+                Ok(package) => SyscallReply::PackageInstalled { package },
+                Err(error) => SyscallReply::Error {
+                    message: error.to_string(),
+                },
+            }
+        }
+        Syscall::RemovePackage { name } => {
+            match kernel
+                .package_registry
+                .remove(package_scope, package_actor, &name)
+            {
+                Ok(()) => SyscallReply::PackageMutationComplete,
+                Err(error) => SyscallReply::Error {
+                    message: error.to_string(),
+                },
+            }
+        }
+        Syscall::ListInstalledPackages => {
+            match kernel.package_registry.list_installed(package_scope) {
+                Ok(packages) => SyscallReply::InstalledPackages { packages },
+                Err(error) => SyscallReply::Error {
+                    message: error.to_string(),
+                },
+            }
+        }
+        Syscall::RunInstalledPackage { name } => {
+            let manifest = match kernel
+                .package_registry
+                .installed_agent_manifest(package_scope, &name)
+            {
+                Ok(manifest) => manifest,
+                Err(error) => {
+                    return SyscallReply::Error {
+                        message: error.to_string(),
+                    }
+                }
+            };
+            match crate::agent_package::load_package_for_tenant(kernel, package_scope, &manifest)
+                .await
+            {
+                Ok(handle) => SyscallReply::AgentCreated {
+                    id: handle.id.to_string(),
+                },
+                Err(error) => SyscallReply::Error {
+                    message: format!("run installed package failed: {error}"),
                 },
             }
         }

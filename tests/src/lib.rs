@@ -16,6 +16,9 @@ mod durable_checkpoints;
 mod agent_package_e2e;
 
 #[cfg(test)]
+mod package_supply_chain_e2e;
+
+#[cfg(test)]
 mod scheduler_props;
 
 #[cfg(test)]

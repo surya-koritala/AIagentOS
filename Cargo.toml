@@ -50,3 +50,4 @@ rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"]
 # adds no new transitive weight — it just exposes `ring::digest` to the kernel.
 ring = "0.17"
 cap-std = "4.0.2"
+semver = { version = "1", features = ["serde"] }

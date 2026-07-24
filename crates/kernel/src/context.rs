@@ -508,7 +508,10 @@ pub const DEFAULT_TENANT: &str = "default";
 
 /// SQLite-backed context manager implementation.
 pub struct SqliteContextManager {
-    conn: Mutex<Connection>,
+    /// Shared durable store used by crate-owned subsystems. The connection is
+    /// crate-visible so transactional modules such as the package supply chain
+    /// can participate in the same backup, restore, and durability boundary.
+    pub(crate) conn: Mutex<Connection>,
     storage_limits: RwLock<ContextStorageLimits>,
     /// Pluggable embedder used for the long-term-memory store/query/ranking
     /// path. Defaults to [`crate::memory_manager::default_embedder`]; swap it
@@ -921,6 +924,90 @@ impl SqliteContextManager {
             );
             CREATE INDEX IF NOT EXISTS idx_loaded_packages_tenant
                 ON loaded_package_instances(tenant_id, loaded_at DESC);
+            CREATE TABLE IF NOT EXISTS package_trust_keys (
+                tenant_id TEXT NOT NULL,
+                key_id TEXT NOT NULL,
+                publisher TEXT NOT NULL,
+                public_key BLOB NOT NULL,
+                status TEXT NOT NULL CHECK (status IN ('trusted', 'revoked')),
+                valid_from TEXT NOT NULL,
+                valid_until TEXT,
+                superseded_by TEXT,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (tenant_id, key_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_package_trust_publisher
+                ON package_trust_keys(tenant_id, publisher, status);
+            CREATE TABLE IF NOT EXISTS package_artifacts (
+                tenant_id TEXT NOT NULL,
+                name TEXT NOT NULL,
+                version TEXT NOT NULL,
+                publisher TEXT NOT NULL,
+                digest TEXT NOT NULL,
+                archive BLOB NOT NULL,
+                manifest_json TEXT NOT NULL,
+                yanked INTEGER NOT NULL DEFAULT 0 CHECK (yanked IN (0, 1)),
+                published_at TEXT NOT NULL,
+                PRIMARY KEY (tenant_id, name, version),
+                UNIQUE (tenant_id, digest)
+            );
+            CREATE INDEX IF NOT EXISTS idx_package_artifact_search
+                ON package_artifacts(tenant_id, name, yanked, version);
+            CREATE TABLE IF NOT EXISTS package_installations (
+                tenant_id TEXT NOT NULL,
+                name TEXT NOT NULL,
+                version TEXT NOT NULL,
+                digest TEXT NOT NULL,
+                lock_json TEXT NOT NULL,
+                manifest_json TEXT NOT NULL,
+                installed_at TEXT NOT NULL,
+                PRIMARY KEY (tenant_id, name)
+            );
+            CREATE TABLE IF NOT EXISTS package_install_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                tenant_id TEXT NOT NULL,
+                name TEXT NOT NULL,
+                snapshot_json TEXT NOT NULL,
+                action TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_package_install_history
+                ON package_install_history(tenant_id, name, id DESC);
+            CREATE TABLE IF NOT EXISTS package_rate_limits (
+                tenant_id TEXT NOT NULL,
+                actor TEXT NOT NULL,
+                window_started_at INTEGER NOT NULL,
+                requests INTEGER NOT NULL CHECK (requests >= 0),
+                PRIMARY KEY (tenant_id, actor)
+            );
+            CREATE TABLE IF NOT EXISTS package_transparency (
+                sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                tenant_id TEXT NOT NULL,
+                action TEXT NOT NULL,
+                name TEXT NOT NULL,
+                version TEXT NOT NULL,
+                digest TEXT NOT NULL,
+                previous_hash TEXT NOT NULL,
+                entry_hash TEXT NOT NULL UNIQUE,
+                actor TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_package_transparency_tenant
+                ON package_transparency(tenant_id, sequence);
+            CREATE TABLE IF NOT EXISTS package_audit (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                tenant_id TEXT NOT NULL,
+                actor TEXT NOT NULL,
+                action TEXT NOT NULL,
+                name TEXT,
+                version TEXT,
+                outcome TEXT NOT NULL,
+                digest TEXT,
+                detail TEXT,
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_package_audit_tenant
+                ON package_audit(tenant_id, id DESC);
             CREATE TABLE IF NOT EXISTS operator_tunables (
                 name TEXT PRIMARY KEY,
                 value INTEGER NOT NULL CHECK (value >= 0),

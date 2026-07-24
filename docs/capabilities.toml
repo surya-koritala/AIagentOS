@@ -10,7 +10,7 @@
 # excluded from the v1 promise declares `v1_disposition = "excluded-from-v1"`.
 
 schema_version = 1
-updated = "2026-07-23"
+updated = "2026-07-24"
 model = [
   "scaffolded",
   "unit-tested",
@@ -75,7 +75,7 @@ public_entry_points = ["crates/kernel/src/syscall_server.rs::CallTool", "crates/
 runtime_call_paths = ["crates/kernel/src/tools.rs::ToolRegistry::authorize_and_acquire_call", "crates/kernel/src/syscall_gate.rs::SyscallGate::authorize_and_acquire_tool_call_declared", "crates/kernel/src/resources.rs::ResourceBrokerImpl::execute (ToolCallGuard held)"]
 test_evidence = ["crates/kernel/src/config.rs", "crates/kernel/src/tools.rs", "crates/kernel/src/policy.rs", "crates/kernel/src/custom_tools.rs", "crates/kernel/src/mcp.rs", "crates/kernel/src/syscall_gate.rs", "tests/src/gate_adversarial_props.rs", "tests/src/os_enforcement.rs", "tests/src/policy_props.rs"]
 platforms = ["linux", "macos", "windows"]
-limitations = ["Declarations, policy validation, model-visible non-secret summaries, and public call paths fail closed, but production qualification still requires independent security review, cross-platform release evidence, approval UX, and the host-isolation work tracked by #111, #119, #124, and #127."]
+limitations = ["Declarations, policy validation, model-visible non-secret summaries, and public call paths fail closed, but production qualification still requires independent security review, cross-platform release evidence, approval UX, signed packages, and broader provider isolation tracked by #119, #124, and #127."]
 
 [[capability]]
 id = "resource-accounting"
@@ -112,16 +112,17 @@ limitations = ["Live-provider qualification is intentionally isolated in a prote
 id = "sandbox-isolation"
 title = "Agent sandbox policy and capability-mediated I/O"
 owner = "security"
-maturity = "integrated"
+maturity = "public-api-e2e"
 release = "v0.5"
 tracking_issue = 111
+qualification_issue = 127
 kernel_modules = ["docker_sandbox", "resources", "sandbox"]
-source_paths = ["crates/kernel/src/docker_sandbox.rs", "crates/kernel/src/resources.rs", "crates/kernel/src/sandbox.rs"]
-public_entry_points = ["crates/kernel/src/lib.rs::SandboxConfig"]
+source_paths = [".github/workflows/extended-security.yml", "crates/kernel/src/docker_sandbox.rs", "crates/kernel/src/resources.rs", "crates/kernel/src/sandbox.rs", "docs/SANDBOX_QUALIFICATION.md", "docs/THREAT_MODEL.md"]
+public_entry_points = ["crates/kernel/src/lib.rs::SandboxConfig", "crates/kernel/src/syscall_server.rs::Syscall::CallTool", "crates/kernel/src/mcp_server.rs::handle_tools_call", "crates/sdk/src/lib.rs::KernelClient::call_tool"]
 runtime_call_paths = ["crates/kernel/src/resources.rs::ResourceBrokerImpl::execute", "crates/kernel/src/lib.rs::AgentKernelImpl::create_agent_full"]
-test_evidence = ["crates/kernel/src/docker_sandbox.rs", "crates/kernel/src/resources.rs", "crates/kernel/src/sandbox.rs", "tests/src/sandbox_props.rs", "tests/src/lifecycle_coordinator.rs"]
+test_evidence = [".github/workflows/extended-security.yml::rootless-container-sandbox", "crates/kernel/src/docker_sandbox.rs", "crates/kernel/src/resources.rs", "crates/kernel/src/sandbox.rs", "tests/src/sandbox_props.rs", "tests/src/sandbox_surfaces.rs", "tests/src/lifecycle_coordinator.rs"]
 platforms = ["linux", "macos", "windows"]
-limitations = ["Sandbox identity is mandatory at the live ResourceBroker boundary. Non-trusted filesystem I/O is directory-capability relative with ownership/quota checks and symlink-swap regression coverage. HTTP resolves and pins only public answers, disables ambient proxies/redirects, and restricts ports. Linux container execution requires rootless Docker and a verified digest-pinned image with a hardened run contract; it still needs live breakout and crash qualification. Native Process mode, direct host MCP launch, and unisolated browser execution fail closed. macOS/Windows process/container backends and independent security review remain outstanding under #111/#127."]
+limitations = ["The public API is E2E-qualified for mandatory managed workspaces, capability-relative filesystem I/O, pinned public-only HTTP, and digest-pinned rootless Linux containers with live breakout/cancellation/crash-cleanup evidence. Native Process mode, direct host MCP launch, unisolated browser/peripheral execution, and macOS/Windows process/container isolation are explicitly unsupported for untrusted agents and fail closed. Independent penetration testing and the production-qualification decision remain owned by #127."]
 
 [[capability]]
 id = "agent-lifecycle"
@@ -356,7 +357,7 @@ owner = "kernel"
 maturity = "unit-tested"
 release = "v0.9"
 tracking_issue = 128
-qualification_issue = 111
+qualification_issue = 127
 kernel_modules = ["editing", "function_calling", "indexer", "learning", "linux_compat", "modules", "planning", "shell"]
 source_paths = ["crates/kernel/src", "docs/SECONDARY_CAPABILITIES.md"]
 public_entry_points = []

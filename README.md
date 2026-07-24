@@ -62,10 +62,15 @@ AI Agent OS provides:
 - **Packages** — bounded, validated manifests and registry-backed tool resolution
 
 > [!CAUTION]
-> Capability-mediated workspace and HTTP isolation is implemented. Linux
-> container execution now has a hardened rootless, digest-pinned contract, but
-> live breakout/crash qualification and macOS/Windows process backends are still
-> tracked by [#111](https://github.com/surya-koritala/AIagentOS/issues/111).
+> Capability-mediated workspace and HTTP isolation is public-API E2E tested.
+> Digest-pinned Linux containers are live-qualified on a rootless daemon for
+> breakout prerequisites, cancellation, and crash cleanup. Native host
+> processes, unisolated browsers/peripherals, outbound host MCP, and
+> macOS/Windows process containers are explicitly unsupported for untrusted
+> agents and fail closed. See the
+> [sandbox qualification contract](docs/SANDBOX_QUALIFICATION.md); independent
+> penetration testing remains tracked by
+> [#127](https://github.com/surya-koritala/AIagentOS/issues/127).
 > Package signing and durable supply-chain qualification remain tracked by
 > [#119](https://github.com/surya-koritala/AIagentOS/issues/119).
 

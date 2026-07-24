@@ -1,6 +1,6 @@
 //! System prerequisite validation.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Result of system prerequisite checks.
 #[derive(Debug, Clone)]
@@ -20,10 +20,29 @@ pub fn check_with_thresholds(
     min_disk_gb: u64,
     check_internet: bool,
 ) -> PrerequisiteResult {
+    let check_path = prerequisite_check_path();
+    evaluate_thresholds(
+        min_ram_gb,
+        min_disk_gb,
+        check_internet,
+        total_memory_gb(),
+        disk_free_gb(&check_path),
+        !check_internet || std::net::ToSocketAddrs::to_socket_addrs(&("dns.google", 443)).is_ok(),
+    )
+}
+
+fn evaluate_thresholds(
+    min_ram_gb: u64,
+    min_disk_gb: u64,
+    check_internet: bool,
+    total_ram_gb: Option<u64>,
+    free_disk_gb: Option<u64>,
+    internet_reachable: bool,
+) -> PrerequisiteResult {
     let mut deficiencies = Vec::new();
 
     if min_ram_gb > 0 {
-        match total_memory_gb() {
+        match total_ram_gb {
             Some(gb) if gb < min_ram_gb => deficiencies.push(format!(
                 "Insufficient RAM: {}GB (need {}GB)",
                 gb, min_ram_gb
@@ -36,13 +55,8 @@ pub fn check_with_thresholds(
         }
     }
 
-    let check_path = if Path::new("/home").exists() {
-        "/home"
-    } else {
-        "/"
-    };
     if min_disk_gb > 0 {
-        match disk_free_gb(check_path) {
+        match free_disk_gb {
             Some(gb) if gb < min_disk_gb => deficiencies.push(format!(
                 "Insufficient disk: {}GB (need {}GB)",
                 gb, min_disk_gb
@@ -55,13 +69,29 @@ pub fn check_with_thresholds(
         }
     }
 
-    if check_internet && std::net::ToSocketAddrs::to_socket_addrs(&("dns.google", 443)).is_err() {
+    if check_internet && !internet_reachable {
         deficiencies.push("No internet connectivity".to_string());
     }
 
     PrerequisiteResult {
         passed: deficiencies.is_empty(),
         deficiencies,
+    }
+}
+
+fn prerequisite_check_path() -> PathBuf {
+    #[cfg(unix)]
+    {
+        if Path::new("/home").exists() {
+            PathBuf::from("/home")
+        } else {
+            PathBuf::from("/")
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        std::env::current_dir().unwrap_or_else(|_| PathBuf::from(r"C:\"))
     }
 }
 
@@ -100,17 +130,28 @@ fn total_memory_gb() -> Option<u64> {
         (result == 0 && size == std::mem::size_of::<u64>()).then_some(bytes / 1024 / 1024 / 1024)
     }
 
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(windows)]
     {
-        None
+        use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+
+        let mut status = MEMORYSTATUSEX {
+            dwLength: std::mem::size_of::<MEMORYSTATUSEX>() as u32,
+            ..MEMORYSTATUSEX::default()
+        };
+        // SAFETY: `status` is a writable `MEMORYSTATUSEX` whose `dwLength`
+        // identifies the exact buffer size required by GlobalMemoryStatusEx.
+        let succeeded = unsafe { GlobalMemoryStatusEx(&mut status) } != 0;
+        succeeded.then_some(status.ullTotalPhys / 1024 / 1024 / 1024)
     }
 }
 
-fn disk_free_gb(path: &str) -> Option<u64> {
+fn disk_free_gb(path: &Path) -> Option<u64> {
     #[cfg(unix)]
     {
         use std::ffi::CString;
-        let c_path = CString::new(path).ok()?;
+        use std::os::unix::ffi::OsStrExt;
+
+        let c_path = CString::new(path.as_os_str().as_bytes()).ok()?;
         unsafe {
             let mut stat: libc::statvfs = std::mem::zeroed();
             if libc::statvfs(c_path.as_ptr(), &mut stat) == 0 {
@@ -120,10 +161,27 @@ fn disk_free_gb(path: &str) -> Option<u64> {
         }
         None
     }
-    #[cfg(not(unix))]
+
+    #[cfg(windows)]
     {
-        let _ = path;
-        None
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
+
+        let wide_path: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+        let mut available_bytes = 0u64;
+        // SAFETY: `wide_path` is NUL-terminated and remains live for the call;
+        // `available_bytes` is a writable u64, and the optional outputs are
+        // deliberately null because this check only needs caller-available
+        // capacity.
+        let succeeded = unsafe {
+            GetDiskFreeSpaceExW(
+                wide_path.as_ptr(),
+                &mut available_bytes,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        } != 0;
+        succeeded.then_some(available_bytes / 1024 / 1024 / 1024)
     }
 }
 
@@ -132,10 +190,45 @@ mod tests {
     use super::*;
 
     #[test]
-    fn check_prerequisites_runs() {
+    fn real_check_only_reports_specific_deficiency_types() {
         let result = check_prerequisites();
-        // On a dev machine, should pass
-        assert!(result.passed || !result.deficiencies.is_empty());
+        assert_eq!(result.passed, result.deficiencies.is_empty());
+        assert!(result.deficiencies.iter().all(|deficiency| {
+            deficiency.starts_with("Insufficient RAM:")
+                || deficiency.starts_with("Unable to determine RAM")
+                || deficiency.starts_with("Insufficient disk:")
+                || deficiency.starts_with("Unable to determine free disk space")
+                || deficiency == "No internet connectivity"
+        }));
+    }
+
+    #[test]
+    fn deterministic_measurements_enforce_every_threshold_and_unknown_value() {
+        let exact = evaluate_thresholds(8, 10, true, Some(8), Some(10), true);
+        assert!(exact.passed);
+        assert!(exact.deficiencies.is_empty());
+
+        let deficient = evaluate_thresholds(9, 11, true, Some(8), Some(10), false);
+        assert!(!deficient.passed);
+        assert_eq!(deficient.deficiencies.len(), 3);
+        assert!(deficient
+            .deficiencies
+            .iter()
+            .any(|item| item.starts_with("Insufficient RAM:")));
+        assert!(deficient
+            .deficiencies
+            .iter()
+            .any(|item| item.starts_with("Insufficient disk:")));
+        assert!(deficient
+            .deficiencies
+            .contains(&"No internet connectivity".to_string()));
+
+        let unknown = evaluate_thresholds(1, 1, false, None, None, true);
+        assert_eq!(unknown.deficiencies.len(), 2);
+        assert!(unknown
+            .deficiencies
+            .iter()
+            .all(|item| item.starts_with("Unable to determine")));
     }
 
     #[test]
@@ -150,5 +243,19 @@ mod tests {
         let result = check_with_thresholds(0, 0, false);
         assert!(result.passed);
         assert!(result.deficiencies.is_empty());
+    }
+
+    #[test]
+    fn every_supported_platform_discovers_memory_and_disk() {
+        assert!(
+            total_memory_gb().is_some(),
+            "supported platforms must report physical memory"
+        );
+        let path = prerequisite_check_path();
+        assert!(
+            disk_free_gb(&path).is_some(),
+            "supported platforms must report free disk for {}",
+            path.display()
+        );
     }
 }

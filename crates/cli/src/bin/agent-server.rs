@@ -7,7 +7,7 @@
 //! backend; with none, the non-LLM syscalls still work (keyless boot).
 //!
 //! Usage:
-//!   agent-server [ADDR]                 # TCP, default 127.0.0.1:7777
+//!   agent-server \[ADDR\]               # TCP, default 127.0.0.1:7777
 //!   AGENT_SERVER_UNIX=/path.sock agent-server   # Unix-domain socket instead
 //!   AGENT_SERVER_TOKEN=secret agent-server      # require auth before any syscall
 //!   AGENT_SERVER_TLS_CERT=cert.pem AGENT_SERVER_TLS_KEY=key.pem agent-server

@@ -45,7 +45,7 @@ impl BenchConfig {
         }
     }
 
-    /// Only used by the smoke test below; the bin's `main` uses [`full`].
+    /// Only used by the smoke test below; the bin's `main` uses `full`.
     #[cfg_attr(not(test), allow(dead_code))]
     fn smoke() -> Self {
         Self {

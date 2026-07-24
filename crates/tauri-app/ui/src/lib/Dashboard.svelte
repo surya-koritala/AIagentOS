@@ -59,7 +59,7 @@
 <style>
   .dashboard { padding: 2rem; overflow-y: auto; }
   header { margin-bottom: 2rem; }
-  h1 { margin: 0; font-size: 2rem; background: linear-gradient(135deg, #4a90d9, #a855f7); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
+  h1 { margin: 0; font-size: 2rem; background: linear-gradient(135deg, #4a90d9, #a855f7); background-clip: text; -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
   .subtitle { margin: 0.25rem 0 0; color: #666; }
   .stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 1rem; margin-bottom: 2rem; }
   .stat-card { background: #1a1a2e; border: 1px solid #2a2a44; border-radius: 12px; padding: 1.25rem; text-align: center; }

@@ -3,7 +3,7 @@
 //! Linux analogue: SELinux policy modules (the `.te` source an operator writes
 //! and `checkpolicy` validates) plus `sesearch`/`audit2why` for explaining why
 //! a decision was reached. This module is the *authoring* layer that sits above
-//! the [`MacEngine`](crate::mac::MacEngine): operators write a `PolicyDocument`
+//! the [`MacEngine`]: operators write a `PolicyDocument`
 //! (TOML), it is **validated and linted** at load, then **lowered** (`compile`)
 //! to the flat rules the engine already enforces. The engine stays unchanged —
 //! this layer is purely about making policy authorable, checkable, and

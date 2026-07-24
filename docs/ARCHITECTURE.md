@@ -346,8 +346,11 @@ agent KV storage (`agent_kv`), and context snapshots (`context_snapshots`).
   lifecycle, scheduler fairness, permission monotonicity, gate non-bypass, etc.
 - **E2E** in `tests/src/e2e_pipeline.rs` + `governance_e2e.rs` drive the full
   kernel through `wiremock`-backed adapters.
-- CI runs `cargo test --workspace --exclude tauri-app` (tauri needs GTK/WebKit;
-  built separately in `build-app`). Gates on `fmt`; clippy is `-D warnings`.
+- CI runs deterministic Rust tests on Linux, macOS, and Windows. The Tauri
+  backend is checked separately on all three platforms (Linux installs
+  GTK/WebKit first), and the Svelte frontend has locked install, audit,
+  warning, and production-build gates. Formatting, Clippy, docs, dependency
+  policy, coverage, and container persistence feed one required status.
 
 ---
 

@@ -4,9 +4,10 @@ version = "0.3.0"
 edition = "2021"
 description = "Embeddable Rust SDK for building agents against the AI Agent OS kernel over its syscall server."
 license.workspace = true
+rust-version.workspace = true
 
 [dependencies]
-kernel = { path = "../kernel" }
+kernel = { path = "../kernel", version = "=0.3.0" }
 tokio = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
@@ -15,7 +16,7 @@ rustls = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
-adapters = { path = "../adapters" }
+adapters = { path = "../adapters", version = "=0.3.0" }
 wiremock = { workspace = true }
 async-trait = { workspace = true }
 rcgen = { workspace = true }

@@ -148,13 +148,16 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
 
 ### Quality
 
-- CI now treats formatting, Clippy, tests, capability claims, documentation,
-  dependency policy, frontend audit/build, and coverage as blocking; Linux,
-  macOS, and Windows builds are represented, with scheduled Miri, sanitizer, and
-  fuzz smoke jobs. Release jobs add deterministic artifacts, SBOMs, checksums,
-  Sigstore bundles, provenance, and a non-root container smoke test. These gates
-  are not Production-qualified until the remote protected-branch and tagged
-  workflows have run successfully. (#110)
+- CI now treats formatting, Clippy, tests, capability claims, rustdoc/mdBook,
+  dependency policy, Svelte warnings/audit/build, global coverage, and explicit
+  critical-subsystem floors as blocking. Linux, macOS, and Windows run both
+  kernel and desktop checks; scheduled Miri, sanitizer, and fuzz jobs preserve
+  evidence. Release qualification reuses full CI and produces byte-reproducible
+  archives, CycloneDX/SPDX SBOMs, checksums, Sigstore bundles, provenance, and a
+  non-root container restart proof using durable application data. Toolchains,
+  Actions, and Docker bases are pinned, with weekly dependency updates.
+  Protected-branch and remote qualification evidence are required before this
+  capability is promoted. (#110)
 - Regression coverage expanded across authorization, sandbox escapes, lifecycle
   cleanup, checkpoints, scheduling, context pressure, accounting, persistence,
   services, packages, providers, wire compatibility, CLI/TUI state, and claim

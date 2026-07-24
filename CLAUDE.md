@@ -126,6 +126,10 @@ Each adapter in `crates/adapters/src/` implements `LlmProviderAdapter` (defined 
 
 - **Conventional Commits** are required (`feat:`, `fix:`, `docs:`, `test:`, `refactor:`, `chore:`).
 - **License**: AGPL-3.0. Modifications must remain AGPL-licensed.
-- **Rust toolchain**: stable, MSRV 1.75+.
+- **Rust toolchain**: MSRV 1.97; `rust-toolchain.toml` pins CI/local work to
+  Rust 1.97.1.
 - **Workspace deps**: shared versions live in the root `Cargo.toml` `[workspace.dependencies]` table; member crates should reference them via `workspace = true` rather than pinning their own versions.
-- **CI excludes `tauri-app`** from `cargo test` because it needs GTK/WebKit system libraries; the `build-app` job builds it separately. Don't add tests that require Tauri to the default test run.
+- **Desktop CI**: the default workspace test excludes `tauri-app` because it
+  needs platform UI libraries. A separate blocking matrix runs Tauri Clippy on
+  Linux, macOS, and Windows, while the Svelte job rejects compiler/type/a11y
+  warnings and high/critical npm advisories.

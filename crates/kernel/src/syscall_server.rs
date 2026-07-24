@@ -1773,7 +1773,7 @@ impl SyscallServer {
 
     /// Bind a TLS listener to `addr`, terminating rustls on every accepted TCP
     /// connection before handing the encrypted stream to the same generic
-    /// [`handle`](Self::handle) loop used by the plaintext transports.
+    /// request loop used by the plaintext transports.
     ///
     /// `config` is a fully-built [`rustls::ServerConfig`] (certificate chain +
     /// private key, ALPN, client-auth policy, …). Build it however you like; a

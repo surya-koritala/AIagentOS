@@ -12,7 +12,7 @@ pub struct AzureOpenAiAdapter {
     id: ProviderId,
     client: reqwest::Client,
     api_key: String,
-    /// e.g. "https://myresource.openai.azure.com"
+    /// e.g. "<https://myresource.openai.azure.com>"
     endpoint: String,
     /// e.g. "gpt-4o"
     deployment: String,

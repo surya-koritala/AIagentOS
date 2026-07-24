@@ -277,7 +277,7 @@ pub(crate) struct CgroupQuotaSnapshot {
 ///
 /// Answers "what am I allowed to do?" for an SDK/agent without mutating any
 /// gate state (no counter bumps, no cgroup accounting). Built from the agent's
-/// [`GateRecord`].
+/// internal gate record.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentGateInfo {
     /// OS PID (Linux-analogue) the gate assigned to this agent.

@@ -1,0 +1,53 @@
+name: Live provider qualification
+
+# This workflow is intentionally absent from pull_request/push. It spends real
+# provider quota, consumes a protected secret, and must be dispatched explicitly.
+on:
+  workflow_dispatch:
+    inputs:
+      model:
+        description: OpenAI model to qualify
+        required: true
+        default: gpt-4o-mini
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  openai-canary:
+    name: Secret-backed OpenAI canary
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: provider-qualification
+    env:
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      XDG_CONFIG_HOME: ${{ github.workspace }}/.qualification/config
+      XDG_DATA_HOME: ${{ github.workspace }}/.qualification/data
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
+        with:
+          toolchain: 1.97.1
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - name: Require the protected provider credential
+        run: test -n "$OPENAI_API_KEY"
+      - name: Create isolated non-secret configuration
+        env:
+          QUALIFICATION_MODEL: ${{ inputs.model }}
+        run: |
+          [[ "$QUALIFICATION_MODEL" =~ ^[A-Za-z0-9._:-]+$ ]]
+          mkdir -p "$XDG_CONFIG_HOME/ai-agent-os" "$XDG_DATA_HOME/ai-agent-os"
+          {
+            printf 'llm_provider = "openai"\n'
+            printf 'default_model = "%s"\n' "$QUALIFICATION_MODEL"
+            printf 'data_dir = "%s/ai-agent-os"\n' "$XDG_DATA_HOME"
+            printf 'setup_complete = true\n'
+            printf 'permission_profile = "standard"\n'
+            printf '[api_keys]\n'
+          } > "$XDG_CONFIG_HOME/ai-agent-os/config.toml"
+      - name: Execute one governed live turn
+        run: |
+          response="$(timeout 5m cargo run --locked --package agent-cli -- \
+            -c 'Reply with a short acknowledgement that the live provider path is working.')"
+          test -n "${response//[[:space:]]/}"

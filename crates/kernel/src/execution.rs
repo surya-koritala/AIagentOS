@@ -2715,13 +2715,18 @@ mod tests {
     }
 
     fn execution_rate_limiter() -> Arc<crate::rate_limit::RateLimiter> {
-        Arc::new(crate::rate_limit::RateLimiter::new(
-            crate::rate_limit::RateLimitConfig {
-                rpm: 100,
-                tpm: 10_000,
-                max_concurrent: 4,
-            },
-        ))
+        Arc::new(
+            crate::rate_limit::RateLimiter::with_store(
+                crate::rate_limit::RateLimitConfig {
+                    rpm: 100,
+                    tpm: 10_000,
+                    max_concurrent: 4,
+                },
+                mock_context_manager(),
+                Arc::new(crate::quota_clock::ManualQuotaClock::new(0)),
+            )
+            .expect("the deterministic execution rate limiter must initialize"),
+        )
     }
 
     #[tokio::test]

@@ -358,9 +358,14 @@ fn database_nonexistent_file() {
         std::env::temp_dir().join(format!("nonexistent_db_edge_{}.db", uuid::Uuid::new_v4()));
     let path_text = path.to_string_lossy().into_owned();
     let result = query_sqlite(&path_text, "SELECT 1", true);
-    // Should either create the file or error gracefully
-    assert!(result.is_ok() || result.is_err());
-    std::fs::remove_file(&path).ok();
+    assert!(
+        result.unwrap_err().starts_with("Connection failed:"),
+        "read-only access to a missing database must fail explicitly"
+    );
+    assert!(
+        !path.exists(),
+        "a read-only missing-file probe must not create durable state"
+    );
 }
 
 // ─── Learning Edge Cases ─────────────────────────────────────────────────────

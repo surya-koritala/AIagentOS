@@ -1,7 +1,8 @@
 # Getting Started with AI Agent OS
 
 ## Prerequisites
-- Rust 1.75+
+- Rust 1.97+ (the repository pins 1.97.1)
+- Node.js 22.12+ for the desktop frontend
 - An LLM API key (Azure OpenAI, OpenAI, or Anthropic)
 
 ## Installation
@@ -44,17 +45,17 @@ cargo run --package agent-cli -- -c "What files are in /tmp?"
 cat src/main.rs | cargo run --package agent-cli -- "Explain this code"
 ```
 
-## Running the OS Kernel
+## Running the OS service
 
-```rust
-use kernel::os_kernel::OsKernel;
+The supported public entry point is the versioned syscall service:
 
-let kernel = OsKernel::new();
-kernel.boot(Some(Path::new("/etc/agents/"))).await?;
-let id = kernel.start_agent("my-agent").await?;
-kernel.tool_call(id, "/tools/fs", "read", &json!({"path": "/tmp/test"})).await?;
-kernel.shutdown().await;
+```bash
+cargo run --package agent-cli --bin agent-server
 ```
+
+Rust applications should use `agent_sdk::Agent` or
+`agent_sdk::KernelClient`; see the book's
+[Getting Started](../src/getting-started.md) guide for a current example.
 
 ## Next Steps
 - [Writing a service file](service-files.md)

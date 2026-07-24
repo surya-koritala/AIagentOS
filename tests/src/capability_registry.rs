@@ -56,6 +56,12 @@ fn load_registry() -> Registry {
         .unwrap_or_else(|error| panic!("invalid capability registry {}: {error}", path.display()))
 }
 
+fn read_workspace_file(relative: &str) -> String {
+    let path = workspace_root().join(relative);
+    std::fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()))
+}
+
 fn evidence_path(reference: &str) -> &str {
     reference.split("::").next().unwrap_or(reference)
 }
@@ -315,4 +321,142 @@ fn user_facing_status_docs_defer_to_the_registry() {
         !readme.contains("tests passing"),
         "volatile test counts must come from CI instead of a hand-maintained README claim"
     );
+}
+
+#[test]
+fn release_blocking_workflows_keep_their_security_contract() {
+    let ci = read_workspace_file(".github/workflows/ci.yml");
+    for os in ["ubuntu-latest", "macos-latest", "windows-latest"] {
+        assert!(ci.contains(os), "blocking CI must retain the {os} runner");
+    }
+    for required_job in [
+        "- quality",
+        "- rust-platforms",
+        "- desktop-platforms",
+        "- frontend",
+        "- rust-supply-chain",
+        "- coverage",
+        "- container-smoke",
+    ] {
+        assert!(
+            ci.contains(required_job),
+            "required release gate lost {required_job}"
+        );
+    }
+    for command in [
+        "cargo fmt --all -- --check",
+        "cargo clippy --workspace --exclude tauri-app --all-targets -- -D warnings",
+        "RUSTDOCFLAGS: -D warnings",
+        "mdbook build docs",
+        "npm ci",
+        "npm audit --audit-level=high",
+        "npm run check",
+        "advisories bans licenses sources",
+        "verify_workflow_action_pins.py --remote",
+        "check_critical_coverage.py lcov.info",
+        "\"storage_get\"",
+    ] {
+        assert!(
+            ci.contains(command),
+            "blocking CI lost required command or proof {command:?}"
+        );
+    }
+
+    let extended = read_workspace_file(".github/workflows/extended-security.yml");
+    for proof in [
+        "schedule:",
+        "RUSTUP_TOOLCHAIN: nightly-2026-07-20",
+        "MIRIFLAGS: -Zmiri-disable-isolation",
+        "cargo miri test",
+        "-Zsanitizer=address",
+        "cargo fuzz build --target x86_64-unknown-linux-gnu",
+        "cargo fuzz run wire_syscall --target x86_64-unknown-linux-gnu",
+    ] {
+        assert!(
+            extended.contains(proof),
+            "extended security workflow lost {proof:?}"
+        );
+    }
+
+    let live = read_workspace_file(".github/workflows/live-provider-qualification.yml");
+    assert!(
+        live.contains("workflow_dispatch:") && !live.contains("pull_request:"),
+        "secret-backed qualification must be explicit and separate from deterministic PR CI"
+    );
+    for proof in [
+        "environment: provider-qualification",
+        "secrets.OPENAI_API_KEY",
+        "Execute one governed live turn",
+    ] {
+        assert!(
+            live.contains(proof),
+            "live-provider qualification lost {proof:?}"
+        );
+    }
+
+    let release = read_workspace_file(".github/workflows/release.yml");
+    for proof in [
+        "workflow_dispatch:",
+        "uses: ./.github/workflows/ci.yml",
+        "macos-15-intel",
+        "-C link-arg=/Brepro",
+        "byte-for-byte reproducible",
+        "cyclonedx-json",
+        "spdx-json",
+        "SHA256SUMS",
+        "cosign sign-blob",
+        "attest-build-provenance@",
+        "\"storage_get\"",
+    ] {
+        assert!(
+            release.contains(proof),
+            "release qualification workflow lost {proof:?}"
+        );
+    }
+
+    let dockerfile = read_workspace_file("Dockerfile");
+    for image in ["FROM rust:", "FROM debian:"] {
+        let line = dockerfile
+            .lines()
+            .find(|line| line.starts_with(image))
+            .unwrap_or_else(|| panic!("Dockerfile lost {image} base"));
+        assert!(
+            line.contains("@sha256:"),
+            "release image bases must be digest-pinned: {line}"
+        );
+    }
+
+    let windows_icon = std::fs::read(workspace_root().join("crates/tauri-app/icons/icon.ico"))
+        .expect("the Tauri Windows build requires icons/icon.ico");
+    assert!(
+        windows_icon.starts_with(&[0, 0, 1, 0]) && windows_icon.len() > 6,
+        "the Tauri Windows icon must be a non-empty ICO image"
+    );
+
+    for workflow in [
+        ".github/workflows/ci.yml",
+        ".github/workflows/extended-security.yml",
+        ".github/workflows/live-provider-qualification.yml",
+        ".github/workflows/release.yml",
+    ] {
+        for line in read_workspace_file(workflow).lines() {
+            let Some(action) = line.trim().strip_prefix("- uses: ") else {
+                continue;
+            };
+            if action.starts_with("./") {
+                continue;
+            }
+            let revision = action
+                .split_once('@')
+                .unwrap_or_else(|| panic!("{workflow} action has no revision: {action}"))
+                .1
+                .split_whitespace()
+                .next()
+                .unwrap();
+            assert!(
+                revision.len() == 40 && revision.chars().all(|ch| ch.is_ascii_hexdigit()),
+                "{workflow} action must be pinned to a full commit SHA: {action}"
+            );
+        }
+    }
 }

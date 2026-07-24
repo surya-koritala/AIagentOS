@@ -44,6 +44,7 @@ pub mod modules;
 pub mod mount_table;
 pub mod namespaces;
 pub mod observability;
+pub mod operator_control;
 pub mod package;
 pub mod permissions;
 pub mod planning;
@@ -1062,6 +1063,9 @@ pub struct AgentKernelImpl {
     pub rate_limiter: Arc<RateLimiter>,
     pub cgroups: Arc<CgroupManager>,
     pub syscall_gate: Arc<SyscallGate>,
+    /// Durable, audited operator settings plus the consistency barrier used by
+    /// the typed operations snapshot.
+    pub operator_control: Arc<crate::operator_control::OperatorControl>,
     /// Hard cumulative USD spend ceiling on the LLM path (the cgroup quota only
     /// bounds per-minute tokens, not lifetime cost). Inert unless config sets a
     /// price + ceiling. Installed on each executor in `send_message`.
@@ -1297,6 +1301,9 @@ impl AgentKernelImpl {
             .load_budget_usage_snapshot()
             .map_err(KernelError::Context)?;
         budget_enforcer.rehydrate(&budget_snapshot);
+        let operator_control = Arc::new(crate::operator_control::OperatorControl::new(
+            context_manager.clone(),
+        )?);
         let os = Arc::new(OsSubsystems::new());
 
         let ipc = Arc::new(IpcManager::new());
@@ -1338,6 +1345,7 @@ impl AgentKernelImpl {
             rate_limiter,
             cgroups,
             syscall_gate,
+            operator_control,
             budget_enforcer,
             context_budget_tokens: budgets.max_context_tokens.min(u32::MAX as u64) as u32,
             context_admission: Arc::new(crate::context_paging::ActiveContextManager::new(
@@ -1647,6 +1655,16 @@ impl AgentKernelImpl {
         group: Option<&str>,
         tenant_id: &str,
     ) -> Result<AgentHandle, KernelError> {
+        let _operator_mutation = self.operator_control.mutation_guard().await;
+        let max_agents = self.operator_control.max_agents();
+        if max_agents > 0
+            && u64::try_from(self.agent_manager.list_agents(None).len()).unwrap_or(u64::MAX)
+                >= max_agents
+        {
+            return Err(KernelError::Policy(format!(
+                "agent admission quota exceeded: kernel.max_agents is {max_agents}"
+            )));
+        }
         // Absence means the secure managed default, never host-unconfined. Only
         // in-process operator code can explicitly request IsolationLevel::Trusted;
         // the wire and package formats do not expose that bypass.
@@ -2574,6 +2592,7 @@ impl AgentKernelImpl {
         let _ = self.quiesce_agent(agent_id).await;
         let _ = self.cleanup_agent_resources(agent_id).await;
         self.agent_manager.purge_agent(agent_id);
+        self.syscall_gate.purge_agent_stats(agent_id);
         let _ = self.context_manager.purge_agent_data(agent_id);
         self.lifecycle_locks.remove(&agent_id);
     }
@@ -2814,6 +2833,7 @@ impl AgentKernelImpl {
     }
 
     async fn pause_agent_inner(&self, agent_id: AgentId) -> Result<AgentState, KernelError> {
+        let _operator_mutation = self.operator_control.mutation_guard().await;
         let lock = self.lifecycle_lock(agent_id);
         let _guard = lock.lock().await;
         let state = self
@@ -2853,6 +2873,7 @@ impl AgentKernelImpl {
     }
 
     async fn resume_agent_inner(&self, agent_id: AgentId) -> Result<AgentState, KernelError> {
+        let _operator_mutation = self.operator_control.mutation_guard().await;
         let lock = self.lifecycle_lock(agent_id);
         let _guard = lock.lock().await;
         let state = self
@@ -2885,6 +2906,7 @@ impl AgentKernelImpl {
     }
 
     async fn stop_agent_inner(&self, agent_id: AgentId) -> Result<AgentState, KernelError> {
+        let _operator_mutation = self.operator_control.mutation_guard().await;
         let lock = self.lifecycle_lock(agent_id);
         let _guard = lock.lock().await;
         let state = self
@@ -2946,6 +2968,7 @@ impl AgentKernelImpl {
     }
 
     async fn kill_agent_inner(&self, agent_id: AgentId) -> Result<AgentState, KernelError> {
+        let _operator_mutation = self.operator_control.mutation_guard().await;
         let lock = self.lifecycle_lock(agent_id);
         let _guard = lock.lock().await;
         let state = self
@@ -3103,6 +3126,7 @@ impl AgentKernelImpl {
         agent_id: AgentId,
         checkpoint_id: Option<uuid::Uuid>,
     ) -> Result<(AgentState, Option<AgentOutput>, Option<uuid::Uuid>), KernelError> {
+        let _operator_mutation = self.operator_control.mutation_guard().await;
         let lifecycle_lock = self.lifecycle_lock(agent_id);
         let lifecycle_guard = lifecycle_lock.lock().await;
         let state = self.get_agent_status(agent_id)?;

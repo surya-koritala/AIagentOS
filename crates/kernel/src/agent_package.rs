@@ -301,6 +301,28 @@ async fn load_package_scoped(
         }
     }
 
+    let instance = crate::operator_control::LoadedPackageInstance {
+        agent_id: handle.id.to_string(),
+        tenant_id: tenant_id
+            .unwrap_or(crate::context::DEFAULT_TENANT)
+            .to_string(),
+        name: manifest.name.clone(),
+        provider: manifest.provider.clone(),
+        profile: manifest.profile.clone(),
+        loaded_at: chrono::Utc::now().to_rfc3339(),
+    };
+    {
+        let _operator_mutation = kernel.operator_control.mutation_guard().await;
+        if let Err(error) = kernel
+            .context_manager
+            .save_loaded_package_instance(&instance)
+        {
+            drop(_operator_mutation);
+            kernel.rollback_created_agent(handle.id).await;
+            return Err(AgentPackageError::Kernel(error.to_string()));
+        }
+    }
+
     Ok(handle)
 }
 

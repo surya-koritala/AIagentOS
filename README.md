@@ -191,7 +191,7 @@ presence in the Rust crate is not a v1 support claim.
 | Context pressure (not virtual memory) | Hierarchical active-prompt admission, durable-byte quotas, verified/retained spills, explicit backpressure | Production-qualified — [#115](https://github.com/surya-koritala/AIagentOS/issues/115) |
 | Namespaces | Tool and IPC visibility primitives | Unit-tested — [#107](https://github.com/surya-koritala/AIagentOS/issues/107) |
 | VFS + mount | Experimental descriptor/mount prototypes, excluded from v1 | Scaffolded — [ADR 0001](docs/ADR-0001-PUBLIC-ABI.md) |
-| /proc filesystem | Snapshot-oriented `ProcFs` helpers | Unit-tested — [#117](https://github.com/surya-koritala/AIagentOS/issues/117) |
+| `/proc` + sysctl analogue | Remote tenant-safe typed snapshot, scoped gate/package views, and durable audited tunables | Production-qualified — [#117](https://github.com/surya-koritala/AIagentOS/issues/117) |
 | apt/rpm | Validated unsigned manifest loading; registry/signing remain prototypes | Public-API E2E (not supply-chain qualified) — [#119](https://github.com/surya-koritala/AIagentOS/issues/119) |
 
 ## How enforcement works in practice

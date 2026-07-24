@@ -42,8 +42,10 @@ use tokio::net::ToSocketAddrs;
 // SDK consumers can name them without depending on the kernel directly.
 pub use kernel::context::ContextPressureStats;
 pub use kernel::init_system::ServiceRuntimeInfo;
+pub use kernel::operator_control::{OperatorTunable, OperatorTunableAudit};
 pub use kernel::syscall_server::{
     AgentSummary, FactSummary, GenerationCheckpointSummary, OperatorAgentSnapshot,
+    OperatorCgroupSnapshot, OperatorNamespaceSnapshot, OperatorPackageSnapshot,
     OperatorServiceSnapshot, OperatorSnapshot, ProviderSummary, WireErrorCode,
 };
 
@@ -694,6 +696,65 @@ impl KernelClient {
         match self.call(Syscall::OperatorSnapshot).await? {
             SyscallReply::OperatorSnapshot { snapshot } => Ok(*snapshot),
             other => Err(unexpected("OperatorSnapshot", &other)),
+        }
+    }
+
+    pub async fn list_operator_tunables(&mut self) -> Result<Vec<OperatorTunable>, SdkError> {
+        match self.call(Syscall::ListOperatorTunables).await? {
+            SyscallReply::OperatorTunables { tunables } => Ok(tunables),
+            other => Err(unexpected("OperatorTunables", &other)),
+        }
+    }
+
+    pub async fn set_operator_tunable(
+        &mut self,
+        name: impl Into<String>,
+        value: u64,
+        expected_revision: u64,
+    ) -> Result<OperatorTunable, SdkError> {
+        match self
+            .call(Syscall::SetOperatorTunable {
+                name: name.into(),
+                value,
+                expected_revision,
+            })
+            .await?
+        {
+            SyscallReply::OperatorTunable { tunable } => Ok(tunable),
+            other => Err(unexpected("OperatorTunable", &other)),
+        }
+    }
+
+    pub async fn rollback_operator_tunable(
+        &mut self,
+        name: impl Into<String>,
+        target_revision: u64,
+        expected_revision: u64,
+    ) -> Result<OperatorTunable, SdkError> {
+        match self
+            .call(Syscall::RollbackOperatorTunable {
+                name: name.into(),
+                target_revision,
+                expected_revision,
+            })
+            .await?
+        {
+            SyscallReply::OperatorTunable { tunable } => Ok(tunable),
+            other => Err(unexpected("OperatorTunable", &other)),
+        }
+    }
+
+    pub async fn operator_tunable_audit(
+        &mut self,
+        name: Option<String>,
+        limit: usize,
+    ) -> Result<Vec<OperatorTunableAudit>, SdkError> {
+        match self
+            .call(Syscall::ListOperatorTunableAudit { name, limit })
+            .await?
+        {
+            SyscallReply::OperatorTunableAudit { entries } => Ok(entries),
+            other => Err(unexpected("OperatorTunableAudit", &other)),
         }
     }
 

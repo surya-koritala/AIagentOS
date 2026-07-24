@@ -99,7 +99,7 @@ Goal: someone can `agentpkg install foo` from a real registry and it runs.
 - [ ] **Real package format** — `.agent` archive: manifest + tools + policies + signed checksum
 - [ ] **Local registry** that actually serves packages over HTTP; `cargo run --bin agentpkg-registry`
 - [ ] **Install / verify / uninstall** end-to-end with deps
-- [ ] **Live procfs** — agent can read `/proc/agents/<id>/status`, `/proc/cgroups`, `/proc/syscalls/stats`
+- [x] **Live operator control** — remote typed agent/cgroup/namespace/gate/package/service/provider views plus durable audited CAS/rollback tunables; legacy `ProcFs`/`Sysctl` are not public mounts
 - [ ] **Cross-platform sandbox** — Linux has a fail-closed hardened rootless-container contract pending live breakout/crash qualification; Windows Job Objects/AppContainer and a supported macOS process sandbox remain to be implemented
 - [x] **Feature-gate heavy deps in `resources` crate** — `chromiumoxide` (~50 MB) behind `browser`, `scraper` behind `web`. Default build is lean. CI exercises both lean (`cargo test`) and full (`cargo build --all-features`) modes. Note: `wasmtime` (~10 MB) is still load-bearing in the kernel for `models.rs` types — gating it out is a follow-up that requires moving `ResourceRequirements` out of `modules.rs`.
 

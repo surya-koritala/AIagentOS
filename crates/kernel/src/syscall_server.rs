@@ -70,6 +70,9 @@ fn default_profile() -> String {
 fn default_priority() -> u8 {
     3
 }
+fn default_tunable_audit_limit() -> usize {
+    100
+}
 
 /// A syscall request from an agent / SDK to the kernel.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -258,6 +261,29 @@ pub enum Syscall {
     /// only their agents and no global counters/services; trusted system
     /// callers receive the global scheduler/gate snapshot as well.
     OperatorSnapshot,
+    /// List the small, versioned set of durable settings that drive live
+    /// operator/kernel behavior. System-scoped because values are global.
+    ListOperatorTunables,
+    /// Compare-and-set a durable live tunable.
+    SetOperatorTunable {
+        name: String,
+        value: u64,
+        expected_revision: u64,
+    },
+    /// Restore the effective value from an earlier applied revision while
+    /// still advancing the current revision.
+    RollbackOperatorTunable {
+        name: String,
+        target_revision: u64,
+        expected_revision: u64,
+    },
+    /// Read the durable applied/denied mutation history.
+    ListOperatorTunableAudit {
+        #[serde(default)]
+        name: Option<String>,
+        #[serde(default = "default_tunable_audit_limit")]
+        limit: usize,
+    },
     /// System-scoped service supervisor operations. Tenant credentials cannot
     /// access these until service ownership is tenant-aware.
     ListServices,
@@ -287,6 +313,12 @@ pub struct ProviderSummary {
     pub name: String,
     pub provider_type: String,
     pub available: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sampled_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub probe_duration_ms: Option<u64>,
+    #[serde(default)]
+    pub probe_timed_out: bool,
 }
 
 /// A short, serializable view of a long-term-memory fact.
@@ -318,9 +350,46 @@ pub struct OperatorAgentSnapshot {
     pub sandbox_active: bool,
     pub capabilities: Vec<String>,
     pub namespaces: Vec<u64>,
+    #[serde(default)]
+    pub namespace_details: Vec<OperatorNamespaceSnapshot>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cgroup: Option<OperatorCgroupSnapshot>,
+    #[serde(default)]
+    pub gate_decisions: crate::syscall_gate::GateStats,
     pub checkpoint_count: usize,
     pub context_pressure: ContextPressureStats,
     pub latest_usage: Option<crate::context::UsageRecord>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OperatorNamespaceSnapshot {
+    pub id: u64,
+    pub kind: String,
+    pub parent: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OperatorCgroupSnapshot {
+    pub id: u64,
+    pub scope: String,
+    pub tokens_per_minute_limit: u64,
+    pub concurrent_tool_limit: u32,
+    pub context_token_limit: u64,
+    pub agent_limit: u32,
+    pub active_tool_calls: u32,
+    pub context_tokens: u64,
+    pub agent_count: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OperatorPackageSnapshot {
+    pub agent_id: String,
+    pub tenant_id: String,
+    pub name: String,
+    pub provider: String,
+    pub profile: String,
+    pub loaded_at: String,
+    pub agent_state: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -342,7 +411,17 @@ pub struct OperatorSnapshot {
     pub kernel_version: String,
     pub protocol_version: u32,
     pub agents: Vec<OperatorAgentSnapshot>,
+    #[serde(default)]
+    pub total_visible_agents: usize,
+    #[serde(default)]
+    pub agents_truncated: bool,
     pub providers: Vec<ProviderSummary>,
+    #[serde(default)]
+    pub packages: Vec<OperatorPackageSnapshot>,
+    #[serde(default)]
+    pub scoped_gate_decisions: crate::syscall_gate::GateStats,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tunables: Option<Vec<crate::operator_control::OperatorTunable>>,
     pub services: Option<Vec<OperatorServiceSnapshot>>,
     pub system_metrics: Option<crate::metrics::MetricsSnapshot>,
     pub global_spend_usd: Option<f64>,
@@ -586,6 +665,15 @@ pub enum SyscallReply {
     OperatorSnapshot {
         snapshot: Box<OperatorSnapshot>,
     },
+    OperatorTunables {
+        tunables: Vec<crate::operator_control::OperatorTunable>,
+    },
+    OperatorTunable {
+        tunable: crate::operator_control::OperatorTunable,
+    },
+    OperatorTunableAudit {
+        entries: Vec<crate::operator_control::OperatorTunableAudit>,
+    },
     Services {
         services: Vec<crate::init_system::ServiceRuntimeInfo>,
     },
@@ -713,6 +801,14 @@ fn syscall_policy(call: &Syscall) -> (AccessLevel, &'static str, Option<&str>) {
         Syscall::NodeInfo => (AccessLevel::System, "system.node_info", None),
         Syscall::Metrics => (AccessLevel::System, "system.metrics", None),
         Syscall::OperatorSnapshot => (AccessLevel::ReadOnly, "operator.snapshot", None),
+        Syscall::ListOperatorTunables => (AccessLevel::System, "operator.tunable.list", None),
+        Syscall::SetOperatorTunable { .. } => (AccessLevel::System, "operator.tunable.set", None),
+        Syscall::RollbackOperatorTunable { .. } => {
+            (AccessLevel::System, "operator.tunable.rollback", None)
+        }
+        Syscall::ListOperatorTunableAudit { .. } => {
+            (AccessLevel::System, "operator.tunable.audit", None)
+        }
         Syscall::ListServices => (AccessLevel::System, "service.list", None),
         Syscall::StartService { .. } => (AccessLevel::System, "service.start", None),
         Syscall::StopService { .. } => (AccessLevel::System, "service.stop", None),
@@ -794,6 +890,35 @@ async fn authorize(
     let target_id = target.and_then(|value| uuid::Uuid::parse_str(value).ok());
 
     if !role_allows(principal.role, required) {
+        match call {
+            Syscall::SetOperatorTunable { name, value, .. } => {
+                kernel.operator_control.record_denial(
+                    name,
+                    Some(*value),
+                    &format!(
+                        "tenant:{} user:{} role:{}",
+                        principal.tenant_id,
+                        principal.user_id,
+                        principal.role.as_str()
+                    ),
+                    "authorization denied: system scope is required",
+                );
+            }
+            Syscall::RollbackOperatorTunable { name, .. } => {
+                kernel.operator_control.record_denial(
+                    name,
+                    None,
+                    &format!(
+                        "tenant:{} user:{} role:{}",
+                        principal.tenant_id,
+                        principal.user_id,
+                        principal.role.as_str()
+                    ),
+                    "authorization denied: system scope is required",
+                );
+            }
+            _ => {}
+        }
         audit_authorization_denial(kernel, principal, action, target_id, "insufficient role");
         return Err(authorization_error());
     }
@@ -1213,6 +1338,9 @@ pub async fn dispatch_scoped(
                     name: p.name,
                     provider_type: format!("{:?}", p.provider_type),
                     available: p.available,
+                    sampled_at: None,
+                    probe_duration_ms: None,
+                    probe_timed_out: false,
                 })
                 .collect();
             SyscallReply::Providers { providers }
@@ -1485,16 +1613,19 @@ pub async fn dispatch_scoped(
             }
         }
         Syscall::OperatorSnapshot => {
-            let allowed_ids: Option<std::collections::HashSet<uuid::Uuid>> = tenant.map(|tenant| {
-                kernel
-                    .context_manager
-                    .list_agents_for_tenant(tenant)
-                    .unwrap_or_default()
-                    .into_iter()
-                    .collect()
-            });
-            let mut agents = Vec::new();
-            for agent in kernel
+            let state_guard = kernel.operator_control.snapshot_guard().await;
+            let allowed_ids: Option<std::collections::HashSet<uuid::Uuid>> = match tenant {
+                Some(tenant) => match kernel.context_manager.list_agents_for_tenant(tenant) {
+                    Ok(ids) => Some(ids.into_iter().collect()),
+                    Err(error) => {
+                        return SyscallReply::Error {
+                            message: format!("operator snapshot tenant lookup failed: {error}"),
+                        };
+                    }
+                },
+                None => None,
+            };
+            let mut visible_agents = kernel
                 .agent_manager
                 .list_agents(None)
                 .into_iter()
@@ -1503,7 +1634,26 @@ pub async fn dispatch_scoped(
                         .as_ref()
                         .is_none_or(|allowed| allowed.contains(&agent.id))
                 })
-            {
+                .collect::<Vec<_>>();
+            visible_agents.sort_by_key(|agent| agent.id);
+            let total_visible_agents = visible_agents.len();
+            let scoped_ids = visible_agents
+                .iter()
+                .map(|agent| agent.id)
+                .collect::<Vec<_>>();
+            let scoped_gate_decisions = if tenant.is_some() {
+                kernel
+                    .syscall_gate
+                    .aggregate_agent_stats(scoped_ids.iter().copied())
+            } else {
+                kernel.syscall_gate.stats()
+            };
+            let snapshot_limit = kernel.operator_control.snapshot_max_agents();
+            let agents_truncated = visible_agents.len() > snapshot_limit;
+            visible_agents.truncate(snapshot_limit);
+
+            let mut agents = Vec::with_capacity(visible_agents.len());
+            for agent in visible_agents {
                 let gate = kernel.syscall_gate.agent_info(agent.id);
                 let checkpoint_count = kernel
                     .context_manager
@@ -1547,6 +1697,38 @@ pub async fn dispatch_scoped(
                             updated_at: chrono::Utc::now(),
                         }
                     });
+                let namespace_details = gate
+                    .as_ref()
+                    .map(|info| {
+                        info.namespaces
+                            .iter()
+                            .filter_map(|namespace_id| {
+                                kernel.os.namespaces.get(*namespace_id).map(|namespace| {
+                                    OperatorNamespaceSnapshot {
+                                        id: namespace.id,
+                                        kind: format!("{:?}", namespace.ns_type)
+                                            .to_ascii_lowercase(),
+                                        parent: namespace.parent,
+                                    }
+                                })
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let cgroup = gate
+                    .as_ref()
+                    .and_then(|info| kernel.cgroups.get(info.cgroup))
+                    .map(|group| OperatorCgroupSnapshot {
+                        id: group.id,
+                        scope: group.quota_scope,
+                        tokens_per_minute_limit: group.limits.tokens_per_min,
+                        concurrent_tool_limit: group.limits.max_concurrent_tool_calls,
+                        context_token_limit: group.limits.max_context_tokens,
+                        agent_limit: group.limits.max_agents,
+                        active_tool_calls: group.usage.active_tool_calls,
+                        context_tokens: group.usage.context_tokens,
+                        agent_count: group.usage.agent_count,
+                    });
                 agents.push(OperatorAgentSnapshot {
                     id: agent.id.to_string(),
                     name: agent.name,
@@ -1570,25 +1752,14 @@ pub async fn dispatch_scoped(
                         .as_ref()
                         .map(|info| info.namespaces.clone())
                         .unwrap_or_default(),
+                    namespace_details,
+                    cgroup,
+                    gate_decisions: kernel.syscall_gate.agent_stats(agent.id),
                     checkpoint_count,
                     context_pressure,
                     latest_usage: kernel.context_manager.latest_usage(agent.id),
                 });
             }
-            agents.sort_by(|a, b| a.id.cmp(&b.id));
-
-            let providers = kernel
-                .connector
-                .probe_providers()
-                .await
-                .into_iter()
-                .map(|provider| ProviderSummary {
-                    id: provider.id,
-                    name: provider.name,
-                    provider_type: format!("{:?}", provider.provider_type),
-                    available: provider.available,
-                })
-                .collect();
             let trusted_system = principal.is_none();
             let services = if trusted_system {
                 let mut services = kernel
@@ -1611,11 +1782,90 @@ pub async fn dispatch_scoped(
             } else {
                 None
             };
+            let package_instances =
+                match kernel.context_manager.list_loaded_package_instances(tenant) {
+                    Ok(packages) => packages,
+                    Err(error) => {
+                        return SyscallReply::Error {
+                            message: format!("operator package view failed: {error}"),
+                        };
+                    }
+                };
+            let packages = package_instances
+                .into_iter()
+                .map(|package| OperatorPackageSnapshot {
+                    agent_state: uuid::Uuid::parse_str(&package.agent_id)
+                        .ok()
+                        .and_then(|agent_id| kernel.agent_manager.get_agent_state(agent_id))
+                        .map(|state| format!("{state:?}"))
+                        .unwrap_or_else(|| "Unknown".into()),
+                    agent_id: package.agent_id,
+                    tenant_id: package.tenant_id,
+                    name: package.name,
+                    provider: package.provider,
+                    profile: package.profile,
+                    loaded_at: package.loaded_at,
+                })
+                .collect();
+            let tunables = if trusted_system {
+                match kernel.operator_control.list() {
+                    Ok(tunables) => Some(tunables),
+                    Err(error) => {
+                        return SyscallReply::Error {
+                            message: format!("operator tunable view failed: {error}"),
+                        };
+                    }
+                }
+            } else {
+                None
+            };
+            let system_metrics =
+                trusted_system.then(|| crate::metrics::MetricsSnapshot::collect(kernel));
+            let global_spend_usd = trusted_system.then(|| kernel.budget_enforcer.current_spend());
+            drop(state_guard);
+
+            let probe_started = std::time::Instant::now();
+            let sampled_at = chrono::Utc::now().to_rfc3339();
+            let provider_probe = tokio::time::timeout(
+                kernel.operator_control.provider_probe_timeout(),
+                kernel.connector.probe_providers(),
+            )
+            .await;
+            let probe_duration_ms =
+                u64::try_from(probe_started.elapsed().as_millis()).unwrap_or(u64::MAX);
+            let providers = match provider_probe {
+                Ok(providers) => providers
+                    .into_iter()
+                    .map(|provider| ProviderSummary {
+                        id: provider.id,
+                        name: provider.name,
+                        provider_type: format!("{:?}", provider.provider_type),
+                        available: provider.available,
+                        sampled_at: Some(sampled_at.clone()),
+                        probe_duration_ms: Some(probe_duration_ms),
+                        probe_timed_out: false,
+                    })
+                    .collect(),
+                Err(_) => kernel
+                    .connector
+                    .list_providers()
+                    .into_iter()
+                    .map(|provider| ProviderSummary {
+                        id: provider.id,
+                        name: provider.name,
+                        provider_type: format!("{:?}", provider.provider_type),
+                        available: false,
+                        sampled_at: Some(sampled_at.clone()),
+                        probe_duration_ms: Some(probe_duration_ms),
+                        probe_timed_out: true,
+                    })
+                    .collect(),
+            };
             SyscallReply::OperatorSnapshot {
                 snapshot: Box::new(OperatorSnapshot {
                     captured_at: chrono::Utc::now().to_rfc3339(),
                     consistency:
-                        "single collection pass; subsystem counters may advance during sampling"
+                        "structural agent/lifecycle/tunable state is barrier-consistent; counters and provider health are sampled and may advance independently"
                             .into(),
                     scope: tenant
                         .map(|tenant| format!("tenant:{tenant}"))
@@ -1623,13 +1873,82 @@ pub async fn dispatch_scoped(
                     kernel_version: env!("CARGO_PKG_VERSION").into(),
                     protocol_version: PROTOCOL_VERSION,
                     agents,
+                    total_visible_agents,
+                    agents_truncated,
                     providers,
+                    packages,
+                    scoped_gate_decisions,
+                    tunables,
                     services,
-                    system_metrics: trusted_system
-                        .then(|| crate::metrics::MetricsSnapshot::collect(kernel)),
-                    global_spend_usd: trusted_system
-                        .then(|| kernel.budget_enforcer.current_spend()),
+                    system_metrics,
+                    global_spend_usd,
                 }),
+            }
+        }
+        Syscall::ListOperatorTunables => match kernel.operator_control.list() {
+            Ok(tunables) => SyscallReply::OperatorTunables { tunables },
+            Err(error) => SyscallReply::Error {
+                message: error.to_string(),
+            },
+        },
+        Syscall::SetOperatorTunable {
+            name,
+            value,
+            expected_revision,
+        } => {
+            let actor = principal
+                .map(|principal| {
+                    format!(
+                        "tenant:{} user:{} role:{}",
+                        principal.tenant_id,
+                        principal.user_id,
+                        principal.role.as_str()
+                    )
+                })
+                .unwrap_or_else(|| "trusted-system".into());
+            match kernel
+                .operator_control
+                .set(&name, value, expected_revision, &actor)
+                .await
+            {
+                Ok(tunable) => SyscallReply::OperatorTunable { tunable },
+                Err(error) => SyscallReply::Error {
+                    message: error.to_string(),
+                },
+            }
+        }
+        Syscall::RollbackOperatorTunable {
+            name,
+            target_revision,
+            expected_revision,
+        } => {
+            let actor = principal
+                .map(|principal| {
+                    format!(
+                        "tenant:{} user:{} role:{}",
+                        principal.tenant_id,
+                        principal.user_id,
+                        principal.role.as_str()
+                    )
+                })
+                .unwrap_or_else(|| "trusted-system".into());
+            match kernel
+                .operator_control
+                .rollback(&name, target_revision, expected_revision, &actor)
+                .await
+            {
+                Ok(tunable) => SyscallReply::OperatorTunable { tunable },
+                Err(error) => SyscallReply::Error {
+                    message: error.to_string(),
+                },
+            }
+        }
+        Syscall::ListOperatorTunableAudit { name, limit } => {
+            match kernel.operator_control.audit(name.as_deref(), limit) {
+                Ok(entries) => SyscallReply::OperatorTunableAudit { entries },
+                Err(error) => SyscallReply::Error {
+                    message: error.to_string(),
+                },
             }
         }
         Syscall::ListServices => SyscallReply::Services {
@@ -2089,6 +2408,52 @@ impl SyscallClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct SlowHealthProvider {
+        id: crate::ProviderId,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::connector::LlmProviderAdapter for SlowHealthProvider {
+        fn id(&self) -> &crate::ProviderId {
+            &self.id
+        }
+
+        fn name(&self) -> &str {
+            "slow-health"
+        }
+
+        fn provider_type(&self) -> crate::connector::ProviderType {
+            crate::connector::ProviderType::Cloud
+        }
+
+        async fn is_available(&self) -> bool {
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            true
+        }
+
+        async fn create_session(
+            &self,
+        ) -> Result<Box<dyn crate::connector::LlmSession>, crate::ConnectorError> {
+            Err(crate::ConnectorError::ProviderUnavailable(self.id.clone()))
+        }
+
+        fn translate_to_provider(
+            &self,
+            message: &crate::connector::StandardMessage,
+        ) -> serde_json::Value {
+            serde_json::json!({"role": message.role, "content": message.content})
+        }
+
+        fn translate_from_provider(
+            &self,
+            value: &serde_json::Value,
+        ) -> Option<crate::connector::StandardMessage> {
+            Some(crate::connector::StandardMessage::user(
+                value.get("content")?.as_str()?.to_string(),
+            ))
+        }
+    }
 
     #[test]
     fn wire_wait_agent_timeout_is_bounded() {
@@ -3451,6 +3816,30 @@ memory = ["remember this"]
             (Syscall::NodeInfo, AccessLevel::System),
             (Syscall::Metrics, AccessLevel::System),
             (Syscall::OperatorSnapshot, AccessLevel::ReadOnly),
+            (Syscall::ListOperatorTunables, AccessLevel::System),
+            (
+                Syscall::SetOperatorTunable {
+                    name: crate::operator_control::MAX_AGENTS.into(),
+                    value: 1,
+                    expected_revision: 1,
+                },
+                AccessLevel::System,
+            ),
+            (
+                Syscall::RollbackOperatorTunable {
+                    name: crate::operator_control::MAX_AGENTS.into(),
+                    target_revision: 1,
+                    expected_revision: 2,
+                },
+                AccessLevel::System,
+            ),
+            (
+                Syscall::ListOperatorTunableAudit {
+                    name: None,
+                    limit: 10,
+                },
+                AccessLevel::System,
+            ),
             (Syscall::ListServices, AccessLevel::System),
             (
                 Syscall::StartService { name: "x".into() },
@@ -3488,7 +3877,7 @@ memory = ["remember this"]
         // syscall_policy is an exhaustive match. Adding a new enum variant
         // cannot compile until it receives an authorization classification;
         // this table then records the expected role/resource behavior.
-        assert_eq!(agent_calls.len() + unscoped_calls.len(), 37);
+        assert_eq!(agent_calls.len() + unscoped_calls.len(), 41);
     }
 
     #[tokio::test]
@@ -3681,6 +4070,11 @@ memory = ["remember this"]
         assert!(tenant_snapshot.system_metrics.is_none());
         assert!(tenant_snapshot.services.is_none());
         assert!(tenant_snapshot.global_spend_usd.is_none());
+        assert!(tenant_snapshot.tunables.is_none());
+        assert_eq!(tenant_snapshot.total_visible_agents, 1);
+        assert!(!tenant_snapshot.agents_truncated);
+        assert!(tenant_snapshot.agents[0].cgroup.is_some());
+        assert!(!tenant_snapshot.agents[0].namespace_details.is_empty());
 
         kernel.pause_agent(own.id).await.unwrap();
         let paused =
@@ -3707,8 +4101,427 @@ memory = ["remember this"]
             other => panic!("expected system snapshot, got {other:?}"),
         };
         assert_eq!(system.agents.len(), 2);
-        assert!(system.system_metrics.is_some());
+        let metrics = system.system_metrics.as_ref().unwrap();
+        assert_eq!(metrics.agent_count as usize, system.total_visible_agents);
+        assert_eq!(metrics.gate, system.scoped_gate_decisions);
         assert!(system.services.is_some());
+        assert!(system.tunables.is_some());
+    }
+
+    #[tokio::test]
+    async fn operator_snapshot_bounds_slow_provider_health_probes() {
+        let kernel = AgentKernelImpl::new().expect("kernel new");
+        kernel
+            .register_provider(Arc::new(SlowHealthProvider {
+                id: "slow-health".into(),
+            }))
+            .unwrap();
+        let current = kernel
+            .operator_control
+            .list()
+            .unwrap()
+            .into_iter()
+            .find(|tunable| tunable.name == crate::operator_control::PROVIDER_PROBE_TIMEOUT_MS)
+            .unwrap();
+        kernel
+            .operator_control
+            .set(&current.name, 50, current.revision, "provider-timeout-test")
+            .await
+            .unwrap();
+
+        let started = std::time::Instant::now();
+        let snapshot = match dispatch(&kernel, Syscall::OperatorSnapshot).await {
+            SyscallReply::OperatorSnapshot { snapshot } => snapshot,
+            other => panic!("expected operator snapshot, got {other:?}"),
+        };
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "a provider health probe must not block the operator API"
+        );
+        let provider = snapshot
+            .providers
+            .iter()
+            .find(|provider| provider.id == "slow-health")
+            .expect("registered provider must remain visible after timeout");
+        assert!(!provider.available);
+        assert!(provider.probe_timed_out);
+        assert!(provider
+            .probe_duration_ms
+            .is_some_and(|duration| duration >= 50));
+    }
+
+    #[tokio::test]
+    async fn operator_tunables_are_durable_audited_atomic_and_enforced() {
+        let db_path = std::env::temp_dir().join(format!(
+            "agentos-operator-tunables-{}.sqlite",
+            uuid::Uuid::new_v4()
+        ));
+        {
+            let kernel = AgentKernelImpl::with_db_path(&db_path).unwrap();
+            let initial = match dispatch(&kernel, Syscall::ListOperatorTunables).await {
+                SyscallReply::OperatorTunables { tunables } => tunables,
+                other => panic!("expected tunables, got {other:?}"),
+            };
+            let max_agents = initial
+                .iter()
+                .find(|tunable| tunable.name == crate::operator_control::MAX_AGENTS)
+                .unwrap();
+            assert_eq!(max_agents.value, 0);
+            assert_eq!(max_agents.revision, 1);
+
+            let tenant = kernel.create_tenant("denied-ops").await.unwrap();
+            let user = kernel
+                .register_user(&tenant, "admin", "admin@denied.test", Role::Admin)
+                .await
+                .unwrap();
+            let tenant_admin = Principal {
+                user_id: user,
+                tenant_id: tenant,
+                role: Role::Admin,
+                credential: None,
+            };
+            assert_authorization_denied(
+                dispatch_scoped(
+                    &kernel,
+                    Syscall::SetOperatorTunable {
+                        name: crate::operator_control::MAX_AGENTS.into(),
+                        value: 9,
+                        expected_revision: 1,
+                    },
+                    Some(&tenant_admin),
+                )
+                .await,
+            );
+
+            let applied = match dispatch(
+                &kernel,
+                Syscall::SetOperatorTunable {
+                    name: crate::operator_control::MAX_AGENTS.into(),
+                    value: 1,
+                    expected_revision: 1,
+                },
+            )
+            .await
+            {
+                SyscallReply::OperatorTunable { tunable } => tunable,
+                other => panic!("expected applied tunable, got {other:?}"),
+            };
+            assert_eq!(applied.value, 1);
+            assert_eq!(applied.revision, 2);
+
+            let config = |name: &str| AgentConfig {
+                name: name.into(),
+                task: "bounded creation".into(),
+                llm_provider: "stub".into(),
+                permission_profile: "standard".into(),
+                priority: Priority::default(),
+                sandbox_config: None,
+            };
+            let (left, right) = tokio::join!(
+                kernel.create_agent_full(config("left")),
+                kernel.create_agent_full(config("right"))
+            );
+            assert_eq!(
+                usize::from(left.is_ok()) + usize::from(right.is_ok()),
+                1,
+                "compare-and-create must enforce max_agents atomically"
+            );
+            let rejected = left.err().or_else(|| right.err()).unwrap().to_string();
+            assert!(rejected.contains("kernel.max_agents"));
+
+            assert!(matches!(
+                dispatch(
+                    &kernel,
+                    Syscall::SetOperatorTunable {
+                        name: crate::operator_control::MAX_AGENTS.into(),
+                        value: 1_000_001,
+                        expected_revision: 2,
+                    },
+                )
+                .await,
+                SyscallReply::Error { .. }
+            ));
+            assert!(matches!(
+                dispatch(
+                    &kernel,
+                    Syscall::SetOperatorTunable {
+                        name: crate::operator_control::MAX_AGENTS.into(),
+                        value: 2,
+                        expected_revision: 1,
+                    },
+                )
+                .await,
+                SyscallReply::Error { .. }
+            ));
+
+            let restored = match dispatch(
+                &kernel,
+                Syscall::RollbackOperatorTunable {
+                    name: crate::operator_control::MAX_AGENTS.into(),
+                    target_revision: 1,
+                    expected_revision: 2,
+                },
+            )
+            .await
+            {
+                SyscallReply::OperatorTunable { tunable } => tunable,
+                other => panic!("expected rollback, got {other:?}"),
+            };
+            assert_eq!(restored.value, 0);
+            assert_eq!(restored.revision, 3);
+            let persisted_package = crate::agent_package::AgentManifest::from_toml_str(
+                "name = \"after-rollback-package\"\ntask = \"durable package view\"",
+            )
+            .unwrap();
+            crate::agent_package::load_package(&kernel, &persisted_package)
+                .await
+                .expect("rollback must update live admission");
+
+            let audit = match dispatch(
+                &kernel,
+                Syscall::ListOperatorTunableAudit {
+                    name: Some(crate::operator_control::MAX_AGENTS.into()),
+                    limit: 100,
+                },
+            )
+            .await
+            {
+                SyscallReply::OperatorTunableAudit { entries } => entries,
+                other => panic!("expected audit, got {other:?}"),
+            };
+            assert!(audit.iter().any(|entry| {
+                entry.outcome == "denied"
+                    && entry
+                        .reason
+                        .as_deref()
+                        .is_some_and(|reason| reason.contains("authorization denied"))
+            }));
+            assert!(
+                audit
+                    .iter()
+                    .filter(|entry| entry.outcome == "denied")
+                    .count()
+                    >= 3
+            );
+            assert!(audit
+                .iter()
+                .any(|entry| entry.action == "rollback" && entry.effective_value == Some(0)));
+        }
+
+        {
+            let restarted = AgentKernelImpl::with_db_path(&db_path).unwrap();
+            let persisted = restarted.operator_control.list().unwrap();
+            let max_agents = persisted
+                .iter()
+                .find(|tunable| tunable.name == crate::operator_control::MAX_AGENTS)
+                .unwrap();
+            assert_eq!(max_agents.value, 0);
+            assert_eq!(max_agents.revision, 3);
+            assert_eq!(
+                restarted.syscall_gate.stats(),
+                crate::syscall_gate::GateStats::default(),
+                "ephemeral decision counters reset on process restart"
+            );
+            assert!(restarted
+                .operator_control
+                .audit(Some(crate::operator_control::MAX_AGENTS), 100)
+                .unwrap()
+                .iter()
+                .any(|entry| entry.action == "rollback"));
+            let snapshot = match dispatch(&restarted, Syscall::OperatorSnapshot).await {
+                SyscallReply::OperatorSnapshot { snapshot } => snapshot,
+                other => panic!("expected restarted snapshot, got {other:?}"),
+            };
+            assert!(snapshot
+                .packages
+                .iter()
+                .any(|package| package.name == "after-rollback-package"));
+        }
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_file(format!("{}-wal", db_path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", db_path.display()));
+    }
+
+    #[tokio::test]
+    async fn package_and_gate_views_are_tenant_scoped() {
+        let kernel = AgentKernelImpl::new().unwrap();
+        let tenant_a = kernel.create_tenant("view-a").await.unwrap();
+        let tenant_b = kernel.create_tenant("view-b").await.unwrap();
+        let user_a = kernel
+            .register_user(&tenant_a, "a", "a@view.test", Role::User)
+            .await
+            .unwrap();
+        let user_b = kernel
+            .register_user(&tenant_b, "b", "b@view.test", Role::User)
+            .await
+            .unwrap();
+        let principal_a = Principal {
+            user_id: user_a,
+            tenant_id: tenant_a.clone(),
+            role: Role::User,
+            credential: None,
+        };
+        let principal_b = Principal {
+            user_id: user_b,
+            tenant_id: tenant_b.clone(),
+            role: Role::User,
+            credential: None,
+        };
+        let package_a = crate::agent_package::AgentManifest::from_toml_str(
+            "name = \"tenant-a-package\"\ntask = \"private-a\"\nprofile = \"read-only\"",
+        )
+        .unwrap();
+        let package_b = crate::agent_package::AgentManifest::from_toml_str(
+            "name = \"tenant-b-package\"\ntask = \"private-b\"\nprofile = \"read-only\"",
+        )
+        .unwrap();
+        let agent_a = crate::agent_package::load_package_for_tenant(&kernel, &tenant_a, &package_a)
+            .await
+            .unwrap();
+        let agent_b = crate::agent_package::load_package_for_tenant(&kernel, &tenant_b, &package_b)
+            .await
+            .unwrap();
+
+        let denied_write = |agent_id: uuid::Uuid| Syscall::CallTool {
+            agent_id: agent_id.to_string(),
+            tool: "write_file".into(),
+            args: serde_json::json!({"path": "blocked.txt", "content": "x"}),
+        };
+        assert!(matches!(
+            dispatch_scoped(&kernel, denied_write(agent_a.id), Some(&principal_a)).await,
+            SyscallReply::Error { .. }
+        ));
+        for _ in 0..2 {
+            assert!(matches!(
+                dispatch_scoped(&kernel, denied_write(agent_b.id), Some(&principal_b)).await,
+                SyscallReply::Error { .. }
+            ));
+        }
+
+        let snapshot_a =
+            match dispatch_scoped(&kernel, Syscall::OperatorSnapshot, Some(&principal_a)).await {
+                SyscallReply::OperatorSnapshot { snapshot } => snapshot,
+                other => panic!("expected tenant A snapshot, got {other:?}"),
+            };
+        let snapshot_b =
+            match dispatch_scoped(&kernel, Syscall::OperatorSnapshot, Some(&principal_b)).await {
+                SyscallReply::OperatorSnapshot { snapshot } => snapshot,
+                other => panic!("expected tenant B snapshot, got {other:?}"),
+            };
+        assert_eq!(snapshot_a.packages.len(), 1);
+        assert_eq!(snapshot_a.packages[0].name, "tenant-a-package");
+        assert_eq!(snapshot_b.packages.len(), 1);
+        assert_eq!(snapshot_b.packages[0].name, "tenant-b-package");
+        assert_eq!(snapshot_a.scoped_gate_decisions.denied_capability, 1);
+        assert_eq!(snapshot_b.scoped_gate_decisions.denied_capability, 2);
+        assert_eq!(snapshot_a.agents[0].gate_decisions.denied_capability, 1);
+        assert_eq!(snapshot_b.agents[0].gate_decisions.denied_capability, 2);
+        let encoded_a = serde_json::to_string(&snapshot_a).unwrap();
+        assert!(!encoded_a.contains("tenant-b-package"));
+        assert!(!encoded_a.contains("private-b"));
+
+        let system = match dispatch(&kernel, Syscall::OperatorSnapshot).await {
+            SyscallReply::OperatorSnapshot { snapshot } => snapshot,
+            other => panic!("expected system snapshot, got {other:?}"),
+        };
+        assert_eq!(system.packages.len(), 2);
+        assert_eq!(
+            system.scoped_gate_decisions.denied_capability,
+            snapshot_a.scoped_gate_decisions.denied_capability
+                + snapshot_b.scoped_gate_decisions.denied_capability
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_lifecycle_and_reconfigure_snapshots_are_structurally_valid() {
+        let kernel = AgentKernelImpl::new().unwrap();
+        let agent = kernel
+            .create_agent_full(AgentConfig {
+                name: "snapshot-race".into(),
+                task: "exercise barrier".into(),
+                llm_provider: "stub".into(),
+                permission_profile: "standard".into(),
+                priority: Priority::default(),
+                sandbox_config: None,
+            })
+            .await
+            .unwrap();
+
+        let mutate_lifecycle = async {
+            for _ in 0..20 {
+                kernel.pause_agent(agent.id).await.unwrap();
+                kernel.resume_agent(agent.id).await.unwrap();
+            }
+        };
+        let reconfigure = async {
+            for index in 0..20 {
+                let current = kernel
+                    .operator_control
+                    .list()
+                    .unwrap()
+                    .into_iter()
+                    .find(|tunable| {
+                        tunable.name == crate::operator_control::PROVIDER_PROBE_TIMEOUT_MS
+                    })
+                    .unwrap();
+                kernel
+                    .operator_control
+                    .set(
+                        &current.name,
+                        if index % 2 == 0 { 100 } else { 200 },
+                        current.revision,
+                        "concurrency-test",
+                    )
+                    .await
+                    .unwrap();
+            }
+        };
+        let observe = async {
+            for _ in 0..80 {
+                let snapshot = match dispatch(&kernel, Syscall::OperatorSnapshot).await {
+                    SyscallReply::OperatorSnapshot { snapshot } => snapshot,
+                    other => panic!("expected snapshot, got {other:?}"),
+                };
+                let agent = snapshot
+                    .agents
+                    .iter()
+                    .find(|entry| entry.id == agent.id.to_string())
+                    .unwrap();
+                match agent.state.as_str() {
+                    "Running" => {
+                        assert!(agent.sandbox_active);
+                        assert!(agent.cgroup.is_some());
+                        assert!(
+                            matches!(agent.scheduler_state.as_str(), "queued" | "running"),
+                            "running lifecycle state cannot pair with scheduler state {:?}",
+                            agent.scheduler_state
+                        );
+                    }
+                    "Paused" => {
+                        assert!(agent.sandbox_active);
+                        assert!(agent.cgroup.is_some());
+                        assert_eq!(agent.scheduler_state, "paused");
+                    }
+                    other => panic!("impossible concurrent state {other:?}"),
+                }
+            }
+        };
+        tokio::join!(mutate_lifecycle, reconfigure, observe);
+
+        kernel.kill_agent(agent.id).await.unwrap();
+        let stopped = match dispatch(&kernel, Syscall::OperatorSnapshot).await {
+            SyscallReply::OperatorSnapshot { snapshot } => snapshot,
+            other => panic!("expected snapshot, got {other:?}"),
+        };
+        let stopped = stopped
+            .agents
+            .iter()
+            .find(|entry| entry.id == agent.id.to_string())
+            .unwrap();
+        assert_eq!(stopped.state, "Stopped");
+        assert_eq!(stopped.scheduler_state, "stopped");
+        assert!(!stopped.sandbox_active);
+        assert!(stopped.cgroup.is_none());
     }
 
     #[tokio::test]

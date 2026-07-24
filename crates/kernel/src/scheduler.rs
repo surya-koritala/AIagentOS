@@ -406,10 +406,10 @@ impl PriorityScheduler {
     pub fn set_queued(&self, agent_id: AgentId) {
         if let Some(mut info) = self.agents.get_mut(&agent_id) {
             if info.state == AgentScheduleState::Running {
-                info.state = AgentScheduleState::Queued;
                 self.running_count.fetch_sub(1, AtomicOrdering::SeqCst);
                 self.slot_available.notify_one();
             }
+            info.state = AgentScheduleState::Queued;
         }
     }
 
@@ -668,6 +668,18 @@ mod tests {
         sched.suspend(id).await.unwrap();
         sched.resume(id).await.unwrap();
         assert_eq!(sched.get_queue_status().running_agents, 1);
+    }
+
+    #[test]
+    fn lifecycle_resume_requeues_a_paused_agent() {
+        let sched = PriorityScheduler::new();
+        let id = uuid::Uuid::new_v4();
+        sched.admit(&make_handle(id));
+        sched.set_paused(id);
+        assert_eq!(sched.schedule_state(id), Some("paused"));
+        sched.set_queued(id);
+        assert_eq!(sched.schedule_state(id), Some("queued"));
+        assert_eq!(sched.get_queue_status().running_agents, 0);
     }
 
     #[tokio::test]

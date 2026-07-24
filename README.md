@@ -54,16 +54,18 @@ AI Agent OS provides:
 
 - **Process management** — create, clone, signal, kill agents (like fork/exec/kill)
 - **Fair scheduling** — cooperative, CFS-inspired weighted turn admission
-- **Context management** — bounded active prompts, durable spill references, explicit backpressure
+- **Context management** — per-agent/tenant/kernel active and durable bounds, verified spill references, explicit backpressure
 - **Logical isolation** — tenant ownership, namespaces, cgroup-style quotas, and sandbox identities
 - **Security** — fail-closed tool declarations, MAC policies, capabilities, approvals, and audit logging
 - **IPC** — inter-agent messaging, delegation, and discovery (broker-routed via `IpcManager`)
-- **Service supervision** — dependency ordering, coordinated lifecycle, and restart policy
+- **Service supervision** — validated dependency graphs, durable ownership/history, health-driven restart/backoff, and atomic rolling reload
 - **Packages** — bounded, validated manifests and registry-backed tool resolution
 
 > [!CAUTION]
-> Logical isolation is implemented, but production-grade host/container isolation
-> is still tracked by [#111](https://github.com/surya-koritala/AIagentOS/issues/111).
+> Capability-mediated workspace and HTTP isolation is implemented. Linux
+> container execution now has a hardened rootless, digest-pinned contract, but
+> live breakout/crash qualification and macOS/Windows process backends are still
+> tracked by [#111](https://github.com/surya-koritala/AIagentOS/issues/111).
 > Package signing and durable supply-chain qualification remain tracked by
 > [#119](https://github.com/surya-koritala/AIagentOS/issues/119).
 
@@ -154,7 +156,7 @@ cargo run --package agent-cli
 | **Networking** | `ipc` |
 | **Security** | `mac`, `permissions`, `namespaces`, `sandbox` |
 | **Resource Control** | `cgroups`, `rate_limit`, `production` |
-| **Init & Services** | `init_system`, `agentctl`, `agentps` |
+| **Init & Services** | `init_system`, `agentps` (the `agentctl` operator is an SDK-backed CLI binary) |
 | **Observability** | `observability`, `procfs`, `event_loop` |
 | **Syscall Layer** | `syscall_server` JSON ABI (`syscall_interface` is experimental) |
 | **Execution** | `execution`, `planning`, `editing`, `delegation` |
@@ -182,14 +184,14 @@ presence in the Rust crate is not a v1 support claim.
 | `task_struct` | `AgentStruct` (Uuid + u64 PID translation) | Unit-tested — [#112](https://github.com/surya-koritala/AIagentOS/issues/112) |
 | Signals (SIGKILL, SIGSTOP) | Agent signal/state primitives | Unit-tested — [#112](https://github.com/surya-koritala/AIagentOS/issues/112) |
 | Unix sockets / IPC | Messaging, delegation, and discovery | Unit-tested — [#112](https://github.com/surya-koritala/AIagentOS/issues/112) |
-| systemd | Service files, dependency ordering, restart policy | Unit-tested — [#118](https://github.com/surya-koritala/AIagentOS/issues/118) |
+| systemd | Validated service files, dependencies, durable health/restart supervision, and rolling reload | Production-qualified — [#118](https://github.com/surya-koritala/AIagentOS/issues/118) |
 | syscall interface | Versioned JSON wire protocol; numbered table explicitly experimental | Public-API E2E — [#116](https://github.com/surya-koritala/AIagentOS/issues/116) |
 | `fork()/clone()` | `agent_clone(flags)` primitive | Unit-tested — [#112](https://github.com/surya-koritala/AIagentOS/issues/112) |
-| CFS scheduler | Vruntime/nice accounting and admission primitives | Integrated — [#114](https://github.com/surya-koritala/AIagentOS/issues/114) |
-| Virtual memory analogy | Active prompt bound, durable spill, explicit backpressure | Integrated — [#115](https://github.com/surya-koritala/AIagentOS/issues/115) |
+| CFS-inspired scheduler | Cooperative weighted turn/provider admission, bounded aging, priority inheritance, and metrics | Production-qualified — [#114](https://github.com/surya-koritala/AIagentOS/issues/114) |
+| Context pressure (not virtual memory) | Hierarchical active-prompt admission, durable-byte quotas, verified/retained spills, explicit backpressure | Production-qualified — [#115](https://github.com/surya-koritala/AIagentOS/issues/115) |
 | Namespaces | Tool and IPC visibility primitives | Unit-tested — [#107](https://github.com/surya-koritala/AIagentOS/issues/107) |
 | VFS + mount | Experimental descriptor/mount prototypes, excluded from v1 | Scaffolded — [ADR 0001](docs/ADR-0001-PUBLIC-ABI.md) |
-| /proc filesystem | Snapshot-oriented `ProcFs` helpers | Unit-tested — [#117](https://github.com/surya-koritala/AIagentOS/issues/117) |
+| `/proc` + sysctl analogue | Remote tenant-safe typed snapshot, scoped gate/package views, and durable audited tunables | Production-qualified — [#117](https://github.com/surya-koritala/AIagentOS/issues/117) |
 | apt/rpm | Validated unsigned manifest loading; registry/signing remain prototypes | Public-API E2E (not supply-chain qualified) — [#119](https://github.com/surya-koritala/AIagentOS/issues/119) |
 
 ## How enforcement works in practice

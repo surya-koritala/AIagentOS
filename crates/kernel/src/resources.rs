@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::permissions::{AccessDecision, ActionOutcome, PermissionSystem};
 use crate::sandbox::{SandboxAction, SandboxManager};
-use crate::{AgentId, ResourceError, SandboxId};
+use crate::{AgentId, IsolationLevel, ResourceError, SandboxId};
 
 /// Resource types available to agents.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -350,9 +350,12 @@ impl ResourceBrokerImpl {
         }
     }
 
-    fn enforce_sandbox(&self, request: &mut ResourceRequest) -> Result<(), ResourceError> {
+    fn enforce_sandbox(
+        &self,
+        request: &mut ResourceRequest,
+    ) -> Result<Option<(SandboxId, IsolationLevel)>, ResourceError> {
         let Some(manager) = &self.sandbox_manager else {
-            return Ok(());
+            return Ok(None);
         };
         let actual = manager
             .get_sandbox_for_agent(request.agent_id)
@@ -386,12 +389,19 @@ impl ResourceBrokerImpl {
                 "path".into(),
                 serde_json::Value::String(resolved.to_string()),
             );
-            Ok(())
+            let isolation = manager
+                .isolation_level(actual)
+                .map_err(|_| ResourceError::OperationFailed("Sandbox denied".into()))?;
+            Ok(Some((actual, isolation)))
         } else {
             let action = Self::sandbox_action(request)?;
             manager
                 .intercept_action(actual, &action)
-                .map_err(|_| ResourceError::OperationFailed("Sandbox denied".into()))
+                .map_err(|_| ResourceError::OperationFailed("Sandbox denied".into()))?;
+            let isolation = manager
+                .isolation_level(actual)
+                .map_err(|_| ResourceError::OperationFailed("Sandbox denied".into()))?;
+            Ok(Some((actual, isolation)))
         }
     }
 }
@@ -455,7 +465,25 @@ impl ResourceBroker for ResourceBrokerImpl {
             AccessDecision::Allowed => {}
         }
 
-        if let Err(error) = self.enforce_sandbox(&mut request) {
+        let sandbox = match self.enforce_sandbox(&mut request) {
+            Ok(sandbox) => sandbox,
+            Err(error) => {
+                self.permission_system.log_action(
+                    request.agent_id,
+                    &request.operation,
+                    &format!("{:?}", request.resource_type),
+                    AccessDecision::Denied,
+                    ActionOutcome::Failure,
+                );
+                return Err(error);
+            }
+        };
+        if matches!(
+            sandbox,
+            Some((_, ref isolation))
+                if request.resource_type == ResourceType::Browser
+                    && *isolation != IsolationLevel::Trusted
+        ) {
             self.permission_system.log_action(
                 request.agent_id,
                 &request.operation,
@@ -463,7 +491,9 @@ impl ResourceBroker for ResourceBrokerImpl {
                 AccessDecision::Denied,
                 ActionOutcome::Failure,
             );
-            return Err(error);
+            return Err(ResourceError::OperationFailed(
+                "isolated browser backend unavailable".into(),
+            ));
         }
 
         // Dispatch to provider
@@ -518,19 +548,89 @@ impl ResourceBroker for ResourceBrokerImpl {
         // its tool guard while a side effect still runs. Keep ownership until
         // the edit transaction finishes. Other provider operations retain the
         // bounded 30-second execution contract.
-        let result =
-            if request.resource_type == ResourceType::Filesystem && request.operation == "edit" {
-                provider
-                    .execute(&request.operation, &request.parameters)
-                    .await
-            } else {
-                tokio::time::timeout(
-                    std::time::Duration::from_secs(30),
-                    provider.execute(&request.operation, &request.parameters),
-                )
+        let capability_filesystem = match sandbox {
+            Some((sandbox_id, ref isolation))
+                if request.resource_type == ResourceType::Filesystem
+                    && *isolation != IsolationLevel::Trusted =>
+            {
+                Some(sandbox_id)
+            }
+            _ => None,
+        };
+        let capability_network = match sandbox {
+            Some((sandbox_id, ref isolation))
+                if request.resource_type == ResourceType::Network
+                    && *isolation != IsolationLevel::Trusted =>
+            {
+                Some(sandbox_id)
+            }
+            _ => None,
+        };
+        let isolated_process = match sandbox {
+            Some((sandbox_id, IsolationLevel::Container))
+                if request.resource_type == ResourceType::Application =>
+            {
+                Some(sandbox_id)
+            }
+            _ => None,
+        };
+        let result = if let Some(sandbox_id) = capability_filesystem {
+            let manager = Arc::clone(
+                self.sandbox_manager
+                    .as_ref()
+                    .expect("sandbox identity came from a sandbox manager"),
+            );
+            let operation = request.operation.clone();
+            let parameters = request.parameters.clone();
+            tokio::task::spawn_blocking(move || {
+                manager
+                    .execute_filesystem(sandbox_id, &operation, &parameters)
+                    .map_err(|error| ResourceError::OperationFailed(error.to_string()))
+            })
+            .await
+            .map_err(|error| ResourceError::OperationFailed(error.to_string()))?
+        } else if let Some(sandbox_id) = capability_network {
+            let manager = Arc::clone(
+                self.sandbox_manager
+                    .as_ref()
+                    .expect("sandbox identity came from a sandbox manager"),
+            );
+            tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                manager.execute_network(sandbox_id, &request.operation, &request.parameters),
+            )
+            .await
+            .unwrap_or(Err(crate::SandboxError::BoundaryViolation(
+                "network request timed out".into(),
+            )))
+            .map_err(|error| ResourceError::OperationFailed(error.to_string()))
+        } else if let Some(sandbox_id) = isolated_process {
+            let manager = Arc::clone(
+                self.sandbox_manager
+                    .as_ref()
+                    .expect("sandbox identity came from a sandbox manager"),
+            );
+            tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                manager.execute_process(sandbox_id, &request.parameters),
+            )
+            .await
+            .unwrap_or(Err(crate::SandboxError::BoundaryViolation(
+                "container execution timed out".into(),
+            )))
+            .map_err(|error| ResourceError::OperationFailed(error.to_string()))
+        } else if request.resource_type == ResourceType::Filesystem && request.operation == "edit" {
+            provider
+                .execute(&request.operation, &request.parameters)
                 .await
-                .unwrap_or(Err(ResourceError::Timeout))
-            };
+        } else {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                provider.execute(&request.operation, &request.parameters),
+            )
+            .await
+            .unwrap_or(Err(ResourceError::Timeout))
+        };
         drop(permit);
 
         match result {
@@ -843,7 +943,7 @@ mod tests {
         let agent = uuid::Uuid::new_v4();
         perms.assign_profile(agent, &"full-access".to_string());
         let root = std::env::temp_dir().join(format!("agentos-broker-{}", uuid::Uuid::new_v4()));
-        sandboxes
+        let sandbox = sandboxes
             .create_sandbox(
                 agent,
                 &SandboxConfig {
@@ -852,6 +952,7 @@ mod tests {
                     max_disk_usage_bytes: None,
                     max_memory_bytes: None,
                     isolation_level: IsolationLevel::Filesystem,
+                    container_image: None,
                 },
             )
             .unwrap();
@@ -871,15 +972,17 @@ mod tests {
             .await;
         assert!(result.is_err());
         assert_eq!(calls.load(Ordering::SeqCst), 0);
+        sandboxes.destroy_sandbox(sandbox).unwrap();
         std::fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]
-    async fn broker_rewrites_relative_file_path_to_validated_workspace_target() {
+    async fn broker_executes_relative_file_through_workspace_capability() {
         let perms = Arc::new(PermissionManager::new());
         let sandboxes = Arc::new(SandboxManagerImpl::new());
         let broker = ResourceBrokerImpl::new(perms.clone(), sandboxes.clone());
-        broker.register_provider(Box::new(MockProvider));
+        let provider_calls = Arc::new(AtomicUsize::new(0));
+        broker.register_provider(Box::new(CountingProvider(provider_calls.clone())));
         let agent = uuid::Uuid::new_v4();
         perms.assign_profile(agent, &"full-access".to_string());
         let root =
@@ -893,9 +996,12 @@ mod tests {
                     max_disk_usage_bytes: None,
                     max_memory_bytes: None,
                     isolation_level: IsolationLevel::Filesystem,
+                    container_image: None,
                 },
             )
             .unwrap();
+        std::fs::create_dir_all(root.join("nested")).unwrap();
+        std::fs::write(root.join("nested/file.txt"), "capability content").unwrap();
 
         let response = broker
             .execute(with_test_gate_proof(
@@ -912,14 +1018,14 @@ mod tests {
             .await
             .unwrap();
 
+        assert!(response.success);
+        assert_eq!(response.data["content"], "capability content");
         assert_eq!(
-            response.data["params"]["path"],
-            serde_json::json!(std::fs::canonicalize(&root)
-                .unwrap()
-                .join("nested/file.txt")
-                .to_str()
-                .unwrap())
+            provider_calls.load(Ordering::SeqCst),
+            0,
+            "untrusted filesystem I/O must not reopen a host path in a provider"
         );
+        sandboxes.destroy_sandbox(sandbox).unwrap();
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -945,6 +1051,64 @@ mod tests {
             ))
             .await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn broker_rejects_private_dns_answers_before_provider_invocation() {
+        let permissions = Arc::new(PermissionManager::new());
+        let sandboxes = Arc::new(SandboxManagerImpl::new());
+        let broker = ResourceBrokerImpl::new(permissions.clone(), sandboxes.clone());
+        let calls = Arc::new(AtomicUsize::new(0));
+        broker.register_provider(Box::new(BlindProvider {
+            resource_type: ResourceType::Network,
+            advertised: vec!["get".into()],
+            calls: calls.clone(),
+        }));
+
+        let agent = uuid::Uuid::new_v4();
+        permissions.assign_profile(agent, &"full-access".into());
+        let root =
+            std::env::temp_dir().join(format!("agentos-private-dns-{}", uuid::Uuid::new_v4()));
+        let sandbox = sandboxes
+            .create_sandbox(
+                agent,
+                &SandboxConfig {
+                    workspace_dir: root.clone(),
+                    allowed_network_hosts: Some(vec!["localhost".into()]),
+                    max_disk_usage_bytes: None,
+                    max_memory_bytes: None,
+                    isolation_level: IsolationLevel::Filesystem,
+                    container_image: None,
+                },
+            )
+            .unwrap();
+
+        let response = broker
+            .execute(with_test_gate_proof(
+                ResourceRequest {
+                    agent_id: agent,
+                    resource_type: ResourceType::Network,
+                    operation: "get".into(),
+                    parameters: serde_json::json!({"url": "http://localhost/"}),
+                    sandbox_context: None,
+                    gate_admission: None,
+                },
+                false,
+            ))
+            .await
+            .unwrap();
+        assert!(!response.success);
+        assert!(response
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("denied address")));
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "a provider must never see a target whose DNS answer is private"
+        );
+        sandboxes.destroy_sandbox(sandbox).unwrap();
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]
@@ -1077,7 +1241,7 @@ mod tests {
         permissions.assign_profile(agent, &"standard".into());
         let root =
             std::env::temp_dir().join(format!("agentos-approved-delete-{}", uuid::Uuid::new_v4()));
-        sandboxes
+        let sandbox = sandboxes
             .create_sandbox(
                 agent,
                 &SandboxConfig {
@@ -1086,9 +1250,11 @@ mod tests {
                     max_disk_usage_bytes: None,
                     max_memory_bytes: None,
                     isolation_level: IsolationLevel::Filesystem,
+                    container_image: None,
                 },
             )
             .unwrap();
+        std::fs::write(root.join("victim.txt"), "delete me").unwrap();
 
         let registry = ToolRegistry::new();
         registry
@@ -1178,8 +1344,14 @@ mod tests {
             .unwrap();
         let response = broker.execute(prepared.request).await.unwrap();
         assert!(response.success);
-        assert_eq!(response.data["operation"], "delete");
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(response.data["deleted"], true);
+        assert!(!root.join("victim.txt").exists());
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "untrusted delete must be capability-mediated, not provider-mediated"
+        );
+        sandboxes.destroy_sandbox(sandbox).unwrap();
         std::fs::remove_dir_all(root).unwrap();
     }
 

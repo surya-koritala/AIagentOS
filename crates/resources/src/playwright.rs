@@ -17,7 +17,6 @@ impl BrowserAutomation {
     pub async fn launch() -> Result<Self, String> {
         let (browser, mut handler) = chromiumoxide::Browser::launch(
             chromiumoxide::BrowserConfig::builder()
-                .no_sandbox()
                 .arg("--headless=new")
                 .build()
                 .map_err(|e| format!("Browser config error: {}", e))?,

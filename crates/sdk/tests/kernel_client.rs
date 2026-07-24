@@ -261,6 +261,56 @@ memory = ["seeded by package"]
 }
 
 #[tokio::test]
+async fn operator_snapshot_and_tunable_control_via_sdk() {
+    let addr = spawn_server().await;
+    let mut client = KernelClient::connect(addr).await.expect("connect");
+
+    let initial = client
+        .list_operator_tunables()
+        .await
+        .expect("list_operator_tunables");
+    let max_agents = initial
+        .iter()
+        .find(|tunable| tunable.name == kernel::operator_control::MAX_AGENTS)
+        .unwrap();
+    let changed = client
+        .set_operator_tunable(&max_agents.name, 2, max_agents.revision)
+        .await
+        .expect("set_operator_tunable");
+    assert_eq!(changed.value, 2);
+
+    let package_id = client
+        .load_package("name = \"ops-sdk\"\ntask = \"operator view\"")
+        .await
+        .expect("load package");
+    let snapshot = client.operator_snapshot().await.expect("operator_snapshot");
+    assert_eq!(snapshot.total_visible_agents, 1);
+    assert!(!snapshot.agents_truncated);
+    assert_eq!(snapshot.packages.len(), 1);
+    assert_eq!(snapshot.packages[0].agent_id, package_id);
+    assert!(snapshot.tunables.is_some());
+    assert_eq!(
+        snapshot
+            .system_metrics
+            .as_ref()
+            .expect("system metrics")
+            .gate,
+        snapshot.scoped_gate_decisions
+    );
+
+    let rolled_back = client
+        .rollback_operator_tunable(&changed.name, 1, changed.revision)
+        .await
+        .expect("rollback_operator_tunable");
+    assert_eq!(rolled_back.value, 0);
+    let audit = client
+        .operator_tunable_audit(Some(changed.name), 10)
+        .await
+        .expect("operator_tunable_audit");
+    assert!(audit.iter().any(|entry| entry.action == "rollback"));
+}
+
+#[tokio::test]
 async fn read_only_agent_tool_call_is_denied() {
     let addr = spawn_server().await;
 

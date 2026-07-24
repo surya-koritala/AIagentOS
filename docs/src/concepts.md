@@ -17,7 +17,7 @@ semantics are deliberately the same so the OS framing stays load-bearing.
 | `tool_descriptors`, `mount_table` | Experimental VFS analogy, excluded from v1 |
 | `ipc` | Inter-agent messaging + delegation, broker-routed; discovery via the agent directory |
 | `mac`, `permissions`, `namespaces`, `sandbox`, `cgroups` | Security: SELinux-style MAC, capabilities, isolation |
-| `init_system`, `agentctl`, `agentps` | systemd-style service files + dependency ordering |
+| `init_system`, `agentps`, SDK-backed `agentctl` binary | service supervision + operator control |
 | `syscall_server` | Canonical versioned JSON public ABI |
 | `syscall_interface` | Experimental numbered-syscall prototype; unsupported calls return ENOSYS |
 | `procfs`, `observability`, `event_loop` | `/proc` filesystem + audit logging |

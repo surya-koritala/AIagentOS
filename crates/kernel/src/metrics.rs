@@ -18,6 +18,7 @@
 //!   * an optional raw-`tokio` HTTP `/metrics` endpoint (in `agent-server`) for
 //!     a real Prometheus scraper.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 use std::time::Instant;
 
@@ -25,6 +26,136 @@ use crate::agent::AgentKernel;
 use crate::observability::{MetricScope, ObservabilityEngine};
 use crate::syscall_gate::GateStats;
 use crate::AgentKernelImpl;
+
+/// Bounded lifecycle outcomes for one operation. These counters are
+/// process-local and monotonic; no agent id appears as a metric label.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct LifecycleOperationMetrics {
+    pub requested: u64,
+    pub completed: u64,
+    pub timed_out: u64,
+    pub forced: u64,
+    pub failed: u64,
+    /// Cumulative wall-clock time for completed attempts, in microseconds.
+    pub duration_microseconds_total: u64,
+    /// Number of attempts represented by `duration_microseconds_total`.
+    pub duration_samples: u64,
+}
+
+/// Lifecycle counters grouped by the fixed public operation set.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct LifecycleMetricsSnapshot {
+    pub pause: LifecycleOperationMetrics,
+    pub resume: LifecycleOperationMetrics,
+    pub stop: LifecycleOperationMetrics,
+    pub kill: LifecycleOperationMetrics,
+    pub wait: LifecycleOperationMetrics,
+}
+
+#[derive(Debug, Default)]
+struct LifecycleOperationCounters {
+    requested: AtomicU64,
+    completed: AtomicU64,
+    timed_out: AtomicU64,
+    forced: AtomicU64,
+    failed: AtomicU64,
+    duration_microseconds_total: AtomicU64,
+    duration_samples: AtomicU64,
+}
+
+impl LifecycleOperationCounters {
+    fn record(&self, outcome: crate::LifecycleOutcome) {
+        let counter = match outcome {
+            crate::LifecycleOutcome::Requested => &self.requested,
+            crate::LifecycleOutcome::Completed => &self.completed,
+            crate::LifecycleOutcome::TimedOut => &self.timed_out,
+            crate::LifecycleOutcome::Forced => &self.forced,
+            crate::LifecycleOutcome::Failed => &self.failed,
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_duration(&self, duration: std::time::Duration) {
+        let micros = u64::try_from(duration.as_micros()).unwrap_or(u64::MAX);
+        let _ = self.duration_microseconds_total.fetch_update(
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+            |current| Some(current.saturating_add(micros)),
+        );
+        let _ =
+            self.duration_samples
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                    Some(current.saturating_add(1))
+                });
+    }
+
+    fn snapshot(&self) -> LifecycleOperationMetrics {
+        LifecycleOperationMetrics {
+            requested: self.requested.load(Ordering::Relaxed),
+            completed: self.completed.load(Ordering::Relaxed),
+            timed_out: self.timed_out.load(Ordering::Relaxed),
+            forced: self.forced.load(Ordering::Relaxed),
+            failed: self.failed.load(Ordering::Relaxed),
+            duration_microseconds_total: self.duration_microseconds_total.load(Ordering::Relaxed),
+            duration_samples: self.duration_samples.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// Process-local lifecycle telemetry shared by the kernel coordinator and
+/// operator metrics exporter.
+#[derive(Debug, Default)]
+pub(crate) struct LifecycleCounters {
+    pause: LifecycleOperationCounters,
+    resume: LifecycleOperationCounters,
+    stop: LifecycleOperationCounters,
+    kill: LifecycleOperationCounters,
+    wait: LifecycleOperationCounters,
+}
+
+impl LifecycleCounters {
+    pub(crate) fn record(
+        &self,
+        operation: crate::LifecycleOperation,
+        outcome: crate::LifecycleOutcome,
+    ) {
+        let counters = match operation {
+            crate::LifecycleOperation::Pause => &self.pause,
+            crate::LifecycleOperation::Resume => &self.resume,
+            crate::LifecycleOperation::Stop => &self.stop,
+            crate::LifecycleOperation::Kill => &self.kill,
+            crate::LifecycleOperation::Wait => &self.wait,
+        };
+        counters.record(outcome);
+    }
+
+    pub(crate) fn record_duration(
+        &self,
+        operation: crate::LifecycleOperation,
+        duration: std::time::Duration,
+    ) {
+        let counters = match operation {
+            crate::LifecycleOperation::Pause => &self.pause,
+            crate::LifecycleOperation::Resume => &self.resume,
+            crate::LifecycleOperation::Stop => &self.stop,
+            crate::LifecycleOperation::Kill => &self.kill,
+            crate::LifecycleOperation::Wait => &self.wait,
+        };
+        counters.record_duration(duration);
+    }
+
+    pub(crate) fn snapshot(&self) -> LifecycleMetricsSnapshot {
+        LifecycleMetricsSnapshot {
+            pause: self.pause.snapshot(),
+            resume: self.resume.snapshot(),
+            stop: self.stop.snapshot(),
+            kill: self.kill.snapshot(),
+            wait: self.wait.snapshot(),
+        }
+    }
+}
 
 /// The Prometheus exposition content type, including the format version. Use
 /// this for the `Content-Type` header of an HTTP `/metrics` response.
@@ -63,7 +194,12 @@ pub struct MetricsSnapshot {
     pub waiting_turns: u64,
     pub turn_capacity: u64,
     pub turn_admitted_total: u64,
+    pub turn_admitted_realtime_total: u64,
+    pub turn_admitted_normal_total: u64,
+    pub turn_admitted_background_total: u64,
+    pub turn_admitted_deadline_total: u64,
     pub turn_cancelled_total: u64,
+    pub turn_cooperative_yields_total: u64,
     pub turn_starvation_total: u64,
     pub turn_wait_ns_total: u64,
     pub turn_run_ns_total: u64,
@@ -93,6 +229,17 @@ pub struct MetricsSnapshot {
     pub quota_denied_cgroup_tokens: u64,
     pub quota_denied_migration_fence: u64,
     pub quota_storage_healthy: bool,
+    /// Lifecycle requests and bounded outcomes by operation.
+    pub lifecycle: LifecycleMetricsSnapshot,
+    /// Kernel-owned service-supervisor state and bounded counters.
+    pub service_configured: u64,
+    pub service_desired: u64,
+    pub service_running: u64,
+    pub service_ready: u64,
+    pub service_healthy: u64,
+    pub service_failed: u64,
+    pub service_restarts_total: u64,
+    pub service_dependency_blocks_total: u64,
     /// System-wide tokens consumed (sum across agents).
     pub tokens_consumed: u64,
     /// System-wide LLM api calls made (sum across agents).
@@ -132,6 +279,12 @@ impl MetricsSnapshot {
         let turns = kernel.turn_admission.metrics();
         let llm = kernel.llm_scheduler.metrics();
         let quota = kernel.rate_limiter.stats();
+        let services = kernel
+            .os
+            .init
+            .try_lock()
+            .map(|init| init.metrics())
+            .unwrap_or_default();
         Self {
             gate,
             agent_count,
@@ -144,7 +297,12 @@ impl MetricsSnapshot {
             waiting_turns: turns.waiting as u64,
             turn_capacity: turns.capacity as u64,
             turn_admitted_total: turns.admitted_total,
+            turn_admitted_realtime_total: turns.admitted_realtime_total,
+            turn_admitted_normal_total: turns.admitted_normal_total,
+            turn_admitted_background_total: turns.admitted_background_total,
+            turn_admitted_deadline_total: turns.admitted_deadline_total,
             turn_cancelled_total: turns.cancelled_total,
+            turn_cooperative_yields_total: turns.cooperative_yields_total,
             turn_starvation_total: turns.starvation_total,
             turn_wait_ns_total: turns.wait_ns_total,
             turn_run_ns_total: turns.run_ns_total,
@@ -170,6 +328,15 @@ impl MetricsSnapshot {
             quota_denied_cgroup_tokens: quota.denied_cgroup_tokens,
             quota_denied_migration_fence: quota.denied_migration_fence,
             quota_storage_healthy: quota.healthy,
+            lifecycle: kernel.lifecycle_counters.snapshot(),
+            service_configured: services.configured,
+            service_desired: services.desired,
+            service_running: services.running,
+            service_ready: services.ready,
+            service_healthy: services.healthy,
+            service_failed: services.failed,
+            service_restarts_total: services.restarts_total,
+            service_dependency_blocks_total: services.dependency_blocks_total,
             tokens_consumed: sys.tokens_consumed,
             api_calls_made: sys.api_calls_made,
             uptime_seconds: process_start().elapsed().as_secs(),
@@ -254,6 +421,35 @@ impl MetricsSnapshot {
             out.push_str(&format!("agentos_{name}_agents {value}\n"));
         }
 
+        out.push_str("# HELP agentos_services Service supervisor units by bounded state.\n");
+        out.push_str("# TYPE agentos_services gauge\n");
+        for (state, value) in [
+            ("configured", self.service_configured),
+            ("desired", self.service_desired),
+            ("running", self.service_running),
+            ("ready", self.service_ready),
+            ("healthy", self.service_healthy),
+            ("failed", self.service_failed),
+        ] {
+            out.push_str(&format!("agentos_services{{state=\"{state}\"}} {value}\n"));
+        }
+        out.push_str(
+            "# HELP agentos_service_restarts_total Service restart attempts in durable runtime history.\n",
+        );
+        out.push_str("# TYPE agentos_service_restarts_total counter\n");
+        out.push_str(&format!(
+            "agentos_service_restarts_total {}\n",
+            self.service_restarts_total
+        ));
+        out.push_str(
+            "# HELP agentos_service_dependency_blocks_total Service starts or restarts blocked by required dependencies.\n",
+        );
+        out.push_str("# TYPE agentos_service_dependency_blocks_total counter\n");
+        out.push_str(&format!(
+            "agentos_service_dependency_blocks_total {}\n",
+            self.service_dependency_blocks_total
+        ));
+
         out.push_str("# HELP agentos_turn_admission Turn admission slots by state.\n");
         out.push_str("# TYPE agentos_turn_admission gauge\n");
         out.push_str(&format!(
@@ -275,12 +471,32 @@ impl MetricsSnapshot {
             self.turn_admitted_total
         ));
         out.push_str(
+            "# HELP agentos_turn_class_admitted_total Agent turns admitted by bounded scheduling class.\n",
+        );
+        out.push_str("# TYPE agentos_turn_class_admitted_total counter\n");
+        for (class, value) in [
+            ("realtime", self.turn_admitted_realtime_total),
+            ("normal", self.turn_admitted_normal_total),
+            ("background", self.turn_admitted_background_total),
+            ("deadline", self.turn_admitted_deadline_total),
+        ] {
+            out.push_str(&format!(
+                "agentos_turn_class_admitted_total{{class=\"{class}\"}} {value}\n"
+            ));
+        }
+        out.push_str(
             "# HELP agentos_turn_cancelled_total Turn waiters cancelled before admission.\n",
         );
         out.push_str("# TYPE agentos_turn_cancelled_total counter\n");
         out.push_str(&format!(
             "agentos_turn_cancelled_total {}\n",
             self.turn_cancelled_total
+        ));
+        out.push_str("# HELP agentos_turn_cooperative_yields_total Completed turns that exhausted their token slice and yielded at the public turn boundary.\n");
+        out.push_str("# TYPE agentos_turn_cooperative_yields_total counter\n");
+        out.push_str(&format!(
+            "agentos_turn_cooperative_yields_total {}\n",
+            self.turn_cooperative_yields_total
         ));
         out.push_str("# HELP agentos_turn_starvation_total Admitted turns whose wait exceeded the 30-second starvation threshold.\n");
         out.push_str("# TYPE agentos_turn_starvation_total counter\n");
@@ -431,6 +647,50 @@ impl MetricsSnapshot {
             ));
         }
 
+        out.push_str(
+            "# HELP agentos_lifecycle_operations_total Agent lifecycle operations by operation and bounded outcome.\n",
+        );
+        out.push_str("# TYPE agentos_lifecycle_operations_total counter\n");
+        for (operation, counters) in [
+            ("pause", self.lifecycle.pause),
+            ("resume", self.lifecycle.resume),
+            ("stop", self.lifecycle.stop),
+            ("kill", self.lifecycle.kill),
+            ("wait", self.lifecycle.wait),
+        ] {
+            for (outcome, value) in [
+                ("requested", counters.requested),
+                ("completed", counters.completed),
+                ("timed_out", counters.timed_out),
+                ("forced", counters.forced),
+                ("failed", counters.failed),
+            ] {
+                out.push_str(&format!(
+                    "agentos_lifecycle_operations_total{{operation=\"{operation}\",outcome=\"{outcome}\"}} {value}\n"
+                ));
+            }
+        }
+        out.push_str(
+            "# HELP agentos_lifecycle_duration_seconds Wall-clock lifecycle operation latency.\n",
+        );
+        out.push_str("# TYPE agentos_lifecycle_duration_seconds summary\n");
+        for (operation, counters) in [
+            ("pause", self.lifecycle.pause),
+            ("resume", self.lifecycle.resume),
+            ("stop", self.lifecycle.stop),
+            ("kill", self.lifecycle.kill),
+            ("wait", self.lifecycle.wait),
+        ] {
+            out.push_str(&format!(
+                "agentos_lifecycle_duration_seconds_sum{{operation=\"{operation}\"}} {:.6}\n",
+                counters.duration_microseconds_total as f64 / 1_000_000.0
+            ));
+            out.push_str(&format!(
+                "agentos_lifecycle_duration_seconds_count{{operation=\"{operation}\"}} {}\n",
+                counters.duration_samples
+            ));
+        }
+
         // --- LLM usage totals (system scope).
         out.push_str("# HELP agentos_tokens_consumed_total Tokens consumed across all agents.\n");
         out.push_str("# TYPE agentos_tokens_consumed_total counter\n");
@@ -492,7 +752,12 @@ mod tests {
             waiting_turns: 1,
             turn_capacity: 3,
             turn_admitted_total: 9,
+            turn_admitted_realtime_total: 1,
+            turn_admitted_normal_total: 6,
+            turn_admitted_background_total: 1,
+            turn_admitted_deadline_total: 1,
             turn_cancelled_total: 2,
+            turn_cooperative_yields_total: 4,
             turn_starvation_total: 1,
             turn_wait_ns_total: 100,
             turn_run_ns_total: 200,
@@ -518,6 +783,35 @@ mod tests {
             quota_denied_cgroup_tokens: 8,
             quota_denied_migration_fence: 9,
             quota_storage_healthy: true,
+            lifecycle: LifecycleMetricsSnapshot {
+                pause: LifecycleOperationMetrics {
+                    requested: 3,
+                    completed: 2,
+                    timed_out: 1,
+                    forced: 0,
+                    failed: 0,
+                    duration_microseconds_total: 125_000,
+                    duration_samples: 3,
+                },
+                kill: LifecycleOperationMetrics {
+                    requested: 1,
+                    completed: 0,
+                    timed_out: 0,
+                    forced: 1,
+                    failed: 0,
+                    duration_microseconds_total: 5_000,
+                    duration_samples: 1,
+                },
+                ..Default::default()
+            },
+            service_configured: 4,
+            service_desired: 3,
+            service_running: 2,
+            service_ready: 2,
+            service_healthy: 2,
+            service_failed: 1,
+            service_restarts_total: 5,
+            service_dependency_blocks_total: 2,
             tokens_consumed: 1234,
             api_calls_made: 12,
             uptime_seconds: 99,
@@ -533,7 +827,11 @@ mod tests {
         assert!(text.contains("# TYPE agentos_agents gauge"));
         assert!(text.contains("# TYPE agentos_running_agents gauge"));
         assert!(text.contains("# TYPE agentos_live_agents gauge"));
+        assert!(text.contains("# TYPE agentos_services gauge"));
+        assert!(text.contains("# TYPE agentos_service_restarts_total counter"));
         assert!(text.contains("# TYPE agentos_turn_admission gauge"));
+        assert!(text.contains("# TYPE agentos_turn_class_admitted_total counter"));
+        assert!(text.contains("# TYPE agentos_turn_cooperative_yields_total counter"));
         assert!(text.contains("# TYPE agentos_llm_cores gauge"));
         assert!(text.contains("# TYPE agentos_turn_wait_nanoseconds_total counter"));
         assert!(text.contains("# TYPE agentos_llm_wait_nanoseconds_total counter"));
@@ -541,6 +839,8 @@ mod tests {
         assert!(text.contains("# TYPE agentos_provider_quota_usage gauge"));
         assert!(text.contains("# TYPE agentos_quota_receipts gauge"));
         assert!(text.contains("# TYPE agentos_quota_denied_total counter"));
+        assert!(text.contains("# TYPE agentos_lifecycle_operations_total counter"));
+        assert!(text.contains("# TYPE agentos_lifecycle_duration_seconds summary"));
         assert!(text.contains("# TYPE agentos_tokens_consumed_total counter"));
         assert!(text.contains("# TYPE agentos_api_calls_total counter"));
         assert!(text.contains("# TYPE agentos_process_uptime_seconds gauge"));
@@ -563,6 +863,8 @@ mod tests {
         assert!(text.contains("agentos_paused_agents 1"));
         assert!(text.contains("agentos_stopped_agents 1"));
         assert!(text.contains("agentos_turn_admission{state=\"active\"} 2"));
+        assert!(text.contains("agentos_turn_class_admitted_total{class=\"normal\"} 6"));
+        assert!(text.contains("agentos_turn_cooperative_yields_total 4"));
         assert!(text.contains("agentos_llm_cores{state=\"in_flight\"} 1"));
         assert!(text.contains("agentos_quota_storage_healthy 1"));
         assert!(text.contains("agentos_quota_epoch 42"));
@@ -571,6 +873,16 @@ mod tests {
         assert!(
             text.contains("agentos_quota_denied_total{scope=\"cgroup\",dimension=\"tokens\"} 8")
         );
+        assert!(text.contains(
+            "agentos_lifecycle_operations_total{operation=\"pause\",outcome=\"timed_out\"} 1"
+        ));
+        assert!(text.contains(
+            "agentos_lifecycle_operations_total{operation=\"kill\",outcome=\"forced\"} 1"
+        ));
+        assert!(
+            text.contains("agentos_lifecycle_duration_seconds_sum{operation=\"pause\"} 0.125000")
+        );
+        assert!(text.contains("agentos_lifecycle_duration_seconds_count{operation=\"pause\"} 3"));
         assert!(text.contains("agentos_tokens_consumed_total 1234"));
         assert!(text.contains("agentos_api_calls_total 12"));
         assert!(text.contains("agentos_process_uptime_seconds 99"));

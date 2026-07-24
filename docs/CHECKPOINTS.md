@@ -72,3 +72,13 @@ boot so work remains recoverable.
 
 Provider/model incompatibility, expiry, concurrent claim, corruption, and
 foreign-tenant access are recoverable errors; none silently starts a new turn.
+
+## Operations and latency
+
+Pause and resume emit the same bounded lifecycle requested/completed/timed-out/
+forced/failed events as other lifecycle operations. Prometheus exposition also
+publishes `agentos_lifecycle_duration_seconds_sum` and
+`agentos_lifecycle_duration_seconds_count`, keyed only by the bounded
+`operation` label. These cumulative summary values include successful and
+failed attempts without putting agent, tenant, provider, or prompt data in
+metric labels.

@@ -100,9 +100,11 @@ live admission locks but does not erase its cumulative spend.
   execution hold no provider permit. This live gauge is process-local and
   correctly starts at zero after restart because no prior work remains active.
 - Turn concurrency: actively executing agent turns, separately CFS-ordered.
-- Context limit: complete active provider-input tokens per executor, including
-  tool-definition schemas; old non-system pages are evicted before a provider
-  request, and an irreducible pinned/schema payload fails closed.
+- Context limits: complete active provider-input tokens, including tool schemas,
+  are admitted at agent, tenant, and kernel scopes; older non-pinned messages
+  spill before a provider request, and irreducible pinned/schema or durable-byte
+  pressure fails closed. Conversations, fact embeddings, snapshots, active
+  checkpoints, and spills share the configured durable context ceilings.
 - Per-turn tool limit: cumulative tool calls across every provider response in
   one logical user turn, including calls completed before pause/resume. Reaching
   the limit skips all remaining side effects in the response and records

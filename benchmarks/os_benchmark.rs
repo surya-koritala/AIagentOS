@@ -3,6 +3,8 @@
 //! Tests the OS properties: concurrency, isolation, scheduling, fault tolerance.
 
 use kernel::agent::AgentKernel;
+use kernel::agent_struct::SchedClass;
+use kernel::cfs::{CfsScheduler, TurnAdmission};
 use kernel::ipc::{AgentIpc, IpcManager};
 use kernel::permissions::{AccessDecision, PermissionManager, PermissionSystem};
 use kernel::production::CircuitBreaker;
@@ -78,32 +80,70 @@ async fn main() {
         failed += 1;
     }
 
+    // ═══ BENCHMARK 2B: Turn-scheduler overhead ═══════════════════════
+    // This measures the scheduler directly, separate from the mock
+    // SyscallGate throughput benchmark below.
+    print!("2b. Turn admission overhead (10,000 uncontended slots)... ");
+    let cfs = tokio::sync::Mutex::new(CfsScheduler::new(1000));
+    for pid in 1..=32 {
+        cfs.lock().await.enqueue(pid, 0, SchedClass::Normal);
+    }
+    let admission = TurnAdmission::new(8);
+    let start = Instant::now();
+    for turn in 0..10_000u64 {
+        let pid = turn % 32 + 1;
+        drop(admission.acquire(pid, &cfs).await.unwrap());
+    }
+    let elapsed = start.elapsed();
+    let scheduler_metrics = admission.metrics();
+    if scheduler_metrics.admitted_total == 10_000
+        && scheduler_metrics.running == 0
+        && scheduler_metrics.waiting == 0
+    {
+        println!(
+            "✅ {}ns/slot, no leaked admissions",
+            elapsed.as_nanos() / 10_000
+        );
+        passed += 1;
+    } else {
+        println!("❌ inconsistent scheduler metrics: {scheduler_metrics:?}");
+        failed += 1;
+    }
+
     // ═══ BENCHMARK 3: Sandbox Isolation ═══════════════════════════════
     print!("3. Sandbox isolation (agent can't escape)... ");
     let sandbox_mgr = SandboxManagerImpl::new();
     let agent_a = uuid::Uuid::new_v4();
     let agent_b = uuid::Uuid::new_v4();
+    let sandbox_root = std::env::temp_dir().join(format!(
+        "aiagentos-benchmark-sandbox-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let workspace_a = sandbox_root.join("a");
+    let workspace_b = sandbox_root.join("b");
     let sid_a = sandbox_mgr
         .create_sandbox(
             agent_a,
             &SandboxConfig {
-                workspace_dir: "/tmp/sandbox_a".into(),
+                workspace_dir: workspace_a.clone(),
                 allowed_network_hosts: Some(vec!["api.openai.com".into()]),
                 max_disk_usage_bytes: None,
                 max_memory_bytes: None,
                 isolation_level: IsolationLevel::Filesystem,
+                container_image: None,
             },
         )
         .unwrap();
-    let _sid_b = sandbox_mgr
+    let sid_b = sandbox_mgr
         .create_sandbox(
             agent_b,
             &SandboxConfig {
-                workspace_dir: "/tmp/sandbox_b".into(),
+                workspace_dir: workspace_b.clone(),
                 allowed_network_hosts: Some(vec!["api.anthropic.com".into()]),
                 max_disk_usage_bytes: None,
                 max_memory_bytes: None,
                 isolation_level: IsolationLevel::Filesystem,
+                container_image: None,
             },
         )
         .unwrap();
@@ -111,18 +151,23 @@ async fn main() {
     // Agent A tries to access Agent B's workspace
     let cross_access = sandbox_mgr.intercept_action(
         sid_a,
-        &SandboxAction::FileAccess("/tmp/sandbox_b/secret.txt".into()),
+        &SandboxAction::FileAccess(workspace_b.join("secret.txt")),
     );
     let self_access = sandbox_mgr.intercept_action(
         sid_a,
-        &SandboxAction::FileAccess("/tmp/sandbox_a/myfile.txt".into()),
+        &SandboxAction::FileAccess(workspace_a.join("myfile.txt")),
     );
-    let net_blocked =
-        sandbox_mgr.intercept_action(sid_a, &SandboxAction::NetworkAccess("evil.com".into()));
+    let net_blocked = sandbox_mgr.intercept_action(
+        sid_a,
+        &SandboxAction::NetworkAccess("https://evil.com/".into()),
+    );
     let net_allowed = sandbox_mgr.intercept_action(
         sid_a,
-        &SandboxAction::NetworkAccess("api.openai.com".into()),
+        &SandboxAction::NetworkAccess("https://api.openai.com/v1".into()),
     );
+    sandbox_mgr.destroy_sandbox(sid_a).unwrap();
+    sandbox_mgr.destroy_sandbox(sid_b).unwrap();
+    std::fs::remove_dir_all(&sandbox_root).unwrap();
 
     if cross_access.is_err() && self_access.is_ok() && net_blocked.is_err() && net_allowed.is_ok() {
         println!("✅ Cross-access blocked, self-access allowed, network filtered");

@@ -418,6 +418,10 @@ pub struct SyscallGate {
     denied_unknown: AtomicU64,
     denied_namespace: AtomicU64,
     audited: AtomicU64,
+    /// Process-local per-agent decision counters. Entries survive normal
+    /// lifecycle cleanup so tenant aggregates do not decrease when an agent
+    /// stops; they reset on process restart as documented.
+    agent_stats: DashMap<uuid::Uuid, GateStats>,
     #[cfg(test)]
     authorization_snapshot_hook: std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<()>>>,
     #[cfg(test)]
@@ -571,6 +575,7 @@ impl SyscallGate {
             denied_unknown: AtomicU64::new(0),
             denied_namespace: AtomicU64::new(0),
             audited: AtomicU64::new(0),
+            agent_stats: DashMap::new(),
             #[cfg(test)]
             authorization_snapshot_hook: std::sync::Mutex::new(None),
             #[cfg(test)]
@@ -727,6 +732,7 @@ impl SyscallGate {
                 authorization_revision,
             },
         );
+        self.agent_stats.entry(kid).or_default();
         Ok(pid)
     }
 
@@ -815,6 +821,24 @@ impl SyscallGate {
             .map(|record| record.clone())
             .ok_or(GateMutationError::UnknownAgent(kid))?;
         self.cgroups.try_remove_agent(rec.cgroup, rec.pid)?;
+        self.records.remove(&kid);
+        self.approvals
+            .retain(|(agent, _, _, _, _), _| *agent != kid);
+        Ok(())
+    }
+
+    /// Revoke lifecycle admission and remove an agent even when a binding has
+    /// not cooperatively released its tool-call guard. The cgroup manager
+    /// invalidates those exact guards before removing membership, so their
+    /// eventual drops are accounting no-ops.
+    pub(crate) fn force_unregister_agent(&self, kid: uuid::Uuid) -> Result<(), GateMutationError> {
+        let _mutation = self.mutation_lock.lock().unwrap();
+        let rec = self
+            .records
+            .get(&kid)
+            .map(|record| record.clone())
+            .ok_or(GateMutationError::UnknownAgent(kid))?;
+        self.cgroups.force_remove_agent(rec.cgroup, rec.pid)?;
         self.records.remove(&kid);
         self.approvals
             .retain(|(agent, _, _, _, _), _| *agent != kid);
@@ -1040,6 +1064,7 @@ impl SyscallGate {
         if !self.unconfined {
             let Some(security) = default_security_catalog().get(tool_name) else {
                 self.denied_unknown.fetch_add(1, Ordering::Relaxed);
+                self.record_agent_denial(kid, &GateDenial::UnknownTool(tool_name.to_string()));
                 return Err(GateDenial::UnknownTool(tool_name.to_string()));
             };
             return self
@@ -1167,7 +1192,8 @@ impl SyscallGate {
                     .snapshot
                     .as_ref()
                     .expect("governed authorization carries a state snapshot"),
-            )?
+            )
+            .inspect_err(|error| self.record_agent_denial(kid, error))?
         };
         let approval_satisfied = if self.unconfined {
             true
@@ -1183,6 +1209,13 @@ impl SyscallGate {
             };
             if !consumed {
                 self.denied_approval.fetch_add(1, Ordering::Relaxed);
+                self.record_agent_denial(
+                    kid,
+                    &GateDenial::ApprovalRequired {
+                        tool: tool_name.to_string(),
+                        policy: required,
+                    },
+                );
                 self.emit_audit(AuditEvent {
                     agent: kid,
                     pid: authorized.pid,
@@ -1201,6 +1234,7 @@ impl SyscallGate {
             false
         };
         self.allowed.fetch_add(1, Ordering::Relaxed);
+        self.record_agent_allowed(kid, authorized.audited);
         if authorized.audited {
             self.audited.fetch_add(1, Ordering::Relaxed);
             self.emit_audit(AuditEvent {
@@ -1239,6 +1273,7 @@ impl SyscallGate {
         if self.unconfined {
             if count_success {
                 self.allowed.fetch_add(1, Ordering::Relaxed);
+                self.record_agent_allowed(kid, false);
             }
             return Ok(AuthorizedToolCall {
                 pid: 0,
@@ -1253,6 +1288,7 @@ impl SyscallGate {
                 Ok(snapshot) => snapshot,
                 Err(GateDenial::UnknownAgent) => {
                     self.denied_unknown.fetch_add(1, Ordering::Relaxed);
+                    self.record_agent_denial(kid, &GateDenial::UnknownAgent);
                     return Err(GateDenial::UnknownAgent);
                 }
                 Err(other) => return Err(other),
@@ -1261,6 +1297,12 @@ impl SyscallGate {
         let agent = &snapshot.agent;
         if !agent.accepting_tool_calls {
             self.denied_cgroup.fetch_add(1, Ordering::Relaxed);
+            self.record_agent_denial(
+                kid,
+                &GateDenial::CgroupUnavailable(
+                    "agent tool admission is closed for lifecycle cleanup".into(),
+                ),
+            );
             return Err(GateDenial::CgroupUnavailable(
                 "agent tool admission is closed for lifecycle cleanup".into(),
             ));
@@ -1271,6 +1313,13 @@ impl SyscallGate {
         if let Some(tool_ns) = snapshot.tool_namespace.namespace {
             if !agent.namespaces.contains(&tool_ns) {
                 self.denied_namespace.fetch_add(1, Ordering::Relaxed);
+                self.record_agent_denial(
+                    kid,
+                    &GateDenial::NotInNamespace {
+                        tool: tool_name.to_string(),
+                        namespace: tool_ns,
+                    },
+                );
                 return Err(GateDenial::NotInNamespace {
                     tool: tool_name.to_string(),
                     namespace: tool_ns,
@@ -1282,6 +1331,7 @@ impl SyscallGate {
         for &required in required_capabilities {
             if !agent.caps.has(required) {
                 self.denied_capability.fetch_add(1, Ordering::Relaxed);
+                self.record_agent_denial(kid, &GateDenial::MissingCapability(required));
                 return Err(GateDenial::MissingCapability(required));
             }
         }
@@ -1299,6 +1349,13 @@ impl SyscallGate {
             MacDecision::Deny => {
                 let resource_identity = crate::resources::opaque_identity(resource.as_bytes());
                 self.denied_mac.fetch_add(1, Ordering::Relaxed);
+                self.record_agent_denial(
+                    kid,
+                    &GateDenial::MacDeny {
+                        action,
+                        resource: resource_identity.clone(),
+                    },
+                );
                 self.emit_audit(AuditEvent {
                     agent: kid,
                     pid: agent.pid,
@@ -1358,6 +1415,13 @@ impl SyscallGate {
                 .is_some_and(|entry| (*entry).satisfies(approval_policy));
             if !approved {
                 self.denied_approval.fetch_add(1, Ordering::Relaxed);
+                self.record_agent_denial(
+                    kid,
+                    &GateDenial::ApprovalRequired {
+                        tool: tool_name.to_string(),
+                        policy: approval_policy,
+                    },
+                );
                 self.emit_audit(AuditEvent {
                     agent: kid,
                     pid: agent.pid,
@@ -1386,12 +1450,15 @@ impl SyscallGate {
                 .quota_constraints_for_agent(agent.cgroup, agent.pid)
                 .map_err(|error| {
                     self.denied_cgroup.fetch_add(1, Ordering::Relaxed);
-                    GateDenial::CgroupUnavailable(error.to_string())
+                    let denial = GateDenial::CgroupUnavailable(error.to_string());
+                    self.record_agent_denial(kid, &denial);
+                    denial
                 })?;
         }
 
         if count_success {
             self.allowed.fetch_add(1, Ordering::Relaxed);
+            self.record_agent_allowed(kid, audited);
         }
         Ok(AuthorizedToolCall {
             pid: agent.pid,
@@ -1473,6 +1540,84 @@ impl SyscallGate {
             denied_unknown: self.denied_unknown.load(Ordering::Relaxed),
             denied_namespace: self.denied_namespace.load(Ordering::Relaxed),
             audited: self.audited.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Per-agent process-local decision counters. Normal stop/kill retains the
+    /// counters so a tenant's totals never move backwards within one process.
+    pub fn agent_stats(&self, agent_id: uuid::Uuid) -> GateStats {
+        self.agent_stats
+            .get(&agent_id)
+            .map(|stats| *stats)
+            .unwrap_or_default()
+    }
+
+    /// Sum only the supplied identities, used for tenant-safe operations
+    /// snapshots. Saturation keeps diagnostics total even after extreme uptime.
+    pub fn aggregate_agent_stats(
+        &self,
+        agent_ids: impl IntoIterator<Item = uuid::Uuid>,
+    ) -> GateStats {
+        let mut total = GateStats::default();
+        for agent_id in agent_ids {
+            let stats = self.agent_stats(agent_id);
+            total.allowed = total.allowed.saturating_add(stats.allowed);
+            total.denied_capability = total
+                .denied_capability
+                .saturating_add(stats.denied_capability);
+            total.denied_mac = total.denied_mac.saturating_add(stats.denied_mac);
+            total.denied_approval = total.denied_approval.saturating_add(stats.denied_approval);
+            total.denied_cgroup = total.denied_cgroup.saturating_add(stats.denied_cgroup);
+            total.denied_unknown = total.denied_unknown.saturating_add(stats.denied_unknown);
+            total.denied_namespace = total
+                .denied_namespace
+                .saturating_add(stats.denied_namespace);
+            total.audited = total.audited.saturating_add(stats.audited);
+        }
+        total
+    }
+
+    pub(crate) fn purge_agent_stats(&self, agent_id: uuid::Uuid) {
+        self.agent_stats.remove(&agent_id);
+    }
+
+    fn record_agent_allowed(&self, agent_id: uuid::Uuid, audited: bool) {
+        if let Some(mut stats) = self.agent_stats.get_mut(&agent_id) {
+            stats.allowed = stats.allowed.saturating_add(1);
+            if audited {
+                stats.audited = stats.audited.saturating_add(1);
+            }
+        }
+    }
+
+    fn record_agent_denial(&self, agent_id: uuid::Uuid, denial: &GateDenial) {
+        if let Some(mut stats) = self.agent_stats.get_mut(&agent_id) {
+            match denial {
+                GateDenial::MissingCapability(_) => {
+                    stats.denied_capability = stats.denied_capability.saturating_add(1);
+                }
+                GateDenial::MacDeny { .. } => {
+                    stats.denied_mac = stats.denied_mac.saturating_add(1);
+                }
+                GateDenial::ApprovalRequired { .. } => {
+                    stats.denied_approval = stats.denied_approval.saturating_add(1);
+                }
+                GateDenial::CgroupQuota
+                | GateDenial::CgroupToolLimit
+                | GateDenial::CgroupUnavailable(_)
+                | GateDenial::CgroupMembershipChanged => {
+                    stats.denied_cgroup = stats.denied_cgroup.saturating_add(1);
+                }
+                GateDenial::AuthorizationStateChanged => {
+                    stats.denied_unknown = stats.denied_unknown.saturating_add(1);
+                }
+                GateDenial::NotInNamespace { .. } => {
+                    stats.denied_namespace = stats.denied_namespace.saturating_add(1);
+                }
+                GateDenial::UnknownAgent | GateDenial::UnknownTool(_) => {
+                    stats.denied_unknown = stats.denied_unknown.saturating_add(1);
+                }
+            }
         }
     }
 
@@ -2406,6 +2551,38 @@ mod tests {
             .unwrap()
             .unwrap();
         gate.try_unregister_agent(kid).unwrap();
+    }
+
+    #[test]
+    fn forced_unregister_revokes_only_the_target_agents_reservations() {
+        let (gate, cgroups) = fresh_gate();
+        let group = cgroups.create(
+            "shared-force-cleanup".into(),
+            cgroups.root(),
+            CgroupLimits::default(),
+        );
+        let killed = uuid::Uuid::new_v4();
+        let survivor = uuid::Uuid::new_v4();
+        gate.register_agent(killed, CapabilitySet::all(), Some(group));
+        gate.register_agent(survivor, CapabilitySet::all(), Some(group));
+        let killed_guard = gate.acquire_tool_call(killed).unwrap();
+        let survivor_guard = gate.acquire_tool_call(survivor).unwrap();
+        assert_eq!(cgroups.get(group).unwrap().usage.active_tool_calls, 2);
+
+        gate.force_unregister_agent(killed).unwrap();
+        assert_eq!(cgroups.get(group).unwrap().usage.active_tool_calls, 1);
+        assert!(gate.agent_info(killed).is_none());
+        assert!(gate.agent_info(survivor).is_some());
+
+        drop(killed_guard);
+        assert_eq!(
+            cgroups.get(group).unwrap().usage.active_tool_calls,
+            1,
+            "revoked guard must not consume the survivor's reservation"
+        );
+        drop(survivor_guard);
+        assert_eq!(cgroups.get(group).unwrap().usage.active_tool_calls, 0);
+        gate.try_unregister_agent(survivor).unwrap();
     }
 
     #[tokio::test]

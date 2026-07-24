@@ -110,46 +110,46 @@ limitations = ["Live-provider qualification is intentionally isolated in a prote
 
 [[capability]]
 id = "sandbox-isolation"
-title = "Host-enforced agent sandboxing"
+title = "Agent sandbox policy and capability-mediated I/O"
 owner = "security"
 maturity = "integrated"
 release = "v0.5"
 tracking_issue = 111
 kernel_modules = ["docker_sandbox", "resources", "sandbox"]
-source_paths = ["crates/resources/src/filesystem.rs", "crates/resources/src/network.rs"]
+source_paths = ["crates/kernel/src/docker_sandbox.rs", "crates/kernel/src/resources.rs", "crates/kernel/src/sandbox.rs"]
 public_entry_points = ["crates/kernel/src/lib.rs::SandboxConfig"]
 runtime_call_paths = ["crates/kernel/src/resources.rs::ResourceBrokerImpl::execute", "crates/kernel/src/lib.rs::AgentKernelImpl::create_agent_full"]
-test_evidence = ["tests/src/sandbox_props.rs", "tests/src/e2e_pipeline.rs"]
+test_evidence = ["crates/kernel/src/docker_sandbox.rs", "crates/kernel/src/resources.rs", "crates/kernel/src/sandbox.rs", "tests/src/sandbox_props.rs", "tests/src/lifecycle_coordinator.rs"]
 platforms = ["linux", "macos", "windows"]
-limitations = ["Sandbox policy is mandatory at the live ResourceBroker boundary and fails closed. Filesystem request aliases are normalized before MAC, approval, and proof creation, and built-in HTTP providers do not follow redirects; no-follow/dirfd confinement, symlink-swap resistance, complete cross-platform host/container isolation, DNS rebinding defense, and independent security qualification remain outstanding."]
+limitations = ["Sandbox identity is mandatory at the live ResourceBroker boundary. Non-trusted filesystem I/O is directory-capability relative with ownership/quota checks and symlink-swap regression coverage. HTTP resolves and pins only public answers, disables ambient proxies/redirects, and restricts ports. Linux container execution requires rootless Docker and a verified digest-pinned image with a hardened run contract; it still needs live breakout and crash qualification. Native Process mode, direct host MCP launch, and unisolated browser execution fail closed. macOS/Windows process/container backends and independent security review remain outstanding under #111/#127."]
 
 [[capability]]
 id = "agent-lifecycle"
 title = "Coordinated agent lifecycle and cleanup"
 owner = "kernel"
-maturity = "public-api-e2e"
+maturity = "production-qualified"
 release = "v0.5"
 tracking_issue = 112
 kernel_modules = ["agent", "agent_struct", "agent_syscalls", "delegation", "ipc"]
 source_paths = ["crates/kernel/src/lib.rs"]
 public_entry_points = ["crates/kernel/src/syscall_server.rs::Syscall"]
 runtime_call_paths = ["crates/kernel/src/lib.rs::AgentKernelImpl::pause_agent", "crates/kernel/src/lib.rs::AgentKernelImpl::stop_agent", "crates/kernel/src/syscall_server.rs::Syscall::PauseAgent"]
-test_evidence = ["tests/src/agent_lifecycle_props.rs", "tests/src/lifecycle_coordinator.rs", "crates/sdk/src/lib.rs"]
+test_evidence = ["tests/src/agent_lifecycle_props.rs", "tests/src/lifecycle_coordinator.rs", "crates/kernel/src/lib.rs", "crates/sdk/src/lib.rs"]
 platforms = ["linux", "macos", "windows"]
-limitations = ["Public stop/pause/resume/kill coordinate live subsystem cleanup and restart state, but independent cross-platform soak/fault qualification remains outstanding."]
+limitations = ["Lifecycle coordination is authoritative within one kernel owner; cluster-wide ownership transfer and cross-node lifecycle orchestration are separate capabilities."]
 
 [[capability]]
 id = "turn-checkpoints"
 title = "Durable mid-generation pause and resume"
 owner = "runtime"
-maturity = "public-api-e2e"
+maturity = "production-qualified"
 release = "v0.5"
 tracking_issue = 113
 kernel_modules = ["execution"]
 source_paths = ["crates/kernel/src/context.rs"]
 public_entry_points = ["crates/kernel/src/syscall_server.rs::Syscall::ResumeGenerationCheckpoint", "crates/sdk/src/lib.rs::KernelClient::resume_generation_checkpoint"]
 runtime_call_paths = ["crates/kernel/src/lib.rs::AgentKernelImpl::send_message", "crates/kernel/src/lib.rs::AgentKernelImpl::resume_agent_from_checkpoint"]
-test_evidence = ["tests/src/durable_checkpoints.rs", "crates/sdk/src/lib.rs"]
+test_evidence = ["tests/src/durable_checkpoints.rs", "tests/src/lifecycle_coordinator.rs", "crates/kernel/src/context.rs", "crates/sdk/src/lib.rs"]
 platforms = ["linux", "macos", "windows"]
 limitations = ["Hosted providers pause at request boundaries, token-level streaming depends on adapter support, and external side effects are at-least-once across the documented crash window."]
 
@@ -157,31 +157,31 @@ limitations = ["Hosted providers pause at request boundaries, token-level stream
 id = "scheduling-admission"
 title = "Scheduling and resource admission"
 owner = "kernel"
-maturity = "integrated"
+maturity = "production-qualified"
 release = "v0.5"
 tracking_issue = 114
 kernel_modules = ["cfs", "llm_sched", "scheduler"]
-source_paths = ["crates/kernel/src/lib.rs"]
+source_paths = ["crates/kernel/src/cfs.rs", "crates/kernel/src/llm_sched.rs", "crates/kernel/src/scheduler.rs", "crates/kernel/src/metrics.rs", "crates/kernel/src/lib.rs", "docs/SCHEDULER.md"]
 public_entry_points = ["crates/kernel/src/lib.rs::AgentKernelImpl::send_message"]
 runtime_call_paths = ["crates/kernel/src/lib.rs::AgentKernelImpl::send_message"]
-test_evidence = ["tests/src/scheduler_props.rs", "tests/src/os_enforcement.rs"]
+test_evidence = ["crates/kernel/src/cfs.rs", "crates/kernel/src/llm_sched.rs", "crates/kernel/src/scheduler.rs", "crates/kernel/src/lib.rs", "tests/src/scheduler_props.rs", "tests/src/os_enforcement.rs", "benchmarks/os_benchmark.rs"]
 platforms = ["linux", "macos", "windows"]
-limitations = ["Turn scheduling is cooperative/token-accounted rather than CPU preemption or Linux EEVDF; real-time/background classes remain experimental and independent long-soak qualification is outstanding."]
+limitations = ["Turn scheduling is cooperative and token-accounted at completed-turn, provider-request, and tool boundaries; it is not CPU preemption or Linux EEVDF. Real-time, deadline, and background classes are experimental and excluded from the public v1 scheduling guarantee."]
 
 [[capability]]
 id = "context-pressure"
 title = "Durable context spill and pressure handling"
 owner = "runtime"
-maturity = "integrated"
+maturity = "production-qualified"
 release = "v0.5"
 tracking_issue = 115
 kernel_modules = ["context", "context_paging"]
-source_paths = ["crates/kernel/src/execution.rs"]
+source_paths = ["crates/kernel/src/context.rs", "crates/kernel/src/context_paging.rs", "crates/kernel/src/execution.rs", "crates/kernel/src/config.rs", "docs/CONTEXT_PRESSURE.md"]
 public_entry_points = ["crates/kernel/src/syscall_server.rs::Syscall::ContextPressure", "crates/sdk/src/lib.rs::KernelClient::context_pressure"]
-runtime_call_paths = ["crates/kernel/src/execution.rs::AgentExecutor::compact_to_token_budget"]
-test_evidence = ["tests/src/context_props.rs", "crates/kernel/src/execution.rs", "crates/sdk/src/lib.rs"]
+runtime_call_paths = ["crates/kernel/src/execution.rs::AgentExecutor::compact_to_token_budget", "crates/kernel/src/execution.rs::AgentExecutor::send_with_retry", "crates/kernel/src/context.rs::SqliteContextManager::store_context_spill"]
+test_evidence = ["crates/kernel/src/context.rs", "crates/kernel/src/context_paging.rs", "crates/kernel/src/execution.rs", "tests/src/context_props.rs", "crates/sdk/src/lib.rs"]
 platforms = ["linux", "macos", "windows"]
-limitations = ["Per-agent active prompts are bounded with durable spill or fail-closed rejection; tenant/global active pools, stored-byte/embedding/RSS quotas, automatic page-in, quality qualification, and a host-memory OOM policy remain outstanding."]
+limitations = ["Active prompt and durable context limits use explicit backpressure, not Linux virtual memory. Host RSS and external provider/vector-store caches are outside these counters and remain governed by process/container policy; there is intentionally no OOM victim killer. Page-in is explicit rather than automatic, and lossless storage tests do not claim zero model-quality impact from an immediately compacted prompt."]
 
 [[capability]]
 id = "syscall-vfs"
@@ -201,33 +201,33 @@ limitations = ["JSON Syscall/SyscallReply is the only supported ABI. Numbered sy
 
 [[capability]]
 id = "operator-control"
-title = "Live authenticated operator snapshot"
+title = "Live authenticated operator control and introspection"
 owner = "operations"
-maturity = "public-api-e2e"
+maturity = "production-qualified"
 release = "v0.6"
 tracking_issue = 117
-kernel_modules = ["agentctl", "agentps", "event_loop", "observability", "procfs", "sysctl"]
-source_paths = ["crates/kernel/src/lib.rs"]
-public_entry_points = ["crates/kernel/src/syscall_server.rs::Syscall::OperatorSnapshot", "crates/sdk/src/lib.rs::KernelClient::operator_snapshot", "crates/cli/src/bin/agentctl.rs"]
-runtime_call_paths = ["crates/kernel/src/syscall_server.rs::dispatch_scoped", "crates/kernel/src/metrics.rs::MetricsSnapshot::collect"]
-test_evidence = ["tests/src/observability_props.rs", "crates/kernel/src/syscall_server.rs", "crates/sdk/src/lib.rs", "crates/tui/src/app.rs"]
+kernel_modules = ["agentps", "event_loop", "observability", "operator_control", "procfs", "sysctl"]
+source_paths = ["crates/kernel/src/operator_control.rs", "crates/kernel/src/syscall_server.rs", "crates/kernel/src/context.rs", "docs/OPERATIONS_API.md"]
+public_entry_points = ["crates/kernel/src/syscall_server.rs::Syscall::OperatorSnapshot", "crates/kernel/src/syscall_server.rs::Syscall::SetOperatorTunable", "crates/sdk/src/lib.rs::KernelClient::operator_snapshot", "crates/sdk/src/lib.rs::KernelClient::set_operator_tunable", "crates/cli/src/bin/agentctl.rs"]
+runtime_call_paths = ["crates/kernel/src/syscall_server.rs::dispatch_scoped", "crates/kernel/src/operator_control.rs::OperatorControl::set", "crates/kernel/src/metrics.rs::MetricsSnapshot::collect"]
+test_evidence = ["crates/kernel/src/operator_control.rs", "crates/kernel/src/syscall_server.rs", "crates/sdk/tests/kernel_client.rs", "crates/tui/src/app.rs"]
 platforms = ["linux", "macos", "windows"]
-limitations = ["The live tenant-safe snapshot covers agents, scheduler, sandbox, namespaces/capabilities, checkpoints, context pressure, usage, provider health and system-only metrics/services. Durable audited tunable writes, package views, per-tenant gate aggregates, and production concurrency/soak qualification remain outstanding; legacy ProcFs/Sysctl are not public sources of truth."]
+limitations = ["The package view is durable loaded-manifest instance metadata, not the signed registry/supply chain tracked by #119. Provider health is availability/timeout evidence; provider contract and circuit-breaker qualification remains #120. Gate decision counters are process-local and reset on restart. Legacy ProcFs/Sysctl helpers are not public sources of truth or host mounts."]
 
 [[capability]]
 id = "init-supervisor"
-title = "Coordinated service boot and lifecycle"
+title = "Durable init and service supervision"
 owner = "kernel"
-maturity = "public-api-e2e"
+maturity = "production-qualified"
 release = "v0.6"
 tracking_issue = 118
 kernel_modules = ["init_system", "runtime"]
-source_paths = ["crates/kernel/src/lib.rs", "crates/kernel/src/init_system.rs", "docs/SERVICES.md"]
-public_entry_points = ["crates/kernel/src/syscall_server.rs::Syscall::StartService", "crates/sdk/src/lib.rs::KernelClient::start_service", "crates/cli/src/bin/agentctl.rs"]
-runtime_call_paths = ["crates/cli/src/bin/agent-server.rs", "crates/kernel/src/lib.rs::AgentKernelImpl::start_service", "crates/kernel/src/lib.rs::AgentKernelImpl::stop_service"]
-test_evidence = ["crates/kernel/src/init_system.rs", "tests/src/service_supervisor.rs", "crates/sdk/src/lib.rs"]
+source_paths = ["crates/kernel/src/lib.rs", "crates/kernel/src/init_system.rs", "crates/kernel/src/context.rs", "crates/kernel/src/runtime.rs", "docs/SERVICES.md"]
+public_entry_points = ["crates/kernel/src/syscall_server.rs::Syscall::StartService", "crates/kernel/src/syscall_server.rs::Syscall::ReloadServices", "crates/sdk/src/lib.rs::KernelClient::start_service", "crates/sdk/src/lib.rs::KernelClient::reload_services", "crates/cli/src/bin/agentctl.rs", "crates/tui/src/app.rs"]
+runtime_call_paths = ["crates/cli/src/bin/agent-server.rs", "crates/kernel/src/runtime.rs::KernelRuntime::spawn_service_supervisor", "crates/kernel/src/lib.rs::AgentKernelImpl::service_supervisor_sweep", "crates/kernel/src/lib.rs::AgentKernelImpl::reload_service_directory"]
+test_evidence = ["crates/kernel/src/init_system.rs", "tests/src/service_supervisor.rs", "crates/sdk/src/lib.rs", "crates/tui/src/app.rs"]
 platforms = ["linux", "macos", "windows"]
-limitations = ["Validated boot order, rollback, reverse shutdown and public system-only lifecycle are live. Automatic readiness/liveness, crash-loop backoff/jitter/windows, durable service state, tenant/profile/secret/tool ownership, oneshot/notify behavior, and rolling live reload remain outstanding; restart policy is not yet an automatic monitor."]
+limitations = ["Health is the kernel-owned agent lifecycle state plus a bounded readiness delay, not an arbitrary HTTP/command probe. Supervision is single-kernel rather than a distributed lease protocol. Only Simple services are accepted; unsupported Oneshot/Notify, per-service model overrides, and per-service tool allow-lists fail validation instead of being silently ignored."]
 
 [[capability]]
 id = "package-trust"

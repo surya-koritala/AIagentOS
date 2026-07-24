@@ -14,14 +14,34 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
 
 - **Coordinated lifecycle and durable checkpoints** — public wire/SDK operations
   now coordinate pause, resume, stop, kill, cleanup, restart rehydration, and
-  versioned generation checkpoints across kernel subsystems. (#112, #113)
-- **Live operator and service APIs** — tenant-safe operator snapshots now power
-  the SDK, `agentctl`, and TUI; the kernel-owned service supervisor validates
-  dependency order and coordinates startup, rollback, and shutdown. (#117,
-  #118)
+  versioned generation checkpoints across kernel subsystems. Checkpoint
+  retention, corruption/incompatibility handling, completion races, restart
+  side-effect replay protection, multi-agent permit release, and lifecycle
+  latency metrics are regression-qualified. (#112, #113)
+- **Live operator and service APIs** — tenant-safe operator snapshots now expose
+  barrier-consistent lifecycle/scheduler/sandbox/cgroup/namespace state,
+  per-tenant gate-denial aggregates, bounded provider-health samples, and
+  durable package-instance metadata to the SDK, `agentctl`, and TUI. Three
+  range-validated live tunables use SQLite revision CAS, rollback, persistence,
+  and durable applied/denied audit history. The kernel-owned service supervisor
+  validates dependency order and coordinates startup, rollback, and shutdown.
+  (#117, #118)
+- **Durable init supervisor** — configured services now carry tenant, permission
+  profile, namespace, sandbox, resource-budget, and secret-reference policy.
+  Kernel health sweeps enforce readiness/startup deadlines, dependency failure
+  propagation, bounded exponential restart with deterministic jitter/windows,
+  exhaustion, and cleanup. SQLite ownership/history prevents duplicate agents
+  after a process crash; validated rolling reload restarts the dependency
+  closure atomically or restores the previous graph. SDK, `agentctl`, TUI, and
+  Prometheus service views use that same kernel-owned state. (#118)
 - **Context and admission controls** — bounded turn/LLM/tool admission,
-  CFS-inspired fairness, durable context spill references, and explicit
-  backpressure replace unsupported CPU-preemption and OOM claims. (#114, #115)
+  CFS-inspired fairness, exclusive shared-resource priority inheritance,
+  starvation escape, and per-class/yield metrics. Context pressure now enforces
+  per-agent/tenant/kernel active-prompt and durable-byte ceilings; retains and
+  verifies lossless spill payloads; counts conversations, embeddings,
+  snapshots, and checkpoints; and exposes content-free usage/rejection
+  telemetry. Explicit backpressure replaces unsupported CPU-preemption,
+  virtual-memory, and OOM-killer claims. (#114, #115)
 - **Validated agent-package loading** — manifests are bounded and fail closed,
   declared tools resolve against the live registry, tenant privilege is
   constrained, and partial creation rolls back atomically. Packages remain

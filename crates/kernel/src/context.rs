@@ -6,8 +6,8 @@
 use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
 #[cfg(test)]
-use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
+use std::sync::{Arc, Mutex, RwLock};
 
 use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
@@ -385,15 +385,71 @@ pub struct StoredGenerationCheckpoint {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContextPressureStats {
     pub agent_id: AgentId,
+    #[serde(default)]
+    pub tenant_id: String,
     pub active_tokens: u32,
     pub budget_tokens: u32,
+    #[serde(default)]
+    pub agent_active_tokens: u64,
+    #[serde(default)]
+    pub agent_active_limit: u64,
+    #[serde(default)]
+    pub tenant_active_tokens: u64,
+    #[serde(default)]
+    pub tenant_active_limit: u64,
+    #[serde(default)]
+    pub global_active_tokens: u64,
+    #[serde(default)]
+    pub global_active_limit: u64,
+    #[serde(default)]
+    pub active_rejection_count: u64,
     pub spill_count: u64,
     pub evicted_messages: u64,
     pub stored_spills: u64,
     pub stored_spill_bytes: u64,
+    #[serde(default)]
+    pub agent_stored_bytes: u64,
+    #[serde(default)]
+    pub agent_storage_limit: u64,
+    #[serde(default)]
+    pub tenant_stored_bytes: u64,
+    #[serde(default)]
+    pub tenant_storage_limit: u64,
+    #[serde(default)]
+    pub global_stored_bytes: u64,
+    #[serde(default)]
+    pub global_storage_limit: u64,
+    #[serde(default)]
+    pub spill_retention_seconds: u64,
     pub error_count: u64,
     pub last_error: Option<String>,
     pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContextStorageLimits {
+    pub per_agent_bytes: u64,
+    pub per_tenant_bytes: u64,
+    pub global_bytes: u64,
+    pub spill_retention_seconds: u64,
+}
+
+impl Default for ContextStorageLimits {
+    fn default() -> Self {
+        Self {
+            per_agent_bytes: 0,
+            per_tenant_bytes: 0,
+            global_bytes: 0,
+            spill_retention_seconds: 30 * 24 * 60 * 60,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct ContextStorageUsage {
+    agent_bytes: u64,
+    tenant_bytes: u64,
+    global_bytes: u64,
 }
 
 pub const GENERATION_CHECKPOINT_VERSION: u32 = 1;
@@ -453,6 +509,7 @@ pub const DEFAULT_TENANT: &str = "default";
 /// SQLite-backed context manager implementation.
 pub struct SqliteContextManager {
     conn: Mutex<Connection>,
+    storage_limits: RwLock<ContextStorageLimits>,
     /// Pluggable embedder used for the long-term-memory store/query/ranking
     /// path. Defaults to [`crate::memory_manager::default_embedder`]; swap it
     /// via [`SqliteContextManager::with_embedder`] to change embedding strategy
@@ -460,6 +517,8 @@ pub struct SqliteContextManager {
     embedder: Arc<dyn Embedder>,
     #[cfg(test)]
     fail_next_agent_save: AtomicBool,
+    #[cfg(test)]
+    fail_agent_status_update_after: AtomicUsize,
 }
 
 impl SqliteContextManager {
@@ -510,9 +569,12 @@ impl SqliteContextManager {
         }
         let mgr = Self {
             conn: Mutex::new(conn),
+            storage_limits: RwLock::new(ContextStorageLimits::default()),
             embedder: crate::memory_manager::default_embedder(),
             #[cfg(test)]
             fail_next_agent_save: AtomicBool::new(false),
+            #[cfg(test)]
+            fail_agent_status_update_after: AtomicUsize::new(0),
         };
         mgr.init_schema()?;
         Ok(mgr)
@@ -524,9 +586,12 @@ impl SqliteContextManager {
             Connection::open_in_memory().map_err(|e| ContextError::StorageError(e.to_string()))?;
         let mgr = Self {
             conn: Mutex::new(conn),
+            storage_limits: RwLock::new(ContextStorageLimits::default()),
             embedder: crate::memory_manager::default_embedder(),
             #[cfg(test)]
             fail_next_agent_save: AtomicBool::new(false),
+            #[cfg(test)]
+            fail_agent_status_update_after: AtomicUsize::new(0),
         };
         mgr.init_schema()?;
         Ok(mgr)
@@ -662,6 +727,7 @@ impl SqliteContextManager {
                 "conversations",
                 "usage_log",
                 "agent_kv",
+                "context_spills",
                 "context_pressure",
                 "context_snapshots",
                 "generation_checkpoints",
@@ -786,6 +852,18 @@ impl SqliteContextManager {
                 PRIMARY KEY(agent_id, key)
             );
             CREATE INDEX IF NOT EXISTS idx_agent_kv_agent ON agent_kv(agent_id);
+            CREATE TABLE IF NOT EXISTS context_spills (
+                agent_id TEXT NOT NULL,
+                key TEXT NOT NULL,
+                tenant_id TEXT NOT NULL,
+                sha256 TEXT NOT NULL,
+                byte_count INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                PRIMARY KEY(agent_id, key)
+            );
+            CREATE INDEX IF NOT EXISTS idx_context_spills_tenant
+                ON context_spills(tenant_id, expires_at);
             CREATE TABLE IF NOT EXISTS context_pressure (
                 agent_id TEXT PRIMARY KEY,
                 active_tokens INTEGER NOT NULL,
@@ -833,6 +911,67 @@ impl SqliteContextManager {
                 created_at TEXT NOT NULL,
                 last_activity_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS loaded_package_instances (
+                agent_id TEXT PRIMARY KEY,
+                tenant_id TEXT NOT NULL,
+                name TEXT NOT NULL,
+                provider TEXT NOT NULL,
+                profile TEXT NOT NULL,
+                loaded_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_loaded_packages_tenant
+                ON loaded_package_instances(tenant_id, loaded_at DESC);
+            CREATE TABLE IF NOT EXISTS operator_tunables (
+                name TEXT PRIMARY KEY,
+                value INTEGER NOT NULL CHECK (value >= 0),
+                revision INTEGER NOT NULL CHECK (revision > 0),
+                updated_at TEXT NOT NULL,
+                updated_by TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS operator_tunable_audit (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                revision INTEGER,
+                previous_value INTEGER,
+                requested_value INTEGER,
+                effective_value INTEGER,
+                action TEXT NOT NULL,
+                outcome TEXT NOT NULL,
+                actor TEXT NOT NULL,
+                reason TEXT,
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_operator_tunable_audit_name
+                ON operator_tunable_audit(name, id DESC);
+            CREATE TABLE IF NOT EXISTS service_runtime (
+                name TEXT PRIMARY KEY,
+                definition_revision TEXT NOT NULL,
+                status TEXT NOT NULL,
+                agent_id TEXT,
+                restart_count INTEGER NOT NULL CHECK (restart_count >= 0),
+                restart_attempts_total INTEGER NOT NULL CHECK (restart_attempts_total >= 0),
+                last_exit_code INTEGER,
+                desired_running INTEGER NOT NULL CHECK (desired_running IN (0, 1)),
+                ready INTEGER NOT NULL CHECK (ready IN (0, 1)),
+                healthy INTEGER NOT NULL CHECK (healthy IN (0, 1)),
+                restart_exhausted INTEGER NOT NULL CHECK (restart_exhausted IN (0, 1)),
+                last_failure TEXT,
+                next_restart_at TEXT,
+                restart_window_started_at TEXT,
+                last_transition_at TEXT NOT NULL,
+                dependency_blocks INTEGER NOT NULL CHECK (dependency_blocks >= 0)
+            );
+            CREATE TABLE IF NOT EXISTS service_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                event TEXT NOT NULL,
+                status TEXT NOT NULL,
+                agent_id TEXT,
+                reason TEXT,
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_service_history_name
+                ON service_history(name, id DESC);
             -- Tenancy: tenants are the top-level isolation unit; users/sessions/
             -- api-keys are scoped to a tenant. Secrets are stored hashed (the
             -- *_hash columns), never in plaintext (see auth.rs).
@@ -1043,6 +1182,81 @@ impl SqliteContextManager {
                 params![Utc::now().to_rfc3339()],
             );
         }
+        // PR129 stored context spills in agent_kv before digest/retention
+        // metadata existed. Upgrade them in place so restart-safe references
+        // remain usable without creating an unretained privacy bypass.
+        let legacy_spills = {
+            let mut statement = conn
+                .prepare(
+                    "SELECT kv.agent_id, kv.key, kv.value, kv.updated_at,
+                            COALESCE(a.tenant_id, 'default')
+                     FROM agent_kv kv
+                     LEFT JOIN agents a ON a.id = kv.agent_id
+                     LEFT JOIN context_spills spill
+                       ON spill.agent_id = kv.agent_id AND spill.key = kv.key
+                     WHERE kv.key LIKE 'context_spill:%' AND spill.key IS NULL",
+                )
+                .map_err(|error| ContextError::StorageError(error.to_string()))?;
+            let rows = statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                    ))
+                })
+                .map_err(|error| ContextError::StorageError(error.to_string()))?;
+            let mut spills = Vec::new();
+            for row in rows {
+                spills.push(row.map_err(|error| ContextError::StorageError(error.to_string()))?);
+            }
+            spills
+        };
+        for (agent_id, key, value, updated_at, tenant_id) in legacy_spills {
+            let digest = ring::digest::digest(&ring::digest::SHA256, value.as_bytes())
+                .as_ref()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            let created_at = DateTime::parse_from_rfc3339(&updated_at)
+                .map(|value| value.with_timezone(&Utc))
+                .unwrap_or_else(|_| Utc::now() - chrono::Duration::days(30));
+            let expires_at = created_at + chrono::Duration::days(30);
+            conn.execute(
+                "INSERT INTO context_spills
+                 (agent_id, key, tenant_id, sha256, byte_count, created_at, expires_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    agent_id,
+                    key,
+                    tenant_id,
+                    digest,
+                    value.len() as u64,
+                    created_at.to_rfc3339(),
+                    expires_at.to_rfc3339()
+                ],
+            )
+            .map_err(|error| ContextError::StorageError(error.to_string()))?;
+        }
+        let now = Utc::now().to_rfc3339();
+        conn.execute(
+            "DELETE FROM agent_kv
+             WHERE EXISTS (
+                SELECT 1 FROM context_spills
+                WHERE context_spills.agent_id = agent_kv.agent_id
+                  AND context_spills.key = agent_kv.key
+                  AND context_spills.expires_at <= ?1
+             )",
+            params![now],
+        )
+        .map_err(|error| ContextError::StorageError(error.to_string()))?;
+        conn.execute(
+            "DELETE FROM context_spills WHERE expires_at <= ?1",
+            params![now],
+        )
+        .map_err(|error| ContextError::StorageError(error.to_string()))?;
         if legacy_database_has_rows {
             // The old release kept RPM/TPM only in process memory. There is no
             // honest backfill after upgrade, so fence just the current fixed
@@ -2603,13 +2817,45 @@ impl SqliteContextManager {
         let id_str = agent_id.to_string();
 
         for attempt in 0..MAX_RETRIES {
-            let conn = self.conn.lock().unwrap();
-            let result = conn.execute(
-                "INSERT OR REPLACE INTO contexts (agent_id, context_json, updated_at) VALUES (?1, ?2, ?3)",
-                params![id_str, json, now],
-            );
+            let mut conn = self.conn.lock().unwrap();
+            let transaction = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
+            let tenant_id = transaction
+                .query_row(
+                    "SELECT tenant_id FROM agents WHERE id = ?1",
+                    params![id_str],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+                .map_err(|error| ContextError::StorageError(error.to_string()))?
+                .unwrap_or_else(|| DEFAULT_TENANT.to_string());
+            let replaced_bytes = transaction
+                .query_row(
+                    "SELECT LENGTH(context_json) FROM contexts WHERE agent_id = ?1",
+                    params![id_str],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()
+                .map_err(|error| ContextError::StorageError(error.to_string()))?
+                .unwrap_or(0)
+                .max(0) as u64;
+            self.enforce_context_storage_locked(
+                &transaction,
+                agent_id,
+                &tenant_id,
+                json.len() as u64,
+                replaced_bytes,
+            )?;
+            let result = (|| {
+                transaction.execute(
+                    "INSERT OR REPLACE INTO contexts (agent_id, context_json, updated_at) VALUES (?1, ?2, ?3)",
+                    params![id_str, json, now],
+                )?;
+                transaction.commit()
+            })();
             match result {
-                Ok(_) => return Ok(()),
+                Ok(()) => return Ok(()),
                 Err(e) if attempt < MAX_RETRIES - 1 => {
                     tracing::warn!("Persist attempt {} failed: {}", attempt + 1, e);
                     continue;
@@ -2709,7 +2955,10 @@ impl ContextManager for SqliteContextManager {
     }
 
     async fn store_fact(&self, agent_id: AgentId, fact: Fact) -> Result<(), ContextError> {
-        let conn = self.conn.lock().unwrap();
+        let mut conn = self.conn.lock().unwrap();
+        let transaction = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| ContextError::StorageError(error.to_string()))?;
         // Every stored fact gets a deterministic embedding. If the caller didn't
         // supply one, compute it from the content via the Memory Manager so
         // query_memory can rank by semantic (cosine) similarity later.
@@ -2720,8 +2969,47 @@ impl ContextManager for SqliteContextManager {
         let embedding_json = Some(serde_json::to_string(&embedding).unwrap_or_default());
         let category_str = serde_json::to_string(&fact.category)
             .map_err(|e| ContextError::StorageError(e.to_string()))?;
+        let tenant_id = transaction
+            .query_row(
+                "SELECT tenant_id FROM agents WHERE id = ?1",
+                params![agent_id.to_string()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| ContextError::StorageError(error.to_string()))?
+            .unwrap_or_else(|| DEFAULT_TENANT.to_string());
+        let existing = transaction
+            .query_row(
+                "SELECT agent_id,
+                        LENGTH(content) + COALESCE(LENGTH(embedding_json), 0)
+                 FROM facts WHERE id = ?1",
+                params![fact.id.to_string()],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .optional()
+            .map_err(|error| ContextError::StorageError(error.to_string()))?;
+        if existing
+            .as_ref()
+            .is_some_and(|(owner, _)| owner != &agent_id.to_string())
+        {
+            return Err(ContextError::StorageError(
+                "fact id is already owned by another agent".into(),
+            ));
+        }
+        let replaced_bytes = existing.map_or(0, |(_, bytes)| bytes.max(0) as u64);
+        let incoming_bytes =
+            fact.content
+                .len()
+                .saturating_add(embedding_json.as_deref().map_or(0, str::len)) as u64;
+        self.enforce_context_storage_locked(
+            &transaction,
+            agent_id,
+            &tenant_id,
+            incoming_bytes,
+            replaced_bytes,
+        )?;
 
-        conn.execute(
+        transaction.execute(
             "INSERT OR REPLACE INTO facts (id, agent_id, content, category, created_at, last_accessed_at, embedding_json)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
@@ -2734,6 +3022,9 @@ impl ContextManager for SqliteContextManager {
                 embedding_json,
             ],
         ).map_err(|e| ContextError::StorageError(e.to_string()))?;
+        transaction
+            .commit()
+            .map_err(|error| ContextError::StorageError(error.to_string()))?;
         Ok(())
     }
 
@@ -2861,8 +3152,44 @@ impl SqliteContextManager {
         let json = serde_json::to_string(messages)
             .map_err(|e| ContextError::PersistenceFailed(e.to_string()))?;
         let now = chrono::Utc::now().to_rfc3339();
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
+        let mut conn = self.conn.lock().unwrap();
+        let transaction = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
+        let tenant_id = transaction
+            .query_row(
+                "SELECT tenant_id FROM agents WHERE id = ?1",
+                params![agent_id.to_string()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| ContextError::StorageError(error.to_string()))?
+            .unwrap_or_else(|| DEFAULT_TENANT.to_string());
+        let existing = transaction
+            .query_row(
+                "SELECT agent_id, LENGTH(messages_json) FROM conversations WHERE id = ?1",
+                params![id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .optional()
+            .map_err(|error| ContextError::StorageError(error.to_string()))?;
+        if existing
+            .as_ref()
+            .is_some_and(|(owner, _)| owner != &agent_id.to_string())
+        {
+            return Err(ContextError::PersistenceFailed(
+                "conversation id is already owned by another agent".into(),
+            ));
+        }
+        let replaced_bytes = existing.map_or(0, |(_, bytes)| bytes.max(0) as u64);
+        self.enforce_context_storage_locked(
+            &transaction,
+            agent_id,
+            &tenant_id,
+            json.len() as u64,
+            replaced_bytes,
+        )?;
+        transaction.execute(
             "INSERT OR REPLACE INTO conversations (id, agent_id, messages_json, created_at, updated_at) VALUES (?1, ?2, ?3, COALESCE((SELECT created_at FROM conversations WHERE id=?1), ?4), ?4)",
             rusqlite::params![id, agent_id.to_string(), json, now],
         ).map_err(|e| ContextError::PersistenceFailed(e.to_string()))?;
@@ -2871,11 +3198,14 @@ impl SqliteContextManager {
             .map(|m| m.content.as_str())
             .collect::<Vec<_>>()
             .join(" ");
-        conn.execute(
+        transaction.execute(
             "INSERT OR REPLACE INTO conversations_fts (conversation_id, content) VALUES (?1, ?2)",
             rusqlite::params![id, text_content],
         )
         .ok();
+        transaction
+            .commit()
+            .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
         Ok(())
     }
 
@@ -3064,6 +3394,28 @@ impl SqliteContextManager {
         agent_id: AgentId,
         status: &crate::AgentState,
     ) -> Result<(), ContextError> {
+        #[cfg(test)]
+        {
+            let prior = self
+                .fail_agent_status_update_after
+                .fetch_update(
+                    AtomicOrdering::AcqRel,
+                    AtomicOrdering::Acquire,
+                    |countdown| {
+                        if countdown > 0 {
+                            Some(countdown - 1)
+                        } else {
+                            None
+                        }
+                    },
+                )
+                .ok();
+            if prior == Some(1) {
+                return Err(ContextError::PersistenceFailed(
+                    "injected agent-status update failure".into(),
+                ));
+            }
+        }
         let status = serde_json::to_string(status)
             .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
         let conn = self.conn.lock().unwrap();
@@ -3106,8 +3458,268 @@ impl SqliteContextManager {
 /// opaque strings (callers may JSON-encode structured data). Backed by the same
 /// single SQLite handle as the rest of the context manager (no separate db).
 impl SqliteContextManager {
+    pub fn set_context_storage_limits(
+        &self,
+        limits: ContextStorageLimits,
+    ) -> Result<(), ContextError> {
+        if limits.spill_retention_seconds == 0 {
+            return Err(ContextError::PersistenceFailed(
+                "context spill retention must be greater than zero".into(),
+            ));
+        }
+        let mut conn = self.conn.lock().unwrap();
+        let spills = {
+            let mut statement = conn
+                .prepare("SELECT agent_id, key, created_at, expires_at FROM context_spills")
+                .map_err(|error| ContextError::StorageError(error.to_string()))?;
+            let rows = statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                })
+                .map_err(|error| ContextError::StorageError(error.to_string()))?;
+            let mut values = Vec::new();
+            for row in rows {
+                values.push(row.map_err(|error| ContextError::StorageError(error.to_string()))?);
+            }
+            values
+        };
+        for (agent_id, key, created_at, current_expiry) in spills {
+            let created_at = DateTime::parse_from_rfc3339(&created_at)
+                .map_err(|error| ContextError::StorageError(error.to_string()))?
+                .with_timezone(&Utc);
+            let current_expiry = DateTime::parse_from_rfc3339(&current_expiry)
+                .map_err(|error| ContextError::StorageError(error.to_string()))?
+                .with_timezone(&Utc);
+            let configured_expiry = created_at
+                + chrono::Duration::seconds(
+                    limits.spill_retention_seconds.min(i64::MAX as u64) as i64
+                );
+            if configured_expiry < current_expiry {
+                conn.execute(
+                    "UPDATE context_spills SET expires_at = ?1
+                     WHERE agent_id = ?2 AND key = ?3",
+                    params![configured_expiry.to_rfc3339(), agent_id, key],
+                )
+                .map_err(|error| ContextError::StorageError(error.to_string()))?;
+            }
+        }
+        Self::purge_expired_spills_locked(&mut conn)?;
+        drop(conn);
+        if let Ok(mut configured) = self.storage_limits.write() {
+            *configured = limits;
+            Ok(())
+        } else {
+            Err(ContextError::StorageError(
+                "context storage limit lock is poisoned".into(),
+            ))
+        }
+    }
+
+    fn context_storage_usage_locked(
+        conn: &Connection,
+        agent_id: AgentId,
+        tenant_id: &str,
+    ) -> Result<ContextStorageUsage, ContextError> {
+        let (agent, tenant, global) = conn
+            .query_row(
+                "WITH context_bytes(agent_id, byte_count) AS (
+                    SELECT agent_id, LENGTH(context_json) FROM contexts
+                    UNION ALL
+                    SELECT agent_id, LENGTH(content) + COALESCE(LENGTH(embedding_json), 0) FROM facts
+                    UNION ALL
+                    SELECT agent_id, LENGTH(messages_json) FROM conversations
+                    UNION ALL
+                    SELECT agent_id, LENGTH(value) FROM agent_kv
+                        WHERE key LIKE 'context_spill:%'
+                    UNION ALL
+                    SELECT agent_id, LENGTH(context_json) FROM context_snapshots
+                    UNION ALL
+                    SELECT agent_id, LENGTH(checkpoint_json) FROM generation_checkpoints
+                        WHERE status IN ('active', 'resuming')
+                )
+                SELECT
+                    COALESCE(SUM(CASE WHEN agent_id = ?1 THEN byte_count ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN COALESCE(
+                        (SELECT tenant_id FROM agents WHERE id = context_bytes.agent_id),
+                        'default'
+                    ) = ?2 THEN byte_count ELSE 0 END), 0),
+                    COALESCE(SUM(byte_count), 0)
+                FROM context_bytes",
+                params![agent_id.to_string(), tenant_id],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                },
+            )
+            .map_err(|error| ContextError::StorageError(error.to_string()))?;
+        Ok(ContextStorageUsage {
+            agent_bytes: agent.max(0) as u64,
+            tenant_bytes: tenant.max(0) as u64,
+            global_bytes: global.max(0) as u64,
+        })
+    }
+
+    fn enforce_context_storage_locked(
+        &self,
+        conn: &Connection,
+        agent_id: AgentId,
+        tenant_id: &str,
+        incoming_bytes: u64,
+        replaced_bytes: u64,
+    ) -> Result<(), ContextError> {
+        let limits = self
+            .storage_limits
+            .read()
+            .map(|limits| *limits)
+            .unwrap_or_default();
+        let usage = Self::context_storage_usage_locked(conn, agent_id, tenant_id)?;
+        let delta = incoming_bytes.saturating_sub(replaced_bytes);
+        for (scope, used, limit) in [
+            ("agent", usage.agent_bytes, limits.per_agent_bytes),
+            ("tenant", usage.tenant_bytes, limits.per_tenant_bytes),
+            ("global", usage.global_bytes, limits.global_bytes),
+        ] {
+            if limit > 0 && used.saturating_add(delta) > limit {
+                return Err(ContextError::PersistenceFailed(format!(
+                    "context storage pressure: {scope} would use {} bytes above limit {limit}; delete retained context or retry after retention cleanup",
+                    used.saturating_add(delta)
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn purge_expired_spills_locked(conn: &mut Connection) -> Result<u64, ContextError> {
+        let transaction = conn
+            .transaction()
+            .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
+        let now = Utc::now().to_rfc3339();
+        let removed = transaction
+            .execute(
+                "DELETE FROM agent_kv
+                 WHERE EXISTS (
+                    SELECT 1 FROM context_spills
+                    WHERE context_spills.agent_id = agent_kv.agent_id
+                      AND context_spills.key = agent_kv.key
+                      AND context_spills.expires_at <= ?1
+                 )",
+                params![now],
+            )
+            .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
+        transaction
+            .execute(
+                "DELETE FROM context_spills WHERE expires_at <= ?1",
+                params![now],
+            )
+            .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
+        transaction
+            .commit()
+            .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
+        Ok(removed as u64)
+    }
+
+    /// Persist a spill with a verifiable digest, bounded retention, and atomic
+    /// per-agent/tenant/global durable-byte admission.
+    pub fn store_context_spill(
+        &self,
+        agent_id: AgentId,
+        key: &str,
+        value: &str,
+        sha256: &str,
+    ) -> Result<(), ContextError> {
+        if !key.starts_with("context_spill:") {
+            return Err(ContextError::PersistenceFailed(
+                "context spill key must start with context_spill:".into(),
+            ));
+        }
+        let mut conn = self.conn.lock().unwrap();
+        Self::purge_expired_spills_locked(&mut conn)?;
+        let transaction = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
+        let tenant_id = transaction
+            .query_row(
+                "SELECT tenant_id FROM agents WHERE id = ?1",
+                params![agent_id.to_string()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| ContextError::StorageError(error.to_string()))?
+            .unwrap_or_else(|| DEFAULT_TENANT.to_string());
+        let replaced_bytes = transaction
+            .query_row(
+                "SELECT LENGTH(value) FROM agent_kv WHERE agent_id = ?1 AND key = ?2",
+                params![agent_id.to_string(), key],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(|error| ContextError::StorageError(error.to_string()))?
+            .unwrap_or(0)
+            .max(0) as u64;
+        self.enforce_context_storage_locked(
+            &transaction,
+            agent_id,
+            &tenant_id,
+            value.len() as u64,
+            replaced_bytes,
+        )?;
+        let retention_seconds = self
+            .storage_limits
+            .read()
+            .map(|limits| limits.spill_retention_seconds)
+            .unwrap_or(0);
+        if retention_seconds == 0 {
+            return Err(ContextError::PersistenceFailed(
+                "context spill retention must be greater than zero".into(),
+            ));
+        }
+        let now = Utc::now();
+        let expires_at =
+            now + chrono::Duration::seconds(retention_seconds.min(i64::MAX as u64) as i64);
+        transaction
+            .execute(
+                "INSERT OR REPLACE INTO agent_kv
+                 (agent_id, key, value, updated_at) VALUES (?1, ?2, ?3, ?4)",
+                params![agent_id.to_string(), key, value, now.to_rfc3339()],
+            )
+            .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
+        transaction
+            .execute(
+                "INSERT OR REPLACE INTO context_spills
+                 (agent_id, key, tenant_id, sha256, byte_count, created_at, expires_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    agent_id.to_string(),
+                    key,
+                    tenant_id,
+                    sha256,
+                    value.len() as u64,
+                    now.to_rfc3339(),
+                    expires_at.to_rfc3339()
+                ],
+            )
+            .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
+        transaction
+            .commit()
+            .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
+        Ok(())
+    }
+
     /// Put (insert-or-overwrite) a value for `key` under `agent_id`.
     pub fn kv_put(&self, agent_id: AgentId, key: &str, value: &str) -> Result<(), ContextError> {
+        if key.starts_with("context_spill:") {
+            return Err(ContextError::PersistenceFailed(
+                "context spills require verified store_context_spill admission".into(),
+            ));
+        }
         let now = Utc::now().to_rfc3339();
         let conn = self.conn.lock().unwrap();
         conn.execute(
@@ -3120,13 +3732,41 @@ impl SqliteContextManager {
 
     /// Get the value for `key` under `agent_id`, or `None` if absent.
     pub fn kv_get(&self, agent_id: AgentId, key: &str) -> Result<Option<String>, ContextError> {
-        let conn = self.conn.lock().unwrap();
+        let mut conn = self.conn.lock().unwrap();
+        Self::purge_expired_spills_locked(&mut conn)?;
         let result = conn.query_row(
             "SELECT value FROM agent_kv WHERE agent_id = ?1 AND key = ?2",
             params![agent_id.to_string(), key],
             |row| row.get::<_, String>(0),
         );
         match result {
+            Ok(value) if key.starts_with("context_spill:") => {
+                let expected = conn
+                    .query_row(
+                        "SELECT sha256 FROM context_spills
+                         WHERE agent_id = ?1 AND key = ?2",
+                        params![agent_id.to_string(), key],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()
+                    .map_err(|error| ContextError::StorageError(error.to_string()))?
+                    .ok_or_else(|| {
+                        ContextError::RestoreFailed(
+                            "context spill metadata is missing; page-in fails closed".into(),
+                        )
+                    })?;
+                let actual = ring::digest::digest(&ring::digest::SHA256, value.as_bytes())
+                    .as_ref()
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<String>();
+                if actual != expected {
+                    return Err(ContextError::RestoreFailed(
+                        "context spill digest mismatch; page-in fails closed".into(),
+                    ));
+                }
+                Ok(Some(value))
+            }
             Ok(value) => Ok(Some(value)),
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(e) => Err(ContextError::StorageError(e.to_string())),
@@ -3135,7 +3775,8 @@ impl SqliteContextManager {
 
     /// List the keys stored under `agent_id` (sorted ascending).
     pub fn kv_list(&self, agent_id: AgentId) -> Result<Vec<String>, ContextError> {
-        let conn = self.conn.lock().unwrap();
+        let mut conn = self.conn.lock().unwrap();
+        Self::purge_expired_spills_locked(&mut conn)?;
         let mut stmt = conn
             .prepare("SELECT key FROM agent_kv WHERE agent_id = ?1 ORDER BY key ASC")
             .map_err(|e| ContextError::StorageError(e.to_string()))?;
@@ -3152,12 +3793,24 @@ impl SqliteContextManager {
     /// Delete the value for `key` under `agent_id`. Returns `true` if a row was
     /// removed, `false` if no such key existed.
     pub fn kv_delete(&self, agent_id: AgentId, key: &str) -> Result<bool, ContextError> {
-        let conn = self.conn.lock().unwrap();
-        let affected = conn
+        let mut conn = self.conn.lock().unwrap();
+        let transaction = conn
+            .transaction()
+            .map_err(|e| ContextError::PersistenceFailed(e.to_string()))?;
+        transaction
+            .execute(
+                "DELETE FROM context_spills WHERE agent_id = ?1 AND key = ?2",
+                params![agent_id.to_string(), key],
+            )
+            .map_err(|e| ContextError::PersistenceFailed(e.to_string()))?;
+        let affected = transaction
             .execute(
                 "DELETE FROM agent_kv WHERE agent_id = ?1 AND key = ?2",
                 params![agent_id.to_string(), key],
             )
+            .map_err(|e| ContextError::PersistenceFailed(e.to_string()))?;
+        transaction
+            .commit()
             .map_err(|e| ContextError::PersistenceFailed(e.to_string()))?;
         Ok(affected > 0)
     }
@@ -3211,7 +3864,17 @@ impl SqliteContextManager {
         &self,
         agent_id: AgentId,
     ) -> Result<ContextPressureStats, ContextError> {
-        let conn = self.conn.lock().unwrap();
+        let mut conn = self.conn.lock().unwrap();
+        Self::purge_expired_spills_locked(&mut conn)?;
+        let tenant_id = conn
+            .query_row(
+                "SELECT tenant_id FROM agents WHERE id = ?1",
+                params![agent_id.to_string()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| ContextError::StorageError(error.to_string()))?
+            .unwrap_or_else(|| DEFAULT_TENANT.to_string());
         let recorded = conn.query_row(
             "SELECT active_tokens, budget_tokens, spill_count, evicted_messages,
                     error_count, last_error, updated_at
@@ -3256,14 +3919,35 @@ impl SqliteContextManager {
         let updated_at = DateTime::parse_from_rfc3339(&updated_at)
             .map_err(|error| ContextError::StorageError(error.to_string()))?
             .with_timezone(&Utc);
+        let storage = Self::context_storage_usage_locked(&conn, agent_id, &tenant_id)?;
+        let limits = self
+            .storage_limits
+            .read()
+            .map(|limits| *limits)
+            .unwrap_or_default();
         Ok(ContextPressureStats {
             agent_id,
+            tenant_id,
             active_tokens,
             budget_tokens,
+            agent_active_tokens: 0,
+            agent_active_limit: 0,
+            tenant_active_tokens: 0,
+            tenant_active_limit: 0,
+            global_active_tokens: 0,
+            global_active_limit: 0,
+            active_rejection_count: 0,
             spill_count,
             evicted_messages,
             stored_spills,
             stored_spill_bytes,
+            agent_stored_bytes: storage.agent_bytes,
+            agent_storage_limit: limits.per_agent_bytes,
+            tenant_stored_bytes: storage.tenant_bytes,
+            tenant_storage_limit: limits.per_tenant_bytes,
+            global_stored_bytes: storage.global_bytes,
+            global_storage_limit: limits.global_bytes,
+            spill_retention_seconds: limits.spill_retention_seconds,
             error_count,
             last_error,
             updated_at,
@@ -3286,10 +3970,13 @@ impl SqliteContextManager {
     /// `(agent_id, label)`. Errors with [`ContextError::RestoreFailed`] if the
     /// agent has no current context to snapshot.
     pub fn snapshot_context(&self, agent_id: AgentId, label: &str) -> Result<(), ContextError> {
-        let conn = self.conn.lock().unwrap();
+        let mut conn = self.conn.lock().unwrap();
+        let transaction = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
         let id_str = agent_id.to_string();
         // Read the agent's current context (mirrors get_context's query path).
-        let json = match conn.query_row(
+        let json = match transaction.query_row(
             "SELECT context_json FROM contexts WHERE agent_id = ?1",
             params![id_str],
             |row| row.get::<_, String>(0),
@@ -3304,11 +3991,41 @@ impl SqliteContextManager {
             Err(e) => return Err(ContextError::StorageError(e.to_string())),
         };
         let now = Utc::now().to_rfc3339();
-        conn.execute(
+        let tenant_id = transaction
+            .query_row(
+                "SELECT tenant_id FROM agents WHERE id = ?1",
+                params![id_str],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| ContextError::StorageError(error.to_string()))?
+            .unwrap_or_else(|| DEFAULT_TENANT.to_string());
+        let replaced_bytes = transaction
+            .query_row(
+                "SELECT LENGTH(context_json) FROM context_snapshots
+                 WHERE agent_id = ?1 AND label = ?2",
+                params![id_str, label],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(|error| ContextError::StorageError(error.to_string()))?
+            .unwrap_or(0)
+            .max(0) as u64;
+        self.enforce_context_storage_locked(
+            &transaction,
+            agent_id,
+            &tenant_id,
+            json.len() as u64,
+            replaced_bytes,
+        )?;
+        transaction.execute(
             "INSERT OR REPLACE INTO context_snapshots (agent_id, label, context_json, created_at) VALUES (?1, ?2, ?3, ?4)",
             params![id_str, label, json, now],
         )
         .map_err(|e| ContextError::PersistenceFailed(e.to_string()))?;
+        transaction
+            .commit()
+            .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
         Ok(())
     }
 
@@ -3392,6 +4109,16 @@ impl SqliteContextManager {
     pub(crate) fn fail_next_agent_save_for_test(&self) {
         self.fail_next_agent_save
             .store(true, AtomicOrdering::Release);
+    }
+
+    /// Fail the Nth subsequent lifecycle-status update. A value of one fails
+    /// the next update; two lets the durable `Stopping` write commit and fails
+    /// the following terminal `Stopped` write.
+    #[cfg(test)]
+    pub(crate) fn fail_agent_status_update_on_nth_call_for_test(&self, nth: usize) {
+        assert!(nth > 0, "status-update failure index must be positive");
+        self.fail_agent_status_update_after
+            .store(nth, AtomicOrdering::Release);
     }
 
     /// Insert-or-update an agent's durable identity + config.
@@ -3541,7 +4268,7 @@ impl SqliteContextManager {
             .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
         let mut conn = self.conn.lock().unwrap();
         let transaction = conn
-            .transaction()
+            .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
         transaction
             .execute(
@@ -3549,6 +4276,28 @@ impl SqliteContextManager {
                 params![now.to_rfc3339()],
             )
             .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
+        let replaced_bytes = transaction
+            .query_row(
+                "SELECT LENGTH(checkpoint_json) FROM generation_checkpoints
+                 WHERE agent_id = ?1 AND status = 'active'
+                 ORDER BY created_at DESC LIMIT 1 OFFSET ?2",
+                params![
+                    checkpoint.agent_id.to_string(),
+                    (MAX_GENERATION_CHECKPOINTS_PER_AGENT - 1) as i64
+                ],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(|error| ContextError::StorageError(error.to_string()))?
+            .unwrap_or(0)
+            .max(0) as u64;
+        self.enforce_context_storage_locked(
+            &transaction,
+            checkpoint.agent_id,
+            tenant_id,
+            json.len() as u64,
+            replaced_bytes,
+        )?;
         transaction
             .execute(
                 "INSERT INTO generation_checkpoints (id, agent_id, tenant_id, version, provider_id, model_id, checkpoint_json, status, created_at, expires_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'active', ?8, ?9)",
@@ -3840,6 +4589,7 @@ impl SqliteContextManager {
             "context_snapshots",
             "generation_checkpoints",
             "context_pressure",
+            "loaded_package_instances",
         ] {
             tx.execute(
                 &format!("DELETE FROM {table} WHERE agent_id = ?1"),
@@ -3860,6 +4610,651 @@ impl SqliteContextManager {
         let conn = self.conn.lock().unwrap();
         let _ = conn.pragma_update(None, "wal_checkpoint", "TRUNCATE");
         Ok(())
+    }
+}
+
+/// Durable operator-control state and non-sensitive package-instance metadata.
+impl SqliteContextManager {
+    pub fn ensure_operator_tunable(
+        &self,
+        name: &str,
+        value: u64,
+        actor: &str,
+    ) -> Result<(), ContextError> {
+        let value = i64::try_from(value).map_err(|_| {
+            ContextError::PersistenceFailed(format!(
+                "operator tunable {name:?} exceeds SQLite integer range"
+            ))
+        })?;
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
+        let now = Utc::now().to_rfc3339();
+        let inserted = tx
+            .execute(
+                "INSERT OR IGNORE INTO operator_tunables
+                 (name, value, revision, updated_at, updated_by)
+                 VALUES (?1, ?2, 1, ?3, ?4)",
+                params![name, value, &now, actor],
+            )
+            .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
+        if inserted > 0 {
+            tx.execute(
+                "INSERT INTO operator_tunable_audit
+                 (name, revision, previous_value, requested_value, effective_value,
+                  action, outcome, actor, reason, created_at)
+                 VALUES (?1, 1, NULL, ?2, ?2, 'bootstrap', 'applied', ?3, NULL, ?4)",
+                params![name, value, actor, now],
+            )
+            .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
+        }
+        tx.commit()
+            .map_err(|error| ContextError::PersistenceFailed(error.to_string()))
+    }
+
+    pub fn list_operator_tunables(
+        &self,
+    ) -> Result<Vec<crate::operator_control::StoredOperatorTunable>, ContextError> {
+        let conn = self.conn.lock().unwrap();
+        let mut statement = conn
+            .prepare(
+                "SELECT name, value, revision, updated_at, updated_by
+                 FROM operator_tunables ORDER BY name",
+            )
+            .map_err(|error| ContextError::StorageError(error.to_string()))?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok(crate::operator_control::StoredOperatorTunable {
+                    name: row.get(0)?,
+                    value: row.get::<_, i64>(1)?.max(0) as u64,
+                    revision: row.get::<_, i64>(2)?.max(0) as u64,
+                    updated_at: row.get(3)?,
+                    updated_by: row.get(4)?,
+                })
+            })
+            .map_err(|error| ContextError::StorageError(error.to_string()))?;
+        let mut tunables = Vec::new();
+        for row in rows {
+            tunables.push(row.map_err(|error| ContextError::StorageError(error.to_string()))?);
+        }
+        Ok(tunables)
+    }
+
+    pub fn set_operator_tunable(
+        &self,
+        name: &str,
+        value: u64,
+        expected_revision: u64,
+        actor: &str,
+    ) -> Result<crate::operator_control::StoredOperatorTunable, ContextError> {
+        let value = i64::try_from(value).map_err(|_| {
+            ContextError::PersistenceFailed(format!(
+                "operator tunable {name:?} exceeds SQLite integer range"
+            ))
+        })?;
+        let expected_revision = i64::try_from(expected_revision).map_err(|_| {
+            ContextError::PersistenceFailed("operator tunable revision is too large".into())
+        })?;
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
+        let current = tx
+            .query_row(
+                "SELECT value, revision FROM operator_tunables WHERE name = ?1",
+                params![name],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .optional()
+            .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?
+            .ok_or_else(|| {
+                ContextError::PersistenceFailed(format!(
+                    "operator tunable {name:?} is not registered"
+                ))
+            })?;
+        if current.1 != expected_revision {
+            return Err(ContextError::PersistenceFailed(format!(
+                "operator tunable conflict for {name:?}: expected revision {expected_revision}, current revision {}",
+                current.1
+            )));
+        }
+        let revision = current
+            .1
+            .checked_add(1)
+            .ok_or_else(|| ContextError::PersistenceFailed("revision overflow".into()))?;
+        let now = Utc::now().to_rfc3339();
+        tx.execute(
+            "UPDATE operator_tunables
+             SET value = ?1, revision = ?2, updated_at = ?3, updated_by = ?4
+             WHERE name = ?5",
+            params![value, revision, &now, actor, name],
+        )
+        .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
+        tx.execute(
+            "INSERT INTO operator_tunable_audit
+             (name, revision, previous_value, requested_value, effective_value,
+              action, outcome, actor, reason, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?4, 'set', 'applied', ?5, NULL, ?6)",
+            params![name, revision, current.0, value, actor, &now],
+        )
+        .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
+        tx.commit()
+            .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
+        Ok(crate::operator_control::StoredOperatorTunable {
+            name: name.to_string(),
+            value: value as u64,
+            revision: revision as u64,
+            updated_at: now,
+            updated_by: actor.to_string(),
+        })
+    }
+
+    pub fn rollback_operator_tunable(
+        &self,
+        name: &str,
+        target_revision: u64,
+        expected_revision: u64,
+        actor: &str,
+    ) -> Result<crate::operator_control::StoredOperatorTunable, ContextError> {
+        let target_revision = i64::try_from(target_revision).map_err(|_| {
+            ContextError::PersistenceFailed("target tunable revision is too large".into())
+        })?;
+        let expected_revision = i64::try_from(expected_revision).map_err(|_| {
+            ContextError::PersistenceFailed("operator tunable revision is too large".into())
+        })?;
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
+        let current = tx
+            .query_row(
+                "SELECT value, revision FROM operator_tunables WHERE name = ?1",
+                params![name],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .optional()
+            .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?
+            .ok_or_else(|| {
+                ContextError::PersistenceFailed(format!(
+                    "operator tunable {name:?} is not registered"
+                ))
+            })?;
+        if current.1 != expected_revision {
+            return Err(ContextError::PersistenceFailed(format!(
+                "operator tunable conflict for {name:?}: expected revision {expected_revision}, current revision {}",
+                current.1
+            )));
+        }
+        let target_value = tx
+            .query_row(
+                "SELECT effective_value FROM operator_tunable_audit
+                 WHERE name = ?1 AND revision = ?2
+                   AND outcome = 'applied' AND effective_value IS NOT NULL
+                 ORDER BY id DESC LIMIT 1",
+                params![name, target_revision],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?
+            .ok_or_else(|| {
+                ContextError::PersistenceFailed(format!(
+                    "operator tunable {name:?} has no applied revision {target_revision}"
+                ))
+            })?;
+        let revision = current
+            .1
+            .checked_add(1)
+            .ok_or_else(|| ContextError::PersistenceFailed("revision overflow".into()))?;
+        let now = Utc::now().to_rfc3339();
+        tx.execute(
+            "UPDATE operator_tunables
+             SET value = ?1, revision = ?2, updated_at = ?3, updated_by = ?4
+             WHERE name = ?5",
+            params![target_value, revision, &now, actor, name],
+        )
+        .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
+        tx.execute(
+            "INSERT INTO operator_tunable_audit
+             (name, revision, previous_value, requested_value, effective_value,
+              action, outcome, actor, reason, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?4, 'rollback', 'applied', ?5, ?6, ?7)",
+            params![
+                name,
+                revision,
+                current.0,
+                target_value,
+                actor,
+                format!("restored revision {target_revision}"),
+                &now
+            ],
+        )
+        .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
+        tx.commit()
+            .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
+        Ok(crate::operator_control::StoredOperatorTunable {
+            name: name.to_string(),
+            value: target_value.max(0) as u64,
+            revision: revision as u64,
+            updated_at: now,
+            updated_by: actor.to_string(),
+        })
+    }
+
+    pub fn record_operator_tunable_denial(
+        &self,
+        name: &str,
+        requested_value: Option<u64>,
+        actor: &str,
+        reason: &str,
+    ) -> Result<(), ContextError> {
+        let requested_value = requested_value
+            .map(i64::try_from)
+            .transpose()
+            .map_err(|_| ContextError::PersistenceFailed("requested value is too large".into()))?;
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO operator_tunable_audit
+             (name, revision, previous_value, requested_value, effective_value,
+              action, outcome, actor, reason, created_at)
+             VALUES (?1, NULL, NULL, ?2, NULL, 'set', 'denied', ?3, ?4, ?5)",
+            params![
+                name,
+                requested_value,
+                actor,
+                reason,
+                Utc::now().to_rfc3339()
+            ],
+        )
+        .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
+        Ok(())
+    }
+
+    pub fn list_operator_tunable_audit(
+        &self,
+        name: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<crate::operator_control::OperatorTunableAudit>, ContextError> {
+        let limit = i64::try_from(limit.clamp(1, 1_000)).unwrap_or(1_000);
+        let conn = self.conn.lock().unwrap();
+        let sql = if name.is_some() {
+            "SELECT id, name, revision, previous_value, requested_value,
+                    effective_value, action, outcome, actor, reason, created_at
+             FROM operator_tunable_audit WHERE name = ?1
+             ORDER BY id DESC LIMIT ?2"
+        } else {
+            "SELECT id, name, revision, previous_value, requested_value,
+                    effective_value, action, outcome, actor, reason, created_at
+             FROM operator_tunable_audit
+             ORDER BY id DESC LIMIT ?1"
+        };
+        let mut statement = conn
+            .prepare(sql)
+            .map_err(|error| ContextError::StorageError(error.to_string()))?;
+        let map_row = |row: &rusqlite::Row<'_>| {
+            Ok(crate::operator_control::OperatorTunableAudit {
+                id: row.get::<_, i64>(0)?.max(0) as u64,
+                name: row.get(1)?,
+                revision: row
+                    .get::<_, Option<i64>>(2)?
+                    .map(|value| value.max(0) as u64),
+                previous_value: row
+                    .get::<_, Option<i64>>(3)?
+                    .map(|value| value.max(0) as u64),
+                requested_value: row
+                    .get::<_, Option<i64>>(4)?
+                    .map(|value| value.max(0) as u64),
+                effective_value: row
+                    .get::<_, Option<i64>>(5)?
+                    .map(|value| value.max(0) as u64),
+                action: row.get(6)?,
+                outcome: row.get(7)?,
+                actor: row.get(8)?,
+                reason: row.get(9)?,
+                created_at: row.get(10)?,
+            })
+        };
+        let mut audit = Vec::new();
+        if let Some(name) = name {
+            let rows = statement
+                .query_map(params![name, limit], map_row)
+                .map_err(|error| ContextError::StorageError(error.to_string()))?;
+            for row in rows {
+                audit.push(row.map_err(|error| ContextError::StorageError(error.to_string()))?);
+            }
+        } else {
+            let rows = statement
+                .query_map(params![limit], map_row)
+                .map_err(|error| ContextError::StorageError(error.to_string()))?;
+            for row in rows {
+                audit.push(row.map_err(|error| ContextError::StorageError(error.to_string()))?);
+            }
+        }
+        Ok(audit)
+    }
+
+    pub fn save_loaded_package_instance(
+        &self,
+        instance: &crate::operator_control::LoadedPackageInstance,
+    ) -> Result<(), ContextError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO loaded_package_instances
+             (agent_id, tenant_id, name, provider, profile, loaded_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                instance.agent_id,
+                instance.tenant_id,
+                instance.name,
+                instance.provider,
+                instance.profile,
+                instance.loaded_at
+            ],
+        )
+        .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
+        Ok(())
+    }
+
+    pub fn list_loaded_package_instances(
+        &self,
+        tenant_id: Option<&str>,
+    ) -> Result<Vec<crate::operator_control::LoadedPackageInstance>, ContextError> {
+        let conn = self.conn.lock().unwrap();
+        let sql = if tenant_id.is_some() {
+            "SELECT agent_id, tenant_id, name, provider, profile, loaded_at
+             FROM loaded_package_instances WHERE tenant_id = ?1
+             ORDER BY loaded_at DESC, agent_id"
+        } else {
+            "SELECT agent_id, tenant_id, name, provider, profile, loaded_at
+             FROM loaded_package_instances ORDER BY loaded_at DESC, agent_id"
+        };
+        let mut statement = conn
+            .prepare(sql)
+            .map_err(|error| ContextError::StorageError(error.to_string()))?;
+        let map_row = |row: &rusqlite::Row<'_>| {
+            Ok(crate::operator_control::LoadedPackageInstance {
+                agent_id: row.get(0)?,
+                tenant_id: row.get(1)?,
+                name: row.get(2)?,
+                provider: row.get(3)?,
+                profile: row.get(4)?,
+                loaded_at: row.get(5)?,
+            })
+        };
+        let mut packages = Vec::new();
+        if let Some(tenant_id) = tenant_id {
+            let rows = statement
+                .query_map(params![tenant_id], map_row)
+                .map_err(|error| ContextError::StorageError(error.to_string()))?;
+            for row in rows {
+                packages.push(row.map_err(|error| ContextError::StorageError(error.to_string()))?);
+            }
+        } else {
+            let rows = statement
+                .query_map([], map_row)
+                .map_err(|error| ContextError::StorageError(error.to_string()))?;
+            for row in rows {
+                packages.push(row.map_err(|error| ContextError::StorageError(error.to_string()))?);
+            }
+        }
+        Ok(packages)
+    }
+}
+
+/// Durable init-supervisor ownership and bounded transition history.
+impl SqliteContextManager {
+    pub fn save_service_runtime(
+        &self,
+        runtime: &crate::init_system::ServiceRuntimeInfo,
+        event: &str,
+        reason: Option<&str>,
+    ) -> Result<(), ContextError> {
+        let status = serde_json::to_string(&runtime.status)
+            .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
+        let restart_count = i64::from(runtime.restart_count);
+        let restart_attempts_total =
+            i64::try_from(runtime.restart_attempts_total).map_err(|_| {
+                ContextError::PersistenceFailed("service restart counter overflow".into())
+            })?;
+        let dependency_blocks = i64::try_from(runtime.dependency_blocks).map_err(|_| {
+            ContextError::PersistenceFailed("service dependency block counter overflow".into())
+        })?;
+        let mut conn = self.conn.lock().unwrap();
+        let transaction = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
+        transaction
+            .execute(
+                "INSERT INTO service_runtime
+                 (name, definition_revision, status, agent_id, restart_count,
+                  restart_attempts_total, last_exit_code, desired_running, ready, healthy,
+                  restart_exhausted, last_failure, next_restart_at,
+                  restart_window_started_at, last_transition_at, dependency_blocks)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
+                 ON CONFLICT(name) DO UPDATE SET
+                   definition_revision = excluded.definition_revision,
+                   status = excluded.status,
+                   agent_id = excluded.agent_id,
+                   restart_count = excluded.restart_count,
+                   restart_attempts_total = excluded.restart_attempts_total,
+                   last_exit_code = excluded.last_exit_code,
+                   desired_running = excluded.desired_running,
+                   ready = excluded.ready,
+                   healthy = excluded.healthy,
+                   restart_exhausted = excluded.restart_exhausted,
+                   last_failure = excluded.last_failure,
+                   next_restart_at = excluded.next_restart_at,
+                   restart_window_started_at = excluded.restart_window_started_at,
+                   last_transition_at = excluded.last_transition_at,
+                   dependency_blocks = excluded.dependency_blocks",
+                params![
+                    runtime.name,
+                    runtime.definition_revision,
+                    status,
+                    runtime.agent_id.map(|id| id.to_string()),
+                    restart_count,
+                    restart_attempts_total,
+                    runtime.last_exit_code,
+                    i64::from(runtime.desired_running),
+                    i64::from(runtime.ready),
+                    i64::from(runtime.healthy),
+                    i64::from(runtime.restart_exhausted),
+                    runtime.last_failure,
+                    runtime.next_restart_at,
+                    runtime.restart_window_started_at,
+                    runtime.last_transition_at,
+                    dependency_blocks
+                ],
+            )
+            .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
+        transaction
+            .execute(
+                "INSERT INTO service_history
+                 (name, event, status, agent_id, reason, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    runtime.name,
+                    event,
+                    status,
+                    runtime.agent_id.map(|id| id.to_string()),
+                    reason,
+                    Utc::now().to_rfc3339()
+                ],
+            )
+            .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
+        transaction
+            .execute(
+                "DELETE FROM service_history
+                 WHERE name = ?1
+                   AND id NOT IN (
+                     SELECT id FROM service_history
+                     WHERE name = ?1 ORDER BY id DESC LIMIT 1000
+                   )",
+                params![runtime.name],
+            )
+            .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
+        transaction
+            .commit()
+            .map_err(|error| ContextError::PersistenceFailed(error.to_string()))
+    }
+
+    pub fn load_service_runtime(
+        &self,
+    ) -> Result<Vec<crate::init_system::ServiceRuntimeInfo>, ContextError> {
+        let conn = self.conn.lock().unwrap();
+        let mut statement = conn
+            .prepare(
+                "SELECT name, definition_revision, status, agent_id,
+                        restart_count, restart_attempts_total, last_exit_code, desired_running, ready,
+                        healthy, restart_exhausted, last_failure,
+                        next_restart_at, restart_window_started_at,
+                        last_transition_at, dependency_blocks
+                 FROM service_runtime ORDER BY name",
+            )
+            .map_err(|error| ContextError::StorageError(error.to_string()))?;
+        let rows = statement
+            .query_map([], |row| {
+                let status: String = row.get(2)?;
+                let status = serde_json::from_str::<crate::init_system::ServiceStatus>(&status)
+                    .map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            2,
+                            rusqlite::types::Type::Text,
+                            Box::new(error),
+                        )
+                    })?;
+                let agent_id = row
+                    .get::<_, Option<String>>(3)?
+                    .map(|id| {
+                        uuid::Uuid::parse_str(&id).map_err(|error| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                3,
+                                rusqlite::types::Type::Text,
+                                Box::new(error),
+                            )
+                        })
+                    })
+                    .transpose()?;
+                Ok(crate::init_system::ServiceRuntimeInfo {
+                    name: row.get(0)?,
+                    definition_revision: row.get(1)?,
+                    status,
+                    agent_id,
+                    restart_count: u32::try_from(row.get::<_, i64>(4)?.max(0)).unwrap_or(u32::MAX),
+                    restart_attempts_total: row.get::<_, i64>(5)?.max(0) as u64,
+                    last_exit_code: row.get(6)?,
+                    desired_running: row.get::<_, i64>(7)? != 0,
+                    ready: row.get::<_, i64>(8)? != 0,
+                    healthy: row.get::<_, i64>(9)? != 0,
+                    restart_exhausted: row.get::<_, i64>(10)? != 0,
+                    last_failure: row.get(11)?,
+                    next_restart_at: row.get(12)?,
+                    restart_window_started_at: row.get(13)?,
+                    last_transition_at: row.get(14)?,
+                    dependency_blocks: row.get::<_, i64>(15)?.max(0) as u64,
+                })
+            })
+            .map_err(|error| ContextError::StorageError(error.to_string()))?;
+        let mut runtime = Vec::new();
+        for row in rows {
+            runtime.push(row.map_err(|error| ContextError::StorageError(error.to_string()))?);
+        }
+        Ok(runtime)
+    }
+
+    pub fn remove_service_runtime(&self, name: &str, reason: &str) -> Result<(), ContextError> {
+        let mut conn = self.conn.lock().unwrap();
+        let transaction = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
+        transaction
+            .execute("DELETE FROM service_runtime WHERE name = ?1", params![name])
+            .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
+        transaction
+            .execute(
+                "INSERT INTO service_history
+                 (name, event, status, agent_id, reason, created_at)
+                 VALUES (?1, 'definition_removed', ?2, NULL, ?3, ?4)",
+                params![
+                    name,
+                    serde_json::to_string(&crate::init_system::ServiceStatus::Inactive)
+                        .unwrap_or_else(|_| "\"Inactive\"".into()),
+                    reason,
+                    Utc::now().to_rfc3339()
+                ],
+            )
+            .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
+        transaction
+            .commit()
+            .map_err(|error| ContextError::PersistenceFailed(error.to_string()))
+    }
+
+    pub fn list_service_history(
+        &self,
+        name: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<crate::init_system::ServiceHistoryEntry>, ContextError> {
+        let limit = i64::try_from(limit.clamp(1, 1_000)).unwrap_or(1_000);
+        let conn = self.conn.lock().unwrap();
+        let sql = if name.is_some() {
+            "SELECT id, name, event, status, agent_id, reason, created_at
+             FROM service_history WHERE name = ?1 ORDER BY id DESC LIMIT ?2"
+        } else {
+            "SELECT id, name, event, status, agent_id, reason, created_at
+             FROM service_history ORDER BY id DESC LIMIT ?1"
+        };
+        let mut statement = conn
+            .prepare(sql)
+            .map_err(|error| ContextError::StorageError(error.to_string()))?;
+        let map_row = |row: &rusqlite::Row<'_>| {
+            let status: String = row.get(3)?;
+            let status = serde_json::from_str::<crate::init_system::ServiceStatus>(&status)
+                .map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        3,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })?;
+            let agent_id = row
+                .get::<_, Option<String>>(4)?
+                .map(|id| {
+                    uuid::Uuid::parse_str(&id).map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            4,
+                            rusqlite::types::Type::Text,
+                            Box::new(error),
+                        )
+                    })
+                })
+                .transpose()?;
+            Ok(crate::init_system::ServiceHistoryEntry {
+                id: row.get::<_, i64>(0)?.max(0) as u64,
+                name: row.get(1)?,
+                event: row.get(2)?,
+                status,
+                agent_id,
+                reason: row.get(5)?,
+                created_at: row.get(6)?,
+            })
+        };
+        let mut entries = Vec::new();
+        if let Some(name) = name {
+            let rows = statement
+                .query_map(params![name, limit], map_row)
+                .map_err(|error| ContextError::StorageError(error.to_string()))?;
+            for row in rows {
+                entries.push(row.map_err(|error| ContextError::StorageError(error.to_string()))?);
+            }
+        } else {
+            let rows = statement
+                .query_map(params![limit], map_row)
+                .map_err(|error| ContextError::StorageError(error.to_string()))?;
+            for row in rows {
+                entries.push(row.map_err(|error| ContextError::StorageError(error.to_string()))?);
+            }
+        }
+        Ok(entries)
     }
 }
 
@@ -4224,6 +5619,138 @@ impl SqliteContextManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sample_generation_checkpoint(agent_id: AgentId) -> crate::execution::GenerationCheckpoint {
+        crate::execution::GenerationCheckpoint {
+            agent_id,
+            conversation_id: "checkpoint-conversation".into(),
+            user_message: "sensitive prompt".into(),
+            messages: vec![crate::connector::StandardMessage::user("sensitive prompt")],
+            partial_content: String::new(),
+            tool_calls_made: 0,
+            tokens_used: 0,
+            usage: crate::execution::UsageTelemetry::default(),
+        }
+    }
+
+    #[test]
+    fn generation_checkpoint_retention_version_and_corruption_fail_closed() {
+        let manager = SqliteContextManager::in_memory().unwrap();
+        let retention_agent = uuid::Uuid::new_v4();
+        let retention_checkpoint = sample_generation_checkpoint(retention_agent);
+        for _ in 0..(MAX_GENERATION_CHECKPOINTS_PER_AGENT + 3) {
+            manager
+                .save_generation_checkpoint(
+                    DEFAULT_TENANT,
+                    "provider",
+                    "model",
+                    &retention_checkpoint,
+                    std::time::Duration::from_secs(60),
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            manager
+                .list_generation_checkpoints(DEFAULT_TENANT, Some(retention_agent))
+                .unwrap()
+                .len(),
+            MAX_GENERATION_CHECKPOINTS_PER_AGENT
+        );
+
+        let incompatible_agent = uuid::Uuid::new_v4();
+        let incompatible = manager
+            .save_generation_checkpoint(
+                DEFAULT_TENANT,
+                "provider",
+                "model",
+                &sample_generation_checkpoint(incompatible_agent),
+                std::time::Duration::from_secs(60),
+            )
+            .unwrap();
+        manager
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE generation_checkpoints SET version = ?1 WHERE id = ?2",
+                params![
+                    i64::from(GENERATION_CHECKPOINT_VERSION) + 1,
+                    incompatible.to_string()
+                ],
+            )
+            .unwrap();
+        let incompatible_error = manager
+            .claim_generation_checkpoint(incompatible, incompatible_agent, DEFAULT_TENANT)
+            .unwrap_err();
+        assert!(incompatible_error.to_string().contains("incompatible"));
+
+        let corrupt_agent = uuid::Uuid::new_v4();
+        let corrupt = manager
+            .save_generation_checkpoint(
+                DEFAULT_TENANT,
+                "provider",
+                "model",
+                &sample_generation_checkpoint(corrupt_agent),
+                std::time::Duration::from_secs(60),
+            )
+            .unwrap();
+        manager
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE generation_checkpoints SET checkpoint_json = '{' WHERE id = ?1",
+                params![corrupt.to_string()],
+            )
+            .unwrap();
+        let corrupt_error = manager
+            .claim_generation_checkpoint(corrupt, corrupt_agent, DEFAULT_TENANT)
+            .unwrap_err();
+        assert!(corrupt_error.to_string().contains("corrupt"));
+
+        let statuses = manager.conn.lock().unwrap();
+        for (id, expected) in [(incompatible, "incompatible"), (corrupt, "corrupt")] {
+            let status = statuses
+                .query_row(
+                    "SELECT status FROM generation_checkpoints WHERE id = ?1",
+                    params![id.to_string()],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap();
+            assert_eq!(status, expected);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn persistent_checkpoint_store_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!(
+            "aiagentos-checkpoint-permissions-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let db = root.join("kernel.sqlite");
+        let manager = SqliteContextManager::new(&db).unwrap();
+        let agent_id = uuid::Uuid::new_v4();
+        manager
+            .save_generation_checkpoint(
+                DEFAULT_TENANT,
+                "provider",
+                "model",
+                &sample_generation_checkpoint(agent_id),
+                std::time::Duration::from_secs(60),
+            )
+            .unwrap();
+        assert_eq!(
+            std::fs::metadata(&db).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+
+        drop(manager);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[tokio::test]
     async fn create_and_get_context() {
@@ -4655,8 +6182,10 @@ mod tests {
         .unwrap();
         let mgr = SqliteContextManager {
             conn: Mutex::new(conn),
+            storage_limits: RwLock::new(ContextStorageLimits::default()),
             embedder: crate::memory_manager::default_embedder(),
             fail_next_agent_save: AtomicBool::new(false),
+            fail_agent_status_update_after: AtomicUsize::new(0),
         };
         mgr.init_schema().unwrap();
 
@@ -5942,5 +7471,320 @@ mod tests {
         assert!(manager
             .reserve_provider_rate_with_cgroups(uuid::Uuid::new_v4(), 190, 10, 1_000, 1, &scopes,)
             .is_err());
+    }
+
+    fn sha256(value: &str) -> String {
+        ring::digest::digest(&ring::digest::SHA256, value.as_bytes())
+            .as_ref()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    }
+
+    #[test]
+    fn context_spill_quota_restart_integrity_and_retention_fail_closed() {
+        let database = QuotaTestDatabase::new("context-pressure");
+        let agent = uuid::Uuid::new_v4();
+        let legacy_agent = uuid::Uuid::new_v4();
+        let first_value = "a".repeat(80);
+        let first_key = "context_spill:conversation:first";
+        {
+            let manager = SqliteContextManager::new(&database.path).unwrap();
+            manager
+                .set_context_storage_limits(ContextStorageLimits {
+                    per_agent_bytes: 120,
+                    per_tenant_bytes: 200,
+                    global_bytes: 240,
+                    spill_retention_seconds: 60,
+                })
+                .unwrap();
+            manager
+                .store_context_spill(agent, first_key, &first_value, &sha256(&first_value))
+                .unwrap();
+            let error = manager
+                .store_context_spill(
+                    agent,
+                    "context_spill:conversation:second",
+                    &"b".repeat(80),
+                    &sha256(&"b".repeat(80)),
+                )
+                .unwrap_err();
+            assert!(error.to_string().contains("agent would use 160 bytes"));
+            manager
+                .conn
+                .lock()
+                .unwrap()
+                .execute(
+                    "INSERT INTO agent_kv (agent_id, key, value, updated_at)
+                     VALUES (?1, 'context_spill:legacy:1', 'legacy-value', ?2)",
+                    params![legacy_agent.to_string(), Utc::now().to_rfc3339()],
+                )
+                .unwrap();
+        }
+
+        let manager = SqliteContextManager::new(&database.path).unwrap();
+        manager
+            .set_context_storage_limits(ContextStorageLimits {
+                per_agent_bytes: 120,
+                per_tenant_bytes: 200,
+                global_bytes: 240,
+                spill_retention_seconds: 60,
+            })
+            .unwrap();
+        assert_eq!(
+            manager.kv_get(agent, first_key).unwrap().as_deref(),
+            Some(first_value.as_str())
+        );
+        assert_eq!(
+            manager
+                .kv_get(legacy_agent, "context_spill:legacy:1")
+                .unwrap()
+                .as_deref(),
+            Some("legacy-value"),
+            "legacy spills must gain digest/retention metadata during restart migration"
+        );
+        manager
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE agent_kv SET value = 'corrupt'
+                 WHERE agent_id = ?1 AND key = ?2",
+                params![agent.to_string(), first_key],
+            )
+            .unwrap();
+        assert!(manager
+            .kv_get(agent, first_key)
+            .unwrap_err()
+            .to_string()
+            .contains("digest mismatch"));
+        manager
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE context_spills SET expires_at = ?1
+                 WHERE agent_id = ?2 AND key = ?3",
+                params![
+                    (Utc::now() - chrono::Duration::seconds(1)).to_rfc3339(),
+                    agent.to_string(),
+                    first_key
+                ],
+            )
+            .unwrap();
+        assert_eq!(manager.kv_get(agent, first_key).unwrap(), None);
+        assert_eq!(
+            manager.context_pressure_stats(agent).unwrap().stored_spills,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn durable_context_quota_covers_conversations_embeddings_and_checkpoints() {
+        let manager = SqliteContextManager::in_memory().unwrap();
+        manager
+            .set_context_storage_limits(ContextStorageLimits {
+                per_agent_bytes: 128,
+                per_tenant_bytes: 0,
+                global_bytes: 0,
+                spill_retention_seconds: 60,
+            })
+            .unwrap();
+
+        let conversation_agent = uuid::Uuid::new_v4();
+        let conversation = vec![crate::connector::StandardMessage::user("x".repeat(256))];
+        assert!(manager
+            .save_conversation("oversized", conversation_agent, &conversation)
+            .unwrap_err()
+            .to_string()
+            .contains("context storage pressure"));
+
+        let fact_agent = uuid::Uuid::new_v4();
+        let fact = Fact {
+            id: uuid::Uuid::new_v4(),
+            content: "memory".repeat(40),
+            category: FactCategory::Fact,
+            created_at: Utc::now(),
+            last_accessed_at: Utc::now(),
+            embedding: None,
+        };
+        assert!(manager
+            .store_fact(fact_agent, fact)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("context storage pressure"));
+
+        let checkpoint_agent = uuid::Uuid::new_v4();
+        assert!(manager
+            .save_generation_checkpoint(
+                DEFAULT_TENANT,
+                "provider",
+                "model",
+                &sample_generation_checkpoint(checkpoint_agent),
+                std::time::Duration::from_secs(60),
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("context storage pressure"));
+    }
+
+    #[test]
+    fn durable_storage_admission_is_tenant_and_global_isolated() {
+        let manager = SqliteContextManager::in_memory().unwrap();
+        manager
+            .set_context_storage_limits(ContextStorageLimits {
+                per_agent_bytes: 200,
+                per_tenant_bytes: 150,
+                global_bytes: 220,
+                spill_retention_seconds: 60,
+            })
+            .unwrap();
+        let a = uuid::Uuid::new_v4();
+        let b = uuid::Uuid::new_v4();
+        let c = uuid::Uuid::new_v4();
+        {
+            let conn = manager.conn.lock().unwrap();
+            for (agent, tenant) in [(a, "tenant-a"), (b, "tenant-a"), (c, "tenant-b")] {
+                conn.execute(
+                    "INSERT INTO agents
+                     (id, session_id, name, task, llm_provider, permission_profile,
+                      priority, status, created_at, last_activity_at, tenant_id)
+                     VALUES (?1, ?2, 'agent', 'task', 'provider', 'standard',
+                             3, '\"Running\"', ?3, ?3, ?4)",
+                    params![
+                        agent.to_string(),
+                        uuid::Uuid::new_v4().to_string(),
+                        Utc::now().to_rfc3339(),
+                        tenant
+                    ],
+                )
+                .unwrap();
+            }
+        }
+        let value = "x".repeat(80);
+        manager
+            .store_context_spill(a, "context_spill:a:1", &value, &sha256(&value))
+            .unwrap();
+        let tenant_error = manager
+            .store_context_spill(b, "context_spill:b:1", &value, &sha256(&value))
+            .unwrap_err();
+        assert!(tenant_error
+            .to_string()
+            .contains("tenant would use 160 bytes"));
+
+        manager
+            .store_context_spill(c, "context_spill:c:1", &value, &sha256(&value))
+            .unwrap();
+        let global_error = manager
+            .store_context_spill(
+                c,
+                "context_spill:c:2",
+                &"y".repeat(70),
+                &sha256(&"y".repeat(70)),
+            )
+            .unwrap_err();
+        assert!(global_error
+            .to_string()
+            .contains("global would use 230 bytes"));
+        assert_eq!(
+            manager
+                .context_pressure_stats(a)
+                .unwrap()
+                .tenant_stored_bytes,
+            80
+        );
+        assert_eq!(
+            manager
+                .context_pressure_stats(c)
+                .unwrap()
+                .global_stored_bytes,
+            160
+        );
+    }
+
+    #[test]
+    fn independent_sqlite_handles_cannot_race_past_context_storage_limit() {
+        let database = QuotaTestDatabase::new("context-storage-race");
+        let first = Arc::new(SqliteContextManager::new(&database.path).unwrap());
+        let second = Arc::new(SqliteContextManager::new(&database.path).unwrap());
+        let limits = ContextStorageLimits {
+            per_agent_bytes: 0,
+            per_tenant_bytes: 100,
+            global_bytes: 100,
+            spill_retention_seconds: 60,
+        };
+        first.set_context_storage_limits(limits).unwrap();
+        second.set_context_storage_limits(limits).unwrap();
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let attempts = [
+            (first, uuid::Uuid::new_v4()),
+            (second, uuid::Uuid::new_v4()),
+        ]
+        .into_iter()
+        .map(|(manager, agent)| {
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                let value = "r".repeat(80);
+                barrier.wait();
+                manager.store_context_spill(
+                    agent,
+                    &format!("context_spill:race:{agent}"),
+                    &value,
+                    &sha256(&value),
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+        let results = attempts
+            .into_iter()
+            .map(|attempt| attempt.join().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(results.iter().filter(|result| result.is_err()).count(), 1);
+        assert!(results
+            .iter()
+            .filter_map(|result| result.as_ref().err())
+            .any(|error| error.to_string().contains("context storage pressure")));
+    }
+
+    #[tokio::test]
+    async fn durable_context_ids_cannot_be_reassigned_across_agents() {
+        let manager = SqliteContextManager::in_memory().unwrap();
+        let owner = uuid::Uuid::new_v4();
+        let foreign = uuid::Uuid::new_v4();
+        manager
+            .save_conversation(
+                "owned-conversation",
+                owner,
+                &[crate::connector::StandardMessage::user("owner")],
+            )
+            .unwrap();
+        assert!(manager
+            .save_conversation(
+                "owned-conversation",
+                foreign,
+                &[crate::connector::StandardMessage::user("foreign")],
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("owned by another agent"));
+
+        let fact_id = uuid::Uuid::new_v4();
+        let fact = Fact {
+            id: fact_id,
+            content: "owner fact".into(),
+            category: FactCategory::Fact,
+            created_at: Utc::now(),
+            last_accessed_at: Utc::now(),
+            embedding: None,
+        };
+        manager.store_fact(owner, fact.clone()).await.unwrap();
+        assert!(manager
+            .store_fact(foreign, fact)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("owned by another agent"));
     }
 }

@@ -41,9 +41,11 @@ use tokio::net::ToSocketAddrs;
 // Re-export the kernel wire types that appear in this crate's public API, so
 // SDK consumers can name them without depending on the kernel directly.
 pub use kernel::context::ContextPressureStats;
-pub use kernel::init_system::ServiceRuntimeInfo;
+pub use kernel::init_system::{ServiceHistoryEntry, ServiceRuntimeInfo};
+pub use kernel::operator_control::{OperatorTunable, OperatorTunableAudit};
 pub use kernel::syscall_server::{
     AgentSummary, FactSummary, GenerationCheckpointSummary, OperatorAgentSnapshot,
+    OperatorCgroupSnapshot, OperatorNamespaceSnapshot, OperatorPackageSnapshot,
     OperatorServiceSnapshot, OperatorSnapshot, ProviderSummary, WireErrorCode,
 };
 
@@ -697,6 +699,65 @@ impl KernelClient {
         }
     }
 
+    pub async fn list_operator_tunables(&mut self) -> Result<Vec<OperatorTunable>, SdkError> {
+        match self.call(Syscall::ListOperatorTunables).await? {
+            SyscallReply::OperatorTunables { tunables } => Ok(tunables),
+            other => Err(unexpected("OperatorTunables", &other)),
+        }
+    }
+
+    pub async fn set_operator_tunable(
+        &mut self,
+        name: impl Into<String>,
+        value: u64,
+        expected_revision: u64,
+    ) -> Result<OperatorTunable, SdkError> {
+        match self
+            .call(Syscall::SetOperatorTunable {
+                name: name.into(),
+                value,
+                expected_revision,
+            })
+            .await?
+        {
+            SyscallReply::OperatorTunable { tunable } => Ok(tunable),
+            other => Err(unexpected("OperatorTunable", &other)),
+        }
+    }
+
+    pub async fn rollback_operator_tunable(
+        &mut self,
+        name: impl Into<String>,
+        target_revision: u64,
+        expected_revision: u64,
+    ) -> Result<OperatorTunable, SdkError> {
+        match self
+            .call(Syscall::RollbackOperatorTunable {
+                name: name.into(),
+                target_revision,
+                expected_revision,
+            })
+            .await?
+        {
+            SyscallReply::OperatorTunable { tunable } => Ok(tunable),
+            other => Err(unexpected("OperatorTunable", &other)),
+        }
+    }
+
+    pub async fn operator_tunable_audit(
+        &mut self,
+        name: Option<String>,
+        limit: usize,
+    ) -> Result<Vec<OperatorTunableAudit>, SdkError> {
+        match self
+            .call(Syscall::ListOperatorTunableAudit { name, limit })
+            .await?
+        {
+            SyscallReply::OperatorTunableAudit { entries } => Ok(entries),
+            other => Err(unexpected("OperatorTunableAudit", &other)),
+        }
+    }
+
     pub async fn list_services(&mut self) -> Result<Vec<ServiceRuntimeInfo>, SdkError> {
         match self.call(Syscall::ListServices).await? {
             SyscallReply::Services { services } => Ok(services),
@@ -740,6 +801,27 @@ impl KernelClient {
         {
             SyscallReply::Service { service } => Ok(service),
             other => Err(unexpected("Service", &other)),
+        }
+    }
+
+    pub async fn reload_services(&mut self) -> Result<Vec<String>, SdkError> {
+        match self.call(Syscall::ReloadServices).await? {
+            SyscallReply::ServiceConfigurationReloaded { boot_order } => Ok(boot_order),
+            other => Err(unexpected("ServiceConfigurationReloaded", &other)),
+        }
+    }
+
+    pub async fn service_history(
+        &mut self,
+        name: Option<String>,
+        limit: usize,
+    ) -> Result<Vec<ServiceHistoryEntry>, SdkError> {
+        match self
+            .call(Syscall::ListServiceHistory { name, limit })
+            .await?
+        {
+            SyscallReply::ServiceHistory { entries } => Ok(entries),
+            other => Err(unexpected("ServiceHistory", &other)),
         }
     }
 
@@ -1123,6 +1205,142 @@ mod protocol_tests {
         }
     }
 
+    pub(super) async fn assert_public_lifecycle_contract(client: &mut KernelClient, prefix: &str) {
+        fn assert_kernel_error(error: SdkError, expected: &str) {
+            match error {
+                SdkError::Kernel(message) => assert!(
+                    message.contains(expected),
+                    "expected kernel error containing {expected:?}, got {message:?}"
+                ),
+                other => panic!("expected kernel error containing {expected:?}, got {other:?}"),
+            }
+        }
+
+        // Running, Paused, and Stopped are the stable states exposed by the
+        // public protocol. Exercise every valid operation/state pairing plus
+        // the invalid terminal transitions over the caller's real transport.
+        let paused_stop = client
+            .create_agent(
+                format!("{prefix}-paused-stop"),
+                "public lifecycle matrix",
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            client.agent_status(paused_stop.clone()).await.unwrap(),
+            "Running"
+        );
+        assert_eq!(
+            client.resume_agent(paused_stop.clone()).await.unwrap(),
+            "Running"
+        );
+        assert_kernel_error(
+            client
+                .wait_agent(paused_stop.clone(), std::time::Duration::from_millis(20))
+                .await
+                .unwrap_err(),
+            "timed out",
+        );
+        assert_eq!(
+            client.pause_agent(paused_stop.clone()).await.unwrap(),
+            "Paused"
+        );
+        assert_eq!(
+            client.agent_status(paused_stop.clone()).await.unwrap(),
+            "Paused"
+        );
+        assert_eq!(
+            client.pause_agent(paused_stop.clone()).await.unwrap(),
+            "Paused"
+        );
+        assert!(client
+            .send_message(paused_stop.clone(), "must not run while paused")
+            .await
+            .is_err());
+        assert_eq!(
+            client.resume_agent(paused_stop.clone()).await.unwrap(),
+            "Running"
+        );
+        assert_eq!(
+            client.pause_agent(paused_stop.clone()).await.unwrap(),
+            "Paused"
+        );
+        assert_eq!(
+            client.stop_agent(paused_stop.clone()).await.unwrap(),
+            "Stopped"
+        );
+        assert_eq!(
+            client.stop_agent(paused_stop.clone()).await.unwrap(),
+            "Stopped"
+        );
+        assert_eq!(
+            client.kill_agent(paused_stop.clone()).await.unwrap(),
+            "Stopped"
+        );
+        assert_eq!(
+            client
+                .wait_agent(paused_stop.clone(), std::time::Duration::from_secs(1),)
+                .await
+                .unwrap(),
+            "Stopped"
+        );
+        assert_kernel_error(
+            client.pause_agent(paused_stop.clone()).await.unwrap_err(),
+            "Invalid state transition",
+        );
+        assert_kernel_error(
+            client.resume_agent(paused_stop.clone()).await.unwrap_err(),
+            "Invalid state transition",
+        );
+        assert!(client
+            .send_message(paused_stop, "must not run after stop")
+            .await
+            .is_err());
+
+        let running_stop = client
+            .create_agent(
+                format!("{prefix}-running-stop"),
+                "stop from running",
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(client.stop_agent(running_stop).await.unwrap(), "Stopped");
+
+        let running_kill = client
+            .create_agent(
+                format!("{prefix}-running-kill"),
+                "kill from running",
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(client.kill_agent(running_kill).await.unwrap(), "Stopped");
+
+        let paused_kill = client
+            .create_agent(
+                format!("{prefix}-paused-kill"),
+                "kill from paused",
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            client.pause_agent(paused_kill.clone()).await.unwrap(),
+            "Paused"
+        );
+        assert_eq!(client.kill_agent(paused_kill).await.unwrap(), "Stopped");
+    }
+
     /// `hello()` negotiates against a current server and returns its window.
     #[tokio::test]
     async fn sdk_hello_negotiates_current_server() {
@@ -1146,25 +1364,7 @@ mod protocol_tests {
         tokio::spawn(server.serve());
 
         let mut client = KernelClient::connect(addr).await.expect("connect");
-        let id = client
-            .create_agent("lifecycle-sdk", "test lifecycle", None, None, None)
-            .await
-            .unwrap();
-
-        assert_eq!(client.agent_status(id.clone()).await.unwrap(), "Running");
-        assert_eq!(client.pause_agent(id.clone()).await.unwrap(), "Paused");
-        assert_eq!(client.pause_agent(id.clone()).await.unwrap(), "Paused");
-        assert!(client.send_message(id.clone(), "blocked").await.is_err());
-        assert_eq!(client.resume_agent(id.clone()).await.unwrap(), "Running");
-        assert_eq!(client.stop_agent(id.clone()).await.unwrap(), "Stopped");
-        assert_eq!(client.stop_agent(id.clone()).await.unwrap(), "Stopped");
-        assert_eq!(
-            client
-                .wait_agent(id, std::time::Duration::from_secs(1))
-                .await
-                .unwrap(),
-            "Stopped"
-        );
+        assert_public_lifecycle_contract(&mut client, "tcp").await;
     }
 
     #[tokio::test]
@@ -1184,7 +1384,12 @@ mod protocol_tests {
         let uuid = id.parse::<kernel::AgentId>().unwrap();
         kernel
             .context_manager
-            .kv_put(uuid, "context_spill:test:1", "sensitive prompt content")
+            .store_context_spill(
+                uuid,
+                "context_spill:test:1",
+                "sensitive prompt content",
+                "d53a2e0e81dc3fddd58698ee6aaa79e0e885f0e52d510b91ecd127ddc91e1058",
+            )
             .unwrap();
         kernel
             .context_manager
@@ -1214,36 +1419,20 @@ mod protocol_tests {
 
     #[tokio::test]
     async fn sdk_service_supervisor_uses_public_coordinated_lifecycle() {
-        use kernel::init_system::{
-            DependencyConfig, ExecConfig, ResourceConfig, RestartPolicy, ServiceConfig, ServiceDef,
-            ServiceStatus, ServiceType,
-        };
+        use kernel::init_system::ServiceStatus;
 
         let kernel = Arc::new(AgentKernelImpl::new().expect("kernel new"));
-        kernel
-            .os
-            .init
-            .lock()
-            .await
-            .replace_definitions(vec![ServiceDef {
-                name: "public-service".into(),
-                description: Some("public service test".into()),
-                exec: ExecConfig {
-                    provider: "stub".into(),
-                    system_prompt: "run".into(),
-                    tools: Vec::new(),
-                    model: None,
-                },
-                service: ServiceConfig {
-                    restart: RestartPolicy::OnFailure,
-                    restart_delay_ms: 0,
-                    max_restarts: 2,
-                    service_type: ServiceType::Simple,
-                },
-                dependencies: DependencyConfig::default(),
-                resources: ResourceConfig::default(),
-            }])
-            .unwrap();
+        let directory =
+            std::env::temp_dir().join(format!("agentos-sdk-service-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let definition_path = directory.join("public-service.toml");
+        std::fs::write(
+            &definition_path,
+            "name = \"public-service\"\ndescription = \"public service test\"\n\
+             [exec]\nprovider = \"stub\"\nsystem_prompt = \"run\"\n",
+        )
+        .unwrap();
+        kernel.reload_service_directory(&directory).await.unwrap();
         let server = SyscallServer::bind(Arc::clone(&kernel), "127.0.0.1:0")
             .await
             .unwrap();
@@ -1256,17 +1445,49 @@ mod protocol_tests {
         assert_eq!(started.status, ServiceStatus::Running);
         let first_agent = started.agent_id.unwrap();
 
-        let restarted = client.restart_service("public-service").await.unwrap();
-        assert_eq!(restarted.status, ServiceStatus::Running);
-        assert_ne!(restarted.agent_id, Some(first_agent));
+        std::fs::write(
+            &definition_path,
+            "name = \"public-service\"\ndescription = \"reloaded public service\"\n\
+             [exec]\nprovider = \"stub\"\nsystem_prompt = \"run\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            client.reload_services().await.unwrap(),
+            vec!["public-service"]
+        );
+        let reloaded = client.list_services().await.unwrap().remove(0);
+        assert_ne!(reloaded.agent_id, Some(first_agent));
+        let reloaded_agent = reloaded.agent_id.unwrap();
         assert_eq!(
             client.agent_status(first_agent.to_string()).await.unwrap(),
+            "Stopped"
+        );
+
+        let restarted = client.restart_service("public-service").await.unwrap();
+        assert_eq!(restarted.status, ServiceStatus::Running);
+        assert_ne!(restarted.agent_id, Some(reloaded_agent));
+        assert_eq!(
+            client
+                .agent_status(reloaded_agent.to_string())
+                .await
+                .unwrap(),
             "Stopped"
         );
 
         let stopped = client.stop_service("public-service").await.unwrap();
         assert_eq!(stopped.status, ServiceStatus::Inactive);
         assert!(stopped.agent_id.is_none());
+        let history = client
+            .service_history(Some("public-service".into()), 100)
+            .await
+            .unwrap();
+        assert!(history.iter().any(|entry| entry.event == "ready"));
+        assert!(history.iter().any(|entry| entry.event == "manual_restart"));
+        assert!(history
+            .iter()
+            .any(|entry| entry.event == "configuration_reloaded"));
+        assert!(history.iter().any(|entry| entry.event == "stopped"));
+        let _ = std::fs::remove_dir_all(directory);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1397,5 +1618,6 @@ mod tls_tests {
             agents.iter().any(|a| a.id == id && a.name == "tls-sdk"),
             "agent created over the SDK TLS client should be listed: {agents:?}"
         );
+        crate::protocol_tests::assert_public_lifecycle_contract(&mut client, "tls").await;
     }
 }

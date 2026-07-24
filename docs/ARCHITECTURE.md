@@ -79,6 +79,7 @@ syscall_gate ◀── the chokepoint                       budget_enforcer (USD
 turn_admission (CFS-ordered turn gate)                llm_scheduler (bounded "LLM cores")
 tenant/profile/agent cgroup maps (stable hierarchy)  group_namespaces (per agent group)
 executors (per-agent AgentExecutor)                   event_tx (broadcast KernelEvent)
+operator_control (durable tunables + snapshot barrier)
 os: OsSubsystems { cfs, namespaces, init, procfs, sysctl }
 ```
 
@@ -106,7 +107,7 @@ which CI verifies against every public kernel module.
 | `cgroups`, `budget`, `rate_limit`, `metrics` | Resource control and accounting | `resource-accounting` |
 | `syscall_gate`, `custom_tools` | Tool enforcement chokepoint | `tool-governance` |
 | `init_system`, `runtime` | systemd-style service boot and supervision | `init-supervisor` |
-| `agentctl`, `agentps`, `procfs`, `observability`, `event_loop`, `sysctl` | `/proc`, control, audit, events, tunables | `operator-control` |
+| SDK-backed `crates/cli/src/bin/agentctl.rs`, `agentps`, `procfs`, `observability`, `event_loop`, `sysctl` | typed control, audit, events, tunables | `operator-control` |
 | `syscall_server`, `mcp`, `mcp_server`; experimental `syscall_interface` | Versioned JSON/TLS ABI and MCP; numbered prototype outside v1 | `syscall-vfs`, `wire-protocol` |
 | `agentpkg`, `package`, `agent_package`, `marketplace`, `agent_hub`, `tool_registry_share` | apt-like packages and registry | `package-trust` |
 | `execution` | resumable think→act→observe loop | `turn-checkpoints` |
@@ -214,10 +215,12 @@ bypass the combined declaration/slot gate from a new execution path.
 ## 8. Context & memory
 
 - **Context pressure** (`execution.rs`, with legacy paging primitives in
-  `context_paging.rs`) — `max_context_tokens` bounds the live provider prompt.
-  Old non-pinned messages are serialized to durable per-agent storage and
-  replaced by a verifiable reference; impossible pinned state fails closed.
-  There is no host-memory OOM-killer claim. See
+  `context_paging.rs`) — agent, tenant, and kernel limits atomically bound
+  active provider prompts, while durable-byte limits cover conversations,
+  spills, embeddings, snapshots, and checkpoints. Old non-pinned messages are
+  serialized to retained per-agent storage and replaced by a digest-verified
+  reference; impossible pinned or storage state fails closed. There is no
+  host-memory OOM-killer claim. See
   [`CONTEXT_PRESSURE.md`](CONTEXT_PRESSURE.md).
 - **Long-term memory** (`memory_manager.rs`) — a pluggable embedding seam:
   - `Embedder` trait (object-safe, `Arc<dyn Embedder>`); default `BlendedEmbedder`

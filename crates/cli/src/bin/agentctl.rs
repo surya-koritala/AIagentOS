@@ -7,7 +7,7 @@ use agent_sdk::KernelClient;
 fn usage() -> ! {
     eprintln!(
         "usage: agentctl [--addr HOST:PORT] [--token TOKEN] \
-         <list|inspect|pressure|status|pause|resume|stop|kill|wait|services|service-start|service-stop|service-restart> [ID_OR_NAME] [TIMEOUT_MS]"
+         <list|inspect|pressure|tunables|tunable-set|tunable-rollback|tunable-history|status|pause|resume|stop|kill|wait|services|service-start|service-stop|service-restart|service-reload|service-history> [ARGS...]"
     );
     std::process::exit(2);
 }
@@ -79,6 +79,95 @@ async fn main() {
             );
             return;
         }
+        "tunables" => {
+            let tunables = client
+                .list_operator_tunables()
+                .await
+                .unwrap_or_else(|error| fail(error));
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&tunables).unwrap_or_else(|error| {
+                    fail(agent_sdk::SdkError::Kernel(format!(
+                        "tunable encoding failed: {error}"
+                    )))
+                })
+            );
+            return;
+        }
+        "tunable-set" => {
+            let name = args.next().unwrap_or_else(|| usage());
+            let value = args
+                .next()
+                .unwrap_or_else(|| usage())
+                .parse::<u64>()
+                .unwrap_or_else(|_| usage());
+            let expected_revision = args
+                .next()
+                .unwrap_or_else(|| usage())
+                .parse::<u64>()
+                .unwrap_or_else(|_| usage());
+            let tunable = client
+                .set_operator_tunable(name, value, expected_revision)
+                .await
+                .unwrap_or_else(|error| fail(error));
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&tunable).unwrap_or_else(|error| {
+                    fail(agent_sdk::SdkError::Kernel(format!(
+                        "tunable encoding failed: {error}"
+                    )))
+                })
+            );
+            return;
+        }
+        "tunable-rollback" => {
+            let name = args.next().unwrap_or_else(|| usage());
+            let target_revision = args
+                .next()
+                .unwrap_or_else(|| usage())
+                .parse::<u64>()
+                .unwrap_or_else(|_| usage());
+            let expected_revision = args
+                .next()
+                .unwrap_or_else(|| usage())
+                .parse::<u64>()
+                .unwrap_or_else(|_| usage());
+            let tunable = client
+                .rollback_operator_tunable(name, target_revision, expected_revision)
+                .await
+                .unwrap_or_else(|error| fail(error));
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&tunable).unwrap_or_else(|error| {
+                    fail(agent_sdk::SdkError::Kernel(format!(
+                        "tunable encoding failed: {error}"
+                    )))
+                })
+            );
+            return;
+        }
+        "tunable-history" => {
+            let name = args.next();
+            let limit = args
+                .next()
+                .as_deref()
+                .unwrap_or("100")
+                .parse::<usize>()
+                .unwrap_or_else(|_| usage());
+            let entries = client
+                .operator_tunable_audit(name, limit)
+                .await
+                .unwrap_or_else(|error| fail(error));
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&entries).unwrap_or_else(|error| {
+                    fail(agent_sdk::SdkError::Kernel(format!(
+                        "tunable audit encoding failed: {error}"
+                    )))
+                })
+            );
+            return;
+        }
         "services" => {
             for service in client
                 .list_services()
@@ -86,14 +175,17 @@ async fn main() {
                 .unwrap_or_else(|error| fail(error))
             {
                 println!(
-                    "{}\t{:?}\t{}\trestarts={}",
+                    "{}\t{:?}\t{}\tready={}\thealthy={}\trestarts={}\tdesired={}",
                     service.name,
                     service.status,
                     service
                         .agent_id
                         .map(|id| id.to_string())
                         .unwrap_or_else(|| "-".into()),
-                    service.restart_count
+                    service.ready,
+                    service.healthy,
+                    service.restart_count,
+                    service.desired_running,
                 );
             }
             return;
@@ -120,6 +212,36 @@ async fn main() {
                 .await
                 .unwrap_or_else(|error| fail(error));
             println!("{}\t{:?}", service.name, service.status);
+            return;
+        }
+        "service-reload" => {
+            let order = client
+                .reload_services()
+                .await
+                .unwrap_or_else(|error| fail(error));
+            println!("{}", order.join("\n"));
+            return;
+        }
+        "service-history" => {
+            let name = args.next();
+            let limit = args
+                .next()
+                .as_deref()
+                .unwrap_or("100")
+                .parse::<usize>()
+                .unwrap_or_else(|_| usage());
+            let history = client
+                .service_history(name, limit)
+                .await
+                .unwrap_or_else(|error| fail(error));
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&history).unwrap_or_else(|error| {
+                    fail(agent_sdk::SdkError::Kernel(format!(
+                        "service history encoding failed: {error}"
+                    )))
+                })
+            );
             return;
         }
         "status" => {

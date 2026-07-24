@@ -2,13 +2,13 @@
 //!
 //! Defines the core orchestrator interface for managing agent lifecycle,
 //! state queries, and event subscriptions. Provides a concrete `AgentManager`
-//! implementation with state machine validation, watchdog timers, and
-//! lock-free concurrent agent storage.
+//! implementation with state machine validation and lock-free concurrent agent
+//! storage. The wired kernel runtime owns watchdog termination so every timeout
+//! flows through the coordinated cleanup path.
 
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
 use tokio::sync::broadcast;
 
 use crate::models::Agent;
@@ -102,10 +102,6 @@ pub trait AgentKernel: Send + Sync {
 /// Duration allowed for agent initialization before timeout.
 const INIT_TIMEOUT_SECS: u64 = 5;
 
-/// Duration after which an unresponsive agent is terminated.
-#[allow(dead_code)]
-const WATCHDOG_TIMEOUT_SECS: u64 = 30;
-
 /// Concrete implementation of the AgentKernel trait.
 ///
 /// Uses `DashMap` for lock-free concurrent agent storage and
@@ -163,50 +159,30 @@ impl AgentManager {
         Ok(old_state)
     }
 
-    /// Start a watchdog timer for an agent. If the agent remains in the Running
-    /// state without activity for 30 seconds, it is transitioned to Error.
-    #[allow(dead_code)]
-    fn start_watchdog(self: &Arc<Self>, agent_id: AgentId) {
-        let manager = Arc::clone(self);
-        tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(tokio::time::Duration::from_secs(WATCHDOG_TIMEOUT_SECS)).await;
-
-                // Check if agent still exists and is in Running state
-                let should_terminate = {
-                    if let Some(agent) = manager.agents.get(&agent_id) {
-                        if agent.state == AgentState::Running {
-                            let elapsed = Utc::now()
-                                .signed_duration_since(agent.last_activity_at)
-                                .num_seconds();
-                            elapsed >= WATCHDOG_TIMEOUT_SECS as i64
-                        } else {
-                            // Agent is no longer running, stop the watchdog
-                            return;
-                        }
-                    } else {
-                        // Agent no longer exists, stop the watchdog
-                        return;
-                    }
-                };
-
-                if should_terminate {
-                    let _ = manager.transition_state(
-                        agent_id,
-                        AgentState::Error("Unresponsive for 30 seconds".to_string()),
-                    );
-                    // After transitioning to Error, release resources and move to Stopped
-                    let _ = manager.transition_state(agent_id, AgentState::Stopped);
-                    return;
-                }
-            }
-        });
-    }
-
     /// Record activity for an agent (resets the watchdog timer effectively).
     pub fn record_activity(&self, agent_id: AgentId) {
         if let Some(mut agent) = self.agents.get_mut(&agent_id) {
             agent.last_activity_at = Utc::now();
+        }
+    }
+
+    /// Whether a running agent has recorded no progress since `cutoff`.
+    /// Kernel watchdog code combines this with active-turn membership so an
+    /// intentionally idle runnable agent is never treated as hung.
+    pub(crate) fn is_unresponsive_since(&self, agent_id: AgentId, cutoff: DateTime<Utc>) -> bool {
+        self.agents.get(&agent_id).is_some_and(|agent| {
+            agent.state == AgentState::Running && agent.last_activity_at <= cutoff
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_last_activity_for_test(
+        &self,
+        agent_id: AgentId,
+        last_activity_at: DateTime<Utc>,
+    ) {
+        if let Some(mut agent) = self.agents.get_mut(&agent_id) {
+            agent.last_activity_at = last_activity_at;
         }
     }
 
@@ -233,8 +209,30 @@ impl AgentManager {
         self.agents.get(&agent_id).map(|agent| agent.config.clone())
     }
 
+    /// Enter the non-runnable cleanup state from any non-terminal state. Forced
+    /// kill uses this after durably staging `Stopping`, before revoking live
+    /// subsystem state.
+    pub(crate) fn force_stopping(&self, agent_id: AgentId) -> Result<(), KernelError> {
+        let mut agent = self
+            .agents
+            .get_mut(&agent_id)
+            .ok_or(AgentError::NotFound(agent_id))?;
+        let old = agent.state.clone();
+        if matches!(old, AgentState::Stopping | AgentState::Stopped) {
+            return Ok(());
+        }
+        agent.state = AgentState::Stopping;
+        agent.last_activity_at = Utc::now();
+        let _ = self.event_tx.send(KernelEvent::AgentStateChanged {
+            agent_id,
+            old,
+            new: AgentState::Stopping,
+        });
+        Ok(())
+    }
+
     /// Forced terminal transition used only by the kernel lifecycle coordinator
-    /// after it has cancelled execution and begun subsystem cleanup.
+    /// after every mandatory subsystem cleanup step has completed.
     pub fn force_stopped(&self, agent_id: AgentId) -> Result<(), KernelError> {
         let mut agent = self
             .agents
@@ -258,8 +256,10 @@ impl AgentManager {
     /// bypassing the create/init state machine (the agent already existed across
     /// the restart). Used by the kernel's boot-time registry rehydration to bring
     /// agents back with their original id, session, config, and timestamps. A
-    /// restored agent that was mid-flight is brought up `Running` so it is
-    /// schedulable again; terminal states are preserved as-is.
+    /// The caller must resolve interrupted transitional states before invoking
+    /// this method. The supplied state is restored exactly so this low-level
+    /// primitive can never turn an incomplete initialization or shutdown into
+    /// runnable work.
     pub fn restore_agent(
         &self,
         id: AgentId,
@@ -269,21 +269,12 @@ impl AgentManager {
         created_at: DateTime<Utc>,
         last_activity_at: DateTime<Utc>,
     ) {
-        // Map only transient states to Running so interrupted initialization or
-        // stopping can recover. A deliberate pause must survive restart, while
-        // terminal states remain terminal and are not re-admitted by the kernel.
-        let restored_state = match state {
-            AgentState::Paused => AgentState::Paused,
-            AgentState::Stopped => AgentState::Stopped,
-            AgentState::Error(e) => AgentState::Error(e),
-            _ => AgentState::Running,
-        };
         let sandbox_id = config.sandbox_config.as_ref().map(|_| uuid::Uuid::new_v4());
         let agent = Agent {
             id,
             session_id,
             name: config.name.clone(),
-            state: restored_state,
+            state,
             config,
             sandbox_id,
             created_at,
@@ -806,6 +797,7 @@ mod tests {
             max_disk_usage_bytes: None,
             max_memory_bytes: None,
             isolation_level: crate::IsolationLevel::Filesystem,
+            container_image: None,
         });
 
         let manager = AgentManager::new(16);
@@ -816,44 +808,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn watchdog_terminates_unresponsive_agent() {
-        // Use a shorter timeout for testing by directly manipulating last_activity_at
-        let manager = Arc::new(AgentManager::new(16));
+    async fn watchdog_detection_requires_running_state_older_than_cutoff() {
+        let manager = AgentManager::new(16);
         let handle = manager.create_agent(test_config()).await.unwrap();
-
-        // Set last_activity_at to 31 seconds ago to simulate unresponsiveness
-        {
-            let mut agent = manager.agents.get_mut(&handle.id).unwrap();
-            agent.last_activity_at = Utc::now() - chrono::Duration::seconds(31);
-        }
-
-        // Start watchdog — it will check immediately after WATCHDOG_TIMEOUT_SECS sleep
-        // For testing, we simulate the watchdog logic directly
-        let should_terminate = {
-            let agent = manager.agents.get(&handle.id).unwrap();
-            let elapsed = Utc::now()
-                .signed_duration_since(agent.last_activity_at)
-                .num_seconds();
-            agent.state == AgentState::Running && elapsed >= WATCHDOG_TIMEOUT_SECS as i64
-        };
-
-        assert!(should_terminate);
-
-        // Simulate what the watchdog would do
-        manager
-            .transition_state(
-                handle.id,
-                AgentState::Error("Unresponsive for 30 seconds".to_string()),
-            )
-            .unwrap();
-        manager
-            .transition_state(handle.id, AgentState::Stopped)
-            .unwrap();
-
-        assert_eq!(
-            manager.get_agent_state(handle.id),
-            Some(AgentState::Stopped)
-        );
+        let now = Utc::now();
+        manager.set_last_activity_for_test(handle.id, now - chrono::Duration::seconds(31));
+        assert!(manager.is_unresponsive_since(handle.id, now - chrono::Duration::seconds(30)));
+        manager.pause_agent(handle.id).await.unwrap();
+        assert!(!manager.is_unresponsive_since(handle.id, now - chrono::Duration::seconds(30)));
     }
 
     #[tokio::test]

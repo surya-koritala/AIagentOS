@@ -6,7 +6,7 @@
 //! concurrent-tool-call limits remain in memory; token accounting does not.
 
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use dashmap::mapref::entry::Entry;
@@ -115,6 +115,14 @@ pub enum CgroupError {
 
     #[error("cgroup {0} has active tool-call reservations")]
     ActiveToolReservations(CgroupId),
+
+    #[error("cgroup {cgroup_id} limit {dimension}={limit} is below current usage {usage}")]
+    LimitBelowUsage {
+        cgroup_id: CgroupId,
+        dimension: &'static str,
+        limit: u64,
+        usage: u64,
+    },
 }
 
 /// The cgroup hierarchy manager.
@@ -125,6 +133,11 @@ pub struct CgroupManager {
     /// moves/unregistration consult this exact map instead of inferring
     /// ownership from aggregate ancestor counters.
     active_tool_calls_by_agent: DashMap<AgentId, u32>,
+    /// One revocable generation shared by every active reservation for an
+    /// agent. Forced termination invalidates and removes the generation after
+    /// subtracting its counters, so guards dropped later cannot subtract a
+    /// second time or corrupt another agent's aggregate usage.
+    tool_call_generations: DashMap<AgentId, Arc<AtomicBool>>,
     tool_calls_changed: tokio::sync::Notify,
     root: CgroupId,
     /// Serializes structural publication/removal. Membership and tool-slot
@@ -156,6 +169,7 @@ impl CgroupManager {
             groups: DashMap::new(),
             scope_index: DashMap::new(),
             active_tool_calls_by_agent: DashMap::new(),
+            tool_call_generations: DashMap::new(),
             tool_calls_changed: tokio::sync::Notify::new(),
             root: root_id,
             tree_lock: Mutex::new(()),
@@ -398,6 +412,64 @@ impl CgroupManager {
         };
         group.members.swap_remove(index);
         group.usage.agent_count = group.members.len().min(u32::MAX as usize) as u32;
+        self.tool_call_generations.remove(&agent_id);
+        Ok(())
+    }
+
+    /// Revoke every active tool reservation and remove one agent membership.
+    ///
+    /// Lifecycle `kill` uses this after cancelling in-kernel work. Existing
+    /// guards become inert through their shared generation token; a later drop
+    /// therefore cannot decrement counters belonging to a newly registered
+    /// generation of the same stable identity.
+    pub(crate) fn force_remove_agent(
+        &self,
+        cgroup_id: CgroupId,
+        agent_id: AgentId,
+    ) -> Result<(), CgroupError> {
+        let _tree = self.lock_tree()?;
+        let hierarchy = self.hierarchy_unlocked(cgroup_id)?;
+        let leaf = hierarchy
+            .last()
+            .ok_or(CgroupError::HierarchyDoesNotReachRoot(cgroup_id))?;
+        if !leaf.members.contains(&agent_id) {
+            return Err(CgroupError::AgentNotMember {
+                cgroup_id,
+                agent_id,
+            });
+        }
+
+        if let Some((_, generation)) = self.tool_call_generations.remove(&agent_id) {
+            generation.store(false, Ordering::Release);
+        }
+        let active = self
+            .active_tool_calls_by_agent
+            .remove(&agent_id)
+            .map_or(0, |(_, active)| active);
+        if active > 0 {
+            for snapshot in &hierarchy {
+                if let Some(mut group) = self.groups.get_mut(&snapshot.id) {
+                    group.usage.active_tool_calls =
+                        group.usage.active_tool_calls.saturating_sub(active);
+                }
+            }
+        }
+
+        let mut group = self
+            .groups
+            .get_mut(&cgroup_id)
+            .ok_or(CgroupError::GroupNotFound(cgroup_id))?;
+        let index = group
+            .members
+            .iter()
+            .position(|member| *member == agent_id)
+            .ok_or(CgroupError::AgentNotMember {
+                cgroup_id,
+                agent_id,
+            })?;
+        group.members.swap_remove(index);
+        group.usage.agent_count = group.members.len().min(u32::MAX as usize) as u32;
+        self.tool_calls_changed.notify_waiters();
         Ok(())
     }
 
@@ -623,15 +695,29 @@ impl CgroupManager {
         }
     }
 
-    fn release_tool_call(&self, cgroups: &[CgroupId], agent_id: Option<AgentId>) {
+    fn release_tool_call(
+        &self,
+        cgroups: &[CgroupId],
+        agent_reservation: Option<(AgentId, &Arc<AtomicBool>)>,
+    ) {
+        let _tree = match self.lock_tree() {
+            Ok(tree) => tree,
+            Err(_) => return,
+        };
+        if let Some((_, generation)) = agent_reservation {
+            if !generation.load(Ordering::Acquire) {
+                return;
+            }
+        }
         self.rollback_tool_calls(cgroups);
-        let Some(agent_id) = agent_id else {
+        let Some((agent_id, _)) = agent_reservation else {
             return;
         };
         if let Entry::Occupied(mut active) = self.active_tool_calls_by_agent.entry(agent_id) {
             let remaining = active.get().saturating_sub(1);
             if remaining == 0 {
                 active.remove();
+                self.tool_call_generations.remove(&agent_id);
             } else {
                 *active.get_mut() = remaining;
             }
@@ -682,16 +768,24 @@ impl CgroupManager {
             group.usage.active_tool_calls = group.usage.active_tool_calls.saturating_add(1);
             acquired.push(group.id);
         }
-        if let Some(agent_id) = agent_id {
+        let agent_reservation = if let Some(agent_id) = agent_id {
+            let generation = self
+                .tool_call_generations
+                .entry(agent_id)
+                .or_insert_with(|| Arc::new(AtomicBool::new(true)))
+                .clone();
             self.active_tool_calls_by_agent
                 .entry(agent_id)
                 .and_modify(|active| *active = active.saturating_add(1))
                 .or_insert(1);
-        }
+            Some((agent_id, generation))
+        } else {
+            None
+        };
         Ok(ToolCallGuard {
             manager: self.clone(),
             cgroups: acquired,
-            agent_id,
+            agent_reservation,
         })
     }
 
@@ -735,6 +829,45 @@ impl CgroupManager {
         self.groups.get(&id).map(|group| group.clone())
     }
 
+    /// Atomically replace one leaf's limits after proving current membership,
+    /// tool reservations, and context usage fit. Service policy uses this only
+    /// on a freshly-created per-agent leaf.
+    pub fn update_limits(&self, id: CgroupId, limits: CgroupLimits) -> Result<(), CgroupError> {
+        let _tree = self.lock_tree()?;
+        let mut group = self
+            .groups
+            .get_mut(&id)
+            .ok_or(CgroupError::GroupNotFound(id))?;
+        for (dimension, limit, usage) in [
+            (
+                "agents",
+                u64::from(limits.max_agents),
+                u64::from(group.usage.agent_count),
+            ),
+            (
+                "tool_calls",
+                u64::from(limits.max_concurrent_tool_calls),
+                u64::from(group.usage.active_tool_calls),
+            ),
+            (
+                "context_tokens",
+                limits.max_context_tokens,
+                group.usage.context_tokens,
+            ),
+        ] {
+            if limit > 0 && usage > limit {
+                return Err(CgroupError::LimitBelowUsage {
+                    cgroup_id: id,
+                    dimension,
+                    limit,
+                    usage,
+                });
+            }
+        }
+        group.limits = limits;
+        Ok(())
+    }
+
     #[cfg(test)]
     pub(crate) fn structural_counts(&self) -> (usize, usize) {
         let _tree = self
@@ -776,12 +909,17 @@ pub fn enforce_limits(
 pub struct ToolCallGuard {
     manager: Arc<CgroupManager>,
     cgroups: Vec<CgroupId>,
-    agent_id: Option<AgentId>,
+    agent_reservation: Option<(AgentId, Arc<AtomicBool>)>,
 }
 
 impl Drop for ToolCallGuard {
     fn drop(&mut self) {
-        self.manager.release_tool_call(&self.cgroups, self.agent_id);
+        self.manager.release_tool_call(
+            &self.cgroups,
+            self.agent_reservation
+                .as_ref()
+                .map(|(agent_id, generation)| (*agent_id, generation)),
+        );
     }
 }
 

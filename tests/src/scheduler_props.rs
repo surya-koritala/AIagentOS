@@ -8,12 +8,17 @@
 //! with different priorities under constraints, lower-priority agents throttled
 //! before higher-priority.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use proptest::prelude::*;
 
 use kernel::scheduler::{AgentScheduler, PriorityScheduler};
-use kernel::{AgentHandle, AgentState, Priority};
+use kernel::{
+    agent_struct::SchedClass,
+    cfs::{CfsScheduler, TurnAdmission},
+    AgentHandle, AgentState, Priority,
+};
 
 fn make_handle(id: uuid::Uuid) -> AgentHandle {
     let (tx, _rx) = tokio::sync::mpsc::channel(1);
@@ -176,4 +181,53 @@ proptest! {
             Ok(())
         })?;
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sustained_turn_contention_never_exceeds_capacity_and_reports_class_share() {
+    const CAPACITY: usize = 8;
+    const TURNS: usize = 160;
+
+    let cfs = Arc::new(tokio::sync::Mutex::new(CfsScheduler::new(1000)));
+    for pid in 1..=TURNS as u64 {
+        let class = match pid % 4 {
+            0 => SchedClass::RealTime,
+            1 => SchedClass::Normal,
+            2 => SchedClass::Background,
+            _ => SchedClass::Deadline { deadline_ms: 500 },
+        };
+        cfs.lock().await.enqueue(pid, 0, class);
+    }
+    let admission = Arc::new(TurnAdmission::new(CAPACITY));
+    let active = Arc::new(AtomicUsize::new(0));
+    let maximum = Arc::new(AtomicUsize::new(0));
+    let mut tasks = Vec::with_capacity(TURNS);
+
+    for pid in 1..=TURNS as u64 {
+        let admission = Arc::clone(&admission);
+        let cfs = Arc::clone(&cfs);
+        let active = Arc::clone(&active);
+        let maximum = Arc::clone(&maximum);
+        tasks.push(tokio::spawn(async move {
+            let _slot = admission.acquire(pid, &cfs).await.unwrap();
+            let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+            maximum.fetch_max(now, Ordering::SeqCst);
+            tokio::task::yield_now().await;
+            active.fetch_sub(1, Ordering::SeqCst);
+        }));
+    }
+    for task in tasks {
+        task.await.unwrap();
+    }
+
+    assert_eq!(active.load(Ordering::SeqCst), 0);
+    assert!(maximum.load(Ordering::SeqCst) <= CAPACITY);
+    let metrics = admission.metrics();
+    assert_eq!(metrics.running, 0);
+    assert_eq!(metrics.waiting, 0);
+    assert_eq!(metrics.admitted_total, TURNS as u64);
+    assert_eq!(metrics.admitted_realtime_total, 40);
+    assert_eq!(metrics.admitted_normal_total, 40);
+    assert_eq!(metrics.admitted_background_total, 40);
+    assert_eq!(metrics.admitted_deadline_total, 40);
 }

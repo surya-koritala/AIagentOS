@@ -7,7 +7,6 @@ pub mod agent_hub;
 pub mod agent_package;
 pub mod agent_struct;
 pub mod agent_syscalls;
-pub mod agentctl;
 pub mod agentpkg;
 pub mod agentps;
 pub mod auth;
@@ -44,6 +43,7 @@ pub mod modules;
 pub mod mount_table;
 pub mod namespaces;
 pub mod observability;
+pub mod operator_control;
 pub mod package;
 pub mod permissions;
 pub mod planning;
@@ -135,13 +135,18 @@ impl Default for Priority {
 // ─── Sandbox Config ──────────────────────────────────────────────────────────
 
 /// Sandbox configuration for agent isolation.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SandboxConfig {
     pub workspace_dir: std::path::PathBuf,
     pub allowed_network_hosts: Option<Vec<String>>,
     pub max_disk_usage_bytes: Option<u64>,
     pub max_memory_bytes: Option<u64>,
     pub isolation_level: IsolationLevel,
+    /// Operator-selected OCI image for `Container` isolation. It must be an
+    /// immutable digest reference (`name@sha256:<64 hex>`); packages and wire
+    /// creation cannot populate this field.
+    #[serde(default)]
+    pub container_image: Option<String>,
 }
 
 /// Level of isolation for the sandbox.
@@ -192,6 +197,29 @@ pub enum AgentCommand {
     Execute(String),
 }
 
+/// Bounded lifecycle operation labels used by events and metrics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LifecycleOperation {
+    Pause,
+    Resume,
+    Stop,
+    Kill,
+    Wait,
+}
+
+/// Bounded lifecycle outcomes. `forced` is the successful terminal outcome of
+/// `kill`; the other operations complete cooperatively.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LifecycleOutcome {
+    Requested,
+    Completed,
+    TimedOut,
+    Forced,
+    Failed,
+}
+
 // ─── Kernel Event ────────────────────────────────────────────────────────────
 
 /// Events broadcast by the kernel to subsystems.
@@ -203,10 +231,20 @@ pub enum KernelEvent {
         old: AgentState,
         new: AgentState,
     },
+    AgentLifecycle {
+        agent_id: AgentId,
+        operation: LifecycleOperation,
+        outcome: LifecycleOutcome,
+    },
     ResourceRequested {
         agent_id: AgentId,
         resource: String,
         operation: String,
+    },
+    ServiceStateChanged {
+        name: String,
+        status: crate::init_system::ServiceStatus,
+        reason: Option<String>,
     },
     ShutdownInitiated,
 }
@@ -250,6 +288,12 @@ pub enum KernelError {
         "Credential revocation incomplete after {timeout_ms}ms; the identity remains durably revoked and closed to new requests"
     )]
     CredentialRevocationIncomplete { timeout_ms: u64 },
+
+    #[error("Lifecycle operation timed out: {0}")]
+    LifecycleTimeout(String),
+
+    #[error("Lifecycle cleanup incomplete: {0}")]
+    LifecycleCleanup(String),
 
     #[error("Policy error: {0}")]
     Policy(String),
@@ -845,6 +889,53 @@ impl ResourceProvider for BuiltinNetworkProvider {
 
 struct BuiltinAppProvider;
 
+/// Cancelling an application tool must terminate the complete process tree,
+/// not only the direct shell/launcher child.
+struct ProcessTreeGuard {
+    pid: u32,
+    armed: bool,
+}
+
+impl ProcessTreeGuard {
+    fn new(pid: u32) -> Self {
+        Self { pid, armed: true }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ProcessTreeGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        #[cfg(unix)]
+        {
+            // The child is placed in a new process group whose id equals its
+            // pid. A negative pid targets every descendant that inherited the
+            // group, including background grandchildren.
+            if let Ok(pid) = libc::pid_t::try_from(self.pid) {
+                // SAFETY: `kill` does not dereference memory; the negative,
+                // validated process-group id is scoped to the spawned child.
+                unsafe {
+                    libc::kill(-pid, libc::SIGKILL);
+                }
+            }
+        }
+        #[cfg(windows)]
+        {
+            // `taskkill /T` is the platform process-tree primitive. The child
+            // also has Tokio's kill-on-drop enabled as a direct-child fallback.
+            let pid = self.pid.to_string();
+            let _ = std::process::Command::new("taskkill")
+                .args(["/PID", pid.as_str(), "/T", "/F"])
+                .status();
+        }
+    }
+}
+
 #[async_trait::async_trait]
 impl ResourceProvider for BuiltinAppProvider {
     fn resource_type(&self) -> ResourceType {
@@ -874,10 +965,23 @@ impl ResourceProvider for BuiltinAppProvider {
             .unwrap_or_default();
         let mut command = tokio::process::Command::new(cmd);
         command.args(&args).kill_on_drop(true);
-        let output = command
-            .output()
-            .await
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            command.as_std_mut().process_group(0);
+        }
+        let child = command
+            .spawn()
             .map_err(|e| ResourceError::OperationFailed(e.to_string()))?;
+        let pid = child.id().ok_or_else(|| {
+            ResourceError::OperationFailed("spawned application has no process id".into())
+        })?;
+        let mut process_tree = ProcessTreeGuard::new(pid);
+        let output = child.wait_with_output().await;
+        if output.is_ok() {
+            process_tree.disarm();
+        }
+        let output = output.map_err(|e| ResourceError::OperationFailed(e.to_string()))?;
         Ok(serde_json::json!({
             "stdout": String::from_utf8_lossy(&output.stdout).to_string(),
             "stderr": String::from_utf8_lossy(&output.stderr).to_string(),
@@ -963,6 +1067,9 @@ pub struct AgentKernelImpl {
     pub rate_limiter: Arc<RateLimiter>,
     pub cgroups: Arc<CgroupManager>,
     pub syscall_gate: Arc<SyscallGate>,
+    /// Durable, audited operator settings plus the consistency barrier used by
+    /// the typed operations snapshot.
+    pub operator_control: Arc<crate::operator_control::OperatorControl>,
     /// Hard cumulative USD spend ceiling on the LLM path (the cgroup quota only
     /// bounds per-minute tokens, not lifetime cost). Inert unless config sets a
     /// price + ceiling. Installed on each executor in `send_message`.
@@ -970,6 +1077,8 @@ pub struct AgentKernelImpl {
     /// Active-context token budget applied to each executor (from
     /// `budgets.max_context_tokens`; 0 = unbounded). Drives context paging.
     context_budget_tokens: u32,
+    /// Atomic per-agent/tenant/global admission for active provider prompts.
+    context_admission: Arc<crate::context_paging::ActiveContextManager>,
     /// Cumulative tool-call ceiling for one logical turn, including calls made
     /// before a durable pause/resume boundary. `0` means unlimited.
     max_tool_calls_per_turn: u32,
@@ -1019,10 +1128,20 @@ pub struct AgentKernelImpl {
     executors: DashMap<AgentId, Arc<tokio::sync::Mutex<AgentExecutor>>>,
     lifecycle_locks: DashMap<AgentId, Arc<tokio::sync::Mutex<()>>>,
     active_cancellations: DashMap<AgentId, tokio_util::sync::CancellationToken>,
+    pub(crate) lifecycle_counters: crate::metrics::LifecycleCounters,
+    /// Serializes public service lifecycle, rolling reload, and supervisor
+    /// recovery so two control paths cannot create duplicate live instances.
+    service_operation_lock: tokio::sync::Mutex<()>,
+    /// Monotonic per-service liveness cadence. Durable service state stores
+    /// outcomes; monotonic process time is intentionally rebuilt after boot.
+    service_health_checks: DashMap<String, std::time::Instant>,
+    /// Explicit operator-configured definition source used by remote reload.
+    service_directory: std::sync::RwLock<Option<std::path::PathBuf>>,
     event_tx: broadcast::Sender<KernelEvent>,
 }
 
 impl AgentKernelImpl {
+    const WATCHDOG_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
     #[cfg(not(test))]
     const TOOL_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
     #[cfg(test)]
@@ -1097,15 +1216,23 @@ impl AgentKernelImpl {
             &mac_rules,
         )?;
         if let Some(service_dir) = &config.service_dir {
+            *kernel
+                .service_directory
+                .write()
+                .map_err(|_| KernelError::Policy("service directory lock is poisoned".into()))? =
+                Some(service_dir.clone());
             let mut init = kernel.os.init.try_lock().map_err(|_| {
                 KernelError::Policy("service supervisor was unexpectedly busy during boot".into())
             })?;
+            init.set_allowed_secret_refs(config.api_keys.keys().cloned())
+                .map_err(KernelError::Policy)?;
             init.load_directory_checked(service_dir)
                 .map_err(KernelError::Policy)?;
         }
         // Bring back any agents persisted by a previous run on this DB so a
         // restart restores the full registry (and re-arms enforcement).
         kernel.rehydrate_agents_blocking();
+        kernel.restore_service_runtime_from_store()?;
         Ok(kernel)
     }
 
@@ -1143,6 +1270,12 @@ impl AgentKernelImpl {
     ) -> Result<Self, KernelError> {
         budgets.validate().map_err(|error| {
             KernelError::Policy(format!("invalid budget configuration: {error}"))
+        })?;
+        context_manager.set_context_storage_limits(crate::context::ContextStorageLimits {
+            per_agent_bytes: budgets.max_context_storage_bytes,
+            per_tenant_bytes: budgets.tenant_max_context_storage_bytes,
+            global_bytes: budgets.global_max_context_storage_bytes,
+            spill_retention_seconds: budgets.context_spill_retention_seconds,
         })?;
         let rate_limiter = Arc::new(RateLimiter::with_store(
             RateLimitConfig {
@@ -1188,6 +1321,9 @@ impl AgentKernelImpl {
             .load_budget_usage_snapshot()
             .map_err(KernelError::Context)?;
         budget_enforcer.rehydrate(&budget_snapshot);
+        let operator_control = Arc::new(crate::operator_control::OperatorControl::new(
+            context_manager.clone(),
+        )?);
         let os = Arc::new(OsSubsystems::new());
 
         let ipc = Arc::new(IpcManager::new());
@@ -1229,8 +1365,16 @@ impl AgentKernelImpl {
             rate_limiter,
             cgroups,
             syscall_gate,
+            operator_control,
             budget_enforcer,
             context_budget_tokens: budgets.max_context_tokens.min(u32::MAX as u64) as u32,
+            context_admission: Arc::new(crate::context_paging::ActiveContextManager::new(
+                crate::context_paging::ActiveContextLimits {
+                    per_agent_tokens: budgets.max_context_tokens,
+                    per_tenant_tokens: budgets.tenant_max_context_tokens,
+                    global_tokens: budgets.global_max_context_tokens,
+                },
+            )),
             max_tool_calls_per_turn: budgets.max_tool_calls,
             max_output_tokens_per_request: budgets.max_output_tokens_per_request,
             turn_admission: Arc::new(TurnAdmission::new(budgets.max_concurrent as usize)),
@@ -1248,6 +1392,10 @@ impl AgentKernelImpl {
             executors: DashMap::new(),
             lifecycle_locks: DashMap::new(),
             active_cancellations: DashMap::new(),
+            lifecycle_counters: crate::metrics::LifecycleCounters::default(),
+            service_operation_lock: tokio::sync::Mutex::new(()),
+            service_health_checks: DashMap::new(),
+            service_directory: std::sync::RwLock::new(None),
             event_tx,
         })
     }
@@ -1530,6 +1678,16 @@ impl AgentKernelImpl {
         group: Option<&str>,
         tenant_id: &str,
     ) -> Result<AgentHandle, KernelError> {
+        let _operator_mutation = self.operator_control.mutation_guard().await;
+        let max_agents = self.operator_control.max_agents();
+        if max_agents > 0
+            && u64::try_from(self.agent_manager.list_agents(None).len()).unwrap_or(u64::MAX)
+                >= max_agents
+        {
+            return Err(KernelError::Policy(format!(
+                "agent admission quota exceeded: kernel.max_agents is {max_agents}"
+            )));
+        }
         // Absence means the secure managed default, never host-unconfined. Only
         // in-process operator code can explicitly request IsolationLevel::Trusted;
         // the wire and package formats do not expose that bypass.
@@ -1739,6 +1897,22 @@ impl AgentKernelImpl {
             .context_manager
             .load_all_agents()
             .map_err(KernelError::Context)?;
+        let active_managed_workspaces = persisted
+            .iter()
+            .filter(|record| {
+                matches!(
+                    serde_json::from_str::<AgentState>(&record.status),
+                    Ok(AgentState::Running | AgentState::Paused)
+                )
+            })
+            .filter_map(|record| record.sandbox_config_json.as_deref())
+            .filter_map(|serialized| serde_json::from_str::<SandboxConfig>(serialized).ok())
+            .filter(SandboxManagerImpl::is_managed_config)
+            .map(|config| config.workspace_dir)
+            .collect::<std::collections::HashSet<_>>();
+        self.sandbox_manager
+            .reconcile_managed_workspaces(&active_managed_workspaces)
+            .map_err(KernelError::Sandbox)?;
         let mut restored = Vec::new();
         for p in persisted {
             // An explicit reconciliation pass may run after boot. Treat an
@@ -1763,7 +1937,36 @@ impl AgentKernelImpl {
                 priority,
                 sandbox_config: Some(sandbox_config.clone()),
             };
-            let state: AgentState = serde_json::from_str(&p.status).unwrap_or(AgentState::Running);
+            let persisted_state = match serde_json::from_str::<AgentState>(&p.status) {
+                Ok(state) => state,
+                Err(error) => {
+                    // A corrupt lifecycle row must never become runnable. Keep
+                    // it durable for operator repair while omitting it from all
+                    // live kernel registries.
+                    tracing::warn!(
+                        "Skipping persisted agent {} because lifecycle state is invalid: {}",
+                        p.id,
+                        error
+                    );
+                    continue;
+                }
+            };
+            // A process restart is the recovery boundary for incomplete
+            // lifecycle transitions. Creation never committed, so preserve the
+            // identity as terminal error history. A requested stop wins across
+            // a crash and completes as Stopped. Neither state is re-admitted.
+            let state = match persisted_state.clone() {
+                AgentState::Initializing => {
+                    AgentState::Error("initialization interrupted by process restart".into())
+                }
+                AgentState::Stopping => AgentState::Stopped,
+                state => state,
+            };
+            if state != persisted_state {
+                self.context_manager
+                    .update_agent_status(p.id, &state)
+                    .map_err(KernelError::Context)?;
+            }
             let terminal = matches!(state, AgentState::Stopped | AgentState::Error(_));
             if terminal {
                 // Terminal registry rows are durable history, not live kernel
@@ -1820,7 +2023,7 @@ impl AgentKernelImpl {
                     p.id,
                     error
                 );
-                self.cleanup_agent_resources(p.id).await;
+                let _ = self.cleanup_agent_resources(p.id).await;
                 self.agent_manager.purge_agent(p.id);
                 continue;
             }
@@ -2176,6 +2379,134 @@ impl AgentKernelImpl {
         }
     }
 
+    /// Rebind durable service ownership only after agent rehydration. A live
+    /// persisted instance is reused; a missing/terminal instance is marked for
+    /// supervised recovery, preventing duplicate agents after a crash.
+    fn restore_service_runtime_from_store(&self) -> Result<(), KernelError> {
+        let mut runtime = self
+            .context_manager
+            .load_service_runtime()
+            .map_err(KernelError::Context)?;
+        let configured = self
+            .os
+            .init
+            .try_lock()
+            .map_err(|_| {
+                KernelError::Policy(
+                    "service supervisor was unexpectedly busy during recovery".into(),
+                )
+            })?
+            .definitions()
+            .into_iter()
+            .map(|definition| definition.name)
+            .collect::<std::collections::HashSet<_>>();
+        let removed = runtime
+            .iter()
+            .filter(|service| !configured.contains(&service.name))
+            .cloned()
+            .collect::<Vec<_>>();
+        if !removed.is_empty() {
+            std::thread::scope(|scope| {
+                scope
+                    .spawn(|| {
+                        let runtime = tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()
+                            .map_err(|error| {
+                                KernelError::Context(crate::ContextError::StorageError(format!(
+                                    "runtime build for removed-service cleanup failed: {error}"
+                                )))
+                            })?;
+                        runtime.block_on(async {
+                            for service in &removed {
+                                if let Some(agent_id) = service.agent_id {
+                                    if !matches!(
+                                        self.agent_manager.get_agent_state(agent_id),
+                                        None | Some(AgentState::Stopped)
+                                    ) {
+                                        self.stop_agent(agent_id).await?;
+                                    }
+                                }
+                            }
+                            Ok::<_, KernelError>(())
+                        })
+                    })
+                    .join()
+            })
+            .map_err(|_| {
+                KernelError::LifecycleCleanup(
+                    "removed-service recovery cleanup thread panicked".into(),
+                )
+            })??;
+            for service in &removed {
+                self.context_manager
+                    .remove_service_runtime(
+                        &service.name,
+                        "definition was removed while the supervisor was offline",
+                    )
+                    .map_err(KernelError::Context)?;
+            }
+            runtime.retain(|service| configured.contains(&service.name));
+        }
+        for service in &mut runtime {
+            let Some(agent_id) = service.agent_id else {
+                if service.desired_running {
+                    service.status = ServiceStatus::Failed;
+                    service.ready = false;
+                    service.healthy = false;
+                    service.last_failure =
+                        Some("service had no durable owner after process restart".into());
+                }
+                continue;
+            };
+            match self.agent_manager.get_agent_state(agent_id) {
+                Some(AgentState::Running) => {
+                    service.status = ServiceStatus::Running;
+                    service.healthy = true;
+                }
+                Some(AgentState::Paused) => {
+                    service.status = ServiceStatus::Running;
+                    service.ready = false;
+                    service.healthy = false;
+                    service.last_failure =
+                        Some("service owner recovered paused; liveness recovery required".into());
+                }
+                Some(AgentState::Stopped | AgentState::Error(_)) | None => {
+                    service.status = ServiceStatus::Failed;
+                    service.ready = false;
+                    service.healthy = false;
+                    service.last_failure =
+                        Some("service owner was terminal after process restart".into());
+                }
+                Some(AgentState::Initializing | AgentState::Stopping) => {
+                    service.status = ServiceStatus::Failed;
+                    service.ready = false;
+                    service.healthy = false;
+                    service.last_failure =
+                        Some("service owner had an incomplete lifecycle after restart".into());
+                }
+            }
+        }
+        let mut init = self.os.init.try_lock().map_err(|_| {
+            KernelError::Policy("service supervisor was unexpectedly busy during recovery".into())
+        })?;
+        init.restore_runtime(&runtime);
+        let recovered = init.list_runtime();
+        drop(init);
+        for service in &recovered {
+            if runtime.iter().any(|stored| stored.name == service.name) {
+                self.context_manager
+                    .save_service_runtime(
+                        service,
+                        "process_recovered",
+                        service.last_failure.as_deref(),
+                    )
+                    .map_err(KernelError::Context)?;
+            }
+        }
+        Ok(())
+    }
+
     fn lifecycle_lock(&self, agent_id: AgentId) -> Arc<tokio::sync::Mutex<()>> {
         self.lifecycle_locks
             .entry(agent_id)
@@ -2183,25 +2514,51 @@ impl AgentKernelImpl {
             .clone()
     }
 
+    fn record_lifecycle(
+        &self,
+        agent_id: AgentId,
+        operation: LifecycleOperation,
+        outcome: LifecycleOutcome,
+    ) {
+        self.lifecycle_counters.record(operation, outcome);
+        let _ = self.event_tx.send(KernelEvent::AgentLifecycle {
+            agent_id,
+            operation,
+            outcome,
+        });
+    }
+
+    fn record_lifecycle_result<T>(
+        &self,
+        agent_id: AgentId,
+        operation: LifecycleOperation,
+        result: &Result<T, KernelError>,
+        started: std::time::Instant,
+    ) {
+        let outcome = match result {
+            Ok(_) if operation == LifecycleOperation::Kill => LifecycleOutcome::Forced,
+            Ok(_) => LifecycleOutcome::Completed,
+            Err(KernelError::LifecycleTimeout(_)) => LifecycleOutcome::TimedOut,
+            Err(_) => LifecycleOutcome::Failed,
+        };
+        self.lifecycle_counters
+            .record_duration(operation, started.elapsed());
+        self.record_lifecycle(agent_id, operation, outcome);
+    }
+
     /// Reclaim the process-local per-agent cgroup after gate membership has
     /// been removed (or when registration never succeeded). Durable quota rows
     /// are keyed by the stable scope and intentionally remain in SQLite.
-    fn reclaim_agent_cgroup(&self, agent_id: AgentId) {
+    fn reclaim_agent_cgroup(&self, agent_id: AgentId) -> Result<(), String> {
         // Lock order is kernel tree lock → CgroupManager tree lock, matching
         // cgroup_for_agent. Gate mutation/membership removal has already
         // completed before this method is called.
-        let _tree = match self.cgroup_tree_lock.lock() {
-            Ok(tree) => tree,
-            Err(_) => {
-                tracing::warn!(
-                    "cannot reclaim per-agent cgroup for {agent_id}: hierarchy lock is poisoned"
-                );
-                return;
-            }
-        };
+        let _tree = self.cgroup_tree_lock.lock().map_err(|_| {
+            format!("cannot reclaim per-agent cgroup for {agent_id}: hierarchy lock is poisoned")
+        })?;
         let cgroup_id = match self.agent_cgroups.remove(&agent_id) {
             Some((_, cgroup_id)) => cgroup_id,
-            None => return,
+            None => return Ok(()),
         };
         let profile_id = self.cgroups.get(cgroup_id).and_then(|leaf| leaf.parent);
 
@@ -2216,9 +2573,12 @@ impl AgentKernelImpl {
                 // Preserve the lookup if the leaf still exists so a later
                 // idempotent cleanup can retry without orphaning the node.
                 self.agent_cgroups.insert(agent_id, cgroup_id);
-                tracing::warn!("per-agent cgroup cleanup failed for {agent_id}: {error}");
+                return Err(format!(
+                    "per-agent cgroup cleanup failed for {agent_id}: {error}"
+                ));
             }
         }
+        Ok(())
     }
 
     /// Reclaim empty aggregate nodes created by `cgroup_for_agent`. Exact map
@@ -2282,18 +2642,46 @@ impl AgentKernelImpl {
         }
     }
 
-    async fn cleanup_agent_resources(&self, agent_id: AgentId) {
+    async fn cleanup_agent_resources(&self, agent_id: AgentId) -> Result<(), KernelError> {
+        self.cleanup_agent_resources_with_mode(agent_id, false)
+            .await
+    }
+
+    /// Forced cleanup revokes already-admitted tool reservations before
+    /// tearing down the remaining subsystems. Cooperative work is cancelled by
+    /// the lifecycle caller; any stale reservation guard that eventually drops
+    /// is inert and cannot corrupt cgroup accounting.
+    async fn force_cleanup_agent_resources(&self, agent_id: AgentId) -> Result<(), KernelError> {
+        self.cleanup_agent_resources_with_mode(agent_id, true).await
+    }
+
+    async fn cleanup_agent_resources_with_mode(
+        &self,
+        agent_id: AgentId,
+        forced: bool,
+    ) -> Result<(), KernelError> {
+        let mut failures = Vec::new();
         let gate_info = self.syscall_gate.agent_info(agent_id);
         let gate_registered = gate_info.is_some();
-        if gate_registered {
+        let mut cgroup_membership_released = !gate_registered;
+        if forced && gate_registered {
+            match self.syscall_gate.force_unregister_agent(agent_id) {
+                Ok(()) => cgroup_membership_released = true,
+                Err(error) => {
+                    failures.push(format!(
+                        "forced syscall-gate cleanup failed for {agent_id}: {error}"
+                    ));
+                }
+            }
+        } else if gate_registered {
             if let Err(error) = self
                 .syscall_gate
                 .close_tool_admission_and_wait(agent_id)
                 .await
             {
-                tracing::warn!(
+                failures.push(format!(
                     "cannot quiesce syscall-gate tool admission for {agent_id}: {error}"
-                );
+                ));
             }
         }
         self.scheduler.deschedule(agent_id);
@@ -2313,29 +2701,33 @@ impl AgentKernelImpl {
 
         if let Some(sandbox_id) = self.sandbox_manager.get_sandbox_for_agent(agent_id) {
             if let Err(error) = self.sandbox_manager.destroy_sandbox(sandbox_id) {
-                tracing::warn!("sandbox cleanup failed for {agent_id}: {error}");
+                failures.push(format!("sandbox cleanup failed for {agent_id}: {error}"));
             }
         }
         self.observability.purge_agent(agent_id);
         self.budget_enforcer.unregister_agent(agent_id);
-        let cgroup_membership_released = if gate_registered {
+        if gate_registered && !forced {
             if let Err(error) = self.syscall_gate.try_unregister_agent(agent_id) {
-                tracing::warn!("syscall-gate cleanup failed for {agent_id}: {error}");
-                false
+                failures.push(format!(
+                    "syscall-gate cleanup failed for {agent_id}: {error}"
+                ));
             } else {
-                true
+                cgroup_membership_released = true;
             }
-        } else {
-            // Creation can fail after the leaf is allocated but before gate
-            // registration. Such a leaf has no membership to release.
-            true
-        };
+        }
         if cgroup_membership_released {
             // `agent_cgroups` always names the private leaf allocated at
             // creation. The gate may now name a shared/custom destination
             // after a move; unregister releases that membership, while only
             // the original private leaf is structurally reclaimed here.
-            self.reclaim_agent_cgroup(agent_id);
+            if let Err(error) = self.reclaim_agent_cgroup(agent_id) {
+                failures.push(error);
+            }
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(KernelError::LifecycleCleanup(failures.join("; ")))
         }
     }
 
@@ -2349,33 +2741,206 @@ impl AgentKernelImpl {
             let _ = self.agent_manager.force_stopped(agent_id);
         }
         let _ = self.quiesce_agent(agent_id).await;
-        self.cleanup_agent_resources(agent_id).await;
+        let _ = self.cleanup_agent_resources(agent_id).await;
         self.agent_manager.purge_agent(agent_id);
+        self.syscall_gate.purge_agent_stats(agent_id);
         let _ = self.context_manager.purge_agent_data(agent_id);
         self.lifecycle_locks.remove(&agent_id);
     }
 
-    /// Reload a complete service directory atomically. This validates parsing,
-    /// duplicate names, required dependencies, ordering, and cycles before the
-    /// live definition set is replaced.
+    async fn persist_service_transition(
+        &self,
+        name: &str,
+        event: &str,
+        reason: Option<&str>,
+    ) -> Result<(), KernelError> {
+        let runtime = self
+            .os
+            .init
+            .lock()
+            .await
+            .list_runtime()
+            .into_iter()
+            .find(|service| service.name == name)
+            .ok_or_else(|| KernelError::Policy(format!("service '{name}' not found")))?;
+        self.context_manager
+            .save_service_runtime(&runtime, event, reason)
+            .map_err(KernelError::Context)?;
+        let _ = self.event_tx.send(KernelEvent::ServiceStateChanged {
+            name: name.to_string(),
+            status: runtime.status,
+            reason: reason.map(str::to_string),
+        });
+        Ok(())
+    }
+
+    pub fn list_service_history(
+        &self,
+        name: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<crate::init_system::ServiceHistoryEntry>, KernelError> {
+        self.context_manager
+            .list_service_history(name, limit)
+            .map_err(KernelError::Context)
+    }
+
+    /// Reload the explicitly configured service directory. The complete graph
+    /// is parsed and validated before any live state changes. Changed/removed
+    /// services stop in reverse dependency order, new definitions publish as
+    /// one replacement, and affected desired services start in the new order.
+    /// A failed rollout restores the prior graph and desired instances.
+    pub async fn reload_configured_services(&self) -> Result<Vec<String>, KernelError> {
+        let path = self
+            .service_directory
+            .read()
+            .map_err(|_| KernelError::Policy("service directory lock is poisoned".into()))?
+            .clone()
+            .ok_or_else(|| {
+                KernelError::Policy("no service directory is configured for reload".into())
+            })?;
+        self.reload_service_directory(&path).await
+    }
+
     pub async fn reload_service_directory(
         &self,
         path: &std::path::Path,
     ) -> Result<Vec<String>, KernelError> {
-        let mut init = self.os.init.lock().await;
-        if init.list_runtime().iter().any(|service| {
-            !matches!(
-                service.status,
-                ServiceStatus::Inactive | ServiceStatus::Failed
+        let definitions = InitSystem::read_directory_checked(path).map_err(KernelError::Policy)?;
+        let _operation = self.service_operation_lock.lock().await;
+        let (old_definitions, old_order, old_runtime, new_order) = {
+            let init = self.os.init.lock().await;
+            let new_order = init
+                .validate_replacement(definitions.clone())
+                .map_err(KernelError::Policy)?;
+            (
+                init.definitions(),
+                init.boot_order().to_vec(),
+                init.list_runtime(),
+                new_order,
             )
-        }) {
-            return Err(KernelError::Policy(
-                "service reload requires all services to be inactive or failed; stop them before retrying"
-                    .into(),
-            ));
+        };
+        let old_by_name = old_definitions
+            .iter()
+            .map(|definition| (definition.name.clone(), definition.clone()))
+            .collect::<std::collections::HashMap<_, _>>();
+        let new_by_name = definitions
+            .iter()
+            .map(|definition| (definition.name.clone(), definition.clone()))
+            .collect::<std::collections::HashMap<_, _>>();
+        let directly_changed = old_by_name
+            .iter()
+            .filter(|(name, definition)| new_by_name.get(*name) != Some(*definition))
+            .map(|(name, _)| name.clone())
+            .collect::<std::collections::HashSet<_>>();
+        let mut affected = directly_changed;
+        loop {
+            let before = affected.len();
+            for (name, definition) in old_by_name.iter().chain(new_by_name.iter()) {
+                if definition
+                    .dependencies
+                    .requires
+                    .iter()
+                    .any(|required| affected.contains(required))
+                {
+                    affected.insert(name.clone());
+                }
+            }
+            if affected.len() == before {
+                break;
+            }
         }
-        init.load_directory_checked(path)
-            .map_err(KernelError::Policy)
+        let old_desired = old_runtime
+            .iter()
+            .filter(|runtime| runtime.desired_running)
+            .map(|runtime| runtime.name.as_str())
+            .collect::<std::collections::HashSet<_>>();
+        let old_active = old_runtime
+            .iter()
+            .filter(|runtime| runtime.status == ServiceStatus::Running)
+            .map(|runtime| runtime.name.as_str())
+            .collect::<std::collections::HashSet<_>>();
+        let changed_or_removed = old_order
+            .iter()
+            .rev()
+            .filter(|name| affected.contains(*name))
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut stopped = Vec::new();
+        for name in &changed_or_removed {
+            if let Err(error) = self.stop_service_inner(name, false).await {
+                for old_name in &old_order {
+                    if stopped.contains(old_name) && old_active.contains(old_name.as_str()) {
+                        let _ = self.start_service_inner(old_name).await;
+                    }
+                }
+                return Err(KernelError::Policy(format!(
+                    "rolling service reload could not quiesce '{name}' and restored stopped services: {error}"
+                )));
+            }
+            stopped.push(name.clone());
+        }
+        {
+            let mut init = self.os.init.lock().await;
+            init.replace_definitions(definitions)
+                .map_err(KernelError::Policy)?;
+        }
+        let mut started = Vec::new();
+        for name in &new_order {
+            let is_added = !old_by_name.contains_key(name);
+            let should_roll = affected.contains(name) && old_desired.contains(name.as_str());
+            if is_added || should_roll {
+                match self.start_service_inner(name).await {
+                    Ok(_) => started.push(name.clone()),
+                    Err(error) => {
+                        for started_name in started.iter().rev() {
+                            let _ = self.stop_service_inner(started_name, false).await;
+                        }
+                        {
+                            let mut init = self.os.init.lock().await;
+                            let _ = init.replace_definitions(old_definitions.clone());
+                            init.restore_runtime(&old_runtime);
+                        }
+                        for added_name in new_by_name.keys() {
+                            if !old_by_name.contains_key(added_name) {
+                                let _ = self.context_manager.remove_service_runtime(
+                                    added_name,
+                                    "removed by rolling reload rollback",
+                                );
+                            }
+                        }
+                        for old_name in &old_order {
+                            if old_active.contains(old_name.as_str()) {
+                                let _ = self.start_service_inner(old_name).await;
+                            }
+                        }
+                        return Err(KernelError::Policy(format!(
+                            "rolling service reload failed at '{name}' and restored the previous graph: {error}"
+                        )));
+                    }
+                }
+            }
+        }
+        for name in old_by_name.keys() {
+            if !new_by_name.contains_key(name) {
+                self.context_manager
+                    .remove_service_runtime(name, "removed by validated rolling reload")
+                    .map_err(KernelError::Context)?;
+            }
+        }
+        *self
+            .service_directory
+            .write()
+            .map_err(|_| KernelError::Policy("service directory lock is poisoned".into()))? =
+            Some(path.to_path_buf());
+        for service in self.list_services().await {
+            self.persist_service_transition(
+                &service.name,
+                "configuration_reloaded",
+                Some("validated rolling configuration published"),
+            )
+            .await?;
+        }
+        Ok(new_order)
     }
 
     pub async fn list_services(&self) -> Vec<ServiceRuntimeInfo> {
@@ -2383,8 +2948,22 @@ impl AgentKernelImpl {
     }
 
     /// Start one validated service through the same full agent admission path
-    /// as every other agent. Required dependencies must already be running.
+    /// as every other agent. Required dependencies must be running and ready.
     pub async fn start_service(&self, name: &str) -> Result<AgentId, KernelError> {
+        let _operation = self.service_operation_lock.lock().await;
+        {
+            let mut init = self.os.init.lock().await;
+            let state = init
+                .state(name)
+                .ok_or_else(|| KernelError::Policy(format!("service '{name}' not found")))?;
+            if state.status == ServiceStatus::Failed || state.restart_exhausted {
+                init.reset_restart_budget(name);
+            }
+        }
+        self.start_service_inner(name).await
+    }
+
+    async fn start_service_inner(&self, name: &str) -> Result<AgentId, KernelError> {
         let state = self
             .os
             .init
@@ -2392,32 +2971,94 @@ impl AgentKernelImpl {
             .await
             .state(name)
             .ok_or_else(|| KernelError::Policy(format!("service '{name}' not found")))?;
-        if state.status == ServiceStatus::Running {
-            if let Some(agent_id) = state.agent_id {
-                if let Ok(agent_state) = self.get_agent_status(agent_id) {
-                    if !matches!(agent_state, AgentState::Stopped | AgentState::Error(_)) {
-                        return Ok(agent_id);
-                    }
-                }
-            }
-        }
         {
-            let init = self.os.init.lock().await;
+            let mut init = self.os.init.lock().await;
             for required in &state.def.dependencies.requires {
-                if init.status(required) != Some(ServiceStatus::Running) {
+                let dependency = init.state(required);
+                if !dependency.is_some_and(|dependency| {
+                    dependency.status == ServiceStatus::Running
+                        && dependency.ready
+                        && dependency.healthy
+                }) {
+                    let reason = format!("required service '{required}' is not running and ready");
+                    init.record_dependency_block(name, reason.clone());
+                    drop(init);
+                    self.persist_service_transition(name, "dependency_blocked", Some(&reason))
+                        .await?;
                     return Err(KernelError::Policy(format!(
                         "service '{name}' is blocked by required service '{required}'"
                     )));
                 }
             }
         }
+        if state.status == ServiceStatus::Running {
+            if let Some(agent_id) = state.agent_id {
+                if let Ok(agent_state) = self.get_agent_status(agent_id) {
+                    if agent_state == AgentState::Running && state.ready && state.healthy {
+                        return Ok(agent_id);
+                    }
+                }
+            }
+        }
+        if let Some(stale_agent_id) = state.agent_id {
+            if !matches!(
+                self.agent_manager.get_agent_state(stale_agent_id),
+                Some(AgentState::Stopped)
+            ) {
+                self.stop_agent(stale_agent_id).await?;
+            }
+            self.os.init.lock().await.clear_instance_for_restart(name);
+            self.persist_service_transition(
+                name,
+                "stale_owner_cleaned",
+                Some("previous service owner was terminal or no longer healthy"),
+            )
+            .await?;
+        }
         self.os.init.lock().await.mark_starting(name);
+        self.persist_service_transition(name, "starting", None)
+            .await?;
 
         let provider = if state.def.exec.provider.trim().is_empty() {
             "stub".to_string()
         } else {
             state.def.exec.provider.clone()
         };
+        if provider != "stub"
+            && !self
+                .connector
+                .list_providers()
+                .iter()
+                .any(|registered| registered.id == provider)
+        {
+            let reason = format!("provider '{provider}' is not registered");
+            self.os
+                .init
+                .lock()
+                .await
+                .mark_failed_reason(name, 1, reason.clone());
+            self.persist_service_transition(name, "startup_failed", Some(&reason))
+                .await?;
+            return Err(KernelError::Policy(format!("service '{name}' {reason}")));
+        }
+        if state.def.policy.tenant_id != crate::context::DEFAULT_TENANT
+            && self
+                .auth
+                .read()
+                .await
+                .get_tenant(&state.def.policy.tenant_id)
+                .is_none()
+        {
+            let reason = format!("tenant '{}' is not registered", state.def.policy.tenant_id);
+            self.os
+                .init
+                .lock()
+                .await
+                .mark_failed_reason(name, 1, reason.clone());
+            self.persist_service_transition(name, "startup_failed", Some(&reason))
+                .await?;
+            return Err(KernelError::Policy(format!("service '{name}' {reason}")));
+        }
         let task = state
             .def
             .description
@@ -2430,7 +3071,7 @@ impl AgentKernelImpl {
                     state.def.exec.system_prompt.clone()
                 }
             });
-        let nice = state.def.resources.nice.unwrap_or(0).clamp(-20, 19);
+        let nice = state.def.resources.nice.unwrap_or(0);
         let priority_value = match nice {
             -20..=-12 => 1,
             -11..=-4 => 2,
@@ -2438,36 +3079,204 @@ impl AgentKernelImpl {
             5..=12 => 4,
             _ => 5,
         };
-        let created = self
-            .create_agent_full(AgentConfig {
+        let namespace_group = state.def.policy.namespace.as_ref().map(|namespace| {
+            format!(
+                "service:{}:{namespace}",
+                quota_scope_segment(&state.def.policy.tenant_id)
+            )
+        });
+        let tenant_group = if state.def.policy.tenant_id == crate::context::DEFAULT_TENANT {
+            None
+        } else {
+            Some(state.def.policy.tenant_id.clone())
+        };
+        let group = namespace_group.as_deref().or(tenant_group.as_deref());
+        let startup_started = std::time::Instant::now();
+        let startup_timeout = std::time::Duration::from_millis(state.def.health.startup_timeout_ms);
+        let create = self.create_agent_grouped(
+            AgentConfig {
                 name: format!("service:{name}"),
                 task,
                 llm_provider: provider,
-                permission_profile: "standard".into(),
+                permission_profile: state.def.policy.profile.clone(),
                 priority: Priority::new(priority_value).unwrap_or_default(),
-                sandbox_config: None,
-            })
-            .await;
+                sandbox_config: state.def.policy.sandbox.clone(),
+            },
+            group,
+            &state.def.policy.tenant_id,
+        );
+        let created = tokio::time::timeout(startup_timeout, create).await;
         match created {
-            Ok(handle) => {
+            Ok(Ok(handle)) => {
+                let policy = (|| {
+                    let gate_info = self.syscall_gate.agent_info(handle.id).ok_or_else(|| {
+                        KernelError::Policy(format!(
+                            "service '{name}' disappeared from the syscall gate"
+                        ))
+                    })?;
+                    let mut limits = self
+                        .cgroups
+                        .get(gate_info.cgroup)
+                        .map(|group| group.limits)
+                        .ok_or_else(|| {
+                            KernelError::Policy(format!(
+                                "service '{name}' has no enforceable cgroup after creation"
+                            ))
+                        })?;
+                    if let Some(tokens_per_min) = state
+                        .def
+                        .token_budget_per_minute()
+                        .map_err(|error| KernelError::Policy(format!("service '{name}' {error}")))?
+                    {
+                        limits.tokens_per_min = tokens_per_min;
+                    }
+                    if let Some(max_context) = state.def.resources.max_context {
+                        limits.max_context_tokens = max_context;
+                    }
+                    if let Some(max_tools) = state.def.resources.max_concurrent_tool_calls {
+                        limits.max_concurrent_tool_calls = max_tools;
+                    }
+                    Ok::<_, KernelError>((gate_info.cgroup, limits))
+                })();
+                let (cgroup_id, limits) = match policy {
+                    Ok(policy) => policy,
+                    Err(error) => {
+                        let reason = error.to_string();
+                        self.fail_service_start(name, handle.id, "startup_failed", &reason)
+                            .await?;
+                        return Err(error);
+                    }
+                };
+                if let Err(error) = self.cgroups.update_limits(cgroup_id, limits) {
+                    let reason = format!("resource policy could not be enforced: {error}");
+                    self.fail_service_start(name, handle.id, "startup_failed", &reason)
+                        .await?;
+                    return Err(KernelError::Policy(format!("service '{name}' {reason}")));
+                }
                 if state.def.resources.nice.is_some() {
                     if let Err(error) = self.set_nice(handle.id, nice).await {
-                        let _ = self.kill_agent(handle.id).await;
-                        self.os.init.lock().await.mark_failed(name, 1);
+                        self.fail_service_start(
+                            name,
+                            handle.id,
+                            "startup_failed",
+                            &error.to_string(),
+                        )
+                        .await?;
                         return Err(error);
                     }
                 }
                 self.os.init.lock().await.mark_started(name, handle.id);
+                self.persist_service_transition(name, "started", None)
+                    .await?;
+                let remaining = startup_timeout.saturating_sub(startup_started.elapsed());
+                let readiness = tokio::time::timeout(remaining, async {
+                    if state.def.health.readiness_delay_ms > 0 {
+                        tokio::time::sleep(std::time::Duration::from_millis(
+                            state.def.health.readiness_delay_ms,
+                        ))
+                        .await;
+                    }
+                    self.get_agent_status(handle.id)
+                })
+                .await;
+                let agent_state = match readiness {
+                    Ok(Ok(agent_state)) => agent_state,
+                    Ok(Err(error)) => {
+                        self.fail_service_start(
+                            name,
+                            handle.id,
+                            "readiness_failed",
+                            &error.to_string(),
+                        )
+                        .await?;
+                        return Err(error);
+                    }
+                    Err(_) => {
+                        let reason =
+                            format!("startup exceeded {}ms", state.def.health.startup_timeout_ms);
+                        self.fail_service_start(name, handle.id, "startup_timeout", &reason)
+                            .await?;
+                        return Err(KernelError::LifecycleTimeout(format!(
+                            "service '{name}' {reason}"
+                        )));
+                    }
+                };
+                if agent_state != AgentState::Running {
+                    let reason = format!("service owner was {agent_state:?} at readiness check");
+                    self.fail_service_start(name, handle.id, "readiness_failed", &reason)
+                        .await?;
+                    return Err(KernelError::Policy(format!(
+                        "service '{name}' readiness failed"
+                    )));
+                }
+                self.os.init.lock().await.mark_ready(name);
+                self.service_health_checks
+                    .insert(name.to_string(), std::time::Instant::now());
+                self.persist_service_transition(name, "ready", None).await?;
                 Ok(handle.id)
             }
-            Err(error) => {
-                self.os.init.lock().await.mark_failed(name, 1);
+            Ok(Err(error)) => {
+                self.os
+                    .init
+                    .lock()
+                    .await
+                    .mark_failed_reason(name, 1, error.to_string());
+                self.persist_service_transition(name, "startup_failed", Some(&error.to_string()))
+                    .await?;
                 Err(error)
+            }
+            Err(_) => {
+                let reason = format!("startup exceeded {}ms", state.def.health.startup_timeout_ms);
+                self.os
+                    .init
+                    .lock()
+                    .await
+                    .mark_failed_reason(name, 1, reason.clone());
+                self.persist_service_transition(name, "startup_timeout", Some(&reason))
+                    .await?;
+                Err(KernelError::LifecycleTimeout(format!(
+                    "service '{name}' {reason}"
+                )))
             }
         }
     }
 
+    async fn fail_service_start(
+        &self,
+        name: &str,
+        agent_id: AgentId,
+        event: &str,
+        reason: &str,
+    ) -> Result<(), KernelError> {
+        let cleanup = self.kill_agent(agent_id).await;
+        self.os
+            .init
+            .lock()
+            .await
+            .mark_failed_reason(name, 1, reason.to_string());
+        self.os.init.lock().await.clear_instance(name);
+        self.persist_service_transition(name, event, Some(reason))
+            .await?;
+        cleanup.map(|_| ())
+    }
+
     pub async fn stop_service(&self, name: &str) -> Result<(), KernelError> {
+        let _operation = self.service_operation_lock.lock().await;
+        let order = self.os.init.lock().await.dependents_of(name);
+        if order.is_empty() {
+            return Err(KernelError::Policy(format!("service '{name}' not found")));
+        }
+        for service in order {
+            self.stop_service_inner(&service, false).await?;
+        }
+        Ok(())
+    }
+
+    async fn stop_service_inner(
+        &self,
+        name: &str,
+        desired_running: bool,
+    ) -> Result<(), KernelError> {
         let state = self
             .os
             .init
@@ -2476,53 +3285,357 @@ impl AgentKernelImpl {
             .state(name)
             .ok_or_else(|| KernelError::Policy(format!("service '{name}' not found")))?;
         if state.status == ServiceStatus::Inactive {
+            self.os
+                .init
+                .lock()
+                .await
+                .mark_stopped_with_desired(name, desired_running);
+            self.persist_service_transition(name, "stopped", None)
+                .await?;
             return Ok(());
         }
         self.os.init.lock().await.mark_stopping(name);
+        self.persist_service_transition(name, "stopping", None)
+            .await?;
         if let Some(agent_id) = state.agent_id {
-            if let Err(error) = self.stop_agent(agent_id).await {
-                self.os.init.lock().await.mark_failed(name, 1);
-                return Err(error);
+            let graceful = tokio::time::timeout(
+                std::time::Duration::from_millis(state.def.health.shutdown_timeout_ms),
+                self.stop_agent(agent_id),
+            )
+            .await;
+            match graceful {
+                Ok(Ok(_)) => {}
+                Ok(Err(error)) => {
+                    self.os
+                        .init
+                        .lock()
+                        .await
+                        .mark_failed_reason(name, 1, error.to_string());
+                    self.persist_service_transition(
+                        name,
+                        "shutdown_failed",
+                        Some(&error.to_string()),
+                    )
+                    .await?;
+                    return Err(error);
+                }
+                Err(_) => {
+                    self.kill_agent(agent_id).await?;
+                    self.persist_service_transition(
+                        name,
+                        "shutdown_forced",
+                        Some("graceful shutdown deadline exceeded"),
+                    )
+                    .await?;
+                }
             }
         }
-        self.os.init.lock().await.mark_stopped(name);
+        self.os
+            .init
+            .lock()
+            .await
+            .mark_stopped_with_desired(name, desired_running);
+        self.service_health_checks.remove(name);
+        self.persist_service_transition(name, "stopped", None)
+            .await?;
         Ok(())
     }
 
     pub async fn restart_service(&self, name: &str) -> Result<AgentId, KernelError> {
-        let state = self
-            .os
-            .init
-            .lock()
-            .await
-            .state(name)
-            .ok_or_else(|| KernelError::Policy(format!("service '{name}' not found")))?;
-        self.stop_service(name).await?;
-        self.os.init.lock().await.record_restart(name);
+        let _operation = self.service_operation_lock.lock().await;
+        let (state, reverse_order, desired) = {
+            let init = self.os.init.lock().await;
+            let state = init
+                .state(name)
+                .ok_or_else(|| KernelError::Policy(format!("service '{name}' not found")))?;
+            let reverse_order = init.dependents_of(name);
+            let desired = reverse_order
+                .iter()
+                .filter_map(|service| {
+                    init.state(service)
+                        .map(|state| (service.clone(), state.desired_running))
+                })
+                .collect::<std::collections::HashMap<_, _>>();
+            (state, reverse_order, desired)
+        };
+        for service in &reverse_order {
+            let keep_desired = service == name || desired.get(service).copied().unwrap_or(false);
+            self.stop_service_inner(service, keep_desired).await?;
+        }
+        for service in &reverse_order {
+            if service == name || desired.get(service).copied().unwrap_or(false) {
+                let mut init = self.os.init.lock().await;
+                init.reset_restart_budget(service);
+                init.record_restart(service);
+                drop(init);
+                let reason = if service == name {
+                    "operator requested restart"
+                } else {
+                    "required dependency was manually restarted"
+                };
+                self.persist_service_transition(service, "manual_restart", Some(reason))
+                    .await?;
+            }
+        }
         tokio::time::sleep(std::time::Duration::from_millis(
-            state.def.service.restart_delay_ms.min(30_000),
+            state
+                .def
+                .service
+                .restart_delay_ms
+                .min(state.def.service.restart_max_delay_ms),
         ))
         .await;
-        self.start_service(name).await
+        let mut target = None;
+        for service in reverse_order.iter().rev() {
+            if service == name || desired.get(service).copied().unwrap_or(false) {
+                let agent_id = self.start_service_inner(service).await?;
+                if service == name {
+                    target = Some(agent_id);
+                }
+            }
+        }
+        target.ok_or_else(|| KernelError::Policy(format!("service '{name}' restart was skipped")))
     }
 
     /// Start all services in validated dependency order. A failure rolls back
     /// services started by this attempt in reverse order.
     pub async fn boot_services(&self) -> Result<Vec<AgentId>, KernelError> {
+        let _operation = self.service_operation_lock.lock().await;
         let order = self.os.init.lock().await.boot_order().to_vec();
-        let mut started = Vec::new();
+        let mut active = Vec::new();
+        let mut started_by_attempt = Vec::new();
         for name in order {
-            match self.start_service(&name).await {
-                Ok(agent_id) => started.push((name, agent_id)),
+            let recovered = self
+                .os
+                .init
+                .lock()
+                .await
+                .state(&name)
+                .expect("boot order only contains configured services");
+            if recovered.desired_running {
+                let dependencies_ready = {
+                    let init = self.os.init.lock().await;
+                    recovered.def.dependencies.requires.iter().all(|required| {
+                        init.state(required).is_some_and(|dependency| {
+                            dependency.status == ServiceStatus::Running
+                                && dependency.ready
+                                && dependency.healthy
+                        })
+                    })
+                };
+                if recovered.status == ServiceStatus::Running
+                    && recovered.ready
+                    && recovered.healthy
+                    && dependencies_ready
+                {
+                    if let Some(agent_id) = recovered.agent_id {
+                        active.push(agent_id);
+                    }
+                }
+                // Any other desired state is crash-recovery work. Preserve its
+                // durable delay/exhaustion and let the runtime supervisor
+                // reconcile it instead of bypassing policy during boot.
+                continue;
+            }
+            match self.start_service_inner(&name).await {
+                Ok(agent_id) => {
+                    active.push(agent_id);
+                    started_by_attempt.push(name);
+                }
                 Err(error) => {
-                    for (started_name, _) in started.iter().rev() {
-                        let _ = self.stop_service(started_name).await;
+                    for started_name in started_by_attempt.iter().rev() {
+                        let _ = self.stop_service_inner(started_name, false).await;
                     }
                     return Err(error);
                 }
             }
         }
-        Ok(started.into_iter().map(|(_, agent_id)| agent_id).collect())
+        Ok(active)
+    }
+
+    /// One liveness/restart reconciliation pass. The runtime calls this on a
+    /// bounded interval; the global operation lock prevents overlap with
+    /// operator lifecycle and rolling reload.
+    pub(crate) async fn service_supervisor_sweep(&self) -> Result<(), KernelError> {
+        let Ok(_operation) = self.service_operation_lock.try_lock() else {
+            return Ok(());
+        };
+        let now = chrono::Utc::now();
+        let names = self.os.init.lock().await.boot_order().to_vec();
+
+        // Required-dependency failure propagates from dependents backwards.
+        for name in names.iter().rev() {
+            let Some(state) = self.os.init.lock().await.state(name) else {
+                continue;
+            };
+            if !state.desired_running || state.status != ServiceStatus::Running {
+                continue;
+            }
+            let dependency_failure = {
+                let init = self.os.init.lock().await;
+                state.def.dependencies.requires.iter().find_map(|required| {
+                    let dependency = init.state(required)?;
+                    (!(dependency.status == ServiceStatus::Running
+                        && dependency.ready
+                        && dependency.healthy))
+                        .then(|| required.clone())
+                })
+            };
+            if let Some(required) = dependency_failure {
+                let reason = format!("required service '{required}' became unavailable");
+                self.stop_service_inner(name, true).await?;
+                {
+                    let mut init = self.os.init.lock().await;
+                    init.mark_failed_reason(name, 1, reason.clone());
+                    init.record_dependency_block(name, reason.clone());
+                    let _ = init.schedule_restart(name, now);
+                }
+                self.persist_service_transition(name, "dependency_failed", Some(&reason))
+                    .await?;
+            }
+        }
+
+        for name in names {
+            let Some(state) = self.os.init.lock().await.state(&name) else {
+                continue;
+            };
+            if !state.desired_running {
+                continue;
+            }
+            if state.status == ServiceStatus::Running {
+                let liveness_interval =
+                    std::time::Duration::from_millis(state.def.health.liveness_interval_ms);
+                if self
+                    .service_health_checks
+                    .get(&name)
+                    .is_some_and(|last_check| last_check.elapsed() < liveness_interval)
+                {
+                    continue;
+                }
+                self.service_health_checks
+                    .insert(name.clone(), std::time::Instant::now());
+                let live = state.agent_id.and_then(|agent_id| {
+                    self.agent_manager
+                        .get_agent_state(agent_id)
+                        .map(|agent_state| (agent_id, agent_state))
+                });
+                match live {
+                    Some((_, AgentState::Running)) if state.ready && state.healthy => continue,
+                    Some((_, AgentState::Running)) => {
+                        self.os.init.lock().await.mark_ready(&name);
+                        self.persist_service_transition(&name, "health_recovered", None)
+                            .await?;
+                        continue;
+                    }
+                    Some((agent_id, agent_state)) => {
+                        let reason = format!("liveness failed: owner state is {agent_state:?}");
+                        let mut init = self.os.init.lock().await;
+                        init.mark_failed_reason(&name, 1, reason.clone());
+                        let _ = init.schedule_restart(&name, now);
+                        drop(init);
+                        if !matches!(agent_state, AgentState::Stopped) {
+                            self.stop_agent(agent_id).await?;
+                        }
+                        self.os.init.lock().await.clear_instance(&name);
+                        self.persist_service_transition(&name, "liveness_failed", Some(&reason))
+                            .await?;
+                    }
+                    None => {
+                        let reason = "liveness failed: durable owner is missing".to_string();
+                        let mut init = self.os.init.lock().await;
+                        init.mark_failed_reason(&name, 1, reason.clone());
+                        let _ = init.schedule_restart(&name, now);
+                        drop(init);
+                        self.persist_service_transition(&name, "liveness_failed", Some(&reason))
+                            .await?;
+                    }
+                }
+            } else if state.status == ServiceStatus::Failed && state.next_restart_at.is_none() {
+                let mut init = self.os.init.lock().await;
+                let scheduled = init.schedule_restart(&name, now);
+                drop(init);
+                if scheduled.is_some() {
+                    self.persist_service_transition(
+                        &name,
+                        "restart_scheduled",
+                        state.last_failure.as_deref(),
+                    )
+                    .await?;
+                }
+            }
+
+            let due = self.os.init.lock().await.restart_due(&name, now);
+            if !due {
+                continue;
+            }
+            let required_ready = {
+                let init = self.os.init.lock().await;
+                let state = init.state(&name).expect("service exists during sweep");
+                state.def.dependencies.requires.iter().all(|required| {
+                    init.state(required).is_some_and(|dependency| {
+                        dependency.status == ServiceStatus::Running
+                            && dependency.ready
+                            && dependency.healthy
+                    })
+                })
+            };
+            if !required_ready {
+                let reason = "restart deferred until required dependencies are ready".to_string();
+                self.os.init.lock().await.defer_restart(
+                    &name,
+                    std::time::Duration::from_millis(state.def.health.liveness_interval_ms.max(50)),
+                    reason.clone(),
+                );
+                self.persist_service_transition(&name, "restart_deferred", Some(&reason))
+                    .await?;
+                continue;
+            }
+            if let Some(agent_id) = state.agent_id {
+                if !matches!(
+                    self.agent_manager.get_agent_state(agent_id),
+                    Some(AgentState::Stopped)
+                ) {
+                    let cleanup = self.stop_agent(agent_id).await;
+                    if let Err(error) = cleanup {
+                        self.os.init.lock().await.defer_restart(
+                            &name,
+                            std::time::Duration::from_millis(
+                                state.def.health.liveness_interval_ms.max(50),
+                            ),
+                            format!("restart cleanup failed: {error}"),
+                        );
+                        self.persist_service_transition(
+                            &name,
+                            "restart_cleanup_failed",
+                            Some(&error.to_string()),
+                        )
+                        .await?;
+                        continue;
+                    }
+                }
+            }
+            {
+                let mut init = self.os.init.lock().await;
+                init.clear_instance_for_restart(&name);
+                init.record_restart(&name);
+            }
+            self.persist_service_transition(
+                &name,
+                "restart_attempt",
+                state.last_failure.as_deref(),
+            )
+            .await?;
+            if let Err(error) = self.start_service_inner(&name).await {
+                let reason = format!("restart attempt failed: {error}");
+                let mut init = self.os.init.lock().await;
+                init.mark_failed_reason(&name, 1, reason.clone());
+                let _ = init.schedule_restart(&name, chrono::Utc::now());
+                drop(init);
+                self.persist_service_transition(&name, "restart_failed", Some(&reason))
+                    .await?;
+            }
+        }
+        Ok(())
     }
 
     /// Cancel an active turn and wait until the per-agent executor is idle.
@@ -2540,7 +3653,7 @@ impl AgentKernelImpl {
             let idle = tokio::time::timeout(Self::TOOL_DRAIN_TIMEOUT, executor.lock())
                 .await
                 .map_err(|_| {
-                    KernelError::Policy(format!(
+                    KernelError::LifecycleTimeout(format!(
                         "timed out waiting for active agent turn to quiesce for agent {agent_id}"
                     ))
                 })?;
@@ -2569,7 +3682,7 @@ impl AgentKernelImpl {
                 // agent's admission state so a timed-out stop/kill attempt does
                 // not leave it half-disabled; a later retry closes it again.
                 let _ = self.syscall_gate.reopen_tool_admission(agent_id);
-                Err(KernelError::Policy(format!(
+                Err(KernelError::LifecycleTimeout(format!(
                     "timed out draining active external tool calls for agent {agent_id}"
                 )))
             }
@@ -2579,6 +3692,19 @@ impl AgentKernelImpl {
     /// Pause admission for an agent and cooperatively cancel any active turn.
     /// Repeating a pause is idempotent.
     pub async fn pause_agent(&self, agent_id: AgentId) -> Result<AgentState, KernelError> {
+        let started = std::time::Instant::now();
+        self.record_lifecycle(
+            agent_id,
+            LifecycleOperation::Pause,
+            LifecycleOutcome::Requested,
+        );
+        let result = self.pause_agent_inner(agent_id).await;
+        self.record_lifecycle_result(agent_id, LifecycleOperation::Pause, &result, started);
+        result
+    }
+
+    async fn pause_agent_inner(&self, agent_id: AgentId) -> Result<AgentState, KernelError> {
+        let _operator_mutation = self.operator_control.mutation_guard().await;
         let lock = self.lifecycle_lock(agent_id);
         let _guard = lock.lock().await;
         let state = self
@@ -2606,6 +3732,19 @@ impl AgentKernelImpl {
     /// Resume admission for a paused agent. The next turn receives a fresh
     /// cancellation token; repeating resume on Running is idempotent.
     pub async fn resume_agent(&self, agent_id: AgentId) -> Result<AgentState, KernelError> {
+        let started = std::time::Instant::now();
+        self.record_lifecycle(
+            agent_id,
+            LifecycleOperation::Resume,
+            LifecycleOutcome::Requested,
+        );
+        let result = self.resume_agent_inner(agent_id).await;
+        self.record_lifecycle_result(agent_id, LifecycleOperation::Resume, &result, started);
+        result
+    }
+
+    async fn resume_agent_inner(&self, agent_id: AgentId) -> Result<AgentState, KernelError> {
+        let _operator_mutation = self.operator_control.mutation_guard().await;
         let lock = self.lifecycle_lock(agent_id);
         let _guard = lock.lock().await;
         let state = self
@@ -2626,6 +3765,19 @@ impl AgentKernelImpl {
     /// Durable conversations, facts, usage, and the terminal registry row are
     /// retained; repeating stop is idempotent.
     pub async fn stop_agent(&self, agent_id: AgentId) -> Result<AgentState, KernelError> {
+        let started = std::time::Instant::now();
+        self.record_lifecycle(
+            agent_id,
+            LifecycleOperation::Stop,
+            LifecycleOutcome::Requested,
+        );
+        let result = self.stop_agent_inner(agent_id).await;
+        self.record_lifecycle_result(agent_id, LifecycleOperation::Stop, &result, started);
+        result
+    }
+
+    async fn stop_agent_inner(&self, agent_id: AgentId) -> Result<AgentState, KernelError> {
+        let _operator_mutation = self.operator_control.mutation_guard().await;
         let lock = self.lifecycle_lock(agent_id);
         let _guard = lock.lock().await;
         let state = self
@@ -2633,27 +3785,61 @@ impl AgentKernelImpl {
             .get_agent_state(agent_id)
             .ok_or(AgentError::NotFound(agent_id))?;
         if state == AgentState::Stopped {
-            let persisted = self
-                .context_manager
-                .update_agent_status(agent_id, &AgentState::Stopped);
-            self.cleanup_agent_resources(agent_id).await;
-            persisted?;
+            self.cleanup_agent_resources(agent_id).await?;
+            self.context_manager
+                .update_agent_status(agent_id, &AgentState::Stopped)?;
             return Ok(state);
         }
-        self.quiesce_agent(agent_id).await?;
-        self.drain_agent_tool_calls(agent_id).await?;
-        self.agent_manager.stop_agent(agent_id).await?;
-        let persisted = self
-            .context_manager
-            .update_agent_status(agent_id, &AgentState::Stopped);
-        self.cleanup_agent_resources(agent_id).await;
-        persisted?;
+        if state != AgentState::Stopping {
+            if !matches!(
+                state,
+                AgentState::Running | AgentState::Paused | AgentState::Error(_)
+            ) {
+                return Err(AgentError::InvalidTransition {
+                    from: state,
+                    to: AgentState::Stopping,
+                }
+                .into());
+            }
+            self.quiesce_agent(agent_id).await?;
+            self.drain_agent_tool_calls(agent_id).await?;
+            if let Err(error) = self
+                .context_manager
+                .update_agent_status(agent_id, &AgentState::Stopping)
+            {
+                // A successful drain closes admission. If durable staging
+                // fails, the in-memory agent is still runnable, so restore
+                // admission before returning the persistence error.
+                let _ = self.syscall_gate.reopen_tool_admission(agent_id);
+                return Err(error.into());
+            }
+            self.agent_manager.force_stopping(agent_id)?;
+        }
+        self.cleanup_agent_resources(agent_id).await?;
+        self.context_manager
+            .update_agent_status(agent_id, &AgentState::Stopped)?;
+        self.agent_manager.force_stopped(agent_id)?;
         Ok(AgentState::Stopped)
     }
 
-    /// Force a terminal state from any non-terminal lifecycle state, then run
-    /// the exact same cleanup invariant as graceful stop.
+    /// Force a terminal state from any non-terminal lifecycle state. Unlike
+    /// graceful stop, kill does not wait for an uncooperative turn or external
+    /// binding: it cancels execution, revokes admitted tool guards, and tears
+    /// down every live subsystem immediately.
     pub async fn kill_agent(&self, agent_id: AgentId) -> Result<AgentState, KernelError> {
+        let started = std::time::Instant::now();
+        self.record_lifecycle(
+            agent_id,
+            LifecycleOperation::Kill,
+            LifecycleOutcome::Requested,
+        );
+        let result = self.kill_agent_inner(agent_id).await;
+        self.record_lifecycle_result(agent_id, LifecycleOperation::Kill, &result, started);
+        result
+    }
+
+    async fn kill_agent_inner(&self, agent_id: AgentId) -> Result<AgentState, KernelError> {
+        let _operator_mutation = self.operator_control.mutation_guard().await;
         let lock = self.lifecycle_lock(agent_id);
         let _guard = lock.lock().await;
         let state = self
@@ -2661,21 +3847,25 @@ impl AgentKernelImpl {
             .get_agent_state(agent_id)
             .ok_or(AgentError::NotFound(agent_id))?;
         if state == AgentState::Stopped {
-            let persisted = self
-                .context_manager
-                .update_agent_status(agent_id, &AgentState::Stopped);
-            self.cleanup_agent_resources(agent_id).await;
-            persisted?;
+            self.force_cleanup_agent_resources(agent_id).await?;
+            self.context_manager
+                .update_agent_status(agent_id, &AgentState::Stopped)?;
             return Ok(state);
         }
-        self.quiesce_agent(agent_id).await?;
-        self.drain_agent_tool_calls(agent_id).await?;
+        if state != AgentState::Stopping {
+            // The durable non-runnable marker commits before forced revocation.
+            // A crash can therefore never re-admit a partially killed agent.
+            self.context_manager
+                .update_agent_status(agent_id, &AgentState::Stopping)?;
+            self.agent_manager.force_stopping(agent_id)?;
+        }
+        if let Some(token) = self.active_cancellations.get(&agent_id) {
+            token.cancel();
+        }
+        self.force_cleanup_agent_resources(agent_id).await?;
+        self.context_manager
+            .update_agent_status(agent_id, &AgentState::Stopped)?;
         self.agent_manager.force_stopped(agent_id)?;
-        let persisted = self
-            .context_manager
-            .update_agent_status(agent_id, &AgentState::Stopped);
-        self.cleanup_agent_resources(agent_id).await;
-        persisted?;
         Ok(AgentState::Stopped)
     }
 
@@ -2690,6 +3880,22 @@ impl AgentKernelImpl {
         agent_id: AgentId,
         timeout: std::time::Duration,
     ) -> Result<AgentState, KernelError> {
+        let started = std::time::Instant::now();
+        self.record_lifecycle(
+            agent_id,
+            LifecycleOperation::Wait,
+            LifecycleOutcome::Requested,
+        );
+        let result = self.wait_agent_inner(agent_id, timeout).await;
+        self.record_lifecycle_result(agent_id, LifecycleOperation::Wait, &result, started);
+        result
+    }
+
+    async fn wait_agent_inner(
+        &self,
+        agent_id: AgentId,
+        timeout: std::time::Duration,
+    ) -> Result<AgentState, KernelError> {
         tokio::time::timeout(timeout, async {
             loop {
                 let state = self.get_agent_status(agent_id)?;
@@ -2700,7 +3906,36 @@ impl AgentKernelImpl {
             }
         })
         .await
-        .map_err(|_| KernelError::Policy("wait_agent timed out".into()))?
+        .map_err(|_| KernelError::LifecycleTimeout("wait_agent timed out".into()))?
+    }
+
+    /// Force-clean active turns that have made no recorded progress within the
+    /// watchdog bound. Idle runnable agents are deliberately excluded: only an
+    /// agent with a live cancellation token can be classified as unresponsive.
+    pub(crate) async fn watchdog_sweep(&self) -> Vec<AgentId> {
+        let cutoff = chrono::Utc::now()
+            - chrono::Duration::from_std(Self::WATCHDOG_TIMEOUT)
+                .expect("fixed watchdog timeout is representable");
+        let candidates = self
+            .agent_manager
+            .list_agents(None)
+            .into_iter()
+            .filter(|agent| self.active_cancellations.contains_key(&agent.id))
+            .filter(|agent| self.agent_manager.is_unresponsive_since(agent.id, cutoff))
+            .map(|agent| agent.id)
+            .collect::<Vec<_>>();
+        let mut terminated = Vec::new();
+        for agent_id in candidates {
+            // Recheck active membership immediately before the coordinator
+            // call. A turn that completed while the sweep was being assembled
+            // must not be killed merely because its previous timestamp aged.
+            if self.active_cancellations.contains_key(&agent_id)
+                && self.kill_agent(agent_id).await.is_ok()
+            {
+                terminated.push(agent_id);
+            }
+        }
+        terminated
     }
 
     /// Latest active durable turn checkpoint for an agent, if any.
@@ -2719,6 +3954,23 @@ impl AgentKernelImpl {
             .next())
     }
 
+    /// Content-free durable and live context-pressure usage for one agent.
+    pub fn context_pressure_stats(
+        &self,
+        agent_id: AgentId,
+    ) -> Result<crate::context::ContextPressureStats, KernelError> {
+        let mut stats = self.context_manager.context_pressure_stats(agent_id)?;
+        let active = self.context_admission.usage(agent_id, &stats.tenant_id);
+        stats.agent_active_tokens = active.agent_tokens;
+        stats.agent_active_limit = active.per_agent_limit;
+        stats.tenant_active_tokens = active.tenant_tokens;
+        stats.tenant_active_limit = active.per_tenant_limit;
+        stats.global_active_tokens = active.global_tokens;
+        stats.global_active_limit = active.global_limit;
+        stats.active_rejection_count = active.rejection_count;
+        Ok(stats)
+    }
+
     /// Resume the newest (or explicitly selected) durable in-flight turn while
     /// holding lifecycle admission. Returns the completed output, or a new
     /// checkpoint id if another pause interrupted the continuation.
@@ -2727,6 +3979,25 @@ impl AgentKernelImpl {
         agent_id: AgentId,
         checkpoint_id: Option<uuid::Uuid>,
     ) -> Result<(AgentState, Option<AgentOutput>, Option<uuid::Uuid>), KernelError> {
+        let started = std::time::Instant::now();
+        self.record_lifecycle(
+            agent_id,
+            LifecycleOperation::Resume,
+            LifecycleOutcome::Requested,
+        );
+        let result = self
+            .resume_agent_from_checkpoint_inner(agent_id, checkpoint_id)
+            .await;
+        self.record_lifecycle_result(agent_id, LifecycleOperation::Resume, &result, started);
+        result
+    }
+
+    async fn resume_agent_from_checkpoint_inner(
+        &self,
+        agent_id: AgentId,
+        checkpoint_id: Option<uuid::Uuid>,
+    ) -> Result<(AgentState, Option<AgentOutput>, Option<uuid::Uuid>), KernelError> {
+        let _operator_mutation = self.operator_control.mutation_guard().await;
         let lifecycle_lock = self.lifecycle_lock(agent_id);
         let lifecycle_guard = lifecycle_lock.lock().await;
         let state = self.get_agent_status(agent_id)?;
@@ -2797,6 +4068,7 @@ impl AgentKernelImpl {
         self.context_manager
             .update_agent_status(agent_id, &AgentState::Running)?;
         let cancellation = executor.renew_cancel_token();
+        self.agent_manager.record_activity(agent_id);
         self.active_cancellations.insert(agent_id, cancellation);
         drop(lifecycle_guard);
 
@@ -2843,6 +4115,13 @@ impl AgentKernelImpl {
                 Ok((self.get_agent_status(agent_id)?, Some(output), None))
             }
             Ok(TurnResult::Paused(checkpoint)) => {
+                if self.get_agent_status(agent_id)? != AgentState::Paused {
+                    self.context_manager
+                        .release_generation_checkpoint(checkpoint_id)?;
+                    return Err(KernelError::Policy(
+                        "checkpoint resume cancelled by terminal lifecycle operation".into(),
+                    ));
+                }
                 let executor = self
                     .executors
                     .get(&agent_id)
@@ -2922,6 +4201,11 @@ impl AgentKernelImpl {
         executor.set_budget_enforcer(self.budget_enforcer.clone());
         executor.set_rate_limiter(self.rate_limiter.clone());
         executor.set_context_budget(self.context_budget_tokens);
+        let tenant_id = self
+            .context_manager
+            .agent_tenant(agent_id)?
+            .unwrap_or_else(|| crate::context::DEFAULT_TENANT.to_string());
+        executor.set_context_admission(self.context_admission.clone(), tenant_id);
         executor.set_max_tool_calls(self.max_tool_calls_per_turn);
         executor.set_max_output_tokens_per_request(self.max_output_tokens_per_request);
         if let Some(pid) = self.syscall_gate.pid_of(agent_id) {
@@ -3005,11 +4289,20 @@ impl AgentKernelImpl {
             },
         )?;
         if let Some(pid) = self.syscall_gate.pid_of(agent_id) {
-            self.os
-                .cfs
-                .lock()
-                .await
-                .account_tokens(pid, u64::from(tokens));
+            let yielded = {
+                let mut scheduler = self.os.cfs.lock().await;
+                scheduler.account_tokens(pid, u64::from(tokens));
+                let yielded = scheduler.time_slice_expired(pid);
+                if yielded {
+                    // The live contract yields only at a completed turn
+                    // boundary; this is not CPU or mid-future preemption.
+                    scheduler.reset_slice(pid);
+                }
+                yielded
+            };
+            if yielded {
+                self.turn_admission.record_cooperative_yield();
+            }
         }
         Ok(())
     }
@@ -3058,6 +4351,7 @@ impl AgentKernelImpl {
             match executor.try_lock() {
                 Ok(mut executor_guard) => {
                     let cancellation = executor_guard.renew_cancel_token();
+                    self.agent_manager.record_activity(agent_id);
                     self.active_cancellations.insert(agent_id, cancellation);
                     drop(lifecycle_guard);
                     break executor_guard;
@@ -3111,6 +4405,11 @@ impl AgentKernelImpl {
         let output = match run_result? {
             TurnResult::Completed(output) => output,
             TurnResult::Paused(checkpoint) => {
+                if self.get_agent_status(agent_id)? != AgentState::Paused {
+                    return Err(KernelError::Policy(
+                        "agent turn cancelled by terminal lifecycle operation".into(),
+                    ));
+                }
                 let tenant = self
                     .context_manager
                     .agent_tenant(agent_id)?
@@ -3189,25 +4488,34 @@ impl AgentKernelImpl {
         let _ = self.event_tx.send(KernelEvent::ShutdownInitiated);
 
         let mut stopped = Vec::new();
+        let mut failures = Vec::new();
 
         // Coordinated services stop first in reverse dependency order. Their
         // agents become terminal through `stop_agent`, so the general pass
         // below naturally skips them.
-        let service_shutdown_order = {
-            let init = self.os.init.lock().await;
-            init.reverse_boot_order()
-        };
-        for service in service_shutdown_order {
-            let agent_id = self
-                .os
-                .init
-                .lock()
-                .await
-                .state(&service)
-                .and_then(|state| state.agent_id);
-            if self.stop_service(&service).await.is_ok() {
-                if let Some(agent_id) = agent_id {
-                    stopped.push(agent_id);
+        {
+            let _operation = self.service_operation_lock.lock().await;
+            let service_shutdown_order = {
+                let init = self.os.init.lock().await;
+                init.reverse_boot_order()
+            };
+            for service in service_shutdown_order {
+                let agent_id = self
+                    .os
+                    .init
+                    .lock()
+                    .await
+                    .state(&service)
+                    .and_then(|state| state.agent_id);
+                match self.stop_service_inner(&service, false).await {
+                    Ok(()) => {
+                        if let Some(agent_id) = agent_id {
+                            stopped.push(agent_id);
+                        }
+                    }
+                    Err(error) => {
+                        failures.push(format!("service {service}: {error}"));
+                    }
                 }
             }
         }
@@ -3215,18 +4523,26 @@ impl AgentKernelImpl {
         let agents = self.agent_manager.list_agents(None);
 
         for info in agents {
-            match info.state {
-                AgentState::Stopped | AgentState::Error(_) => {}
-                AgentState::Running | AgentState::Paused => {
-                    if self.stop_agent(info.id).await.is_ok() {
-                        stopped.push(info.id);
-                    }
+            if stopped.contains(&info.id) || info.state == AgentState::Stopped {
+                continue;
+            }
+            let mut result = match info.state {
+                AgentState::Running | AgentState::Paused | AgentState::Error(_) => {
+                    self.stop_agent(info.id).await
                 }
-                AgentState::Initializing | AgentState::Stopping => {
-                    if self.kill_agent(info.id).await.is_ok() {
-                        stopped.push(info.id);
-                    }
-                }
+                AgentState::Initializing | AgentState::Stopping => self.kill_agent(info.id).await,
+                AgentState::Stopped => unreachable!("stopped agents are skipped above"),
+            };
+            if matches!(&result, Err(KernelError::LifecycleTimeout(_))) {
+                // Shutdown is terminal: an uncooperative provider/tool binding
+                // must not keep the process alive indefinitely. Escalate only
+                // bounded graceful timeouts; structural cleanup faults remain
+                // visible to the caller and retryable.
+                result = self.kill_agent(info.id).await;
+            }
+            match result {
+                Ok(_) => stopped.push(info.id),
+                Err(error) => failures.push(format!("agent {}: {error}", info.id)),
             }
         }
 
@@ -3234,11 +4550,19 @@ impl AgentKernelImpl {
         // fully-consolidated, consistent database. Best-effort. (Crash recovery
         // does NOT depend on this — committed transactions are already durable;
         // this just truncates the WAL on a clean exit.)
-        if let Err(e) = self.context_manager.checkpoint() {
-            tracing::warn!("WAL checkpoint on shutdown failed: {e}");
+        if let Err(error) = self.context_manager.checkpoint() {
+            failures.push(format!("WAL checkpoint: {error}"));
         }
 
-        Ok(stopped)
+        if failures.is_empty() {
+            Ok(stopped)
+        } else {
+            Err(KernelError::LifecycleCleanup(format!(
+                "shutdown incomplete ({} agent(s) stopped): {}",
+                stopped.len(),
+                failures.join("; ")
+            )))
+        }
     }
 
     /// Subscribe to kernel events.
@@ -3250,8 +4574,8 @@ impl AgentKernelImpl {
     /// procfs as `current_agent`. Durable fixed-epoch quota windows need no
     /// background reset timer. Returns the
     /// [`KernelRuntime`](crate::runtime::KernelRuntime) so the caller can
-    /// `stop()` it on shutdown. Calling twice spawns two observers, so call once
-    /// at startup.
+    /// `stop()` it on shutdown. Starting the returned runtime more than once is
+    /// idempotent and does not create duplicate background loops.
     pub fn start_runtime(self: &Arc<Self>) -> crate::runtime::KernelRuntime {
         let runtime = crate::runtime::KernelRuntime::new(self.clone());
         let _handles = runtime.start();
@@ -3289,6 +4613,27 @@ pub fn boot_in_memory() -> Result<Arc<AgentKernelImpl>, KernelError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn lifecycle_test_config(name: &str) -> AgentConfig {
+        AgentConfig {
+            name: name.into(),
+            task: "lifecycle atomicity regression".into(),
+            llm_provider: "test".into(),
+            permission_profile: "standard".into(),
+            priority: Priority::default(),
+            sandbox_config: None,
+        }
+    }
+
+    fn durable_agent_status(context: &SqliteContextManager, agent_id: AgentId) -> AgentState {
+        let persisted = context
+            .load_all_agents()
+            .unwrap()
+            .into_iter()
+            .find(|agent| agent.id == agent_id)
+            .expect("agent registry row");
+        serde_json::from_str(&persisted.status).expect("typed durable lifecycle state")
+    }
 
     #[test]
     fn invalid_budget_config_is_rejected_before_creating_the_data_directory() {
@@ -3870,6 +5215,156 @@ mod tests {
         assert_eq!(kernel.sandbox_manager.structural_counts(), (0, 0));
     }
 
+    #[tokio::test]
+    async fn stopping_persistence_failure_restores_live_admission_before_retry() {
+        let context = Arc::new(SqliteContextManager::in_memory().unwrap());
+        let kernel = AgentKernelImpl::with_context_manager(
+            context.clone(),
+            &crate::config::BudgetConfig::default(),
+            true,
+            &[],
+        )
+        .unwrap();
+        let agent = kernel
+            .create_agent_full(lifecycle_test_config("staging-failure"))
+            .await
+            .unwrap();
+        context.fail_agent_status_update_on_nth_call_for_test(1);
+
+        let error = kernel.stop_agent(agent.id).await.unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("injected agent-status update failure"));
+        assert_eq!(
+            kernel.get_agent_status(agent.id).unwrap(),
+            AgentState::Running
+        );
+        assert_eq!(
+            durable_agent_status(&context, agent.id),
+            AgentState::Running
+        );
+        assert!(kernel.scheduler.contains(agent.id));
+        assert!(kernel.ipc.is_registered(agent.id));
+        assert!(kernel.syscall_gate.agent_info(agent.id).is_some());
+        assert!(kernel
+            .sandbox_manager
+            .get_sandbox_for_agent(agent.id)
+            .is_some());
+        drop(
+            kernel
+                .syscall_gate
+                .acquire_tool_call(agent.id)
+                .expect("failed staging must reopen tool admission"),
+        );
+
+        assert_eq!(
+            kernel.stop_agent(agent.id).await.unwrap(),
+            AgentState::Stopped
+        );
+        assert_eq!(
+            durable_agent_status(&context, agent.id),
+            AgentState::Stopped
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_persistence_failure_stays_non_runnable_until_retry() {
+        let context = Arc::new(SqliteContextManager::in_memory().unwrap());
+        let kernel = AgentKernelImpl::with_context_manager(
+            context.clone(),
+            &crate::config::BudgetConfig::default(),
+            true,
+            &[],
+        )
+        .unwrap();
+        let agent = kernel
+            .create_agent_full(lifecycle_test_config("terminal-failure"))
+            .await
+            .unwrap();
+        context.fail_agent_status_update_on_nth_call_for_test(2);
+
+        let error = kernel.kill_agent(agent.id).await.unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("injected agent-status update failure"));
+        assert_eq!(
+            kernel.get_agent_status(agent.id).unwrap(),
+            AgentState::Stopping
+        );
+        assert_eq!(
+            durable_agent_status(&context, agent.id),
+            AgentState::Stopping
+        );
+        assert!(!kernel.scheduler.contains(agent.id));
+        assert!(!kernel.ipc.is_registered(agent.id));
+        assert!(kernel.syscall_gate.agent_info(agent.id).is_none());
+        assert!(kernel
+            .sandbox_manager
+            .get_sandbox_for_agent(agent.id)
+            .is_none());
+        assert!(!kernel.agent_cgroups.contains_key(&agent.id));
+
+        assert_eq!(
+            kernel.kill_agent(agent.id).await.unwrap(),
+            AgentState::Stopped
+        );
+        assert_eq!(
+            durable_agent_status(&context, agent.id),
+            AgentState::Stopped
+        );
+    }
+
+    #[tokio::test]
+    async fn sandbox_cleanup_failure_is_reported_and_retryable() {
+        let context = Arc::new(SqliteContextManager::in_memory().unwrap());
+        let kernel = AgentKernelImpl::with_context_manager(
+            context.clone(),
+            &crate::config::BudgetConfig::default(),
+            true,
+            &[],
+        )
+        .unwrap();
+        let agent = kernel
+            .create_agent_full(lifecycle_test_config("sandbox-failure"))
+            .await
+            .unwrap();
+        kernel.sandbox_manager.fail_next_destroy_for_test();
+
+        let error = kernel.stop_agent(agent.id).await.unwrap_err();
+        assert!(matches!(error, KernelError::LifecycleCleanup(_)));
+        assert!(error
+            .to_string()
+            .contains("injected sandbox destruction failure"));
+        assert_eq!(
+            kernel.get_agent_status(agent.id).unwrap(),
+            AgentState::Stopping
+        );
+        assert_eq!(
+            durable_agent_status(&context, agent.id),
+            AgentState::Stopping
+        );
+        assert!(!kernel.scheduler.contains(agent.id));
+        assert!(!kernel.ipc.is_registered(agent.id));
+        assert!(kernel.syscall_gate.agent_info(agent.id).is_none());
+        assert!(kernel
+            .sandbox_manager
+            .get_sandbox_for_agent(agent.id)
+            .is_some());
+
+        assert_eq!(
+            kernel.stop_agent(agent.id).await.unwrap(),
+            AgentState::Stopped
+        );
+        assert_eq!(
+            durable_agent_status(&context, agent.id),
+            AgentState::Stopped
+        );
+        assert!(kernel
+            .sandbox_manager
+            .get_sandbox_for_agent(agent.id)
+            .is_none());
+    }
+
     #[test]
     fn only_explicit_full_access_has_unlimited_token_and_tool_limits() {
         let budgets = crate::config::BudgetConfig {
@@ -4067,10 +5562,10 @@ mod tests {
         let hung_guard = kernel.syscall_gate.acquire_tool_call(hung.id).unwrap();
         let error = tokio::time::timeout(
             std::time::Duration::from_secs(1),
-            kernel.kill_agent(hung.id),
+            kernel.stop_agent(hung.id),
         )
         .await
-        .expect("kill has a finite external-tool drain contract")
+        .expect("stop has a finite external-tool drain contract")
         .unwrap_err();
         assert!(error.to_string().contains("timed out draining"));
         assert_eq!(kernel.get_agent_status(hung.id).unwrap(), original_state);
@@ -4079,9 +5574,19 @@ mod tests {
             .acquire_tool_call(hung.id)
             .expect("failed terminal transition must restore admission");
         drop(reopened);
-        drop(hung_guard);
         kernel.kill_agent(hung.id).await.unwrap();
         assert_eq!(kernel.cgroups.structural_counts(), (1, 1));
+        drop(hung_guard);
+        assert_eq!(
+            kernel
+                .cgroups
+                .get(kernel.cgroups.root())
+                .unwrap()
+                .usage
+                .active_tool_calls,
+            0,
+            "late guard drop after forced kill must not double-decrement accounting"
+        );
     }
 
     #[tokio::test]
@@ -4141,7 +5646,7 @@ mod tests {
 
         let error = tokio::time::timeout(
             std::time::Duration::from_secs(1),
-            kernel.kill_agent(agent.id),
+            kernel.stop_agent(agent.id),
         )
         .await
         .expect("terminal quiesce must have a finite bound")
@@ -4151,9 +5656,326 @@ mod tests {
             .contains("timed out waiting for active agent turn"));
         assert_eq!(kernel.get_agent_status(agent.id).unwrap(), original_state);
 
-        drop(held);
         kernel.kill_agent(agent.id).await.unwrap();
         assert_eq!(kernel.cgroups.structural_counts(), (1, 1));
+        drop(held);
+    }
+
+    #[tokio::test]
+    async fn kill_during_provider_request_releases_every_admission_layer() {
+        struct BlockingLifecycleSession {
+            id: ProviderId,
+            entered: Arc<tokio::sync::Notify>,
+            release: Arc<tokio::sync::Notify>,
+        }
+
+        #[async_trait::async_trait]
+        impl crate::connector::LlmSession for BlockingLifecycleSession {
+            async fn send(
+                &self,
+                messages: Vec<crate::connector::StandardMessage>,
+            ) -> Result<crate::connector::LlmResponse, ConnectorError> {
+                self.send_with_tools(messages, &[]).await
+            }
+
+            async fn send_with_tools(
+                &self,
+                _messages: Vec<crate::connector::StandardMessage>,
+                _tools: &[crate::connector::ToolDefinition],
+            ) -> Result<crate::connector::LlmResponse, ConnectorError> {
+                self.entered.notify_one();
+                self.release.notified().await;
+                Ok(crate::connector::LlmResponse {
+                    content: "must be cancelled".into(),
+                    finish_reason: Some("stop".into()),
+                    tokens_used: 1,
+                    usage: crate::connector::LlmUsage::reported(1, 1, 0),
+                    tool_calls: Vec::new(),
+                })
+            }
+
+            fn provider_id(&self) -> &ProviderId {
+                &self.id
+            }
+        }
+
+        let kernel = Arc::new(AgentKernelImpl::new().unwrap());
+        let agent = kernel
+            .create_agent_full(lifecycle_test_config("provider-kill"))
+            .await
+            .unwrap();
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let mut executor = AgentExecutor::new(
+            agent.id,
+            Box::new(BlockingLifecycleSession {
+                id: "blocking-lifecycle".into(),
+                entered: entered.clone(),
+                release: Arc::new(tokio::sync::Notify::new()),
+            }),
+            kernel.resource_broker.clone(),
+            kernel.tool_registry.clone(),
+            kernel.context_manager.clone(),
+            kernel.syscall_gate.clone(),
+            "system".into(),
+        );
+        executor.set_rate_limiter(kernel.rate_limiter.clone());
+        let pid = kernel.syscall_gate.pid_of(agent.id).unwrap();
+        let nice = kernel.os.cfs.lock().await.nice_of(pid).unwrap_or(0);
+        executor.set_llm_scheduler(kernel.llm_scheduler.clone(), pid, nice);
+        kernel
+            .executors
+            .insert(agent.id, Arc::new(tokio::sync::Mutex::new(executor)));
+
+        let turn_kernel = kernel.clone();
+        let turn = tokio::spawn(async move {
+            turn_kernel
+                .send_message(agent.id, "block in provider")
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), entered.notified())
+            .await
+            .expect("provider request did not start");
+        assert_eq!(kernel.llm_scheduler.metrics().in_flight, 1);
+        assert_eq!(kernel.turn_admission.metrics().running, 1);
+
+        let killed = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            kernel.kill_agent(agent.id),
+        )
+        .await
+        .expect("forced kill waited for the provider")
+        .unwrap();
+        assert_eq!(killed, AgentState::Stopped);
+        let turn_error = tokio::time::timeout(std::time::Duration::from_secs(1), turn)
+            .await
+            .expect("cancelled provider turn did not finish")
+            .unwrap()
+            .unwrap_err();
+        assert!(turn_error
+            .to_string()
+            .contains("cancelled by terminal lifecycle operation"));
+        assert!(kernel
+            .latest_generation_checkpoint(agent.id)
+            .unwrap()
+            .is_none());
+        assert_eq!(kernel.llm_scheduler.metrics().in_flight, 0);
+        assert_eq!(kernel.turn_admission.metrics().running, 0);
+        assert!(!kernel.active_cancellations.contains_key(&agent.id));
+        assert!(!kernel.scheduler.contains(agent.id));
+        assert!(!kernel.ipc.is_registered(agent.id));
+        assert!(kernel.syscall_gate.agent_info(agent.id).is_none());
+        assert!(kernel
+            .sandbox_manager
+            .get_sandbox_for_agent(agent.id)
+            .is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_stop_pause_and_message_races_do_not_deadlock_or_leak() {
+        let kernel = Arc::new(AgentKernelImpl::new().unwrap());
+        for round in 0..32 {
+            let agent = kernel
+                .create_agent_full(lifecycle_test_config(&format!("race-{round}")))
+                .await
+                .unwrap();
+            let agent_id = agent.id;
+            let barrier = Arc::new(tokio::sync::Barrier::new(4));
+
+            let pause_kernel = kernel.clone();
+            let pause_barrier = barrier.clone();
+            let pause = tokio::spawn(async move {
+                pause_barrier.wait().await;
+                pause_kernel.pause_agent(agent_id).await
+            });
+
+            let stop_kernel = kernel.clone();
+            let stop_barrier = barrier.clone();
+            let stop = tokio::spawn(async move {
+                stop_barrier.wait().await;
+                stop_kernel.stop_agent(agent_id).await
+            });
+
+            let message_kernel = kernel.clone();
+            let message_barrier = barrier.clone();
+            let message = tokio::spawn(async move {
+                message_barrier.wait().await;
+                message_kernel.send_message(agent_id, "race").await
+            });
+
+            barrier.wait().await;
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                let _ = tokio::join!(pause, stop, message);
+            })
+            .await
+            .expect("lifecycle/message race deadlocked");
+
+            kernel.kill_agent(agent_id).await.unwrap();
+            assert_eq!(
+                kernel.get_agent_status(agent_id).unwrap(),
+                AgentState::Stopped
+            );
+            assert!(!kernel.scheduler.contains(agent_id));
+            assert!(!kernel.ipc.is_registered(agent_id));
+            assert!(kernel.syscall_gate.agent_info(agent_id).is_none());
+            assert!(kernel
+                .sandbox_manager
+                .get_sandbox_for_agent(agent_id)
+                .is_none());
+            assert!(!kernel.active_cancellations.contains_key(&agent_id));
+            assert!(!kernel.executors.contains_key(&agent_id));
+        }
+        assert_eq!(kernel.cgroups.structural_counts(), (1, 1));
+    }
+
+    #[tokio::test]
+    async fn shutdown_surfaces_cleanup_failure_and_retry_completes() {
+        let kernel = AgentKernelImpl::new().unwrap();
+        let agent = kernel
+            .create_agent_full(lifecycle_test_config("shutdown-failure"))
+            .await
+            .unwrap();
+        kernel.sandbox_manager.fail_next_destroy_for_test();
+
+        let error = kernel.shutdown().await.unwrap_err();
+        assert!(matches!(error, KernelError::LifecycleCleanup(_)));
+        assert!(error
+            .to_string()
+            .contains("injected sandbox destruction failure"));
+        assert_eq!(
+            kernel.get_agent_status(agent.id).unwrap(),
+            AgentState::Stopping
+        );
+
+        let stopped = kernel.shutdown().await.unwrap();
+        assert_eq!(stopped, vec![agent.id]);
+        assert_eq!(
+            kernel.get_agent_status(agent.id).unwrap(),
+            AgentState::Stopped
+        );
+        assert!(kernel
+            .sandbox_manager
+            .get_sandbox_for_agent(agent.id)
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn shutdown_escalates_graceful_tool_timeout_to_forced_cleanup() {
+        let kernel = AgentKernelImpl::new().unwrap();
+        let agent = kernel
+            .create_agent_full(lifecycle_test_config("shutdown-force"))
+            .await
+            .unwrap();
+        let held = kernel.syscall_gate.acquire_tool_call(agent.id).unwrap();
+
+        assert_eq!(kernel.shutdown().await.unwrap(), vec![agent.id]);
+        assert_eq!(
+            kernel.get_agent_status(agent.id).unwrap(),
+            AgentState::Stopped
+        );
+        assert!(kernel.syscall_gate.agent_info(agent.id).is_none());
+        assert_eq!(kernel.cgroups.structural_counts(), (1, 1));
+        drop(held);
+        assert_eq!(
+            kernel
+                .cgroups
+                .get(kernel.cgroups.root())
+                .unwrap()
+                .usage
+                .active_tool_calls,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_cleans_agents_already_in_error_state() {
+        let kernel = AgentKernelImpl::new().unwrap();
+        let agent = kernel
+            .create_agent_full(lifecycle_test_config("shutdown-error"))
+            .await
+            .unwrap();
+        kernel
+            .agent_manager
+            .transition_state(agent.id, AgentState::Error("injected".into()))
+            .unwrap();
+
+        assert_eq!(kernel.shutdown().await.unwrap(), vec![agent.id]);
+        assert_eq!(
+            kernel.get_agent_status(agent.id).unwrap(),
+            AgentState::Stopped
+        );
+        assert!(!kernel.scheduler.contains(agent.id));
+        assert!(!kernel.ipc.is_registered(agent.id));
+        assert!(kernel.syscall_gate.agent_info(agent.id).is_none());
+        assert!(kernel
+            .sandbox_manager
+            .get_sandbox_for_agent(agent.id)
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn watchdog_uses_forced_coordinator_and_ignores_idle_agents() {
+        let kernel = AgentKernelImpl::new().unwrap();
+        let active = kernel
+            .create_agent_full(AgentConfig {
+                name: "watchdog-active".into(),
+                task: "watchdog cleanup regression".into(),
+                llm_provider: "test".into(),
+                permission_profile: "standard".into(),
+                priority: Priority::default(),
+                sandbox_config: None,
+            })
+            .await
+            .unwrap();
+        let idle = kernel
+            .create_agent_full(AgentConfig {
+                name: "watchdog-idle".into(),
+                task: "idle agents are not hung".into(),
+                llm_provider: "test".into(),
+                permission_profile: "standard".into(),
+                priority: Priority::default(),
+                sandbox_config: None,
+            })
+            .await
+            .unwrap();
+        let active_guard = kernel.syscall_gate.acquire_tool_call(active.id).unwrap();
+        kernel
+            .active_cancellations
+            .insert(active.id, tokio_util::sync::CancellationToken::new());
+        let stale = chrono::Utc::now() - chrono::Duration::seconds(31);
+        kernel
+            .agent_manager
+            .set_last_activity_for_test(active.id, stale);
+        kernel
+            .agent_manager
+            .set_last_activity_for_test(idle.id, stale);
+
+        assert_eq!(kernel.watchdog_sweep().await, vec![active.id]);
+        assert_eq!(
+            kernel.get_agent_status(active.id).unwrap(),
+            AgentState::Stopped
+        );
+        assert_eq!(
+            kernel.get_agent_status(idle.id).unwrap(),
+            AgentState::Running,
+            "a runnable agent with no active turn is intentionally idle"
+        );
+        assert!(!kernel.scheduler.contains(active.id));
+        assert!(!kernel.ipc.is_registered(active.id));
+        assert!(kernel.syscall_gate.agent_info(active.id).is_none());
+        assert!(kernel
+            .sandbox_manager
+            .get_sandbox_for_agent(active.id)
+            .is_none());
+        drop(active_guard);
+        assert_eq!(
+            kernel
+                .cgroups
+                .get(kernel.cgroups.root())
+                .unwrap()
+                .usage
+                .active_tool_calls,
+            0
+        );
     }
 
     #[tokio::test]
@@ -4211,14 +6033,14 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn dropping_application_provider_kills_child_before_delayed_side_effect() {
+    async fn dropping_application_provider_kills_descendant_process_tree() {
         let marker =
             std::env::temp_dir().join(format!("agentos-kill-on-drop-{}", uuid::Uuid::new_v4()));
         let parameters = serde_json::json!({
             "command": "/bin/sh",
             "args": [
                 "-c",
-                "sleep 0.3; touch \"$1\"",
+                "(sleep 0.3; touch \"$1\") & wait",
                 "agentos-child",
                 marker.to_string_lossy()
             ]
@@ -4232,7 +6054,7 @@ mod tests {
 
         assert!(
             !marker.exists(),
-            "a dropped process tool must not continue to a delayed side effect"
+            "a dropped process tool must kill background descendants before their delayed side effect"
         );
     }
 
@@ -4399,6 +6221,11 @@ mod tests {
                 old: AgentState::Initializing,
                 new: AgentState::Running,
             },
+            KernelEvent::AgentLifecycle {
+                agent_id: id,
+                operation: LifecycleOperation::Stop,
+                outcome: LifecycleOutcome::Completed,
+            },
             KernelEvent::ResourceRequested {
                 agent_id: id,
                 resource: "filesystem".to_string(),
@@ -4406,6 +6233,42 @@ mod tests {
             },
             KernelEvent::ShutdownInitiated,
         ];
-        assert_eq!(events.len(), 4);
+        assert_eq!(events.len(), 5);
+    }
+
+    #[tokio::test]
+    async fn completed_turn_slice_exhaustion_records_a_cooperative_yield() {
+        let kernel = AgentKernelImpl::new().unwrap();
+        let agent = kernel
+            .create_agent_full(lifecycle_test_config("cooperative-yield"))
+            .await
+            .unwrap();
+        let output = AgentOutput {
+            content: "completed at a turn boundary".into(),
+            tool_calls_made: 0,
+            tokens_used: 1_001,
+            provider_id: "test".into(),
+            model_id: "test-model".into(),
+            estimated_cost_usd: 0.0,
+            usage: crate::execution::UsageTelemetry {
+                output_tokens: 1_001,
+                ..crate::execution::UsageTelemetry::default()
+            },
+        };
+
+        kernel
+            .record_output_since(
+                agent.id,
+                &output,
+                0,
+                0,
+                crate::execution::UsageTelemetry::default(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(kernel.turn_admission.metrics().cooperative_yields_total, 1);
+        let pid = kernel.syscall_gate.pid_of(agent.id).unwrap();
+        assert_eq!(kernel.os.cfs.lock().await.tokens_used_of(pid), Some(0));
     }
 }

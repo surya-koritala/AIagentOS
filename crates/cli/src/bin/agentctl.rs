@@ -7,7 +7,7 @@ use agent_sdk::KernelClient;
 fn usage() -> ! {
     eprintln!(
         "usage: agentctl [--addr HOST:PORT] [--token TOKEN] \
-         <list|inspect|pressure|status|pause|resume|stop|kill|wait|services|service-start|service-stop|service-restart> [ID_OR_NAME] [TIMEOUT_MS]"
+         <list|inspect|pressure|tunables|tunable-set|tunable-rollback|tunable-history|status|pause|resume|stop|kill|wait|services|service-start|service-stop|service-restart> [ARGS...]"
     );
     std::process::exit(2);
 }
@@ -74,6 +74,95 @@ async fn main() {
                 serde_json::to_string_pretty(&stats).unwrap_or_else(|error| {
                     fail(agent_sdk::SdkError::Kernel(format!(
                         "pressure encoding failed: {error}"
+                    )))
+                })
+            );
+            return;
+        }
+        "tunables" => {
+            let tunables = client
+                .list_operator_tunables()
+                .await
+                .unwrap_or_else(|error| fail(error));
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&tunables).unwrap_or_else(|error| {
+                    fail(agent_sdk::SdkError::Kernel(format!(
+                        "tunable encoding failed: {error}"
+                    )))
+                })
+            );
+            return;
+        }
+        "tunable-set" => {
+            let name = args.next().unwrap_or_else(|| usage());
+            let value = args
+                .next()
+                .unwrap_or_else(|| usage())
+                .parse::<u64>()
+                .unwrap_or_else(|_| usage());
+            let expected_revision = args
+                .next()
+                .unwrap_or_else(|| usage())
+                .parse::<u64>()
+                .unwrap_or_else(|_| usage());
+            let tunable = client
+                .set_operator_tunable(name, value, expected_revision)
+                .await
+                .unwrap_or_else(|error| fail(error));
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&tunable).unwrap_or_else(|error| {
+                    fail(agent_sdk::SdkError::Kernel(format!(
+                        "tunable encoding failed: {error}"
+                    )))
+                })
+            );
+            return;
+        }
+        "tunable-rollback" => {
+            let name = args.next().unwrap_or_else(|| usage());
+            let target_revision = args
+                .next()
+                .unwrap_or_else(|| usage())
+                .parse::<u64>()
+                .unwrap_or_else(|_| usage());
+            let expected_revision = args
+                .next()
+                .unwrap_or_else(|| usage())
+                .parse::<u64>()
+                .unwrap_or_else(|_| usage());
+            let tunable = client
+                .rollback_operator_tunable(name, target_revision, expected_revision)
+                .await
+                .unwrap_or_else(|error| fail(error));
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&tunable).unwrap_or_else(|error| {
+                    fail(agent_sdk::SdkError::Kernel(format!(
+                        "tunable encoding failed: {error}"
+                    )))
+                })
+            );
+            return;
+        }
+        "tunable-history" => {
+            let name = args.next();
+            let limit = args
+                .next()
+                .as_deref()
+                .unwrap_or("100")
+                .parse::<usize>()
+                .unwrap_or_else(|_| usage());
+            let entries = client
+                .operator_tunable_audit(name, limit)
+                .await
+                .unwrap_or_else(|error| fail(error));
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&entries).unwrap_or_else(|error| {
+                    fail(agent_sdk::SdkError::Kernel(format!(
+                        "tunable audit encoding failed: {error}"
                     )))
                 })
             );

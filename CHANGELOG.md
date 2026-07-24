@@ -18,10 +18,14 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
   retention, corruption/incompatibility handling, completion races, restart
   side-effect replay protection, multi-agent permit release, and lifecycle
   latency metrics are regression-qualified. (#112, #113)
-- **Live operator and service APIs** — tenant-safe operator snapshots now power
-  the SDK, `agentctl`, and TUI; the kernel-owned service supervisor validates
-  dependency order and coordinates startup, rollback, and shutdown. (#117,
-  #118)
+- **Live operator and service APIs** — tenant-safe operator snapshots now expose
+  barrier-consistent lifecycle/scheduler/sandbox/cgroup/namespace state,
+  per-tenant gate-denial aggregates, bounded provider-health samples, and
+  durable package-instance metadata to the SDK, `agentctl`, and TUI. Three
+  range-validated live tunables use SQLite revision CAS, rollback, persistence,
+  and durable applied/denied audit history. The kernel-owned service supervisor
+  validates dependency order and coordinates startup, rollback, and shutdown.
+  (#117, #118)
 - **Context and admission controls** — bounded turn/LLM/tool admission,
   CFS-inspired fairness, exclusive shared-resource priority inheritance,
   starvation escape, and per-class/yield metrics. Context pressure now enforces

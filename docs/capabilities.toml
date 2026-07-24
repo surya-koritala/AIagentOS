@@ -201,18 +201,18 @@ limitations = ["JSON Syscall/SyscallReply is the only supported ABI. Numbered sy
 
 [[capability]]
 id = "operator-control"
-title = "Live authenticated operator snapshot"
+title = "Live authenticated operator control and introspection"
 owner = "operations"
-maturity = "public-api-e2e"
+maturity = "production-qualified"
 release = "v0.6"
 tracking_issue = 117
-kernel_modules = ["agentctl", "agentps", "event_loop", "observability", "procfs", "sysctl"]
-source_paths = ["crates/kernel/src/lib.rs"]
-public_entry_points = ["crates/kernel/src/syscall_server.rs::Syscall::OperatorSnapshot", "crates/sdk/src/lib.rs::KernelClient::operator_snapshot", "crates/cli/src/bin/agentctl.rs"]
-runtime_call_paths = ["crates/kernel/src/syscall_server.rs::dispatch_scoped", "crates/kernel/src/metrics.rs::MetricsSnapshot::collect"]
-test_evidence = ["tests/src/observability_props.rs", "crates/kernel/src/syscall_server.rs", "crates/sdk/src/lib.rs", "crates/tui/src/app.rs"]
+kernel_modules = ["agentctl", "agentps", "event_loop", "observability", "operator_control", "procfs", "sysctl"]
+source_paths = ["crates/kernel/src/operator_control.rs", "crates/kernel/src/syscall_server.rs", "crates/kernel/src/context.rs", "docs/OPERATIONS_API.md"]
+public_entry_points = ["crates/kernel/src/syscall_server.rs::Syscall::OperatorSnapshot", "crates/kernel/src/syscall_server.rs::Syscall::SetOperatorTunable", "crates/sdk/src/lib.rs::KernelClient::operator_snapshot", "crates/sdk/src/lib.rs::KernelClient::set_operator_tunable", "crates/cli/src/bin/agentctl.rs"]
+runtime_call_paths = ["crates/kernel/src/syscall_server.rs::dispatch_scoped", "crates/kernel/src/operator_control.rs::OperatorControl::set", "crates/kernel/src/metrics.rs::MetricsSnapshot::collect"]
+test_evidence = ["crates/kernel/src/operator_control.rs", "crates/kernel/src/syscall_server.rs", "crates/sdk/tests/kernel_client.rs", "crates/tui/src/app.rs"]
 platforms = ["linux", "macos", "windows"]
-limitations = ["The live tenant-safe snapshot covers agents, scheduler, sandbox, namespaces/capabilities, checkpoints, context pressure, usage, provider health and system-only metrics/services. Durable audited tunable writes, package views, per-tenant gate aggregates, and production concurrency/soak qualification remain outstanding; legacy ProcFs/Sysctl are not public sources of truth."]
+limitations = ["The package view is durable loaded-manifest instance metadata, not the signed registry/supply chain tracked by #119. Provider health is availability/timeout evidence; provider contract and circuit-breaker qualification remains #120. Gate decision counters are process-local and reset on restart. Legacy ProcFs/Sysctl helpers are not public sources of truth or host mounts."]
 
 [[capability]]
 id = "init-supervisor"

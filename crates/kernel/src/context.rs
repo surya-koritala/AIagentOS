@@ -911,6 +911,38 @@ impl SqliteContextManager {
                 created_at TEXT NOT NULL,
                 last_activity_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS loaded_package_instances (
+                agent_id TEXT PRIMARY KEY,
+                tenant_id TEXT NOT NULL,
+                name TEXT NOT NULL,
+                provider TEXT NOT NULL,
+                profile TEXT NOT NULL,
+                loaded_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_loaded_packages_tenant
+                ON loaded_package_instances(tenant_id, loaded_at DESC);
+            CREATE TABLE IF NOT EXISTS operator_tunables (
+                name TEXT PRIMARY KEY,
+                value INTEGER NOT NULL CHECK (value >= 0),
+                revision INTEGER NOT NULL CHECK (revision > 0),
+                updated_at TEXT NOT NULL,
+                updated_by TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS operator_tunable_audit (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                revision INTEGER,
+                previous_value INTEGER,
+                requested_value INTEGER,
+                effective_value INTEGER,
+                action TEXT NOT NULL,
+                outcome TEXT NOT NULL,
+                actor TEXT NOT NULL,
+                reason TEXT,
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_operator_tunable_audit_name
+                ON operator_tunable_audit(name, id DESC);
             -- Tenancy: tenants are the top-level isolation unit; users/sessions/
             -- api-keys are scoped to a tenant. Secrets are stored hashed (the
             -- *_hash columns), never in plaintext (see auth.rs).
@@ -4528,6 +4560,7 @@ impl SqliteContextManager {
             "context_snapshots",
             "generation_checkpoints",
             "context_pressure",
+            "loaded_package_instances",
         ] {
             tx.execute(
                 &format!("DELETE FROM {table} WHERE agent_id = ?1"),
@@ -4548,6 +4581,394 @@ impl SqliteContextManager {
         let conn = self.conn.lock().unwrap();
         let _ = conn.pragma_update(None, "wal_checkpoint", "TRUNCATE");
         Ok(())
+    }
+}
+
+/// Durable operator-control state and non-sensitive package-instance metadata.
+impl SqliteContextManager {
+    pub fn ensure_operator_tunable(
+        &self,
+        name: &str,
+        value: u64,
+        actor: &str,
+    ) -> Result<(), ContextError> {
+        let value = i64::try_from(value).map_err(|_| {
+            ContextError::PersistenceFailed(format!(
+                "operator tunable {name:?} exceeds SQLite integer range"
+            ))
+        })?;
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
+        let now = Utc::now().to_rfc3339();
+        let inserted = tx
+            .execute(
+                "INSERT OR IGNORE INTO operator_tunables
+                 (name, value, revision, updated_at, updated_by)
+                 VALUES (?1, ?2, 1, ?3, ?4)",
+                params![name, value, &now, actor],
+            )
+            .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
+        if inserted > 0 {
+            tx.execute(
+                "INSERT INTO operator_tunable_audit
+                 (name, revision, previous_value, requested_value, effective_value,
+                  action, outcome, actor, reason, created_at)
+                 VALUES (?1, 1, NULL, ?2, ?2, 'bootstrap', 'applied', ?3, NULL, ?4)",
+                params![name, value, actor, now],
+            )
+            .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
+        }
+        tx.commit()
+            .map_err(|error| ContextError::PersistenceFailed(error.to_string()))
+    }
+
+    pub fn list_operator_tunables(
+        &self,
+    ) -> Result<Vec<crate::operator_control::StoredOperatorTunable>, ContextError> {
+        let conn = self.conn.lock().unwrap();
+        let mut statement = conn
+            .prepare(
+                "SELECT name, value, revision, updated_at, updated_by
+                 FROM operator_tunables ORDER BY name",
+            )
+            .map_err(|error| ContextError::StorageError(error.to_string()))?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok(crate::operator_control::StoredOperatorTunable {
+                    name: row.get(0)?,
+                    value: row.get::<_, i64>(1)?.max(0) as u64,
+                    revision: row.get::<_, i64>(2)?.max(0) as u64,
+                    updated_at: row.get(3)?,
+                    updated_by: row.get(4)?,
+                })
+            })
+            .map_err(|error| ContextError::StorageError(error.to_string()))?;
+        let mut tunables = Vec::new();
+        for row in rows {
+            tunables.push(row.map_err(|error| ContextError::StorageError(error.to_string()))?);
+        }
+        Ok(tunables)
+    }
+
+    pub fn set_operator_tunable(
+        &self,
+        name: &str,
+        value: u64,
+        expected_revision: u64,
+        actor: &str,
+    ) -> Result<crate::operator_control::StoredOperatorTunable, ContextError> {
+        let value = i64::try_from(value).map_err(|_| {
+            ContextError::PersistenceFailed(format!(
+                "operator tunable {name:?} exceeds SQLite integer range"
+            ))
+        })?;
+        let expected_revision = i64::try_from(expected_revision).map_err(|_| {
+            ContextError::PersistenceFailed("operator tunable revision is too large".into())
+        })?;
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
+        let current = tx
+            .query_row(
+                "SELECT value, revision FROM operator_tunables WHERE name = ?1",
+                params![name],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .optional()
+            .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?
+            .ok_or_else(|| {
+                ContextError::PersistenceFailed(format!(
+                    "operator tunable {name:?} is not registered"
+                ))
+            })?;
+        if current.1 != expected_revision {
+            return Err(ContextError::PersistenceFailed(format!(
+                "operator tunable conflict for {name:?}: expected revision {expected_revision}, current revision {}",
+                current.1
+            )));
+        }
+        let revision = current
+            .1
+            .checked_add(1)
+            .ok_or_else(|| ContextError::PersistenceFailed("revision overflow".into()))?;
+        let now = Utc::now().to_rfc3339();
+        tx.execute(
+            "UPDATE operator_tunables
+             SET value = ?1, revision = ?2, updated_at = ?3, updated_by = ?4
+             WHERE name = ?5",
+            params![value, revision, &now, actor, name],
+        )
+        .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
+        tx.execute(
+            "INSERT INTO operator_tunable_audit
+             (name, revision, previous_value, requested_value, effective_value,
+              action, outcome, actor, reason, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?4, 'set', 'applied', ?5, NULL, ?6)",
+            params![name, revision, current.0, value, actor, &now],
+        )
+        .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
+        tx.commit()
+            .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
+        Ok(crate::operator_control::StoredOperatorTunable {
+            name: name.to_string(),
+            value: value as u64,
+            revision: revision as u64,
+            updated_at: now,
+            updated_by: actor.to_string(),
+        })
+    }
+
+    pub fn rollback_operator_tunable(
+        &self,
+        name: &str,
+        target_revision: u64,
+        expected_revision: u64,
+        actor: &str,
+    ) -> Result<crate::operator_control::StoredOperatorTunable, ContextError> {
+        let target_revision = i64::try_from(target_revision).map_err(|_| {
+            ContextError::PersistenceFailed("target tunable revision is too large".into())
+        })?;
+        let expected_revision = i64::try_from(expected_revision).map_err(|_| {
+            ContextError::PersistenceFailed("operator tunable revision is too large".into())
+        })?;
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
+        let current = tx
+            .query_row(
+                "SELECT value, revision FROM operator_tunables WHERE name = ?1",
+                params![name],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .optional()
+            .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?
+            .ok_or_else(|| {
+                ContextError::PersistenceFailed(format!(
+                    "operator tunable {name:?} is not registered"
+                ))
+            })?;
+        if current.1 != expected_revision {
+            return Err(ContextError::PersistenceFailed(format!(
+                "operator tunable conflict for {name:?}: expected revision {expected_revision}, current revision {}",
+                current.1
+            )));
+        }
+        let target_value = tx
+            .query_row(
+                "SELECT effective_value FROM operator_tunable_audit
+                 WHERE name = ?1 AND revision = ?2
+                   AND outcome = 'applied' AND effective_value IS NOT NULL
+                 ORDER BY id DESC LIMIT 1",
+                params![name, target_revision],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?
+            .ok_or_else(|| {
+                ContextError::PersistenceFailed(format!(
+                    "operator tunable {name:?} has no applied revision {target_revision}"
+                ))
+            })?;
+        let revision = current
+            .1
+            .checked_add(1)
+            .ok_or_else(|| ContextError::PersistenceFailed("revision overflow".into()))?;
+        let now = Utc::now().to_rfc3339();
+        tx.execute(
+            "UPDATE operator_tunables
+             SET value = ?1, revision = ?2, updated_at = ?3, updated_by = ?4
+             WHERE name = ?5",
+            params![target_value, revision, &now, actor, name],
+        )
+        .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
+        tx.execute(
+            "INSERT INTO operator_tunable_audit
+             (name, revision, previous_value, requested_value, effective_value,
+              action, outcome, actor, reason, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?4, 'rollback', 'applied', ?5, ?6, ?7)",
+            params![
+                name,
+                revision,
+                current.0,
+                target_value,
+                actor,
+                format!("restored revision {target_revision}"),
+                &now
+            ],
+        )
+        .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
+        tx.commit()
+            .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
+        Ok(crate::operator_control::StoredOperatorTunable {
+            name: name.to_string(),
+            value: target_value.max(0) as u64,
+            revision: revision as u64,
+            updated_at: now,
+            updated_by: actor.to_string(),
+        })
+    }
+
+    pub fn record_operator_tunable_denial(
+        &self,
+        name: &str,
+        requested_value: Option<u64>,
+        actor: &str,
+        reason: &str,
+    ) -> Result<(), ContextError> {
+        let requested_value = requested_value
+            .map(i64::try_from)
+            .transpose()
+            .map_err(|_| ContextError::PersistenceFailed("requested value is too large".into()))?;
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO operator_tunable_audit
+             (name, revision, previous_value, requested_value, effective_value,
+              action, outcome, actor, reason, created_at)
+             VALUES (?1, NULL, NULL, ?2, NULL, 'set', 'denied', ?3, ?4, ?5)",
+            params![
+                name,
+                requested_value,
+                actor,
+                reason,
+                Utc::now().to_rfc3339()
+            ],
+        )
+        .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
+        Ok(())
+    }
+
+    pub fn list_operator_tunable_audit(
+        &self,
+        name: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<crate::operator_control::OperatorTunableAudit>, ContextError> {
+        let limit = i64::try_from(limit.clamp(1, 1_000)).unwrap_or(1_000);
+        let conn = self.conn.lock().unwrap();
+        let sql = if name.is_some() {
+            "SELECT id, name, revision, previous_value, requested_value,
+                    effective_value, action, outcome, actor, reason, created_at
+             FROM operator_tunable_audit WHERE name = ?1
+             ORDER BY id DESC LIMIT ?2"
+        } else {
+            "SELECT id, name, revision, previous_value, requested_value,
+                    effective_value, action, outcome, actor, reason, created_at
+             FROM operator_tunable_audit
+             ORDER BY id DESC LIMIT ?1"
+        };
+        let mut statement = conn
+            .prepare(sql)
+            .map_err(|error| ContextError::StorageError(error.to_string()))?;
+        let map_row = |row: &rusqlite::Row<'_>| {
+            Ok(crate::operator_control::OperatorTunableAudit {
+                id: row.get::<_, i64>(0)?.max(0) as u64,
+                name: row.get(1)?,
+                revision: row
+                    .get::<_, Option<i64>>(2)?
+                    .map(|value| value.max(0) as u64),
+                previous_value: row
+                    .get::<_, Option<i64>>(3)?
+                    .map(|value| value.max(0) as u64),
+                requested_value: row
+                    .get::<_, Option<i64>>(4)?
+                    .map(|value| value.max(0) as u64),
+                effective_value: row
+                    .get::<_, Option<i64>>(5)?
+                    .map(|value| value.max(0) as u64),
+                action: row.get(6)?,
+                outcome: row.get(7)?,
+                actor: row.get(8)?,
+                reason: row.get(9)?,
+                created_at: row.get(10)?,
+            })
+        };
+        let mut audit = Vec::new();
+        if let Some(name) = name {
+            let rows = statement
+                .query_map(params![name, limit], map_row)
+                .map_err(|error| ContextError::StorageError(error.to_string()))?;
+            for row in rows {
+                audit.push(row.map_err(|error| ContextError::StorageError(error.to_string()))?);
+            }
+        } else {
+            let rows = statement
+                .query_map(params![limit], map_row)
+                .map_err(|error| ContextError::StorageError(error.to_string()))?;
+            for row in rows {
+                audit.push(row.map_err(|error| ContextError::StorageError(error.to_string()))?);
+            }
+        }
+        Ok(audit)
+    }
+
+    pub fn save_loaded_package_instance(
+        &self,
+        instance: &crate::operator_control::LoadedPackageInstance,
+    ) -> Result<(), ContextError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO loaded_package_instances
+             (agent_id, tenant_id, name, provider, profile, loaded_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                instance.agent_id,
+                instance.tenant_id,
+                instance.name,
+                instance.provider,
+                instance.profile,
+                instance.loaded_at
+            ],
+        )
+        .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
+        Ok(())
+    }
+
+    pub fn list_loaded_package_instances(
+        &self,
+        tenant_id: Option<&str>,
+    ) -> Result<Vec<crate::operator_control::LoadedPackageInstance>, ContextError> {
+        let conn = self.conn.lock().unwrap();
+        let sql = if tenant_id.is_some() {
+            "SELECT agent_id, tenant_id, name, provider, profile, loaded_at
+             FROM loaded_package_instances WHERE tenant_id = ?1
+             ORDER BY loaded_at DESC, agent_id"
+        } else {
+            "SELECT agent_id, tenant_id, name, provider, profile, loaded_at
+             FROM loaded_package_instances ORDER BY loaded_at DESC, agent_id"
+        };
+        let mut statement = conn
+            .prepare(sql)
+            .map_err(|error| ContextError::StorageError(error.to_string()))?;
+        let map_row = |row: &rusqlite::Row<'_>| {
+            Ok(crate::operator_control::LoadedPackageInstance {
+                agent_id: row.get(0)?,
+                tenant_id: row.get(1)?,
+                name: row.get(2)?,
+                provider: row.get(3)?,
+                profile: row.get(4)?,
+                loaded_at: row.get(5)?,
+            })
+        };
+        let mut packages = Vec::new();
+        if let Some(tenant_id) = tenant_id {
+            let rows = statement
+                .query_map(params![tenant_id], map_row)
+                .map_err(|error| ContextError::StorageError(error.to_string()))?;
+            for row in rows {
+                packages.push(row.map_err(|error| ContextError::StorageError(error.to_string()))?);
+            }
+        } else {
+            let rows = statement
+                .query_map([], map_row)
+                .map_err(|error| ContextError::StorageError(error.to_string()))?;
+            for row in rows {
+                packages.push(row.map_err(|error| ContextError::StorageError(error.to_string()))?);
+            }
+        }
+        Ok(packages)
     }
 }
 

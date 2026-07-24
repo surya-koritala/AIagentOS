@@ -79,6 +79,7 @@ syscall_gate ◀── the chokepoint                       budget_enforcer (USD
 turn_admission (CFS-ordered turn gate)                llm_scheduler (bounded "LLM cores")
 tenant/profile/agent cgroup maps (stable hierarchy)  group_namespaces (per agent group)
 executors (per-agent AgentExecutor)                   event_tx (broadcast KernelEvent)
+operator_control (durable tunables + snapshot barrier)
 os: OsSubsystems { cfs, namespaces, init, procfs, sysctl }
 ```
 

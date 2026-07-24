@@ -1123,6 +1123,142 @@ mod protocol_tests {
         }
     }
 
+    pub(super) async fn assert_public_lifecycle_contract(client: &mut KernelClient, prefix: &str) {
+        fn assert_kernel_error(error: SdkError, expected: &str) {
+            match error {
+                SdkError::Kernel(message) => assert!(
+                    message.contains(expected),
+                    "expected kernel error containing {expected:?}, got {message:?}"
+                ),
+                other => panic!("expected kernel error containing {expected:?}, got {other:?}"),
+            }
+        }
+
+        // Running, Paused, and Stopped are the stable states exposed by the
+        // public protocol. Exercise every valid operation/state pairing plus
+        // the invalid terminal transitions over the caller's real transport.
+        let paused_stop = client
+            .create_agent(
+                format!("{prefix}-paused-stop"),
+                "public lifecycle matrix",
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            client.agent_status(paused_stop.clone()).await.unwrap(),
+            "Running"
+        );
+        assert_eq!(
+            client.resume_agent(paused_stop.clone()).await.unwrap(),
+            "Running"
+        );
+        assert_kernel_error(
+            client
+                .wait_agent(paused_stop.clone(), std::time::Duration::from_millis(20))
+                .await
+                .unwrap_err(),
+            "timed out",
+        );
+        assert_eq!(
+            client.pause_agent(paused_stop.clone()).await.unwrap(),
+            "Paused"
+        );
+        assert_eq!(
+            client.agent_status(paused_stop.clone()).await.unwrap(),
+            "Paused"
+        );
+        assert_eq!(
+            client.pause_agent(paused_stop.clone()).await.unwrap(),
+            "Paused"
+        );
+        assert!(client
+            .send_message(paused_stop.clone(), "must not run while paused")
+            .await
+            .is_err());
+        assert_eq!(
+            client.resume_agent(paused_stop.clone()).await.unwrap(),
+            "Running"
+        );
+        assert_eq!(
+            client.pause_agent(paused_stop.clone()).await.unwrap(),
+            "Paused"
+        );
+        assert_eq!(
+            client.stop_agent(paused_stop.clone()).await.unwrap(),
+            "Stopped"
+        );
+        assert_eq!(
+            client.stop_agent(paused_stop.clone()).await.unwrap(),
+            "Stopped"
+        );
+        assert_eq!(
+            client.kill_agent(paused_stop.clone()).await.unwrap(),
+            "Stopped"
+        );
+        assert_eq!(
+            client
+                .wait_agent(paused_stop.clone(), std::time::Duration::from_secs(1),)
+                .await
+                .unwrap(),
+            "Stopped"
+        );
+        assert_kernel_error(
+            client.pause_agent(paused_stop.clone()).await.unwrap_err(),
+            "Invalid state transition",
+        );
+        assert_kernel_error(
+            client.resume_agent(paused_stop.clone()).await.unwrap_err(),
+            "Invalid state transition",
+        );
+        assert!(client
+            .send_message(paused_stop, "must not run after stop")
+            .await
+            .is_err());
+
+        let running_stop = client
+            .create_agent(
+                format!("{prefix}-running-stop"),
+                "stop from running",
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(client.stop_agent(running_stop).await.unwrap(), "Stopped");
+
+        let running_kill = client
+            .create_agent(
+                format!("{prefix}-running-kill"),
+                "kill from running",
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(client.kill_agent(running_kill).await.unwrap(), "Stopped");
+
+        let paused_kill = client
+            .create_agent(
+                format!("{prefix}-paused-kill"),
+                "kill from paused",
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            client.pause_agent(paused_kill.clone()).await.unwrap(),
+            "Paused"
+        );
+        assert_eq!(client.kill_agent(paused_kill).await.unwrap(), "Stopped");
+    }
+
     /// `hello()` negotiates against a current server and returns its window.
     #[tokio::test]
     async fn sdk_hello_negotiates_current_server() {
@@ -1146,25 +1282,7 @@ mod protocol_tests {
         tokio::spawn(server.serve());
 
         let mut client = KernelClient::connect(addr).await.expect("connect");
-        let id = client
-            .create_agent("lifecycle-sdk", "test lifecycle", None, None, None)
-            .await
-            .unwrap();
-
-        assert_eq!(client.agent_status(id.clone()).await.unwrap(), "Running");
-        assert_eq!(client.pause_agent(id.clone()).await.unwrap(), "Paused");
-        assert_eq!(client.pause_agent(id.clone()).await.unwrap(), "Paused");
-        assert!(client.send_message(id.clone(), "blocked").await.is_err());
-        assert_eq!(client.resume_agent(id.clone()).await.unwrap(), "Running");
-        assert_eq!(client.stop_agent(id.clone()).await.unwrap(), "Stopped");
-        assert_eq!(client.stop_agent(id.clone()).await.unwrap(), "Stopped");
-        assert_eq!(
-            client
-                .wait_agent(id, std::time::Duration::from_secs(1))
-                .await
-                .unwrap(),
-            "Stopped"
-        );
+        assert_public_lifecycle_contract(&mut client, "tcp").await;
     }
 
     #[tokio::test]
@@ -1397,5 +1515,6 @@ mod tls_tests {
             agents.iter().any(|a| a.id == id && a.name == "tls-sdk"),
             "agent created over the SDK TLS client should be listed: {agents:?}"
         );
+        crate::protocol_tests::assert_public_lifecycle_contract(&mut client, "tls").await;
     }
 }

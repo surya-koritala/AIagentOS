@@ -884,6 +884,53 @@ impl ResourceProvider for BuiltinNetworkProvider {
 
 struct BuiltinAppProvider;
 
+/// Cancelling an application tool must terminate the complete process tree,
+/// not only the direct shell/launcher child.
+struct ProcessTreeGuard {
+    pid: u32,
+    armed: bool,
+}
+
+impl ProcessTreeGuard {
+    fn new(pid: u32) -> Self {
+        Self { pid, armed: true }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ProcessTreeGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        #[cfg(unix)]
+        {
+            // The child is placed in a new process group whose id equals its
+            // pid. A negative pid targets every descendant that inherited the
+            // group, including background grandchildren.
+            if let Ok(pid) = libc::pid_t::try_from(self.pid) {
+                // SAFETY: `kill` does not dereference memory; the negative,
+                // validated process-group id is scoped to the spawned child.
+                unsafe {
+                    libc::kill(-pid, libc::SIGKILL);
+                }
+            }
+        }
+        #[cfg(windows)]
+        {
+            // `taskkill /T` is the platform process-tree primitive. The child
+            // also has Tokio's kill-on-drop enabled as a direct-child fallback.
+            let pid = self.pid.to_string();
+            let _ = std::process::Command::new("taskkill")
+                .args(["/PID", pid.as_str(), "/T", "/F"])
+                .status();
+        }
+    }
+}
+
 #[async_trait::async_trait]
 impl ResourceProvider for BuiltinAppProvider {
     fn resource_type(&self) -> ResourceType {
@@ -913,10 +960,23 @@ impl ResourceProvider for BuiltinAppProvider {
             .unwrap_or_default();
         let mut command = tokio::process::Command::new(cmd);
         command.args(&args).kill_on_drop(true);
-        let output = command
-            .output()
-            .await
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            command.as_std_mut().process_group(0);
+        }
+        let child = command
+            .spawn()
             .map_err(|e| ResourceError::OperationFailed(e.to_string()))?;
+        let pid = child.id().ok_or_else(|| {
+            ResourceError::OperationFailed("spawned application has no process id".into())
+        })?;
+        let mut process_tree = ProcessTreeGuard::new(pid);
+        let output = child.wait_with_output().await;
+        if output.is_ok() {
+            process_tree.disarm();
+        }
+        let output = output.map_err(|e| ResourceError::OperationFailed(e.to_string()))?;
         Ok(serde_json::json!({
             "stdout": String::from_utf8_lossy(&output.stdout).to_string(),
             "stderr": String::from_utf8_lossy(&output.stderr).to_string(),
@@ -3119,6 +3179,13 @@ impl AgentKernelImpl {
                 Ok((self.get_agent_status(agent_id)?, Some(output), None))
             }
             Ok(TurnResult::Paused(checkpoint)) => {
+                if self.get_agent_status(agent_id)? != AgentState::Paused {
+                    self.context_manager
+                        .release_generation_checkpoint(checkpoint_id)?;
+                    return Err(KernelError::Policy(
+                        "checkpoint resume cancelled by terminal lifecycle operation".into(),
+                    ));
+                }
                 let executor = self
                     .executors
                     .get(&agent_id)
@@ -3388,6 +3455,11 @@ impl AgentKernelImpl {
         let output = match run_result? {
             TurnResult::Completed(output) => output,
             TurnResult::Paused(checkpoint) => {
+                if self.get_agent_status(agent_id)? != AgentState::Paused {
+                    return Err(KernelError::Policy(
+                        "agent turn cancelled by terminal lifecycle operation".into(),
+                    ));
+                }
                 let tenant = self
                     .context_manager
                     .agent_tenant(agent_id)?
@@ -3466,6 +3538,7 @@ impl AgentKernelImpl {
         let _ = self.event_tx.send(KernelEvent::ShutdownInitiated);
 
         let mut stopped = Vec::new();
+        let mut failures = Vec::new();
 
         // Coordinated services stop first in reverse dependency order. Their
         // agents become terminal through `stop_agent`, so the general pass
@@ -3482,9 +3555,14 @@ impl AgentKernelImpl {
                 .await
                 .state(&service)
                 .and_then(|state| state.agent_id);
-            if self.stop_service(&service).await.is_ok() {
-                if let Some(agent_id) = agent_id {
-                    stopped.push(agent_id);
+            match self.stop_service(&service).await {
+                Ok(()) => {
+                    if let Some(agent_id) = agent_id {
+                        stopped.push(agent_id);
+                    }
+                }
+                Err(error) => {
+                    failures.push(format!("service {service}: {error}"));
                 }
             }
         }
@@ -3492,18 +3570,26 @@ impl AgentKernelImpl {
         let agents = self.agent_manager.list_agents(None);
 
         for info in agents {
-            match info.state {
-                AgentState::Stopped | AgentState::Error(_) => {}
-                AgentState::Running | AgentState::Paused => {
-                    if self.stop_agent(info.id).await.is_ok() {
-                        stopped.push(info.id);
-                    }
+            if stopped.contains(&info.id) || info.state == AgentState::Stopped {
+                continue;
+            }
+            let mut result = match info.state {
+                AgentState::Running | AgentState::Paused | AgentState::Error(_) => {
+                    self.stop_agent(info.id).await
                 }
-                AgentState::Initializing | AgentState::Stopping => {
-                    if self.kill_agent(info.id).await.is_ok() {
-                        stopped.push(info.id);
-                    }
-                }
+                AgentState::Initializing | AgentState::Stopping => self.kill_agent(info.id).await,
+                AgentState::Stopped => unreachable!("stopped agents are skipped above"),
+            };
+            if matches!(&result, Err(KernelError::LifecycleTimeout(_))) {
+                // Shutdown is terminal: an uncooperative provider/tool binding
+                // must not keep the process alive indefinitely. Escalate only
+                // bounded graceful timeouts; structural cleanup faults remain
+                // visible to the caller and retryable.
+                result = self.kill_agent(info.id).await;
+            }
+            match result {
+                Ok(_) => stopped.push(info.id),
+                Err(error) => failures.push(format!("agent {}: {error}", info.id)),
             }
         }
 
@@ -3511,11 +3597,19 @@ impl AgentKernelImpl {
         // fully-consolidated, consistent database. Best-effort. (Crash recovery
         // does NOT depend on this — committed transactions are already durable;
         // this just truncates the WAL on a clean exit.)
-        if let Err(e) = self.context_manager.checkpoint() {
-            tracing::warn!("WAL checkpoint on shutdown failed: {e}");
+        if let Err(error) = self.context_manager.checkpoint() {
+            failures.push(format!("WAL checkpoint: {error}"));
         }
 
-        Ok(stopped)
+        if failures.is_empty() {
+            Ok(stopped)
+        } else {
+            Err(KernelError::LifecycleCleanup(format!(
+                "shutdown incomplete ({} agent(s) stopped): {}",
+                stopped.len(),
+                failures.join("; ")
+            )))
+        }
     }
 
     /// Subscribe to kernel events.
@@ -4615,6 +4709,257 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn kill_during_provider_request_releases_every_admission_layer() {
+        struct BlockingLifecycleSession {
+            id: ProviderId,
+            entered: Arc<tokio::sync::Notify>,
+            release: Arc<tokio::sync::Notify>,
+        }
+
+        #[async_trait::async_trait]
+        impl crate::connector::LlmSession for BlockingLifecycleSession {
+            async fn send(
+                &self,
+                messages: Vec<crate::connector::StandardMessage>,
+            ) -> Result<crate::connector::LlmResponse, ConnectorError> {
+                self.send_with_tools(messages, &[]).await
+            }
+
+            async fn send_with_tools(
+                &self,
+                _messages: Vec<crate::connector::StandardMessage>,
+                _tools: &[crate::connector::ToolDefinition],
+            ) -> Result<crate::connector::LlmResponse, ConnectorError> {
+                self.entered.notify_one();
+                self.release.notified().await;
+                Ok(crate::connector::LlmResponse {
+                    content: "must be cancelled".into(),
+                    finish_reason: Some("stop".into()),
+                    tokens_used: 1,
+                    usage: crate::connector::LlmUsage::reported(1, 1, 0),
+                    tool_calls: Vec::new(),
+                })
+            }
+
+            fn provider_id(&self) -> &ProviderId {
+                &self.id
+            }
+        }
+
+        let kernel = Arc::new(AgentKernelImpl::new().unwrap());
+        let agent = kernel
+            .create_agent_full(lifecycle_test_config("provider-kill"))
+            .await
+            .unwrap();
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let mut executor = AgentExecutor::new(
+            agent.id,
+            Box::new(BlockingLifecycleSession {
+                id: "blocking-lifecycle".into(),
+                entered: entered.clone(),
+                release: Arc::new(tokio::sync::Notify::new()),
+            }),
+            kernel.resource_broker.clone(),
+            kernel.tool_registry.clone(),
+            kernel.context_manager.clone(),
+            kernel.syscall_gate.clone(),
+            "system".into(),
+        );
+        executor.set_rate_limiter(kernel.rate_limiter.clone());
+        let pid = kernel.syscall_gate.pid_of(agent.id).unwrap();
+        let nice = kernel.os.cfs.lock().await.nice_of(pid).unwrap_or(0);
+        executor.set_llm_scheduler(kernel.llm_scheduler.clone(), pid, nice);
+        kernel
+            .executors
+            .insert(agent.id, Arc::new(tokio::sync::Mutex::new(executor)));
+
+        let turn_kernel = kernel.clone();
+        let turn = tokio::spawn(async move {
+            turn_kernel
+                .send_message(agent.id, "block in provider")
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), entered.notified())
+            .await
+            .expect("provider request did not start");
+        assert_eq!(kernel.llm_scheduler.metrics().in_flight, 1);
+        assert_eq!(kernel.turn_admission.metrics().running, 1);
+
+        let killed = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            kernel.kill_agent(agent.id),
+        )
+        .await
+        .expect("forced kill waited for the provider")
+        .unwrap();
+        assert_eq!(killed, AgentState::Stopped);
+        let turn_error = tokio::time::timeout(std::time::Duration::from_secs(1), turn)
+            .await
+            .expect("cancelled provider turn did not finish")
+            .unwrap()
+            .unwrap_err();
+        assert!(turn_error
+            .to_string()
+            .contains("cancelled by terminal lifecycle operation"));
+        assert!(kernel
+            .latest_generation_checkpoint(agent.id)
+            .unwrap()
+            .is_none());
+        assert_eq!(kernel.llm_scheduler.metrics().in_flight, 0);
+        assert_eq!(kernel.turn_admission.metrics().running, 0);
+        assert!(!kernel.active_cancellations.contains_key(&agent.id));
+        assert!(!kernel.scheduler.contains(agent.id));
+        assert!(!kernel.ipc.is_registered(agent.id));
+        assert!(kernel.syscall_gate.agent_info(agent.id).is_none());
+        assert!(kernel
+            .sandbox_manager
+            .get_sandbox_for_agent(agent.id)
+            .is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_stop_pause_and_message_races_do_not_deadlock_or_leak() {
+        let kernel = Arc::new(AgentKernelImpl::new().unwrap());
+        for round in 0..32 {
+            let agent = kernel
+                .create_agent_full(lifecycle_test_config(&format!("race-{round}")))
+                .await
+                .unwrap();
+            let agent_id = agent.id;
+            let barrier = Arc::new(tokio::sync::Barrier::new(4));
+
+            let pause_kernel = kernel.clone();
+            let pause_barrier = barrier.clone();
+            let pause = tokio::spawn(async move {
+                pause_barrier.wait().await;
+                pause_kernel.pause_agent(agent_id).await
+            });
+
+            let stop_kernel = kernel.clone();
+            let stop_barrier = barrier.clone();
+            let stop = tokio::spawn(async move {
+                stop_barrier.wait().await;
+                stop_kernel.stop_agent(agent_id).await
+            });
+
+            let message_kernel = kernel.clone();
+            let message_barrier = barrier.clone();
+            let message = tokio::spawn(async move {
+                message_barrier.wait().await;
+                message_kernel.send_message(agent_id, "race").await
+            });
+
+            barrier.wait().await;
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                let _ = tokio::join!(pause, stop, message);
+            })
+            .await
+            .expect("lifecycle/message race deadlocked");
+
+            kernel.kill_agent(agent_id).await.unwrap();
+            assert_eq!(
+                kernel.get_agent_status(agent_id).unwrap(),
+                AgentState::Stopped
+            );
+            assert!(!kernel.scheduler.contains(agent_id));
+            assert!(!kernel.ipc.is_registered(agent_id));
+            assert!(kernel.syscall_gate.agent_info(agent_id).is_none());
+            assert!(kernel
+                .sandbox_manager
+                .get_sandbox_for_agent(agent_id)
+                .is_none());
+            assert!(!kernel.active_cancellations.contains_key(&agent_id));
+            assert!(!kernel.executors.contains_key(&agent_id));
+        }
+        assert_eq!(kernel.cgroups.structural_counts(), (1, 1));
+    }
+
+    #[tokio::test]
+    async fn shutdown_surfaces_cleanup_failure_and_retry_completes() {
+        let kernel = AgentKernelImpl::new().unwrap();
+        let agent = kernel
+            .create_agent_full(lifecycle_test_config("shutdown-failure"))
+            .await
+            .unwrap();
+        kernel.sandbox_manager.fail_next_destroy_for_test();
+
+        let error = kernel.shutdown().await.unwrap_err();
+        assert!(matches!(error, KernelError::LifecycleCleanup(_)));
+        assert!(error
+            .to_string()
+            .contains("injected sandbox destruction failure"));
+        assert_eq!(
+            kernel.get_agent_status(agent.id).unwrap(),
+            AgentState::Stopping
+        );
+
+        let stopped = kernel.shutdown().await.unwrap();
+        assert_eq!(stopped, vec![agent.id]);
+        assert_eq!(
+            kernel.get_agent_status(agent.id).unwrap(),
+            AgentState::Stopped
+        );
+        assert!(kernel
+            .sandbox_manager
+            .get_sandbox_for_agent(agent.id)
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn shutdown_escalates_graceful_tool_timeout_to_forced_cleanup() {
+        let kernel = AgentKernelImpl::new().unwrap();
+        let agent = kernel
+            .create_agent_full(lifecycle_test_config("shutdown-force"))
+            .await
+            .unwrap();
+        let held = kernel.syscall_gate.acquire_tool_call(agent.id).unwrap();
+
+        assert_eq!(kernel.shutdown().await.unwrap(), vec![agent.id]);
+        assert_eq!(
+            kernel.get_agent_status(agent.id).unwrap(),
+            AgentState::Stopped
+        );
+        assert!(kernel.syscall_gate.agent_info(agent.id).is_none());
+        assert_eq!(kernel.cgroups.structural_counts(), (1, 1));
+        drop(held);
+        assert_eq!(
+            kernel
+                .cgroups
+                .get(kernel.cgroups.root())
+                .unwrap()
+                .usage
+                .active_tool_calls,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_cleans_agents_already_in_error_state() {
+        let kernel = AgentKernelImpl::new().unwrap();
+        let agent = kernel
+            .create_agent_full(lifecycle_test_config("shutdown-error"))
+            .await
+            .unwrap();
+        kernel
+            .agent_manager
+            .transition_state(agent.id, AgentState::Error("injected".into()))
+            .unwrap();
+
+        assert_eq!(kernel.shutdown().await.unwrap(), vec![agent.id]);
+        assert_eq!(
+            kernel.get_agent_status(agent.id).unwrap(),
+            AgentState::Stopped
+        );
+        assert!(!kernel.scheduler.contains(agent.id));
+        assert!(!kernel.ipc.is_registered(agent.id));
+        assert!(kernel.syscall_gate.agent_info(agent.id).is_none());
+        assert!(kernel
+            .sandbox_manager
+            .get_sandbox_for_agent(agent.id)
+            .is_none());
+    }
+
+    #[tokio::test]
     async fn watchdog_uses_forced_coordinator_and_ignores_idle_agents() {
         let kernel = AgentKernelImpl::new().unwrap();
         let active = kernel
@@ -4735,14 +5080,14 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn dropping_application_provider_kills_child_before_delayed_side_effect() {
+    async fn dropping_application_provider_kills_descendant_process_tree() {
         let marker =
             std::env::temp_dir().join(format!("agentos-kill-on-drop-{}", uuid::Uuid::new_v4()));
         let parameters = serde_json::json!({
             "command": "/bin/sh",
             "args": [
                 "-c",
-                "sleep 0.3; touch \"$1\"",
+                "(sleep 0.3; touch \"$1\") & wait",
                 "agentos-child",
                 marker.to_string_lossy()
             ]
@@ -4756,7 +5101,7 @@ mod tests {
 
         assert!(
             !marker.exists(),
-            "a dropped process tool must not continue to a delayed side effect"
+            "a dropped process tool must kill background descendants before their delayed side effect"
         );
     }
 

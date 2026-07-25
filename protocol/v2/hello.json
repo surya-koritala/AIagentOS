@@ -1,0 +1,1 @@
+{"status":"hello","protocol_version":2,"min_protocol_version":1,"server_version":"0.3.0","features":["bounded_json_frames","protocol_description","typed_errors"]}

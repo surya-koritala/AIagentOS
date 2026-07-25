@@ -24,8 +24,11 @@
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, Lines};
+#[cfg(test)]
+use tokio::io::AsyncBufReadExt;
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream, ToSocketAddrs};
+use tokio::sync::Semaphore;
 
 use crate::agent::AgentKernel;
 use crate::auth::{Principal, Role};
@@ -33,7 +36,19 @@ use crate::connector::AgentConnector;
 use crate::context::{ContextManager, ContextPressureStats, Fact, FactCategory};
 use crate::observability::{AgentAction, ObservabilityEngine};
 use crate::resources::ResourceBroker;
+use crate::wire_io::{read_bounded_line, write_bounded_json};
 use crate::{AgentConfig, AgentKernelImpl, Priority};
+
+/// Default simultaneous syscall connection limit.
+pub use crate::wire_io::DEFAULT_MAX_CONNECTIONS as DEFAULT_WIRE_MAX_CONNECTIONS;
+/// Maximum time for the first frame and TLS negotiation.
+pub use crate::wire_io::HANDSHAKE_TIMEOUT as WIRE_HANDSHAKE_TIMEOUT;
+/// Maximum idle time between syscall frames.
+pub use crate::wire_io::IDLE_TIMEOUT as WIRE_IDLE_TIMEOUT;
+/// Maximum serialized syscall request or reply frame.
+pub use crate::wire_io::MAX_JSON_FRAME_BYTES as MAX_WIRE_FRAME_BYTES;
+/// Maximum wall-clock duration of one dispatched syscall.
+pub use crate::wire_io::REQUEST_TIMEOUT as WIRE_REQUEST_TIMEOUT;
 
 /// The wire-protocol version this build speaks.
 ///
@@ -79,7 +94,7 @@ fn default_package_requirement() -> String {
 }
 
 /// A syscall request from an agent / SDK to the kernel.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum Syscall {
     /// Create an agent through the full kernel path (gate registration, cgroup,
@@ -259,6 +274,10 @@ pub enum Syscall {
     Authenticate {
         token: String,
     },
+    /// Return the versioned, machine-readable request/reply/MCP schemas,
+    /// feature identifiers, compatibility behavior, and transport bounds.
+    /// Like `Hello`, this is safe before authentication.
+    DescribeProtocol,
     /// Load an agent package from a TOML manifest (see `crate::agent_package`):
     /// parse + validate, then create the agent through the full admission path
     /// and seed its memory. Replies with the new agent's id (`AgentCreated`).
@@ -630,7 +649,7 @@ impl WireErrorCode {
 }
 
 /// The kernel's reply to a [`Syscall`].
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum SyscallReply {
     AgentCreated {
@@ -749,9 +768,16 @@ pub enum SyscallReply {
         min_protocol_version: u32,
         /// The server's crate version (`CARGO_PKG_VERSION`), informational.
         server_version: String,
+        /// Fine-grained stable capabilities available on this server.
+        #[serde(default)]
+        features: Vec<String>,
     },
     /// The connection is authenticated (reply to [`Syscall::Authenticate`]).
     Authenticated,
+    /// Machine-readable public protocol contract.
+    ProtocolDescription {
+        description: crate::wire_contract::ProtocolDescription,
+    },
     /// A trust root was added, rotated, or revoked.
     PackageKeyUpdated,
     /// A signed artifact was published.
@@ -838,6 +864,53 @@ pub enum SyscallReply {
         message: String,
         retryable: bool,
     },
+}
+
+fn redact_debug_fields(value: &mut serde_json::Value, fields: &[&str]) {
+    let Some(object) = value.as_object_mut() else {
+        return;
+    };
+    for field in fields {
+        if object.contains_key(*field) {
+            object.insert((*field).to_string(), serde_json::json!("[REDACTED]"));
+        }
+    }
+}
+
+impl std::fmt::Debug for Syscall {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut value =
+            serde_json::to_value(self).unwrap_or_else(|_| serde_json::json!("<unserializable>"));
+        let fields: &[&str] = match self {
+            Self::Authenticate { .. } => &["token"],
+            Self::SendMessage { .. } => &["message"],
+            Self::CallTool { .. } => &["args"],
+            Self::MemoryStore { .. } | Self::MemoryUpdate { .. } => &["content"],
+            Self::StoragePut { .. } => &["value"],
+            Self::LoadPackage { .. } => &["manifest_toml"],
+            Self::PublishPackage { .. } => &["archive_hex"],
+            _ => &[],
+        };
+        redact_debug_fields(&mut value, fields);
+        formatter.debug_tuple("Syscall").field(&value).finish()
+    }
+}
+
+impl std::fmt::Debug for SyscallReply {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut value =
+            serde_json::to_value(self).unwrap_or_else(|_| serde_json::json!("<unserializable>"));
+        let fields: &[&str] = match self {
+            Self::Message { .. } => &["content"],
+            Self::ToolResult { .. } => &["data"],
+            Self::Memory { .. } => &["facts"],
+            Self::StorageValue { .. } => &["value"],
+            Self::PackageArchive { .. } => &["archive_hex"],
+            _ => &[],
+        };
+        redact_debug_fields(&mut value, fields);
+        formatter.debug_tuple("SyscallReply").field(&value).finish()
+    }
 }
 
 impl SyscallReply {
@@ -951,6 +1024,7 @@ fn syscall_policy(call: &Syscall) -> (AccessLevel, &'static str, Option<&str>) {
             (AccessLevel::User, "snapshot.delete", Some(agent_id))
         }
         Syscall::Hello { .. } => (AccessLevel::ReadOnly, "protocol.hello", None),
+        Syscall::DescribeProtocol => (AccessLevel::ReadOnly, "protocol.describe", None),
         Syscall::Authenticate { .. } => (AccessLevel::ReadOnly, "auth.authenticate", None),
         Syscall::LoadPackage { .. } => (AccessLevel::Admin, "package.load", None),
         Syscall::TrustPackageKey { .. } => (AccessLevel::Admin, "package.trust_key", None),
@@ -1807,6 +1881,13 @@ pub async fn dispatch_scoped(
             protocol_version: PROTOCOL_VERSION,
             min_protocol_version: MIN_PROTOCOL_VERSION,
             server_version: env!("CARGO_PKG_VERSION").to_string(),
+            features: crate::wire_contract::WIRE_FEATURES
+                .iter()
+                .map(|feature| (*feature).to_string())
+                .collect(),
+        },
+        Syscall::DescribeProtocol => SyscallReply::ProtocolDescription {
+            description: crate::wire_contract::protocol_description(),
         },
         Syscall::LoadPackage { manifest_toml } => {
             match crate::agent_package::AgentManifest::from_toml_str(&manifest_toml) {
@@ -2564,6 +2645,7 @@ pub struct SyscallServer {
     /// When set, a connection must [`Authenticate`](Syscall::Authenticate) with
     /// this token before any other syscall is dispatched.
     auth_token: Option<Arc<String>>,
+    connection_limit: Arc<Semaphore>,
 }
 
 impl SyscallServer {
@@ -2576,6 +2658,7 @@ impl SyscallServer {
             kernel,
             listener: Listener::Tcp(TcpListener::bind(addr).await?),
             auth_token: None,
+            connection_limit: Arc::new(Semaphore::new(DEFAULT_WIRE_MAX_CONNECTIONS)),
         })
     }
 
@@ -2592,6 +2675,7 @@ impl SyscallServer {
             kernel,
             listener: Listener::Unix(tokio::net::UnixListener::bind(path)?),
             auth_token: None,
+            connection_limit: Arc::new(Semaphore::new(DEFAULT_WIRE_MAX_CONNECTIONS)),
         })
     }
 
@@ -2616,6 +2700,7 @@ impl SyscallServer {
             kernel,
             listener: Listener::Tls(TcpListener::bind(addr).await?, acceptor),
             auth_token: None,
+            connection_limit: Arc::new(Semaphore::new(DEFAULT_WIRE_MAX_CONNECTIONS)),
         })
     }
 
@@ -2623,6 +2708,15 @@ impl SyscallServer {
     /// syscall. Recommended for any non-loopback TCP bind.
     pub fn with_auth_token(mut self, token: impl Into<String>) -> Self {
         self.auth_token = Some(Arc::new(token.into()));
+        self
+    }
+
+    /// Override the number of simultaneously admitted client connections.
+    ///
+    /// Excess accepted sockets are closed immediately instead of allocating an
+    /// unbounded task per peer. A zero value is rejected by clamping it to one.
+    pub fn with_connection_limit(mut self, max_connections: usize) -> Self {
+        self.connection_limit = Arc::new(Semaphore::new(max_connections.max(1)));
         self
     }
 
@@ -2643,28 +2737,42 @@ impl SyscallServer {
     /// Accept connections forever, handling each on its own task. Each
     /// connection is a stream of newline-delimited [`Syscall`] requests.
     pub async fn serve(self) -> std::io::Result<()> {
+        let connection_limit = self.connection_limit.clone();
         match self.listener {
             Listener::Tcp(listener) => loop {
                 let (stream, _peer) = listener.accept().await?;
+                let Ok(connection_permit) = connection_limit.clone().try_acquire_owned() else {
+                    drop(stream);
+                    continue;
+                };
                 let kernel = self.kernel.clone();
                 let auth = self.auth_token.clone();
                 tokio::spawn(async move {
+                    let _connection_permit = connection_permit;
                     let (read, write) = stream.into_split();
                     let _ = Self::handle(kernel, read, write, auth).await;
                 });
             },
             Listener::Tls(listener, acceptor) => loop {
                 let (stream, _peer) = listener.accept().await?;
+                let Ok(connection_permit) = connection_limit.clone().try_acquire_owned() else {
+                    drop(stream);
+                    continue;
+                };
                 let kernel = self.kernel.clone();
                 let auth = self.auth_token.clone();
                 let acceptor = acceptor.clone();
                 tokio::spawn(async move {
+                    let _connection_permit = connection_permit;
                     // Perform the rustls handshake; a failed handshake drops the
                     // connection without affecting the accept loop.
-                    let tls = match acceptor.accept(stream).await {
-                        Ok(tls) => tls,
-                        Err(_) => return,
-                    };
+                    let tls =
+                        match tokio::time::timeout(WIRE_HANDSHAKE_TIMEOUT, acceptor.accept(stream))
+                            .await
+                        {
+                            Ok(Ok(tls)) => tls,
+                            Ok(Err(_)) | Err(_) => return,
+                        };
                     // The TLS stream is one AsyncRead+AsyncWrite object; split it
                     // into halves so it drops into the existing generic handler.
                     let (read, write) = tokio::io::split(tls);
@@ -2674,9 +2782,14 @@ impl SyscallServer {
             #[cfg(unix)]
             Listener::Unix(listener) => loop {
                 let (stream, _peer) = listener.accept().await?;
+                let Ok(connection_permit) = connection_limit.clone().try_acquire_owned() else {
+                    drop(stream);
+                    continue;
+                };
                 let kernel = self.kernel.clone();
                 let auth = self.auth_token.clone();
                 tokio::spawn(async move {
+                    let _connection_permit = connection_permit;
                     let (read, write) = stream.into_split();
                     let _ = Self::handle(kernel, read, write, auth).await;
                 });
@@ -2698,7 +2811,7 @@ impl SyscallServer {
         R: AsyncRead + Unpin,
         W: AsyncWrite + Unpin,
     {
-        let mut lines = BufReader::new(read).lines();
+        let mut reader = BufReader::new(read);
         // No shared-secret token configured ⇒ authenticated from the start.
         let mut authed = auth.is_none();
         // A client that skips Hello receives the released v1 response shape.
@@ -2707,7 +2820,32 @@ impl SyscallServer {
         // Connections retain only the credential's SHA-256 identity. The
         // plaintext presented to Authenticate is dropped with that request.
         let mut credential: Option<crate::auth::CredentialIdentity> = None;
-        while let Some(line) = lines.next_line().await? {
+        let mut first_frame = true;
+        loop {
+            let timeout = if first_frame {
+                WIRE_HANDSHAKE_TIMEOUT
+            } else {
+                WIRE_IDLE_TIMEOUT
+            };
+            let line = match tokio::time::timeout(
+                timeout,
+                read_bounded_line(&mut reader, MAX_WIRE_FRAME_BYTES),
+            )
+            .await
+            {
+                Ok(Ok(Some(line))) => line,
+                Ok(Ok(None)) | Err(_) => break,
+                Ok(Err(error)) if error.kind() == std::io::ErrorKind::InvalidData => {
+                    let reply = SyscallReply::Error {
+                        message: format!("bad request: {error}"),
+                    }
+                    .into_public_wire(negotiated_version);
+                    write_bounded_json(&mut write, &reply, MAX_WIRE_FRAME_BYTES).await?;
+                    break;
+                }
+                Ok(Err(error)) => return Err(error),
+            };
+            first_frame = false;
             if line.trim().is_empty() {
                 continue;
             }
@@ -2722,6 +2860,10 @@ impl SyscallServer {
                             protocol_version: PROTOCOL_VERSION,
                             min_protocol_version: MIN_PROTOCOL_VERSION,
                             server_version: env!("CARGO_PKG_VERSION").to_string(),
+                            features: crate::wire_contract::WIRE_FEATURES
+                                .iter()
+                                .map(|feature| (*feature).to_string())
+                                .collect(),
                         }
                     } else {
                         SyscallReply::Error {
@@ -2732,6 +2874,9 @@ impl SyscallServer {
                         }
                     }
                 }
+                Ok(Syscall::DescribeProtocol) => SyscallReply::ProtocolDescription {
+                    description: crate::wire_contract::protocol_description(),
+                },
                 // Authentication accepts two credentials, tried in order:
                 //   1. the server's shared secret (unchanged legacy path), and
                 //   2. an AuthSystem API key / session token, which additionally
@@ -2784,7 +2929,17 @@ impl SyscallServer {
                     if let Some(identity) = credential.as_ref() {
                         match kernel.acquire_credential_principal(identity).await {
                             Some((resolved, _credential_lease)) => {
-                                dispatch_scoped(&kernel, call, Some(&resolved)).await
+                                match tokio::time::timeout(
+                                    WIRE_REQUEST_TIMEOUT,
+                                    dispatch_scoped(&kernel, call, Some(&resolved)),
+                                )
+                                .await
+                                {
+                                    Ok(reply) => reply,
+                                    Err(_) => SyscallReply::Error {
+                                        message: "syscall timed out".into(),
+                                    },
+                                }
                             }
                             None => {
                                 authed = false;
@@ -2795,7 +2950,17 @@ impl SyscallServer {
                             }
                         }
                     } else {
-                        dispatch_scoped(&kernel, call, None).await
+                        match tokio::time::timeout(
+                            WIRE_REQUEST_TIMEOUT,
+                            dispatch_scoped(&kernel, call, None),
+                        )
+                        .await
+                        {
+                            Ok(reply) => reply,
+                            Err(_) => SyscallReply::Error {
+                                message: "syscall timed out".into(),
+                            },
+                        }
                     }
                 }
                 Err(e) => SyscallReply::Error {
@@ -2803,12 +2968,16 @@ impl SyscallServer {
                 },
             };
             let reply = reply.into_public_wire(negotiated_version);
-            let mut buf = serde_json::to_vec(&reply).unwrap_or_else(|_| {
-                br#"{"status":"error","message":"serialization failed"}"#.to_vec()
-            });
-            buf.push(b'\n');
-            write.write_all(&buf).await?;
-            write.flush().await?;
+            if let Err(error) = write_bounded_json(&mut write, &reply, MAX_WIRE_FRAME_BYTES).await {
+                if error.kind() != std::io::ErrorKind::InvalidData {
+                    return Err(error);
+                }
+                let fallback = SyscallReply::Error {
+                    message: "response exceeds the wire frame limit".into(),
+                }
+                .into_public_wire(negotiated_version);
+                write_bounded_json(&mut write, &fallback, MAX_WIRE_FRAME_BYTES).await?;
+            }
         }
         Ok(())
     }
@@ -2818,21 +2987,34 @@ impl SyscallServer {
 /// tests). The wire format is plain JSON, so any client could speak it. The IO
 /// halves are boxed so one client type works over both TCP and Unix sockets.
 pub struct SyscallClient {
-    reader: Lines<BufReader<Box<dyn AsyncRead + Unpin + Send>>>,
+    reader: BufReader<Box<dyn AsyncRead + Unpin + Send>>,
     writer: Box<dyn AsyncWrite + Unpin + Send>,
 }
 
 impl SyscallClient {
     /// Connect over TCP.
     pub async fn connect(addr: impl ToSocketAddrs) -> std::io::Result<Self> {
-        let (read, writer) = TcpStream::connect(addr).await?.into_split();
+        let stream = tokio::time::timeout(WIRE_HANDSHAKE_TIMEOUT, TcpStream::connect(addr))
+            .await
+            .map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::TimedOut, "wire connect timed out")
+            })??;
+        let (read, writer) = stream.into_split();
         Ok(Self::from_halves(Box::new(read), Box::new(writer)))
     }
 
     /// Connect over a Unix-domain socket.
     #[cfg(unix)]
     pub async fn connect_unix(path: impl AsRef<std::path::Path>) -> std::io::Result<Self> {
-        let (read, writer) = tokio::net::UnixStream::connect(path).await?.into_split();
+        let stream = tokio::time::timeout(
+            WIRE_HANDSHAKE_TIMEOUT,
+            tokio::net::UnixStream::connect(path),
+        )
+        .await
+        .map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::TimedOut, "wire connect timed out")
+        })??;
+        let (read, writer) = stream.into_split();
         Ok(Self::from_halves(Box::new(read), Box::new(writer)))
     }
 
@@ -2854,8 +3036,16 @@ impl SyscallClient {
         let name = server_name.into();
         let dns = rustls::pki_types::ServerName::try_from(name)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
-        let tcp = TcpStream::connect(addr).await?;
-        let tls = connector.connect(dns, tcp).await?;
+        let tcp = tokio::time::timeout(WIRE_HANDSHAKE_TIMEOUT, TcpStream::connect(addr))
+            .await
+            .map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::TimedOut, "wire connect timed out")
+            })??;
+        let tls = tokio::time::timeout(WIRE_HANDSHAKE_TIMEOUT, connector.connect(dns, tcp))
+            .await
+            .map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::TimedOut, "TLS handshake timed out")
+            })??;
         let (read, write) = tokio::io::split(tls);
         Ok(Self::from_halves(Box::new(read), Box::new(write)))
     }
@@ -2865,7 +3055,7 @@ impl SyscallClient {
         writer: Box<dyn AsyncWrite + Unpin + Send>,
     ) -> Self {
         Self {
-            reader: BufReader::new(read).lines(),
+            reader: BufReader::new(read),
             writer,
         }
     }
@@ -2884,13 +3074,23 @@ impl SyscallClient {
 
     /// Send one syscall and await its reply.
     pub async fn call(&mut self, call: Syscall) -> std::io::Result<SyscallReply> {
-        let mut buf = serde_json::to_vec(&call).map_err(std::io::Error::other)?;
-        buf.push(b'\n');
-        self.writer.write_all(&buf).await?;
-        self.writer.flush().await?;
-        let line = self.reader.next_line().await?.ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "server closed")
-        })?;
+        write_bounded_json(&mut self.writer, &call, MAX_WIRE_FRAME_BYTES).await?;
+        let line = match tokio::time::timeout(
+            WIRE_REQUEST_TIMEOUT,
+            read_bounded_line(&mut self.reader, MAX_WIRE_FRAME_BYTES),
+        )
+        .await
+        {
+            Ok(result) => result?,
+            Err(_) => {
+                let _ = self.writer.shutdown().await;
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "wire request timed out; connection closed",
+                ));
+            }
+        }
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "server closed"))?;
         serde_json::from_str(&line).map_err(std::io::Error::other)
     }
 }
@@ -3744,10 +3944,12 @@ mod tests {
                 protocol_version,
                 min_protocol_version,
                 server_version,
+                features,
             } => {
                 assert_eq!(protocol_version, PROTOCOL_VERSION);
                 assert_eq!(min_protocol_version, MIN_PROTOCOL_VERSION);
                 assert_eq!(server_version, env!("CARGO_PKG_VERSION"));
+                assert!(features.contains(&"typed_errors".to_string()));
             }
             other => panic!("expected Hello, got {other:?}"),
         }
@@ -3784,6 +3986,41 @@ mod tests {
             SyscallReply::NodeInfo { .. } => {}
             other => panic!("expected NodeInfo after rejected Hello, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn protocol_description_is_available_before_authentication() {
+        let kernel = Arc::new(AgentKernelImpl::new().expect("kernel new"));
+        let server = SyscallServer::bind(kernel, "127.0.0.1:0")
+            .await
+            .unwrap()
+            .with_auth_token("secret");
+        let addr = server.local_addr().unwrap();
+        tokio::spawn(server.serve());
+
+        let mut client = SyscallClient::connect(addr).await.unwrap();
+        assert!(matches!(
+            client
+                .call(Syscall::Hello {
+                    protocol_version: PROTOCOL_VERSION,
+                })
+                .await
+                .unwrap(),
+            SyscallReply::Hello { .. }
+        ));
+        let description = match client.call(Syscall::DescribeProtocol).await.unwrap() {
+            SyscallReply::ProtocolDescription { description } => description,
+            other => panic!("expected protocol description, got {other:?}"),
+        };
+        assert!(description.features.contains(&"typed_errors".to_string()));
+        assert_eq!(description.transport.max_frame_bytes, MAX_WIRE_FRAME_BYTES);
+        assert!(matches!(
+            client.call(Syscall::ListAgents).await.unwrap(),
+            SyscallReply::TypedError {
+                code: WireErrorCode::AuthenticationRequired,
+                ..
+            }
+        ));
     }
 
     #[tokio::test]
@@ -4354,9 +4591,79 @@ memory = ["remember this"]
                 Syscall::Authenticate { token: "x".into() },
                 AccessLevel::ReadOnly,
             ),
+            (Syscall::DescribeProtocol, AccessLevel::ReadOnly),
             (
                 Syscall::LoadPackage {
                     manifest_toml: "x".into(),
+                },
+                AccessLevel::Admin,
+            ),
+            (
+                Syscall::TrustPackageKey {
+                    publisher: "publisher".into(),
+                    key_id: "key".into(),
+                    public_key_hex: "00".into(),
+                    valid_from: "2026-01-01T00:00:00Z".into(),
+                    valid_until: None,
+                    supersedes: None,
+                },
+                AccessLevel::Admin,
+            ),
+            (
+                Syscall::RevokePackageKey {
+                    key_id: "key".into(),
+                },
+                AccessLevel::Admin,
+            ),
+            (
+                Syscall::PublishPackage {
+                    archive_hex: "00".into(),
+                },
+                AccessLevel::Admin,
+            ),
+            (
+                Syscall::YankPackage {
+                    name: "package".into(),
+                    version: "1.0.0".into(),
+                },
+                AccessLevel::Admin,
+            ),
+            (
+                Syscall::FetchPackage {
+                    name: "package".into(),
+                    version: "1.0.0".into(),
+                },
+                AccessLevel::ReadOnly,
+            ),
+            (
+                Syscall::SearchPackages {
+                    query: "package".into(),
+                },
+                AccessLevel::ReadOnly,
+            ),
+            (
+                Syscall::InstallPackage {
+                    name: "package".into(),
+                    requirement: "*".into(),
+                },
+                AccessLevel::Admin,
+            ),
+            (
+                Syscall::RollbackPackage {
+                    name: "package".into(),
+                },
+                AccessLevel::Admin,
+            ),
+            (
+                Syscall::RemovePackage {
+                    name: "package".into(),
+                },
+                AccessLevel::Admin,
+            ),
+            (Syscall::ListInstalledPackages, AccessLevel::ReadOnly),
+            (
+                Syscall::RunInstalledPackage {
+                    name: "package".into(),
                 },
                 AccessLevel::Admin,
             ),
@@ -4429,10 +4736,38 @@ memory = ["remember this"]
             );
         }
 
-        // syscall_policy is an exhaustive match. Adding a new enum variant
-        // cannot compile until it receives an authorization classification;
-        // this table then records the expected role/resource behavior.
-        assert_eq!(agent_calls.len() + unscoped_calls.len(), 46);
+        // syscall_policy is an exhaustive match. This table additionally feeds
+        // every concrete operation through serde and proves that the published
+        // machine-readable request schema has neither omissions nor extras.
+        let calls = agent_calls
+            .iter()
+            .chain(unscoped_calls.iter().map(|(call, _)| call))
+            .collect::<Vec<_>>();
+        let fixture_tags = calls
+            .iter()
+            .map(|call| {
+                serde_json::to_value(call)
+                    .unwrap()
+                    .get("op")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap()
+                    .to_string()
+            })
+            .collect::<std::collections::HashSet<_>>();
+        let schema = crate::wire_contract::protocol_description();
+        let schema_tags = schema.request_schema["oneOf"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|variant| {
+                variant["properties"]["op"]["const"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(calls.len(), 58);
+        assert_eq!(fixture_tags, schema_tags);
     }
 
     #[tokio::test]
@@ -5448,5 +5783,35 @@ profile = "standard"
             }
             _ => panic!("expected CreateAgent"),
         }
+    }
+
+    #[test]
+    fn syscall_debug_never_exposes_credentials_or_payload_content() {
+        let auth = format!(
+            "{:?}",
+            Syscall::Authenticate {
+                token: "super-secret-token".into(),
+            }
+        );
+        assert!(!auth.contains("super-secret-token"));
+        assert!(auth.contains("[REDACTED]"));
+
+        let call = format!(
+            "{:?}",
+            Syscall::CallTool {
+                agent_id: "agent".into(),
+                tool: "http".into(),
+                args: serde_json::json!({"authorization": "Bearer secret"}),
+            }
+        );
+        assert!(!call.contains("Bearer secret"));
+
+        let reply = format!(
+            "{:?}",
+            SyscallReply::StorageValue {
+                value: Some("private-value".into()),
+            }
+        );
+        assert!(!reply.contains("private-value"));
     }
 }

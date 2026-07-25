@@ -12,7 +12,8 @@
 //! this crate adds on top is:
 //!
 //! * [`KernelClient`] — a typed wrapper that maps each [`Syscall`] variant to an
-//!   async method and folds [`SyscallReply::Error`] into a [`Result<_, SdkError>`].
+//!   async method and preserves stable [`WireErrorCode`] categories from typed
+//!   server errors.
 //! * [`Agent`] — a builder (`Agent::builder()`) that creates an agent on the
 //!   kernel and exposes `.send(..)` / `.call_tool(..)`.
 //!
@@ -53,6 +54,7 @@ pub use kernel::syscall_server::{
     OperatorCgroupSnapshot, OperatorNamespaceSnapshot, OperatorPackageSnapshot,
     OperatorServiceSnapshot, OperatorSnapshot, ProviderSummary, WireErrorCode,
 };
+pub use kernel::wire_contract::{ProtocolDescription, TransportDescription};
 
 /// The wire-protocol version this SDK build was compiled against. A client
 /// announces it via [`KernelClient::hello`]; a server outside its support
@@ -71,8 +73,9 @@ pub use patterns::{
 
 /// Errors surfaced by the SDK.
 ///
-/// [`SdkError::Kernel`] carries a denial or failure message that the kernel
-/// returned as [`SyscallReply::Error`] (e.g. a syscall-gate capability denial).
+/// [`SdkError::Wire`] carries the stable code, retry hint, and safe message from
+/// protocol-v2 servers. [`SdkError::Kernel`] remains the compatibility form for
+/// legacy-v1 replies and local SDK validation.
 /// [`SdkError::Transport`] wraps I/O / connection failures, and
 /// [`SdkError::UnexpectedReply`] guards the typed methods against a reply
 /// variant that doesn't match the syscall that was sent.
@@ -82,6 +85,17 @@ pub enum SdkError {
     /// an unknown tool, or an invalid agent id.
     #[error("kernel error: {0}")]
     Kernel(String),
+
+    /// A protocol-v2 kernel error with a stable machine-readable category.
+    #[error("kernel {code:?} error: {message}")]
+    Wire {
+        /// Stable public error category.
+        code: WireErrorCode,
+        /// Human-readable, redacted diagnostic.
+        message: String,
+        /// Whether retrying after backoff or an external state change can help.
+        retryable: bool,
+    },
 
     /// A transport / connection failure talking to the syscall server.
     #[error("transport error: {0}")]
@@ -111,6 +125,35 @@ pub enum SdkError {
         /// predates protocol versioning).
         server: String,
     },
+}
+
+impl SdkError {
+    /// Stable wire category when the server supplied one.
+    pub fn wire_code(&self) -> Option<WireErrorCode> {
+        match self {
+            Self::Wire { code, .. } => Some(*code),
+            _ => None,
+        }
+    }
+
+    /// The kernel/local validation message without transport formatting.
+    pub fn kernel_message(&self) -> Option<&str> {
+        match self {
+            Self::Kernel(message) | Self::Wire { message, .. } => Some(message),
+            _ => None,
+        }
+    }
+
+    /// Whether the server explicitly classified the failure as retryable.
+    pub fn is_retryable(&self) -> bool {
+        matches!(
+            self,
+            Self::Wire {
+                retryable: true,
+                ..
+            }
+        )
+    }
 }
 
 /// Result of a [`KernelClient::send_message`] / [`Agent::send`] turn.
@@ -148,6 +191,14 @@ pub struct GateStats {
     pub audited: u64,
 }
 
+/// One agent's gate-enforced process identity and granted namespaces.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentEnforcementInfo {
+    pub pid: u64,
+    pub capabilities: Vec<String>,
+    pub namespaces: Vec<u64>,
+}
+
 /// A kernel node's load/health snapshot (reply to `node_info`).
 #[derive(Debug, Clone, Copy, Default)]
 pub struct NodeLoad {
@@ -176,6 +227,8 @@ pub struct ProtocolInfo {
     pub min_protocol_version: u32,
     /// The server's crate version (informational).
     pub server_version: String,
+    /// Fine-grained stable features advertised by this server.
+    pub features: Vec<String>,
 }
 
 /// The kernel's operational metrics (reply to `metrics`). Carries the rendered
@@ -478,6 +531,30 @@ impl KernelClient {
         }
     }
 
+    /// Read one agent's effective capability and namespace grants.
+    pub async fn agent_info(
+        &mut self,
+        agent_id: impl Into<String>,
+    ) -> Result<AgentEnforcementInfo, SdkError> {
+        match self
+            .call(Syscall::AgentInfo {
+                agent_id: agent_id.into(),
+            })
+            .await?
+        {
+            SyscallReply::AgentInfo {
+                pid,
+                capabilities,
+                namespaces,
+            } => Ok(AgentEnforcementInfo {
+                pid,
+                capabilities,
+                namespaces,
+            }),
+            other => Err(unexpected("AgentInfo", &other)),
+        }
+    }
+
     /// Negotiate the wire protocol with the server.
     ///
     /// Sends [`Syscall::Hello`] with this SDK's [`PROTOCOL_VERSION`] and verifies
@@ -502,12 +579,14 @@ impl KernelClient {
                 protocol_version,
                 min_protocol_version,
                 server_version,
+                features,
             } => {
                 if (min_protocol_version..=protocol_version).contains(&PROTOCOL_VERSION) {
                     Ok(ProtocolInfo {
                         protocol_version,
                         min_protocol_version,
                         server_version,
+                        features,
                     })
                 } else {
                     Err(SdkError::IncompatibleProtocol {
@@ -529,6 +608,15 @@ impl KernelClient {
                 server: format!("rejected handshake: {message}"),
             }),
             other => Err(unexpected("Hello", &other)),
+        }
+    }
+
+    /// Fetch the server's versioned machine-readable schemas and transport
+    /// contract. This remains available before authentication.
+    pub async fn describe_protocol(&mut self) -> Result<ProtocolDescription, SdkError> {
+        match self.call(Syscall::DescribeProtocol).await? {
+            SyscallReply::ProtocolDescription { description } => Ok(description),
+            other => Err(unexpected("ProtocolDescription", &other)),
         }
     }
 
@@ -1165,7 +1253,15 @@ impl KernelClient {
     pub async fn call(&mut self, call: Syscall) -> Result<SyscallReply, SdkError> {
         match self.inner.call(call).await? {
             SyscallReply::Error { message } => Err(SdkError::Kernel(message)),
-            SyscallReply::TypedError { message, .. } => Err(SdkError::Kernel(message)),
+            SyscallReply::TypedError {
+                code,
+                message,
+                retryable,
+            } => Err(SdkError::Wire {
+                code,
+                message,
+                retryable,
+            }),
             reply => Ok(reply),
         }
     }
@@ -1438,13 +1534,13 @@ mod protocol_tests {
 
     pub(super) async fn assert_public_lifecycle_contract(client: &mut KernelClient, prefix: &str) {
         fn assert_kernel_error(error: SdkError, expected: &str) {
-            match error {
-                SdkError::Kernel(message) => assert!(
-                    message.contains(expected),
-                    "expected kernel error containing {expected:?}, got {message:?}"
-                ),
-                other => panic!("expected kernel error containing {expected:?}, got {other:?}"),
-            }
+            let message = error.kernel_message().unwrap_or_else(|| {
+                panic!("expected kernel error containing {expected:?}, got {error:?}")
+            });
+            assert!(
+                message.contains(expected),
+                "expected kernel error containing {expected:?}, got {message:?}"
+            );
         }
 
         // Running, Paused, and Stopped are the stable states exposed by the

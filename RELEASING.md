@@ -115,16 +115,21 @@ adds version 2 while continuing to serve versions 1 through 2:
   new optional syscall) don't.
 - A client negotiates with the optional `Syscall::Hello { protocol_version }`
   handshake and learns the server's `[MIN_PROTOCOL_VERSION, PROTOCOL_VERSION]`
-  window. An out-of-range client — or one talking to a server too old to
+  window plus fine-grained feature identifiers. An out-of-range client — or one talking to a server too old to
   understand `Hello` — gets a clear `SdkError::IncompatibleProtocol` up front
   rather than a confusing failure on a later syscall.
 - The SDK pins the version it was built against (re-exported `PROTOCOL_VERSION`)
   and negotiates automatically on connect; `KernelClient::hello()` remains
   available for explicit inspection.
+- `Syscall::DescribeProtocol` publishes draft-2020-12 request/reply/MCP schemas,
+  compatibility behavior, and framing/deadline/connection bounds before auth.
+- Golden fixtures under `protocol/` retain the released v1 shape and current v2
+  contract; exhaustive authorization tests also prove all request operations
+  appear exactly once in the published schema.
 
 Version 1 keeps the released prose-only error reply. Version 2 adds stable typed
 error categories and a retry hint; a connection that omits `Hello` stays on v1.
-What remains for the 1.0 promise is a schema-driven compatibility policy and
-longer support commitment. Until 1.0, the protocol may still change between
-minors — bump `PROTOCOL_VERSION`, retain or explicitly retire older fixtures,
-and note any wire-breaking change prominently in the changelog entry.
+The compatibility/deprecation rules and current non-streaming limitation are
+documented in `docs/PROTOCOL.md`. Until 1.0, any wire-breaking minor must bump
+`PROTOCOL_VERSION`, retain the immediately previous window and fixtures unless
+retirement is explicit, and call out the migration in the changelog.

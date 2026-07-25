@@ -4,7 +4,7 @@
 
 use std::sync::Arc;
 
-use agent_sdk::{Agent, KernelClient, SdkError};
+use agent_sdk::{Agent, KernelClient, SdkError, WireErrorCode};
 use kernel::syscall_server::SyscallServer;
 use kernel::AgentKernelImpl;
 
@@ -41,6 +41,18 @@ async fn create_lists_and_gate_stats_via_kernel_client() {
     let stats = client.gate_stats().await.expect("gate_stats");
     // The create path admits the agent without a tool denial.
     assert_eq!(stats.denied_capability, 0);
+
+    let enforcement = client.agent_info(&id).await.expect("agent_info");
+    assert!(enforcement.pid > 0);
+    assert!(!enforcement.capabilities.is_empty());
+    assert!(!enforcement.namespaces.is_empty());
+
+    let protocol = client.describe_protocol().await.expect("describe_protocol");
+    assert!(protocol.features.contains(&"typed_errors".to_string()));
+    assert!(protocol
+        .features
+        .contains(&"bounded_json_frames".to_string()));
+    assert!(protocol.request_schema["oneOf"].is_array());
 }
 
 #[tokio::test]
@@ -213,10 +225,10 @@ async fn snapshot_context_via_sdk() {
         .restore_snapshot(&id, "missing")
         .await
         .expect_err("missing snapshot should fail");
-    match err {
-        SdkError::Kernel(msg) => assert!(msg.contains("restore snapshot failed"), "{msg}"),
-        other => panic!("expected Kernel error, got {other:?}"),
-    }
+    let message = err
+        .kernel_message()
+        .unwrap_or_else(|| panic!("expected kernel error, got {err:?}"));
+    assert!(message.contains("restore snapshot failed"), "{message}");
 }
 
 #[tokio::test]
@@ -254,10 +266,10 @@ memory = ["seeded by package"]
         .load_package("name = \"x\"")
         .await
         .expect_err("missing task should fail");
-    match err {
-        SdkError::Kernel(msg) => assert!(msg.contains("invalid package"), "{msg}"),
-        other => panic!("expected Kernel error, got {other:?}"),
-    }
+    let message = err
+        .kernel_message()
+        .unwrap_or_else(|| panic!("expected kernel error, got {err:?}"));
+    assert!(message.contains("invalid package"), "{message}");
 }
 
 #[tokio::test]
@@ -330,13 +342,15 @@ async fn read_only_agent_tool_call_is_denied() {
         )
         .await
         .expect_err("write should be denied for a read-only agent");
-    match err {
-        SdkError::Kernel(msg) => assert!(
-            msg.contains("denied by kernel"),
-            "expected a kernel denial, got: {msg}"
-        ),
-        other => panic!("expected Kernel denial, got {other:?}"),
-    }
+    assert_eq!(err.wire_code(), Some(WireErrorCode::PermissionDenied));
+    assert!(!err.is_retryable());
+    let message = err
+        .kernel_message()
+        .unwrap_or_else(|| panic!("expected kernel denial, got {err:?}"));
+    assert!(
+        message.contains("denied by kernel"),
+        "expected a kernel denial, got: {message}"
+    );
 
     // The denial is reflected in the gate counters over the same connection.
     let stats = agent.client().gate_stats().await.expect("gate_stats");

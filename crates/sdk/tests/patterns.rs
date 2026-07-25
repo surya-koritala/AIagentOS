@@ -368,15 +368,13 @@ async fn planner_executor_propagates_gate_denial_e2e() {
         .run(&mut agent, "try to write")
         .await
         .expect_err("write step should be denied by the gate");
-    match err {
-        agent_sdk::SdkError::Kernel(msg) => {
-            assert!(
-                msg.contains("denied by kernel"),
-                "expected gate denial: {msg}"
-            )
-        }
-        other => panic!("expected Kernel denial, got {other:?}"),
-    }
+    let message = err
+        .kernel_message()
+        .unwrap_or_else(|| panic!("expected kernel denial, got {err:?}"));
+    assert!(
+        message.contains("denied by kernel"),
+        "expected gate denial: {message}"
+    );
 }
 
 async fn executor_path_allows(
@@ -488,7 +486,13 @@ async fn sdk_pattern_path_allows(
             );
             true
         }
-        Err(agent_sdk::SdkError::Kernel(message)) if message.contains("denied by kernel") => false,
+        Err(error)
+            if error
+                .kernel_message()
+                .is_some_and(|message| message.contains("denied by kernel")) =>
+        {
+            false
+        }
         Err(other) => panic!("unexpected SDK planner verdict: {other:?}"),
     }
 }

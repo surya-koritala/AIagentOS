@@ -67,6 +67,8 @@ pub mod tool_registry_share;
 pub mod tools;
 pub mod vision;
 pub mod voice;
+pub mod wire_contract;
+mod wire_io;
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;

@@ -267,13 +267,13 @@ owner = "platform"
 maturity = "public-api-e2e"
 release = "v0.9"
 tracking_issue = 121
-kernel_modules = ["mcp", "mcp_server", "syscall_server"]
-source_paths = ["crates/sdk/src/lib.rs"]
+kernel_modules = ["mcp", "mcp_server", "syscall_server", "wire_contract"]
+source_paths = ["crates/kernel/src/mcp_server.rs", "crates/kernel/src/syscall_server.rs", "crates/kernel/src/wire_contract.rs", "crates/kernel/src/wire_io.rs", "crates/sdk/src/lib.rs", "docs/PROTOCOL.md"]
 public_entry_points = ["crates/kernel/src/syscall_server.rs::Syscall", "crates/sdk/src/lib.rs::KernelClient"]
 runtime_call_paths = ["crates/kernel/src/syscall_server.rs::dispatch_scoped"]
-test_evidence = ["crates/sdk/tests/kernel_client.rs", "crates/kernel/src/mcp_server.rs"]
+test_evidence = ["crates/kernel/src/mcp_server.rs", "crates/kernel/src/wire_contract.rs", "crates/sdk/tests/kernel_client.rs", "protocol/v1/error.json", "protocol/v2/hello.json", "protocol/mcp/initialize.json"]
 platforms = ["linux", "macos", "windows"]
-limitations = ["The protocol lacks complete stable compatibility, cancellation/streaming semantics, authorization conformance, and MCP/SDK parity."]
+limitations = ["Protocol v2 now publishes feature identifiers, exhaustive top-level JSON Schemas, compatibility rules, golden v1/v2/MCP fixtures, typed SDK errors, enforcement introspection, redacted Debug output, bounded frames/connections, and handshake/idle/request deadlines across syscall and MCP transports. Token streaming, request-id cancellation, mixed-version/generated non-Rust conformance, and complete CLI/TUI/Desktop parity remain #121."]
 
 [[capability]]
 id = "distributed-control-plane"

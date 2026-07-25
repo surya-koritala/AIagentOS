@@ -10,7 +10,10 @@ mod tests {
     use crate::huggingface::HuggingFaceAdapter;
     use crate::local::LocalLlmAdapter;
     use crate::vllm::VllmAdapter;
-    use kernel::connector::{LlmProviderAdapter, LlmRequestOptions, StandardMessage};
+    use kernel::connector::{
+        LlmProviderAdapter, LlmRequestOptions, ProviderEventSink, ProviderStreamEvent,
+        StandardMessage,
+    };
     use wiremock::matchers::{body_partial_json, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -204,6 +207,56 @@ mod tests {
             .send_with_options(vec![StandardMessage::user("bounded")], &[], bound(61))
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn azure_native_stream_emits_ordered_sse_deltas_before_completion() {
+        let server = MockServer::start().await;
+        let request_path = "/openai/deployments/test/chat/completions";
+        let body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Hel\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"lo\"},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":2,\"total_tokens\":4}}\n\n",
+            "data: [DONE]\n\n"
+        );
+        Mock::given(method("POST"))
+            .and(path(request_path))
+            .and(body_partial_json(serde_json::json!({"stream": true})))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(body)
+                    .insert_header("content-type", "text/event-stream"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let adapter = AzureOpenAiAdapter::new(server.uri(), "test".into(), "key".into());
+        let session = adapter.create_session().await.unwrap();
+        let (events_tx, mut events_rx) = tokio::sync::mpsc::channel(4);
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let response = session
+            .send_streaming_events_controlled(
+                vec![StandardMessage::user("stream")],
+                &[],
+                bound(59),
+                &cancellation,
+                ProviderEventSink::new(events_tx),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.content, "Hello");
+        assert_eq!(response.tokens_used, 4);
+        assert_eq!(
+            events_rx.recv().await,
+            Some(ProviderStreamEvent::TextDelta("Hel".into()))
+        );
+        assert_eq!(
+            events_rx.recv().await,
+            Some(ProviderStreamEvent::TextDelta("lo".into()))
+        );
+        assert_eq!(events_rx.recv().await, None);
     }
 
     #[tokio::test]

@@ -130,9 +130,9 @@ exec 3<>/dev/tcp/127.0.0.1/7777; printf '{"op":"node_info"}\n' >&3; head -1 <&3
 
 Connect with the SDK or any client speaking newline-delimited JSON syscalls.
 See [the public protocol contract](docs/PROTOCOL.md) for version negotiation,
-machine-readable schemas, typed errors, framing/deadline limits, and
-conformance fixtures; [docs/SERVER_QUICKSTART.md](docs/SERVER_QUICKSTART.md)
-covers deployment.
+machine-readable schemas, typed errors, ordered token streaming, exact-request
+cancellation, framing/deadline limits, and conformance fixtures;
+[docs/SERVER_QUICKSTART.md](docs/SERVER_QUICKSTART.md) covers deployment.
 
 ### From source
 

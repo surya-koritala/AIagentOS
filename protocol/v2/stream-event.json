@@ -1,0 +1,1 @@
+{"status":"stream_event","request_id":"turn-42","sequence":0,"event":{"event":"token","delta":"hello"}}

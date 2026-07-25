@@ -49,6 +49,8 @@ pub use crate::wire_io::IDLE_TIMEOUT as WIRE_IDLE_TIMEOUT;
 pub use crate::wire_io::MAX_JSON_FRAME_BYTES as MAX_WIRE_FRAME_BYTES;
 /// Maximum wall-clock duration of one dispatched syscall.
 pub use crate::wire_io::REQUEST_TIMEOUT as WIRE_REQUEST_TIMEOUT;
+/// Maximum queued stream events at each transport boundary.
+pub use crate::wire_io::STREAM_EVENT_BUFFER_CAPACITY;
 
 /// The wire-protocol version this build speaks.
 ///
@@ -157,6 +159,20 @@ pub enum Syscall {
     SendMessage {
         agent_id: String,
         message: String,
+    },
+    /// Drive one turn while emitting ordered request-scoped event frames on
+    /// this connection. Cancellation is sent from another authenticated
+    /// connection with [`CancelRequest`](Self::CancelRequest).
+    SendMessageStream {
+        request_id: String,
+        agent_id: String,
+        message: String,
+    },
+    /// Cooperatively cancel one exact active streaming request. The agent id
+    /// keeps the operation inside the normal tenant ownership check.
+    CancelRequest {
+        request_id: String,
+        agent_id: String,
     },
     /// Invoke a single tool as an agent. Goes through the syscall gate
     /// (namespace / capability / MAC / approval / cgroup membership) before the
@@ -449,6 +465,28 @@ pub struct GenerationCheckpointSummary {
     pub expires_at: String,
 }
 
+/// Ordered events emitted by [`Syscall::SendMessageStream`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "event", rename_all = "snake_case")]
+pub enum MessageStreamEvent {
+    Started,
+    Token {
+        delta: String,
+    },
+    ToolCallStarted {
+        name: String,
+    },
+    ToolCallCompleted {
+        name: String,
+    },
+    ContextPressure {
+        active_tokens: u32,
+        budget_tokens: u32,
+        evicted_messages: usize,
+        spill_key: String,
+    },
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OperatorAgentSnapshot {
     pub id: String,
@@ -625,6 +663,10 @@ impl WireErrorCode {
             (Self::QuotaExceeded, true)
         } else if message.contains("timeout") || message.contains("timed out") {
             (Self::Timeout, true)
+        } else if message.contains("partial provider stream") {
+            // Output is already visible. Retrying would duplicate content even
+            // if the underlying provider transport later recovers.
+            (Self::Provider, false)
         } else if message.contains("provider") || message.contains("connector") {
             (Self::Provider, true)
         } else if message.contains("not found") || message.contains("unknown agent") {
@@ -680,6 +722,31 @@ pub enum SyscallReply {
         content: String,
         tool_calls: usize,
         tokens: u32,
+    },
+    /// One ordered frame in a live message stream.
+    StreamEvent {
+        request_id: String,
+        sequence: u64,
+        event: MessageStreamEvent,
+    },
+    /// Terminal successful frame for a live message stream.
+    StreamCompleted {
+        request_id: String,
+        content: String,
+        tool_calls: usize,
+        tokens: u32,
+    },
+    /// Terminal failed/cancelled frame for a live message stream.
+    StreamFailed {
+        request_id: String,
+        code: WireErrorCode,
+        message: String,
+        retryable: bool,
+    },
+    /// Whether an exact active request accepted a cancellation signal.
+    RequestCancellation {
+        request_id: String,
+        accepted: bool,
     },
     ToolResult {
         data: serde_json::Value,
@@ -883,7 +950,7 @@ impl std::fmt::Debug for Syscall {
             serde_json::to_value(self).unwrap_or_else(|_| serde_json::json!("<unserializable>"));
         let fields: &[&str] = match self {
             Self::Authenticate { .. } => &["token"],
-            Self::SendMessage { .. } => &["message"],
+            Self::SendMessage { .. } | Self::SendMessageStream { .. } => &["message"],
             Self::CallTool { .. } => &["args"],
             Self::MemoryStore { .. } | Self::MemoryUpdate { .. } => &["content"],
             Self::StoragePut { .. } => &["value"],
@@ -901,7 +968,8 @@ impl std::fmt::Debug for SyscallReply {
         let mut value =
             serde_json::to_value(self).unwrap_or_else(|_| serde_json::json!("<unserializable>"));
         let fields: &[&str] = match self {
-            Self::Message { .. } => &["content"],
+            Self::Message { .. } | Self::StreamCompleted { .. } => &["content"],
+            Self::StreamEvent { .. } => &["event"],
             Self::ToolResult { .. } => &["data"],
             Self::Memory { .. } => &["facts"],
             Self::StorageValue { .. } => &["value"],
@@ -976,6 +1044,14 @@ fn syscall_policy(call: &Syscall) -> (AccessLevel, &'static str, Option<&str>) {
         }
         Syscall::SendMessage { agent_id, .. } => {
             (AccessLevel::User, "agent.send_message", Some(agent_id))
+        }
+        Syscall::SendMessageStream { agent_id, .. } => (
+            AccessLevel::User,
+            "agent.send_message_stream",
+            Some(agent_id),
+        ),
+        Syscall::CancelRequest { agent_id, .. } => {
+            (AccessLevel::User, "agent.cancel_request", Some(agent_id))
         }
         Syscall::CallTool { agent_id, .. } => {
             (AccessLevel::User, "agent.call_tool", Some(agent_id))
@@ -1492,6 +1568,21 @@ pub async fn dispatch_scoped(
                 Err(e) => SyscallReply::Error {
                     message: e.to_string(),
                 },
+            },
+            Err(_) => SyscallReply::Error {
+                message: format!("invalid agent id: {agent_id}"),
+            },
+        },
+        Syscall::SendMessageStream { .. } => SyscallReply::Error {
+            message: "streaming requests require the streaming wire transport".into(),
+        },
+        Syscall::CancelRequest {
+            request_id,
+            agent_id,
+        } => match uuid::Uuid::parse_str(&agent_id) {
+            Ok(id) => SyscallReply::RequestCancellation {
+                accepted: kernel.cancel_request(id, &request_id),
+                request_id,
             },
             Err(_) => SyscallReply::Error {
                 message: format!("invalid agent id: {agent_id}"),
@@ -2576,6 +2667,193 @@ pub async fn dispatch_scoped(
     }
 }
 
+fn public_stream_event(event: crate::execution::StreamEvent) -> Option<MessageStreamEvent> {
+    match event {
+        crate::execution::StreamEvent::Started { .. } => Some(MessageStreamEvent::Started),
+        crate::execution::StreamEvent::Token(delta) => Some(MessageStreamEvent::Token { delta }),
+        crate::execution::StreamEvent::ToolCallStarted { name, .. } => {
+            Some(MessageStreamEvent::ToolCallStarted { name })
+        }
+        crate::execution::StreamEvent::ToolCallResult { name, .. } => {
+            Some(MessageStreamEvent::ToolCallCompleted { name })
+        }
+        crate::execution::StreamEvent::ContextPressure {
+            active_tokens,
+            budget_tokens,
+            evicted_messages,
+            spill_key,
+        } => Some(MessageStreamEvent::ContextPressure {
+            active_tokens,
+            budget_tokens,
+            evicted_messages,
+            spill_key,
+        }),
+        crate::execution::StreamEvent::Done(_)
+        | crate::execution::StreamEvent::Cancelled { .. }
+        | crate::execution::StreamEvent::Paused { .. }
+        | crate::execution::StreamEvent::Error(_) => None,
+    }
+}
+
+async fn write_public_stream_event<W>(
+    write: &mut W,
+    request_id: &str,
+    sequence: &mut u64,
+    event: crate::execution::StreamEvent,
+) -> std::io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    let Some(event) = public_stream_event(event) else {
+        return Ok(());
+    };
+    let reply = SyscallReply::StreamEvent {
+        request_id: request_id.to_string(),
+        sequence: *sequence,
+        event,
+    };
+    *sequence = sequence.saturating_add(1);
+    write_bounded_json(write, &reply, MAX_WIRE_FRAME_BYTES).await
+}
+
+/// Authorize and drive one live stream on the current connection. The
+/// credential lease acquired by the caller remains held until this returns.
+async fn dispatch_message_stream<W>(
+    kernel: &AgentKernelImpl,
+    request_id: String,
+    agent_id: String,
+    message: String,
+    principal: Option<&Principal>,
+    write: &mut W,
+    negotiated_version: u32,
+) -> std::io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    if negotiated_version < 2 {
+        let reply = SyscallReply::Error {
+            message: "incompatible wire-protocol version: message streaming requires v2".into(),
+        }
+        .into_public_wire(negotiated_version);
+        return write_bounded_json(write, &reply, MAX_WIRE_FRAME_BYTES).await;
+    }
+    let call = Syscall::SendMessageStream {
+        request_id: request_id.clone(),
+        agent_id: agent_id.clone(),
+        message: message.clone(),
+    };
+    if let Err(reply) = authorize(kernel, principal, &call).await {
+        return write_bounded_json(
+            write,
+            &reply.into_public_wire(negotiated_version),
+            MAX_WIRE_FRAME_BYTES,
+        )
+        .await;
+    }
+    let parsed_agent = match uuid::Uuid::parse_str(&agent_id) {
+        Ok(agent) => agent,
+        Err(_) => {
+            let reply = SyscallReply::Error {
+                message: format!("invalid agent id: {agent_id}"),
+            }
+            .into_public_wire(negotiated_version);
+            return write_bounded_json(write, &reply, MAX_WIRE_FRAME_BYTES).await;
+        }
+    };
+    if request_id.is_empty() || request_id.len() > 128 {
+        let reply = SyscallReply::Error {
+            message: "invalid request id: expected 1..=128 bytes".into(),
+        }
+        .into_public_wire(negotiated_version);
+        return write_bounded_json(write, &reply, MAX_WIRE_FRAME_BYTES).await;
+    }
+
+    // A bounded channel makes the socket writer the backpressure boundary:
+    // provider/executor production cannot outrun a slow client without bound.
+    let (events_tx, mut events_rx) = tokio::sync::mpsc::channel(STREAM_EVENT_BUFFER_CAPACITY);
+    let run = kernel.send_message_stream(parsed_agent, &message, &request_id, events_tx);
+    tokio::pin!(run);
+    let mut sequence = 0_u64;
+    let mut events_open = true;
+
+    enum StreamStep {
+        Event(Option<crate::execution::StreamEvent>),
+        Finished(Result<crate::execution::AgentOutput, crate::KernelError>),
+    }
+
+    loop {
+        let step = tokio::time::timeout(WIRE_REQUEST_TIMEOUT, async {
+            tokio::select! {
+                biased;
+                event = events_rx.recv(), if events_open => StreamStep::Event(event),
+                result = &mut run => StreamStep::Finished(result),
+            }
+        })
+        .await;
+
+        let step = match step {
+            Ok(step) => step,
+            Err(_) => {
+                kernel.cancel_request(parsed_agent, &request_id);
+                // Cancellation-aware providers normally settle immediately.
+                // Bound cleanup before the connection is released.
+                let _ = tokio::time::timeout(WIRE_HANDSHAKE_TIMEOUT, &mut run).await;
+                let reply = SyscallReply::StreamFailed {
+                    request_id: request_id.clone(),
+                    code: WireErrorCode::Timeout,
+                    message: "stream request timed out".into(),
+                    retryable: true,
+                };
+                return write_bounded_json(write, &reply, MAX_WIRE_FRAME_BYTES).await;
+            }
+        };
+
+        match step {
+            StreamStep::Event(Some(event)) => {
+                if let Err(error) =
+                    write_public_stream_event(write, &request_id, &mut sequence, event).await
+                {
+                    kernel.cancel_request(parsed_agent, &request_id);
+                    return Err(error);
+                }
+            }
+            StreamStep::Event(None) => events_open = false,
+            StreamStep::Finished(result) => {
+                // A fast provider can finish in the same scheduler poll that
+                // enqueues its events. Drain every already-buffered event
+                // before the terminal frame to preserve the sequence contract.
+                while let Ok(event) = events_rx.try_recv() {
+                    if let Err(error) =
+                        write_public_stream_event(write, &request_id, &mut sequence, event).await
+                    {
+                        kernel.cancel_request(parsed_agent, &request_id);
+                        return Err(error);
+                    }
+                }
+                let reply = match result {
+                    Ok(output) => SyscallReply::StreamCompleted {
+                        request_id: request_id.clone(),
+                        content: output.content,
+                        tool_calls: output.tool_calls_made,
+                        tokens: output.tokens_used,
+                    },
+                    Err(error) => {
+                        let message = error.to_string();
+                        let (code, retryable) = WireErrorCode::classify(&message);
+                        SyscallReply::StreamFailed {
+                            request_id: request_id.clone(),
+                            code,
+                            message,
+                            retryable,
+                        }
+                    }
+                };
+                return write_bounded_json(write, &reply, MAX_WIRE_FRAME_BYTES).await;
+            }
+        }
+    }
+}
+
 /// Map a wire category string onto a [`FactCategory`], defaulting to `Fact`.
 fn parse_fact_category(s: Option<&str>) -> FactCategory {
     match s.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
@@ -2849,7 +3127,69 @@ impl SyscallServer {
             if line.trim().is_empty() {
                 continue;
             }
-            let reply = match serde_json::from_str::<Syscall>(&line) {
+            let parsed = serde_json::from_str::<Syscall>(&line);
+
+            // A streaming turn owns this connection until its terminal frame.
+            // Cancellation is intentionally sent from another authenticated
+            // connection so event ordering on this socket remains unambiguous.
+            if authed
+                && matches!(
+                    &parsed,
+                    Ok(Syscall::SendMessageStream {
+                        request_id: _,
+                        agent_id: _,
+                        message: _
+                    })
+                )
+            {
+                let Ok(Syscall::SendMessageStream {
+                    request_id,
+                    agent_id,
+                    message,
+                }) = parsed
+                else {
+                    unreachable!("stream pattern checked above")
+                };
+                if let Some(identity) = credential.as_ref() {
+                    match kernel.acquire_credential_principal(identity).await {
+                        Some((resolved, _credential_lease)) => {
+                            dispatch_message_stream(
+                                &kernel,
+                                request_id,
+                                agent_id,
+                                message,
+                                Some(&resolved),
+                                &mut write,
+                                negotiated_version,
+                            )
+                            .await?;
+                        }
+                        None => {
+                            authed = false;
+                            credential = None;
+                            let reply = SyscallReply::Error {
+                                message: "authentication required".into(),
+                            }
+                            .into_public_wire(negotiated_version);
+                            write_bounded_json(&mut write, &reply, MAX_WIRE_FRAME_BYTES).await?;
+                        }
+                    }
+                } else {
+                    dispatch_message_stream(
+                        &kernel,
+                        request_id,
+                        agent_id,
+                        message,
+                        None,
+                        &mut write,
+                        negotiated_version,
+                    )
+                    .await?;
+                }
+                continue;
+            }
+
+            let reply = match parsed {
                 // Protocol negotiation. Allowed before auth so a client can
                 // confirm compatibility before presenting credentials; has no
                 // side effects and never changes authentication state.
@@ -2921,6 +3261,19 @@ impl SyscallServer {
                 Ok(_) if !authed => SyscallReply::Error {
                     message: "authentication required".into(),
                 },
+                Ok(call)
+                    if negotiated_version < 2
+                        && matches!(
+                            &call,
+                            Syscall::SendMessageStream { .. } | Syscall::CancelRequest { .. }
+                        ) =>
+                {
+                    SyscallReply::Error {
+                        message:
+                            "incompatible wire-protocol version: v2 is required for streaming and cancellation"
+                                .into(),
+                    }
+                }
                 Ok(call) => {
                     // Re-resolve tenant credentials for every request under a
                     // short auth read lock. A per-credential lease remains alive
@@ -3072,9 +3425,17 @@ impl SyscallClient {
         .await
     }
 
-    /// Send one syscall and await its reply.
-    pub async fn call(&mut self, call: Syscall) -> std::io::Result<SyscallReply> {
+    /// Send one syscall frame without reading a reply. Streaming clients use
+    /// this once and then call [`read_reply`](Self::read_reply) until a terminal
+    /// stream frame arrives.
+    pub async fn send(&mut self, call: &Syscall) -> std::io::Result<()> {
         write_bounded_json(&mut self.writer, &call, MAX_WIRE_FRAME_BYTES).await?;
+        Ok(())
+    }
+
+    /// Read one bounded reply frame. The timeout is per frame, so a live stream
+    /// can outlast one ordinary request while still bounding silent peers.
+    pub async fn read_reply(&mut self) -> std::io::Result<SyscallReply> {
         let line = match tokio::time::timeout(
             WIRE_REQUEST_TIMEOUT,
             read_bounded_line(&mut self.reader, MAX_WIRE_FRAME_BYTES),
@@ -3092,6 +3453,12 @@ impl SyscallClient {
         }
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "server closed"))?;
         serde_json::from_str(&line).map_err(std::io::Error::other)
+    }
+
+    /// Send one syscall and await its reply.
+    pub async fn call(&mut self, call: Syscall) -> std::io::Result<SyscallReply> {
+        self.send(&call).await?;
+        self.read_reply().await
     }
 }
 
@@ -3325,6 +3692,18 @@ mod tests {
         }
     }
 
+    #[test]
+    fn partial_provider_stream_is_terminal_on_the_public_wire() {
+        let message = crate::KernelError::Connector(crate::ConnectorError::PartialStream(
+            "provider failed after publishing output".into(),
+        ))
+        .to_string();
+        assert_eq!(
+            WireErrorCode::classify(&message),
+            (WireErrorCode::Provider, false)
+        );
+    }
+
     #[tokio::test]
     async fn v1_error_fixture_and_v2_typed_error_are_both_served() {
         let kernel = Arc::new(AgentKernelImpl::new().expect("kernel new"));
@@ -3349,6 +3728,27 @@ mod tests {
             .unwrap(),
             SyscallReply::Error { .. }
         ));
+        for call in [
+            Syscall::SendMessageStream {
+                request_id: "v1-stream".into(),
+                agent_id: "not-a-uuid".into(),
+                message: "must not start".into(),
+            },
+            Syscall::CancelRequest {
+                request_id: "v1-stream".into(),
+                agent_id: "not-a-uuid".into(),
+            },
+        ] {
+            match v1.call(call).await.unwrap() {
+                SyscallReply::Error { message } => {
+                    assert!(
+                        message.contains("incompatible wire-protocol") && message.contains("v2"),
+                        "{message}"
+                    );
+                }
+                other => panic!("expected v1 feature-version error, got {other:?}"),
+            }
+        }
 
         let mut v2 = SyscallClient::connect(addr).await.unwrap();
         assert!(matches!(
@@ -4491,6 +4891,15 @@ memory = ["remember this"]
                 agent_id: id.clone(),
                 message: "test".into(),
             },
+            Syscall::SendMessageStream {
+                request_id: "request-1".into(),
+                agent_id: id.clone(),
+                message: "test".into(),
+            },
+            Syscall::CancelRequest {
+                request_id: "request-1".into(),
+                agent_id: id.clone(),
+            },
             Syscall::CallTool {
                 agent_id: id.clone(),
                 tool: "read_file".into(),
@@ -4766,7 +5175,7 @@ memory = ["remember this"]
                     .to_string()
             })
             .collect::<std::collections::HashSet<_>>();
-        assert_eq!(calls.len(), 58);
+        assert_eq!(calls.len(), 60);
         assert_eq!(fixture_tags, schema_tags);
     }
 
@@ -5805,6 +6214,28 @@ profile = "standard"
             }
         );
         assert!(!call.contains("Bearer secret"));
+
+        let stream = format!(
+            "{:?}",
+            Syscall::SendMessageStream {
+                request_id: "request".into(),
+                agent_id: "agent".into(),
+                message: "private prompt".into(),
+            }
+        );
+        assert!(!stream.contains("private prompt"));
+
+        let stream_event = format!(
+            "{:?}",
+            SyscallReply::StreamEvent {
+                request_id: "request".into(),
+                sequence: 0,
+                event: MessageStreamEvent::Token {
+                    delta: "private completion".into(),
+                },
+            }
+        );
+        assert!(!stream_event.contains("private completion"));
 
         let reply = format!(
             "{:?}",

@@ -11,7 +11,8 @@ use serde_json::{json, Map, Value};
 
 use crate::syscall_server::{MIN_PROTOCOL_VERSION, PROTOCOL_VERSION};
 use crate::wire_io::{
-    DEFAULT_MAX_CONNECTIONS, HANDSHAKE_TIMEOUT, IDLE_TIMEOUT, MAX_JSON_FRAME_BYTES, REQUEST_TIMEOUT,
+    DEFAULT_MAX_CONNECTIONS, HANDSHAKE_TIMEOUT, IDLE_TIMEOUT, MAX_JSON_FRAME_BYTES,
+    REQUEST_TIMEOUT, STREAM_EVENT_BUFFER_CAPACITY,
 };
 
 /// Stable feature identifiers announced by `hello`.
@@ -24,10 +25,12 @@ pub const WIRE_FEATURES: &[&str] = &[
     "operator_control",
     "protocol_description",
     "request_deadlines",
+    "request_id_cancellation",
     "service_supervision",
     "signed_packages",
     "tenant_bound_auth",
     "tls",
+    "token_streaming",
     "typed_errors",
 ];
 
@@ -42,8 +45,7 @@ pub struct ProtocolDescription {
     pub request_schema: Value,
     pub reply_schema: Value,
     pub mcp_schema: Value,
-    /// Streaming/event frames are not advertised until their public contract is
-    /// implemented. An empty schema is an explicit capability result.
+    /// Schema for the nested event object carried by `stream_event` replies.
     pub event_schema: Value,
 }
 
@@ -57,6 +59,7 @@ pub struct TransportDescription {
     pub handshake_timeout_ms: u64,
     pub idle_timeout_ms: u64,
     pub request_timeout_ms: u64,
+    pub stream_event_buffer_capacity: usize,
     pub request_ordering: String,
     pub unknown_field_behavior: String,
     pub unknown_operation_behavior: String,
@@ -194,6 +197,21 @@ const REQUEST_VARIANTS: &[Variant] = &[
         fields: &[
             Field::required("agent_id", S),
             Field::required("message", S),
+        ],
+    },
+    Variant {
+        tag: "send_message_stream",
+        fields: &[
+            Field::required("request_id", S),
+            Field::required("agent_id", S),
+            Field::required("message", S),
+        ],
+    },
+    Variant {
+        tag: "cancel_request",
+        fields: &[
+            Field::required("request_id", S),
+            Field::required("agent_id", S),
         ],
     },
     Variant {
@@ -455,6 +473,39 @@ const REPLY_VARIANTS: &[Variant] = &[
         ],
     },
     Variant {
+        tag: "stream_event",
+        fields: &[
+            Field::required("request_id", S),
+            Field::required("sequence", I),
+            Field::required("event", O),
+        ],
+    },
+    Variant {
+        tag: "stream_completed",
+        fields: &[
+            Field::required("request_id", S),
+            Field::required("content", S),
+            Field::required("tool_calls", I),
+            Field::required("tokens", I),
+        ],
+    },
+    Variant {
+        tag: "stream_failed",
+        fields: &[
+            Field::required("request_id", S),
+            Field::required("code", S),
+            Field::required("message", S),
+            Field::required("retryable", B),
+        ],
+    },
+    Variant {
+        tag: "request_cancellation",
+        fields: &[
+            Field::required("request_id", S),
+            Field::required("accepted", B),
+        ],
+    },
+    Variant {
         tag: "tool_result",
         fields: &[Field::required("data", X)],
     },
@@ -655,6 +706,34 @@ const REPLY_VARIANTS: &[Variant] = &[
     },
 ];
 
+const EVENT_VARIANTS: &[Variant] = &[
+    Variant {
+        tag: "started",
+        fields: &[],
+    },
+    Variant {
+        tag: "token",
+        fields: &[Field::required("delta", S)],
+    },
+    Variant {
+        tag: "tool_call_started",
+        fields: &[Field::required("name", S)],
+    },
+    Variant {
+        tag: "tool_call_completed",
+        fields: &[Field::required("name", S)],
+    },
+    Variant {
+        tag: "context_pressure",
+        fields: &[
+            Field::required("active_tokens", I),
+            Field::required("budget_tokens", I),
+            Field::required("evicted_messages", I),
+            Field::required("spill_key", S),
+        ],
+    },
+];
+
 fn tagged_union_schema(title: &str, tag: &str, variants: &[Variant]) -> Value {
     let one_of = variants
         .iter()
@@ -719,7 +798,9 @@ pub fn protocol_description() -> ProtocolDescription {
             handshake_timeout_ms: HANDSHAKE_TIMEOUT.as_millis() as u64,
             idle_timeout_ms: IDLE_TIMEOUT.as_millis() as u64,
             request_timeout_ms: REQUEST_TIMEOUT.as_millis() as u64,
-            request_ordering: "one request and one reply at a time per connection".into(),
+            stream_event_buffer_capacity: STREAM_EVENT_BUFFER_CAPACITY,
+            request_ordering:
+                "one ordinary request/reply or one ordered stream at a time per connection".into(),
             unknown_field_behavior: "ignored for known operations; additive fields are compatible"
                 .into(),
             unknown_operation_behavior: "invalid_request; connection remains usable".into(),
@@ -727,12 +808,11 @@ pub fn protocol_description() -> ProtocolDescription {
         request_schema: tagged_union_schema("AI Agent OS syscall request", "op", REQUEST_VARIANTS),
         reply_schema: tagged_union_schema("AI Agent OS syscall reply", "status", REPLY_VARIANTS),
         mcp_schema: mcp_schema(),
-        event_schema: json!({
-            "$schema": "https://json-schema.org/draft/2020-12/schema",
-            "title": "AI Agent OS event frame",
-            "not": {},
-            "description": "No event or streaming frame is advertised by protocol v2."
-        }),
+        event_schema: tagged_union_schema(
+            "AI Agent OS message stream event",
+            "event",
+            EVENT_VARIANTS,
+        ),
     }
 }
 
@@ -755,11 +835,12 @@ mod tests {
     }
 
     #[test]
-    fn schemas_have_unique_operation_and_reply_tags() {
+    fn schemas_have_unique_request_reply_and_event_tags() {
         let description = protocol_description();
         for (schema, tag) in [
             (&description.request_schema, "op"),
             (&description.reply_schema, "status"),
+            (&description.event_schema, "event"),
         ] {
             let values = tags(schema, tag);
             let unique = values.iter().collect::<std::collections::HashSet<_>>();
@@ -777,8 +858,27 @@ mod tests {
         assert!(description
             .features
             .contains(&"bounded_json_frames".to_string()));
+        assert!(description
+            .features
+            .contains(&"request_id_cancellation".to_string()));
+        assert!(description
+            .features
+            .contains(&"token_streaming".to_string()));
         assert_eq!(description.transport.max_frame_bytes, MAX_JSON_FRAME_BYTES);
-        assert!(description.event_schema.get("not").is_some());
+        assert_eq!(
+            description.transport.stream_event_buffer_capacity,
+            STREAM_EVENT_BUFFER_CAPACITY
+        );
+        assert_eq!(
+            tags(&description.event_schema, "event"),
+            vec![
+                "started",
+                "token",
+                "tool_call_started",
+                "tool_call_completed",
+                "context_pressure"
+            ]
+        );
     }
 
     #[test]
@@ -815,6 +915,56 @@ mod tests {
         assert!(matches!(
             describe,
             crate::syscall_server::Syscall::DescribeProtocol
+        ));
+
+        let stream: crate::syscall_server::Syscall = serde_json::from_str(include_str!(
+            "../../../protocol/v2/send-message-stream.json"
+        ))
+        .unwrap();
+        assert!(matches!(
+            stream,
+            crate::syscall_server::Syscall::SendMessageStream { .. }
+        ));
+        let cancel: crate::syscall_server::Syscall =
+            serde_json::from_str(include_str!("../../../protocol/v2/cancel-request.json")).unwrap();
+        assert!(matches!(
+            cancel,
+            crate::syscall_server::Syscall::CancelRequest { .. }
+        ));
+        let event: crate::syscall_server::SyscallReply =
+            serde_json::from_str(include_str!("../../../protocol/v2/stream-event.json")).unwrap();
+        assert!(matches!(
+            event,
+            crate::syscall_server::SyscallReply::StreamEvent {
+                sequence: 0,
+                event: crate::syscall_server::MessageStreamEvent::Token { .. },
+                ..
+            }
+        ));
+        let completed: crate::syscall_server::SyscallReply =
+            serde_json::from_str(include_str!("../../../protocol/v2/stream-completed.json"))
+                .unwrap();
+        assert!(matches!(
+            completed,
+            crate::syscall_server::SyscallReply::StreamCompleted { .. }
+        ));
+        let failed: crate::syscall_server::SyscallReply =
+            serde_json::from_str(include_str!("../../../protocol/v2/stream-failed.json")).unwrap();
+        assert!(matches!(
+            failed,
+            crate::syscall_server::SyscallReply::StreamFailed {
+                code: crate::syscall_server::WireErrorCode::Cancelled,
+                retryable: false,
+                ..
+            }
+        ));
+        let cancelled: crate::syscall_server::SyscallReply = serde_json::from_str(include_str!(
+            "../../../protocol/v2/request-cancellation.json"
+        ))
+        .unwrap();
+        assert!(matches!(
+            cancelled,
+            crate::syscall_server::SyscallReply::RequestCancellation { accepted: true, .. }
         ));
 
         let mcp: crate::mcp_server::JsonRpcRequest =

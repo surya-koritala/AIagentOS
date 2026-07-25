@@ -420,6 +420,11 @@ pub enum ConnectorError {
     #[error("Stream error: {0}")]
     StreamError(String),
 
+    /// A provider stream failed after publishing output. Retrying or failing
+    /// over would duplicate already-visible content, so this is terminal.
+    #[error("Partial provider stream: {0}")]
+    PartialStream(String),
+
     #[error("Provider authentication failed: {0:?}")]
     Authentication(ProviderErrorContext),
 
@@ -539,7 +544,8 @@ impl ConnectorError {
             Self::ProviderUnavailable(_)
             | Self::ConnectionFailed(_)
             | Self::ProtocolError(_)
-            | Self::StreamError(_) => None,
+            | Self::StreamError(_)
+            | Self::PartialStream(_) => None,
         }
     }
 }
@@ -1279,6 +1285,10 @@ pub struct AgentKernelImpl {
     executors: DashMap<AgentId, Arc<tokio::sync::Mutex<AgentExecutor>>>,
     lifecycle_locks: DashMap<AgentId, Arc<tokio::sync::Mutex<()>>>,
     active_cancellations: DashMap<AgentId, tokio_util::sync::CancellationToken>,
+    /// Request-scoped cancellation handles for public streaming turns. The
+    /// agent id is part of the key so tenant authorization happens before a
+    /// request can signal another turn.
+    active_requests: DashMap<(AgentId, String), tokio_util::sync::CancellationToken>,
     pub(crate) lifecycle_counters: crate::metrics::LifecycleCounters,
     /// Serializes public service lifecycle, rolling reload, and supervisor
     /// recovery so two control paths cannot create duplicate live instances.
@@ -1289,6 +1299,31 @@ pub struct AgentKernelImpl {
     /// Explicit operator-configured definition source used by remote reload.
     service_directory: std::sync::RwLock<Option<std::path::PathBuf>>,
     event_tx: broadcast::Sender<KernelEvent>,
+}
+
+/// Removes live turn/request registrations even when the owning future is
+/// dropped because a client disconnects. This keeps cancellation and
+/// observability state from leaking across requests.
+struct ActiveTurnRegistration<'a> {
+    kernel: &'a AgentKernelImpl,
+    agent_id: AgentId,
+    request_id: Option<String>,
+}
+
+impl Drop for ActiveTurnRegistration<'_> {
+    fn drop(&mut self) {
+        self.kernel.active_cancellations.remove(&self.agent_id);
+        if let Some(request_id) = self.request_id.as_ref() {
+            self.kernel
+                .active_requests
+                .remove(&(self.agent_id, request_id.clone()));
+        }
+        match self.kernel.agent_manager.get_agent_state(self.agent_id) {
+            Some(AgentState::Running) => self.kernel.scheduler.set_queued(self.agent_id),
+            Some(AgentState::Paused) => self.kernel.scheduler.set_paused(self.agent_id),
+            _ => self.kernel.scheduler.deschedule(self.agent_id),
+        }
+    }
 }
 
 impl AgentKernelImpl {
@@ -1548,6 +1583,7 @@ impl AgentKernelImpl {
             executors: DashMap::new(),
             lifecycle_locks: DashMap::new(),
             active_cancellations: DashMap::new(),
+            active_requests: DashMap::new(),
             lifecycle_counters: crate::metrics::LifecycleCounters::default(),
             service_operation_lock: tokio::sync::Mutex::new(()),
             service_health_checks: DashMap::new(),
@@ -4473,6 +4509,52 @@ impl AgentKernelImpl {
         agent_id: AgentId,
         message: &str,
     ) -> Result<AgentOutput, KernelError> {
+        self.send_message_inner(agent_id, message, None, None).await
+    }
+
+    /// Send a message while publishing bounded execution events and registering
+    /// an exact request id that a separately authenticated connection can
+    /// cancel. Request ids are scoped by agent ownership.
+    pub async fn send_message_stream(
+        &self,
+        agent_id: AgentId,
+        message: &str,
+        request_id: &str,
+        events: tokio::sync::mpsc::Sender<crate::execution::StreamEvent>,
+    ) -> Result<AgentOutput, KernelError> {
+        if request_id.is_empty() || request_id.len() > 128 {
+            return Err(KernelError::Policy(
+                "request id must contain 1..=128 bytes".into(),
+            ));
+        }
+        self.send_message_inner(
+            agent_id,
+            message,
+            Some(request_id.to_string()),
+            Some(events),
+        )
+        .await
+    }
+
+    /// Signal one exact active streaming request. The public wire authorizes
+    /// the agent before calling this method, so a request id alone is never an
+    /// ambient cancellation capability.
+    pub fn cancel_request(&self, agent_id: AgentId, request_id: &str) -> bool {
+        let key = (agent_id, request_id.to_string());
+        let Some(token) = self.active_requests.get(&key) else {
+            return false;
+        };
+        token.cancel();
+        true
+    }
+
+    async fn send_message_inner(
+        &self,
+        agent_id: AgentId,
+        message: &str,
+        request_id: Option<String>,
+        events: Option<tokio::sync::mpsc::Sender<crate::execution::StreamEvent>>,
+    ) -> Result<AgentOutput, KernelError> {
         // Serialize executor creation against pause/stop/kill and reject work
         // unless the agent is currently runnable.
         let lifecycle_lock = self.lifecycle_lock(agent_id);
@@ -4511,7 +4593,12 @@ impl AgentKernelImpl {
                 Ok(mut executor_guard) => {
                     let cancellation = executor_guard.renew_cancel_token();
                     self.agent_manager.record_activity(agent_id);
-                    self.active_cancellations.insert(agent_id, cancellation);
+                    self.active_cancellations
+                        .insert(agent_id, cancellation.clone());
+                    if let Some(request_id) = request_id.as_ref() {
+                        self.active_requests
+                            .insert((agent_id, request_id.clone()), cancellation);
+                    }
                     drop(lifecycle_guard);
                     break executor_guard;
                 }
@@ -4524,6 +4611,21 @@ impl AgentKernelImpl {
                 }
             }
         };
+        let registration = ActiveTurnRegistration {
+            kernel: self,
+            agent_id,
+            request_id: request_id.clone(),
+        };
+        if let Some(events) = events {
+            executor.set_event_channel(events.clone());
+            if let Some(request_id) = request_id.as_ref() {
+                let _ = events
+                    .send(crate::execution::StreamEvent::Started {
+                        request_id: request_id.clone(),
+                    })
+                    .await;
+            }
+        }
 
         // CFS-ordered turn admission: under contention (more agents than
         // `max_concurrent` slots) the next freed slot goes to the
@@ -4540,7 +4642,8 @@ impl AgentKernelImpl {
                 Ok(slot) => Some(slot),
                 Err(SchedulerError::AdmissionCancelled(_)) => None,
                 Err(error) => {
-                    self.active_cancellations.remove(&agent_id);
+                    executor.clear_event_channel();
+                    drop(registration);
                     return Err(error.into());
                 }
             },
@@ -4555,12 +4658,8 @@ impl AgentKernelImpl {
         // the turn errors.
         self.scheduler.set_running(agent_id);
         let run_result = executor.run_resumable(message).await;
-        self.active_cancellations.remove(&agent_id);
-        match self.agent_manager.get_agent_state(agent_id) {
-            Some(AgentState::Running) => self.scheduler.set_queued(agent_id),
-            Some(AgentState::Paused) => self.scheduler.set_paused(agent_id),
-            _ => self.scheduler.deschedule(agent_id),
-        }
+        executor.clear_event_channel();
+        drop(registration);
         let output = match run_result? {
             TurnResult::Completed(output) => output,
             TurnResult::Paused(checkpoint) => {

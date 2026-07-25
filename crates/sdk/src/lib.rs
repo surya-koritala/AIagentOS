@@ -50,9 +50,10 @@ pub use kernel::package::{
     PackageSummary, PackageTrustInput, PackageTrustKey, SbomComponent, VerifiedPackage,
 };
 pub use kernel::syscall_server::{
-    AgentSummary, FactSummary, GenerationCheckpointSummary, OperatorAgentSnapshot,
-    OperatorCgroupSnapshot, OperatorNamespaceSnapshot, OperatorPackageSnapshot,
-    OperatorServiceSnapshot, OperatorSnapshot, ProviderSummary, WireErrorCode,
+    AgentSummary, FactSummary, GenerationCheckpointSummary, MessageStreamEvent,
+    OperatorAgentSnapshot, OperatorCgroupSnapshot, OperatorNamespaceSnapshot,
+    OperatorPackageSnapshot, OperatorServiceSnapshot, OperatorSnapshot, ProviderSummary,
+    WireErrorCode,
 };
 pub use kernel::wire_contract::{ProtocolDescription, TransportDescription};
 
@@ -482,6 +483,106 @@ impl KernelClient {
                 tokens,
             }),
             other => Err(unexpected("Message", &other)),
+        }
+    }
+
+    /// Drive one turn and deliver ordered stream events as they arrive.
+    ///
+    /// `request_id` must be unique among active streams for this agent and is
+    /// used by [`cancel_request`](Self::cancel_request) from a second
+    /// authenticated client. The callback is synchronous and should return
+    /// quickly so it does not become the stream's backpressure bottleneck.
+    pub async fn send_message_stream<F>(
+        &mut self,
+        request_id: impl Into<String>,
+        agent_id: impl Into<String>,
+        message: impl Into<String>,
+        mut on_event: F,
+    ) -> Result<MessageResult, SdkError>
+    where
+        F: FnMut(&MessageStreamEvent),
+    {
+        let request_id = request_id.into();
+        self.inner
+            .send(&Syscall::SendMessageStream {
+                request_id: request_id.clone(),
+                agent_id: agent_id.into(),
+                message: message.into(),
+            })
+            .await?;
+        let mut next_sequence = 0_u64;
+        loop {
+            match self.inner.read_reply().await? {
+                SyscallReply::StreamEvent {
+                    request_id: reply_id,
+                    sequence,
+                    event,
+                } if reply_id == request_id && sequence == next_sequence => {
+                    next_sequence = next_sequence.saturating_add(1);
+                    on_event(&event);
+                }
+                SyscallReply::StreamCompleted {
+                    request_id: reply_id,
+                    content,
+                    tool_calls,
+                    tokens,
+                } if reply_id == request_id => {
+                    return Ok(MessageResult {
+                        content,
+                        tool_calls,
+                        tokens,
+                    });
+                }
+                SyscallReply::StreamFailed {
+                    request_id: reply_id,
+                    code,
+                    message,
+                    retryable,
+                } if reply_id == request_id => {
+                    return Err(SdkError::Wire {
+                        code,
+                        message,
+                        retryable,
+                    });
+                }
+                SyscallReply::Error { message } => return Err(SdkError::Kernel(message)),
+                SyscallReply::TypedError {
+                    code,
+                    message,
+                    retryable,
+                } => {
+                    return Err(SdkError::Wire {
+                        code,
+                        message,
+                        retryable,
+                    });
+                }
+                other => return Err(unexpected("ordered message stream frame", &other)),
+            }
+        }
+    }
+
+    /// Cooperatively cancel one exact active stream. This must normally be
+    /// called from a second authenticated client because the streaming client
+    /// owns its connection until the terminal frame.
+    pub async fn cancel_request(
+        &mut self,
+        request_id: impl Into<String>,
+        agent_id: impl Into<String>,
+    ) -> Result<bool, SdkError> {
+        let request_id = request_id.into();
+        match self
+            .call(Syscall::CancelRequest {
+                request_id: request_id.clone(),
+                agent_id: agent_id.into(),
+            })
+            .await?
+        {
+            SyscallReply::RequestCancellation {
+                request_id: reply_id,
+                accepted,
+            } if reply_id == request_id => Ok(accepted),
+            other => Err(unexpected("RequestCancellation", &other)),
         }
     }
 
@@ -1375,6 +1476,23 @@ impl Agent {
     pub async fn send(&mut self, message: impl Into<String>) -> Result<MessageResult, SdkError> {
         let id = self.id.clone();
         self.client.send_message(id, message).await
+    }
+
+    /// Drive one turn with ordered stream events. Use a second
+    /// [`KernelClient`] to cancel by `request_id` while this call owns the
+    /// agent's connection.
+    pub async fn send_stream<F>(
+        &mut self,
+        request_id: impl Into<String>,
+        message: impl Into<String>,
+        on_event: F,
+    ) -> Result<MessageResult, SdkError>
+    where
+        F: FnMut(&MessageStreamEvent),
+    {
+        self.client
+            .send_message_stream(request_id, self.id.clone(), message, on_event)
+            .await
     }
 
     /// Invoke a tool as this agent (subject to the kernel's syscall gate).

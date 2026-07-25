@@ -54,8 +54,10 @@ version and compatibility fixture.
 Feature discovery is the negotiated version plus stable identifiers returned by
 `Hello`. `DescribeProtocol` publishes machine-readable request/reply/MCP
 schemas, compatibility behavior, and bounded transport controls. Protocol v2
-explicitly advertises no event/stream frame; token streaming and request-id
-cancellation remain #121 rather than being implied by the unary ABI.
+also defines ordered message-stream event/terminal frames, bounded
+backpressure, and exact request-id cancellation from a second authenticated
+connection. Non-native backends emit one completed-response delta; Azure OpenAI
+forwards native SSE deltas.
 
 ## Consequences
 

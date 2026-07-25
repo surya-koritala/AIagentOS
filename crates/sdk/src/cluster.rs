@@ -13,7 +13,7 @@
 
 use std::collections::HashMap;
 
-use crate::{AgentSummary, KernelClient, MessageResult, NodeLoad, SdkError};
+use crate::{AgentSummary, KernelClient, MessageResult, MessageStreamEvent, NodeLoad, SdkError};
 
 /// One kernel node in the cluster: its address-derived id and a live client.
 pub struct NodeHandle {
@@ -201,6 +201,42 @@ impl ClusterClient {
     ) -> Result<MessageResult, SdkError> {
         let idx = self.owner_index(agent_id)?;
         self.nodes[idx].client.send_message(agent_id, message).await
+    }
+
+    /// Drive one streamed turn on the agent's owning node.
+    pub async fn send_message_stream<F>(
+        &mut self,
+        request_id: impl Into<String>,
+        agent_id: &str,
+        message: impl Into<String>,
+        on_event: F,
+    ) -> Result<MessageResult, SdkError>
+    where
+        F: FnMut(&MessageStreamEvent),
+    {
+        let idx = self.owner_index(agent_id)?;
+        self.nodes[idx]
+            .client
+            .send_message_stream(request_id, agent_id, message, on_event)
+            .await
+    }
+
+    /// Cancel one exact active stream on the agent's owning node.
+    ///
+    /// The owning node needs a second connection while
+    /// [`send_message_stream`](Self::send_message_stream) is active. Callers
+    /// can obtain one with [`node`](Self::node), or use a separate
+    /// [`KernelClient`] connected and authenticated to the same node.
+    pub async fn cancel_request(
+        &mut self,
+        request_id: impl Into<String>,
+        agent_id: &str,
+    ) -> Result<bool, SdkError> {
+        let idx = self.owner_index(agent_id)?;
+        self.nodes[idx]
+            .client
+            .cancel_request(request_id, agent_id)
+            .await
     }
 
     /// Invoke a tool as an agent, routed to its owning node (gate-enforced there).

@@ -385,7 +385,9 @@ fn release_blocking_workflows_keep_their_security_contract() {
     );
     for proof in [
         "environment: provider-qualification",
-        "secrets.OPENAI_API_KEY",
+        "QUALIFICATION_MODEL: ${{ vars[matrix.model_variable] }}",
+        "QUALIFICATION_API_KEY: ${{ secrets[matrix.credential_secret] }}",
+        "QUALIFICATION_ENDPOINT: ${{ secrets[matrix.endpoint_secret] }}",
         "Execute one governed live turn",
     ] {
         assert!(
@@ -393,6 +395,30 @@ fn release_blocking_workflows_keep_their_security_contract() {
             "live-provider qualification lost {proof:?}"
         );
     }
+    for secret in [
+        "OPENAI_API_KEY",
+        "ANTHROPIC_API_KEY",
+        "AZURE_OPENAI_API_KEY",
+        "GROQ_API_KEY",
+        "DEEPSEEK_API_KEY",
+        "GEMINI_API_KEY",
+        "HUGGINGFACE_API_KEY",
+        "VLLM_API_KEY",
+    ] {
+        assert!(
+            live.contains(&format!("credential_secret: {secret}")),
+            "live-provider qualification lost matrix credential {secret:?}"
+        );
+        assert!(
+            !live.contains(&format!("${{{{ secrets.{secret} }}}}")),
+            "live-provider jobs must not receive unrelated credential {secret:?}"
+        );
+    }
+    assert_eq!(
+        live.matches("secrets[").count(),
+        2,
+        "live-provider jobs must select only their credential and endpoint secrets"
+    );
 
     let release = read_workspace_file(".github/workflows/release.yml");
     for proof in [

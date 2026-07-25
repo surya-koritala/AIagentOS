@@ -35,19 +35,20 @@ impl CircuitBreaker {
 
     /// Check if requests should be allowed.
     pub fn is_available(&self) -> bool {
-        let state = self.state.lock().unwrap();
+        let mut state = self.state.lock().unwrap();
         match *state {
             BreakerState::Closed => true,
             BreakerState::Open => {
-                // Check if cooldown has passed
                 if let Some(last) = *self.last_failure.lock().unwrap() {
                     if last.elapsed().as_secs() >= self.cooldown_secs {
-                        return true; // Allow one test request (half-open)
+                        // Only this caller owns the single recovery probe.
+                        *state = BreakerState::HalfOpen;
+                        return true;
                     }
                 }
                 false
             }
-            BreakerState::HalfOpen => true,
+            BreakerState::HalfOpen => false,
         }
     }
 
@@ -60,18 +61,27 @@ impl CircuitBreaker {
     /// Record a failed request.
     pub fn record_failure(&self) {
         let failures = self.consecutive_failures.fetch_add(1, Ordering::SeqCst) + 1;
+        // Keep the same lock order as `is_available`: state, then timestamp.
+        let mut state = self.state.lock().unwrap();
         *self.last_failure.lock().unwrap() = Some(Instant::now());
         if failures >= self.failure_threshold {
-            *self.state.lock().unwrap() = BreakerState::Open;
+            *state = BreakerState::Open;
         }
     }
 
     /// Get current state info.
     pub fn status(&self) -> (bool, u32) {
-        (
-            self.is_available(),
-            self.consecutive_failures.load(Ordering::SeqCst),
-        )
+        let state = self.state.lock().unwrap();
+        let available = match *state {
+            BreakerState::Closed => true,
+            BreakerState::HalfOpen => false,
+            BreakerState::Open => self
+                .last_failure
+                .lock()
+                .unwrap()
+                .is_some_and(|last| last.elapsed().as_secs() >= self.cooldown_secs),
+        };
+        (available, self.consecutive_failures.load(Ordering::SeqCst))
     }
 }
 
@@ -102,5 +112,15 @@ mod tests {
         cb.record_success();
         assert!(cb.is_available());
         assert_eq!(cb.status().1, 0);
+    }
+
+    #[test]
+    fn circuit_breaker_allows_exactly_one_half_open_probe() {
+        let cb = CircuitBreaker::new(1, 0);
+        cb.record_failure();
+        assert!(cb.is_available());
+        assert!(!cb.is_available());
+        cb.record_success();
+        assert!(cb.is_available());
     }
 }

@@ -104,6 +104,9 @@ mod tests {
             .send(vec![StandardMessage::user("test")])
             .await
             .unwrap_err();
-        assert!(matches!(error, kernel::ConnectorError::ConnectionFailed(_)));
+        assert!(matches!(
+            error,
+            kernel::ConnectorError::ServiceUnavailable(_)
+        ));
     }
 }

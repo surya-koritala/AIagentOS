@@ -118,6 +118,12 @@ impl LlmSession for VllmSession {
                     .json()
                     .await
                     .map_err(|e| ConnectorError::ProtocolError(e.to_string()))?;
+                if let Some(error) = crate::content_filter_error(
+                    &self.provider_id,
+                    json["choices"][0]["finish_reason"].as_str(),
+                ) {
+                    return Err(error);
+                }
                 let content = json["choices"][0]["message"]["content"]
                     .as_str()
                     .unwrap_or("")
@@ -156,8 +162,8 @@ impl LlmSession for VllmSession {
                     tool_calls,
                 })
             }
-            Ok(resp) => Err(crate::http_status_error(resp.status(), None)),
-            Err(e) => Err(ConnectorError::ConnectionFailed(e.to_string())),
+            Ok(resp) => Err(crate::provider_http_error(&self.provider_id, resp).await),
+            Err(e) => Err(crate::transport_error(&self.provider_id, e)),
         }
     }
 
@@ -184,6 +190,15 @@ impl LlmProviderAdapter for VllmAdapter {
     }
     fn provider_type(&self) -> ProviderType {
         ProviderType::Local
+    }
+    fn capabilities(&self) -> kernel::connector::ProviderCapabilities {
+        kernel::connector::ProviderCapabilities {
+            tool_calls: true,
+            parallel_tool_calls: true,
+            prompt_cancellation: true,
+            api_family: "openai-compatible-v1".into(),
+            ..Default::default()
+        }
     }
 
     async fn is_available(&self) -> bool {

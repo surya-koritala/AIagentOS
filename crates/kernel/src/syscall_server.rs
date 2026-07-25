@@ -174,10 +174,25 @@ pub enum Syscall {
         #[serde(default)]
         category: Option<String>,
     },
-    /// Query an agent's long-term memory by substring, newest first.
+    /// Query an agent's long-term memory using its configured semantic index.
     MemoryQuery {
         agent_id: String,
         query: String,
+    },
+    /// Replace the content and embedding of an agent-owned fact.
+    MemoryUpdate {
+        agent_id: String,
+        fact_id: String,
+        content: String,
+    },
+    /// Delete an agent-owned fact.
+    MemoryDelete {
+        agent_id: String,
+        fact_id: String,
+    },
+    /// Rebuild all embeddings owned by an agent with the active embedding model.
+    MemoryReindex {
+        agent_id: String,
     },
     /// Put (insert-or-overwrite) a value into the agent's durable key/value
     /// store (the per-agent `agent_kv` table). `value` is an opaque string —
@@ -380,6 +395,14 @@ pub struct ProviderSummary {
     pub name: String,
     pub provider_type: String,
     pub available: bool,
+    #[serde(default)]
+    pub circuit_open: bool,
+    #[serde(default)]
+    pub consecutive_failures: u32,
+    #[serde(default)]
+    pub capabilities: crate::connector::ProviderCapabilities,
+    #[serde(default)]
+    pub routing_policy: crate::connector::ProviderRoutingPolicy,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sampled_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -670,6 +693,18 @@ pub enum SyscallReply {
     Memory {
         facts: Vec<FactSummary>,
     },
+    /// Whether an agent-owned fact was updated.
+    MemoryUpdated {
+        updated: bool,
+    },
+    /// Whether an agent-owned fact was deleted.
+    MemoryDeleted {
+        deleted: bool,
+    },
+    /// Number of agent-owned facts whose embeddings were rebuilt.
+    MemoryReindexed {
+        count: usize,
+    },
     /// A value was written to the key/value store (reply to [`Syscall::StoragePut`]).
     StorageOk,
     /// A value read from the key/value store (reply to [`Syscall::StorageGet`]);
@@ -880,6 +915,15 @@ fn syscall_policy(call: &Syscall) -> (AccessLevel, &'static str, Option<&str>) {
         }
         Syscall::MemoryQuery { agent_id, .. } => {
             (AccessLevel::ReadOnly, "memory.query", Some(agent_id))
+        }
+        Syscall::MemoryUpdate { agent_id, .. } => {
+            (AccessLevel::User, "memory.update", Some(agent_id))
+        }
+        Syscall::MemoryDelete { agent_id, .. } => {
+            (AccessLevel::User, "memory.delete", Some(agent_id))
+        }
+        Syscall::MemoryReindex { agent_id } => {
+            (AccessLevel::User, "memory.reindex", Some(agent_id))
         }
         Syscall::StoragePut { agent_id, .. } => (AccessLevel::User, "storage.put", Some(agent_id)),
         Syscall::StorageGet { agent_id, .. } => {
@@ -1466,6 +1510,10 @@ pub async fn dispatch_scoped(
                     name: p.name,
                     provider_type: format!("{:?}", p.provider_type),
                     available: p.available,
+                    circuit_open: p.circuit_open,
+                    consecutive_failures: p.consecutive_failures,
+                    capabilities: p.capabilities,
+                    routing_policy: p.routing_policy,
                     sampled_at: None,
                     probe_duration_ms: None,
                     probe_timed_out: false,
@@ -1525,6 +1573,77 @@ pub async fn dispatch_scoped(
                 },
                 Err(e) => SyscallReply::Error {
                     message: format!("memory query failed: {e}"),
+                },
+            }
+        }
+        Syscall::MemoryUpdate {
+            agent_id,
+            fact_id,
+            content,
+        } => {
+            let agent_id = match uuid::Uuid::parse_str(&agent_id) {
+                Ok(id) => id,
+                Err(_) => {
+                    return SyscallReply::Error {
+                        message: format!("invalid agent id: {agent_id}"),
+                    }
+                }
+            };
+            let fact_id = match uuid::Uuid::parse_str(&fact_id) {
+                Ok(id) => id,
+                Err(_) => {
+                    return SyscallReply::Error {
+                        message: format!("invalid fact id: {fact_id}"),
+                    }
+                }
+            };
+            match kernel
+                .context_manager
+                .update_fact(agent_id, fact_id, &content)
+            {
+                Ok(updated) => SyscallReply::MemoryUpdated { updated },
+                Err(e) => SyscallReply::Error {
+                    message: format!("memory update failed: {e}"),
+                },
+            }
+        }
+        Syscall::MemoryDelete { agent_id, fact_id } => {
+            let agent_id = match uuid::Uuid::parse_str(&agent_id) {
+                Ok(id) => id,
+                Err(_) => {
+                    return SyscallReply::Error {
+                        message: format!("invalid agent id: {agent_id}"),
+                    }
+                }
+            };
+            let fact_id = match uuid::Uuid::parse_str(&fact_id) {
+                Ok(id) => id,
+                Err(_) => {
+                    return SyscallReply::Error {
+                        message: format!("invalid fact id: {fact_id}"),
+                    }
+                }
+            };
+            match kernel.context_manager.delete_fact(agent_id, fact_id) {
+                Ok(deleted) => SyscallReply::MemoryDeleted { deleted },
+                Err(e) => SyscallReply::Error {
+                    message: format!("memory delete failed: {e}"),
+                },
+            }
+        }
+        Syscall::MemoryReindex { agent_id } => {
+            let agent_id = match uuid::Uuid::parse_str(&agent_id) {
+                Ok(id) => id,
+                Err(_) => {
+                    return SyscallReply::Error {
+                        message: format!("invalid agent id: {agent_id}"),
+                    }
+                }
+            };
+            match kernel.context_manager.reindex_memory(agent_id) {
+                Ok(count) => SyscallReply::MemoryReindexed { count },
+                Err(e) => SyscallReply::Error {
+                    message: format!("memory reindex failed: {e}"),
                 },
             }
         }
@@ -2190,6 +2309,10 @@ pub async fn dispatch_scoped(
                         name: provider.name,
                         provider_type: format!("{:?}", provider.provider_type),
                         available: provider.available,
+                        circuit_open: provider.circuit_open,
+                        consecutive_failures: provider.consecutive_failures,
+                        capabilities: provider.capabilities,
+                        routing_policy: provider.routing_policy,
                         sampled_at: Some(sampled_at.clone()),
                         probe_duration_ms: Some(probe_duration_ms),
                         probe_timed_out: false,
@@ -2204,6 +2327,10 @@ pub async fn dispatch_scoped(
                         name: provider.name,
                         provider_type: format!("{:?}", provider.provider_type),
                         available: false,
+                        circuit_open: provider.circuit_open,
+                        consecutive_failures: provider.consecutive_failures,
+                        capabilities: provider.capabilities,
+                        routing_policy: provider.routing_policy,
                         sampled_at: Some(sampled_at.clone()),
                         probe_duration_ms: Some(probe_duration_ms),
                         probe_timed_out: true,
@@ -3259,8 +3386,9 @@ mod tests {
             other => panic!("expected AgentCreated, got {other:?}"),
         };
 
-        // Store a fact, then find it by substring.
-        match client
+        // Store a fact, mutate it, rebuild its embedding, query it, then delete
+        // it through the public wire surface.
+        let fact_id = match client
             .call(Syscall::MemoryStore {
                 agent_id: id.clone(),
                 content: "the deploy key lives in vault".into(),
@@ -3269,13 +3397,35 @@ mod tests {
             .await
             .unwrap()
         {
-            SyscallReply::MemoryStored { id } => assert!(!id.is_empty()),
+            SyscallReply::MemoryStored { id } => id,
             other => panic!("expected MemoryStored, got {other:?}"),
-        }
+        };
+        assert!(!fact_id.is_empty());
+
+        assert!(matches!(
+            client
+                .call(Syscall::MemoryUpdate {
+                    agent_id: id.clone(),
+                    fact_id: fact_id.clone(),
+                    content: "the production deploy key lives in vault".into(),
+                })
+                .await
+                .unwrap(),
+            SyscallReply::MemoryUpdated { updated: true }
+        ));
+        assert!(matches!(
+            client
+                .call(Syscall::MemoryReindex {
+                    agent_id: id.clone(),
+                })
+                .await
+                .unwrap(),
+            SyscallReply::MemoryReindexed { count: 1 }
+        ));
 
         match client
             .call(Syscall::MemoryQuery {
-                agent_id: id,
+                agent_id: id.clone(),
                 query: "deploy key".into(),
             })
             .await
@@ -3289,6 +3439,28 @@ mod tests {
                     "stored fact should be retrievable with its category: {facts:?}"
                 );
             }
+            other => panic!("expected Memory, got {other:?}"),
+        }
+
+        assert!(matches!(
+            client
+                .call(Syscall::MemoryDelete {
+                    agent_id: id.clone(),
+                    fact_id,
+                })
+                .await
+                .unwrap(),
+            SyscallReply::MemoryDeleted { deleted: true }
+        ));
+        match client
+            .call(Syscall::MemoryQuery {
+                agent_id: id,
+                query: "deploy key".into(),
+            })
+            .await
+            .unwrap()
+        {
+            SyscallReply::Memory { facts } => assert!(facts.is_empty()),
             other => panic!("expected Memory, got {other:?}"),
         }
     }
@@ -4099,6 +4271,18 @@ memory = ["remember this"]
                 agent_id: id.clone(),
                 query: "test".into(),
             },
+            Syscall::MemoryUpdate {
+                agent_id: id.clone(),
+                fact_id: uuid::Uuid::new_v4().to_string(),
+                content: "updated".into(),
+            },
+            Syscall::MemoryDelete {
+                agent_id: id.clone(),
+                fact_id: uuid::Uuid::new_v4().to_string(),
+            },
+            Syscall::MemoryReindex {
+                agent_id: id.clone(),
+            },
             Syscall::StoragePut {
                 agent_id: id.clone(),
                 key: "k".into(),
@@ -4248,7 +4432,7 @@ memory = ["remember this"]
         // syscall_policy is an exhaustive match. Adding a new enum variant
         // cannot compile until it receives an authorization classification;
         // this table then records the expected role/resource behavior.
-        assert_eq!(agent_calls.len() + unscoped_calls.len(), 43);
+        assert_eq!(agent_calls.len() + unscoped_calls.len(), 46);
     }
 
     #[tokio::test]
@@ -4333,6 +4517,18 @@ memory = ["remember this"]
             Syscall::MemoryQuery {
                 agent_id: id.clone(),
                 query: "private".into(),
+            },
+            Syscall::MemoryUpdate {
+                agent_id: id.clone(),
+                fact_id: uuid::Uuid::new_v4().to_string(),
+                content: "poison".into(),
+            },
+            Syscall::MemoryDelete {
+                agent_id: id.clone(),
+                fact_id: uuid::Uuid::new_v4().to_string(),
+            },
+            Syscall::MemoryReindex {
+                agent_id: id.clone(),
             },
             Syscall::StoragePut {
                 agent_id: id.clone(),

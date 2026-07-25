@@ -1,0 +1,95 @@
+name: On-device GGUF qualification
+
+# A repository-owned runner supplies licensed model weights. GitHub-hosted
+# runners never download an arbitrary model or claim real inference coverage.
+on:
+  workflow_dispatch:
+    inputs:
+      model_path:
+        description: Absolute path to a provisioned GGUF model on the runner
+        required: true
+        type: string
+      tokenizer_path:
+        description: Absolute path to the matching tokenizer.json
+        required: true
+        type: string
+      model_id:
+        description: Stable model and quantization identifier
+        required: true
+        type: string
+      chat_template:
+        description: Prompt template provisioned for the model
+        required: true
+        default: chatml
+        type: choice
+        options: [simple, chatml, llama3]
+      max_context_tokens:
+        description: Hard prompt plus completion token ceiling
+        required: true
+        default: "4096"
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: on-device-qualification
+  cancel-in-progress: false
+
+jobs:
+  real-model:
+    name: Real GGUF CPU inference
+    runs-on: [self-hosted, linux, x64, agentos-model]
+    timeout-minutes: 45
+    environment: model-qualification
+    env:
+      AGENTOS_GGUF_MODEL: ${{ inputs.model_path }}
+      AGENTOS_TOKENIZER: ${{ inputs.tokenizer_path }}
+      AGENTOS_MODEL_ID: ${{ inputs.model_id }}
+      AGENTOS_CHAT_TEMPLATE: ${{ inputs.chat_template }}
+      AGENTOS_MAX_CONTEXT_TOKENS: ${{ inputs.max_context_tokens }}
+      AGENTOS_MAX_NEW_TOKENS: "32"
+      RAYON_NUM_THREADS: "4"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
+        with:
+          toolchain: 1.97.1
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - name: Validate provisioned model inputs
+        run: |
+          test -f "$AGENTOS_GGUF_MODEL"
+          test -r "$AGENTOS_GGUF_MODEL"
+          test -f "$AGENTOS_TOKENIZER"
+          test -r "$AGENTOS_TOKENIZER"
+          [[ "$AGENTOS_MAX_CONTEXT_TOKENS" =~ ^[1-9][0-9]{0,6}$ ]]
+          [[ "$AGENTOS_MODEL_ID" =~ ^[A-Za-z0-9._:/+-]+$ ]]
+      - name: Exercise real load, tokenize, prefill, decode, and detokenize
+        run: >-
+          /usr/bin/time -v -o on-device-resources.txt
+          cargo test -p adapters --features candle
+          on_device_generates_tokens --locked -- --ignored --nocapture
+      - name: Record non-sensitive qualification metadata
+        run: |
+          jq -n \
+            --arg model "$AGENTOS_MODEL_ID" \
+            --arg template "$AGENTOS_CHAT_TEMPLATE" \
+            --arg context "$AGENTOS_MAX_CONTEXT_TOKENS" \
+            --arg runner_os "$RUNNER_OS" \
+            '{
+              schema_version: 1,
+              status: "passed",
+              device: "cpu",
+              model: $model,
+              chat_template: $template,
+              max_context_tokens: ($context | tonumber),
+              runner_os: $runner_os
+            }' > on-device-qualification.json
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: on-device-qualification
+          path: |
+            on-device-qualification.json
+            on-device-resources.txt
+          if-no-files-found: error
+          retention-days: 30

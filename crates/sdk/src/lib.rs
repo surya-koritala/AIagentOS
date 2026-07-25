@@ -613,7 +613,7 @@ impl KernelClient {
         }
     }
 
-    /// Query an agent's long-term memory by substring (newest first).
+    /// Query an agent's long-term memory using the configured semantic index.
     pub async fn memory_query(
         &mut self,
         agent_id: impl Into<String>,
@@ -626,6 +626,53 @@ impl KernelClient {
         match self.call(call).await? {
             SyscallReply::Memory { facts } => Ok(facts),
             other => Err(unexpected("Memory", &other)),
+        }
+    }
+
+    /// Replace one agent-owned fact and regenerate its embedding.
+    pub async fn memory_update(
+        &mut self,
+        agent_id: impl Into<String>,
+        fact_id: impl Into<String>,
+        content: impl Into<String>,
+    ) -> Result<bool, SdkError> {
+        let call = Syscall::MemoryUpdate {
+            agent_id: agent_id.into(),
+            fact_id: fact_id.into(),
+            content: content.into(),
+        };
+        match self.call(call).await? {
+            SyscallReply::MemoryUpdated { updated } => Ok(updated),
+            other => Err(unexpected("MemoryUpdated", &other)),
+        }
+    }
+
+    /// Delete one agent-owned fact.
+    pub async fn memory_delete(
+        &mut self,
+        agent_id: impl Into<String>,
+        fact_id: impl Into<String>,
+    ) -> Result<bool, SdkError> {
+        let call = Syscall::MemoryDelete {
+            agent_id: agent_id.into(),
+            fact_id: fact_id.into(),
+        };
+        match self.call(call).await? {
+            SyscallReply::MemoryDeleted { deleted } => Ok(deleted),
+            other => Err(unexpected("MemoryDeleted", &other)),
+        }
+    }
+
+    /// Rebuild all of an agent's embeddings with the active embedding model.
+    pub async fn memory_reindex(&mut self, agent_id: impl Into<String>) -> Result<usize, SdkError> {
+        match self
+            .call(Syscall::MemoryReindex {
+                agent_id: agent_id.into(),
+            })
+            .await?
+        {
+            SyscallReply::MemoryReindexed { count } => Ok(count),
+            other => Err(unexpected("MemoryReindexed", &other)),
         }
     }
 
@@ -1280,7 +1327,8 @@ mod protocol_tests {
     use super::*;
     use async_trait::async_trait;
     use kernel::connector::{
-        LlmProviderAdapter, LlmResponse, LlmSession, ProviderType, StandardMessage, ToolDefinition,
+        LlmProviderAdapter, LlmResponse, LlmSession, ProviderCapabilities, ProviderType,
+        StandardMessage, ToolDefinition,
     };
     use kernel::syscall_server::SyscallServer;
     use kernel::{AgentKernelImpl, ConnectorError};
@@ -1372,6 +1420,13 @@ mod protocol_tests {
                 calls: Arc::clone(&self.calls),
                 started: Arc::clone(&self.started),
             }))
+        }
+        fn capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities {
+                tool_calls: true,
+                prompt_cancellation: true,
+                ..ProviderCapabilities::default()
+            }
         }
         fn translate_to_provider(&self, message: &StandardMessage) -> serde_json::Value {
             serde_json::json!({"role": message.role, "content": message.content})
@@ -1594,6 +1649,52 @@ mod protocol_tests {
     }
 
     #[tokio::test]
+    async fn sdk_memory_lifecycle_roundtrip_is_typed() {
+        let kernel = Arc::new(AgentKernelImpl::new().expect("kernel new"));
+        let server = SyscallServer::bind(kernel, "127.0.0.1:0").await.unwrap();
+        let address = server.local_addr().unwrap();
+        tokio::spawn(server.serve());
+        let mut client = KernelClient::connect(address).await.unwrap();
+        let agent_id = client
+            .create_agent("sdk-memory", "remember", None, None, None)
+            .await
+            .unwrap();
+
+        let fact_id = client
+            .memory_store(
+                agent_id.clone(),
+                "deploy key is in staging",
+                Some("instruction".into()),
+            )
+            .await
+            .unwrap();
+        assert!(client
+            .memory_update(
+                agent_id.clone(),
+                fact_id.clone(),
+                "production deploy key is in vault",
+            )
+            .await
+            .unwrap());
+        assert_eq!(client.memory_reindex(agent_id.clone()).await.unwrap(), 1);
+        let facts = client
+            .memory_query(agent_id.clone(), "production deploy key")
+            .await
+            .unwrap();
+        assert_eq!(facts.len(), 1);
+        assert_eq!(facts[0].id, fact_id);
+        assert!(client
+            .memory_delete(agent_id.clone(), fact_id)
+            .await
+            .unwrap());
+        assert!(client
+            .memory_query(agent_id, "production deploy key")
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
     async fn sdk_service_supervisor_uses_public_coordinated_lifecycle() {
         use kernel::init_system::ServiceStatus;
 
@@ -1685,6 +1786,16 @@ mod protocol_tests {
         tokio::spawn(server.serve());
 
         let mut control = KernelClient::connect(addr).await.unwrap();
+        let provider = control
+            .list_providers()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|provider| provider.id == "wire-checkpoint")
+            .expect("registered provider is publicly discoverable");
+        assert!(provider.capabilities.tool_calls);
+        assert!(provider.capabilities.prompt_cancellation);
+        assert!(!provider.circuit_open);
         let id = control
             .create_agent(
                 "public-checkpoint",

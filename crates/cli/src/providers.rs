@@ -55,7 +55,8 @@ pub fn register_providers(kernel: &AgentKernelImpl, config: &Config) {
                 .map(|s| s.to_string())
                 .or_else(|| std::env::var("OPENAI_API_KEY").ok())
             {
-                let _ = kernel.register_provider(Arc::new(OpenAiAdapter::new(key)));
+                let adapter = OpenAiAdapter::new(key).with_model(config.default_model.clone());
+                let _ = kernel.register_provider(Arc::new(adapter));
             }
         }
         "anthropic" => {
@@ -64,7 +65,8 @@ pub fn register_providers(kernel: &AgentKernelImpl, config: &Config) {
                 .map(|s| s.to_string())
                 .or_else(|| std::env::var("ANTHROPIC_API_KEY").ok())
             {
-                let _ = kernel.register_provider(Arc::new(AnthropicAdapter::new(key)));
+                let adapter = AnthropicAdapter::new(key).with_model(config.default_model.clone());
+                let _ = kernel.register_provider(Arc::new(adapter));
             }
         }
         "groq" => {

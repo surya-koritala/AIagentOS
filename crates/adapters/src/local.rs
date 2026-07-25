@@ -66,10 +66,10 @@ impl LlmSession for LocalSession {
             .json(&body)
             .send()
             .await
-            .map_err(|e| ConnectorError::ConnectionFailed(e.to_string()))?;
+            .map_err(|e| crate::transport_error(&self.provider_id, e))?;
 
         if !resp.status().is_success() {
-            return Err(crate::http_status_error(resp.status(), None));
+            return Err(crate::provider_http_error(&self.provider_id, resp).await);
         }
 
         let json: serde_json::Value = resp
@@ -119,6 +119,13 @@ impl LlmProviderAdapter for LocalLlmAdapter {
     }
     fn provider_type(&self) -> ProviderType {
         ProviderType::Local
+    }
+    fn capabilities(&self) -> kernel::connector::ProviderCapabilities {
+        kernel::connector::ProviderCapabilities {
+            prompt_cancellation: true,
+            api_family: "ollama-v1".into(),
+            ..Default::default()
+        }
     }
 
     async fn is_available(&self) -> bool {

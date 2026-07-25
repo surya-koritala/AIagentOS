@@ -12,6 +12,24 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
 
 ### Added
 
+- **Provider and on-device qualification contract** — provider adapters expose
+  conservative streaming/tool/parallel/cancellation/API-family capabilities;
+  HTTP failures preserve typed auth, authorization, throttling, timeout,
+  service, invalid-request, content-filter, retry-after, and bounded request-ID
+  context through an 8 KiB redacted diagnostic path. The resilient connector
+  adds exact half-open circuit probes, compatibility-checked regional and
+  local-to-cloud failover, per-attempt timeouts/cancellation, actual
+  provider/model attribution, and duplicate-retry ownership regressions.
+  Nightly/manual protected workflows now emit explicit live `passed`, `failed`,
+  or `not_run` evidence; real GGUF inference remains gated to a
+  repository-owned model runner. (#120)
+- **Versioned retrieval-memory lifecycle** — facts persist embedding
+  model/version/dimension/content hashes, deterministically rebuild stale or
+  corrupt vectors, and support agent-owned update, delete, and reindex over the
+  wire and SDK. Concurrent writes, cross-agent mutations, tenant artifact
+  purge, and large retrieval have regressions. A blocking exact-vs-LSH
+  benchmark emits recall, agreement, latency, and memory evidence and enforces
+  recall@10/top-1 floors. (#120)
 - **Coordinated lifecycle and durable checkpoints** — public wire/SDK operations
   now coordinate pause, resume, stop, kill, cleanup, restart rehydration, and
   versioned generation checkpoints across kernel subsystems. Checkpoint
@@ -153,9 +171,13 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
   one SQLite transaction. The serialized prompt floor and a provider-enforced
   output allowance are reserved before I/O; successful calls reconcile every
   scope in the original epoch without replacing provider-reported invoice
-  usage used for billing. Hosted adapters make one outbound attempt and the
-  executor is the transient-only retry owner, so durable RPM receipts map
-  one-to-one to provider attempts. Restart, cancellation, overflow, sibling
+  usage used for billing. Hosted adapters make one outbound request per
+  connector attempt. The executor owns bounded retry rounds while the resilient
+  connector owns one attempt per compatible failover provider inside a round,
+  avoiding stacked retry loops. Each round durably reserves its worst-case
+  failover count before I/O and reconciles exact attempts afterward, so RPM
+  receipts still map one-to-one to provider attempts. Restart, cancellation,
+  overflow, sibling
   races, tenant/per-agent isolation, low-level membership reassignment races,
   and managed-hierarchy immutability are covered.
   Exhausted execution-path quotas now return retryable epoch-boundary
@@ -177,8 +199,10 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
   The complete v1 compatibility/conformance commitment remains tracked by #121.
   (#116, #121)
 - **Provider claims** — documentation now distinguishes mock-fixture evidence,
-  live qualification, unsupported tool/usage behavior, and the experimental
-  local/on-device paths. (#120)
+  explicit live `not_run` evidence, unsupported multimodal/discovery/tool/usage
+  behavior, local-to-cloud routing policy, and the bounded CPU-only on-device
+  path. No fixture result is described as live production qualification.
+  (#120)
 
 ### Quality
 

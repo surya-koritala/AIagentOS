@@ -159,6 +159,8 @@ impl UsageTelemetry {
 struct ProviderCall {
     response: crate::connector::LlmResponse,
     usage: crate::connector::LlmUsage,
+    provider_id: crate::ProviderId,
+    model_id: String,
     attempts: u32,
     retries: u32,
     latency_ms: u64,
@@ -200,6 +202,9 @@ pub struct AgentExecutor {
     /// preserves the source-compatible direct-executor behavior; production
     /// kernel wiring always installs a positive validated value.
     max_output_tokens_per_request: u32,
+    /// Per-attempt provider timeout. `None` preserves direct-executor
+    /// compatibility; production kernel wiring installs a finite bound.
+    provider_request_timeout: Option<std::time::Duration>,
     messages: Vec<StandardMessage>,
     cancel_token: CancellationToken,
     event_tx: Option<mpsc::Sender<StreamEvent>>,
@@ -215,14 +220,19 @@ impl AgentExecutor {
         tokens_used: u32,
         usage: UsageTelemetry,
     ) -> AgentOutput {
-        let provider_id = self.session.provider_id().clone();
+        let (provider_id, model_id) = self.session.last_attribution().unwrap_or_else(|| {
+            (
+                self.session.provider_id().clone(),
+                self.session.model_id().to_string(),
+            )
+        });
         let estimated_cost_usd = usage.charged_cost_micros as f64 / 1_000_000.0;
         AgentOutput {
             content,
             tool_calls_made,
             tokens_used,
             provider_id,
-            model_id: self.session.model_id().to_string(),
+            model_id,
             estimated_cost_usd,
             usage,
         }
@@ -253,6 +263,7 @@ impl AgentExecutor {
             context_budget_tokens: 0,
             max_tool_calls_per_turn: 0,
             max_output_tokens_per_request: 0,
+            provider_request_timeout: None,
             messages: vec![StandardMessage::system(&system_prompt)],
             cancel_token: CancellationToken::new(),
             event_tx: None,
@@ -345,6 +356,10 @@ impl AgentExecutor {
     /// prompt before quota admission.
     pub fn set_max_output_tokens_per_request(&mut self, max_output_tokens: u32) {
         self.max_output_tokens_per_request = max_output_tokens;
+    }
+
+    pub fn set_provider_request_timeout(&mut self, timeout: std::time::Duration) {
+        self.provider_request_timeout = Some(timeout);
     }
 
     fn estimate_prompt_tokens(&self, messages: &[StandardMessage]) -> u32 {
@@ -907,8 +922,8 @@ impl AgentExecutor {
             if let Some(ref budget) = self.budget_enforcer {
                 let (_charged_usd, charged_micros) = budget.record_usage_charge(
                     self.agent_id,
-                    self.session.provider_id(),
-                    self.session.model_id(),
+                    &call.provider_id,
+                    &call.model_id,
                     call.usage,
                 );
                 usage.charged_cost_micros =
@@ -1110,10 +1125,19 @@ impl AgentExecutor {
             .saturating_add(Self::conservative_tool_tokens(tools));
         let estimated_admission_tokens =
             estimated_input_tokens.saturating_add(self.max_output_tokens_per_request);
+        let provider_attempt_budget = self.session.max_provider_attempts().max(1);
+        let estimated_attempt_tokens = u64::from(estimated_admission_tokens)
+            .saturating_mul(u64::from(provider_attempt_budget));
 
         let mut last_err = None;
         let mut provider_latency_ms = 0u64;
-        for attempt in 0..LLM_RETRIES {
+        let mut completed_provider_attempts = 0u32;
+        let max_attempts = if self.session.handles_retries() {
+            1
+        } else {
+            LLM_RETRIES
+        };
+        for attempt in 0..max_attempts {
             if attempt > 0 {
                 let delay = tokio::time::Duration::from_millis(500 * (1 << attempt));
                 tokio::select! {
@@ -1151,7 +1175,7 @@ impl AgentExecutor {
             // stale snapshot is fully refunded and retried without consuming a
             // provider retry attempt.
             let mut membership_retries = 0u8;
-            let (mut rate_guard, _llm_core) = loop {
+            let (rate_guard, _llm_core) = loop {
                 let (quota_snapshot, mut membership_changes) = match &self.rate_limiter {
                     Some(_) => {
                         // Subscribe first. The receiver carries the exact
@@ -1171,8 +1195,9 @@ impl AgentExecutor {
                 };
                 let admission = match (&self.rate_limiter, quota_snapshot.as_ref()) {
                     (Some(limiter), Some(snapshot)) => limiter
-                        .try_acquire_tokens_with_cgroups_cancellable(
-                            u64::from(estimated_admission_tokens),
+                        .try_acquire_attempts_with_cgroups_cancellable(
+                            u64::from(provider_attempt_budget),
+                            estimated_attempt_tokens,
                             &snapshot.constraints,
                             Some((
                                 membership_changes
@@ -1283,25 +1308,19 @@ impl AgentExecutor {
                 }
             };
             let started = std::time::Instant::now();
-            let result = tokio::select! {
-                biased;
-                result = self.session.send_streaming_with_options(
+            let result = self
+                .session
+                .send_streaming_controlled(
                     clean_messages.clone(),
                     tools,
                     crate::connector::LlmRequestOptions {
                         max_output_tokens: (self.max_output_tokens_per_request > 0)
                             .then_some(self.max_output_tokens_per_request),
+                        timeout: self.provider_request_timeout,
                     },
-                ) => result,
-                _ = self.cancel_token.cancelled() => {
-                    if let Some(guard) = rate_guard.take() {
-                        guard.retain_estimate()?;
-                    }
-                    return Err(KernelError::Policy(
-                        "execution cancelled after provider invocation".into(),
-                    ));
-                }
-            };
+                    &self.cancel_token,
+                )
+                .await;
             provider_latency_ms = provider_latency_ms
                 .saturating_add(started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64);
             drop(_llm_core);
@@ -1332,29 +1351,57 @@ impl AgentExecutor {
                             provider_reported: false,
                         }
                     };
+                    let current_send_attempts = self.session.last_attempts().unwrap_or(1).max(1);
                     if let Some(guard) = rate_guard {
                         // Quota enforcement is deliberately stricter than
                         // invoice accounting. A provider cannot refund below
                         // the kernel's complete serialized-prompt floor, while
                         // billing and user-facing telemetry retain the
                         // provider-reported usage used by the invoice.
-                        let quota_tokens = usage
+                        let successful_attempt_tokens = usage
                             .total()
                             .max(estimated_input_tokens.saturating_add(usage.output_tokens));
-                        guard.reconcile(u64::from(quota_tokens))?;
+                        let failed_attempt_tokens = u64::from(estimated_admission_tokens)
+                            .saturating_mul(u64::from(current_send_attempts.saturating_sub(1)));
+                        let quota_tokens = u64::from(successful_attempt_tokens)
+                            .saturating_add(failed_attempt_tokens);
+                        guard.reconcile_attempts(u64::from(current_send_attempts), quota_tokens)?;
                     }
+                    let (provider_id, model_id) =
+                        self.session.last_attribution().unwrap_or_else(|| {
+                            (
+                                self.session.provider_id().clone(),
+                                self.session.model_id().to_string(),
+                            )
+                        });
+                    let attempts =
+                        completed_provider_attempts.saturating_add(current_send_attempts);
                     return Ok(ProviderCall {
                         response,
                         usage,
-                        attempts: (attempt + 1) as u32,
-                        retries: attempt as u32,
+                        provider_id,
+                        model_id,
+                        attempts,
+                        retries: attempts.saturating_sub(1),
                         latency_ms: provider_latency_ms,
                     });
                 }
                 Err(e) => {
+                    let observed_attempts = self.session.last_attempts().unwrap_or(1);
                     if let Some(guard) = rate_guard {
-                        guard.retain_estimate()?;
+                        if observed_attempts > 0 {
+                            let conservative_tokens = u64::from(estimated_admission_tokens)
+                                .saturating_mul(u64::from(observed_attempts));
+                            guard.reconcile_attempts(
+                                u64::from(observed_attempts),
+                                conservative_tokens,
+                            )?;
+                        } else {
+                            guard.retain_estimate()?;
+                        }
                     }
+                    completed_provider_attempts =
+                        completed_provider_attempts.saturating_add(observed_attempts);
                     if !crate::connector::is_transient(&e) {
                         return Err(KernelError::Connector(e));
                     }
@@ -3400,7 +3447,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancellation_after_provider_invocation_retains_estimate() {
+    async fn cancellation_after_provider_invocation_reconciles_started_attempt() {
         let calls = Arc::new(AtomicUsize::new(0));
         let entered = Arc::new(tokio::sync::Notify::new());
         let release = Arc::new(tokio::sync::Notify::new());
@@ -3435,7 +3482,8 @@ mod tests {
         assert_eq!(stats.requests_this_minute, 1);
         assert!(stats.tokens_this_minute > 0);
         assert_eq!(stats.in_flight_receipts, 0);
-        assert_eq!(stats.estimated_receipts, 1);
+        assert_eq!(stats.estimated_receipts, 0);
+        assert_eq!(stats.reconciled_receipts, 1);
     }
 
     #[tokio::test]
@@ -3471,7 +3519,8 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         let stats = limiter.try_stats().unwrap();
         assert_eq!(stats.requests_this_minute, 1);
-        assert_eq!(stats.estimated_receipts, 1);
+        assert_eq!(stats.estimated_receipts, 0);
+        assert_eq!(stats.reconciled_receipts, 1);
         assert_eq!(stats.reserved_receipts, 0);
         assert_eq!(stats.in_flight_receipts, 0);
     }

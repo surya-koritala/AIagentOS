@@ -1,53 +1,115 @@
 name: Live provider qualification
 
-# This workflow is intentionally absent from pull_request/push. It spends real
-# provider quota, consumes a protected secret, and must be dispatched explicitly.
+# Live contracts are isolated from pull requests because they consume protected
+# credentials and provider quota. Missing credentials/endpoints produce an
+# explicit not_run evidence record; they are never reported as a pass.
 on:
+  schedule:
+    - cron: "17 4 * * *"
   workflow_dispatch:
-    inputs:
-      model:
-        description: OpenAI model to qualify
-        required: true
-        default: gpt-4o-mini
-        type: string
 
 permissions:
   contents: read
 
+concurrency:
+  group: live-provider-qualification
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
 jobs:
-  openai-canary:
-    name: Secret-backed OpenAI canary
+  fixture-contracts:
+    name: Provider fixture contracts
     runs-on: ubuntu-latest
-    timeout-minutes: 15
-    environment: provider-qualification
-    env:
-      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-      XDG_CONFIG_HOME: ${{ github.workspace }}/.qualification/config
-      XDG_DATA_HOME: ${{ github.workspace }}/.qualification/data
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
         with:
           toolchain: 1.97.1
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-      - name: Require the protected provider credential
-        run: test -n "$OPENAI_API_KEY"
-      - name: Create isolated non-secret configuration
-        env:
-          QUALIFICATION_MODEL: ${{ inputs.model }}
-        run: |
-          [[ "$QUALIFICATION_MODEL" =~ ^[A-Za-z0-9._:-]+$ ]]
-          mkdir -p "$XDG_CONFIG_HOME/ai-agent-os" "$XDG_DATA_HOME/ai-agent-os"
-          {
-            printf 'llm_provider = "openai"\n'
-            printf 'default_model = "%s"\n' "$QUALIFICATION_MODEL"
-            printf 'data_dir = "%s/ai-agent-os"\n' "$XDG_DATA_HOME"
-            printf 'setup_complete = true\n'
-            printf 'permission_profile = "standard"\n'
-            printf '[api_keys]\n'
-          } > "$XDG_CONFIG_HOME/ai-agent-os/config.toml"
+      - name: Run every adapter fixture and typed-error contract
+        run: cargo test -p adapters --all-features --locked
+
+  live-contract:
+    name: Live contract (${{ matrix.provider }})
+    needs: fixture-contracts
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: provider-qualification
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - provider: openai
+            model_variable: OPENAI_QUALIFICATION_MODEL
+            credential_secret: OPENAI_API_KEY
+            endpoint_secret: UNUSED_PROVIDER_ENDPOINT
+          - provider: anthropic
+            model_variable: ANTHROPIC_QUALIFICATION_MODEL
+            credential_secret: ANTHROPIC_API_KEY
+            endpoint_secret: UNUSED_PROVIDER_ENDPOINT
+          - provider: azure-openai
+            model_variable: AZURE_OPENAI_QUALIFICATION_MODEL
+            credential_secret: AZURE_OPENAI_API_KEY
+            endpoint_secret: AZURE_OPENAI_ENDPOINT
+          - provider: groq
+            model_variable: GROQ_QUALIFICATION_MODEL
+            credential_secret: GROQ_API_KEY
+            endpoint_secret: UNUSED_PROVIDER_ENDPOINT
+          - provider: deepseek
+            model_variable: DEEPSEEK_QUALIFICATION_MODEL
+            credential_secret: DEEPSEEK_API_KEY
+            endpoint_secret: UNUSED_PROVIDER_ENDPOINT
+          - provider: gemini
+            model_variable: GEMINI_QUALIFICATION_MODEL
+            credential_secret: GEMINI_API_KEY
+            endpoint_secret: UNUSED_PROVIDER_ENDPOINT
+          - provider: huggingface
+            model_variable: HUGGINGFACE_QUALIFICATION_MODEL
+            credential_secret: HUGGINGFACE_API_KEY
+            endpoint_secret: UNUSED_PROVIDER_ENDPOINT
+          - provider: ollama
+            model_variable: OLLAMA_QUALIFICATION_MODEL
+            credential_secret: UNUSED_PROVIDER_CREDENTIAL
+            endpoint_secret: OLLAMA_BASE_URL
+          - provider: vllm
+            model_variable: VLLM_QUALIFICATION_MODEL
+            credential_secret: VLLM_API_KEY
+            endpoint_secret: VLLM_BASE_URL
+    env:
+      QUALIFICATION_PROVIDER: ${{ matrix.provider }}
+      QUALIFICATION_MODEL: ${{ vars[matrix.model_variable] }}
+      QUALIFICATION_API_KEY: ${{ secrets[matrix.credential_secret] }}
+      QUALIFICATION_ENDPOINT: ${{ secrets[matrix.endpoint_secret] }}
+      QUALIFICATION_DEPLOYMENT: ${{ vars.AZURE_OPENAI_DEPLOYMENT }}
+      QUALIFICATION_API_VERSION: ${{ vars.AZURE_OPENAI_API_VERSION }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
+        with:
+          toolchain: 1.97.1
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - name: Execute one governed live turn
+        run: >-
+          timeout 5m cargo run --locked -p adapters
+          --example live_provider_qualification
+          > "provider-${QUALIFICATION_PROVIDER}.json"
+      - name: Publish result in the job summary
         run: |
-          response="$(timeout 5m cargo run --locked --package agent-cli -- \
-            -c 'Reply with a short acknowledgement that the live provider path is working.')"
-          test -n "${response//[[:space:]]/}"
+          status="$(jq -r .status "provider-${QUALIFICATION_PROVIDER}.json")"
+          {
+            printf '### %s provider qualification\n\n' "$QUALIFICATION_PROVIDER"
+            printf -- '- Status: `%s`\n' "$status"
+            printf -- '- Evidence artifact: `provider-%s`\n' "$QUALIFICATION_PROVIDER"
+          } >> "$GITHUB_STEP_SUMMARY"
+          test "$status" = "passed" || test "$status" = "not_run"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: provider-${{ matrix.provider }}
+          path: provider-${{ matrix.provider }}.json
+          if-no-files-found: error
+          retention-days: 30

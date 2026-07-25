@@ -25,6 +25,10 @@ path = "agent_bench.rs"
 name = "governance-demo"
 path = "src/bin/governance-demo.rs"
 
+[[bin]]
+name = "memory-qualification"
+path = "src/bin/memory-qualification.rs"
+
 [dependencies]
 kernel = { path = "../crates/kernel", version = "=0.3.0" }
 adapters = { path = "../crates/adapters", version = "=0.3.0" }

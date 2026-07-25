@@ -7,6 +7,9 @@
 
 use kernel::connector::*;
 use kernel::{ConnectorError, ProviderId};
+use tokio_stream::StreamExt;
+
+const MAX_AZURE_STREAM_BYTES: usize = 8 * 1024 * 1024;
 
 pub struct AzureOpenAiAdapter {
     id: ProviderId,
@@ -123,6 +126,12 @@ impl LlmSession for AzureSession {
                     .json()
                     .await
                     .map_err(|e| ConnectorError::ProtocolError(e.to_string()))?;
+                if let Some(error) = crate::content_filter_error(
+                    &self.provider_id,
+                    json["choices"][0]["finish_reason"].as_str(),
+                ) {
+                    return Err(error);
+                }
                 let content = json["choices"][0]["message"]["content"]
                     .as_str()
                     .unwrap_or("")
@@ -161,12 +170,8 @@ impl LlmSession for AzureSession {
                     tool_calls,
                 })
             }
-            Ok(resp) => {
-                let status = resp.status();
-                let body = resp.text().await.unwrap_or_default();
-                Err(crate::http_status_error(status, Some(&body)))
-            }
-            Err(e) => Err(ConnectorError::ConnectionFailed(e.to_string())),
+            Ok(resp) => Err(crate::provider_http_error(&self.provider_id, resp).await),
+            Err(e) => Err(crate::transport_error(&self.provider_id, e)),
         }
     }
 
@@ -227,22 +232,35 @@ impl LlmSession for AzureSession {
             .json(&body)
             .send()
             .await
-            .map_err(|e| ConnectorError::ConnectionFailed(e.to_string()))?;
+            .map_err(|e| crate::transport_error(&self.provider_id, e))?;
 
         if !resp.status().is_success() {
-            let status = resp.status();
-            let text = resp.text().await.unwrap_or_default();
-            return Err(crate::http_status_error(status, Some(&text)));
+            return Err(crate::provider_http_error(&self.provider_id, resp).await);
         }
 
-        let full_body = resp
-            .text()
-            .await
-            .map_err(|e| ConnectorError::StreamError(e.to_string()))?;
+        let mut body_stream = resp.bytes_stream();
+        let mut full_body = Vec::new();
+        while let Some(chunk) = body_stream.next().await {
+            let chunk = chunk.map_err(|e| ConnectorError::StreamError(e.to_string()))?;
+            if full_body.len().saturating_add(chunk.len()) > MAX_AZURE_STREAM_BYTES {
+                return Err(ConnectorError::ProtocolError(format!(
+                    "azure streaming response exceeded {MAX_AZURE_STREAM_BYTES} bytes"
+                )));
+            }
+            full_body.extend_from_slice(&chunk);
+        }
+        let full_body = String::from_utf8(full_body)
+            .map_err(|_| ConnectorError::ProtocolError("azure stream was not UTF-8".into()))?;
 
         // If response is not SSE (e.g., from wiremock), parse as regular JSON
         if !full_body.starts_with("data:") {
             if let Ok(json) = serde_json::from_str::<serde_json::Value>(&full_body) {
+                if let Some(error) = crate::content_filter_error(
+                    &self.provider_id,
+                    json["choices"][0]["finish_reason"].as_str(),
+                ) {
+                    return Err(error);
+                }
                 let content = json["choices"][0]["message"]["content"]
                     .as_str()
                     .unwrap_or("")
@@ -267,7 +285,9 @@ impl LlmSession for AzureSession {
                     .unwrap_or_default();
                 return Ok(LlmResponse {
                     content,
-                    finish_reason: Some("stop".into()),
+                    finish_reason: json["choices"][0]["finish_reason"]
+                        .as_str()
+                        .map(ToString::to_string),
                     tokens_used: tokens,
                     usage: kernel::connector::LlmUsage::reported(
                         crate::json_usage_u32(&json["usage"]["prompt_tokens"]),
@@ -287,6 +307,10 @@ impl LlmSession for AzureSession {
         let mut tool_args: std::collections::HashMap<usize, String> =
             std::collections::HashMap::new();
         let mut tokens_used: u32 = 0;
+        let mut input_tokens: u32 = 0;
+        let mut output_tokens: u32 = 0;
+        let mut cached_tokens: u32 = 0;
+        let mut finish_reason: Option<String> = None;
 
         for line in full_body.lines() {
             if let Some(data) = line.strip_prefix("data: ") {
@@ -297,7 +321,6 @@ impl LlmSession for AzureSession {
                     if let Some(delta) = json["choices"].get(0).and_then(|c| c.get("delta")) {
                         if let Some(text) = delta["content"].as_str() {
                             content.push_str(text);
-                            eprint!("{}", text);
                         }
                         if let Some(tcs) = delta["tool_calls"].as_array() {
                             for tc in tcs {
@@ -317,15 +340,26 @@ impl LlmSession for AzureSession {
                             }
                         }
                     }
+                    if let Some(reason) = json["choices"]
+                        .get(0)
+                        .and_then(|choice| choice["finish_reason"].as_str())
+                    {
+                        if let Some(error) =
+                            crate::content_filter_error(&self.provider_id, Some(reason))
+                        {
+                            return Err(error);
+                        }
+                        finish_reason = Some(reason.to_string());
+                    }
                     if let Some(usage) = json.get("usage") {
                         tokens_used = crate::json_usage_u32(&usage["total_tokens"]);
+                        input_tokens = crate::json_usage_u32(&usage["prompt_tokens"]);
+                        output_tokens = crate::json_usage_u32(&usage["completion_tokens"]);
+                        cached_tokens =
+                            crate::json_usage_u32(&usage["prompt_tokens_details"]["cached_tokens"]);
                     }
                 }
             }
-        }
-
-        if !content.is_empty() {
-            eprintln!();
         }
 
         for (idx, args) in &tool_args {
@@ -336,9 +370,13 @@ impl LlmSession for AzureSession {
 
         Ok(LlmResponse {
             content,
-            finish_reason: Some("stop".into()),
+            finish_reason,
             tokens_used,
-            usage: Default::default(),
+            usage: if input_tokens > 0 || output_tokens > 0 {
+                kernel::connector::LlmUsage::reported(input_tokens, output_tokens, cached_tokens)
+            } else {
+                Default::default()
+            },
             tool_calls,
         })
     }
@@ -354,6 +392,16 @@ impl LlmProviderAdapter for AzureOpenAiAdapter {
     }
     fn provider_type(&self) -> ProviderType {
         ProviderType::Cloud
+    }
+    fn capabilities(&self) -> kernel::connector::ProviderCapabilities {
+        kernel::connector::ProviderCapabilities {
+            native_streaming: true,
+            tool_calls: true,
+            parallel_tool_calls: true,
+            prompt_cancellation: true,
+            api_family: "azure-openai".into(),
+            ..Default::default()
+        }
     }
 
     async fn is_available(&self) -> bool {

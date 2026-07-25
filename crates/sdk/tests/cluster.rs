@@ -25,6 +25,21 @@ async fn spawn_cluster(n: usize) -> Vec<String> {
     addrs
 }
 
+async fn spawn_authenticated_cluster(n: usize, token: &str) -> Vec<String> {
+    let mut addrs = Vec::with_capacity(n);
+    for _ in 0..n {
+        let kernel = Arc::new(AgentKernelImpl::new().expect("kernel new"));
+        let server = SyscallServer::bind(kernel, "127.0.0.1:0")
+            .await
+            .expect("bind")
+            .with_auth_token(token);
+        let addr = server.local_addr().expect("local_addr");
+        tokio::spawn(server.serve());
+        addrs.push(addr.to_string());
+    }
+    addrs
+}
+
 #[tokio::test]
 async fn least_loaded_placement_spreads_agents() {
     let addrs = spawn_cluster(3).await;
@@ -121,10 +136,10 @@ async fn routing_reaches_owning_node_and_unknown_agent_errors() {
         )
         .await
         .expect_err("write must be denied for a read-only agent");
-    match err {
-        SdkError::Kernel(msg) => assert!(msg.contains("denied by kernel"), "{msg}"),
-        other => panic!("expected kernel denial, got {other:?}"),
-    }
+    let message = err
+        .kernel_message()
+        .unwrap_or_else(|| panic!("expected kernel denial, got {err:?}"));
+    assert!(message.contains("denied by kernel"), "{message}");
 
     // An agent the cluster never placed has no owning node → routing error.
     let err = cluster
@@ -135,4 +150,24 @@ async fn routing_reaches_owning_node_and_unknown_agent_errors() {
         SdkError::Kernel(msg) => assert!(msg.contains("no cluster node owns"), "{msg}"),
         other => panic!("expected ownership error, got {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn authenticated_cluster_construction_is_all_or_nothing() {
+    let addrs = spawn_authenticated_cluster(2, "cluster-secret").await;
+
+    let error = match ClusterClient::connect_authenticated(&addrs, "wrong-secret").await {
+        Err(error) => error,
+        Ok(_) => panic!("wrong credential must fail cluster construction"),
+    };
+    assert_eq!(
+        error.wire_code(),
+        Some(agent_sdk::WireErrorCode::AuthenticationFailed)
+    );
+
+    let mut cluster = ClusterClient::connect_authenticated(&addrs, "cluster-secret")
+        .await
+        .expect("authenticated cluster");
+    assert_eq!(cluster.node_count(), 2);
+    assert!(cluster.list_agents().await.expect("list").is_empty());
 }

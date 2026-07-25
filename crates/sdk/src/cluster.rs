@@ -61,12 +61,30 @@ pub struct ClusterClient {
 impl ClusterClient {
     /// Connect to every node address. The address string becomes the node id.
     pub async fn connect(addrs: &[String]) -> Result<Self, SdkError> {
+        Self::connect_with_token(addrs, None).await
+    }
+
+    /// Connect and authenticate every node with the same tenant/system token.
+    ///
+    /// Construction is all-or-nothing: a failed node authentication drops all
+    /// earlier connections and never returns a partially authorized cluster.
+    pub async fn connect_authenticated(
+        addrs: &[String],
+        token: impl Into<String>,
+    ) -> Result<Self, SdkError> {
+        Self::connect_with_token(addrs, Some(token.into())).await
+    }
+
+    async fn connect_with_token(addrs: &[String], token: Option<String>) -> Result<Self, SdkError> {
         if addrs.is_empty() {
             return Err(SdkError::Kernel("cluster needs at least one node".into()));
         }
         let mut nodes = Vec::with_capacity(addrs.len());
         for addr in addrs {
-            let client = KernelClient::connect(addr.as_str()).await?;
+            let mut client = KernelClient::connect(addr.as_str()).await?;
+            if let Some(token) = token.as_deref() {
+                client.authenticate(token).await?;
+            }
             nodes.push(NodeHandle {
                 id: addr.clone(),
                 client,

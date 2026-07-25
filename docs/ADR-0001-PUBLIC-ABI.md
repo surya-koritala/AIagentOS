@@ -51,8 +51,11 @@ Rust SDK negotiates its compiled version on connect. Additive requests may be
 introduced within a version; incompatible field/variant changes require a new
 version and compatibility fixture.
 
-Feature discovery is currently the negotiated version plus documented syscall
-schema. Fine-grained feature flags and machine-generated schemas remain #121.
+Feature discovery is the negotiated version plus stable identifiers returned by
+`Hello`. `DescribeProtocol` publishes machine-readable request/reply/MCP
+schemas, compatibility behavior, and bounded transport controls. Protocol v2
+explicitly advertises no event/stream frame; token streaming and request-id
+cancellation remain #121 rather than being implied by the unary ABI.
 
 ## Consequences
 

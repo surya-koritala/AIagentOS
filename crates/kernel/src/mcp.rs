@@ -15,7 +15,7 @@ use crate::resources::ResourceType;
 use crate::tools::{ToolBinding, ToolRegistry, ToolSecurity};
 
 /// MCP server configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct McpServerConfig {
     pub name: String,
@@ -23,6 +23,23 @@ pub struct McpServerConfig {
     pub args: Vec<String>,
     #[serde(default)]
     pub env: HashMap<String, String>,
+}
+
+impl std::fmt::Debug for McpServerConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let redacted_env = self
+            .env
+            .keys()
+            .map(|key| (key, "[REDACTED]"))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        formatter
+            .debug_struct("McpServerConfig")
+            .field("name", &self.name)
+            .field("command", &self.command)
+            .field("args", &"[REDACTED]")
+            .field("env", &redacted_env)
+            .finish()
+    }
 }
 
 /// A connected MCP server instance.
@@ -425,5 +442,19 @@ mod tests {
         assert_eq!(catalog.len(), before + 2);
         assert!(catalog.contains_key("mcp_remote_fetch"));
         assert!(catalog.contains_key("mcp_remote_post"));
+    }
+
+    #[test]
+    fn mcp_config_debug_redacts_environment_and_arguments() {
+        let config = McpServerConfig {
+            name: "remote".into(),
+            command: "server".into(),
+            args: vec!["--token=argument-secret".into()],
+            env: HashMap::from([("API_KEY".into(), "environment-secret".into())]),
+        };
+        let rendered = format!("{config:?}");
+        assert!(!rendered.contains("argument-secret"));
+        assert!(!rendered.contains("environment-secret"));
+        assert!(rendered.contains("API_KEY"));
     }
 }

@@ -11,6 +11,7 @@
   - [Durable Checkpoints](./checkpoints.md)
   - [Context Pressure](./context-pressure.md)
   - [Operations API](./operations-api.md)
+  - [Public Wire Protocol](./protocol.md)
   - [Agent Service Supervisor](./services.md)
   - [Secondary Capability Disposition](./secondary-capabilities.md)
   - [Sandbox Qualification](./sandbox-qualification.md)

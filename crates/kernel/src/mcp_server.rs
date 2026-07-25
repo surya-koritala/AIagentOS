@@ -27,12 +27,25 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, Lines};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream, ToSocketAddrs};
+use tokio::sync::Semaphore;
 
 use crate::auth::Role;
 use crate::resources::ResourceBroker;
+use crate::wire_io::{read_bounded_line, write_bounded_json};
 use crate::{AgentId, AgentKernelImpl};
+
+/// Default simultaneous MCP connection limit.
+pub use crate::wire_io::DEFAULT_MAX_CONNECTIONS as DEFAULT_MCP_MAX_CONNECTIONS;
+/// Maximum time for the first MCP frame.
+pub use crate::wire_io::HANDSHAKE_TIMEOUT as MCP_HANDSHAKE_TIMEOUT;
+/// Maximum idle time between MCP frames.
+pub use crate::wire_io::IDLE_TIMEOUT as MCP_IDLE_TIMEOUT;
+/// Maximum serialized MCP JSON-RPC request or response frame.
+pub use crate::wire_io::MAX_JSON_FRAME_BYTES as MAX_MCP_FRAME_BYTES;
+/// Maximum wall-clock duration of one MCP request.
+pub use crate::wire_io::REQUEST_TIMEOUT as MCP_REQUEST_TIMEOUT;
 
 /// The MCP protocol version this server implements (the spec revision the
 /// in-tree client also negotiates against; see [`crate::mcp`]).
@@ -60,7 +73,7 @@ pub mod error_codes {
 
 /// A JSON-RPC 2.0 request. `id` is absent for notifications; we accept it as an
 /// arbitrary JSON value (number or string per the spec) and echo it back.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 pub struct JsonRpcRequest {
     pub jsonrpc: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -68,6 +81,32 @@ pub struct JsonRpcRequest {
     pub method: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub params: Option<Value>,
+}
+
+impl std::fmt::Debug for JsonRpcRequest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut params = self.params.clone();
+        if self.method == "agentos/authenticate" {
+            if let Some(object) = params.as_mut().and_then(Value::as_object_mut) {
+                if object.contains_key("token") {
+                    object.insert("token".into(), json!("[REDACTED]"));
+                }
+            }
+        } else if self.method == "tools/call" {
+            if let Some(object) = params.as_mut().and_then(Value::as_object_mut) {
+                if object.contains_key("arguments") {
+                    object.insert("arguments".into(), json!("[REDACTED]"));
+                }
+            }
+        }
+        formatter
+            .debug_struct("JsonRpcRequest")
+            .field("jsonrpc", &self.jsonrpc)
+            .field("id", &self.id)
+            .field("method", &self.method)
+            .field("params", &params)
+            .finish()
+    }
 }
 
 /// A JSON-RPC 2.0 response — exactly one of `result` / `error` is set.
@@ -157,7 +196,7 @@ async fn dispatch_for_connection(
     }
 
     let resp = match req.method.as_str() {
-        "initialize" => handle_initialize(),
+        "initialize" => handle_initialize(req.params),
         "agentos/authenticate" => handle_authenticate(kernel, identity, req.params).await,
         "tools/list" | "tools/call" => {
             handle_authenticated_method(kernel, identity, &req.method, req.params).await
@@ -306,11 +345,25 @@ async fn handle_authenticated_method(
 
 /// `initialize`: announce the protocol version, our tool capability, and server
 /// identity. Mirrors the handshake the in-tree MCP client expects.
-fn handle_initialize() -> Result<Value, (i64, String)> {
+fn handle_initialize(params: Option<Value>) -> Result<Value, (i64, String)> {
+    if let Some(requested) = params
+        .as_ref()
+        .and_then(|params| params.get("protocolVersion"))
+        .and_then(Value::as_str)
+    {
+        if requested != PROTOCOL_VERSION {
+            return Err((
+                error_codes::INVALID_PARAMS,
+                format!(
+                    "unsupported MCP protocol version: client requested {requested}, server supports {PROTOCOL_VERSION}"
+                ),
+            ));
+        }
+    }
     Ok(json!({
         "protocolVersion": PROTOCOL_VERSION,
         "capabilities": { "tools": { "listChanged": false } },
-        "serverInfo": { "name": "ai-agent-os-kernel", "version": "0.1.0" }
+        "serverInfo": { "name": "ai-agent-os-kernel", "version": env!("CARGO_PKG_VERSION") }
     }))
 }
 
@@ -343,7 +396,7 @@ fn handle_tools_list(kernel: &AgentKernelImpl, agent_id: AgentId) -> Result<Valu
 /// - `agent_id` (string UUID, optional compatibility assertion): when present,
 ///   it must exactly match the identity already bound to this connection.
 ///
-/// A gate denial is returned as an `INTERNAL_ERROR` JSON-RPC error. On success
+/// A gate denial is returned as an `AUTHORIZATION_DENIED` JSON-RPC error. On success
 /// the result follows the MCP `content` shape (a single `text` block carrying
 /// the tool's JSON output) plus a raw `data` field for structured consumers.
 async fn handle_tools_call(
@@ -395,7 +448,7 @@ async fn handle_tools_call(
                 format!("tool '{tool}' denied by kernel: {error}"),
             ),
             crate::tools::ToolAuthorizationError::Denied(denial) => (
-                error_codes::INTERNAL_ERROR,
+                error_codes::AUTHORIZATION_DENIED,
                 format!("tool '{tool}' denied by kernel: {}", denial.message()),
             ),
         })?;
@@ -431,6 +484,7 @@ async fn handle_tools_call(
 pub struct McpServer {
     kernel: Arc<AgentKernelImpl>,
     listener: TcpListener,
+    connection_limit: Arc<Semaphore>,
 }
 
 impl McpServer {
@@ -455,7 +509,17 @@ impl McpServer {
                 ),
             ));
         }
-        Ok(Self { kernel, listener })
+        Ok(Self {
+            kernel,
+            listener,
+            connection_limit: Arc::new(Semaphore::new(DEFAULT_MCP_MAX_CONNECTIONS)),
+        })
+    }
+
+    /// Override the number of simultaneously admitted MCP connections.
+    pub fn with_connection_limit(mut self, max_connections: usize) -> Self {
+        self.connection_limit = Arc::new(Semaphore::new(max_connections.max(1)));
+        self
     }
 
     /// The actually-bound TCP address (resolves an ephemeral `:0` port).
@@ -468,8 +532,13 @@ impl McpServer {
     pub async fn serve(self) -> std::io::Result<()> {
         loop {
             let (stream, _peer) = self.listener.accept().await?;
+            let Ok(connection_permit) = self.connection_limit.clone().try_acquire_owned() else {
+                drop(stream);
+                continue;
+            };
             let kernel = self.kernel.clone();
             tokio::spawn(async move {
+                let _connection_permit = connection_permit;
                 let (read, write) = stream.into_split();
                 let _ = Self::handle(kernel, read, write).await;
             });
@@ -489,14 +558,55 @@ impl McpServer {
         R: AsyncRead + Unpin,
         W: AsyncWrite + Unpin,
     {
-        let mut lines = BufReader::new(read).lines();
+        let mut reader = BufReader::new(read);
         let mut identity = ConnectionIdentity::Unauthenticated;
-        while let Some(line) = lines.next_line().await? {
+        let mut first_frame = true;
+        loop {
+            let timeout = if first_frame {
+                MCP_HANDSHAKE_TIMEOUT
+            } else {
+                MCP_IDLE_TIMEOUT
+            };
+            let line = match tokio::time::timeout(
+                timeout,
+                read_bounded_line(&mut reader, MAX_MCP_FRAME_BYTES),
+            )
+            .await
+            {
+                Ok(Ok(Some(line))) => line,
+                Ok(Ok(None)) | Err(_) => break,
+                Ok(Err(error)) if error.kind() == std::io::ErrorKind::InvalidData => {
+                    let response = JsonRpcResponse::err(
+                        None,
+                        error_codes::PARSE_ERROR,
+                        format!("parse error: {error}"),
+                    );
+                    write_bounded_json(&mut write, &response, MAX_MCP_FRAME_BYTES).await?;
+                    break;
+                }
+                Ok(Err(error)) => return Err(error),
+            };
+            first_frame = false;
             if line.trim().is_empty() {
                 continue;
             }
             let response = match serde_json::from_str::<JsonRpcRequest>(&line) {
-                Ok(req) => dispatch_for_connection(&kernel, req, &mut identity).await,
+                Ok(req) => {
+                    let request_id = req.id.clone();
+                    match tokio::time::timeout(
+                        MCP_REQUEST_TIMEOUT,
+                        dispatch_for_connection(&kernel, req, &mut identity),
+                    )
+                    .await
+                    {
+                        Ok(response) => response,
+                        Err(_) => Some(JsonRpcResponse::err(
+                            request_id,
+                            error_codes::INTERNAL_ERROR,
+                            "request timed out",
+                        )),
+                    }
+                }
                 Err(e) => Some(JsonRpcResponse::err(
                     None,
                     error_codes::PARSE_ERROR,
@@ -505,12 +615,19 @@ impl McpServer {
             };
             // Notifications (and only notifications) produce no reply.
             if let Some(response) = response {
-                let mut buf = serde_json::to_vec(&response).unwrap_or_else(|_| {
-                    br#"{"jsonrpc":"2.0","id":null,"error":{"code":-32603,"message":"serialization failed"}}"#.to_vec()
-                });
-                buf.push(b'\n');
-                write.write_all(&buf).await?;
-                write.flush().await?;
+                if let Err(error) =
+                    write_bounded_json(&mut write, &response, MAX_MCP_FRAME_BYTES).await
+                {
+                    if error.kind() != std::io::ErrorKind::InvalidData {
+                        return Err(error);
+                    }
+                    let fallback = JsonRpcResponse::err(
+                        response.id,
+                        error_codes::INTERNAL_ERROR,
+                        "response exceeds the MCP frame limit",
+                    );
+                    write_bounded_json(&mut write, &fallback, MAX_MCP_FRAME_BYTES).await?;
+                }
             }
         }
         Ok(())
@@ -520,7 +637,7 @@ impl McpServer {
 /// A thin MCP client for the server (used by round-trip tests; the wire format
 /// is plain JSON-RPC, so any MCP client could speak it).
 pub struct McpClient {
-    reader: Lines<BufReader<Box<dyn AsyncRead + Unpin + Send>>>,
+    reader: BufReader<Box<dyn AsyncRead + Unpin + Send>>,
     writer: Box<dyn AsyncWrite + Unpin + Send>,
     next_id: u64,
 }
@@ -528,9 +645,14 @@ pub struct McpClient {
 impl McpClient {
     /// Connect over TCP.
     pub async fn connect(addr: impl ToSocketAddrs) -> std::io::Result<Self> {
-        let (read, writer) = TcpStream::connect(addr).await?.into_split();
+        let stream = tokio::time::timeout(MCP_HANDSHAKE_TIMEOUT, TcpStream::connect(addr))
+            .await
+            .map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::TimedOut, "MCP connect timed out")
+            })??;
+        let (read, writer) = stream.into_split();
         Ok(Self {
-            reader: BufReader::new(Box::new(read) as Box<dyn AsyncRead + Unpin + Send>).lines(),
+            reader: BufReader::new(Box::new(read) as Box<dyn AsyncRead + Unpin + Send>),
             writer: Box::new(writer),
             next_id: 1,
         })
@@ -577,15 +699,18 @@ impl McpClient {
     /// Send a raw JSON value as one line (used by tests to exercise malformed /
     /// notification inputs the typed API can't express).
     pub async fn send_value(&mut self, value: &Value) -> std::io::Result<()> {
-        let mut buf = serde_json::to_vec(value).map_err(std::io::Error::other)?;
-        buf.push(b'\n');
-        self.writer.write_all(&buf).await?;
-        self.writer.flush().await
+        write_bounded_json(&mut self.writer, value, MAX_MCP_FRAME_BYTES).await
     }
 
     /// Send a raw line verbatim (e.g. invalid JSON), no trailing-newline added
     /// beyond the one provided here.
     pub async fn send_line(&mut self, line: &str) -> std::io::Result<()> {
+        if line.len() > MAX_MCP_FRAME_BYTES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("JSON frame exceeds {MAX_MCP_FRAME_BYTES} bytes"),
+            ));
+        }
         self.writer.write_all(line.as_bytes()).await?;
         self.writer.write_all(b"\n").await?;
         self.writer.flush().await
@@ -593,9 +718,22 @@ impl McpClient {
 
     /// Read one JSON-RPC response line.
     pub async fn read_response(&mut self) -> std::io::Result<JsonRpcResponse> {
-        let line = self.reader.next_line().await?.ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "server closed")
-        })?;
+        let line = match tokio::time::timeout(
+            MCP_REQUEST_TIMEOUT,
+            read_bounded_line(&mut self.reader, MAX_MCP_FRAME_BYTES),
+        )
+        .await
+        {
+            Ok(result) => result?,
+            Err(_) => {
+                let _ = self.writer.shutdown().await;
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "MCP request timed out; connection closed",
+                ));
+            }
+        }
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "server closed"))?;
         serde_json::from_str(&line).map_err(std::io::Error::other)
     }
 }
@@ -690,6 +828,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn initialize_rejects_an_incompatible_mcp_version() {
+        let (_kernel, addr) = spawn_server().await;
+        let mut client = McpClient::connect(addr).await.unwrap();
+        let response = client
+            .request("initialize", Some(json!({"protocolVersion": "2099-01-01"})))
+            .await
+            .unwrap();
+        let error = response.error.expect("version mismatch");
+        assert_eq!(error.code, error_codes::INVALID_PARAMS);
+        assert!(error.message.contains("unsupported MCP protocol version"));
+
+        // A rejected initialize does not poison framing or grant authority.
+        let response = client
+            .request(
+                "initialize",
+                Some(json!({"protocolVersion": PROTOCOL_VERSION})),
+            )
+            .await
+            .unwrap();
+        assert!(response.error.is_none());
+    }
+
+    #[tokio::test]
     async fn plaintext_server_rejects_non_loopback_bind() {
         let kernel = Arc::new(AgentKernelImpl::new().expect("kernel new"));
         let error = match McpServer::bind(kernel, "0.0.0.0:0").await {
@@ -744,7 +905,7 @@ mod tests {
         // The gate denial must arrive as a JSON-RPC error, not a result.
         assert!(resp.result.is_none(), "expected no result on denial");
         let err = resp.error.expect("expected a JSON-RPC error");
-        assert_eq!(err.code, error_codes::INTERNAL_ERROR);
+        assert_eq!(err.code, error_codes::AUTHORIZATION_DENIED);
         assert!(
             err.message.contains("denied by kernel"),
             "expected kernel denial, got: {}",
@@ -1034,5 +1195,26 @@ mod tests {
         assert_eq!(v["id"], 7);
         assert_eq!(v["result"]["ok"], true);
         assert!(v.get("error").is_none());
+    }
+
+    #[test]
+    fn jsonrpc_debug_redacts_auth_and_tool_arguments() {
+        let auth = JsonRpcRequest {
+            jsonrpc: "2.0".into(),
+            id: Some(json!(1)),
+            method: "agentos/authenticate".into(),
+            params: Some(json!({"token": "secret-token", "agent_id": "agent"})),
+        };
+        let rendered = format!("{auth:?}");
+        assert!(!rendered.contains("secret-token"));
+        assert!(rendered.contains("[REDACTED]"));
+
+        let tool = JsonRpcRequest {
+            jsonrpc: "2.0".into(),
+            id: Some(json!(2)),
+            method: "tools/call".into(),
+            params: Some(json!({"name": "http", "arguments": {"token": "secret"}})),
+        };
+        assert!(!format!("{tool:?}").contains("\"secret\""));
     }
 }

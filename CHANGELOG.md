@@ -10,6 +10,12 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
 
 ## [Unreleased]
 
+- Added pre-auth wire protocol discovery with exhaustive JSON Schemas, stable
+  feature identifiers, v1/v2/MCP golden fixtures, typed SDK errors, agent
+  enforcement introspection, credential-safe debug output, bounded
+  syscall/MCP frames and connection admission, and transport/request deadlines
+  as the first production-qualification slice of #121.
+
 ### Added
 
 - **Provider and on-device qualification contract** — provider adapters expose

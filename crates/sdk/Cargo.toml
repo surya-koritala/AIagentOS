@@ -20,4 +20,5 @@ adapters = { path = "../adapters", version = "=0.3.0" }
 wiremock = { workspace = true }
 async-trait = { workspace = true }
 rcgen = { workspace = true }
+tokio-util = { workspace = true }
 uuid = { workspace = true }

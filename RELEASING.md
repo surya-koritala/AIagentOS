@@ -129,7 +129,8 @@ adds version 2 while continuing to serve versions 1 through 2:
 
 Version 1 keeps the released prose-only error reply. Version 2 adds stable typed
 error categories and a retry hint; a connection that omits `Hello` stays on v1.
-The compatibility/deprecation rules and current non-streaming limitation are
-documented in `docs/PROTOCOL.md`. Until 1.0, any wire-breaking minor must bump
+The compatibility/deprecation, ordered streaming, request-id cancellation,
+backpressure, and provider-granularity rules are documented in
+`docs/PROTOCOL.md`. Until 1.0, any wire-breaking minor must bump
 `PROTOCOL_VERSION`, retain the immediately previous window and fixtures unless
 retirement is explicit, and call out the migration in the changelog.

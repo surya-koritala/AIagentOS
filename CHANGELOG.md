@@ -15,6 +15,11 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
   enforcement introspection, credential-safe debug output, bounded
   syscall/MCP frames and connection admission, and transport/request deadlines
   as the first production-qualification slice of #121.
+- Added ordered request-scoped message streams, bounded event backpressure,
+  second-connection request-id cancellation, SDK stream callbacks, exact
+  tenant/agent cancellation authorization, disconnect-safe cleanup, and
+  incremental Azure OpenAI SSE deltas. Retry/failover now stops after visible
+  partial output to prevent duplicate stream content.
 
 ### Added
 

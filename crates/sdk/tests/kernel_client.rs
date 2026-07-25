@@ -4,9 +4,147 @@
 
 use std::sync::Arc;
 
-use agent_sdk::{Agent, KernelClient, SdkError, WireErrorCode};
+use agent_sdk::{Agent, KernelClient, MessageStreamEvent, SdkError, WireErrorCode};
+use kernel::connector::{
+    LlmProviderAdapter, LlmRequestOptions, LlmResponse, LlmSession, LlmUsage, ProviderCapabilities,
+    ProviderEventSink, ProviderStreamEvent, ProviderType, StandardMessage, ToolDefinition,
+};
 use kernel::syscall_server::SyscallServer;
-use kernel::AgentKernelImpl;
+use kernel::{AgentKernelImpl, ConnectorError, ProviderId};
+
+struct StreamTestAdapter {
+    id: ProviderId,
+    blocked: bool,
+    event_count: usize,
+}
+
+struct StreamTestSession {
+    id: ProviderId,
+    blocked: bool,
+    event_count: usize,
+}
+
+#[async_trait::async_trait]
+impl LlmSession for StreamTestSession {
+    async fn send(&self, messages: Vec<StandardMessage>) -> Result<LlmResponse, ConnectorError> {
+        self.send_with_tools(messages, &[]).await
+    }
+
+    async fn send_with_tools(
+        &self,
+        _messages: Vec<StandardMessage>,
+        _tools: &[ToolDefinition],
+    ) -> Result<LlmResponse, ConnectorError> {
+        if self.blocked {
+            std::future::pending::<()>().await;
+        }
+        Ok(LlmResponse {
+            content: "streamed reply".into(),
+            finish_reason: Some("stop".into()),
+            tokens_used: 3,
+            usage: LlmUsage::reported(1, 2, 0),
+            tool_calls: vec![],
+        })
+    }
+
+    async fn send_streaming_events_controlled(
+        &self,
+        _messages: Vec<StandardMessage>,
+        _tools: &[ToolDefinition],
+        _options: LlmRequestOptions,
+        cancellation: &tokio_util::sync::CancellationToken,
+        events: ProviderEventSink,
+    ) -> Result<LlmResponse, ConnectorError> {
+        if self.blocked {
+            events
+                .emit(ProviderStreamEvent::TextDelta("before-cancel".into()))
+                .await;
+            cancellation.cancelled().await;
+            return Err(ConnectorError::cancelled(self.id.clone(), None));
+        }
+        let event_count = self.event_count.max(1);
+        for _ in 0..event_count {
+            tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => {
+                    return Err(ConnectorError::cancelled(self.id.clone(), None));
+                }
+                _ = events.emit(ProviderStreamEvent::TextDelta(
+                    if self.event_count == 0 {
+                        "streamed reply".into()
+                    } else {
+                        "x".into()
+                    }
+                )) => {}
+            }
+        }
+        Ok(LlmResponse {
+            content: if self.event_count == 0 {
+                "streamed reply".into()
+            } else {
+                "x".repeat(self.event_count)
+            },
+            finish_reason: Some("stop".into()),
+            tokens_used: event_count.try_into().unwrap_or(u32::MAX),
+            usage: LlmUsage::reported(1, event_count.try_into().unwrap_or(u32::MAX), 0),
+            tool_calls: vec![],
+        })
+    }
+
+    fn enforces_max_output_tokens(&self) -> bool {
+        true
+    }
+
+    fn provider_id(&self) -> &ProviderId {
+        &self.id
+    }
+
+    fn model_id(&self) -> &str {
+        "stream-test-model"
+    }
+}
+
+#[async_trait::async_trait]
+impl LlmProviderAdapter for StreamTestAdapter {
+    fn id(&self) -> &ProviderId {
+        &self.id
+    }
+
+    fn name(&self) -> &str {
+        "stream test"
+    }
+
+    fn provider_type(&self) -> ProviderType {
+        ProviderType::Local
+    }
+
+    async fn is_available(&self) -> bool {
+        true
+    }
+
+    async fn create_session(&self) -> Result<Box<dyn LlmSession>, ConnectorError> {
+        Ok(Box::new(StreamTestSession {
+            id: self.id.clone(),
+            blocked: self.blocked,
+            event_count: self.event_count,
+        }))
+    }
+
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities {
+            prompt_cancellation: true,
+            ..ProviderCapabilities::default()
+        }
+    }
+
+    fn translate_to_provider(&self, message: &StandardMessage) -> serde_json::Value {
+        serde_json::json!({"role": message.role, "content": message.content})
+    }
+
+    fn translate_from_provider(&self, value: &serde_json::Value) -> Option<StandardMessage> {
+        Some(StandardMessage::assistant(value.get("content")?.as_str()?))
+    }
+}
 
 /// Boot an in-memory kernel + syscall server on 127.0.0.1:0 and return its addr.
 async fn spawn_server() -> std::net::SocketAddr {
@@ -17,6 +155,27 @@ async fn spawn_server() -> std::net::SocketAddr {
     let addr = server.local_addr().expect("local_addr");
     tokio::spawn(server.serve());
     addr
+}
+
+async fn spawn_stream_server(
+    provider_id: &str,
+    blocked: bool,
+    event_count: usize,
+) -> (std::net::SocketAddr, Arc<AgentKernelImpl>) {
+    let kernel = Arc::new(AgentKernelImpl::new().expect("kernel new"));
+    kernel
+        .register_provider(Arc::new(StreamTestAdapter {
+            id: provider_id.into(),
+            blocked,
+            event_count,
+        }))
+        .expect("register stream provider");
+    let server = SyscallServer::bind(Arc::clone(&kernel), "127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = server.local_addr().expect("local_addr");
+    tokio::spawn(server.serve());
+    (addr, kernel)
 }
 
 #[tokio::test]
@@ -53,6 +212,141 @@ async fn create_lists_and_gate_stats_via_kernel_client() {
         .features
         .contains(&"bounded_json_frames".to_string()));
     assert!(protocol.request_schema["oneOf"].is_array());
+}
+
+#[tokio::test]
+async fn message_stream_is_ordered_and_returns_the_terminal_result() {
+    let (addr, _kernel) = spawn_stream_server("stream-success", false, 0).await;
+    let mut client = KernelClient::connect(addr).await.expect("connect");
+    let id = client
+        .create_agent(
+            "streaming",
+            "stream one turn",
+            Some("stream-success".into()),
+            None,
+            None,
+        )
+        .await
+        .expect("create agent");
+    let mut events = Vec::new();
+    let result = client
+        .send_message_stream("request-success", &id, "hello", |event| {
+            events.push(event.clone())
+        })
+        .await
+        .expect("stream turn");
+
+    assert_eq!(result.content, "streamed reply");
+    assert_eq!(result.tokens, 2);
+    assert_eq!(events.first(), Some(&MessageStreamEvent::Started));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        MessageStreamEvent::Token { delta } if delta == "streamed reply"
+    )));
+    assert!(client
+        .list_agents()
+        .await
+        .expect("connection remains usable")
+        .iter()
+        .any(|agent| agent.id == id));
+}
+
+#[tokio::test]
+async fn sustained_stream_crosses_bounded_buffers_without_loss_or_reordering() {
+    const EVENT_COUNT: usize = 10_000;
+    let (addr, _kernel) = spawn_stream_server("stream-soak", false, EVENT_COUNT).await;
+    let mut client = KernelClient::connect(addr).await.expect("connect");
+    let id = client
+        .create_agent(
+            "stream-soak",
+            "exercise bounded backpressure",
+            Some("stream-soak".into()),
+            None,
+            None,
+        )
+        .await
+        .expect("create agent");
+    let mut started = 0_usize;
+    let mut deltas = 0_usize;
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        client.send_message_stream("request-soak", &id, "start", |event| match event {
+            MessageStreamEvent::Started => started += 1,
+            MessageStreamEvent::Token { delta } => {
+                assert_eq!(delta, "x");
+                deltas += 1;
+            }
+            _ => {}
+        }),
+    )
+    .await
+    .expect("bounded stream timed out")
+    .expect("bounded stream");
+
+    assert_eq!(started, 1);
+    assert_eq!(deltas, EVENT_COUNT);
+    assert_eq!(result.content.len(), EVENT_COUNT);
+    assert_eq!(result.tokens, EVENT_COUNT as u32 + 1);
+}
+
+#[tokio::test]
+async fn second_authenticated_connection_cancels_one_exact_stream_request() {
+    let (addr, kernel) = spawn_stream_server("stream-blocked", true, 0).await;
+    let mut stream_client = KernelClient::connect(addr).await.expect("stream connect");
+    let mut control_client = KernelClient::connect(addr).await.expect("control connect");
+    let id = stream_client
+        .create_agent(
+            "cancel-stream",
+            "wait for cancellation",
+            Some("stream-blocked".into()),
+            None,
+            None,
+        )
+        .await
+        .expect("create agent");
+
+    let (started_tx, mut started_rx) = tokio::sync::mpsc::unbounded_channel();
+    let stream_agent = id.clone();
+    let stream = tokio::spawn(async move {
+        stream_client
+            .send_message_stream(
+                "request-cancel",
+                stream_agent,
+                "block until cancelled",
+                |event| {
+                    if matches!(event, MessageStreamEvent::Started) {
+                        let _ = started_tx.send(());
+                    }
+                },
+            )
+            .await
+    });
+
+    tokio::time::timeout(std::time::Duration::from_secs(2), started_rx.recv())
+        .await
+        .expect("started event timeout")
+        .expect("started event channel");
+    assert!(control_client
+        .cancel_request("request-cancel", &id)
+        .await
+        .expect("cancel request"));
+
+    let error = tokio::time::timeout(std::time::Duration::from_secs(2), stream)
+        .await
+        .expect("stream cancellation timeout")
+        .expect("stream task")
+        .expect_err("cancelled stream must fail");
+    assert_eq!(error.wire_code(), Some(WireErrorCode::Cancelled));
+    assert!(!control_client
+        .cancel_request("request-cancel", &id)
+        .await
+        .expect("completed request is no longer active"));
+    assert_eq!(
+        kernel
+            .get_agent_status(id.parse().expect("agent id"))
+            .expect("agent state"),
+        kernel::AgentState::Running
+    );
 }
 
 #[tokio::test]

@@ -19,6 +19,9 @@ pub const MAX_JSON_FRAME_BYTES: usize = crate::package::MAX_ARCHIVE_BYTES * 2 + 
 /// Default maximum number of simultaneously admitted transport connections.
 pub const DEFAULT_MAX_CONNECTIONS: usize = 256;
 
+/// Maximum queued provider/executor events at each streaming boundary.
+pub const STREAM_EVENT_BUFFER_CAPACITY: usize = 64;
+
 /// Maximum time allowed for the first frame on a connection.
 pub const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 

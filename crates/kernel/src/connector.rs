@@ -46,6 +46,7 @@ pub fn is_transient(err: &ConnectorError) -> bool {
         // Protocol errors include auth / bad-request style failures that will
         // not succeed on retry.
         ConnectorError::ProtocolError(_)
+        | ConnectorError::PartialStream(_)
         | ConnectorError::Authentication(_)
         | ConnectorError::Authorization(_)
         | ConnectorError::InvalidRequest(_)
@@ -275,6 +276,43 @@ pub struct LlmResponse {
     pub tool_calls: Vec<ToolCall>,
 }
 
+/// Provider-originated deltas forwarded to the executor's bounded stream.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProviderStreamEvent {
+    TextDelta(String),
+}
+
+/// Cloneable bounded event sink that records whether output became visible.
+///
+/// The visibility bit lets retry/failover fail closed after a partial stream:
+/// once a delta reached the caller, replaying the request could duplicate
+/// content or side effects.
+#[derive(Clone)]
+pub struct ProviderEventSink {
+    sender: tokio::sync::mpsc::Sender<ProviderStreamEvent>,
+    emitted: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl ProviderEventSink {
+    pub fn new(sender: tokio::sync::mpsc::Sender<ProviderStreamEvent>) -> Self {
+        Self {
+            sender,
+            emitted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+
+    pub async fn emit(&self, event: ProviderStreamEvent) {
+        if self.sender.send(event).await.is_ok() {
+            self.emitted
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+    }
+
+    pub fn has_emitted(&self) -> bool {
+        self.emitted.load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+
 /// Per-call generation bounds supplied by the kernel.
 ///
 /// This is deliberately separate from provider configuration: the execution
@@ -470,6 +508,30 @@ pub trait LlmSession: Send + Sync {
             }
         }
     }
+
+    /// Cancellation-aware streaming with a bounded delta sink.
+    ///
+    /// The compatibility default emits the completed response as one text
+    /// delta. Native streaming adapters override this to publish finer-grained
+    /// deltas while retaining the same terminal [`LlmResponse`].
+    async fn send_streaming_events_controlled(
+        &self,
+        messages: Vec<StandardMessage>,
+        tools: &[ToolDefinition],
+        options: LlmRequestOptions,
+        cancellation: &tokio_util::sync::CancellationToken,
+        events: ProviderEventSink,
+    ) -> Result<LlmResponse, ConnectorError> {
+        let response = self
+            .send_streaming_controlled(messages, tools, options, cancellation)
+            .await?;
+        if !response.content.is_empty() {
+            events
+                .emit(ProviderStreamEvent::TextDelta(response.content.clone()))
+                .await;
+        }
+        Ok(response)
+    }
 }
 
 /// An LLM provider adapter.
@@ -526,6 +588,7 @@ struct ProviderSend<'a> {
     mode: SendMode,
     options: LlmRequestOptions,
     cancellation: &'a tokio_util::sync::CancellationToken,
+    events: Option<tokio::sync::mpsc::Sender<ProviderStreamEvent>>,
 }
 
 struct FailoverControls<'a> {
@@ -534,6 +597,7 @@ struct FailoverControls<'a> {
     cancellation: &'a tokio_util::sync::CancellationToken,
     observed_attempts: Option<&'a std::sync::atomic::AtomicU32>,
     max_attempts_per_provider: Option<u32>,
+    events: Option<tokio::sync::mpsc::Sender<ProviderStreamEvent>>,
 }
 
 struct ProviderAttemptOutcome {
@@ -742,6 +806,7 @@ impl AgentConnectorImpl {
                 cancellation,
                 observed_attempts: None,
                 max_attempts_per_provider: None,
+                events: None,
             },
         )
         .await
@@ -810,6 +875,7 @@ impl AgentConnectorImpl {
                         mode: controls.mode,
                         options: controls.options,
                         cancellation: controls.cancellation,
+                        events: controls.events.clone(),
                     },
                     &mut total_attempts,
                     controls.observed_attempts,
@@ -831,7 +897,9 @@ impl AgentConnectorImpl {
                 Err(error) => {
                     if matches!(
                         error,
-                        ConnectorError::Cancelled(_) | ConnectorError::ContentFiltered(_)
+                        ConnectorError::Cancelled(_)
+                            | ConnectorError::ContentFiltered(_)
+                            | ConnectorError::PartialStream(_)
                     ) {
                         return Err(error);
                     }
@@ -915,14 +983,37 @@ impl AgentConnectorImpl {
                         .await
                 }
                 SendMode::Streaming => {
-                    session
-                        .send_streaming_controlled(
-                            request.messages.to_vec(),
-                            request.tools,
-                            request.options,
-                            request.cancellation,
-                        )
-                        .await
+                    if let Some(events) = request.events.as_ref() {
+                        let sink = ProviderEventSink::new(events.clone());
+                        let result = session
+                            .send_streaming_events_controlled(
+                                request.messages.to_vec(),
+                                request.tools,
+                                request.options,
+                                request.cancellation,
+                                sink.clone(),
+                            )
+                            .await;
+                        if result.is_err()
+                            && sink.has_emitted()
+                            && !matches!(result, Err(ConnectorError::Cancelled(_)))
+                        {
+                            return Err(ConnectorError::PartialStream(
+                                "provider failed after publishing output; retry and failover were suppressed"
+                                    .into(),
+                            ));
+                        }
+                        result
+                    } else {
+                        session
+                            .send_streaming_controlled(
+                                request.messages.to_vec(),
+                                request.tools,
+                                request.options,
+                                request.cancellation,
+                            )
+                            .await
+                    }
                 }
             };
 
@@ -1027,6 +1118,41 @@ impl LlmSession for ResilientSession {
                     cancellation,
                     observed_attempts: Some(&self.last_attempts),
                     max_attempts_per_provider: Some(1),
+                    events: None,
+                },
+            )
+            .await?;
+        self.last_attempts
+            .store(outcome.attempts, std::sync::atomic::Ordering::Release);
+        *self
+            .last_attribution
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            (outcome.served_by, outcome.model_id);
+        Ok(outcome.response)
+    }
+
+    async fn send_streaming_events_controlled(
+        &self,
+        messages: Vec<StandardMessage>,
+        tools: &[ToolDefinition],
+        options: LlmRequestOptions,
+        cancellation: &tokio_util::sync::CancellationToken,
+        events: ProviderEventSink,
+    ) -> Result<LlmResponse, ConnectorError> {
+        let outcome = self
+            .connector
+            .send_with_failover_observed(
+                &self.primary,
+                messages,
+                tools,
+                FailoverControls {
+                    mode: SendMode::Streaming,
+                    options,
+                    cancellation,
+                    observed_attempts: Some(&self.last_attempts),
+                    max_attempts_per_provider: Some(1),
+                    events: Some(events.sender.clone()),
                 },
             )
             .await?;
@@ -1080,6 +1206,7 @@ impl LlmSession for ResilientSession {
                     cancellation,
                     observed_attempts: Some(&self.last_attempts),
                     max_attempts_per_provider: Some(1),
+                    events: None,
                 },
             )
             .await?;
@@ -1338,6 +1465,115 @@ mod tests {
         }
         fn provider_id(&self) -> &ProviderId {
             &self.provider_id
+        }
+    }
+
+    struct PartialStreamAdapter {
+        id: ProviderId,
+        fail_after_delta: bool,
+        attempts: Arc<std::sync::atomic::AtomicU32>,
+    }
+
+    struct PartialStreamSession {
+        provider_id: ProviderId,
+        fail_after_delta: bool,
+        attempts: Arc<std::sync::atomic::AtomicU32>,
+    }
+
+    #[async_trait::async_trait]
+    impl LlmSession for PartialStreamSession {
+        async fn send(
+            &self,
+            _messages: Vec<StandardMessage>,
+        ) -> Result<LlmResponse, ConnectorError> {
+            self.attempts
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(LlmResponse {
+                content: "complete".into(),
+                finish_reason: Some("stop".into()),
+                tokens_used: 1,
+                usage: LlmUsage::reported(1, 1, 0),
+                tool_calls: vec![],
+            })
+        }
+
+        async fn send_with_tools(
+            &self,
+            messages: Vec<StandardMessage>,
+            _tools: &[ToolDefinition],
+        ) -> Result<LlmResponse, ConnectorError> {
+            self.send(messages).await
+        }
+
+        async fn send_streaming_events_controlled(
+            &self,
+            _messages: Vec<StandardMessage>,
+            _tools: &[ToolDefinition],
+            _options: LlmRequestOptions,
+            _cancellation: &tokio_util::sync::CancellationToken,
+            events: ProviderEventSink,
+        ) -> Result<LlmResponse, ConnectorError> {
+            self.attempts
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            events
+                .emit(ProviderStreamEvent::TextDelta("partial".into()))
+                .await;
+            if self.fail_after_delta {
+                Err(ConnectorError::StreamError(
+                    "transport failed after a visible delta".into(),
+                ))
+            } else {
+                Ok(LlmResponse {
+                    content: "complete".into(),
+                    finish_reason: Some("stop".into()),
+                    tokens_used: 1,
+                    usage: LlmUsage::reported(1, 1, 0),
+                    tool_calls: vec![],
+                })
+            }
+        }
+
+        fn enforces_max_output_tokens(&self) -> bool {
+            true
+        }
+
+        fn provider_id(&self) -> &ProviderId {
+            &self.provider_id
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl LlmProviderAdapter for PartialStreamAdapter {
+        fn id(&self) -> &ProviderId {
+            &self.id
+        }
+
+        fn name(&self) -> &str {
+            "partial stream"
+        }
+
+        fn provider_type(&self) -> ProviderType {
+            ProviderType::Cloud
+        }
+
+        async fn is_available(&self) -> bool {
+            true
+        }
+
+        async fn create_session(&self) -> Result<Box<dyn LlmSession>, ConnectorError> {
+            Ok(Box::new(PartialStreamSession {
+                provider_id: self.id.clone(),
+                fail_after_delta: self.fail_after_delta,
+                attempts: Arc::clone(&self.attempts),
+            }))
+        }
+
+        fn translate_to_provider(&self, message: &StandardMessage) -> serde_json::Value {
+            serde_json::json!({"role": message.role, "content": message.content})
+        }
+
+        fn translate_from_provider(&self, value: &serde_json::Value) -> Option<StandardMessage> {
+            Some(StandardMessage::assistant(value.get("content")?.as_str()?))
         }
     }
 
@@ -1812,6 +2048,58 @@ mod tests {
             .expect_err("cancellation must stop the whole failover chain");
 
         assert!(matches!(error, ConnectorError::Cancelled(_)));
+        assert_eq!(
+            primary_attempts.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert_eq!(backup_attempts.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn visible_partial_stream_suppresses_retry_and_failover() {
+        let connector = fast_connector();
+        let primary_attempts = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let backup_attempts = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        connector
+            .register_provider(Arc::new(PartialStreamAdapter {
+                id: "primary".into(),
+                fail_after_delta: true,
+                attempts: Arc::clone(&primary_attempts),
+            }))
+            .unwrap();
+        connector
+            .register_provider(Arc::new(PartialStreamAdapter {
+                id: "backup".into(),
+                fail_after_delta: false,
+                attempts: Arc::clone(&backup_attempts),
+            }))
+            .unwrap();
+        connector.set_backup(&"primary".into(), &"backup".into());
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let (events, mut received) = tokio::sync::mpsc::channel(4);
+
+        let error = connector
+            .send_with_failover_observed(
+                &"primary".into(),
+                vec![StandardMessage::user("stream once")],
+                &[],
+                FailoverControls {
+                    mode: SendMode::Streaming,
+                    options: LlmRequestOptions::default(),
+                    cancellation: &cancellation,
+                    observed_attempts: None,
+                    max_attempts_per_provider: None,
+                    events: Some(events),
+                },
+            )
+            .await
+            .expect_err("visible partial output must stop replay");
+
+        assert!(matches!(error, ConnectorError::PartialStream(_)));
+        assert_eq!(
+            received.recv().await,
+            Some(ProviderStreamEvent::TextDelta("partial".into()))
+        );
         assert_eq!(
             primary_attempts.load(std::sync::atomic::Ordering::SeqCst),
             1

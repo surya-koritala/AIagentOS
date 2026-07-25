@@ -37,11 +37,11 @@ compatibility behavior, and transport limits:
 {"op":"describe_protocol"}
 ```
 
-The schemas use JSON Schema draft 2020-12 and cover every top-level request and
-reply tag. The authorization/schema regression constructs all 58 current
-syscalls and rejects either a missing schema operation or an undocumented
-extra. Domain payload examples and previous-version shapes are retained under
-`protocol/`.
+The schemas use JSON Schema draft 2020-12 and cover every top-level request,
+reply, and stream-event tag. The authorization/schema regression constructs
+all 60 current syscalls and rejects either a missing schema operation or an
+undocumented extra. Domain payload examples and previous-version shapes are
+retained under `protocol/`.
 
 ## Compatibility policy
 
@@ -71,18 +71,52 @@ Both syscall and MCP servers share one bounded framing implementation:
 | First-frame / TLS handshake deadline | 15 seconds |
 | Established connection idle deadline | 300 seconds |
 | Per-request dispatch deadline | 130 seconds |
-| Ordering | One request and one reply at a time per connection |
+| Stream event buffers | 64 events at each provider/executor and executor/socket boundary |
+| Ordering | One ordinary request/reply or one ordered stream at a time per connection |
 
 Oversized or invalid UTF-8 input is rejected before an unbounded allocation.
 An oversized response is replaced with a bounded typed/internal error.
 Connection admission is semaphore-bounded; excess sockets are closed rather
-than spawning unbounded tasks. A client-side request timeout closes the
-connection so a late reply cannot be mistaken for the next request.
+than spawning unbounded tasks. A client-side ordinary-request timeout closes
+the connection so a late reply cannot be mistaken for the next request. A
+stream uses the same timeout between frames and can therefore outlast one
+ordinary request without accepting a silent peer indefinitely.
 
-Protocol v2 does not advertise event or streaming frames. Hosted/local provider
-work is cancellable through lifecycle pause/kill, including from a second
-connection, but token streaming and request-id cancellation require a future
-protocol feature and remain open in issue #121.
+### Message streaming and request cancellation
+
+Protocol v2 advertises `token_streaming` and `request_id_cancellation`. Start a
+stream with an application-generated id:
+
+```json
+{"op":"send_message_stream","request_id":"turn-42","agent_id":"…","message":"hello"}
+```
+
+The server sends monotonically sequenced `stream_event` replies followed by
+exactly one `stream_completed` or `stream_failed` terminal reply. Event kinds
+are `started`, `token`, `tool_call_started`, `tool_call_completed`, and
+`context_pressure`. The SDK rejects a skipped, duplicated, out-of-order, or
+cross-request sequence.
+
+The per-connection event channel is bounded to 64 entries. A slow reader
+therefore backpressures the executor/provider rather than creating an unbounded
+queue. Azure OpenAI SSE deltas are forwarded incrementally. A backend without
+native deltas emits its completed response as one token event, which is honest
+fallback behavior rather than a claim of provider token granularity.
+
+Because one connection belongs to its stream until the terminal frame,
+cancellation uses a second authenticated connection:
+
+```json
+{"op":"cancel_request","request_id":"turn-42","agent_id":"…"}
+```
+
+The agent id passes through the normal tenant-ownership authorization check; a
+request id by itself is not a cancellation capability. The exact active
+request token is signalled cooperatively. The original stream ends with
+`stream_failed` and code `cancelled`, while the agent remains runnable. Once
+any provider delta is visible, retry and failover are suppressed to prevent
+duplicated output. A socket write failure drops the stream immediately; a
+silent disconnected peer is bounded by the per-frame inactivity timeout.
 
 ## Errors
 
@@ -127,9 +161,17 @@ Versioned fixtures:
 - `protocol/v2/hello.json`
 - `protocol/v2/typed-error.json`
 - `protocol/v2/describe-protocol-request.json`
+- `protocol/v2/send-message-stream.json`
+- `protocol/v2/stream-event.json`
+- `protocol/v2/stream-completed.json`
+- `protocol/v2/stream-failed.json`
+- `protocol/v2/cancel-request.json`
+- `protocol/v2/request-cancellation.json`
 - `protocol/mcp/initialize.json`
 
 Kernel tests verify fixture parsing, complete operation/schema parity, typed
 error classification, authorization, bounds, redaction, TCP/Unix/TLS behavior,
-and MCP parity. SDK tests exercise the same real server boundary and preserve
-typed errors and enforcement introspection.
+stream ordering/backpressure, and MCP parity. SDK tests exercise the same real
+server boundary, preserve typed errors and enforcement introspection, and prove
+second-connection request cancellation. Adapter tests prove incremental Azure
+SSE deltas and bounded output.

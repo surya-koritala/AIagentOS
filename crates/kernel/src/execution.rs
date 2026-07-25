@@ -20,6 +20,8 @@ const LLM_RETRIES: usize = 3;
 /// Events streamed during agent execution.
 #[derive(Debug, Clone)]
 pub enum StreamEvent {
+    /// A request-scoped execution stream is registered and cancellable.
+    Started { request_id: String },
     /// A text token from the LLM.
     Token(String),
     /// A tool call is starting.
@@ -628,6 +630,11 @@ impl AgentExecutor {
     /// Set an event channel for streaming events to the caller.
     pub fn set_event_channel(&mut self, tx: mpsc::Sender<StreamEvent>) {
         self.event_tx = Some(tx);
+    }
+
+    /// Remove the current event channel after a request-scoped stream ends.
+    pub fn clear_event_channel(&mut self) {
+        self.event_tx = None;
     }
 
     /// Set a rule store for learning from corrections.
@@ -1308,19 +1315,42 @@ impl AgentExecutor {
                 }
             };
             let started = std::time::Instant::now();
-            let result = self
-                .session
-                .send_streaming_controlled(
-                    clean_messages.clone(),
-                    tools,
-                    crate::connector::LlmRequestOptions {
-                        max_output_tokens: (self.max_output_tokens_per_request > 0)
-                            .then_some(self.max_output_tokens_per_request),
-                        timeout: self.provider_request_timeout,
-                    },
-                    &self.cancel_token,
-                )
-                .await;
+            let (provider_events_tx, mut provider_events_rx) =
+                mpsc::channel(crate::wire_io::STREAM_EVENT_BUFFER_CAPACITY);
+            let send = self.session.send_streaming_events_controlled(
+                clean_messages.clone(),
+                tools,
+                crate::connector::LlmRequestOptions {
+                    max_output_tokens: (self.max_output_tokens_per_request > 0)
+                        .then_some(self.max_output_tokens_per_request),
+                    timeout: self.provider_request_timeout,
+                },
+                &self.cancel_token,
+                crate::connector::ProviderEventSink::new(provider_events_tx),
+            );
+            tokio::pin!(send);
+            let mut provider_events_open = true;
+            let result = loop {
+                tokio::select! {
+                    biased;
+                    event = provider_events_rx.recv(), if provider_events_open => {
+                        match event {
+                            Some(crate::connector::ProviderStreamEvent::TextDelta(delta)) => {
+                                self.emit(StreamEvent::Token(delta)).await;
+                            }
+                            None => provider_events_open = false,
+                        }
+                    }
+                    result = &mut send => {
+                        while let Ok(crate::connector::ProviderStreamEvent::TextDelta(delta)) =
+                            provider_events_rx.try_recv()
+                        {
+                            self.emit(StreamEvent::Token(delta)).await;
+                        }
+                        break result;
+                    }
+                }
+            };
             provider_latency_ms = provider_latency_ms
                 .saturating_add(started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64);
             drop(_llm_core);

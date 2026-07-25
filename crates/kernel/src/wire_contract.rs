@@ -11,14 +11,16 @@ use serde_json::{json, Map, Value};
 
 use crate::syscall_server::{MIN_PROTOCOL_VERSION, PROTOCOL_VERSION};
 use crate::wire_io::{
-    DEFAULT_MAX_CONNECTIONS, HANDSHAKE_TIMEOUT, IDLE_TIMEOUT, MAX_JSON_FRAME_BYTES,
-    REQUEST_TIMEOUT, STREAM_EVENT_BUFFER_CAPACITY,
+    DEFAULT_MAX_CONNECTIONS, GRACEFUL_CLOSE_TIMEOUT, HANDSHAKE_TIMEOUT, IDLE_TIMEOUT,
+    MAX_JSON_FRAME_BYTES, RECOMMENDED_KEEPALIVE_INTERVAL, REQUEST_TIMEOUT,
+    STREAM_EVENT_BUFFER_CAPACITY,
 };
 
 /// Stable feature identifiers announced by `hello`.
 pub const WIRE_FEATURES: &[&str] = &[
     "agent_enforcement_introspection",
     "bounded_json_frames",
+    "connection_keepalive",
     "context_pressure",
     "durable_generation_checkpoints",
     "memory_lifecycle",
@@ -26,6 +28,7 @@ pub const WIRE_FEATURES: &[&str] = &[
     "protocol_description",
     "request_deadlines",
     "request_id_cancellation",
+    "graceful_connection_close",
     "service_supervision",
     "signed_packages",
     "tenant_bound_auth",
@@ -58,11 +61,15 @@ pub struct TransportDescription {
     pub default_max_connections: usize,
     pub handshake_timeout_ms: u64,
     pub idle_timeout_ms: u64,
+    pub recommended_keepalive_interval_ms: u64,
+    pub graceful_close_timeout_ms: u64,
     pub request_timeout_ms: u64,
     pub stream_event_buffer_capacity: usize,
     pub request_ordering: String,
     pub unknown_field_behavior: String,
     pub unknown_operation_behavior: String,
+    pub idle_close_behavior: String,
+    pub graceful_close_behavior: String,
 }
 
 #[derive(Clone, Copy)]
@@ -318,6 +325,10 @@ const REQUEST_VARIANTS: &[Variant] = &[
         fields: &[],
     },
     Variant {
+        tag: "ping",
+        fields: &[],
+    },
+    Variant {
         tag: "load_package",
         fields: &[Field::required("manifest_toml", S)],
     },
@@ -454,7 +465,10 @@ pub fn conformance_request_fixtures(protocol_version: u32) -> Result<Vec<Value>,
         .iter()
         .filter(|variant| {
             protocol_version >= 2
-                || !matches!(variant.tag, "send_message_stream" | "cancel_request")
+                || !matches!(
+                    variant.tag,
+                    "send_message_stream" | "cancel_request" | "ping"
+                )
         })
         .map(|variant| {
             let mut request = Map::new();
@@ -659,6 +673,10 @@ const REPLY_VARIANTS: &[Variant] = &[
         ],
     },
     Variant {
+        tag: "pong",
+        fields: &[],
+    },
+    Variant {
         tag: "authenticated",
         fields: &[],
     },
@@ -830,7 +848,7 @@ fn mcp_schema() -> Value {
             "jsonrpc": {"const": "2.0"},
             "id": {},
             "method": {
-                "enum": ["initialize", "agentos/authenticate", "tools/list", "tools/call"]
+                "enum": ["initialize", "ping", "agentos/authenticate", "tools/list", "tools/call"]
             },
             "params": {"type": ["object", "null"]}
         },
@@ -856,6 +874,8 @@ pub fn protocol_description() -> ProtocolDescription {
             default_max_connections: DEFAULT_MAX_CONNECTIONS,
             handshake_timeout_ms: HANDSHAKE_TIMEOUT.as_millis() as u64,
             idle_timeout_ms: IDLE_TIMEOUT.as_millis() as u64,
+            recommended_keepalive_interval_ms: RECOMMENDED_KEEPALIVE_INTERVAL.as_millis() as u64,
+            graceful_close_timeout_ms: GRACEFUL_CLOSE_TIMEOUT.as_millis() as u64,
             request_timeout_ms: REQUEST_TIMEOUT.as_millis() as u64,
             stream_event_buffer_capacity: STREAM_EVENT_BUFFER_CAPACITY,
             request_ordering:
@@ -863,6 +883,12 @@ pub fn protocol_description() -> ProtocolDescription {
             unknown_field_behavior: "ignored for known operations; additive fields are compatible"
                 .into(),
             unknown_operation_behavior: "invalid_request; connection remains usable".into(),
+            idle_close_behavior:
+                "server write side is shut down without an application error after the idle deadline"
+                    .into(),
+            graceful_close_behavior:
+                "after all replies are consumed, client half-closes output and waits for peer EOF"
+                    .into(),
         },
         request_schema: tagged_union_schema("AI Agent OS syscall request", "op", REQUEST_VARIANTS),
         reply_schema: tagged_union_schema("AI Agent OS syscall reply", "status", REPLY_VARIANTS),
@@ -923,7 +949,21 @@ mod tests {
         assert!(description
             .features
             .contains(&"token_streaming".to_string()));
+        assert!(description
+            .features
+            .contains(&"connection_keepalive".to_string()));
+        assert!(description
+            .features
+            .contains(&"graceful_connection_close".to_string()));
         assert_eq!(description.transport.max_frame_bytes, MAX_JSON_FRAME_BYTES);
+        assert_eq!(
+            description.transport.recommended_keepalive_interval_ms,
+            RECOMMENDED_KEEPALIVE_INTERVAL.as_millis() as u64
+        );
+        assert_eq!(
+            description.transport.graceful_close_timeout_ms,
+            GRACEFUL_CLOSE_TIMEOUT.as_millis() as u64
+        );
         assert_eq!(
             description.transport.stream_event_buffer_capacity,
             STREAM_EVENT_BUFFER_CAPACITY
@@ -1025,11 +1065,23 @@ mod tests {
             cancelled,
             crate::syscall_server::SyscallReply::RequestCancellation { accepted: true, .. }
         ));
+        let ping: crate::syscall_server::Syscall =
+            serde_json::from_str(include_str!("../../../protocol/v2/ping.json")).unwrap();
+        assert!(matches!(ping, crate::syscall_server::Syscall::Ping));
+        let pong: crate::syscall_server::SyscallReply =
+            serde_json::from_str(include_str!("../../../protocol/v2/pong.json")).unwrap();
+        assert!(matches!(pong, crate::syscall_server::SyscallReply::Pong));
 
         let mcp: crate::mcp_server::JsonRpcRequest =
             serde_json::from_str(include_str!("../../../protocol/mcp/initialize.json")).unwrap();
         assert_eq!(mcp.jsonrpc, "2.0");
         assert_eq!(mcp.method, "initialize");
+        let mcp_ping: crate::mcp_server::JsonRpcRequest =
+            serde_json::from_str(include_str!("../../../protocol/mcp/ping.json")).unwrap();
+        assert_eq!(mcp_ping.method, "ping");
+        let mcp_pong: crate::mcp_server::JsonRpcResponse =
+            serde_json::from_str(include_str!("../../../protocol/mcp/ping-response.json")).unwrap();
+        assert_eq!(mcp_pong.result, Some(json!({})));
     }
 
     #[test]
@@ -1052,7 +1104,7 @@ mod tests {
             }
         }
         assert_eq!(conformance_request_fixtures(1).unwrap().len(), 58);
-        assert_eq!(conformance_request_fixtures(2).unwrap().len(), 60);
+        assert_eq!(conformance_request_fixtures(2).unwrap().len(), 61);
         assert!(conformance_request_fixtures(0).is_err());
         assert!(conformance_request_fixtures(PROTOCOL_VERSION + 1).is_err());
     }

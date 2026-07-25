@@ -39,9 +39,9 @@ compatibility behavior, and transport limits:
 
 The schemas use JSON Schema draft 2020-12 and cover every top-level request,
 reply, and stream-event tag. The authorization/schema regression constructs
-all 60 current syscalls and rejects either a missing schema operation or an
+all 61 current syscalls and rejects either a missing schema operation or an
 undocumented extra. Deterministic golden request arrays cover all 58 v1
-operations and all 60 v2 operations. Domain payload examples and
+operations and all 61 v2 operations. Domain payload examples and
 previous-version shapes are retained under `protocol/`.
 
 ## Compatibility policy
@@ -71,6 +71,8 @@ Both syscall and MCP servers share one bounded framing implementation:
 | Default admitted connections | 256 per bound server |
 | First-frame / TLS handshake deadline | 15 seconds |
 | Established connection idle deadline | 300 seconds |
+| Recommended keepalive interval | At most 150 seconds between complete frames |
+| Graceful-close deadline | 5 seconds from client half-close to peer EOF |
 | Per-request dispatch deadline | 130 seconds |
 | Stream event buffers | 64 events at each provider/executor and executor/socket boundary |
 | Ordering | One ordinary request/reply or one ordered stream at a time per connection |
@@ -82,6 +84,37 @@ than spawning unbounded tasks. A client-side ordinary-request timeout closes
 the connection so a late reply cannot be mistaken for the next request. A
 stream uses the same timeout between frames and can therefore outlast one
 ordinary request without accepting a silent peer indefinitely.
+
+### Connection liveness and graceful close
+
+Protocol v2 provides an application-level liveness probe:
+
+```json
+{"op":"ping"}
+{"status":"pong"}
+```
+
+`ping` is safe before authentication, performs no kernel work, and is rejected
+on a negotiated v1 connection with `incompatible_version`. Every complete
+frame starts a fresh established-idle window, so a quiet client should send a
+ping no less often than the published 150-second recommendation. The Rust SDK
+exposes this as `KernelClient::ping`.
+
+MCP uses its standard parameterless JSON-RPC `ping` method and returns an empty
+result. It is accepted before `initialize`, as required by the negotiated
+2024-11-05 lifecycle. There is no private MCP shutdown method.
+
+Graceful shutdown uses the transport for both protocols. After consuming every
+ordinary reply or terminal stream frame, the client half-closes its write side
+and waits up to five seconds for server EOF. The server stops admitting frames,
+shuts down its write side, and releases the connection permit. An unread frame
+during that handshake is a client protocol-state error. The Rust
+`SyscallClient`, `KernelClient`, and in-tree `McpClient` expose consuming
+`close` methods that enforce this sequence. If the 300-second idle deadline
+expires instead, the server closes the write side without an application error;
+the next client operation must reconnect. Closing a transport during an
+in-flight request is not a cancellation signal—stream cancellation remains the
+explicit request-id operation described below.
 
 ### Message streaming and request cancellation
 
@@ -163,14 +196,18 @@ Versioned fixtures:
 - `protocol/v2/hello.json`
 - `protocol/v2/typed-error.json`
 - `protocol/v2/describe-protocol-request.json`
-- `protocol/v2/requests.json` (all 60 v2 operations)
+- `protocol/v2/requests.json` (all 61 v2 operations)
 - `protocol/v2/send-message-stream.json`
 - `protocol/v2/stream-event.json`
 - `protocol/v2/stream-completed.json`
 - `protocol/v2/stream-failed.json`
 - `protocol/v2/cancel-request.json`
 - `protocol/v2/request-cancellation.json`
+- `protocol/v2/ping.json`
+- `protocol/v2/pong.json`
 - `protocol/mcp/initialize.json`
+- `protocol/mcp/ping.json`
+- `protocol/mcp/ping-response.json`
 
 Regenerate a version after an intentional schema change:
 
@@ -195,7 +232,8 @@ The runner performs only `Hello`, optional `Authenticate`, and
 `DescribeProtocol`; it never executes the mutating golden requests. Kernel
 tests verify fixture parsing, complete per-version operation/schema parity,
 typed error classification, authorization, bounds, redaction, TCP/Unix/TLS
-behavior, stream ordering/backpressure, and MCP parity. SDK tests exercise the
-same real server boundary, preserve typed errors and enforcement introspection,
-and prove second-connection request cancellation. Adapter tests prove
-incremental Azure SSE deltas and bounded output.
+behavior, ping idle-reset semantics, bounded half-close/EOF shutdown, stream
+ordering/backpressure, and MCP parity. SDK tests exercise the same real server
+boundary, preserve typed errors and enforcement introspection, and prove
+second-connection request cancellation plus typed liveness and close APIs.
+Adapter tests prove incremental Azure SSE deltas and bounded output.

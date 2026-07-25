@@ -140,3 +140,9 @@ Every supported request operation must also remain represented in
 Regenerate those files with the `export-wire-fixtures` example and run
 `python3 scripts/verify_wire_fixtures.py`; the Rust and Python regression suites
 both reject schema, type, version, or operation-set drift.
+
+Connection lifecycle changes must preserve the documented application ping,
+idle-close, and client-half-close/peer-EOF contract for raw, SDK, TLS, Unix, and
+MCP callers. Keep the recommended keepalive and graceful-close deadlines in
+`DescribeProtocol`, exercise short idle windows in regression tests, and do not
+introduce a private MCP shutdown RPC.

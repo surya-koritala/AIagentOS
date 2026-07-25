@@ -23,6 +23,9 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
 - Added deterministic golden request sets for every v1 and v2 operation plus a
   dependency-free Python conformance runner that negotiates both supported
   versions and validates the fixtures against a live server's published schema.
+- Added protocol-v2 `ping`/`pong`, standard MCP ping, published keepalive and
+  graceful-close bounds, and SDK/raw/MCP half-close APIs that require bounded
+  peer EOF after all replies are consumed.
 
 ### Added
 

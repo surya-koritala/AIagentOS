@@ -104,6 +104,14 @@ pub trait Embedder: Send + Sync {
     fn embed(&self, text: &str) -> Vec<f32>;
     /// The dimensionality of vectors produced by [`Embedder::embed`].
     fn dim(&self) -> usize;
+    /// Stable persistence identifier. Changing the embedding algorithm requires
+    /// a new model id or version so stale rows are rebuilt deterministically.
+    fn model_id(&self) -> &str {
+        "custom"
+    }
+    fn version(&self) -> u32 {
+        1
+    }
 }
 
 /// The original feature-hash embedder: unigram + adjacent-bigram FNV-1a feature
@@ -132,6 +140,10 @@ impl Embedder for FeatureHashEmbedder {
 
     fn dim(&self) -> usize {
         EMBED_DIM
+    }
+
+    fn model_id(&self) -> &str {
+        "feature-hash"
     }
 }
 
@@ -229,6 +241,14 @@ impl Embedder for BlendedEmbedder {
 
     fn dim(&self) -> usize {
         EMBED_DIM
+    }
+
+    fn model_id(&self) -> &str {
+        "blended-feature-hash"
+    }
+
+    fn version(&self) -> u32 {
+        2
     }
 }
 

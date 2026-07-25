@@ -42,15 +42,15 @@ Sizes: **S** ≈ days, **M** ≈ 1–2 weeks, **L** ≈ 3–6 weeks, **XL** ≈ 
 
 | ID | Title | Size | Deps | Status |
 |----|-------|------|------|--------|
-| **B0.1** | Syscall server: expose `AgentKernelImpl` over the canonical JSON syscall API (TCP + Unix socket); explicitly retire the numbered prototype from the public boundary | XL | — | **Done** (`syscall_server`: agent lifecycle + LLM turn/providers + memory store/query + tool call + gate stats/agent info; TCP **and** Unix socket; optional shared-secret auth; enforcement over the wire; see ADR 0001) |
-| **B0.2** | Embeddable **Rust SDK** crate: `Agent` builder + typed client over the syscall API (and an in-process mode), `llm` / `memory` / `storage` / `tool` calls | L | B0.1 | **Done** (`agent-sdk`: `KernelClient` + `Agent` builder; create/list/send/tool/gate + providers/memory/load_package) |
+| **B0.1** | Syscall server: expose `AgentKernelImpl` over the canonical JSON syscall API (TCP + Unix socket); explicitly retire the numbered prototype from the public boundary | XL | — | **Done** (`syscall_server`: agent lifecycle + LLM turn/providers + memory store/query/update/delete/reindex + tool call + gate stats/agent info; TCP **and** Unix socket; optional shared-secret auth; enforcement over the wire; see ADR 0001) |
+| **B0.2** | Embeddable **Rust SDK** crate: `Agent` builder + typed client over the syscall API (and an in-process mode), `llm` / `memory` / `storage` / `tool` calls | L | B0.1 | **Done** (`agent-sdk`: `KernelClient` + `Agent` builder; create/list/send/tool/gate + providers/memory lifecycle/load_package) |
 | **B0.3** | Agent package format + loader/runner (a Rust agent crate + a manifest the kernel can load and run) | M | B0.2 | **Done** (`agent_package`: TOML `AgentManifest` + `load_package`/`run_package`; `LoadPackage` syscall + SDK; `docs/AGENT_PACKAGE.md` + sample) |
 
 ## Phase 1 — LLM Core
 
 | ID | Title | Size | Deps | Notes |
 |----|-------|------|------|-------|
-| **B1.1** | LLM backend breadth: add more `LlmProviderAdapter`s — 4 → 9+ | M | — | **Done** (9 providers: azure-openai, openai, anthropic, local, groq, deepseek, gemini, vllm, huggingface; routing/failover via the connector) |
+| **B1.1** | LLM backend breadth: add more `LlmProviderAdapter`s — 4 → 9+ | M | — | **Public-API E2E** (9 network providers plus feature-gated on-device GGUF; typed errors, cancellation/timeouts, circuits, compatible routing, exact attempt accounting, fixtures, and protected evidence workflows are implemented. Production promotion waits for reviewed live/provider-model artifacts in #120.) |
 | **B1.2** | LLM-request scheduling: scheduler dispatches queued LLM *requests* to LLM cores (CFS-inspired `TurnAdmission` gates agent *turns*) | L | B0.1 | **Production-qualified** (bounded per-request LLM cores, priority aging, cancellation-safe RAII admission, starvation escape, shared-resource priority inheritance, class/yield metrics, and sustained contention tests; scheduling remains cooperative rather than CPU preemption). |
 | **B1.3** | Function-calling shim for open-source models (structured tool-calling for models without native support) | M | — | **Done** (`function_calling`: render_tools_prompt + parse_tool_calls; executor plaintext-fallback path) |
 
@@ -65,7 +65,7 @@ Sizes: **S** ≈ days, **M** ≈ 1–2 weeks, **L** ≈ 3–6 weeks, **XL** ≈ 
 
 | ID | Title | Size | Deps | Notes |
 |----|-------|------|------|-------|
-| **B3.1** | Memory Manager with retrieval: promote `query_memory` into a per-agent subsystem with embeddings + vector search | L | — | **Done** (`memory_manager`: deterministic offline feature-hash embedder + cosine ranking; `query_memory` now semantic, transparent to the memory syscalls) |
+| **B3.1** | Memory Manager with retrieval: promote `query_memory` into a per-agent subsystem with embeddings + vector search | L | — | **Public-API E2E** (`memory_manager`: versioned deterministic offline embeddings, exact + LSH ranking, stale/corrupt rebuild, owner update/delete/reindex, concurrent/purge regressions, and a blocking exact-vs-ANN quality gate. Sustained cached-index/100k+ performance remains #125.) |
 | **B3.2** | Storage Manager: formalize persistent-storage syscalls beyond raw SQLite | M | B0.1 | **Done** (per-agent `agent_kv` store on SqliteContextManager; `Storage{Put,Get,List,Delete}` syscalls + SDK methods) |
 | **B3.3** | Semantic file system over agent storage | XL | B3.2 | **Optional / defer** |
 

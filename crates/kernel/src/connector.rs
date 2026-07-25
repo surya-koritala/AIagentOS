@@ -21,7 +21,7 @@
 //! deterministic — production uses [`TokioClock`] (real `tokio::time::sleep`),
 //! tests use a no-op clock.
 
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use dashmap::DashMap;
@@ -37,12 +37,20 @@ use crate::{AgentId, ConnectorError, ProviderId};
 /// is treated as transient.
 pub fn is_transient(err: &ConnectorError) -> bool {
     match err {
-        ConnectorError::ProviderUnavailable(_) => true,
-        ConnectorError::ConnectionFailed(_) => true,
-        ConnectorError::StreamError(_) => true,
+        ConnectorError::ProviderUnavailable(_)
+        | ConnectorError::ConnectionFailed(_)
+        | ConnectorError::StreamError(_)
+        | ConnectorError::RateLimited(_)
+        | ConnectorError::ServiceUnavailable(_)
+        | ConnectorError::Timeout(_) => true,
         // Protocol errors include auth / bad-request style failures that will
         // not succeed on retry.
-        ConnectorError::ProtocolError(_) => false,
+        ConnectorError::ProtocolError(_)
+        | ConnectorError::Authentication(_)
+        | ConnectorError::Authorization(_)
+        | ConnectorError::InvalidRequest(_)
+        | ConnectorError::ContentFiltered(_)
+        | ConnectorError::Cancelled(_) => false,
     }
 }
 
@@ -102,6 +110,51 @@ pub enum ProviderType {
     Local,
 }
 
+/// Provider features that have an adapter implementation and qualification
+/// evidence. Defaults are deliberately conservative for third-party adapters.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderCapabilities {
+    pub native_streaming: bool,
+    pub tool_calls: bool,
+    pub parallel_tool_calls: bool,
+    pub vision: bool,
+    pub audio: bool,
+    pub prompt_cancellation: bool,
+    pub model_discovery: bool,
+    /// Operator-facing API family/version such as `openai-v1`.
+    pub api_family: String,
+    /// Regions in which the adapter guarantees processing. Empty means no
+    /// data-residency guarantee is being made.
+    pub data_regions: Vec<String>,
+}
+
+impl Default for ProviderCapabilities {
+    fn default() -> Self {
+        Self {
+            native_streaming: false,
+            tool_calls: false,
+            parallel_tool_calls: false,
+            vision: false,
+            audio: false,
+            prompt_cancellation: false,
+            model_discovery: false,
+            api_family: "custom".into(),
+            data_regions: Vec::new(),
+        }
+    }
+}
+
+/// Fail-closed routing controls for provider failover.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderRoutingPolicy {
+    /// Required processing region. A provider with no region declaration is
+    /// incompatible when this is set.
+    pub required_region: Option<String>,
+    /// Local prompts do not fail over to cloud providers unless explicitly
+    /// allowed by an operator.
+    pub allow_local_to_cloud: bool,
+}
+
 /// Information about a registered provider.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderInfo {
@@ -109,6 +162,14 @@ pub struct ProviderInfo {
     pub name: String,
     pub provider_type: ProviderType,
     pub available: bool,
+    #[serde(default)]
+    pub circuit_open: bool,
+    #[serde(default)]
+    pub consecutive_failures: u32,
+    #[serde(default)]
+    pub capabilities: ProviderCapabilities,
+    #[serde(default)]
+    pub routing_policy: ProviderRoutingPolicy,
 }
 
 /// A standard message format for LLM communication.
@@ -228,6 +289,9 @@ pub struct LlmRequestOptions {
     /// Maximum number of new/completion tokens the provider may generate.
     /// `None` preserves the adapter's configured default.
     pub max_output_tokens: Option<u32>,
+    /// Per-attempt wall-clock timeout. This remains effective across resilient
+    /// retry and failover because it is forwarded to every fresh session.
+    pub timeout: Option<Duration>,
 }
 
 /// An LLM session for an agent.
@@ -252,6 +316,49 @@ pub trait LlmSession: Send + Sync {
         _options: LlmRequestOptions,
     ) -> Result<LlmResponse, ConnectorError> {
         self.send_with_tools(messages, tools).await
+    }
+
+    /// Cancellation-aware non-streaming send. Hosted adapters inherit
+    /// cancellation by dropping their request future. Local inference adapters
+    /// should override this and observe the token inside their decode loop.
+    async fn send_controlled(
+        &self,
+        messages: Vec<StandardMessage>,
+        tools: &[ToolDefinition],
+        options: LlmRequestOptions,
+        cancellation: &tokio_util::sync::CancellationToken,
+    ) -> Result<LlmResponse, ConnectorError> {
+        let provider_id = self.provider_id().clone();
+        let send = self.send_with_options(messages, tools, options);
+        tokio::pin!(send);
+        match options.timeout {
+            Some(timeout) => {
+                tokio::select! {
+                    biased;
+                    _ = cancellation.cancelled() => {
+                        Err(ConnectorError::cancelled(provider_id, None))
+                    }
+                    result = tokio::time::timeout(timeout, &mut send) => {
+                        result.unwrap_or_else(|_| {
+                            Err(ConnectorError::timeout(
+                                provider_id,
+                                format!("attempt exceeded {} ms", timeout.as_millis()),
+                                None,
+                            ))
+                        })
+                    }
+                }
+            }
+            None => {
+                tokio::select! {
+                    biased;
+                    _ = cancellation.cancelled() => {
+                        Err(ConnectorError::cancelled(provider_id, None))
+                    }
+                    result = &mut send => result,
+                }
+            }
+        }
     }
 
     /// Whether this session translates and enforces
@@ -280,6 +387,26 @@ pub trait LlmSession: Send + Sync {
         None
     }
 
+    /// Actual provider and model that served the latest successful call.
+    fn last_attribution(&self) -> Option<(ProviderId, String)> {
+        None
+    }
+
+    /// Number of provider attempts used by the latest successful call.
+    fn last_attempts(&self) -> Option<u32> {
+        None
+    }
+
+    /// Whether retry and failover are already managed inside this session.
+    fn handles_retries(&self) -> bool {
+        false
+    }
+
+    /// Worst-case number of provider attempts one logical send can start.
+    fn max_provider_attempts(&self) -> u32 {
+        1
+    }
+
     /// Send with streaming support. Default falls back to non-streaming.
     async fn send_streaming(
         &self,
@@ -302,6 +429,47 @@ pub trait LlmSession: Send + Sync {
     ) -> Result<LlmResponse, ConnectorError> {
         self.send_with_options(messages, tools, options).await
     }
+
+    /// Cancellation-aware streaming counterpart.
+    async fn send_streaming_controlled(
+        &self,
+        messages: Vec<StandardMessage>,
+        tools: &[ToolDefinition],
+        options: LlmRequestOptions,
+        cancellation: &tokio_util::sync::CancellationToken,
+    ) -> Result<LlmResponse, ConnectorError> {
+        let provider_id = self.provider_id().clone();
+        let send = self.send_streaming_with_options(messages, tools, options);
+        tokio::pin!(send);
+        match options.timeout {
+            Some(timeout) => {
+                tokio::select! {
+                    biased;
+                    _ = cancellation.cancelled() => {
+                        Err(ConnectorError::cancelled(provider_id, None))
+                    }
+                    result = tokio::time::timeout(timeout, &mut send) => {
+                        result.unwrap_or_else(|_| {
+                            Err(ConnectorError::timeout(
+                                provider_id,
+                                format!("attempt exceeded {} ms", timeout.as_millis()),
+                                None,
+                            ))
+                        })
+                    }
+                }
+            }
+            None => {
+                tokio::select! {
+                    biased;
+                    _ = cancellation.cancelled() => {
+                        Err(ConnectorError::cancelled(provider_id, None))
+                    }
+                    result = &mut send => result,
+                }
+            }
+        }
+    }
 }
 
 /// An LLM provider adapter.
@@ -312,6 +480,9 @@ pub trait LlmProviderAdapter: Send + Sync {
     fn provider_type(&self) -> ProviderType;
     async fn is_available(&self) -> bool;
     async fn create_session(&self) -> Result<Box<dyn LlmSession>, ConnectorError>;
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities::default()
+    }
     /// Translate standard messages to provider format and back (for testing round-trip).
     fn translate_to_provider(&self, msg: &StandardMessage) -> serde_json::Value;
     fn translate_from_provider(&self, value: &serde_json::Value) -> Option<StandardMessage>;
@@ -336,6 +507,8 @@ pub struct SendOutcome {
     pub response: LlmResponse,
     /// The provider that ultimately produced the response (may be a backup).
     pub served_by: ProviderId,
+    /// Concrete provider model/deployment that produced the response.
+    pub model_id: String,
     /// Total number of attempts made across all providers tried.
     pub attempts: u32,
 }
@@ -345,6 +518,27 @@ pub struct SendOutcome {
 pub enum SendMode {
     NonStreaming,
     Streaming,
+}
+
+struct ProviderSend<'a> {
+    messages: &'a [StandardMessage],
+    tools: &'a [ToolDefinition],
+    mode: SendMode,
+    options: LlmRequestOptions,
+    cancellation: &'a tokio_util::sync::CancellationToken,
+}
+
+struct FailoverControls<'a> {
+    mode: SendMode,
+    options: LlmRequestOptions,
+    cancellation: &'a tokio_util::sync::CancellationToken,
+    observed_attempts: Option<&'a std::sync::atomic::AtomicU32>,
+    max_attempts_per_provider: Option<u32>,
+}
+
+struct ProviderAttemptOutcome {
+    response: LlmResponse,
+    model_id: String,
 }
 
 /// Concrete agent connector implementation.
@@ -358,6 +552,10 @@ pub struct AgentConnectorImpl {
     retry_policy: RetryPolicy,
     /// Clock used for backoff sleeps (injectable for deterministic tests).
     clock: Arc<dyn Clock>,
+    /// Per-provider failure isolation.
+    circuit_breakers: DashMap<ProviderId, Arc<crate::production::CircuitBreaker>>,
+    /// Fail-closed residency and local/cloud routing rules, keyed by primary.
+    routing_policies: DashMap<ProviderId, ProviderRoutingPolicy>,
 }
 
 impl Default for AgentConnectorImpl {
@@ -374,6 +572,8 @@ impl AgentConnectorImpl {
             sessions: DashMap::new(),
             retry_policy: RetryPolicy::default(),
             clock: Arc::new(TokioClock),
+            circuit_breakers: DashMap::new(),
+            routing_policies: DashMap::new(),
         }
     }
 
@@ -399,6 +599,17 @@ impl AgentConnectorImpl {
                 name: provider.name().to_string(),
                 provider_type: provider.provider_type(),
                 available: provider.is_available().await,
+                circuit_open: self
+                    .circuit_breakers
+                    .get(provider.id())
+                    .is_some_and(|breaker| !breaker.status().0),
+                consecutive_failures: self
+                    .circuit_breakers
+                    .get(provider.id())
+                    .map(|breaker| breaker.status().1)
+                    .unwrap_or(0),
+                capabilities: provider.capabilities(),
+                routing_policy: self.routing_policy(provider.id()),
             });
         }
         health.sort_by(|a, b| a.id.cmp(&b.id));
@@ -414,6 +625,50 @@ impl AgentConnectorImpl {
     /// Set a backup provider for failover.
     pub fn set_backup(&self, primary: &ProviderId, backup: &ProviderId) {
         self.backup_provider.insert(primary.clone(), backup.clone());
+    }
+
+    pub fn set_routing_policy(&self, provider: &ProviderId, policy: ProviderRoutingPolicy) {
+        self.routing_policies.insert(provider.clone(), policy);
+    }
+
+    fn routing_policy(&self, provider: &ProviderId) -> ProviderRoutingPolicy {
+        self.routing_policies
+            .get(provider)
+            .map(|policy| policy.value().clone())
+            .unwrap_or_default()
+    }
+
+    fn provider_is_compatible(
+        &self,
+        primary_type: &ProviderType,
+        candidate: &dyn LlmProviderAdapter,
+        tools: &[ToolDefinition],
+        policy: &ProviderRoutingPolicy,
+        is_primary: bool,
+    ) -> bool {
+        let capabilities = candidate.capabilities();
+        // An explicitly selected primary may be a third-party adapter written
+        // before capability declarations were added. Compatibility is a
+        // failover boundary: conservative defaults must prevent a prompt from
+        // reaching an incompatible *backup* without breaking the chosen
+        // primary's existing contract.
+        if !is_primary && !tools.is_empty() && !capabilities.tool_calls {
+            return false;
+        }
+        if !is_primary
+            && *primary_type == ProviderType::Local
+            && candidate.provider_type() == ProviderType::Cloud
+            && !policy.allow_local_to_cloud
+        {
+            return false;
+        }
+        if let Some(required_region) = &policy.required_region {
+            return capabilities
+                .data_regions
+                .iter()
+                .any(|region| region.eq_ignore_ascii_case(required_region));
+        }
+        true
     }
 
     /// Resolve the ordered failover chain starting at `primary`: the primary
@@ -454,11 +709,65 @@ impl AgentConnectorImpl {
         tools: &[ToolDefinition],
         mode: SendMode,
     ) -> Result<SendOutcome, ConnectorError> {
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        self.send_with_failover_controlled(
+            primary,
+            messages,
+            tools,
+            mode,
+            LlmRequestOptions::default(),
+            &cancellation,
+        )
+        .await
+    }
+
+    /// Cancellation- and output-bound-aware resilient send used by production
+    /// executors. Every retry and failover attempt receives the same controls.
+    pub async fn send_with_failover_controlled(
+        &self,
+        primary: &ProviderId,
+        messages: Vec<StandardMessage>,
+        tools: &[ToolDefinition],
+        mode: SendMode,
+        options: LlmRequestOptions,
+        cancellation: &tokio_util::sync::CancellationToken,
+    ) -> Result<SendOutcome, ConnectorError> {
+        self.send_with_failover_observed(
+            primary,
+            messages,
+            tools,
+            FailoverControls {
+                mode,
+                options,
+                cancellation,
+                observed_attempts: None,
+                max_attempts_per_provider: None,
+            },
+        )
+        .await
+    }
+
+    async fn send_with_failover_observed(
+        &self,
+        primary: &ProviderId,
+        messages: Vec<StandardMessage>,
+        tools: &[ToolDefinition],
+        controls: FailoverControls<'_>,
+    ) -> Result<SendOutcome, ConnectorError> {
+        if let Some(attempts) = controls.observed_attempts {
+            attempts.store(0, std::sync::atomic::Ordering::Release);
+        }
         let chain = self.failover_chain(primary);
         let mut total_attempts: u32 = 0;
         let mut last_err: Option<ConnectorError> = None;
+        let routing_policy = self.routing_policy(primary);
+        let primary_type = self
+            .providers
+            .get(primary)
+            .map(|provider| provider.provider_type())
+            .unwrap_or(ProviderType::Cloud);
 
-        for provider_id in chain {
+        for (provider_index, provider_id) in chain.into_iter().enumerate() {
             let adapter = match self.providers.get(&provider_id) {
                 Some(a) => a.value().clone(),
                 None => {
@@ -466,27 +775,73 @@ impl AgentConnectorImpl {
                     continue;
                 }
             };
-
-            // A registered-but-unavailable provider is a transient condition:
-            // skip straight to failover without burning the retry budget.
-            if !adapter.is_available().await {
-                total_attempts = total_attempts.saturating_add(1);
-                last_err = Some(ConnectorError::ProviderUnavailable(provider_id.clone()));
+            if !self.provider_is_compatible(
+                &primary_type,
+                adapter.as_ref(),
+                tools,
+                &routing_policy,
+                provider_index == 0,
+            ) {
+                last_err = Some(ConnectorError::ProviderUnavailable(format!(
+                    "{provider_id} is incompatible with the request routing policy"
+                )));
+                continue;
+            }
+            let breaker = self
+                .circuit_breakers
+                .get(&provider_id)
+                .map(|breaker| Arc::clone(breaker.value()));
+            if breaker
+                .as_ref()
+                .is_some_and(|breaker| !breaker.is_available())
+            {
+                last_err = Some(ConnectorError::ProviderUnavailable(format!(
+                    "{provider_id} circuit is open"
+                )));
                 continue;
             }
 
             match self
-                .send_one_provider(&adapter, &messages, tools, mode, &mut total_attempts)
+                .send_one_provider(
+                    &adapter,
+                    ProviderSend {
+                        messages: &messages,
+                        tools,
+                        mode: controls.mode,
+                        options: controls.options,
+                        cancellation: controls.cancellation,
+                    },
+                    &mut total_attempts,
+                    controls.observed_attempts,
+                    controls.max_attempts_per_provider,
+                )
                 .await
             {
-                Ok(response) => {
+                Ok(outcome) => {
+                    if let Some(breaker) = &breaker {
+                        breaker.record_success();
+                    }
                     return Ok(SendOutcome {
-                        response,
+                        response: outcome.response,
                         served_by: provider_id,
+                        model_id: outcome.model_id,
                         attempts: total_attempts,
                     });
                 }
-                Err(e) => last_err = Some(e),
+                Err(error) => {
+                    if matches!(
+                        error,
+                        ConnectorError::Cancelled(_) | ConnectorError::ContentFiltered(_)
+                    ) {
+                        return Err(error);
+                    }
+                    if is_transient(&error) {
+                        if let Some(breaker) = &breaker {
+                            breaker.record_failure();
+                        }
+                    }
+                    last_err = Some(error);
+                }
             }
         }
 
@@ -501,21 +856,30 @@ impl AgentConnectorImpl {
     async fn send_one_provider(
         &self,
         adapter: &Arc<dyn LlmProviderAdapter>,
-        messages: &[StandardMessage],
-        tools: &[ToolDefinition],
-        mode: SendMode,
+        request: ProviderSend<'_>,
         total_attempts: &mut u32,
-    ) -> Result<LlmResponse, ConnectorError> {
-        let max_attempts = self.retry_policy.max_attempts.max(1);
+        observed_attempts: Option<&std::sync::atomic::AtomicU32>,
+        max_attempts_per_provider: Option<u32>,
+    ) -> Result<ProviderAttemptOutcome, ConnectorError> {
+        let max_attempts = max_attempts_per_provider
+            .unwrap_or(self.retry_policy.max_attempts)
+            .max(1);
         let mut last_err: Option<ConnectorError> = None;
 
         for attempt in 0..max_attempts {
             if attempt > 0 {
-                self.clock
-                    .sleep(self.retry_policy.backoff_for(attempt - 1))
-                    .await;
+                tokio::select! {
+                    biased;
+                    _ = request.cancellation.cancelled() => {
+                        return Err(ConnectorError::cancelled(adapter.id().clone(), None));
+                    }
+                    _ = self.clock.sleep(self.retry_policy.backoff_for(attempt - 1)) => {}
+                }
             }
             *total_attempts = total_attempts.saturating_add(1);
+            if let Some(observed) = observed_attempts {
+                observed.store(*total_attempts, std::sync::atomic::Ordering::Release);
+            }
 
             // A fresh session per attempt so a torn-down connection is rebuilt.
             let session = match adapter.create_session().await {
@@ -529,15 +893,48 @@ impl AgentConnectorImpl {
                     continue;
                 }
             };
+            if request.options.max_output_tokens.is_some() && !session.enforces_max_output_tokens()
+            {
+                return Err(ConnectorError::invalid_request(
+                    adapter.id().clone(),
+                    "adapter does not enforce max_output_tokens",
+                    None,
+                ));
+            }
+            let model_id = session.model_id().to_string();
 
-            let result = match mode {
-                SendMode::NonStreaming => session.send_with_tools(messages.to_vec(), tools).await,
-                SendMode::Streaming => session.send_streaming(messages.to_vec(), tools).await,
+            let result = match request.mode {
+                SendMode::NonStreaming => {
+                    session
+                        .send_controlled(
+                            request.messages.to_vec(),
+                            request.tools,
+                            request.options,
+                            request.cancellation,
+                        )
+                        .await
+                }
+                SendMode::Streaming => {
+                    session
+                        .send_streaming_controlled(
+                            request.messages.to_vec(),
+                            request.tools,
+                            request.options,
+                            request.cancellation,
+                        )
+                        .await
+                }
             };
 
             match result {
-                Ok(response) => return Ok(response),
+                Ok(response) => return Ok(ProviderAttemptOutcome { response, model_id }),
                 Err(e) => {
+                    if matches!(
+                        e,
+                        ConnectorError::Cancelled(_) | ConnectorError::ContentFiltered(_)
+                    ) {
+                        return Err(e);
+                    }
                     let transient = is_transient(&e);
                     last_err = Some(e);
                     // Permanent errors won't improve with retry on this provider.
@@ -552,6 +949,187 @@ impl AgentConnectorImpl {
             ConnectorError::ConnectionFailed("no attempts produced a result".into())
         }))
     }
+
+    /// Create a session that keeps retry and failover load-bearing after the
+    /// executor has been constructed.
+    pub async fn connect_resilient(
+        self: &Arc<Self>,
+        agent_id: AgentId,
+        provider_id: &ProviderId,
+    ) -> Result<Box<dyn LlmSession>, ConnectorError> {
+        let provider = self
+            .providers
+            .get(provider_id)
+            .map(|provider| Arc::clone(provider.value()))
+            .ok_or_else(|| ConnectorError::ProviderUnavailable(provider_id.clone()))?;
+        let configured_model = provider.create_session().await?.model_id().to_string();
+        self.sessions.insert(agent_id, provider_id.clone());
+        Ok(Box::new(ResilientSession {
+            connector: Arc::clone(self),
+            primary: provider_id.clone(),
+            configured_model: configured_model.clone(),
+            last_attribution: RwLock::new((provider_id.clone(), configured_model)),
+            last_attempts: std::sync::atomic::AtomicU32::new(0),
+        }))
+    }
+}
+
+struct ResilientSession {
+    connector: Arc<AgentConnectorImpl>,
+    primary: ProviderId,
+    configured_model: String,
+    last_attribution: RwLock<(ProviderId, String)>,
+    last_attempts: std::sync::atomic::AtomicU32,
+}
+
+#[async_trait::async_trait]
+impl LlmSession for ResilientSession {
+    async fn send(&self, messages: Vec<StandardMessage>) -> Result<LlmResponse, ConnectorError> {
+        self.send_with_tools(messages, &[]).await
+    }
+
+    async fn send_with_tools(
+        &self,
+        messages: Vec<StandardMessage>,
+        tools: &[ToolDefinition],
+    ) -> Result<LlmResponse, ConnectorError> {
+        self.send_with_options(messages, tools, LlmRequestOptions::default())
+            .await
+    }
+
+    async fn send_with_options(
+        &self,
+        messages: Vec<StandardMessage>,
+        tools: &[ToolDefinition],
+        options: LlmRequestOptions,
+    ) -> Result<LlmResponse, ConnectorError> {
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        self.send_controlled(messages, tools, options, &cancellation)
+            .await
+    }
+
+    async fn send_controlled(
+        &self,
+        messages: Vec<StandardMessage>,
+        tools: &[ToolDefinition],
+        options: LlmRequestOptions,
+        cancellation: &tokio_util::sync::CancellationToken,
+    ) -> Result<LlmResponse, ConnectorError> {
+        let outcome = self
+            .connector
+            .send_with_failover_observed(
+                &self.primary,
+                messages,
+                tools,
+                FailoverControls {
+                    mode: SendMode::NonStreaming,
+                    options,
+                    cancellation,
+                    observed_attempts: Some(&self.last_attempts),
+                    max_attempts_per_provider: Some(1),
+                },
+            )
+            .await?;
+        self.last_attempts
+            .store(outcome.attempts, std::sync::atomic::Ordering::Release);
+        *self
+            .last_attribution
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            (outcome.served_by, outcome.model_id);
+        Ok(outcome.response)
+    }
+
+    async fn send_streaming(
+        &self,
+        messages: Vec<StandardMessage>,
+        tools: &[ToolDefinition],
+    ) -> Result<LlmResponse, ConnectorError> {
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        self.send_streaming_controlled(messages, tools, LlmRequestOptions::default(), &cancellation)
+            .await
+    }
+
+    async fn send_streaming_with_options(
+        &self,
+        messages: Vec<StandardMessage>,
+        tools: &[ToolDefinition],
+        options: LlmRequestOptions,
+    ) -> Result<LlmResponse, ConnectorError> {
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        self.send_streaming_controlled(messages, tools, options, &cancellation)
+            .await
+    }
+
+    async fn send_streaming_controlled(
+        &self,
+        messages: Vec<StandardMessage>,
+        tools: &[ToolDefinition],
+        options: LlmRequestOptions,
+        cancellation: &tokio_util::sync::CancellationToken,
+    ) -> Result<LlmResponse, ConnectorError> {
+        let outcome = self
+            .connector
+            .send_with_failover_observed(
+                &self.primary,
+                messages,
+                tools,
+                FailoverControls {
+                    mode: SendMode::Streaming,
+                    options,
+                    cancellation,
+                    observed_attempts: Some(&self.last_attempts),
+                    max_attempts_per_provider: Some(1),
+                },
+            )
+            .await?;
+        self.last_attempts
+            .store(outcome.attempts, std::sync::atomic::Ordering::Release);
+        *self
+            .last_attribution
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            (outcome.served_by, outcome.model_id);
+        Ok(outcome.response)
+    }
+
+    fn enforces_max_output_tokens(&self) -> bool {
+        true
+    }
+
+    fn provider_id(&self) -> &ProviderId {
+        &self.primary
+    }
+
+    fn model_id(&self) -> &str {
+        &self.configured_model
+    }
+
+    fn last_attribution(&self) -> Option<(ProviderId, String)> {
+        Some(
+            self.last_attribution
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone(),
+        )
+    }
+
+    fn last_attempts(&self) -> Option<u32> {
+        Some(
+            self.last_attempts
+                .load(std::sync::atomic::Ordering::Acquire),
+        )
+    }
+
+    fn handles_retries(&self) -> bool {
+        false
+    }
+
+    fn max_provider_attempts(&self) -> u32 {
+        u32::try_from(self.connector.failover_chain(&self.primary).len())
+            .unwrap_or(u32::MAX)
+            .max(1)
+    }
 }
 
 #[async_trait::async_trait]
@@ -561,7 +1139,9 @@ impl AgentConnector for AgentConnectorImpl {
         adapter: Arc<dyn LlmProviderAdapter>,
     ) -> Result<(), ConnectorError> {
         let id = adapter.id().clone();
-        self.providers.insert(id, adapter);
+        self.providers.insert(id.clone(), adapter);
+        self.circuit_breakers
+            .insert(id, Arc::new(crate::production::CircuitBreaker::new(3, 30)));
         Ok(())
     }
 
@@ -607,7 +1187,21 @@ impl AgentConnector for AgentConnectorImpl {
                     id: adapter.id().clone(),
                     name: adapter.name().to_string(),
                     provider_type: adapter.provider_type(),
-                    available: true, // Async check not possible in sync method
+                    available: self
+                        .circuit_breakers
+                        .get(adapter.id())
+                        .is_none_or(|breaker| breaker.status().0),
+                    circuit_open: self
+                        .circuit_breakers
+                        .get(adapter.id())
+                        .is_some_and(|breaker| !breaker.status().0),
+                    consecutive_failures: self
+                        .circuit_breakers
+                        .get(adapter.id())
+                        .map(|breaker| breaker.status().1)
+                        .unwrap_or(0),
+                    capabilities: adapter.capabilities(),
+                    routing_policy: self.routing_policy(adapter.id()),
                 }
             })
             .collect()
@@ -747,6 +1341,131 @@ mod tests {
         }
     }
 
+    struct QualificationAdapter {
+        id: ProviderId,
+        provider_type: ProviderType,
+        capabilities: ProviderCapabilities,
+        model_id: String,
+        error: Option<ConnectorError>,
+        block: bool,
+        attempts: Arc<std::sync::atomic::AtomicU32>,
+    }
+
+    struct QualificationSession {
+        provider_id: ProviderId,
+        model_id: String,
+        error: Option<ConnectorError>,
+        block: bool,
+        attempts: Arc<std::sync::atomic::AtomicU32>,
+    }
+
+    #[async_trait::async_trait]
+    impl LlmSession for QualificationSession {
+        async fn send(
+            &self,
+            _messages: Vec<StandardMessage>,
+        ) -> Result<LlmResponse, ConnectorError> {
+            self.attempts
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.block {
+                std::future::pending::<()>().await;
+            }
+            if let Some(error) = &self.error {
+                return Err(error.clone());
+            }
+            Ok(LlmResponse {
+                content: format!("ok from {}", self.provider_id),
+                finish_reason: Some("stop".into()),
+                tokens_used: 7,
+                usage: LlmUsage::reported(5, 2, 0),
+                tool_calls: vec![],
+            })
+        }
+
+        async fn send_with_tools(
+            &self,
+            messages: Vec<StandardMessage>,
+            _tools: &[ToolDefinition],
+        ) -> Result<LlmResponse, ConnectorError> {
+            self.send(messages).await
+        }
+
+        fn enforces_max_output_tokens(&self) -> bool {
+            true
+        }
+
+        fn provider_id(&self) -> &ProviderId {
+            &self.provider_id
+        }
+
+        fn model_id(&self) -> &str {
+            &self.model_id
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl LlmProviderAdapter for QualificationAdapter {
+        fn id(&self) -> &ProviderId {
+            &self.id
+        }
+
+        fn name(&self) -> &str {
+            "Qualification"
+        }
+
+        fn provider_type(&self) -> ProviderType {
+            self.provider_type.clone()
+        }
+
+        async fn is_available(&self) -> bool {
+            true
+        }
+
+        async fn create_session(&self) -> Result<Box<dyn LlmSession>, ConnectorError> {
+            Ok(Box::new(QualificationSession {
+                provider_id: self.id.clone(),
+                model_id: self.model_id.clone(),
+                error: self.error.clone(),
+                block: self.block,
+                attempts: Arc::clone(&self.attempts),
+            }))
+        }
+
+        fn capabilities(&self) -> ProviderCapabilities {
+            self.capabilities.clone()
+        }
+
+        fn translate_to_provider(&self, msg: &StandardMessage) -> serde_json::Value {
+            serde_json::json!({"role": msg.role, "content": msg.content})
+        }
+
+        fn translate_from_provider(&self, value: &serde_json::Value) -> Option<StandardMessage> {
+            Some(StandardMessage::user(value.get("content")?.as_str()?))
+        }
+    }
+
+    fn qualification_adapter(
+        id: &str,
+        provider_type: ProviderType,
+        model_id: &str,
+        error: Option<ConnectorError>,
+        attempts: Arc<std::sync::atomic::AtomicU32>,
+    ) -> QualificationAdapter {
+        QualificationAdapter {
+            id: id.into(),
+            provider_type,
+            capabilities: ProviderCapabilities {
+                tool_calls: true,
+                prompt_cancellation: true,
+                ..ProviderCapabilities::default()
+            },
+            model_id: model_id.into(),
+            error,
+            block: false,
+            attempts,
+        }
+    }
+
     #[async_trait::async_trait]
     impl LlmProviderAdapter for ScriptedAdapter {
         fn id(&self) -> &ProviderId {
@@ -762,6 +1481,9 @@ mod tests {
             self.available
         }
         async fn create_session(&self) -> Result<Box<dyn LlmSession>, ConnectorError> {
+            if !self.available {
+                return Err(ConnectorError::ProviderUnavailable(self.id.clone()));
+            }
             Ok(Box::new(ScriptedSession {
                 provider_id: self.id.clone(),
                 fail_count: self.fail_count,
@@ -1044,6 +1766,202 @@ mod tests {
             chain,
             vec!["a".to_string(), "b".to_string(), "c".to_string()]
         );
+    }
+
+    #[tokio::test]
+    async fn cancellation_stops_retry_and_failover_without_duplicate_side_effects() {
+        let connector = fast_connector();
+        let primary_attempts = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let backup_attempts = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let mut primary = qualification_adapter(
+            "primary",
+            ProviderType::Cloud,
+            "primary-model",
+            None,
+            Arc::clone(&primary_attempts),
+        );
+        primary.block = true;
+        connector.register_provider(Arc::new(primary)).unwrap();
+        connector
+            .register_provider(Arc::new(qualification_adapter(
+                "backup",
+                ProviderType::Cloud,
+                "backup-model",
+                None,
+                Arc::clone(&backup_attempts),
+            )))
+            .unwrap();
+        connector.set_backup(&"primary".into(), &"backup".into());
+
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let cancellation_trigger = cancellation.clone();
+        tokio::spawn(async move {
+            tokio::task::yield_now().await;
+            cancellation_trigger.cancel();
+        });
+        let error = connector
+            .send_with_failover_controlled(
+                &"primary".into(),
+                vec![StandardMessage::user("cancel me")],
+                &[],
+                SendMode::NonStreaming,
+                LlmRequestOptions::default(),
+                &cancellation,
+            )
+            .await
+            .expect_err("cancellation must stop the whole failover chain");
+
+        assert!(matches!(error, ConnectorError::Cancelled(_)));
+        assert_eq!(
+            primary_attempts.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert_eq!(backup_attempts.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn incompatible_tool_backup_is_never_invoked() {
+        let connector = fast_connector();
+        let primary_attempts = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let backup_attempts = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        connector
+            .register_provider(Arc::new(qualification_adapter(
+                "primary",
+                ProviderType::Cloud,
+                "primary-model",
+                Some(ConnectorError::ConnectionFailed("offline".into())),
+                Arc::clone(&primary_attempts),
+            )))
+            .unwrap();
+        let mut backup = qualification_adapter(
+            "backup",
+            ProviderType::Cloud,
+            "backup-model",
+            None,
+            Arc::clone(&backup_attempts),
+        );
+        backup.capabilities.tool_calls = false;
+        connector.register_provider(Arc::new(backup)).unwrap();
+        connector.set_backup(&"primary".into(), &"backup".into());
+        let tools = vec![ToolDefinition {
+            name: "read".into(),
+            description: "read".into(),
+            parameters: serde_json::json!({"type": "object"}),
+        }];
+
+        let error = connector
+            .send_with_failover(
+                &"primary".into(),
+                vec![StandardMessage::user("use a tool")],
+                &tools,
+                SendMode::NonStreaming,
+            )
+            .await
+            .expect_err("an incompatible backup must not receive the request");
+        assert!(matches!(error, ConnectorError::ProviderUnavailable(_)));
+        assert_eq!(backup_attempts.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn local_to_cloud_failover_requires_explicit_operator_opt_in() {
+        let connector = fast_connector();
+        let local_attempts = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let cloud_attempts = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        connector
+            .register_provider(Arc::new(qualification_adapter(
+                "local",
+                ProviderType::Local,
+                "local-model",
+                Some(ConnectorError::ConnectionFailed("offline".into())),
+                Arc::clone(&local_attempts),
+            )))
+            .unwrap();
+        connector
+            .register_provider(Arc::new(qualification_adapter(
+                "cloud",
+                ProviderType::Cloud,
+                "cloud-model",
+                None,
+                Arc::clone(&cloud_attempts),
+            )))
+            .unwrap();
+        connector.set_backup(&"local".into(), &"cloud".into());
+
+        connector
+            .send_with_failover(
+                &"local".into(),
+                vec![StandardMessage::user("private")],
+                &[],
+                SendMode::NonStreaming,
+            )
+            .await
+            .expect_err("local data must not fail over to cloud by default");
+        assert_eq!(cloud_attempts.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+        connector.set_routing_policy(
+            &"local".into(),
+            ProviderRoutingPolicy {
+                required_region: None,
+                allow_local_to_cloud: true,
+            },
+        );
+        let outcome = connector
+            .send_with_failover(
+                &"local".into(),
+                vec![StandardMessage::user("operator approved")],
+                &[],
+                SendMode::NonStreaming,
+            )
+            .await
+            .expect("explicit opt-in should allow cloud failover");
+        assert_eq!(outcome.served_by, "cloud");
+        assert_eq!(outcome.model_id, "cloud-model");
+    }
+
+    #[tokio::test]
+    async fn resilient_session_reports_actual_provider_model_and_attempts() {
+        let connector = Arc::new(fast_connector());
+        let primary_attempts = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let backup_attempts = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        connector
+            .register_provider(Arc::new(qualification_adapter(
+                "primary",
+                ProviderType::Cloud,
+                "configured-primary",
+                Some(ConnectorError::ConnectionFailed("offline".into())),
+                Arc::clone(&primary_attempts),
+            )))
+            .unwrap();
+        connector
+            .register_provider(Arc::new(qualification_adapter(
+                "backup",
+                ProviderType::Cloud,
+                "served-backup",
+                None,
+                Arc::clone(&backup_attempts),
+            )))
+            .unwrap();
+        connector.set_backup(&"primary".into(), &"backup".into());
+
+        let session = connector
+            .connect_resilient(uuid::Uuid::new_v4(), &"primary".into())
+            .await
+            .unwrap();
+        assert_eq!(session.model_id(), "configured-primary");
+        assert_eq!(session.max_provider_attempts(), 2);
+        assert!(
+            !session.handles_retries(),
+            "the executor owns retry rounds; this session owns one compatible failover attempt per provider"
+        );
+        session
+            .send(vec![StandardMessage::user("hello")])
+            .await
+            .unwrap();
+        assert_eq!(
+            session.last_attribution(),
+            Some(("backup".into(), "served-backup".into()))
+        );
+        assert_eq!(session.last_attempts(), Some(2));
     }
 
     #[tokio::test]

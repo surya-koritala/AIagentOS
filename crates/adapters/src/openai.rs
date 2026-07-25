@@ -8,6 +8,7 @@ pub struct OpenAiAdapter {
     client: reqwest::Client,
     api_key: String,
     base_url: String,
+    model: String,
 }
 
 impl OpenAiAdapter {
@@ -17,11 +18,17 @@ impl OpenAiAdapter {
             client: reqwest::Client::new(),
             api_key,
             base_url: "https://api.openai.com/v1".to_string(),
+            model: "gpt-4".to_string(),
         }
     }
 
     pub fn with_base_url(mut self, url: String) -> Self {
         self.base_url = url;
+        self
+    }
+
+    pub fn with_model(mut self, model: String) -> Self {
+        self.model = model;
         self
     }
 }
@@ -31,6 +38,7 @@ struct OpenAiSession {
     client: reqwest::Client,
     api_key: String,
     base_url: String,
+    model: String,
 }
 
 #[async_trait::async_trait]
@@ -74,7 +82,7 @@ impl LlmSession for OpenAiSession {
                 .collect();
 
         let mut body = serde_json::json!({
-            "model": "gpt-4",
+            "model": self.model,
             "messages": msgs,
         });
 
@@ -103,6 +111,12 @@ impl LlmSession for OpenAiSession {
                     .json()
                     .await
                     .map_err(|e| ConnectorError::ProtocolError(e.to_string()))?;
+                if let Some(error) = crate::content_filter_error(
+                    &self.provider_id,
+                    json["choices"][0]["finish_reason"].as_str(),
+                ) {
+                    return Err(error);
+                }
                 let content = json["choices"][0]["message"]["content"]
                     .as_str()
                     .unwrap_or("")
@@ -141,8 +155,8 @@ impl LlmSession for OpenAiSession {
                     tool_calls,
                 })
             }
-            Ok(resp) => Err(crate::http_status_error(resp.status(), None)),
-            Err(e) => Err(ConnectorError::ConnectionFailed(e.to_string())),
+            Ok(resp) => Err(crate::provider_http_error(&self.provider_id, resp).await),
+            Err(e) => Err(crate::transport_error(&self.provider_id, e)),
         }
     }
 
@@ -155,7 +169,7 @@ impl LlmSession for OpenAiSession {
     }
 
     fn model_id(&self) -> &str {
-        "gpt-4"
+        &self.model
     }
 }
 
@@ -169,6 +183,15 @@ impl LlmProviderAdapter for OpenAiAdapter {
     }
     fn provider_type(&self) -> ProviderType {
         ProviderType::Cloud
+    }
+    fn capabilities(&self) -> kernel::connector::ProviderCapabilities {
+        kernel::connector::ProviderCapabilities {
+            tool_calls: true,
+            parallel_tool_calls: true,
+            prompt_cancellation: true,
+            api_family: "openai-v1".into(),
+            ..Default::default()
+        }
     }
 
     async fn is_available(&self) -> bool {
@@ -187,6 +210,7 @@ impl LlmProviderAdapter for OpenAiAdapter {
             client: self.client.clone(),
             api_key: self.api_key.clone(),
             base_url: self.base_url.clone(),
+            model: self.model.clone(),
         }))
     }
 

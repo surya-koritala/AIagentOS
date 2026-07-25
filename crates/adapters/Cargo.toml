@@ -18,6 +18,8 @@ tokio-tungstenite = { workspace = true }
 tokio-stream = "0.1"
 futures-core = "0.3"
 tracing = { workspace = true }
+chrono = { workspace = true }
+tokio-util = { workspace = true }
 
 # On-device inference (pure-Rust, CPU). Optional + feature-gated so the default
 # build and CI footprint are untouched — these pull a large ML stack and long

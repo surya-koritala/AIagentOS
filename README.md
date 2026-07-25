@@ -60,6 +60,7 @@ AI Agent OS provides:
 - **IPC** — inter-agent messaging, delegation, and discovery (broker-routed via `IpcManager`)
 - **Service supervision** — validated dependency graphs, durable ownership/history, health-driven restart/backoff, and atomic rolling reload
 - **Packages** — signed archives, tenant trust roots, deterministic dependency locks, and transactional installs
+- **LLM and memory backends** — typed provider failures, bounded resilient routing, actual provider/model accounting, and versioned semantic memory
 
 > [!CAUTION]
 > Capability-mediated workspace and HTTP isolation is public-API E2E tested.
@@ -255,6 +256,9 @@ cargo run --package os-benchmark --bin os-demo --locked
 
 # Broader benchmark suite; results depend on the host and provider configuration
 cargo run --package os-benchmark --bin os-benchmark --locked
+
+# Deterministic exact-vs-ANN retrieval gate (JSON output; no model/network)
+cargo run --package os-benchmark --bin memory-qualification --locked
 ```
 
 Sustained-load methodology, SLOs, chaos testing, and publishable performance
@@ -272,23 +276,26 @@ qualification remain tracked by [#125](https://github.com/surya-koritala/AIagent
 
 ## LLM Providers
 
-Adapters run behind a connector with failover, retry/backoff, and rate-limiting
-under load. Tests use `wiremock` rather than live vendor APIs, so these statuses
-describe current fixture evidence—not production support. See the complete
-[provider contract matrix](docs/PROVIDERS.md).
+Adapters run behind a connector with typed errors, circuit breaking,
+compatibility-checked failover, bounded retry/backoff, cancellation/timeouts,
+and durable worst-case attempt admission. Pull-request tests use local fixtures;
+nightly protected workflows separately record `passed`, `failed`, or `not_run`
+live evidence. No provider is production-qualified merely because its fixture
+passes. See the complete [provider and memory qualification
+contract](docs/PROVIDERS.md).
 
 | Provider | Status |
 |----------|--------|
-| Azure OpenAI | Public-path E2E with native SSE/tools; live qualification pending — default |
-| OpenAI | Fixture-verified text/tools; live qualification pending |
-| Anthropic (Claude) | Fixture-verified text/tools; live qualification pending |
-| Gemini | Fixture-verified text only; tools not implemented |
-| Groq | Fixture-verified text/tools; live qualification pending |
-| DeepSeek | Fixture-verified text/tools; live qualification pending |
-| Hugging Face | Fixture-verified text only; tools/usage unavailable |
-| vLLM | Fixture-verified OpenAI-compatible text/tools; live qualification pending |
-| Local (Ollama) | Experimental configured local endpoint; no live nightly contract |
-| On-device Candle/GGUF | Feature-gated spike; not production-supported |
+| Azure OpenAI | Fixture-qualified native SSE, tools, usage, typed errors; protected live evidence not yet run |
+| OpenAI | Fixture-qualified text/tools/usage, configured model, typed errors; protected live evidence not yet run |
+| Anthropic (Claude) | Fixture-qualified text/tools/usage, configured model, typed errors; protected live evidence not yet run |
+| Gemini | Fixture-qualified text/usage; native tools unsupported; protected live evidence not yet run |
+| Groq | Fixture-qualified text/tools/usage; protected live evidence not yet run |
+| DeepSeek | Fixture-qualified text/tools/usage; protected live evidence not yet run |
+| Hugging Face | Fixture-qualified text; native tools and provider usage unsupported; protected live evidence not yet run |
+| vLLM | Fixture-qualified OpenAI-compatible text/tools/usage; protected endpoint evidence not yet run |
+| Local (Ollama) | Fixture-qualified text/usage with explicit local-to-cloud failover protection; protected endpoint evidence not yet run |
+| On-device Candle/GGUF | CPU-only quantized Llama-family path with template, size, context, cancellation, and failure checks; provisioned real-model evidence not yet run |
 
 ## Contributing
 

@@ -10,6 +10,7 @@ dependencies = [
  "async-trait",
  "candle-core",
  "candle-transformers",
+ "chrono",
  "futures-core",
  "kernel",
  "proptest",
@@ -21,6 +22,7 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tokio-tungstenite",
+ "tokio-util",
  "tracing",
  "wiremock",
 ]

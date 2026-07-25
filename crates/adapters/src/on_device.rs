@@ -12,15 +12,17 @@
 //! syscall gate, scheduler and persistence treat it exactly like any cloud
 //! provider — the only difference is where the tokens are produced.
 //!
-//! ## Scope (this is a spike)
+//! ## Supported boundary
 //! - Greedy / temperature sampling of a single GGUF model on CPU.
-//! - A model-agnostic instruct prompt format (see [`build_prompt`]). Production
-//!   use should apply the model's real chat template.
+//! - Explicit Simple, ChatML, and Llama 3 prompt templates selected by the
+//!   operator for the provisioned tokenizer/model family.
 //! - No native tool-calling: small on-device models emit tool calls as plain
 //!   text, which the executor's plaintext shim recovers — so we return an empty
 //!   `tool_calls` vec, same as the Ollama adapter.
 //! - KV-cache is re-primed from the full prompt on every `send` (the executor
 //!   passes the whole history each turn), so turns don't share cache state.
+//! - Model bytes, total context tokens, output tokens, timeout, and cooperative
+//!   cancellation are bounded. GPU and non-Llama-family loaders are unsupported.
 //!
 //! ## Running it
 //! Build with the feature and point it at a local GGUF + tokenizer:
@@ -42,6 +44,14 @@ use tokenizers::Tokenizer;
 use kernel::connector::*;
 use kernel::{ConnectorError, ProviderId};
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ChatTemplate {
+    #[default]
+    Simple,
+    ChatMl,
+    Llama3,
+}
+
 /// Configuration for the on-device adapter.
 #[derive(Debug, Clone)]
 pub struct OnDeviceConfig {
@@ -51,12 +61,20 @@ pub struct OnDeviceConfig {
     pub tokenizer_path: String,
     /// Provider id surfaced to the kernel (defaults to `on-device`).
     pub provider_id: ProviderId,
+    /// Stable model identifier surfaced in usage and checkpoint attribution.
+    pub model_id: String,
     /// Max tokens to generate per turn.
     pub max_new_tokens: usize,
     /// Sampling temperature; `<= 0.0` means greedy (deterministic).
     pub temperature: f64,
     /// RNG seed for sampling (kept fixed so spikes are reproducible).
     pub seed: u64,
+    /// Reject unexpectedly large model files before parsing or allocation.
+    pub max_model_bytes: u64,
+    /// Hard prompt + completion context ceiling.
+    pub max_context_tokens: usize,
+    /// Chat serialization required by the provisioned model family.
+    pub chat_template: ChatTemplate,
 }
 
 impl OnDeviceConfig {
@@ -67,9 +85,13 @@ impl OnDeviceConfig {
             model_path: model_path.into(),
             tokenizer_path: tokenizer_path.into(),
             provider_id: "on-device".to_string(),
+            model_id: "on-device-gguf".to_string(),
             max_new_tokens: 256,
             temperature: 0.0,
             seed: 42,
+            max_model_bytes: 16 * 1024 * 1024 * 1024,
+            max_context_tokens: 4096,
+            chat_template: ChatTemplate::Simple,
         }
     }
 
@@ -80,8 +102,11 @@ impl OnDeviceConfig {
         let model_path = std::env::var("AGENTOS_GGUF_MODEL").ok()?;
         let tokenizer_path = std::env::var("AGENTOS_TOKENIZER").ok()?;
         let mut cfg = Self::new(model_path, tokenizer_path);
-        if let Ok(id) = std::env::var("AGENTOS_MODEL_ID") {
+        if let Ok(id) = std::env::var("AGENTOS_PROVIDER_ID") {
             cfg.provider_id = id;
+        }
+        if let Ok(id) = std::env::var("AGENTOS_MODEL_ID") {
+            cfg.model_id = id;
         }
         if let Some(n) = std::env::var("AGENTOS_MAX_NEW_TOKENS")
             .ok()
@@ -94,6 +119,25 @@ impl OnDeviceConfig {
             .and_then(|s| s.parse().ok())
         {
             cfg.temperature = t;
+        }
+        if let Some(n) = std::env::var("AGENTOS_MAX_CONTEXT_TOKENS")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+        {
+            cfg.max_context_tokens = n.clamp(1, 1_048_576);
+        }
+        if let Some(n) = std::env::var("AGENTOS_MAX_MODEL_BYTES")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+        {
+            cfg.max_model_bytes = n.max(1);
+        }
+        if let Ok(template) = std::env::var("AGENTOS_CHAT_TEMPLATE") {
+            cfg.chat_template = match template.to_ascii_lowercase().as_str() {
+                "chatml" => ChatTemplate::ChatMl,
+                "llama3" | "llama-3" => ChatTemplate::Llama3,
+                _ => ChatTemplate::Simple,
+            };
         }
         Some(cfg)
     }
@@ -109,6 +153,9 @@ struct Engine {
     max_new_tokens: usize,
     temperature: f64,
     seed: u64,
+    model_id: String,
+    max_context_tokens: usize,
+    chat_template: ChatTemplate,
 }
 
 impl Engine {
@@ -117,6 +164,20 @@ impl Engine {
     fn load(cfg: &OnDeviceConfig) -> Result<Self, ConnectorError> {
         let device = Device::Cpu;
 
+        let metadata = std::fs::metadata(&cfg.model_path).map_err(|e| {
+            ConnectorError::ConnectionFailed(format!("open GGUF model '{}': {e}", cfg.model_path))
+        })?;
+        if metadata.len() > cfg.max_model_bytes {
+            return Err(ConnectorError::invalid_request(
+                cfg.provider_id.clone(),
+                format!(
+                    "GGUF model is {} bytes, above configured {} byte limit",
+                    metadata.len(),
+                    cfg.max_model_bytes
+                ),
+                None,
+            ));
+        }
         let mut file = std::fs::File::open(&cfg.model_path).map_err(|e| {
             ConnectorError::ConnectionFailed(format!("open GGUF model '{}': {e}", cfg.model_path))
         })?;
@@ -147,6 +208,9 @@ impl Engine {
             max_new_tokens: cfg.max_new_tokens,
             temperature: cfg.temperature,
             seed: cfg.seed,
+            model_id: cfg.model_id.clone(),
+            max_context_tokens: cfg.max_context_tokens,
+            chat_template: cfg.chat_template,
         })
     }
 
@@ -157,7 +221,12 @@ impl Engine {
         &self,
         prompt: &str,
         max_output_tokens: Option<usize>,
+        provider_id: &ProviderId,
+        cancellation: &tokio_util::sync::CancellationToken,
     ) -> Result<(String, u32), ConnectorError> {
+        if cancellation.is_cancelled() {
+            return Err(ConnectorError::cancelled(provider_id.clone(), None));
+        }
         let encoding = self
             .tokenizer
             .encode(prompt, true)
@@ -165,6 +234,17 @@ impl Engine {
         let prompt_tokens = encoding.get_ids().to_vec();
         if prompt_tokens.is_empty() {
             return Ok((String::new(), 0));
+        }
+        if prompt_tokens.len() > self.max_context_tokens {
+            return Err(ConnectorError::invalid_request(
+                provider_id.clone(),
+                format!(
+                    "prompt has {} tokens, above configured {} token on-device context limit",
+                    prompt_tokens.len(),
+                    self.max_context_tokens
+                ),
+                None,
+            ));
         }
 
         let temperature = if self.temperature <= 0.0 {
@@ -178,15 +258,30 @@ impl Engine {
             .model
             .lock()
             .map_err(|_| ConnectorError::ConnectionFailed("model lock poisoned".into()))?;
+        if cancellation.is_cancelled() {
+            return Err(ConnectorError::cancelled(provider_id.clone(), None));
+        }
 
-        // Prime the cache with the full prompt (index_pos = 0), then sample.
-        let input = Tensor::new(prompt_tokens.as_slice(), &self.device)
-            .and_then(|t| t.unsqueeze(0))
-            .map_err(|e| ConnectorError::ProtocolError(format!("input tensor: {e}")))?;
-        let logits = model
-            .forward(&input, 0)
-            .and_then(|l| l.squeeze(0))
-            .map_err(|e| ConnectorError::ProtocolError(format!("forward(prompt): {e}")))?;
+        const PROMPT_CHUNK_TOKENS: usize = 64;
+        let mut logits = None;
+        let mut index_pos = 0usize;
+        for chunk in prompt_tokens.chunks(PROMPT_CHUNK_TOKENS) {
+            if cancellation.is_cancelled() {
+                return Err(ConnectorError::cancelled(provider_id.clone(), None));
+            }
+            let input = Tensor::new(chunk, &self.device)
+                .and_then(|tensor| tensor.unsqueeze(0))
+                .map_err(|error| ConnectorError::ProtocolError(format!("input tensor: {error}")))?;
+            let chunk_logits = model
+                .forward(&input, index_pos)
+                .and_then(|tensor| tensor.squeeze(0))
+                .map_err(|error| {
+                    ConnectorError::ProtocolError(format!("forward(prompt): {error}"))
+                })?;
+            logits = Some(chunk_logits);
+            index_pos = index_pos.saturating_add(chunk.len());
+        }
+        let logits = logits.expect("non-empty prompts produce at least one chunk");
         let mut next = logits_processor
             .sample(&logits)
             .map_err(|e| ConnectorError::ProtocolError(format!("sample: {e}")))?;
@@ -194,8 +289,12 @@ impl Engine {
         let mut generated = Vec::new();
         let max_new_tokens = max_output_tokens
             .unwrap_or(self.max_new_tokens)
-            .min(self.max_new_tokens);
+            .min(self.max_new_tokens)
+            .min(self.max_context_tokens.saturating_sub(prompt_tokens.len()));
         for step in 0..max_new_tokens {
+            if cancellation.is_cancelled() {
+                return Err(ConnectorError::cancelled(provider_id.clone(), None));
+            }
             if self.eos_ids.contains(&next) {
                 break;
             }
@@ -222,10 +321,41 @@ impl Engine {
 
 /// Render a chat history into a single prompt string.
 ///
-/// Model-agnostic and deliberately simple — enough to drive a quantized
-/// instruct model in a spike. Production use should switch on the model family
-/// and apply its real chat template (ChatML, Llama-3, etc.).
+/// The no-argument compatibility helper uses the Simple template. Production
+/// configuration should select the model's actual template through
+/// [`OnDeviceConfig::chat_template`].
 pub fn build_prompt(messages: &[StandardMessage]) -> String {
+    build_prompt_with_template(messages, ChatTemplate::Simple)
+}
+
+pub fn build_prompt_with_template(messages: &[StandardMessage], template: ChatTemplate) -> String {
+    match template {
+        ChatTemplate::ChatMl => {
+            let mut out = String::new();
+            for message in messages {
+                out.push_str("<|im_start|>");
+                out.push_str(&message.role);
+                out.push('\n');
+                out.push_str(&message.content);
+                out.push_str("<|im_end|>\n");
+            }
+            out.push_str("<|im_start|>assistant\n");
+            return out;
+        }
+        ChatTemplate::Llama3 => {
+            let mut out = "<|begin_of_text|>".to_string();
+            for message in messages {
+                out.push_str("<|start_header_id|>");
+                out.push_str(&message.role);
+                out.push_str("<|end_header_id|>\n\n");
+                out.push_str(&message.content);
+                out.push_str("<|eot_id|>");
+            }
+            out.push_str("<|start_header_id|>assistant<|end_header_id|>\n\n");
+            return out;
+        }
+        ChatTemplate::Simple => {}
+    }
     let mut out = String::new();
     for m in messages {
         match m.role.as_str() {
@@ -284,15 +414,68 @@ impl LlmSession for OnDeviceSession {
         _tools: &[ToolDefinition],
         options: LlmRequestOptions,
     ) -> Result<LlmResponse, ConnectorError> {
-        let prompt = build_prompt(&messages);
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        self.send_controlled(messages, _tools, options, &cancellation)
+            .await
+    }
+
+    async fn send_controlled(
+        &self,
+        messages: Vec<StandardMessage>,
+        _tools: &[ToolDefinition],
+        options: LlmRequestOptions,
+        cancellation: &tokio_util::sync::CancellationToken,
+    ) -> Result<LlmResponse, ConnectorError> {
+        if cancellation.is_cancelled() {
+            return Err(ConnectorError::cancelled(self.provider_id.clone(), None));
+        }
+        let prompt = build_prompt_with_template(&messages, self.engine.chat_template);
         let engine = self.engine.clone();
         let max_output_tokens = options.max_output_tokens.map(|limit| limit as usize);
-        // Inference is a long, blocking, CPU-bound computation — keep it off the
-        // async runtime's worker threads.
-        let (content, tokens) =
-            tokio::task::spawn_blocking(move || engine.generate(&prompt, max_output_tokens))
+        let provider_id = self.provider_id.clone();
+        let worker_cancel = tokio_util::sync::CancellationToken::new();
+        let worker_token = worker_cancel.clone();
+        let worker_provider = provider_id.clone();
+        let mut worker = tokio::task::spawn_blocking(move || {
+            engine.generate(&prompt, max_output_tokens, &worker_provider, &worker_token)
+        });
+        let joined = async {
+            (&mut worker)
                 .await
-                .map_err(|e| ConnectorError::ConnectionFailed(format!("inference task: {e}")))??;
+                .map_err(|e| ConnectorError::ConnectionFailed(format!("inference task: {e}")))?
+        };
+        tokio::pin!(joined);
+        let result = match options.timeout {
+            Some(timeout) => {
+                tokio::select! {
+                    biased;
+                    _ = cancellation.cancelled() => {
+                        worker_cancel.cancel();
+                        Err(ConnectorError::cancelled(provider_id.clone(), None))
+                    }
+                    _ = tokio::time::sleep(timeout) => {
+                        worker_cancel.cancel();
+                        Err(ConnectorError::timeout(
+                            provider_id.clone(),
+                            format!("on-device inference exceeded {} ms", timeout.as_millis()),
+                            None,
+                        ))
+                    }
+                    result = &mut joined => result,
+                }
+            }
+            None => {
+                tokio::select! {
+                    biased;
+                    _ = cancellation.cancelled() => {
+                        worker_cancel.cancel();
+                        Err(ConnectorError::cancelled(provider_id.clone(), None))
+                    }
+                    result = &mut joined => result,
+                }
+            }
+        };
+        let (content, tokens) = result?;
 
         Ok(LlmResponse {
             content,
@@ -312,7 +495,7 @@ impl LlmSession for OnDeviceSession {
     }
 
     fn model_id(&self) -> &str {
-        "on-device"
+        &self.engine.model_id
     }
 }
 
@@ -327,6 +510,13 @@ impl LlmProviderAdapter for OnDeviceLlmAdapter {
     fn provider_type(&self) -> ProviderType {
         // It runs locally, so it is a Local provider from the kernel's view.
         ProviderType::Local
+    }
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities {
+            prompt_cancellation: true,
+            api_family: "candle-gguf".into(),
+            ..Default::default()
+        }
     }
 
     async fn is_available(&self) -> bool {
@@ -387,6 +577,17 @@ mod tests {
         assert_eq!(c.max_new_tokens, 256);
         assert_eq!(c.temperature, 0.0);
         assert_eq!(c.model_path, "/m.gguf");
+        assert_eq!(c.max_context_tokens, 4096);
+        assert_eq!(c.max_model_bytes, 16 * 1024 * 1024 * 1024);
+    }
+
+    #[test]
+    fn supported_chat_templates_render_explicit_assistant_boundary() {
+        let messages = [StandardMessage::user("hello")];
+        let chatml = build_prompt_with_template(&messages, ChatTemplate::ChatMl);
+        assert!(chatml.ends_with("<|im_start|>assistant\n"));
+        let llama3 = build_prompt_with_template(&messages, ChatTemplate::Llama3);
+        assert!(llama3.ends_with("<|start_header_id|>assistant<|end_header_id|>\n\n"));
     }
 
     #[test]
@@ -399,6 +600,31 @@ mod tests {
             Err(other) => panic!("expected ConnectionFailed, got {other:?}"),
             Ok(_) => panic!("loading a nonexistent model should fail"),
         }
+    }
+
+    #[test]
+    fn corrupt_or_oversized_gguf_fails_cleanly_before_inference() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("agentos-invalid-{unique}.gguf"));
+        std::fs::write(&path, b"not a gguf").unwrap();
+
+        let mut oversized =
+            OnDeviceConfig::new(path.to_string_lossy(), "/nonexistent/tokenizer.json");
+        oversized.max_model_bytes = 1;
+        assert!(matches!(
+            OnDeviceLlmAdapter::load(oversized),
+            Err(ConnectorError::InvalidRequest(_))
+        ));
+
+        let corrupt = OnDeviceConfig::new(path.to_string_lossy(), "/nonexistent/tokenizer.json");
+        assert!(matches!(
+            OnDeviceLlmAdapter::load(corrupt),
+            Err(ConnectorError::ProtocolError(_))
+        ));
+        let _ = std::fs::remove_file(path);
     }
 
     /// Real end-to-end generation. Skipped unless a model is provisioned on the
@@ -418,7 +644,11 @@ mod tests {
             .send(vec![StandardMessage::user("Say hello in one word.")])
             .await
             .expect("generation should succeed");
-        println!("on-device output: {:?}", resp.content);
+        println!(
+            "on-device generation completed: tokens={}, output_bytes={}",
+            resp.tokens_used,
+            resp.content.len()
+        );
         assert!(resp.tokens_used > 0, "model should emit at least one token");
     }
 }

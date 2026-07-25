@@ -382,6 +382,27 @@ pub enum PermissionError {
     ElevationFailed(String),
 }
 
+/// Redacted, correlation-friendly context for a provider failure.
+///
+/// Provider adapters must never place credentials or raw response bodies in
+/// this structure. `request_id` is the provider-issued correlation identifier,
+/// when one was supplied.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderErrorContext {
+    pub provider: ProviderId,
+    pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
+}
+
+/// Structured provider throttling metadata.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderRateLimit {
+    pub context: ProviderErrorContext,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_after_ms: Option<u64>,
+}
+
 /// Errors related to the LLM connector.
 #[derive(Debug, thiserror::Error, Clone, PartialEq, Eq)]
 pub enum ConnectorError {
@@ -396,6 +417,129 @@ pub enum ConnectorError {
 
     #[error("Stream error: {0}")]
     StreamError(String),
+
+    #[error("Provider authentication failed: {0:?}")]
+    Authentication(ProviderErrorContext),
+
+    #[error("Provider authorization failed: {0:?}")]
+    Authorization(ProviderErrorContext),
+
+    #[error("Provider rate limited request: {0:?}")]
+    RateLimited(ProviderRateLimit),
+
+    #[error("Provider service unavailable: {0:?}")]
+    ServiceUnavailable(ProviderErrorContext),
+
+    #[error("Provider rejected request: {0:?}")]
+    InvalidRequest(ProviderErrorContext),
+
+    #[error("Provider content filter blocked request: {0:?}")]
+    ContentFiltered(ProviderErrorContext),
+
+    #[error("Provider request timed out: {0:?}")]
+    Timeout(ProviderErrorContext),
+
+    #[error("Provider request cancelled: {0:?}")]
+    Cancelled(ProviderErrorContext),
+}
+
+impl ConnectorError {
+    fn provider_context(
+        provider: ProviderId,
+        message: impl Into<String>,
+        request_id: Option<String>,
+    ) -> ProviderErrorContext {
+        ProviderErrorContext {
+            provider,
+            message: message.into(),
+            request_id,
+        }
+    }
+
+    pub fn authentication(
+        provider: ProviderId,
+        message: impl Into<String>,
+        request_id: Option<String>,
+    ) -> Self {
+        Self::Authentication(Self::provider_context(provider, message, request_id))
+    }
+
+    pub fn authorization(
+        provider: ProviderId,
+        message: impl Into<String>,
+        request_id: Option<String>,
+    ) -> Self {
+        Self::Authorization(Self::provider_context(provider, message, request_id))
+    }
+
+    pub fn rate_limited(
+        provider: ProviderId,
+        message: impl Into<String>,
+        request_id: Option<String>,
+        retry_after_ms: Option<u64>,
+    ) -> Self {
+        Self::RateLimited(ProviderRateLimit {
+            context: Self::provider_context(provider, message, request_id),
+            retry_after_ms,
+        })
+    }
+
+    pub fn service_unavailable(
+        provider: ProviderId,
+        message: impl Into<String>,
+        request_id: Option<String>,
+    ) -> Self {
+        Self::ServiceUnavailable(Self::provider_context(provider, message, request_id))
+    }
+
+    pub fn invalid_request(
+        provider: ProviderId,
+        message: impl Into<String>,
+        request_id: Option<String>,
+    ) -> Self {
+        Self::InvalidRequest(Self::provider_context(provider, message, request_id))
+    }
+
+    pub fn content_filtered(
+        provider: ProviderId,
+        message: impl Into<String>,
+        request_id: Option<String>,
+    ) -> Self {
+        Self::ContentFiltered(Self::provider_context(provider, message, request_id))
+    }
+
+    pub fn timeout(
+        provider: ProviderId,
+        message: impl Into<String>,
+        request_id: Option<String>,
+    ) -> Self {
+        Self::Timeout(Self::provider_context(provider, message, request_id))
+    }
+
+    pub fn cancelled(provider: ProviderId, request_id: Option<String>) -> Self {
+        Self::Cancelled(Self::provider_context(
+            provider,
+            "request cancelled",
+            request_id,
+        ))
+    }
+
+    pub fn request_id(&self) -> Option<&str> {
+        match self {
+            Self::Authentication(context)
+            | Self::Authorization(context)
+            | Self::ServiceUnavailable(context)
+            | Self::InvalidRequest(context)
+            | Self::ContentFiltered(context)
+            | Self::Timeout(context)
+            | Self::Cancelled(context) => context.request_id.as_deref(),
+            Self::RateLimited(limit) => limit.context.request_id.as_deref(),
+            Self::ProviderUnavailable(_)
+            | Self::ConnectionFailed(_)
+            | Self::ProtocolError(_)
+            | Self::StreamError(_) => None,
+        }
+    }
 }
 
 /// Errors related to the WASM module system.
@@ -1087,6 +1231,8 @@ pub struct AgentKernelImpl {
     max_tool_calls_per_turn: u32,
     /// Provider-enforced completion allowance reserved with every prompt.
     max_output_tokens_per_request: u32,
+    /// Finite timeout applied to every hosted or local provider attempt.
+    provider_request_timeout: std::time::Duration,
     /// CFS-ordered turn admission: bounds concurrent turns to
     /// `budgets.max_concurrent` and, under contention, grants the next slot to
     /// the CFS-preferred (lowest-vruntime / highest-priority) waiting agent.
@@ -1384,6 +1530,7 @@ impl AgentKernelImpl {
             )),
             max_tool_calls_per_turn: budgets.max_tool_calls,
             max_output_tokens_per_request: budgets.max_output_tokens_per_request,
+            provider_request_timeout: std::time::Duration::from_secs(120),
             turn_admission: Arc::new(TurnAdmission::new(budgets.max_concurrent as usize)),
             llm_scheduler: Arc::new(LlmScheduler::new(DEFAULT_LLM_CORES)),
             os,
@@ -4193,7 +4340,9 @@ impl AgentKernelImpl {
             .agent_manager
             .get_agent_provider(agent_id)
             .ok_or(AgentError::NotFound(agent_id))?;
-        let session = AgentConnector::connect(&*self.connector, agent_id, &provider_id)
+        let session = self
+            .connector
+            .connect_resilient(agent_id, &provider_id)
             .await
             .map_err(KernelError::Connector)?;
         let mut executor = AgentExecutor::new(
@@ -4215,6 +4364,7 @@ impl AgentKernelImpl {
         executor.set_context_admission(self.context_admission.clone(), tenant_id);
         executor.set_max_tool_calls(self.max_tool_calls_per_turn);
         executor.set_max_output_tokens_per_request(self.max_output_tokens_per_request);
+        executor.set_provider_request_timeout(self.provider_request_timeout);
         if let Some(pid) = self.syscall_gate.pid_of(agent_id) {
             let nice = self.os.cfs.lock().await.nice_of(pid).unwrap_or(0);
             executor.set_llm_scheduler(self.llm_scheduler.clone(), pid, nice);

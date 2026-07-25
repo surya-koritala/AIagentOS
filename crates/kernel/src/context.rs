@@ -138,10 +138,21 @@ impl ProviderRateReceiptState {
 pub(crate) struct ProviderRateReservation {
     pub id: uuid::Uuid,
     pub epoch: u64,
+    pub reserved_requests: u64,
     pub reserved_tokens: u64,
     pub state: ProviderRateReceiptState,
     /// Stable cgroup scope paths in root-to-leaf reservation order.
     pub cgroup_scopes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ProviderRateRequest {
+    pub receipt_id: uuid::Uuid,
+    pub requested_epoch: u64,
+    pub rpm: u32,
+    pub tpm: u64,
+    pub estimated_requests: u64,
+    pub estimated_tokens: u64,
 }
 
 /// Durable usage and receipt-state counts for one effective provider epoch.
@@ -506,6 +517,15 @@ const MAX_RETRIES: u32 = 3;
 /// still enforced relative to this id.
 pub const DEFAULT_TENANT: &str = "default";
 
+fn memory_content_hash(content: &str) -> String {
+    let digest = ring::digest::digest(&ring::digest::SHA256, content.as_bytes());
+    digest
+        .as_ref()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
 /// SQLite-backed context manager implementation.
 pub struct SqliteContextManager {
     /// Shared durable store used by crate-owned subsystems. The connection is
@@ -816,7 +836,11 @@ impl SqliteContextManager {
                 category TEXT NOT NULL,
                 created_at TEXT NOT NULL,
                 last_accessed_at TEXT NOT NULL,
-                embedding_json TEXT
+                embedding_json TEXT,
+                embedding_model TEXT NOT NULL DEFAULT 'legacy',
+                embedding_version INTEGER NOT NULL DEFAULT 0,
+                embedding_dim INTEGER NOT NULL DEFAULT 0,
+                content_hash TEXT NOT NULL DEFAULT ''
             );
             CREATE INDEX IF NOT EXISTS idx_facts_agent ON facts(agent_id);
             CREATE INDEX IF NOT EXISTS idx_facts_category ON facts(agent_id, category);
@@ -1179,6 +1203,16 @@ impl SqliteContextManager {
                     CHECK (typeof(epoch) = 'blob' AND length(epoch) = 8)
             ) WITHOUT ROWID;",
         ).map_err(|e| ContextError::StorageError(e.to_string()))?;
+        // Legacy fact rows are deliberately marked stale and rebuilt on their
+        // next query or an explicit reindex.
+        for column in [
+            "embedding_model TEXT NOT NULL DEFAULT 'legacy'",
+            "embedding_version INTEGER NOT NULL DEFAULT 0",
+            "embedding_dim INTEGER NOT NULL DEFAULT 0",
+            "content_hash TEXT NOT NULL DEFAULT ''",
+        ] {
+            let _ = conn.execute(&format!("ALTER TABLE facts ADD COLUMN {column}"), []);
+        }
         if hierarchy_schema_upgrade_needed && hierarchy_database_has_rows {
             // Commit the fence before changing the schema. If the process dies
             // after ALTER TABLE (or a later index migration fails), the next
@@ -1606,7 +1640,13 @@ impl SqliteContextManager {
             } else {
                 0
             };
-            let expected_actual_requests = receipt.actual_requests.map(|_| expected_requests);
+            let expected_actual_requests = receipt.actual_requests.map(|actual| {
+                if scope.key.kind == QuotaScopeKind::Provider {
+                    actual
+                } else {
+                    0
+                }
+            });
             if scope.reserved_requests != expected_requests
                 || scope.reserved_tokens != receipt.reserved_tokens
                 || scope.actual_requests != expected_actual_requests
@@ -2156,6 +2196,7 @@ impl SqliteContextManager {
     /// stable cgroup scopes. Provider/global records one request plus the token
     /// estimate; cgroup scopes record only the same token estimate and enforce
     /// only their token limit.
+    #[cfg(test)]
     pub(crate) fn reserve_provider_rate_with_cgroups(
         &self,
         receipt_id: uuid::Uuid,
@@ -2165,6 +2206,40 @@ impl SqliteContextManager {
         estimated_tokens: u64,
         cgroups: &[CgroupQuotaConstraint],
     ) -> Result<ProviderRateReserveOutcome, ContextError> {
+        self.reserve_provider_rate_attempts_with_cgroups(
+            ProviderRateRequest {
+                receipt_id,
+                requested_epoch,
+                rpm,
+                tpm,
+                estimated_requests: 1,
+                estimated_tokens,
+            },
+            cgroups,
+        )
+    }
+
+    /// Reserve a bounded batch of possible resilient provider attempts under
+    /// one affine receipt. The caller reconciles the exact attempt count after
+    /// a successful request.
+    pub(crate) fn reserve_provider_rate_attempts_with_cgroups(
+        &self,
+        request: ProviderRateRequest,
+        cgroups: &[CgroupQuotaConstraint],
+    ) -> Result<ProviderRateReserveOutcome, ContextError> {
+        let ProviderRateRequest {
+            receipt_id,
+            requested_epoch,
+            rpm,
+            tpm,
+            estimated_requests,
+            estimated_tokens,
+        } = request;
+        if estimated_requests == 0 {
+            return Err(quota_error(
+                "provider attempt reservation must include at least one request",
+            ));
+        }
         let mut seen = BTreeSet::new();
         for constraint in cgroups {
             let key = QuotaScopeKey::cgroup(&constraint.scope_id);
@@ -2201,7 +2276,9 @@ impl SqliteContextManager {
                 .iter()
                 .map(|constraint| constraint.scope_id.as_str())
                 .collect();
-            if receipt.reserved_requests != 1 || receipt.reserved_tokens != estimated_tokens {
+            if receipt.reserved_requests != estimated_requests
+                || receipt.reserved_tokens != estimated_tokens
+            {
                 return Err(quota_error(format!(
                     "quota receipt {receipt_id} was reused with conflicting reservation data"
                 )));
@@ -2214,6 +2291,7 @@ impl SqliteContextManager {
             let reservation = ProviderRateReservation {
                 id: receipt.id,
                 epoch: receipt.epoch,
+                reserved_requests: receipt.reserved_requests,
                 reserved_tokens: receipt.reserved_tokens,
                 state: receipt.state,
                 cgroup_scopes: stored_cgroups.into_iter().map(str::to_string).collect(),
@@ -2261,13 +2339,13 @@ impl SqliteContextManager {
             cgroup_usages.push((constraint, scope, usage));
         }
         let rpm = u64::from(rpm);
-        if rpm != 0 && usage.0 >= rpm {
+        if rpm != 0 && (usage.0 > rpm || estimated_requests > rpm.saturating_sub(usage.0)) {
             let outcome = ProviderRateReserveOutcome::Denied {
                 epoch: effective_epoch,
                 scope: provider_scope.clone(),
                 dimension: ProviderRateLimitDimension::Requests,
                 used: usage.0,
-                requested: 1,
+                requested: estimated_requests,
                 limit: rpm,
             };
             Self::commit_quota_transaction(tx)?;
@@ -2303,7 +2381,7 @@ impl SqliteContextManager {
             }
         }
 
-        let one = u64_blob(1);
+        let requests = u64_blob(estimated_requests);
         let zero = u64_blob(0);
         let estimate = u64_blob(estimated_tokens);
         tx.execute(
@@ -2314,7 +2392,7 @@ impl SqliteContextManager {
             params![
                 receipt_id.to_string(),
                 epoch_blob.as_slice(),
-                one.as_slice(),
+                requests.as_slice(),
                 estimate.as_slice()
             ],
         )
@@ -2331,7 +2409,7 @@ impl SqliteContextManager {
                 receipt_id.to_string(),
                 PROVIDER_QUOTA_SCOPE_KIND,
                 PROVIDER_QUOTA_SCOPE_ID,
-                one.as_slice(),
+                requests.as_slice(),
                 estimate.as_slice()
             ],
         )
@@ -2368,7 +2446,7 @@ impl SqliteContextManager {
             &tx,
             &provider_scope,
             effective_epoch,
-            usage.0.saturating_add(1),
+            usage.0.saturating_add(estimated_requests),
             usage.1.saturating_add(estimated_tokens),
         )?;
         for (_, scope, aggregate) in cgroup_usages {
@@ -2385,6 +2463,7 @@ impl SqliteContextManager {
             ProviderRateReservation {
                 id: receipt_id,
                 epoch: effective_epoch,
+                reserved_requests: estimated_requests,
                 reserved_tokens: estimated_tokens,
                 state: ProviderRateReceiptState::Reserved,
                 cgroup_scopes: cgroups
@@ -2522,6 +2601,24 @@ impl SqliteContextManager {
         receipt_id: uuid::Uuid,
         actual_tokens: u64,
     ) -> Result<(), ContextError> {
+        self.reconcile_provider_rate_inner(receipt_id, None, actual_tokens)
+    }
+
+    pub(crate) fn reconcile_provider_rate_attempts(
+        &self,
+        receipt_id: uuid::Uuid,
+        actual_requests: u64,
+        actual_tokens: u64,
+    ) -> Result<(), ContextError> {
+        self.reconcile_provider_rate_inner(receipt_id, Some(actual_requests), actual_tokens)
+    }
+
+    fn reconcile_provider_rate_inner(
+        &self,
+        receipt_id: uuid::Uuid,
+        actual_requests: Option<u64>,
+        actual_tokens: u64,
+    ) -> Result<(), ContextError> {
         let mut conn = self
             .conn
             .lock()
@@ -2530,27 +2627,37 @@ impl SqliteContextManager {
         let receipt = Self::load_quota_receipt(&tx, receipt_id)?
             .ok_or_else(|| quota_error(format!("unknown quota receipt {receipt_id}")))?;
         let scopes = Self::load_receipt_scopes(&tx, &receipt)?;
+        let actual_requests = actual_requests.unwrap_or(receipt.reserved_requests);
+        if actual_requests == 0 || actual_requests > receipt.reserved_requests {
+            return Err(quota_error(format!(
+                "quota receipt {receipt_id} actual request count {actual_requests} is outside reserved range 1..={}",
+                receipt.reserved_requests
+            )));
+        }
         for scope in &scopes {
             Self::required_scope_epoch_aggregate(&tx, &scope.key, receipt.epoch)?;
         }
         match receipt.state {
             ProviderRateReceiptState::Reconciled => {
-                if receipt.actual_tokens != Some(actual_tokens) {
+                if receipt.actual_requests != Some(actual_requests)
+                    || receipt.actual_tokens != Some(actual_tokens)
+                {
                     return Err(quota_error(format!(
                         "quota receipt {receipt_id} was reconciled with different usage"
                     )));
                 }
             }
             ProviderRateReceiptState::InFlight | ProviderRateReceiptState::Estimated => {
-                let actual_requests = u64_blob(receipt.reserved_requests);
+                let actual_requests_blob = u64_blob(actual_requests);
                 let actual_tokens_blob = u64_blob(actual_tokens);
+                let zero = u64_blob(0);
                 tx.execute(
                     "UPDATE quota_receipts
                      SET state = 'reconciled',
                          actual_requests = ?1, actual_tokens = ?2
                      WHERE id = ?3",
                     params![
-                        actual_requests.as_slice(),
+                        actual_requests_blob.as_slice(),
                         actual_tokens_blob.as_slice(),
                         receipt_id.to_string()
                     ],
@@ -2560,10 +2667,18 @@ impl SqliteContextManager {
                 })?;
                 tx.execute(
                     "UPDATE quota_receipt_scopes
-                     SET actual_requests = reserved_requests,
-                         actual_tokens = ?1
-                     WHERE receipt_id = ?2",
-                    params![actual_tokens_blob.as_slice(), receipt_id.to_string()],
+                     SET actual_requests = CASE
+                             WHEN scope_kind = 'provider' THEN ?1
+                             ELSE ?2
+                         END,
+                         actual_tokens = ?3
+                     WHERE receipt_id = ?4",
+                    params![
+                        actual_requests_blob.as_slice(),
+                        zero.as_slice(),
+                        actual_tokens_blob.as_slice(),
+                        receipt_id.to_string()
+                    ],
                 )
                 .map_err(|error| {
                     quota_error(format!("failed to reconcile provider quota scope: {error}"))
@@ -2574,7 +2689,14 @@ impl SqliteContextManager {
                         &scope.key,
                         receipt.epoch,
                         Self::scope_contribution(&receipt, scope),
-                        (scope.reserved_requests, actual_tokens),
+                        (
+                            if scope.key.kind == QuotaScopeKind::Provider {
+                                actual_requests
+                            } else {
+                                0
+                            },
+                            actual_tokens,
+                        ),
                     )?;
                 }
             }
@@ -3046,14 +3168,14 @@ impl ContextManager for SqliteContextManager {
         let transaction = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| ContextError::StorageError(error.to_string()))?;
-        // Every stored fact gets a deterministic embedding. If the caller didn't
-        // supply one, compute it from the content via the Memory Manager so
-        // query_memory can rank by semantic (cosine) similarity later.
-        let embedding = match &fact.embedding {
-            Some(e) => e.clone(),
-            None => self.embedder.embed(&fact.content),
-        };
+        // Persistence owns the embedding: caller-supplied vectors are not
+        // trusted because they may have the wrong model, dimension, or tenant.
+        let embedding = self.embedder.embed(&fact.content);
         let embedding_json = Some(serde_json::to_string(&embedding).unwrap_or_default());
+        let embedding_model = self.embedder.model_id();
+        let embedding_version = self.embedder.version();
+        let embedding_dim = self.embedder.dim();
+        let content_hash = memory_content_hash(&fact.content);
         let category_str = serde_json::to_string(&fact.category)
             .map_err(|e| ContextError::StorageError(e.to_string()))?;
         let tenant_id = transaction
@@ -3069,6 +3191,7 @@ impl ContextManager for SqliteContextManager {
             .query_row(
                 "SELECT agent_id,
                         LENGTH(content) + COALESCE(LENGTH(embedding_json), 0)
+                        + LENGTH(embedding_model) + LENGTH(content_hash)
                  FROM facts WHERE id = ?1",
                 params![fact.id.to_string()],
                 |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
@@ -3084,10 +3207,12 @@ impl ContextManager for SqliteContextManager {
             ));
         }
         let replaced_bytes = existing.map_or(0, |(_, bytes)| bytes.max(0) as u64);
-        let incoming_bytes =
-            fact.content
-                .len()
-                .saturating_add(embedding_json.as_deref().map_or(0, str::len)) as u64;
+        let incoming_bytes = fact
+            .content
+            .len()
+            .saturating_add(embedding_json.as_deref().map_or(0, str::len))
+            .saturating_add(embedding_model.len())
+            .saturating_add(content_hash.len()) as u64;
         self.enforce_context_storage_locked(
             &transaction,
             agent_id,
@@ -3096,19 +3221,28 @@ impl ContextManager for SqliteContextManager {
             replaced_bytes,
         )?;
 
-        transaction.execute(
-            "INSERT OR REPLACE INTO facts (id, agent_id, content, category, created_at, last_accessed_at, embedding_json)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![
-                fact.id.to_string(),
-                agent_id.to_string(),
-                fact.content,
-                category_str,
-                fact.created_at.to_rfc3339(),
-                fact.last_accessed_at.to_rfc3339(),
-                embedding_json,
-            ],
-        ).map_err(|e| ContextError::StorageError(e.to_string()))?;
+        transaction
+            .execute(
+                "INSERT OR REPLACE INTO facts
+                (id, agent_id, content, category, created_at, last_accessed_at,
+                 embedding_json, embedding_model, embedding_version,
+                 embedding_dim, content_hash)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                params![
+                    fact.id.to_string(),
+                    agent_id.to_string(),
+                    fact.content,
+                    category_str,
+                    fact.created_at.to_rfc3339(),
+                    fact.last_accessed_at.to_rfc3339(),
+                    embedding_json,
+                    embedding_model,
+                    i64::from(embedding_version),
+                    i64::try_from(embedding_dim).unwrap_or(i64::MAX),
+                    content_hash,
+                ],
+            )
+            .map_err(|e| ContextError::StorageError(e.to_string()))?;
         transaction
             .commit()
             .map_err(|error| ContextError::StorageError(error.to_string()))?;
@@ -3129,7 +3263,9 @@ impl ContextManager for SqliteContextManager {
         // query — that's the whole point of vector retrieval.
         let mut stmt = conn
             .prepare(
-                "SELECT id, content, category, created_at, last_accessed_at, embedding_json
+                "SELECT id, content, category, created_at, last_accessed_at,
+                        embedding_json, embedding_model, embedding_version,
+                        embedding_dim, content_hash
              FROM facts WHERE agent_id = ?1
              ORDER BY last_accessed_at DESC",
             )
@@ -3143,6 +3279,10 @@ impl ContextManager for SqliteContextManager {
                 let created_str: String = row.get(3)?;
                 let accessed_str: String = row.get(4)?;
                 let embedding_str: Option<String> = row.get(5)?;
+                let embedding_model: String = row.get(6)?;
+                let embedding_version: i64 = row.get(7)?;
+                let embedding_dim: i64 = row.get(8)?;
+                let content_hash: String = row.get(9)?;
                 Ok((
                     id_str,
                     content,
@@ -3150,14 +3290,29 @@ impl ContextManager for SqliteContextManager {
                     created_str,
                     accessed_str,
                     embedding_str,
+                    embedding_model,
+                    embedding_version,
+                    embedding_dim,
+                    content_hash,
                 ))
             })
             .map_err(|e| ContextError::StorageError(e.to_string()))?;
 
         let mut result = Vec::new();
+        let mut repairs = Vec::new();
         for row in facts {
-            let (id_str, content, category_str, created_str, accessed_str, embedding_str) =
-                row.map_err(|e| ContextError::StorageError(e.to_string()))?;
+            let (
+                id_str,
+                content,
+                category_str,
+                created_str,
+                accessed_str,
+                embedding_str,
+                embedding_model,
+                embedding_version,
+                embedding_dim,
+                content_hash,
+            ) = row.map_err(|e| ContextError::StorageError(e.to_string()))?;
 
             let id = uuid::Uuid::parse_str(&id_str)
                 .map_err(|e| ContextError::StorageError(e.to_string()))?;
@@ -3169,7 +3324,27 @@ impl ContextManager for SqliteContextManager {
             let last_accessed_at = DateTime::parse_from_rfc3339(&accessed_str)
                 .map_err(|e| ContextError::StorageError(e.to_string()))?
                 .with_timezone(&Utc);
-            let embedding = embedding_str.and_then(|s| serde_json::from_str(&s).ok());
+            let stored_embedding: Option<Vec<f32>> = embedding_str
+                .as_deref()
+                .and_then(|value| serde_json::from_str(value).ok());
+            let expected_hash = memory_content_hash(&content);
+            let valid_embedding = embedding_model == self.embedder.model_id()
+                && embedding_version == i64::from(self.embedder.version())
+                && embedding_dim == i64::try_from(self.embedder.dim()).unwrap_or(i64::MAX)
+                && content_hash == expected_hash
+                && stored_embedding.as_ref().is_some_and(|embedding| {
+                    embedding.len() == self.embedder.dim()
+                        && embedding.iter().all(|value| value.is_finite())
+                });
+            let embedding = if valid_embedding {
+                stored_embedding.expect("validated embedding is present")
+            } else {
+                let rebuilt = self.embedder.embed(&content);
+                let rebuilt_json = serde_json::to_string(&rebuilt)
+                    .map_err(|error| ContextError::StorageError(error.to_string()))?;
+                repairs.push((id_str.clone(), rebuilt_json, expected_hash));
+                rebuilt
+            };
 
             result.push(Fact {
                 id,
@@ -3177,13 +3352,34 @@ impl ContextManager for SqliteContextManager {
                 category,
                 created_at,
                 last_accessed_at,
-                embedding,
+                embedding: Some(embedding),
             });
+        }
+        drop(stmt);
+
+        for (fact_id, embedding_json, content_hash) in repairs {
+            conn.execute(
+                "UPDATE facts
+                 SET embedding_json = ?1, embedding_model = ?2,
+                     embedding_version = ?3, embedding_dim = ?4,
+                     content_hash = ?5
+                 WHERE id = ?6 AND agent_id = ?7",
+                params![
+                    embedding_json,
+                    self.embedder.model_id(),
+                    i64::from(self.embedder.version()),
+                    i64::try_from(self.embedder.dim()).unwrap_or(i64::MAX),
+                    content_hash,
+                    fact_id,
+                    id_str,
+                ],
+            )
+            .map_err(|error| ContextError::StorageError(error.to_string()))?;
         }
 
         // Semantic ranking: embed the query and return the top-K facts by cosine
-        // similarity (best-first). A fact missing a stored embedding falls back to
-        // embedding its content on the fly; an empty/unparseable embedding scores 0.
+        // similarity (best-first). Invalid or stale rows were rebuilt and
+        // persisted above before they are admitted to the index.
         //
         // Ranking goes through the `VectorIndex` seam (`rank_topk`): an exact scan
         // at small candidate counts, and the approximate `LshIndex` above
@@ -5639,6 +5835,190 @@ impl SqliteContextManager {
 /// `None` result, exactly as if the data did not exist. The kernel routes
 /// tenant-bound connections through these instead of the raw per-agent reads.
 impl SqliteContextManager {
+    /// Rebuild every embedding owned by one agent with the currently configured
+    /// model/version. Returns the number of rows migrated.
+    pub fn reindex_memory(&self, agent_id: AgentId) -> Result<usize, ContextError> {
+        let mut conn = self
+            .conn
+            .lock()
+            .map_err(|_| ContextError::StorageError("SQLite mutex poisoned".into()))?;
+        let facts = {
+            let mut statement = conn
+                .prepare("SELECT id, content FROM facts WHERE agent_id = ?1 ORDER BY id")
+                .map_err(|error| ContextError::StorageError(error.to_string()))?;
+            let rows = statement
+                .query_map([agent_id.to_string()], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })
+                .map_err(|error| ContextError::StorageError(error.to_string()))?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(|error| ContextError::StorageError(error.to_string()))?
+        };
+        let transaction = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| ContextError::StorageError(error.to_string()))?;
+        for (id, content) in &facts {
+            let embedding = self.embedder.embed(content);
+            let embedding_json = serde_json::to_string(&embedding)
+                .map_err(|error| ContextError::StorageError(error.to_string()))?;
+            transaction
+                .execute(
+                    "UPDATE facts
+                     SET embedding_json = ?1, embedding_model = ?2,
+                         embedding_version = ?3, embedding_dim = ?4,
+                         content_hash = ?5
+                     WHERE id = ?6 AND agent_id = ?7",
+                    params![
+                        embedding_json,
+                        self.embedder.model_id(),
+                        i64::from(self.embedder.version()),
+                        i64::try_from(self.embedder.dim()).unwrap_or(i64::MAX),
+                        memory_content_hash(content),
+                        id,
+                        agent_id.to_string(),
+                    ],
+                )
+                .map_err(|error| ContextError::StorageError(error.to_string()))?;
+        }
+        transaction
+            .commit()
+            .map_err(|error| ContextError::StorageError(error.to_string()))?;
+        Ok(facts.len())
+    }
+
+    /// Update one fact only when it belongs to the supplied agent.
+    pub fn update_fact(
+        &self,
+        agent_id: AgentId,
+        fact_id: uuid::Uuid,
+        content: &str,
+    ) -> Result<bool, ContextError> {
+        let embedding = self.embedder.embed(content);
+        let embedding_json = serde_json::to_string(&embedding)
+            .map_err(|error| ContextError::StorageError(error.to_string()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| ContextError::StorageError("SQLite mutex poisoned".into()))?;
+        let updated = conn
+            .execute(
+                "UPDATE facts
+                 SET content = ?1, last_accessed_at = ?2, embedding_json = ?3,
+                     embedding_model = ?4, embedding_version = ?5,
+                     embedding_dim = ?6, content_hash = ?7
+                 WHERE id = ?8 AND agent_id = ?9",
+                params![
+                    content,
+                    Utc::now().to_rfc3339(),
+                    embedding_json,
+                    self.embedder.model_id(),
+                    i64::from(self.embedder.version()),
+                    i64::try_from(self.embedder.dim()).unwrap_or(i64::MAX),
+                    memory_content_hash(content),
+                    fact_id.to_string(),
+                    agent_id.to_string(),
+                ],
+            )
+            .map_err(|error| ContextError::StorageError(error.to_string()))?;
+        Ok(updated == 1)
+    }
+
+    /// Delete one fact only when it belongs to the supplied agent.
+    pub fn delete_fact(
+        &self,
+        agent_id: AgentId,
+        fact_id: uuid::Uuid,
+    ) -> Result<bool, ContextError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| ContextError::StorageError("SQLite mutex poisoned".into()))?;
+        let deleted = conn
+            .execute(
+                "DELETE FROM facts WHERE id = ?1 AND agent_id = ?2",
+                params![fact_id.to_string(), agent_id.to_string()],
+            )
+            .map_err(|error| ContextError::StorageError(error.to_string()))?;
+        Ok(deleted == 1)
+    }
+
+    /// Irreversibly purge all tenant-owned runtime and memory artifacts while
+    /// retaining durable agent identity rows for audit/recovery semantics.
+    pub fn purge_tenant_data(&self, tenant_id: &str) -> Result<usize, ContextError> {
+        let mut conn = self
+            .conn
+            .lock()
+            .map_err(|_| ContextError::StorageError("SQLite mutex poisoned".into()))?;
+        let transaction = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| ContextError::StorageError(error.to_string()))?;
+        let agent_selector = "SELECT id FROM agents WHERE tenant_id = ?1";
+        let mut deleted = 0usize;
+        deleted = deleted.saturating_add(
+            transaction
+                .execute(
+                    &format!(
+                        "DELETE FROM conversations_fts WHERE conversation_id IN
+                         (SELECT id FROM conversations WHERE agent_id IN ({agent_selector}))"
+                    ),
+                    [tenant_id],
+                )
+                .map_err(|error| ContextError::StorageError(error.to_string()))?,
+        );
+        for table in [
+            "contexts",
+            "facts",
+            "conversations",
+            "usage_log",
+            "agent_kv",
+            "context_pressure",
+            "context_snapshots",
+        ] {
+            deleted = deleted.saturating_add(
+                transaction
+                    .execute(
+                        &format!("DELETE FROM {table} WHERE agent_id IN ({agent_selector})"),
+                        [tenant_id],
+                    )
+                    .map_err(|error| ContextError::StorageError(error.to_string()))?,
+            );
+        }
+        deleted = deleted.saturating_add(
+            transaction
+                .execute(
+                    &format!(
+                        "DELETE FROM context_spills
+                         WHERE tenant_id = ?1 OR agent_id IN ({agent_selector})"
+                    ),
+                    [tenant_id],
+                )
+                .map_err(|error| ContextError::StorageError(error.to_string()))?,
+        );
+        deleted = deleted.saturating_add(
+            transaction
+                .execute(
+                    &format!(
+                        "DELETE FROM generation_checkpoints
+                         WHERE tenant_id = ?1 OR agent_id IN ({agent_selector})"
+                    ),
+                    [tenant_id],
+                )
+                .map_err(|error| ContextError::StorageError(error.to_string()))?,
+        );
+        deleted = deleted.saturating_add(
+            transaction
+                .execute(
+                    "DELETE FROM loaded_package_instances WHERE tenant_id = ?1",
+                    [tenant_id],
+                )
+                .map_err(|error| ContextError::StorageError(error.to_string()))?,
+        );
+        transaction
+            .commit()
+            .map_err(|error| ContextError::StorageError(error.to_string()))?;
+        Ok(deleted)
+    }
+
     /// `true` if `agent_id` is owned by `tenant_id` (or the agent is unknown,
     /// which callers treat as "no data"). The single isolation predicate the
     /// scoped reads below share.
@@ -6043,6 +6423,213 @@ mod tests {
                 .any(|f| f.content.contains("syscall gate enforces capability")),
             "the closest fact should be in the capped results"
         );
+    }
+
+    #[tokio::test]
+    async fn corrupt_or_stale_memory_is_rebuilt_and_owner_mutations_are_isolated() {
+        let manager = SqliteContextManager::in_memory().unwrap();
+        let owner = uuid::Uuid::new_v4();
+        let foreign = uuid::Uuid::new_v4();
+        let fact_id = uuid::Uuid::new_v4();
+        manager
+            .store_fact(
+                owner,
+                Fact {
+                    id: fact_id,
+                    content: "durable memory content".into(),
+                    category: FactCategory::Fact,
+                    created_at: Utc::now(),
+                    last_accessed_at: Utc::now(),
+                    embedding: None,
+                },
+            )
+            .await
+            .unwrap();
+        manager
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE facts
+                 SET embedding_json = 'not-json', embedding_model = 'old',
+                     embedding_version = 0, embedding_dim = 1,
+                     content_hash = 'wrong'
+                 WHERE id = ?1",
+                [fact_id.to_string()],
+            )
+            .unwrap();
+
+        let results = manager.query_memory(owner, "durable").await.unwrap();
+        assert_eq!(
+            results[0].embedding.as_ref().unwrap().len(),
+            crate::memory_manager::EMBED_DIM
+        );
+        let metadata = manager
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT embedding_model, embedding_version, embedding_dim,
+                        content_hash
+                 FROM facts WHERE id = ?1",
+                [fact_id.to_string()],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(metadata.0, manager.embedder.model_id());
+        assert_eq!(metadata.1, i64::from(manager.embedder.version()));
+        assert_eq!(metadata.2, manager.embedder.dim() as i64);
+        assert_eq!(metadata.3, memory_content_hash("durable memory content"));
+
+        assert!(!manager
+            .update_fact(foreign, fact_id, "foreign update")
+            .unwrap());
+        assert!(!manager.delete_fact(foreign, fact_id).unwrap());
+        assert!(manager.update_fact(owner, fact_id, "owner update").unwrap());
+        assert_eq!(manager.reindex_memory(owner).unwrap(), 1);
+        assert!(manager.delete_fact(owner, fact_id).unwrap());
+    }
+
+    #[test]
+    fn concurrent_memory_writes_preserve_all_rows() {
+        let manager = std::sync::Arc::new(SqliteContextManager::in_memory().unwrap());
+        let agent = uuid::Uuid::new_v4();
+        std::thread::scope(|scope| {
+            for worker in 0..8 {
+                let manager = std::sync::Arc::clone(&manager);
+                scope.spawn(move || {
+                    let runtime = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .unwrap();
+                    for item in 0..20 {
+                        runtime
+                            .block_on(manager.store_fact(
+                                agent,
+                                Fact {
+                                    id: uuid::Uuid::new_v4(),
+                                    content: format!("worker {worker} memory {item}"),
+                                    category: FactCategory::Fact,
+                                    created_at: Utc::now(),
+                                    last_accessed_at: Utc::now(),
+                                    embedding: None,
+                                },
+                            ))
+                            .unwrap();
+                    }
+                });
+            }
+        });
+        let count: i64 = manager
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM facts WHERE agent_id = ?1",
+                [agent.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 160);
+    }
+
+    #[tokio::test]
+    async fn tenant_purge_removes_artifacts_without_touching_other_tenants_or_identities() {
+        let manager = SqliteContextManager::in_memory().unwrap();
+        let tenant_a_agent = uuid::Uuid::new_v4();
+        let tenant_b_agent = uuid::Uuid::new_v4();
+        {
+            let conn = manager.conn.lock().unwrap();
+            for (agent, tenant) in [(tenant_a_agent, "tenant-a"), (tenant_b_agent, "tenant-b")] {
+                conn.execute(
+                    "INSERT INTO agents
+                     (id, session_id, name, task, llm_provider, permission_profile,
+                      priority, status, created_at, last_activity_at, tenant_id)
+                     VALUES (?1, ?2, 'agent', 'task', 'provider', 'standard',
+                             3, '\"Running\"', ?3, ?3, ?4)",
+                    params![
+                        agent.to_string(),
+                        uuid::Uuid::new_v4().to_string(),
+                        Utc::now().to_rfc3339(),
+                        tenant
+                    ],
+                )
+                .unwrap();
+            }
+        }
+        for agent in [tenant_a_agent, tenant_b_agent] {
+            manager
+                .store_fact(
+                    agent,
+                    Fact {
+                        id: uuid::Uuid::new_v4(),
+                        content: format!("memory for {agent}"),
+                        category: FactCategory::Fact,
+                        created_at: Utc::now(),
+                        last_accessed_at: Utc::now(),
+                        embedding: None,
+                    },
+                )
+                .await
+                .unwrap();
+            manager.kv_put(agent, "secret", "value").unwrap();
+            manager
+                .save_conversation(
+                    &format!("conversation-{agent}"),
+                    agent,
+                    &[crate::connector::StandardMessage::user("private")],
+                )
+                .unwrap();
+            let spill = format!("spill-{agent}");
+            manager
+                .store_context_spill(
+                    agent,
+                    &format!("context_spill:purge:{agent}"),
+                    &spill,
+                    &sha256(&spill),
+                )
+                .unwrap();
+        }
+
+        assert!(manager.purge_tenant_data("tenant-a").unwrap() > 0);
+        let conn = manager.conn.lock().unwrap();
+        for table in ["facts", "conversations", "agent_kv", "context_spills"] {
+            let tenant_a_rows: i64 = conn
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM {table} WHERE agent_id = ?1"),
+                    [tenant_a_agent.to_string()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let tenant_b_rows: i64 = conn
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM {table} WHERE agent_id = ?1"),
+                    [tenant_b_agent.to_string()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(tenant_a_rows, 0, "{table} retained tenant A artifacts");
+            let expected_tenant_b_rows = if table == "agent_kv" { 2 } else { 1 };
+            assert_eq!(
+                tenant_b_rows, expected_tenant_b_rows,
+                "{table} damaged tenant B artifacts"
+            );
+        }
+        let identities: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM agents WHERE id IN (?1, ?2)",
+                params![tenant_a_agent.to_string(), tenant_b_agent.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(identities, 2, "purge must retain durable identity history");
     }
 
     #[test]

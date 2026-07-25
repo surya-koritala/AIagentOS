@@ -17,6 +17,7 @@ mod tests {
     fn bound(limit: u32) -> LlmRequestOptions {
         LlmRequestOptions {
             max_output_tokens: Some(limit),
+            ..LlmRequestOptions::default()
         }
     }
 

@@ -227,10 +227,13 @@ bypass the combined declaration/slot gate from a new execution path.
     (word unigrams + bigrams + char-trigrams in salted hash subspaces, sublinear
     TF, L2-normalized). `FeatureHashEmbedder` preserves the original FNV-1a
     behavior for bit-compatibility.
-  - `VectorIndex` trait with an exact-cosine `BruteForceIndex` default — the seam
-    where an ANN index can later drop in without touching callers.
+  - `VectorIndex` trait with exact-cosine `BruteForceIndex` and deterministic
+    multi-table `LshIndex`; CI compares ANN results with exact search and fails
+    below documented recall/top-1 thresholds.
   - Wired through `SqliteContextManager` (`with_embedder(...)` builder); store
-    and query both route through the same embedder.
+    and query route through the same embedder. Facts persist model, version,
+    dimension, and content-hash metadata; invalid/stale vectors rebuild before
+    ranking. Store/query/update/delete/reindex are available over wire + SDK.
   - All pure-Rust, deterministic, offline — no models downloaded, no network.
 
 ---
@@ -260,19 +263,27 @@ bypass the combined declaration/slot gate from a new execution path.
 ```
 anthropic   azure_openai (default)   openai   gemini   groq
 deepseek    huggingface              vllm     local (Ollama)
+on_device (feature-gated CPU GGUF)
 ```
 
 Centralized streaming in `streaming.rs`. The send path supports:
-- **Failover** — ordered, acyclic backup chain; falls over to the next provider
-  on transient/unavailable errors.
-- **Retry/backoff** — bounded exponential backoff (injectable clock) for transient
-  errors; permanent errors (auth/protocol) are not retried.
-- **Rate limiting** (`rate_limit.rs`) — single-mutex atomic check-and-reserve for
-  RPM/TPM windows (closes the TOCTOU race) + a counting semaphore for concurrency
-  (no lost wakeups). Streaming and non-streaming share semantics.
+- **Failover** — ordered, acyclic backup chain with tool, region, and
+  local-to-cloud compatibility checks before a backup receives the prompt.
+- **Retry/backoff** — the executor owns bounded transient retry rounds; each
+  round uses one fresh attempt per compatible failover provider, with
+  cancellation/timeouts, per-provider circuits, and actual
+  serving-provider/model attribution.
+- **Typed failure handling** — auth, authorization, rate-limit, service,
+  invalid-request, content-filter, timeout, and cancellation errors with
+  bounded/redacted diagnostics and request IDs.
+- **Rate limiting** (`rate_limit.rs`) — atomic durable SQLite RPM/TPM
+  worst-case-attempt reservation and exact reconciliation, plus a counting
+  semaphore for concurrency. Streaming and non-streaming share semantics.
 
-Adapter tests use `wiremock` — tests never hit real APIs. Exact per-provider
-evidence and unsupported behavior are listed in [PROVIDERS.md](PROVIDERS.md).
+Pull-request adapter tests use `wiremock` and never hit live APIs. Protected
+nightly/manual workflows record live `passed`, `failed`, or `not_run` artifacts.
+Exact evidence and unsupported behavior are listed in
+[PROVIDERS.md](PROVIDERS.md).
 
 ---
 

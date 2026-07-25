@@ -17,7 +17,8 @@ use uuid::Uuid;
 
 use crate::context::{
     CgroupQuotaConstraint, ProviderRateLimitDimension, ProviderRateReceiptState,
-    ProviderRateReservation, ProviderRateReserveOutcome, QuotaScopeKind, SqliteContextManager,
+    ProviderRateRequest, ProviderRateReservation, ProviderRateReserveOutcome, QuotaScopeKind,
+    SqliteContextManager,
 };
 use crate::quota_clock::{quota_epoch, QuotaClock, SystemQuotaClock, QUOTA_EPOCH_MILLIS};
 use crate::ContextError;
@@ -265,6 +266,7 @@ impl RateLimiter {
         cancellation: &CancellationToken,
     ) -> Result<RateLimitGuard, RateLimitError> {
         self.acquire_tokens_with_cgroups_cancellable_inner(
+            1,
             estimated_tokens,
             cgroups,
             membership_changes,
@@ -278,6 +280,7 @@ impl RateLimiter {
     /// epoch. Exhaustion returns retryable structured backpressure immediately,
     /// so a quota-blocked turn cannot occupy global turn admission and starve
     /// an independently funded cgroup.
+    #[cfg(test)]
     pub(crate) async fn try_acquire_tokens_with_cgroups_cancellable(
         &self,
         estimated_tokens: u64,
@@ -286,6 +289,29 @@ impl RateLimiter {
         cancellation: &CancellationToken,
     ) -> Result<RateLimitGuard, RateLimitError> {
         self.acquire_tokens_with_cgroups_cancellable_inner(
+            1,
+            estimated_tokens,
+            cgroups,
+            membership_changes,
+            cancellation,
+            false,
+        )
+        .await
+    }
+
+    /// Reserve the full bounded retry/failover attempt budget before provider
+    /// I/O. Cgroup scopes receive the conservative token estimate but never an
+    /// additional request count.
+    pub(crate) async fn try_acquire_attempts_with_cgroups_cancellable(
+        &self,
+        estimated_requests: u64,
+        estimated_tokens: u64,
+        cgroups: &[CgroupQuotaConstraint],
+        membership_changes: Option<(&mut watch::Receiver<u64>, u64)>,
+        cancellation: &CancellationToken,
+    ) -> Result<RateLimitGuard, RateLimitError> {
+        self.acquire_tokens_with_cgroups_cancellable_inner(
+            estimated_requests,
             estimated_tokens,
             cgroups,
             membership_changes,
@@ -297,6 +323,7 @@ impl RateLimiter {
 
     async fn acquire_tokens_with_cgroups_cancellable_inner(
         &self,
+        estimated_requests: u64,
         estimated_tokens: u64,
         cgroups: &[CgroupQuotaConstraint],
         mut membership_changes: Option<(&mut watch::Receiver<u64>, u64)>,
@@ -379,12 +406,15 @@ impl RateLimiter {
             let receipt_id = Uuid::new_v4();
             let outcome = self
                 .store
-                .reserve_provider_rate_with_cgroups(
-                    receipt_id,
-                    requested_epoch,
-                    self.config.rpm,
-                    self.config.tpm,
-                    estimated_tokens,
+                .reserve_provider_rate_attempts_with_cgroups(
+                    ProviderRateRequest {
+                        receipt_id,
+                        requested_epoch,
+                        rpm: self.config.rpm,
+                        tpm: self.config.tpm,
+                        estimated_requests,
+                        estimated_tokens,
+                    },
                     cgroups,
                 )
                 .map_err(|error| self.poison(error))?;
@@ -671,6 +701,30 @@ impl RateLimitGuard {
         Ok(())
     }
 
+    /// Reconcile both the exact provider attempt count and conservative token
+    /// usage after a resilient logical request succeeds.
+    pub fn reconcile_attempts(
+        mut self,
+        actual_requests: u64,
+        actual_tokens: u64,
+    ) -> Result<(), RateLimitError> {
+        if !self.invoked {
+            return Err(RateLimitError::NotInvoked);
+        }
+        if let Some(receipt) = self.reservation.take() {
+            self.store
+                .reconcile_provider_rate_attempts(receipt.id, actual_requests, actual_tokens)
+                .map_err(|error| {
+                    self.healthy.store(false, Ordering::Release);
+                    RateLimiter::storage_error(error)
+                })?;
+            self.capacity_changed
+                .send_modify(|generation| *generation = generation.wrapping_add(1));
+        }
+        self.permit.take();
+        Ok(())
+    }
+
     /// Explicitly retain the estimate after provider error or cancellation.
     ///
     /// Consuming this guard exposes persistence failures to the execution path;
@@ -785,6 +839,31 @@ mod tests {
         assert_eq!(guard.admission_epoch(), 1);
         drop(guard);
         assert_eq!(limiter.stats().epoch, 1);
+    }
+
+    #[tokio::test]
+    async fn resilient_attempt_batch_reserves_worst_case_and_reconciles_exact_requests() {
+        let clock = Arc::new(ManualQuotaClock::new(0));
+        let limiter = deterministic_limiter(
+            RateLimitConfig {
+                rpm: 10,
+                tpm: 1_000,
+                max_concurrent: 1,
+            },
+            clock,
+        );
+        let cancellation = CancellationToken::new();
+        let mut guard = limiter
+            .try_acquire_attempts_with_cgroups_cancellable(3, 300, &[], None, &cancellation)
+            .await
+            .unwrap();
+        assert_eq!(limiter.stats().requests_this_minute, 3);
+        assert_eq!(limiter.stats().tokens_this_minute, 300);
+        guard.mark_invoked().unwrap();
+        guard.reconcile_attempts(2, 120).unwrap();
+        let stats = limiter.stats();
+        assert_eq!(stats.requests_this_minute, 2);
+        assert_eq!(stats.tokens_this_minute, 120);
     }
 
     #[tokio::test]

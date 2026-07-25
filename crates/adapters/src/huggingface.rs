@@ -122,8 +122,8 @@ impl LlmSession for HuggingFaceSession {
                     tool_calls: vec![],
                 })
             }
-            Ok(resp) => Err(crate::http_status_error(resp.status(), None)),
-            Err(e) => Err(ConnectorError::ConnectionFailed(e.to_string())),
+            Ok(resp) => Err(crate::provider_http_error(&self.provider_id, resp).await),
+            Err(e) => Err(crate::transport_error(&self.provider_id, e)),
         }
     }
 
@@ -150,6 +150,13 @@ impl LlmProviderAdapter for HuggingFaceAdapter {
     }
     fn provider_type(&self) -> ProviderType {
         ProviderType::Cloud
+    }
+    fn capabilities(&self) -> kernel::connector::ProviderCapabilities {
+        kernel::connector::ProviderCapabilities {
+            prompt_cancellation: true,
+            api_family: "huggingface-inference".into(),
+            ..Default::default()
+        }
     }
 
     async fn is_available(&self) -> bool {

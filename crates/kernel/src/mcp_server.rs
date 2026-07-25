@@ -33,17 +33,21 @@ use tokio::sync::Semaphore;
 
 use crate::auth::Role;
 use crate::resources::ResourceBroker;
-use crate::wire_io::{read_bounded_line, write_bounded_json};
+use crate::wire_io::{graceful_close_framed, read_bounded_line, write_bounded_json};
 use crate::{AgentId, AgentKernelImpl};
 
 /// Default simultaneous MCP connection limit.
 pub use crate::wire_io::DEFAULT_MAX_CONNECTIONS as DEFAULT_MCP_MAX_CONNECTIONS;
+/// Maximum duration of the MCP client half-close / peer-EOF handshake.
+pub use crate::wire_io::GRACEFUL_CLOSE_TIMEOUT as MCP_GRACEFUL_CLOSE_TIMEOUT;
 /// Maximum time for the first MCP frame.
 pub use crate::wire_io::HANDSHAKE_TIMEOUT as MCP_HANDSHAKE_TIMEOUT;
 /// Maximum idle time between MCP frames.
 pub use crate::wire_io::IDLE_TIMEOUT as MCP_IDLE_TIMEOUT;
 /// Maximum serialized MCP JSON-RPC request or response frame.
 pub use crate::wire_io::MAX_JSON_FRAME_BYTES as MAX_MCP_FRAME_BYTES;
+/// Recommended maximum interval between MCP ping requests.
+pub use crate::wire_io::RECOMMENDED_KEEPALIVE_INTERVAL as MCP_KEEPALIVE_INTERVAL;
 /// Maximum wall-clock duration of one MCP request.
 pub use crate::wire_io::REQUEST_TIMEOUT as MCP_REQUEST_TIMEOUT;
 
@@ -197,6 +201,9 @@ async fn dispatch_for_connection(
 
     let resp = match req.method.as_str() {
         "initialize" => handle_initialize(req.params),
+        // MCP 2024-11-05 permits ping before initialization. It has no
+        // parameters or side effects and promptly returns an empty result.
+        "ping" => Ok(json!({})),
         "agentos/authenticate" => handle_authenticate(kernel, identity, req.params).await,
         "tools/list" | "tools/call" => {
             handle_authenticated_method(kernel, identity, &req.method, req.params).await
@@ -485,6 +492,7 @@ pub struct McpServer {
     kernel: Arc<AgentKernelImpl>,
     listener: TcpListener,
     connection_limit: Arc<Semaphore>,
+    idle_timeout: std::time::Duration,
 }
 
 impl McpServer {
@@ -513,12 +521,22 @@ impl McpServer {
             kernel,
             listener,
             connection_limit: Arc::new(Semaphore::new(DEFAULT_MCP_MAX_CONNECTIONS)),
+            idle_timeout: MCP_IDLE_TIMEOUT,
         })
     }
 
     /// Override the number of simultaneously admitted MCP connections.
     pub fn with_connection_limit(mut self, max_connections: usize) -> Self {
         self.connection_limit = Arc::new(Semaphore::new(max_connections.max(1)));
+        self
+    }
+
+    /// Override the established MCP connection idle deadline.
+    ///
+    /// The public contract reports the 300-second default. Zero is clamped to
+    /// one millisecond.
+    pub fn with_idle_timeout(mut self, idle_timeout: std::time::Duration) -> Self {
+        self.idle_timeout = idle_timeout.max(std::time::Duration::from_millis(1));
         self
     }
 
@@ -530,6 +548,7 @@ impl McpServer {
     /// Accept connections forever, handling each on its own task. Each
     /// connection is a stream of newline-delimited JSON-RPC requests.
     pub async fn serve(self) -> std::io::Result<()> {
+        let idle_timeout = self.idle_timeout;
         loop {
             let (stream, _peer) = self.listener.accept().await?;
             let Ok(connection_permit) = self.connection_limit.clone().try_acquire_owned() else {
@@ -540,7 +559,7 @@ impl McpServer {
             tokio::spawn(async move {
                 let _connection_permit = connection_permit;
                 let (read, write) = stream.into_split();
-                let _ = Self::handle(kernel, read, write).await;
+                let _ = Self::handle(kernel, read, write, idle_timeout).await;
             });
         }
     }
@@ -553,6 +572,7 @@ impl McpServer {
         kernel: Arc<AgentKernelImpl>,
         read: R,
         mut write: W,
+        idle_timeout: std::time::Duration,
     ) -> std::io::Result<()>
     where
         R: AsyncRead + Unpin,
@@ -565,7 +585,7 @@ impl McpServer {
             let timeout = if first_frame {
                 MCP_HANDSHAKE_TIMEOUT
             } else {
-                MCP_IDLE_TIMEOUT
+                idle_timeout
             };
             let line = match tokio::time::timeout(
                 timeout,
@@ -630,7 +650,7 @@ impl McpServer {
                 }
             }
         }
-        Ok(())
+        write.shutdown().await
     }
 }
 
@@ -696,6 +716,11 @@ impl McpClient {
         .await
     }
 
+    /// Send the standard MCP application-level liveness probe.
+    pub async fn ping(&mut self) -> std::io::Result<JsonRpcResponse> {
+        self.request("ping", None).await
+    }
+
     /// Send a raw JSON value as one line (used by tests to exercise malformed /
     /// notification inputs the typed API can't express).
     pub async fn send_value(&mut self, value: &Value) -> std::io::Result<()> {
@@ -735,6 +760,18 @@ impl McpClient {
         }
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "server closed"))?;
         serde_json::from_str(&line).map_err(std::io::Error::other)
+    }
+
+    /// Gracefully close an idle MCP connection using the 2024-11-05 lifecycle:
+    /// half-close client output, then require bounded peer EOF.
+    pub async fn close(mut self) -> std::io::Result<()> {
+        graceful_close_framed(
+            &mut self.reader,
+            &mut self.writer,
+            MAX_MCP_FRAME_BYTES,
+            MCP_GRACEFUL_CLOSE_TIMEOUT,
+        )
+        .await
     }
 }
 
@@ -825,6 +862,61 @@ mod tests {
         assert_eq!(result["protocolVersion"], PROTOCOL_VERSION);
         assert_eq!(result["serverInfo"]["name"], "ai-agent-os-kernel");
         assert!(result["capabilities"]["tools"].is_object());
+    }
+
+    #[tokio::test]
+    async fn ping_is_preinitialize_keepalive_and_close_confirms_peer_eof() {
+        let kernel = Arc::new(AgentKernelImpl::new().expect("kernel new"));
+        let server = McpServer::bind(kernel, "127.0.0.1:0")
+            .await
+            .unwrap()
+            .with_idle_timeout(std::time::Duration::from_millis(500));
+        let addr = server.local_addr().unwrap();
+        tokio::spawn(server.serve());
+        let mut client = McpClient::connect(addr).await.unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let first = client.ping().await.unwrap();
+        assert_eq!(first.result, Some(json!({})));
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let second = client.ping().await.unwrap();
+        assert_eq!(second.result, Some(json!({})));
+
+        let initialized = client
+            .request(
+                "initialize",
+                Some(json!({
+                    "protocolVersion": PROTOCOL_VERSION,
+                    "capabilities": {},
+                    "clientInfo": {"name": "keepalive-test", "version": "1.0.0"}
+                })),
+            )
+            .await
+            .unwrap();
+        assert!(initialized.error.is_none());
+        client.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn idle_deadline_closes_quiet_mcp_connection_without_stopping_listener() {
+        let kernel = Arc::new(AgentKernelImpl::new().expect("kernel new"));
+        let server = McpServer::bind(kernel, "127.0.0.1:0")
+            .await
+            .unwrap()
+            .with_idle_timeout(std::time::Duration::from_millis(75));
+        let addr = server.local_addr().unwrap();
+        tokio::spawn(server.serve());
+        let mut stale = McpClient::connect(addr).await.unwrap();
+        assert!(stale.ping().await.unwrap().error.is_none());
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        stale
+            .ping()
+            .await
+            .expect_err("idle MCP connection must close");
+
+        let mut fresh = McpClient::connect(addr).await.unwrap();
+        assert!(fresh.ping().await.unwrap().error.is_none());
+        fresh.close().await.unwrap();
     }
 
     #[tokio::test]

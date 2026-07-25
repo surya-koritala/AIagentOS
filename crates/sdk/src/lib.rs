@@ -721,6 +721,15 @@ impl KernelClient {
         }
     }
 
+    /// Verify that this protocol-v2 connection is responsive and reset the
+    /// server's established idle deadline.
+    pub async fn ping(&mut self) -> Result<(), SdkError> {
+        match self.call(Syscall::Ping).await? {
+            SyscallReply::Pong => Ok(()),
+            other => Err(unexpected("Pong", &other)),
+        }
+    }
+
     /// Read a kernel node's load/health (agent counts) — used by
     /// [`ClusterClient`] for placement.
     pub async fn node_info(&mut self) -> Result<NodeLoad, SdkError> {
@@ -1347,6 +1356,16 @@ impl KernelClient {
             SyscallReply::Authenticated => Ok(()),
             other => Err(unexpected("Authenticated", &other)),
         }
+    }
+
+    /// Gracefully close this idle client connection.
+    ///
+    /// The method consumes the client, half-closes its output, and waits for
+    /// bounded peer EOF. Finish every request or message stream before calling
+    /// it; an unread frame is reported as a transport error.
+    pub async fn close(self) -> Result<(), SdkError> {
+        self.inner.close().await?;
+        Ok(())
     }
 
     /// Issue a raw syscall and fold [`SyscallReply::Error`] into [`SdkError`].

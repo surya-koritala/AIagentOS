@@ -21,7 +21,7 @@ from urllib.parse import urlparse
 
 MAX_FRAME_BYTES = 8 * 1024 * 1024
 SUPPORTED_VERSIONS = (1, 2)
-V2_ONLY_OPERATIONS = {"cancel_request", "send_message_stream"}
+V2_ONLY_OPERATIONS = {"cancel_request", "ping", "send_message_stream"}
 
 
 class ConformanceError(ValueError):

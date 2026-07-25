@@ -36,17 +36,21 @@ use crate::connector::AgentConnector;
 use crate::context::{ContextManager, ContextPressureStats, Fact, FactCategory};
 use crate::observability::{AgentAction, ObservabilityEngine};
 use crate::resources::ResourceBroker;
-use crate::wire_io::{read_bounded_line, write_bounded_json};
+use crate::wire_io::{graceful_close_framed, read_bounded_line, write_bounded_json};
 use crate::{AgentConfig, AgentKernelImpl, Priority};
 
 /// Default simultaneous syscall connection limit.
 pub use crate::wire_io::DEFAULT_MAX_CONNECTIONS as DEFAULT_WIRE_MAX_CONNECTIONS;
+/// Maximum duration of the client half-close / peer-EOF handshake.
+pub use crate::wire_io::GRACEFUL_CLOSE_TIMEOUT as WIRE_GRACEFUL_CLOSE_TIMEOUT;
 /// Maximum time for the first frame and TLS negotiation.
 pub use crate::wire_io::HANDSHAKE_TIMEOUT as WIRE_HANDSHAKE_TIMEOUT;
 /// Maximum idle time between syscall frames.
 pub use crate::wire_io::IDLE_TIMEOUT as WIRE_IDLE_TIMEOUT;
 /// Maximum serialized syscall request or reply frame.
 pub use crate::wire_io::MAX_JSON_FRAME_BYTES as MAX_WIRE_FRAME_BYTES;
+/// Recommended maximum interval between application-level pings.
+pub use crate::wire_io::RECOMMENDED_KEEPALIVE_INTERVAL as WIRE_KEEPALIVE_INTERVAL;
 /// Maximum wall-clock duration of one dispatched syscall.
 pub use crate::wire_io::REQUEST_TIMEOUT as WIRE_REQUEST_TIMEOUT;
 /// Maximum queued stream events at each transport boundary.
@@ -294,6 +298,10 @@ pub enum Syscall {
     /// feature identifiers, compatibility behavior, and transport bounds.
     /// Like `Hello`, this is safe before authentication.
     DescribeProtocol,
+    /// Prove that a quiet protocol-v2 connection is still responsive and reset
+    /// its established idle deadline. Safe before authentication and free of
+    /// kernel side effects.
+    Ping,
     /// Load an agent package from a TOML manifest (see `crate::agent_package`):
     /// parse + validate, then create the agent through the full admission path
     /// and seed its memory. Replies with the new agent's id (`AgentCreated`).
@@ -839,6 +847,8 @@ pub enum SyscallReply {
         #[serde(default)]
         features: Vec<String>,
     },
+    /// Prompt response to [`Syscall::Ping`].
+    Pong,
     /// The connection is authenticated (reply to [`Syscall::Authenticate`]).
     Authenticated,
     /// Machine-readable public protocol contract.
@@ -1101,6 +1111,7 @@ fn syscall_policy(call: &Syscall) -> (AccessLevel, &'static str, Option<&str>) {
         }
         Syscall::Hello { .. } => (AccessLevel::ReadOnly, "protocol.hello", None),
         Syscall::DescribeProtocol => (AccessLevel::ReadOnly, "protocol.describe", None),
+        Syscall::Ping => (AccessLevel::ReadOnly, "protocol.ping", None),
         Syscall::Authenticate { .. } => (AccessLevel::ReadOnly, "auth.authenticate", None),
         Syscall::LoadPackage { .. } => (AccessLevel::Admin, "package.load", None),
         Syscall::TrustPackageKey { .. } => (AccessLevel::Admin, "package.trust_key", None),
@@ -1980,6 +1991,7 @@ pub async fn dispatch_scoped(
         Syscall::DescribeProtocol => SyscallReply::ProtocolDescription {
             description: crate::wire_contract::protocol_description(),
         },
+        Syscall::Ping => SyscallReply::Pong,
         Syscall::LoadPackage { manifest_toml } => {
             match crate::agent_package::AgentManifest::from_toml_str(&manifest_toml) {
                 Ok(manifest) => {
@@ -2924,6 +2936,7 @@ pub struct SyscallServer {
     /// this token before any other syscall is dispatched.
     auth_token: Option<Arc<String>>,
     connection_limit: Arc<Semaphore>,
+    idle_timeout: std::time::Duration,
 }
 
 impl SyscallServer {
@@ -2937,6 +2950,7 @@ impl SyscallServer {
             listener: Listener::Tcp(TcpListener::bind(addr).await?),
             auth_token: None,
             connection_limit: Arc::new(Semaphore::new(DEFAULT_WIRE_MAX_CONNECTIONS)),
+            idle_timeout: WIRE_IDLE_TIMEOUT,
         })
     }
 
@@ -2954,6 +2968,7 @@ impl SyscallServer {
             listener: Listener::Unix(tokio::net::UnixListener::bind(path)?),
             auth_token: None,
             connection_limit: Arc::new(Semaphore::new(DEFAULT_WIRE_MAX_CONNECTIONS)),
+            idle_timeout: WIRE_IDLE_TIMEOUT,
         })
     }
 
@@ -2979,6 +2994,7 @@ impl SyscallServer {
             listener: Listener::Tls(TcpListener::bind(addr).await?, acceptor),
             auth_token: None,
             connection_limit: Arc::new(Semaphore::new(DEFAULT_WIRE_MAX_CONNECTIONS)),
+            idle_timeout: WIRE_IDLE_TIMEOUT,
         })
     }
 
@@ -2995,6 +3011,15 @@ impl SyscallServer {
     /// unbounded task per peer. A zero value is rejected by clamping it to one.
     pub fn with_connection_limit(mut self, max_connections: usize) -> Self {
         self.connection_limit = Arc::new(Semaphore::new(max_connections.max(1)));
+        self
+    }
+
+    /// Override the established connection idle deadline.
+    ///
+    /// The public contract reports the 300-second default. Deployments may
+    /// tighten it; zero is clamped to one millisecond.
+    pub fn with_idle_timeout(mut self, idle_timeout: std::time::Duration) -> Self {
+        self.idle_timeout = idle_timeout.max(std::time::Duration::from_millis(1));
         self
     }
 
@@ -3016,6 +3041,7 @@ impl SyscallServer {
     /// connection is a stream of newline-delimited [`Syscall`] requests.
     pub async fn serve(self) -> std::io::Result<()> {
         let connection_limit = self.connection_limit.clone();
+        let idle_timeout = self.idle_timeout;
         match self.listener {
             Listener::Tcp(listener) => loop {
                 let (stream, _peer) = listener.accept().await?;
@@ -3028,7 +3054,7 @@ impl SyscallServer {
                 tokio::spawn(async move {
                     let _connection_permit = connection_permit;
                     let (read, write) = stream.into_split();
-                    let _ = Self::handle(kernel, read, write, auth).await;
+                    let _ = Self::handle(kernel, read, write, auth, idle_timeout).await;
                 });
             },
             Listener::Tls(listener, acceptor) => loop {
@@ -3054,7 +3080,7 @@ impl SyscallServer {
                     // The TLS stream is one AsyncRead+AsyncWrite object; split it
                     // into halves so it drops into the existing generic handler.
                     let (read, write) = tokio::io::split(tls);
-                    let _ = Self::handle(kernel, read, write, auth).await;
+                    let _ = Self::handle(kernel, read, write, auth, idle_timeout).await;
                 });
             },
             #[cfg(unix)]
@@ -3069,7 +3095,7 @@ impl SyscallServer {
                 tokio::spawn(async move {
                     let _connection_permit = connection_permit;
                     let (read, write) = stream.into_split();
-                    let _ = Self::handle(kernel, read, write, auth).await;
+                    let _ = Self::handle(kernel, read, write, auth, idle_timeout).await;
                 });
             },
         }
@@ -3084,6 +3110,7 @@ impl SyscallServer {
         read: R,
         mut write: W,
         auth: Option<Arc<String>>,
+        idle_timeout: std::time::Duration,
     ) -> std::io::Result<()>
     where
         R: AsyncRead + Unpin,
@@ -3103,7 +3130,7 @@ impl SyscallServer {
             let timeout = if first_frame {
                 WIRE_HANDSHAKE_TIMEOUT
             } else {
-                WIRE_IDLE_TIMEOUT
+                idle_timeout
             };
             let line = match tokio::time::timeout(
                 timeout,
@@ -3258,6 +3285,13 @@ impl SyscallServer {
                         }
                     }
                 }
+                // Protocol-v2 liveness probe. It is deliberately safe before
+                // authentication and has no effect beyond proving application
+                // responsiveness and starting the next idle-deadline window.
+                Ok(Syscall::Ping) if negotiated_version >= 2 => SyscallReply::Pong,
+                Ok(Syscall::Ping) => SyscallReply::Error {
+                    message: "incompatible wire-protocol version: v2 is required for ping".into(),
+                },
                 Ok(_) if !authed => SyscallReply::Error {
                     message: "authentication required".into(),
                 },
@@ -3332,7 +3366,7 @@ impl SyscallServer {
                 write_bounded_json(&mut write, &fallback, MAX_WIRE_FRAME_BYTES).await?;
             }
         }
-        Ok(())
+        write.shutdown().await
     }
 }
 
@@ -3425,6 +3459,11 @@ impl SyscallClient {
         .await
     }
 
+    /// Send the protocol-v2 application-level keepalive probe.
+    pub async fn ping(&mut self) -> std::io::Result<SyscallReply> {
+        self.call(Syscall::Ping).await
+    }
+
     /// Send one syscall frame without reading a reply. Streaming clients use
     /// this once and then call [`read_reply`](Self::read_reply) until a terminal
     /// stream frame arrives.
@@ -3459,6 +3498,20 @@ impl SyscallClient {
     pub async fn call(&mut self, call: Syscall) -> std::io::Result<SyscallReply> {
         self.send(&call).await?;
         self.read_reply().await
+    }
+
+    /// Gracefully close an idle connection by half-closing client output and
+    /// requiring the server to answer with EOF within the public close bound.
+    ///
+    /// Every ordinary reply or terminal stream frame must be consumed first.
+    pub async fn close(mut self) -> std::io::Result<()> {
+        graceful_close_framed(
+            &mut self.reader,
+            &mut self.writer,
+            MAX_WIRE_FRAME_BYTES,
+            WIRE_GRACEFUL_CLOSE_TIMEOUT,
+        )
+        .await
     }
 }
 
@@ -3738,6 +3791,7 @@ mod tests {
                 request_id: "v1-stream".into(),
                 agent_id: "not-a-uuid".into(),
             },
+            Syscall::Ping,
         ] {
             match v1.call(call).await.unwrap() {
                 SyscallReply::Error { message } => {
@@ -4356,6 +4410,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ping_resets_idle_deadline_without_granting_auth_and_close_confirms_eof() {
+        let kernel = Arc::new(AgentKernelImpl::new().expect("kernel new"));
+        let server = SyscallServer::bind(kernel, "127.0.0.1:0")
+            .await
+            .unwrap()
+            .with_auth_token("secret")
+            .with_idle_timeout(std::time::Duration::from_millis(500));
+        let addr = server.local_addr().unwrap();
+        tokio::spawn(server.serve());
+        let mut client = SyscallClient::connect(addr).await.unwrap();
+
+        assert!(matches!(
+            client
+                .call(Syscall::Hello {
+                    protocol_version: PROTOCOL_VERSION,
+                })
+                .await
+                .unwrap(),
+            SyscallReply::Hello { .. }
+        ));
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(matches!(client.ping().await.unwrap(), SyscallReply::Pong));
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(matches!(client.ping().await.unwrap(), SyscallReply::Pong));
+
+        match client.call(Syscall::ListAgents).await.unwrap() {
+            SyscallReply::TypedError { message, .. } => {
+                assert_eq!(message, "authentication required");
+            }
+            other => panic!("ping must not authenticate the connection: {other:?}"),
+        }
+        assert!(matches!(
+            client.authenticate("secret").await.unwrap(),
+            SyscallReply::Authenticated
+        ));
+        client.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn idle_deadline_closes_quiet_connection_without_stopping_listener() {
+        let kernel = Arc::new(AgentKernelImpl::new().expect("kernel new"));
+        let server = SyscallServer::bind(kernel, "127.0.0.1:0")
+            .await
+            .unwrap()
+            .with_idle_timeout(std::time::Duration::from_millis(75));
+        let addr = server.local_addr().unwrap();
+        tokio::spawn(server.serve());
+        let mut stale = SyscallClient::connect(addr).await.unwrap();
+        assert!(matches!(
+            stale
+                .call(Syscall::Hello {
+                    protocol_version: PROTOCOL_VERSION,
+                })
+                .await
+                .unwrap(),
+            SyscallReply::Hello { .. }
+        ));
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        stale.ping().await.expect_err("idle connection must close");
+
+        let mut fresh = SyscallClient::connect(addr).await.unwrap();
+        assert!(matches!(
+            fresh
+                .call(Syscall::Hello {
+                    protocol_version: PROTOCOL_VERSION,
+                })
+                .await
+                .unwrap(),
+            SyscallReply::Hello { .. }
+        ));
+        fresh.close().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn hello_rejects_incompatible_version_with_clear_error() {
         let kernel = Arc::new(AgentKernelImpl::new().expect("kernel new"));
         let server = SyscallServer::bind(kernel, "127.0.0.1:0").await.unwrap();
@@ -4667,6 +4795,7 @@ memory = ["remember this"]
             }
             other => panic!("expected Agents over unix socket, got {other:?}"),
         }
+        client.close().await.unwrap();
         let _ = std::fs::remove_file(&path);
     }
 
@@ -4766,6 +4895,7 @@ memory = ["remember this"]
             ),
             other => panic!("expected Agents over TLS, got {other:?}"),
         }
+        client.close().await.unwrap();
     }
 
     #[tokio::test]
@@ -4806,6 +4936,7 @@ memory = ["remember this"]
             client.call(Syscall::ListAgents).await.unwrap(),
             SyscallReply::Agents { .. }
         ));
+        client.close().await.unwrap();
     }
 
     fn assert_authorization_denied(reply: SyscallReply) {
@@ -5001,6 +5132,7 @@ memory = ["remember this"]
                 AccessLevel::ReadOnly,
             ),
             (Syscall::DescribeProtocol, AccessLevel::ReadOnly),
+            (Syscall::Ping, AccessLevel::ReadOnly),
             (
                 Syscall::LoadPackage {
                     manifest_toml: "x".into(),
@@ -5175,7 +5307,7 @@ memory = ["remember this"]
                     .to_string()
             })
             .collect::<std::collections::HashSet<_>>();
-        assert_eq!(calls.len(), 60);
+        assert_eq!(calls.len(), 61);
         assert_eq!(fixture_tags, schema_tags);
     }
 

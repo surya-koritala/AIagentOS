@@ -162,6 +162,9 @@
     "op": "describe_protocol"
   },
   {
+    "op": "ping"
+  },
+  {
     "manifest_toml": "name = \"fixture\"\nversion = \"0.1.0\"",
     "op": "load_package"
   },

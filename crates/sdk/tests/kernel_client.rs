@@ -211,7 +211,21 @@ async fn create_lists_and_gate_stats_via_kernel_client() {
     assert!(protocol
         .features
         .contains(&"bounded_json_frames".to_string()));
+    assert!(protocol
+        .features
+        .contains(&"connection_keepalive".to_string()));
+    assert!(protocol
+        .features
+        .contains(&"graceful_connection_close".to_string()));
     assert!(protocol.request_schema["oneOf"].is_array());
+}
+
+#[tokio::test]
+async fn sdk_ping_and_graceful_close_roundtrip() {
+    let addr = spawn_server().await;
+    let mut client = KernelClient::connect(addr).await.expect("connect");
+    client.ping().await.expect("ping");
+    client.close().await.expect("graceful close");
 }
 
 #[tokio::test]

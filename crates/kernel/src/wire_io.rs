@@ -28,6 +28,15 @@ pub const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_sec
 /// Maximum idle time between complete frames on an established connection.
 pub const IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
+/// Recommended maximum interval between application-level keepalive probes.
+///
+/// This is deliberately half the default idle timeout so one delayed probe
+/// does not immediately turn a healthy but quiet connection into an idle close.
+pub const RECOMMENDED_KEEPALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(150);
+
+/// Maximum time a client waits for peer EOF after half-closing its write side.
+pub const GRACEFUL_CLOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Maximum wall-clock duration of one wire or MCP request.
 ///
 /// Provider turns have their own 120-second timeout. This outer deadline leaves
@@ -100,9 +109,43 @@ where
     writer.flush().await
 }
 
+/// Half-close a framed client's write side and require bounded peer EOF.
+///
+/// Callers must have consumed the reply (or terminal stream frame) for every
+/// request before entering this handshake. Receiving another frame after the
+/// half-close is therefore a protocol-state error rather than data to discard.
+pub async fn graceful_close_framed<R, W>(
+    reader: &mut BufReader<R>,
+    writer: &mut W,
+    max_bytes: usize,
+    timeout: std::time::Duration,
+) -> std::io::Result<()>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    writer.shutdown().await?;
+    let peer = tokio::time::timeout(timeout, read_bounded_line(reader, max_bytes))
+        .await
+        .map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "peer did not finish graceful close before the deadline",
+            )
+        })??;
+    match peer {
+        None => Ok(()),
+        Some(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "peer sent an unexpected frame during graceful close",
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::AsyncReadExt;
 
     #[tokio::test]
     async fn bounded_reader_accepts_crlf_and_eof_terminated_frames() {
@@ -147,5 +190,52 @@ mod tests {
             .await
             .expect_err("oversized");
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
+    async fn graceful_close_half_closes_and_confirms_peer_eof() {
+        let (client, mut peer) = tokio::io::duplex(64);
+        let (read, mut write) = tokio::io::split(client);
+        let mut reader = BufReader::new(read);
+        let peer_task = tokio::spawn(async move {
+            let mut input = Vec::new();
+            peer.read_to_end(&mut input).await.unwrap();
+            assert!(input.is_empty());
+            peer.shutdown().await.unwrap();
+        });
+
+        graceful_close_framed(
+            &mut reader,
+            &mut write,
+            64,
+            std::time::Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+        peer_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn graceful_close_rejects_an_unread_peer_frame() {
+        let (client, mut peer) = tokio::io::duplex(64);
+        let (read, mut write) = tokio::io::split(client);
+        let mut reader = BufReader::new(read);
+        let peer_task = tokio::spawn(async move {
+            let mut input = Vec::new();
+            peer.read_to_end(&mut input).await.unwrap();
+            peer.write_all(b"unexpected\n").await.unwrap();
+            peer.shutdown().await.unwrap();
+        });
+
+        let error = graceful_close_framed(
+            &mut reader,
+            &mut write,
+            64,
+            std::time::Duration::from_secs(1),
+        )
+        .await
+        .expect_err("unread frame must fail close");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        peer_task.await.unwrap();
     }
 }

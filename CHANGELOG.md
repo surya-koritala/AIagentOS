@@ -20,6 +20,9 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
   tenant/agent cancellation authorization, disconnect-safe cleanup, and
   incremental Azure OpenAI SSE deltas. Retry/failover now stops after visible
   partial output to prevent duplicate stream content.
+- Added deterministic golden request sets for every v1 and v2 operation plus a
+  dependency-free Python conformance runner that negotiates both supported
+  versions and validates the fixtures against a live server's published schema.
 
 ### Added
 

@@ -134,3 +134,9 @@ backpressure, and provider-granularity rules are documented in
 `docs/PROTOCOL.md`. Until 1.0, any wire-breaking minor must bump
 `PROTOCOL_VERSION`, retain the immediately previous window and fixtures unless
 retirement is explicit, and call out the migration in the changelog.
+
+Every supported request operation must also remain represented in
+`protocol/v1/requests.json` or `protocol/v2/requests.json` as applicable.
+Regenerate those files with the `export-wire-fixtures` example and run
+`python3 scripts/verify_wire_fixtures.py`; the Rust and Python regression suites
+both reject schema, type, version, or operation-set drift.

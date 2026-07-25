@@ -437,6 +437,65 @@ const REQUEST_VARIANTS: &[Variant] = &[
     },
 ];
 
+/// Generate one deterministic, syntactically valid request fixture for every
+/// operation available in `protocol_version`.
+///
+/// These values are conformance inputs, not executable examples: identifiers,
+/// credentials, package material, and other strings are inert placeholders.
+/// Keeping generation beside the schema prevents the versioned, language-
+/// neutral fixture sets from silently drifting away from the Rust wire types.
+pub fn conformance_request_fixtures(protocol_version: u32) -> Result<Vec<Value>, String> {
+    if !(MIN_PROTOCOL_VERSION..=PROTOCOL_VERSION).contains(&protocol_version) {
+        return Err(format!(
+            "unsupported protocol version {protocol_version}; expected {MIN_PROTOCOL_VERSION}..={PROTOCOL_VERSION}"
+        ));
+    }
+    Ok(REQUEST_VARIANTS
+        .iter()
+        .filter(|variant| {
+            protocol_version >= 2
+                || !matches!(variant.tag, "send_message_stream" | "cancel_request")
+        })
+        .map(|variant| {
+            let mut request = Map::new();
+            request.insert("op".into(), Value::String(variant.tag.into()));
+            for field in variant.fields {
+                let value = match (field.name, field.kind) {
+                    ("protocol_version", JsonKind::Integer) => {
+                        Value::Number(protocol_version.into())
+                    }
+                    ("agent_id", JsonKind::String) => {
+                        Value::String("00000000-0000-0000-0000-000000000001".into())
+                    }
+                    ("checkpoint_id", JsonKind::String) => {
+                        Value::String("00000000-0000-0000-0000-000000000002".into())
+                    }
+                    ("fact_id", JsonKind::String) => {
+                        Value::String("00000000-0000-0000-0000-000000000003".into())
+                    }
+                    ("public_key_hex" | "archive_hex", JsonKind::String) => {
+                        Value::String("00".into())
+                    }
+                    ("valid_from", JsonKind::String) => {
+                        Value::String("2026-01-01T00:00:00Z".into())
+                    }
+                    ("manifest_toml", JsonKind::String) => {
+                        Value::String("name = \"fixture\"\nversion = \"0.1.0\"".into())
+                    }
+                    (_, JsonKind::String) => Value::String("fixture".into()),
+                    (_, JsonKind::Integer) => Value::Number(1.into()),
+                    (_, JsonKind::Boolean) => Value::Bool(true),
+                    (_, JsonKind::Object) | (_, JsonKind::Any) => Value::Object(Map::new()),
+                    (_, JsonKind::Array) => Value::Array(Vec::new()),
+                    (_, JsonKind::StringOrNull | JsonKind::IntegerOrNull) => Value::Null,
+                };
+                request.insert(field.name.into(), value);
+            }
+            Value::Object(request)
+        })
+        .collect())
+}
+
 const REPLY_VARIANTS: &[Variant] = &[
     Variant {
         tag: "agent_created",
@@ -971,5 +1030,30 @@ mod tests {
             serde_json::from_str(include_str!("../../../protocol/mcp/initialize.json")).unwrap();
         assert_eq!(mcp.jsonrpc, "2.0");
         assert_eq!(mcp.method, "initialize");
+    }
+
+    #[test]
+    fn generated_request_fixtures_cover_every_operation_in_each_supported_version() {
+        for (version, source) in [
+            (1, include_str!("../../../protocol/v1/requests.json")),
+            (2, include_str!("../../../protocol/v2/requests.json")),
+        ] {
+            let committed: Vec<Value> = serde_json::from_str(source).unwrap();
+            let generated = conformance_request_fixtures(version).unwrap();
+            assert_eq!(
+                committed, generated,
+                "protocol/v{version}/requests.json is stale; regenerate it with the export-wire-fixtures example"
+            );
+            for request in &committed {
+                serde_json::from_value::<crate::syscall_server::Syscall>(request.clone())
+                    .unwrap_or_else(|error| {
+                        panic!("invalid v{version} fixture {request}: {error}")
+                    });
+            }
+        }
+        assert_eq!(conformance_request_fixtures(1).unwrap().len(), 58);
+        assert_eq!(conformance_request_fixtures(2).unwrap().len(), 60);
+        assert!(conformance_request_fixtures(0).is_err());
+        assert!(conformance_request_fixtures(PROTOCOL_VERSION + 1).is_err());
     }
 }

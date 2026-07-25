@@ -40,8 +40,9 @@ compatibility behavior, and transport limits:
 The schemas use JSON Schema draft 2020-12 and cover every top-level request,
 reply, and stream-event tag. The authorization/schema regression constructs
 all 60 current syscalls and rejects either a missing schema operation or an
-undocumented extra. Domain payload examples and previous-version shapes are
-retained under `protocol/`.
+undocumented extra. Deterministic golden request arrays cover all 58 v1
+operations and all 60 v2 operations. Domain payload examples and
+previous-version shapes are retained under `protocol/`.
 
 ## Compatibility policy
 
@@ -158,9 +159,11 @@ cancelled, incompatible version, provider, lifecycle, and internal failures.
 Versioned fixtures:
 
 - `protocol/v1/error.json`
+- `protocol/v1/requests.json` (all 58 v1 operations)
 - `protocol/v2/hello.json`
 - `protocol/v2/typed-error.json`
 - `protocol/v2/describe-protocol-request.json`
+- `protocol/v2/requests.json` (all 60 v2 operations)
 - `protocol/v2/send-message-stream.json`
 - `protocol/v2/stream-event.json`
 - `protocol/v2/stream-completed.json`
@@ -169,9 +172,30 @@ Versioned fixtures:
 - `protocol/v2/request-cancellation.json`
 - `protocol/mcp/initialize.json`
 
-Kernel tests verify fixture parsing, complete operation/schema parity, typed
-error classification, authorization, bounds, redaction, TCP/Unix/TLS behavior,
-stream ordering/backpressure, and MCP parity. SDK tests exercise the same real
-server boundary, preserve typed errors and enforcement introspection, and prove
-second-connection request cancellation. Adapter tests prove incremental Azure
-SSE deltas and bounded output.
+Regenerate a version after an intentional schema change:
+
+```bash
+cargo run -p kernel --example export-wire-fixtures --locked -- 1 > protocol/v1/requests.json
+cargo run -p kernel --example export-wire-fixtures --locked -- 2 > protocol/v2/requests.json
+python3 scripts/verify_wire_fixtures.py
+```
+
+Prospective non-Rust clients can check both version handshakes and validate
+every fixture against a live server's `DescribeProtocol` schema without any
+third-party Python dependency:
+
+```bash
+python3 scripts/verify_wire_fixtures.py --address tcp://127.0.0.1:7777
+# Authenticated server:
+AGENTOS_TOKEN=… python3 scripts/verify_wire_fixtures.py \
+  --address tcp://127.0.0.1:7777 --token-env AGENTOS_TOKEN
+```
+
+The runner performs only `Hello`, optional `Authenticate`, and
+`DescribeProtocol`; it never executes the mutating golden requests. Kernel
+tests verify fixture parsing, complete per-version operation/schema parity,
+typed error classification, authorization, bounds, redaction, TCP/Unix/TLS
+behavior, stream ordering/backpressure, and MCP parity. SDK tests exercise the
+same real server boundary, preserve typed errors and enforcement introspection,
+and prove second-connection request cancellation. Adapter tests prove
+incremental Azure SSE deltas and bounded output.

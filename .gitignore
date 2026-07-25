@@ -1,6 +1,8 @@
 # Build artifacts
 /target/
 **/target/
+__pycache__/
+*.py[cod]
 
 # Dependencies
 **/node_modules/

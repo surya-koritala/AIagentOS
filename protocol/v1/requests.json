@@ -1,0 +1,260 @@
+[
+  {
+    "name": "fixture",
+    "op": "create_agent",
+    "priority": 1,
+    "profile": "fixture",
+    "provider": "fixture",
+    "task": "fixture"
+  },
+  {
+    "op": "list_agents"
+  },
+  {
+    "agent_id": "00000000-0000-0000-0000-000000000001",
+    "op": "pause_agent"
+  },
+  {
+    "agent_id": "00000000-0000-0000-0000-000000000001",
+    "op": "resume_agent"
+  },
+  {
+    "agent_id": "00000000-0000-0000-0000-000000000001",
+    "op": "stop_agent"
+  },
+  {
+    "agent_id": "00000000-0000-0000-0000-000000000001",
+    "op": "kill_agent"
+  },
+  {
+    "agent_id": "00000000-0000-0000-0000-000000000001",
+    "op": "get_agent_status"
+  },
+  {
+    "agent_id": "00000000-0000-0000-0000-000000000001",
+    "op": "wait_agent",
+    "timeout_ms": 1
+  },
+  {
+    "agent_id": "00000000-0000-0000-0000-000000000001",
+    "op": "list_generation_checkpoints"
+  },
+  {
+    "agent_id": "00000000-0000-0000-0000-000000000001",
+    "checkpoint_id": "00000000-0000-0000-0000-000000000002",
+    "op": "resume_generation_checkpoint"
+  },
+  {
+    "agent_id": "00000000-0000-0000-0000-000000000001",
+    "checkpoint_id": "00000000-0000-0000-0000-000000000002",
+    "op": "delete_generation_checkpoint"
+  },
+  {
+    "agent_id": "00000000-0000-0000-0000-000000000001",
+    "message": "fixture",
+    "op": "send_message"
+  },
+  {
+    "agent_id": "00000000-0000-0000-0000-000000000001",
+    "args": {},
+    "op": "call_tool",
+    "tool": "fixture"
+  },
+  {
+    "op": "gate_stats"
+  },
+  {
+    "agent_id": "00000000-0000-0000-0000-000000000001",
+    "op": "agent_info"
+  },
+  {
+    "op": "list_providers"
+  },
+  {
+    "agent_id": "00000000-0000-0000-0000-000000000001",
+    "category": null,
+    "content": "fixture",
+    "op": "memory_store"
+  },
+  {
+    "agent_id": "00000000-0000-0000-0000-000000000001",
+    "op": "memory_query",
+    "query": "fixture"
+  },
+  {
+    "agent_id": "00000000-0000-0000-0000-000000000001",
+    "content": "fixture",
+    "fact_id": "00000000-0000-0000-0000-000000000003",
+    "op": "memory_update"
+  },
+  {
+    "agent_id": "00000000-0000-0000-0000-000000000001",
+    "fact_id": "00000000-0000-0000-0000-000000000003",
+    "op": "memory_delete"
+  },
+  {
+    "agent_id": "00000000-0000-0000-0000-000000000001",
+    "op": "memory_reindex"
+  },
+  {
+    "agent_id": "00000000-0000-0000-0000-000000000001",
+    "key": "fixture",
+    "op": "storage_put",
+    "value": "fixture"
+  },
+  {
+    "agent_id": "00000000-0000-0000-0000-000000000001",
+    "key": "fixture",
+    "op": "storage_get"
+  },
+  {
+    "agent_id": "00000000-0000-0000-0000-000000000001",
+    "op": "storage_list"
+  },
+  {
+    "agent_id": "00000000-0000-0000-0000-000000000001",
+    "op": "context_pressure"
+  },
+  {
+    "agent_id": "00000000-0000-0000-0000-000000000001",
+    "key": "fixture",
+    "op": "storage_delete"
+  },
+  {
+    "agent_id": "00000000-0000-0000-0000-000000000001",
+    "label": "fixture",
+    "op": "snapshot_context"
+  },
+  {
+    "agent_id": "00000000-0000-0000-0000-000000000001",
+    "label": "fixture",
+    "op": "restore_snapshot"
+  },
+  {
+    "agent_id": "00000000-0000-0000-0000-000000000001",
+    "op": "list_snapshots"
+  },
+  {
+    "agent_id": "00000000-0000-0000-0000-000000000001",
+    "label": "fixture",
+    "op": "delete_snapshot"
+  },
+  {
+    "op": "hello",
+    "protocol_version": 1
+  },
+  {
+    "op": "authenticate",
+    "token": "fixture"
+  },
+  {
+    "op": "describe_protocol"
+  },
+  {
+    "manifest_toml": "name = \"fixture\"\nversion = \"0.1.0\"",
+    "op": "load_package"
+  },
+  {
+    "key_id": "fixture",
+    "op": "trust_package_key",
+    "public_key_hex": "00",
+    "publisher": "fixture",
+    "supersedes": null,
+    "valid_from": "2026-01-01T00:00:00Z",
+    "valid_until": null
+  },
+  {
+    "key_id": "fixture",
+    "op": "revoke_package_key"
+  },
+  {
+    "archive_hex": "00",
+    "op": "publish_package"
+  },
+  {
+    "name": "fixture",
+    "op": "yank_package",
+    "version": "fixture"
+  },
+  {
+    "name": "fixture",
+    "op": "fetch_package",
+    "version": "fixture"
+  },
+  {
+    "op": "search_packages",
+    "query": "fixture"
+  },
+  {
+    "name": "fixture",
+    "op": "install_package",
+    "requirement": "fixture"
+  },
+  {
+    "name": "fixture",
+    "op": "rollback_package"
+  },
+  {
+    "name": "fixture",
+    "op": "remove_package"
+  },
+  {
+    "op": "list_installed_packages"
+  },
+  {
+    "name": "fixture",
+    "op": "run_installed_package"
+  },
+  {
+    "op": "node_info"
+  },
+  {
+    "op": "metrics"
+  },
+  {
+    "op": "operator_snapshot"
+  },
+  {
+    "op": "list_operator_tunables"
+  },
+  {
+    "expected_revision": 1,
+    "name": "fixture",
+    "op": "set_operator_tunable",
+    "value": 1
+  },
+  {
+    "expected_revision": 1,
+    "name": "fixture",
+    "op": "rollback_operator_tunable",
+    "target_revision": 1
+  },
+  {
+    "limit": 1,
+    "name": null,
+    "op": "list_operator_tunable_audit"
+  },
+  {
+    "op": "list_services"
+  },
+  {
+    "name": "fixture",
+    "op": "start_service"
+  },
+  {
+    "name": "fixture",
+    "op": "stop_service"
+  },
+  {
+    "name": "fixture",
+    "op": "restart_service"
+  },
+  {
+    "op": "reload_services"
+  },
+  {
+    "limit": 1,
+    "name": null,
+    "op": "list_service_history"
+  }
+]

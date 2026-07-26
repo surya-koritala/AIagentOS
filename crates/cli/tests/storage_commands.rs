@@ -770,3 +770,135 @@ fn storage_encryption_cli_migrates_backs_up_restores_and_rotates_offline() {
     )
     .expect("rotated database accepts new key");
 }
+
+#[test]
+fn portable_storage_cli_exports_verifies_and_rekeys_a_complete_installation() {
+    let root = TestRoot::new();
+    let source = root.0.join("portable-source.db");
+    let bundle = root.0.join("portable-bundle");
+    let imported = root.0.join("portable-imported.db");
+    let source_key_file = root.0.join("portable-source.key");
+    let destination_key_file = root.0.join("portable-destination.key");
+    drop(kernel::context::SqliteContextManager::new(&source).expect("create source"));
+
+    for (key_id, path) in [
+        ("portable-source-generation", &source_key_file),
+        ("portable-destination-generation", &destination_key_file),
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_agentctl"))
+            .arg("storage-key-generate")
+            .arg(key_id)
+            .arg(path)
+            .output()
+            .expect("run portable storage key generation");
+        assert!(
+            output.status.success(),
+            "storage-key-generate failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let encrypted = Command::new(env!("CARGO_BIN_EXE_agentctl"))
+        .arg("storage-encrypt")
+        .arg(&source)
+        .arg(&source_key_file)
+        .arg("--confirm-offline")
+        .output()
+        .expect("encrypt portable source");
+    assert!(
+        encrypted.status.success(),
+        "storage-encrypt failed: {}",
+        String::from_utf8_lossy(&encrypted.stderr)
+    );
+
+    let unconfirmed_export = Command::new(env!("CARGO_BIN_EXE_agentctl"))
+        .arg("storage-portable-export")
+        .arg(&source)
+        .arg(&bundle)
+        .arg("--storage-key")
+        .arg(&source_key_file)
+        .output()
+        .expect("run unconfirmed portable export");
+    assert_eq!(unconfirmed_export.status.code(), Some(2));
+    assert!(!bundle.exists());
+
+    let exported = Command::new(env!("CARGO_BIN_EXE_agentctl"))
+        .arg("storage-portable-export")
+        .arg(&source)
+        .arg(&bundle)
+        .arg("--storage-key")
+        .arg(&source_key_file)
+        .arg("--confirm-offline")
+        .output()
+        .expect("run portable export");
+    assert!(
+        exported.status.success(),
+        "storage-portable-export failed: {}",
+        String::from_utf8_lossy(&exported.stderr)
+    );
+    let export_report: kernel::storage::PortableStorageExportReport =
+        serde_json::from_slice(&exported.stdout).expect("portable export report JSON");
+    assert_eq!(
+        export_report.manifest.source_storage_key_id.as_deref(),
+        Some("portable-source-generation")
+    );
+
+    let verified = Command::new(env!("CARGO_BIN_EXE_agentctl"))
+        .arg("storage-portable-verify")
+        .arg(&bundle)
+        .output()
+        .expect("run portable verification");
+    assert!(
+        verified.status.success(),
+        "storage-portable-verify failed: {}",
+        String::from_utf8_lossy(&verified.stderr)
+    );
+    let verified_manifest: kernel::storage::PortableStorageManifest =
+        serde_json::from_slice(&verified.stdout).expect("portable manifest JSON");
+    assert_eq!(verified_manifest, export_report.manifest);
+
+    let unconfirmed_import = Command::new(env!("CARGO_BIN_EXE_agentctl"))
+        .arg("storage-portable-import")
+        .arg(&bundle)
+        .arg(&imported)
+        .arg("--storage-key")
+        .arg(&destination_key_file)
+        .output()
+        .expect("run unconfirmed portable import");
+    assert_eq!(unconfirmed_import.status.code(), Some(2));
+    assert!(!imported.exists());
+
+    let imported_output = Command::new(env!("CARGO_BIN_EXE_agentctl"))
+        .arg("storage-portable-import")
+        .arg(&bundle)
+        .arg(&imported)
+        .arg("--storage-key")
+        .arg(&destination_key_file)
+        .arg("--confirm-offline")
+        .output()
+        .expect("run portable import");
+    assert!(
+        imported_output.status.success(),
+        "storage-portable-import failed: {}",
+        String::from_utf8_lossy(&imported_output.stderr)
+    );
+    let import_report: kernel::storage::PortableStorageImportReport =
+        serde_json::from_slice(&imported_output.stdout).expect("portable import report JSON");
+    assert_eq!(
+        import_report.destination_storage_key_id.as_deref(),
+        Some("portable-destination-generation")
+    );
+    assert_eq!(
+        import_report.installation_id,
+        export_report.manifest.installation_id
+    );
+    assert!(kernel::context::SqliteContextManager::new_encrypted(
+        &imported,
+        kernel::storage_encryption::load_storage_encryption_key(&source_key_file).unwrap()
+    )
+    .is_err());
+    kernel::context::SqliteContextManager::new_encrypted(
+        &imported,
+        kernel::storage_encryption::load_storage_encryption_key(&destination_key_file).unwrap(),
+    )
+    .expect("portable import boots with destination key");
+}

@@ -10,6 +10,15 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
 
 ## [Unreleased]
 
+- Added versioned full-installation portability under #123. Confirmed offline
+  `storage-portable-export`, `storage-portable-verify`, and
+  `storage-portable-import` commands move every durable SQLite state class from
+  plaintext or SQLCipher storage into an owner-only, integrity-checked
+  plaintext transfer bundle, then atomically publish a fresh destination with
+  optional re-encryption under a different key. Exact-format, schema,
+  installation-identity, hash, symlink, unexpected-file, running-owner,
+  tamper, no-overwrite, plaintext/encrypted round-trip, rekey, and CLI
+  regressions fail closed without publishing partial destinations.
 - Added authenticated usage and quota accounting under #123 with schema version
   3. Every usage row, quota aggregate, receipt, scope, refund tombstone, epoch
   floor, and migration fence contributes a keyed HMAC to one enforcement-state

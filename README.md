@@ -196,6 +196,28 @@ cargo run -p agent-cli --bin agentctl --locked -- \
 
 The command keeps the old database as rollback until the restored configuration
 boots the full kernel and every persisted agent is re-admitted to enforcement.
+
+To move a complete installation to a fresh database or a new storage-key
+generation, stop the server and use the versioned portable format. The bundle
+is intentionally plaintext and contains every durable tenant and system record,
+so transport it through a trusted channel, keep its directory owner-only, and
+securely remove it after the destination is verified:
+
+```bash
+cargo run -p agent-cli --bin agentctl --locked -- \
+  storage-portable-export /var/lib/agentos/agent_os.db \
+  /srv/transfer/agentos-portable \
+  --storage-key /etc/agentos/storage-keys/storage-generation-1.json \
+  --confirm-offline
+cargo run -p agent-cli --bin agentctl --locked -- \
+  storage-portable-verify /srv/transfer/agentos-portable
+cargo run -p agent-cli --bin agentctl --locked -- \
+  storage-portable-import /srv/transfer/agentos-portable \
+  /var/lib/agentos-new/agent_os.db \
+  --storage-key /etc/agentos/storage-keys/storage-generation-2.json \
+  --confirm-offline
+```
+
 Automatic backup configuration, exact durability boundaries, lower-level
 offline restore, and remaining disaster-recovery work are documented in
 [docs/DURABILITY.md](docs/DURABILITY.md).

@@ -39,6 +39,11 @@ const BACKUP_SIGNING_DOMAIN_V1: &[u8] = b"AIAGENTOS-BACKUP-MANIFEST-V1\0";
 const BACKUP_SIGNING_DOMAIN_V2: &[u8] = b"AIAGENTOS-BACKUP-MANIFEST-V2\0";
 const BACKUP_ENCRYPTION_FORMAT_VERSION: u32 = 1;
 const BACKUP_ENCRYPTION_ALGORITHM: &str = "sqlcipher-4";
+pub const PORTABLE_STORAGE_FORMAT_VERSION: u32 = 1;
+const PORTABLE_STORAGE_DATABASE_FILE: &str = "storage.sqlite3";
+const PORTABLE_STORAGE_MANIFEST_FILE: &str = "portable-storage.json";
+const PORTABLE_STORAGE_PAYLOAD_FORMAT: &str = "sqlite3-plaintext";
+const PORTABLE_STORAGE_CONFIDENTIALITY: &str = "plaintext-owner-only";
 
 /// Whole-database encryption identity required to authenticate a backup.
 ///
@@ -213,6 +218,49 @@ pub struct BackupManifest {
     pub encryption: Option<BackupEncryption>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub authenticity: Option<BackupAuthenticity>,
+}
+
+/// Versioned, integrity-checked description of a complete installation export.
+///
+/// The payload is deliberately plaintext so it can be imported under a
+/// different storage key. It contains all durable state and must therefore be
+/// handled as a secret by the operator.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PortableStorageManifest {
+    pub format_version: u32,
+    pub payload_format: String,
+    pub confidentiality: String,
+    pub database_file: String,
+    pub application_id: i64,
+    pub schema_version: i64,
+    pub min_reader_schema_version: i64,
+    pub installation_id: String,
+    pub created_at: String,
+    pub byte_count: u64,
+    pub sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_storage_key_id: Option<String>,
+}
+
+/// Result of atomically publishing a portable installation bundle.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PortableStorageExportReport {
+    pub bundle_dir: PathBuf,
+    pub manifest: PortableStorageManifest,
+}
+
+/// Result of atomically importing a portable installation bundle.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PortableStorageImportReport {
+    pub bundle_dir: PathBuf,
+    pub database_path: PathBuf,
+    pub format_version: u32,
+    pub schema_version: i64,
+    pub installation_id: String,
+    pub byte_count: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub destination_storage_key_id: Option<String>,
 }
 
 /// Result of an offline restore.
@@ -1109,6 +1157,570 @@ fn read_manifest(path: &Path) -> Result<BackupManifest, ContextError> {
             "failed to parse backup manifest {}: {error}",
             path.display()
         ))
+    })
+}
+
+fn write_portable_storage_manifest(
+    path: &Path,
+    manifest: &PortableStorageManifest,
+) -> Result<(), ContextError> {
+    let mut bytes = serde_json::to_vec_pretty(manifest).map_err(|error| {
+        storage_error(format!(
+            "failed to serialize portable storage manifest: {error}"
+        ))
+    })?;
+    bytes.push(b'\n');
+    write_new_owner_only_file(path, &bytes, "portable storage manifest")
+}
+
+fn read_portable_storage_manifest(path: &Path) -> Result<PortableStorageManifest, ContextError> {
+    let size = require_regular_file(path, "portable storage manifest")?;
+    if size > MAX_MANIFEST_BYTES {
+        return Err(storage_error(format!(
+            "portable storage manifest {} exceeds {MAX_MANIFEST_BYTES} bytes",
+            path.display()
+        )));
+    }
+    let file = File::open(path).map_err(|error| {
+        storage_error(format!(
+            "failed to open portable storage manifest {}: {error}",
+            path.display()
+        ))
+    })?;
+    serde_json::from_reader(file).map_err(|error| {
+        storage_error(format!(
+            "failed to parse portable storage manifest {}: {error}",
+            path.display()
+        ))
+    })
+}
+
+fn require_portable_storage_contents(bundle_dir: &Path) -> Result<(), ContextError> {
+    let mut found_database = false;
+    let mut found_manifest = false;
+    let mut entries = 0_usize;
+    for entry in fs::read_dir(bundle_dir).map_err(|error| {
+        storage_error(format!(
+            "failed to enumerate portable storage bundle {}: {error}",
+            bundle_dir.display()
+        ))
+    })? {
+        let entry = entry.map_err(|error| {
+            storage_error(format!(
+                "failed to enumerate portable storage bundle {}: {error}",
+                bundle_dir.display()
+            ))
+        })?;
+        entries += 1;
+        if entries > 2 {
+            return Err(storage_error(
+                "portable storage bundle must contain exactly its database and manifest",
+            ));
+        }
+        let metadata = fs::symlink_metadata(entry.path()).map_err(|error| {
+            storage_error(format!(
+                "failed to inspect portable storage entry {}: {error}",
+                entry.path().display()
+            ))
+        })?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(storage_error(
+                "portable storage bundle contains a non-regular file or symlink",
+            ));
+        }
+        match entry.file_name().to_str() {
+            Some(PORTABLE_STORAGE_DATABASE_FILE) => found_database = true,
+            Some(PORTABLE_STORAGE_MANIFEST_FILE) => found_manifest = true,
+            _ => {
+                return Err(storage_error(format!(
+                    "portable storage bundle contains unexpected entry {:?}",
+                    entry.file_name()
+                )))
+            }
+        }
+    }
+    if entries != 2 || !found_database || !found_manifest {
+        return Err(storage_error(
+            "portable storage bundle is incomplete or contains duplicate entries",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_portable_storage_manifest(
+    manifest: &PortableStorageManifest,
+) -> Result<(), ContextError> {
+    if manifest.format_version != PORTABLE_STORAGE_FORMAT_VERSION {
+        return Err(storage_error(format!(
+            "unsupported portable storage format version {}, expected \
+             {PORTABLE_STORAGE_FORMAT_VERSION}",
+            manifest.format_version
+        )));
+    }
+    if manifest.payload_format != PORTABLE_STORAGE_PAYLOAD_FORMAT {
+        return Err(storage_error(format!(
+            "unsupported portable storage payload format {:?}",
+            manifest.payload_format
+        )));
+    }
+    if manifest.confidentiality != PORTABLE_STORAGE_CONFIDENTIALITY {
+        return Err(storage_error(format!(
+            "unsupported portable storage confidentiality declaration {:?}",
+            manifest.confidentiality
+        )));
+    }
+    if manifest.database_file != PORTABLE_STORAGE_DATABASE_FILE {
+        return Err(storage_error(format!(
+            "portable storage database filename {:?} is not supported",
+            manifest.database_file
+        )));
+    }
+    if uuid::Uuid::parse_str(&manifest.installation_id).is_err() {
+        return Err(storage_error(
+            "portable storage installation id is not a UUID",
+        ));
+    }
+    chrono::DateTime::parse_from_rfc3339(&manifest.created_at).map_err(|error| {
+        storage_error(format!(
+            "portable storage creation timestamp is invalid: {error}"
+        ))
+    })?;
+    if let Some(key_id) = manifest.source_storage_key_id.as_deref() {
+        if key_id.is_empty()
+            || key_id.len() > 96
+            || !key_id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+        {
+            return Err(storage_error(
+                "portable storage source key id has an invalid format",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn require_matching_portable_metadata(
+    manifest: &PortableStorageManifest,
+    metadata: &crate::schema::StorageMetadata,
+) -> Result<(), ContextError> {
+    if manifest.application_id != metadata.application_id
+        || manifest.schema_version != metadata.schema_version
+        || manifest.min_reader_schema_version != metadata.min_reader_schema_version
+        || manifest.installation_id != metadata.installation_id
+    {
+        return Err(storage_error(
+            "portable storage manifest identity does not match its SQLite payload",
+        ));
+    }
+    Ok(())
+}
+
+/// Verify the exact bundle shape, version, complete payload hash, SQLite
+/// integrity, schema compatibility, and installation identity.
+pub fn verify_portable_storage(bundle_dir: &Path) -> Result<PortableStorageManifest, ContextError> {
+    require_real_directory(bundle_dir, "portable storage bundle")?;
+    require_portable_storage_contents(bundle_dir)?;
+    let manifest =
+        read_portable_storage_manifest(&bundle_dir.join(PORTABLE_STORAGE_MANIFEST_FILE))?;
+    validate_portable_storage_manifest(&manifest)?;
+    let database_path = bundle_dir.join(PORTABLE_STORAGE_DATABASE_FILE);
+    let byte_count = require_regular_file(&database_path, "portable storage database")?;
+    if byte_count != manifest.byte_count {
+        return Err(storage_error(format!(
+            "portable storage byte count mismatch: manifest={}, actual={byte_count}",
+            manifest.byte_count
+        )));
+    }
+    if sha256_file(&database_path)? != manifest.sha256 {
+        return Err(storage_error("portable storage SHA-256 mismatch"));
+    }
+    let (connection, metadata) = open_verified_database(&database_path, None)?;
+    drop(connection);
+    require_matching_portable_metadata(&manifest, &metadata)?;
+    // Opening the payload must not introduce an untracked SQLite sidecar.
+    require_portable_storage_contents(bundle_dir)?;
+    Ok(manifest)
+}
+
+fn prepare_portable_source(
+    database_path: &Path,
+    storage_key: Option<&StorageEncryptionKey>,
+) -> Result<(Connection, crate::schema::StorageMetadata), ContextError> {
+    require_regular_file(database_path, "portable storage source database")?;
+    let connection = Connection::open(database_path).map_err(|error| {
+        storage_error(format!(
+            "failed to open portable storage source {}: {error}",
+            database_path.display()
+        ))
+    })?;
+    if let Some(key) = storage_key {
+        key.apply(&connection)?;
+    }
+    connection
+        .busy_timeout(Duration::from_secs(5))
+        .map_err(|error| {
+            storage_error(format!(
+                "failed to set portable storage busy timeout: {error}"
+            ))
+        })?;
+    crate::schema::verify(&connection)?;
+    let metadata = crate::schema::read_storage_metadata(&connection)?;
+    let (busy, _log_pages, _checkpointed_pages): (i64, i64, i64) = connection
+        .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })
+        .map_err(|error| {
+            storage_error(format!(
+                "failed to checkpoint portable storage source WAL: {error}"
+            ))
+        })?;
+    if busy != 0 {
+        return Err(storage_error(
+            "portable storage source WAL is busy; stop all database users before export",
+        ));
+    }
+    Ok((connection, metadata))
+}
+
+fn sqlcipher_export_to_file(
+    source: &Connection,
+    destination: &Path,
+    destination_key: Option<&StorageEncryptionKey>,
+    metadata: &crate::schema::StorageMetadata,
+) -> Result<(), ContextError> {
+    let destination_text = destination.to_str().ok_or_else(|| {
+        storage_error("portable storage database path must be valid UTF-8 for SQLCipher export")
+    })?;
+    let database_name = if let Some(key) = destination_key {
+        source
+            .execute("ATTACH DATABASE ?1 AS encrypted", [destination_text])
+            .map_err(|error| {
+                storage_error(format!(
+                    "failed to attach encrypted portable storage destination: {error}"
+                ))
+            })?;
+        key.apply_to_attached(source, "encrypted")?;
+        "encrypted"
+    } else {
+        source
+            .execute("ATTACH DATABASE ?1 AS portable KEY ''", [destination_text])
+            .map_err(|error| {
+                storage_error(format!(
+                    "failed to attach plaintext portable storage destination: {error}"
+                ))
+            })?;
+        "portable"
+    };
+    let export_sql = if destination_key.is_some() {
+        "SELECT sqlcipher_export('encrypted')"
+    } else {
+        "SELECT sqlcipher_export('portable')"
+    };
+    source
+        .query_row(export_sql, [], |_| Ok(()))
+        .map_err(|error| storage_error(format!("portable SQLCipher export failed: {error}")))?;
+    let attached = rusqlite::DatabaseName::Attached(database_name);
+    source
+        .pragma_update(Some(attached), "application_id", metadata.application_id)
+        .map_err(|error| {
+            storage_error(format!(
+                "failed to preserve portable storage application id: {error}"
+            ))
+        })?;
+    source
+        .pragma_update(Some(attached), "user_version", metadata.schema_version)
+        .map_err(|error| {
+            storage_error(format!(
+                "failed to preserve portable storage schema version: {error}"
+            ))
+        })?;
+    let detach_sql = if destination_key.is_some() {
+        "DETACH DATABASE encrypted"
+    } else {
+        "DETACH DATABASE portable"
+    };
+    source
+        .execute(detach_sql, [])
+        .map_err(|error| storage_error(format!("failed to finalize portable storage: {error}")))?;
+    set_owner_only_file(destination)?;
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(destination)
+        .and_then(|file| file.sync_all())
+        .map_err(|error| {
+            storage_error(format!(
+                "failed to sync portable storage database {}: {error}",
+                destination.display()
+            ))
+        })
+}
+
+fn encrypt_portable_payload(
+    payload: &Path,
+    destination: &Path,
+    destination_key: &StorageEncryptionKey,
+    metadata: &crate::schema::StorageMetadata,
+) -> Result<(), ContextError> {
+    let payload_text = payload.to_str().ok_or_else(|| {
+        storage_error("portable storage payload path must be valid UTF-8 for SQLCipher import")
+    })?;
+    let destination_text = destination.to_str().ok_or_else(|| {
+        storage_error("portable storage destination path must be valid UTF-8 for SQLCipher import")
+    })?;
+    let bridge = Connection::open_in_memory().map_err(|error| {
+        storage_error(format!(
+            "failed to create portable storage import bridge: {error}"
+        ))
+    })?;
+    bridge
+        .execute(
+            "ATTACH DATABASE ?1 AS portable_source KEY ''",
+            [payload_text],
+        )
+        .map_err(|error| {
+            storage_error(format!(
+                "failed to attach portable storage import source: {error}"
+            ))
+        })?;
+    bridge
+        .query_row(
+            "SELECT count(*) FROM portable_source.sqlite_schema",
+            [],
+            |_| Ok(()),
+        )
+        .map_err(|error| {
+            storage_error(format!(
+                "failed to authenticate plaintext portable storage source: {error}"
+            ))
+        })?;
+    bridge
+        .execute("ATTACH DATABASE ?1 AS encrypted", [destination_text])
+        .map_err(|error| {
+            storage_error(format!(
+                "failed to attach encrypted portable storage destination: {error}"
+            ))
+        })?;
+    destination_key.apply_to_attached(&bridge, "encrypted")?;
+    bridge
+        .query_row(
+            "SELECT sqlcipher_export('encrypted', 'portable_source')",
+            [],
+            |_| Ok(()),
+        )
+        .map_err(|error| storage_error(format!("portable SQLCipher import failed: {error}")))?;
+    bridge
+        .pragma_update(
+            Some(rusqlite::DatabaseName::Attached("encrypted")),
+            "application_id",
+            metadata.application_id,
+        )
+        .map_err(|error| {
+            storage_error(format!(
+                "failed to preserve imported storage application id: {error}"
+            ))
+        })?;
+    bridge
+        .pragma_update(
+            Some(rusqlite::DatabaseName::Attached("encrypted")),
+            "user_version",
+            metadata.schema_version,
+        )
+        .map_err(|error| {
+            storage_error(format!(
+                "failed to preserve imported storage schema version: {error}"
+            ))
+        })?;
+    bridge
+        .execute("DETACH DATABASE encrypted", [])
+        .map_err(|error| {
+            storage_error(format!(
+                "failed to finalize encrypted portable storage import: {error}"
+            ))
+        })?;
+    bridge
+        .execute("DETACH DATABASE portable_source", [])
+        .map_err(|error| {
+            storage_error(format!(
+                "failed to release portable storage import source: {error}"
+            ))
+        })?;
+    set_owner_only_file(destination)?;
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(destination)
+        .and_then(|file| file.sync_all())
+        .map_err(|error| {
+            storage_error(format!(
+                "failed to sync imported storage database {}: {error}",
+                destination.display()
+            ))
+        })
+}
+
+/// Export all durable installation state into an atomically published,
+/// owner-only plaintext bundle.
+pub fn export_portable_storage(
+    database_path: &Path,
+    bundle_dir: &Path,
+    source_key: Option<&StorageEncryptionKey>,
+) -> Result<PortableStorageExportReport, ContextError> {
+    let parent = bundle_dir.parent().ok_or_else(|| {
+        storage_error("portable storage bundle destination must have a parent directory")
+    })?;
+    require_real_directory(parent, "portable storage bundle parent")?;
+    reject_existing_path(bundle_dir, "portable storage bundle")?;
+    let _lease = acquire_storage_lease(database_path)?;
+    let (source, metadata) = prepare_portable_source(database_path, source_key)?;
+
+    let staging_dir = parent.join(format!(
+        ".portable-storage-{}.staging",
+        uuid::Uuid::new_v4()
+    ));
+    reject_existing_path(&staging_dir, "portable storage staging directory")?;
+    fs::create_dir(&staging_dir).map_err(|error| {
+        storage_error(format!(
+            "failed to create portable storage staging directory {}: {error}",
+            staging_dir.display()
+        ))
+    })?;
+    let mut staging_guard = StagingDirectory::new(staging_dir.clone());
+    set_owner_only_directory(&staging_dir)?;
+
+    let database_file = staging_dir.join(PORTABLE_STORAGE_DATABASE_FILE);
+    sqlcipher_export_to_file(&source, &database_file, None, &metadata)?;
+    drop(source);
+    let (verified, exported_metadata) = open_verified_database(&database_file, None)?;
+    drop(verified);
+    if exported_metadata != metadata {
+        return Err(storage_error(
+            "portable storage identity changed during plaintext export",
+        ));
+    }
+    let byte_count = require_regular_file(&database_file, "portable storage database")?;
+    let manifest = PortableStorageManifest {
+        format_version: PORTABLE_STORAGE_FORMAT_VERSION,
+        payload_format: PORTABLE_STORAGE_PAYLOAD_FORMAT.into(),
+        confidentiality: PORTABLE_STORAGE_CONFIDENTIALITY.into(),
+        database_file: PORTABLE_STORAGE_DATABASE_FILE.into(),
+        application_id: metadata.application_id,
+        schema_version: metadata.schema_version,
+        min_reader_schema_version: metadata.min_reader_schema_version,
+        installation_id: metadata.installation_id,
+        created_at: Utc::now().to_rfc3339(),
+        byte_count,
+        sha256: sha256_file(&database_file)?,
+        source_storage_key_id: source_key.map(|key| key.key_id().to_owned()),
+    };
+    write_portable_storage_manifest(&staging_dir.join(PORTABLE_STORAGE_MANIFEST_FILE), &manifest)?;
+    sync_directory(&staging_dir)?;
+    let verified_manifest = verify_portable_storage(&staging_dir)?;
+    if verified_manifest != manifest {
+        return Err(storage_error(
+            "portable storage manifest changed before publication",
+        ));
+    }
+    reject_existing_path(bundle_dir, "portable storage bundle")?;
+    fs::rename(&staging_dir, bundle_dir).map_err(|error| {
+        storage_error(format!(
+            "failed to publish portable storage bundle {}: {error}",
+            bundle_dir.display()
+        ))
+    })?;
+    if let Err(error) = sync_directory(parent) {
+        fs::rename(bundle_dir, &staging_dir).map_err(|rollback_error| {
+            storage_error(format!(
+                "portable storage publication was not durable ({error}); reverting it also \
+                 failed: {rollback_error}"
+            ))
+        })?;
+        return Err(error);
+    }
+    staging_guard.disarm();
+    Ok(PortableStorageExportReport {
+        bundle_dir: bundle_dir.to_path_buf(),
+        manifest,
+    })
+}
+
+/// Import a verified portable bundle into a fresh database, optionally
+/// encrypting it under a destination key before atomic publication.
+pub fn import_portable_storage(
+    bundle_dir: &Path,
+    destination_database: &Path,
+    destination_key: Option<&StorageEncryptionKey>,
+) -> Result<PortableStorageImportReport, ContextError> {
+    let manifest = verify_portable_storage(bundle_dir)?;
+    let parent = destination_database.parent().ok_or_else(|| {
+        storage_error("portable storage import destination must have a parent directory")
+    })?;
+    require_real_directory(parent, "portable storage import parent")?;
+    reject_existing_path(destination_database, "portable storage import destination")?;
+    let _lease = acquire_storage_lease(destination_database)?;
+
+    let stage = companion_path(
+        destination_database,
+        &format!(".portable-import-{}.staging", uuid::Uuid::new_v4()),
+    );
+    reject_existing_path(&stage, "portable storage import staging file")?;
+    let mut stage_guard = StagingFile::new(stage.clone());
+    let payload = bundle_dir.join(PORTABLE_STORAGE_DATABASE_FILE);
+    if let Some(key) = destination_key {
+        let (source, metadata) = open_verified_database(&payload, None)?;
+        drop(source);
+        require_matching_portable_metadata(&manifest, &metadata)?;
+        encrypt_portable_payload(&payload, &stage, key, &metadata)?;
+    } else {
+        copy_to_new_file(&payload, &stage)?;
+    }
+    set_owner_only_file(&stage)?;
+    let (verified, metadata) = open_verified_database(&stage, destination_key)?;
+    drop(verified);
+    require_matching_portable_metadata(&manifest, &metadata)?;
+    // Revalidate the independently supplied bundle immediately before publish.
+    if verify_portable_storage(bundle_dir)? != manifest {
+        return Err(storage_error(
+            "portable storage bundle changed during import",
+        ));
+    }
+    reject_existing_path(destination_database, "portable storage import destination")?;
+    fs::rename(&stage, destination_database).map_err(|error| {
+        storage_error(format!(
+            "failed to publish portable storage import {}: {error}",
+            destination_database.display()
+        ))
+    })?;
+    let publication = (|| {
+        sync_directory(parent)?;
+        let (published, published_metadata) =
+            open_verified_database(destination_database, destination_key)?;
+        drop(published);
+        require_matching_portable_metadata(&manifest, &published_metadata)
+    })();
+    if let Err(error) = publication {
+        fs::rename(destination_database, &stage).map_err(|rollback_error| {
+            storage_error(format!(
+                "portable storage import failed after publication ({error}); reverting it also \
+                 failed: {rollback_error}"
+            ))
+        })?;
+        sync_directory(parent)?;
+        return Err(error);
+    }
+    stage_guard.disarm();
+    Ok(PortableStorageImportReport {
+        bundle_dir: bundle_dir.to_path_buf(),
+        database_path: destination_database.to_path_buf(),
+        format_version: manifest.format_version,
+        schema_version: manifest.schema_version,
+        installation_id: manifest.installation_id,
+        byte_count: require_regular_file(
+            destination_database,
+            "portable storage import destination",
+        )?,
+        destination_storage_key_id: destination_key.map(|key| key.key_id().to_owned()),
     })
 }
 
@@ -3078,6 +3690,188 @@ mod tests {
             .unwrap_err();
         assert!(error.to_string().contains("injected failure"));
         assert!(!destination.exists());
+    }
+
+    #[test]
+    fn portable_storage_moves_complete_encrypted_state_to_a_distinct_key() {
+        let directory = TestDirectory::new("portable-encrypted");
+        let source = directory.path.join("source.db");
+        let secret = "portable-secret-state";
+        {
+            let manager = SqliteContextManager::new_encrypted(
+                &source,
+                encrypted_test_key("source-generation", 0x41),
+            )
+            .unwrap();
+            seed(&manager, "portable-proof", secret);
+        }
+
+        let bundle = directory.path.join("portable-bundle");
+        let export = export_portable_storage(
+            &source,
+            &bundle,
+            Some(&encrypted_test_key("source-generation", 0x41)),
+        )
+        .unwrap();
+        assert_eq!(
+            export.manifest.source_storage_key_id.as_deref(),
+            Some("source-generation")
+        );
+        assert_eq!(verify_portable_storage(&bundle).unwrap(), export.manifest);
+        assert_eq!(
+            value(
+                &bundle.join(PORTABLE_STORAGE_DATABASE_FILE),
+                "portable-proof"
+            )
+            .as_deref(),
+            Some(secret)
+        );
+
+        let destination = directory.path.join("imported.db");
+        let import = import_portable_storage(
+            &bundle,
+            &destination,
+            Some(&encrypted_test_key("destination-generation", 0x52)),
+        )
+        .unwrap();
+        assert_eq!(
+            import.destination_storage_key_id.as_deref(),
+            Some("destination-generation")
+        );
+        assert_eq!(import.installation_id, export.manifest.installation_id);
+        assert!(open_verified_database(
+            &destination,
+            Some(&encrypted_test_key("source-generation", 0x41))
+        )
+        .is_err());
+        let imported = SqliteContextManager::new_encrypted(
+            &destination,
+            encrypted_test_key("destination-generation", 0x52),
+        )
+        .unwrap();
+        let imported_value: String = imported
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT value FROM agent_kv WHERE key = 'portable-proof'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(imported_value, secret);
+    }
+
+    #[test]
+    fn portable_storage_plaintext_round_trip_is_fresh_only_and_offline() {
+        let directory = TestDirectory::new("portable-plaintext");
+        let source = directory.path.join("source.db");
+        let manager = SqliteContextManager::new(&source).unwrap();
+        seed(&manager, "portable-proof", "plain");
+        let blocked_bundle = directory.path.join("blocked-bundle");
+        let error = export_portable_storage(&source, &blocked_bundle, None).unwrap_err();
+        assert!(error.to_string().contains("already owned"));
+        assert!(!blocked_bundle.exists());
+        drop(manager);
+
+        let bundle = directory.path.join("portable-bundle");
+        export_portable_storage(&source, &bundle, None).unwrap();
+        let destination = directory.path.join("imported.db");
+        import_portable_storage(&bundle, &destination, None).unwrap();
+        assert_eq!(
+            value(&destination, "portable-proof").as_deref(),
+            Some("plain")
+        );
+
+        let error = import_portable_storage(&bundle, &destination, None).unwrap_err();
+        assert!(error.to_string().contains("already exists"));
+        assert_eq!(
+            value(&destination, "portable-proof").as_deref(),
+            Some("plain")
+        );
+    }
+
+    #[test]
+    fn portable_storage_rejects_tampering_without_publishing_a_destination() {
+        let directory = TestDirectory::new("portable-tampering");
+        let source = directory.path.join("source.db");
+        {
+            let manager = SqliteContextManager::new(&source).unwrap();
+            seed(&manager, "portable-proof", "untampered");
+        }
+        let bundle = directory.path.join("portable-bundle");
+        export_portable_storage(&source, &bundle, None).unwrap();
+
+        let manifest_path = bundle.join(PORTABLE_STORAGE_MANIFEST_FILE);
+        let original_manifest = fs::read(&manifest_path).unwrap();
+        let mut unknown_manifest: serde_json::Value =
+            serde_json::from_slice(&original_manifest).unwrap();
+        unknown_manifest["unexpected"] = serde_json::json!(true);
+        fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&unknown_manifest).unwrap(),
+        )
+        .unwrap();
+        let destination = directory.path.join("must-not-exist.db");
+        assert!(import_portable_storage(&bundle, &destination, None).is_err());
+        assert!(!destination.exists());
+        fs::write(&manifest_path, &original_manifest).unwrap();
+
+        let unexpected = bundle.join("unexpected.txt");
+        fs::write(&unexpected, b"not allowed").unwrap();
+        assert!(import_portable_storage(&bundle, &destination, None).is_err());
+        assert!(!destination.exists());
+        fs::remove_file(unexpected).unwrap();
+
+        let database = bundle.join(PORTABLE_STORAGE_DATABASE_FILE);
+        let mut file = OpenOptions::new().write(true).open(&database).unwrap();
+        file.seek(SeekFrom::Start(64)).unwrap();
+        file.write_all(b"tampered").unwrap();
+        file.sync_all().unwrap();
+        assert!(verify_portable_storage(&bundle)
+            .unwrap_err()
+            .to_string()
+            .contains("SHA-256 mismatch"));
+        assert!(import_portable_storage(&bundle, &destination, None).is_err());
+        assert!(!destination.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn portable_storage_is_owner_only_and_rejects_symlink_payloads() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let directory = TestDirectory::new("portable-permissions");
+        let source = directory.path.join("source.db");
+        drop(SqliteContextManager::new(&source).unwrap());
+        let bundle = directory.path.join("portable-bundle");
+        export_portable_storage(&source, &bundle, None).unwrap();
+        assert_eq!(
+            fs::metadata(&bundle).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            fs::metadata(bundle.join(PORTABLE_STORAGE_DATABASE_FILE))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        assert_eq!(
+            fs::metadata(bundle.join(PORTABLE_STORAGE_MANIFEST_FILE))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+
+        let database = bundle.join(PORTABLE_STORAGE_DATABASE_FILE);
+        let moved = directory.path.join("moved.sqlite3");
+        fs::rename(&database, &moved).unwrap();
+        symlink(&moved, &database).unwrap();
+        assert!(verify_portable_storage(&bundle).is_err());
     }
 
     #[cfg(unix)]

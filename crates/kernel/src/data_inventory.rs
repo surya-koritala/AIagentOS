@@ -608,6 +608,17 @@ pub const NON_SQLITE_DATA_INVENTORY: &[StaticDataInventoryEntry] = &[
         "confirmed verified-retention operation; remote copies are separate"
     ),
     boundary_entry!(
+        "file/portable-storage-transfer-bundles",
+        "durable-file",
+        "system operator",
+        "same mixed tenancy as complete database",
+        "contains every database sensitivity class and database-resident integrity secret",
+        "temporary operator-controlled transfer lifetime",
+        "intentionally plaintext with owner-only permissions; operator must use encrypted media and trusted transport",
+        "not automatically backed up; this is a full-installation transfer artifact",
+        "operator-owned secure deletion after verified import; storage media may retain blocks"
+    ),
+    boundary_entry!(
         "file/service-definitions",
         "durable-file",
         "system operator",

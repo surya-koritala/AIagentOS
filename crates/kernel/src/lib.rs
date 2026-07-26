@@ -1416,6 +1416,17 @@ impl AgentKernelImpl {
     /// Create a kernel from config (uses config.data_dir for persistence and
     /// config.budgets for cgroup/rate-limit quotas).
     pub fn from_config(config: &crate::config::Config) -> Result<Self, KernelError> {
+        Self::validate_storage_boot_config(config)?;
+        let db_path = config.data_dir.join("agent_os.db");
+        if let Some(parent) = db_path.parent() {
+            std::fs::create_dir_all(parent).ok();
+        }
+        let storage_lease =
+            crate::storage::acquire_storage_lease(&db_path).map_err(KernelError::Context)?;
+        Self::from_validated_config_with_storage_lease(config, storage_lease)
+    }
+
+    fn validate_storage_boot_config(config: &crate::config::Config) -> Result<(), KernelError> {
         config.budgets.validate().map_err(|error| {
             KernelError::Policy(format!("invalid budget configuration: {error}"))
         })?;
@@ -1425,13 +1436,23 @@ impl AgentKernelImpl {
         config.storage_encryption.validate().map_err(|error| {
             KernelError::Policy(format!("invalid storage-encryption configuration: {error}"))
         })?;
+        Ok(())
+    }
+
+    pub(crate) fn from_config_with_storage_lease(
+        config: &crate::config::Config,
+        storage_lease: std::fs::File,
+    ) -> Result<Self, KernelError> {
+        Self::validate_storage_boot_config(config)?;
+        Self::from_validated_config_with_storage_lease(config, storage_lease)
+    }
+
+    fn from_validated_config_with_storage_lease(
+        config: &crate::config::Config,
+        storage_lease: std::fs::File,
+    ) -> Result<Self, KernelError> {
         set_max_browse_chars(config.max_browse_chars);
         let db_path = config.data_dir.join("agent_os.db");
-        if let Some(parent) = db_path.parent() {
-            std::fs::create_dir_all(parent).ok();
-        }
-        let storage_lease =
-            crate::storage::acquire_storage_lease(&db_path).map_err(KernelError::Context)?;
         let context_manager = Arc::new(match config.storage_encryption.key_path.as_deref() {
             Some(key_path) => {
                 let key = crate::storage_encryption::load_storage_encryption_key(key_path)

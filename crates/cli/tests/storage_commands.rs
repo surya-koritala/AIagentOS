@@ -487,8 +487,31 @@ fn storage_encryption_cli_migrates_backs_up_restores_and_rotates_offline() {
     let backup_root = root.0.join("encrypted-backups");
     let backup_dir = backup_root.join("encrypted_001");
     let restored = root.0.join("fresh-host/agent_os.db");
+    let recovery_data_dir = root.0.join("qualified-fresh-host");
+    let recovery_config = root.0.join("recovery-config.toml");
 
-    drop(kernel::AgentKernelImpl::with_db_path(&source).expect("plaintext source"));
+    let recovered_agent_id = {
+        let runtime = tokio::runtime::Runtime::new().expect("test runtime");
+        let kernel = kernel::AgentKernelImpl::with_db_path(&source).expect("plaintext source");
+        runtime.block_on(async {
+            let agent = kernel
+                .create_agent_full(kernel::AgentConfig {
+                    name: "disaster-recovery-agent".into(),
+                    task: "prove enforcement is restored".into(),
+                    llm_provider: "stub".into(),
+                    permission_profile: "standard".into(),
+                    priority: kernel::Priority::default(),
+                    sandbox_config: None,
+                })
+                .await
+                .expect("create persisted recovery agent");
+            kernel
+                .pause_agent(agent.id)
+                .await
+                .expect("pause recovery agent");
+            agent.id
+        })
+    };
     for (key_id, path) in [
         ("storage-generation-1", &key_one),
         ("storage-generation-2", &key_two),
@@ -595,6 +618,103 @@ fn storage_encryption_cli_migrates_backs_up_restores_and_rotates_offline() {
         "encrypted signed verification failed: {}",
         String::from_utf8_lossy(&fully_verified.stderr)
     );
+
+    let failed_data_dir = root.0.join("failed-replacement");
+    let failed_config = root.0.join("failed-recovery-config.toml");
+    let escaped_failed_data_dir = failed_data_dir.to_string_lossy().replace('\\', "\\\\");
+    let escaped_missing_services = root
+        .0
+        .join("missing-services")
+        .to_string_lossy()
+        .replace('\\', "\\\\");
+    let escaped_key = key_one.to_string_lossy().replace('\\', "\\\\");
+    std::fs::write(
+        &failed_config,
+        format!(
+            "llm_provider = \"local\"\n\
+             default_model = \"qualification\"\n\
+             data_dir = \"{escaped_failed_data_dir}\"\n\
+             service_dir = \"{escaped_missing_services}\"\n\
+             [api_keys]\n\
+             [storage_encryption]\n\
+             required = true\n\
+             key_path = \"{escaped_key}\"\n"
+        ),
+    )
+    .expect("write failed recovery configuration");
+    let failed_recovery = Command::new(env!("CARGO_BIN_EXE_agentctl"))
+        .arg("backup-disaster-recover")
+        .arg(&backup_dir)
+        .arg(&failed_config)
+        .arg(&backup_trust)
+        .arg("--confirm-offline")
+        .output()
+        .expect("run failing disaster recovery");
+    assert!(!failed_recovery.status.success());
+    assert!(
+        String::from_utf8_lossy(&failed_recovery.stderr)
+            .contains("failed configured kernel qualification"),
+        "{}",
+        String::from_utf8_lossy(&failed_recovery.stderr)
+    );
+    assert!(
+        !failed_data_dir.join("agent_os.db").exists(),
+        "failed post-restore qualification must remove a fresh-host destination"
+    );
+
+    let escaped_data_dir = recovery_data_dir.to_string_lossy().replace('\\', "\\\\");
+    std::fs::write(
+        &recovery_config,
+        format!(
+            "llm_provider = \"local\"\n\
+             default_model = \"qualification\"\n\
+             data_dir = \"{escaped_data_dir}\"\n\
+             [api_keys]\n\
+             [storage_encryption]\n\
+             required = true\n\
+             key_path = \"{escaped_key}\"\n"
+        ),
+    )
+    .expect("write recovery configuration");
+    let unconfirmed_recovery = Command::new(env!("CARGO_BIN_EXE_agentctl"))
+        .arg("backup-disaster-recover")
+        .arg(&backup_dir)
+        .arg(&recovery_config)
+        .arg(&backup_trust)
+        .output()
+        .expect("run unconfirmed disaster recovery");
+    assert_eq!(unconfirmed_recovery.status.code(), Some(2));
+    assert!(!recovery_data_dir.join("agent_os.db").exists());
+
+    let recovery = Command::new(env!("CARGO_BIN_EXE_agentctl"))
+        .arg("backup-disaster-recover")
+        .arg(&backup_dir)
+        .arg(&recovery_config)
+        .arg(&backup_trust)
+        .arg("--confirm-offline")
+        .output()
+        .expect("run disaster recovery");
+    assert!(
+        recovery.status.success(),
+        "disaster recovery failed: {}",
+        String::from_utf8_lossy(&recovery.stderr)
+    );
+    let recovery_report: kernel::storage::DisasterRecoveryReport =
+        serde_json::from_slice(&recovery.stdout).expect("disaster recovery report JSON");
+    assert_eq!(recovery_report.persisted_agent_count, 1);
+    assert!(recovery_report.enforcement_rearmed);
+    assert!(!recovery_report.restore.replaced_existing);
+    let recovered_config =
+        kernel::config::Config::try_load_from(&recovery_config).expect("recovery config");
+    let recovered_kernel =
+        kernel::AgentKernelImpl::from_config(&recovered_config).expect("boot recovered kernel");
+    assert_eq!(
+        recovered_kernel
+            .get_agent_status(recovered_agent_id)
+            .expect("recovered agent status"),
+        kernel::AgentState::Paused
+    );
+    drop(recovered_kernel);
 
     let restore = Command::new(env!("CARGO_BIN_EXE_agentctl"))
         .arg("backup-restore")

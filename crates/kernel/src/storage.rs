@@ -226,6 +226,15 @@ pub struct RestoreReport {
     pub rollback_retained: bool,
 }
 
+/// Evidence returned after an authenticated restore also boots the configured
+/// kernel and proves every persisted agent was re-admitted to enforcement.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DisasterRecoveryReport {
+    pub restore: RestoreReport,
+    pub persisted_agent_count: usize,
+    pub enforcement_rearmed: bool,
+}
+
 /// Bounded policy for expiring verified backups from one installation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1791,7 +1800,10 @@ pub fn restore_backup(
     backup_dir: &Path,
     destination_database: &Path,
 ) -> Result<RestoreReport, ContextError> {
-    restore_backup_internal(backup_dir, destination_database, None, None)
+    restore_backup_internal(backup_dir, destination_database, None, None, |_, lease| {
+        Ok(lease)
+    })
+    .map(|(report, _lease)| report)
 }
 
 /// Restore a backup only after it passes integrity and trusted-signature
@@ -1801,7 +1813,14 @@ pub fn restore_backup_with_trust(
     destination_database: &Path,
     trust: &BackupTrustRoot,
 ) -> Result<RestoreReport, ContextError> {
-    restore_backup_internal(backup_dir, destination_database, Some(trust), None)
+    restore_backup_internal(
+        backup_dir,
+        destination_database,
+        Some(trust),
+        None,
+        |_, lease| Ok(lease),
+    )
+    .map(|(report, _lease)| report)
 }
 
 /// Restore an encrypted backup while authenticating both the snapshot and any
@@ -1811,7 +1830,14 @@ pub fn restore_backup_with_storage_key(
     destination_database: &Path,
     storage_key: &StorageEncryptionKey,
 ) -> Result<RestoreReport, ContextError> {
-    restore_backup_internal(backup_dir, destination_database, None, Some(storage_key))
+    restore_backup_internal(
+        backup_dir,
+        destination_database,
+        None,
+        Some(storage_key),
+        |_, lease| Ok(lease),
+    )
+    .map(|(report, _lease)| report)
 }
 
 /// Restore an encrypted, signed backup only after both storage-key and
@@ -1827,15 +1853,74 @@ pub fn restore_backup_with_storage_key_and_trust(
         destination_database,
         Some(trust),
         Some(storage_key),
+        |_, lease| Ok(lease),
     )
+    .map(|(report, _lease)| report)
 }
 
-fn restore_backup_internal(
+/// Restore a trusted backup to the database selected by `config`, then boot the
+/// complete configured kernel before discarding the previous database.
+///
+/// This is the production disaster-recovery path. If schema verification,
+/// configured key loading, service recovery, budget reconstruction, or any
+/// persisted agent's enforcement re-admission fails, a replacement restore is
+/// rolled back and a fresh-host destination is removed.
+pub fn recover_backup_from_config(
+    backup_dir: &Path,
+    config: &crate::config::Config,
+    trust: &BackupTrustRoot,
+) -> Result<DisasterRecoveryReport, ContextError> {
+    if !config.data_dir.is_absolute() {
+        return Err(storage_error(
+            "disaster recovery requires an absolute configured data_dir",
+        ));
+    }
+    let destination_database = config.data_dir.join(BACKUP_DATABASE_FILE);
+    let storage_key = config
+        .storage_encryption
+        .key_path
+        .as_deref()
+        .map(crate::storage_encryption::load_storage_encryption_key)
+        .transpose()?;
+    let (restore, (persisted_agent_count, _qualified_kernel)) = restore_backup_internal(
+        backup_dir,
+        &destination_database,
+        Some(trust),
+        storage_key.as_ref(),
+        |_, storage_lease| {
+            let kernel =
+                crate::AgentKernelImpl::from_config_with_storage_lease(config, storage_lease)
+                    .map_err(|error| {
+                        storage_error(format!(
+                            "restored database failed configured kernel qualification: {error}"
+                        ))
+                    })?;
+            let persisted = kernel.context_manager.load_all_agents()?;
+            for agent in &persisted {
+                kernel.get_agent_status(agent.id).map_err(|error| {
+                    storage_error(format!(
+                        "restored agent {} was not re-admitted to enforcement: {error}",
+                        agent.id
+                    ))
+                })?;
+            }
+            Ok((persisted.len(), kernel))
+        },
+    )?;
+    Ok(DisasterRecoveryReport {
+        restore,
+        persisted_agent_count,
+        enforcement_rearmed: true,
+    })
+}
+
+fn restore_backup_internal<T>(
     backup_dir: &Path,
     destination_database: &Path,
     trust: Option<&BackupTrustRoot>,
     storage_key: Option<&StorageEncryptionKey>,
-) -> Result<RestoreReport, ContextError> {
+    qualify_published: impl FnOnce(&BackupManifest, File) -> Result<T, ContextError>,
+) -> Result<(RestoreReport, T), ContextError> {
     let manifest = verify_backup_internal(backup_dir, trust, storage_key)?;
     let parent = destination_database
         .parent()
@@ -1865,7 +1950,12 @@ fn restore_backup_internal(
             )));
         }
     }
-    let _lease = acquire_storage_lease(destination_database)?;
+    let storage_lease = acquire_storage_lease(destination_database)?;
+    let qualification_lease = storage_lease.try_clone().map_err(|error| {
+        storage_error(format!(
+            "failed to retain storage lease during restore qualification: {error}"
+        ))
+    })?;
 
     let stage = companion_path(
         destination_database,
@@ -1906,6 +1996,7 @@ fn restore_backup_internal(
         })?;
     }
 
+    let mut qualification = None;
     let publish_result = (|| {
         if replaced_existing {
             remove_if_exists(&companion_path(destination_database, "-wal"))?;
@@ -1935,6 +2026,7 @@ fn restore_backup_internal(
                 "published restore does not match the verified backup",
             ));
         }
+        qualification = Some(qualify_published(&manifest, qualification_lease)?);
         Ok(())
     })();
 
@@ -1964,11 +2056,14 @@ fn restore_backup_internal(
     } else {
         false
     };
-    Ok(RestoreReport {
-        manifest,
-        replaced_existing,
-        rollback_retained,
-    })
+    Ok((
+        RestoreReport {
+            manifest,
+            replaced_existing,
+            rollback_retained,
+        },
+        qualification.expect("successful restore must run post-publication qualification"),
+    ))
 }
 
 #[cfg(unix)]
@@ -2921,6 +3016,46 @@ mod tests {
         }
         let error = restore_backup(&backup_dir, &destination).unwrap_err();
         assert!(error.to_string().contains("injected failure"));
+        assert_eq!(
+            value(&destination, "destination").as_deref(),
+            Some("must-survive")
+        );
+        assert_eq!(value(&destination, "source"), None);
+        let reopened = SqliteContextManager::new(&destination).unwrap();
+        crate::schema::verify(&reopened.conn.lock().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn post_publication_qualification_failure_rolls_back_the_original_database() {
+        let directory = TestDirectory::new("qualification-rollback");
+        let source = directory.path.join("source.db");
+        let source_manager = SqliteContextManager::new(&source).unwrap();
+        seed(&source_manager, "source", "unqualified");
+        source_manager
+            .create_backup(&directory.path.join("backups"), "qualification")
+            .unwrap();
+        let backup_dir = directory.path.join("backups/qualification");
+
+        let destination = directory.path.join("destination.db");
+        {
+            let destination_manager = SqliteContextManager::new(&destination).unwrap();
+            seed(&destination_manager, "destination", "must-survive");
+        }
+        let error = restore_backup_internal(
+            &backup_dir,
+            &destination,
+            None,
+            None,
+            |_, _qualification_lease| {
+                Err::<File, ContextError>(storage_error(
+                    "injected configured-kernel qualification failure",
+                ))
+            },
+        )
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("configured-kernel qualification failure"));
         assert_eq!(
             value(&destination, "destination").as_deref(),
             Some("must-survive")

@@ -35,6 +35,10 @@ config.toml
 # Proptest regressions (auto-generated)
 **/proptest-regressions/
 
+# Local fuzz output (the extended-security workflow uploads this as evidence)
+fuzz/corpus/
+fuzz/artifacts/
+
 # Frontend build output (regenerated)
 crates/tauri-app/ui/dist/
 .claude/

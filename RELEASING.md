@@ -38,7 +38,8 @@ All workspace crates share one version number; bump them together.
    `## [X.Y.Z] - YYYY-MM-DD` section (leave a fresh empty `Unreleased`).
 3. Bump the version in every workspace crate and the exact `version =
    "=X.Y.Z"` constraint on each internal path dependency (including
-   `fuzz/Cargo.toml`); run `cargo build` so `Cargo.lock` updates.
+   `fuzz/Cargo.toml`); run `cargo build` and
+   `cargo build --manifest-path fuzz/Cargo.toml` so both lockfiles update.
 4. Open a `chore/release-vX.Y.Z` PR; merge once green.
 5. Create a signed, annotated tag for the merged commit, verify it locally, and
    push it. Project policy treats published tags as immutable: never move or
@@ -146,3 +147,10 @@ idle-close, and client-half-close/peer-EOF contract for raw, SDK, TLS, Unix, and
 MCP callers. Keep the recommended keepalive and graceful-close deadlines in
 `DescribeProtocol`, exercise short idle windows in regression tests, and do not
 introduce a private MCP shutdown RPC.
+
+Framing changes must use the incremental decoder in `wire_io`, keep its
+retained and allocated capacity at or below the advertised frame limit, pass
+the deterministic ordered/fragmented/shuffled property suite, and leave both
+`wire_syscall` and `wire_transport` fuzz targets buildable. The protected
+extended-security workflow runs each target and preserves its corpus and crash
+artifacts.

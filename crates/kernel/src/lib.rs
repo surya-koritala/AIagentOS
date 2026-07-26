@@ -68,6 +68,11 @@ pub mod tools;
 pub mod vision;
 pub mod voice;
 pub mod wire_contract;
+#[cfg(feature = "fuzzing")]
+#[doc(hidden)]
+pub use wire_fuzz::exercise_fragmented_transport;
+#[cfg(feature = "fuzzing")]
+mod wire_fuzz;
 mod wire_io;
 
 use serde::{Deserialize, Serialize};

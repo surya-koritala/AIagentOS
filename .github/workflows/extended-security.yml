@@ -102,6 +102,8 @@ jobs:
         run: cargo fuzz build --target x86_64-unknown-linux-gnu
       - name: Exercise untrusted wire input
         run: cargo fuzz run wire_syscall --target x86_64-unknown-linux-gnu -- -max_total_time=120 -max_len=65536
+      - name: Exercise partial and out-of-order transport fragments
+        run: cargo fuzz run wire_transport --target x86_64-unknown-linux-gnu -- -max_total_time=120 -max_len=262144
       - name: Preserve newly discovered corpus and crash evidence
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -110,4 +112,6 @@ jobs:
           path: |
             fuzz/corpus/wire_syscall
             fuzz/artifacts/wire_syscall
+            fuzz/corpus/wire_transport
+            fuzz/artifacts/wire_transport
           if-no-files-found: warn

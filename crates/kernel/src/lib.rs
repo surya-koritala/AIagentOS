@@ -13,6 +13,7 @@ pub mod auth;
 pub mod budget;
 pub mod cfs;
 pub mod cgroups;
+pub mod cluster_control;
 pub mod config;
 pub mod connector;
 pub mod context;
@@ -1211,6 +1212,9 @@ pub struct AgentKernelImpl {
     pub agent_manager: Arc<AgentManager>,
     pub scheduler: Arc<PriorityScheduler>,
     pub context_manager: Arc<SqliteContextManager>,
+    /// Durable cryptographic node identity plus generation-fenced
+    /// active/draining/quarantined admission state.
+    pub cluster_control: Arc<crate::cluster_control::ClusterControl>,
     pub permission_manager: Arc<PermissionManager>,
     pub sandbox_manager: Arc<SandboxManagerImpl>,
     pub ipc: Arc<IpcManager>,
@@ -1518,6 +1522,10 @@ impl AgentKernelImpl {
         let package_registry = Arc::new(crate::package::PackageRegistry::from_store(
             context_manager.clone(),
         ));
+        let cluster_control = Arc::new(
+            crate::cluster_control::ClusterControl::new(context_manager.clone())
+                .map_err(KernelError::Context)?,
+        );
         let os = Arc::new(OsSubsystems::new());
 
         let ipc = Arc::new(IpcManager::new());
@@ -1548,6 +1556,7 @@ impl AgentKernelImpl {
             agent_manager,
             scheduler: Arc::new(PriorityScheduler::new()),
             context_manager,
+            cluster_control,
             permission_manager,
             sandbox_manager,
             ipc,

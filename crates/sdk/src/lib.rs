@@ -41,6 +41,9 @@ use tokio::net::ToSocketAddrs;
 
 // Re-export the kernel wire types that appear in this crate's public API, so
 // SDK consumers can name them without depending on the kernel directly.
+pub use kernel::cluster_control::{
+    NodeAvailability, NodeControlAudit, NodeControlStatus, NodeIdentity, NodeProfile,
+};
 pub use kernel::context::ContextPressureStats;
 pub use kernel::init_system::{ServiceHistoryEntry, ServiceRuntimeInfo};
 pub use kernel::operator_control::{OperatorTunable, OperatorTunableAudit};
@@ -66,7 +69,7 @@ pub use kernel::syscall_server::PROTOCOL_VERSION;
 pub mod cluster;
 pub mod patterns;
 
-pub use cluster::{ClusterClient, NodeHandle, PlacedAgent, Placement};
+pub use cluster::{ClusterClient, NodeHandle, PlacedAgent, Placement, PlacementConstraints};
 pub use patterns::{
     Decision, DirectiveReasoner, FnPlanner, PlanRun, Planner, PlannerExecutor, ReActLoop,
     ReActOutcome, ReActStep, Reasoner, Step, StepResult, ToolInvocation,
@@ -201,8 +204,11 @@ pub struct AgentEnforcementInfo {
 }
 
 /// A kernel node's load/health snapshot (reply to `node_info`).
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct NodeLoad {
+    /// Durable identity, admission state, and placement constraints. Older
+    /// compatible servers may omit this additive field.
+    pub control: Option<NodeControlStatus>,
     /// Total agents the node hosts.
     pub agent_count: usize,
     /// Agents currently executing a turn.
@@ -217,6 +223,15 @@ pub struct NodeLoad {
     pub llm_requests_in_flight: usize,
     pub llm_requests_waiting: usize,
     pub llm_core_capacity: usize,
+}
+
+/// Signed response to a discovery nonce.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NodeIdentityProof {
+    pub node_id: String,
+    pub fingerprint: String,
+    pub public_key: String,
+    pub signature_hex: String,
 }
 
 /// The server's wire-protocol support window (reply to `hello`).
@@ -735,6 +750,7 @@ impl KernelClient {
     pub async fn node_info(&mut self) -> Result<NodeLoad, SdkError> {
         match self.call(Syscall::NodeInfo).await? {
             SyscallReply::NodeInfo {
+                control,
                 agent_count,
                 running_agents,
                 live_agents,
@@ -748,6 +764,7 @@ impl KernelClient {
                 llm_requests_waiting,
                 llm_core_capacity,
             } => Ok(NodeLoad {
+                control,
                 agent_count,
                 running_agents,
                 live_agents,
@@ -762,6 +779,80 @@ impl KernelClient {
                 llm_core_capacity,
             }),
             other => Err(unexpected("NodeInfo", &other)),
+        }
+    }
+
+    /// Sign a nonce with the node's durable Ed25519 identity.
+    pub async fn prove_node_identity(
+        &mut self,
+        challenge_hex: impl Into<String>,
+    ) -> Result<NodeIdentityProof, SdkError> {
+        match self
+            .call(Syscall::ProveNodeIdentity {
+                challenge_hex: challenge_hex.into(),
+            })
+            .await?
+        {
+            SyscallReply::NodeIdentityProof {
+                node_id,
+                fingerprint,
+                public_key,
+                signature_hex,
+            } => Ok(NodeIdentityProof {
+                node_id,
+                fingerprint,
+                public_key,
+                signature_hex,
+            }),
+            other => Err(unexpected("NodeIdentityProof", &other)),
+        }
+    }
+
+    pub async fn set_node_availability(
+        &mut self,
+        availability: NodeAvailability,
+        expected_generation: u64,
+        reason: impl Into<String>,
+    ) -> Result<NodeControlStatus, SdkError> {
+        match self
+            .call(Syscall::SetNodeAvailability {
+                availability,
+                expected_generation,
+                reason: reason.into(),
+            })
+            .await?
+        {
+            SyscallReply::NodeControlUpdated { control } => Ok(control),
+            other => Err(unexpected("NodeControlUpdated", &other)),
+        }
+    }
+
+    pub async fn set_node_profile(
+        &mut self,
+        profile: NodeProfile,
+        expected_generation: u64,
+        reason: impl Into<String>,
+    ) -> Result<NodeControlStatus, SdkError> {
+        match self
+            .call(Syscall::SetNodeProfile {
+                profile,
+                expected_generation,
+                reason: reason.into(),
+            })
+            .await?
+        {
+            SyscallReply::NodeControlUpdated { control } => Ok(control),
+            other => Err(unexpected("NodeControlUpdated", &other)),
+        }
+    }
+
+    pub async fn node_control_audit(
+        &mut self,
+        limit: usize,
+    ) -> Result<Vec<NodeControlAudit>, SdkError> {
+        match self.call(Syscall::ListNodeControlAudit { limit }).await? {
+            SyscallReply::NodeControlAudit { entries } => Ok(entries),
+            other => Err(unexpected("NodeControlAudit", &other)),
         }
     }
 

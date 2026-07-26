@@ -181,13 +181,45 @@ cancelled, incompatible version, provider, lifecycle, and internal failures.
   revalidated for every request.
 - TLS verifies the server certificate; shared/tenant authentication occurs
   inside the encrypted stream.
+- Setting `AGENT_SERVER_TLS_CLIENT_CA` makes the TLS handshake mutually
+  authenticated. `ClusterClient::connect_tls` accepts a rustls client config
+  carrying the client certificate and cluster trust roots.
 - Unix sockets rely on filesystem permissions and may additionally require a
   token.
 - Plaintext MCP binds only to loopback. Remote MCP is not advertised until it
   has a TLS transport.
-- `ClusterClient::connect_authenticated` authenticates every node
-  all-or-nothing. It performs no hidden retry of side-effecting calls and does
-  not infer ownership for an agent it did not place.
+- `ClusterClient::connect_authenticated` and its TLS variants connect every node
+  all-or-nothing. They perform no hidden retry of side-effecting calls.
+
+## Distributed node contract
+
+Protocol-v2 nodes publish a durable Ed25519 identity and local control state in
+the optional `control` field of `node_info`. `prove_node_identity` signs a fresh
+client challenge. Cluster construction verifies that proof, treats dial
+addresses as transport locations rather than identities, and rejects duplicate
+node identities. The private key and node-control revision are persisted in the
+kernel SQLite database; filesystem permissions protect that database.
+
+Node state is generation-fenced:
+
+- `active` accepts placement and normal work;
+- `draining` rejects new agents, resumed work, turns, tool calls, and installed
+  package starts while allowing observation and cleanup;
+- `quarantined` permits only diagnostics, control recovery, and cleanup.
+
+Placement can require exact region, data-residency, model, sandbox-profile, and
+label matches. A missing match is a retryable `unavailable` error. On
+construction or explicit `rebuild_owners`, the cluster lists durable node state
+and reconstructs agent routing. Duplicate agent ownership is a non-routable
+`conflict`; the client never guesses an owner.
+
+This is not yet a consensus or lease protocol. Discovery uses an explicit
+address list, and there is no authoritative membership service, automatic
+ownership migration, partition fencing, cluster-wide quota transaction,
+policy/package convergence, rolling-upgrade coordinator, or disaster-recovery
+controller. Individual client-certificate revocation currently requires
+replacing the trust configuration and restarting affected listeners. Those
+requirements remain tracked by #122.
 
 ## Conformance evidence
 
@@ -198,7 +230,7 @@ Versioned fixtures:
 - `protocol/v2/hello.json`
 - `protocol/v2/typed-error.json`
 - `protocol/v2/describe-protocol-request.json`
-- `protocol/v2/requests.json` (all 61 v2 operations)
+- `protocol/v2/requests.json` (all 65 v2 operations)
 - `protocol/v2/send-message-stream.json`
 - `protocol/v2/stream-event.json`
 - `protocol/v2/stream-completed.json`

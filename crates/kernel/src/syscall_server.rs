@@ -367,6 +367,27 @@ pub enum Syscall {
     /// agents this kernel node hosts (total + currently running) so a cluster
     /// client can pick the least-loaded node. No side effects.
     NodeInfo,
+    /// Sign an operator nonce with the node's durable Ed25519 identity.
+    ProveNodeIdentity {
+        challenge_hex: String,
+    },
+    /// Generation-fenced active/draining/quarantined transition.
+    SetNodeAvailability {
+        availability: crate::cluster_control::NodeAvailability,
+        expected_generation: u64,
+        reason: String,
+    },
+    /// Generation-fenced replacement of placement constraint metadata.
+    SetNodeProfile {
+        profile: crate::cluster_control::NodeProfile,
+        expected_generation: u64,
+        reason: String,
+    },
+    /// Read the durable node-control transition/profile audit.
+    ListNodeControlAudit {
+        #[serde(default = "default_tunable_audit_limit")]
+        limit: usize,
+    },
     /// Pull the kernel's operational metrics as a Prometheus text exposition
     /// (format version 0.0.4), rendered from the syscall-gate enforcement
     /// counters, agent counts, system token/api totals, and process uptime.
@@ -886,6 +907,8 @@ pub enum SyscallReply {
     PackageMutationComplete,
     /// Node load/health (reply to [`Syscall::NodeInfo`]).
     NodeInfo {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        control: Option<crate::cluster_control::NodeControlStatus>,
         agent_count: usize,
         running_agents: usize,
         live_agents: usize,
@@ -898,6 +921,21 @@ pub enum SyscallReply {
         llm_requests_in_flight: usize,
         llm_requests_waiting: usize,
         llm_core_capacity: usize,
+    },
+    /// Signed proof that the server possesses the durable node private key.
+    NodeIdentityProof {
+        node_id: String,
+        fingerprint: String,
+        public_key: String,
+        signature_hex: String,
+    },
+    /// Current node-control state after a successful fenced mutation.
+    NodeControlUpdated {
+        control: crate::cluster_control::NodeControlStatus,
+    },
+    /// Durable node-control audit entries.
+    NodeControlAudit {
+        entries: Vec<crate::cluster_control::NodeControlAudit>,
     },
     /// The kernel's operational metrics (reply to [`Syscall::Metrics`]). Carries
     /// the rendered Prometheus text exposition plus a couple of the headline
@@ -1131,6 +1169,12 @@ fn syscall_policy(call: &Syscall) -> (AccessLevel, &'static str, Option<&str>) {
         Syscall::ListInstalledPackages => (AccessLevel::ReadOnly, "package.installed.list", None),
         Syscall::RunInstalledPackage { .. } => (AccessLevel::Admin, "package.run", None),
         Syscall::NodeInfo => (AccessLevel::System, "system.node_info", None),
+        Syscall::ProveNodeIdentity { .. } => (AccessLevel::System, "cluster.identity.prove", None),
+        Syscall::SetNodeAvailability { .. } => {
+            (AccessLevel::System, "cluster.node.availability.set", None)
+        }
+        Syscall::SetNodeProfile { .. } => (AccessLevel::System, "cluster.node.profile.set", None),
+        Syscall::ListNodeControlAudit { .. } => (AccessLevel::System, "cluster.node.audit", None),
         Syscall::Metrics => (AccessLevel::System, "system.metrics", None),
         Syscall::OperatorSnapshot => (AccessLevel::ReadOnly, "operator.snapshot", None),
         Syscall::ListOperatorTunables => (AccessLevel::System, "operator.tunable.list", None),
@@ -1308,6 +1352,70 @@ where
     }
 }
 
+fn enforce_node_admission(kernel: &AgentKernelImpl, call: &Syscall) -> Result<(), String> {
+    use crate::cluster_control::NodeAvailability;
+
+    let availability = kernel
+        .cluster_control
+        .status()
+        .map_err(|error| format!("node control unavailable: {error}"))?
+        .availability;
+    match availability {
+        NodeAvailability::Active => Ok(()),
+        NodeAvailability::Draining if starts_new_work(call) => {
+            Err("node unavailable: draining rejects new workload admission".to_string())
+        }
+        NodeAvailability::Draining => Ok(()),
+        NodeAvailability::Quarantined if quarantine_recovery_call(call) => Ok(()),
+        NodeAvailability::Quarantined => {
+            Err("node unavailable: quarantined by operator".to_string())
+        }
+    }
+}
+
+fn starts_new_work(call: &Syscall) -> bool {
+    matches!(
+        call,
+        Syscall::CreateAgent { .. }
+            | Syscall::ResumeAgent { .. }
+            | Syscall::ResumeGenerationCheckpoint { .. }
+            | Syscall::SendMessage { .. }
+            | Syscall::SendMessageStream { .. }
+            | Syscall::CallTool { .. }
+            | Syscall::RunInstalledPackage { .. }
+    )
+}
+
+fn quarantine_recovery_call(call: &Syscall) -> bool {
+    matches!(
+        call,
+        Syscall::Hello { .. }
+            | Syscall::DescribeProtocol
+            | Syscall::Ping
+            | Syscall::Authenticate { .. }
+            | Syscall::NodeInfo
+            | Syscall::ProveNodeIdentity { .. }
+            | Syscall::SetNodeAvailability { .. }
+            | Syscall::SetNodeProfile { .. }
+            | Syscall::ListNodeControlAudit { .. }
+            | Syscall::Metrics
+            | Syscall::OperatorSnapshot
+            | Syscall::ListOperatorTunables
+            | Syscall::ListOperatorTunableAudit { .. }
+            | Syscall::ListServices
+            | Syscall::ListServiceHistory { .. }
+            | Syscall::ListAgents
+            | Syscall::GetAgentStatus { .. }
+            | Syscall::WaitAgent { .. }
+            | Syscall::ListGenerationCheckpoints { .. }
+            | Syscall::AgentInfo { .. }
+            | Syscall::PauseAgent { .. }
+            | Syscall::StopAgent { .. }
+            | Syscall::KillAgent { .. }
+            | Syscall::CancelRequest { .. }
+    )
+}
+
 /// Dispatch a single syscall against the kernel. Pure routing — every call goes
 /// through the same `AgentKernelImpl` methods the in-process paths use, so the
 /// syscall gate's capability/MAC/approval/cgroup/namespace checks still apply.
@@ -1329,6 +1437,9 @@ pub async fn dispatch_scoped(
 ) -> SyscallReply {
     if let Err(reply) = authorize(kernel, principal, &call).await {
         return reply;
+    }
+    if let Err(message) = enforce_node_admission(kernel, &call) {
+        return SyscallReply::Error { message };
     }
     let tenant = principal.map(|principal| principal.tenant_id.as_str());
     let package_scope = tenant.unwrap_or(crate::context::DEFAULT_TENANT);
@@ -2239,7 +2350,16 @@ pub async fn dispatch_scoped(
         }
         Syscall::NodeInfo => {
             let snapshot = crate::metrics::MetricsSnapshot::collect(kernel);
+            let control = match kernel.cluster_control.status() {
+                Ok(control) => control,
+                Err(error) => {
+                    return SyscallReply::Error {
+                        message: format!("node control unavailable: {error}"),
+                    }
+                }
+            };
             SyscallReply::NodeInfo {
+                control: Some(control),
                 agent_count: snapshot.agent_count as usize,
                 running_agents: snapshot.running_agents as usize,
                 live_agents: snapshot.live_agents as usize,
@@ -2254,6 +2374,66 @@ pub async fn dispatch_scoped(
                 llm_core_capacity: snapshot.llm_core_capacity as usize,
             }
         }
+        Syscall::ProveNodeIdentity { challenge_hex } => {
+            match kernel.cluster_control.prove_challenge_hex(&challenge_hex) {
+                Ok(signature_hex) => {
+                    let identity = kernel.cluster_control.identity();
+                    SyscallReply::NodeIdentityProof {
+                        node_id: identity.node_id.clone(),
+                        fingerprint: identity.fingerprint.clone(),
+                        public_key: identity.public_key.clone(),
+                        signature_hex,
+                    }
+                }
+                Err(error) => SyscallReply::Error {
+                    message: error.to_string(),
+                },
+            }
+        }
+        Syscall::SetNodeAvailability {
+            availability,
+            expected_generation,
+            reason,
+        } => {
+            let actor = principal
+                .map(|principal| principal.user_id.as_str())
+                .unwrap_or("system");
+            match kernel.cluster_control.transition(
+                availability,
+                expected_generation,
+                actor,
+                &reason,
+            ) {
+                Ok(control) => SyscallReply::NodeControlUpdated { control },
+                Err(error) => SyscallReply::Error {
+                    message: error.to_string(),
+                },
+            }
+        }
+        Syscall::SetNodeProfile {
+            profile,
+            expected_generation,
+            reason,
+        } => {
+            let actor = principal
+                .map(|principal| principal.user_id.as_str())
+                .unwrap_or("system");
+            match kernel
+                .cluster_control
+                .set_profile(profile, expected_generation, actor, &reason)
+            {
+                Ok(control) => SyscallReply::NodeControlUpdated { control },
+                Err(error) => SyscallReply::Error {
+                    message: error.to_string(),
+                },
+            }
+        }
+        Syscall::ListNodeControlAudit { limit } => match kernel.cluster_control.audit(limit) {
+            Ok(entries) => SyscallReply::NodeControlAudit { entries },
+            Err(error) => SyscallReply::Error {
+                message: error.to_string(),
+            },
+        },
         Syscall::Metrics => {
             let snap = crate::metrics::MetricsSnapshot::collect(kernel);
             SyscallReply::Metrics {
@@ -2921,6 +3101,64 @@ pub fn server_config_from_pem(
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))
 }
 
+/// Build a mutually authenticated TLS server config from a server certificate,
+/// private key, and one or more trusted client CA certificates. Peers that do
+/// not present a currently valid certificate chaining to `client_ca_pem` are
+/// rejected during the TLS handshake, before any syscall bytes are accepted.
+pub fn server_config_from_pem_with_client_ca(
+    cert_pem: &[u8],
+    key_pem: &[u8],
+    client_ca_pem: &[u8],
+) -> std::io::Result<rustls::ServerConfig> {
+    use rustls::pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer};
+
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let certs = CertificateDer::pem_slice_iter(cert_pem)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
+    if certs.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "no certificates found in cert_pem",
+        ));
+    }
+    let key = PrivateKeyDer::pem_slice_iter(key_pem)
+        .next()
+        .transpose()
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "no private key found in key_pem",
+            )
+        })?;
+    let client_ca_certs = CertificateDer::pem_slice_iter(client_ca_pem)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
+    if client_ca_certs.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "no certificates found in client_ca_pem",
+        ));
+    }
+    let mut client_roots = rustls::RootCertStore::empty();
+    for certificate in client_ca_certs {
+        client_roots.add(certificate).map_err(|error| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("invalid client CA certificate: {error}"),
+            )
+        })?;
+    }
+    let verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(client_roots))
+        .build()
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
+    rustls::ServerConfig::builder()
+        .with_client_cert_verifier(verifier)
+        .with_single_cert(certs, key)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))
+}
+
 /// The transport a [`SyscallServer`] is bound to.
 enum Listener {
     Tcp(TcpListener),
@@ -3304,12 +3542,17 @@ impl SyscallServer {
                     if negotiated_version < 2
                         && matches!(
                             &call,
-                            Syscall::SendMessageStream { .. } | Syscall::CancelRequest { .. }
+                            Syscall::SendMessageStream { .. }
+                                | Syscall::CancelRequest { .. }
+                                | Syscall::ProveNodeIdentity { .. }
+                                | Syscall::SetNodeAvailability { .. }
+                                | Syscall::SetNodeProfile { .. }
+                                | Syscall::ListNodeControlAudit { .. }
                         ) =>
                 {
                     SyscallReply::Error {
                         message:
-                            "incompatible wire-protocol version: v2 is required for streaming and cancellation"
+                            "incompatible wire-protocol version: v2 is required for this operation"
                                 .into(),
                     }
                 }
@@ -4360,10 +4603,58 @@ mod tests {
         let mut client = SyscallClient::connect(addr).await.unwrap();
 
         // Fresh node: zero agents.
-        match client.call(Syscall::NodeInfo).await.unwrap() {
-            SyscallReply::NodeInfo { agent_count, .. } => assert_eq!(agent_count, 0),
+        let identity = match client.call(Syscall::NodeInfo).await.unwrap() {
+            SyscallReply::NodeInfo {
+                agent_count,
+                control: Some(control),
+                ..
+            } => {
+                assert_eq!(agent_count, 0);
+                control.identity
+            }
             other => panic!("expected NodeInfo, got {other:?}"),
-        }
+        };
+        match client
+            .call(Syscall::ProveNodeIdentity {
+                challenge_hex: "00".repeat(32),
+            })
+            .await
+            .unwrap()
+        {
+            SyscallReply::Error { message } => {
+                assert!(message.contains("v2 is required"), "{message}")
+            }
+            other => panic!("v1 connection accepted a v2 node-control operation: {other:?}"),
+        };
+        assert!(matches!(
+            client
+                .call(Syscall::Hello {
+                    protocol_version: PROTOCOL_VERSION,
+                })
+                .await
+                .unwrap(),
+            SyscallReply::Hello { .. }
+        ));
+        match client
+            .call(Syscall::ProveNodeIdentity {
+                challenge_hex: "00".repeat(32),
+            })
+            .await
+            .unwrap()
+        {
+            SyscallReply::NodeIdentityProof {
+                node_id,
+                fingerprint,
+                public_key,
+                signature_hex,
+            } => {
+                assert_eq!(node_id, identity.node_id);
+                assert_eq!(fingerprint, identity.fingerprint);
+                assert_eq!(public_key, identity.public_key);
+                assert_eq!(signature_hex.len(), 128);
+            }
+            other => panic!("expected signed node identity proof, got {other:?}"),
+        };
 
         // After creating two agents, the node reports the load.
         for n in ["a", "b"] {
@@ -4382,6 +4673,115 @@ mod tests {
             SyscallReply::NodeInfo { agent_count, .. } => assert_eq!(agent_count, 2),
             other => panic!("expected NodeInfo, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn node_admission_transitions_are_fenced_audited_and_recoverable() {
+        use crate::cluster_control::NodeAvailability;
+
+        let kernel = AgentKernelImpl::new().expect("kernel new");
+        let drained = match dispatch(
+            &kernel,
+            Syscall::SetNodeAvailability {
+                availability: NodeAvailability::Draining,
+                expected_generation: 0,
+                reason: "rolling maintenance".into(),
+            },
+        )
+        .await
+        {
+            SyscallReply::NodeControlUpdated { control } => control,
+            other => panic!("expected draining transition, got {other:?}"),
+        };
+        assert_eq!(drained.generation, 1);
+        assert_eq!(drained.availability, NodeAvailability::Draining);
+        assert!(matches!(
+            dispatch(
+                &kernel,
+                Syscall::CreateAgent {
+                    name: "rejected".into(),
+                    task: "new work".into(),
+                    provider: "stub".into(),
+                    profile: "standard".into(),
+                    priority: 3,
+                },
+            )
+            .await,
+            SyscallReply::Error { message } if message.contains("draining")
+        ));
+        assert!(matches!(
+            dispatch(&kernel, Syscall::ListAgents).await,
+            SyscallReply::Agents { .. }
+        ));
+        assert!(matches!(
+            dispatch(
+                &kernel,
+                Syscall::SetNodeAvailability {
+                    availability: NodeAvailability::Active,
+                    expected_generation: 0,
+                    reason: "stale operator".into(),
+                },
+            )
+            .await,
+            SyscallReply::Error { message } if message.contains("revision conflict")
+        ));
+
+        let quarantined = match dispatch(
+            &kernel,
+            Syscall::SetNodeAvailability {
+                availability: NodeAvailability::Quarantined,
+                expected_generation: drained.generation,
+                reason: "security response".into(),
+            },
+        )
+        .await
+        {
+            SyscallReply::NodeControlUpdated { control } => control,
+            other => panic!("expected quarantine transition, got {other:?}"),
+        };
+        assert!(matches!(
+            dispatch(&kernel, Syscall::ListProviders).await,
+            SyscallReply::Error { message } if message.contains("quarantined")
+        ));
+        assert!(matches!(
+            dispatch(&kernel, Syscall::NodeInfo).await,
+            SyscallReply::NodeInfo { .. }
+        ));
+
+        let restored = match dispatch(
+            &kernel,
+            Syscall::SetNodeAvailability {
+                availability: NodeAvailability::Active,
+                expected_generation: quarantined.generation,
+                reason: "incident cleared".into(),
+            },
+        )
+        .await
+        {
+            SyscallReply::NodeControlUpdated { control } => control,
+            other => panic!("expected active transition, got {other:?}"),
+        };
+        assert_eq!(restored.availability, NodeAvailability::Active);
+        let audit = match dispatch(&kernel, Syscall::ListNodeControlAudit { limit: 10 }).await {
+            SyscallReply::NodeControlAudit { entries } => entries,
+            other => panic!("expected node-control audit, got {other:?}"),
+        };
+        assert_eq!(audit.len(), 3, "rejected stale writes must not be audited");
+        assert_eq!(audit[0].generation, restored.generation);
+        assert!(matches!(
+            dispatch(
+                &kernel,
+                Syscall::CreateAgent {
+                    name: "accepted".into(),
+                    task: "new work".into(),
+                    provider: "stub".into(),
+                    profile: "standard".into(),
+                    priority: 3,
+                },
+            )
+            .await,
+            SyscallReply::AgentCreated { .. }
+        ));
     }
 
     #[tokio::test]
@@ -4852,6 +5252,14 @@ memory = ["remember this"]
             .expect_err("missing private key should fail");
         assert_eq!(missing_key.kind(), std::io::ErrorKind::InvalidInput);
         assert!(missing_key.to_string().contains("no private key found"));
+
+        let missing_client_ca =
+            server_config_from_pem_with_client_ca(cert_pem.as_bytes(), key_pem.as_bytes(), b"")
+                .expect_err("mutual TLS without a client trust anchor should fail");
+        assert_eq!(missing_client_ca.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(missing_client_ca
+            .to_string()
+            .contains("no certificates found in client_ca_pem"));
     }
 
     #[tokio::test]
@@ -5214,6 +5622,32 @@ memory = ["remember this"]
                 AccessLevel::Admin,
             ),
             (Syscall::NodeInfo, AccessLevel::System),
+            (
+                Syscall::ProveNodeIdentity {
+                    challenge_hex: "00".into(),
+                },
+                AccessLevel::System,
+            ),
+            (
+                Syscall::SetNodeAvailability {
+                    availability: crate::cluster_control::NodeAvailability::Draining,
+                    expected_generation: 0,
+                    reason: "test".into(),
+                },
+                AccessLevel::System,
+            ),
+            (
+                Syscall::SetNodeProfile {
+                    profile: crate::cluster_control::NodeProfile::default(),
+                    expected_generation: 0,
+                    reason: "test".into(),
+                },
+                AccessLevel::System,
+            ),
+            (
+                Syscall::ListNodeControlAudit { limit: 10 },
+                AccessLevel::System,
+            ),
             (Syscall::Metrics, AccessLevel::System),
             (Syscall::OperatorSnapshot, AccessLevel::ReadOnly),
             (Syscall::ListOperatorTunables, AccessLevel::System),
@@ -5312,7 +5746,7 @@ memory = ["remember this"]
                     .to_string()
             })
             .collect::<std::collections::HashSet<_>>();
-        assert_eq!(calls.len(), 61);
+        assert_eq!(calls.len(), 65);
         assert_eq!(fixture_tags, schema_tags);
     }
 

@@ -279,16 +279,16 @@ limitations = ["Protocol v2 now publishes feature identifiers, exhaustive top-le
 id = "distributed-control-plane"
 title = "Distributed ownership, consistency, and trust"
 owner = "platform"
-maturity = "unit-tested"
+maturity = "integrated"
 release = "v0.9"
 tracking_issue = 122
-kernel_modules = []
-source_paths = ["crates/sdk/src/cluster.rs"]
-public_entry_points = ["crates/sdk/src/cluster.rs::ClusterClient"]
-runtime_call_paths = []
-test_evidence = ["crates/sdk/tests/cluster.rs"]
+kernel_modules = ["cluster_control"]
+source_paths = ["crates/kernel/src/cluster_control.rs", "crates/kernel/src/syscall_server.rs", "crates/sdk/src/cluster.rs", "docs/PROTOCOL.md"]
+public_entry_points = ["crates/kernel/src/syscall_server.rs::Syscall::NodeInfo", "crates/kernel/src/syscall_server.rs::Syscall::ProveNodeIdentity", "crates/sdk/src/cluster.rs::ClusterClient"]
+runtime_call_paths = ["crates/kernel/src/syscall_server.rs::enforce_node_admission", "crates/kernel/src/cluster_control.rs::ClusterControl", "crates/sdk/src/cluster.rs::ClusterClient::rebuild_owners"]
+test_evidence = ["crates/kernel/src/cluster_control.rs", "crates/kernel/src/syscall_server.rs::tests::node_admission_transitions_are_fenced_audited_and_recoverable", "crates/sdk/tests/cluster.rs"]
 platforms = ["linux", "macos", "windows"]
-limitations = ["ClusterClient is client-side routing, not a durable distributed kernel control plane."]
+limitations = ["This is an integrated control-plane foundation, not a consensus-backed distributed kernel. Durable signed node identity, optional mTLS, local generation-fenced drain/quarantine, constrained placement, restart routing reconstruction, and duplicate identity/ownership rejection are implemented. Discovery still uses an explicit address list; membership leases/revocation, automatic ownership transfer/migration, partition fencing, global quota coordination, policy/package convergence, rolling upgrades, and disaster recovery remain #122."]
 
 [[capability]]
 id = "durable-state"

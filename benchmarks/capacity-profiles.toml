@@ -1,0 +1,90 @@
+schema_version = 1
+suite = "agentos-v1-capacity"
+
+[[profiles]]
+name = "idle"
+kind = "idle"
+operations = 60
+concurrency = 1
+duration_ms = 60000
+payload_bytes = 0
+provider_delay_ms = 0
+tenants = 1
+agents_per_tenant = 0
+
+[[profiles]]
+name = "many-agents"
+kind = "many_agents"
+operations = 1000
+concurrency = 32
+duration_ms = 0
+payload_bytes = 0
+provider_delay_ms = 0
+tenants = 1
+agents_per_tenant = 1000
+
+[[profiles]]
+name = "long-context"
+kind = "long_context"
+operations = 100
+concurrency = 8
+duration_ms = 0
+payload_bytes = 262144
+provider_delay_ms = 10
+tenants = 1
+agents_per_tenant = 100
+
+[[profiles]]
+name = "tool-heavy"
+kind = "tool_heavy"
+operations = 10000
+concurrency = 32
+duration_ms = 0
+payload_bytes = 0
+provider_delay_ms = 0
+tenants = 1
+agents_per_tenant = 32
+
+[[profiles]]
+name = "provider-latency"
+kind = "provider_latency"
+operations = 500
+concurrency = 32
+duration_ms = 0
+payload_bytes = 4096
+provider_delay_ms = 250
+tenants = 1
+agents_per_tenant = 32
+
+[[profiles]]
+name = "tenant-contention"
+kind = "tenant_contention"
+operations = 1024
+concurrency = 32
+duration_ms = 0
+payload_bytes = 2048
+provider_delay_ms = 50
+tenants = 16
+agents_per_tenant = 8
+
+[[profiles]]
+name = "package-install"
+kind = "package_install"
+operations = 20
+concurrency = 1
+duration_ms = 0
+payload_bytes = 65536
+provider_delay_ms = 0
+tenants = 1
+agents_per_tenant = 0
+
+[[profiles]]
+name = "restart"
+kind = "restart"
+operations = 25
+concurrency = 1
+duration_ms = 0
+payload_bytes = 4096
+provider_delay_ms = 0
+tenants = 1
+agents_per_tenant = 4

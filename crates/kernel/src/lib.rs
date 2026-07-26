@@ -1229,7 +1229,7 @@ pub struct AgentKernelImpl {
     /// Root-kernel ownership lease. Unlike the shared context manager, this is
     /// released as soon as the file-backed kernel itself stops, even if a
     /// cancelled background task briefly retains a subsystem reference.
-    _storage_lease: Option<std::fs::File>,
+    _storage_lease: Option<crate::storage::StorageLease>,
     /// Durable cryptographic node identity plus generation-fenced
     /// active/draining/quarantined admission state.
     pub cluster_control: Arc<crate::cluster_control::ClusterControl>,
@@ -1446,7 +1446,7 @@ impl AgentKernelImpl {
 
     pub(crate) fn from_config_with_storage_lease(
         config: &crate::config::Config,
-        storage_lease: std::fs::File,
+        storage_lease: crate::storage::StorageLease,
     ) -> Result<Self, KernelError> {
         Self::validate_storage_boot_config(config)?;
         Self::from_validated_config_with_storage_lease(config, storage_lease)
@@ -1454,7 +1454,7 @@ impl AgentKernelImpl {
 
     fn from_validated_config_with_storage_lease(
         config: &crate::config::Config,
-        storage_lease: std::fs::File,
+        storage_lease: crate::storage::StorageLease,
     ) -> Result<Self, KernelError> {
         set_max_browse_chars(config.max_browse_chars);
         let db_path = config.data_dir.join("agent_os.db");
@@ -1586,7 +1586,7 @@ impl AgentKernelImpl {
         mac_enforcing: bool,
         mac_rules: &[crate::mac::PolicyRule],
         quota_clock: Arc<dyn crate::quota_clock::QuotaClock>,
-        storage_lease: Option<std::fs::File>,
+        storage_lease: Option<crate::storage::StorageLease>,
     ) -> Result<Self, KernelError> {
         budgets.validate().map_err(|error| {
             KernelError::Policy(format!("invalid budget configuration: {error}"))

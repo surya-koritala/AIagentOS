@@ -1,0 +1,82 @@
+name: Capacity qualification
+
+# Full profiles run only on a repository-owned, stable target host. A missing
+# runner leaves the workflow queued/not_run; GitHub-hosted hardware is not
+# silently substituted and cannot create production-capacity evidence.
+on:
+  workflow_dispatch:
+    inputs:
+      environment_id:
+        description: Stable non-secret deployment/runner shape identifier
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: capacity-qualification
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  AGENTOS_QUALIFICATION_ENVIRONMENT: ${{ inputs.environment_id }}
+
+jobs:
+  deterministic-baseline:
+    name: Exact-commit release workload baseline
+    runs-on: [self-hosted, linux, x64, agentos-capacity]
+    timeout-minutes: 120
+    environment: capacity-qualification
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
+        with:
+          toolchain: 1.97.1
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - name: Validate workload contract
+        run: >-
+          cargo run --release --locked --package os-benchmark
+          --bin capacity-qualification -- --validate
+      - name: Run every release workload
+        run: |
+          mkdir -p target/qualification
+          /usr/bin/time -v -o target/qualification/capacity-resources.txt \
+            cargo run --release --locked --package os-benchmark \
+            --bin capacity-qualification -- \
+            --all --output target/qualification/capacity-baseline.json
+      - name: Verify artifact classification and exact source
+        run: |
+          test "$(jq -r .passed target/qualification/capacity-baseline.json)" = "true"
+          test "$(jq -r .build_profile target/qualification/capacity-baseline.json)" = "release"
+          test "$(jq -r .smoke_scaled target/qualification/capacity-baseline.json)" = "false"
+          test "$(jq -r .capacity_claim_allowed target/qualification/capacity-baseline.json)" = "false"
+          test "$(jq -r .source.dirty target/qualification/capacity-baseline.json)" = "false"
+          test "$(jq -r .source.commit target/qualification/capacity-baseline.json)" = "$GITHUB_SHA"
+          test "$(jq '.profiles | length' target/qualification/capacity-baseline.json)" = "8"
+      - name: Publish summary
+        if: always()
+        run: |
+          {
+            printf '### Deterministic capacity baseline\n\n'
+            printf -- '- Commit: `%s`\n' "$GITHUB_SHA"
+            printf -- '- Environment: `%s`\n' "$AGENTOS_QUALIFICATION_ENVIRONMENT"
+            if test -f target/qualification/capacity-baseline.json; then
+              printf -- '- Passed: `%s`\n' \
+                "$(jq -r .passed target/qualification/capacity-baseline.json)"
+              printf -- '- Capacity claim allowed: `%s`\n' \
+                "$(jq -r .capacity_claim_allowed target/qualification/capacity-baseline.json)"
+            else
+              printf -- '- Status: `failed before report publication`\n'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: capacity-baseline-${{ github.sha }}
+          path: |
+            target/qualification/capacity-baseline.json
+            target/qualification/capacity-resources.txt
+          if-no-files-found: warn
+          retention-days: 90

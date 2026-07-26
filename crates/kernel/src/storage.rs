@@ -9,6 +9,7 @@ use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::Utc;
@@ -48,6 +49,43 @@ const PORTABLE_STORAGE_CONFIDENTIALITY: &str = "plaintext-owner-only";
 const CORRUPT_RECOVERY_FORMAT_VERSION: u32 = 1;
 const CORRUPT_RECOVERY_JOURNAL_SUFFIX: &str = ".corrupt-recovery.json";
 const MAX_CORRUPT_RECOVERY_JOURNAL_BYTES: u64 = 64 * 1024;
+
+/// Exclusive ownership of one file-backed kernel database.
+///
+/// The lock is explicitly released when the final in-process owner disappears.
+/// Closing the descriptor alone is insufficient on Unix: a concurrently
+/// forked child can briefly inherit the descriptor before `exec` applies
+/// close-on-exec, extending an otherwise finished lease. Explicit `unlock`
+/// releases the lock on the shared open-file description even in that window.
+#[derive(Debug)]
+pub(crate) struct StorageLease {
+    inner: Arc<StorageLeaseInner>,
+}
+
+#[derive(Debug)]
+struct StorageLeaseInner {
+    file: File,
+}
+
+impl Drop for StorageLeaseInner {
+    fn drop(&mut self) {
+        let _ = self.file.unlock();
+    }
+}
+
+impl StorageLease {
+    fn new(file: File) -> Self {
+        Self {
+            inner: Arc::new(StorageLeaseInner { file }),
+        }
+    }
+
+    fn try_clone(&self) -> std::io::Result<Self> {
+        Ok(Self {
+            inner: Arc::clone(&self.inner),
+        })
+    }
+}
 
 /// Whole-database encryption identity required to authenticate a backup.
 ///
@@ -1129,7 +1167,7 @@ impl Drop for StagingDirectory {
     }
 }
 
-pub(crate) fn acquire_storage_lease(database_path: &Path) -> Result<File, ContextError> {
+pub(crate) fn acquire_storage_lease(database_path: &Path) -> Result<StorageLease, ContextError> {
     let lock_path = companion_path(database_path, ".lock");
     let lock = OpenOptions::new()
         .create(true)
@@ -1150,7 +1188,7 @@ pub(crate) fn acquire_storage_lease(database_path: &Path) -> Result<File, Contex
             database_path.display()
         ))
     })?;
-    Ok(lock)
+    Ok(StorageLease::new(lock))
 }
 
 fn validate_backup_name(name: &str) -> Result<(), ContextError> {
@@ -2865,7 +2903,7 @@ fn recover_backup_from_config_internal(
 
 fn qualify_recovered_database(
     config: &crate::config::Config,
-    storage_lease: File,
+    storage_lease: StorageLease,
 ) -> Result<(usize, crate::AgentKernelImpl), ContextError> {
     let kernel = crate::AgentKernelImpl::from_config_with_storage_lease(config, storage_lease)
         .map_err(|error| {
@@ -3518,7 +3556,7 @@ fn restore_backup_internal<T>(
     trust: Option<&BackupTrustRoot>,
     storage_key: Option<&StorageEncryptionKey>,
     recovery_anchor: Option<&BackupRecoveryAnchor>,
-    qualify_published: impl FnOnce(&BackupManifest, File) -> Result<T, ContextError>,
+    qualify_published: impl FnOnce(&BackupManifest, StorageLease) -> Result<T, ContextError>,
 ) -> Result<(RestoreReport, T), ContextError> {
     let manifest = match (trust, recovery_anchor) {
         (Some(trust), Some(anchor)) => {
@@ -4782,6 +4820,25 @@ mod tests {
         );
         let restored = SqliteContextManager::new(&destination).unwrap();
         crate::schema::verify(&restored.conn.lock().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn final_storage_lease_owner_unlocks_an_inherited_descriptor() {
+        let directory = TestDirectory::new("inherited-storage-lease");
+        let database = directory.path.join("agent_os.db");
+        let lease = acquire_storage_lease(&database).unwrap();
+        let inherited_descriptor = lease.inner.file.try_clone().unwrap();
+
+        let competing_owner = acquire_storage_lease(&database).unwrap_err();
+        assert!(competing_owner.to_string().contains("already owned"));
+
+        // Model a descriptor inherited across fork before close-on-exec takes
+        // effect. The final Rust owner must explicitly unlock rather than rely
+        // on closing its descriptor, because the duplicate remains open.
+        drop(lease);
+        let replacement = acquire_storage_lease(&database).unwrap();
+        drop(replacement);
+        drop(inherited_descriptor);
     }
 
     #[test]

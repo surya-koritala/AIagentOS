@@ -10,6 +10,15 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
 
 ## [Unreleased]
 
+- Added the first deterministic resilience qualification suite under #125.
+  Public TCP/SDK scenarios now prove explicit active-turn and waiting-turn
+  bounds, stable overload rejection, slow-client connection admission and idle
+  reaping, provider-outage classification, control-plane recovery, and complete
+  turn/LLM/quota-permit drainage. `budgets.max_waiting_turns` makes the turn
+  backlog an operator-controlled hard limit, while server-local bounded
+  connection counters make rejection and recovery measurable. JSON artifacts
+  bind source/configuration/results and explicitly forbid production claims;
+  the long soak and remaining fault/game-day matrix stay open.
 - Fixed file-backed kernel lease release across a concurrent Unix
   `fork`/`exec` window. Storage leases now share one process-local owner that
   explicitly unlocks when its final owner exits, so a briefly inherited file

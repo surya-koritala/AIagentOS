@@ -33,6 +33,10 @@ path = "src/bin/memory-qualification.rs"
 name = "capacity-qualification"
 path = "src/bin/capacity-qualification.rs"
 
+[[bin]]
+name = "resilience-qualification"
+path = "src/bin/resilience-qualification.rs"
+
 [dependencies]
 kernel = { path = "../crates/kernel", version = "=0.3.0" }
 adapters = { path = "../crates/adapters", version = "=0.3.0" }

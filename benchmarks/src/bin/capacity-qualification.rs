@@ -119,6 +119,7 @@ struct KernelLimits {
     provider_requests_per_minute: u32,
     provider_tokens_per_minute: u64,
     concurrent_turns: u32,
+    waiting_turns: u32,
     agent_tokens_per_minute: u64,
     agent_context_tokens: u64,
     tenant_context_tokens: u64,
@@ -416,7 +417,12 @@ fn register_delayed_provider(
 }
 
 fn budget_for_profile(profile: &ProfileConfig) -> BudgetConfig {
-    let mut budgets = BudgetConfig::default();
+    let mut budgets = BudgetConfig {
+        max_waiting_turns: u32::try_from(profile.concurrency.saturating_mul(2))
+            .unwrap_or(u32::MAX)
+            .max(16),
+        ..BudgetConfig::default()
+    };
     if matches!(
         profile.kind,
         WorkloadKind::LongContext | WorkloadKind::ProviderLatency | WorkloadKind::TenantContention
@@ -465,6 +471,7 @@ fn reported_limits(profile: &ProfileConfig) -> KernelLimits {
         provider_requests_per_minute: budgets.rpm,
         provider_tokens_per_minute: budgets.tpm,
         concurrent_turns: budgets.max_concurrent,
+        waiting_turns: budgets.max_waiting_turns,
         agent_tokens_per_minute: budgets.agent_tokens_per_min,
         agent_context_tokens: budgets.max_context_tokens,
         tenant_context_tokens: budgets.tenant_max_context_tokens,

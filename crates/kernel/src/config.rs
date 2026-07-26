@@ -298,7 +298,8 @@ pub struct Config {
 /// `agent_tokens_per_min` bounds a non-`full-access` agent's per-minute provider
 /// token spend (0 = unlimited); `full-access` agents are unlimited and
 /// `elevated` gets a wider budget. `tenant_tokens_per_min` independently bounds
-/// each tenant. `rpm`/`tpm`/`max_concurrent` configure provider-wide limits.
+/// each tenant. `rpm`/`tpm`/`max_concurrent` configure provider-wide limits,
+/// while `max_waiting_turns` bounds queued turns before overload is rejected.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BudgetConfig {
@@ -357,6 +358,12 @@ pub struct BudgetConfig {
     pub tpm: u64,
     #[serde(default = "default_max_concurrent")]
     pub max_concurrent: u32,
+    /// Maximum turns allowed to wait behind `max_concurrent` active turns.
+    /// `0` uses the compatibility default: 64 waiters per active turn, with a
+    /// minimum of 64. Configure an explicit finite value in production so the
+    /// overload envelope is intentional and can be qualified.
+    #[serde(default)]
+    pub max_waiting_turns: u32,
     /// Hard cumulative USD spend ceiling across all agents (0.0 = unlimited).
     /// Enforced by [`crate::budget::BudgetEnforcer`] on the LLM path.
     #[serde(default)]
@@ -407,6 +414,7 @@ impl Default for BudgetConfig {
             rpm: default_rpm(),
             tpm: default_tpm(),
             max_concurrent: default_max_concurrent(),
+            max_waiting_turns: 0,
             max_usd: 0.0,
             per_agent_max_usd: 0.0,
             per_tenant_max_usd: 0.0,

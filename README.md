@@ -399,6 +399,11 @@ cargo run --package os-benchmark --bin capacity-qualification --locked -- --vali
 # Non-publishable development smoke across every capacity profile
 cargo run --package os-benchmark --bin capacity-qualification --locked -- \
   --all --smoke --output target/qualification/capacity-smoke.json
+
+# Validate and smoke-test bounded overload and graceful degradation
+cargo run --package os-benchmark --bin resilience-qualification --locked -- --validate
+cargo run --package os-benchmark --bin resilience-qualification --locked -- \
+  --all --smoke --output target/qualification/resilience-smoke.json
 ```
 
 The versioned [production observability contract](docs/OBSERVABILITY.md) now
@@ -411,6 +416,9 @@ strict idle, many-agent, long-context, tool-heavy, provider-latency,
 tenant-contention, signed-package, and restart workload suite. Fixture results
 are always labeled non-publishable until an exact release candidate is run on
 the intended deployment and completes the remaining #125 proof.
+The [resilience qualification guide](docs/RESILIENCE_QUALIFICATION.md) covers
+the initial turn-overload, slow-client, and provider-outage matrix, including
+the explicit `max_waiting_turns` admission limit and the evidence still needed.
 
 ## Architecture Docs
 
@@ -421,6 +429,7 @@ the intended deployment and completes the remaining #125 proof.
 - [`docs/ACCOUNTING.md`](docs/ACCOUNTING.md) — usage, pricing, quotas, and metrics contract
 - [`docs/OBSERVABILITY.md`](docs/OBSERVABILITY.md) — SLOs, traces, metrics, alerts, and runbooks
 - [`docs/CAPACITY_QUALIFICATION.md`](docs/CAPACITY_QUALIFICATION.md) — reproducible workload profiles and sizing method
+- [`docs/RESILIENCE_QUALIFICATION.md`](docs/RESILIENCE_QUALIFICATION.md) — overload, slow-peer, and dependency-failure evidence
 - [`docs/COMPLETE_SPEC.md`](docs/COMPLETE_SPEC.md) — long-form implementation spec
 - [`docs/FULL_ROADMAP.md`](docs/FULL_ROADMAP.md) — long-form vision roadmap
 

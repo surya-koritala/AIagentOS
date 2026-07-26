@@ -24,6 +24,7 @@ pub const WIRE_FEATURES: &[&str] = &[
     "bounded_json_frames",
     "connection_keepalive",
     "context_pressure",
+    "data_inventory",
     "data_erasure",
     "durable_node_identity",
     "durable_generation_checkpoints",
@@ -509,6 +510,10 @@ const REQUEST_VARIANTS: &[Variant] = &[
         fields: &[],
     },
     Variant {
+        tag: "storage_data_inventory",
+        fields: &[],
+    },
+    Variant {
         tag: "erase_data",
         fields: &[Field::required("target", O), Field::required("confirm", B)],
     },
@@ -561,6 +566,7 @@ pub fn conformance_request_fixtures(protocol_version: u32) -> Result<Vec<Value>,
                         | "cancel_request"
                         | "enforce_storage_backup_retention"
                         | "storage_backup_status"
+                        | "storage_data_inventory"
                         | "ping"
                         | "erase_data"
                         | "prove_node_identity"
@@ -925,6 +931,10 @@ const REPLY_VARIANTS: &[Variant] = &[
         fields: &[Field::required("maintenance", O)],
     },
     Variant {
+        tag: "storage_data_inventory",
+        fields: &[Field::required("inventory", O)],
+    },
+    Variant {
         tag: "data_erased",
         fields: &[Field::required("receipt", ON)],
     },
@@ -1279,7 +1289,7 @@ mod tests {
             }
         }
         assert_eq!(conformance_request_fixtures(1).unwrap().len(), 59);
-        assert_eq!(conformance_request_fixtures(2).unwrap().len(), 74);
+        assert_eq!(conformance_request_fixtures(2).unwrap().len(), 75);
         assert!(conformance_request_fixtures(0).is_err());
         assert!(conformance_request_fixtures(PROTOCOL_VERSION + 1).is_err());
     }

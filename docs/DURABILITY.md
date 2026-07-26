@@ -261,11 +261,31 @@ measured recovery objectives remain future work.
 
 ## Data ownership and erasure contract
 
-`context::DURABLE_DATA_CATALOG` is the authoritative table-by-table ownership
-and deletion registry. A schema-introspection regression compares that catalog
-with every logical SQLite table, excluding only the private FTS5 shadow tables.
-Adding a durable table without assigning an owner and deletion behavior fails
+`data_inventory::SQLITE_DATA_INVENTORY` is the authoritative full policy
+registry. It classifies every logical SQLite table or view by owner, tenant key,
+sensitivity, retention, encryption, backup, and deletion behavior.
+`context::DURABLE_DATA_CATALOG` is the compact erasure implementation registry
+used by deletion code. A schema-introspection regression compares both catalogs
+with every logical SQLite object, excluding only private FTS5 shadow tables.
+Adding durable state without complete policy and erasure classifications fails
 the kernel test suite.
+
+`data_inventory::NON_SQLITE_DATA_INVENTORY` also classifies supported
+configuration/key files, backups, workspaces, in-process state, sandbox
+processes, providers, remote backups, telemetry sinks, registries, and external
+tool services. A trusted system operator can inspect the combined, versioned
+policy document through `KernelClient::storage_data_inventory` or:
+
+```bash
+agentctl --addr 127.0.0.1:7777 --token "$AGENT_SERVER_TOKEN" \
+  data-inventory
+```
+
+The command returns policy metadata only. It never reads or returns live
+content, credentials, tenant identifiers, configured paths, or secret material.
+The inventory deliberately reports boundaries that are not encrypted or not
+locally deletable; publication is evidence of classification, not evidence that
+those gaps are resolved.
 
 The current policy classes are:
 

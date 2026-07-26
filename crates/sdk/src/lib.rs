@@ -47,6 +47,7 @@ pub use kernel::cluster_control::{
     NodeControlStatus, NodeIdentity, NodeProfile,
 };
 pub use kernel::context::{ContextPressureStats, DeletionReceipt};
+pub use kernel::data_inventory::{DataInventoryEntry, StorageDataInventory};
 pub use kernel::init_system::{ServiceHistoryEntry, ServiceRuntimeInfo};
 pub use kernel::operator_control::{OperatorTunable, OperatorTunableAudit};
 pub use kernel::package::{
@@ -1283,6 +1284,15 @@ impl KernelClient {
         match self.call(Syscall::StorageBackupStatus).await? {
             SyscallReply::StorageBackupStatus { maintenance } => Ok(maintenance),
             other => Err(unexpected("StorageBackupStatus", &other)),
+        }
+    }
+
+    /// Read the versioned, non-secret policy inventory for every supported
+    /// durable, ephemeral, and external data boundary.
+    pub async fn storage_data_inventory(&mut self) -> Result<StorageDataInventory, SdkError> {
+        match self.call(Syscall::StorageDataInventory).await? {
+            SyscallReply::StorageDataInventory { inventory } => Ok(inventory),
+            other => Err(unexpected("StorageDataInventory", &other)),
         }
     }
 

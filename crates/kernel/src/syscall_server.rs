@@ -476,6 +476,9 @@ pub enum Syscall {
     /// Read automatic backup policy and bounded process-local health. The root
     /// path and failure diagnostic are system-operator information.
     StorageBackupStatus,
+    /// Return the versioned, non-secret policy inventory for every supported
+    /// SQLite, file, ephemeral, and external data boundary.
+    StorageDataInventory,
     /// Irreversibly erase one classified data boundary. This is system-only and
     /// requires an explicit confirmation bit on the wire so a generic client
     /// cannot turn an inspection command into deletion by argument drift.
@@ -1050,6 +1053,11 @@ pub enum SyscallReply {
     StorageBackupStatus {
         maintenance: crate::storage::BackupMaintenanceStatus,
     },
+    /// Versioned data ownership, sensitivity, retention, protection, backup,
+    /// and deletion policy. Contains policy metadata only.
+    StorageDataInventory {
+        inventory: crate::data_inventory::StorageDataInventory,
+    },
     /// Privacy-safe durable proof of a committed erasure. `None` means the
     /// requested subject already had no classified durable or live state.
     DataErased {
@@ -1298,6 +1306,7 @@ fn syscall_policy(call: &Syscall) -> (AccessLevel, &'static str, Option<&str>) {
             (AccessLevel::System, "storage.backup.retention", None)
         }
         Syscall::StorageBackupStatus => (AccessLevel::System, "storage.backup.status", None),
+        Syscall::StorageDataInventory => (AccessLevel::System, "storage.data.inventory", None),
         Syscall::EraseData { .. } => (AccessLevel::System, "storage.data.erase", None),
         Syscall::ListServices => (AccessLevel::System, "service.list", None),
         Syscall::StartService { .. } => (AccessLevel::System, "service.start", None),
@@ -1524,6 +1533,7 @@ fn quarantine_recovery_call(call: &Syscall) -> bool {
             | Syscall::CreateStorageBackup { .. }
             | Syscall::EnforceStorageBackupRetention { .. }
             | Syscall::StorageBackupStatus
+            | Syscall::StorageDataInventory
             | Syscall::EraseData { .. }
             | Syscall::ListServices
             | Syscall::ListServiceHistory { .. }
@@ -3051,6 +3061,9 @@ pub async fn dispatch_scoped(
         }
         Syscall::StorageBackupStatus => SyscallReply::StorageBackupStatus {
             maintenance: kernel.backup_maintenance.status(),
+        },
+        Syscall::StorageDataInventory => SyscallReply::StorageDataInventory {
+            inventory: crate::data_inventory::storage_data_inventory(),
         },
         Syscall::EraseData { target, confirm } => {
             if !confirm {
@@ -6016,6 +6029,7 @@ memory = ["remember this"]
                 AccessLevel::System,
             ),
             (Syscall::StorageBackupStatus, AccessLevel::System),
+            (Syscall::StorageDataInventory, AccessLevel::System),
             (
                 Syscall::EraseData {
                     target: DataErasureTarget::Agent {
@@ -6097,7 +6111,7 @@ memory = ["remember this"]
                     .to_string()
             })
             .collect::<std::collections::HashSet<_>>();
-        assert_eq!(calls.len(), 74);
+        assert_eq!(calls.len(), 75);
         assert_eq!(fixture_tags, schema_tags);
     }
 
@@ -6238,6 +6252,32 @@ memory = ["remember this"]
             dispatch(&kernel, Syscall::StorageBackupStatus).await,
             SyscallReply::StorageBackupStatus { maintenance } if !maintenance.enabled
         ));
+        assert_authorization_denied(
+            dispatch_scoped(&kernel, Syscall::StorageDataInventory, Some(&admin)).await,
+        );
+        let inventory = match dispatch(&kernel, Syscall::StorageDataInventory).await {
+            SyscallReply::StorageDataInventory { inventory } => inventory,
+            other => panic!("unexpected inventory reply: {other:?}"),
+        };
+        assert_eq!(
+            inventory.schema_version,
+            crate::data_inventory::STORAGE_DATA_INVENTORY_SCHEMA_VERSION
+        );
+        assert_eq!(
+            inventory.database_schema_version,
+            crate::schema::CURRENT_SCHEMA_VERSION
+        );
+        assert!(inventory
+            .entries
+            .iter()
+            .any(|entry| entry.id == "sqlite/contexts"));
+        assert!(inventory
+            .entries
+            .iter()
+            .any(|entry| entry.id == "external/provider-request-and-retention"));
+        let encoded = serde_json::to_string(&inventory).unwrap();
+        assert!(!encoded.contains("127.0.0.1"));
+        assert!(!encoded.contains("token"));
         let _ = std::fs::remove_dir_all(root);
     }
 

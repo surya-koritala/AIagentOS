@@ -37,6 +37,7 @@ V2_ONLY_OPERATIONS = {
     "set_node_availability",
     "set_node_profile",
     "storage_backup_status",
+    "storage_data_inventory",
 }
 
 

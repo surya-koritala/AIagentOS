@@ -7,12 +7,13 @@ use agent_cli::OperatorClient;
 fn usage() -> ! {
     eprintln!(
         "usage: agentctl [--addr HOST:PORT] [--token TOKEN] \
-         <list|inspect|pressure|tunables|tunable-set|tunable-rollback|tunable-history|status|pause|resume|stop|kill|wait|services|service-start|service-stop|service-restart|service-reload|service-history|backup-create|backup-retention|backup-status|backup-key-generate|backup-verify|backup-restore|erase-agent|erase-user|erase-tenant> [ARGS...]\n\
+         <list|inspect|pressure|tunables|tunable-set|tunable-rollback|tunable-history|status|pause|resume|stop|kill|wait|services|service-start|service-stop|service-restart|service-reload|service-history|backup-create|backup-retention|backup-status|data-inventory|backup-key-generate|backup-verify|backup-restore|erase-agent|erase-user|erase-tenant> [ARGS...]\n\
          \n\
          storage commands:\n\
            agentctl [SERVER OPTIONS] backup-create BACKUP_ROOT NAME\n\
            agentctl [SERVER OPTIONS] backup-retention BACKUP_ROOT KEEP_LATEST MAX_AGE_SECONDS <--dry-run|--confirm>\n\
            agentctl [SERVER OPTIONS] backup-status\n\
+           agentctl [SERVER OPTIONS] data-inventory\n\
            agentctl backup-key-generate KEY_ID PRIVATE_KEY_FILE PUBLIC_TRUST_FILE\n\
            agentctl backup-verify BACKUP_DIR [--require-signature PUBLIC_TRUST_FILE]\n\
            agentctl backup-restore BACKUP_DIR DATABASE [--require-signature PUBLIC_TRUST_FILE] --confirm-offline\n\
@@ -313,6 +314,17 @@ async fn main() {
                 .await
                 .unwrap_or_else(|error| fail(error));
             print_json(&status, "backup maintenance status");
+            return;
+        }
+        "data-inventory" => {
+            if args.next().is_some() {
+                usage();
+            }
+            let inventory = client
+                .storage_data_inventory()
+                .await
+                .unwrap_or_else(|error| fail(error));
+            print_json(&inventory, "storage data inventory");
             return;
         }
         "erase-agent" => {

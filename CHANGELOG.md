@@ -10,6 +10,15 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
 
 ## [Unreleased]
 
+- Added a versioned storage data inventory for #123. A schema-enforced catalog
+  classifies every logical SQLite object plus supported file, ephemeral, and
+  external boundary by owner, tenant key, sensitivity, retention, encryption,
+  backup, and deletion policy. Trusted system operators can inspect the
+  non-secret policy document through protocol v2, the typed SDK, or
+  `agentctl data-inventory`; wire, authorization, schema, SDK, and CLI
+  regressions prevent silent drift. The inventory explicitly exposes remaining
+  encryption, external deletion, and remote-retention gaps rather than treating
+  them as implemented.
 - Added optional Ed25519 backup authenticity for #123. An owner-only
   operator-generated PKCS#8 key signs both scheduled and live operator backup
   manifests; verification and offline restore can require a matching,

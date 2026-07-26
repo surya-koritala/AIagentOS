@@ -188,17 +188,16 @@ limitations = ["Active prompt and durable context limits use explicit backpressu
 id = "syscall-vfs"
 title = "Coherent public syscall ABI; experimental VFS disposition"
 owner = "kernel"
-maturity = "public-api-e2e"
+maturity = "production-qualified"
 release = "v0.6"
 tracking_issue = 116
-qualification_issue = 121
 kernel_modules = ["mount_table", "syscall_interface", "tool_descriptors", "tools"]
 source_paths = ["crates/kernel/src/syscall_server.rs", "docs/ADR-0001-PUBLIC-ABI.md"]
 public_entry_points = ["crates/kernel/src/syscall_server.rs::Syscall"]
 runtime_call_paths = ["crates/kernel/src/syscall_server.rs::dispatch_scoped", "crates/kernel/src/execution.rs::AgentExecutor::execute_tool"]
 test_evidence = ["crates/kernel/src/syscall_server.rs", "crates/sdk/tests/kernel_client.rs", "tests/src/os_enforcement.rs"]
 platforms = ["linux", "macos", "windows"]
-limitations = ["JSON Syscall/SyscallReply is the only supported ABI. Numbered syscalls, descriptors, mounts, and semantic filesystem behavior are experimental prototypes explicitly excluded from v1; fine-grained feature flags and generated schemas remain outstanding."]
+limitations = ["JSON Syscall/SyscallReply is the only supported ABI and publishes fine-grained features plus exhaustive generated schemas. Numbered syscalls, descriptors, mounts, and semantic filesystem behavior are experimental prototypes explicitly excluded from v1 and are not part of the supported surface."]
 
 [[capability]]
 id = "operator-control"
@@ -267,6 +266,7 @@ owner = "platform"
 maturity = "public-api-e2e"
 release = "v0.9"
 tracking_issue = 121
+qualification_issue = 125
 kernel_modules = ["mcp", "mcp_server", "syscall_server", "wire_contract"]
 source_paths = [".github/workflows/extended-security.yml", "crates/adapters/src/azure_openai.rs", "crates/cli/src/lib.rs", "crates/kernel/src/connector.rs", "crates/kernel/src/execution.rs", "crates/kernel/src/mcp_server.rs", "crates/kernel/src/syscall_server.rs", "crates/kernel/src/wire_contract.rs", "crates/kernel/src/wire_fuzz.rs", "crates/kernel/src/wire_io.rs", "crates/sdk/src/lib.rs", "crates/tauri-app/src/lib.rs", "crates/tui/src/lib.rs", "docs/PROTOCOL.md", "fuzz/fuzz_targets/wire_syscall.rs", "fuzz/fuzz_targets/wire_transport.rs", "tests/src/client_conformance.rs"]
 public_entry_points = ["crates/kernel/src/syscall_server.rs::Syscall", "crates/sdk/src/lib.rs::KernelClient"]

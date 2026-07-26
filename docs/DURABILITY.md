@@ -211,6 +211,55 @@ lets automatic retention authenticate and expire old generations safely.
 Remove generation 1 from configuration and custody only after every dependent
 backup has expired.
 
+## Versioned full-installation portability
+
+Portable storage bundles move the complete durable SQLite installation across
+hosts or storage-key generations. They are not a tenant- or user-selective data
+export. Every agent, conversation, memory record, package, service, quota,
+credential digest, integrity secret, audit record, and installation identifier
+in the source database is preserved.
+
+Stop every source and destination kernel before running the workflow:
+
+```bash
+agentctl storage-portable-export /var/lib/agentos/agent_os.db \
+  /srv/transfer/agentos-portable \
+  --storage-key /etc/agentos/storage-keys/storage-generation-1.json \
+  --confirm-offline
+agentctl storage-portable-verify /srv/transfer/agentos-portable
+agentctl storage-portable-import /srv/transfer/agentos-portable \
+  /var/lib/agentos-new/agent_os.db \
+  --storage-key /etc/agentos/storage-keys/storage-generation-2.json \
+  --confirm-offline
+```
+
+Export takes the same exclusive storage lease used by restore, verifies the
+source schema and authenticated accounting state, checkpoints committed WAL
+pages, uses SQLCipher's logical export, verifies the plaintext result, and
+atomically publishes an owner-only directory. Its version 1 manifest fixes the
+payload format and filename and records application/schema compatibility,
+installation identity, source key identifier, byte count, timestamp, and a
+SHA-256 digest. Verification rejects unknown manifest fields, unexpected files,
+symlinks, unsupported versions, changed bytes, corrupt SQLite pages, schema or
+accounting-integrity failures, and identity mismatches.
+
+Import re-verifies the bundle before and after staging, only accepts a fresh
+destination, optionally encrypts it under an independently supplied destination
+key, verifies the staged database with that key, and publishes it by
+same-directory atomic rename. A running owner, existing destination, bad key,
+or failed verification leaves no destination database.
+
+The transfer payload is intentionally plaintext so an encrypted installation
+can be re-keyed. It contains all durable sensitivity classes, including the
+database-resident accounting integrity secret and credential digests. Keep it
+on owner-only encrypted media, transport it through a trusted channel, and
+delete it according to operator policy after the destination is qualified.
+SHA-256 detects corruption or payload changes relative to the manifest but does
+not authenticate who created the bundle or prevent an attacker from replacing
+both files; wrap it in an independently authenticated transport or signed
+archive when provenance matters. Backups remain the supported recovery artifact
+and can carry an independently verified Ed25519 signature.
+
 ## Online backup
 
 `SqliteContextManager::create_backup` uses SQLite's online backup API. It never

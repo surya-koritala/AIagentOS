@@ -149,11 +149,16 @@ impl StorageEncryptionKey {
             })
     }
 
-    fn apply_to_attached(
+    pub(crate) fn apply_to_attached(
         &self,
         connection: &Connection,
         database_name: &str,
     ) -> Result<(), ContextError> {
+        if database_name != "encrypted" {
+            return Err(storage_error(
+                "storage encryption only supports the fixed attached database name",
+            ));
+        }
         let database_name = CString::new(database_name)
             .map_err(|_| storage_error("attached database name contains a NUL byte"))?;
         let result = unsafe {

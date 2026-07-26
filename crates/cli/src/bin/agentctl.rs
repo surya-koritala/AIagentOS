@@ -7,7 +7,7 @@ use agent_cli::OperatorClient;
 fn usage() -> ! {
     eprintln!(
         "usage: agentctl [--addr HOST:PORT] [--token TOKEN] \
-         <list|inspect|pressure|tunables|tunable-set|tunable-rollback|tunable-history|status|pause|resume|stop|kill|wait|services|service-start|service-stop|service-restart|service-reload|service-history|backup-create|backup-retention|backup-status|data-inventory|backup-key-generate|backup-verify|backup-restore|backup-disaster-recover|storage-key-generate|storage-encrypt|storage-encrypt-recover|storage-key-rotate|erase-agent|erase-user|erase-tenant> [ARGS...]\n\
+         <list|inspect|pressure|tunables|tunable-set|tunable-rollback|tunable-history|status|pause|resume|stop|kill|wait|services|service-start|service-stop|service-restart|service-reload|service-history|backup-create|backup-retention|backup-status|data-inventory|backup-key-generate|backup-verify|backup-restore|backup-disaster-recover|storage-key-generate|storage-encrypt|storage-encrypt-recover|storage-key-rotate|storage-portable-export|storage-portable-verify|storage-portable-import|erase-agent|erase-user|erase-tenant> [ARGS...]\n\
          \n\
          storage commands:\n\
            agentctl [SERVER OPTIONS] backup-create BACKUP_ROOT NAME\n\
@@ -22,6 +22,9 @@ fn usage() -> ! {
            agentctl storage-encrypt DATABASE KEY_FILE --confirm-offline\n\
            agentctl storage-encrypt-recover DATABASE KEY_FILE --confirm-offline\n\
            agentctl storage-key-rotate DATABASE CURRENT_KEY_FILE NEXT_KEY_FILE --confirm-offline\n\
+           agentctl storage-portable-export DATABASE BUNDLE_DIR [--storage-key KEY_FILE] --confirm-offline\n\
+           agentctl storage-portable-verify BUNDLE_DIR\n\
+           agentctl storage-portable-import BUNDLE_DIR DATABASE [--storage-key KEY_FILE] --confirm-offline\n\
            agentctl [SERVER OPTIONS] erase-agent AGENT_ID --confirm\n\
            agentctl [SERVER OPTIONS] erase-user USER_ID --confirm\n\
            agentctl [SERVER OPTIONS] erase-tenant TENANT_ID --confirm"
@@ -49,6 +52,29 @@ fn parse_backup_file_options(
             }
             "--require-signature" if parsed.trust_root.is_none() => {
                 parsed.trust_root = Some(values.next().unwrap_or_else(|| usage()));
+            }
+            "--confirm-offline" if confirmation_required && !parsed.confirmed_offline => {
+                parsed.confirmed_offline = true;
+            }
+            _ => usage(),
+        }
+    }
+    if confirmation_required && !parsed.confirmed_offline {
+        usage();
+    }
+    parsed
+}
+
+fn parse_portable_file_options(
+    values: impl IntoIterator<Item = String>,
+    confirmation_required: bool,
+) -> BackupFileOptions {
+    let mut values = values.into_iter();
+    let mut parsed = BackupFileOptions::default();
+    while let Some(value) = values.next() {
+        match value.as_str() {
+            "--storage-key" if parsed.storage_key.is_none() => {
+                parsed.storage_key = Some(values.next().unwrap_or_else(|| usage()));
             }
             "--confirm-offline" if confirmation_required && !parsed.confirmed_offline => {
                 parsed.confirmed_offline = true;
@@ -203,6 +229,51 @@ async fn main() {
             )
             .unwrap_or_else(|error| fail_storage(error));
             print_json(&report, "disaster recovery report");
+            return;
+        }
+        "storage-portable-export" => {
+            let database = args.next().unwrap_or_else(|| usage());
+            let bundle_dir = args.next().unwrap_or_else(|| usage());
+            let options = parse_portable_file_options(args.collect::<Vec<_>>(), true);
+            let storage_key = options.storage_key.as_deref().map(|path| {
+                kernel::storage_encryption::load_storage_encryption_key(std::path::Path::new(path))
+                    .unwrap_or_else(|error| fail_storage(error))
+            });
+            let report = kernel::storage::export_portable_storage(
+                std::path::Path::new(&database),
+                std::path::Path::new(&bundle_dir),
+                storage_key.as_ref(),
+            )
+            .unwrap_or_else(|error| fail_storage(error));
+            print_json(&report, "portable storage export report");
+            return;
+        }
+        "storage-portable-verify" => {
+            let bundle_dir = args.next().unwrap_or_else(|| usage());
+            if args.next().is_some() {
+                usage();
+            }
+            let manifest =
+                kernel::storage::verify_portable_storage(std::path::Path::new(&bundle_dir))
+                    .unwrap_or_else(|error| fail_storage(error));
+            print_json(&manifest, "portable storage manifest");
+            return;
+        }
+        "storage-portable-import" => {
+            let bundle_dir = args.next().unwrap_or_else(|| usage());
+            let database = args.next().unwrap_or_else(|| usage());
+            let options = parse_portable_file_options(args.collect::<Vec<_>>(), true);
+            let storage_key = options.storage_key.as_deref().map(|path| {
+                kernel::storage_encryption::load_storage_encryption_key(std::path::Path::new(path))
+                    .unwrap_or_else(|error| fail_storage(error))
+            });
+            let report = kernel::storage::import_portable_storage(
+                std::path::Path::new(&bundle_dir),
+                std::path::Path::new(&database),
+                storage_key.as_ref(),
+            )
+            .unwrap_or_else(|error| fail_storage(error));
+            print_json(&report, "portable storage import report");
             return;
         }
         "storage-key-generate" => {

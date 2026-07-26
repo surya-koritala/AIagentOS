@@ -130,6 +130,15 @@ exec 3<>/dev/tcp/127.0.0.1/7777; printf '{"op":"node_info"}\n' >&3; head -1 <&3
 
 ### Back up and recover persistent state
 
+The Compose server enables automatic hourly verified backups in the separate
+`agentos-backups` volume, runs one backup at startup, keeps at least 24, and
+expires additional backups after seven days. Inspect its bounded health:
+
+```bash
+cargo run -p agent-cli --bin agentctl --locked -- \
+  --addr 127.0.0.1:7777 --token "$AGENT_SERVER_TOKEN" backup-status
+```
+
 Create a consistent backup while the server is running. The backup root is on
 the server host and requires trusted system-operator access:
 
@@ -152,8 +161,9 @@ cargo run -p agent-cli --bin agentctl --locked -- \
   /var/lib/agentos/agent_os.db --confirm-offline
 ```
 
-The exact durability boundary, manifest checks, and remaining recovery work are
-documented in [docs/DURABILITY.md](docs/DURABILITY.md).
+Automatic backup configuration, exact durability boundaries, manifest checks,
+offline restore, and remaining disaster-recovery work are documented in
+[docs/DURABILITY.md](docs/DURABILITY.md).
 
 Connect with the SDK or any client speaking newline-delimited JSON syscalls.
 See [the public protocol contract](docs/PROTOCOL.md) for version negotiation,

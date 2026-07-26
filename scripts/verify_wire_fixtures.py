@@ -36,6 +36,7 @@ V2_ONLY_OPERATIONS = {
     "set_cluster_member_state",
     "set_node_availability",
     "set_node_profile",
+    "storage_backup_status",
 }
 
 

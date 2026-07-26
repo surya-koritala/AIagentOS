@@ -656,6 +656,17 @@ async fn system_operator_can_create_and_verify_online_backup_via_sdk() {
     let database = root.join("agent_os.db");
     let backup_root = root.join("backups");
     let kernel = Arc::new(AgentKernelImpl::with_db_path(&database).expect("persistent kernel"));
+    kernel
+        .backup_maintenance
+        .configure(kernel::config::BackupScheduleConfig {
+            enabled: true,
+            root: Some(backup_root.clone()),
+            interval_seconds: 60,
+            run_on_start: false,
+            keep_latest: 2,
+            max_age_seconds: 3_600,
+        })
+        .expect("configure backup maintenance");
     let server = SyscallServer::bind(Arc::clone(&kernel), "127.0.0.1:0")
         .await
         .expect("bind");
@@ -663,6 +674,17 @@ async fn system_operator_can_create_and_verify_online_backup_via_sdk() {
     let server_task = tokio::spawn(server.serve());
 
     let mut client = KernelClient::connect(addr).await.expect("connect");
+    let status = client
+        .storage_backup_status()
+        .await
+        .expect("storage_backup_status");
+    let expected_backup_root = backup_root.to_string_lossy().into_owned();
+    assert!(status.enabled);
+    assert_eq!(status.keep_latest, 2);
+    assert_eq!(
+        status.backup_root.as_deref(),
+        Some(expected_backup_root.as_str())
+    );
     let manifest = client
         .create_storage_backup(backup_root.to_string_lossy(), "operator_001")
         .await

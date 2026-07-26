@@ -168,6 +168,7 @@ Inside the `agentos` container everything is under `/data` (a named volume
 
 - `/data/config/ai-agent-os/config.toml` — rendered by the entrypoint from env vars.
 - `/data/share/ai-agent-os/agent_os.db` — the SQLite kernel/conversation store.
+- `/backups` — verified automatic snapshots when scheduled backups are enabled.
 
 `HOME`, `XDG_CONFIG_HOME` and `XDG_DATA_HOME` are pinned in the Dockerfile /
 compose so the `dirs` crate resolves these paths deterministically. There is no
@@ -186,6 +187,17 @@ Consumed by `docker/entrypoint.sh` to render `config.toml`:
 | `AGENTOS_LLM_PROVIDER` | `local` | `config.llm_provider` |
 | `AGENTOS_MODEL` | `llama3.2` | `config.default_model` |
 | `OLLAMA_BASE_URL` | `http://ollama:11434` (compose) / `http://localhost:11434` (image default) | `api_keys.local` (the Ollama URL field) |
+| `AGENTOS_BACKUP_ENABLED` | `false` (image) / `true` (server Compose profile) | `backup.enabled` |
+| `AGENTOS_BACKUP_ROOT` | `/backups` | `backup.root` |
+| `AGENTOS_BACKUP_INTERVAL_SECONDS` | `3600` | `backup.interval_seconds` |
+| `AGENTOS_BACKUP_RUN_ON_START` | `true` | `backup.run_on_start` |
+| `AGENTOS_BACKUP_KEEP_LATEST` | `24` | `backup.keep_latest` |
+| `AGENTOS_BACKUP_MAX_AGE_SECONDS` | `604800` | `backup.max_age_seconds` |
+
+Backup roots must be absolute. Boolean, path, and numeric environment values
+are validated before the entrypoint writes configuration. The application also
+validates that the interval, age, and minimum retained count form a safe policy
+before creating its data directory.
 
 Cloud-provider keys are read directly from the process environment by the CLI
 (no TOML needed) — set these and switch `AGENTOS_LLM_PROVIDER` accordingly:

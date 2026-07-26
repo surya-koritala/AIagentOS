@@ -31,6 +31,22 @@ async fn backup_create_command_uses_the_live_system_operator_api() {
     let addr = server.local_addr().expect("server address");
     let server_task = tokio::spawn(server.serve());
 
+    let status_output = Command::new(env!("CARGO_BIN_EXE_agentctl"))
+        .arg("--addr")
+        .arg(addr.to_string())
+        .arg("backup-status")
+        .output()
+        .expect("run backup-status");
+    assert!(
+        status_output.status.success(),
+        "backup-status failed: {}",
+        String::from_utf8_lossy(&status_output.stderr)
+    );
+    let status: kernel::storage::BackupMaintenanceStatus =
+        serde_json::from_slice(&status_output.stdout).expect("backup status JSON");
+    assert!(!status.enabled);
+    assert_eq!(status.attempts_total, 0);
+
     let command_backup_root = backup_root.clone();
     let output = tokio::task::spawn_blocking(move || {
         Command::new(env!("CARGO_BIN_EXE_agentctl"))

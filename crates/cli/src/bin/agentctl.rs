@@ -7,11 +7,12 @@ use agent_cli::OperatorClient;
 fn usage() -> ! {
     eprintln!(
         "usage: agentctl [--addr HOST:PORT] [--token TOKEN] \
-         <list|inspect|pressure|tunables|tunable-set|tunable-rollback|tunable-history|status|pause|resume|stop|kill|wait|services|service-start|service-stop|service-restart|service-reload|service-history|backup-create|backup-retention|backup-verify|backup-restore|erase-agent|erase-user|erase-tenant> [ARGS...]\n\
+         <list|inspect|pressure|tunables|tunable-set|tunable-rollback|tunable-history|status|pause|resume|stop|kill|wait|services|service-start|service-stop|service-restart|service-reload|service-history|backup-create|backup-retention|backup-status|backup-verify|backup-restore|erase-agent|erase-user|erase-tenant> [ARGS...]\n\
          \n\
          storage commands:\n\
            agentctl [SERVER OPTIONS] backup-create BACKUP_ROOT NAME\n\
            agentctl [SERVER OPTIONS] backup-retention BACKUP_ROOT KEEP_LATEST MAX_AGE_SECONDS <--dry-run|--confirm>\n\
+           agentctl [SERVER OPTIONS] backup-status\n\
            agentctl backup-verify BACKUP_DIR\n\
            agentctl backup-restore BACKUP_DIR DATABASE --confirm-offline\n\
            agentctl [SERVER OPTIONS] erase-agent AGENT_ID --confirm\n\
@@ -254,6 +255,17 @@ async fn main() {
             }
             .unwrap_or_else(|error| fail(error));
             print_json(&report, "backup retention report");
+            return;
+        }
+        "backup-status" => {
+            if args.next().is_some() {
+                usage();
+            }
+            let status = client
+                .storage_backup_status()
+                .await
+                .unwrap_or_else(|error| fail(error));
+            print_json(&status, "backup maintenance status");
             return;
         }
         "erase-agent" => {

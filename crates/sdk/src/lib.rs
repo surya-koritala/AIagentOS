@@ -1275,6 +1275,16 @@ impl KernelClient {
         }
     }
 
+    /// Read the configured automatic-backup policy and bounded live health.
+    pub async fn storage_backup_status(
+        &mut self,
+    ) -> Result<kernel::storage::BackupMaintenanceStatus, SdkError> {
+        match self.call(Syscall::StorageBackupStatus).await? {
+            SyscallReply::StorageBackupStatus { maintenance } => Ok(maintenance),
+            other => Err(unexpected("StorageBackupStatus", &other)),
+        }
+    }
+
     /// Irreversibly erase one agent after the kernel drains its tenant requests
     /// and live runtime resources.
     pub async fn erase_agent_data(

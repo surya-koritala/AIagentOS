@@ -10,6 +10,16 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
 
 ## [Unreleased]
 
+- Added automatic verified local backups for #123. A fail-closed `[backup]`
+  policy controls startup execution, interval, absolute backup root, and safe
+  retention; blocking SQLite work runs off the async runtime and failures
+  preserve prior backups while updating bounded health. A system-only protocol
+  v2 status operation, typed SDK method, `agentctl backup-status`, structured
+  logs, and stable Prometheus counters make maintenance observable. The
+  rootless Compose profile uses a separate backup volume, and config,
+  scheduler, retention/failure, authorization, SDK, CLI, entrypoint, metrics,
+  and wire regressions cover the path. Remote replication, automated restore,
+  encryption, and measured RPO/RTO remain open in #123.
 - Added safe verified local-backup retention for #123. The kernel serializes
   retention with backup publication, bounds root scans, considers only verified
   backups from the current installation, always preserves a configured latest

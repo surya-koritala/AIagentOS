@@ -16,6 +16,7 @@ use ring::digest::{Context as DigestContext, SHA256};
 use rusqlite::{Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
 
+use crate::config::BackupScheduleConfig;
 use crate::context::SqliteContextManager;
 use crate::ContextError;
 
@@ -93,6 +94,199 @@ pub struct BackupRetentionReport {
     pub retained: Vec<BackupRetentionEntry>,
     /// Unknown, unsafe, corrupt, or foreign-installation entries.
     pub skipped: Vec<BackupRetentionIssue>,
+}
+
+/// Result of one automatic backup and retention cycle.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScheduledBackupReport {
+    pub backup: BackupManifest,
+    pub retention: BackupRetentionReport,
+}
+
+/// Bounded operator-visible state for automatic backup maintenance.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackupMaintenanceStatus {
+    pub enabled: bool,
+    pub backup_root: Option<String>,
+    pub interval_seconds: u64,
+    pub run_on_start: bool,
+    pub keep_latest: usize,
+    pub max_age_seconds: u64,
+    pub attempts_total: u64,
+    pub successes_total: u64,
+    pub failures_total: u64,
+    pub retention_deleted_total: u64,
+    pub consecutive_failures: u64,
+    pub last_attempt_at: Option<String>,
+    pub last_success_at: Option<String>,
+    pub last_failure_at: Option<String>,
+    pub last_backup_name: Option<String>,
+    pub last_error: Option<String>,
+}
+
+/// Process-local coordinator for scheduled backup policy and health.
+///
+/// The published backups themselves are durable. This status intentionally
+/// resets on process restart and is exported without per-path metric labels.
+pub struct BackupMaintenance {
+    config: std::sync::RwLock<BackupScheduleConfig>,
+    status: std::sync::Mutex<BackupMaintenanceStatus>,
+}
+
+impl Default for BackupMaintenance {
+    fn default() -> Self {
+        Self::new(BackupScheduleConfig::default())
+            .expect("the disabled default backup configuration is valid")
+    }
+}
+
+impl BackupMaintenance {
+    pub fn new(config: BackupScheduleConfig) -> Result<Self, ContextError> {
+        config.validate().map_err(storage_error)?;
+        let status = Self::status_for_config(&config);
+        Ok(Self {
+            config: std::sync::RwLock::new(config),
+            status: std::sync::Mutex::new(status),
+        })
+    }
+
+    fn status_for_config(config: &BackupScheduleConfig) -> BackupMaintenanceStatus {
+        BackupMaintenanceStatus {
+            enabled: config.enabled,
+            backup_root: config
+                .root
+                .as_ref()
+                .map(|path| path.to_string_lossy().into_owned()),
+            interval_seconds: config.interval_seconds,
+            run_on_start: config.run_on_start,
+            keep_latest: config.keep_latest,
+            max_age_seconds: config.max_age_seconds,
+            ..BackupMaintenanceStatus::default()
+        }
+    }
+
+    pub fn configure(&self, config: BackupScheduleConfig) -> Result<(), ContextError> {
+        config.validate().map_err(storage_error)?;
+        let next_status = Self::status_for_config(&config);
+        *self
+            .config
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = config;
+        *self
+            .status
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = next_status;
+        Ok(())
+    }
+
+    pub fn config(&self) -> BackupScheduleConfig {
+        self.config
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    pub fn status(&self) -> BackupMaintenanceStatus {
+        self.status
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Run one synchronous backup plus confirmed retention pass.
+    ///
+    /// The scheduler calls this through `spawn_blocking`. If retention fails,
+    /// the newly published verified backup remains intact and the complete
+    /// cycle is reported as failed so operators can investigate.
+    pub fn run_cycle(
+        &self,
+        manager: &SqliteContextManager,
+    ) -> Result<ScheduledBackupReport, ContextError> {
+        let config = self.config();
+        if !config.enabled {
+            return Err(storage_error("scheduled backups are disabled"));
+        }
+        let root = config
+            .root
+            .as_deref()
+            .ok_or_else(|| storage_error("scheduled backup root is not configured"))?;
+        let attempted_at = Utc::now();
+        {
+            let mut status = self
+                .status
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            status.attempts_total = status.attempts_total.saturating_add(1);
+            status.last_attempt_at = Some(attempted_at.to_rfc3339());
+        }
+
+        let name = format!(
+            "scheduled_{}_{}",
+            attempted_at.format("%Y%m%dT%H%M%S%3fZ"),
+            uuid::Uuid::new_v4().simple()
+        );
+        let result = (|| {
+            let backup = manager.create_backup(root, &name)?;
+            let retention = manager.apply_backup_retention(
+                root,
+                BackupRetentionPolicy {
+                    keep_latest: config.keep_latest,
+                    max_age_seconds: config.max_age_seconds,
+                },
+                false,
+            )?;
+            Ok(ScheduledBackupReport { backup, retention })
+        })();
+
+        let completed_at = Utc::now().to_rfc3339();
+        let mut status = self
+            .status
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match &result {
+            Ok(report) => {
+                status.successes_total = status.successes_total.saturating_add(1);
+                status.retention_deleted_total = status
+                    .retention_deleted_total
+                    .saturating_add(report.retention.deleted.len() as u64);
+                status.consecutive_failures = 0;
+                status.last_success_at = Some(completed_at);
+                status.last_backup_name = Some(name);
+                status.last_error = None;
+            }
+            Err(error) => {
+                status.failures_total = status.failures_total.saturating_add(1);
+                status.consecutive_failures = status.consecutive_failures.saturating_add(1);
+                status.last_failure_at = Some(completed_at);
+                status.last_error = Some(bounded_backup_error(error));
+            }
+        }
+        result
+    }
+
+    pub(crate) fn record_worker_failure(&self, message: &str) {
+        let now = Utc::now().to_rfc3339();
+        let mut status = self
+            .status
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        status.failures_total = status.failures_total.saturating_add(1);
+        status.consecutive_failures = status.consecutive_failures.saturating_add(1);
+        status.last_failure_at = Some(now);
+        status.last_error = Some(bounded_text(message));
+    }
+}
+
+fn bounded_backup_error(error: &ContextError) -> String {
+    bounded_text(&error.to_string())
+}
+
+fn bounded_text(value: &str) -> String {
+    value
+        .chars()
+        .filter(|character| !character.is_control())
+        .take(512)
+        .collect()
 }
 
 fn storage_error(message: impl Into<String>) -> ContextError {
@@ -1273,6 +1467,78 @@ mod tests {
         let mut manifest = read_manifest(&manifest_path).unwrap();
         manifest.created_at = (Utc::now() - age).to_rfc3339();
         fs::write(manifest_path, serde_json::to_vec_pretty(&manifest).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn scheduled_cycle_publishes_verified_backup_applies_retention_and_reports_health() {
+        let directory = TestDirectory::new("scheduled-cycle");
+        let manager = SqliteContextManager::new(&directory.path.join("source.db")).unwrap();
+        seed(&manager, "scheduled-proof", "survived");
+        let root = directory.path.join("backups");
+        manager.create_backup(&root, "expired").unwrap();
+        set_backup_age(&root, "expired", chrono::Duration::hours(8));
+
+        let maintenance = BackupMaintenance::new(BackupScheduleConfig {
+            enabled: true,
+            root: Some(root.clone()),
+            interval_seconds: 60,
+            run_on_start: true,
+            keep_latest: 1,
+            max_age_seconds: 60,
+        })
+        .unwrap();
+        let report = maintenance.run_cycle(&manager).unwrap();
+        assert_eq!(report.retention.deleted.len(), 1);
+        assert_eq!(report.retention.deleted[0].name, "expired");
+        assert!(!root.join("expired").exists());
+
+        let scheduled_name = maintenance
+            .status()
+            .last_backup_name
+            .expect("last successful backup name");
+        assert_eq!(
+            verify_backup(&root.join(scheduled_name)).unwrap(),
+            report.backup
+        );
+        let status = maintenance.status();
+        assert_eq!(status.attempts_total, 1);
+        assert_eq!(status.successes_total, 1);
+        assert_eq!(status.failures_total, 0);
+        assert_eq!(status.retention_deleted_total, 1);
+        assert_eq!(status.consecutive_failures, 0);
+        assert!(status.last_success_at.is_some());
+        assert!(status.last_error.is_none());
+    }
+
+    #[test]
+    fn scheduled_cycle_failure_is_bounded_visible_and_preserves_prior_backup() {
+        let directory = TestDirectory::new("scheduled-failure");
+        let manager = SqliteContextManager::new(&directory.path.join("source.db")).unwrap();
+        let root = directory.path.join("backups");
+        manager.create_backup(&root, "known_good").unwrap();
+        let blocked = directory.path.join("not-a-directory");
+        fs::write(&blocked, b"block backup root").unwrap();
+        let maintenance = BackupMaintenance::new(BackupScheduleConfig {
+            enabled: true,
+            root: Some(blocked),
+            interval_seconds: 60,
+            run_on_start: true,
+            keep_latest: 1,
+            max_age_seconds: 60,
+        })
+        .unwrap();
+
+        assert!(maintenance.run_cycle(&manager).is_err());
+        assert!(verify_backup(&root.join("known_good")).is_ok());
+        let status = maintenance.status();
+        assert_eq!(status.attempts_total, 1);
+        assert_eq!(status.successes_total, 0);
+        assert_eq!(status.failures_total, 1);
+        assert_eq!(status.consecutive_failures, 1);
+        assert!(status.last_failure_at.is_some());
+        let error = status.last_error.expect("bounded failure");
+        assert!(error.len() <= 512);
+        assert!(!error.chars().any(char::is_control));
     }
 
     #[test]

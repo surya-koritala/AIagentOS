@@ -41,9 +41,9 @@ compatibility behavior, and transport limits:
 
 The schemas use JSON Schema draft 2020-12 and cover every top-level request,
 reply, and stream-event tag. The authorization/schema regression constructs
-all 73 current syscalls and rejects either a missing schema operation or an
+all 74 current syscalls and rejects either a missing schema operation or an
 undocumented extra. Deterministic golden request arrays cover all 59 v1
-operations and all 73 v2 operations. Domain payload examples and
+operations and all 74 v2 operations. Domain payload examples and
 previous-version shapes are retained under `protocol/`.
 
 ## Compatibility policy
@@ -234,6 +234,18 @@ Tenant credentials are denied, and deletion requires `confirm: true`;
 
 The server serializes retention with backup publication and returns an
 auditable report of eligible, deleted, retained, and skipped entries.
+
+Protocol v2 also advertises `scheduled_backups`. A trusted system operator can
+read the configured policy and bounded process-local maintenance health:
+
+```json
+{"op":"storage_backup_status"}
+```
+
+The `storage_backup_status` reply carries a `maintenance` object with bounded
+attempt/success/failure counters, consecutive failures, timestamps, the last
+published name, and a bounded diagnostic. Tenant credentials are denied. The
+same values are available without filesystem-path labels in Prometheus.
 An agent-only erasure reopens the unaffected tenant credentials after the
 operation. Successful user and tenant erasure leaves their credentials revoked.
 Failure before the durable commit reopens still-valid credentials so the
@@ -310,7 +322,7 @@ Versioned fixtures:
 - `protocol/v2/hello.json`
 - `protocol/v2/typed-error.json`
 - `protocol/v2/describe-protocol-request.json`
-- `protocol/v2/requests.json` (all 73 v2 operations)
+- `protocol/v2/requests.json` (all 74 v2 operations)
 - `protocol/v2/send-message-stream.json`
 - `protocol/v2/stream-event.json`
 - `protocol/v2/stream-completed.json`

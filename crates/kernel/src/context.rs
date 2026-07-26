@@ -549,6 +549,7 @@ impl SqliteContextManager {
     pub fn new(db_path: &Path) -> Result<Self, ContextError> {
         let conn =
             Connection::open(db_path).map_err(|e| ContextError::StorageError(e.to_string()))?;
+        let schema_version = crate::schema::preflight(&conn)?;
         // Generation checkpoints contain prompts and tool results. Protect the
         // SQLite file with owner-only permissions on Unix before writing them.
         #[cfg(unix)]
@@ -599,7 +600,7 @@ impl SqliteContextManager {
             #[cfg(test)]
             fail_agent_status_update_after: AtomicUsize::new(0),
         };
-        mgr.init_schema()?;
+        mgr.init_schema(schema_version)?;
         Ok(mgr)
     }
 
@@ -607,6 +608,7 @@ impl SqliteContextManager {
     pub fn in_memory() -> Result<Self, ContextError> {
         let conn =
             Connection::open_in_memory().map_err(|e| ContextError::StorageError(e.to_string()))?;
+        let schema_version = crate::schema::preflight(&conn)?;
         let mgr = Self {
             conn: Mutex::new(conn),
             storage_limits: RwLock::new(ContextStorageLimits::default()),
@@ -616,7 +618,7 @@ impl SqliteContextManager {
             #[cfg(test)]
             fail_agent_status_update_after: AtomicUsize::new(0),
         };
-        mgr.init_schema()?;
+        mgr.init_schema(schema_version)?;
         Ok(mgr)
     }
 
@@ -628,7 +630,7 @@ impl SqliteContextManager {
         self
     }
 
-    fn init_schema(&self) -> Result<(), ContextError> {
+    fn init_schema(&self, schema_version: i64) -> Result<(), ContextError> {
         let mut conn = self
             .conn
             .lock()
@@ -1201,17 +1203,76 @@ impl SqliteContextManager {
             CREATE TABLE IF NOT EXISTS quota_migration_fence (
                 epoch BLOB PRIMARY KEY
                     CHECK (typeof(epoch) = 'blob' AND length(epoch) = 8)
-            ) WITHOUT ROWID;",
+            ) WITHOUT ROWID;
+            CREATE TABLE IF NOT EXISTS cluster_node_identity (
+                singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                node_id TEXT NOT NULL UNIQUE,
+                private_key BLOB NOT NULL,
+                public_key BLOB NOT NULL,
+                fingerprint TEXT NOT NULL UNIQUE,
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS cluster_node_control (
+                singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                availability TEXT NOT NULL,
+                generation INTEGER NOT NULL CHECK (generation >= 0),
+                profile_json TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS cluster_node_control_audit (
+                generation INTEGER PRIMARY KEY,
+                previous_availability TEXT NOT NULL,
+                current_availability TEXT NOT NULL,
+                actor TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                changed_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS cluster_membership_authority (
+                singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                cluster_id TEXT NOT NULL UNIQUE,
+                generation INTEGER NOT NULL CHECK (generation >= 0),
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS cluster_join_challenges (
+                challenge_hash TEXT PRIMARY KEY,
+                expires_at TEXT NOT NULL,
+                consumed_at TEXT
+            );
+            CREATE TABLE IF NOT EXISTS cluster_members (
+                node_id TEXT PRIMARY KEY,
+                fingerprint TEXT NOT NULL UNIQUE,
+                public_key TEXT NOT NULL,
+                endpoint TEXT NOT NULL UNIQUE,
+                server_version TEXT NOT NULL,
+                min_protocol_version INTEGER NOT NULL CHECK (min_protocol_version >= 1),
+                protocol_version INTEGER NOT NULL CHECK (protocol_version >= min_protocol_version),
+                state TEXT NOT NULL,
+                generation INTEGER NOT NULL CHECK (generation >= 1),
+                joined_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                reason TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS cluster_membership_audit (
+                membership_generation INTEGER PRIMARY KEY,
+                node_id TEXT NOT NULL,
+                member_generation INTEGER NOT NULL CHECK (member_generation >= 1),
+                previous_state TEXT,
+                current_state TEXT NOT NULL,
+                actor TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                changed_at TEXT NOT NULL
+            );",
         ).map_err(|e| ContextError::StorageError(e.to_string()))?;
         // Legacy fact rows are deliberately marked stale and rebuilt on their
         // next query or an explicit reindex.
-        for column in [
-            "embedding_model TEXT NOT NULL DEFAULT 'legacy'",
-            "embedding_version INTEGER NOT NULL DEFAULT 0",
-            "embedding_dim INTEGER NOT NULL DEFAULT 0",
-            "content_hash TEXT NOT NULL DEFAULT ''",
+        for (column, definition) in [
+            ("embedding_model", "TEXT NOT NULL DEFAULT 'legacy'"),
+            ("embedding_version", "INTEGER NOT NULL DEFAULT 0"),
+            ("embedding_dim", "INTEGER NOT NULL DEFAULT 0"),
+            ("content_hash", "TEXT NOT NULL DEFAULT ''"),
         ] {
-            let _ = conn.execute(&format!("ALTER TABLE facts ADD COLUMN {column}"), []);
+            crate::schema::add_column_if_missing(&conn, "facts", column, definition)?;
         }
         if hierarchy_schema_upgrade_needed && hierarchy_database_has_rows {
             // Commit the fence before changing the schema. If the process dies
@@ -1251,27 +1312,31 @@ impl SqliteContextManager {
                     "failed to create quota receipt scope-order index: {error}"
                 ))
             })?;
-            let _ = conn.execute(
-                "ALTER TABLE agents ADD COLUMN tenant_id TEXT NOT NULL DEFAULT 'default'",
-                [],
-            );
-            let _ = conn.execute("ALTER TABLE usage_log ADD COLUMN provider TEXT", []);
-            let _ = conn.execute(
-                "ALTER TABLE usage_log ADD COLUMN tool_calls INTEGER NOT NULL DEFAULT 0",
-                [],
-            );
-            for column in [
-                "input_tokens INTEGER NOT NULL DEFAULT 0",
-                "output_tokens INTEGER NOT NULL DEFAULT 0",
-                "cached_tokens INTEGER NOT NULL DEFAULT 0",
-                "llm_requests INTEGER NOT NULL DEFAULT 0",
-                "retries INTEGER NOT NULL DEFAULT 0",
-                "provider_latency_ms INTEGER NOT NULL DEFAULT 0",
-                "provider_reported_requests INTEGER NOT NULL DEFAULT 0",
-                "estimated_requests INTEGER NOT NULL DEFAULT 0",
-                "cost_micros INTEGER NOT NULL DEFAULT 0",
+            crate::schema::add_column_if_missing(
+                &conn,
+                "agents",
+                "tenant_id",
+                "TEXT NOT NULL DEFAULT 'default'",
+            )?;
+            crate::schema::add_column_if_missing(&conn, "usage_log", "provider", "TEXT")?;
+            crate::schema::add_column_if_missing(
+                &conn,
+                "usage_log",
+                "tool_calls",
+                "INTEGER NOT NULL DEFAULT 0",
+            )?;
+            for (column, definition) in [
+                ("input_tokens", "INTEGER NOT NULL DEFAULT 0"),
+                ("output_tokens", "INTEGER NOT NULL DEFAULT 0"),
+                ("cached_tokens", "INTEGER NOT NULL DEFAULT 0"),
+                ("llm_requests", "INTEGER NOT NULL DEFAULT 0"),
+                ("retries", "INTEGER NOT NULL DEFAULT 0"),
+                ("provider_latency_ms", "INTEGER NOT NULL DEFAULT 0"),
+                ("provider_reported_requests", "INTEGER NOT NULL DEFAULT 0"),
+                ("estimated_requests", "INTEGER NOT NULL DEFAULT 0"),
+                ("cost_micros", "INTEGER NOT NULL DEFAULT 0"),
             ] {
-                let _ = conn.execute(&format!("ALTER TABLE usage_log ADD COLUMN {column}"), []);
+                crate::schema::add_column_if_missing(&conn, "usage_log", column, definition)?;
             }
             // Older rows only stored a floating-point USD estimate. Backfill
             // once into the exact integer unit used by enforcement. New rows
@@ -1293,15 +1358,25 @@ impl SqliteContextManager {
             // that claim on boot: external side effects therefore have the
             // documented at-least-once crash semantics unless the tool uses its
             // stable call id as an idempotency key.
-            let _ = conn.execute(
+            conn.execute(
                 "UPDATE generation_checkpoints SET status = 'active'
                  WHERE status = 'resuming' AND expires_at > ?1",
                 params![Utc::now().to_rfc3339()],
-            );
-            let _ = conn.execute(
+            )
+            .map_err(|error| {
+                ContextError::StorageError(format!(
+                    "failed to re-arm generation checkpoints: {error}"
+                ))
+            })?;
+            conn.execute(
                 "DELETE FROM generation_checkpoints WHERE expires_at <= ?1",
                 params![Utc::now().to_rfc3339()],
-            );
+            )
+            .map_err(|error| {
+                ContextError::StorageError(format!(
+                    "failed to prune expired generation checkpoints: {error}"
+                ))
+            })?;
         }
         // PR129 stored context spills in agent_kv before digest/retention
         // metadata existed. Upgrade them in place so restart-safe references
@@ -1385,6 +1460,7 @@ impl SqliteContextManager {
             // databases do not receive this fence.
             Self::install_current_quota_migration_fence(&mut conn)?;
         }
+        crate::schema::complete_migration(&mut conn, schema_version)?;
         Ok(())
     }
 
@@ -6861,7 +6937,7 @@ mod tests {
             fail_next_agent_save: AtomicBool::new(false),
             fail_agent_status_update_after: AtomicUsize::new(0),
         };
-        mgr.init_schema().unwrap();
+        mgr.init_schema(0).unwrap();
 
         let record = mgr
             .latest_usage(uuid::Uuid::from_u128(1))
@@ -7314,6 +7390,158 @@ mod tests {
     }
 
     #[test]
+    fn fresh_database_is_owned_versioned_complete_and_idempotent() {
+        let database = QuotaTestDatabase::new("schema-version");
+        {
+            let manager = SqliteContextManager::new(&database.path).unwrap();
+            let connection = manager.conn.lock().unwrap();
+            let application_id: i64 = connection
+                .pragma_query_value(None, "application_id", |row| row.get(0))
+                .unwrap();
+            let schema_version: i64 = connection
+                .pragma_query_value(None, "user_version", |row| row.get(0))
+                .unwrap();
+            let migration_count: i64 = connection
+                .query_row("SELECT COUNT(*) FROM schema_migrations", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            let cluster_table_count: i64 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_schema
+                     WHERE type = 'table' AND name LIKE 'cluster_%'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(application_id, crate::schema::APPLICATION_ID);
+            assert_eq!(schema_version, crate::schema::CURRENT_SCHEMA_VERSION);
+            assert_eq!(migration_count, 1);
+            assert_eq!(cluster_table_count, 7);
+        }
+
+        let reopened = SqliteContextManager::new(&database.path).unwrap();
+        let connection = reopened.conn.lock().unwrap();
+        let migration_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM schema_migrations", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(migration_count, 1);
+        crate::schema::verify(&connection).unwrap();
+    }
+
+    #[test]
+    fn newer_database_is_rejected_before_schema_mutation() {
+        let database = QuotaTestDatabase::new("future-schema");
+        {
+            let connection = Connection::open(&database.path).unwrap();
+            connection
+                .execute("CREATE TABLE future_only(value TEXT NOT NULL)", [])
+                .unwrap();
+            connection
+                .execute("INSERT INTO future_only VALUES ('preserve-me')", [])
+                .unwrap();
+            connection
+                .pragma_update(None, "application_id", crate::schema::APPLICATION_ID)
+                .unwrap();
+            connection
+                .pragma_update(
+                    None,
+                    "user_version",
+                    crate::schema::CURRENT_SCHEMA_VERSION + 1,
+                )
+                .unwrap();
+        }
+
+        let error = SqliteContextManager::new(&database.path)
+            .err()
+            .expect("a newer schema must fail closed");
+        assert_eq!(
+            error,
+            ContextError::DatabaseTooNew {
+                found: crate::schema::CURRENT_SCHEMA_VERSION + 1,
+                supported: crate::schema::CURRENT_SCHEMA_VERSION,
+            }
+        );
+
+        let connection = Connection::open(&database.path).unwrap();
+        let value: String = connection
+            .query_row("SELECT value FROM future_only", [], |row| row.get(0))
+            .unwrap();
+        let contexts_exist = connection
+            .query_row(
+                "SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'contexts'",
+                [],
+                |_| Ok(()),
+            )
+            .optional()
+            .unwrap()
+            .is_some();
+        assert_eq!(value, "preserve-me");
+        assert!(!contexts_exist);
+    }
+
+    #[test]
+    fn unrelated_owned_database_is_rejected() {
+        let database = QuotaTestDatabase::new("foreign-application");
+        {
+            let connection = Connection::open(&database.path).unwrap();
+            connection
+                .execute("CREATE TABLE foreign_data(value TEXT NOT NULL)", [])
+                .unwrap();
+            connection
+                .pragma_update(None, "application_id", 0x1234_i64)
+                .unwrap();
+        }
+
+        let error = SqliteContextManager::new(&database.path)
+            .err()
+            .expect("an unrelated application database must be rejected");
+        assert!(error.to_string().contains("is not an AI Agent OS store"));
+        let connection = Connection::open(&database.path).unwrap();
+        let contexts_exist = connection
+            .query_row(
+                "SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'contexts'",
+                [],
+                |_| Ok(()),
+            )
+            .optional()
+            .unwrap()
+            .is_some();
+        assert!(!contexts_exist);
+    }
+
+    #[test]
+    fn unowned_unrelated_database_is_not_adopted_as_legacy() {
+        let database = QuotaTestDatabase::new("unowned-foreign-application");
+        {
+            let connection = Connection::open(&database.path).unwrap();
+            connection
+                .execute("CREATE TABLE customer_orders(value TEXT NOT NULL)", [])
+                .unwrap();
+        }
+
+        let error = SqliteContextManager::new(&database.path)
+            .err()
+            .expect("an unrelated unowned database must not be adopted");
+        assert!(error
+            .to_string()
+            .contains("has no recognized AI Agent OS legacy tables"));
+        let connection = Connection::open(&database.path).unwrap();
+        let contexts_exist = connection
+            .query_row(
+                "SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'contexts'",
+                [],
+                |_| Ok(()),
+            )
+            .optional()
+            .unwrap()
+            .is_some();
+        assert!(!contexts_exist);
+    }
+
+    #[test]
     fn nonempty_legacy_database_is_fenced_for_exactly_its_upgrade_epoch() {
         let database = QuotaTestDatabase::new("migration");
         {
@@ -7591,6 +7819,14 @@ mod tests {
 
         let durable_fence = {
             let conn = Connection::open(&database.path).unwrap();
+            let application_id: i64 = conn
+                .pragma_query_value(None, "application_id", |row| row.get(0))
+                .unwrap();
+            let schema_version: i64 = conn
+                .pragma_query_value(None, "user_version", |row| row.get(0))
+                .unwrap();
+            assert_eq!(application_id, 0);
+            assert_eq!(schema_version, 0);
             let has_scope_order = conn
                 .prepare("PRAGMA table_info(quota_receipt_scopes)")
                 .unwrap()

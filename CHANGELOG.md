@@ -10,6 +10,15 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
 
 ## [Unreleased]
 
+- Added the first #123 durability foundation: the kernel SQLite store now has
+  an explicit AI Agent OS application ID, monotonic schema version, installation
+  metadata, and migration ledger. Startup checks integrity and rejects corrupt,
+  unrelated, or newer databases before schema mutation; legacy column upgrades
+  no longer swallow arbitrary SQLite errors; cluster tables are part of the
+  canonical schema; and version, retry, downgrade-fence, and ownership
+  regressions document the forward-only compatibility contract. Consistent
+  backup/restore, encryption, complete deletion, and disaster qualification
+  remain open.
 - Added a durable, system-scoped cluster membership authority. Nodes join by
   signing one-time expiring challenges that bind cluster ID, durable identity,
   endpoint, software version, and protocol window. Atomic membership snapshots,

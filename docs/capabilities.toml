@@ -298,12 +298,12 @@ maturity = "integrated"
 release = "v0.9"
 tracking_issue = 123
 kernel_modules = ["database"]
-source_paths = ["crates/kernel/src/context.rs"]
+source_paths = ["crates/kernel/src/context.rs", "crates/kernel/src/schema.rs", "crates/kernel/src/cluster_control.rs", "docs/DURABILITY.md"]
 public_entry_points = ["crates/kernel/src/lib.rs::AgentKernelImpl::with_db_path"]
 runtime_call_paths = ["crates/kernel/src/context.rs::SqliteContextManager"]
-test_evidence = ["tests/src/persistence_props.rs"]
+test_evidence = ["tests/src/persistence_props.rs", "crates/kernel/src/context.rs"]
 platforms = ["linux", "macos", "windows"]
-limitations = ["Restart rehydration exists, but schema migrations, consistent backup/restore, corruption recovery, encryption, and cascading deletion are not production-qualified."]
+limitations = ["Restart rehydration and a fail-closed versioned SQLite ownership boundary exist. The first schema version adopts recognized legacy stores, includes kernel and cluster tables, rejects newer/foreign databases before mutation, records migration metadata, and verifies integrity and foreign keys. Ordered multi-version upgrade fixtures, consistent backup/restore, corruption recovery, encryption/key rotation, cascading deletion, disk-full/crash qualification, and operator recovery workflows remain open in #123; this capability is not production-qualified."]
 
 [[capability]]
 id = "resource-providers"

@@ -891,11 +891,15 @@ fn portable_storage_cli_exports_verifies_and_rekeys_a_complete_installation() {
         import_report.installation_id,
         export_report.manifest.installation_id
     );
-    assert!(kernel::context::SqliteContextManager::new_encrypted(
+    let source_key_attempt = kernel::context::SqliteContextManager::new_encrypted(
         &imported,
-        kernel::storage_encryption::load_storage_encryption_key(&source_key_file).unwrap()
-    )
-    .is_err());
+        kernel::storage_encryption::load_storage_encryption_key(&source_key_file).unwrap(),
+    );
+    assert!(source_key_attempt.is_err());
+    // The failed open temporarily owns the same offline storage lease. Drop the
+    // complete Result before immediately proving that the destination key can
+    // boot the import; assert!() temporary lifetimes differ across targets.
+    drop(source_key_attempt);
     kernel::context::SqliteContextManager::new_encrypted(
         &imported,
         kernel::storage_encryption::load_storage_encryption_key(&destination_key_file).unwrap(),

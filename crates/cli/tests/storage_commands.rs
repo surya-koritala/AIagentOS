@@ -55,6 +55,65 @@ async fn backup_create_command_uses_the_live_system_operator_api() {
         kernel::storage::verify_backup(&backup_root.join("operator_001")).unwrap(),
         manifest
     );
+    tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
+    kernel
+        .context_manager
+        .create_backup(&backup_root, "operator_002")
+        .expect("second backup");
+
+    let unconfirmed = Command::new(env!("CARGO_BIN_EXE_agentctl"))
+        .arg("--addr")
+        .arg(addr.to_string())
+        .arg("backup-retention")
+        .arg(&backup_root)
+        .arg("1")
+        .arg("1")
+        .output()
+        .expect("run unconfirmed backup-retention");
+    assert_eq!(unconfirmed.status.code(), Some(2));
+    assert!(backup_root.join("operator_001").exists());
+
+    let preview = Command::new(env!("CARGO_BIN_EXE_agentctl"))
+        .arg("--addr")
+        .arg(addr.to_string())
+        .arg("backup-retention")
+        .arg(&backup_root)
+        .arg("1")
+        .arg("1")
+        .arg("--dry-run")
+        .output()
+        .expect("run backup-retention dry-run");
+    assert!(
+        preview.status.success(),
+        "backup-retention dry-run failed: {}",
+        String::from_utf8_lossy(&preview.stderr)
+    );
+    let preview: kernel::storage::BackupRetentionReport =
+        serde_json::from_slice(&preview.stdout).expect("retention preview JSON");
+    assert!(preview.dry_run);
+    assert_eq!(preview.eligible.len(), 1);
+    assert!(backup_root.join("operator_001").exists());
+
+    let applied = Command::new(env!("CARGO_BIN_EXE_agentctl"))
+        .arg("--addr")
+        .arg(addr.to_string())
+        .arg("backup-retention")
+        .arg(&backup_root)
+        .arg("1")
+        .arg("1")
+        .arg("--confirm")
+        .output()
+        .expect("run confirmed backup-retention");
+    assert!(
+        applied.status.success(),
+        "backup-retention failed: {}",
+        String::from_utf8_lossy(&applied.stderr)
+    );
+    let applied: kernel::storage::BackupRetentionReport =
+        serde_json::from_slice(&applied.stdout).expect("retention report JSON");
+    assert_eq!(applied.deleted.len(), 1);
+    assert!(!backup_root.join("operator_001").exists());
+    assert!(backup_root.join("operator_002").exists());
 
     server_task.abort();
     let _ = server_task.await;

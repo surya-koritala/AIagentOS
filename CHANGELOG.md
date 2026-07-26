@@ -10,6 +10,16 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
 
 ## [Unreleased]
 
+- Added safe verified local-backup retention for #123. The kernel serializes
+  retention with backup publication, bounds root scans, considers only verified
+  backups from the current installation, always preserves a configured latest
+  set, and expires only age-eligible backups. Unknown content, symlinks,
+  corrupt/foreign backups, and future timestamps are reported but untouched;
+  deletion never recursively removes arbitrary content. Protocol v2, the typed
+  SDK, and `agentctl` support dry-run reports and explicitly confirmed
+  enforcement, with kernel safety/concurrency and live SDK/CLI regressions.
+  Scheduling, remote/object-store retention, encryption, and measured recovery
+  qualification remain open in #123.
 - Added the supported #123 hot-erasure workflow for agents, users, and tenants.
   The system-only wire operation requires explicit confirmation, closes and
   drains affected credential leases, disables supervised owners, quiesces

@@ -20,6 +20,7 @@ use crate::wire_io::{
 pub const WIRE_FEATURES: &[&str] = &[
     "agent_enforcement_introspection",
     "authorized_cluster_membership",
+    "backup_retention",
     "bounded_json_frames",
     "connection_keepalive",
     "context_pressure",
@@ -493,6 +494,16 @@ const REQUEST_VARIANTS: &[Variant] = &[
         ],
     },
     Variant {
+        tag: "enforce_storage_backup_retention",
+        fields: &[
+            Field::required("backup_root", S),
+            Field::required("keep_latest", I),
+            Field::required("max_age_seconds", I),
+            Field::required("dry_run", B),
+            Field::required("confirm", B),
+        ],
+    },
+    Variant {
         tag: "erase_data",
         fields: &[Field::required("target", O), Field::required("confirm", B)],
     },
@@ -543,6 +554,7 @@ pub fn conformance_request_fixtures(protocol_version: u32) -> Result<Vec<Value>,
                     variant.tag,
                     "send_message_stream"
                         | "cancel_request"
+                        | "enforce_storage_backup_retention"
                         | "ping"
                         | "erase_data"
                         | "prove_node_identity"
@@ -899,6 +911,10 @@ const REPLY_VARIANTS: &[Variant] = &[
         fields: &[Field::required("manifest", O)],
     },
     Variant {
+        tag: "storage_backup_retention",
+        fields: &[Field::required("report", O)],
+    },
+    Variant {
         tag: "data_erased",
         fields: &[Field::required("receipt", ON)],
     },
@@ -1253,7 +1269,7 @@ mod tests {
             }
         }
         assert_eq!(conformance_request_fixtures(1).unwrap().len(), 59);
-        assert_eq!(conformance_request_fixtures(2).unwrap().len(), 72);
+        assert_eq!(conformance_request_fixtures(2).unwrap().len(), 73);
         assert!(conformance_request_fixtures(0).is_err());
         assert!(conformance_request_fixtures(PROTOCOL_VERSION + 1).is_err());
     }

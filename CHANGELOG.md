@@ -10,6 +10,15 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
 
 ## [Unreleased]
 
+- Added the #123 storage-erasure foundation with schema version 2. Every logical
+  durable table now has a test-enforced ownership/deletion classification.
+  Agent, user, and tenant erasure runs in one immediate transaction, removes
+  owned rows plus FTS/service/quota references, reconciles orphaned children,
+  preserves explicitly shared accounting state, and publishes a durable
+  non-identifying deletion receipt. Failure injection proves all-or-nothing
+  rollback, file-backed restart tests prove erasure persistence, and a released
+  v1 fixture proves the v2 migration. Live-resource coordination and supported
+  wire/SDK/CLI erasure commands remain the next #123 slice.
 - Added the supported #123 operator workflow for storage recovery. Trusted
   system operators can create WAL-consistent backups through the server and
   typed Rust SDK without blocking the async request runtime; `agentctl` can

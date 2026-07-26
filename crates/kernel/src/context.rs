@@ -3,7 +3,7 @@
 //! Provides SQLite-backed persistence for conversation history, working state,
 //! tasks, results, and long-term facts with retry logic and summarization.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 #[cfg(test)]
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
@@ -98,6 +98,269 @@ pub struct BudgetUsageSnapshot {
     pub per_tenant_micros: HashMap<String, u64>,
     pub agent_tenants: HashMap<AgentId, String>,
 }
+
+/// The durable subject boundary erased by a deletion transaction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeletionSubjectKind {
+    Agent,
+    User,
+    Tenant,
+}
+
+impl DeletionSubjectKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Agent => "agent",
+            Self::User => "user",
+            Self::Tenant => "tenant",
+        }
+    }
+}
+
+/// Privacy-safe proof that one erasure transaction committed.
+///
+/// A receipt deliberately contains no subject id, tenant id, user id, actor,
+/// free-form reason, or deleted content. The caller is responsible for keeping
+/// the returned opaque receipt id alongside its external request record when
+/// correlation is required.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeletionReceipt {
+    pub id: uuid::Uuid,
+    pub subject_kind: DeletionSubjectKind,
+    pub deleted_at: DateTime<Utc>,
+    pub deleted_rows: BTreeMap<String, u64>,
+    pub retained_records: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct DurableDataClassification {
+    pub table: &'static str,
+    pub owner: &'static str,
+    pub deletion: &'static str,
+}
+
+/// Canonical ownership/deletion catalog for every logical durable table.
+///
+/// The schema regression below compares this list with `sqlite_schema`, so a
+/// new durable table cannot silently escape an explicit deletion decision.
+pub const DURABLE_DATA_CATALOG: &[DurableDataClassification] = &[
+    DurableDataClassification {
+        table: "contexts",
+        owner: "agent",
+        deletion: "erase",
+    },
+    DurableDataClassification {
+        table: "facts",
+        owner: "agent",
+        deletion: "erase",
+    },
+    DurableDataClassification {
+        table: "conversations",
+        owner: "agent",
+        deletion: "erase",
+    },
+    DurableDataClassification {
+        table: "conversations_fts",
+        owner: "agent",
+        deletion: "erase-before-conversation",
+    },
+    DurableDataClassification {
+        table: "usage_log",
+        owner: "agent",
+        deletion: "erase; shared quota ledger remains",
+    },
+    DurableDataClassification {
+        table: "agent_kv",
+        owner: "agent",
+        deletion: "erase",
+    },
+    DurableDataClassification {
+        table: "context_spills",
+        owner: "agent+tenant",
+        deletion: "erase",
+    },
+    DurableDataClassification {
+        table: "context_pressure",
+        owner: "agent",
+        deletion: "erase",
+    },
+    DurableDataClassification {
+        table: "context_snapshots",
+        owner: "agent",
+        deletion: "erase",
+    },
+    DurableDataClassification {
+        table: "generation_checkpoints",
+        owner: "agent+tenant",
+        deletion: "erase",
+    },
+    DurableDataClassification {
+        table: "agents",
+        owner: "agent+tenant",
+        deletion: "erase-last",
+    },
+    DurableDataClassification {
+        table: "loaded_package_instances",
+        owner: "agent+tenant",
+        deletion: "erase",
+    },
+    DurableDataClassification {
+        table: "package_trust_keys",
+        owner: "tenant",
+        deletion: "erase",
+    },
+    DurableDataClassification {
+        table: "package_artifacts",
+        owner: "tenant",
+        deletion: "erase",
+    },
+    DurableDataClassification {
+        table: "package_installations",
+        owner: "tenant",
+        deletion: "erase",
+    },
+    DurableDataClassification {
+        table: "package_install_history",
+        owner: "tenant",
+        deletion: "erase",
+    },
+    DurableDataClassification {
+        table: "package_rate_limits",
+        owner: "tenant+user-actor",
+        deletion: "erase tenant; erase user actor limiter",
+    },
+    DurableDataClassification {
+        table: "package_transparency",
+        owner: "tenant; user is pseudonymous actor",
+        deletion: "erase tenant; retain on user erasure",
+    },
+    DurableDataClassification {
+        table: "package_audit",
+        owner: "tenant; user is pseudonymous actor",
+        deletion: "erase tenant; retain on user erasure",
+    },
+    DurableDataClassification {
+        table: "operator_tunables",
+        owner: "system",
+        deletion: "retain",
+    },
+    DurableDataClassification {
+        table: "operator_tunable_audit",
+        owner: "system",
+        deletion: "retain",
+    },
+    DurableDataClassification {
+        table: "service_runtime",
+        owner: "system; optional agent reference",
+        deletion: "clear agent reference",
+    },
+    DurableDataClassification {
+        table: "service_history",
+        owner: "system; optional agent reference",
+        deletion: "clear agent reference",
+    },
+    DurableDataClassification {
+        table: "tenants",
+        owner: "tenant",
+        deletion: "erase-last",
+    },
+    DurableDataClassification {
+        table: "users",
+        owner: "user+tenant",
+        deletion: "erase",
+    },
+    DurableDataClassification {
+        table: "api_keys",
+        owner: "user+tenant",
+        deletion: "erase",
+    },
+    DurableDataClassification {
+        table: "sessions",
+        owner: "user+tenant",
+        deletion: "erase",
+    },
+    DurableDataClassification {
+        table: "quota_epoch_floor",
+        owner: "system",
+        deletion: "retain",
+    },
+    DurableDataClassification {
+        table: "quota_epochs",
+        owner: "system+tenant+agent scopes",
+        deletion: "erase subject cgroup scopes; retain shared scopes",
+    },
+    DurableDataClassification {
+        table: "quota_receipts",
+        owner: "system",
+        deletion: "retain non-identifying accounting receipt",
+    },
+    DurableDataClassification {
+        table: "quota_receipt_scopes",
+        owner: "system+tenant+agent scopes",
+        deletion: "erase subject cgroup scopes",
+    },
+    DurableDataClassification {
+        table: "quota_refunded_receipts",
+        owner: "system",
+        deletion: "retain idempotency tombstone",
+    },
+    DurableDataClassification {
+        table: "quota_migration_fence",
+        owner: "system",
+        deletion: "retain",
+    },
+    DurableDataClassification {
+        table: "cluster_node_identity",
+        owner: "system",
+        deletion: "retain",
+    },
+    DurableDataClassification {
+        table: "cluster_node_control",
+        owner: "system",
+        deletion: "retain",
+    },
+    DurableDataClassification {
+        table: "cluster_node_control_audit",
+        owner: "system",
+        deletion: "retain",
+    },
+    DurableDataClassification {
+        table: "cluster_membership_authority",
+        owner: "system",
+        deletion: "retain",
+    },
+    DurableDataClassification {
+        table: "cluster_join_challenges",
+        owner: "system",
+        deletion: "retain until expiry/reconciliation",
+    },
+    DurableDataClassification {
+        table: "cluster_members",
+        owner: "system",
+        deletion: "retain until membership removal",
+    },
+    DurableDataClassification {
+        table: "cluster_membership_audit",
+        owner: "system",
+        deletion: "retain",
+    },
+    DurableDataClassification {
+        table: "storage_meta",
+        owner: "system",
+        deletion: "retain",
+    },
+    DurableDataClassification {
+        table: "schema_migrations",
+        owner: "system",
+        deletion: "retain",
+    },
+    DurableDataClassification {
+        table: "deletion_receipts",
+        owner: "system",
+        deletion: "retain bounded non-identifying proof",
+    },
+];
 
 /// Length of one fixed provider-rate accounting epoch.
 ///
@@ -524,6 +787,54 @@ fn memory_content_hash(content: &str) -> String {
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect()
+}
+
+fn quota_scope_segment(value: &str) -> String {
+    value.replace('~', "~0").replace('/', "~1")
+}
+
+fn record_deleted_rows(
+    deleted_rows: &mut BTreeMap<String, u64>,
+    key: impl Into<String>,
+    count: usize,
+) {
+    if count > 0 {
+        deleted_rows.insert(key.into(), u64::try_from(count).unwrap_or(u64::MAX));
+    }
+}
+
+fn persist_deletion_receipt(
+    transaction: &Transaction<'_>,
+    subject_kind: DeletionSubjectKind,
+    deleted_rows: BTreeMap<String, u64>,
+    retained_records: Vec<String>,
+) -> Result<DeletionReceipt, ContextError> {
+    let receipt = DeletionReceipt {
+        id: uuid::Uuid::new_v4(),
+        subject_kind,
+        deleted_at: Utc::now(),
+        deleted_rows,
+        retained_records,
+    };
+    let deleted_rows_json = serde_json::to_string(&receipt.deleted_rows)
+        .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
+    let retained_records_json = serde_json::to_string(&receipt.retained_records)
+        .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
+    transaction
+        .execute(
+            "INSERT INTO deletion_receipts
+             (id, subject_kind, deleted_at, deleted_rows_json, retained_records_json)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                receipt.id.to_string(),
+                receipt.subject_kind.as_str(),
+                receipt.deleted_at.to_rfc3339(),
+                deleted_rows_json,
+                retained_records_json
+            ],
+        )
+        .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
+    Ok(receipt)
 }
 
 /// SQLite-backed context manager implementation.
@@ -1132,6 +1443,16 @@ impl SqliteContextManager {
                 user_id TEXT NOT NULL,
                 tenant_id TEXT NOT NULL,
                 expires_at TEXT NOT NULL
+            );
+            -- Privacy-safe proof of a committed erasure. Subject identifiers,
+            -- actors, reasons, and deleted values are intentionally absent.
+            CREATE TABLE IF NOT EXISTS deletion_receipts (
+                id TEXT PRIMARY KEY CHECK (length(id) = 36),
+                subject_kind TEXT NOT NULL
+                    CHECK (subject_kind IN ('agent', 'user', 'tenant')),
+                deleted_at TEXT NOT NULL,
+                deleted_rows_json TEXT NOT NULL,
+                retained_records_json TEXT NOT NULL
             );
             -- Generic durable quota ledger. Unsigned counters and epochs are
             -- fixed-width big-endian blobs because SQLite INTEGER is signed
@@ -4929,16 +5250,21 @@ impl SqliteContextManager {
         Ok(ids)
     }
 
-    /// Remove an agent's durable identity (e.g. on permanent teardown).
+    /// Irreversibly erase an agent's durable identity and every directly owned
+    /// artifact. Shared provider/tenant quota aggregates remain so deletion
+    /// cannot refund already consumed system capacity.
     pub fn delete_agent(&self, agent_id: AgentId) -> Result<bool, ContextError> {
-        let conn = self.conn.lock().unwrap();
-        let affected = conn
-            .execute(
-                "DELETE FROM agents WHERE id = ?1",
-                params![agent_id.to_string()],
-            )
-            .map_err(|e| ContextError::PersistenceFailed(e.to_string()))?;
-        Ok(affected > 0)
+        self.erase_agent_data(agent_id)
+            .map(|receipt| receipt.is_some())
+    }
+
+    /// Perform a schema-wide agent erasure in one `BEGIN IMMEDIATE`
+    /// transaction and return a non-identifying durable receipt.
+    pub fn erase_agent_data(
+        &self,
+        agent_id: AgentId,
+    ) -> Result<Option<DeletionReceipt>, ContextError> {
+        self.erase_agent_data_with_receipt(agent_id, true)
     }
 
     /// Transactionally remove every durable row owned by an agent whose
@@ -4946,38 +5272,126 @@ impl SqliteContextManager {
     /// while seeding memory). Normal stop/kill intentionally does not call this
     /// because terminal history is retained.
     pub fn purge_agent_data(&self, agent_id: AgentId) -> Result<(), ContextError> {
+        self.erase_agent_data_with_receipt(agent_id, false)
+            .map(|_| ())
+    }
+
+    fn erase_agent_data_with_receipt(
+        &self,
+        agent_id: AgentId,
+        record_receipt: bool,
+    ) -> Result<Option<DeletionReceipt>, ContextError> {
+        if agent_id.is_nil() {
+            return Err(ContextError::PersistenceFailed(
+                "the reserved nil agent id cannot be erased".into(),
+            ));
+        }
         let mut conn = self.conn.lock().unwrap();
         let tx = conn
-            .transaction()
+            .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
         let id = agent_id.to_string();
-        tx.execute(
-            "DELETE FROM conversations_fts WHERE conversation_id IN
+        let mut deleted_rows = BTreeMap::new();
+
+        let deleted = tx
+            .execute(
+                "DELETE FROM conversations_fts WHERE conversation_id IN
              (SELECT id FROM conversations WHERE agent_id = ?1)",
-            params![&id],
-        )
-        .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
+                params![&id],
+            )
+            .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
+        record_deleted_rows(&mut deleted_rows, "conversations_fts", deleted);
+
         for table in [
             "contexts",
             "facts",
             "conversations",
             "usage_log",
             "agent_kv",
+            "context_spills",
             "context_snapshots",
             "generation_checkpoints",
             "context_pressure",
             "loaded_package_instances",
         ] {
-            tx.execute(
-                &format!("DELETE FROM {table} WHERE agent_id = ?1"),
+            let deleted = tx
+                .execute(
+                    &format!("DELETE FROM {table} WHERE agent_id = ?1"),
+                    params![&id],
+                )
+                .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
+            record_deleted_rows(&mut deleted_rows, table, deleted);
+        }
+
+        let cleared = tx
+            .execute(
+                "UPDATE service_runtime SET agent_id = NULL WHERE agent_id = ?1",
                 params![&id],
             )
             .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
-        }
-        tx.execute("DELETE FROM agents WHERE id = ?1", params![&id])
+        record_deleted_rows(
+            &mut deleted_rows,
+            "service_runtime.agent_reference",
+            cleared,
+        );
+        let cleared = tx
+            .execute(
+                "UPDATE service_history SET agent_id = NULL WHERE agent_id = ?1",
+                params![&id],
+            )
             .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
+        record_deleted_rows(
+            &mut deleted_rows,
+            "service_history.agent_reference",
+            cleared,
+        );
+
+        let agent_scope_suffix = format!("/agent/{agent_id}");
+        let deleted = tx
+            .execute(
+                "DELETE FROM quota_receipt_scopes
+                 WHERE scope_kind = 'cgroup'
+                   AND substr(scope_id, -length(?1)) = ?1",
+                params![&agent_scope_suffix],
+            )
+            .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
+        record_deleted_rows(&mut deleted_rows, "quota_receipt_scopes", deleted);
+        let deleted = tx
+            .execute(
+                "DELETE FROM quota_epochs
+                 WHERE scope_kind = 'cgroup'
+                   AND substr(scope_id, -length(?1)) = ?1",
+                params![&agent_scope_suffix],
+            )
+            .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
+        record_deleted_rows(&mut deleted_rows, "quota_epochs", deleted);
+
+        let deleted = tx
+            .execute("DELETE FROM agents WHERE id = ?1", params![&id])
+            .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
+        record_deleted_rows(&mut deleted_rows, "agents", deleted);
+
+        if deleted_rows.is_empty() {
+            return Ok(None);
+        }
+        let receipt = if record_receipt {
+            Some(persist_deletion_receipt(
+                &tx,
+                DeletionSubjectKind::Agent,
+                deleted_rows,
+                vec![
+                    "shared provider and tenant quota aggregates".to_string(),
+                    "non-identifying quota receipt and refund tombstones".to_string(),
+                    "previously published operator backups until their retention expiry"
+                        .to_string(),
+                ],
+            )?)
+        } else {
+            None
+        };
         tx.commit()
-            .map_err(|error| ContextError::PersistenceFailed(error.to_string()))
+            .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
+        Ok(receipt)
     }
 
     /// Flush the WAL into the main database file (truncating checkpoint) so a
@@ -5765,6 +6179,55 @@ impl SqliteContextManager {
         Ok(changed > 0)
     }
 
+    /// Irreversibly erase one user's identity and credentials. Runtime agents
+    /// are tenant-owned rather than user-owned. Package transparency/audit
+    /// entries retain only the now-pseudonymous actor id so their security
+    /// chain remains verifiable.
+    pub fn erase_user_data(&self, user_id: &str) -> Result<Option<DeletionReceipt>, ContextError> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
+        let mut deleted_rows = BTreeMap::new();
+        for table in ["sessions", "api_keys"] {
+            let deleted = tx
+                .execute(
+                    &format!("DELETE FROM {table} WHERE user_id = ?1"),
+                    params![user_id],
+                )
+                .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
+            record_deleted_rows(&mut deleted_rows, table, deleted);
+        }
+        let deleted = tx
+            .execute(
+                "DELETE FROM package_rate_limits WHERE actor = ?1",
+                params![user_id],
+            )
+            .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
+        record_deleted_rows(&mut deleted_rows, "package_rate_limits", deleted);
+        let deleted = tx
+            .execute("DELETE FROM users WHERE id = ?1", params![user_id])
+            .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
+        record_deleted_rows(&mut deleted_rows, "users", deleted);
+
+        if deleted_rows.is_empty() {
+            return Ok(None);
+        }
+        let receipt = persist_deletion_receipt(
+            &tx,
+            DeletionSubjectKind::User,
+            deleted_rows,
+            vec![
+                "tenant-owned agents and runtime data".to_string(),
+                "pseudonymous package transparency and security audit actor references".to_string(),
+                "previously published operator backups until their retention expiry".to_string(),
+            ],
+        )?;
+        tx.commit()
+            .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
+        Ok(Some(receipt))
+    }
+
     /// Revoke a tenant, its users, and every issued credential atomically.
     /// Durable agent data remains present for explicit administrative recovery,
     /// but no tenant principal can authenticate after this commits.
@@ -6047,9 +6510,26 @@ impl SqliteContextManager {
         Ok(deleted == 1)
     }
 
-    /// Irreversibly purge all tenant-owned runtime and memory artifacts while
-    /// retaining durable agent identity rows for audit/recovery semantics.
+    /// Irreversibly erase all tenant-owned identities, credentials, agents,
+    /// memory, package state, indexes, checkpoints, and subject quota scopes.
     pub fn purge_tenant_data(&self, tenant_id: &str) -> Result<usize, ContextError> {
+        let receipt = self.erase_tenant_data(tenant_id)?;
+        Ok(receipt
+            .map(|receipt| {
+                receipt
+                    .deleted_rows
+                    .values()
+                    .fold(0u64, |total, count| total.saturating_add(*count))
+                    .min(usize::MAX as u64) as usize
+            })
+            .unwrap_or(0))
+    }
+
+    /// Schema-wide tenant erasure with a privacy-safe durable receipt.
+    pub fn erase_tenant_data(
+        &self,
+        tenant_id: &str,
+    ) -> Result<Option<DeletionReceipt>, ContextError> {
         let mut conn = self
             .conn
             .lock()
@@ -6058,18 +6538,35 @@ impl SqliteContextManager {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| ContextError::StorageError(error.to_string()))?;
         let agent_selector = "SELECT id FROM agents WHERE tenant_id = ?1";
-        let mut deleted = 0usize;
-        deleted = deleted.saturating_add(
-            transaction
+        let mut deleted_rows = BTreeMap::new();
+        let deleted = transaction
+            .execute(
+                &format!(
+                    "DELETE FROM conversations_fts WHERE conversation_id IN
+                     (SELECT id FROM conversations WHERE agent_id IN ({agent_selector}))"
+                ),
+                [tenant_id],
+            )
+            .map_err(|error| ContextError::StorageError(error.to_string()))?;
+        record_deleted_rows(&mut deleted_rows, "conversations_fts", deleted);
+
+        for table in ["service_runtime", "service_history"] {
+            let cleared = transaction
                 .execute(
                     &format!(
-                        "DELETE FROM conversations_fts WHERE conversation_id IN
-                         (SELECT id FROM conversations WHERE agent_id IN ({agent_selector}))"
+                        "UPDATE {table} SET agent_id = NULL
+                         WHERE agent_id IN ({agent_selector})"
                     ),
                     [tenant_id],
                 )
-                .map_err(|error| ContextError::StorageError(error.to_string()))?,
-        );
+                .map_err(|error| ContextError::StorageError(error.to_string()))?;
+            record_deleted_rows(
+                &mut deleted_rows,
+                format!("{table}.agent_reference"),
+                cleared,
+            );
+        }
+
         for table in [
             "contexts",
             "facts",
@@ -6079,49 +6576,99 @@ impl SqliteContextManager {
             "context_pressure",
             "context_snapshots",
         ] {
-            deleted = deleted.saturating_add(
-                transaction
-                    .execute(
-                        &format!("DELETE FROM {table} WHERE agent_id IN ({agent_selector})"),
-                        [tenant_id],
-                    )
-                    .map_err(|error| ContextError::StorageError(error.to_string()))?,
-            );
+            let deleted = transaction
+                .execute(
+                    &format!("DELETE FROM {table} WHERE agent_id IN ({agent_selector})"),
+                    [tenant_id],
+                )
+                .map_err(|error| ContextError::StorageError(error.to_string()))?;
+            record_deleted_rows(&mut deleted_rows, table, deleted);
         }
-        deleted = deleted.saturating_add(
-            transaction
+        for table in ["context_spills", "generation_checkpoints"] {
+            let deleted = transaction
                 .execute(
                     &format!(
-                        "DELETE FROM context_spills
+                        "DELETE FROM {table}
                          WHERE tenant_id = ?1 OR agent_id IN ({agent_selector})"
                     ),
                     [tenant_id],
                 )
-                .map_err(|error| ContextError::StorageError(error.to_string()))?,
-        );
-        deleted = deleted.saturating_add(
-            transaction
+                .map_err(|error| ContextError::StorageError(error.to_string()))?;
+            record_deleted_rows(&mut deleted_rows, table, deleted);
+        }
+
+        for table in [
+            "loaded_package_instances",
+            "package_trust_keys",
+            "package_artifacts",
+            "package_installations",
+            "package_install_history",
+            "package_rate_limits",
+            "package_transparency",
+            "package_audit",
+            "sessions",
+            "api_keys",
+            "users",
+        ] {
+            let deleted = transaction
                 .execute(
-                    &format!(
-                        "DELETE FROM generation_checkpoints
-                         WHERE tenant_id = ?1 OR agent_id IN ({agent_selector})"
-                    ),
+                    &format!("DELETE FROM {table} WHERE tenant_id = ?1"),
                     [tenant_id],
                 )
-                .map_err(|error| ContextError::StorageError(error.to_string()))?,
-        );
-        deleted = deleted.saturating_add(
-            transaction
-                .execute(
-                    "DELETE FROM loaded_package_instances WHERE tenant_id = ?1",
-                    [tenant_id],
-                )
-                .map_err(|error| ContextError::StorageError(error.to_string()))?,
-        );
+                .map_err(|error| ContextError::StorageError(error.to_string()))?;
+            record_deleted_rows(&mut deleted_rows, table, deleted);
+        }
+
+        let tenant_scope = format!("/tenant/{}", quota_scope_segment(tenant_id));
+        let descendant_prefix = format!("{tenant_scope}/");
+        let deleted = transaction
+            .execute(
+                "DELETE FROM quota_receipt_scopes
+                 WHERE scope_kind = 'cgroup'
+                   AND (scope_id = ?1
+                        OR substr(scope_id, 1, length(?2)) = ?2)",
+                params![&tenant_scope, &descendant_prefix],
+            )
+            .map_err(|error| ContextError::StorageError(error.to_string()))?;
+        record_deleted_rows(&mut deleted_rows, "quota_receipt_scopes", deleted);
+        let deleted = transaction
+            .execute(
+                "DELETE FROM quota_epochs
+                 WHERE scope_kind = 'cgroup'
+                   AND (scope_id = ?1
+                        OR substr(scope_id, 1, length(?2)) = ?2)",
+                params![&tenant_scope, &descendant_prefix],
+            )
+            .map_err(|error| ContextError::StorageError(error.to_string()))?;
+        record_deleted_rows(&mut deleted_rows, "quota_epochs", deleted);
+
+        let deleted = transaction
+            .execute("DELETE FROM agents WHERE tenant_id = ?1", [tenant_id])
+            .map_err(|error| ContextError::StorageError(error.to_string()))?;
+        record_deleted_rows(&mut deleted_rows, "agents", deleted);
+        let deleted = transaction
+            .execute("DELETE FROM tenants WHERE id = ?1", [tenant_id])
+            .map_err(|error| ContextError::StorageError(error.to_string()))?;
+        record_deleted_rows(&mut deleted_rows, "tenants", deleted);
+
+        if deleted_rows.is_empty() {
+            return Ok(None);
+        }
+        let receipt = persist_deletion_receipt(
+            &transaction,
+            DeletionSubjectKind::Tenant,
+            deleted_rows,
+            vec![
+                "system-wide provider quota aggregates".to_string(),
+                "non-identifying quota receipt and refund tombstones".to_string(),
+                "operator, cluster, and schema state".to_string(),
+                "previously published operator backups until their retention expiry".to_string(),
+            ],
+        )?;
         transaction
             .commit()
             .map_err(|error| ContextError::StorageError(error.to_string()))?;
-        Ok(deleted)
+        Ok(Some(receipt))
     }
 
     /// `true` if `agent_id` is owned by `tenant_id` (or the agent is unknown,
@@ -6191,6 +6738,50 @@ impl SqliteContextManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_logical_durable_table_has_an_ownership_and_deletion_classification() {
+        let manager = SqliteContextManager::in_memory().unwrap();
+        let connection = manager.conn.lock().unwrap();
+        let mut statement = connection
+            .prepare(
+                "SELECT name FROM sqlite_schema
+                 WHERE type IN ('table', 'view') AND name NOT LIKE 'sqlite_%'
+                 ORDER BY name",
+            )
+            .unwrap();
+        let actual: BTreeSet<String> = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .filter(|name| !name.starts_with("conversations_fts_"))
+            .collect();
+        let classified: BTreeSet<String> = DURABLE_DATA_CATALOG
+            .iter()
+            .map(|entry| {
+                assert!(
+                    !entry.owner.trim().is_empty(),
+                    "{} has no owner",
+                    entry.table
+                );
+                assert!(
+                    !entry.deletion.trim().is_empty(),
+                    "{} has no deletion policy",
+                    entry.table
+                );
+                entry.table.to_string()
+            })
+            .collect();
+        assert_eq!(
+            classified.len(),
+            DURABLE_DATA_CATALOG.len(),
+            "durable data catalog contains duplicate table entries"
+        );
+        assert_eq!(
+            actual, classified,
+            "every new logical durable table must be explicitly classified"
+        );
+    }
 
     fn sample_generation_checkpoint(agent_id: AgentId) -> crate::execution::GenerationCheckpoint {
         crate::execution::GenerationCheckpoint {
@@ -6646,7 +7237,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tenant_purge_removes_artifacts_without_touching_other_tenants_or_identities() {
+    async fn tenant_purge_removes_artifacts_and_identity_without_touching_other_tenants() {
         let manager = SqliteContextManager::in_memory().unwrap();
         let tenant_a_agent = uuid::Uuid::new_v4();
         let tenant_b_agent = uuid::Uuid::new_v4();
@@ -6734,7 +7325,186 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(identities, 2, "purge must retain durable identity history");
+        assert_eq!(identities, 1, "only the other tenant identity may remain");
+        let receipt: (String, String) = conn
+            .query_row(
+                "SELECT subject_kind, deleted_rows_json FROM deletion_receipts",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(receipt.0, "tenant");
+        assert!(!receipt.1.contains("tenant-a"));
+        assert!(!receipt.1.contains(&tenant_a_agent.to_string()));
+    }
+
+    #[test]
+    fn user_erasure_revokes_identity_while_retaining_pseudonymous_security_chain() {
+        let manager = SqliteContextManager::in_memory().unwrap();
+        let tenant_id = "tenant-a";
+        let user_id = uuid::Uuid::new_v4().to_string();
+        let now = Utc::now().to_rfc3339();
+        {
+            let connection = manager.conn.lock().unwrap();
+            connection
+                .execute(
+                    "INSERT INTO tenants (id, name, created_at)
+                     VALUES (?1, 'Tenant A', ?2)",
+                    params![tenant_id, &now],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO users (id, tenant_id, username, email, role, created_at)
+                     VALUES (?1, ?2, 'alice', 'alice@example.test', 'admin', ?3)",
+                    params![&user_id, tenant_id, &now],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO api_keys (key_hash, name, user_id, tenant_id, created_at)
+                     VALUES ('key-hash', 'key', ?1, ?2, ?3)",
+                    params![&user_id, tenant_id, &now],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO sessions (token_hash, user_id, tenant_id, expires_at)
+                     VALUES ('session-hash', ?1, ?2, ?3)",
+                    params![&user_id, tenant_id, &now],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO package_rate_limits
+                     (tenant_id, actor, window_started_at, requests)
+                     VALUES (?1, ?2, 1, 1)",
+                    params![tenant_id, &user_id],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO package_transparency
+                     (tenant_id, action, name, version, digest, previous_hash,
+                      entry_hash, actor, created_at)
+                     VALUES (?1, 'publish', 'pkg', '1.0.0', 'digest', 'previous',
+                             'entry', ?2, ?3)",
+                    params![tenant_id, &user_id, &now],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO package_audit
+                     (tenant_id, actor, action, outcome, created_at)
+                     VALUES (?1, ?2, 'publish', 'allowed', ?3)",
+                    params![tenant_id, &user_id, &now],
+                )
+                .unwrap();
+        }
+
+        let receipt = manager
+            .erase_user_data(&user_id)
+            .unwrap()
+            .expect("user exists");
+        assert_eq!(receipt.subject_kind, DeletionSubjectKind::User);
+        let receipt_json = serde_json::to_string(&receipt).unwrap();
+        assert!(!receipt_json.contains(&user_id));
+        assert!(!receipt_json.contains(tenant_id));
+
+        let connection = manager.conn.lock().unwrap();
+        for (table, column) in [
+            ("users", "id"),
+            ("api_keys", "user_id"),
+            ("sessions", "user_id"),
+            ("package_rate_limits", "actor"),
+        ] {
+            let count: i64 = connection
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM {table} WHERE {column} = ?1"),
+                    [&user_id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 0, "{table} retained active user identity data");
+        }
+        for table in ["package_transparency", "package_audit"] {
+            let count: i64 = connection
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM {table} WHERE actor = ?1"),
+                    [&user_id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 1, "{table} security evidence was not retained");
+        }
+    }
+
+    #[test]
+    fn tenant_erasure_and_private_receipt_survive_restart() {
+        let database = QuotaTestDatabase::new("tenant-erasure-restart");
+        let tenant_id = "tenant-restart";
+        let agent_id = uuid::Uuid::new_v4();
+        let now = Utc::now();
+        let receipt_id;
+        {
+            let manager = SqliteContextManager::new(&database.path).unwrap();
+            manager
+                .save_agent(&PersistedAgent {
+                    id: agent_id,
+                    session_id: uuid::Uuid::new_v4(),
+                    tenant_id: tenant_id.into(),
+                    name: "private agent".into(),
+                    task: "private task".into(),
+                    llm_provider: "stub".into(),
+                    permission_profile: "standard".into(),
+                    priority: 3,
+                    status: "\"Stopped\"".into(),
+                    sandbox_config_json: None,
+                    created_at: now,
+                    last_activity_at: now,
+                })
+                .unwrap();
+            manager
+                .conn
+                .lock()
+                .unwrap()
+                .execute(
+                    "INSERT INTO tenants (id, name, created_at)
+                     VALUES (?1, 'private tenant', ?2)",
+                    params![tenant_id, now.to_rfc3339()],
+                )
+                .unwrap();
+            let receipt = manager
+                .erase_tenant_data(tenant_id)
+                .unwrap()
+                .expect("tenant exists");
+            receipt_id = receipt.id;
+        }
+
+        let manager = SqliteContextManager::new(&database.path).unwrap();
+        let connection = manager.conn.lock().unwrap();
+        let subject_rows: i64 = connection
+            .query_row(
+                "SELECT
+                    (SELECT COUNT(*) FROM tenants WHERE id = ?1) +
+                    (SELECT COUNT(*) FROM agents WHERE tenant_id = ?1)",
+                [tenant_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let receipt: (String, String, String) = connection
+            .query_row(
+                "SELECT subject_kind, deleted_rows_json, retained_records_json
+                 FROM deletion_receipts WHERE id = ?1",
+                [receipt_id.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(subject_rows, 0);
+        assert_eq!(receipt.0, "tenant");
+        assert!(!receipt.1.contains(tenant_id));
+        assert!(!receipt.2.contains(tenant_id));
+        assert!(!receipt.1.contains(&agent_id.to_string()));
     }
 
     #[test]
@@ -6912,6 +7682,372 @@ mod tests {
         // Delete removes it.
         assert!(mgr.delete_agent(a.id).unwrap());
         assert!(mgr.load_all_agents().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn agent_erasure_cascades_indexes_services_quota_and_returns_private_receipt() {
+        let manager = SqliteContextManager::in_memory().unwrap();
+        let agent = uuid::Uuid::new_v4();
+        let tenant = "tenant/%_special";
+        let profile = "standard";
+        let now = Utc::now();
+        manager
+            .save_agent(&PersistedAgent {
+                id: agent,
+                session_id: uuid::Uuid::new_v4(),
+                tenant_id: tenant.to_string(),
+                name: "private name".into(),
+                task: "private task".into(),
+                llm_provider: "stub".into(),
+                permission_profile: profile.into(),
+                priority: 3,
+                status: "\"Stopped\"".into(),
+                sandbox_config_json: None,
+                created_at: now,
+                last_activity_at: now,
+            })
+            .unwrap();
+        manager.create_context(agent).await.unwrap();
+        manager
+            .store_fact(
+                agent,
+                Fact {
+                    id: uuid::Uuid::new_v4(),
+                    content: "private memory".into(),
+                    category: FactCategory::Fact,
+                    created_at: now,
+                    last_accessed_at: now,
+                    embedding: None,
+                },
+            )
+            .await
+            .unwrap();
+        let conversation_id = format!("private-conversation-{agent}");
+        manager
+            .save_conversation(
+                &conversation_id,
+                agent,
+                &[crate::connector::StandardMessage::user("private prompt")],
+            )
+            .unwrap();
+        manager
+            .kv_put(agent, "private-key", "private-value")
+            .unwrap();
+        manager
+            .store_context_spill(
+                agent,
+                &format!("context_spill:test:{agent}"),
+                "private spill",
+                &sha256("private spill"),
+            )
+            .unwrap();
+        manager.snapshot_context(agent, "private-snapshot").unwrap();
+        manager
+            .save_generation_checkpoint(
+                tenant,
+                "provider",
+                "model",
+                &sample_generation_checkpoint(agent),
+                std::time::Duration::from_secs(60),
+            )
+            .unwrap();
+        manager
+            .log_usage(
+                agent,
+                &UsageRecord {
+                    tokens_used: 10,
+                    input_tokens: 8,
+                    output_tokens: 2,
+                    cached_tokens: 0,
+                    llm_requests: 1,
+                    retries: 0,
+                    provider_latency_ms: 1,
+                    provider_reported_requests: 1,
+                    estimated_requests: 0,
+                    provider: "stub".into(),
+                    model: "stub".into(),
+                    tool_calls: 0,
+                    estimated_cost_usd: 0.01,
+                    cost_micros: 10_000,
+                },
+            )
+            .unwrap();
+
+        let agent_scope = format!(
+            "/tenant/{}/profile/{}/agent/{agent}",
+            quota_scope_segment(tenant),
+            quota_scope_segment(profile)
+        );
+        let quota_receipt = uuid::Uuid::new_v4();
+        {
+            let connection = manager.conn.lock().unwrap();
+            connection
+                .execute(
+                    "INSERT INTO context_pressure
+                     (agent_id, active_tokens, budget_tokens, updated_at)
+                     VALUES (?1, 1, 10, ?2)",
+                    params![agent.to_string(), now.to_rfc3339()],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO loaded_package_instances
+                     (agent_id, tenant_id, name, provider, profile, loaded_at)
+                     VALUES (?1, ?2, 'pkg', 'stub', ?3, ?4)",
+                    params![agent.to_string(), tenant, profile, now.to_rfc3339()],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO service_runtime
+                     (name, definition_revision, status, agent_id, restart_count,
+                      restart_attempts_total, desired_running, ready, healthy,
+                      restart_exhausted, last_transition_at, dependency_blocks)
+                     VALUES ('svc', 'rev', '\"Running\"', ?1, 0, 0, 0, 0, 0, 0, ?2, 0)",
+                    params![agent.to_string(), now.to_rfc3339()],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO service_history
+                     (name, event, status, agent_id, created_at)
+                     VALUES ('svc', 'started', '\"Running\"', ?1, ?2)",
+                    params![agent.to_string(), now.to_rfc3339()],
+                )
+                .unwrap();
+            let epoch = u64_blob(7);
+            let one = u64_blob(1);
+            for scope in ["provider-global".to_string(), agent_scope.clone()] {
+                let (kind, id) = if scope == "provider-global" {
+                    ("provider", "global")
+                } else {
+                    ("cgroup", scope.as_str())
+                };
+                connection
+                    .execute(
+                        "INSERT INTO quota_epochs
+                         (scope_kind, scope_id, epoch, requests, tokens)
+                         VALUES (?1, ?2, ?3, ?4, ?4)",
+                        params![kind, id, epoch.as_slice(), one.as_slice()],
+                    )
+                    .unwrap();
+            }
+            connection
+                .execute(
+                    "INSERT INTO quota_receipts
+                     (id, receipt_kind, epoch, state, reserved_requests, reserved_tokens)
+                     VALUES (?1, 'provider_rate', ?2, 'reserved', ?3, ?3)",
+                    params![quota_receipt.to_string(), epoch.as_slice(), one.as_slice()],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO quota_receipt_scopes
+                     (receipt_id, scope_order, scope_kind, scope_id,
+                      reserved_requests, reserved_tokens)
+                     VALUES (?1, 0, 'cgroup', ?2, ?3, ?3)",
+                    params![quota_receipt.to_string(), &agent_scope, one.as_slice()],
+                )
+                .unwrap();
+        }
+
+        let receipt = manager
+            .erase_agent_data(agent)
+            .unwrap()
+            .expect("agent exists");
+        assert_eq!(receipt.subject_kind, DeletionSubjectKind::Agent);
+        assert!(receipt.deleted_rows.contains_key("context_spills"));
+        assert!(receipt.deleted_rows.contains_key("quota_epochs"));
+        let receipt_json = serde_json::to_string(&receipt).unwrap();
+        assert!(!receipt_json.contains(&agent.to_string()));
+        assert!(!receipt_json.contains(tenant));
+        assert!(!receipt_json.contains("private"));
+
+        let connection = manager.conn.lock().unwrap();
+        for table in [
+            "contexts",
+            "facts",
+            "conversations",
+            "usage_log",
+            "agent_kv",
+            "context_spills",
+            "context_pressure",
+            "context_snapshots",
+            "generation_checkpoints",
+            "loaded_package_instances",
+        ] {
+            let count: i64 = connection
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM {table} WHERE agent_id = ?1"),
+                    [agent.to_string()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 0, "{table} retained erased agent data");
+        }
+        let fts_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM conversations_fts WHERE conversation_id = ?1",
+                [&conversation_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(fts_count, 0);
+        for table in ["service_runtime", "service_history"] {
+            let count: i64 = connection
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM {table} WHERE agent_id = ?1"),
+                    [agent.to_string()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 0, "{table} retained an agent reference");
+        }
+        let erased_scope_rows: i64 = connection
+            .query_row(
+                "SELECT
+                    (SELECT COUNT(*) FROM quota_epochs WHERE scope_id = ?1) +
+                    (SELECT COUNT(*) FROM quota_receipt_scopes WHERE scope_id = ?1)",
+                [&agent_scope],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let shared_provider_rows: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM quota_epochs
+                 WHERE scope_kind = 'provider' AND scope_id = 'global'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let accounting_receipt_rows: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM quota_receipts WHERE id = ?1",
+                [quota_receipt.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(erased_scope_rows, 0);
+        assert_eq!(shared_provider_rows, 1);
+        assert_eq!(accounting_receipt_rows, 1);
+    }
+
+    #[test]
+    fn injected_agent_erasure_failure_rolls_back_rows_and_receipt() {
+        let manager = SqliteContextManager::in_memory().unwrap();
+        let agent = uuid::Uuid::new_v4();
+        let now = Utc::now();
+        manager
+            .save_agent(&PersistedAgent {
+                id: agent,
+                session_id: uuid::Uuid::new_v4(),
+                tenant_id: "tenant-a".into(),
+                name: "agent".into(),
+                task: "task".into(),
+                llm_provider: "stub".into(),
+                permission_profile: "standard".into(),
+                priority: 3,
+                status: "\"Stopped\"".into(),
+                sandbox_config_json: None,
+                created_at: now,
+                last_activity_at: now,
+            })
+            .unwrap();
+        {
+            let connection = manager.conn.lock().unwrap();
+            connection
+                .execute(
+                    "INSERT INTO facts
+                     (id, agent_id, content, category, created_at, last_accessed_at)
+                     VALUES (?1, ?2, 'private', '\"Fact\"', ?3, ?3)",
+                    params![
+                        uuid::Uuid::new_v4().to_string(),
+                        agent.to_string(),
+                        now.to_rfc3339()
+                    ],
+                )
+                .unwrap();
+            connection
+                .execute_batch(
+                    "CREATE TRIGGER fail_agent_erasure
+                     BEFORE DELETE ON agents BEGIN
+                       SELECT RAISE(ABORT, 'injected erasure failure');
+                     END;",
+                )
+                .unwrap();
+        }
+
+        assert!(manager.erase_agent_data(agent).is_err());
+        {
+            let connection = manager.conn.lock().unwrap();
+            let counts: (i64, i64, i64) = connection
+                .query_row(
+                    "SELECT
+                       (SELECT COUNT(*) FROM agents WHERE id = ?1),
+                       (SELECT COUNT(*) FROM facts WHERE agent_id = ?1),
+                       (SELECT COUNT(*) FROM deletion_receipts)",
+                    [agent.to_string()],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap();
+            assert_eq!(counts, (1, 1, 0));
+            connection
+                .execute("DROP TRIGGER fail_agent_erasure", [])
+                .unwrap();
+        }
+        assert!(manager.erase_agent_data(agent).unwrap().is_some());
+    }
+
+    #[test]
+    fn erasure_reconciles_orphaned_agent_user_and_tenant_rows() {
+        let manager = SqliteContextManager::in_memory().unwrap();
+        let agent = uuid::Uuid::new_v4();
+        let user = uuid::Uuid::new_v4().to_string();
+        let tenant = "orphan-tenant";
+        let now = Utc::now().to_rfc3339();
+        {
+            let connection = manager.conn.lock().unwrap();
+            connection
+                .execute(
+                    "INSERT INTO facts
+                     (id, agent_id, content, category, created_at, last_accessed_at)
+                     VALUES (?1, ?2, 'orphan memory', '\"Fact\"', ?3, ?3)",
+                    params![uuid::Uuid::new_v4().to_string(), agent.to_string(), &now],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO api_keys
+                     (key_hash, name, user_id, tenant_id, created_at)
+                     VALUES ('orphan-key', 'key', ?1, ?2, ?3)",
+                    params![&user, tenant, &now],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO package_audit
+                     (tenant_id, actor, action, outcome, created_at)
+                     VALUES (?1, 'system', 'orphan', 'allowed', ?2)",
+                    params![tenant, &now],
+                )
+                .unwrap();
+        }
+
+        assert!(manager.erase_agent_data(agent).unwrap().is_some());
+        assert!(manager.erase_user_data(&user).unwrap().is_some());
+        assert!(manager.erase_tenant_data(tenant).unwrap().is_some());
+        let connection = manager.conn.lock().unwrap();
+        let remaining: i64 = connection
+            .query_row(
+                "SELECT
+                   (SELECT COUNT(*) FROM facts WHERE agent_id = ?1) +
+                   (SELECT COUNT(*) FROM api_keys WHERE user_id = ?2) +
+                   (SELECT COUNT(*) FROM package_audit WHERE tenant_id = ?3)",
+                params![agent.to_string(), &user, tenant],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(remaining, 0);
     }
 
     #[test]
@@ -7448,7 +8584,11 @@ mod tests {
                 .unwrap();
             assert_eq!(application_id, crate::schema::APPLICATION_ID);
             assert_eq!(schema_version, crate::schema::CURRENT_SCHEMA_VERSION);
-            assert_eq!(migration_count, 1);
+            assert_eq!(
+                migration_count,
+                crate::schema::CURRENT_SCHEMA_VERSION,
+                "fresh stores record every released schema transition"
+            );
             assert_eq!(cluster_table_count, 7);
         }
 
@@ -7459,7 +8599,55 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(migration_count, 1);
+        assert_eq!(
+            migration_count,
+            crate::schema::CURRENT_SCHEMA_VERSION,
+            "idempotent reopen must not duplicate migration entries"
+        );
+        crate::schema::verify(&connection).unwrap();
+    }
+
+    #[test]
+    fn released_v1_store_upgrades_to_v2_with_receipt_schema_and_ledger() {
+        let database = QuotaTestDatabase::new("schema-v1-to-v2");
+        {
+            let manager = SqliteContextManager::new(&database.path).unwrap();
+            let connection = manager.conn.lock().unwrap();
+            connection
+                .execute("DELETE FROM schema_migrations WHERE version = 2", [])
+                .unwrap();
+            connection
+                .execute("DROP TABLE deletion_receipts", [])
+                .unwrap();
+            connection
+                .execute("UPDATE storage_meta SET schema_version = 1", [])
+                .unwrap();
+            connection.pragma_update(None, "user_version", 1).unwrap();
+        }
+
+        let manager = SqliteContextManager::new(&database.path).unwrap();
+        let connection = manager.conn.lock().unwrap();
+        let version: i64 = connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        let migration_name: String = connection
+            .query_row(
+                "SELECT name FROM schema_migrations WHERE version = 2",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let receipt_table: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_schema
+                 WHERE type = 'table' AND name = 'deletion_receipts'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(version, 2);
+        assert_eq!(migration_name, "add-privacy-safe-deletion-receipts");
+        assert_eq!(receipt_table, 1);
         crate::schema::verify(&connection).unwrap();
     }
 

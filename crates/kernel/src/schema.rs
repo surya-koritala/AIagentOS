@@ -12,8 +12,13 @@ use crate::ContextError;
 /// ASCII `AIOS`, registered on every database owned by this kernel.
 pub(crate) const APPLICATION_ID: i64 = 0x4149_4f53;
 /// Latest schema this binary can read and write.
-pub(crate) const CURRENT_SCHEMA_VERSION: i64 = 1;
+pub(crate) const CURRENT_SCHEMA_VERSION: i64 = 2;
 const MIN_READABLE_SCHEMA_VERSION: i64 = 1;
+
+const MIGRATIONS: &[(i64, &str)] = &[
+    (1, "adopt-versioned-kernel-schema"),
+    (2, "add-privacy-safe-deletion-receipts"),
+];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StorageMetadata {
@@ -64,6 +69,7 @@ const REQUIRED_TABLES: &[&str] = &[
     "cluster_join_challenges",
     "cluster_members",
     "cluster_membership_audit",
+    "deletion_receipts",
 ];
 
 const LEGACY_MARKER_TABLES: &[&str] = &[
@@ -246,12 +252,15 @@ pub(crate) fn complete_migration(
         .map_err(|error| storage_error(format!("failed to create schema metadata: {error}")))?;
 
     let now = Utc::now().to_rfc3339();
-    if starting_version == 0 {
+    for (version, name) in MIGRATIONS
+        .iter()
+        .filter(|(version, _)| *version > starting_version)
+    {
         transaction
             .execute(
                 "INSERT INTO schema_migrations(version, name, applied_at)
-                 VALUES (?1, 'adopt-versioned-kernel-schema', ?2)",
-                params![CURRENT_SCHEMA_VERSION, &now],
+                 VALUES (?1, ?2, ?3)",
+                params![version, name, &now],
             )
             .map_err(|error| {
                 storage_error(format!("failed to record schema migration: {error}"))

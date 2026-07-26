@@ -6,7 +6,9 @@ packages, operator settings, services, identity, and cluster control state.
 
 This document describes the guarantees implemented today. The kernel backup
 and offline restore primitives plus authenticated SDK/CLI entry points are
-integrated, but scheduled recovery, encryption, and deletion are not
+integrated. Transactional storage erasure and non-identifying deletion receipts
+are integrated as an internal foundation, but live-resource coordination,
+operator erasure commands, scheduled recovery, and encryption are not yet
 production-qualified.
 
 ## Database identity and version
@@ -117,6 +119,59 @@ Fresh-host and replacement restore are supported by this CLI workflow.
 Scheduled retention, remote object storage, and measured recovery objectives
 remain future work.
 
+## Data ownership and erasure contract
+
+`context::DURABLE_DATA_CATALOG` is the authoritative table-by-table ownership
+and deletion registry. A schema-introspection regression compares that catalog
+with every logical SQLite table, excluding only the private FTS5 shadow tables.
+Adding a durable table without assigning an owner and deletion behavior fails
+the kernel test suite.
+
+The current policy classes are:
+
+- agent-private state: contexts, facts/embeddings, conversations and their FTS
+  index, KV, spills, pressure, snapshots, checkpoints, usage rows, loaded
+  package instances, and the agent registry row;
+- tenant-private state: tenant identity and credentials plus package trust,
+  archives, installations, history, rate limits, transparency, and audit;
+- user identity state: the user row, sessions, API-key hashes, and that user's
+  package rate-limit state;
+- system state: schema/install metadata, cluster identity/control, global
+  operator settings, and shared quota/accounting records.
+
+`erase_agent_data`, `erase_user_data`, and `erase_tenant_data` use
+`BEGIN IMMEDIATE` and either commit the complete classified mutation plus one
+receipt or roll everything back. They also reconcile orphaned child rows when a
+registry identity is already absent. Agent and tenant erasure removes FTS
+entries, clears optional service references, and removes the subject's stable
+cgroup quota scopes. Provider/global quota aggregates, quota receipt UUIDs,
+refund tombstones, and system state remain so deletion cannot manufacture new
+global capacity or break idempotency.
+
+Deletion receipts contain only an opaque receipt UUID, subject kind, timestamp,
+per-table row counts, and a fixed list of retained record classes. They never
+contain a tenant, user, agent, actor, reason, prompt, path, or deleted value.
+Receipts are retained indefinitely because automated pruning is not yet
+implemented. User erasure retains the now-pseudonymous actor UUID in per-tenant
+package transparency/audit chains; deleting the tenant removes those chains.
+
+All kernel SQLite tables are included in verified backups. Published backups
+are immutable snapshots and are not retroactively changed by a live-database
+erasure; operators must expire and destroy backup directories according to
+their retention policy. The database is protected with owner-only permissions
+on Unix, but application-level encryption and key rotation remain open in
+#123. Provider configuration files, agent workspaces, remote provider data, and
+external object stores are outside this SQLite deletion boundary.
+
+Ephemeral process state includes scheduler queues, executors and cancellation
+handles, syscall-gate registrations, namespaces/cgroups, sandboxes, credential
+leases/auth caches, provider circuit state, and in-memory observability data.
+Normal kernel lifecycle cleanup or process exit removes it. A supported
+system-authorized erase operation that first drains those live resources and
+then invokes the transactional storage primitive is the next deletion slice;
+the storage primitives must not be treated as a safe remote hot-delete API on
+their own.
+
 ## Current durability boundary
 
 File-backed stores require WAL mode, `synchronous=FULL`, foreign-key
@@ -130,7 +185,8 @@ The following remain open under issue #123:
 - signed manifests or external authenticity/immutability controls;
 - corruption recovery beyond fail-closed startup detection;
 - encryption at rest and key rotation;
-- schema-wide agent and tenant deletion with retention policy and receipts;
+- live-resource-coordinated system API/SDK/CLI erasure, backup expiration, and
+  measured retention enforcement;
 - disk-full, interrupted migration, object-store, and extended crash
   qualification;
 - measured RPO/RTO on supported deployment profiles.

@@ -2,6 +2,7 @@
 //!
 //! Core types, error hierarchy, and module declarations for the Agent Kernel.
 
+mod accounting_integrity;
 pub mod agent;
 pub mod agent_hub;
 pub mod agent_package;

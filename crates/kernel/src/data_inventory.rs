@@ -137,7 +137,7 @@ pub const SQLITE_DATA_INVENTORY: &[StaticDataInventoryEntry] = &[
         "tenant_id and agent_id",
         "tenant metering and model metadata",
         "until agent or tenant erasure",
-        "not encrypted; owner-only database file permissions",
+        "HMAC-authenticated; plaintext mode exposes the integrity secret",
         "erase subject rows; shared quota ledger remains"
     ),
     sqlite_entry!(
@@ -344,7 +344,7 @@ pub const SQLITE_DATA_INVENTORY: &[StaticDataInventoryEntry] = &[
         "none",
         "global accounting epoch metadata",
         "indefinite enforcement floor",
-        "not confidential; database integrity and file permissions",
+        "HMAC-authenticated; plaintext mode exposes the integrity secret",
         "retain"
     ),
     sqlite_entry!(
@@ -353,7 +353,7 @@ pub const SQLITE_DATA_INVENTORY: &[StaticDataInventoryEntry] = &[
         "scope_key contains stable tenant/cgroup scope",
         "resource usage and quota aggregates",
         "indefinite until a future accounting-retention policy",
-        "not encrypted; owner-only database file permissions",
+        "HMAC-authenticated; plaintext mode exposes the integrity secret",
         "erase subject cgroup scopes; retain shared scopes"
     ),
     sqlite_entry!(
@@ -362,7 +362,7 @@ pub const SQLITE_DATA_INVENTORY: &[StaticDataInventoryEntry] = &[
         "scope links carry tenant and agent ownership",
         "provider usage, cost, model, and idempotency metadata",
         "indefinite enforcement and reconciliation record",
-        "not encrypted; owner-only database file permissions",
+        "HMAC-authenticated; plaintext mode exposes the integrity secret",
         "retain non-content accounting receipt"
     ),
     sqlite_entry!(
@@ -371,7 +371,7 @@ pub const SQLITE_DATA_INVENTORY: &[StaticDataInventoryEntry] = &[
         "scope_key contains stable tenant/cgroup scope",
         "resource-accounting scope linkage",
         "with referenced quota receipt",
-        "not encrypted; owner-only database file permissions",
+        "HMAC-authenticated; plaintext mode exposes the integrity secret",
         "erase subject cgroup scopes"
     ),
     sqlite_entry!(
@@ -380,7 +380,7 @@ pub const SQLITE_DATA_INVENTORY: &[StaticDataInventoryEntry] = &[
         "none",
         "non-content accounting idempotency tombstone",
         "indefinite to prevent duplicate refunds",
-        "not confidential; database integrity and file permissions",
+        "HMAC-authenticated; plaintext mode exposes the integrity secret",
         "retain"
     ),
     sqlite_entry!(
@@ -389,8 +389,26 @@ pub const SQLITE_DATA_INVENTORY: &[StaticDataInventoryEntry] = &[
         "none",
         "schema migration fence metadata",
         "indefinite",
-        "not confidential; database integrity and file permissions",
+        "HMAC-authenticated; plaintext mode exposes the integrity secret",
         "retain"
+    ),
+    sqlite_entry!(
+        "accounting_integrity",
+        "system",
+        "none",
+        "secret HMAC key and authenticated enforcement-state root",
+        "for database lifetime",
+        "plaintext mode exposes the secret and detects corruption only",
+        "retain with the protected accounting rows"
+    ),
+    sqlite_entry!(
+        "accounting_events",
+        "system; record keys are keyed pseudonymous digests",
+        "none",
+        "append-only authenticated usage and quota mutation digests",
+        "for database lifetime",
+        "HMAC-authenticated pseudonymous digests; plaintext mode exposes the integrity secret",
+        "retain non-identifying integrity chain"
     ),
     sqlite_entry!(
         "cluster_node_identity",

@@ -12,12 +12,13 @@ use crate::ContextError;
 /// ASCII `AIOS`, registered on every database owned by this kernel.
 pub(crate) const APPLICATION_ID: i64 = 0x4149_4f53;
 /// Latest schema this binary can read and write.
-pub(crate) const CURRENT_SCHEMA_VERSION: i64 = 2;
+pub(crate) const CURRENT_SCHEMA_VERSION: i64 = 3;
 const MIN_READABLE_SCHEMA_VERSION: i64 = 1;
 
 const MIGRATIONS: &[(i64, &str)] = &[
     (1, "adopt-versioned-kernel-schema"),
     (2, "add-privacy-safe-deletion-receipts"),
+    (3, "authenticate-usage-and-quota-accounting"),
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -62,6 +63,8 @@ const REQUIRED_TABLES: &[&str] = &[
     "quota_receipt_scopes",
     "quota_refunded_receipts",
     "quota_migration_fence",
+    "accounting_integrity",
+    "accounting_events",
     "cluster_node_identity",
     "cluster_node_control",
     "cluster_node_control_audit",
@@ -257,15 +260,35 @@ pub(crate) fn complete_migration(
         .iter()
         .filter(|(version, _)| *version > starting_version)
     {
-        connection
-            .execute(
-                "INSERT INTO schema_migrations(version, name, applied_at)
-                 VALUES (?1, ?2, ?3)",
-                params![version, name, &now],
+        let existing = connection
+            .query_row(
+                "SELECT name FROM schema_migrations WHERE version = ?1",
+                [version],
+                |row| row.get::<_, String>(0),
             )
+            .optional()
             .map_err(|error| {
-                storage_error(format!("failed to record schema migration: {error}"))
+                storage_error(format!("failed to inspect schema migration: {error}"))
             })?;
+        match existing {
+            Some(existing) if existing == *name => {}
+            Some(existing) => {
+                return Err(storage_error(format!(
+                    "schema migration {version} is recorded as {existing:?}, expected {name:?}"
+                )));
+            }
+            None => {
+                connection
+                    .execute(
+                        "INSERT INTO schema_migrations(version, name, applied_at)
+                         VALUES (?1, ?2, ?3)",
+                        params![version, name, &now],
+                    )
+                    .map_err(|error| {
+                        storage_error(format!("failed to record schema migration: {error}"))
+                    })?;
+            }
+        }
     }
     connection
         .execute(
@@ -337,6 +360,7 @@ pub(crate) fn verify(connection: &Connection) -> Result<(), ContextError> {
             "schema metadata installation_id is not a UUID",
         ));
     }
+    crate::accounting_integrity::verify(connection)?;
     Ok(())
 }
 

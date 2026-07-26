@@ -597,6 +597,17 @@ pub const NON_SQLITE_DATA_INVENTORY: &[StaticDataInventoryEntry] = &[
         "remove only after every dependent backup expires"
     ),
     boundary_entry!(
+        "file/backup-recovery-anchor",
+        "durable-file",
+        "independent recovery operator",
+        "none",
+        "public exact backup identity, timestamp, size, hashes, and signing-key identity",
+        "retain for every recovery point the operator intends to preserve",
+        "public material; integrity, ordering, and independent custody required",
+        "must be retained outside the pinned backup failure domain",
+        "replace or remove only under the independent recovery-point retention policy"
+    ),
+    boundary_entry!(
         "file/published-database-backups",
         "durable-file",
         "system operator",

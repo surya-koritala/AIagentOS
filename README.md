@@ -175,15 +175,23 @@ cargo run -p agent-cli --bin agentctl --locked -- \
 
 Set `AGENTOS_BACKUP_SIGNING_KEY_PATH` and
 `AGENTOS_BACKUP_SIGNING_KEY_ID=release-2026.1` together. New scheduled and live
-operator backups will be signed. Verification is read-only. Production disaster
-recovery consumes the exact new-host `config.toml`, derives the destination and
-storage key from it, and refuses to run while a kernel owns the destination:
+operator backups will be signed. After selecting a recovery point, create its
+non-overwriting recovery anchor in a separately governed location. The
+signature proves who created the backup; the anchor pins the exact signed
+manifest so a different, older valid backup is rejected:
 
 ```bash
 cargo run -p agent-cli --bin agentctl --locked -- \
+  backup-anchor-create /var/lib/agentos/backups/nightly_2026_07_25 \
+  /srv/recovery/agentos-trust/release-2026.1.json \
+  /srv/recovery/agentos-anchors/nightly_2026_07_25.json \
+  --storage-key /etc/agentos/storage-keys/storage-generation-1.json
+
+cargo run -p agent-cli --bin agentctl --locked -- \
   backup-verify /var/lib/agentos/backups/nightly_2026_07_25 \
   --storage-key /etc/agentos/storage-keys/storage-generation-1.json \
-  --require-signature /srv/recovery/agentos-trust/release-2026.1.json
+  --require-signature /srv/recovery/agentos-trust/release-2026.1.json \
+  --require-anchor /srv/recovery/agentos-anchors/nightly_2026_07_25.json
 
 # Stop agent-server first. The confirmation flag cannot bypass the lock.
 cargo run -p agent-cli --bin agentctl --locked -- \
@@ -191,8 +199,15 @@ cargo run -p agent-cli --bin agentctl --locked -- \
   /var/lib/agentos/backups/nightly_2026_07_25 \
   /etc/agentos/config.toml \
   /srv/recovery/agentos-trust/release-2026.1.json \
+  /srv/recovery/agentos-anchors/nightly_2026_07_25.json \
   --confirm-offline
 ```
+
+Production disaster recovery consumes the exact new-host `config.toml`, derives
+the destination and storage key from it, and refuses to run while a kernel owns
+the destination. Keep each anchor outside its backup directory and failure
+domain. The CLI rejects direct co-location, but filesystem paths alone cannot
+prove independent or immutable custody.
 
 The command keeps the old database as rollback until the restored configuration
 boots the full kernel and every persisted agent is re-admitted to enforcement.
@@ -208,6 +223,7 @@ cargo run -p agent-cli --bin agentctl --locked -- \
   /var/lib/agentos/backups/nightly_2026_07_25 \
   /etc/agentos/config.toml \
   /srv/recovery/agentos-trust/release-2026.1.json \
+  /srv/recovery/agentos-anchors/nightly_2026_07_25.json \
   5df0185b-03c3-4f1d-8026-2d99d4d82f22 \
   --confirm-offline
 ```

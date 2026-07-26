@@ -56,9 +56,9 @@ pub use kernel::package::{
     PackageSummary, PackageTrustInput, PackageTrustKey, SbomComponent, VerifiedPackage,
 };
 pub use kernel::storage::{
-    BackupAuthenticity, BackupMaintenanceStatus, BackupManifest, BackupRetentionEntry,
-    BackupRetentionIssue, BackupRetentionPolicy, BackupRetentionReport, BackupTrustRoot,
-    CorruptStorageRecoveryReport, RestoreReport,
+    BackupAuthenticity, BackupMaintenanceStatus, BackupManifest, BackupRecoveryAnchor,
+    BackupRetentionEntry, BackupRetentionIssue, BackupRetentionPolicy, BackupRetentionReport,
+    BackupTrustRoot, CorruptStorageRecoveryReport, RestoreReport,
 };
 pub use kernel::syscall_server::{
     AgentSummary, FactSummary, GenerationCheckpointSummary, MessageStreamEvent,

@@ -387,6 +387,7 @@ fn signed_backup_cli_requires_external_trust_for_verified_restore() {
     let destination = root.0.join("fresh-host/agent_os.db");
     let private_key = root.0.join("backup-signing.pk8");
     let public_trust = root.0.join("backup-trust.json");
+    let recovery_anchor = root.0.join("recovery-anchors/signed_001.json");
 
     let keygen = Command::new(env!("CARGO_BIN_EXE_agentctl"))
         .arg("backup-key-generate")
@@ -413,12 +414,30 @@ fn signed_backup_cli_requires_external_trust_for_verified_restore() {
             .create_signed_backup(&backup_root, "signed_001", &signer)
             .expect("signed source backup");
     }
+    std::fs::create_dir(recovery_anchor.parent().unwrap()).unwrap();
+    let anchor_create = Command::new(env!("CARGO_BIN_EXE_agentctl"))
+        .arg("backup-anchor-create")
+        .arg(&backup_dir)
+        .arg(&public_trust)
+        .arg(&recovery_anchor)
+        .output()
+        .expect("run backup-anchor-create");
+    assert!(
+        anchor_create.status.success(),
+        "backup-anchor-create failed: {}",
+        String::from_utf8_lossy(&anchor_create.stderr)
+    );
+    let anchor: kernel::storage::BackupRecoveryAnchor =
+        serde_json::from_slice(&anchor_create.stdout).expect("recovery anchor JSON");
+    assert_eq!(anchor.signing_key_id, trust.key_id);
 
     let verify = Command::new(env!("CARGO_BIN_EXE_agentctl"))
         .arg("backup-verify")
         .arg(&backup_dir)
         .arg("--require-signature")
         .arg(&public_trust)
+        .arg("--require-anchor")
+        .arg(&recovery_anchor)
         .output()
         .expect("run signature-required backup-verify");
     assert!(
@@ -432,6 +451,16 @@ fn signed_backup_cli_requires_external_trust_for_verified_restore() {
         manifest.authenticity.as_ref().expect("authenticity").key_id,
         trust.key_id
     );
+    let anchor_without_trust = Command::new(env!("CARGO_BIN_EXE_agentctl"))
+        .arg("backup-verify")
+        .arg(&backup_dir)
+        .arg("--require-anchor")
+        .arg(&recovery_anchor)
+        .output()
+        .expect("run anchor-only backup verification");
+    assert!(!anchor_without_trust.status.success());
+    assert!(String::from_utf8_lossy(&anchor_without_trust.stderr)
+        .contains("--require-anchor also requires --require-signature"));
 
     let unsigned_root = root.0.join("unsigned-backups");
     let unsigned_dir = unsigned_root.join("unsigned_001");
@@ -462,6 +491,8 @@ fn signed_backup_cli_requires_external_trust_for_verified_restore() {
         .arg(&destination)
         .arg("--require-signature")
         .arg(&public_trust)
+        .arg("--require-anchor")
+        .arg(&recovery_anchor)
         .arg("--confirm-offline")
         .output()
         .expect("run trusted backup-restore");
@@ -489,6 +520,7 @@ fn storage_encryption_cli_migrates_backs_up_restores_and_rotates_offline() {
     let restored = root.0.join("fresh-host/agent_os.db");
     let recovery_data_dir = root.0.join("qualified-fresh-host");
     let recovery_config = root.0.join("recovery-config.toml");
+    let recovery_anchor = root.0.join("recovery-anchors/encrypted_001.json");
 
     let recovered_agent_id = {
         let runtime = tokio::runtime::Runtime::new().expect("test runtime");
@@ -581,6 +613,21 @@ fn storage_encryption_cli_migrates_backs_up_restores_and_rotates_offline() {
             .create_signed_backup(&backup_root, "encrypted_001", &signer)
             .expect("encrypted backup");
     }
+    std::fs::create_dir(recovery_anchor.parent().unwrap()).unwrap();
+    let anchor_create = Command::new(env!("CARGO_BIN_EXE_agentctl"))
+        .arg("backup-anchor-create")
+        .arg(&backup_dir)
+        .arg(&backup_trust)
+        .arg(&recovery_anchor)
+        .arg("--storage-key")
+        .arg(&key_one)
+        .output()
+        .expect("create encrypted recovery anchor");
+    assert!(
+        anchor_create.status.success(),
+        "encrypted recovery anchor failed: {}",
+        String::from_utf8_lossy(&anchor_create.stderr)
+    );
     let unkeyed_verify = Command::new(env!("CARGO_BIN_EXE_agentctl"))
         .arg("backup-verify")
         .arg(&backup_dir)
@@ -647,6 +694,7 @@ fn storage_encryption_cli_migrates_backs_up_restores_and_rotates_offline() {
         .arg(&backup_dir)
         .arg(&failed_config)
         .arg(&backup_trust)
+        .arg(&recovery_anchor)
         .arg("--confirm-offline")
         .output()
         .expect("run failing disaster recovery");
@@ -681,6 +729,7 @@ fn storage_encryption_cli_migrates_backs_up_restores_and_rotates_offline() {
         .arg(&backup_dir)
         .arg(&recovery_config)
         .arg(&backup_trust)
+        .arg(&recovery_anchor)
         .output()
         .expect("run unconfirmed disaster recovery");
     assert_eq!(unconfirmed_recovery.status.code(), Some(2));
@@ -691,6 +740,7 @@ fn storage_encryption_cli_migrates_backs_up_restores_and_rotates_offline() {
         .arg(&backup_dir)
         .arg(&recovery_config)
         .arg(&backup_trust)
+        .arg(&recovery_anchor)
         .arg("--confirm-offline")
         .output()
         .expect("run disaster recovery");
@@ -724,6 +774,8 @@ fn storage_encryption_cli_migrates_backs_up_restores_and_rotates_offline() {
         .arg(&key_one)
         .arg("--require-signature")
         .arg(&backup_trust)
+        .arg("--require-anchor")
+        .arg(&recovery_anchor)
         .arg("--confirm-offline")
         .output()
         .expect("run encrypted restore");
@@ -912,6 +964,7 @@ fn corruption_recovery_cli_requires_confirmation_and_returns_forensic_evidence()
     let root = TestRoot::new();
     let private_key = root.0.join("backup-signing-key.json");
     let public_trust = root.0.join("backup-public-trust.json");
+    let recovery_anchor = root.0.join("recovery-anchors/qualified.json");
     let key_generation = Command::new(env!("CARGO_BIN_EXE_agentctl"))
         .arg("backup-key-generate")
         .arg("cli-corrupt-recovery")
@@ -933,6 +986,19 @@ fn corruption_recovery_cli_requires_confirmation_and_returns_forensic_evidence()
         .create_signed_backup(&backup_root, "qualified", &signer)
         .unwrap();
     drop(manager);
+    std::fs::create_dir(recovery_anchor.parent().unwrap()).unwrap();
+    let anchor_create = Command::new(env!("CARGO_BIN_EXE_agentctl"))
+        .arg("backup-anchor-create")
+        .arg(backup_root.join("qualified"))
+        .arg(&public_trust)
+        .arg(&recovery_anchor)
+        .output()
+        .expect("create corruption recovery anchor");
+    assert!(
+        anchor_create.status.success(),
+        "corruption recovery anchor failed: {}",
+        String::from_utf8_lossy(&anchor_create.stderr)
+    );
 
     let data_dir = root.0.join("data");
     std::fs::create_dir(&data_dir).unwrap();
@@ -956,6 +1022,7 @@ fn corruption_recovery_cli_requires_confirmation_and_returns_forensic_evidence()
         .arg(backup_root.join("qualified"))
         .arg(&config_file)
         .arg(&public_trust)
+        .arg(&recovery_anchor)
         .arg(&manifest.installation_id)
         .output()
         .expect("run unconfirmed corruption recovery");
@@ -970,6 +1037,7 @@ fn corruption_recovery_cli_requires_confirmation_and_returns_forensic_evidence()
         .arg(backup_root.join("qualified"))
         .arg(&config_file)
         .arg(&public_trust)
+        .arg(&recovery_anchor)
         .arg(&manifest.installation_id)
         .arg("--confirm-offline")
         .output()

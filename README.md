@@ -175,8 +175,9 @@ cargo run -p agent-cli --bin agentctl --locked -- \
 
 Set `AGENTOS_BACKUP_SIGNING_KEY_PATH` and
 `AGENTOS_BACKUP_SIGNING_KEY_ID=release-2026.1` together. New scheduled and live
-operator backups will be signed. Verification is read-only; trusted restore is
-deliberately offline and refuses to run while a kernel owns the destination:
+operator backups will be signed. Verification is read-only. Production disaster
+recovery consumes the exact new-host `config.toml`, derives the destination and
+storage key from it, and refuses to run while a kernel owns the destination:
 
 ```bash
 cargo run -p agent-cli --bin agentctl --locked -- \
@@ -186,14 +187,16 @@ cargo run -p agent-cli --bin agentctl --locked -- \
 
 # Stop agent-server first. The confirmation flag cannot bypass the lock.
 cargo run -p agent-cli --bin agentctl --locked -- \
-  backup-restore /var/lib/agentos/backups/nightly_2026_07_25 \
-  /var/lib/agentos/agent_os.db \
-  --storage-key /etc/agentos/storage-keys/storage-generation-1.json \
-  --require-signature /srv/recovery/agentos-trust/release-2026.1.json \
+  backup-disaster-recover \
+  /var/lib/agentos/backups/nightly_2026_07_25 \
+  /etc/agentos/config.toml \
+  /srv/recovery/agentos-trust/release-2026.1.json \
   --confirm-offline
 ```
 
-Automatic backup configuration, exact durability boundaries, manifest checks,
+The command keeps the old database as rollback until the restored configuration
+boots the full kernel and every persisted agent is re-admitted to enforcement.
+Automatic backup configuration, exact durability boundaries, lower-level
 offline restore, and remaining disaster-recovery work are documented in
 [docs/DURABILITY.md](docs/DURABILITY.md).
 

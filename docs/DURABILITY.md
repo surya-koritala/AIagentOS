@@ -11,10 +11,10 @@ and live-resource-coordinated system operator erasure through the wire, SDK,
 and CLI are integrated. Verified local-backup retention, disabled-by-default
 automatic local backup maintenance, optional Ed25519 manifest authenticity,
 and SQLCipher whole-database encryption with operator-custodied keys are
-integrated. Restore, plaintext migration, and storage-key rotation remain
-explicit offline operator actions. Remote retention, automated disaster
-recovery, measured recovery objectives, and independent release qualification
-are not yet complete.
+integrated. Authenticated configured-host disaster recovery, plaintext
+migration, and storage-key rotation remain explicit offline operator actions.
+Remote retention, measured recovery objectives, and independent release
+qualification are not yet complete.
 
 ## Database identity and version
 
@@ -376,31 +376,40 @@ If cleanup of the obsolete rollback file cannot be made durable, restore still
 returns a successful report with `rollback_retained = true` so the operator is
 not told that the already-verified replacement failed.
 
-Verify a signed backup without changing any state, then stop the server and
-restore it to the configured database path:
+Verify a signed backup without changing any state, then stop the server and run
+configured-host recovery:
 
 ```bash
 agentctl backup-verify /var/lib/agentos/backups/nightly_2026_07_25 \
   --storage-key /etc/agentos/storage-keys/storage-generation-1.json \
   --require-signature /srv/recovery/agentos-trust/release-2026.1.json
-agentctl backup-restore /var/lib/agentos/backups/nightly_2026_07_25 \
-  /var/lib/agentos/agent_os.db \
-  --storage-key /etc/agentos/storage-keys/storage-generation-1.json \
-  --require-signature /srv/recovery/agentos-trust/release-2026.1.json \
+agentctl backup-disaster-recover \
+  /var/lib/agentos/backups/nightly_2026_07_25 \
+  /etc/agentos/config.toml \
+  /srv/recovery/agentos-trust/release-2026.1.json \
   --confirm-offline
 ```
 
-The confirmation flag makes the destructive intent explicit; it does not
-bypass the storage lease. If any kernel still owns the destination, restore
-fails before changing it. Both commands emit versioned manifest/report JSON so
-automation can retain recovery evidence.
+The recovery command requires an existing configuration with an absolute
+`data_dir`, derives `agent_os.db` and its independently retained storage key
+from that configuration, and always requires the external public trust file.
+After authenticated restore, it boots the complete configured kernel, including
+budget reconstruction and service recovery, and verifies every persisted agent
+is present in the live enforcing registry. The previous database remains the
+rollback target until that qualification succeeds. A failed qualification
+removes a fresh-host destination or atomically restores the previous database.
 
-Fresh-host and replacement restore are supported by this CLI workflow. The
-fresh host must receive the exact storage-key generation named by the manifest;
-the key is intentionally absent from the backup. After restore, configure that
-key path before starting the kernel.
-Automatic local backup creation is supported; recovery remains deliberately
-offline and operator-initiated. Remote object storage, automated recovery, and
+The confirmation flag makes the destructive intent explicit; it does not
+bypass the storage lease. If any kernel still owns the destination, recovery
+fails before changing it. The command emits a versioned manifest/report so
+automation can retain evidence. The lower-level `backup-restore` command remains
+available for manual repair, but it does not perform configured-kernel
+qualification.
+
+Fresh-host and replacement recovery are supported by this workflow. The fresh
+host must receive the exact storage-key generation and configuration required by
+the manifest; key material is intentionally absent from the backup. Recovery
+remains deliberately offline and operator-initiated. Remote object storage and
 measured recovery objectives remain future work.
 
 ## Data ownership and erasure contract
@@ -513,8 +522,7 @@ capacity tests on every supported deployment profile.
 
 The following remain open under issue #123:
 
-- remote object storage retention, automated recovery orchestration, and a
-  measured recovery runbook;
+- remote object storage retention and a measured recovery runbook;
 - independent immutable/remote retention controls and released trust fixtures;
 - corruption recovery beyond fail-closed startup detection;
 - measured deletion/retention enforcement across external workspaces,

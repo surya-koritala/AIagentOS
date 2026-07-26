@@ -10,6 +10,13 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
 
 ## [Unreleased]
 
+- Added authenticated configured-host disaster recovery under #123.
+  `agentctl backup-disaster-recover` now requires an independently retained
+  public trust root and the exact destination `config.toml`, restores the
+  matching signed/encrypted backup offline, boots the complete configured
+  kernel, and proves every persisted agent was re-admitted to enforcement
+  before discarding rollback state. Failed configured-kernel qualification
+  removes a fresh destination or restores the previous database.
 - Added atomic released-storage upgrade qualification under #123. One immediate
   transaction now covers schema DDL, backfills, reconciliation, quota fences,
   migration metadata, and final version publication, so a late failure rolls
@@ -17,8 +24,7 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
   representative databases from every published tag (`v0.1.0`, `v0.2.0`, and
   `v0.3.0`) and prove context, memory, FTS, usage-cost, tenant, and KV retention
   through upgrade and idempotent reopen. Version bumps must add the next
-  fixture before release. Automated disaster restore orchestration and released
-  trust fixtures remain open.
+  fixture before release. Released public-trust fixtures remain open.
 - Added journaled recovery for interrupted offline storage encryption under
   #123. `storage-encrypt` now durably records a secret-free migration identity
   before staging, and `agentctl storage-encrypt-recover ... --confirm-offline`

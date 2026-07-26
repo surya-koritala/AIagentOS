@@ -388,6 +388,33 @@ pub enum Syscall {
         #[serde(default = "default_tunable_audit_limit")]
         limit: usize,
     },
+    /// Create a one-time authority challenge for admitting a durable node.
+    IssueClusterJoinChallenge {
+        ttl_seconds: u64,
+    },
+    /// Register or re-register a node after verifying its challenged identity.
+    RegisterClusterMember {
+        registration: crate::cluster_control::ClusterMemberRegistration,
+        challenge_hex: String,
+        signature_hex: String,
+        #[serde(default)]
+        expected_generation: Option<u64>,
+        reason: String,
+    },
+    /// Generation-fenced clean leave or terminal identity revocation.
+    SetClusterMemberState {
+        node_id: String,
+        state: crate::cluster_control::ClusterMemberState,
+        expected_generation: u64,
+        reason: String,
+    },
+    /// Read one transactionally consistent authority discovery snapshot.
+    GetClusterMembership,
+    /// Read the durable membership mutation history.
+    ListClusterMembershipAudit {
+        #[serde(default = "default_tunable_audit_limit")]
+        limit: usize,
+    },
     /// Pull the kernel's operational metrics as a Prometheus text exposition
     /// (format version 0.0.4), rendered from the syscall-gate enforcement
     /// counters, agent counts, system token/api totals, and process uptime.
@@ -937,6 +964,22 @@ pub enum SyscallReply {
     NodeControlAudit {
         entries: Vec<crate::cluster_control::NodeControlAudit>,
     },
+    /// One-time authority challenge for a node join.
+    ClusterJoinChallenge {
+        challenge: crate::cluster_control::ClusterJoinChallenge,
+    },
+    /// Membership record after a successful join/leave/revocation.
+    ClusterMemberUpdated {
+        member: crate::cluster_control::ClusterMember,
+    },
+    /// Atomic authority discovery view.
+    ClusterMembership {
+        membership: crate::cluster_control::ClusterMembershipSnapshot,
+    },
+    /// Durable membership audit entries.
+    ClusterMembershipAudit {
+        entries: Vec<crate::cluster_control::ClusterMembershipAudit>,
+    },
     /// The kernel's operational metrics (reply to [`Syscall::Metrics`]). Carries
     /// the rendered Prometheus text exposition plus a couple of the headline
     /// numbers as structured fields, so a client can use either form.
@@ -1175,6 +1218,19 @@ fn syscall_policy(call: &Syscall) -> (AccessLevel, &'static str, Option<&str>) {
         }
         Syscall::SetNodeProfile { .. } => (AccessLevel::System, "cluster.node.profile.set", None),
         Syscall::ListNodeControlAudit { .. } => (AccessLevel::System, "cluster.node.audit", None),
+        Syscall::IssueClusterJoinChallenge { .. } => {
+            (AccessLevel::System, "cluster.membership.challenge", None)
+        }
+        Syscall::RegisterClusterMember { .. } => {
+            (AccessLevel::System, "cluster.membership.join", None)
+        }
+        Syscall::SetClusterMemberState { .. } => {
+            (AccessLevel::System, "cluster.membership.state.set", None)
+        }
+        Syscall::GetClusterMembership => (AccessLevel::System, "cluster.membership.snapshot", None),
+        Syscall::ListClusterMembershipAudit { .. } => {
+            (AccessLevel::System, "cluster.membership.audit", None)
+        }
         Syscall::Metrics => (AccessLevel::System, "system.metrics", None),
         Syscall::OperatorSnapshot => (AccessLevel::ReadOnly, "operator.snapshot", None),
         Syscall::ListOperatorTunables => (AccessLevel::System, "operator.tunable.list", None),
@@ -1398,6 +1454,11 @@ fn quarantine_recovery_call(call: &Syscall) -> bool {
             | Syscall::SetNodeAvailability { .. }
             | Syscall::SetNodeProfile { .. }
             | Syscall::ListNodeControlAudit { .. }
+            | Syscall::IssueClusterJoinChallenge { .. }
+            | Syscall::RegisterClusterMember { .. }
+            | Syscall::SetClusterMemberState { .. }
+            | Syscall::GetClusterMembership
+            | Syscall::ListClusterMembershipAudit { .. }
             | Syscall::Metrics
             | Syscall::OperatorSnapshot
             | Syscall::ListOperatorTunables
@@ -2434,6 +2495,76 @@ pub async fn dispatch_scoped(
                 message: error.to_string(),
             },
         },
+        Syscall::IssueClusterJoinChallenge { ttl_seconds } => {
+            match kernel.cluster_control.issue_join_challenge(ttl_seconds) {
+                Ok(challenge) => SyscallReply::ClusterJoinChallenge { challenge },
+                Err(error) => SyscallReply::Error {
+                    message: error.to_string(),
+                },
+            }
+        }
+        Syscall::RegisterClusterMember {
+            registration,
+            challenge_hex,
+            signature_hex,
+            expected_generation,
+            reason,
+        } => {
+            let actor = principal
+                .map(|principal| principal.user_id.as_str())
+                .unwrap_or("system");
+            match kernel.cluster_control.register_member(
+                registration,
+                &challenge_hex,
+                &signature_hex,
+                expected_generation,
+                MIN_PROTOCOL_VERSION,
+                PROTOCOL_VERSION,
+                actor,
+                &reason,
+            ) {
+                Ok(member) => SyscallReply::ClusterMemberUpdated { member },
+                Err(error) => SyscallReply::Error {
+                    message: error.to_string(),
+                },
+            }
+        }
+        Syscall::SetClusterMemberState {
+            node_id,
+            state,
+            expected_generation,
+            reason,
+        } => {
+            let actor = principal
+                .map(|principal| principal.user_id.as_str())
+                .unwrap_or("system");
+            match kernel.cluster_control.set_member_state(
+                &node_id,
+                state,
+                expected_generation,
+                actor,
+                &reason,
+            ) {
+                Ok(member) => SyscallReply::ClusterMemberUpdated { member },
+                Err(error) => SyscallReply::Error {
+                    message: error.to_string(),
+                },
+            }
+        }
+        Syscall::GetClusterMembership => match kernel.cluster_control.membership_snapshot() {
+            Ok(membership) => SyscallReply::ClusterMembership { membership },
+            Err(error) => SyscallReply::Error {
+                message: error.to_string(),
+            },
+        },
+        Syscall::ListClusterMembershipAudit { limit } => {
+            match kernel.cluster_control.membership_audit(limit) {
+                Ok(entries) => SyscallReply::ClusterMembershipAudit { entries },
+                Err(error) => SyscallReply::Error {
+                    message: error.to_string(),
+                },
+            }
+        }
         Syscall::Metrics => {
             let snap = crate::metrics::MetricsSnapshot::collect(kernel);
             SyscallReply::Metrics {
@@ -3548,6 +3679,11 @@ impl SyscallServer {
                                 | Syscall::SetNodeAvailability { .. }
                                 | Syscall::SetNodeProfile { .. }
                                 | Syscall::ListNodeControlAudit { .. }
+                                | Syscall::IssueClusterJoinChallenge { .. }
+                                | Syscall::RegisterClusterMember { .. }
+                                | Syscall::SetClusterMemberState { .. }
+                                | Syscall::GetClusterMembership
+                                | Syscall::ListClusterMembershipAudit { .. }
                         ) =>
                 {
                     SyscallReply::Error {
@@ -5648,6 +5784,42 @@ memory = ["remember this"]
                 Syscall::ListNodeControlAudit { limit: 10 },
                 AccessLevel::System,
             ),
+            (
+                Syscall::IssueClusterJoinChallenge { ttl_seconds: 30 },
+                AccessLevel::System,
+            ),
+            (
+                Syscall::RegisterClusterMember {
+                    registration: crate::cluster_control::ClusterMemberRegistration {
+                        node_id: "00000000-0000-0000-0000-000000000004".into(),
+                        fingerprint: "00".repeat(32),
+                        public_key: "00".repeat(32),
+                        endpoint: "127.0.0.1:7443".into(),
+                        server_version: "0.3.0".into(),
+                        min_protocol_version: 1,
+                        protocol_version: 2,
+                    },
+                    challenge_hex: "00".into(),
+                    signature_hex: "00".into(),
+                    expected_generation: None,
+                    reason: "test".into(),
+                },
+                AccessLevel::System,
+            ),
+            (
+                Syscall::SetClusterMemberState {
+                    node_id: "00000000-0000-0000-0000-000000000004".into(),
+                    state: crate::cluster_control::ClusterMemberState::Left,
+                    expected_generation: 1,
+                    reason: "test".into(),
+                },
+                AccessLevel::System,
+            ),
+            (Syscall::GetClusterMembership, AccessLevel::System),
+            (
+                Syscall::ListClusterMembershipAudit { limit: 10 },
+                AccessLevel::System,
+            ),
             (Syscall::Metrics, AccessLevel::System),
             (Syscall::OperatorSnapshot, AccessLevel::ReadOnly),
             (Syscall::ListOperatorTunables, AccessLevel::System),
@@ -5746,7 +5918,7 @@ memory = ["remember this"]
                     .to_string()
             })
             .collect::<std::collections::HashSet<_>>();
-        assert_eq!(calls.len(), 65);
+        assert_eq!(calls.len(), 70);
         assert_eq!(fixture_tags, schema_tags);
     }
 

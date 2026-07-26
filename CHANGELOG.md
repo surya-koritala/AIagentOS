@@ -10,6 +10,14 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
 
 ## [Unreleased]
 
+- Added a durable, system-scoped cluster membership authority. Nodes join by
+  signing one-time expiring challenges that bind cluster ID, durable identity,
+  endpoint, software version, and protocol window. Atomic membership snapshots,
+  generation-fenced leave/revocation, compatibility and duplicate checks,
+  durable audit, authenticated SDK discovery, mixed-revision rejection, and
+  authority-restart recovery are covered by regressions. This is deliberately a
+  single-authority model; quorum failover, ownership leases, live TLS
+  certificate revocation, migration, and partition fencing remain #122.
 - Added the first distributed-control-plane foundation: every kernel now owns
   a durable Ed25519 node identity and generation-fenced active/draining/
   quarantined state with placement metadata and audit history. `ClusterClient`

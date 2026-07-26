@@ -19,6 +19,7 @@ use crate::wire_io::{
 /// Stable feature identifiers announced by `hello`.
 pub const WIRE_FEATURES: &[&str] = &[
     "agent_enforcement_introspection",
+    "authorized_cluster_membership",
     "bounded_json_frames",
     "connection_keepalive",
     "context_pressure",
@@ -418,6 +419,37 @@ const REQUEST_VARIANTS: &[Variant] = &[
         fields: &[Field::optional("limit", I)],
     },
     Variant {
+        tag: "issue_cluster_join_challenge",
+        fields: &[Field::required("ttl_seconds", I)],
+    },
+    Variant {
+        tag: "register_cluster_member",
+        fields: &[
+            Field::required("registration", O),
+            Field::required("challenge_hex", S),
+            Field::required("signature_hex", S),
+            Field::optional("expected_generation", N),
+            Field::required("reason", S),
+        ],
+    },
+    Variant {
+        tag: "set_cluster_member_state",
+        fields: &[
+            Field::required("node_id", S),
+            Field::required("state", S),
+            Field::required("expected_generation", I),
+            Field::required("reason", S),
+        ],
+    },
+    Variant {
+        tag: "get_cluster_membership",
+        fields: &[],
+    },
+    Variant {
+        tag: "list_cluster_membership_audit",
+        fields: &[Field::optional("limit", I)],
+    },
+    Variant {
         tag: "metrics",
         fields: &[],
     },
@@ -501,6 +533,11 @@ pub fn conformance_request_fixtures(protocol_version: u32) -> Result<Vec<Value>,
                         | "set_node_availability"
                         | "set_node_profile"
                         | "list_node_control_audit"
+                        | "issue_cluster_join_challenge"
+                        | "register_cluster_member"
+                        | "set_cluster_member_state"
+                        | "get_cluster_membership"
+                        | "list_cluster_membership_audit"
                 )
         })
         .map(|variant| {
@@ -523,7 +560,18 @@ pub fn conformance_request_fixtures(protocol_version: u32) -> Result<Vec<Value>,
                     ("public_key_hex" | "archive_hex" | "challenge_hex", JsonKind::String) => {
                         Value::String("00".into())
                     }
+                    ("signature_hex", JsonKind::String) => Value::String("00".into()),
                     ("availability", JsonKind::String) => Value::String("active".into()),
+                    ("state", JsonKind::String) => Value::String("left".into()),
+                    ("registration", JsonKind::Object) => serde_json::json!({
+                        "node_id": "00000000-0000-0000-0000-000000000004",
+                        "fingerprint": "0000000000000000000000000000000000000000000000000000000000000000",
+                        "public_key": "0000000000000000000000000000000000000000000000000000000000000000",
+                        "endpoint": "127.0.0.1:7443",
+                        "server_version": "0.3.0",
+                        "min_protocol_version": 1,
+                        "protocol_version": 2
+                    }),
                     ("valid_from", JsonKind::String) => {
                         Value::String("2026-01-01T00:00:00Z".into())
                     }
@@ -779,6 +827,22 @@ const REPLY_VARIANTS: &[Variant] = &[
     },
     Variant {
         tag: "node_control_audit",
+        fields: &[Field::required("entries", A)],
+    },
+    Variant {
+        tag: "cluster_join_challenge",
+        fields: &[Field::required("challenge", O)],
+    },
+    Variant {
+        tag: "cluster_member_updated",
+        fields: &[Field::required("member", O)],
+    },
+    Variant {
+        tag: "cluster_membership",
+        fields: &[Field::required("membership", O)],
+    },
+    Variant {
+        tag: "cluster_membership_audit",
         fields: &[Field::required("entries", A)],
     },
     Variant {
@@ -1156,7 +1220,7 @@ mod tests {
             }
         }
         assert_eq!(conformance_request_fixtures(1).unwrap().len(), 58);
-        assert_eq!(conformance_request_fixtures(2).unwrap().len(), 65);
+        assert_eq!(conformance_request_fixtures(2).unwrap().len(), 70);
         assert!(conformance_request_fixtures(0).is_err());
         assert!(conformance_request_fixtures(PROTOCOL_VERSION + 1).is_err());
     }

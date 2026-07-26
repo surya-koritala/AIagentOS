@@ -9,8 +9,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use agent_sdk::{
-    ClusterClient, NodeAvailability, NodeProfile, Placement, PlacementConstraints, SdkError,
-    WireErrorCode,
+    ClusterClient, ClusterMemberState, KernelClient, NodeAvailability, NodeProfile, Placement,
+    PlacementConstraints, SdkError, WireErrorCode,
 };
 use kernel::syscall_server::SyscallServer;
 use kernel::AgentKernelImpl;
@@ -488,4 +488,218 @@ async fn cluster_requires_mutual_tls_before_identity_discovery() {
 
     task.abort();
     let _ = task.await;
+}
+
+#[tokio::test]
+async fn authorized_membership_drives_discovery_leave_and_revocation() {
+    let token = "membership-system-secret";
+    let authority_kernel = Arc::new(AgentKernelImpl::new().expect("authority kernel"));
+    let authority_server = SyscallServer::bind(authority_kernel, "127.0.0.1:0")
+        .await
+        .expect("bind authority")
+        .with_auth_token(token);
+    let authority_address = authority_server.local_addr().unwrap().to_string();
+    let authority_task = tokio::spawn(authority_server.serve());
+
+    let mut member_tasks = Vec::new();
+    let mut member_addresses = Vec::new();
+    for _ in 0..2 {
+        let kernel = Arc::new(AgentKernelImpl::new().expect("member kernel"));
+        let server = SyscallServer::bind(kernel, "127.0.0.1:0")
+            .await
+            .expect("bind member")
+            .with_auth_token(token);
+        member_addresses.push(server.local_addr().unwrap().to_string());
+        member_tasks.push(tokio::spawn(server.serve()));
+    }
+
+    let mut authority = KernelClient::connect(&authority_address)
+        .await
+        .expect("connect authority");
+    authority.authenticate(token).await.expect("auth authority");
+    let mut joined = Vec::new();
+    for endpoint in &member_addresses {
+        let mut member = KernelClient::connect(endpoint)
+            .await
+            .expect("connect member");
+        member.authenticate(token).await.expect("auth member");
+        joined.push(
+            ClusterClient::admit_node(
+                &mut authority,
+                &mut member,
+                endpoint,
+                None,
+                "initial membership",
+            )
+            .await
+            .expect("admit node"),
+        );
+    }
+
+    let snapshot = authority
+        .cluster_membership()
+        .await
+        .expect("membership snapshot");
+    assert_eq!(snapshot.generation, 2);
+    assert_eq!(snapshot.members.len(), 2);
+    assert!(snapshot
+        .members
+        .iter()
+        .all(|member| member.state == ClusterMemberState::Active));
+
+    let discovered = ClusterClient::connect_discovered_authenticated(&authority_address, token)
+        .await
+        .expect("authorized discovery");
+    assert_eq!(discovered.node_count(), 2);
+    drop(discovered);
+
+    let left = authority
+        .set_cluster_member_state(
+            &joined[0].node_id,
+            ClusterMemberState::Left,
+            joined[0].generation,
+            "rolling maintenance",
+        )
+        .await
+        .expect("leave member");
+    assert_eq!(left.state, ClusterMemberState::Left);
+    let stale = authority
+        .set_cluster_member_state(
+            &joined[0].node_id,
+            ClusterMemberState::Revoked,
+            joined[0].generation,
+            "stale operator",
+        )
+        .await
+        .expect_err("stale generation must fail");
+    assert_eq!(stale.wire_code(), Some(WireErrorCode::Conflict));
+
+    let discovered = ClusterClient::connect_discovered_authenticated(&authority_address, token)
+        .await
+        .expect("discovery skips left member");
+    assert_eq!(discovered.node_count(), 1);
+    assert_eq!(discovered.node_ids(), vec![joined[1].node_id.clone()]);
+    drop(discovered);
+
+    let revoked = authority
+        .set_cluster_member_state(
+            &joined[1].node_id,
+            ClusterMemberState::Revoked,
+            joined[1].generation,
+            "identity compromise",
+        )
+        .await
+        .expect("revoke member");
+    assert_eq!(revoked.state, ClusterMemberState::Revoked);
+    let unavailable =
+        match ClusterClient::connect_discovered_authenticated(&authority_address, token).await {
+            Err(error) => error,
+            Ok(_) => panic!("no inactive or revoked member may be discovered"),
+        };
+    assert_eq!(unavailable.wire_code(), Some(WireErrorCode::Unavailable));
+
+    let audit = authority
+        .cluster_membership_audit(10)
+        .await
+        .expect("membership audit");
+    assert_eq!(audit.len(), 4);
+    assert_eq!(audit[0].current, ClusterMemberState::Revoked);
+
+    authority_task.abort();
+    let _ = authority_task.await;
+    for task in member_tasks {
+        task.abort();
+        let _ = task.await;
+    }
+}
+
+#[tokio::test]
+async fn membership_authority_and_discovery_survive_authority_restart() {
+    let token = "persistent-membership-secret";
+    let database = TempDb::new("membership-authority");
+    let authority_kernel = Arc::new(
+        AgentKernelImpl::with_db_path(database.path()).expect("persistent authority kernel"),
+    );
+    let authority_server = SyscallServer::bind(authority_kernel, "127.0.0.1:0")
+        .await
+        .expect("bind authority")
+        .with_auth_token(token);
+    let first_authority_address = authority_server.local_addr().unwrap().to_string();
+    let first_authority_task = tokio::spawn(authority_server.serve());
+
+    let member_kernel = Arc::new(AgentKernelImpl::new().expect("member kernel"));
+    let member_server = SyscallServer::bind(member_kernel, "127.0.0.1:0")
+        .await
+        .expect("bind member")
+        .with_auth_token(token);
+    let member_address = member_server.local_addr().unwrap().to_string();
+    let member_task = tokio::spawn(member_server.serve());
+
+    let mut authority = KernelClient::connect(&first_authority_address)
+        .await
+        .expect("connect authority");
+    authority.authenticate(token).await.expect("auth authority");
+    let mut member = KernelClient::connect(&member_address)
+        .await
+        .expect("connect member");
+    member.authenticate(token).await.expect("auth member");
+    let joined = ClusterClient::admit_node(
+        &mut authority,
+        &mut member,
+        &member_address,
+        None,
+        "persistent admission",
+    )
+    .await
+    .expect("admit member");
+    let before = authority.cluster_membership().await.expect("snapshot");
+    assert_eq!(before.members, vec![joined]);
+    drop(authority);
+    first_authority_task.abort();
+    let _ = first_authority_task.await;
+
+    let restarted_kernel =
+        Arc::new(AgentKernelImpl::with_db_path(database.path()).expect("restart authority kernel"));
+    let restarted_server = SyscallServer::bind(restarted_kernel, "127.0.0.1:0")
+        .await
+        .expect("bind restarted authority")
+        .with_auth_token(token);
+    let restarted_address = restarted_server.local_addr().unwrap().to_string();
+    let restarted_task = tokio::spawn(restarted_server.serve());
+    let mut restarted = KernelClient::connect(&restarted_address)
+        .await
+        .expect("connect restarted authority");
+    restarted
+        .authenticate(token)
+        .await
+        .expect("auth restarted authority");
+    assert_eq!(
+        restarted
+            .cluster_membership()
+            .await
+            .expect("persisted membership"),
+        before
+    );
+    assert_eq!(
+        restarted
+            .cluster_membership_audit(10)
+            .await
+            .expect("persisted audit")
+            .len(),
+        1
+    );
+
+    let discovered = ClusterClient::connect_discovered_authenticated(&restarted_address, token)
+        .await
+        .expect("discover after authority restart");
+    assert_eq!(discovered.node_count(), 1);
+    assert_eq!(
+        discovered.node_ids(),
+        vec![before.members[0].node_id.clone()]
+    );
+
+    restarted_task.abort();
+    let _ = restarted_task.await;
+    member_task.abort();
+    let _ = member_task.await;
 }

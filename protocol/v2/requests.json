@@ -243,6 +243,40 @@
     "op": "list_node_control_audit"
   },
   {
+    "op": "issue_cluster_join_challenge",
+    "ttl_seconds": 1
+  },
+  {
+    "challenge_hex": "00",
+    "expected_generation": null,
+    "op": "register_cluster_member",
+    "reason": "fixture",
+    "registration": {
+      "endpoint": "127.0.0.1:7443",
+      "fingerprint": "0000000000000000000000000000000000000000000000000000000000000000",
+      "min_protocol_version": 1,
+      "node_id": "00000000-0000-0000-0000-000000000004",
+      "protocol_version": 2,
+      "public_key": "0000000000000000000000000000000000000000000000000000000000000000",
+      "server_version": "0.3.0"
+    },
+    "signature_hex": "00"
+  },
+  {
+    "expected_generation": 1,
+    "node_id": "fixture",
+    "op": "set_cluster_member_state",
+    "reason": "fixture",
+    "state": "left"
+  },
+  {
+    "op": "get_cluster_membership"
+  },
+  {
+    "limit": 1,
+    "op": "list_cluster_membership_audit"
+  },
+  {
     "op": "metrics"
   },
   {

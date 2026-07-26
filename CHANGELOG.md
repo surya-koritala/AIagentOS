@@ -26,6 +26,10 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
 - Added protocol-v2 `ping`/`pong`, standard MCP ping, published keepalive and
   graceful-close bounds, and SDK/raw/MCP half-close APIs that require bounded
   peer EOF after all replies are consumed.
+- Reworked newline framing around one incremental bounded decoder and added
+  deterministic fragmentation/shuffle properties plus a scheduled transport
+  fuzz target that asserts retained and allocated frame memory never exceeds
+  the selected limit.
 
 ### Added
 

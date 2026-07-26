@@ -371,6 +371,8 @@ fn release_blocking_workflows_keep_their_security_contract() {
         "-Zsanitizer=address",
         "cargo fuzz build --target x86_64-unknown-linux-gnu",
         "cargo fuzz run wire_syscall --target x86_64-unknown-linux-gnu",
+        "cargo fuzz run wire_transport --target x86_64-unknown-linux-gnu",
+        "-max_len=262144",
     ] {
         assert!(
             extended.contains(proof),

@@ -233,7 +233,11 @@ The runner performs only `Hello`, optional `Authenticate`, and
 tests verify fixture parsing, complete per-version operation/schema parity,
 typed error classification, authorization, bounds, redaction, TCP/Unix/TLS
 behavior, ping idle-reset semantics, bounded half-close/EOF shutdown, stream
-ordering/backpressure, and MCP parity. SDK tests exercise the same real server
+ordering/backpressure, and MCP parity. The production incremental frame decoder
+also runs through 512-case ordered-fragment equivalence and shuffled-fragment
+properties with explicit retained/allocation bounds; the protected
+extended-security workflow fuzzes whole envelopes and fragmented/reordered
+transport input independently. SDK tests exercise the same real server
 boundary, preserve typed errors and enforcement introspection, and prove
 second-connection request cancellation plus typed liveness and close APIs.
 Adapter tests prove incremental Azure SSE deltas and bounded output.

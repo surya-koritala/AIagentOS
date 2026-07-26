@@ -97,6 +97,18 @@ AGENT_SERVER_UNIX=/tmp/agent.sock cargo run --package agent-cli --bin agent-serv
 AGENT_SERVER_TOKEN=secret cargo run --package agent-cli --bin agent-server
 ```
 
+Drive a protected service through the SDK-backed operator CLI or TUI. Prefer
+the environment variable so a token is not retained in shell history:
+
+```bash
+AGENT_SERVER_TOKEN=secret cargo run --package agent-cli --bin agentctl -- list
+AGENT_SERVER_TOKEN=secret cargo run --package agent-tui -- --addr 127.0.0.1:7777
+```
+
+The packaged desktop starts an ephemeral loopback syscall service protected by
+a random per-process secret. Its Tauri commands use the same typed SDK path;
+they do not call lifecycle or tool methods directly on the kernel.
+
 The server has three explicit caller modes:
 
 - The default loopback listener and a Unix-domain socket are trusted local

@@ -86,3 +86,6 @@ mod capability_registry;
 
 #[cfg(test)]
 mod service_supervisor;
+
+#[cfg(test)]
+mod client_conformance;

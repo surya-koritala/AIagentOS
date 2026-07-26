@@ -5,7 +5,9 @@
 //! create agents and send turns without leaving the terminal. Rust-native
 //! (ratatui + crossterm) — no web stack.
 //!
-//! Usage: `agent-tui [ADDR]` (default `127.0.0.1:7777`). Start a server first
+//! Usage: `agent-tui [--addr ADDR] [--token TOKEN]` (default
+//! `127.0.0.1:7777`). `AGENTOS_ADDR` and `AGENT_SERVER_TOKEN` provide the same
+//! settings without exposing a token in shell history. Start a server first
 //! with `agent-server`.
 //!
 //! Keys: `j`/`k` (or arrows) move · `r` refresh · `c` create (`name|task`) ·
@@ -15,7 +17,6 @@
 use std::io;
 use std::time::Duration;
 
-use agent_sdk::KernelClient;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -23,15 +24,16 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::Frame;
 
-use agent_tui::app::{App, Key, Mode, UiAction};
+use agent_tui::{
+    app::{App, Key, Mode, UiAction},
+    TuiClient,
+};
 
 fn main() -> io::Result<()> {
-    let addr = std::env::args()
-        .nth(1)
-        .unwrap_or_else(|| "127.0.0.1:7777".to_string());
+    let (addr, token) = connection_options();
 
     let rt = tokio::runtime::Runtime::new()?;
-    let mut client = match rt.block_on(KernelClient::connect(addr.clone())) {
+    let mut client = match rt.block_on(TuiClient::connect(&addr, token.as_deref())) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("agent-tui: could not connect to {addr}: {e}");
@@ -51,10 +53,34 @@ fn main() -> io::Result<()> {
     result
 }
 
+fn connection_options() -> (String, Option<String>) {
+    let mut addr = std::env::var("AGENTOS_ADDR").unwrap_or_else(|_| "127.0.0.1:7777".to_string());
+    let mut token = std::env::var("AGENT_SERVER_TOKEN").ok();
+    let mut positional_addr = false;
+    let mut args = std::env::args().skip(1);
+    while let Some(argument) = args.next() {
+        match argument.as_str() {
+            "--addr" => addr = args.next().unwrap_or_else(|| usage()),
+            "--token" => token = Some(args.next().unwrap_or_else(|| usage())),
+            value if !value.starts_with('-') && !positional_addr => {
+                addr = value.to_string();
+                positional_addr = true;
+            }
+            _ => usage(),
+        }
+    }
+    (addr, token)
+}
+
+fn usage() -> ! {
+    eprintln!("usage: agent-tui [--addr HOST:PORT] [--token TOKEN] [HOST:PORT]");
+    std::process::exit(2);
+}
+
 fn run(
     terminal: &mut ratatui::DefaultTerminal,
     app: &mut App,
-    client: &mut KernelClient,
+    client: &mut TuiClient,
     rt: &tokio::runtime::Runtime,
 ) -> io::Result<()> {
     loop {
@@ -79,12 +105,7 @@ fn run(
 }
 
 /// Run an action's async I/O against the kernel, folding results into status.
-fn perform(
-    action: UiAction,
-    app: &mut App,
-    client: &mut KernelClient,
-    rt: &tokio::runtime::Runtime,
-) {
+fn perform(action: UiAction, app: &mut App, client: &mut TuiClient, rt: &tokio::runtime::Runtime) {
     match action {
         UiAction::Quit => app.should_quit = true,
         UiAction::Refresh => match rt.block_on(app.refresh(client)) {

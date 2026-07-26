@@ -1,0 +1,203 @@
+//! Backend client for the AI Agent OS desktop application.
+//!
+//! The desktop UI is a client of the public syscall service. Even though the
+//! packaged application hosts its kernel in the same process, it reaches that
+//! kernel through an authenticated loopback server so lifecycle and tool calls
+//! cannot bypass the canonical authorization path.
+
+use std::sync::Arc;
+
+use agent_sdk::{AgentEnforcementInfo, KernelClient, MessageResult, OperatorSnapshot, SdkError};
+use kernel::{syscall_server::SyscallServer, AgentKernelImpl};
+use serde::Serialize;
+use tokio::sync::Mutex;
+
+#[cfg(feature = "desktop-shell")]
+pub mod commands;
+
+/// Serializable agent row consumed by the Svelte UI.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DesktopAgent {
+    pub id: String,
+    pub name: String,
+    pub state: String,
+    pub priority: u8,
+}
+
+/// A serialized, single-connection desktop session.
+///
+/// Tauri commands may run concurrently, while one wire connection is ordered
+/// request/reply. The mutex preserves that protocol invariant.
+pub struct DesktopClient {
+    inner: Mutex<KernelClient>,
+}
+
+impl DesktopClient {
+    /// Connect to an existing syscall service and optionally authenticate.
+    pub async fn connect(addr: &str, token: Option<&str>) -> Result<Self, SdkError> {
+        let mut inner = KernelClient::connect(addr).await?;
+        if let Some(token) = token {
+            inner.authenticate(token).await?;
+        }
+        Ok(Self {
+            inner: Mutex::new(inner),
+        })
+    }
+
+    /// Expose an in-process kernel only through an authenticated ephemeral
+    /// loopback service, then connect the desktop client to that service.
+    pub async fn connect_embedded(kernel: Arc<AgentKernelImpl>) -> Result<Self, String> {
+        let token = format!("desktop-{}", uuid::Uuid::new_v4());
+        let server = SyscallServer::bind(kernel, "127.0.0.1:0")
+            .await
+            .map_err(|error| format!("failed to bind desktop kernel service: {error}"))?
+            .with_auth_token(token.clone());
+        let addr = server
+            .local_addr()
+            .map_err(|error| format!("failed to read desktop service address: {error}"))?;
+        tokio::spawn(async move {
+            if let Err(error) = server.serve().await {
+                tracing::error!("desktop kernel service stopped: {error}");
+            }
+        });
+        Self::connect(&addr.to_string(), Some(&token))
+            .await
+            .map_err(|error| format!("failed to connect desktop kernel client: {error}"))
+    }
+
+    pub async fn ping(&self) -> Result<(), SdkError> {
+        self.inner.lock().await.ping().await
+    }
+
+    pub async fn authenticate(&self, token: impl Into<String>) -> Result<(), SdkError> {
+        self.inner.lock().await.authenticate(token).await
+    }
+
+    pub async fn create_agent(
+        &self,
+        name: impl Into<String>,
+        task: impl Into<String>,
+        provider: Option<String>,
+    ) -> Result<String, SdkError> {
+        self.inner
+            .lock()
+            .await
+            .create_agent(
+                name,
+                task,
+                Some(provider.unwrap_or_else(|| "openai".to_string())),
+                None,
+                None,
+            )
+            .await
+    }
+
+    pub async fn send_message(
+        &self,
+        agent_id: impl Into<String>,
+        message: impl Into<String>,
+    ) -> Result<MessageResult, SdkError> {
+        self.inner
+            .lock()
+            .await
+            .send_message(agent_id, message)
+            .await
+    }
+
+    pub async fn pause_agent(&self, agent_id: impl Into<String>) -> Result<(), SdkError> {
+        self.inner
+            .lock()
+            .await
+            .pause_agent(agent_id)
+            .await
+            .map(|_| ())
+    }
+
+    pub async fn resume_agent(&self, agent_id: impl Into<String>) -> Result<(), SdkError> {
+        self.inner
+            .lock()
+            .await
+            .resume_agent(agent_id)
+            .await
+            .map(|_| ())
+    }
+
+    pub async fn stop_agent(&self, agent_id: impl Into<String>) -> Result<(), SdkError> {
+        self.inner
+            .lock()
+            .await
+            .stop_agent(agent_id)
+            .await
+            .map(|_| ())
+    }
+
+    pub async fn operator_snapshot(&self) -> Result<OperatorSnapshot, SdkError> {
+        self.inner.lock().await.operator_snapshot().await
+    }
+
+    pub async fn list_agents(&self) -> Result<Vec<DesktopAgent>, SdkError> {
+        Ok(self
+            .operator_snapshot()
+            .await?
+            .agents
+            .into_iter()
+            .map(|agent| DesktopAgent {
+                id: agent.id,
+                name: agent.name,
+                state: agent.state,
+                priority: agent.priority,
+            })
+            .collect())
+    }
+
+    pub async fn agent_info(
+        &self,
+        agent_id: impl Into<String>,
+    ) -> Result<AgentEnforcementInfo, SdkError> {
+        self.inner.lock().await.agent_info(agent_id).await
+    }
+
+    pub async fn call_tool(
+        &self,
+        agent_id: impl Into<String>,
+        tool: impl Into<String>,
+        args: serde_json::Value,
+    ) -> Result<serde_json::Value, SdkError> {
+        self.inner
+            .lock()
+            .await
+            .call_tool(agent_id, tool, args)
+            .await
+    }
+}
+
+/// State managed by Tauri for every backend command.
+pub struct AppState {
+    pub client: DesktopClient,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn embedded_desktop_reaches_the_kernel_only_through_its_wire_client() {
+        let kernel = Arc::new(AgentKernelImpl::new().expect("kernel"));
+        let client = DesktopClient::connect_embedded(kernel)
+            .await
+            .expect("embedded desktop");
+
+        client.ping().await.expect("authenticated ping");
+        assert!(client.list_agents().await.expect("initial list").is_empty());
+        let id = client
+            .create_agent("desktop-test", "wire boundary", Some("stub".to_string()))
+            .await
+            .expect("create over wire");
+        assert!(client
+            .list_agents()
+            .await
+            .expect("updated list")
+            .iter()
+            .any(|agent| agent.id == id));
+    }
+}

@@ -1,12 +1,7 @@
 //! Tauri command handlers for the AI Agent OS desktop app.
 
 use crate::AppState;
-use kernel::{
-    agent::AgentKernel,
-    config::Config,
-    observability::{MetricScope, ObservabilityEngine},
-    AgentConfig, Priority,
-};
+use kernel::config::Config;
 use tauri::State;
 
 #[tauri::command]
@@ -16,20 +11,11 @@ pub async fn create_agent(
     task: String,
     provider: Option<String>,
 ) -> Result<String, String> {
-    let config = AgentConfig {
-        name,
-        task,
-        llm_provider: provider.unwrap_or_else(|| "openai".to_string()),
-        permission_profile: "standard".to_string(),
-        priority: Priority::default(),
-        sandbox_config: None,
-    };
-    let handle = state
-        .kernel
-        .create_agent_full(config)
+    state
+        .client
+        .create_agent(name, task, provider)
         .await
-        .map_err(|e| e.to_string())?;
-    Ok(handle.id.to_string())
+        .map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -38,78 +24,68 @@ pub async fn send_message(
     agent_id: String,
     message: String,
 ) -> Result<serde_json::Value, String> {
-    let id = uuid::Uuid::parse_str(&agent_id).map_err(|e| e.to_string())?;
     let output = state
-        .kernel
-        .send_message(id, &message)
+        .client
+        .send_message(agent_id, message)
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|error| error.to_string())?;
     Ok(serde_json::json!({
         "content": output.content,
-        "tool_calls_made": output.tool_calls_made,
-        "tokens_used": output.tokens_used,
+        "tool_calls_made": output.tool_calls,
+        "tokens_used": output.tokens,
     }))
 }
 
 #[tauri::command]
 pub async fn pause_agent(state: State<'_, AppState>, agent_id: String) -> Result<(), String> {
-    let id = uuid::Uuid::parse_str(&agent_id).map_err(|e| e.to_string())?;
     state
-        .kernel
-        .pause_agent(id)
+        .client
+        .pause_agent(agent_id)
         .await
-        .map(|_| ())
-        .map_err(|e| e.to_string())
+        .map_err(|error| error.to_string())
 }
 
 #[tauri::command]
 pub async fn resume_agent(state: State<'_, AppState>, agent_id: String) -> Result<(), String> {
-    let id = uuid::Uuid::parse_str(&agent_id).map_err(|e| e.to_string())?;
     state
-        .kernel
-        .resume_agent(id)
+        .client
+        .resume_agent(agent_id)
         .await
-        .map(|_| ())
-        .map_err(|e| e.to_string())
+        .map_err(|error| error.to_string())
 }
 
 #[tauri::command]
 pub async fn stop_agent(state: State<'_, AppState>, agent_id: String) -> Result<(), String> {
-    let id = uuid::Uuid::parse_str(&agent_id).map_err(|e| e.to_string())?;
     state
-        .kernel
-        .stop_agent(id)
+        .client
+        .stop_agent(agent_id)
         .await
-        .map(|_| ())
-        .map_err(|e| e.to_string())
+        .map_err(|error| error.to_string())
 }
 
 #[tauri::command]
-pub fn list_agents(state: State<'_, AppState>) -> Vec<serde_json::Value> {
-    state
-        .kernel
-        .agent_manager
-        .list_agents(None)
-        .iter()
-        .map(|info| {
-            serde_json::json!({
-                "id": info.id.to_string(),
-                "name": info.name,
-                "state": format!("{:?}", info.state),
-                "priority": info.priority.value(),
-            })
-        })
-        .collect()
+pub async fn list_agents(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
+    let agents = state
+        .client
+        .list_agents()
+        .await
+        .map_err(|error| error.to_string())?;
+    serde_json::to_value(agents).map_err(|error| error.to_string())
 }
 
 #[tauri::command]
-pub fn get_metrics(state: State<'_, AppState>) -> serde_json::Value {
-    let m = state.kernel.observability.get_metrics(MetricScope::System);
-    serde_json::json!({
-        "tokens_consumed": m.tokens_consumed,
-        "api_calls_made": m.api_calls_made,
-        "time_elapsed_ms": m.time_elapsed_ms,
-    })
+pub async fn get_metrics(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
+    let snapshot = state
+        .client
+        .operator_snapshot()
+        .await
+        .map_err(|error| error.to_string())?;
+    let metrics = snapshot.system_metrics.unwrap_or_default();
+    Ok(serde_json::json!({
+        "tokens_consumed": metrics.tokens_consumed,
+        "api_calls_made": metrics.api_calls_made,
+        "time_elapsed_ms": metrics.uptime_seconds.saturating_mul(1_000),
+    }))
 }
 
 #[tauri::command]

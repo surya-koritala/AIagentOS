@@ -25,6 +25,9 @@ uuid = { workspace = true }
 semver = { workspace = true }
 
 [dev-dependencies]
+agent-cli = { path = "../crates/cli", version = "=0.3.0" }
+agent-tui = { path = "../crates/tui", version = "=0.3.0" }
+tauri-app = { path = "../crates/tauri-app", version = "=0.3.0", default-features = false }
 proptest = { workspace = true }
 wiremock = { workspace = true }
 futures = "0.3"

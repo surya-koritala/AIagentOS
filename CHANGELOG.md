@@ -30,6 +30,12 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
   deterministic fragmentation/shuffle properties plus a scheduled transport
   fuzz target that asserts retained and allocated frame memory never exceeds
   the selected limit.
+- Added one shared authorization/behavior conformance suite for the Rust SDK,
+  `agentctl`, TUI, desktop, raw JSON, and MCP clients. The TUI now supports
+  protected servers, the desktop uses a random-secret authenticated loopback
+  wire service instead of direct kernel calls, MCP distinguishes invalid
+  credentials from missing authentication, and v2 preserves a stable
+  `authorization_denied` code without exposing foreign-resource existence.
 
 ### Added
 

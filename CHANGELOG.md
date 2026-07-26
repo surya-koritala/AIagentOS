@@ -10,6 +10,12 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
 
 ## [Unreleased]
 
+- Fixed file-backed kernel lease release across a concurrent Unix
+  `fork`/`exec` window. Storage leases now share one process-local owner that
+  explicitly unlocks when its final owner exits, so a briefly inherited file
+  descriptor cannot keep an offline database fenced after shutdown. A
+  deterministic inherited-descriptor regression and repeated parallel storage
+  CLI coverage protect restart, restore, rekey, and portable-import paths.
 - Added a strict schema-v1 capacity qualification harness under #125. Eight
   release-mode workload profiles exercise public idle health, concurrent agent
   admission, long prompts, tool-heavy calls, deterministic provider delay,

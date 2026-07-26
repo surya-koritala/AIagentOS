@@ -855,7 +855,7 @@ pub struct SqliteContextManager {
     pub(crate) conn: Mutex<Connection>,
     /// Process-lifetime exclusive lease for the database path. Offline restore
     /// acquires the same lease and therefore cannot race a running kernel.
-    _storage_lease: Option<std::fs::File>,
+    _storage_lease: Option<crate::storage::StorageLease>,
     /// Operator-custodied whole-database key. The key identifier is public;
     /// bytes remain zeroized secret memory and are needed for encrypted online
     /// backups.

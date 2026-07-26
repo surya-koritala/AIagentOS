@@ -58,6 +58,7 @@ pub mod resources;
 pub mod runtime;
 pub mod sandbox;
 pub mod scheduler;
+mod schema;
 pub mod shell;
 pub mod syscall_gate;
 pub mod syscall_interface;
@@ -362,6 +363,12 @@ pub enum ContextError {
 
     #[error("Storage error: {0}")]
     StorageError(String),
+
+    #[error(
+        "Database schema version {found} is newer than this binary supports ({supported}); \
+         refusing to modify it"
+    )]
+    DatabaseTooNew { found: i64, supported: i64 },
 }
 
 /// Errors related to resource access.

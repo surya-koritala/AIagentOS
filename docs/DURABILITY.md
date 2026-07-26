@@ -492,6 +492,54 @@ the manifest; key material is intentionally absent from the backup. Recovery
 remains deliberately offline and operator-initiated. Remote object storage and
 measured recovery objectives remain future work.
 
+## Corrupt database recovery
+
+Normal restore intentionally refuses an existing database that cannot pass
+schema verification and a WAL checkpoint. Do not delete that database to force
+restore. Stop every process using the configured data directory, retain an
+independent copy of the complete directory, and use the explicit corruption
+workflow:
+
+```bash
+agentctl backup-corruption-recover \
+  /var/lib/agentos/backups/nightly_2026_07_25 \
+  /etc/agentos/config.toml \
+  /srv/recovery/agentos-trust/release-2026.1.json \
+  5df0185b-03c3-4f1d-8026-2d99d4d82f22 \
+  --confirm-offline
+```
+
+The expected installation UUID is a mandatory independent recovery input. It
+must come from operator inventory or previously retained trusted evidence, not
+from the backup being considered. Recovery refuses a signed backup for any
+other installation, a wrong signature trust root, a wrong SQLCipher key, a
+healthy destination, a symlink/non-file database or sidecar, or a destination
+still owned by a running kernel.
+
+Preflight checks inspect an isolated copy because SQLite may update `-shm` even
+when a connection is read-only. Once the signed backup, key, UUID, paths, and
+lease pass, recovery writes an owner-only, secret-free journal beside
+`agent_os.db`, then moves the original database and its exact WAL/SHM files
+into a unique owner-only quarantine. It copies and re-verifies the backup,
+publishes it atomically, boots the complete configured kernel, and verifies
+that every persisted agent returns to the live enforcement registry.
+
+An interrupted command can be rerun with the exact same backup, configuration,
+trust root, and UUID. The journal binds those inputs and resumes from the
+observed files without deleting ambiguous state. An ordinary qualification or
+publication error automatically restores the corrupt original and its
+sidecars; the failed replacement remains in quarantine for diagnosis. If
+automatic rollback itself fails, the journal is retained and the error reports
+its location. Do not move, edit, or delete journal-owned files before
+investigation.
+
+On success, the JSON report includes `quarantine_dir`. Quarantine can contain
+all tenant and system data. SQLCipher source files remain encrypted, while a
+plaintext installation remains plaintext. Restrict custody, copy it to
+approved forensic storage if required, and securely remove it only after an
+independent operator accepts the recovered installation. Filesystem
+secure-deletion guarantees depend on the underlying storage medium.
+
 ## Data ownership and erasure contract
 
 `data_inventory::SQLITE_DATA_INVENTORY` is the authoritative full policy

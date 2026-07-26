@@ -891,14 +891,102 @@ fn portable_storage_cli_exports_verifies_and_rekeys_a_complete_installation() {
         import_report.installation_id,
         export_report.manifest.installation_id
     );
-    assert!(kernel::context::SqliteContextManager::new_encrypted(
+    let source_key_attempt = kernel::context::SqliteContextManager::new_encrypted(
         &imported,
-        kernel::storage_encryption::load_storage_encryption_key(&source_key_file).unwrap()
-    )
-    .is_err());
+        kernel::storage_encryption::load_storage_encryption_key(&source_key_file).unwrap(),
+    );
+    assert!(source_key_attempt.is_err());
+    // The failed open temporarily owns the same offline storage lease. Drop the
+    // complete Result before immediately proving that the destination key can
+    // boot the import; assert!() temporary lifetimes differ across targets.
+    drop(source_key_attempt);
     kernel::context::SqliteContextManager::new_encrypted(
         &imported,
         kernel::storage_encryption::load_storage_encryption_key(&destination_key_file).unwrap(),
     )
     .expect("portable import boots with destination key");
+}
+
+#[test]
+fn corruption_recovery_cli_requires_confirmation_and_returns_forensic_evidence() {
+    let root = TestRoot::new();
+    let private_key = root.0.join("backup-signing-key.json");
+    let public_trust = root.0.join("backup-public-trust.json");
+    let key_generation = Command::new(env!("CARGO_BIN_EXE_agentctl"))
+        .arg("backup-key-generate")
+        .arg("cli-corrupt-recovery")
+        .arg(&private_key)
+        .arg(&public_trust)
+        .output()
+        .expect("generate backup signing key");
+    assert!(
+        key_generation.status.success(),
+        "backup key generation failed: {}",
+        String::from_utf8_lossy(&key_generation.stderr)
+    );
+    let signer =
+        kernel::storage::load_backup_signing_key(&private_key, "cli-corrupt-recovery").unwrap();
+    let source = root.0.join("source.db");
+    let manager = kernel::context::SqliteContextManager::new(&source).unwrap();
+    let backup_root = root.0.join("backups");
+    let manifest = manager
+        .create_signed_backup(&backup_root, "qualified", &signer)
+        .unwrap();
+    drop(manager);
+
+    let data_dir = root.0.join("data");
+    std::fs::create_dir(&data_dir).unwrap();
+    let destination = data_dir.join("agent_os.db");
+    std::fs::write(&destination, b"corrupt CLI database evidence").unwrap();
+    let config_file = root.0.join("recovery-config.toml");
+    let escaped_data_dir = data_dir.to_string_lossy().replace('\\', "\\\\");
+    std::fs::write(
+        &config_file,
+        format!(
+            "llm_provider = \"local\"\n\
+             default_model = \"qualification\"\n\
+             data_dir = \"{escaped_data_dir}\"\n\
+             [api_keys]\n"
+        ),
+    )
+    .unwrap();
+
+    let unconfirmed = Command::new(env!("CARGO_BIN_EXE_agentctl"))
+        .arg("backup-corruption-recover")
+        .arg(backup_root.join("qualified"))
+        .arg(&config_file)
+        .arg(&public_trust)
+        .arg(&manifest.installation_id)
+        .output()
+        .expect("run unconfirmed corruption recovery");
+    assert_eq!(unconfirmed.status.code(), Some(2));
+    assert_eq!(
+        std::fs::read(&destination).unwrap(),
+        b"corrupt CLI database evidence"
+    );
+
+    let recovery = Command::new(env!("CARGO_BIN_EXE_agentctl"))
+        .arg("backup-corruption-recover")
+        .arg(backup_root.join("qualified"))
+        .arg(&config_file)
+        .arg(&public_trust)
+        .arg(&manifest.installation_id)
+        .arg("--confirm-offline")
+        .output()
+        .expect("run confirmed corruption recovery");
+    assert!(
+        recovery.status.success(),
+        "corruption recovery failed: {}",
+        String::from_utf8_lossy(&recovery.stderr)
+    );
+    let report: kernel::storage::CorruptStorageRecoveryReport =
+        serde_json::from_slice(&recovery.stdout).expect("corruption recovery report JSON");
+    assert!(report.enforcement_rearmed);
+    assert_eq!(report.manifest, manifest);
+    assert_eq!(
+        std::fs::read(report.quarantine_dir.join("corrupt-database.sqlite3")).unwrap(),
+        b"corrupt CLI database evidence"
+    );
+    let _recovered =
+        kernel::context::SqliteContextManager::new(&destination).expect("open recovered database");
 }

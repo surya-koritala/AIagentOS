@@ -7,7 +7,7 @@ use agent_cli::OperatorClient;
 fn usage() -> ! {
     eprintln!(
         "usage: agentctl [--addr HOST:PORT] [--token TOKEN] \
-         <list|inspect|pressure|tunables|tunable-set|tunable-rollback|tunable-history|status|pause|resume|stop|kill|wait|services|service-start|service-stop|service-restart|service-reload|service-history|backup-create|backup-retention|backup-status|data-inventory|backup-key-generate|backup-verify|backup-restore|backup-disaster-recover|storage-key-generate|storage-encrypt|storage-encrypt-recover|storage-key-rotate|storage-portable-export|storage-portable-verify|storage-portable-import|erase-agent|erase-user|erase-tenant> [ARGS...]\n\
+         <list|inspect|pressure|tunables|tunable-set|tunable-rollback|tunable-history|status|pause|resume|stop|kill|wait|services|service-start|service-stop|service-restart|service-reload|service-history|backup-create|backup-retention|backup-status|data-inventory|backup-key-generate|backup-verify|backup-restore|backup-disaster-recover|backup-corruption-recover|storage-key-generate|storage-encrypt|storage-encrypt-recover|storage-key-rotate|storage-portable-export|storage-portable-verify|storage-portable-import|erase-agent|erase-user|erase-tenant> [ARGS...]\n\
          \n\
          storage commands:\n\
            agentctl [SERVER OPTIONS] backup-create BACKUP_ROOT NAME\n\
@@ -18,6 +18,7 @@ fn usage() -> ! {
            agentctl backup-verify BACKUP_DIR [--storage-key KEY_FILE] [--require-signature PUBLIC_TRUST_FILE]\n\
            agentctl backup-restore BACKUP_DIR DATABASE [--storage-key KEY_FILE] [--require-signature PUBLIC_TRUST_FILE] --confirm-offline\n\
            agentctl backup-disaster-recover BACKUP_DIR CONFIG_FILE PUBLIC_TRUST_FILE --confirm-offline\n\
+           agentctl backup-corruption-recover BACKUP_DIR CONFIG_FILE PUBLIC_TRUST_FILE EXPECTED_INSTALLATION_ID --confirm-offline\n\
            agentctl storage-key-generate KEY_ID KEY_FILE\n\
            agentctl storage-encrypt DATABASE KEY_FILE --confirm-offline\n\
            agentctl storage-encrypt-recover DATABASE KEY_FILE --confirm-offline\n\
@@ -229,6 +230,42 @@ async fn main() {
             )
             .unwrap_or_else(|error| fail_storage(error));
             print_json(&report, "disaster recovery report");
+            return;
+        }
+        "backup-corruption-recover" => {
+            let backup_dir = args.next().unwrap_or_else(|| usage());
+            let config_file = args.next().unwrap_or_else(|| usage());
+            let public_trust = args.next().unwrap_or_else(|| usage());
+            let expected_installation_id = args.next().unwrap_or_else(|| usage());
+            if args.next().as_deref() != Some("--confirm-offline") || args.next().is_some() {
+                usage();
+            }
+            let config_path = std::path::Path::new(&config_file);
+            let metadata = std::fs::symlink_metadata(config_path).unwrap_or_else(|error| {
+                fail_operator(format!(
+                    "failed to inspect recovery configuration {config_file}: {error}"
+                ))
+            });
+            if !metadata.is_file() {
+                fail_operator(format!(
+                    "recovery configuration {config_file} must be an existing file"
+                ));
+            }
+            let config =
+                kernel::config::Config::try_load_from(config_path).unwrap_or_else(|error| {
+                    fail_operator(format!("failed to load recovery configuration: {error}"))
+                });
+            let trust =
+                kernel::storage::load_backup_trust_root(std::path::Path::new(&public_trust))
+                    .unwrap_or_else(|error| fail_storage(error));
+            let report = kernel::storage::recover_corrupt_storage_from_config(
+                std::path::Path::new(&backup_dir),
+                &config,
+                &trust,
+                &expected_installation_id,
+            )
+            .unwrap_or_else(|error| fail_storage(error));
+            print_json(&report, "corrupt storage recovery report");
             return;
         }
         "storage-portable-export" => {

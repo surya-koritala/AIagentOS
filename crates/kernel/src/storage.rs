@@ -44,6 +44,9 @@ const PORTABLE_STORAGE_DATABASE_FILE: &str = "storage.sqlite3";
 const PORTABLE_STORAGE_MANIFEST_FILE: &str = "portable-storage.json";
 const PORTABLE_STORAGE_PAYLOAD_FORMAT: &str = "sqlite3-plaintext";
 const PORTABLE_STORAGE_CONFIDENTIALITY: &str = "plaintext-owner-only";
+const CORRUPT_RECOVERY_FORMAT_VERSION: u32 = 1;
+const CORRUPT_RECOVERY_JOURNAL_SUFFIX: &str = ".corrupt-recovery.json";
+const MAX_CORRUPT_RECOVERY_JOURNAL_BYTES: u64 = 64 * 1024;
 
 /// Whole-database encryption identity required to authenticate a backup.
 ///
@@ -281,6 +284,44 @@ pub struct DisasterRecoveryReport {
     pub restore: RestoreReport,
     pub persisted_agent_count: usize,
     pub enforcement_rearmed: bool,
+}
+
+/// Evidence returned after a corrupt database was preserved and a trusted
+/// backup passed complete configured-kernel qualification.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CorruptStorageRecoveryReport {
+    pub manifest: BackupManifest,
+    pub database_path: PathBuf,
+    /// Owner-only directory retaining the corrupt database and SQLite
+    /// sidecars. Operators must treat it as sensitive and remove it only after
+    /// the recovered installation has been independently accepted.
+    pub quarantine_dir: PathBuf,
+    pub original_wal_preserved: bool,
+    pub original_shm_preserved: bool,
+    pub resumed_interrupted_recovery: bool,
+    /// Whether deletion of the completed journal was confirmed durable in the
+    /// destination directory. A journal that reappears after a crash remains
+    /// safe to resume because it binds the exact recovery inputs.
+    pub journal_cleanup_durable: bool,
+    pub persisted_agent_count: usize,
+    pub enforcement_rearmed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CorruptRecoveryJournal {
+    format_version: u32,
+    database_file: String,
+    stage_file: String,
+    quarantine_dir: String,
+    quarantined_database_file: String,
+    quarantined_wal_file: String,
+    quarantined_shm_file: String,
+    installation_id: String,
+    backup_sha256: String,
+    backup_byte_count: u64,
+    original_wal: bool,
+    original_shm: bool,
 }
 
 /// Bounded policy for expiring verified backups from one installation.
@@ -2499,31 +2540,624 @@ pub fn recover_backup_from_config(
         &destination_database,
         Some(trust),
         storage_key.as_ref(),
-        |_, storage_lease| {
-            let kernel =
-                crate::AgentKernelImpl::from_config_with_storage_lease(config, storage_lease)
-                    .map_err(|error| {
-                        storage_error(format!(
-                            "restored database failed configured kernel qualification: {error}"
-                        ))
-                    })?;
-            let persisted = kernel.context_manager.load_all_agents()?;
-            for agent in &persisted {
-                kernel.get_agent_status(agent.id).map_err(|error| {
-                    storage_error(format!(
-                        "restored agent {} was not re-admitted to enforcement: {error}",
-                        agent.id
-                    ))
-                })?;
-            }
-            Ok((persisted.len(), kernel))
-        },
+        |_, storage_lease| qualify_recovered_database(config, storage_lease),
     )?;
     Ok(DisasterRecoveryReport {
         restore,
         persisted_agent_count,
         enforcement_rearmed: true,
     })
+}
+
+fn qualify_recovered_database(
+    config: &crate::config::Config,
+    storage_lease: File,
+) -> Result<(usize, crate::AgentKernelImpl), ContextError> {
+    let kernel = crate::AgentKernelImpl::from_config_with_storage_lease(config, storage_lease)
+        .map_err(|error| {
+            storage_error(format!(
+                "restored database failed configured kernel qualification: {error}"
+            ))
+        })?;
+    let persisted = kernel.context_manager.load_all_agents()?;
+    for agent in &persisted {
+        kernel.get_agent_status(agent.id).map_err(|error| {
+            storage_error(format!(
+                "restored agent {} was not re-admitted to enforcement: {error}",
+                agent.id
+            ))
+        })?;
+    }
+    Ok((persisted.len(), kernel))
+}
+
+/// Replace an unreadable configured database with a signed backup while
+/// preserving every original SQLite file for forensic custody.
+///
+/// This deliberately does not weaken [`restore_backup`]. The destination must
+/// exist, must fail complete AIagentOS database verification, and must be
+/// offline. The caller supplies the expected installation UUID independently
+/// so a signed backup from another installation cannot be substituted merely
+/// because corruption made the local identity unreadable.
+///
+/// A durable journal makes interruption resumable. On an ordinary error after
+/// quarantine begins, the corrupt database is restored automatically and the
+/// failed candidate is retained in the quarantine directory.
+pub fn recover_corrupt_storage_from_config(
+    backup_dir: &Path,
+    config: &crate::config::Config,
+    trust: &BackupTrustRoot,
+    expected_installation_id: &str,
+) -> Result<CorruptStorageRecoveryReport, ContextError> {
+    if !config.data_dir.is_absolute() {
+        return Err(storage_error(
+            "corrupt storage recovery requires an absolute configured data_dir",
+        ));
+    }
+    uuid::Uuid::parse_str(expected_installation_id)
+        .map_err(|_| storage_error("expected installation id must be a UUID"))?;
+    let destination = config.data_dir.join(BACKUP_DATABASE_FILE);
+    let parent = destination
+        .parent()
+        .ok_or_else(|| storage_error("recovery destination must have a parent directory"))?;
+    require_real_directory(parent, "corrupt recovery destination parent")?;
+    let storage_key = config
+        .storage_encryption
+        .key_path
+        .as_deref()
+        .map(crate::storage_encryption::load_storage_encryption_key)
+        .transpose()?;
+    let manifest = verify_backup_internal(backup_dir, Some(trust), storage_key.as_ref())?;
+    if manifest.installation_id != expected_installation_id {
+        return Err(storage_error(format!(
+            "trusted backup installation id {} does not match expected installation id",
+            manifest.installation_id
+        )));
+    }
+
+    let storage_lease = acquire_storage_lease(&destination)?;
+    let journal_path = companion_path(&destination, CORRUPT_RECOVERY_JOURNAL_SUFFIX);
+    let (journal, resumed) = match optional_regular_file_exists(
+        &journal_path,
+        "corrupt recovery journal",
+    )? {
+        true => (
+            load_corrupt_recovery_journal(
+                &journal_path,
+                &destination,
+                &manifest,
+                expected_installation_id,
+            )?,
+            true,
+        ),
+        false => {
+            require_regular_file(&destination, "corrupt recovery destination database")?;
+            if destination_verifies_without_mutation(&destination, storage_key.as_ref())? {
+                return Err(storage_error(
+                    "corrupt recovery refuses a healthy verified destination; use normal offline restore",
+                ));
+            }
+            let original_wal = optional_regular_file_exists(
+                &companion_path(&destination, "-wal"),
+                "corrupt destination WAL",
+            )?;
+            let original_shm = optional_regular_file_exists(
+                &companion_path(&destination, "-shm"),
+                "corrupt destination SHM",
+            )?;
+            let operation_id = uuid::Uuid::new_v4();
+            let database_file = recovery_filename(&destination, "database")?;
+            let stage_file = format!(".{database_file}.corrupt-recovery-{operation_id}.staging");
+            let quarantine_dir =
+                format!(".{database_file}.corrupt-recovery-{operation_id}.quarantine");
+            let quarantine_path = parent.join(&quarantine_dir);
+            reject_existing_path(&quarantine_path, "corrupt recovery quarantine")?;
+            fs::create_dir(&quarantine_path).map_err(|error| {
+                storage_error(format!(
+                    "failed to create corrupt recovery quarantine {}: {error}",
+                    quarantine_path.display()
+                ))
+            })?;
+            let journal = CorruptRecoveryJournal {
+                format_version: CORRUPT_RECOVERY_FORMAT_VERSION,
+                database_file,
+                stage_file,
+                quarantine_dir,
+                quarantined_database_file: "corrupt-database.sqlite3".to_owned(),
+                quarantined_wal_file: "corrupt-database.sqlite3-wal".to_owned(),
+                quarantined_shm_file: "corrupt-database.sqlite3-shm".to_owned(),
+                installation_id: manifest.installation_id.clone(),
+                backup_sha256: manifest.sha256.clone(),
+                backup_byte_count: manifest.byte_count,
+                original_wal,
+                original_shm,
+            };
+            if let Err(error) = (|| {
+                set_owner_only_directory(&quarantine_path)?;
+                sync_directory(parent)?;
+                write_corrupt_recovery_journal(&journal_path, &journal)
+            })() {
+                let _ = fs::remove_dir(&quarantine_path);
+                return Err(error);
+            }
+            (journal, false)
+        }
+    };
+
+    let quarantine = parent.join(&journal.quarantine_dir);
+    require_real_directory(&quarantine, "corrupt recovery quarantine")?;
+    verify_owner_only_directory(&quarantine)?;
+    let stage = parent.join(&journal.stage_file);
+    let quarantined_database = quarantine.join(&journal.quarantined_database_file);
+    let source_wal = companion_path(&destination, "-wal");
+    let source_shm = companion_path(&destination, "-shm");
+    let quarantined_wal = quarantine.join(&journal.quarantined_wal_file);
+    let quarantined_shm = quarantine.join(&journal.quarantined_shm_file);
+    let mut mutation_started = quarantined_database.exists();
+
+    let recovery = (|| {
+        let destination_exists =
+            optional_regular_file_exists(&destination, "corrupt recovery destination database")?;
+        let quarantined_exists =
+            optional_regular_file_exists(&quarantined_database, "quarantined database")?;
+        if destination_exists && quarantined_exists {
+            preserve_interrupted_candidate_sidecar(
+                &source_wal,
+                &quarantine.join("interrupted-candidate.sqlite3-wal"),
+                "WAL",
+            )?;
+            preserve_interrupted_candidate_sidecar(
+                &source_shm,
+                &quarantine.join("interrupted-candidate.sqlite3-shm"),
+                "SHM",
+            )?;
+            verify_recovery_candidate(&destination, &manifest, storage_key.as_ref())?;
+            validate_quarantined_original_sidecar(&quarantined_wal, journal.original_wal, "WAL")?;
+            validate_quarantined_original_sidecar(&quarantined_shm, journal.original_shm, "SHM")?;
+        } else if destination_exists {
+            fs::rename(&destination, &quarantined_database).map_err(|error| {
+                storage_error(format!(
+                    "failed to quarantine corrupt database {}: {error}",
+                    destination.display()
+                ))
+            })?;
+            mutation_started = true;
+        } else if !quarantined_exists {
+            return Err(storage_error(
+                "corrupt recovery journal exists but neither original nor quarantined database exists",
+            ));
+        }
+
+        if !(destination_exists && quarantined_exists) {
+            reconcile_quarantined_sidecar(
+                &source_wal,
+                &quarantined_wal,
+                journal.original_wal,
+                "WAL",
+            )?;
+            reconcile_quarantined_sidecar(
+                &source_shm,
+                &quarantined_shm,
+                journal.original_shm,
+                "SHM",
+            )?;
+        }
+        sync_directory(&quarantine)?;
+        sync_directory(parent)?;
+
+        if !destination.exists() {
+            if optional_regular_file_exists(&stage, "corrupt recovery staging database")? {
+                verify_recovery_candidate(&stage, &manifest, storage_key.as_ref())?;
+            } else {
+                copy_to_new_file(&backup_dir.join(BACKUP_DATABASE_FILE), &stage)?;
+                verify_recovery_candidate(&stage, &manifest, storage_key.as_ref())?;
+            }
+            fs::rename(&stage, &destination).map_err(|error| {
+                storage_error(format!(
+                    "failed to publish corrupt recovery database {}: {error}",
+                    destination.display()
+                ))
+            })?;
+            sync_directory(parent)?;
+        }
+        verify_recovery_candidate(&destination, &manifest, storage_key.as_ref())?;
+        let qualification_lease = storage_lease.try_clone().map_err(|error| {
+            storage_error(format!(
+                "failed to retain storage lease during corrupt recovery qualification: {error}"
+            ))
+        })?;
+        qualify_recovered_database(config, qualification_lease)
+    })();
+
+    let (persisted_agent_count, qualified_kernel) = match recovery {
+        Ok(qualified) => qualified,
+        Err(error) if mutation_started => {
+            return match rollback_corrupt_recovery(
+                parent,
+                &destination,
+                &stage,
+                &quarantine,
+                &quarantined_database,
+                &quarantined_wal,
+                &quarantined_shm,
+                journal.original_wal,
+                journal.original_shm,
+                &journal_path,
+            ) {
+                Ok(()) => Err(error),
+                Err(rollback_error) => Err(storage_error(format!(
+                    "corrupt storage recovery failed ({error}); automatic rollback also failed: \
+                     {rollback_error}; inspect recovery state and journal path {}",
+                    journal_path.display()
+                ))),
+            };
+        }
+        Err(error) => return Err(error),
+    };
+
+    fs::remove_file(&journal_path).map_err(|error| {
+        storage_error(format!(
+            "recovered database qualified but recovery journal {} could not be removed: {error}",
+            journal_path.display()
+        ))
+    })?;
+    let journal_cleanup_durable = sync_directory(parent).is_ok();
+    drop(qualified_kernel);
+    Ok(CorruptStorageRecoveryReport {
+        manifest,
+        database_path: destination,
+        quarantine_dir: quarantine,
+        original_wal_preserved: journal.original_wal,
+        original_shm_preserved: journal.original_shm,
+        resumed_interrupted_recovery: resumed,
+        journal_cleanup_durable,
+        persisted_agent_count,
+        enforcement_rearmed: true,
+    })
+}
+
+fn recovery_filename(path: &Path, label: &str) -> Result<String, ContextError> {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| storage_error(format!("{label} path requires a non-empty UTF-8 filename")))
+}
+
+fn validate_recovery_basename(name: &str, label: &str) -> Result<(), ContextError> {
+    if name.is_empty()
+        || name.len() > 512
+        || Path::new(name).file_name().and_then(|value| value.to_str()) != Some(name)
+    {
+        return Err(storage_error(format!(
+            "corrupt recovery journal {label} filename is invalid"
+        )));
+    }
+    Ok(())
+}
+
+fn write_corrupt_recovery_journal(
+    path: &Path,
+    journal: &CorruptRecoveryJournal,
+) -> Result<(), ContextError> {
+    let mut encoded = serde_json::to_vec_pretty(journal).map_err(|error| {
+        storage_error(format!(
+            "failed to encode corrupt recovery journal: {error}"
+        ))
+    })?;
+    encoded.push(b'\n');
+    if encoded.len() as u64 > MAX_CORRUPT_RECOVERY_JOURNAL_BYTES {
+        return Err(storage_error("corrupt recovery journal exceeds size limit"));
+    }
+    write_new_owner_only_file(path, &encoded, "corrupt recovery journal")
+}
+
+fn load_corrupt_recovery_journal(
+    path: &Path,
+    destination: &Path,
+    manifest: &BackupManifest,
+    expected_installation_id: &str,
+) -> Result<CorruptRecoveryJournal, ContextError> {
+    let encoded = read_bounded_regular_file(
+        path,
+        "corrupt recovery journal",
+        MAX_CORRUPT_RECOVERY_JOURNAL_BYTES,
+        true,
+    )?;
+    let journal: CorruptRecoveryJournal = serde_json::from_slice(&encoded)
+        .map_err(|_| storage_error("corrupt recovery journal is not valid bounded JSON"))?;
+    if journal.format_version != CORRUPT_RECOVERY_FORMAT_VERSION {
+        return Err(storage_error(format!(
+            "unsupported corrupt recovery journal version {}",
+            journal.format_version
+        )));
+    }
+    for (label, name) in [
+        ("database", &journal.database_file),
+        ("stage", &journal.stage_file),
+        ("quarantine", &journal.quarantine_dir),
+        ("quarantined database", &journal.quarantined_database_file),
+        ("quarantined WAL", &journal.quarantined_wal_file),
+        ("quarantined SHM", &journal.quarantined_shm_file),
+    ] {
+        validate_recovery_basename(name, label)?;
+    }
+    if journal.database_file != recovery_filename(destination, "database")?
+        || journal.installation_id != expected_installation_id
+        || journal.installation_id != manifest.installation_id
+        || journal.backup_sha256 != manifest.sha256
+        || journal.backup_byte_count != manifest.byte_count
+    {
+        return Err(storage_error(
+            "corrupt recovery journal does not match the destination or trusted backup",
+        ));
+    }
+    if path != companion_path(destination, CORRUPT_RECOVERY_JOURNAL_SUFFIX) {
+        return Err(storage_error(
+            "corrupt recovery journal path does not match the destination",
+        ));
+    }
+    let operation_prefix = format!(".{}.corrupt-recovery-", journal.database_file);
+    let stage_operation = journal
+        .stage_file
+        .strip_prefix(&operation_prefix)
+        .and_then(|value| value.strip_suffix(".staging"));
+    let quarantine_operation = journal
+        .quarantine_dir
+        .strip_prefix(&operation_prefix)
+        .and_then(|value| value.strip_suffix(".quarantine"));
+    if stage_operation != quarantine_operation
+        || stage_operation
+            .and_then(|value| uuid::Uuid::parse_str(value).ok())
+            .is_none()
+        || journal.quarantined_database_file != "corrupt-database.sqlite3"
+        || journal.quarantined_wal_file != "corrupt-database.sqlite3-wal"
+        || journal.quarantined_shm_file != "corrupt-database.sqlite3-shm"
+    {
+        return Err(storage_error(
+            "corrupt recovery journal contains non-canonical recovery paths",
+        ));
+    }
+    let mut identities = [
+        journal.database_file.as_str(),
+        journal.stage_file.as_str(),
+        journal.quarantine_dir.as_str(),
+        journal.quarantined_database_file.as_str(),
+        journal.quarantined_wal_file.as_str(),
+        journal.quarantined_shm_file.as_str(),
+    ];
+    identities.sort_unstable();
+    if identities.windows(2).any(|pair| pair[0] == pair[1]) {
+        return Err(storage_error(
+            "corrupt recovery journal contains overlapping file identities",
+        ));
+    }
+    Ok(journal)
+}
+
+fn optional_regular_file_exists(path: &Path, label: &str) -> Result<bool, ContextError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+            Err(storage_error(format!(
+                "{label} {} must be a regular non-symlink file",
+                path.display()
+            )))
+        }
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(storage_error(format!(
+            "failed to inspect {label} {}: {error}",
+            path.display()
+        ))),
+    }
+}
+
+fn reconcile_quarantined_sidecar(
+    source: &Path,
+    quarantined: &Path,
+    expected: bool,
+    label: &str,
+) -> Result<(), ContextError> {
+    let source_exists =
+        optional_regular_file_exists(source, &format!("corrupt destination {label}"))?;
+    let quarantined_exists =
+        optional_regular_file_exists(quarantined, &format!("quarantined {label}"))?;
+    match (expected, source_exists, quarantined_exists) {
+        (true, true, false) => fs::rename(source, quarantined).map_err(|error| {
+            storage_error(format!(
+                "failed to quarantine corrupt destination {label}: {error}"
+            ))
+        }),
+        (true, false, true) | (false, false, false) => Ok(()),
+        (true, false, false) => Err(storage_error(format!(
+            "journaled corrupt destination {label} is missing from both active and quarantine paths"
+        ))),
+        (true, true, true) => Err(storage_error(format!(
+            "corrupt destination {label} exists at both active and quarantine paths"
+        ))),
+        (false, true, _) | (false, false, true) => Err(storage_error(format!(
+            "unexpected corrupt destination {label} conflicts with recovery journal"
+        ))),
+    }
+}
+
+fn validate_quarantined_original_sidecar(
+    quarantined: &Path,
+    expected: bool,
+    label: &str,
+) -> Result<(), ContextError> {
+    let exists = optional_regular_file_exists(quarantined, &format!("quarantined {label}"))?;
+    if exists == expected {
+        Ok(())
+    } else {
+        Err(storage_error(format!(
+            "quarantined original {label} does not match the recovery journal"
+        )))
+    }
+}
+
+fn preserve_interrupted_candidate_sidecar(
+    source: &Path,
+    forensic_destination: &Path,
+    label: &str,
+) -> Result<(), ContextError> {
+    if !optional_regular_file_exists(source, &format!("interrupted candidate {label}"))? {
+        return Ok(());
+    }
+    reject_existing_path(
+        forensic_destination,
+        &format!("interrupted candidate {label} forensic file"),
+    )?;
+    fs::rename(source, forensic_destination).map_err(|error| {
+        storage_error(format!(
+            "failed to preserve interrupted recovery candidate {label}: {error}"
+        ))
+    })
+}
+
+fn verify_recovery_candidate(
+    path: &Path,
+    manifest: &BackupManifest,
+    storage_key: Option<&StorageEncryptionKey>,
+) -> Result<(), ContextError> {
+    let (_connection, metadata) = open_verified_database(path, storage_key)?;
+    if metadata.installation_id != manifest.installation_id
+        || fs::metadata(path)
+            .map_err(|error| {
+                storage_error(format!("failed to inspect {}: {error}", path.display()))
+            })?
+            .len()
+            != manifest.byte_count
+        || sha256_file(path)? != manifest.sha256
+    {
+        return Err(storage_error(
+            "corrupt recovery candidate does not match the trusted backup",
+        ));
+    }
+    Ok(())
+}
+
+fn destination_verifies_without_mutation(
+    destination: &Path,
+    storage_key: Option<&StorageEncryptionKey>,
+) -> Result<bool, ContextError> {
+    let parent = destination
+        .parent()
+        .ok_or_else(|| storage_error("recovery destination must have a parent directory"))?;
+    let inspection_dir = parent.join(format!(
+        ".corrupt-recovery-inspection-{}",
+        uuid::Uuid::new_v4()
+    ));
+    reject_existing_path(&inspection_dir, "corrupt recovery inspection directory")?;
+    fs::create_dir(&inspection_dir).map_err(|error| {
+        storage_error(format!(
+            "failed to create corrupt recovery inspection directory {}: {error}",
+            inspection_dir.display()
+        ))
+    })?;
+    set_owner_only_directory(&inspection_dir)?;
+    let inspection_guard = StagingDirectory::new(inspection_dir.clone());
+    let inspection_database = inspection_dir.join(BACKUP_DATABASE_FILE);
+    copy_to_new_file(destination, &inspection_database)?;
+    for suffix in ["-wal", "-shm"] {
+        let source = companion_path(destination, suffix);
+        if optional_regular_file_exists(&source, "corrupt recovery SQLite sidecar")? {
+            copy_to_new_file(&source, &companion_path(&inspection_database, suffix))?;
+        }
+    }
+    let verified = open_verified_database(&inspection_database, storage_key).is_ok();
+    drop(inspection_guard);
+    Ok(verified)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn rollback_corrupt_recovery(
+    parent: &Path,
+    destination: &Path,
+    stage: &Path,
+    quarantine: &Path,
+    quarantined_database: &Path,
+    quarantined_wal: &Path,
+    quarantined_shm: &Path,
+    original_wal: bool,
+    original_shm: bool,
+    journal_path: &Path,
+) -> Result<(), ContextError> {
+    preserve_failed_recovery_file(destination, &quarantine.join("failed-replacement.sqlite3"))?;
+    preserve_failed_recovery_file(
+        &companion_path(destination, "-wal"),
+        &quarantine.join("failed-replacement.sqlite3-wal"),
+    )?;
+    preserve_failed_recovery_file(
+        &companion_path(destination, "-shm"),
+        &quarantine.join("failed-replacement.sqlite3-shm"),
+    )?;
+    preserve_failed_recovery_file(stage, &quarantine.join("failed-staging.sqlite3"))?;
+    fs::rename(quarantined_database, destination).map_err(|error| {
+        storage_error(format!(
+            "failed to restore quarantined database {}: {error}",
+            destination.display()
+        ))
+    })?;
+    if original_wal {
+        fs::rename(quarantined_wal, companion_path(destination, "-wal")).map_err(|error| {
+            storage_error(format!("failed to restore quarantined WAL: {error}"))
+        })?;
+    }
+    if original_shm {
+        fs::rename(quarantined_shm, companion_path(destination, "-shm")).map_err(|error| {
+            storage_error(format!("failed to restore quarantined SHM: {error}"))
+        })?;
+    }
+    sync_directory(quarantine)?;
+    sync_directory(parent)?;
+    fs::remove_file(journal_path).map_err(|error| {
+        storage_error(format!(
+            "failed to remove rolled-back corrupt recovery journal {}: {error}",
+            journal_path.display()
+        ))
+    })?;
+    // The restored database and sidecars were synced before journal removal.
+    // If this final sync fails, a crash may resurrect the journal; resuming it
+    // remains safe because it binds the exact backup and observed files.
+    let _ = sync_directory(parent);
+    Ok(())
+}
+
+fn preserve_failed_recovery_file(source: &Path, destination: &Path) -> Result<(), ContextError> {
+    if !optional_regular_file_exists(source, "failed recovery file")? {
+        return Ok(());
+    }
+    reject_existing_path(destination, "failed recovery quarantine file")?;
+    fs::rename(source, destination).map_err(|error| {
+        storage_error(format!(
+            "failed to preserve recovery candidate {}: {error}",
+            source.display()
+        ))
+    })
+}
+
+#[cfg(unix)]
+fn verify_owner_only_directory(path: &Path) -> Result<(), ContextError> {
+    use std::os::unix::fs::PermissionsExt;
+    let metadata = fs::symlink_metadata(path).map_err(|error| {
+        storage_error(format!(
+            "failed to inspect recovery quarantine {}: {error}",
+            path.display()
+        ))
+    })?;
+    if metadata.permissions().mode() & 0o077 != 0 {
+        return Err(storage_error(format!(
+            "recovery quarantine {} must not be accessible by group or other users",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn verify_owner_only_directory(_path: &Path) -> Result<(), ContextError> {
+    Ok(())
 }
 
 fn restore_backup_internal<T>(
@@ -3675,6 +4309,436 @@ mod tests {
         assert_eq!(value(&destination, "source"), None);
         let reopened = SqliteContextManager::new(&destination).unwrap();
         crate::schema::verify(&reopened.conn.lock().unwrap()).unwrap();
+    }
+
+    fn recovery_config(data_dir: &Path) -> crate::config::Config {
+        crate::config::Config {
+            llm_provider: "local".to_owned(),
+            default_model: "qualification".to_owned(),
+            data_dir: data_dir.to_path_buf(),
+            ..crate::config::Config::default()
+        }
+    }
+
+    #[test]
+    fn corrupt_recovery_preserves_original_files_and_qualifies_backup() {
+        let directory = TestDirectory::new("corrupt-recovery");
+        let source = directory.path.join("source.db");
+        let source_manager = SqliteContextManager::new(&source).unwrap();
+        seed(&source_manager, "recovery-proof", "survived");
+        let (signer, _) = BackupSigningKey::generate("corrupt-recovery").unwrap();
+        let backup_root = directory.path.join("backups");
+        let manifest = source_manager
+            .create_signed_backup(&backup_root, "qualified", &signer)
+            .unwrap();
+        drop(source_manager);
+
+        let data_dir = directory.path.join("data");
+        fs::create_dir(&data_dir).unwrap();
+        let destination = data_dir.join(BACKUP_DATABASE_FILE);
+        let corrupt_bytes = b"corrupt database evidence";
+        let wal_bytes = b"corrupt wal evidence";
+        let shm_bytes = b"corrupt shm evidence";
+        fs::write(&destination, corrupt_bytes).unwrap();
+        fs::write(companion_path(&destination, "-wal"), wal_bytes).unwrap();
+        fs::write(companion_path(&destination, "-shm"), shm_bytes).unwrap();
+
+        let report = recover_corrupt_storage_from_config(
+            &backup_root.join("qualified"),
+            &recovery_config(&data_dir),
+            &signer.trust_root(),
+            &manifest.installation_id,
+        )
+        .unwrap();
+        assert!(report.enforcement_rearmed);
+        assert_eq!(report.persisted_agent_count, 0);
+        assert!(report.original_wal_preserved);
+        assert!(report.original_shm_preserved);
+        assert!(!report.resumed_interrupted_recovery);
+        assert_eq!(
+            fs::read(report.quarantine_dir.join("corrupt-database.sqlite3")).unwrap(),
+            corrupt_bytes
+        );
+        assert_eq!(
+            fs::read(report.quarantine_dir.join("corrupt-database.sqlite3-wal")).unwrap(),
+            wal_bytes
+        );
+        assert_eq!(
+            fs::read(report.quarantine_dir.join("corrupt-database.sqlite3-shm")).unwrap(),
+            shm_bytes
+        );
+        assert_eq!(
+            value(&destination, "recovery-proof").as_deref(),
+            Some("survived")
+        );
+        assert!(!companion_path(&destination, CORRUPT_RECOVERY_JOURNAL_SUFFIX).exists());
+    }
+
+    #[test]
+    fn corrupt_recovery_rejects_healthy_or_wrong_installation_without_mutation() {
+        let directory = TestDirectory::new("corrupt-recovery-refusal");
+        let source = directory.path.join("source.db");
+        let source_manager = SqliteContextManager::new(&source).unwrap();
+        seed(&source_manager, "proof", "trusted");
+        let (signer, _) = BackupSigningKey::generate("corrupt-refusal").unwrap();
+        let backup_root = directory.path.join("backups");
+        let manifest = source_manager
+            .create_signed_backup(&backup_root, "qualified", &signer)
+            .unwrap();
+        drop(source_manager);
+
+        let data_dir = directory.path.join("data");
+        fs::create_dir(&data_dir).unwrap();
+        let destination = data_dir.join(BACKUP_DATABASE_FILE);
+        fs::write(&destination, b"must remain corrupt").unwrap();
+        let wrong_id = uuid::Uuid::new_v4().to_string();
+        let error = recover_corrupt_storage_from_config(
+            &backup_root.join("qualified"),
+            &recovery_config(&data_dir),
+            &signer.trust_root(),
+            &wrong_id,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("does not match expected"));
+        assert_eq!(fs::read(&destination).unwrap(), b"must remain corrupt");
+        assert!(!companion_path(&destination, CORRUPT_RECOVERY_JOURNAL_SUFFIX).exists());
+
+        fs::remove_file(&destination).unwrap();
+        let healthy = SqliteContextManager::new(&destination).unwrap();
+        drop(healthy);
+        let healthy_bytes = fs::read(&destination).unwrap();
+        let error = recover_corrupt_storage_from_config(
+            &backup_root.join("qualified"),
+            &recovery_config(&data_dir),
+            &signer.trust_root(),
+            &manifest.installation_id,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("refuses a healthy"));
+        assert_eq!(fs::read(&destination).unwrap(), healthy_bytes);
+        assert!(!companion_path(&destination, CORRUPT_RECOVERY_JOURNAL_SUFFIX).exists());
+    }
+
+    #[test]
+    fn corrupt_recovery_qualification_failure_restores_original_and_keeps_candidate() {
+        let directory = TestDirectory::new("corrupt-recovery-rollback");
+        let source = directory.path.join("source.db");
+        let source_manager = SqliteContextManager::new(&source).unwrap();
+        let (signer, _) = BackupSigningKey::generate("corrupt-rollback").unwrap();
+        let backup_root = directory.path.join("backups");
+        let manifest = source_manager
+            .create_signed_backup(&backup_root, "qualified", &signer)
+            .unwrap();
+        drop(source_manager);
+
+        let data_dir = directory.path.join("data");
+        fs::create_dir(&data_dir).unwrap();
+        let destination = data_dir.join(BACKUP_DATABASE_FILE);
+        fs::write(&destination, b"original corrupt evidence").unwrap();
+        let mut config = recovery_config(&data_dir);
+        config.service_dir = Some(directory.path.join("missing-services"));
+        let error = recover_corrupt_storage_from_config(
+            &backup_root.join("qualified"),
+            &config,
+            &signer.trust_root(),
+            &manifest.installation_id,
+        )
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("failed configured kernel qualification"));
+        assert_eq!(
+            fs::read(&destination).unwrap(),
+            b"original corrupt evidence"
+        );
+        assert!(!companion_path(&destination, CORRUPT_RECOVERY_JOURNAL_SUFFIX).exists());
+        let quarantines: Vec<_> = fs::read_dir(&data_dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().ends_with(".quarantine"))
+            .collect();
+        assert_eq!(quarantines.len(), 1);
+        assert!(quarantines[0]
+            .path()
+            .join("failed-replacement.sqlite3")
+            .exists());
+    }
+
+    #[test]
+    fn corrupt_recovery_resumes_published_candidate_and_separates_new_sidecars() {
+        let directory = TestDirectory::new("corrupt-recovery-resume");
+        let source = directory.path.join("source.db");
+        let source_manager = SqliteContextManager::new(&source).unwrap();
+        seed(&source_manager, "resume-proof", "survived");
+        let (signer, _) = BackupSigningKey::generate("corrupt-resume").unwrap();
+        let backup_root = directory.path.join("backups");
+        let manifest = source_manager
+            .create_signed_backup(&backup_root, "qualified", &signer)
+            .unwrap();
+        drop(source_manager);
+
+        let data_dir = directory.path.join("data");
+        fs::create_dir(&data_dir).unwrap();
+        let destination = data_dir.join(BACKUP_DATABASE_FILE);
+        fs::write(&destination, b"interrupted corrupt evidence").unwrap();
+        let operation_id = uuid::Uuid::new_v4();
+        let journal = CorruptRecoveryJournal {
+            format_version: CORRUPT_RECOVERY_FORMAT_VERSION,
+            database_file: BACKUP_DATABASE_FILE.to_owned(),
+            stage_file: format!(".{BACKUP_DATABASE_FILE}.corrupt-recovery-{operation_id}.staging"),
+            quarantine_dir: format!(
+                ".{BACKUP_DATABASE_FILE}.corrupt-recovery-{operation_id}.quarantine"
+            ),
+            quarantined_database_file: "corrupt-database.sqlite3".to_owned(),
+            quarantined_wal_file: "corrupt-database.sqlite3-wal".to_owned(),
+            quarantined_shm_file: "corrupt-database.sqlite3-shm".to_owned(),
+            installation_id: manifest.installation_id.clone(),
+            backup_sha256: manifest.sha256.clone(),
+            backup_byte_count: manifest.byte_count,
+            original_wal: false,
+            original_shm: false,
+        };
+        let quarantine = data_dir.join(&journal.quarantine_dir);
+        fs::create_dir(&quarantine).unwrap();
+        set_owner_only_directory(&quarantine).unwrap();
+        write_corrupt_recovery_journal(
+            &companion_path(&destination, CORRUPT_RECOVERY_JOURNAL_SUFFIX),
+            &journal,
+        )
+        .unwrap();
+        fs::rename(
+            &destination,
+            quarantine.join(&journal.quarantined_database_file),
+        )
+        .unwrap();
+        fs::copy(
+            backup_root.join("qualified").join(BACKUP_DATABASE_FILE),
+            &destination,
+        )
+        .unwrap();
+        fs::write(
+            companion_path(&destination, "-wal"),
+            b"interrupted candidate wal",
+        )
+        .unwrap();
+        fs::write(
+            companion_path(&destination, "-shm"),
+            b"interrupted candidate shm",
+        )
+        .unwrap();
+        sync_directory(&data_dir).unwrap();
+
+        let report = recover_corrupt_storage_from_config(
+            &backup_root.join("qualified"),
+            &recovery_config(&data_dir),
+            &signer.trust_root(),
+            &manifest.installation_id,
+        )
+        .unwrap();
+        assert!(report.resumed_interrupted_recovery);
+        assert_eq!(
+            value(&destination, "resume-proof").as_deref(),
+            Some("survived")
+        );
+        assert_eq!(
+            fs::read(report.quarantine_dir.join("corrupt-database.sqlite3")).unwrap(),
+            b"interrupted corrupt evidence"
+        );
+        assert_eq!(
+            fs::read(
+                report
+                    .quarantine_dir
+                    .join("interrupted-candidate.sqlite3-wal")
+            )
+            .unwrap(),
+            b"interrupted candidate wal"
+        );
+        assert_eq!(
+            fs::read(
+                report
+                    .quarantine_dir
+                    .join("interrupted-candidate.sqlite3-shm")
+            )
+            .unwrap(),
+            b"interrupted candidate shm"
+        );
+    }
+
+    #[test]
+    fn corrupt_recovery_supports_encrypted_backups_and_excludes_a_running_owner() {
+        let directory = TestDirectory::new("corrupt-recovery-encrypted");
+        let key_path = directory.path.join("storage-key.json");
+        crate::storage_encryption::generate_storage_encryption_key_file(
+            "corrupt-recovery-generation",
+            &key_path,
+        )
+        .unwrap();
+        let source = directory.path.join("source.db");
+        let source_manager = SqliteContextManager::new_encrypted(
+            &source,
+            crate::storage_encryption::load_storage_encryption_key(&key_path).unwrap(),
+        )
+        .unwrap();
+        seed(&source_manager, "encrypted-recovery-proof", "survived");
+        let (signer, _) = BackupSigningKey::generate("encrypted-corrupt-recovery").unwrap();
+        let backup_root = directory.path.join("backups");
+        let manifest = source_manager
+            .create_signed_backup(&backup_root, "qualified", &signer)
+            .unwrap();
+        drop(source_manager);
+
+        let data_dir = directory.path.join("data");
+        fs::create_dir(&data_dir).unwrap();
+        let destination = data_dir.join(BACKUP_DATABASE_FILE);
+        fs::copy(&source, &destination).unwrap();
+        let mut file = OpenOptions::new().write(true).open(&destination).unwrap();
+        file.seek(SeekFrom::Start(64)).unwrap();
+        file.write_all(b"corrupted encrypted page").unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+        let mut config = recovery_config(&data_dir);
+        config.storage_encryption.required = true;
+        config.storage_encryption.key_path = Some(key_path);
+
+        let lease = acquire_storage_lease(&destination).unwrap();
+        let error = recover_corrupt_storage_from_config(
+            &backup_root.join("qualified"),
+            &config,
+            &signer.trust_root(),
+            &manifest.installation_id,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("already owned"));
+        drop(lease);
+
+        let report = recover_corrupt_storage_from_config(
+            &backup_root.join("qualified"),
+            &config,
+            &signer.trust_root(),
+            &manifest.installation_id,
+        )
+        .unwrap();
+        assert_eq!(
+            report
+                .manifest
+                .encryption
+                .as_ref()
+                .map(|encryption| encryption.key_id.as_str()),
+            Some("corrupt-recovery-generation")
+        );
+        let recovered = SqliteContextManager::new_encrypted(
+            &destination,
+            crate::storage_encryption::load_storage_encryption_key(
+                config.storage_encryption.key_path.as_ref().unwrap(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            recovered
+                .conn
+                .lock()
+                .unwrap()
+                .query_row(
+                    "SELECT value FROM agent_kv WHERE key = 'encrypted-recovery-proof'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "survived"
+        );
+    }
+
+    #[test]
+    fn corrupt_recovery_journal_rejects_unknown_or_unsafe_state() {
+        let directory = TestDirectory::new("corrupt-recovery-journal");
+        let source = directory.path.join("source.db");
+        let source_manager = SqliteContextManager::new(&source).unwrap();
+        let (signer, _) = BackupSigningKey::generate("corrupt-journal").unwrap();
+        let backup_root = directory.path.join("backups");
+        let manifest = source_manager
+            .create_signed_backup(&backup_root, "qualified", &signer)
+            .unwrap();
+        drop(source_manager);
+        let destination = directory.path.join(BACKUP_DATABASE_FILE);
+        let journal_path = companion_path(&destination, CORRUPT_RECOVERY_JOURNAL_SUFFIX);
+        let journal = CorruptRecoveryJournal {
+            format_version: CORRUPT_RECOVERY_FORMAT_VERSION,
+            database_file: BACKUP_DATABASE_FILE.to_owned(),
+            stage_file: ".agent_os.db.corrupt-recovery-test.staging".to_owned(),
+            quarantine_dir: ".agent_os.db.corrupt-recovery-test.quarantine".to_owned(),
+            quarantined_database_file: "corrupt-database.sqlite3".to_owned(),
+            quarantined_wal_file: "corrupt-database.sqlite3-wal".to_owned(),
+            quarantined_shm_file: "corrupt-database.sqlite3-shm".to_owned(),
+            installation_id: manifest.installation_id.clone(),
+            backup_sha256: manifest.sha256.clone(),
+            backup_byte_count: manifest.byte_count,
+            original_wal: false,
+            original_shm: false,
+        };
+        let mut encoded = serde_json::to_value(&journal).unwrap();
+        encoded["unexpected"] = serde_json::json!(true);
+        let mut bytes = serde_json::to_vec_pretty(&encoded).unwrap();
+        bytes.push(b'\n');
+        write_new_owner_only_file(&journal_path, &bytes, "test recovery journal").unwrap();
+        assert!(load_corrupt_recovery_journal(
+            &journal_path,
+            &destination,
+            &manifest,
+            &manifest.installation_id,
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("not valid bounded JSON"));
+        fs::remove_file(&journal_path).unwrap();
+
+        let mut unsafe_journal = journal;
+        unsafe_journal.stage_file = "../outside".to_owned();
+        write_corrupt_recovery_journal(&journal_path, &unsafe_journal).unwrap();
+        assert!(load_corrupt_recovery_journal(
+            &journal_path,
+            &destination,
+            &manifest,
+            &manifest.installation_id,
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("filename is invalid"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn corrupt_recovery_rejects_symlink_sidecar_without_touching_target() {
+        use std::os::unix::fs::symlink;
+
+        let directory = TestDirectory::new("corrupt-recovery-symlink");
+        let source = directory.path.join("source.db");
+        let source_manager = SqliteContextManager::new(&source).unwrap();
+        let (signer, _) = BackupSigningKey::generate("corrupt-symlink").unwrap();
+        let backup_root = directory.path.join("backups");
+        let manifest = source_manager
+            .create_signed_backup(&backup_root, "qualified", &signer)
+            .unwrap();
+        drop(source_manager);
+        let data_dir = directory.path.join("data");
+        fs::create_dir(&data_dir).unwrap();
+        let destination = data_dir.join(BACKUP_DATABASE_FILE);
+        fs::write(&destination, b"corrupt database").unwrap();
+        let outside = directory.path.join("outside-wal");
+        fs::write(&outside, b"must remain untouched").unwrap();
+        symlink(&outside, companion_path(&destination, "-wal")).unwrap();
+
+        let error = recover_corrupt_storage_from_config(
+            &backup_root.join("qualified"),
+            &recovery_config(&data_dir),
+            &signer.trust_root(),
+            &manifest.installation_id,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("regular non-symlink"));
+        assert_eq!(fs::read(&outside).unwrap(), b"must remain untouched");
+        assert_eq!(fs::read(&destination).unwrap(), b"corrupt database");
+        assert!(!companion_path(&destination, CORRUPT_RECOVERY_JOURNAL_SUFFIX).exists());
     }
 
     #[test]

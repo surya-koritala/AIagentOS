@@ -71,6 +71,8 @@ pub mod error_codes {
     pub const INTERNAL_ERROR: i64 = -32603;
     /// The connection has no currently valid authenticated identity.
     pub const AUTHENTICATION_REQUIRED: i64 = -32001;
+    /// A presented credential was invalid.
+    pub const AUTHENTICATION_FAILED: i64 = -32002;
     /// The authenticated principal cannot act as the requested agent.
     pub const AUTHORIZATION_DENIED: i64 = -32003;
 }
@@ -260,7 +262,7 @@ async fn handle_authenticate(
 
     let Some(principal) = kernel.resolve_principal(token).await else {
         return Err((
-            error_codes::AUTHENTICATION_REQUIRED,
+            error_codes::AUTHENTICATION_FAILED,
             "authentication failed".to_string(),
         ));
     };
@@ -1161,7 +1163,7 @@ mod tests {
                 .error
                 .expect("replacement authentication must fail")
                 .code,
-            error_codes::AUTHENTICATION_REQUIRED
+            error_codes::AUTHENTICATION_FAILED
         );
         let list = client.request("tools/list", None).await.unwrap();
         assert_eq!(

@@ -2,18 +2,13 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-mod commands;
-
 use adapters::anthropic::AnthropicAdapter;
 use adapters::azure_openai::AzureOpenAiAdapter;
 use adapters::local::LocalLlmAdapter;
 use adapters::openai::OpenAiAdapter;
 use kernel::{config::Config, AgentKernelImpl};
 use std::sync::Arc;
-
-pub struct AppState {
-    pub kernel: Arc<AgentKernelImpl>,
-}
+use tauri_app::{commands, AppState, DesktopClient};
 
 fn register_providers(kernel: &AgentKernelImpl, config: &Config) {
     match config.llm_provider.as_str() {
@@ -71,11 +66,12 @@ fn main() {
     // matching the CLI and agent-server. Durable quota uses fixed SQLite epochs
     // and needs no reset task. Held for the app's lifetime.
     let _runtime = kernel.start_runtime();
+    let client =
+        tauri::async_runtime::block_on(DesktopClient::connect_embedded(Arc::clone(&kernel)))
+            .expect("Failed to start authenticated desktop kernel client");
 
     tauri::Builder::default()
-        .manage(AppState {
-            kernel: Arc::clone(&kernel),
-        })
+        .manage(AppState { client })
         .invoke_handler(tauri::generate_handler![
             commands::create_agent,
             commands::send_message,

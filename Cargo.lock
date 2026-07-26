@@ -3169,7 +3169,9 @@ name = "integration-tests"
 version = "0.3.0"
 dependencies = [
  "adapters",
+ "agent-cli",
  "agent-sdk",
+ "agent-tui",
  "anyhow",
  "async-trait",
  "chrono",
@@ -3181,6 +3183,7 @@ dependencies = [
  "semver",
  "serde",
  "serde_json",
+ "tauri-app",
  "tokio",
  "toml 1.1.2+spec-1.1.0",
  "uuid",
@@ -6302,12 +6305,14 @@ name = "tauri-app"
 version = "0.3.0"
 dependencies = [
  "adapters",
+ "agent-sdk",
  "kernel",
  "serde",
  "serde_json",
  "tauri",
  "tauri-build",
  "tokio",
+ "tracing",
  "uuid",
 ]
 

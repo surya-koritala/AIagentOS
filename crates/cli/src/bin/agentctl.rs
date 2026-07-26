@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use agent_sdk::KernelClient;
+use agent_cli::OperatorClient;
 
 fn usage() -> ! {
     eprintln!(
@@ -27,16 +27,12 @@ async fn main() {
     }
 
     let command = args.next().unwrap_or_else(|| usage());
-    let mut client = KernelClient::connect(&addr).await.unwrap_or_else(|error| {
-        eprintln!("agentctl: could not connect to {addr}: {error}");
-        std::process::exit(1);
-    });
-    if let Some(token) = token {
-        client
-            .authenticate(token)
-            .await
-            .unwrap_or_else(|error| fail(error));
-    }
+    let mut client = OperatorClient::connect(&addr, token.as_deref())
+        .await
+        .unwrap_or_else(|error| {
+            eprintln!("agentctl: could not connect to {addr}: {error}");
+            std::process::exit(1);
+        });
 
     let result = match command.as_str() {
         "list" => {

@@ -3,7 +3,9 @@
 AI Agent OS has one canonical remote ABI:
 `kernel::syscall_server::Syscall` / `SyscallReply` as UTF-8,
 newline-delimited JSON. The Rust SDK, CLI, TUI backend, and raw clients must use
-that boundary. MCP tool calls enter the same authorization, tool-registry,
+that boundary. The desktop packages an ephemeral loopback server protected by a
+random per-process secret and reaches its in-process kernel only through the
+same typed client. MCP tool calls enter the same authorization, tool-registry,
 syscall-gate, sandbox, accounting, and audit path.
 
 The numbered in-process syscall prototype is not part of this contract.
@@ -240,4 +242,9 @@ extended-security workflow fuzzes whole envelopes and fragmented/reordered
 transport input independently. SDK tests exercise the same real server
 boundary, preserve typed errors and enforcement introspection, and prove
 second-connection request cancellation plus typed liveness and close APIs.
+One shared scenario runner also drives the SDK, `agentctl`, TUI refresh,
+desktop backend, raw protocol, and MCP client. Every surface must prove
+pre-auth liveness, typed missing/invalid authentication, tenant-scoped
+visibility, allowed owner behavior, identical foreign/absent denial,
+failed-reauthentication reset, and read-only mutation denial.
 Adapter tests prove incremental Azure SSE deltas and bounded output.

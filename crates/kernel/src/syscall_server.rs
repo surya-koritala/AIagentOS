@@ -623,7 +623,12 @@ pub enum WireErrorCode {
 impl WireErrorCode {
     fn classify(message: &str) -> (Self, bool) {
         let message = message.to_ascii_lowercase();
-        if message.contains("incompatible wire-protocol") {
+        if message == AUTHORIZATION_DENIED {
+            // Foreign and absent resources deliberately share this safe
+            // non-oracle message. Preserve the authorization category instead
+            // of allowing the phrase "not found" to misclassify it.
+            (Self::AuthorizationDenied, false)
+        } else if message.contains("incompatible wire-protocol") {
             (Self::IncompatibleVersion, false)
         } else if message.contains("authentication required") {
             (Self::AuthenticationRequired, false)

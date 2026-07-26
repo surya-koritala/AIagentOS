@@ -858,7 +858,8 @@ max_age_seconds = 3600
     #[test]
     fn scheduled_backup_config_fails_closed_when_unsafe_or_incomplete() {
         let mut config = Config::default();
-        config.backup.signing_key_path = Some(PathBuf::from("/private/backup.pk8"));
+        config.backup.signing_key_path =
+            Some(std::env::temp_dir().join("agentos-backup-signing.pk8"));
         assert!(config
             .backup
             .validate()
@@ -912,7 +913,8 @@ max_age_seconds = 3600
     #[test]
     fn backup_signing_identity_roundtrips_without_becoming_enabled_by_default() {
         let mut config = Config::default();
-        config.backup.signing_key_path = Some(PathBuf::from("/run/secrets/backup-signing.pk8"));
+        let signing_key_path = std::env::temp_dir().join("agentos-backup-signing.pk8");
+        config.backup.signing_key_path = Some(signing_key_path.clone());
         config.backup.signing_key_id = Some("release-2026.1".into());
 
         let encoded = toml::to_string_pretty(&config).unwrap();
@@ -920,7 +922,7 @@ max_age_seconds = 3600
         assert!(!parsed.backup.enabled);
         assert_eq!(
             parsed.backup.signing_key_path.as_deref(),
-            Some(std::path::Path::new("/run/secrets/backup-signing.pk8"))
+            Some(signing_key_path.as_path())
         );
         assert_eq!(
             parsed.backup.signing_key_id.as_deref(),

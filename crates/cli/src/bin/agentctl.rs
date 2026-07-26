@@ -7,7 +7,7 @@ use agent_cli::OperatorClient;
 fn usage() -> ! {
     eprintln!(
         "usage: agentctl [--addr HOST:PORT] [--token TOKEN] \
-         <list|inspect|pressure|tunables|tunable-set|tunable-rollback|tunable-history|status|pause|resume|stop|kill|wait|services|service-start|service-stop|service-restart|service-reload|service-history|backup-create|backup-retention|backup-status|data-inventory|backup-key-generate|backup-verify|backup-restore|storage-key-generate|storage-encrypt|storage-key-rotate|erase-agent|erase-user|erase-tenant> [ARGS...]\n\
+         <list|inspect|pressure|tunables|tunable-set|tunable-rollback|tunable-history|status|pause|resume|stop|kill|wait|services|service-start|service-stop|service-restart|service-reload|service-history|backup-create|backup-retention|backup-status|data-inventory|backup-key-generate|backup-verify|backup-restore|storage-key-generate|storage-encrypt|storage-encrypt-recover|storage-key-rotate|erase-agent|erase-user|erase-tenant> [ARGS...]\n\
          \n\
          storage commands:\n\
            agentctl [SERVER OPTIONS] backup-create BACKUP_ROOT NAME\n\
@@ -19,6 +19,7 @@ fn usage() -> ! {
            agentctl backup-restore BACKUP_DIR DATABASE [--storage-key KEY_FILE] [--require-signature PUBLIC_TRUST_FILE] --confirm-offline\n\
            agentctl storage-key-generate KEY_ID KEY_FILE\n\
            agentctl storage-encrypt DATABASE KEY_FILE --confirm-offline\n\
+           agentctl storage-encrypt-recover DATABASE KEY_FILE --confirm-offline\n\
            agentctl storage-key-rotate DATABASE CURRENT_KEY_FILE NEXT_KEY_FILE --confirm-offline\n\
            agentctl [SERVER OPTIONS] erase-agent AGENT_ID --confirm\n\
            agentctl [SERVER OPTIONS] erase-user USER_ID --confirm\n\
@@ -202,6 +203,24 @@ async fn main() {
             )
             .unwrap_or_else(|error| fail_storage(error));
             print_json(&report, "storage encryption migration report");
+            return;
+        }
+        "storage-encrypt-recover" => {
+            let database = args.next().unwrap_or_else(|| usage());
+            let key_file = args.next().unwrap_or_else(|| usage());
+            if args.next().as_deref() != Some("--confirm-offline") || args.next().is_some() {
+                usage();
+            }
+            let key = kernel::storage_encryption::load_storage_encryption_key(
+                std::path::Path::new(&key_file),
+            )
+            .unwrap_or_else(|error| fail_storage(error));
+            let report = kernel::storage_encryption::recover_interrupted_encryption_migration(
+                std::path::Path::new(&database),
+                &key,
+            )
+            .unwrap_or_else(|error| fail_storage(error));
+            print_json(&report, "storage encryption recovery report");
             return;
         }
         "storage-key-rotate" => {

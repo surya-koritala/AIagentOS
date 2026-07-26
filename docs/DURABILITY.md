@@ -93,11 +93,28 @@ Migration acquires the kernel storage lease, checkpoints WAL, verifies source
 identity and integrity, uses `sqlcipher_export` into a same-directory encrypted
 staging database, syncs and verifies it, preserves the plaintext source as a
 rollback during publication, and removes that rollback only after the
-encrypted replacement authenticates. A crash can leave a clearly named
-plaintext rollback beside the database; treat the directory as sensitive and
-inspect it before restarting. File deletion is not guaranteed to erase blocks
-on copy-on-write filesystems or SSDs, so production hosts should also use
-volume/disk encryption.
+encrypted replacement authenticates. Before staging begins it durably writes an
+owner-only, secret-free migration journal containing the randomized companion
+filenames, public key identifier, and database identity. If the process exits
+at any point, keep the kernel stopped and reconcile the journal:
+
+```bash
+agentctl storage-encrypt-recover /var/lib/agentos/agent_os.db \
+  /etc/agentos/storage-keys/storage-generation-1.json \
+  --confirm-offline
+```
+
+Recovery takes the same exclusive lease and verifies every surviving database
+against the journaled application, schema, and installation identity. It
+finishes publication only when the encrypted stage authenticates with the
+named key; otherwise it preserves or restores the verified plaintext source.
+It refuses symlinks, corrupt files, a wrong key identifier, foreign database
+identity, and ambiguous layouts without deleting evidence. A process-exit
+regression terminates a separate test process after the plaintext rename and
+proves recovery retains all data and removes the plaintext rollback. Until
+recovery completes, treat the database directory as sensitive. File deletion
+is not guaranteed to erase blocks on copy-on-write filesystems or SSDs, so
+production hosts should also use volume/disk encryption.
 
 Rotate the live database key offline:
 
@@ -454,15 +471,22 @@ enforcement, a bounded busy timeout, and owner-only database permissions on
 Unix. The existing restart suite verifies recovery of application state,
 admission accounting, checkpoints, and agent rehydration.
 
+A deterministic `SQLITE_FULL` regression constrains SQLite's page budget,
+attempts a transaction that must grow the database, and verifies the failed
+transaction leaves no partial row while previously committed data survives
+integrity verification and reopen. This qualifies SQLite's transactional
+failure behavior; it does not substitute for destructive host-filesystem
+capacity tests on every supported deployment profile.
+
 The following remain open under issue #123:
 
 - remote object storage retention, automated recovery orchestration, and a
   measured recovery runbook;
 - independent immutable/remote retention controls and released trust fixtures;
 - corruption recovery beyond fail-closed startup detection;
-- encryption at rest and key rotation;
 - measured deletion/retention enforcement across external workspaces,
   providers, remote backup copies, and object stores;
-- disk-full, interrupted migration, object-store, and extended crash
-  qualification;
+- host-filesystem disk-full, power-loss, object-store, and extended crash
+  qualification beyond the deterministic interrupted-encryption process-exit
+  recovery covered above;
 - measured RPO/RTO on supported deployment profiles.

@@ -10,6 +10,15 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
 
 ## [Unreleased]
 
+- Added journaled recovery for interrupted offline storage encryption under
+  #123. `storage-encrypt` now durably records a secret-free migration identity
+  before staging, and `agentctl storage-encrypt-recover ... --confirm-offline`
+  authenticates every surviving file before completing encrypted publication
+  or restoring plaintext. A separate-process exit regression covers the
+  post-rename crash window, wrong keys prove non-mutation, and a deterministic
+  `SQLITE_FULL` regression proves failed growth rolls back without losing
+  committed data. Host-filesystem exhaustion, power-loss, arbitrary
+  corruption repair, and broader disaster qualification remain open.
 - Added SQLCipher whole-database encryption for #123. Operator-custodied
   256-bit key documents (created and validated as owner-only files on Unix) now
   protect SQLite pages, WAL state, and

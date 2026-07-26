@@ -6,10 +6,10 @@ packages, operator settings, services, identity, and cluster control state.
 
 This document describes the guarantees implemented today. The kernel backup
 and offline restore primitives plus authenticated SDK/CLI entry points are
-integrated. Transactional storage erasure and non-identifying deletion receipts
-are integrated as an internal foundation, but live-resource coordination,
-operator erasure commands, scheduled recovery, and encryption are not yet
-production-qualified.
+integrated. Transactional storage erasure, non-identifying deletion receipts,
+and live-resource-coordinated system operator erasure through the wire, SDK,
+and CLI are integrated. Scheduled recovery, retention, and encryption are not
+yet production-qualified.
 
 ## Database identity and version
 
@@ -166,11 +166,31 @@ external object stores are outside this SQLite deletion boundary.
 Ephemeral process state includes scheduler queues, executors and cancellation
 handles, syscall-gate registrations, namespaces/cgroups, sandboxes, credential
 leases/auth caches, provider circuit state, and in-memory observability data.
-Normal kernel lifecycle cleanup or process exit removes it. A supported
-system-authorized erase operation that first drains those live resources and
-then invokes the transactional storage primitive is the next deletion slice;
-the storage primitives must not be treated as a safe remote hot-delete API on
-their own.
+Normal kernel lifecycle cleanup or process exit removes it.
+
+The supported hot-delete boundary is system-authorized `erase_data`. It requires
+explicit confirmation, closes and drains affected credentials, disables
+supervised owners, quiesces turns and external tool calls, removes every
+kernel-owned live boundary, and then commits the classified storage erasure
+behind a global request barrier. Tenant users and tenant administrators cannot
+invoke it. An agent-only operation reopens unaffected tenant credentials after
+completion; successful user and tenant erasure permanently revokes their
+credentials. Pre-commit failures reopen credentials whose identities remain
+valid. Operators can use the typed SDK or:
+
+```bash
+agentctl --addr 127.0.0.1:7777 --token "$AGENT_SERVER_TOKEN" \
+  erase-agent 00000000-0000-0000-0000-000000000001 --confirm
+agentctl --addr 127.0.0.1:7777 --token "$AGENT_SERVER_TOKEN" \
+  erase-user USER_ID --confirm
+agentctl --addr 127.0.0.1:7777 --token "$AGENT_SERVER_TOKEN" \
+  erase-tenant TENANT_ID --confirm
+```
+
+These commands return a privacy-safe receipt or `null` when no classified data
+existed. Provider configuration files, external workspaces, remote provider
+data, published backups, and external object stores remain outside this
+operation and require their own retention/deletion controls.
 
 ## Current durability boundary
 
@@ -185,8 +205,8 @@ The following remain open under issue #123:
 - signed manifests or external authenticity/immutability controls;
 - corruption recovery beyond fail-closed startup detection;
 - encryption at rest and key rotation;
-- live-resource-coordinated system API/SDK/CLI erasure, backup expiration, and
-  measured retention enforcement;
+- backup expiration and measured retention enforcement across live storage,
+  published backups, external workspaces, providers, and object stores;
 - disk-full, interrupted migration, object-store, and extended crash
   qualification;
 - measured RPO/RTO on supported deployment profiles.

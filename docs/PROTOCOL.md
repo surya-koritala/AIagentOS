@@ -41,9 +41,9 @@ compatibility behavior, and transport limits:
 
 The schemas use JSON Schema draft 2020-12 and cover every top-level request,
 reply, and stream-event tag. The authorization/schema regression constructs
-all 71 current syscalls and rejects either a missing schema operation or an
+all 72 current syscalls and rejects either a missing schema operation or an
 undocumented extra. Deterministic golden request arrays cover all 59 v1
-operations and all 71 v2 operations. Domain payload examples and
+operations and all 72 v2 operations. Domain payload examples and
 previous-version shapes are retained under `protocol/`.
 
 ## Compatibility policy
@@ -191,6 +191,39 @@ cancelled, incompatible version, provider, lifecycle, and internal failures.
 - `ClusterClient::connect_authenticated` and its TLS variants connect every node
   all-or-nothing. They perform no hidden retry of side-effecting calls.
 
+## Destructive data erasure
+
+Protocol v2 advertises `data_erasure`. Only a trusted system principal can erase
+data; tenant users and tenant administrators are denied. The request must carry
+an explicit `confirm: true` and exactly one tagged agent, user, or tenant target:
+
+```json
+{
+  "op": "erase_data",
+  "target": {
+    "kind": "agent",
+    "agent_id": "00000000-0000-0000-0000-000000000001"
+  },
+  "confirm": true
+}
+```
+
+The kernel closes affected credential admission and waits for already-admitted
+requests to finish before taking a global erasure barrier. Agent and tenant
+erasure also disables supervised owners, quiesces turns and external tool
+calls, removes live scheduler, executor, sandbox, namespace, cgroup, gate, and
+observability state, and only then commits the classified SQLite transaction.
+An agent-only erasure reopens the unaffected tenant credentials after the
+operation. Successful user and tenant erasure leaves their credentials revoked.
+Failure before the durable commit reopens still-valid credentials so the
+operator can inspect and retry safely.
+
+The reply is `data_erased` with a nullable `receipt`. `null` means no classified
+data existed. A receipt is durable and contains no subject identifier, tenant,
+actor, reason, prompt, path, or deleted value. The typed SDK requires the
+explicit `CONFIRM_DATA_ERASURE` proof value; `agentctl` requires a trailing
+`--confirm`.
+
 ## Distributed node contract
 
 Protocol-v2 nodes publish a durable Ed25519 identity and local control state in
@@ -256,7 +289,7 @@ Versioned fixtures:
 - `protocol/v2/hello.json`
 - `protocol/v2/typed-error.json`
 - `protocol/v2/describe-protocol-request.json`
-- `protocol/v2/requests.json` (all 71 v2 operations)
+- `protocol/v2/requests.json` (all 72 v2 operations)
 - `protocol/v2/send-message-stream.json`
 - `protocol/v2/stream-event.json`
 - `protocol/v2/stream-completed.json`

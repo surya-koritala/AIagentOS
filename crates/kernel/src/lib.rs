@@ -1297,6 +1297,16 @@ pub struct AgentKernelImpl {
     /// SQLite handle. Resolves an API key / session token to a `(user, tenant,
     /// role)`; the tenant then maps onto the namespace group + cgroup below.
     pub auth: Arc<tokio::sync::RwLock<crate::auth::AuthSystem>>,
+    /// Serializes identity and credential mutations without blocking normal
+    /// authentication reads. Erasure closes request admission, drains existing
+    /// leases, and then commits while this fence prevents a new credential from
+    /// appearing between the drain and the durable deletion transaction.
+    auth_mutation_lock: tokio::sync::Mutex<()>,
+    /// Public request barrier for destructive erasure. Normal wire dispatch
+    /// holds a read guard; erasure first closes/drains affected credentials and
+    /// then takes the write guard so no admitted request can recreate deleted
+    /// state during the storage transaction.
+    pub(crate) erasure_barrier: tokio::sync::RwLock<()>,
     /// Per-credential in-flight request admission. Revocation closes and drains
     /// only the affected identity instead of holding the global auth lock across
     /// syscall, tool, or provider I/O.
@@ -1635,6 +1645,8 @@ impl AgentKernelImpl {
             group_namespaces: DashMap::new(),
             group_tool_publication_lock: std::sync::Mutex::new(()),
             auth: Arc::new(tokio::sync::RwLock::new(crate::auth::AuthSystem::new())),
+            auth_mutation_lock: tokio::sync::Mutex::new(()),
+            erasure_barrier: tokio::sync::RwLock::new(()),
             credential_leases: Arc::new(crate::auth::CredentialLeaseManager::default()),
             cgroup_budgets: budgets.clone(),
             executors: DashMap::new(),
@@ -2316,6 +2328,7 @@ impl AgentKernelImpl {
     /// Create a tenant and persist it, returning its id. The tenant's namespace
     /// group + cgroup are created lazily when its first agent is created.
     pub async fn create_tenant(&self, name: &str) -> Result<String, KernelError> {
+        let _mutation = self.auth_mutation_lock.lock().await;
         let mut auth = self.auth.write().await;
         let id = auth.create_tenant(name);
         let record = auth
@@ -2338,6 +2351,7 @@ impl AgentKernelImpl {
         email: &str,
         role: crate::auth::Role,
     ) -> Result<String, KernelError> {
+        let _mutation = self.auth_mutation_lock.lock().await;
         let mut auth = self.auth.write().await;
         let id = match auth.register(tenant_id, username, email, role) {
             Some(id) => id,
@@ -2361,6 +2375,7 @@ impl AgentKernelImpl {
     /// Issue an API key for a user and persist it (hashed). Returns the
     /// **plaintext** key (shown once). Errors if the user is unknown.
     pub async fn issue_api_key(&self, user_id: &str, name: &str) -> Result<String, KernelError> {
+        let _mutation = self.auth_mutation_lock.lock().await;
         let mut auth = self.auth.write().await;
         let key = match auth.create_api_key(user_id, name) {
             Some(k) => k,
@@ -2391,6 +2406,7 @@ impl AgentKernelImpl {
     /// Open a session (login) for a user and persist it (hashed). Returns the
     /// **plaintext** session token (shown once). Errors if the user is unknown.
     pub async fn open_session(&self, user_id: &str) -> Result<String, KernelError> {
+        let _mutation = self.auth_mutation_lock.lock().await;
         let mut auth = self.auth.write().await;
         let token = match auth.create_session(user_id) {
             Some(t) => t,
@@ -2464,6 +2480,7 @@ impl AgentKernelImpl {
             id: crate::auth::hash_secret(token),
         };
         let (persisted, removed, drain) = {
+            let _mutation = self.auth_mutation_lock.lock().await;
             let mut auth = self.auth.write().await;
             let drain = self.credential_leases.close(&identity);
             let persisted = match self.context_manager.revoke_session_hash(&identity.id) {
@@ -2488,6 +2505,7 @@ impl AgentKernelImpl {
             id: crate::auth::hash_secret(key),
         };
         let (persisted, removed, drain) = {
+            let _mutation = self.auth_mutation_lock.lock().await;
             let mut auth = self.auth.write().await;
             let drain = self.credential_leases.close(&identity);
             let persisted = match self.context_manager.revoke_api_key_hash(&identity.id) {
@@ -2507,6 +2525,7 @@ impl AgentKernelImpl {
     /// Revoke a user and all of that user's credentials atomically and durably.
     pub async fn revoke_user(&self, user_id: &str) -> Result<bool, KernelError> {
         let (persisted, removed, drains) = {
+            let _mutation = self.auth_mutation_lock.lock().await;
             let mut auth = self.auth.write().await;
             let live_identities = auth.credential_identities_for_user(user_id);
             let mut identities: std::collections::HashSet<_> =
@@ -2538,6 +2557,7 @@ impl AgentKernelImpl {
     /// Agent/data records remain durable but inaccessible to tenant callers.
     pub async fn revoke_tenant(&self, tenant_id: &str) -> Result<bool, KernelError> {
         let (persisted, removed, drains) = {
+            let _mutation = self.auth_mutation_lock.lock().await;
             let mut auth = self.auth.write().await;
             let live_identities = auth.credential_identities_for_tenant(tenant_id);
             let mut identities: std::collections::HashSet<_> =
@@ -2562,6 +2582,191 @@ impl AgentKernelImpl {
         };
         self.drain_revoked_credentials(drains).await?;
         Ok(removed || persisted)
+    }
+
+    fn invalid_erasure_subject(kind: &str) -> KernelError {
+        KernelError::Context(crate::ContextError::PersistenceFailed(format!(
+            "{kind} erasure requires a non-empty identifier"
+        )))
+    }
+
+    fn credential_identities_for_tenant(
+        &self,
+        auth: &crate::auth::AuthSystem,
+        tenant_id: &str,
+    ) -> (
+        Vec<crate::auth::CredentialIdentity>,
+        Vec<crate::auth::CredentialIdentity>,
+    ) {
+        let live = auth.credential_identities_for_tenant(tenant_id);
+        let mut all: std::collections::HashSet<_> = live.iter().cloned().collect();
+        all.extend(
+            self.credential_leases
+                .credential_identities_for_tenant(tenant_id),
+        );
+        (live, all.into_iter().collect())
+    }
+
+    fn credential_identities_for_user(
+        &self,
+        auth: &crate::auth::AuthSystem,
+        user_id: &str,
+    ) -> (
+        Vec<crate::auth::CredentialIdentity>,
+        Vec<crate::auth::CredentialIdentity>,
+    ) {
+        let live = auth.credential_identities_for_user(user_id);
+        let mut all: std::collections::HashSet<_> = live.iter().cloned().collect();
+        all.extend(
+            self.credential_leases
+                .credential_identities_for_user(user_id),
+        );
+        (live, all.into_iter().collect())
+    }
+
+    async fn drain_credentials_for_erasure(
+        &self,
+        live_identities: &[crate::auth::CredentialIdentity],
+        identities: &[crate::auth::CredentialIdentity],
+    ) -> Result<(), KernelError> {
+        let drains = self.credential_leases.close_many(identities);
+        if let Err(error) = self.drain_revoked_credentials(drains).await {
+            self.credential_leases.reopen_many(live_identities);
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    /// Erase one agent through the supported hot-operation boundary.
+    ///
+    /// Tenant credentials are briefly fenced and drained, service ownership is
+    /// disabled, active turns and external tool calls quiesce, every live
+    /// subsystem is removed, and only then does the transactional SQLite
+    /// erasure commit. Existing tenant credentials reopen after the operation.
+    pub async fn erase_agent_data(
+        &self,
+        agent_id: AgentId,
+    ) -> Result<Option<crate::context::DeletionReceipt>, KernelError> {
+        if agent_id.is_nil() {
+            return Err(Self::invalid_erasure_subject("agent"));
+        }
+        let _service_operation = self.service_operation_lock.lock().await;
+        let _auth_mutation = self.auth_mutation_lock.lock().await;
+        let tenant_id = self.context_manager.agent_tenant(agent_id)?;
+        let (live_identities, identities) = if let Some(tenant_id) = tenant_id.as_deref() {
+            let auth = self.auth.read().await;
+            self.credential_identities_for_tenant(&auth, tenant_id)
+        } else {
+            (Vec::new(), Vec::new())
+        };
+        self.drain_credentials_for_erasure(&live_identities, &identities)
+            .await?;
+
+        let result = async {
+            let service_names = self
+                .os
+                .init
+                .lock()
+                .await
+                .list_runtime()
+                .into_iter()
+                .filter(|service| service.agent_id == Some(agent_id))
+                .map(|service| service.name)
+                .collect::<Vec<_>>();
+            for service_name in service_names {
+                self.stop_service_inner(&service_name, false).await?;
+            }
+
+            let _erasure = self.erasure_barrier.write().await;
+            let _operator_mutation = self.operator_control.mutation_guard().await;
+            self.prepare_live_agent_for_erasure(agent_id).await?;
+            self.context_manager
+                .erase_agent_data(agent_id)
+                .map_err(KernelError::Context)
+        }
+        .await;
+        self.credential_leases.reopen_many(&live_identities);
+        result
+    }
+
+    /// Erase one user after closing and draining every session/API-key lease.
+    /// No user-owned runtime agent exists in the current ownership model.
+    pub async fn erase_user_data(
+        &self,
+        user_id: &str,
+    ) -> Result<Option<crate::context::DeletionReceipt>, KernelError> {
+        if user_id.trim().is_empty() {
+            return Err(Self::invalid_erasure_subject("user"));
+        }
+        let _auth_mutation = self.auth_mutation_lock.lock().await;
+        let (live_identities, identities) = {
+            let auth = self.auth.read().await;
+            self.credential_identities_for_user(&auth, user_id)
+        };
+        self.drain_credentials_for_erasure(&live_identities, &identities)
+            .await?;
+
+        let _erasure = self.erasure_barrier.write().await;
+        let receipt = match self.context_manager.erase_user_data(user_id) {
+            Ok(receipt) => receipt,
+            Err(error) => {
+                self.credential_leases.reopen_many(&live_identities);
+                return Err(KernelError::Context(error));
+            }
+        };
+        self.auth.write().await.revoke_user(user_id);
+        Ok(receipt)
+    }
+
+    /// Erase a tenant after disabling its supervised services, draining every
+    /// tenant credential, and removing all tenant agents from live subsystems.
+    pub async fn erase_tenant_data(
+        &self,
+        tenant_id: &str,
+    ) -> Result<Option<crate::context::DeletionReceipt>, KernelError> {
+        if tenant_id.trim().is_empty() {
+            return Err(Self::invalid_erasure_subject("tenant"));
+        }
+        let _service_operation = self.service_operation_lock.lock().await;
+        let _auth_mutation = self.auth_mutation_lock.lock().await;
+        let (live_identities, identities) = {
+            let auth = self.auth.read().await;
+            self.credential_identities_for_tenant(&auth, tenant_id)
+        };
+        self.drain_credentials_for_erasure(&live_identities, &identities)
+            .await?;
+
+        let result = async {
+            let service_names = {
+                let init = self.os.init.lock().await;
+                init.boot_order()
+                    .iter()
+                    .filter_map(|name| {
+                        init.state(name)
+                            .filter(|state| state.def.policy.tenant_id == tenant_id)
+                            .map(|_| name.clone())
+                    })
+                    .collect::<Vec<_>>()
+            };
+            for service_name in service_names {
+                self.stop_service_inner(&service_name, false).await?;
+            }
+
+            let _erasure = self.erasure_barrier.write().await;
+            let _operator_mutation = self.operator_control.mutation_guard().await;
+            let agent_ids = self.context_manager.list_agents_for_tenant(tenant_id)?;
+            for agent_id in agent_ids {
+                self.prepare_live_agent_for_erasure(agent_id).await?;
+            }
+            let receipt = self.context_manager.erase_tenant_data(tenant_id)?;
+            self.auth.write().await.revoke_tenant(tenant_id);
+            Ok(receipt)
+        }
+        .await;
+        if result.is_err() {
+            self.credential_leases.reopen_many(&live_identities);
+        }
+        result
     }
 
     /// Resolve a presented secret (API key or session token) to a
@@ -2978,6 +3183,40 @@ impl AgentKernelImpl {
         } else {
             Err(KernelError::LifecycleCleanup(failures.join("; ")))
         }
+    }
+
+    /// Put a live agent behind the same non-runnable durable marker and bounded
+    /// cleanup boundary used by normal lifecycle operations, then remove its
+    /// process-local registry history. The caller holds the global erasure and
+    /// operator mutation barriers, so no new public request or agent creation
+    /// can race this transition.
+    async fn prepare_live_agent_for_erasure(&self, agent_id: AgentId) -> Result<bool, KernelError> {
+        let lock = self.lifecycle_lock(agent_id);
+        let _lifecycle = lock.lock().await;
+        let Some(state) = self.agent_manager.get_agent_state(agent_id) else {
+            return Ok(false);
+        };
+
+        if !matches!(state, AgentState::Stopping | AgentState::Stopped) {
+            self.quiesce_agent(agent_id).await?;
+            self.drain_agent_tool_calls(agent_id).await?;
+            if let Err(error) = self
+                .context_manager
+                .update_agent_status(agent_id, &AgentState::Stopping)
+            {
+                let _ = self.syscall_gate.reopen_tool_admission(agent_id);
+                return Err(KernelError::Context(error));
+            }
+            self.agent_manager.force_stopping(agent_id)?;
+        }
+
+        self.cleanup_agent_resources(agent_id).await?;
+        if self.agent_manager.get_agent_state(agent_id) != Some(AgentState::Stopped) {
+            self.agent_manager.force_stopped(agent_id)?;
+        }
+        self.agent_manager.purge_agent(agent_id);
+        self.syscall_gate.purge_agent_stats(agent_id);
+        Ok(true)
     }
 
     /// Roll back a creation that failed after the AgentManager allocated an
@@ -4981,6 +5220,230 @@ mod tests {
     async fn in_memory_kernel_uses_production_mac_defaults() {
         let kernel = AgentKernelImpl::new().unwrap();
         assert!(kernel.syscall_gate.mac_is_enforcing().await);
+    }
+
+    #[tokio::test]
+    async fn agent_erasure_drains_tenant_requests_and_removes_every_live_boundary() {
+        let kernel = Arc::new(AgentKernelImpl::new().unwrap());
+        let tenant = kernel.create_tenant("agent-erasure").await.unwrap();
+        let user = kernel
+            .register_user(
+                &tenant,
+                "alice",
+                "alice@agent-erasure.test",
+                crate::auth::Role::User,
+            )
+            .await
+            .unwrap();
+        let token = kernel.open_session(&user).await.unwrap();
+        let identity = kernel
+            .resolve_principal(&token)
+            .await
+            .unwrap()
+            .credential
+            .unwrap();
+        let (_principal, in_flight) = kernel
+            .acquire_credential_principal(&identity)
+            .await
+            .expect("request lease");
+        let agent = kernel
+            .create_agent_for_tenant(&tenant, lifecycle_test_config("erase-live"))
+            .await
+            .unwrap()
+            .id;
+
+        let erase_kernel = Arc::clone(&kernel);
+        let erasure = tokio::spawn(async move { erase_kernel.erase_agent_data(agent).await });
+        tokio::time::timeout(std::time::Duration::from_millis(100), async {
+            while kernel
+                .acquire_credential_principal(&identity)
+                .await
+                .is_some()
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("agent erasure did not close tenant credential admission");
+        assert!(
+            kernel
+                .context_manager
+                .agent_tenant(agent)
+                .unwrap()
+                .is_some(),
+            "durable erasure committed before an admitted tenant request drained"
+        );
+        assert!(!erasure.is_finished());
+
+        drop(in_flight);
+        let receipt = tokio::time::timeout(std::time::Duration::from_secs(1), erasure)
+            .await
+            .expect("agent erasure did not finish after request drain")
+            .unwrap()
+            .unwrap()
+            .expect("agent data existed");
+        assert_eq!(
+            receipt.subject_kind,
+            crate::context::DeletionSubjectKind::Agent
+        );
+        assert!(kernel
+            .context_manager
+            .agent_tenant(agent)
+            .unwrap()
+            .is_none());
+        assert!(kernel.agent_manager.get_agent_state(agent).is_none());
+        assert!(kernel.syscall_gate.agent_info(agent).is_none());
+        assert!(
+            kernel
+                .acquire_credential_principal(&identity)
+                .await
+                .is_some(),
+            "agent erasure did not reopen the unaffected tenant credential"
+        );
+    }
+
+    #[tokio::test]
+    async fn user_erasure_waits_for_credentials_then_removes_identity() {
+        let kernel = Arc::new(AgentKernelImpl::new().unwrap());
+        let tenant = kernel.create_tenant("user-erasure").await.unwrap();
+        let user = kernel
+            .register_user(
+                &tenant,
+                "alice",
+                "alice@user-erasure.test",
+                crate::auth::Role::User,
+            )
+            .await
+            .unwrap();
+        let token = kernel.open_session(&user).await.unwrap();
+        let identity = kernel
+            .resolve_principal(&token)
+            .await
+            .unwrap()
+            .credential
+            .unwrap();
+        let (_principal, in_flight) = kernel
+            .acquire_credential_principal(&identity)
+            .await
+            .expect("request lease");
+
+        let erase_kernel = Arc::clone(&kernel);
+        let erased_user = user.clone();
+        let erasure = tokio::spawn(async move { erase_kernel.erase_user_data(&erased_user).await });
+        tokio::time::timeout(std::time::Duration::from_millis(100), async {
+            while kernel
+                .acquire_credential_principal(&identity)
+                .await
+                .is_some()
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("user erasure did not close credential admission");
+        assert!(
+            kernel.auth.read().await.get_user(&user).is_some(),
+            "user disappeared before the admitted request drained"
+        );
+        assert!(!erasure.is_finished());
+
+        drop(in_flight);
+        let receipt = tokio::time::timeout(std::time::Duration::from_secs(1), erasure)
+            .await
+            .expect("user erasure did not finish after request drain")
+            .unwrap()
+            .unwrap()
+            .expect("user data existed");
+        assert_eq!(
+            receipt.subject_kind,
+            crate::context::DeletionSubjectKind::User
+        );
+        assert!(kernel.auth.read().await.get_user(&user).is_none());
+        assert!(kernel.resolve_principal(&token).await.is_none());
+        assert!(kernel.context_manager.load_tenancy().unwrap().1.is_empty());
+    }
+
+    #[tokio::test]
+    async fn tenant_erasure_removes_live_agents_and_preserves_other_tenants() {
+        let kernel = AgentKernelImpl::new().unwrap();
+        let erased_tenant = kernel.create_tenant("erase-tenant").await.unwrap();
+        let retained_tenant = kernel.create_tenant("retain-tenant").await.unwrap();
+        let erased_user = kernel
+            .register_user(
+                &erased_tenant,
+                "alice",
+                "alice@erase-tenant.test",
+                crate::auth::Role::User,
+            )
+            .await
+            .unwrap();
+        let retained_user = kernel
+            .register_user(
+                &retained_tenant,
+                "bob",
+                "bob@retain-tenant.test",
+                crate::auth::Role::User,
+            )
+            .await
+            .unwrap();
+        let erased_token = kernel.open_session(&erased_user).await.unwrap();
+        let retained_token = kernel.open_session(&retained_user).await.unwrap();
+        let erased_agent = kernel
+            .create_agent_for_tenant(&erased_tenant, lifecycle_test_config("erase-tenant-agent"))
+            .await
+            .unwrap()
+            .id;
+        let retained_agent = kernel
+            .create_agent_for_tenant(
+                &retained_tenant,
+                lifecycle_test_config("retain-tenant-agent"),
+            )
+            .await
+            .unwrap()
+            .id;
+
+        let receipt = kernel
+            .erase_tenant_data(&erased_tenant)
+            .await
+            .unwrap()
+            .expect("tenant data existed");
+        assert_eq!(
+            receipt.subject_kind,
+            crate::context::DeletionSubjectKind::Tenant
+        );
+        assert!(kernel
+            .auth
+            .read()
+            .await
+            .get_tenant(&erased_tenant)
+            .is_none());
+        assert!(kernel.resolve_principal(&erased_token).await.is_none());
+        assert!(kernel.agent_manager.get_agent_state(erased_agent).is_none());
+        assert!(kernel.syscall_gate.agent_info(erased_agent).is_none());
+        assert!(kernel
+            .context_manager
+            .list_agents_for_tenant(&erased_tenant)
+            .unwrap()
+            .is_empty());
+
+        assert!(kernel
+            .auth
+            .read()
+            .await
+            .get_tenant(&retained_tenant)
+            .is_some());
+        assert!(kernel.resolve_principal(&retained_token).await.is_some());
+        assert!(kernel
+            .agent_manager
+            .get_agent_state(retained_agent)
+            .is_some());
+        assert_eq!(
+            kernel
+                .context_manager
+                .list_agents_for_tenant(&retained_tenant)
+                .unwrap(),
+            vec![retained_agent]
+        );
     }
 
     #[tokio::test]

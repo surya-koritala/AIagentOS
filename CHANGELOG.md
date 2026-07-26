@@ -10,6 +10,16 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
 
 ## [Unreleased]
 
+- Added the supported #123 hot-erasure workflow for agents, users, and tenants.
+  The system-only wire operation requires explicit confirmation, closes and
+  drains affected credential leases, disables supervised owners, quiesces
+  turns and tool calls, removes kernel-owned live resources, and commits the
+  classified SQLite deletion behind a global request barrier. The typed SDK
+  requires an explicit proof-of-intent value and `agentctl` exposes confirmed
+  commands for all three targets. Kernel concurrency/isolation tests plus live
+  wire, SDK, CLI, schema, and golden-fixture regressions cover the workflow.
+  Backup expiration, external-workspace/provider deletion, scheduled retention,
+  encryption, and disaster qualification remain open in #123.
 - Added the #123 storage-erasure foundation with schema version 2. Every logical
   durable table now has a test-enforced ownership/deletion classification.
   Agent, user, and tenant erasure runs in one immediate transaction, removes
@@ -17,8 +27,7 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
   preserves explicitly shared accounting state, and publishes a durable
   non-identifying deletion receipt. Failure injection proves all-or-nothing
   rollback, file-backed restart tests prove erasure persistence, and a released
-  v1 fixture proves the v2 migration. Live-resource coordination and supported
-  wire/SDK/CLI erasure commands remain the next #123 slice.
+  v1 fixture proves the v2 migration.
 - Added the supported #123 operator workflow for storage recovery. Trusted
   system operators can create WAL-consistent backups through the server and
   typed Rust SDK without blocking the async request runtime; `agentctl` can

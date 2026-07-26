@@ -70,6 +70,7 @@ The JSON report includes:
 - attempted, successful, and failed operations;
 - elapsed time, throughput, and p50/p95/p99 operation latency;
 - maximum prompt bytes observed by the deterministic provider;
+- the explicit active-turn and waiting-turn admission limits;
 - an overall pass/fail result and explicit caveats.
 
 Fixture reports always contain:
@@ -108,6 +109,10 @@ For each intended deployment shape:
 6. Repeat with slow providers, slow clients, tenant contention, package
    activity, and restart. A limit is publishable only when the worst required
    profile passes.
+
+The deterministic overload, slow-client, and provider-outage checks are defined
+separately in [Resilience qualification](RESILIENCE_QUALIFICATION.md). Capacity
+evidence is incomplete if either suite fails.
 
 Use this conservative calculation for an initial node limit:
 

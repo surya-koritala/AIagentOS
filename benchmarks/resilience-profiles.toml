@@ -1,0 +1,16 @@
+schema_version = 1
+suite = "agentos-v1-resilience"
+
+[turn_overload]
+operations = 12
+max_concurrent = 2
+max_waiting = 4
+provider_delay_ms = 250
+
+[slow_clients]
+connection_limit = 4
+excess_connections = 8
+idle_timeout_ms = 250
+
+[provider_outage]
+operations = 8

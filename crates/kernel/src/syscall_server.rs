@@ -79,6 +79,118 @@ pub const MIN_PROTOCOL_VERSION: u32 = 1;
 /// incomplete drain. In-process callers can still choose their own timeout.
 pub const MAX_WIRE_WAIT_AGENT_TIMEOUT_MS: u64 = 25_000;
 
+/// Bounded-cardinality transport admission snapshot for qualification and
+/// operator diagnostics. Counters aggregate every connection accepted by one
+/// [`SyscallServer`] instance and never contain peer addresses or tenant data.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct WireConnectionSnapshot {
+    pub capacity: usize,
+    pub active: usize,
+    pub peak_active: usize,
+    pub admitted_total: u64,
+    pub rejected_total: u64,
+    pub handshake_timeouts_total: u64,
+    pub idle_timeouts_total: u64,
+    pub io_errors_total: u64,
+}
+
+#[derive(Default)]
+struct WireConnectionMetricsInner {
+    capacity: std::sync::atomic::AtomicUsize,
+    active: std::sync::atomic::AtomicUsize,
+    peak_active: std::sync::atomic::AtomicUsize,
+    admitted_total: std::sync::atomic::AtomicU64,
+    rejected_total: std::sync::atomic::AtomicU64,
+    handshake_timeouts_total: std::sync::atomic::AtomicU64,
+    idle_timeouts_total: std::sync::atomic::AtomicU64,
+    io_errors_total: std::sync::atomic::AtomicU64,
+}
+
+/// Cloneable read handle for one syscall server's connection-admission state.
+#[derive(Clone)]
+pub struct WireConnectionMetrics {
+    inner: Arc<WireConnectionMetricsInner>,
+}
+
+impl WireConnectionMetrics {
+    fn with_capacity(capacity: usize) -> Self {
+        let metrics = Self {
+            inner: Arc::new(WireConnectionMetricsInner::default()),
+        };
+        metrics
+            .inner
+            .capacity
+            .store(capacity, std::sync::atomic::Ordering::Relaxed);
+        metrics
+    }
+
+    pub fn snapshot(&self) -> WireConnectionSnapshot {
+        use std::sync::atomic::Ordering;
+        WireConnectionSnapshot {
+            capacity: self.inner.capacity.load(Ordering::Relaxed),
+            active: self.inner.active.load(Ordering::Relaxed),
+            peak_active: self.inner.peak_active.load(Ordering::Relaxed),
+            admitted_total: self.inner.admitted_total.load(Ordering::Relaxed),
+            rejected_total: self.inner.rejected_total.load(Ordering::Relaxed),
+            handshake_timeouts_total: self.inner.handshake_timeouts_total.load(Ordering::Relaxed),
+            idle_timeouts_total: self.inner.idle_timeouts_total.load(Ordering::Relaxed),
+            io_errors_total: self.inner.io_errors_total.load(Ordering::Relaxed),
+        }
+    }
+
+    fn set_capacity(&self, capacity: usize) {
+        self.inner
+            .capacity
+            .store(capacity, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn reject(&self) {
+        self.inner
+            .rejected_total
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn admit(&self) -> ActiveWireConnection {
+        use std::sync::atomic::Ordering;
+        self.inner.admitted_total.fetch_add(1, Ordering::Relaxed);
+        let active = self.inner.active.fetch_add(1, Ordering::Relaxed) + 1;
+        self.inner.peak_active.fetch_max(active, Ordering::Relaxed);
+        ActiveWireConnection {
+            metrics: self.clone(),
+        }
+    }
+
+    fn timeout(&self, first_frame: bool) {
+        let counter = if first_frame {
+            &self.inner.handshake_timeouts_total
+        } else {
+            &self.inner.idle_timeouts_total
+        };
+        counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn io_error(&self) {
+        self.inner
+            .io_errors_total
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+struct ActiveWireConnection {
+    metrics: WireConnectionMetrics,
+}
+
+impl Drop for ActiveWireConnection {
+    fn drop(&mut self) {
+        let previous = self
+            .metrics
+            .inner
+            .active
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        debug_assert!(previous > 0, "wire active-connection gauge underflow");
+    }
+}
+
 fn wire_wait_agent_timeout(requested_ms: u64) -> std::time::Duration {
     std::time::Duration::from_millis(requested_ms.min(MAX_WIRE_WAIT_AGENT_TIMEOUT_MS))
 }
@@ -3634,6 +3746,7 @@ pub struct SyscallServer {
     /// this token before any other syscall is dispatched.
     auth_token: Option<Arc<String>>,
     connection_limit: Arc<Semaphore>,
+    connection_metrics: WireConnectionMetrics,
     idle_timeout: std::time::Duration,
 }
 
@@ -3648,6 +3761,7 @@ impl SyscallServer {
             listener: Listener::Tcp(TcpListener::bind(addr).await?),
             auth_token: None,
             connection_limit: Arc::new(Semaphore::new(DEFAULT_WIRE_MAX_CONNECTIONS)),
+            connection_metrics: WireConnectionMetrics::with_capacity(DEFAULT_WIRE_MAX_CONNECTIONS),
             idle_timeout: WIRE_IDLE_TIMEOUT,
         })
     }
@@ -3666,6 +3780,7 @@ impl SyscallServer {
             listener: Listener::Unix(tokio::net::UnixListener::bind(path)?),
             auth_token: None,
             connection_limit: Arc::new(Semaphore::new(DEFAULT_WIRE_MAX_CONNECTIONS)),
+            connection_metrics: WireConnectionMetrics::with_capacity(DEFAULT_WIRE_MAX_CONNECTIONS),
             idle_timeout: WIRE_IDLE_TIMEOUT,
         })
     }
@@ -3692,6 +3807,7 @@ impl SyscallServer {
             listener: Listener::Tls(TcpListener::bind(addr).await?, acceptor),
             auth_token: None,
             connection_limit: Arc::new(Semaphore::new(DEFAULT_WIRE_MAX_CONNECTIONS)),
+            connection_metrics: WireConnectionMetrics::with_capacity(DEFAULT_WIRE_MAX_CONNECTIONS),
             idle_timeout: WIRE_IDLE_TIMEOUT,
         })
     }
@@ -3708,8 +3824,16 @@ impl SyscallServer {
     /// Excess accepted sockets are closed immediately instead of allocating an
     /// unbounded task per peer. A zero value is rejected by clamping it to one.
     pub fn with_connection_limit(mut self, max_connections: usize) -> Self {
-        self.connection_limit = Arc::new(Semaphore::new(max_connections.max(1)));
+        let max_connections = max_connections.max(1);
+        self.connection_limit = Arc::new(Semaphore::new(max_connections));
+        self.connection_metrics.set_capacity(max_connections);
         self
+    }
+
+    /// Return a cloneable read handle for this server's bounded connection
+    /// admission counters. Obtain it before moving the server into [`serve`](Self::serve).
+    pub fn connection_metrics(&self) -> WireConnectionMetrics {
+        self.connection_metrics.clone()
     }
 
     /// Override the established connection idle deadline.
@@ -3739,33 +3863,47 @@ impl SyscallServer {
     /// connection is a stream of newline-delimited [`Syscall`] requests.
     pub async fn serve(self) -> std::io::Result<()> {
         let connection_limit = self.connection_limit.clone();
+        let connection_metrics = self.connection_metrics.clone();
         let idle_timeout = self.idle_timeout;
         match self.listener {
             Listener::Tcp(listener) => loop {
                 let (stream, _peer) = listener.accept().await?;
                 let Ok(connection_permit) = connection_limit.clone().try_acquire_owned() else {
+                    connection_metrics.reject();
                     drop(stream);
                     continue;
                 };
+                let active_connection = connection_metrics.admit();
                 let kernel = self.kernel.clone();
                 let auth = self.auth_token.clone();
+                let connection_metrics = connection_metrics.clone();
                 tokio::spawn(async move {
                     let _connection_permit = connection_permit;
+                    let _active_connection = active_connection;
                     let (read, write) = stream.into_split();
-                    let _ = Self::handle(kernel, read, write, auth, idle_timeout).await;
+                    if Self::handle(kernel, read, write, auth, idle_timeout, &connection_metrics)
+                        .await
+                        .is_err()
+                    {
+                        connection_metrics.io_error();
+                    }
                 });
             },
             Listener::Tls(listener, acceptor) => loop {
                 let (stream, _peer) = listener.accept().await?;
                 let Ok(connection_permit) = connection_limit.clone().try_acquire_owned() else {
+                    connection_metrics.reject();
                     drop(stream);
                     continue;
                 };
+                let active_connection = connection_metrics.admit();
                 let kernel = self.kernel.clone();
                 let auth = self.auth_token.clone();
                 let acceptor = acceptor.clone();
+                let connection_metrics = connection_metrics.clone();
                 tokio::spawn(async move {
                     let _connection_permit = connection_permit;
+                    let _active_connection = active_connection;
                     // Perform the rustls handshake; a failed handshake drops the
                     // connection without affecting the accept loop.
                     let tls =
@@ -3773,27 +3911,48 @@ impl SyscallServer {
                             .await
                         {
                             Ok(Ok(tls)) => tls,
-                            Ok(Err(_)) | Err(_) => return,
+                            Ok(Err(_)) => {
+                                connection_metrics.io_error();
+                                return;
+                            }
+                            Err(_) => {
+                                connection_metrics.timeout(true);
+                                return;
+                            }
                         };
                     // The TLS stream is one AsyncRead+AsyncWrite object; split it
                     // into halves so it drops into the existing generic handler.
                     let (read, write) = tokio::io::split(tls);
-                    let _ = Self::handle(kernel, read, write, auth, idle_timeout).await;
+                    if Self::handle(kernel, read, write, auth, idle_timeout, &connection_metrics)
+                        .await
+                        .is_err()
+                    {
+                        connection_metrics.io_error();
+                    }
                 });
             },
             #[cfg(unix)]
             Listener::Unix(listener) => loop {
                 let (stream, _peer) = listener.accept().await?;
                 let Ok(connection_permit) = connection_limit.clone().try_acquire_owned() else {
+                    connection_metrics.reject();
                     drop(stream);
                     continue;
                 };
+                let active_connection = connection_metrics.admit();
                 let kernel = self.kernel.clone();
                 let auth = self.auth_token.clone();
+                let connection_metrics = connection_metrics.clone();
                 tokio::spawn(async move {
                     let _connection_permit = connection_permit;
+                    let _active_connection = active_connection;
                     let (read, write) = stream.into_split();
-                    let _ = Self::handle(kernel, read, write, auth, idle_timeout).await;
+                    if Self::handle(kernel, read, write, auth, idle_timeout, &connection_metrics)
+                        .await
+                        .is_err()
+                    {
+                        connection_metrics.io_error();
+                    }
                 });
             },
         }
@@ -3809,6 +3968,7 @@ impl SyscallServer {
         mut write: W,
         auth: Option<Arc<String>>,
         idle_timeout: std::time::Duration,
+        connection_metrics: &WireConnectionMetrics,
     ) -> std::io::Result<()>
     where
         R: AsyncRead + Unpin,
@@ -3837,7 +3997,11 @@ impl SyscallServer {
             .await
             {
                 Ok(Ok(Some(line))) => line,
-                Ok(Ok(None)) | Err(_) => break,
+                Ok(Ok(None)) => break,
+                Err(_) => {
+                    connection_metrics.timeout(first_frame);
+                    break;
+                }
                 Ok(Err(error)) if error.kind() == std::io::ErrorKind::InvalidData => {
                     let reply = SyscallReply::Error {
                         message: format!("bad request: {error}"),
@@ -5395,6 +5559,90 @@ mod tests {
             SyscallReply::Hello { .. }
         ));
         fresh.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn slow_clients_are_bounded_reported_and_reaped_for_recovery() {
+        let kernel = Arc::new(AgentKernelImpl::new().expect("kernel new"));
+        let server = SyscallServer::bind(kernel, "127.0.0.1:0")
+            .await
+            .unwrap()
+            .with_connection_limit(2)
+            .with_idle_timeout(std::time::Duration::from_millis(250));
+        let addr = server.local_addr().unwrap();
+        let metrics = server.connection_metrics();
+        let task = tokio::spawn(server.serve());
+
+        let mut slow_a = SyscallClient::connect(addr).await.unwrap();
+        let mut slow_b = SyscallClient::connect(addr).await.unwrap();
+        for client in [&mut slow_a, &mut slow_b] {
+            assert!(matches!(
+                client
+                    .call(Syscall::Hello {
+                        protocol_version: PROTOCOL_VERSION,
+                    })
+                    .await
+                    .unwrap(),
+                SyscallReply::Hello { .. }
+            ));
+        }
+        let saturated = metrics.snapshot();
+        assert_eq!(saturated.capacity, 2);
+        assert_eq!(saturated.active, 2);
+        assert_eq!(saturated.peak_active, 2);
+
+        let mut excess = SyscallClient::connect(addr)
+            .await
+            .expect("the TCP handshake may complete before admission rejection");
+        assert!(
+            excess
+                .call(Syscall::Hello {
+                    protocol_version: PROTOCOL_VERSION,
+                })
+                .await
+                .is_err(),
+            "excess connection must be closed before protocol admission"
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                let snapshot = metrics.snapshot();
+                if snapshot.rejected_total >= 1
+                    && snapshot.idle_timeouts_total >= 2
+                    && snapshot.active == 0
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("slow peers must be reaped within the qualification bound");
+
+        let mut recovered = SyscallClient::connect(addr).await.unwrap();
+        assert!(matches!(
+            recovered
+                .call(Syscall::Hello {
+                    protocol_version: PROTOCOL_VERSION,
+                })
+                .await
+                .unwrap(),
+            SyscallReply::Hello { .. }
+        ));
+        recovered.close().await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while metrics.snapshot().active != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("graceful close must release the connection permit");
+        let recovered = metrics.snapshot();
+        assert_eq!(recovered.peak_active, 2);
+        assert!(recovered.rejected_total >= 1);
+        assert!(recovered.idle_timeouts_total >= 2);
+        assert_eq!(recovered.active, 0);
+        task.abort();
+        let _ = task.await;
     }
 
     #[tokio::test]

@@ -1709,7 +1709,16 @@ impl AgentKernelImpl {
             max_tool_calls_per_turn: budgets.max_tool_calls,
             max_output_tokens_per_request: budgets.max_output_tokens_per_request,
             provider_request_timeout: std::time::Duration::from_secs(120),
-            turn_admission: Arc::new(TurnAdmission::new(budgets.max_concurrent as usize)),
+            turn_admission: Arc::new(if budgets.max_waiting_turns == 0 {
+                TurnAdmission::new(budgets.max_concurrent as usize)
+            } else {
+                let capacity = if budgets.max_concurrent == 0 {
+                    usize::MAX
+                } else {
+                    budgets.max_concurrent as usize
+                };
+                TurnAdmission::with_queue_limit(capacity, budgets.max_waiting_turns as usize)
+            }),
             llm_scheduler: Arc::new(LlmScheduler::new(DEFAULT_LLM_CORES)),
             os,
             tenant_cgroups: DashMap::new(),
@@ -6415,6 +6424,26 @@ mod tests {
         assert_eq!(kernel.turn_admission.capacity(), usize::MAX);
         assert_eq!(kernel.rate_limiter.stats().max_concurrent, 0);
         assert_eq!(kernel.rate_limiter.stats().concurrent_available, 0);
+    }
+
+    #[test]
+    fn configured_turn_waiter_limit_is_applied() {
+        let budgets = crate::config::BudgetConfig {
+            max_concurrent: 2,
+            max_waiting_turns: 7,
+            ..crate::config::BudgetConfig::default()
+        };
+        let kernel = AgentKernelImpl::with_context_manager(
+            Arc::new(SqliteContextManager::in_memory().unwrap()),
+            &budgets,
+            true,
+            &[],
+        )
+        .unwrap();
+
+        let metrics = kernel.turn_admission.metrics();
+        assert_eq!(metrics.capacity, 2);
+        assert_eq!(metrics.queue_capacity, 7);
     }
 
     #[tokio::test]

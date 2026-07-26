@@ -37,10 +37,13 @@ turn is actually executing. These are intentionally different.
    application 8, browser 16, peripheral 8, network 64, and IPC 256. Resource
    admission and execution each time out after 30 seconds.
 
-The turn and LLM queues are bounded at `max(64, capacity * 64)`. A full queue
-returns a stable `retry with backoff` error. Resource admission permits 1,024
-waiters. Waiter registrations are RAII objects: cancellation or future drop
-removes the waiter and wakes contenders, preventing ghost waiters and lost
+The turn queue is explicitly configurable with `budgets.max_waiting_turns`. A
+zero value preserves the compatibility bound `max(64, capacity * 64)`;
+production deployments should select a finite non-zero value through
+qualification. The LLM queue retains the derived compatibility bound. A full
+queue returns a stable `retry with backoff` error. Resource admission permits
+1,024 waiters. Waiter registrations are RAII objects: cancellation or future
+drop removes the waiter and wakes contenders, preventing ghost waiters and lost
 wakeups.
 
 ## Priority changes and inversion
@@ -95,5 +98,8 @@ this `CFS-inspired turn admission`, never a CPU scheduler.
 configured concurrency is never exceeded or leaked. Kernel unit tests cover
 long weighted workloads, cancellation, lost wakeups, queue overload, priority
 inheritance/restoration, starvation escape, and per-class counters.
+The public-path `resilience-qualification` suite proves the configured active
+and waiting turn bounds under deliberate overload and verifies complete permit
+drainage before recovery.
 `cargo run --package os-benchmark --bin os-benchmark --locked` reports direct
 turn-admission nanoseconds per slot separately from syscall-gate throughput.

@@ -36,6 +36,7 @@ impl Drop for TempDb {
         let _ = std::fs::remove_file(&self.0);
         let _ = std::fs::remove_file(format!("{}-wal", self.0.display()));
         let _ = std::fs::remove_file(format!("{}-shm", self.0.display()));
+        let _ = std::fs::remove_file(format!("{}.lock", self.0.display()));
     }
 }
 
@@ -45,6 +46,25 @@ async fn serve_kernel(kernel: Arc<AgentKernelImpl>) -> (String, JoinHandle<std::
         .expect("bind");
     let address = server.local_addr().expect("local_addr").to_string();
     (address, tokio::spawn(server.serve()))
+}
+
+async fn reopen_persistent_kernel(path: &Path, label: &str) -> AgentKernelImpl {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        match AgentKernelImpl::with_db_path(path) {
+            Ok(kernel) => return kernel,
+            Err(error)
+                if error.to_string().contains("already owned")
+                    && tokio::time::Instant::now() < deadline =>
+            {
+                // An aborted in-process test server can have a detached
+                // connection task release its final Arc one scheduler tick
+                // later. A real process exit releases the OS lock immediately.
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            Err(error) => panic!("{label}: {error}"),
+        }
+    }
 }
 
 fn mutual_tls_configs() -> (
@@ -293,9 +313,8 @@ async fn durable_identity_and_agent_ownership_survive_node_and_client_restart() 
     first_server.abort();
     let _ = first_server.await;
 
-    let restarted_kernel = Arc::new(
-        AgentKernelImpl::with_db_path(database.path()).expect("restart persistent kernel"),
-    );
+    let restarted_kernel =
+        Arc::new(reopen_persistent_kernel(database.path(), "restart persistent kernel").await);
     let (restarted_address, restarted_server) = serve_kernel(restarted_kernel).await;
     let mut restarted_cluster = ClusterClient::connect(&[restarted_address])
         .await
@@ -319,12 +338,28 @@ async fn durable_identity_and_agent_ownership_survive_node_and_client_restart() 
 
 #[tokio::test]
 async fn duplicate_durable_node_identity_fails_closed() {
-    let database = TempDb::new("duplicate-identity");
+    let database = TempDb::new("duplicate-identity-source");
     let first = Arc::new(
         AgentKernelImpl::with_db_path(database.path()).expect("create first persistent kernel"),
     );
+    // Clone one verified offline snapshot to a different database path. Two
+    // live kernels may never own one database path, but restoring the same
+    // durable node identity onto two hosts must still be rejected by cluster
+    // discovery.
+    let backup_root = std::env::temp_dir().join(format!(
+        "agentos-cluster-duplicate-backup-{}",
+        uuid::Uuid::new_v4()
+    ));
+    first
+        .context_manager
+        .create_backup(&backup_root, "identity")
+        .expect("back up durable identity");
+    let duplicate_database = TempDb::new("duplicate-identity-restored");
+    kernel::storage::restore_backup(&backup_root.join("identity"), duplicate_database.path())
+        .expect("restore duplicate durable identity");
     let second = Arc::new(
-        AgentKernelImpl::with_db_path(database.path()).expect("create duplicate persistent kernel"),
+        AgentKernelImpl::with_db_path(duplicate_database.path())
+            .expect("create duplicate persistent kernel"),
     );
     let (first_address, first_server) = serve_kernel(first).await;
     let (second_address, second_server) = serve_kernel(second).await;
@@ -342,6 +377,7 @@ async fn duplicate_durable_node_identity_fails_closed() {
     second_server.abort();
     let _ = first_server.await;
     let _ = second_server.await;
+    let _ = std::fs::remove_dir_all(backup_root);
 }
 
 #[tokio::test]
@@ -659,7 +695,7 @@ async fn membership_authority_and_discovery_survive_authority_restart() {
     let _ = first_authority_task.await;
 
     let restarted_kernel =
-        Arc::new(AgentKernelImpl::with_db_path(database.path()).expect("restart authority kernel"));
+        Arc::new(reopen_persistent_kernel(database.path(), "restart authority kernel").await);
     let restarted_server = SyscallServer::bind(restarted_kernel, "127.0.0.1:0")
         .await
         .expect("bind restarted authority")

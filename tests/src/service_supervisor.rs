@@ -770,7 +770,22 @@ async fn crash_recovery_preserves_restart_exhaustion_until_operator_reset() {
         runtime.stop();
     }
 
-    let recovered = Arc::new(AgentKernelImpl::from_config(&config).unwrap());
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    let recovered = Arc::new(loop {
+        match AgentKernelImpl::from_config(&config) {
+            Ok(kernel) => break kernel,
+            Err(error)
+                if error.to_string().contains("already owned")
+                    && tokio::time::Instant::now() < deadline =>
+            {
+                // The stopped in-process runtime loops release their final
+                // kernel Arc on their next scheduled wakeup. A process exit
+                // releases this OS lock immediately.
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            Err(error) => panic!("recover exhausted service state: {error}"),
+        }
+    });
     let state = recovered.list_services().await.remove(0);
     assert!(state.restart_exhausted);
     assert_eq!(state.status, ServiceStatus::Failed);

@@ -313,8 +313,12 @@ mod tests {
             "agentos-operator-cas-{}.sqlite",
             uuid::Uuid::new_v4()
         ));
-        let first_store = Arc::new(SqliteContextManager::new(&db_path).unwrap());
-        let second_store = Arc::new(SqliteContextManager::new(&db_path).unwrap());
+        // This white-box test deliberately models two SQLite participants.
+        // Production context managers enforce one process owner per path.
+        let first_store =
+            Arc::new(SqliteContextManager::new_without_storage_lease(&db_path).unwrap());
+        let second_store =
+            Arc::new(SqliteContextManager::new_without_storage_lease(&db_path).unwrap());
         let first = OperatorControl::new(first_store).unwrap();
         let second = OperatorControl::new(second_store).unwrap();
 
@@ -357,5 +361,6 @@ mod tests {
         let _ = std::fs::remove_file(&db_path);
         let _ = std::fs::remove_file(format!("{}-wal", db_path.display()));
         let _ = std::fs::remove_file(format!("{}-shm", db_path.display()));
+        let _ = std::fs::remove_file(format!("{}.lock", db_path.display()));
     }
 }

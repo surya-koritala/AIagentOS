@@ -15,6 +15,14 @@ pub(crate) const APPLICATION_ID: i64 = 0x4149_4f53;
 pub(crate) const CURRENT_SCHEMA_VERSION: i64 = 1;
 const MIN_READABLE_SCHEMA_VERSION: i64 = 1;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageMetadata {
+    pub application_id: i64,
+    pub schema_version: i64,
+    pub min_reader_schema_version: i64,
+    pub installation_id: String,
+}
+
 const REQUIRED_TABLES: &[&str] = &[
     "contexts",
     "facts",
@@ -302,26 +310,46 @@ pub(crate) fn verify(connection: &Connection) -> Result<(), ContextError> {
         )));
     }
 
-    let metadata: (i64, i64, i64) = connection
-        .query_row(
-            "SELECT application_id, schema_version, min_reader_schema_version
-             FROM storage_meta WHERE singleton = 1",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        )
-        .map_err(|error| storage_error(format!("failed to validate schema metadata: {error}")))?;
-    if metadata
-        != (
-            APPLICATION_ID,
-            CURRENT_SCHEMA_VERSION,
-            MIN_READABLE_SCHEMA_VERSION,
-        )
-    {
+    let metadata = read_storage_metadata(connection)?;
+    if (
+        metadata.application_id,
+        metadata.schema_version,
+        metadata.min_reader_schema_version,
+    ) != (
+        APPLICATION_ID,
+        CURRENT_SCHEMA_VERSION,
+        MIN_READABLE_SCHEMA_VERSION,
+    ) {
         return Err(storage_error(format!(
             "schema metadata is inconsistent: application_id={}, schema_version={}, \
              min_reader_schema_version={}",
-            metadata.0, metadata.1, metadata.2
+            metadata.application_id, metadata.schema_version, metadata.min_reader_schema_version
         )));
     }
+    if uuid::Uuid::parse_str(&metadata.installation_id).is_err() {
+        return Err(storage_error(
+            "schema metadata installation_id is not a UUID",
+        ));
+    }
     Ok(())
+}
+
+pub(crate) fn read_storage_metadata(
+    connection: &Connection,
+) -> Result<StorageMetadata, ContextError> {
+    connection
+        .query_row(
+            "SELECT application_id, schema_version, min_reader_schema_version, installation_id
+             FROM storage_meta WHERE singleton = 1",
+            [],
+            |row| {
+                Ok(StorageMetadata {
+                    application_id: row.get(0)?,
+                    schema_version: row.get(1)?,
+                    min_reader_schema_version: row.get(2)?,
+                    installation_id: row.get(3)?,
+                })
+            },
+        )
+        .map_err(|error| storage_error(format!("failed to read schema metadata: {error}")))
 }

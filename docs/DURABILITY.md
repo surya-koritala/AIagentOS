@@ -4,8 +4,9 @@ AI Agent OS currently stores kernel-owned state in one SQLite database. The
 database includes context, memory, usage and quota accounting, agent lifecycle,
 packages, operator settings, services, identity, and cluster control state.
 
-This document describes the guarantees implemented today. It does not claim
-that backup, restore, encryption, or deletion are production-qualified.
+This document describes the guarantees implemented today. The kernel backup
+and offline restore primitives are integrated, but operator-facing recovery,
+encryption, and deletion are not production-qualified.
 
 ## Database identity and version
 
@@ -39,9 +40,57 @@ physical integrity, and foreign-key consistency. Reopening the current version
 is idempotent and does not append a duplicate migration record.
 
 There is no supported in-place downgrade. Rollback to a binary that requires an
-older schema will require restoring a verified pre-upgrade backup. Until the
-backup/restore work in issue #123 is complete, operators should treat a schema
-upgrade as irreversible and test it on a copy of their data.
+older schema requires an offline restore of a compatible, verified pre-upgrade
+backup.
+
+## Online backup
+
+`SqliteContextManager::create_backup` uses SQLite's online backup API. It never
+copies the main database file directly, so committed rows that are still in WAL
+are included in a transactionally consistent snapshot. The backup runs in
+bounded page steps and tolerates concurrent SQLite writers.
+
+The caller supplies an operator-controlled backup root and a simple backup
+name. The root and published backup must be real directories rather than
+symlinks. Names cannot contain path separators. Creation uses a private staging
+directory, syncs the database and manifest, and renames the complete directory
+into place. Existing destinations are never overwritten.
+
+Each backup directory contains:
+
+- `agent_os.db`, a standalone SQLite snapshot without a required WAL sidecar;
+- `manifest.json`, containing the format version, application ID, schema
+  version, installation ID, timestamp, byte count, and SHA-256 digest.
+
+`storage::verify_backup` rejects unknown manifest fields, unsupported backup or
+schema versions, symlinked inputs, size or hash changes, corrupt SQLite pages,
+foreign-key violations, and mismatched installation metadata. SHA-256 detects
+accidental or uncoordinated modification; it is not an authenticity signature
+against an attacker who can replace both the database and manifest.
+
+## Offline restore
+
+`storage::restore_backup` is intentionally offline. Every file-backed kernel
+(and every standalone file-backed context manager) holds an exclusive lock on
+`agent_os.db.lock` for its lifetime, and restore must acquire the same lock. A
+running kernel therefore causes restore to fail before the destination is
+changed.
+
+Restore verifies the backup first, copies it to a same-directory staging file,
+syncs and verifies that copy, checkpoints an existing destination, and retains
+the old database under a unique rollback name. The staged snapshot is then
+renamed atomically into place and verified again. Any failure after publication
+removes the failed replacement and automatically renames the original database
+back. The rollback copy is removed only after the replacement passes all
+checks.
+If cleanup of the obsolete rollback file cannot be made durable, restore still
+returns a successful report with `rollback_retained = true` so the operator is
+not told that the already-verified replacement failed.
+
+Fresh-host restore and replacement restore are supported by the kernel
+primitive. A system-authorized server/SDK/CLI workflow, scheduled retention,
+remote object storage, and measured recovery objectives remain future work;
+remote callers must not be allowed to choose arbitrary filesystem paths.
 
 ## Current durability boundary
 
@@ -52,10 +101,12 @@ admission accounting, checkpoints, and agent rehydration.
 
 The following remain open under issue #123:
 
-- online, WAL-consistent backup with a signed or hashed manifest;
-- offline verified restore with atomic rollback and fresh-host recovery tests;
+- system-authorized backup/verify/restore API, SDK, CLI, scheduling, retention,
+  and recovery runbook;
+- signed manifests or external authenticity/immutability controls;
 - corruption recovery beyond fail-closed startup detection;
 - encryption at rest and key rotation;
 - schema-wide agent and tenant deletion with retention policy and receipts;
-- disk-full, interrupted migration/restore, and extended crash qualification;
-- operator commands and recovery runbooks with measured RPO/RTO.
+- disk-full, interrupted migration, object-store, and extended crash
+  qualification;
+- measured RPO/RTO on supported deployment profiles.

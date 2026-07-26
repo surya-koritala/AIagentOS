@@ -54,6 +54,7 @@ pub use kernel::package::{
     PackageFileKind, PackageLock, PackageManifest, PackagePayload, PackageSbom, PackageSigningKey,
     PackageSummary, PackageTrustInput, PackageTrustKey, SbomComponent, VerifiedPackage,
 };
+pub use kernel::storage::{BackupManifest, RestoreReport};
 pub use kernel::syscall_server::{
     AgentSummary, FactSummary, GenerationCheckpointSummary, MessageStreamEvent,
     OperatorAgentSnapshot, OperatorCgroupSnapshot, OperatorNamespaceSnapshot,
@@ -1175,6 +1176,25 @@ impl KernelClient {
         {
             SyscallReply::OperatorTunableAudit { entries } => Ok(entries),
             other => Err(unexpected("OperatorTunableAudit", &other)),
+        }
+    }
+
+    /// Ask the running kernel to create and atomically publish a verified
+    /// online backup on the server host.
+    pub async fn create_storage_backup(
+        &mut self,
+        backup_root: impl Into<String>,
+        name: impl Into<String>,
+    ) -> Result<BackupManifest, SdkError> {
+        match self
+            .call(Syscall::CreateStorageBackup {
+                backup_root: backup_root.into(),
+                name: name.into(),
+            })
+            .await?
+        {
+            SyscallReply::StorageBackupCreated { manifest } => Ok(manifest),
+            other => Err(unexpected("StorageBackupCreated", &other)),
         }
     }
 

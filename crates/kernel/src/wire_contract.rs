@@ -482,6 +482,13 @@ const REQUEST_VARIANTS: &[Variant] = &[
         fields: &[Field::optional("name", N), Field::optional("limit", I)],
     },
     Variant {
+        tag: "create_storage_backup",
+        fields: &[
+            Field::required("backup_root", S),
+            Field::required("name", S),
+        ],
+    },
+    Variant {
         tag: "list_services",
         fields: &[],
     },
@@ -870,6 +877,10 @@ const REPLY_VARIANTS: &[Variant] = &[
         fields: &[Field::required("entries", A)],
     },
     Variant {
+        tag: "storage_backup_created",
+        fields: &[Field::required("manifest", O)],
+    },
+    Variant {
         tag: "services",
         fields: &[Field::required("services", A)],
     },
@@ -1219,8 +1230,8 @@ mod tests {
                     });
             }
         }
-        assert_eq!(conformance_request_fixtures(1).unwrap().len(), 58);
-        assert_eq!(conformance_request_fixtures(2).unwrap().len(), 70);
+        assert_eq!(conformance_request_fixtures(1).unwrap().len(), 59);
+        assert_eq!(conformance_request_fixtures(2).unwrap().len(), 71);
         assert!(conformance_request_fixtures(0).is_err());
         assert!(conformance_request_fixtures(PROTOCOL_VERSION + 1).is_err());
     }

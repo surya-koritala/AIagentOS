@@ -128,6 +128,33 @@ exec 3<>/dev/tcp/127.0.0.1/7777; printf '{"op":"node_info"}\n' >&3; head -1 <&3
 # -> {"status":"node_info","agent_count":0,"running_agents":0}
 ```
 
+### Back up and recover persistent state
+
+Create a consistent backup while the server is running. The backup root is on
+the server host and requires trusted system-operator access:
+
+```bash
+cargo run -p agent-cli --bin agentctl --locked -- \
+  --addr 127.0.0.1:7777 --token "$AGENT_SERVER_TOKEN" \
+  backup-create /var/lib/agentos/backups nightly_2026_07_25
+```
+
+Verification is read-only. Restore is deliberately offline and refuses to run
+while a kernel owns the destination database:
+
+```bash
+cargo run -p agent-cli --bin agentctl --locked -- \
+  backup-verify /var/lib/agentos/backups/nightly_2026_07_25
+
+# Stop agent-server first. The confirmation flag cannot bypass the lock.
+cargo run -p agent-cli --bin agentctl --locked -- \
+  backup-restore /var/lib/agentos/backups/nightly_2026_07_25 \
+  /var/lib/agentos/agent_os.db --confirm-offline
+```
+
+The exact durability boundary, manifest checks, and remaining recovery work are
+documented in [docs/DURABILITY.md](docs/DURABILITY.md).
+
 Connect with the SDK or any client speaking newline-delimited JSON syscalls.
 See [the public protocol contract](docs/PROTOCOL.md) for version negotiation,
 machine-readable schemas, typed errors, ordered token streaming, exact-request

@@ -41,9 +41,9 @@ compatibility behavior, and transport limits:
 
 The schemas use JSON Schema draft 2020-12 and cover every top-level request,
 reply, and stream-event tag. The authorization/schema regression constructs
-all 70 current syscalls and rejects either a missing schema operation or an
-undocumented extra. Deterministic golden request arrays cover all 58 v1
-operations and all 70 v2 operations. Domain payload examples and
+all 71 current syscalls and rejects either a missing schema operation or an
+undocumented extra. Deterministic golden request arrays cover all 59 v1
+operations and all 71 v2 operations. Domain payload examples and
 previous-version shapes are retained under `protocol/`.
 
 ## Compatibility policy
@@ -252,11 +252,11 @@ and restarting affected listeners. Those requirements remain tracked by #122.
 Versioned fixtures:
 
 - `protocol/v1/error.json`
-- `protocol/v1/requests.json` (all 58 v1 operations)
+- `protocol/v1/requests.json` (all 59 v1 operations)
 - `protocol/v2/hello.json`
 - `protocol/v2/typed-error.json`
 - `protocol/v2/describe-protocol-request.json`
-- `protocol/v2/requests.json` (all 70 v2 operations)
+- `protocol/v2/requests.json` (all 71 v2 operations)
 - `protocol/v2/send-message-stream.json`
 - `protocol/v2/stream-event.json`
 - `protocol/v2/stream-completed.json`

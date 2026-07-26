@@ -5,8 +5,9 @@ database includes context, memory, usage and quota accounting, agent lifecycle,
 packages, operator settings, services, identity, and cluster control state.
 
 This document describes the guarantees implemented today. The kernel backup
-and offline restore primitives are integrated, but operator-facing recovery,
-encryption, and deletion are not production-qualified.
+and offline restore primitives plus authenticated SDK/CLI entry points are
+integrated, but scheduled recovery, encryption, and deletion are not
+production-qualified.
 
 ## Database identity and version
 
@@ -68,6 +69,17 @@ foreign-key violations, and mismatched installation metadata. SHA-256 detects
 accidental or uncoordinated modification; it is not an authenticity signature
 against an attacker who can replace both the database and manifest.
 
+A trusted system operator can create a live backup through the running server:
+
+```bash
+agentctl --addr 127.0.0.1:7777 --token "$AGENT_SERVER_TOKEN" \
+  backup-create /var/lib/agentos/backups nightly_2026_07_25
+```
+
+`BACKUP_ROOT` is a path on the server host, not the client host. Tenant-bound
+credentials, including tenant administrators, cannot invoke this operation.
+The SDK exposes the same operation as `KernelClient::create_storage_backup`.
+
 ## Offline restore
 
 `storage::restore_backup` is intentionally offline. Every file-backed kernel
@@ -87,10 +99,23 @@ If cleanup of the obsolete rollback file cannot be made durable, restore still
 returns a successful report with `rollback_retained = true` so the operator is
 not told that the already-verified replacement failed.
 
-Fresh-host restore and replacement restore are supported by the kernel
-primitive. A system-authorized server/SDK/CLI workflow, scheduled retention,
-remote object storage, and measured recovery objectives remain future work;
-remote callers must not be allowed to choose arbitrary filesystem paths.
+Verify a backup without changing any state, then stop the server and restore it
+to the configured database path:
+
+```bash
+agentctl backup-verify /var/lib/agentos/backups/nightly_2026_07_25
+agentctl backup-restore /var/lib/agentos/backups/nightly_2026_07_25 \
+  /var/lib/agentos/agent_os.db --confirm-offline
+```
+
+The confirmation flag makes the destructive intent explicit; it does not
+bypass the storage lease. If any kernel still owns the destination, restore
+fails before changing it. Both commands emit versioned manifest/report JSON so
+automation can retain recovery evidence.
+
+Fresh-host and replacement restore are supported by this CLI workflow.
+Scheduled retention, remote object storage, and measured recovery objectives
+remain future work.
 
 ## Current durability boundary
 
@@ -101,8 +126,7 @@ admission accounting, checkpoints, and agent rehydration.
 
 The following remain open under issue #123:
 
-- system-authorized backup/verify/restore API, SDK, CLI, scheduling, retention,
-  and recovery runbook;
+- scheduling, retention, remote object storage, and a measured recovery runbook;
 - signed manifests or external authenticity/immutability controls;
 - corruption recovery beyond fail-closed startup detection;
 - encryption at rest and key rotation;

@@ -298,12 +298,12 @@ maturity = "integrated"
 release = "v0.9"
 tracking_issue = 123
 kernel_modules = ["database", "storage"]
-source_paths = ["crates/kernel/src/context.rs", "crates/kernel/src/schema.rs", "crates/kernel/src/storage.rs", "crates/kernel/src/cluster_control.rs", "docs/DURABILITY.md"]
-public_entry_points = ["crates/kernel/src/lib.rs::AgentKernelImpl::with_db_path", "crates/kernel/src/context.rs::SqliteContextManager::create_backup", "crates/kernel/src/storage.rs::verify_backup", "crates/kernel/src/storage.rs::restore_backup"]
-runtime_call_paths = ["crates/kernel/src/context.rs::SqliteContextManager", "crates/kernel/src/storage.rs"]
-test_evidence = ["tests/src/persistence_props.rs", "crates/kernel/src/context.rs", "crates/kernel/src/storage.rs"]
+source_paths = ["crates/kernel/src/context.rs", "crates/kernel/src/schema.rs", "crates/kernel/src/storage.rs", "crates/kernel/src/syscall_server.rs", "crates/sdk/src/lib.rs", "crates/cli/src/bin/agentctl.rs", "crates/kernel/src/cluster_control.rs", "docs/DURABILITY.md"]
+public_entry_points = ["crates/kernel/src/lib.rs::AgentKernelImpl::with_db_path", "crates/kernel/src/context.rs::SqliteContextManager::create_backup", "crates/kernel/src/storage.rs::verify_backup", "crates/kernel/src/storage.rs::restore_backup", "crates/kernel/src/syscall_server.rs::Syscall::CreateStorageBackup", "crates/sdk/src/lib.rs::KernelClient::create_storage_backup", "crates/cli/src/bin/agentctl.rs"]
+runtime_call_paths = ["crates/kernel/src/context.rs::SqliteContextManager", "crates/kernel/src/storage.rs", "crates/kernel/src/syscall_server.rs::dispatch_scoped"]
+test_evidence = ["tests/src/persistence_props.rs", "crates/kernel/src/context.rs", "crates/kernel/src/storage.rs", "crates/sdk/tests/kernel_client.rs::system_operator_can_create_and_verify_online_backup_via_sdk", "crates/cli/tests/storage_commands.rs"]
 platforms = ["linux", "macos", "windows"]
-limitations = ["Restart rehydration, a fail-closed versioned SQLite ownership boundary, WAL-consistent online backup with a hashed manifest, strict verification, and offline atomic restore with an automatic rollback file are integrated. Active-writer, WAL inclusion, tamper, future-schema, running-owner exclusion, fresh-host restore, replacement, and injected rollback regressions exist. A system-authorized API/SDK/CLI, scheduled retention, remote object storage, signed authenticity, multi-version upgrade fixtures, corruption recovery, encryption/key rotation, cascading deletion, disk-full/crash qualification, and measured recovery runbooks remain open in #123; this capability is not production-qualified."]
+limitations = ["Restart rehydration, a fail-closed versioned SQLite ownership boundary, WAL-consistent online backup with a hashed manifest, strict verification, offline atomic restore with automatic rollback, a system-authorized server/SDK backup operation, and local verify/restore CLI are integrated. Active-writer, WAL inclusion, tamper, future-schema, running-owner exclusion, fresh-host CLI restore, replacement, and injected rollback regressions exist. Scheduled retention, remote object storage, signed authenticity, multi-version upgrade fixtures, corruption recovery, encryption/key rotation, cascading deletion, disk-full/crash qualification, and measured recovery runbooks remain open in #123; this capability is not production-qualified."]
 
 [[capability]]
 id = "resource-providers"

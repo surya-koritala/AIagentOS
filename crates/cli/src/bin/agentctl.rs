@@ -7,7 +7,12 @@ use agent_cli::OperatorClient;
 fn usage() -> ! {
     eprintln!(
         "usage: agentctl [--addr HOST:PORT] [--token TOKEN] \
-         <list|inspect|pressure|tunables|tunable-set|tunable-rollback|tunable-history|status|pause|resume|stop|kill|wait|services|service-start|service-stop|service-restart|service-reload|service-history> [ARGS...]"
+         <list|inspect|pressure|tunables|tunable-set|tunable-rollback|tunable-history|status|pause|resume|stop|kill|wait|services|service-start|service-stop|service-restart|service-reload|service-history|backup-create|backup-verify|backup-restore> [ARGS...]\n\
+         \n\
+         storage commands:\n\
+           agentctl [SERVER OPTIONS] backup-create BACKUP_ROOT NAME\n\
+           agentctl backup-verify BACKUP_DIR\n\
+           agentctl backup-restore BACKUP_DIR DATABASE --confirm-offline"
     );
     std::process::exit(2);
 }
@@ -27,6 +32,38 @@ async fn main() {
     }
 
     let command = args.next().unwrap_or_else(|| usage());
+
+    // Verification and restore operate directly on local files. Restore must
+    // remain offline: the storage lease rejects replacement while a kernel
+    // owns the destination database.
+    match command.as_str() {
+        "backup-verify" => {
+            let backup_dir = args.next().unwrap_or_else(|| usage());
+            if args.next().is_some() {
+                usage();
+            }
+            let manifest = kernel::storage::verify_backup(std::path::Path::new(&backup_dir))
+                .unwrap_or_else(|error| fail_storage(error));
+            print_json(&manifest, "backup manifest");
+            return;
+        }
+        "backup-restore" => {
+            let backup_dir = args.next().unwrap_or_else(|| usage());
+            let database = args.next().unwrap_or_else(|| usage());
+            if args.next().as_deref() != Some("--confirm-offline") || args.next().is_some() {
+                usage();
+            }
+            let report = kernel::storage::restore_backup(
+                std::path::Path::new(&backup_dir),
+                std::path::Path::new(&database),
+            )
+            .unwrap_or_else(|error| fail_storage(error));
+            print_json(&report, "restore report");
+            return;
+        }
+        _ => {}
+    }
+
     let mut client = OperatorClient::connect(&addr, token.as_deref())
         .await
         .unwrap_or_else(|error| {
@@ -164,6 +201,19 @@ async fn main() {
             );
             return;
         }
+        "backup-create" => {
+            let backup_root = args.next().unwrap_or_else(|| usage());
+            let name = args.next().unwrap_or_else(|| usage());
+            if args.next().is_some() {
+                usage();
+            }
+            let manifest = client
+                .create_storage_backup(backup_root, name)
+                .await
+                .unwrap_or_else(|error| fail(error));
+            print_json(&manifest, "backup manifest");
+            return;
+        }
         "services" => {
             for service in client
                 .list_services()
@@ -286,4 +336,18 @@ async fn main() {
 fn fail(error: agent_sdk::SdkError) -> ! {
     eprintln!("agentctl: {error}");
     std::process::exit(1);
+}
+
+fn fail_storage(error: kernel::ContextError) -> ! {
+    eprintln!("agentctl: {error}");
+    std::process::exit(1);
+}
+
+fn print_json(value: &impl serde::Serialize, label: &str) {
+    println!(
+        "{}",
+        serde_json::to_string_pretty(value).unwrap_or_else(|error| fail(
+            agent_sdk::SdkError::Kernel(format!("{label} encoding failed: {error}"))
+        ))
+    );
 }

@@ -51,10 +51,12 @@ dependencies = [
  "dirs 5.0.1",
  "kernel",
  "libc",
+ "serde",
  "serde_json",
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]

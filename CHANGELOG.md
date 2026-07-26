@@ -10,6 +10,14 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
 
 ## [Unreleased]
 
+- Added the supported #123 operator workflow for storage recovery. Trusted
+  system operators can create WAL-consistent backups through the server and
+  typed Rust SDK without blocking the async request runtime; `agentctl` can
+  verify backup manifests locally and perform explicitly confirmed offline
+  fresh-host or replacement restores. The public wire schema and versioned
+  conformance fixtures include the new operation, tenant credentials remain
+  denied, and SDK plus CLI end-to-end regressions cover publication,
+  verification, restore, and reboot of the restored database.
 - Added WAL-consistent online SQLite backup, bounded manifest parsing,
   SHA-256/size/schema/installation verification, and offline atomic restore.
   File-backed kernels now hold a process-lifetime storage lease so restore

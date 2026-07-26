@@ -8,8 +8,9 @@ This document describes the guarantees implemented today. The kernel backup
 and offline restore primitives plus authenticated SDK/CLI entry points are
 integrated. Transactional storage erasure, non-identifying deletion receipts,
 and live-resource-coordinated system operator erasure through the wire, SDK,
-and CLI are integrated. Scheduled recovery, retention, and encryption are not
-yet production-qualified.
+and CLI are integrated. Verified local-backup retention is integrated.
+Scheduled backup/recovery, remote retention, and encryption are not yet
+production-qualified.
 
 ## Database identity and version
 
@@ -82,6 +83,37 @@ agentctl --addr 127.0.0.1:7777 --token "$AGENT_SERVER_TOKEN" \
 credentials, including tenant administrators, cannot invoke this operation.
 The SDK exposes the same operation as `KernelClient::create_storage_backup`.
 
+## Verified local-backup retention
+
+`SqliteContextManager::apply_backup_retention` scans a bounded backup root under
+the same exclusive publication lock used by online backup. It considers only
+strictly verified backups whose installation ID matches the running database.
+The policy always preserves `keep_latest` backups and preserves any additional
+backup younger than `max_age_seconds`.
+
+Unknown files, hidden staging entries, symlinks, corrupt or foreign-installation
+backups, future timestamps, and backup directories containing unexpected
+content are skipped and reported; they are never recursively deleted.
+Expiration first renames a selected directory to a unique same-root tombstone,
+syncs the root, and removes only the known database, SQLite verification
+sidecars, and manifest. Retention cannot race backup publication.
+
+Preview a 30-day policy while always keeping seven backups, then enforce the
+same policy:
+
+```bash
+agentctl --addr 127.0.0.1:7777 --token "$AGENT_SERVER_TOKEN" \
+  backup-retention /var/lib/agentos/backups 7 2592000 --dry-run
+agentctl --addr 127.0.0.1:7777 --token "$AGENT_SERVER_TOKEN" \
+  backup-retention /var/lib/agentos/backups 7 2592000 --confirm
+```
+
+The typed SDK separates preview from enforcement and requires
+`CONFIRM_BACKUP_RETENTION` for deletion. Reports list eligible, deleted,
+retained, and skipped entries. This feature applies only to verified backups in
+the named local root; scheduling, remote/object-store lifecycle, and external
+workspace/provider deletion remain separate operator responsibilities.
+
 ## Offline restore
 
 `storage::restore_backup` is intentionally offline. Every file-backed kernel
@@ -116,8 +148,8 @@ fails before changing it. Both commands emit versioned manifest/report JSON so
 automation can retain recovery evidence.
 
 Fresh-host and replacement restore are supported by this CLI workflow.
-Scheduled retention, remote object storage, and measured recovery objectives
-remain future work.
+Scheduled backup/recovery, remote object storage, and measured recovery
+objectives remain future work.
 
 ## Data ownership and erasure contract
 
@@ -157,11 +189,12 @@ package transparency/audit chains; deleting the tenant removes those chains.
 
 All kernel SQLite tables are included in verified backups. Published backups
 are immutable snapshots and are not retroactively changed by a live-database
-erasure; operators must expire and destroy backup directories according to
-their retention policy. The database is protected with owner-only permissions
-on Unix, but application-level encryption and key rotation remain open in
-#123. Provider configuration files, agent workspaces, remote provider data, and
-external object stores are outside this SQLite deletion boundary.
+erasure. Operators can enforce the verified local-backup retention policy, but
+must separately govern remote copies and external systems. The database is
+protected with owner-only permissions on Unix, but application-level encryption
+and key rotation remain open in #123. Provider configuration files, agent
+workspaces, remote provider data, and external object stores are outside this
+SQLite deletion boundary.
 
 Ephemeral process state includes scheduler queues, executors and cancellation
 handles, syscall-gate registrations, namespaces/cgroups, sandboxes, credential
@@ -201,12 +234,13 @@ admission accounting, checkpoints, and agent rehydration.
 
 The following remain open under issue #123:
 
-- scheduling, retention, remote object storage, and a measured recovery runbook;
+- scheduled backup/recovery, remote object storage retention, and a measured
+  recovery runbook;
 - signed manifests or external authenticity/immutability controls;
 - corruption recovery beyond fail-closed startup detection;
 - encryption at rest and key rotation;
-- backup expiration and measured retention enforcement across live storage,
-  published backups, external workspaces, providers, and object stores;
+- measured deletion/retention enforcement across external workspaces,
+  providers, remote backup copies, and object stores;
 - disk-full, interrupted migration, object-store, and extended crash
   qualification;
 - measured RPO/RTO on supported deployment profiles.

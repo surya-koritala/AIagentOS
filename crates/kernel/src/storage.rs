@@ -21,8 +21,11 @@ use crate::ContextError;
 
 const BACKUP_FORMAT_VERSION: u32 = 1;
 const BACKUP_DATABASE_FILE: &str = "agent_os.db";
+const BACKUP_DATABASE_SHM_FILE: &str = "agent_os.db-shm";
+const BACKUP_DATABASE_WAL_FILE: &str = "agent_os.db-wal";
 const BACKUP_MANIFEST_FILE: &str = "manifest.json";
 const MAX_MANIFEST_BYTES: u64 = 64 * 1024;
+const MAX_BACKUP_ROOT_ENTRIES: usize = 10_000;
 
 /// Integrity and compatibility metadata published beside a SQLite snapshot.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -47,6 +50,49 @@ pub struct RestoreReport {
     /// rollback file could not be made durable. Operators may safely remove any
     /// retained rollback file while offline.
     pub rollback_retained: bool,
+}
+
+/// Bounded policy for expiring verified backups from one installation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BackupRetentionPolicy {
+    /// Always preserve at least this many newest verified backups.
+    pub keep_latest: usize,
+    /// Backups younger than this age are preserved even when they exceed
+    /// `keep_latest`.
+    pub max_age_seconds: u64,
+}
+
+/// One verified backup considered by a retention run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackupRetentionEntry {
+    pub name: String,
+    pub created_at: String,
+    pub byte_count: u64,
+}
+
+/// A root entry that retention deliberately left untouched.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackupRetentionIssue {
+    pub name: String,
+    pub reason: String,
+}
+
+/// Auditable result of a dry-run or confirmed retention pass.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackupRetentionReport {
+    pub evaluated_at: String,
+    pub dry_run: bool,
+    pub policy: BackupRetentionPolicy,
+    /// Old verified backups selected by the policy. In dry-run mode these are
+    /// the backups that would be deleted.
+    pub eligible: Vec<BackupRetentionEntry>,
+    /// Successfully deleted backups. Empty in dry-run mode.
+    pub deleted: Vec<BackupRetentionEntry>,
+    /// Verified current-installation backups preserved by the policy.
+    pub retained: Vec<BackupRetentionEntry>,
+    /// Unknown, unsafe, corrupt, or foreign-installation entries.
+    pub skipped: Vec<BackupRetentionIssue>,
 }
 
 fn storage_error(message: impl Into<String>) -> ContextError {
@@ -169,6 +215,50 @@ fn prepare_backup_root(root: &Path) -> Result<(), ContextError> {
         }
     }
     set_owner_only_directory(root)
+}
+
+fn acquire_backup_publication_lock(root: &Path) -> Result<File, ContextError> {
+    let publication_lock_path = root.join(".agentos-backup.lock");
+    match fs::symlink_metadata(&publication_lock_path) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+            return Err(storage_error(
+                "backup publication lock must be a regular file, not a symlink",
+            ))
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(storage_error(format!(
+                "failed to inspect backup publication lock: {error}"
+            )))
+        }
+    }
+    let publication_lock = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&publication_lock_path)
+        .map_err(|error| {
+            storage_error(format!("failed to open backup publication lock: {error}"))
+        })?;
+    let metadata = fs::symlink_metadata(&publication_lock_path).map_err(|error| {
+        storage_error(format!(
+            "failed to inspect opened backup publication lock: {error}"
+        ))
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(storage_error(
+            "backup publication lock must be a regular file, not a symlink",
+        ));
+    }
+    set_owner_only_file(&publication_lock_path)?;
+    publication_lock.try_lock().map_err(|error| {
+        storage_error(format!(
+            "another backup publication or retention pass is active: {error}"
+        ))
+    })?;
+    Ok(publication_lock)
 }
 
 fn reject_existing_path(path: &Path, label: &str) -> Result<(), ContextError> {
@@ -355,6 +445,145 @@ pub fn verify_backup(backup_dir: &Path) -> Result<BackupManifest, ContextError> 
     Ok(manifest)
 }
 
+fn validate_retention_policy(policy: &BackupRetentionPolicy) -> Result<(), ContextError> {
+    if policy.keep_latest == 0 {
+        return Err(storage_error(
+            "backup retention must keep at least one verified backup",
+        ));
+    }
+    if policy.max_age_seconds == 0 {
+        return Err(storage_error(
+            "backup retention max_age_seconds must be greater than zero",
+        ));
+    }
+    Ok(())
+}
+
+fn bounded_entry_name(entry: &fs::DirEntry) -> String {
+    let name = entry.file_name().to_string_lossy().into_owned();
+    if name.len() <= 128 {
+        name
+    } else {
+        format!("{}…", name.chars().take(128).collect::<String>())
+    }
+}
+
+fn require_removable_backup_contents(backup_dir: &Path) -> Result<(), ContextError> {
+    let mut found_database = false;
+    let mut found_manifest = false;
+    for entry in fs::read_dir(backup_dir).map_err(|error| {
+        storage_error(format!(
+            "failed to enumerate backup {}: {error}",
+            backup_dir.display()
+        ))
+    })? {
+        let entry = entry.map_err(|error| {
+            storage_error(format!(
+                "failed to enumerate backup {}: {error}",
+                backup_dir.display()
+            ))
+        })?;
+        let metadata = fs::symlink_metadata(entry.path()).map_err(|error| {
+            storage_error(format!(
+                "failed to inspect backup entry {}: {error}",
+                entry.path().display()
+            ))
+        })?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(storage_error(
+                "backup contains a non-regular file and cannot be expired automatically",
+            ));
+        }
+        match entry.file_name().to_str() {
+            Some(BACKUP_DATABASE_FILE) => found_database = true,
+            // SQLite may leave an empty shared-memory index after read-only
+            // verification of a WAL-mode database. It is a known sidecar, not
+            // user-controlled backup content.
+            Some(BACKUP_DATABASE_SHM_FILE) => {}
+            Some(BACKUP_DATABASE_WAL_FILE) if metadata.len() == 0 => {}
+            Some(BACKUP_DATABASE_WAL_FILE) => {
+                return Err(storage_error(
+                    "backup has a non-empty WAL and cannot be expired automatically",
+                ))
+            }
+            Some(BACKUP_MANIFEST_FILE) => found_manifest = true,
+            _ => {
+                return Err(storage_error(format!(
+                    "backup contains unexpected entry {:?} and cannot be expired automatically",
+                    entry.file_name()
+                )))
+            }
+        }
+    }
+    if !found_database || !found_manifest {
+        return Err(storage_error(
+            "backup is incomplete and cannot be expired automatically",
+        ));
+    }
+    Ok(())
+}
+
+fn delete_verified_backup(
+    backup_root: &Path,
+    entry: &BackupRetentionEntry,
+    expected_manifest: &BackupManifest,
+) -> Result<(), ContextError> {
+    validate_backup_name(&entry.name)?;
+    let backup_dir = backup_root.join(&entry.name);
+    require_real_directory(&backup_dir, "backup selected for expiration")?;
+    require_removable_backup_contents(&backup_dir)?;
+    let tombstone = backup_root.join(format!(".{}.{}.deleting", entry.name, uuid::Uuid::new_v4()));
+    reject_existing_path(&tombstone, "backup deletion staging directory")?;
+    fs::rename(&backup_dir, &tombstone).map_err(|error| {
+        storage_error(format!(
+            "failed to stage backup {} for expiration: {error}",
+            backup_dir.display()
+        ))
+    })?;
+    sync_directory(backup_root)?;
+    require_real_directory(&tombstone, "staged backup selected for expiration")?;
+    let staged_manifest = verify_backup(&tombstone)?;
+    if &staged_manifest != expected_manifest {
+        return Err(storage_error(format!(
+            "backup {} changed before expiration; deletion staging requires operator inspection at {}",
+            entry.name,
+            tombstone.display()
+        )));
+    }
+    require_removable_backup_contents(&tombstone)?;
+
+    let deletion = (|| {
+        fs::remove_file(tombstone.join(BACKUP_DATABASE_FILE)).map_err(|error| {
+            storage_error(format!(
+                "failed to remove expired backup database {}: {error}",
+                entry.name
+            ))
+        })?;
+        remove_if_exists(&tombstone.join(BACKUP_DATABASE_SHM_FILE))?;
+        remove_if_exists(&tombstone.join(BACKUP_DATABASE_WAL_FILE))?;
+        fs::remove_file(tombstone.join(BACKUP_MANIFEST_FILE)).map_err(|error| {
+            storage_error(format!(
+                "failed to remove expired backup manifest {}: {error}",
+                entry.name
+            ))
+        })?;
+        fs::remove_dir(&tombstone).map_err(|error| {
+            storage_error(format!(
+                "failed to remove expired backup directory {}: {error}",
+                entry.name
+            ))
+        })?;
+        sync_directory(backup_root)
+    })();
+    if let Err(error) = deletion {
+        return Err(storage_error(format!(
+            "{error}; deletion staging may require offline operator cleanup at {}",
+            tombstone.display()
+        )));
+    }
+    Ok(())
+}
+
 impl SqliteContextManager {
     /// Create and atomically publish a WAL-consistent online SQLite backup.
     pub fn create_backup(
@@ -364,20 +593,7 @@ impl SqliteContextManager {
     ) -> Result<BackupManifest, ContextError> {
         validate_backup_name(name)?;
         prepare_backup_root(backup_root)?;
-        let publication_lock_path = backup_root.join(".agentos-backup.lock");
-        let publication_lock = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .truncate(false)
-            .open(&publication_lock_path)
-            .map_err(|error| {
-                storage_error(format!("failed to open backup publication lock: {error}"))
-            })?;
-        set_owner_only_file(&publication_lock_path)?;
-        publication_lock.try_lock().map_err(|error| {
-            storage_error(format!("another backup publication is active: {error}"))
-        })?;
+        let _publication_lock = acquire_backup_publication_lock(backup_root)?;
 
         let final_dir = backup_root.join(name);
         reject_existing_path(&final_dir, "backup destination")?;
@@ -465,6 +681,163 @@ impl SqliteContextManager {
         })()?;
         staging_guard.disarm();
         Ok(manifest)
+    }
+
+    /// Preview or enforce a bounded retention policy over verified backups.
+    ///
+    /// Only backups belonging to this manager's installation are considered.
+    /// Unknown entries, symlinks, corrupt backups, foreign-installation
+    /// backups, and directories with extra content are never deleted.
+    pub fn apply_backup_retention(
+        &self,
+        backup_root: &Path,
+        policy: BackupRetentionPolicy,
+        dry_run: bool,
+    ) -> Result<BackupRetentionReport, ContextError> {
+        validate_retention_policy(&policy)?;
+        require_real_directory(backup_root, "backup root")?;
+        let _publication_lock = acquire_backup_publication_lock(backup_root)?;
+        let installation_id = {
+            let connection = self
+                .conn
+                .lock()
+                .map_err(|_| storage_error("SQLite connection mutex is poisoned"))?;
+            crate::schema::read_storage_metadata(&connection)?.installation_id
+        };
+        let evaluated_at = Utc::now();
+        let mut verified = Vec::new();
+        let mut skipped = Vec::new();
+        let mut scanned = 0_usize;
+
+        for entry in fs::read_dir(backup_root).map_err(|error| {
+            storage_error(format!(
+                "failed to enumerate backup root {}: {error}",
+                backup_root.display()
+            ))
+        })? {
+            let entry = entry.map_err(|error| {
+                storage_error(format!(
+                    "failed to enumerate backup root {}: {error}",
+                    backup_root.display()
+                ))
+            })?;
+            scanned += 1;
+            if scanned > MAX_BACKUP_ROOT_ENTRIES {
+                return Err(storage_error(format!(
+                    "backup root exceeds the scan limit of {MAX_BACKUP_ROOT_ENTRIES} entries"
+                )));
+            }
+            let name = bounded_entry_name(&entry);
+            if name == ".agentos-backup.lock"
+                || name.starts_with('.')
+                || validate_backup_name(&name).is_err()
+            {
+                continue;
+            }
+            let metadata = match fs::symlink_metadata(entry.path()) {
+                Ok(metadata) => metadata,
+                Err(error) => {
+                    skipped.push(BackupRetentionIssue {
+                        name,
+                        reason: format!("could not inspect entry: {error}"),
+                    });
+                    continue;
+                }
+            };
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                skipped.push(BackupRetentionIssue {
+                    name,
+                    reason: "not a real backup directory".into(),
+                });
+                continue;
+            }
+            let manifest = match verify_backup(&entry.path()) {
+                Ok(manifest) => manifest,
+                Err(error) => {
+                    skipped.push(BackupRetentionIssue {
+                        name,
+                        reason: format!("verification failed: {error}"),
+                    });
+                    continue;
+                }
+            };
+            if manifest.installation_id != installation_id {
+                skipped.push(BackupRetentionIssue {
+                    name,
+                    reason: "belongs to a different installation".into(),
+                });
+                continue;
+            }
+            if let Err(error) = require_removable_backup_contents(&entry.path()) {
+                skipped.push(BackupRetentionIssue {
+                    name,
+                    reason: error.to_string(),
+                });
+                continue;
+            }
+            let created_at = match chrono::DateTime::parse_from_rfc3339(&manifest.created_at) {
+                Ok(created_at) => created_at.with_timezone(&Utc),
+                Err(error) => {
+                    skipped.push(BackupRetentionIssue {
+                        name,
+                        reason: format!("invalid creation timestamp: {error}"),
+                    });
+                    continue;
+                }
+            };
+            if created_at > evaluated_at {
+                skipped.push(BackupRetentionIssue {
+                    name,
+                    reason: "creation timestamp is in the future".into(),
+                });
+                continue;
+            }
+            verified.push((
+                created_at,
+                BackupRetentionEntry {
+                    name,
+                    created_at: manifest.created_at.clone(),
+                    byte_count: manifest.byte_count,
+                },
+                manifest,
+            ));
+        }
+
+        verified.sort_by(|(left_time, left, _), (right_time, right, _)| {
+            right_time
+                .cmp(left_time)
+                .then_with(|| right.name.cmp(&left.name))
+        });
+        let max_age_seconds = i64::try_from(policy.max_age_seconds).unwrap_or(i64::MAX);
+        let mut eligible = Vec::new();
+        let mut eligible_manifests = Vec::new();
+        let mut retained = Vec::new();
+        for (index, (created_at, entry, manifest)) in verified.into_iter().enumerate() {
+            let age_seconds = evaluated_at.signed_duration_since(created_at).num_seconds();
+            if index >= policy.keep_latest && age_seconds >= max_age_seconds {
+                eligible.push(entry);
+                eligible_manifests.push(manifest);
+            } else {
+                retained.push(entry);
+            }
+        }
+
+        let mut deleted = Vec::new();
+        if !dry_run {
+            for (entry, manifest) in eligible.iter().zip(&eligible_manifests) {
+                delete_verified_backup(backup_root, entry, manifest)?;
+                deleted.push(entry.clone());
+            }
+        }
+        Ok(BackupRetentionReport {
+            evaluated_at: evaluated_at.to_rfc3339(),
+            dry_run,
+            policy,
+            eligible,
+            deleted,
+            retained,
+            skipped,
+        })
     }
 }
 
@@ -895,6 +1268,194 @@ mod tests {
         assert_eq!(staging_entries, 0);
     }
 
+    fn set_backup_age(root: &Path, name: &str, age: chrono::Duration) {
+        let manifest_path = root.join(name).join(BACKUP_MANIFEST_FILE);
+        let mut manifest = read_manifest(&manifest_path).unwrap();
+        manifest.created_at = (Utc::now() - age).to_rfc3339();
+        fs::write(manifest_path, serde_json::to_vec_pretty(&manifest).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn retention_dry_run_and_confirmation_preserve_the_latest_backups() {
+        let directory = TestDirectory::new("retention");
+        let manager = SqliteContextManager::new(&directory.path.join("source.db")).unwrap();
+        let root = directory.path.join("backups");
+        for name in ["oldest", "old", "new", "newest"] {
+            manager.create_backup(&root, name).unwrap();
+        }
+        set_backup_age(&root, "oldest", chrono::Duration::hours(8));
+        set_backup_age(&root, "old", chrono::Duration::hours(6));
+        set_backup_age(&root, "new", chrono::Duration::minutes(30));
+        set_backup_age(&root, "newest", chrono::Duration::minutes(10));
+        let policy = BackupRetentionPolicy {
+            keep_latest: 2,
+            max_age_seconds: 60 * 60,
+        };
+
+        let preview = manager
+            .apply_backup_retention(&root, policy.clone(), true)
+            .unwrap();
+        assert!(preview.dry_run);
+        assert_eq!(
+            preview
+                .eligible
+                .iter()
+                .map(|entry| entry.name.as_str())
+                .collect::<Vec<_>>(),
+            ["old", "oldest"],
+            "{preview:#?}"
+        );
+        assert!(preview.deleted.is_empty());
+        assert_eq!(
+            preview
+                .retained
+                .iter()
+                .map(|entry| entry.name.as_str())
+                .collect::<Vec<_>>(),
+            ["newest", "new"]
+        );
+        for name in ["oldest", "old", "new", "newest"] {
+            assert!(root.join(name).exists());
+        }
+
+        let applied = manager
+            .apply_backup_retention(&root, policy, false)
+            .unwrap();
+        assert_eq!(applied.deleted, applied.eligible);
+        assert!(!root.join("oldest").exists());
+        assert!(!root.join("old").exists());
+        assert!(root.join("new").exists());
+        assert!(root.join("newest").exists());
+        assert_eq!(verify_backup(&root.join("new")).unwrap().installation_id, {
+            crate::schema::read_storage_metadata(&manager.conn.lock().unwrap())
+                .unwrap()
+                .installation_id
+        });
+    }
+
+    #[test]
+    fn retention_never_deletes_foreign_corrupt_or_augmented_backups() {
+        let directory = TestDirectory::new("retention-safety");
+        let manager = SqliteContextManager::new(&directory.path.join("source.db")).unwrap();
+        let foreign = SqliteContextManager::new(&directory.path.join("foreign.db")).unwrap();
+        let root = directory.path.join("backups");
+        manager.create_backup(&root, "current").unwrap();
+        manager.create_backup(&root, "augmented").unwrap();
+        foreign.create_backup(&root, "foreign").unwrap();
+        set_backup_age(&root, "current", chrono::Duration::hours(8));
+        set_backup_age(&root, "augmented", chrono::Duration::hours(8));
+        set_backup_age(&root, "foreign", chrono::Duration::hours(8));
+        fs::write(root.join("augmented/operator-notes.txt"), b"preserve").unwrap();
+        fs::create_dir(root.join("corrupt")).unwrap();
+        fs::write(root.join("corrupt/manifest.json"), b"not json").unwrap();
+
+        let report = manager
+            .apply_backup_retention(
+                &root,
+                BackupRetentionPolicy {
+                    keep_latest: 1,
+                    max_age_seconds: 1,
+                },
+                false,
+            )
+            .unwrap();
+        assert!(report.deleted.is_empty());
+        assert_eq!(report.retained.len(), 1, "{report:#?}");
+        assert_eq!(report.skipped.len(), 3);
+        assert!(report.skipped.iter().any(
+            |issue| issue.name == "foreign" && issue.reason.contains("different installation")
+        ));
+        assert!(report
+            .skipped
+            .iter()
+            .any(|issue| issue.name == "augmented" && issue.reason.contains("unexpected entry")));
+        assert!(report
+            .skipped
+            .iter()
+            .any(|issue| issue.name == "corrupt" && issue.reason.contains("verification failed")));
+        for name in ["current", "augmented", "foreign", "corrupt"] {
+            assert!(root.join(name).exists());
+        }
+    }
+
+    #[test]
+    fn retention_rejects_unsafe_policy_missing_roots_and_concurrent_publication() {
+        let directory = TestDirectory::new("retention-validation");
+        let manager = SqliteContextManager::new(&directory.path.join("source.db")).unwrap();
+        let missing = directory.path.join("missing");
+        assert!(manager
+            .apply_backup_retention(
+                &missing,
+                BackupRetentionPolicy {
+                    keep_latest: 1,
+                    max_age_seconds: 60,
+                },
+                true,
+            )
+            .is_err());
+
+        let root = directory.path.join("backups");
+        manager.create_backup(&root, "one").unwrap();
+        for policy in [
+            BackupRetentionPolicy {
+                keep_latest: 0,
+                max_age_seconds: 60,
+            },
+            BackupRetentionPolicy {
+                keep_latest: 1,
+                max_age_seconds: 0,
+            },
+        ] {
+            assert!(manager.apply_backup_retention(&root, policy, true).is_err());
+        }
+
+        let _lock = acquire_backup_publication_lock(&root).unwrap();
+        let error = manager
+            .apply_backup_retention(
+                &root,
+                BackupRetentionPolicy {
+                    keep_latest: 1,
+                    max_age_seconds: 60,
+                },
+                true,
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("retention pass is active"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retention_does_not_follow_symlinked_backup_entries() {
+        use std::os::unix::fs::symlink;
+
+        let directory = TestDirectory::new("retention-symlink");
+        let manager = SqliteContextManager::new(&directory.path.join("source.db")).unwrap();
+        let root = directory.path.join("backups");
+        manager.create_backup(&root, "real").unwrap();
+        let outside = directory.path.join("outside");
+        fs::create_dir(&outside).unwrap();
+        fs::write(outside.join("must-survive"), b"proof").unwrap();
+        symlink(&outside, root.join("linked")).unwrap();
+
+        let report = manager
+            .apply_backup_retention(
+                &root,
+                BackupRetentionPolicy {
+                    keep_latest: 1,
+                    max_age_seconds: 1,
+                },
+                false,
+            )
+            .unwrap();
+        assert!(report
+            .skipped
+            .iter()
+            .any(|issue| issue.name == "linked"
+                && issue.reason.contains("not a real backup directory")));
+        assert_eq!(fs::read(outside.join("must-survive")).unwrap(), b"proof");
+        assert!(root.join("linked").exists());
+    }
+
     #[test]
     fn tampered_database_and_manifest_are_rejected() {
         let directory = TestDirectory::new("tamper");
@@ -1066,6 +1627,20 @@ mod tests {
         let linked_root = directory.path.join("linked-root");
         symlink(&real_root, &linked_root).unwrap();
         assert!(manager.create_backup(&linked_root, "blocked").is_err());
+
+        let outside_lock = directory.path.join("outside-lock");
+        fs::write(&outside_lock, b"must not be opened as the lock").unwrap();
+        let publication_lock = real_root.join(".agentos-backup.lock");
+        symlink(&outside_lock, &publication_lock).unwrap();
+        let error = manager
+            .create_backup(&real_root, "lock-blocked")
+            .unwrap_err();
+        assert!(error.to_string().contains("regular file"));
+        assert_eq!(
+            fs::read(&outside_lock).unwrap(),
+            b"must not be opened as the lock"
+        );
+        fs::remove_file(&publication_lock).unwrap();
 
         manager.create_backup(&real_root, "valid").unwrap();
         let backup_dir = real_root.join("valid");

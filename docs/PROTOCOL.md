@@ -41,9 +41,9 @@ compatibility behavior, and transport limits:
 
 The schemas use JSON Schema draft 2020-12 and cover every top-level request,
 reply, and stream-event tag. The authorization/schema regression constructs
-all 72 current syscalls and rejects either a missing schema operation or an
+all 73 current syscalls and rejects either a missing schema operation or an
 undocumented extra. Deterministic golden request arrays cover all 59 v1
-operations and all 72 v2 operations. Domain payload examples and
+operations and all 73 v2 operations. Domain payload examples and
 previous-version shapes are retained under `protocol/`.
 
 ## Compatibility policy
@@ -213,6 +213,27 @@ requests to finish before taking a global erasure barrier. Agent and tenant
 erasure also disables supervised owners, quiesces turns and external tool
 calls, removes live scheduler, executor, sandbox, namespace, cgroup, gate, and
 observability state, and only then commits the classified SQLite transaction.
+
+## Backup retention
+
+Protocol v2 advertises `backup_retention`. A trusted system operator can preview
+or enforce retention over verified backups owned by the running installation.
+Tenant credentials are denied, and deletion requires `confirm: true`;
+`dry_run: true` never deletes:
+
+```json
+{
+  "op": "enforce_storage_backup_retention",
+  "backup_root": "/var/lib/agentos/backups",
+  "keep_latest": 7,
+  "max_age_seconds": 2592000,
+  "dry_run": true,
+  "confirm": false
+}
+```
+
+The server serializes retention with backup publication and returns an
+auditable report of eligible, deleted, retained, and skipped entries.
 An agent-only erasure reopens the unaffected tenant credentials after the
 operation. Successful user and tenant erasure leaves their credentials revoked.
 Failure before the durable commit reopens still-valid credentials so the
@@ -289,7 +310,7 @@ Versioned fixtures:
 - `protocol/v2/hello.json`
 - `protocol/v2/typed-error.json`
 - `protocol/v2/describe-protocol-request.json`
-- `protocol/v2/requests.json` (all 72 v2 operations)
+- `protocol/v2/requests.json` (all 73 v2 operations)
 - `protocol/v2/send-message-stream.json`
 - `protocol/v2/stream-event.json`
 - `protocol/v2/stream-completed.json`

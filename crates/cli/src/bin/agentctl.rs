@@ -7,10 +7,11 @@ use agent_cli::OperatorClient;
 fn usage() -> ! {
     eprintln!(
         "usage: agentctl [--addr HOST:PORT] [--token TOKEN] \
-         <list|inspect|pressure|tunables|tunable-set|tunable-rollback|tunable-history|status|pause|resume|stop|kill|wait|services|service-start|service-stop|service-restart|service-reload|service-history|backup-create|backup-verify|backup-restore|erase-agent|erase-user|erase-tenant> [ARGS...]\n\
+         <list|inspect|pressure|tunables|tunable-set|tunable-rollback|tunable-history|status|pause|resume|stop|kill|wait|services|service-start|service-stop|service-restart|service-reload|service-history|backup-create|backup-retention|backup-verify|backup-restore|erase-agent|erase-user|erase-tenant> [ARGS...]\n\
          \n\
          storage commands:\n\
            agentctl [SERVER OPTIONS] backup-create BACKUP_ROOT NAME\n\
+           agentctl [SERVER OPTIONS] backup-retention BACKUP_ROOT KEEP_LATEST MAX_AGE_SECONDS <--dry-run|--confirm>\n\
            agentctl backup-verify BACKUP_DIR\n\
            agentctl backup-restore BACKUP_DIR DATABASE --confirm-offline\n\
            agentctl [SERVER OPTIONS] erase-agent AGENT_ID --confirm\n\
@@ -215,6 +216,44 @@ async fn main() {
                 .await
                 .unwrap_or_else(|error| fail(error));
             print_json(&manifest, "backup manifest");
+            return;
+        }
+        "backup-retention" => {
+            let backup_root = args.next().unwrap_or_else(|| usage());
+            let keep_latest = args
+                .next()
+                .unwrap_or_else(|| usage())
+                .parse::<usize>()
+                .unwrap_or_else(|_| usage());
+            let max_age_seconds = args
+                .next()
+                .unwrap_or_else(|| usage())
+                .parse::<u64>()
+                .unwrap_or_else(|_| usage());
+            let mode = args.next().unwrap_or_else(|| usage());
+            if args.next().is_some() {
+                usage();
+            }
+            let report = match mode.as_str() {
+                "--dry-run" => {
+                    client
+                        .preview_storage_backup_retention(backup_root, keep_latest, max_age_seconds)
+                        .await
+                }
+                "--confirm" => {
+                    client
+                        .enforce_storage_backup_retention(
+                            backup_root,
+                            keep_latest,
+                            max_age_seconds,
+                            agent_sdk::CONFIRM_BACKUP_RETENTION,
+                        )
+                        .await
+                }
+                _ => usage(),
+            }
+            .unwrap_or_else(|error| fail(error));
+            print_json(&report, "backup retention report");
             return;
         }
         "erase-agent" => {

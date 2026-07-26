@@ -671,6 +671,32 @@ async fn system_operator_can_create_and_verify_online_backup_via_sdk() {
         kernel::storage::verify_backup(&backup_root.join("operator_001")).unwrap(),
         manifest
     );
+    tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
+    client
+        .create_storage_backup(backup_root.to_string_lossy(), "operator_002")
+        .await
+        .expect("create second storage backup");
+    let preview = client
+        .preview_storage_backup_retention(backup_root.to_string_lossy(), 1, 1)
+        .await
+        .expect("preview storage backup retention");
+    assert!(preview.dry_run);
+    assert_eq!(preview.eligible.len(), 1);
+    assert_eq!(preview.eligible[0].name, "operator_001");
+    assert!(backup_root.join("operator_001").exists());
+    let applied = client
+        .enforce_storage_backup_retention(
+            backup_root.to_string_lossy(),
+            1,
+            1,
+            agent_sdk::CONFIRM_BACKUP_RETENTION,
+        )
+        .await
+        .expect("enforce storage backup retention");
+    assert_eq!(applied.deleted.len(), 1);
+    assert_eq!(applied.deleted[0].name, "operator_001");
+    assert!(!backup_root.join("operator_001").exists());
+    assert!(backup_root.join("operator_002").exists());
 
     drop(client);
     server_task.abort();

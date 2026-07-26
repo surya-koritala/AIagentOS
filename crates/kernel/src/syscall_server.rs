@@ -464,6 +464,15 @@ pub enum Syscall {
         backup_root: String,
         name: String,
     },
+    /// Preview or enforce retention for verified backups owned by the current
+    /// installation. A non-dry-run request requires explicit confirmation.
+    EnforceStorageBackupRetention {
+        backup_root: String,
+        keep_latest: usize,
+        max_age_seconds: u64,
+        dry_run: bool,
+        confirm: bool,
+    },
     /// Irreversibly erase one classified data boundary. This is system-only and
     /// requires an explicit confirmation bit on the wire so a generic client
     /// cannot turn an inspection command into deletion by argument drift.
@@ -1030,6 +1039,10 @@ pub enum SyscallReply {
     StorageBackupCreated {
         manifest: crate::storage::BackupManifest,
     },
+    /// Result of a safe backup-retention preview or confirmed pass.
+    StorageBackupRetention {
+        report: crate::storage::BackupRetentionReport,
+    },
     /// Privacy-safe durable proof of a committed erasure. `None` means the
     /// requested subject already had no classified durable or live state.
     DataErased {
@@ -1274,6 +1287,9 @@ fn syscall_policy(call: &Syscall) -> (AccessLevel, &'static str, Option<&str>) {
             (AccessLevel::System, "operator.tunable.audit", None)
         }
         Syscall::CreateStorageBackup { .. } => (AccessLevel::System, "storage.backup.create", None),
+        Syscall::EnforceStorageBackupRetention { .. } => {
+            (AccessLevel::System, "storage.backup.retention", None)
+        }
         Syscall::EraseData { .. } => (AccessLevel::System, "storage.data.erase", None),
         Syscall::ListServices => (AccessLevel::System, "service.list", None),
         Syscall::StartService { .. } => (AccessLevel::System, "service.start", None),
@@ -1498,6 +1514,7 @@ fn quarantine_recovery_call(call: &Syscall) -> bool {
             | Syscall::ListOperatorTunables
             | Syscall::ListOperatorTunableAudit { .. }
             | Syscall::CreateStorageBackup { .. }
+            | Syscall::EnforceStorageBackupRetention { .. }
             | Syscall::EraseData { .. }
             | Syscall::ListServices
             | Syscall::ListServiceHistory { .. }
@@ -2981,6 +2998,40 @@ pub async fn dispatch_scoped(
                 },
                 Err(error) => SyscallReply::Error {
                     message: format!("storage backup worker failed: {error}"),
+                },
+            }
+        }
+        Syscall::EnforceStorageBackupRetention {
+            backup_root,
+            keep_latest,
+            max_age_seconds,
+            dry_run,
+            confirm,
+        } => {
+            if !dry_run && !confirm {
+                return SyscallReply::Error {
+                    message: "backup retention deletion requires explicit confirmation".into(),
+                };
+            }
+            let context_manager = Arc::clone(&kernel.context_manager);
+            match tokio::task::spawn_blocking(move || {
+                context_manager.apply_backup_retention(
+                    std::path::Path::new(&backup_root),
+                    crate::storage::BackupRetentionPolicy {
+                        keep_latest,
+                        max_age_seconds,
+                    },
+                    dry_run,
+                )
+            })
+            .await
+            {
+                Ok(Ok(report)) => SyscallReply::StorageBackupRetention { report },
+                Ok(Err(error)) => SyscallReply::Error {
+                    message: error.to_string(),
+                },
+                Err(error) => SyscallReply::Error {
+                    message: format!("storage backup retention worker failed: {error}"),
                 },
             }
         }
@@ -5938,6 +5989,16 @@ memory = ["remember this"]
                 AccessLevel::System,
             ),
             (
+                Syscall::EnforceStorageBackupRetention {
+                    backup_root: "backups".into(),
+                    keep_latest: 1,
+                    max_age_seconds: 86_400,
+                    dry_run: true,
+                    confirm: false,
+                },
+                AccessLevel::System,
+            ),
+            (
                 Syscall::EraseData {
                     target: DataErasureTarget::Agent {
                         agent_id: uuid::Uuid::new_v4().to_string(),
@@ -6018,7 +6079,7 @@ memory = ["remember this"]
                     .to_string()
             })
             .collect::<std::collections::HashSet<_>>();
-        assert_eq!(calls.len(), 72);
+        assert_eq!(calls.len(), 73);
         assert_eq!(fixture_tags, schema_tags);
     }
 
@@ -6104,6 +6165,55 @@ memory = ["remember this"]
             .agent_tenant(agent.id)
             .unwrap()
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn backup_retention_is_system_only_and_requires_delete_confirmation() {
+        let kernel = AgentKernelImpl::new().expect("kernel new");
+        let tenant = kernel.create_tenant("retention-wire").await.unwrap();
+        let user_id = kernel
+            .register_user(&tenant, "admin", "admin@retention-wire.test", Role::Admin)
+            .await
+            .unwrap();
+        let admin = Principal {
+            user_id,
+            tenant_id: tenant,
+            role: Role::Admin,
+            credential: None,
+        };
+        let root =
+            std::env::temp_dir().join(format!("agentos-wire-retention-{}", uuid::Uuid::new_v4()));
+        kernel.context_manager.create_backup(&root, "one").unwrap();
+        let preview = Syscall::EnforceStorageBackupRetention {
+            backup_root: root.to_string_lossy().into_owned(),
+            keep_latest: 1,
+            max_age_seconds: 60,
+            dry_run: true,
+            confirm: false,
+        };
+
+        assert_authorization_denied(dispatch_scoped(&kernel, preview.clone(), Some(&admin)).await);
+        assert!(matches!(
+            dispatch(&kernel, preview).await,
+            SyscallReply::StorageBackupRetention { report }
+                if report.dry_run && report.retained.len() == 1
+        ));
+        assert!(matches!(
+            dispatch(
+                &kernel,
+                Syscall::EnforceStorageBackupRetention {
+                    backup_root: root.to_string_lossy().into_owned(),
+                    keep_latest: 1,
+                    max_age_seconds: 60,
+                    dry_run: false,
+                    confirm: false,
+                },
+            )
+            .await,
+            SyscallReply::Error { message } if message.contains("explicit confirmation")
+        ));
+        assert!(root.join("one").exists());
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[tokio::test]

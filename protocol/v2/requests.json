@@ -308,6 +308,14 @@
     "op": "create_storage_backup"
   },
   {
+    "backup_root": "fixture",
+    "confirm": true,
+    "dry_run": true,
+    "keep_latest": 1,
+    "max_age_seconds": 1,
+    "op": "enforce_storage_backup_retention"
+  },
+  {
     "confirm": true,
     "op": "erase_data",
     "target": {

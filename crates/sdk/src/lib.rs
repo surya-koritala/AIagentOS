@@ -54,7 +54,10 @@ pub use kernel::package::{
     PackageFileKind, PackageLock, PackageManifest, PackagePayload, PackageSbom, PackageSigningKey,
     PackageSummary, PackageTrustInput, PackageTrustKey, SbomComponent, VerifiedPackage,
 };
-pub use kernel::storage::{BackupManifest, RestoreReport};
+pub use kernel::storage::{
+    BackupManifest, BackupRetentionEntry, BackupRetentionIssue, BackupRetentionPolicy,
+    BackupRetentionReport, RestoreReport,
+};
 pub use kernel::syscall_server::{
     AgentSummary, FactSummary, GenerationCheckpointSummary, MessageStreamEvent,
     OperatorAgentSnapshot, OperatorCgroupSnapshot, OperatorNamespaceSnapshot,
@@ -77,6 +80,12 @@ pub use kernel::syscall_server::PROTOCOL_VERSION;
 pub struct ConfirmDataErasure(());
 
 pub const CONFIRM_DATA_ERASURE: ConfirmDataErasure = ConfirmDataErasure(());
+
+/// Deliberate proof-of-intent required by confirmed backup expiration.
+#[derive(Debug, Clone, Copy)]
+pub struct ConfirmBackupRetention(());
+
+pub const CONFIRM_BACKUP_RETENTION: ConfirmBackupRetention = ConfirmBackupRetention(());
 
 pub mod cluster;
 pub mod patterns;
@@ -1204,6 +1213,65 @@ impl KernelClient {
         {
             SyscallReply::StorageBackupCreated { manifest } => Ok(manifest),
             other => Err(unexpected("StorageBackupCreated", &other)),
+        }
+    }
+
+    /// Preview the verified current-installation backups a retention policy
+    /// would expire without deleting anything.
+    pub async fn preview_storage_backup_retention(
+        &mut self,
+        backup_root: impl Into<String>,
+        keep_latest: usize,
+        max_age_seconds: u64,
+    ) -> Result<BackupRetentionReport, SdkError> {
+        self.storage_backup_retention(
+            backup_root.into(),
+            keep_latest,
+            max_age_seconds,
+            true,
+            false,
+        )
+        .await
+    }
+
+    /// Enforce backup retention after explicit typed confirmation.
+    pub async fn enforce_storage_backup_retention(
+        &mut self,
+        backup_root: impl Into<String>,
+        keep_latest: usize,
+        max_age_seconds: u64,
+        _confirmation: ConfirmBackupRetention,
+    ) -> Result<BackupRetentionReport, SdkError> {
+        self.storage_backup_retention(
+            backup_root.into(),
+            keep_latest,
+            max_age_seconds,
+            false,
+            true,
+        )
+        .await
+    }
+
+    async fn storage_backup_retention(
+        &mut self,
+        backup_root: String,
+        keep_latest: usize,
+        max_age_seconds: u64,
+        dry_run: bool,
+        confirm: bool,
+    ) -> Result<BackupRetentionReport, SdkError> {
+        match self
+            .call(Syscall::EnforceStorageBackupRetention {
+                backup_root,
+                keep_latest,
+                max_age_seconds,
+                dry_run,
+                confirm,
+            })
+            .await?
+        {
+            SyscallReply::StorageBackupRetention { report } => Ok(report),
+            other => Err(unexpected("StorageBackupRetention", &other)),
         }
     }
 

@@ -1,6 +1,8 @@
 use std::process::Command;
 use std::sync::Arc;
 
+use kernel::agent::AgentKernel;
+
 struct TestRoot(std::path::PathBuf);
 
 impl TestRoot {
@@ -53,6 +55,148 @@ async fn backup_create_command_uses_the_live_system_operator_api() {
         kernel::storage::verify_backup(&backup_root.join("operator_001")).unwrap(),
         manifest
     );
+
+    server_task.abort();
+    let _ = server_task.await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn erasure_commands_require_confirmation_and_use_live_operator_api() {
+    let kernel = Arc::new(kernel::AgentKernelImpl::new().expect("kernel"));
+    let agent = kernel
+        .create_agent_full(kernel::AgentConfig {
+            name: "cli-erasure".into(),
+            task: "private task".into(),
+            llm_provider: "stub".into(),
+            permission_profile: "standard".into(),
+            priority: kernel::Priority::default(),
+            sandbox_config: None,
+        })
+        .await
+        .expect("create agent");
+    let server = kernel::syscall_server::SyscallServer::bind(Arc::clone(&kernel), "127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = server.local_addr().expect("server address");
+    let server_task = tokio::spawn(server.serve());
+
+    let agent_id = agent.id;
+    let unconfirmed = tokio::task::spawn_blocking(move || {
+        Command::new(env!("CARGO_BIN_EXE_agentctl"))
+            .arg("--addr")
+            .arg(addr.to_string())
+            .arg("erase-agent")
+            .arg(agent_id.to_string())
+            .output()
+            .expect("run unconfirmed erase-agent")
+    })
+    .await
+    .expect("join unconfirmed erase-agent");
+    assert_eq!(unconfirmed.status.code(), Some(2));
+    assert!(kernel
+        .context_manager
+        .agent_tenant(agent.id)
+        .unwrap()
+        .is_some());
+
+    let confirmed = tokio::task::spawn_blocking(move || {
+        Command::new(env!("CARGO_BIN_EXE_agentctl"))
+            .arg("--addr")
+            .arg(addr.to_string())
+            .arg("erase-agent")
+            .arg(agent.id.to_string())
+            .arg("--confirm")
+            .output()
+            .expect("run confirmed erase-agent")
+    })
+    .await
+    .expect("join confirmed erase-agent");
+    assert!(
+        confirmed.status.success(),
+        "erase-agent failed: {}",
+        String::from_utf8_lossy(&confirmed.stderr)
+    );
+    let receipt: Option<kernel::context::DeletionReceipt> =
+        serde_json::from_slice(&confirmed.stdout).expect("deletion receipt JSON");
+    assert_eq!(
+        receipt.expect("agent existed").subject_kind,
+        kernel::context::DeletionSubjectKind::Agent
+    );
+    assert!(kernel
+        .context_manager
+        .agent_tenant(agent_id)
+        .unwrap()
+        .is_none());
+    assert!(kernel.agent_manager.get_agent_state(agent_id).is_none());
+
+    let user_tenant = kernel.create_tenant("cli-user-erasure").await.unwrap();
+    let user_id = kernel
+        .register_user(
+            &user_tenant,
+            "cli-user",
+            "cli-user@erasure.test",
+            kernel::auth::Role::User,
+        )
+        .await
+        .unwrap();
+    let user_output = Command::new(env!("CARGO_BIN_EXE_agentctl"))
+        .arg("--addr")
+        .arg(addr.to_string())
+        .arg("erase-user")
+        .arg(&user_id)
+        .arg("--confirm")
+        .output()
+        .expect("run erase-user");
+    assert!(
+        user_output.status.success(),
+        "erase-user failed: {}",
+        String::from_utf8_lossy(&user_output.stderr)
+    );
+    let user_receipt: Option<kernel::context::DeletionReceipt> =
+        serde_json::from_slice(&user_output.stdout).expect("user deletion receipt JSON");
+    assert_eq!(
+        user_receipt.expect("user existed").subject_kind,
+        kernel::context::DeletionSubjectKind::User
+    );
+    assert!(kernel.auth.read().await.get_user(&user_id).is_none());
+
+    let tenant_id = kernel.create_tenant("cli-tenant-erasure").await.unwrap();
+    let tenant_agent = kernel
+        .create_agent_for_tenant(
+            &tenant_id,
+            kernel::AgentConfig {
+                name: "cli-tenant-agent".into(),
+                task: "private tenant task".into(),
+                llm_provider: "stub".into(),
+                permission_profile: "standard".into(),
+                priority: kernel::Priority::default(),
+                sandbox_config: None,
+            },
+        )
+        .await
+        .unwrap()
+        .id;
+    let tenant_output = Command::new(env!("CARGO_BIN_EXE_agentctl"))
+        .arg("--addr")
+        .arg(addr.to_string())
+        .arg("erase-tenant")
+        .arg(&tenant_id)
+        .arg("--confirm")
+        .output()
+        .expect("run erase-tenant");
+    assert!(
+        tenant_output.status.success(),
+        "erase-tenant failed: {}",
+        String::from_utf8_lossy(&tenant_output.stderr)
+    );
+    let tenant_receipt: Option<kernel::context::DeletionReceipt> =
+        serde_json::from_slice(&tenant_output.stdout).expect("tenant deletion receipt JSON");
+    assert_eq!(
+        tenant_receipt.expect("tenant existed").subject_kind,
+        kernel::context::DeletionSubjectKind::Tenant
+    );
+    assert!(kernel.auth.read().await.get_tenant(&tenant_id).is_none());
+    assert!(kernel.agent_manager.get_agent_state(tenant_agent).is_none());
 
     server_task.abort();
     let _ = server_task.await;

@@ -99,6 +99,15 @@ fn default_package_requirement() -> String {
     "*".to_string()
 }
 
+/// Explicit subject for a system-authorized irreversible erasure request.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum DataErasureTarget {
+    Agent { agent_id: String },
+    User { user_id: String },
+    Tenant { tenant_id: String },
+}
+
 /// A syscall request from an agent / SDK to the kernel.
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
@@ -454,6 +463,13 @@ pub enum Syscall {
     CreateStorageBackup {
         backup_root: String,
         name: String,
+    },
+    /// Irreversibly erase one classified data boundary. This is system-only and
+    /// requires an explicit confirmation bit on the wire so a generic client
+    /// cannot turn an inspection command into deletion by argument drift.
+    EraseData {
+        target: DataErasureTarget,
+        confirm: bool,
     },
     /// System-scoped service supervisor operations. Tenant credentials cannot
     /// access these until service ownership is tenant-aware.
@@ -1014,6 +1030,11 @@ pub enum SyscallReply {
     StorageBackupCreated {
         manifest: crate::storage::BackupManifest,
     },
+    /// Privacy-safe durable proof of a committed erasure. `None` means the
+    /// requested subject already had no classified durable or live state.
+    DataErased {
+        receipt: Option<crate::context::DeletionReceipt>,
+    },
     Services {
         services: Vec<crate::init_system::ServiceRuntimeInfo>,
     },
@@ -1253,6 +1274,7 @@ fn syscall_policy(call: &Syscall) -> (AccessLevel, &'static str, Option<&str>) {
             (AccessLevel::System, "operator.tunable.audit", None)
         }
         Syscall::CreateStorageBackup { .. } => (AccessLevel::System, "storage.backup.create", None),
+        Syscall::EraseData { .. } => (AccessLevel::System, "storage.data.erase", None),
         Syscall::ListServices => (AccessLevel::System, "service.list", None),
         Syscall::StartService { .. } => (AccessLevel::System, "service.start", None),
         Syscall::StopService { .. } => (AccessLevel::System, "service.stop", None),
@@ -1476,6 +1498,7 @@ fn quarantine_recovery_call(call: &Syscall) -> bool {
             | Syscall::ListOperatorTunables
             | Syscall::ListOperatorTunableAudit { .. }
             | Syscall::CreateStorageBackup { .. }
+            | Syscall::EraseData { .. }
             | Syscall::ListServices
             | Syscall::ListServiceHistory { .. }
             | Syscall::ListAgents
@@ -1509,6 +1532,11 @@ pub async fn dispatch_scoped(
     call: Syscall,
     principal: Option<&Principal>,
 ) -> SyscallReply {
+    let _erasure_read = if matches!(&call, Syscall::EraseData { .. }) {
+        None
+    } else {
+        Some(kernel.erasure_barrier.read().await)
+    };
     if let Err(reply) = authorize(kernel, principal, &call).await {
         return reply;
     }
@@ -2953,6 +2981,33 @@ pub async fn dispatch_scoped(
                 },
                 Err(error) => SyscallReply::Error {
                     message: format!("storage backup worker failed: {error}"),
+                },
+            }
+        }
+        Syscall::EraseData { target, confirm } => {
+            if !confirm {
+                return SyscallReply::Error {
+                    message: "data erasure requires explicit confirmation".into(),
+                };
+            }
+            let erased = match target {
+                DataErasureTarget::Agent { agent_id } => match uuid::Uuid::parse_str(&agent_id) {
+                    Ok(agent_id) => kernel.erase_agent_data(agent_id).await,
+                    Err(_) => {
+                        return SyscallReply::Error {
+                            message: format!("invalid agent id: {agent_id}"),
+                        }
+                    }
+                },
+                DataErasureTarget::User { user_id } => kernel.erase_user_data(&user_id).await,
+                DataErasureTarget::Tenant { tenant_id } => {
+                    kernel.erase_tenant_data(&tenant_id).await
+                }
+            };
+            match erased {
+                Ok(receipt) => SyscallReply::DataErased { receipt },
+                Err(error) => SyscallReply::Error {
+                    message: error.to_string(),
                 },
             }
         }
@@ -5882,6 +5937,15 @@ memory = ["remember this"]
                 },
                 AccessLevel::System,
             ),
+            (
+                Syscall::EraseData {
+                    target: DataErasureTarget::Agent {
+                        agent_id: uuid::Uuid::new_v4().to_string(),
+                    },
+                    confirm: true,
+                },
+                AccessLevel::System,
+            ),
             (Syscall::ListServices, AccessLevel::System),
             (
                 Syscall::StartService { name: "x".into() },
@@ -5954,8 +6018,92 @@ memory = ["remember this"]
                     .to_string()
             })
             .collect::<std::collections::HashSet<_>>();
-        assert_eq!(calls.len(), 71);
+        assert_eq!(calls.len(), 72);
         assert_eq!(fixture_tags, schema_tags);
+    }
+
+    #[tokio::test]
+    async fn data_erasure_is_system_only_confirmed_and_returns_private_receipt() {
+        let kernel = AgentKernelImpl::new().expect("kernel new");
+        let tenant = kernel.create_tenant("wire-erasure").await.unwrap();
+        let admin_id = kernel
+            .register_user(&tenant, "admin", "admin@wire-erasure.test", Role::Admin)
+            .await
+            .unwrap();
+        let admin = Principal {
+            user_id: admin_id,
+            tenant_id: tenant.clone(),
+            role: Role::Admin,
+            credential: None,
+        };
+        let agent = kernel
+            .create_agent_for_tenant(
+                &tenant,
+                AgentConfig {
+                    name: "erase-me".into(),
+                    task: "private task".into(),
+                    llm_provider: "stub".into(),
+                    permission_profile: "standard".into(),
+                    priority: Priority::default(),
+                    sandbox_config: None,
+                },
+            )
+            .await
+            .unwrap();
+        let target = DataErasureTarget::Agent {
+            agent_id: agent.id.to_string(),
+        };
+
+        assert_authorization_denied(
+            dispatch_scoped(
+                &kernel,
+                Syscall::EraseData {
+                    target: target.clone(),
+                    confirm: true,
+                },
+                Some(&admin),
+            )
+            .await,
+        );
+        assert!(matches!(
+            dispatch(
+                &kernel,
+                Syscall::EraseData {
+                    target: target.clone(),
+                    confirm: false,
+                },
+            )
+            .await,
+            SyscallReply::Error { message } if message.contains("confirmation")
+        ));
+        assert_eq!(
+            kernel.context_manager.agent_tenant(agent.id).unwrap(),
+            Some(tenant.clone())
+        );
+
+        let receipt = match dispatch(
+            &kernel,
+            Syscall::EraseData {
+                target,
+                confirm: true,
+            },
+        )
+        .await
+        {
+            SyscallReply::DataErased {
+                receipt: Some(receipt),
+            } => receipt,
+            other => panic!("expected erasure receipt, got {other:?}"),
+        };
+        let encoded = serde_json::to_string(&receipt).unwrap();
+        assert!(!encoded.contains(&agent.id.to_string()));
+        assert!(!encoded.contains(&tenant));
+        assert!(!encoded.contains("private task"));
+        assert!(kernel
+            .context_manager
+            .agent_tenant(agent.id)
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]

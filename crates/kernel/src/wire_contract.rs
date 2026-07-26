@@ -23,6 +23,7 @@ pub const WIRE_FEATURES: &[&str] = &[
     "bounded_json_frames",
     "connection_keepalive",
     "context_pressure",
+    "data_erasure",
     "durable_node_identity",
     "durable_generation_checkpoints",
     "memory_lifecycle",
@@ -86,6 +87,7 @@ enum JsonKind {
     Any,
     StringOrNull,
     IntegerOrNull,
+    ObjectOrNull,
 }
 
 impl JsonKind {
@@ -99,6 +101,7 @@ impl JsonKind {
             Self::Any => json!({}),
             Self::StringOrNull => json!({"type": ["string", "null"]}),
             Self::IntegerOrNull => json!({"type": ["integer", "null"]}),
+            Self::ObjectOrNull => json!({"type": ["object", "null"]}),
         }
     }
 }
@@ -142,6 +145,7 @@ const A: JsonKind = JsonKind::Array;
 const X: JsonKind = JsonKind::Any;
 const N: JsonKind = JsonKind::StringOrNull;
 const NI: JsonKind = JsonKind::IntegerOrNull;
+const ON: JsonKind = JsonKind::ObjectOrNull;
 
 const REQUEST_VARIANTS: &[Variant] = &[
     Variant {
@@ -489,6 +493,10 @@ const REQUEST_VARIANTS: &[Variant] = &[
         ],
     },
     Variant {
+        tag: "erase_data",
+        fields: &[Field::required("target", O), Field::required("confirm", B)],
+    },
+    Variant {
         tag: "list_services",
         fields: &[],
     },
@@ -536,6 +544,7 @@ pub fn conformance_request_fixtures(protocol_version: u32) -> Result<Vec<Value>,
                     "send_message_stream"
                         | "cancel_request"
                         | "ping"
+                        | "erase_data"
                         | "prove_node_identity"
                         | "set_node_availability"
                         | "set_node_profile"
@@ -579,6 +588,10 @@ pub fn conformance_request_fixtures(protocol_version: u32) -> Result<Vec<Value>,
                         "min_protocol_version": 1,
                         "protocol_version": 2
                     }),
+                    ("target", JsonKind::Object) => serde_json::json!({
+                        "kind": "agent",
+                        "agent_id": "00000000-0000-0000-0000-000000000001"
+                    }),
                     ("valid_from", JsonKind::String) => {
                         Value::String("2026-01-01T00:00:00Z".into())
                     }
@@ -590,7 +603,12 @@ pub fn conformance_request_fixtures(protocol_version: u32) -> Result<Vec<Value>,
                     (_, JsonKind::Boolean) => Value::Bool(true),
                     (_, JsonKind::Object) | (_, JsonKind::Any) => Value::Object(Map::new()),
                     (_, JsonKind::Array) => Value::Array(Vec::new()),
-                    (_, JsonKind::StringOrNull | JsonKind::IntegerOrNull) => Value::Null,
+                    (
+                        _,
+                        JsonKind::StringOrNull
+                        | JsonKind::IntegerOrNull
+                        | JsonKind::ObjectOrNull,
+                    ) => Value::Null,
                 };
                 request.insert(field.name.into(), value);
             }
@@ -879,6 +897,10 @@ const REPLY_VARIANTS: &[Variant] = &[
     Variant {
         tag: "storage_backup_created",
         fields: &[Field::required("manifest", O)],
+    },
+    Variant {
+        tag: "data_erased",
+        fields: &[Field::required("receipt", ON)],
     },
     Variant {
         tag: "services",
@@ -1231,7 +1253,7 @@ mod tests {
             }
         }
         assert_eq!(conformance_request_fixtures(1).unwrap().len(), 59);
-        assert_eq!(conformance_request_fixtures(2).unwrap().len(), 71);
+        assert_eq!(conformance_request_fixtures(2).unwrap().len(), 72);
         assert!(conformance_request_fixtures(0).is_err());
         assert!(conformance_request_fixtures(PROTOCOL_VERSION + 1).is_err());
     }

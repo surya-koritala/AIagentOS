@@ -7,12 +7,15 @@ use agent_cli::OperatorClient;
 fn usage() -> ! {
     eprintln!(
         "usage: agentctl [--addr HOST:PORT] [--token TOKEN] \
-         <list|inspect|pressure|tunables|tunable-set|tunable-rollback|tunable-history|status|pause|resume|stop|kill|wait|services|service-start|service-stop|service-restart|service-reload|service-history|backup-create|backup-verify|backup-restore> [ARGS...]\n\
+         <list|inspect|pressure|tunables|tunable-set|tunable-rollback|tunable-history|status|pause|resume|stop|kill|wait|services|service-start|service-stop|service-restart|service-reload|service-history|backup-create|backup-verify|backup-restore|erase-agent|erase-user|erase-tenant> [ARGS...]\n\
          \n\
          storage commands:\n\
            agentctl [SERVER OPTIONS] backup-create BACKUP_ROOT NAME\n\
            agentctl backup-verify BACKUP_DIR\n\
-           agentctl backup-restore BACKUP_DIR DATABASE --confirm-offline"
+           agentctl backup-restore BACKUP_DIR DATABASE --confirm-offline\n\
+           agentctl [SERVER OPTIONS] erase-agent AGENT_ID --confirm\n\
+           agentctl [SERVER OPTIONS] erase-user USER_ID --confirm\n\
+           agentctl [SERVER OPTIONS] erase-tenant TENANT_ID --confirm"
     );
     std::process::exit(2);
 }
@@ -214,6 +217,40 @@ async fn main() {
             print_json(&manifest, "backup manifest");
             return;
         }
+        "erase-agent" => {
+            let agent_id = args
+                .next()
+                .unwrap_or_else(|| usage())
+                .parse::<kernel::AgentId>()
+                .unwrap_or_else(|_| usage());
+            require_erasure_confirmation(&mut args);
+            let receipt = client
+                .erase_agent_data(agent_id, agent_sdk::CONFIRM_DATA_ERASURE)
+                .await
+                .unwrap_or_else(|error| fail(error));
+            print_json(&receipt, "deletion receipt");
+            return;
+        }
+        "erase-user" => {
+            let user_id = args.next().unwrap_or_else(|| usage());
+            require_erasure_confirmation(&mut args);
+            let receipt = client
+                .erase_user_data(user_id, agent_sdk::CONFIRM_DATA_ERASURE)
+                .await
+                .unwrap_or_else(|error| fail(error));
+            print_json(&receipt, "deletion receipt");
+            return;
+        }
+        "erase-tenant" => {
+            let tenant_id = args.next().unwrap_or_else(|| usage());
+            require_erasure_confirmation(&mut args);
+            let receipt = client
+                .erase_tenant_data(tenant_id, agent_sdk::CONFIRM_DATA_ERASURE)
+                .await
+                .unwrap_or_else(|error| fail(error));
+            print_json(&receipt, "deletion receipt");
+            return;
+        }
         "services" => {
             for service in client
                 .list_services()
@@ -350,4 +387,13 @@ fn print_json(value: &impl serde::Serialize, label: &str) {
             agent_sdk::SdkError::Kernel(format!("{label} encoding failed: {error}"))
         ))
     );
+}
+
+fn require_erasure_confirmation<I>(args: &mut std::iter::Peekable<I>)
+where
+    I: Iterator<Item = String>,
+{
+    if args.next().as_deref() != Some("--confirm") || args.next().is_some() {
+        usage();
+    }
 }

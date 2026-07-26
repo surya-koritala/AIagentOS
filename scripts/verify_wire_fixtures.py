@@ -23,6 +23,7 @@ MAX_FRAME_BYTES = 8 * 1024 * 1024
 SUPPORTED_VERSIONS = (1, 2)
 V2_ONLY_OPERATIONS = {
     "cancel_request",
+    "erase_data",
     "get_cluster_membership",
     "issue_cluster_join_challenge",
     "list_cluster_membership_audit",

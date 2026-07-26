@@ -5,6 +5,7 @@
 use std::sync::Arc;
 
 use agent_sdk::{Agent, KernelClient, MessageStreamEvent, SdkError, WireErrorCode};
+use kernel::agent::AgentKernel;
 use kernel::connector::{
     LlmProviderAdapter, LlmRequestOptions, LlmResponse, LlmSession, LlmUsage, ProviderCapabilities,
     ProviderEventSink, ProviderStreamEvent, ProviderType, StandardMessage, ToolDefinition,
@@ -676,6 +677,98 @@ async fn system_operator_can_create_and_verify_online_backup_via_sdk() {
     let _ = server_task.await;
     drop(kernel);
     remove_test_tree_after_handle_release(&root).await;
+}
+
+#[tokio::test]
+async fn system_operator_can_erase_live_agent_user_and_tenant_via_typed_sdk() {
+    let kernel = Arc::new(AgentKernelImpl::new().expect("kernel"));
+    let server = SyscallServer::bind(Arc::clone(&kernel), "127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = server.local_addr().expect("local_addr");
+    let server_task = tokio::spawn(server.serve());
+    let mut client = KernelClient::connect(addr).await.expect("connect");
+    let agent_id = client
+        .create_agent("erase-sdk", "private task", None, None, None)
+        .await
+        .expect("create agent")
+        .parse::<uuid::Uuid>()
+        .expect("agent uuid");
+
+    let receipt = client
+        .erase_agent_data(agent_id, agent_sdk::CONFIRM_DATA_ERASURE)
+        .await
+        .expect("erase through SDK")
+        .expect("agent data existed");
+    assert_eq!(
+        receipt.subject_kind,
+        kernel::context::DeletionSubjectKind::Agent
+    );
+    assert!(kernel
+        .context_manager
+        .agent_tenant(agent_id)
+        .unwrap()
+        .is_none());
+    assert!(kernel.agent_manager.get_agent_state(agent_id).is_none());
+    assert!(!client
+        .list_agents()
+        .await
+        .expect("list after erasure")
+        .iter()
+        .any(|agent| agent.id == agent_id.to_string()));
+
+    let user_tenant = kernel.create_tenant("sdk-user-erasure").await.unwrap();
+    let user_id = kernel
+        .register_user(
+            &user_tenant,
+            "sdk-user",
+            "sdk-user@erasure.test",
+            kernel::auth::Role::User,
+        )
+        .await
+        .unwrap();
+    let user_receipt = client
+        .erase_user_data(user_id.clone(), agent_sdk::CONFIRM_DATA_ERASURE)
+        .await
+        .expect("erase user through SDK")
+        .expect("user data existed");
+    assert_eq!(
+        user_receipt.subject_kind,
+        kernel::context::DeletionSubjectKind::User
+    );
+    assert!(kernel.auth.read().await.get_user(&user_id).is_none());
+
+    let tenant_id = kernel.create_tenant("sdk-tenant-erasure").await.unwrap();
+    let tenant_agent = kernel
+        .create_agent_for_tenant(
+            &tenant_id,
+            kernel::AgentConfig {
+                name: "sdk-tenant-agent".into(),
+                task: "private tenant task".into(),
+                llm_provider: "stub".into(),
+                permission_profile: "standard".into(),
+                priority: kernel::Priority::default(),
+                sandbox_config: None,
+            },
+        )
+        .await
+        .unwrap()
+        .id;
+    let tenant_receipt = client
+        .erase_tenant_data(tenant_id.clone(), agent_sdk::CONFIRM_DATA_ERASURE)
+        .await
+        .expect("erase tenant through SDK")
+        .expect("tenant data existed");
+    assert_eq!(
+        tenant_receipt.subject_kind,
+        kernel::context::DeletionSubjectKind::Tenant
+    );
+    assert!(kernel.auth.read().await.get_tenant(&tenant_id).is_none());
+    assert!(kernel.agent_manager.get_agent_state(tenant_agent).is_none());
+
+    drop(client);
+    server_task.abort();
+    let _ = server_task.await;
 }
 
 #[tokio::test]

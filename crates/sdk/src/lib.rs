@@ -36,7 +36,7 @@
 //! # }
 //! ```
 
-use kernel::syscall_server::{Syscall, SyscallClient, SyscallReply};
+use kernel::syscall_server::{DataErasureTarget, Syscall, SyscallClient, SyscallReply};
 use tokio::net::ToSocketAddrs;
 
 // Re-export the kernel wire types that appear in this crate's public API, so
@@ -46,7 +46,7 @@ pub use kernel::cluster_control::{
     ClusterMembershipAudit, ClusterMembershipSnapshot, NodeAvailability, NodeControlAudit,
     NodeControlStatus, NodeIdentity, NodeProfile,
 };
-pub use kernel::context::ContextPressureStats;
+pub use kernel::context::{ContextPressureStats, DeletionReceipt};
 pub use kernel::init_system::{ServiceHistoryEntry, ServiceRuntimeInfo};
 pub use kernel::operator_control::{OperatorTunable, OperatorTunableAudit};
 pub use kernel::package::{
@@ -68,6 +68,15 @@ pub use kernel::wire_contract::{ProtocolDescription, TransportDescription};
 /// window is reported as [`SdkError::IncompatibleProtocol`] rather than failing
 /// later with a confusing parse error.
 pub use kernel::syscall_server::PROTOCOL_VERSION;
+
+/// Deliberate proof-of-intent required by every typed SDK erasure method.
+///
+/// Callers must pass [`CONFIRM_DATA_ERASURE`] explicitly; there is no default
+/// or boolean conversion that can be toggled accidentally by configuration.
+#[derive(Debug, Clone, Copy)]
+pub struct ConfirmDataErasure(());
+
+pub const CONFIRM_DATA_ERASURE: ConfirmDataErasure = ConfirmDataErasure(());
 
 pub mod cluster;
 pub mod patterns;
@@ -1195,6 +1204,61 @@ impl KernelClient {
         {
             SyscallReply::StorageBackupCreated { manifest } => Ok(manifest),
             other => Err(unexpected("StorageBackupCreated", &other)),
+        }
+    }
+
+    /// Irreversibly erase one agent after the kernel drains its tenant requests
+    /// and live runtime resources.
+    pub async fn erase_agent_data(
+        &mut self,
+        agent_id: uuid::Uuid,
+        _confirmation: ConfirmDataErasure,
+    ) -> Result<Option<DeletionReceipt>, SdkError> {
+        self.erase_data(DataErasureTarget::Agent {
+            agent_id: agent_id.to_string(),
+        })
+        .await
+    }
+
+    /// Irreversibly erase one user identity and every credential after its
+    /// already-admitted requests drain.
+    pub async fn erase_user_data(
+        &mut self,
+        user_id: impl Into<String>,
+        _confirmation: ConfirmDataErasure,
+    ) -> Result<Option<DeletionReceipt>, SdkError> {
+        self.erase_data(DataErasureTarget::User {
+            user_id: user_id.into(),
+        })
+        .await
+    }
+
+    /// Irreversibly erase a tenant, its credentials, services' live owners,
+    /// agents, and all classified tenant-owned durable state.
+    pub async fn erase_tenant_data(
+        &mut self,
+        tenant_id: impl Into<String>,
+        _confirmation: ConfirmDataErasure,
+    ) -> Result<Option<DeletionReceipt>, SdkError> {
+        self.erase_data(DataErasureTarget::Tenant {
+            tenant_id: tenant_id.into(),
+        })
+        .await
+    }
+
+    async fn erase_data(
+        &mut self,
+        target: DataErasureTarget,
+    ) -> Result<Option<DeletionReceipt>, SdkError> {
+        match self
+            .call(Syscall::EraseData {
+                target,
+                confirm: true,
+            })
+            .await?
+        {
+            SyscallReply::DataErased { receipt } => Ok(receipt),
+            other => Err(unexpected("DataErased", &other)),
         }
     }
 

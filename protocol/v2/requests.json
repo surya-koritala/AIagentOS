@@ -308,6 +308,14 @@
     "op": "create_storage_backup"
   },
   {
+    "confirm": true,
+    "op": "erase_data",
+    "target": {
+      "agent_id": "00000000-0000-0000-0000-000000000001",
+      "kind": "agent"
+    }
+  },
+  {
     "op": "list_services"
   },
   {

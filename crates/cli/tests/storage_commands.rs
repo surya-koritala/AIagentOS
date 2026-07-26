@@ -47,6 +47,28 @@ async fn backup_create_command_uses_the_live_system_operator_api() {
     assert!(!status.enabled);
     assert_eq!(status.attempts_total, 0);
 
+    let inventory_output = Command::new(env!("CARGO_BIN_EXE_agentctl"))
+        .arg("--addr")
+        .arg(addr.to_string())
+        .arg("data-inventory")
+        .output()
+        .expect("run data-inventory");
+    assert!(
+        inventory_output.status.success(),
+        "data-inventory failed: {}",
+        String::from_utf8_lossy(&inventory_output.stderr)
+    );
+    let inventory: kernel::data_inventory::StorageDataInventory =
+        serde_json::from_slice(&inventory_output.stdout).expect("data inventory JSON");
+    assert_eq!(
+        inventory.schema_version,
+        kernel::data_inventory::STORAGE_DATA_INVENTORY_SCHEMA_VERSION
+    );
+    assert!(inventory
+        .entries
+        .iter()
+        .any(|entry| entry.id == "file/published-database-backups"));
+
     let command_backup_root = backup_root.clone();
     let output = tokio::task::spawn_blocking(move || {
         Command::new(env!("CARGO_BIN_EXE_agentctl"))

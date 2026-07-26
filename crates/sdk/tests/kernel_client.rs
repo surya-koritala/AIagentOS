@@ -696,6 +696,23 @@ async fn system_operator_can_create_and_verify_online_backup_via_sdk() {
         Some(expected_backup_root.as_str())
     );
     assert_eq!(status.signing_key_id.as_deref(), Some("sdk-release-2026.1"));
+    let inventory = client
+        .storage_data_inventory()
+        .await
+        .expect("storage_data_inventory");
+    assert_eq!(
+        inventory.schema_version,
+        kernel::data_inventory::STORAGE_DATA_INVENTORY_SCHEMA_VERSION
+    );
+    assert!(inventory.database_schema_version > 0);
+    assert!(inventory
+        .entries
+        .iter()
+        .any(|entry| entry.id == "sqlite/contexts"));
+    assert!(inventory
+        .entries
+        .iter()
+        .any(|entry| entry.id == "external/provider-request-and-retention"));
     let manifest = client
         .create_storage_backup(backup_root.to_string_lossy(), "operator_001")
         .await

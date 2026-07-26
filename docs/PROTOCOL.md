@@ -41,9 +41,9 @@ compatibility behavior, and transport limits:
 
 The schemas use JSON Schema draft 2020-12 and cover every top-level request,
 reply, and stream-event tag. The authorization/schema regression constructs
-all 74 current syscalls and rejects either a missing schema operation or an
+all 75 current syscalls and rejects either a missing schema operation or an
 undocumented extra. Deterministic golden request arrays cover all 59 v1
-operations and all 74 v2 operations. Domain payload examples and
+operations and all 75 v2 operations. Domain payload examples and
 previous-version shapes are retained under `protocol/`.
 
 ## Compatibility policy
@@ -191,6 +191,25 @@ cancelled, incompatible version, provider, lifecycle, and internal failures.
 - `ClusterClient::connect_authenticated` and its TLS variants connect every node
   all-or-nothing. They perform no hidden retry of side-effecting calls.
 
+## Storage data inventory
+
+Protocol v2 advertises `data_inventory`. A trusted system operator can read the
+versioned policy classification for every supported SQLite, file, ephemeral,
+and external data boundary:
+
+```json
+{"op":"storage_data_inventory"}
+```
+
+The `storage_data_inventory` reply carries an `inventory` object with the
+inventory schema version, database schema version, and entries classified by
+owner, tenant key, sensitivity, retention, encryption, backup, and deletion
+policy. It is static policy metadata: it does not inspect or return live
+content, credentials, tenant identifiers, configured paths, or secret material.
+Tenant credentials are denied. The SQLite subset is checked against the live
+logical schema, so adding a table or view without a complete classification
+fails regression tests.
+
 ## Destructive data erasure
 
 Protocol v2 advertises `data_erasure`. Only a trusted system principal can erase
@@ -327,7 +346,7 @@ Versioned fixtures:
 - `protocol/v2/hello.json`
 - `protocol/v2/typed-error.json`
 - `protocol/v2/describe-protocol-request.json`
-- `protocol/v2/requests.json` (all 74 v2 operations)
+- `protocol/v2/requests.json` (all 75 v2 operations)
 - `protocol/v2/send-message-stream.json`
 - `protocol/v2/stream-event.json`
 - `protocol/v2/stream-completed.json`

@@ -6781,6 +6781,42 @@ mod tests {
             actual, classified,
             "every new logical durable table must be explicitly classified"
         );
+
+        let inventory: BTreeSet<String> = crate::data_inventory::SQLITE_DATA_INVENTORY
+            .iter()
+            .map(|entry| {
+                assert_eq!(entry.persistence, "durable-sqlite");
+                for (field, value) in [
+                    ("owner", entry.owner),
+                    ("tenant_key", entry.tenant_key),
+                    ("sensitivity", entry.sensitivity),
+                    ("retention", entry.retention),
+                    ("encryption", entry.encryption),
+                    ("backup", entry.backup),
+                    ("deletion", entry.deletion),
+                ] {
+                    assert!(
+                        !value.trim().is_empty(),
+                        "{} has no {field} policy",
+                        entry.id
+                    );
+                }
+                entry
+                    .id
+                    .strip_prefix("sqlite/")
+                    .expect("SQLite inventory ids use the sqlite/ prefix")
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(
+            inventory.len(),
+            crate::data_inventory::SQLITE_DATA_INVENTORY.len(),
+            "full data inventory contains duplicate SQLite entries"
+        );
+        assert_eq!(
+            actual, inventory,
+            "every logical SQLite object needs owner, tenant, sensitivity, retention, encryption, backup, and deletion policy"
+        );
     }
 
     fn sample_generation_checkpoint(agent_id: AgentId) -> crate::execution::GenerationCheckpoint {

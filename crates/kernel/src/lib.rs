@@ -19,6 +19,7 @@ pub mod connector;
 pub mod context;
 pub mod context_paging;
 pub mod custom_tools;
+pub mod data_inventory;
 pub mod database;
 pub mod delegation;
 pub mod docker_sandbox;

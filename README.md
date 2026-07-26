@@ -130,6 +130,16 @@ exec 3<>/dev/tcp/127.0.0.1/7777; printf '{"op":"node_info"}\n' >&3; head -1 <&3
 
 ### Back up and recover persistent state
 
+Inspect the versioned storage policy before provisioning retention and recovery.
+This system-only command reports policy metadata—never live content, credentials,
+or filesystem paths—and includes unresolved protection and external-system
+boundaries:
+
+```bash
+cargo run -p agent-cli --bin agentctl --locked -- \
+  --addr 127.0.0.1:7777 --token "$AGENT_SERVER_TOKEN" data-inventory
+```
+
 The Compose server enables automatic hourly integrity-verified backups in the
 separate `agentos-backups` volume, runs one backup at startup, keeps at least
 24, and expires additional backups after seven days. Inspect its bounded

@@ -319,6 +319,9 @@
     "op": "storage_backup_status"
   },
   {
+    "op": "storage_data_inventory"
+  },
+  {
     "confirm": true,
     "op": "erase_data",
     "target": {

@@ -14,3 +14,10 @@ idle_timeout_ms = 250
 
 [provider_outage]
 operations = 8
+
+[cancellation_storm]
+operations = 16
+max_concurrent = 4
+max_waiting = 16
+start_timeout_ms = 5000
+settle_timeout_ms = 5000

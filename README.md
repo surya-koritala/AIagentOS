@@ -404,6 +404,15 @@ cargo run --package os-benchmark --bin capacity-qualification --locked -- \
 cargo run --package os-benchmark --bin resilience-qualification --locked -- --validate
 cargo run --package os-benchmark --bin resilience-qualification --locked -- \
   --all --smoke --output target/qualification/resilience-smoke.json
+
+# Validate the full-day resource/leak soak contract
+cargo run --package os-benchmark --bin soak-qualification --locked -- --validate
+
+# Non-evidence five-second resource sampler regression
+export AGENTOS_QUALIFICATION_ENVIRONMENT="local-smoke"
+cargo run --package os-benchmark --bin soak-qualification --locked -- \
+  --smoke --state-dir target/qualification/resource-soak-smoke-state \
+  --output target/qualification/resource-soak-smoke.json
 ```
 
 The versioned [production observability contract](docs/OBSERVABILITY.md) now
@@ -417,8 +426,11 @@ tenant-contention, signed-package, and restart workload suite. Fixture results
 are always labeled non-publishable until an exact release candidate is run on
 the intended deployment and completes the remaining #125 proof.
 The [resilience qualification guide](docs/RESILIENCE_QUALIFICATION.md) covers
-the initial turn-overload, slow-client, and provider-outage matrix, including
-the explicit `max_waiting_turns` admission limit and the evidence still needed.
+turn overload, slow clients, provider outage, and an exact-request cancellation
+storm, including the explicit `max_waiting_turns` admission limit.
+The [resource and leak soak guide](docs/SOAK_QUALIFICATION.md) defines the
+separate 24-hour target-host run, retained process/SQLite/admission samples,
+proof eligibility, and the exact work that remains after the harness exists.
 
 ## Architecture Docs
 
@@ -430,6 +442,7 @@ the explicit `max_waiting_turns` admission limit and the evidence still needed.
 - [`docs/OBSERVABILITY.md`](docs/OBSERVABILITY.md) — SLOs, traces, metrics, alerts, and runbooks
 - [`docs/CAPACITY_QUALIFICATION.md`](docs/CAPACITY_QUALIFICATION.md) — reproducible workload profiles and sizing method
 - [`docs/RESILIENCE_QUALIFICATION.md`](docs/RESILIENCE_QUALIFICATION.md) — overload, slow-peer, and dependency-failure evidence
+- [`docs/SOAK_QUALIFICATION.md`](docs/SOAK_QUALIFICATION.md) — 24-hour target resource/leak evidence contract
 - [`docs/COMPLETE_SPEC.md`](docs/COMPLETE_SPEC.md) — long-form implementation spec
 - [`docs/FULL_ROADMAP.md`](docs/FULL_ROADMAP.md) — long-form vision roadmap
 

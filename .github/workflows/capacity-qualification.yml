@@ -72,7 +72,27 @@ jobs:
           test "$(jq -r .production_claim_allowed target/qualification/resilience-baseline.json)" = "false"
           test "$(jq -r .source.dirty target/qualification/resilience-baseline.json)" = "false"
           test "$(jq -r .source.commit target/qualification/resilience-baseline.json)" = "$GITHUB_SHA"
-          test "$(jq '.scenarios | length' target/qualification/resilience-baseline.json)" = "3"
+          test "$(jq '.scenarios | length' target/qualification/resilience-baseline.json)" = "4"
+      - name: Validate target soak contract
+        run: >-
+          cargo run --release --locked --package os-benchmark
+          --bin soak-qualification -- --validate
+      - name: Exercise resource sampling in smoke mode
+        run: >-
+          cargo run --release --locked --package os-benchmark
+          --bin soak-qualification -- --smoke
+          --state-dir target/qualification/resource-soak-smoke-state
+          --output target/qualification/resource-soak-smoke.json
+      - name: Verify smoke classification and resource checks
+        run: |
+          test "$(jq -r .result.passed target/qualification/resource-soak-smoke.json)" = "true"
+          test "$(jq -r .resource_soak_proof_eligible target/qualification/resource-soak-smoke.json)" = "false"
+          test "$(jq -r .production_claim_allowed target/qualification/resource-soak-smoke.json)" = "false"
+          test "$(jq -r .build_profile target/qualification/resource-soak-smoke.json)" = "release"
+          test "$(jq -r .smoke_scaled target/qualification/resource-soak-smoke.json)" = "true"
+          test "$(jq -r .source.dirty target/qualification/resource-soak-smoke.json)" = "false"
+          test "$(jq -r .source.commit target/qualification/resource-soak-smoke.json)" = "$GITHUB_SHA"
+          jq -e '.result.samples | length >= 4' target/qualification/resource-soak-smoke.json
       - name: Publish summary
         if: always()
         run: |
@@ -94,6 +114,12 @@ jobs:
             else
               printf -- '- Resilience status: `failed before report publication`\n'
             fi
+            if test -f target/qualification/resource-soak-smoke.json; then
+              printf -- '- Resource sampler smoke passed: `%s`\n' \
+                "$(jq -r .result.passed target/qualification/resource-soak-smoke.json)"
+            else
+              printf -- '- Resource sampler smoke: `failed before report publication`\n'
+            fi
           } >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()
@@ -103,5 +129,6 @@ jobs:
             target/qualification/capacity-baseline.json
             target/qualification/capacity-resources.txt
             target/qualification/resilience-baseline.json
+            target/qualification/resource-soak-smoke.json
           if-no-files-found: warn
           retention-days: 90

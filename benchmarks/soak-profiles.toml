@@ -1,0 +1,19 @@
+schema_version = 1
+suite = "agentos-v1-resource-soak"
+minimum_proof_duration_seconds = 86400
+duration_seconds = 86400
+warmup_seconds = 3600
+sample_interval_seconds = 60
+workload_interval_ms = 1000
+agent_count = 4
+operations_per_cycle = 4
+max_concurrent = 4
+max_waiting = 16
+provider_delay_ms = 25
+minimum_samples = 120
+
+[thresholds]
+max_rss_growth_bytes = 268435456
+max_descriptor_growth = 16
+max_task_growth = 8
+max_state_growth_bytes_per_operation = 131072

@@ -10,6 +10,18 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
 
 ## [Unreleased]
 
+- Added authenticated offline corruption recovery under #123.
+  `agentctl backup-corruption-recover` refuses healthy databases, requires an
+  independently trusted signed backup plus the operator-supplied expected
+  installation UUID, acquires the normal storage lease, and preserves the
+  corrupt database/WAL/SHM in an owner-only forensic quarantine. A durable
+  secret-free journal resumes interrupted quarantine/publication; configured
+  kernel boot and persisted-agent enforcement qualification must succeed
+  before completion, while ordinary failures restore the original corrupt
+  files and preserve the failed candidate. Plaintext, SQLCipher, wrong
+  identity, healthy-destination, running-owner, exact-sidecar preservation,
+  interruption-resume, qualification-rollback, and CLI regressions cover the
+  recovery contract.
 - Added versioned full-installation portability under #123. Confirmed offline
   `storage-portable-export`, `storage-portable-verify`, and
   `storage-portable-import` commands move every durable SQLite state class from

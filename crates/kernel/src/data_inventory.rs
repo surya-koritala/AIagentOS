@@ -608,6 +608,17 @@ pub const NON_SQLITE_DATA_INVENTORY: &[StaticDataInventoryEntry] = &[
         "confirmed verified-retention operation; remote copies are separate"
     ),
     boundary_entry!(
+        "file/corrupt-recovery-journal-and-quarantine",
+        "durable-file-and-directory",
+        "system operator",
+        "same mixed tenancy as database and SQLite sidecars",
+        "the journal contains non-secret recovery identity and hashes; quarantine may contain every database sensitivity class",
+        "journal until qualified recovery or completed rollback; quarantine until independent operator acceptance",
+        "owner-only permissions; quarantined files inherit source SQLCipher encryption when configured, otherwise may be plaintext",
+        "not automatically backed up; quarantine is forensic recovery evidence",
+        "operator-owned secure deletion after recovered state and evidence are independently accepted"
+    ),
+    boundary_entry!(
         "file/portable-storage-transfer-bundles",
         "durable-file",
         "system operator",

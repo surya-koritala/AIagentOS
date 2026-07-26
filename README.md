@@ -197,6 +197,26 @@ cargo run -p agent-cli --bin agentctl --locked -- \
 The command keeps the old database as rollback until the restored configuration
 boots the full kernel and every persisted agent is re-admitted to enforcement.
 
+If the configured database itself is corrupt and normal restore refuses to
+checkpoint it, keep the server stopped and use the separate forensic path. The
+expected installation UUID must come from independently retained installation
+records; do not copy it blindly from the candidate backup:
+
+```bash
+cargo run -p agent-cli --bin agentctl --locked -- \
+  backup-corruption-recover \
+  /var/lib/agentos/backups/nightly_2026_07_25 \
+  /etc/agentos/config.toml \
+  /srv/recovery/agentos-trust/release-2026.1.json \
+  5df0185b-03c3-4f1d-8026-2d99d4d82f22 \
+  --confirm-offline
+```
+
+Successful recovery reports an owner-only quarantine containing the original
+database and any WAL/SHM files. Treat it as sensitive forensic evidence and
+securely remove it only after independently accepting the recovered state.
+See [the durability runbook](docs/DURABILITY.md#corrupt-database-recovery).
+
 To move a complete installation to a fresh database or a new storage-key
 generation, stop the server and use the versioned portable format. The bundle
 is intentionally plaintext and contains every durable tenant and system record,

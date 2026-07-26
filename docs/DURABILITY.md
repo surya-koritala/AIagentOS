@@ -10,11 +10,12 @@ integrated. Transactional storage erasure, non-identifying deletion receipts,
 and live-resource-coordinated system operator erasure through the wire, SDK,
 and CLI are integrated. Verified local-backup retention, disabled-by-default
 automatic local backup maintenance, optional Ed25519 manifest authenticity,
-and SQLCipher whole-database encryption with operator-custodied keys are
-integrated. Authenticated configured-host disaster recovery, plaintext
-migration, and storage-key rotation remain explicit offline operator actions.
-Remote retention, measured recovery objectives, and independent release
-qualification are not yet complete.
+exact independently retained recovery-point anchors, and SQLCipher
+whole-database encryption with operator-custodied keys are integrated.
+Authenticated configured-host disaster recovery, plaintext migration, and
+storage-key rotation remain explicit offline operator actions. Remote
+retention, measured recovery objectives, and independent release qualification
+are not yet complete.
 
 ## Database identity and version
 
@@ -73,9 +74,10 @@ backup, restore, and storage-key rotation. A production SQLCipher store protects
 the secret from a database-file-only attacker. A deliberately plaintext
 development store detects accidental corruption, but a reader that can obtain
 the secret can forge new state. This mechanism also cannot distinguish a
-complete rollback to an older internally valid database snapshot; independent
-signed backup freshness, immutable retention, and external monotonic anchoring
-remain operator/release concerns under #123.
+complete rollback to an older internally valid live database snapshot.
+Production backup recovery requires an independently retained exact recovery
+anchor, but immutable retention and a monotonic policy proving which anchor is
+newest remain operator/release concerns under #123.
 
 Accounting events retain only keyed pseudonymous record digests and before/after
 MACs, not raw tenant, user, agent, scope, usage, cost, or model values. Subject
@@ -339,25 +341,43 @@ key bytes. Container deployments can supply the paired
 `AGENTOS_BACKUP_SIGNING_KEY_PATH` and `AGENTOS_BACKUP_SIGNING_KEY_ID`
 environment variables; the key path must be a mounted regular non-symlink file.
 
-Require the external trust file during qualification and recovery:
+After selecting a signed recovery point, publish a non-overwriting anchor
+outside the backup directory and failure domain. The trust root proves signing
+provenance; the anchor pins the exact raw manifest and database identity:
 
 ```bash
+install -d -m 700 /srv/recovery/agentos-anchors
+agentctl backup-anchor-create \
+  /var/lib/agentos-backups/nightly_2026_07_25 \
+  /srv/recovery/agentos-trust/release-2026.1.json \
+  /srv/recovery/agentos-anchors/nightly_2026_07_25.json \
+  --storage-key /etc/agentos/storage-keys/storage-generation-1.json
 agentctl backup-verify /var/lib/agentos-backups/nightly_2026_07_25 \
   --storage-key /etc/agentos/storage-keys/storage-generation-1.json \
-  --require-signature /srv/recovery/agentos-trust/release-2026.1.json
+  --require-signature /srv/recovery/agentos-trust/release-2026.1.json \
+  --require-anchor /srv/recovery/agentos-anchors/nightly_2026_07_25.json
 agentctl backup-restore /var/lib/agentos-backups/nightly_2026_07_25 \
   /var/lib/agentos/agent_os.db \
   --storage-key /etc/agentos/storage-keys/storage-generation-1.json \
   --require-signature /srv/recovery/agentos-trust/release-2026.1.json \
+  --require-anchor /srv/recovery/agentos-anchors/nightly_2026_07_25.json \
   --confirm-offline
 ```
 
-These commands reject unsigned backups, the wrong key ID or public key, and any
-signed-manifest modification before restore mutates the destination. For
-rotation, generate a new key ID, retain the old public trust files for every
-backup still inside retention, update both configuration fields together, and
-restart or reload the owning kernel configuration. Removing an old trust file
-before its backups expire makes those backups intentionally unverifiable.
+Anchor creation verifies the complete signed backup and, for SQLCipher, its
+independently supplied storage key. It creates an owner-only file without
+overwrite and rejects direct co-location inside the backup. That path check
+cannot prove separate media, immutable storage, or that an operator selected
+the newest recovery point; those are custody-policy requirements.
+
+Anchored verification and restore reject unsigned backups, the wrong key ID or
+public key, any signed-manifest modification, and substitution of another valid
+signed backup before restore mutates the destination. For rotation, generate a
+new key ID, retain the old public trust files and anchors for every recovery
+point still inside retention, update both configuration fields together, and
+restart or reload the owning kernel configuration. Removing old trust material
+before its dependent backups expire makes those backups intentionally
+unverifiable.
 
 ## Verified local-backup retention
 
@@ -462,17 +482,20 @@ configured-host recovery:
 ```bash
 agentctl backup-verify /var/lib/agentos/backups/nightly_2026_07_25 \
   --storage-key /etc/agentos/storage-keys/storage-generation-1.json \
-  --require-signature /srv/recovery/agentos-trust/release-2026.1.json
+  --require-signature /srv/recovery/agentos-trust/release-2026.1.json \
+  --require-anchor /srv/recovery/agentos-anchors/nightly_2026_07_25.json
 agentctl backup-disaster-recover \
   /var/lib/agentos/backups/nightly_2026_07_25 \
   /etc/agentos/config.toml \
   /srv/recovery/agentos-trust/release-2026.1.json \
+  /srv/recovery/agentos-anchors/nightly_2026_07_25.json \
   --confirm-offline
 ```
 
 The recovery command requires an existing configuration with an absolute
 `data_dir`, derives `agent_os.db` and its independently retained storage key
-from that configuration, and always requires the external public trust file.
+from that configuration, and always requires the external public trust file
+and exact recovery anchor.
 After authenticated restore, it boots the complete configured kernel, including
 budget reconstruction and service recovery, and verifies every persisted agent
 is present in the live enforcing registry. The previous database remains the
@@ -505,6 +528,7 @@ agentctl backup-corruption-recover \
   /var/lib/agentos/backups/nightly_2026_07_25 \
   /etc/agentos/config.toml \
   /srv/recovery/agentos-trust/release-2026.1.json \
+  /srv/recovery/agentos-anchors/nightly_2026_07_25.json \
   5df0185b-03c3-4f1d-8026-2d99d4d82f22 \
   --confirm-offline
 ```
@@ -525,13 +549,13 @@ publishes it atomically, boots the complete configured kernel, and verifies
 that every persisted agent returns to the live enforcement registry.
 
 An interrupted command can be rerun with the exact same backup, configuration,
-trust root, and UUID. The journal binds those inputs and resumes from the
-observed files without deleting ambiguous state. An ordinary qualification or
-publication error automatically restores the corrupt original and its
-sidecars; the failed replacement remains in quarantine for diagnosis. If
-automatic rollback itself fails, the journal is retained and the error reports
-its location. Do not move, edit, or delete journal-owned files before
-investigation.
+trust root, recovery anchor, and UUID. The journal binds the verified backup
+identity and resumes from the observed files without deleting ambiguous state.
+An ordinary qualification or publication error automatically restores the
+corrupt original and its sidecars; the failed replacement remains in quarantine
+for diagnosis. If automatic rollback itself fails, the journal is retained and
+the error reports its location. Do not move, edit, or delete journal-owned
+files before investigation.
 
 On success, the JSON report includes `quarantine_dir`. Quarantine can contain
 all tenant and system data. SQLCipher source files remain encrypted, while a
@@ -653,7 +677,6 @@ The following remain open under issue #123:
 
 - remote object storage retention and a measured recovery runbook;
 - independent immutable/remote retention controls and released trust fixtures;
-- corruption recovery beyond fail-closed startup detection;
 - measured deletion/retention enforcement across external workspaces,
   providers, remote backup copies, and object stores;
 - host-filesystem disk-full, power-loss, object-store, and extended crash

@@ -34,6 +34,7 @@ const MAX_BACKUP_KEY_BYTES: u64 = 16 * 1024;
 const MAX_BACKUP_ROOT_ENTRIES: usize = 10_000;
 const BACKUP_AUTHENTICITY_FORMAT_VERSION: u32 = 1;
 const BACKUP_TRUST_FORMAT_VERSION: u32 = 1;
+pub const BACKUP_RECOVERY_ANCHOR_FORMAT_VERSION: u32 = 1;
 const BACKUP_SIGNATURE_ALGORITHM: &str = "ed25519";
 const BACKUP_SIGNING_DOMAIN_V1: &[u8] = b"AIAGENTOS-BACKUP-MANIFEST-V1\0";
 const BACKUP_SIGNING_DOMAIN_V2: &[u8] = b"AIAGENTOS-BACKUP-MANIFEST-V2\0";
@@ -83,6 +84,27 @@ pub struct BackupTrustRoot {
     pub algorithm: String,
     pub key_id: String,
     pub public_key_hex: String,
+}
+
+/// Independently retained identity of one exact, fully verified recovery point.
+///
+/// A valid backup signature proves provenance but does not distinguish the
+/// newest signed backup from an older, still-valid one. Operators retain this
+/// non-secret document outside the backup failure domain and supply it during
+/// production recovery so a stale or replaced snapshot is rejected before the
+/// destination is mutated.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BackupRecoveryAnchor {
+    pub format_version: u32,
+    pub installation_id: String,
+    pub backup_format_version: u32,
+    pub created_at: String,
+    pub byte_count: u64,
+    pub database_sha256: String,
+    pub manifest_sha256: String,
+    pub signing_key_id: String,
+    pub signing_public_key_sha256: String,
 }
 
 /// In-memory Ed25519 backup signing identity.
@@ -810,10 +832,157 @@ pub fn load_backup_trust_root(path: &Path) -> Result<BackupTrustRoot, ContextErr
     Ok(trust)
 }
 
+fn validate_backup_recovery_anchor(anchor: &BackupRecoveryAnchor) -> Result<(), ContextError> {
+    if anchor.format_version != BACKUP_RECOVERY_ANCHOR_FORMAT_VERSION {
+        return Err(storage_error(format!(
+            "unsupported backup recovery anchor format version {}",
+            anchor.format_version
+        )));
+    }
+    if !matches!(
+        anchor.backup_format_version,
+        LEGACY_BACKUP_FORMAT_VERSION | BACKUP_FORMAT_VERSION
+    ) {
+        return Err(storage_error(format!(
+            "backup recovery anchor references unsupported backup format version {}",
+            anchor.backup_format_version
+        )));
+    }
+    uuid::Uuid::parse_str(&anchor.installation_id)
+        .map_err(|_| storage_error("backup recovery anchor installation id is not a UUID"))?;
+    chrono::DateTime::parse_from_rfc3339(&anchor.created_at).map_err(|error| {
+        storage_error(format!(
+            "backup recovery anchor creation timestamp is invalid: {error}"
+        ))
+    })?;
+    if anchor.byte_count == 0 {
+        return Err(storage_error(
+            "backup recovery anchor byte count must be greater than zero",
+        ));
+    }
+    for (label, value) in [
+        ("database SHA-256", &anchor.database_sha256),
+        ("manifest SHA-256", &anchor.manifest_sha256),
+        ("signing-key fingerprint", &anchor.signing_public_key_sha256),
+    ] {
+        if hex_decode(value).is_none_or(|bytes| bytes.len() != 32) {
+            return Err(storage_error(format!(
+                "backup recovery anchor {label} must be a 32-byte hexadecimal value"
+            )));
+        }
+    }
+    validate_backup_key_id(&anchor.signing_key_id)
+}
+
+fn backup_manifest_bytes(backup_dir: &Path) -> Result<Vec<u8>, ContextError> {
+    require_real_directory(backup_dir, "backup")?;
+    read_bounded_regular_file(
+        &backup_dir.join(BACKUP_MANIFEST_FILE),
+        "backup manifest",
+        MAX_MANIFEST_BYTES,
+        false,
+    )
+}
+
+fn recovery_anchor_for_manifest(
+    manifest: &BackupManifest,
+    manifest_bytes: &[u8],
+) -> Result<BackupRecoveryAnchor, ContextError> {
+    let authenticity = manifest.authenticity.as_ref().ok_or_else(|| {
+        storage_error("backup is unsigned and cannot produce a trusted recovery anchor")
+    })?;
+    validate_authenticity(authenticity)?;
+    let anchor = BackupRecoveryAnchor {
+        format_version: BACKUP_RECOVERY_ANCHOR_FORMAT_VERSION,
+        installation_id: manifest.installation_id.clone(),
+        backup_format_version: manifest.format_version,
+        created_at: manifest.created_at.clone(),
+        byte_count: manifest.byte_count,
+        database_sha256: manifest.sha256.clone(),
+        manifest_sha256: sha256_bytes(manifest_bytes),
+        signing_key_id: authenticity.key_id.clone(),
+        signing_public_key_sha256: authenticity.public_key_sha256.clone(),
+    };
+    validate_backup_recovery_anchor(&anchor)?;
+    Ok(anchor)
+}
+
+/// Read and validate one independently retained backup recovery anchor.
+pub fn load_backup_recovery_anchor(path: &Path) -> Result<BackupRecoveryAnchor, ContextError> {
+    let bytes =
+        read_bounded_regular_file(path, "backup recovery anchor", MAX_MANIFEST_BYTES, false)?;
+    let anchor: BackupRecoveryAnchor = serde_json::from_slice(&bytes).map_err(|error| {
+        storage_error(format!(
+            "failed to parse backup recovery anchor {}: {error}",
+            path.display()
+        ))
+    })?;
+    validate_backup_recovery_anchor(&anchor)?;
+    Ok(anchor)
+}
+
+fn require_anchor_outside_backup(
+    backup_dir: &Path,
+    anchor_path: &Path,
+) -> Result<(), ContextError> {
+    let backup = fs::canonicalize(backup_dir).map_err(|error| {
+        storage_error(format!(
+            "failed to resolve backup directory {}: {error}",
+            backup_dir.display()
+        ))
+    })?;
+    let anchor = match fs::canonicalize(anchor_path) {
+        Ok(path) => path,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let parent = anchor_path
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new("."));
+            let parent = fs::canonicalize(parent).map_err(|error| {
+                storage_error(format!(
+                    "failed to resolve backup recovery anchor parent {}: {error}",
+                    parent.display()
+                ))
+            })?;
+            let file_name = anchor_path
+                .file_name()
+                .ok_or_else(|| storage_error("backup recovery anchor path must name a file"))?;
+            parent.join(file_name)
+        }
+        Err(error) => {
+            return Err(storage_error(format!(
+                "failed to resolve backup recovery anchor {}: {error}",
+                anchor_path.display()
+            )))
+        }
+    };
+    if anchor.starts_with(&backup) {
+        return Err(storage_error(
+            "backup recovery anchor must be retained outside the backup directory",
+        ));
+    }
+    Ok(())
+}
+
+/// Load an anchor while rejecting obvious co-location with the backup it pins.
+///
+/// Filesystem separation alone cannot prove an independent failure domain, but
+/// rejecting an anchor embedded in the backup prevents the most direct
+/// self-authentication mistake. Operators must still retain the anchor in a
+/// separately governed inventory or immutable store.
+pub fn load_independent_backup_recovery_anchor(
+    backup_dir: &Path,
+    anchor_path: &Path,
+) -> Result<BackupRecoveryAnchor, ContextError> {
+    require_anchor_outside_backup(backup_dir, anchor_path)?;
+    load_backup_recovery_anchor(anchor_path)
+}
+
 fn write_new_owner_only_file(path: &Path, bytes: &[u8], label: &str) -> Result<(), ContextError> {
     let parent = path
         .parent()
-        .ok_or_else(|| storage_error(format!("{label} path must have a parent directory")))?;
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
     require_real_directory(parent, &format!("{label} parent"))?;
 
     let mut options = OpenOptions::new();
@@ -829,28 +998,36 @@ fn write_new_owner_only_file(path: &Path, bytes: &[u8], label: &str) -> Result<(
             path.display()
         ))
     })?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        file.set_permissions(fs::Permissions::from_mode(0o600))
+    let persist = (|| {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(fs::Permissions::from_mode(0o600))
+                .map_err(|error| {
+                    storage_error(format!(
+                        "failed to protect opened {label} {}: {error}",
+                        path.display()
+                    ))
+                })?;
+        }
+        #[cfg(not(unix))]
+        set_owner_only_file(path)?;
+        file.write_all(bytes)
+            .and_then(|()| file.sync_all())
             .map_err(|error| {
                 storage_error(format!(
-                    "failed to protect opened {label} {}: {error}",
+                    "failed to persist {label} {}: {error}",
                     path.display()
                 ))
             })?;
+        sync_directory(parent)
+    })();
+    if persist.is_err() {
+        drop(file);
+        let _ = fs::remove_file(path);
+        let _ = sync_directory(parent);
     }
-    #[cfg(not(unix))]
-    set_owner_only_file(path)?;
-    file.write_all(bytes)
-        .and_then(|()| file.sync_all())
-        .map_err(|error| {
-            storage_error(format!(
-                "failed to persist {label} {}: {error}",
-                path.display()
-            ))
-        })?;
-    sync_directory(parent)
+    persist
 }
 
 /// Generate a new backup signing key and independently retainable public trust
@@ -1888,6 +2065,91 @@ pub fn verify_backup_with_storage_key_and_trust(
     verify_backup_internal(backup_dir, Some(trust), Some(storage_key))
 }
 
+fn verify_backup_recovery_anchor_internal(
+    backup_dir: &Path,
+    storage_key: Option<&StorageEncryptionKey>,
+    trust: &BackupTrustRoot,
+    anchor: &BackupRecoveryAnchor,
+) -> Result<BackupManifest, ContextError> {
+    validate_backup_recovery_anchor(anchor)?;
+    let manifest_before = backup_manifest_bytes(backup_dir)?;
+    let manifest = verify_backup_internal(backup_dir, Some(trust), storage_key)?;
+    let manifest_after = backup_manifest_bytes(backup_dir)?;
+    if manifest_before != manifest_after {
+        return Err(storage_error(
+            "backup manifest changed during recovery-anchor verification",
+        ));
+    }
+    let observed = recovery_anchor_for_manifest(&manifest, &manifest_after)?;
+    if observed != *anchor {
+        return Err(storage_error(
+            "backup does not match the independently retained recovery anchor",
+        ));
+    }
+    Ok(manifest)
+}
+
+/// Verify a signed backup against one independently retained exact recovery
+/// point. `storage_key` is required when the manifest declares SQLCipher.
+pub fn verify_backup_with_recovery_anchor(
+    backup_dir: &Path,
+    storage_key: Option<&StorageEncryptionKey>,
+    trust: &BackupTrustRoot,
+    anchor: &BackupRecoveryAnchor,
+) -> Result<BackupManifest, ContextError> {
+    verify_backup_recovery_anchor_internal(backup_dir, storage_key, trust, anchor)
+}
+
+/// Verify a signed backup and publish a non-overwriting, owner-only recovery
+/// anchor outside that backup directory.
+pub fn generate_backup_recovery_anchor(
+    backup_dir: &Path,
+    storage_key: Option<&StorageEncryptionKey>,
+    trust: &BackupTrustRoot,
+    anchor_path: &Path,
+) -> Result<BackupRecoveryAnchor, ContextError> {
+    require_anchor_outside_backup(backup_dir, anchor_path)?;
+    reject_existing_path(anchor_path, "backup recovery anchor")?;
+    let manifest_before = backup_manifest_bytes(backup_dir)?;
+    let manifest = verify_backup_internal(backup_dir, Some(trust), storage_key)?;
+    let manifest_after = backup_manifest_bytes(backup_dir)?;
+    if manifest_before != manifest_after {
+        return Err(storage_error(
+            "backup manifest changed while creating a recovery anchor",
+        ));
+    }
+    let anchor = recovery_anchor_for_manifest(&manifest, &manifest_after)?;
+    let mut encoded = serde_json::to_vec_pretty(&anchor).map_err(|error| {
+        storage_error(format!("failed to encode backup recovery anchor: {error}"))
+    })?;
+    encoded.push(b'\n');
+    write_new_owner_only_file(anchor_path, &encoded, "backup recovery anchor")?;
+    let persisted = load_independent_backup_recovery_anchor(backup_dir, anchor_path);
+    match persisted {
+        Ok(persisted) if persisted == anchor => Ok(anchor),
+        Ok(_) => {
+            let _ = fs::remove_file(anchor_path);
+            let parent = anchor_path
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new("."));
+            let _ = sync_directory(parent);
+            Err(storage_error(
+                "persisted backup recovery anchor failed exact verification",
+            ))
+        }
+        Err(error) => {
+            let _ = fs::remove_file(anchor_path);
+            let parent = anchor_path
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new("."));
+            let _ = sync_directory(parent);
+            Err(error)
+        }
+    }
+}
+
 fn validate_retention_policy(policy: &BackupRetentionPolicy) -> Result<(), ContextError> {
     if policy.keep_latest == 0 {
         return Err(storage_error(
@@ -2453,9 +2715,14 @@ pub fn restore_backup(
     backup_dir: &Path,
     destination_database: &Path,
 ) -> Result<RestoreReport, ContextError> {
-    restore_backup_internal(backup_dir, destination_database, None, None, |_, lease| {
-        Ok(lease)
-    })
+    restore_backup_internal(
+        backup_dir,
+        destination_database,
+        None,
+        None,
+        None,
+        |_, lease| Ok(lease),
+    )
     .map(|(report, _lease)| report)
 }
 
@@ -2470,6 +2737,7 @@ pub fn restore_backup_with_trust(
         backup_dir,
         destination_database,
         Some(trust),
+        None,
         None,
         |_, lease| Ok(lease),
     )
@@ -2488,6 +2756,7 @@ pub fn restore_backup_with_storage_key(
         destination_database,
         None,
         Some(storage_key),
+        None,
         |_, lease| Ok(lease),
     )
     .map(|(report, _lease)| report)
@@ -2506,6 +2775,28 @@ pub fn restore_backup_with_storage_key_and_trust(
         destination_database,
         Some(trust),
         Some(storage_key),
+        None,
+        |_, lease| Ok(lease),
+    )
+    .map(|(report, _lease)| report)
+}
+
+/// Restore one exact signed recovery point pinned by independent anchor
+/// custody. The anchor is rechecked immediately before any existing
+/// destination is moved.
+pub fn restore_backup_with_recovery_anchor(
+    backup_dir: &Path,
+    destination_database: &Path,
+    storage_key: Option<&StorageEncryptionKey>,
+    trust: &BackupTrustRoot,
+    anchor: &BackupRecoveryAnchor,
+) -> Result<RestoreReport, ContextError> {
+    restore_backup_internal(
+        backup_dir,
+        destination_database,
+        Some(trust),
+        storage_key,
+        Some(anchor),
         |_, lease| Ok(lease),
     )
     .map(|(report, _lease)| report)
@@ -2514,7 +2805,9 @@ pub fn restore_backup_with_storage_key_and_trust(
 /// Restore a trusted backup to the database selected by `config`, then boot the
 /// complete configured kernel before discarding the previous database.
 ///
-/// This is the production disaster-recovery path. If schema verification,
+/// This compatibility path authenticates provenance but does not pin an exact
+/// recovery point. Production operators should use
+/// [`recover_backup_from_config_with_anchor`]. If schema verification,
 /// configured key loading, service recovery, budget reconstruction, or any
 /// persisted agent's enforcement re-admission fails, a replacement restore is
 /// rolled back and a fresh-host destination is removed.
@@ -2522,6 +2815,26 @@ pub fn recover_backup_from_config(
     backup_dir: &Path,
     config: &crate::config::Config,
     trust: &BackupTrustRoot,
+) -> Result<DisasterRecoveryReport, ContextError> {
+    recover_backup_from_config_internal(backup_dir, config, trust, None)
+}
+
+/// Production disaster recovery for one exact independently anchored signed
+/// backup. This rejects an older or replaced valid snapshot before mutation.
+pub fn recover_backup_from_config_with_anchor(
+    backup_dir: &Path,
+    config: &crate::config::Config,
+    trust: &BackupTrustRoot,
+    anchor: &BackupRecoveryAnchor,
+) -> Result<DisasterRecoveryReport, ContextError> {
+    recover_backup_from_config_internal(backup_dir, config, trust, Some(anchor))
+}
+
+fn recover_backup_from_config_internal(
+    backup_dir: &Path,
+    config: &crate::config::Config,
+    trust: &BackupTrustRoot,
+    anchor: Option<&BackupRecoveryAnchor>,
 ) -> Result<DisasterRecoveryReport, ContextError> {
     if !config.data_dir.is_absolute() {
         return Err(storage_error(
@@ -2540,6 +2853,7 @@ pub fn recover_backup_from_config(
         &destination_database,
         Some(trust),
         storage_key.as_ref(),
+        anchor,
         |_, storage_lease| qualify_recovered_database(config, storage_lease),
     )?;
     Ok(DisasterRecoveryReport {
@@ -2589,6 +2903,39 @@ pub fn recover_corrupt_storage_from_config(
     trust: &BackupTrustRoot,
     expected_installation_id: &str,
 ) -> Result<CorruptStorageRecoveryReport, ContextError> {
+    recover_corrupt_storage_from_config_internal(
+        backup_dir,
+        config,
+        trust,
+        None,
+        expected_installation_id,
+    )
+}
+
+/// Recover corrupt storage from one exact independently anchored signed backup.
+pub fn recover_corrupt_storage_from_config_with_anchor(
+    backup_dir: &Path,
+    config: &crate::config::Config,
+    trust: &BackupTrustRoot,
+    anchor: &BackupRecoveryAnchor,
+    expected_installation_id: &str,
+) -> Result<CorruptStorageRecoveryReport, ContextError> {
+    recover_corrupt_storage_from_config_internal(
+        backup_dir,
+        config,
+        trust,
+        Some(anchor),
+        expected_installation_id,
+    )
+}
+
+fn recover_corrupt_storage_from_config_internal(
+    backup_dir: &Path,
+    config: &crate::config::Config,
+    trust: &BackupTrustRoot,
+    recovery_anchor: Option<&BackupRecoveryAnchor>,
+    expected_installation_id: &str,
+) -> Result<CorruptStorageRecoveryReport, ContextError> {
     if !config.data_dir.is_absolute() {
         return Err(storage_error(
             "corrupt storage recovery requires an absolute configured data_dir",
@@ -2607,7 +2954,12 @@ pub fn recover_corrupt_storage_from_config(
         .as_deref()
         .map(crate::storage_encryption::load_storage_encryption_key)
         .transpose()?;
-    let manifest = verify_backup_internal(backup_dir, Some(trust), storage_key.as_ref())?;
+    let manifest = match recovery_anchor {
+        Some(anchor) => {
+            verify_backup_recovery_anchor_internal(backup_dir, storage_key.as_ref(), trust, anchor)?
+        }
+        None => verify_backup_internal(backup_dir, Some(trust), storage_key.as_ref())?,
+    };
     if manifest.installation_id != expected_installation_id {
         return Err(storage_error(format!(
             "trusted backup installation id {} does not match expected installation id",
@@ -3165,9 +3517,20 @@ fn restore_backup_internal<T>(
     destination_database: &Path,
     trust: Option<&BackupTrustRoot>,
     storage_key: Option<&StorageEncryptionKey>,
+    recovery_anchor: Option<&BackupRecoveryAnchor>,
     qualify_published: impl FnOnce(&BackupManifest, File) -> Result<T, ContextError>,
 ) -> Result<(RestoreReport, T), ContextError> {
-    let manifest = verify_backup_internal(backup_dir, trust, storage_key)?;
+    let manifest = match (trust, recovery_anchor) {
+        (Some(trust), Some(anchor)) => {
+            verify_backup_recovery_anchor_internal(backup_dir, storage_key, trust, anchor)?
+        }
+        (None, Some(_)) => {
+            return Err(storage_error(
+                "backup recovery anchor requires an independently supplied signing trust root",
+            ))
+        }
+        (_, None) => verify_backup_internal(backup_dir, trust, storage_key)?,
+    };
     let parent = destination_database
         .parent()
         .ok_or_else(|| storage_error("restore destination must have a parent directory"))?;
@@ -3225,6 +3588,20 @@ fn restore_backup_internal<T>(
         Ok(())
     })();
     stage_result?;
+
+    // Pin the independently retained recovery point through the last
+    // non-mutating boundary. A backup directory changed after preflight cannot
+    // cause us to move an existing destination.
+    if let Some(anchor) = recovery_anchor {
+        let trust = trust.expect("recovery anchor requires trust");
+        if verify_backup_recovery_anchor_internal(backup_dir, storage_key, trust, anchor)?
+            != manifest
+        {
+            return Err(storage_error(
+                "backup identity changed before anchored restore publication",
+            ));
+        }
+    }
 
     let replaced_existing = destination_database.exists();
     let rollback = companion_path(
@@ -4036,6 +4413,198 @@ mod tests {
     }
 
     #[test]
+    fn recovery_anchor_pins_one_exact_signed_backup_and_never_overwrites() {
+        let directory = TestDirectory::new("recovery-anchor");
+        let manager = SqliteContextManager::new(&directory.path.join("source.db")).unwrap();
+        let (signer, _) = BackupSigningKey::generate("release-anchor-1").unwrap();
+        let backup_root = directory.path.join("backups");
+        seed(&manager, "generation", "one");
+        let first = manager
+            .create_signed_backup(&backup_root, "backup_001", &signer)
+            .unwrap();
+        seed(&manager, "generation", "two");
+        manager
+            .create_signed_backup(&backup_root, "backup_002", &signer)
+            .unwrap();
+
+        let first_dir = backup_root.join("backup_001");
+        let second_dir = backup_root.join("backup_002");
+        let anchor_path = directory.path.join("recovery-points/backup_001.json");
+        fs::create_dir(anchor_path.parent().unwrap()).unwrap();
+        let anchor =
+            generate_backup_recovery_anchor(&first_dir, None, &signer.trust_root(), &anchor_path)
+                .unwrap();
+        assert_eq!(anchor.installation_id, first.installation_id);
+        assert_eq!(
+            load_independent_backup_recovery_anchor(&first_dir, &anchor_path).unwrap(),
+            anchor
+        );
+        assert_eq!(
+            verify_backup_with_recovery_anchor(&first_dir, None, &signer.trust_root(), &anchor)
+                .unwrap(),
+            first
+        );
+        let stale_or_substituted =
+            verify_backup_with_recovery_anchor(&second_dir, None, &signer.trust_root(), &anchor)
+                .unwrap_err();
+        assert!(stale_or_substituted
+            .to_string()
+            .contains("does not match the independently retained recovery anchor"));
+        assert!(generate_backup_recovery_anchor(
+            &first_dir,
+            None,
+            &signer.trust_root(),
+            &anchor_path,
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("already exists"));
+        assert!(generate_backup_recovery_anchor(
+            &first_dir,
+            None,
+            &signer.trust_root(),
+            &first_dir.join("self-anchor.json"),
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("outside the backup directory"));
+        let mut unknown: serde_json::Value =
+            serde_json::to_value(&anchor).expect("encode anchor value");
+        unknown["unknown"] = serde_json::Value::Bool(true);
+        let malformed_path = directory.path.join("recovery-points/unknown.json");
+        fs::write(&malformed_path, serde_json::to_vec(&unknown).unwrap()).unwrap();
+        assert!(load_backup_recovery_anchor(&malformed_path)
+            .unwrap_err()
+            .to_string()
+            .contains("unknown field"));
+        let colocated = first_dir.join("copied-anchor.json");
+        fs::copy(&anchor_path, &colocated).unwrap();
+        assert!(
+            load_independent_backup_recovery_anchor(&first_dir, &colocated)
+                .unwrap_err()
+                .to_string()
+                .contains("outside the backup directory")
+        );
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(
+                &anchor_path,
+                directory.path.join("recovery-points/anchor-link.json"),
+            )
+            .unwrap();
+            assert!(load_backup_recovery_anchor(
+                &directory.path.join("recovery-points/anchor-link.json")
+            )
+            .is_err());
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&anchor_path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+    }
+
+    #[test]
+    fn anchored_restore_rejects_substitution_before_destination_mutation() {
+        let directory = TestDirectory::new("anchored-restore");
+        let source = SqliteContextManager::new(&directory.path.join("source.db")).unwrap();
+        let destination_manager =
+            SqliteContextManager::new(&directory.path.join("destination.db")).unwrap();
+        seed(&destination_manager, "custody", "must-remain");
+        drop(destination_manager);
+        let (signer, _) = BackupSigningKey::generate("anchored-restore-1").unwrap();
+        let backup_root = directory.path.join("backups");
+        seed(&source, "recovery", "first");
+        source
+            .create_signed_backup(&backup_root, "first", &signer)
+            .unwrap();
+        seed(&source, "recovery", "second");
+        source
+            .create_signed_backup(&backup_root, "second", &signer)
+            .unwrap();
+        let anchor_path = directory.path.join("anchors/first.json");
+        fs::create_dir(anchor_path.parent().unwrap()).unwrap();
+        let anchor = generate_backup_recovery_anchor(
+            &backup_root.join("first"),
+            None,
+            &signer.trust_root(),
+            &anchor_path,
+        )
+        .unwrap();
+
+        let destination = directory.path.join("destination.db");
+        let error = restore_backup_with_recovery_anchor(
+            &backup_root.join("second"),
+            &destination,
+            None,
+            &signer.trust_root(),
+            &anchor,
+        )
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("does not match the independently retained recovery anchor"));
+        assert_eq!(
+            value(&destination, "custody").as_deref(),
+            Some("must-remain")
+        );
+        assert!(!directory.path.read_dir().unwrap().any(|entry| entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .contains(".rollback-")));
+    }
+
+    #[test]
+    fn recovery_anchor_supports_encrypted_signed_backup_restore() {
+        let directory = TestDirectory::new("encrypted-recovery-anchor");
+        let key = encrypted_test_key("anchor-storage-1", 0x91);
+        let manager = SqliteContextManager::new_encrypted(
+            &directory.path.join("source.db"),
+            encrypted_test_key("anchor-storage-1", 0x91),
+        )
+        .unwrap();
+        seed(&manager, "encrypted-anchor", "survived");
+        let (signer, _) = BackupSigningKey::generate("encrypted-anchor-1").unwrap();
+        let backup_root = directory.path.join("backups");
+        manager
+            .create_signed_backup(&backup_root, "qualified", &signer)
+            .unwrap();
+        let backup_dir = backup_root.join("qualified");
+        let anchor_path = directory.path.join("anchors/qualified.json");
+        fs::create_dir(anchor_path.parent().unwrap()).unwrap();
+        let anchor = generate_backup_recovery_anchor(
+            &backup_dir,
+            Some(&key),
+            &signer.trust_root(),
+            &anchor_path,
+        )
+        .unwrap();
+        assert!(verify_backup_with_recovery_anchor(
+            &backup_dir,
+            None,
+            &signer.trust_root(),
+            &anchor,
+        )
+        .is_err());
+
+        let destination = directory.path.join("fresh/agent_os.db");
+        restore_backup_with_recovery_anchor(
+            &backup_dir,
+            &destination,
+            Some(&key),
+            &signer.trust_root(),
+            &anchor,
+        )
+        .unwrap();
+        let restored = SqliteContextManager::new_encrypted(&destination, key).unwrap();
+        drop(restored);
+    }
+
+    #[test]
     fn unsigned_backup_is_rejected_when_authenticity_is_required() {
         let directory = TestDirectory::new("unsigned");
         let manager = SqliteContextManager::new(&directory.path.join("source.db")).unwrap();
@@ -4290,6 +4859,7 @@ mod tests {
         let error = restore_backup_internal(
             &backup_dir,
             &destination,
+            None,
             None,
             None,
             |_, _qualification_lease| {

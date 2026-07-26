@@ -10,6 +10,15 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
 
 ## [Unreleased]
 
+- Added independently retained exact backup recovery anchors under #123.
+  `agentctl backup-anchor-create` fully verifies a signed plaintext or SQLCipher
+  backup and publishes an owner-only, non-overwriting anchor outside the backup
+  directory. Anchored verify/restore rejects another older-but-valid signed
+  backup, and production disaster/corruption recovery now requires the exact
+  anchor before destination mutation. Kernel and CLI regressions cover
+  substitution, non-overwrite, co-location, encrypted restore, confirmation,
+  and fresh-host configured recovery. Immutable remote custody, a monotonic
+  newest-point policy, and measured recovery drills remain open.
 - Added authenticated offline corruption recovery under #123.
   `agentctl backup-corruption-recover` refuses healthy databases, requires an
   independently trusted signed backup plus the operator-supplied expected

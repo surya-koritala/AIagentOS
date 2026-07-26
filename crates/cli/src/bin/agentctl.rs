@@ -7,7 +7,7 @@ use agent_cli::OperatorClient;
 fn usage() -> ! {
     eprintln!(
         "usage: agentctl [--addr HOST:PORT] [--token TOKEN] \
-         <list|inspect|pressure|tunables|tunable-set|tunable-rollback|tunable-history|status|pause|resume|stop|kill|wait|services|service-start|service-stop|service-restart|service-reload|service-history|backup-create|backup-retention|backup-status|data-inventory|backup-key-generate|backup-verify|backup-restore|backup-disaster-recover|backup-corruption-recover|storage-key-generate|storage-encrypt|storage-encrypt-recover|storage-key-rotate|storage-portable-export|storage-portable-verify|storage-portable-import|erase-agent|erase-user|erase-tenant> [ARGS...]\n\
+         <list|inspect|pressure|tunables|tunable-set|tunable-rollback|tunable-history|status|pause|resume|stop|kill|wait|services|service-start|service-stop|service-restart|service-reload|service-history|backup-create|backup-retention|backup-status|data-inventory|backup-key-generate|backup-anchor-create|backup-verify|backup-restore|backup-disaster-recover|backup-corruption-recover|storage-key-generate|storage-encrypt|storage-encrypt-recover|storage-key-rotate|storage-portable-export|storage-portable-verify|storage-portable-import|erase-agent|erase-user|erase-tenant> [ARGS...]\n\
          \n\
          storage commands:\n\
            agentctl [SERVER OPTIONS] backup-create BACKUP_ROOT NAME\n\
@@ -15,10 +15,11 @@ fn usage() -> ! {
            agentctl [SERVER OPTIONS] backup-status\n\
            agentctl [SERVER OPTIONS] data-inventory\n\
            agentctl backup-key-generate KEY_ID PRIVATE_KEY_FILE PUBLIC_TRUST_FILE\n\
-           agentctl backup-verify BACKUP_DIR [--storage-key KEY_FILE] [--require-signature PUBLIC_TRUST_FILE]\n\
-           agentctl backup-restore BACKUP_DIR DATABASE [--storage-key KEY_FILE] [--require-signature PUBLIC_TRUST_FILE] --confirm-offline\n\
-           agentctl backup-disaster-recover BACKUP_DIR CONFIG_FILE PUBLIC_TRUST_FILE --confirm-offline\n\
-           agentctl backup-corruption-recover BACKUP_DIR CONFIG_FILE PUBLIC_TRUST_FILE EXPECTED_INSTALLATION_ID --confirm-offline\n\
+           agentctl backup-anchor-create BACKUP_DIR PUBLIC_TRUST_FILE ANCHOR_FILE [--storage-key KEY_FILE]\n\
+           agentctl backup-verify BACKUP_DIR [--storage-key KEY_FILE] [--require-signature PUBLIC_TRUST_FILE] [--require-anchor ANCHOR_FILE]\n\
+           agentctl backup-restore BACKUP_DIR DATABASE [--storage-key KEY_FILE] [--require-signature PUBLIC_TRUST_FILE] [--require-anchor ANCHOR_FILE] --confirm-offline\n\
+           agentctl backup-disaster-recover BACKUP_DIR CONFIG_FILE PUBLIC_TRUST_FILE ANCHOR_FILE --confirm-offline\n\
+           agentctl backup-corruption-recover BACKUP_DIR CONFIG_FILE PUBLIC_TRUST_FILE ANCHOR_FILE EXPECTED_INSTALLATION_ID --confirm-offline\n\
            agentctl storage-key-generate KEY_ID KEY_FILE\n\
            agentctl storage-encrypt DATABASE KEY_FILE --confirm-offline\n\
            agentctl storage-encrypt-recover DATABASE KEY_FILE --confirm-offline\n\
@@ -37,6 +38,7 @@ fn usage() -> ! {
 struct BackupFileOptions {
     storage_key: Option<String>,
     trust_root: Option<String>,
+    recovery_anchor: Option<String>,
     confirmed_offline: bool,
 }
 
@@ -53,6 +55,9 @@ fn parse_backup_file_options(
             }
             "--require-signature" if parsed.trust_root.is_none() => {
                 parsed.trust_root = Some(values.next().unwrap_or_else(|| usage()));
+            }
+            "--require-anchor" if parsed.recovery_anchor.is_none() => {
+                parsed.recovery_anchor = Some(values.next().unwrap_or_else(|| usage()));
             }
             "--confirm-offline" if confirmation_required && !parsed.confirmed_offline => {
                 parsed.confirmed_offline = true;
@@ -125,6 +130,28 @@ async fn main() {
             print_json(&trust, "backup trust root");
             return;
         }
+        "backup-anchor-create" => {
+            let backup_dir = args.next().unwrap_or_else(|| usage());
+            let public_trust = args.next().unwrap_or_else(|| usage());
+            let anchor_file = args.next().unwrap_or_else(|| usage());
+            let options = parse_portable_file_options(args.collect::<Vec<_>>(), false);
+            let storage_key = options.storage_key.as_deref().map(|path| {
+                kernel::storage_encryption::load_storage_encryption_key(std::path::Path::new(path))
+                    .unwrap_or_else(|error| fail_storage(error))
+            });
+            let trust =
+                kernel::storage::load_backup_trust_root(std::path::Path::new(&public_trust))
+                    .unwrap_or_else(|error| fail_storage(error));
+            let anchor = kernel::storage::generate_backup_recovery_anchor(
+                std::path::Path::new(&backup_dir),
+                storage_key.as_ref(),
+                &trust,
+                std::path::Path::new(&anchor_file),
+            )
+            .unwrap_or_else(|error| fail_storage(error));
+            print_json(&anchor, "backup recovery anchor");
+            return;
+        }
         "backup-verify" => {
             let backup_dir = args.next().unwrap_or_else(|| usage());
             let options = parse_backup_file_options(args.collect::<Vec<_>>(), false);
@@ -136,6 +163,27 @@ async fn main() {
                 kernel::storage::load_backup_trust_root(std::path::Path::new(path))
                     .unwrap_or_else(|error| fail_storage(error))
             });
+            let anchor = options.recovery_anchor.as_deref().map(|path| {
+                kernel::storage::load_independent_backup_recovery_anchor(
+                    std::path::Path::new(&backup_dir),
+                    std::path::Path::new(path),
+                )
+                .unwrap_or_else(|error| fail_storage(error))
+            });
+            if anchor.is_some() && trust.is_none() {
+                fail_operator("--require-anchor also requires --require-signature".into());
+            }
+            if let (Some(trust), Some(anchor)) = (trust.as_ref(), anchor.as_ref()) {
+                let manifest = kernel::storage::verify_backup_with_recovery_anchor(
+                    std::path::Path::new(&backup_dir),
+                    storage_key.as_ref(),
+                    trust,
+                    anchor,
+                )
+                .unwrap_or_else(|error| fail_storage(error));
+                print_json(&manifest, "backup manifest");
+                return;
+            }
             let manifest = match (storage_key.as_ref(), trust.as_ref()) {
                 (None, None) => kernel::storage::verify_backup(std::path::Path::new(&backup_dir)),
                 (None, Some(trust)) => kernel::storage::verify_backup_authenticity(
@@ -170,6 +218,28 @@ async fn main() {
                 kernel::storage::load_backup_trust_root(std::path::Path::new(path))
                     .unwrap_or_else(|error| fail_storage(error))
             });
+            let anchor = options.recovery_anchor.as_deref().map(|path| {
+                kernel::storage::load_independent_backup_recovery_anchor(
+                    std::path::Path::new(&backup_dir),
+                    std::path::Path::new(path),
+                )
+                .unwrap_or_else(|error| fail_storage(error))
+            });
+            if anchor.is_some() && trust.is_none() {
+                fail_operator("--require-anchor also requires --require-signature".into());
+            }
+            if let (Some(trust), Some(anchor)) = (trust.as_ref(), anchor.as_ref()) {
+                let report = kernel::storage::restore_backup_with_recovery_anchor(
+                    std::path::Path::new(&backup_dir),
+                    std::path::Path::new(&database),
+                    storage_key.as_ref(),
+                    trust,
+                    anchor,
+                )
+                .unwrap_or_else(|error| fail_storage(error));
+                print_json(&report, "restore report");
+                return;
+            }
             let report = match (storage_key.as_ref(), trust.as_ref()) {
                 (None, None) => kernel::storage::restore_backup(
                     std::path::Path::new(&backup_dir),
@@ -202,6 +272,7 @@ async fn main() {
             let backup_dir = args.next().unwrap_or_else(|| usage());
             let config_file = args.next().unwrap_or_else(|| usage());
             let public_trust = args.next().unwrap_or_else(|| usage());
+            let anchor_file = args.next().unwrap_or_else(|| usage());
             if args.next().as_deref() != Some("--confirm-offline") || args.next().is_some() {
                 usage();
             }
@@ -223,10 +294,16 @@ async fn main() {
             let trust =
                 kernel::storage::load_backup_trust_root(std::path::Path::new(&public_trust))
                     .unwrap_or_else(|error| fail_storage(error));
-            let report = kernel::storage::recover_backup_from_config(
+            let anchor = kernel::storage::load_independent_backup_recovery_anchor(
+                std::path::Path::new(&backup_dir),
+                std::path::Path::new(&anchor_file),
+            )
+            .unwrap_or_else(|error| fail_storage(error));
+            let report = kernel::storage::recover_backup_from_config_with_anchor(
                 std::path::Path::new(&backup_dir),
                 &config,
                 &trust,
+                &anchor,
             )
             .unwrap_or_else(|error| fail_storage(error));
             print_json(&report, "disaster recovery report");
@@ -236,6 +313,7 @@ async fn main() {
             let backup_dir = args.next().unwrap_or_else(|| usage());
             let config_file = args.next().unwrap_or_else(|| usage());
             let public_trust = args.next().unwrap_or_else(|| usage());
+            let anchor_file = args.next().unwrap_or_else(|| usage());
             let expected_installation_id = args.next().unwrap_or_else(|| usage());
             if args.next().as_deref() != Some("--confirm-offline") || args.next().is_some() {
                 usage();
@@ -258,10 +336,16 @@ async fn main() {
             let trust =
                 kernel::storage::load_backup_trust_root(std::path::Path::new(&public_trust))
                     .unwrap_or_else(|error| fail_storage(error));
-            let report = kernel::storage::recover_corrupt_storage_from_config(
+            let anchor = kernel::storage::load_independent_backup_recovery_anchor(
+                std::path::Path::new(&backup_dir),
+                std::path::Path::new(&anchor_file),
+            )
+            .unwrap_or_else(|error| fail_storage(error));
+            let report = kernel::storage::recover_corrupt_storage_from_config_with_anchor(
                 std::path::Path::new(&backup_dir),
                 &config,
                 &trust,
+                &anchor,
                 &expected_installation_id,
             )
             .unwrap_or_else(|error| fail_storage(error));

@@ -37,11 +37,15 @@ older supported database. An older binary must never write a newer schema.
 
 ## Migration contract
 
-Schema versions only move forward. A version marker is committed after the
-required kernel and cluster tables, indexes, column upgrades, and data
-reconciliation have succeeded. Missing-column upgrades inspect the existing
-schema first; SQLite errors such as read-only media, locking, corruption, or
-disk exhaustion are not treated as harmless duplicate-column errors.
+Schema versions only move forward. Startup holds an immediate SQLite
+transaction across required kernel and cluster tables, indexes, column
+upgrades, data reconciliation, quota migration fences, the migration ledger,
+storage metadata, and the final version markers. A failure in any late step
+rolls back every earlier DDL and backfill from that attempt; the database is
+never published at the new version with only part of the migration applied.
+Missing-column upgrades inspect the existing schema first; SQLite errors such
+as read-only media, locking, corruption, or disk exhaustion are not treated as
+harmless duplicate-column errors.
 
 After migration, startup verifies the ownership metadata, exact schema version,
 physical integrity, and foreign-key consistency. Reopening the current version
@@ -50,6 +54,35 @@ is idempotent and does not append a duplicate migration record.
 There is no supported in-place downgrade. Rollback to a binary that requires an
 older schema requires an offline restore of a compatible, verified pre-upgrade
 backup.
+
+Reviewable SQL fixtures under `tests/fixtures/storage/` reproduce representative
+stores from every immutable published tag (`v0.1.0`, `v0.2.0`, and `v0.3.0`).
+The fixture manifest pins each source tag commit and SQL SHA-256 digest. The
+regression suite builds a real SQLite database from every fixture, upgrades it,
+verifies current ownership/integrity/migration metadata, exercises context
+restore, and checks memory, FTS, usage-cost backfill, tenant, and KV retention
+before an idempotent reopen. A workspace version bump is rejected until the
+matching release fixture is added, so a future release cannot silently leave
+the upgrade matrix behind.
+
+Before upgrading a supported installation:
+
+1. Create and independently verify a signed backup while the current server is
+   healthy; retain every storage key and public trust document required by that
+   backup.
+2. Stop the server cleanly. Never copy a live SQLite main file without the
+   online backup API. For legacy `v0.1.0`–`v0.3.0` installations that predate
+   `backup-create`, preserve an offline snapshot of the complete data directory,
+   including any `-wal` and `-shm` companions.
+3. Start the new binary against the original database. Startup either commits
+   the whole forward migration and passes schema verification or returns an
+   error with no migration step published.
+4. Verify normal agent/context access and create a new signed backup under the
+   upgraded binary before resuming production traffic.
+
+If rollback is required, stop the new binary and restore the verified
+pre-upgrade backup or offline legacy snapshot before starting the older binary.
+Do not point an older binary at a database that a newer schema has committed.
 
 ## Encryption at rest and storage-key custody
 

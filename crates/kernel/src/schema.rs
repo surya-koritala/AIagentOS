@@ -5,7 +5,7 @@
 //! an older or unrelated binary cannot silently mutate the database.
 
 use chrono::Utc;
-use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
+use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::ContextError;
 
@@ -201,18 +201,19 @@ pub(crate) fn add_column_if_missing(
     Ok(())
 }
 
-/// Atomically publish the ownership metadata and final version marker only
-/// after all version-zero adoption work has succeeded.
+/// Publish ownership metadata and the final version marker inside the caller's
+/// schema-migration transaction.
+///
+/// The caller must hold one transaction across every DDL, backfill,
+/// reconciliation, ledger, metadata, and version change. Keeping transaction
+/// ownership in `SqliteContextManager::init_schema` prevents an earlier schema
+/// step from surviving when a later migration step fails.
 pub(crate) fn complete_migration(
-    connection: &mut Connection,
+    connection: &Connection,
     starting_version: i64,
 ) -> Result<(), ContextError> {
-    let transaction = connection
-        .transaction_with_behavior(TransactionBehavior::Immediate)
-        .map_err(|error| storage_error(format!("failed to start schema transaction: {error}")))?;
-
     for table in REQUIRED_TABLES {
-        let exists = transaction
+        let exists = connection
             .query_row(
                 "SELECT 1 FROM sqlite_schema WHERE type IN ('table', 'view') AND name = ?1",
                 [table],
@@ -232,7 +233,7 @@ pub(crate) fn complete_migration(
         }
     }
 
-    transaction
+    connection
         .execute_batch(
             "CREATE TABLE IF NOT EXISTS storage_meta (
                  singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
@@ -256,7 +257,7 @@ pub(crate) fn complete_migration(
         .iter()
         .filter(|(version, _)| *version > starting_version)
     {
-        transaction
+        connection
             .execute(
                 "INSERT INTO schema_migrations(version, name, applied_at)
                  VALUES (?1, ?2, ?3)",
@@ -266,7 +267,7 @@ pub(crate) fn complete_migration(
                 storage_error(format!("failed to record schema migration: {error}"))
             })?;
     }
-    transaction
+    connection
         .execute(
             "INSERT INTO storage_meta
                  (singleton, application_id, schema_version,
@@ -286,17 +287,13 @@ pub(crate) fn complete_migration(
             ],
         )
         .map_err(|error| storage_error(format!("failed to update schema metadata: {error}")))?;
-    transaction
+    connection
         .pragma_update(None, "application_id", APPLICATION_ID)
         .map_err(|error| storage_error(format!("failed to set SQLite application id: {error}")))?;
-    transaction
+    connection
         .pragma_update(None, "user_version", CURRENT_SCHEMA_VERSION)
         .map_err(|error| storage_error(format!("failed to set SQLite schema version: {error}")))?;
-    transaction
-        .commit()
-        .map_err(|error| storage_error(format!("failed to commit schema migration: {error}")))?;
-
-    verify(connection)
+    Ok(())
 }
 
 pub(crate) fn verify(connection: &Connection) -> Result<(), ContextError> {

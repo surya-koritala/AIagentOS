@@ -157,6 +157,24 @@ async fn spawn_server() -> std::net::SocketAddr {
     addr
 }
 
+async fn remove_test_tree_after_handle_release(path: &std::path::Path) {
+    let mut last_error = None;
+    for _ in 0..40 {
+        match std::fs::remove_dir_all(path) {
+            Ok(()) => return,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+            Err(error) => {
+                last_error = Some(error);
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        }
+    }
+    panic!(
+        "remove test root after bounded handle-release wait: {}",
+        last_error.expect("cleanup attempted")
+    );
+}
+
 async fn spawn_stream_server(
     provider_id: &str,
     blocked: bool,
@@ -628,6 +646,36 @@ async fn operator_snapshot_and_tunable_control_via_sdk() {
         .await
         .expect("operator_tunable_audit");
     assert!(audit.iter().any(|entry| entry.action == "rollback"));
+}
+
+#[tokio::test]
+async fn system_operator_can_create_and_verify_online_backup_via_sdk() {
+    let root = std::env::temp_dir().join(format!("agentos-sdk-backup-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&root).expect("create test root");
+    let database = root.join("agent_os.db");
+    let backup_root = root.join("backups");
+    let kernel = Arc::new(AgentKernelImpl::with_db_path(&database).expect("persistent kernel"));
+    let server = SyscallServer::bind(Arc::clone(&kernel), "127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = server.local_addr().expect("local_addr");
+    let server_task = tokio::spawn(server.serve());
+
+    let mut client = KernelClient::connect(addr).await.expect("connect");
+    let manifest = client
+        .create_storage_backup(backup_root.to_string_lossy(), "operator_001")
+        .await
+        .expect("create_storage_backup");
+    assert_eq!(
+        kernel::storage::verify_backup(&backup_root.join("operator_001")).unwrap(),
+        manifest
+    );
+
+    drop(client);
+    server_task.abort();
+    let _ = server_task.await;
+    drop(kernel);
+    remove_test_tree_after_handle_release(&root).await;
 }
 
 #[tokio::test]

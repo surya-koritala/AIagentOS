@@ -235,6 +235,11 @@
     "op": "list_operator_tunable_audit"
   },
   {
+    "backup_root": "fixture",
+    "name": "fixture",
+    "op": "create_storage_backup"
+  },
+  {
     "op": "list_services"
   },
   {

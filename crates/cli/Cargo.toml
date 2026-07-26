@@ -24,8 +24,12 @@ kernel = { path = "../kernel", version = "=0.3.0" }
 agent-sdk = { path = "../sdk", version = "=0.3.0" }
 adapters = { path = "../adapters", version = "=0.3.0" }
 tokio = { version = "1", features = ["full"] }
+serde = { workspace = true }
 serde_json = { workspace = true }
 dirs = "5"
 libc = "0.2"
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+uuid = { workspace = true }

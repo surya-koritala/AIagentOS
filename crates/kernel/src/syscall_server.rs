@@ -448,6 +448,13 @@ pub enum Syscall {
         #[serde(default = "default_tunable_audit_limit")]
         limit: usize,
     },
+    /// Create a verified, WAL-consistent backup on the server host. The path is
+    /// interpreted by the server and is restricted to trusted system
+    /// operators because it writes host files.
+    CreateStorageBackup {
+        backup_root: String,
+        name: String,
+    },
     /// System-scoped service supervisor operations. Tenant credentials cannot
     /// access these until service ownership is tenant-aware.
     ListServices,
@@ -1003,6 +1010,10 @@ pub enum SyscallReply {
     OperatorTunableAudit {
         entries: Vec<crate::operator_control::OperatorTunableAudit>,
     },
+    /// A verified storage backup was atomically published.
+    StorageBackupCreated {
+        manifest: crate::storage::BackupManifest,
+    },
     Services {
         services: Vec<crate::init_system::ServiceRuntimeInfo>,
     },
@@ -1241,6 +1252,7 @@ fn syscall_policy(call: &Syscall) -> (AccessLevel, &'static str, Option<&str>) {
         Syscall::ListOperatorTunableAudit { .. } => {
             (AccessLevel::System, "operator.tunable.audit", None)
         }
+        Syscall::CreateStorageBackup { .. } => (AccessLevel::System, "storage.backup.create", None),
         Syscall::ListServices => (AccessLevel::System, "service.list", None),
         Syscall::StartService { .. } => (AccessLevel::System, "service.start", None),
         Syscall::StopService { .. } => (AccessLevel::System, "service.stop", None),
@@ -1463,6 +1475,7 @@ fn quarantine_recovery_call(call: &Syscall) -> bool {
             | Syscall::OperatorSnapshot
             | Syscall::ListOperatorTunables
             | Syscall::ListOperatorTunableAudit { .. }
+            | Syscall::CreateStorageBackup { .. }
             | Syscall::ListServices
             | Syscall::ListServiceHistory { .. }
             | Syscall::ListAgents
@@ -2924,6 +2937,22 @@ pub async fn dispatch_scoped(
                 Ok(entries) => SyscallReply::OperatorTunableAudit { entries },
                 Err(error) => SyscallReply::Error {
                     message: error.to_string(),
+                },
+            }
+        }
+        Syscall::CreateStorageBackup { backup_root, name } => {
+            let context_manager = Arc::clone(&kernel.context_manager);
+            match tokio::task::spawn_blocking(move || {
+                context_manager.create_backup(std::path::Path::new(&backup_root), &name)
+            })
+            .await
+            {
+                Ok(Ok(manifest)) => SyscallReply::StorageBackupCreated { manifest },
+                Ok(Err(error)) => SyscallReply::Error {
+                    message: error.to_string(),
+                },
+                Err(error) => SyscallReply::Error {
+                    message: format!("storage backup worker failed: {error}"),
                 },
             }
         }
@@ -5846,6 +5875,13 @@ memory = ["remember this"]
                 },
                 AccessLevel::System,
             ),
+            (
+                Syscall::CreateStorageBackup {
+                    backup_root: "backups".into(),
+                    name: "nightly".into(),
+                },
+                AccessLevel::System,
+            ),
             (Syscall::ListServices, AccessLevel::System),
             (
                 Syscall::StartService { name: "x".into() },
@@ -5918,7 +5954,7 @@ memory = ["remember this"]
                     .to_string()
             })
             .collect::<std::collections::HashSet<_>>();
-        assert_eq!(calls.len(), 70);
+        assert_eq!(calls.len(), 71);
         assert_eq!(fixture_tags, schema_tags);
     }
 

@@ -78,6 +78,21 @@ from those fixed-point rows before admitting work, so a later pricing change
 does not reprice historical usage. Stopping or unregistering an agent releases
 live admission locks but does not erase its cumulative spend.
 
+Usage and quota enforcement rows are authenticated as one database state.
+Every accounting insert, update, or deletion updates a keyed HMAC root and an
+append-only authenticated event chain in the same SQLite transaction. Startup
+and backup/restore qualification recompute the root from the protected rows and
+verify the complete chain before trusting the counters. Event records contain
+only keyed pseudonymous digests, not raw usage, subject, scope, model, or cost
+values.
+
+The HMAC secret lives inside the database so verified backups and storage-key
+rotation preserve the chain. SQLCipher protects that secret in production. A
+plaintext development database detects accidental corruption only: a reader
+that obtains the secret can forge state. A complete rollback to a previously
+valid database snapshot also requires an independent freshness/retention
+control to detect.
+
 ## Rate and hierarchy limits
 
 - RPM: provider attempts per fixed, half-open Unix-minute epoch. Epoch `N`

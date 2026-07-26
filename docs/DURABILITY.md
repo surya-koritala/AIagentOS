@@ -48,8 +48,39 @@ as read-only media, locking, corruption, or disk exhaustion are not treated as
 harmless duplicate-column errors.
 
 After migration, startup verifies the ownership metadata, exact schema version,
-physical integrity, and foreign-key consistency. Reopening the current version
-is idempotent and does not append a duplicate migration record.
+physical integrity, foreign-key consistency, authenticated accounting root, and
+complete accounting event chain. Reopening the current version is idempotent
+and does not append a duplicate migration record.
+
+## Authenticated accounting integrity
+
+Schema version `3` authenticates the enforcement state in `usage_log`,
+`quota_epoch_floor`, `quota_epochs`, `quota_receipts`,
+`quota_receipt_scopes`, `quota_refunded_receipts`, and
+`quota_migration_fence`.
+
+Each protected row contributes a domain-separated HMAC-SHA256 digest to a
+commutative state root. Persistent SQLite triggers replace that contribution
+and append a chained, authenticated insert/update/delete event in the same
+transaction as the accounting mutation. The steady-state cost is constant per
+changed row; quota admission does not rescan historical receipts. Startup and
+every canonical schema/backup qualification path independently scan all
+protected rows, recompute the root, verify contiguous event sequences and
+links, and fail closed before accounting can be trusted.
+
+The integrity secret is random and stored inside the database so it survives
+backup, restore, and storage-key rotation. A production SQLCipher store protects
+the secret from a database-file-only attacker. A deliberately plaintext
+development store detects accidental corruption, but a reader that can obtain
+the secret can forge new state. This mechanism also cannot distinguish a
+complete rollback to an older internally valid database snapshot; independent
+signed backup freshness, immutable retention, and external monotonic anchoring
+remain operator/release concerns under #123.
+
+Accounting events retain only keyed pseudonymous record digests and before/after
+MACs, not raw tenant, user, agent, scope, usage, cost, or model values. Subject
+erasure removes the classified live rows while retaining this non-identifying
+integrity chain.
 
 There is no supported in-place downgrade. Rollback to a binary that requires an
 older schema requires an offline restore of a compatible, verified pre-upgrade
@@ -472,10 +503,11 @@ All kernel SQLite tables are included in verified backups. Published backups
 are immutable snapshots and are not retroactively changed by a live-database
 erasure. Operators can enforce the verified local-backup retention policy, but
 must separately govern remote copies and external systems. The database is
-protected with owner-only permissions on Unix, but application-level encryption
-and key rotation remain open in #123. Provider configuration files, agent
-workspaces, remote provider data, and external object stores are outside this
-SQLite deletion boundary.
+protected with owner-only permissions on Unix. Configured production
+deployments additionally use SQLCipher whole-database encryption; offline
+encryption migration and key rotation are supported. Provider configuration
+files, agent workspaces, remote provider data, and external object stores are
+outside this SQLite deletion boundary.
 
 Ephemeral process state includes scheduler queues, executors and cancellation
 handles, syscall-gate registrations, namespaces/cgroups, sandboxes, credential

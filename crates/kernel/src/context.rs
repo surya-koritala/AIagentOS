@@ -311,6 +311,16 @@ pub const DURABLE_DATA_CATALOG: &[DurableDataClassification] = &[
         deletion: "retain",
     },
     DurableDataClassification {
+        table: "accounting_integrity",
+        owner: "system",
+        deletion: "retain authenticated enforcement state",
+    },
+    DurableDataClassification {
+        table: "accounting_events",
+        owner: "system; record keys are keyed pseudonymous digests",
+        deletion: "retain non-identifying integrity chain",
+    },
+    DurableDataClassification {
         table: "cluster_node_identity",
         owner: "system",
         deletion: "retain",
@@ -927,6 +937,31 @@ impl SqliteContextManager {
             key.apply(&conn)?;
         }
         let schema_version = crate::schema::preflight(&conn)?;
+        let accounting_integrity_exists = conn
+            .query_row(
+                "SELECT 1 FROM sqlite_schema
+                 WHERE type = 'table' AND name = 'accounting_integrity'",
+                [],
+                |_| Ok(()),
+            )
+            .optional()
+            .map_err(|error| {
+                ContextError::StorageError(format!(
+                    "failed to inspect accounting integrity schema: {error}"
+                ))
+            })?
+            .is_some();
+        if schema_version >= crate::accounting_integrity::SCHEMA_VERSION
+            && !accounting_integrity_exists
+        {
+            return Err(ContextError::StorageError(
+                "schema version requires accounting integrity state, but it is missing".into(),
+            ));
+        }
+        if accounting_integrity_exists {
+            crate::accounting_integrity::register_functions(&conn)?;
+            crate::accounting_integrity::secure_existing_schema(&conn)?;
+        }
         // Generation checkpoints contain prompts and tool results. Protect the
         // SQLite file with owner-only permissions on Unix before writing them.
         #[cfg(unix)]
@@ -1896,6 +1931,21 @@ impl SqliteContextManager {
             params![now],
         )
         .map_err(|error| ContextError::StorageError(error.to_string()))?;
+        if !legacy_database_has_rows {
+            // A fresh store still needs an explicit floor marker. Without it,
+            // a later reopen after the first ordinary usage row is
+            // indistinguishable from an interrupted legacy quota migration
+            // and would conservatively fence a current release by mistake.
+            let zero = u64_blob(0);
+            conn.execute(
+                "INSERT OR IGNORE INTO quota_epoch_floor(singleton, epoch)
+                 VALUES (1, ?1)",
+                params![zero.as_slice()],
+            )
+            .map_err(|error| {
+                quota_error(format!("failed to initialize fresh quota floor: {error}"))
+            })?;
+        }
         if legacy_database_has_rows {
             // The old release kept RPM/TPM only in process memory. There is no
             // honest backfill after upgrade, so fence just the current fixed
@@ -1903,12 +1953,14 @@ impl SqliteContextManager {
             // databases do not receive this fence.
             Self::install_current_quota_migration_fence(conn)?;
         }
+        crate::accounting_integrity::install(conn)?;
         crate::schema::complete_migration(conn, schema_version)?;
         transaction.commit().map_err(|error| {
             quota_error(format!(
                 "failed to commit atomic schema migration transaction: {error}"
             ))
         })?;
+        crate::accounting_integrity::register_functions(&connection)?;
         crate::schema::verify(&connection)?;
         Ok(())
     }
@@ -8670,6 +8722,7 @@ mod tests {
             .count();
         assert_eq!(admitted, 10);
         assert_eq!(first.provider_rate_usage(80).unwrap().requests, 10);
+        crate::accounting_integrity::verify(&first.conn.lock().unwrap()).unwrap();
     }
 
     #[test]
@@ -8831,8 +8884,8 @@ mod tests {
     }
 
     #[test]
-    fn schema_v1_layout_upgrades_to_v2_with_receipt_schema_and_ledger() {
-        let database = QuotaTestDatabase::new("schema-v1-to-v2");
+    fn schema_v1_version_marker_recovers_through_current_schema() {
+        let database = QuotaTestDatabase::new("schema-v1-to-current");
         {
             let manager = SqliteContextManager::new(&database.path).unwrap();
             let connection = manager.conn.lock().unwrap();
@@ -8868,9 +8921,20 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, 2);
+        let integrity_tables: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_schema
+                 WHERE type = 'table'
+                   AND name IN ('accounting_integrity', 'accounting_events')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(version, crate::schema::CURRENT_SCHEMA_VERSION);
         assert_eq!(migration_name, "add-privacy-safe-deletion-receipts");
         assert_eq!(receipt_table, 1);
+        assert_eq!(integrity_tables, 2);
+        crate::accounting_integrity::verify(&connection).unwrap();
         crate::schema::verify(&connection).unwrap();
     }
 

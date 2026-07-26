@@ -10,6 +10,18 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
 
 ## [Unreleased]
 
+- Added authenticated usage and quota accounting under #123 with schema version
+  3. Every usage row, quota aggregate, receipt, scope, refund tombstone, epoch
+  floor, and migration fence contributes a keyed HMAC to one enforcement-state
+  root. Persistent SQLite triggers update that root and append an authenticated
+  mutation-chain entry in the same transaction as each accounting change;
+  startup, backup qualification, and restore verification independently scan
+  the protected rows and fail closed on mismatch. Regressions cover clean
+  restart, offline usage/quota mutation, event-chain forgery and truncation,
+  canonical-trigger enforcement, transaction rollback, migration, and
+  two-handle quota contention. SQLCipher protects the database-resident
+  integrity secret in production; plaintext development stores provide
+  corruption detection rather than malicious-writer resistance.
 - Added authenticated configured-host disaster recovery under #123.
   `agentctl backup-disaster-recover` now requires an independently retained
   public trust root and the exact destination `config.toml`, restores the

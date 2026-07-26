@@ -10,6 +10,17 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
 
 ## [Unreleased]
 
+- Added cancellation-storm and target resource/leak qualification under #125.
+  The public TCP/SDK resilience suite now cancels concurrent exact request IDs
+  from separate control connections and proves active provider cancellation,
+  request-registry cleanup, bounded settlement, control-plane recovery, and
+  complete turn/LLM/quota/wire drainage. A separate strict 24-hour Linux soak
+  profile retains RSS, task, descriptor, SQLite/WAL, operation, queue, permit,
+  and connection samples; evaluates explicit post-warmup growth thresholds;
+  and has a repository-owned manual workflow that rejects short, dirty,
+  mismatched, unnamed, or failing artifacts. Smoke runs remain ineligible and
+  the production claim remains false until the real run plus remaining fault,
+  release-SLO, game-day, and independent-review gates are complete.
 - Added the first deterministic resilience qualification suite under #125.
   Public TCP/SDK scenarios now prove explicit active-turn and waiting-turn
   bounds, stable overload rejection, slow-client connection admission and idle

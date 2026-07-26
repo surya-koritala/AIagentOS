@@ -8,16 +8,16 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use agent_sdk::{KernelClient, SdkError};
+use agent_sdk::{KernelClient, MessageStreamEvent, SdkError, WireErrorCode};
 use chrono::Utc;
 use kernel::config::{BudgetConfig, Config};
 use kernel::connector::{
-    LlmProviderAdapter, LlmRequestOptions, LlmResponse, LlmSession, ProviderType, StandardMessage,
-    ToolDefinition,
+    LlmProviderAdapter, LlmRequestOptions, LlmResponse, LlmSession, ProviderCapabilities,
+    ProviderEventSink, ProviderStreamEvent, ProviderType, StandardMessage, ToolDefinition,
 };
 use kernel::context::SqliteContextManager;
 use kernel::metrics::MetricsSnapshot;
@@ -28,7 +28,12 @@ use tokio::sync::Barrier;
 use tokio::task::{JoinHandle, JoinSet};
 
 const DEFAULT_CONFIG: &str = include_str!("../../resilience-profiles.toml");
-const SCENARIOS: [&str; 3] = ["turn-overload", "slow-clients", "provider-outage"];
+const SCENARIOS: [&str; 4] = [
+    "turn-overload",
+    "slow-clients",
+    "provider-outage",
+    "cancellation-storm",
+];
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -38,6 +43,7 @@ struct SuiteConfig {
     turn_overload: TurnOverloadConfig,
     slow_clients: SlowClientsConfig,
     provider_outage: ProviderOutageConfig,
+    cancellation_storm: CancellationStormConfig,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -61,6 +67,16 @@ struct SlowClientsConfig {
 #[serde(deny_unknown_fields)]
 struct ProviderOutageConfig {
     operations: usize,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct CancellationStormConfig {
+    operations: usize,
+    max_concurrent: u32,
+    max_waiting: u32,
+    start_timeout_ms: u64,
+    settle_timeout_ms: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -183,6 +199,18 @@ fn validate_config(config: &SuiteConfig) -> Result<(), String> {
     if config.provider_outage.operations == 0 {
         return Err("provider outage operations must be non-zero".into());
     }
+    let cancellations = &config.cancellation_storm;
+    if cancellations.operations == 0
+        || cancellations.max_concurrent == 0
+        || cancellations.max_waiting < cancellations.operations as u32
+        || cancellations.start_timeout_ms == 0
+        || cancellations.settle_timeout_ms == 0
+    {
+        return Err(
+            "cancellation storm requires non-zero operations/timeouts and waiting capacity for every operation"
+                .into(),
+        );
+    }
     Ok(())
 }
 
@@ -190,6 +218,9 @@ fn smoke_scale(config: &SuiteConfig) -> SuiteConfig {
     let mut scaled = config.clone();
     scaled.turn_overload.provider_delay_ms = 50;
     scaled.provider_outage.operations = scaled.provider_outage.operations.min(2);
+    scaled.cancellation_storm.operations = scaled.cancellation_storm.operations.min(4);
+    scaled.cancellation_storm.max_concurrent = scaled.cancellation_storm.max_concurrent.min(2);
+    scaled.cancellation_storm.max_waiting = scaled.cancellation_storm.operations as u32;
     scaled
 }
 
@@ -369,6 +400,106 @@ impl LlmProviderAdapter for OutageProvider {
         Ok(Box::new(OutageSession {
             id: self.id.clone(),
         }))
+    }
+
+    fn translate_to_provider(&self, message: &StandardMessage) -> serde_json::Value {
+        serde_json::json!({"role": message.role, "content": message.content})
+    }
+
+    fn translate_from_provider(&self, value: &serde_json::Value) -> Option<StandardMessage> {
+        Some(StandardMessage::assistant(value.get("content")?.as_str()?))
+    }
+}
+
+struct CancellationProvider {
+    id: ProviderId,
+    started: Arc<AtomicU64>,
+    cancelled: Arc<AtomicU64>,
+}
+
+struct CancellationSession {
+    id: ProviderId,
+    started: Arc<AtomicU64>,
+    cancelled: Arc<AtomicU64>,
+}
+
+#[async_trait::async_trait]
+impl LlmSession for CancellationSession {
+    async fn send(&self, messages: Vec<StandardMessage>) -> Result<LlmResponse, ConnectorError> {
+        self.send_with_tools(messages, &[]).await
+    }
+
+    async fn send_with_tools(
+        &self,
+        _messages: Vec<StandardMessage>,
+        _tools: &[ToolDefinition],
+    ) -> Result<LlmResponse, ConnectorError> {
+        std::future::pending::<Result<LlmResponse, ConnectorError>>().await
+    }
+
+    async fn send_streaming_events_controlled(
+        &self,
+        _messages: Vec<StandardMessage>,
+        _tools: &[ToolDefinition],
+        _options: LlmRequestOptions,
+        cancellation: &tokio_util::sync::CancellationToken,
+        events: ProviderEventSink,
+    ) -> Result<LlmResponse, ConnectorError> {
+        self.started.fetch_add(1, Ordering::Relaxed);
+        events
+            .emit(ProviderStreamEvent::TextDelta(
+                "provider-active-before-cancel".into(),
+            ))
+            .await;
+        cancellation.cancelled().await;
+        self.cancelled.fetch_add(1, Ordering::Relaxed);
+        Err(ConnectorError::cancelled(self.id.clone(), None))
+    }
+
+    fn provider_id(&self) -> &ProviderId {
+        &self.id
+    }
+
+    fn model_id(&self) -> &str {
+        "injected-cancellation-v1"
+    }
+
+    fn enforces_max_output_tokens(&self) -> bool {
+        true
+    }
+}
+
+#[async_trait::async_trait]
+impl LlmProviderAdapter for CancellationProvider {
+    fn id(&self) -> &ProviderId {
+        &self.id
+    }
+
+    fn name(&self) -> &str {
+        "resilience-cancellation-provider"
+    }
+
+    fn provider_type(&self) -> ProviderType {
+        ProviderType::Local
+    }
+
+    async fn is_available(&self) -> bool {
+        true
+    }
+
+    async fn create_session(&self) -> Result<Box<dyn LlmSession>, ConnectorError> {
+        Ok(Box::new(CancellationSession {
+            id: self.id.clone(),
+            started: Arc::clone(&self.started),
+            cancelled: Arc::clone(&self.cancelled),
+        }))
+    }
+
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities {
+            prompt_cancellation: true,
+            ..ProviderCapabilities::default()
+        }
     }
 
     fn translate_to_provider(&self, message: &StandardMessage) -> serde_json::Value {
@@ -778,6 +909,274 @@ async fn provider_outage(config: &ProviderOutageConfig) -> Result<ScenarioResult
     Ok(result("provider-outage", started, checks, observed, notes))
 }
 
+async fn cancellation_storm(config: &CancellationStormConfig) -> Result<ScenarioResult, String> {
+    let mut budgets = BudgetConfig {
+        max_concurrent: config.max_concurrent,
+        max_waiting_turns: config.max_waiting,
+        rpm: 10_000,
+        tpm: 100_000_000,
+        ..BudgetConfig::default()
+    };
+    budgets.agent_tokens_per_min = budgets.tpm;
+    let kernel = Arc::new(qualification_kernel(&budgets)?);
+    let provider = "resilience-cancellation";
+    let provider_started = Arc::new(AtomicU64::new(0));
+    let provider_cancelled = Arc::new(AtomicU64::new(0));
+    kernel
+        .register_provider(Arc::new(CancellationProvider {
+            id: provider.into(),
+            started: Arc::clone(&provider_started),
+            cancelled: Arc::clone(&provider_cancelled),
+        }))
+        .map_err(|error| error.to_string())?;
+    let (address, wire, task) = start_server(
+        Arc::clone(&kernel),
+        config.operations + 4,
+        Duration::from_secs(30),
+    )
+    .await?;
+    let mut setup = KernelClient::connect(address)
+        .await
+        .map_err(|error| error.to_string())?;
+    let mut agents = Vec::with_capacity(config.operations);
+    for operation in 0..config.operations {
+        agents.push(
+            setup
+                .create_agent(
+                    format!("cancel-{operation}"),
+                    "public request cancellation storm qualification",
+                    Some(provider.into()),
+                    Some("read-only".into()),
+                    Some(3),
+                )
+                .await
+                .map_err(|error| error.to_string())?,
+        );
+    }
+    setup.close().await.map_err(|error| error.to_string())?;
+
+    let mut stream_clients = Vec::with_capacity(config.operations);
+    for _ in 0..config.operations {
+        stream_clients.push(
+            KernelClient::connect(address)
+                .await
+                .map_err(|error| error.to_string())?,
+        );
+    }
+    let mut control = KernelClient::connect(address)
+        .await
+        .map_err(|error| error.to_string())?;
+    let (started_tx, mut started_rx) = tokio::sync::mpsc::unbounded_channel();
+    let started = Instant::now();
+    let mut streams = JoinSet::new();
+    let mut request_keys = Vec::with_capacity(config.operations);
+    for (operation, (mut client, agent_id)) in stream_clients.into_iter().zip(agents).enumerate() {
+        let request_id = format!("cancellation-storm-{operation}");
+        request_keys.push((request_id.clone(), agent_id.clone()));
+        let started_tx = started_tx.clone();
+        streams.spawn(async move {
+            let result = client
+                .send_message_stream(
+                    request_id,
+                    agent_id,
+                    "block until the exact public request is cancelled",
+                    |event| {
+                        if matches!(event, MessageStreamEvent::Started) {
+                            let _ = started_tx.send(());
+                        }
+                    },
+                )
+                .await
+                .map(|_| ());
+            let close_ok = client.close().await.is_ok();
+            (result, close_ok)
+        });
+    }
+    drop(started_tx);
+
+    let all_streams_started =
+        tokio::time::timeout(Duration::from_millis(config.start_timeout_ms), async {
+            for _ in 0..config.operations {
+                started_rx
+                    .recv()
+                    .await
+                    .ok_or("stream start channel closed early")?;
+            }
+            Ok::<(), &str>(())
+        })
+        .await
+        .is_ok_and(|result| result.is_ok());
+
+    let mut accepted = 0_u64;
+    let mut cancel_errors = 0_u64;
+    let mut notes = Vec::new();
+    for (request_id, agent_id) in &request_keys {
+        match control.cancel_request(request_id, agent_id).await {
+            Ok(true) => accepted += 1,
+            Ok(false) => {
+                cancel_errors += 1;
+                if notes.len() < 5 {
+                    notes.push(format!("request {request_id} was not active"));
+                }
+            }
+            Err(error) => {
+                cancel_errors += 1;
+                if notes.len() < 5 {
+                    notes.push(error.to_string());
+                }
+            }
+        }
+    }
+
+    let settled = tokio::time::timeout(Duration::from_millis(config.settle_timeout_ms), async {
+        let mut terminal_cancelled = 0_u64;
+        let mut unexpected = 0_u64;
+        let mut connections_closed = 0_u64;
+        while let Some(joined) = streams.join_next().await {
+            match joined {
+                Ok((
+                    Err(SdkError::Wire {
+                        code: WireErrorCode::Cancelled,
+                        ..
+                    }),
+                    close_ok,
+                )) => {
+                    terminal_cancelled += 1;
+                    connections_closed += u64::from(close_ok);
+                }
+                Ok((result, close_ok)) => {
+                    unexpected += 1;
+                    connections_closed += u64::from(close_ok);
+                    if notes.len() < 5 {
+                        notes.push(format!("unexpected stream result: {result:?}"));
+                    }
+                }
+                Err(error) => {
+                    unexpected += 1;
+                    if notes.len() < 5 {
+                        notes.push(error.to_string());
+                    }
+                }
+            }
+        }
+        (terminal_cancelled, unexpected, connections_closed)
+    })
+    .await;
+    let (terminal_cancelled, unexpected, connections_closed, settled_in_time) = match settled {
+        Ok((terminal_cancelled, unexpected, connections_closed)) => {
+            (terminal_cancelled, unexpected, connections_closed, true)
+        }
+        Err(_) => {
+            streams.abort_all();
+            while streams.join_next().await.is_some() {}
+            notes.push("cancellation storm did not settle before the configured timeout".into());
+            (0, config.operations as u64, 0, false)
+        }
+    };
+
+    let mut inactive_after_settle = 0_u64;
+    for (request_id, agent_id) in &request_keys {
+        if matches!(
+            control.cancel_request(request_id, agent_id).await,
+            Ok(false)
+        ) {
+            inactive_after_settle += 1;
+        }
+    }
+    let control_plane_responsive = control.ping().await.is_ok();
+    let control_closed = control.close().await.is_ok();
+    let wire_drained = wait_for_wire(&wire, Duration::from_secs(2), |snapshot| {
+        snapshot.active == 0
+    })
+    .await;
+    let final_wire = wire.snapshot();
+    let final_metrics = MetricsSnapshot::collect(&kernel);
+    let observed_provider_started = provider_started.load(Ordering::Relaxed);
+    let observed_provider_cancelled = provider_cancelled.load(Ordering::Relaxed);
+
+    let mut checks = BTreeMap::new();
+    checks.insert("all_streams_started".into(), all_streams_started);
+    checks.insert(
+        "all_cancellations_accepted".into(),
+        accepted == config.operations as u64 && cancel_errors == 0,
+    );
+    checks.insert("settled_before_deadline".into(), settled_in_time);
+    checks.insert(
+        "all_streams_terminated_cancelled".into(),
+        terminal_cancelled == config.operations as u64 && unexpected == 0,
+    );
+    checks.insert(
+        "stream_connections_closed".into(),
+        connections_closed == config.operations as u64 && control_closed,
+    );
+    checks.insert(
+        "request_registry_drained".into(),
+        inactive_after_settle == config.operations as u64,
+    );
+    checks.insert(
+        "active_provider_work_cancelled".into(),
+        observed_provider_started > 0 && observed_provider_started == observed_provider_cancelled,
+    );
+    checks.insert(
+        "turn_llm_and_quota_gauges_drained".into(),
+        final_metrics.active_turns == 0
+            && final_metrics.waiting_turns == 0
+            && final_metrics.llm_requests_in_flight == 0
+            && final_metrics.llm_requests_waiting == 0
+            && final_metrics.quota_reserved_receipts == 0
+            && final_metrics.quota_in_flight_receipts == 0,
+    );
+    checks.insert(
+        "wire_permits_drained".into(),
+        wire_drained && final_wire.active == 0,
+    );
+    checks.insert("control_plane_responsive".into(), control_plane_responsive);
+    let observed = BTreeMap::from([
+        ("attempted_streams".into(), config.operations as u64),
+        ("accepted_cancellations".into(), accepted),
+        ("cancellation_errors".into(), cancel_errors),
+        ("terminal_cancelled_streams".into(), terminal_cancelled),
+        ("unexpected_stream_outcomes".into(), unexpected),
+        (
+            "inactive_request_ids_after_settle".into(),
+            inactive_after_settle,
+        ),
+        (
+            "provider_requests_started".into(),
+            observed_provider_started,
+        ),
+        (
+            "provider_requests_cancelled".into(),
+            observed_provider_cancelled,
+        ),
+        ("final_active_turns".into(), final_metrics.active_turns),
+        (
+            "final_llm_requests_in_flight".into(),
+            final_metrics.llm_requests_in_flight,
+        ),
+        (
+            "final_quota_receipts".into(),
+            final_metrics
+                .quota_reserved_receipts
+                .saturating_add(final_metrics.quota_in_flight_receipts),
+        ),
+        (
+            "peak_active_connections".into(),
+            final_wire.peak_active as u64,
+        ),
+        ("final_active_connections".into(), final_wire.active as u64),
+    ]);
+    stop_server(task).await;
+    kernel.shutdown().await.map_err(|error| error.to_string())?;
+    Ok(result(
+        "cancellation-storm",
+        started,
+        checks,
+        observed,
+        notes,
+    ))
+}
+
 fn command_output(program: &str, args: &[&str]) -> Option<String> {
     Command::new(program)
         .args(args)
@@ -841,6 +1240,7 @@ async fn run() -> Result<(), String> {
             "turn-overload" => turn_overload(&config.turn_overload).await?,
             "slow-clients" => slow_clients(&config.slow_clients).await?,
             "provider-outage" => provider_outage(&config.provider_outage).await?,
+            "cancellation-storm" => cancellation_storm(&config.cancellation_storm).await?,
             _ => unreachable!("selected scenario is validated"),
         });
     }
@@ -894,7 +1294,7 @@ mod tests {
     fn checked_in_suite_is_complete_and_valid() {
         let config: SuiteConfig = toml::from_str(DEFAULT_CONFIG).unwrap();
         validate_config(&config).unwrap();
-        assert_eq!(SCENARIOS.len(), 3);
+        assert_eq!(SCENARIOS.len(), 4);
     }
 
     #[test]
@@ -913,6 +1313,9 @@ mod tests {
             turn_overload(&config.turn_overload).await.unwrap(),
             slow_clients(&config.slow_clients).await.unwrap(),
             provider_outage(&config.provider_outage).await.unwrap(),
+            cancellation_storm(&config.cancellation_storm)
+                .await
+                .unwrap(),
         ] {
             assert!(result.passed, "{} failed: {:?}", result.name, result);
         }

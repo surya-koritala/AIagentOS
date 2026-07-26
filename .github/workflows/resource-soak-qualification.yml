@@ -1,0 +1,89 @@
+name: Resource soak qualification
+
+# This is intentionally manual and pinned to a repository-owned stable Linux
+# host. The checked-in profile runs for 24 hours; a missing runner is not a
+# pass, and smoke artifacts are never accepted as production proof.
+on:
+  workflow_dispatch:
+    inputs:
+      environment_id:
+        description: Stable non-secret deployment/runner shape identifier
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: resource-soak-qualification
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  AGENTOS_QUALIFICATION_ENVIRONMENT: ${{ inputs.environment_id }}
+
+jobs:
+  target-resource-soak:
+    name: Exact-commit 24-hour resource and leak soak
+    runs-on: [self-hosted, linux, x64, agentos-capacity]
+    timeout-minutes: 1500
+    environment: capacity-qualification
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
+        with:
+          toolchain: 1.97.1
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - name: Validate checked-in soak contract
+        run: >-
+          cargo run --release --locked --package os-benchmark
+          --bin soak-qualification -- --validate
+      - name: Run exact-commit target soak
+        run: |
+          mkdir -p target/qualification
+          /usr/bin/time -v -o target/qualification/resource-soak-process.txt \
+            cargo run --release --locked --package os-benchmark \
+            --bin soak-qualification -- \
+            --state-dir target/qualification/resource-soak-state \
+            --output target/qualification/resource-soak.json
+      - name: Verify eligible resource-soak proof
+        run: |
+          test "$(jq -r .result.passed target/qualification/resource-soak.json)" = "true"
+          test "$(jq -r .resource_soak_proof_eligible target/qualification/resource-soak.json)" = "true"
+          test "$(jq -r .production_claim_allowed target/qualification/resource-soak.json)" = "false"
+          test "$(jq -r .build_profile target/qualification/resource-soak.json)" = "release"
+          test "$(jq -r .smoke_scaled target/qualification/resource-soak.json)" = "false"
+          test "$(jq -r .source.dirty target/qualification/resource-soak.json)" = "false"
+          test "$(jq -r .source.commit target/qualification/resource-soak.json)" = "$GITHUB_SHA"
+          test "$(jq -r .environment.os target/qualification/resource-soak.json)" = "linux"
+          test "$(jq -r .environment.environment_id target/qualification/resource-soak.json)" = "$AGENTOS_QUALIFICATION_ENVIRONMENT"
+          jq -e '.configuration.duration_seconds >= 86400' target/qualification/resource-soak.json
+          jq -e '.result.elapsed_seconds >= 86400' target/qualification/resource-soak.json
+      - name: Publish summary
+        if: always()
+        run: |
+          {
+            printf '### Target resource and leak soak\n\n'
+            printf -- '- Commit: `%s`\n' "$GITHUB_SHA"
+            printf -- '- Environment: `%s`\n' "$AGENTOS_QUALIFICATION_ENVIRONMENT"
+            if test -f target/qualification/resource-soak.json; then
+              printf -- '- Passed: `%s`\n' \
+                "$(jq -r .result.passed target/qualification/resource-soak.json)"
+              printf -- '- Resource-soak proof eligible: `%s`\n' \
+                "$(jq -r .resource_soak_proof_eligible target/qualification/resource-soak.json)"
+              printf -- '- Samples: `%s`\n' \
+                "$(jq '.result.samples | length' target/qualification/resource-soak.json)"
+            else
+              printf -- '- Status: `failed before report publication`\n'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: resource-soak-${{ github.sha }}
+          path: |
+            target/qualification/resource-soak.json
+            target/qualification/resource-soak-process.txt
+          if-no-files-found: warn
+          retention-days: 90

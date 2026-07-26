@@ -14,6 +14,7 @@
   - [Production Observability](./observability.md)
   - [Capacity Qualification](./capacity-qualification.md)
   - [Resilience Qualification](./resilience-qualification.md)
+  - [Resource and Leak Soak](./soak-qualification.md)
   - [Public Wire Protocol](./protocol.md)
   - [Agent Service Supervisor](./services.md)
   - [Secondary Capability Disposition](./secondary-capabilities.md)

@@ -1,0 +1,89 @@
+groups:
+  - name: agentos-slo-v1
+    interval: 30s
+    rules:
+      - record: agentos:slo_eligible_requests:rate5m
+        expr: sum(rate(agentos_requests_total{outcome=~"success|failed|timed_out|cancelled"}[5m]))
+      - record: agentos:slo_success_ratio:rate5m
+        expr: sum(rate(agentos_requests_total{outcome="success"}[5m])) / clamp_min(agentos:slo_eligible_requests:rate5m, 0.000001)
+      - alert: AgentOSAvailabilityBudgetBurn
+        expr: agentos:slo_eligible_requests:rate5m > 0.01 and agentos:slo_success_ratio:rate5m < 0.995
+        for: 10m
+        labels:
+          severity: page
+          contract: "v1"
+        annotations:
+          summary: AgentOS eligible-request success is below 99.5%
+          runbook_url: docs/OBSERVABILITY.md#availability-budget-burn
+      - alert: AgentOSRequestTimeoutRate
+        expr: sum(rate(agentos_requests_total{outcome="timed_out"}[5m])) / clamp_min(agentos:slo_eligible_requests:rate5m, 0.000001) > 0.01
+        for: 10m
+        labels:
+          severity: page
+          contract: "v1"
+        annotations:
+          summary: More than 1% of eligible AgentOS requests are timing out
+          runbook_url: docs/OBSERVABILITY.md#request-timeouts
+      - alert: AgentOSControlPlaneP95Latency
+        expr: histogram_quantile(0.95, sum by (le) (rate(agentos_request_duration_seconds_bucket{subsystem!~"agent|tool",outcome="success"}[5m]))) > 1
+        for: 15m
+        labels:
+          severity: ticket
+          contract: "v1"
+        annotations:
+          summary: AgentOS control-plane p95 latency exceeds one second
+          runbook_url: docs/OBSERVABILITY.md#control-plane-latency
+      - alert: AgentOSAgentTurnP95Latency
+        expr: histogram_quantile(0.95, sum by (le) (rate(agentos_request_duration_seconds_bucket{subsystem="agent",outcome="success"}[15m]))) > 30
+        for: 30m
+        labels:
+          severity: ticket
+          contract: "v1"
+        annotations:
+          summary: AgentOS agent-operation p95 latency exceeds 30 seconds
+          runbook_url: docs/OBSERVABILITY.md#agent-turn-latency
+      - alert: AgentOSQuotaLedgerUnhealthy
+        expr: agentos_quota_storage_healthy != 1
+        for: 1m
+        labels:
+          severity: page
+          contract: "v1"
+        annotations:
+          summary: Durable quota accounting is unhealthy
+          runbook_url: docs/OBSERVABILITY.md#quota-ledger-unhealthy
+      - alert: AgentOSBackupFailures
+        expr: agentos_backup_scheduler_enabled == 1 and agentos_backup_consecutive_failures > 0
+        for: 5m
+        labels:
+          severity: page
+          contract: "v1"
+        annotations:
+          summary: Scheduled AgentOS backups are failing
+          runbook_url: docs/OBSERVABILITY.md#backup-failures
+      - alert: AgentOSBackupStale
+        expr: agentos_backup_scheduler_enabled == 1 and ((agentos_backup_last_success_unixtime_seconds > 0 and time() - agentos_backup_last_success_unixtime_seconds > 90000) or (agentos_backup_last_success_unixtime_seconds == 0 and agentos_process_uptime_seconds > 90000))
+        for: 10m
+        labels:
+          severity: page
+          contract: "v1"
+        annotations:
+          summary: No successful scheduled AgentOS backup in 25 hours
+          runbook_url: docs/OBSERVABILITY.md#backup-stale
+      - alert: AgentOSTurnQueueSaturated
+        expr: agentos_turn_admission{state="waiting"} > agentos_turn_admission{state="capacity"}
+        for: 15m
+        labels:
+          severity: ticket
+          contract: "v1"
+        annotations:
+          summary: AgentOS turn waiters exceed configured capacity
+          runbook_url: docs/OBSERVABILITY.md#turn-queue-saturation
+      - alert: AgentOSProviderQueueSaturated
+        expr: agentos_llm_cores{state="waiting"} > agentos_llm_cores{state="capacity"}
+        for: 15m
+        labels:
+          severity: ticket
+          contract: "v1"
+        annotations:
+          summary: AgentOS provider waiters exceed configured LLM capacity
+          runbook_url: docs/OBSERVABILITY.md#provider-queue-saturation

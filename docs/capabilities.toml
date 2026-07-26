@@ -327,13 +327,13 @@ owner = "operations"
 maturity = "unit-tested"
 release = "v0.9"
 tracking_issue = 125
-kernel_modules = ["production"]
-source_paths = ["benchmarks", "docs/RUNBOOK.md"]
+kernel_modules = ["production", "telemetry"]
+source_paths = ["benchmarks", "crates/kernel/src/metrics.rs", "crates/kernel/src/syscall_server.rs", "crates/kernel/src/telemetry.rs", "crates/cli/src/logging.rs", "observability/telemetry-contract-v1.toml", "observability/prometheus-rules.yml", "observability/grafana-dashboard.json", "docs/OBSERVABILITY.md", "docs/RUNBOOK.md"]
 public_entry_points = ["crates/cli/src/bin/agent-server.rs"]
-runtime_call_paths = []
-test_evidence = ["benchmarks/os_benchmark.rs", "tests/src/governance_e2e.rs"]
+runtime_call_paths = ["crates/kernel/src/syscall_server.rs::dispatch_scoped", "crates/kernel/src/syscall_server.rs::dispatch_message_stream", "crates/kernel/src/metrics.rs::MetricsSnapshot::collect"]
+test_evidence = ["crates/kernel/src/metrics.rs::tests::rendered_metric_families_match_versioned_contract", "crates/kernel/src/syscall_server.rs::tests::dispatch_records_bounded_request_outcomes", "crates/kernel/src/telemetry.rs::tests", "benchmarks/os_benchmark.rs", "tests/src/governance_e2e.rs"]
 platforms = ["linux", "macos", "windows"]
-limitations = ["Microbenchmarks and basic hardening primitives exist without release SLOs, end-to-end tracing, alert rules, chaos evidence, or sustained soak qualification."]
+limitations = ["Telemetry contract v1 catalogs every Prometheus family and enforces bounded labels; dispatched syscall and streaming paths emit server-generated correlation spans through bounded kernel/provider/tool/persistence components, request outcome counters, and latency histograms. Release-candidate SLO targets, an importable Grafana dashboard, Prometheus rules, and alert runbooks are checked in. Protocol negotiation and malformed frames rejected before dispatch are not separate request series, internal model-selected tool calls do not yet have a distinct success family, JSON logs are the supported trace export rather than an OpenTelemetry backend, and external provider spans are not propagated. The 24-hour soak, overload/slow-peer/fault/leak qualification, alert delivery, privacy disable/export verification, incident game day, exact-RC report, and independent review remain open in #125; this capability is not production-qualified."]
 
 [[capability]]
 id = "operator-clients"

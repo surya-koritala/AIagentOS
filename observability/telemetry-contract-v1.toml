@@ -1,0 +1,306 @@
+contract_version = 1
+prometheus_format = "0.0.4"
+compatibility = "Metric names, types, units, label keys, and enumerated label values do not change within contract v1. Additive families require a reviewed contract update."
+forbidden_label_classes = ["agent_id", "request_id", "correlation_id", "tenant_id", "user_id", "credential_id", "prompt", "content", "path", "url", "tool", "provider"]
+
+[[metric]]
+name = "agentos_telemetry_contract_info"
+type = "gauge"
+unit = "dimensionless"
+labels = ["version"]
+allowed_label_values = { version = ["1"] }
+
+[[metric]]
+name = "agentos_requests_in_flight"
+type = "gauge"
+unit = "requests"
+labels = []
+
+[[metric]]
+name = "agentos_requests_total"
+type = "counter"
+unit = "requests"
+labels = ["subsystem", "outcome"]
+allowed_label_values = { subsystem = ["agent", "auth", "checkpoint", "cluster", "memory", "operator", "package", "protocol", "service", "storage", "system", "tool"], outcome = ["success", "rejected", "failed", "timed_out", "cancelled"] }
+
+[[metric]]
+name = "agentos_request_duration_seconds"
+type = "histogram"
+unit = "seconds"
+labels = ["subsystem", "outcome", "le"]
+allowed_label_values = { subsystem = ["agent", "auth", "checkpoint", "cluster", "memory", "operator", "package", "protocol", "service", "storage", "system", "tool"], outcome = ["success", "rejected", "failed", "timed_out", "cancelled"], le = ["0.005", "0.010", "0.025", "0.050", "0.100", "0.250", "0.500", "1.000", "2.500", "5.000", "10.000", "30.000", "60.000", "+Inf"] }
+
+[[metric]]
+name = "agentos_syscall_gate_total"
+type = "counter"
+unit = "decisions"
+labels = ["result"]
+allowed_label_values = { result = ["allowed", "denied_capability", "denied_mac", "denied_approval", "denied_cgroup", "denied_namespace", "denied_unknown"] }
+
+[[metric]]
+name = "agentos_syscall_gate_audited_total"
+type = "counter"
+unit = "decisions"
+labels = []
+
+[[metric]]
+name = "agentos_agents"
+type = "gauge"
+unit = "agents"
+labels = []
+
+[[metric]]
+name = "agentos_running_agents"
+type = "gauge"
+unit = "agents"
+labels = []
+
+[[metric]]
+name = "agentos_live_agents"
+type = "gauge"
+unit = "agents"
+labels = []
+
+[[metric]]
+name = "agentos_queued_agents"
+type = "gauge"
+unit = "agents"
+labels = []
+
+[[metric]]
+name = "agentos_paused_agents"
+type = "gauge"
+unit = "agents"
+labels = []
+
+[[metric]]
+name = "agentos_stopped_agents"
+type = "gauge"
+unit = "agents"
+labels = []
+
+[[metric]]
+name = "agentos_services"
+type = "gauge"
+unit = "services"
+labels = ["state"]
+allowed_label_values = { state = ["configured", "desired", "running", "ready", "healthy", "failed"] }
+
+[[metric]]
+name = "agentos_service_restarts_total"
+type = "counter"
+unit = "attempts"
+labels = []
+
+[[metric]]
+name = "agentos_service_dependency_blocks_total"
+type = "counter"
+unit = "blocks"
+labels = []
+
+[[metric]]
+name = "agentos_turn_admission"
+type = "gauge"
+unit = "turns"
+labels = ["state"]
+allowed_label_values = { state = ["active", "waiting", "capacity"] }
+
+[[metric]]
+name = "agentos_turn_admitted_total"
+type = "counter"
+unit = "turns"
+labels = []
+
+[[metric]]
+name = "agentos_turn_class_admitted_total"
+type = "counter"
+unit = "turns"
+labels = ["class"]
+allowed_label_values = { class = ["realtime", "normal", "background", "deadline"] }
+
+[[metric]]
+name = "agentos_turn_cancelled_total"
+type = "counter"
+unit = "turns"
+labels = []
+
+[[metric]]
+name = "agentos_turn_cooperative_yields_total"
+type = "counter"
+unit = "turns"
+labels = []
+
+[[metric]]
+name = "agentos_turn_starvation_total"
+type = "counter"
+unit = "turns"
+labels = []
+
+[[metric]]
+name = "agentos_turn_wait_nanoseconds_total"
+type = "counter"
+unit = "nanoseconds"
+labels = []
+
+[[metric]]
+name = "agentos_turn_run_nanoseconds_total"
+type = "counter"
+unit = "nanoseconds"
+labels = []
+
+[[metric]]
+name = "agentos_llm_cores"
+type = "gauge"
+unit = "requests"
+labels = ["state"]
+allowed_label_values = { state = ["in_flight", "waiting", "capacity"] }
+
+[[metric]]
+name = "agentos_llm_admitted_total"
+type = "counter"
+unit = "requests"
+labels = []
+
+[[metric]]
+name = "agentos_llm_cancelled_total"
+type = "counter"
+unit = "requests"
+labels = []
+
+[[metric]]
+name = "agentos_llm_wait_nanoseconds_total"
+type = "counter"
+unit = "nanoseconds"
+labels = []
+
+[[metric]]
+name = "agentos_llm_run_nanoseconds_total"
+type = "counter"
+unit = "nanoseconds"
+labels = []
+
+[[metric]]
+name = "agentos_quota_storage_healthy"
+type = "gauge"
+unit = "boolean"
+labels = []
+
+[[metric]]
+name = "agentos_quota_epoch"
+type = "gauge"
+unit = "unix_minutes"
+labels = []
+
+[[metric]]
+name = "agentos_provider_quota_usage"
+type = "gauge"
+unit = "dimension_value"
+labels = ["dimension"]
+allowed_label_values = { dimension = ["requests", "tokens"] }
+
+[[metric]]
+name = "agentos_provider_quota_limit"
+type = "gauge"
+unit = "dimension_value"
+labels = ["dimension"]
+allowed_label_values = { dimension = ["requests", "tokens"] }
+
+[[metric]]
+name = "agentos_quota_receipts"
+type = "gauge"
+unit = "receipts"
+labels = ["state"]
+allowed_label_values = { state = ["reserved", "in_flight", "estimated", "reconciled"] }
+
+[[metric]]
+name = "agentos_quota_denied_total"
+type = "counter"
+unit = "denials"
+labels = ["scope", "dimension"]
+allowed_label_values = { scope = ["provider", "cgroup"], dimension = ["requests", "tokens", "migration_fence"] }
+
+[[metric]]
+name = "agentos_storage_encryption_enabled"
+type = "gauge"
+unit = "boolean"
+labels = []
+
+[[metric]]
+name = "agentos_backup_scheduler_enabled"
+type = "gauge"
+unit = "boolean"
+labels = []
+
+[[metric]]
+name = "agentos_backup_signing_enabled"
+type = "gauge"
+unit = "boolean"
+labels = []
+
+[[metric]]
+name = "agentos_backup_attempts_total"
+type = "counter"
+unit = "attempts"
+labels = []
+
+[[metric]]
+name = "agentos_backup_successes_total"
+type = "counter"
+unit = "attempts"
+labels = []
+
+[[metric]]
+name = "agentos_backup_failures_total"
+type = "counter"
+unit = "attempts"
+labels = []
+
+[[metric]]
+name = "agentos_backup_retention_deleted_total"
+type = "counter"
+unit = "backups"
+labels = []
+
+[[metric]]
+name = "agentos_backup_consecutive_failures"
+type = "gauge"
+unit = "attempts"
+labels = []
+
+[[metric]]
+name = "agentos_backup_last_success_unixtime_seconds"
+type = "gauge"
+unit = "unix_seconds"
+labels = []
+
+[[metric]]
+name = "agentos_lifecycle_operations_total"
+type = "counter"
+unit = "operations"
+labels = ["operation", "outcome"]
+allowed_label_values = { operation = ["pause", "resume", "stop", "kill", "wait"], outcome = ["requested", "completed", "timed_out", "forced", "failed"] }
+
+[[metric]]
+name = "agentos_lifecycle_duration_seconds"
+type = "summary"
+unit = "seconds"
+labels = ["operation"]
+allowed_label_values = { operation = ["pause", "resume", "stop", "kill", "wait"] }
+
+[[metric]]
+name = "agentos_tokens_consumed_total"
+type = "counter"
+unit = "tokens"
+labels = []
+
+[[metric]]
+name = "agentos_api_calls_total"
+type = "counter"
+unit = "calls"
+labels = []
+
+[[metric]]
+name = "agentos_process_uptime_seconds"
+type = "gauge"
+unit = "seconds"
+labels = []

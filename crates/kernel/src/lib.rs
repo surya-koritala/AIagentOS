@@ -68,6 +68,7 @@ pub mod syscall_gate;
 pub mod syscall_interface;
 pub mod syscall_server;
 pub mod sysctl;
+pub mod telemetry;
 pub mod tool_descriptors;
 pub mod tool_registry_share;
 pub mod tools;
@@ -1326,6 +1327,9 @@ pub struct AgentKernelImpl {
     /// request can signal another turn.
     active_requests: DashMap<(AgentId, String), tokio_util::sync::CancellationToken>,
     pub(crate) lifecycle_counters: crate::metrics::LifecycleCounters,
+    /// Stable, bounded-cardinality request outcomes and latency. Correlation
+    /// identifiers remain in trace spans and never become metric labels.
+    pub(crate) request_telemetry: crate::telemetry::RequestTelemetry,
     /// Serializes public service lifecycle, rolling reload, and supervisor
     /// recovery so two control paths cannot create duplicate live instances.
     service_operation_lock: tokio::sync::Mutex<()>,
@@ -1724,6 +1728,7 @@ impl AgentKernelImpl {
             active_cancellations: DashMap::new(),
             active_requests: DashMap::new(),
             lifecycle_counters: crate::metrics::LifecycleCounters::default(),
+            request_telemetry: crate::telemetry::RequestTelemetry::default(),
             service_operation_lock: tokio::sync::Mutex::new(()),
             service_health_checks: DashMap::new(),
             service_directory: std::sync::RwLock::new(None),

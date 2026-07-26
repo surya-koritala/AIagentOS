@@ -1,0 +1,203 @@
+{
+  "annotations": {
+    "list": []
+  },
+  "description": "AgentOS telemetry contract v1 operational dashboard. Request, queue, enforcement, durability, and backup views use bounded public metrics only.",
+  "editable": false,
+  "graphTooltip": 1,
+  "panels": [
+    {
+      "id": 1,
+      "title": "Eligible request success (5m)",
+      "type": "stat",
+      "targets": [
+        {
+          "expr": "sum(rate(agentos_requests_total{outcome=\"success\"}[5m])) / clamp_min(sum(rate(agentos_requests_total{outcome=~\"success|failed|timed_out|cancelled\"}[5m])), 0.000001)",
+          "legendFormat": "success ratio"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "yellow", "value": 0.99 },
+              { "color": "green", "value": 0.995 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 6, "w": 6, "x": 0, "y": 0 }
+    },
+    {
+      "id": 2,
+      "title": "Request rate by subsystem and outcome",
+      "type": "timeseries",
+      "targets": [
+        {
+          "expr": "sum by (subsystem, outcome) (rate(agentos_requests_total[5m]))",
+          "legendFormat": "{{subsystem}} / {{outcome}}"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "reqps" }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 12, "x": 6, "y": 0 }
+    },
+    {
+      "id": 3,
+      "title": "Successful request p95 by subsystem",
+      "type": "timeseries",
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum by (subsystem, le) (rate(agentos_request_duration_seconds_bucket{outcome=\"success\"}[5m])))",
+          "legendFormat": "{{subsystem}}"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 6, "x": 18, "y": 0 }
+    },
+    {
+      "id": 4,
+      "title": "Requests in flight",
+      "type": "stat",
+      "targets": [
+        { "expr": "agentos_requests_in_flight", "legendFormat": "requests" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 6 }
+    },
+    {
+      "id": 5,
+      "title": "Turn admission",
+      "type": "timeseries",
+      "targets": [
+        {
+          "expr": "agentos_turn_admission",
+          "legendFormat": "{{state}}"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "gridPos": { "h": 7, "w": 8, "x": 0, "y": 10 }
+    },
+    {
+      "id": 6,
+      "title": "LLM request cores",
+      "type": "timeseries",
+      "targets": [
+        {
+          "expr": "agentos_llm_cores",
+          "legendFormat": "{{state}}"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "gridPos": { "h": 7, "w": 8, "x": 8, "y": 10 }
+    },
+    {
+      "id": 7,
+      "title": "Gate decisions",
+      "type": "timeseries",
+      "targets": [
+        {
+          "expr": "sum by (result) (rate(agentos_syscall_gate_total[5m]))",
+          "legendFormat": "{{result}}"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "ops" }, "overrides": [] },
+      "gridPos": { "h": 7, "w": 8, "x": 16, "y": 10 }
+    },
+    {
+      "id": 8,
+      "title": "Durable quota ledger health",
+      "type": "stat",
+      "targets": [
+        {
+          "expr": "agentos_quota_storage_healthy",
+          "legendFormat": "healthy"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bool",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "green", "value": 1 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 5, "w": 6, "x": 0, "y": 17 }
+    },
+    {
+      "id": 9,
+      "title": "Hours since last successful backup",
+      "type": "stat",
+      "targets": [
+        {
+          "expr": "(time() - agentos_backup_last_success_unixtime_seconds) / 3600",
+          "legendFormat": "hours"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "h",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 24 },
+              { "color": "red", "value": 25 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 5, "w": 6, "x": 6, "y": 17 }
+    },
+    {
+      "id": 10,
+      "title": "Backup health",
+      "type": "timeseries",
+      "targets": [
+        {
+          "expr": "agentos_backup_consecutive_failures",
+          "legendFormat": "consecutive failures"
+        },
+        {
+          "expr": "rate(agentos_backup_successes_total[1h])",
+          "legendFormat": "successes / second"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "gridPos": { "h": 5, "w": 6, "x": 12, "y": 17 }
+    },
+    {
+      "id": 11,
+      "title": "Lifecycle outcomes",
+      "type": "timeseries",
+      "targets": [
+        {
+          "expr": "sum by (operation, outcome) (rate(agentos_lifecycle_operations_total[5m]))",
+          "legendFormat": "{{operation}} / {{outcome}}"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "ops" }, "overrides": [] },
+      "gridPos": { "h": 5, "w": 6, "x": 18, "y": 17 }
+    }
+  ],
+  "refresh": "30s",
+  "schemaVersion": 39,
+  "tags": ["agentos", "telemetry-contract-v1"],
+  "templating": { "list": [] },
+  "time": { "from": "now-6h", "to": "now" },
+  "timezone": "browser",
+  "title": "AgentOS Production Operations",
+  "uid": "agentos-production-v1",
+  "version": 1
+}

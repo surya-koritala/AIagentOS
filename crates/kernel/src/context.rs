@@ -8693,6 +8693,91 @@ mod tests {
     }
 
     #[test]
+    fn sqlite_full_aborts_the_transaction_and_preserves_committed_data() {
+        let database = QuotaTestDatabase::new("sqlite-full");
+        {
+            let manager = SqliteContextManager::new(&database.path).unwrap();
+            let mut connection = manager.conn.lock().unwrap();
+            connection
+                .execute(
+                    "CREATE TABLE disk_full_regression (
+                        id INTEGER PRIMARY KEY,
+                        payload BLOB NOT NULL
+                    )",
+                    [],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO disk_full_regression (id, payload) VALUES (1, X'01')",
+                    [],
+                )
+                .unwrap();
+            connection
+                .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))
+                .unwrap();
+            let page_count: i64 = connection
+                .pragma_query_value(None, "page_count", |row| row.get(0))
+                .unwrap();
+            connection
+                .pragma_update(None, "max_page_count", page_count)
+                .unwrap();
+
+            let transaction = connection.transaction().unwrap();
+            let error = transaction
+                .execute(
+                    "INSERT INTO disk_full_regression (id, payload)
+                     VALUES (2, zeroblob(1048576))",
+                    [],
+                )
+                .unwrap_err();
+            match error {
+                rusqlite::Error::SqliteFailure(sqlite, _) => {
+                    assert_eq!(sqlite.code, rusqlite::ErrorCode::DiskFull);
+                }
+                other => panic!("expected SQLITE_FULL, got {other}"),
+            }
+            drop(transaction);
+            connection
+                .pragma_update(None, "max_page_count", 2_147_483_646_i64)
+                .unwrap();
+            assert_eq!(
+                connection
+                    .query_row("SELECT COUNT(*) FROM disk_full_regression", [], |row| {
+                        row.get::<_, i64>(0)
+                    })
+                    .unwrap(),
+                1
+            );
+            crate::schema::verify(&connection).unwrap();
+        }
+
+        let reopened = SqliteContextManager::new(&database.path).unwrap();
+        let connection = reopened.conn.lock().unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT hex(payload) FROM disk_full_regression WHERE id = 1",
+                    [],
+                    |row| row.get::<_, String>(0)
+                )
+                .unwrap(),
+            "01"
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM disk_full_regression WHERE id = 2",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0
+        );
+        crate::schema::verify(&connection).unwrap();
+    }
+
+    #[test]
     fn fresh_database_is_owned_versioned_complete_and_idempotent() {
         let database = QuotaTestDatabase::new("schema-version");
         {

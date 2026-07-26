@@ -475,3 +475,178 @@ fn signed_backup_cli_requires_external_trust_for_verified_restore() {
     assert_eq!(report.manifest, manifest);
     kernel::AgentKernelImpl::with_db_path(&destination).expect("boot trusted restored database");
 }
+
+#[test]
+fn storage_encryption_cli_migrates_backs_up_restores_and_rotates_offline() {
+    let root = TestRoot::new();
+    let source = root.0.join("source.db");
+    let key_one = root.0.join("storage-generation-1.json");
+    let key_two = root.0.join("storage-generation-2.json");
+    let backup_signing_key = root.0.join("backup-signing.pk8");
+    let backup_trust = root.0.join("backup-trust.json");
+    let backup_root = root.0.join("encrypted-backups");
+    let backup_dir = backup_root.join("encrypted_001");
+    let restored = root.0.join("fresh-host/agent_os.db");
+
+    drop(kernel::AgentKernelImpl::with_db_path(&source).expect("plaintext source"));
+    for (key_id, path) in [
+        ("storage-generation-1", &key_one),
+        ("storage-generation-2", &key_two),
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_agentctl"))
+            .arg("storage-key-generate")
+            .arg(key_id)
+            .arg(path)
+            .output()
+            .expect("run storage-key-generate");
+        assert!(
+            output.status.success(),
+            "storage-key-generate failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let signing_keygen = Command::new(env!("CARGO_BIN_EXE_agentctl"))
+        .arg("backup-key-generate")
+        .arg("encrypted-backup-signer-1")
+        .arg(&backup_signing_key)
+        .arg(&backup_trust)
+        .output()
+        .expect("run backup-key-generate");
+    assert!(
+        signing_keygen.status.success(),
+        "backup-key-generate failed: {}",
+        String::from_utf8_lossy(&signing_keygen.stderr)
+    );
+
+    let unconfirmed = Command::new(env!("CARGO_BIN_EXE_agentctl"))
+        .arg("storage-encrypt")
+        .arg(&source)
+        .arg(&key_one)
+        .output()
+        .expect("run unconfirmed storage-encrypt");
+    assert_eq!(unconfirmed.status.code(), Some(2));
+    kernel::AgentKernelImpl::with_db_path(&source).expect("unconfirmed command did not mutate");
+
+    let migration = Command::new(env!("CARGO_BIN_EXE_agentctl"))
+        .arg("storage-encrypt")
+        .arg(&source)
+        .arg(&key_one)
+        .arg("--confirm-offline")
+        .output()
+        .expect("run storage-encrypt");
+    assert!(
+        migration.status.success(),
+        "storage-encrypt failed: {}",
+        String::from_utf8_lossy(&migration.stderr)
+    );
+    let migration_report: kernel::storage_encryption::StorageEncryptionChangeReport =
+        serde_json::from_slice(&migration.stdout).expect("migration report JSON");
+    assert_eq!(migration_report.operation, "encrypt");
+    assert_eq!(migration_report.current_key_id, "storage-generation-1");
+
+    {
+        let key = kernel::storage_encryption::load_storage_encryption_key(&key_one)
+            .expect("load first key");
+        let manager =
+            kernel::context::SqliteContextManager::new_encrypted(&source, key).expect("encrypted");
+        let signer = kernel::storage::load_backup_signing_key(
+            &backup_signing_key,
+            "encrypted-backup-signer-1",
+        )
+        .expect("load signer");
+        manager
+            .create_signed_backup(&backup_root, "encrypted_001", &signer)
+            .expect("encrypted backup");
+    }
+    let unkeyed_verify = Command::new(env!("CARGO_BIN_EXE_agentctl"))
+        .arg("backup-verify")
+        .arg(&backup_dir)
+        .output()
+        .expect("run unkeyed encrypted verification");
+    assert!(!unkeyed_verify.status.success());
+    assert!(
+        String::from_utf8_lossy(&unkeyed_verify.stderr).contains("supply that independently"),
+        "{}",
+        String::from_utf8_lossy(&unkeyed_verify.stderr)
+    );
+    let keyed_verify = Command::new(env!("CARGO_BIN_EXE_agentctl"))
+        .arg("backup-verify")
+        .arg(&backup_dir)
+        .arg("--storage-key")
+        .arg(&key_one)
+        .output()
+        .expect("run keyed backup verification");
+    assert!(
+        keyed_verify.status.success(),
+        "keyed verification failed: {}",
+        String::from_utf8_lossy(&keyed_verify.stderr)
+    );
+    let fully_verified = Command::new(env!("CARGO_BIN_EXE_agentctl"))
+        .arg("backup-verify")
+        .arg(&backup_dir)
+        .arg("--require-signature")
+        .arg(&backup_trust)
+        .arg("--storage-key")
+        .arg(&key_one)
+        .output()
+        .expect("run encrypted and signed backup verification");
+    assert!(
+        fully_verified.status.success(),
+        "encrypted signed verification failed: {}",
+        String::from_utf8_lossy(&fully_verified.stderr)
+    );
+
+    let restore = Command::new(env!("CARGO_BIN_EXE_agentctl"))
+        .arg("backup-restore")
+        .arg(&backup_dir)
+        .arg(&restored)
+        .arg("--storage-key")
+        .arg(&key_one)
+        .arg("--require-signature")
+        .arg(&backup_trust)
+        .arg("--confirm-offline")
+        .output()
+        .expect("run encrypted restore");
+    assert!(
+        restore.status.success(),
+        "encrypted restore failed: {}",
+        String::from_utf8_lossy(&restore.stderr)
+    );
+    let restored_key =
+        kernel::storage_encryption::load_storage_encryption_key(&key_one).expect("restore key");
+    drop(
+        kernel::context::SqliteContextManager::new_encrypted(&restored, restored_key)
+            .expect("boot fresh-host encrypted restore"),
+    );
+
+    let rotation = Command::new(env!("CARGO_BIN_EXE_agentctl"))
+        .arg("storage-key-rotate")
+        .arg(&source)
+        .arg(&key_one)
+        .arg(&key_two)
+        .arg("--confirm-offline")
+        .output()
+        .expect("run storage-key-rotate");
+    assert!(
+        rotation.status.success(),
+        "storage-key-rotate failed: {}",
+        String::from_utf8_lossy(&rotation.stderr)
+    );
+    let rotation_report: kernel::storage_encryption::StorageEncryptionChangeReport =
+        serde_json::from_slice(&rotation.stdout).expect("rotation report JSON");
+    assert_eq!(
+        rotation_report.previous_key_id.as_deref(),
+        Some("storage-generation-1")
+    );
+    assert_eq!(rotation_report.current_key_id, "storage-generation-2");
+    assert!(kernel::context::SqliteContextManager::new_encrypted(
+        &source,
+        kernel::storage_encryption::load_storage_encryption_key(&key_one).unwrap()
+    )
+    .is_err());
+    kernel::context::SqliteContextManager::new_encrypted(
+        &source,
+        kernel::storage_encryption::load_storage_encryption_key(&key_two).unwrap(),
+    )
+    .expect("rotated database accepts new key");
+}

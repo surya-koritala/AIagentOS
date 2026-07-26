@@ -9,11 +9,12 @@ and offline restore primitives plus authenticated SDK/CLI entry points are
 integrated. Transactional storage erasure, non-identifying deletion receipts,
 and live-resource-coordinated system operator erasure through the wire, SDK,
 and CLI are integrated. Verified local-backup retention, disabled-by-default
-automatic local backup maintenance, and optional Ed25519 manifest authenticity
-with independently retained public trust are integrated. Restore remains an
-explicit offline operator action. Remote retention, automated disaster
-recovery, encryption, and measured recovery objectives are not yet
-production-qualified.
+automatic local backup maintenance, optional Ed25519 manifest authenticity,
+and SQLCipher whole-database encryption with operator-custodied keys are
+integrated. Restore, plaintext migration, and storage-key rotation remain
+explicit offline operator actions. Remote retention, automated disaster
+recovery, measured recovery objectives, and independent release qualification
+are not yet complete.
 
 ## Database identity and version
 
@@ -50,6 +51,85 @@ There is no supported in-place downgrade. Rollback to a binary that requires an
 older schema requires an offline restore of a compatible, verified pre-upgrade
 backup.
 
+## Encryption at rest and storage-key custody
+
+When `[storage_encryption].key_path` is configured, SQLCipher encrypts the
+complete SQLite database, including WAL pages. The kernel supplies 256-bit key
+bytes through SQLCipher's C API rather than interpolating secrets into SQL.
+Startup authenticates the database before schema inspection and fails closed
+for a missing, malformed, wrong, or symlinked key file. On Unix it also rejects
+group/other-accessible files and files not owned by the current user.
+
+Generate a key outside both the data and backup directories:
+
+```bash
+install -d -m 700 /etc/agentos/storage-keys
+agentctl storage-key-generate storage-generation-1 \
+  /etc/agentos/storage-keys/storage-generation-1.json
+```
+
+The command creates a bounded versioned JSON document without overwrite and
+uses owner-only permissions on Unix. Configure production startup:
+
+```toml
+[storage_encryption]
+required = true
+key_path = "/etc/agentos/storage-keys/storage-generation-1.json"
+```
+
+`required = true` without `key_path` is invalid. A relative key path is always
+invalid. Legacy/developer configurations remain plaintext only when no key path
+is configured and encryption is not required.
+
+Encrypt a legacy plaintext database while every kernel is stopped:
+
+```bash
+agentctl storage-encrypt /var/lib/agentos/agent_os.db \
+  /etc/agentos/storage-keys/storage-generation-1.json \
+  --confirm-offline
+```
+
+Migration acquires the kernel storage lease, checkpoints WAL, verifies source
+identity and integrity, uses `sqlcipher_export` into a same-directory encrypted
+staging database, syncs and verifies it, preserves the plaintext source as a
+rollback during publication, and removes that rollback only after the
+encrypted replacement authenticates. A crash can leave a clearly named
+plaintext rollback beside the database; treat the directory as sensitive and
+inspect it before restarting. File deletion is not guaranteed to erase blocks
+on copy-on-write filesystems or SSDs, so production hosts should also use
+volume/disk encryption.
+
+Rotate the live database key offline:
+
+```bash
+agentctl storage-key-generate storage-generation-2 \
+  /etc/agentos/storage-keys/storage-generation-2.json
+agentctl storage-key-rotate /var/lib/agentos/agent_os.db \
+  /etc/agentos/storage-keys/storage-generation-1.json \
+  /etc/agentos/storage-keys/storage-generation-2.json \
+  --confirm-offline
+```
+
+Rotation refuses a running database, verifies the current key before writing,
+rekeys every page, verifies the new key, and proves the retired key no longer
+opens the database. Update configuration only after the command succeeds, and
+list generations still needed by retained backups:
+
+```toml
+[storage_encryption]
+required = true
+key_path = "/etc/agentos/storage-keys/storage-generation-2.json"
+retired_key_paths = [
+  "/etc/agentos/storage-keys/storage-generation-1.json",
+]
+```
+
+Retired keys are selected only by the key ID in historical backup manifests;
+they are never tried against the live database or used for new backups. This
+lets automatic retention authenticate and expire old generations safely.
+Remove generation 1 from configuration and custody only after every dependent
+backup has expired.
+
 ## Online backup
 
 `SqliteContextManager::create_backup` uses SQLite's online backup API. It never
@@ -65,16 +145,22 @@ into place. Existing destinations are never overwritten.
 
 Each backup directory contains:
 
-- `agent_os.db`, a standalone SQLite snapshot without a required WAL sidecar;
+- `agent_os.db`, a standalone SQLite snapshot without a required WAL sidecar,
+  encrypted under the source storage key when source encryption is enabled;
 - `manifest.json`, containing the format version, application ID, schema
-  version, installation ID, timestamp, byte count, SHA-256 digest, and—when
-  configured—an Ed25519 key identifier, public-key fingerprint, and signature.
+  version, installation ID, timestamp, byte count, SHA-256 digest, optional
+  SQLCipher algorithm/key ID, and—when configured—an Ed25519 key identifier,
+  public-key fingerprint, and signature.
 
 `storage::verify_backup` rejects unknown manifest fields, unsupported backup or
 schema versions, symlinked inputs, size or hash changes, corrupt SQLite pages,
 foreign-key violations, and mismatched installation metadata. This
 integrity-only operation deliberately remains compatible with existing unsigned
-backups. It does not establish signer identity.
+plaintext backups. An encrypted manifest requires
+`verify_backup_with_storage_key` (CLI `--storage-key`) and authenticates the
+database with the independently retained matching key. Signing and encryption
+are separate: the storage key provides confidentiality; the external Ed25519
+trust root establishes provenance.
 
 A trusted system operator can create a live backup through the running server:
 
@@ -127,9 +213,11 @@ Require the external trust file during qualification and recovery:
 
 ```bash
 agentctl backup-verify /var/lib/agentos-backups/nightly_2026_07_25 \
+  --storage-key /etc/agentos/storage-keys/storage-generation-1.json \
   --require-signature /srv/recovery/agentos-trust/release-2026.1.json
 agentctl backup-restore /var/lib/agentos-backups/nightly_2026_07_25 \
   /var/lib/agentos/agent_os.db \
+  --storage-key /etc/agentos/storage-keys/storage-generation-1.json \
   --require-signature /srv/recovery/agentos-trust/release-2026.1.json \
   --confirm-offline
 ```
@@ -203,6 +291,7 @@ policy, attempts, successes, failures, consecutive failures, deleted count,
 last timestamps, last backup name, and a bounded diagnostic. Prometheus exports
 the same health without path labels:
 
+- `agentos_storage_encryption_enabled`
 - `agentos_backup_scheduler_enabled`
 - `agentos_backup_signing_enabled`
 - `agentos_backup_attempts_total`
@@ -242,9 +331,11 @@ restore it to the configured database path:
 
 ```bash
 agentctl backup-verify /var/lib/agentos/backups/nightly_2026_07_25 \
+  --storage-key /etc/agentos/storage-keys/storage-generation-1.json \
   --require-signature /srv/recovery/agentos-trust/release-2026.1.json
 agentctl backup-restore /var/lib/agentos/backups/nightly_2026_07_25 \
   /var/lib/agentos/agent_os.db \
+  --storage-key /etc/agentos/storage-keys/storage-generation-1.json \
   --require-signature /srv/recovery/agentos-trust/release-2026.1.json \
   --confirm-offline
 ```
@@ -254,7 +345,10 @@ bypass the storage lease. If any kernel still owns the destination, restore
 fails before changing it. Both commands emit versioned manifest/report JSON so
 automation can retain recovery evidence.
 
-Fresh-host and replacement restore are supported by this CLI workflow.
+Fresh-host and replacement restore are supported by this CLI workflow. The
+fresh host must receive the exact storage-key generation named by the manifest;
+the key is intentionally absent from the backup. After restore, configure that
+key path before starting the kernel.
 Automatic local backup creation is supported; recovery remains deliberately
 offline and operator-initiated. Remote object storage, automated recovery, and
 measured recovery objectives remain future work.

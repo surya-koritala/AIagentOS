@@ -169,6 +169,8 @@ Inside the `agentos` container everything is under `/data` (a named volume
 - `/data/config/ai-agent-os/config.toml` — rendered by the entrypoint from env vars.
 - `/data/share/ai-agent-os/agent_os.db` — the SQLite kernel/conversation store.
 - `/backups` — verified automatic snapshots when scheduled backups are enabled.
+- `/keys/storage.json` — owner-only SQLCipher key in the separate
+  `agentos-keys` volume.
 
 `HOME`, `XDG_CONFIG_HOME` and `XDG_DATA_HOME` are pinned in the Dockerfile /
 compose so the `dirs` crate resolves these paths deterministically. There is no
@@ -193,11 +195,23 @@ Consumed by `docker/entrypoint.sh` to render `config.toml`:
 | `AGENTOS_BACKUP_RUN_ON_START` | `true` | `backup.run_on_start` |
 | `AGENTOS_BACKUP_KEEP_LATEST` | `24` | `backup.keep_latest` |
 | `AGENTOS_BACKUP_MAX_AGE_SECONDS` | `604800` | `backup.max_age_seconds` |
+| `AGENTOS_STORAGE_ENCRYPTION_REQUIRED` | `false` (image) / `true` (Compose) | `storage_encryption.required` |
+| `AGENTOS_STORAGE_KEY_PATH` | unset (image) / `/keys/storage.json` (Compose) | `storage_encryption.key_path` |
+| `AGENTOS_STORAGE_KEY_ID` | `container-storage-1` | initial generated key ID |
+| `AGENTOS_STORAGE_KEY_AUTO_GENERATE` | `false` (image) / `true` (Compose) | generate once when the mounted key path is absent |
+| `AGENTOS_STORAGE_RETIRED_KEY_PATHS` | unset | colon-separated absolute key files used only for historical backup retention |
 
 Backup roots must be absolute. Boolean, path, and numeric environment values
 are validated before the entrypoint writes configuration. The application also
 validates that the interval, age, and minimum retained count form a safe policy
 before creating its data directory.
+
+The Compose key volume is a separate recovery dependency. Copy it to an
+independently protected location before relying on backups. `docker compose
+down -v` deletes data, backups, and the only local key copy. Existing plaintext
+volumes are not silently migrated; stop the stack and run `agentctl
+storage-encrypt ... --confirm-offline` as documented in
+[`DURABILITY.md`](DURABILITY.md).
 
 Cloud-provider keys are read directly from the process environment by the CLI
 (no TOML needed) — set these and switch `AGENTOS_LLM_PROVIDER` accordingly:

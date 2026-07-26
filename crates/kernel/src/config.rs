@@ -69,6 +69,63 @@ pub enum ConfigLoadError {
     Budget { path: PathBuf, message: String },
     #[error("invalid scheduled-backup configuration in {path}: {message}")]
     Backup { path: PathBuf, message: String },
+    #[error("invalid storage-encryption configuration in {path}: {message}")]
+    StorageEncryption { path: PathBuf, message: String },
+}
+
+/// Whole-database encryption policy for the kernel-owned SQLite store.
+///
+/// The key file is operator-custodied and deliberately lives outside the data
+/// directory and database backups. `required` prevents an omitted key path
+/// from silently starting a production instance with plaintext persistence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct StorageEncryptionConfig {
+    pub required: bool,
+    pub key_path: Option<PathBuf>,
+    /// Previous generations retained only for older encrypted backups.
+    pub retired_key_paths: Vec<PathBuf>,
+}
+
+impl StorageEncryptionConfig {
+    pub fn validate(&self) -> Result<(), String> {
+        match self.key_path.as_deref() {
+            Some(path) if !path.is_absolute() => Err(format!(
+                "storage_encryption.key_path must be an absolute path (got {})",
+                path.display()
+            )),
+            Some(path) => {
+                let mut seen = std::collections::BTreeSet::new();
+                seen.insert(path);
+                for retired in &self.retired_key_paths {
+                    if !retired.is_absolute() {
+                        return Err(format!(
+                            "storage_encryption.retired_key_paths entries must be absolute (got {})",
+                            retired.display()
+                        ));
+                    }
+                    if !seen.insert(retired) {
+                        return Err(format!(
+                            "storage encryption key path is configured more than once: {}",
+                            retired.display()
+                        ));
+                    }
+                }
+                Ok(())
+            }
+            None if self.required => {
+                Err("storage_encryption.key_path is required when encryption is required".into())
+            }
+            None if !self.retired_key_paths.is_empty() => {
+                Err("storage_encryption.retired_key_paths require a current key_path".into())
+            }
+            None => Ok(()),
+        }
+    }
+
+    pub fn enabled(&self) -> bool {
+        self.key_path.is_some()
+    }
 }
 
 /// Operator policy for automatic, verified local backups.
@@ -230,6 +287,10 @@ pub struct Config {
     /// Disabled-by-default automatic local backup and retention policy.
     #[serde(default)]
     pub backup: BackupScheduleConfig,
+    /// Optional whole-database SQLCipher encryption. Production profiles set
+    /// `required = true` so missing key custody fails startup closed.
+    #[serde(default)]
+    pub storage_encryption: StorageEncryptionConfig,
 }
 
 /// Resource budgets applied at agent creation and to the shared rate limiter.
@@ -447,6 +508,7 @@ impl Default for Config {
             policy_file: None,
             service_dir: None,
             backup: BackupScheduleConfig::default(),
+            storage_encryption: StorageEncryptionConfig::default(),
         }
     }
 }
@@ -648,6 +710,12 @@ impl Config {
                 path: path.to_path_buf(),
                 message,
             })?;
+        config.storage_encryption.validate().map_err(|message| {
+            ConfigLoadError::StorageEncryption {
+                path: path.to_path_buf(),
+                message,
+            }
+        })?;
         Ok(config)
     }
 
@@ -669,6 +737,12 @@ impl Config {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 format!("invalid scheduled-backup configuration: {error}"),
+            )
+        })?;
+        self.storage_encryption.validate().map_err(|error| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("invalid storage-encryption configuration: {error}"),
             )
         })?;
         let content = toml::to_string_pretty(self).map_err(std::io::Error::other)?;
@@ -908,6 +982,85 @@ max_age_seconds = 3600
             .validate()
             .unwrap_err()
             .contains("at least backup.interval_seconds"));
+    }
+
+    #[test]
+    fn storage_encryption_defaults_off_and_required_policy_fails_closed() {
+        let legacy =
+            "llm_provider = \"local\"\ndefault_model = \"m\"\ndata_dir = \"/tmp/x\"\n[api_keys]\n";
+        let config = Config::from_toml(legacy).unwrap();
+        assert!(!config.storage_encryption.required);
+        assert!(!config.storage_encryption.enabled());
+
+        let required_without_key = r#"
+llm_provider = "local"
+default_model = "m"
+data_dir = "/tmp/x"
+[api_keys]
+[storage_encryption]
+required = true
+"#;
+        let error = Config::from_toml(required_without_key)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("key_path is required"), "{error}");
+
+        let relative_key = r#"
+llm_provider = "local"
+default_model = "m"
+data_dir = "/tmp/x"
+[api_keys]
+[storage_encryption]
+required = true
+key_path = "keys/storage.json"
+"#;
+        let error = Config::from_toml(relative_key).unwrap_err().to_string();
+        assert!(error.contains("absolute path"), "{error}");
+
+        let configured = Config {
+            storage_encryption: StorageEncryptionConfig {
+                required: true,
+                key_path: Some(std::env::temp_dir().join("agentos-storage-key.json")),
+                retired_key_paths: vec![
+                    std::env::temp_dir().join("agentos-storage-key-retired.json")
+                ],
+            },
+            ..Config::default()
+        };
+        let encoded = toml::to_string_pretty(&configured).unwrap();
+        let parsed = Config::from_toml(&encoded).unwrap();
+        assert!(parsed.storage_encryption.required);
+        assert!(parsed.storage_encryption.enabled());
+        assert_eq!(
+            parsed.storage_encryption.key_path,
+            configured.storage_encryption.key_path
+        );
+        assert_eq!(
+            parsed.storage_encryption.retired_key_paths,
+            configured.storage_encryption.retired_key_paths
+        );
+
+        let mut invalid = configured.clone();
+        invalid.storage_encryption.retired_key_paths = vec![PathBuf::from("relative/retired.json")];
+        assert!(invalid
+            .storage_encryption
+            .validate()
+            .unwrap_err()
+            .contains("must be absolute"));
+        invalid.storage_encryption.retired_key_paths =
+            vec![invalid.storage_encryption.key_path.clone().unwrap()];
+        assert!(invalid
+            .storage_encryption
+            .validate()
+            .unwrap_err()
+            .contains("more than once"));
+        invalid.storage_encryption.key_path = None;
+        invalid.storage_encryption.required = false;
+        assert!(invalid
+            .storage_encryption
+            .validate()
+            .unwrap_err()
+            .contains("require a current"));
     }
 
     #[test]

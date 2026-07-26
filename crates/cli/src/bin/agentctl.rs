@@ -7,7 +7,7 @@ use agent_cli::OperatorClient;
 fn usage() -> ! {
     eprintln!(
         "usage: agentctl [--addr HOST:PORT] [--token TOKEN] \
-         <list|inspect|pressure|tunables|tunable-set|tunable-rollback|tunable-history|status|pause|resume|stop|kill|wait|services|service-start|service-stop|service-restart|service-reload|service-history|backup-create|backup-retention|backup-status|data-inventory|backup-key-generate|backup-verify|backup-restore|erase-agent|erase-user|erase-tenant> [ARGS...]\n\
+         <list|inspect|pressure|tunables|tunable-set|tunable-rollback|tunable-history|status|pause|resume|stop|kill|wait|services|service-start|service-stop|service-restart|service-reload|service-history|backup-create|backup-retention|backup-status|data-inventory|backup-key-generate|backup-verify|backup-restore|storage-key-generate|storage-encrypt|storage-key-rotate|erase-agent|erase-user|erase-tenant> [ARGS...]\n\
          \n\
          storage commands:\n\
            agentctl [SERVER OPTIONS] backup-create BACKUP_ROOT NAME\n\
@@ -15,13 +15,49 @@ fn usage() -> ! {
            agentctl [SERVER OPTIONS] backup-status\n\
            agentctl [SERVER OPTIONS] data-inventory\n\
            agentctl backup-key-generate KEY_ID PRIVATE_KEY_FILE PUBLIC_TRUST_FILE\n\
-           agentctl backup-verify BACKUP_DIR [--require-signature PUBLIC_TRUST_FILE]\n\
-           agentctl backup-restore BACKUP_DIR DATABASE [--require-signature PUBLIC_TRUST_FILE] --confirm-offline\n\
+           agentctl backup-verify BACKUP_DIR [--storage-key KEY_FILE] [--require-signature PUBLIC_TRUST_FILE]\n\
+           agentctl backup-restore BACKUP_DIR DATABASE [--storage-key KEY_FILE] [--require-signature PUBLIC_TRUST_FILE] --confirm-offline\n\
+           agentctl storage-key-generate KEY_ID KEY_FILE\n\
+           agentctl storage-encrypt DATABASE KEY_FILE --confirm-offline\n\
+           agentctl storage-key-rotate DATABASE CURRENT_KEY_FILE NEXT_KEY_FILE --confirm-offline\n\
            agentctl [SERVER OPTIONS] erase-agent AGENT_ID --confirm\n\
            agentctl [SERVER OPTIONS] erase-user USER_ID --confirm\n\
            agentctl [SERVER OPTIONS] erase-tenant TENANT_ID --confirm"
     );
     std::process::exit(2);
+}
+
+#[derive(Default)]
+struct BackupFileOptions {
+    storage_key: Option<String>,
+    trust_root: Option<String>,
+    confirmed_offline: bool,
+}
+
+fn parse_backup_file_options(
+    values: impl IntoIterator<Item = String>,
+    confirmation_required: bool,
+) -> BackupFileOptions {
+    let mut values = values.into_iter();
+    let mut parsed = BackupFileOptions::default();
+    while let Some(value) = values.next() {
+        match value.as_str() {
+            "--storage-key" if parsed.storage_key.is_none() => {
+                parsed.storage_key = Some(values.next().unwrap_or_else(|| usage()));
+            }
+            "--require-signature" if parsed.trust_root.is_none() => {
+                parsed.trust_root = Some(values.next().unwrap_or_else(|| usage()));
+            }
+            "--confirm-offline" if confirmation_required && !parsed.confirmed_offline => {
+                parsed.confirmed_offline = true;
+            }
+            _ => usage(),
+        }
+    }
+    if confirmation_required && !parsed.confirmed_offline {
+        usage();
+    }
+    parsed
 }
 
 #[tokio::main]
@@ -62,22 +98,32 @@ async fn main() {
         }
         "backup-verify" => {
             let backup_dir = args.next().unwrap_or_else(|| usage());
-            let manifest = match args.next().as_deref() {
-                None => kernel::storage::verify_backup(std::path::Path::new(&backup_dir)),
-                Some("--require-signature") => {
-                    let trust_path = args.next().unwrap_or_else(|| usage());
-                    if args.next().is_some() {
-                        usage();
-                    }
-                    let trust =
-                        kernel::storage::load_backup_trust_root(std::path::Path::new(&trust_path))
-                            .unwrap_or_else(|error| fail_storage(error));
-                    kernel::storage::verify_backup_authenticity(
+            let options = parse_backup_file_options(args.collect::<Vec<_>>(), false);
+            let storage_key = options.storage_key.as_deref().map(|path| {
+                kernel::storage_encryption::load_storage_encryption_key(std::path::Path::new(path))
+                    .unwrap_or_else(|error| fail_storage(error))
+            });
+            let trust = options.trust_root.as_deref().map(|path| {
+                kernel::storage::load_backup_trust_root(std::path::Path::new(path))
+                    .unwrap_or_else(|error| fail_storage(error))
+            });
+            let manifest = match (storage_key.as_ref(), trust.as_ref()) {
+                (None, None) => kernel::storage::verify_backup(std::path::Path::new(&backup_dir)),
+                (None, Some(trust)) => kernel::storage::verify_backup_authenticity(
+                    std::path::Path::new(&backup_dir),
+                    trust,
+                ),
+                (Some(key), None) => kernel::storage::verify_backup_with_storage_key(
+                    std::path::Path::new(&backup_dir),
+                    key,
+                ),
+                (Some(key), Some(trust)) => {
+                    kernel::storage::verify_backup_with_storage_key_and_trust(
                         std::path::Path::new(&backup_dir),
-                        &trust,
+                        key,
+                        trust,
                     )
                 }
-                Some(_) => usage(),
             }
             .unwrap_or_else(|error| fail_storage(error));
             print_json(&manifest, "backup manifest");
@@ -86,32 +132,100 @@ async fn main() {
         "backup-restore" => {
             let backup_dir = args.next().unwrap_or_else(|| usage());
             let database = args.next().unwrap_or_else(|| usage());
-            let report = match args.next().as_deref() {
-                Some("--confirm-offline") if args.next().is_none() => {
-                    kernel::storage::restore_backup(
+            let options = parse_backup_file_options(args.collect::<Vec<_>>(), true);
+            let storage_key = options.storage_key.as_deref().map(|path| {
+                kernel::storage_encryption::load_storage_encryption_key(std::path::Path::new(path))
+                    .unwrap_or_else(|error| fail_storage(error))
+            });
+            let trust = options.trust_root.as_deref().map(|path| {
+                kernel::storage::load_backup_trust_root(std::path::Path::new(path))
+                    .unwrap_or_else(|error| fail_storage(error))
+            });
+            let report = match (storage_key.as_ref(), trust.as_ref()) {
+                (None, None) => kernel::storage::restore_backup(
+                    std::path::Path::new(&backup_dir),
+                    std::path::Path::new(&database),
+                ),
+                (None, Some(trust)) => kernel::storage::restore_backup_with_trust(
+                    std::path::Path::new(&backup_dir),
+                    std::path::Path::new(&database),
+                    trust,
+                ),
+                (Some(key), None) => kernel::storage::restore_backup_with_storage_key(
+                    std::path::Path::new(&backup_dir),
+                    std::path::Path::new(&database),
+                    key,
+                ),
+                (Some(key), Some(trust)) => {
+                    kernel::storage::restore_backup_with_storage_key_and_trust(
                         std::path::Path::new(&backup_dir),
                         std::path::Path::new(&database),
+                        key,
+                        trust,
                     )
                 }
-                Some("--require-signature") => {
-                    let trust_path = args.next().unwrap_or_else(|| usage());
-                    if args.next().as_deref() != Some("--confirm-offline") || args.next().is_some()
-                    {
-                        usage();
-                    }
-                    let trust =
-                        kernel::storage::load_backup_trust_root(std::path::Path::new(&trust_path))
-                            .unwrap_or_else(|error| fail_storage(error));
-                    kernel::storage::restore_backup_with_trust(
-                        std::path::Path::new(&backup_dir),
-                        std::path::Path::new(&database),
-                        &trust,
-                    )
-                }
-                _ => usage(),
             }
             .unwrap_or_else(|error| fail_storage(error));
             print_json(&report, "restore report");
+            return;
+        }
+        "storage-key-generate" => {
+            let key_id = args.next().unwrap_or_else(|| usage());
+            let key_file = args.next().unwrap_or_else(|| usage());
+            if args.next().is_some() {
+                usage();
+            }
+            kernel::storage_encryption::generate_storage_encryption_key_file(
+                &key_id,
+                std::path::Path::new(&key_file),
+            )
+            .unwrap_or_else(|error| fail_storage(error));
+            print_json(
+                &serde_json::json!({"key_id": key_id, "key_file": key_file}),
+                "storage key",
+            );
+            return;
+        }
+        "storage-encrypt" => {
+            let database = args.next().unwrap_or_else(|| usage());
+            let key_file = args.next().unwrap_or_else(|| usage());
+            if args.next().as_deref() != Some("--confirm-offline") || args.next().is_some() {
+                usage();
+            }
+            let key = kernel::storage_encryption::load_storage_encryption_key(
+                std::path::Path::new(&key_file),
+            )
+            .unwrap_or_else(|error| fail_storage(error));
+            let report = kernel::storage_encryption::encrypt_existing_database(
+                std::path::Path::new(&database),
+                &key,
+            )
+            .unwrap_or_else(|error| fail_storage(error));
+            print_json(&report, "storage encryption migration report");
+            return;
+        }
+        "storage-key-rotate" => {
+            let database = args.next().unwrap_or_else(|| usage());
+            let current_key_file = args.next().unwrap_or_else(|| usage());
+            let next_key_file = args.next().unwrap_or_else(|| usage());
+            if args.next().as_deref() != Some("--confirm-offline") || args.next().is_some() {
+                usage();
+            }
+            let current_key = kernel::storage_encryption::load_storage_encryption_key(
+                std::path::Path::new(&current_key_file),
+            )
+            .unwrap_or_else(|error| fail_storage(error));
+            let next_key = kernel::storage_encryption::load_storage_encryption_key(
+                std::path::Path::new(&next_key_file),
+            )
+            .unwrap_or_else(|error| fail_storage(error));
+            let report = kernel::storage_encryption::rotate_database_encryption_key(
+                std::path::Path::new(&database),
+                &current_key,
+                &next_key,
+            )
+            .unwrap_or_else(|error| fail_storage(error));
+            print_json(&report, "storage key rotation report");
             return;
         }
         _ => {}

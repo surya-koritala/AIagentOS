@@ -846,6 +846,12 @@ pub struct SqliteContextManager {
     /// Process-lifetime exclusive lease for the database path. Offline restore
     /// acquires the same lease and therefore cannot race a running kernel.
     _storage_lease: Option<std::fs::File>,
+    /// Operator-custodied whole-database key. The key identifier is public;
+    /// bytes remain zeroized secret memory and are needed for encrypted online
+    /// backups.
+    encryption_key: Option<Arc<crate::storage_encryption::StorageEncryptionKey>>,
+    /// Retired generations accepted only for historical backup maintenance.
+    retired_encryption_keys: Vec<Arc<crate::storage_encryption::StorageEncryptionKey>>,
     storage_limits: RwLock<ContextStorageLimits>,
     /// Pluggable embedder used for the long-term-memory store/query/ranking
     /// path. Defaults to [`crate::memory_manager::default_embedder`]; swap it
@@ -861,10 +867,55 @@ pub struct SqliteContextManager {
 impl SqliteContextManager {
     /// Create a new SqliteContextManager with the given database path.
     pub fn new(db_path: &Path) -> Result<Self, ContextError> {
-        Self::open_file(db_path, true)
+        Self::open_file(db_path, true, None, Vec::new())
     }
 
-    fn open_file(db_path: &Path, acquire_lease: bool) -> Result<Self, ContextError> {
+    /// Create a manager for a SQLCipher-encrypted database.
+    pub fn new_encrypted(
+        db_path: &Path,
+        key: crate::storage_encryption::StorageEncryptionKey,
+    ) -> Result<Self, ContextError> {
+        Self::open_file(db_path, true, Some(Arc::new(key)), Vec::new())
+    }
+
+    /// Create an encrypted manager that can also maintain backups made under
+    /// explicitly retained previous key generations.
+    pub fn new_encrypted_with_retired_keys(
+        db_path: &Path,
+        key: crate::storage_encryption::StorageEncryptionKey,
+        retired_keys: Vec<crate::storage_encryption::StorageEncryptionKey>,
+    ) -> Result<Self, ContextError> {
+        Self::open_file(
+            db_path,
+            true,
+            Some(Arc::new(key)),
+            retired_keys.into_iter().map(Arc::new).collect(),
+        )
+    }
+
+    fn open_file(
+        db_path: &Path,
+        acquire_lease: bool,
+        encryption_key: Option<Arc<crate::storage_encryption::StorageEncryptionKey>>,
+        retired_encryption_keys: Vec<Arc<crate::storage_encryption::StorageEncryptionKey>>,
+    ) -> Result<Self, ContextError> {
+        if encryption_key.is_none() && !retired_encryption_keys.is_empty() {
+            return Err(ContextError::StorageError(
+                "retired storage keys require a current database key".into(),
+            ));
+        }
+        let mut key_ids = std::collections::BTreeSet::new();
+        if let Some(key) = encryption_key.as_ref() {
+            key_ids.insert(key.key_id());
+        }
+        for key in &retired_encryption_keys {
+            if !key_ids.insert(key.key_id()) {
+                return Err(ContextError::StorageError(format!(
+                    "storage encryption key id {:?} is configured more than once",
+                    key.key_id()
+                )));
+            }
+        }
         let storage_lease = if acquire_lease {
             Some(crate::storage::acquire_storage_lease(db_path)?)
         } else {
@@ -872,6 +923,9 @@ impl SqliteContextManager {
         };
         let conn =
             Connection::open(db_path).map_err(|e| ContextError::StorageError(e.to_string()))?;
+        if let Some(key) = encryption_key.as_ref() {
+            key.apply(&conn)?;
+        }
         let schema_version = crate::schema::preflight(&conn)?;
         // Generation checkpoints contain prompts and tool results. Protect the
         // SQLite file with owner-only permissions on Unix before writing them.
@@ -917,6 +971,8 @@ impl SqliteContextManager {
         let mgr = Self {
             conn: Mutex::new(conn),
             _storage_lease: storage_lease,
+            encryption_key,
+            retired_encryption_keys,
             storage_limits: RwLock::new(ContextStorageLimits::default()),
             embedder: crate::memory_manager::default_embedder(),
             #[cfg(test)]
@@ -929,7 +985,20 @@ impl SqliteContextManager {
     }
 
     pub(crate) fn new_without_storage_lease(db_path: &Path) -> Result<Self, ContextError> {
-        Self::open_file(db_path, false)
+        Self::open_file(db_path, false, None, Vec::new())
+    }
+
+    pub(crate) fn new_without_storage_lease_encrypted(
+        db_path: &Path,
+        key: crate::storage_encryption::StorageEncryptionKey,
+        retired_keys: Vec<crate::storage_encryption::StorageEncryptionKey>,
+    ) -> Result<Self, ContextError> {
+        Self::open_file(
+            db_path,
+            false,
+            Some(Arc::new(key)),
+            retired_keys.into_iter().map(Arc::new).collect(),
+        )
     }
 
     /// Create an in-memory context manager (for testing).
@@ -940,6 +1009,8 @@ impl SqliteContextManager {
         let mgr = Self {
             conn: Mutex::new(conn),
             _storage_lease: None,
+            encryption_key: None,
+            retired_encryption_keys: Vec::new(),
             storage_limits: RwLock::new(ContextStorageLimits::default()),
             embedder: crate::memory_manager::default_embedder(),
             #[cfg(test)]
@@ -949,6 +1020,32 @@ impl SqliteContextManager {
         };
         mgr.init_schema(schema_version)?;
         Ok(mgr)
+    }
+
+    /// Non-secret identifier of the configured whole-database key.
+    pub fn storage_encryption_key_id(&self) -> Option<&str> {
+        self.encryption_key.as_deref().map(|key| key.key_id())
+    }
+
+    pub(crate) fn storage_encryption_key(
+        &self,
+    ) -> Option<Arc<crate::storage_encryption::StorageEncryptionKey>> {
+        self.encryption_key.clone()
+    }
+
+    pub(crate) fn storage_backup_encryption_key(
+        &self,
+        key_id: &str,
+    ) -> Option<Arc<crate::storage_encryption::StorageEncryptionKey>> {
+        self.encryption_key
+            .iter()
+            .chain(&self.retired_encryption_keys)
+            .find(|key| key.key_id() == key_id)
+            .cloned()
+    }
+
+    pub fn retired_storage_encryption_key_count(&self) -> usize {
+        self.retired_encryption_keys.len()
     }
 
     /// Swap the embedder used by the long-term-memory store/query path. Returns
@@ -8134,6 +8231,8 @@ mod tests {
         let mgr = SqliteContextManager {
             conn: Mutex::new(conn),
             _storage_lease: None,
+            encryption_key: None,
+            retired_encryption_keys: Vec::new(),
             storage_limits: RwLock::new(ContextStorageLimits::default()),
             embedder: crate::memory_manager::default_embedder(),
             fail_next_agent_save: AtomicBool::new(false),

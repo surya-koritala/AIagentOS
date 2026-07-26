@@ -106,14 +106,26 @@ The backup volume is separate from live state but remains on the same Docker
 host. Replicate verified backups to another failure domain before treating them
 as node-loss disaster recovery.
 
+The profile also mounts `agentos-keys` at `/keys`. On first boot the entrypoint
+creates `/keys/storage.json` without overwrite; subsequent boots require that
+exact key and SQLCipher-authenticate the database before schema access. Export
+the key volume to an independently protected recovery location. It is
+deliberately absent from `agentos-backups`; losing it makes every backup from
+that key generation unrecoverable.
+
+After an offline key rotation, point `AGENTOS_STORAGE_KEY_PATH` at the new key
+and set `AGENTOS_STORAGE_RETIRED_KEY_PATHS` to colon-separated old key files
+still referenced by retained backups. Retired keys are not accepted by the
+live database; they only let verified retention process older generations.
+
 The development Compose profile does not ship a signing secret. For production,
 generate one with `agentctl backup-key-generate`, retain the public trust JSON
 outside the backup host, mount the private PKCS#8 file read-only, and set
 `AGENTOS_BACKUP_SIGNING_KEY_PATH` plus `AGENTOS_BACKUP_SIGNING_KEY_ID`
 together. The entrypoint rejects unpaired, relative, missing, or symlinked key
-paths. Use `backup-verify --require-signature TRUST.json` and
-`backup-restore ... --require-signature TRUST.json --confirm-offline` for
-recovery qualification.
+paths. Use `backup-verify --storage-key STORAGE.json --require-signature
+TRUST.json` and `backup-restore ... --storage-key STORAGE.json
+--require-signature TRUST.json --confirm-offline` for recovery qualification.
 
 ## Optional hardening
 

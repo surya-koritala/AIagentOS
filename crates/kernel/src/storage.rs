@@ -20,9 +20,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::BackupScheduleConfig;
 use crate::context::SqliteContextManager;
+use crate::storage_encryption::StorageEncryptionKey;
 use crate::ContextError;
 
-const BACKUP_FORMAT_VERSION: u32 = 1;
+const LEGACY_BACKUP_FORMAT_VERSION: u32 = 1;
+const BACKUP_FORMAT_VERSION: u32 = 2;
 const BACKUP_DATABASE_FILE: &str = "agent_os.db";
 const BACKUP_DATABASE_SHM_FILE: &str = "agent_os.db-shm";
 const BACKUP_DATABASE_WAL_FILE: &str = "agent_os.db-wal";
@@ -33,7 +35,22 @@ const MAX_BACKUP_ROOT_ENTRIES: usize = 10_000;
 const BACKUP_AUTHENTICITY_FORMAT_VERSION: u32 = 1;
 const BACKUP_TRUST_FORMAT_VERSION: u32 = 1;
 const BACKUP_SIGNATURE_ALGORITHM: &str = "ed25519";
-const BACKUP_SIGNING_DOMAIN: &[u8] = b"AIAGENTOS-BACKUP-MANIFEST-V1\0";
+const BACKUP_SIGNING_DOMAIN_V1: &[u8] = b"AIAGENTOS-BACKUP-MANIFEST-V1\0";
+const BACKUP_SIGNING_DOMAIN_V2: &[u8] = b"AIAGENTOS-BACKUP-MANIFEST-V2\0";
+const BACKUP_ENCRYPTION_FORMAT_VERSION: u32 = 1;
+const BACKUP_ENCRYPTION_ALGORITHM: &str = "sqlcipher-4";
+
+/// Whole-database encryption identity required to authenticate a backup.
+///
+/// Only the non-secret key generation identifier is stored in the manifest.
+/// Key material remains outside the database and backup failure domain.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BackupEncryption {
+    pub format_version: u32,
+    pub algorithm: String,
+    pub key_id: String,
+}
 
 /// Optional cryptographic authenticity proof embedded in a backup manifest.
 ///
@@ -192,6 +209,8 @@ pub struct BackupManifest {
     pub created_at: String,
     pub byte_count: u64,
     pub sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encryption: Option<BackupEncryption>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub authenticity: Option<BackupAuthenticity>,
 }
@@ -544,6 +563,33 @@ fn validate_authenticity(authenticity: &BackupAuthenticity) -> Result<(), Contex
     Ok(())
 }
 
+fn validate_backup_encryption(encryption: &BackupEncryption) -> Result<(), ContextError> {
+    if encryption.format_version != BACKUP_ENCRYPTION_FORMAT_VERSION {
+        return Err(storage_error(format!(
+            "unsupported backup encryption format version {}",
+            encryption.format_version
+        )));
+    }
+    if encryption.algorithm != BACKUP_ENCRYPTION_ALGORITHM {
+        return Err(storage_error(format!(
+            "unsupported backup encryption algorithm {:?}",
+            encryption.algorithm
+        )));
+    }
+    if encryption.key_id.is_empty()
+        || encryption.key_id.len() > 96
+        || !encryption
+            .key_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    {
+        return Err(storage_error(
+            "backup encryption key id must be 1-96 ASCII letters, digits, '-', '_' or '.'",
+        ));
+    }
+    Ok(())
+}
+
 fn backup_signing_message(
     manifest: &BackupManifest,
     key_id: &str,
@@ -561,10 +607,19 @@ fn backup_signing_message(
         .map_err(|_| storage_error("backup signing-key fingerprint is too long"))?;
     let payload_len = u64::try_from(payload.len())
         .map_err(|_| storage_error("backup signing payload is too large"))?;
+    let signing_domain = match manifest.format_version {
+        LEGACY_BACKUP_FORMAT_VERSION => BACKUP_SIGNING_DOMAIN_V1,
+        BACKUP_FORMAT_VERSION => BACKUP_SIGNING_DOMAIN_V2,
+        version => {
+            return Err(storage_error(format!(
+                "cannot sign unsupported backup format version {version}"
+            )))
+        }
+    };
     let mut message = Vec::with_capacity(
-        BACKUP_SIGNING_DOMAIN.len() + key_id.len() + fingerprint.len() + payload.len() + 16,
+        signing_domain.len() + key_id.len() + fingerprint.len() + payload.len() + 16,
     );
-    message.extend_from_slice(BACKUP_SIGNING_DOMAIN);
+    message.extend_from_slice(signing_domain);
     message.extend_from_slice(&key_len.to_be_bytes());
     message.extend_from_slice(key_id.as_bytes());
     message.extend_from_slice(&fingerprint_len.to_be_bytes());
@@ -979,6 +1034,7 @@ fn sha256_file(path: &Path) -> Result<String, ContextError> {
 
 fn open_verified_database(
     path: &Path,
+    encryption_key: Option<&StorageEncryptionKey>,
 ) -> Result<(Connection, crate::schema::StorageMetadata), ContextError> {
     require_regular_file(path, "backup database")?;
     let connection =
@@ -988,6 +1044,9 @@ fn open_verified_database(
                 path.display()
             ))
         })?;
+    if let Some(key) = encryption_key {
+        key.apply(&connection)?;
+    }
     crate::schema::verify(&connection)?;
     let metadata = crate::schema::read_storage_metadata(&connection)?;
     Ok((connection, metadata))
@@ -1047,14 +1106,38 @@ fn read_manifest(path: &Path) -> Result<BackupManifest, ContextError> {
 /// Verify manifest integrity, the complete database hash, physical SQLite
 /// integrity, schema compatibility, foreign keys, and installation identity.
 pub fn verify_backup(backup_dir: &Path) -> Result<BackupManifest, ContextError> {
+    verify_backup_internal(backup_dir, None, None)
+}
+
+/// Verify an encrypted backup with its independently retained storage key.
+pub fn verify_backup_with_storage_key(
+    backup_dir: &Path,
+    storage_key: &StorageEncryptionKey,
+) -> Result<BackupManifest, ContextError> {
+    verify_backup_internal(backup_dir, None, Some(storage_key))
+}
+
+fn verify_backup_internal(
+    backup_dir: &Path,
+    trust: Option<&BackupTrustRoot>,
+    storage_key: Option<&StorageEncryptionKey>,
+) -> Result<BackupManifest, ContextError> {
     require_real_directory(backup_dir, "backup")?;
     let manifest_path = backup_dir.join(BACKUP_MANIFEST_FILE);
     let manifest = read_manifest(&manifest_path)?;
-    if manifest.format_version != BACKUP_FORMAT_VERSION {
+    if !matches!(
+        manifest.format_version,
+        LEGACY_BACKUP_FORMAT_VERSION | BACKUP_FORMAT_VERSION
+    ) {
         return Err(storage_error(format!(
-            "unsupported backup format version {}, expected {BACKUP_FORMAT_VERSION}",
-            manifest.format_version
+            "unsupported backup format version {}, expected {} or {BACKUP_FORMAT_VERSION}",
+            manifest.format_version, LEGACY_BACKUP_FORMAT_VERSION
         )));
+    }
+    if manifest.format_version == LEGACY_BACKUP_FORMAT_VERSION && manifest.encryption.is_some() {
+        return Err(storage_error(
+            "legacy backup format cannot declare storage encryption",
+        ));
     }
     if manifest.database_file != BACKUP_DATABASE_FILE {
         return Err(storage_error(format!(
@@ -1070,6 +1153,31 @@ pub fn verify_backup(backup_dir: &Path) -> Result<BackupManifest, ContextError> 
     if let Some(authenticity) = &manifest.authenticity {
         validate_authenticity(authenticity)?;
     }
+    match (&manifest.encryption, storage_key) {
+        (Some(encryption), Some(key)) => {
+            validate_backup_encryption(encryption)?;
+            if encryption.key_id != key.key_id() {
+                return Err(storage_error(format!(
+                    "backup requires storage key {:?}, not supplied key {:?}",
+                    encryption.key_id,
+                    key.key_id()
+                )));
+            }
+        }
+        (Some(encryption), None) => {
+            validate_backup_encryption(encryption)?;
+            return Err(storage_error(format!(
+                "backup is encrypted with storage key {:?}; supply that independently retained key",
+                encryption.key_id
+            )));
+        }
+        (None, Some(_)) => {
+            return Err(storage_error(
+                "backup manifest declares plaintext storage but an encryption key was supplied",
+            ));
+        }
+        (None, None) => {}
+    }
 
     let database_path = backup_dir.join(BACKUP_DATABASE_FILE);
     let byte_count = require_regular_file(&database_path, "backup database")?;
@@ -1084,7 +1192,7 @@ pub fn verify_backup(backup_dir: &Path) -> Result<BackupManifest, ContextError> 
         return Err(storage_error("backup SHA-256 mismatch"));
     }
 
-    let (_connection, metadata) = open_verified_database(&database_path)?;
+    let (_connection, metadata) = open_verified_database(&database_path, storage_key)?;
     if manifest.application_id != metadata.application_id
         || manifest.schema_version != metadata.schema_version
         || manifest.installation_id != metadata.installation_id
@@ -1092,6 +1200,9 @@ pub fn verify_backup(backup_dir: &Path) -> Result<BackupManifest, ContextError> 
         return Err(storage_error(
             "backup manifest identity does not match the SQLite storage metadata",
         ));
+    }
+    if let Some(trust) = trust {
+        trust.verify_manifest(&manifest)?;
     }
     Ok(manifest)
 }
@@ -1102,9 +1213,17 @@ pub fn verify_backup_authenticity(
     backup_dir: &Path,
     trust: &BackupTrustRoot,
 ) -> Result<BackupManifest, ContextError> {
-    let manifest = verify_backup(backup_dir)?;
-    trust.verify_manifest(&manifest)?;
-    Ok(manifest)
+    verify_backup_internal(backup_dir, Some(trust), None)
+}
+
+/// Verify an encrypted backup and require its independently retained signing
+/// trust root.
+pub fn verify_backup_with_storage_key_and_trust(
+    backup_dir: &Path,
+    storage_key: &StorageEncryptionKey,
+    trust: &BackupTrustRoot,
+) -> Result<BackupManifest, ContextError> {
+    verify_backup_internal(backup_dir, Some(trust), Some(storage_key))
 }
 
 fn validate_retention_policy(policy: &BackupRetentionPolicy) -> Result<(), ContextError> {
@@ -1189,6 +1308,7 @@ fn delete_verified_backup(
     backup_root: &Path,
     entry: &BackupRetentionEntry,
     expected_manifest: &BackupManifest,
+    storage_key: Option<&StorageEncryptionKey>,
 ) -> Result<(), ContextError> {
     validate_backup_name(&entry.name)?;
     let backup_dir = backup_root.join(&entry.name);
@@ -1204,7 +1324,7 @@ fn delete_verified_backup(
     })?;
     sync_directory(backup_root)?;
     require_real_directory(&tombstone, "staged backup selected for expiration")?;
-    let staged_manifest = verify_backup(&tombstone)?;
+    let staged_manifest = verify_backup_internal(&tombstone, None, storage_key)?;
     if &staged_manifest != expected_manifest {
         return Err(storage_error(format!(
             "backup {} changed before expiration; deletion staging requires operator inspection at {}",
@@ -1290,6 +1410,7 @@ impl SqliteContextManager {
 
         let manifest = (|| {
             let database_path = staging_dir.join(BACKUP_DATABASE_FILE);
+            let encryption_key = self.storage_encryption_key();
             {
                 let connection = self
                     .conn
@@ -1298,6 +1419,9 @@ impl SqliteContextManager {
                 let mut destination = Connection::open(&database_path).map_err(|error| {
                     storage_error(format!("failed to create backup database: {error}"))
                 })?;
+                if let Some(key) = encryption_key.as_deref() {
+                    key.apply(&destination)?;
+                }
                 let backup = rusqlite::backup::Backup::new(&connection, &mut destination).map_err(
                     |error| storage_error(format!("failed to initialize SQLite backup: {error}")),
                 )?;
@@ -1320,7 +1444,8 @@ impl SqliteContextManager {
                     ))
                 })?;
 
-            let (verified, metadata) = open_verified_database(&database_path)?;
+            let (verified, metadata) =
+                open_verified_database(&database_path, encryption_key.as_deref())?;
             // Windows does not allow the staging directory to be renamed while
             // this read-only SQLite handle remains open.
             drop(verified);
@@ -1334,6 +1459,11 @@ impl SqliteContextManager {
                 created_at: Utc::now().to_rfc3339(),
                 byte_count,
                 sha256: sha256_file(&database_path)?,
+                encryption: encryption_key.as_deref().map(|key| BackupEncryption {
+                    format_version: BACKUP_ENCRYPTION_FORMAT_VERSION,
+                    algorithm: BACKUP_ENCRYPTION_ALGORITHM.into(),
+                    key_id: key.key_id().into(),
+                }),
                 authenticity: None,
             };
             if let Some(signer) = signer {
@@ -1366,6 +1496,24 @@ impl SqliteContextManager {
         })()?;
         staging_guard.disarm();
         Ok(manifest)
+    }
+
+    fn backup_key_for_manifest(
+        &self,
+        manifest: &BackupManifest,
+    ) -> Result<Option<std::sync::Arc<StorageEncryptionKey>>, ContextError> {
+        match manifest.encryption.as_ref() {
+            Some(encryption) => self
+                .storage_backup_encryption_key(&encryption.key_id)
+                .map(Some)
+                .ok_or_else(|| {
+                    storage_error(format!(
+                        "backup requires unavailable retired storage key {:?}",
+                        encryption.key_id
+                    ))
+                }),
+            None => Ok(None),
+        }
     }
 
     /// Preview or enforce a bounded retention policy over verified backups.
@@ -1436,7 +1584,7 @@ impl SqliteContextManager {
                 });
                 continue;
             }
-            let manifest = match verify_backup(&entry.path()) {
+            let declared_manifest = match read_manifest(&entry.path().join(BACKUP_MANIFEST_FILE)) {
                 Ok(manifest) => manifest,
                 Err(error) => {
                     skipped.push(BackupRetentionIssue {
@@ -1446,6 +1594,27 @@ impl SqliteContextManager {
                     continue;
                 }
             };
+            let verification_key = match self.backup_key_for_manifest(&declared_manifest) {
+                Ok(key) => key,
+                Err(error) => {
+                    skipped.push(BackupRetentionIssue {
+                        name,
+                        reason: format!("verification failed: {error}"),
+                    });
+                    continue;
+                }
+            };
+            let manifest =
+                match verify_backup_internal(&entry.path(), None, verification_key.as_deref()) {
+                    Ok(manifest) => manifest,
+                    Err(error) => {
+                        skipped.push(BackupRetentionIssue {
+                            name,
+                            reason: format!("verification failed: {error}"),
+                        });
+                        continue;
+                    }
+                };
             if manifest.installation_id != installation_id {
                 skipped.push(BackupRetentionIssue {
                     name,
@@ -1510,7 +1679,8 @@ impl SqliteContextManager {
         let mut deleted = Vec::new();
         if !dry_run {
             for (entry, manifest) in eligible.iter().zip(&eligible_manifests) {
-                delete_verified_backup(backup_root, entry, manifest)?;
+                let verification_key = self.backup_key_for_manifest(manifest)?;
+                delete_verified_backup(backup_root, entry, manifest, verification_key.as_deref())?;
                 deleted.push(entry.clone());
             }
         }
@@ -1526,7 +1696,10 @@ impl SqliteContextManager {
     }
 }
 
-fn checkpoint_existing_database(path: &Path) -> Result<(), ContextError> {
+fn checkpoint_existing_database(
+    path: &Path,
+    storage_key: Option<&StorageEncryptionKey>,
+) -> Result<(), ContextError> {
     require_regular_file(path, "restore destination database")?;
     let connection = Connection::open(path).map_err(|error| {
         storage_error(format!(
@@ -1534,6 +1707,9 @@ fn checkpoint_existing_database(path: &Path) -> Result<(), ContextError> {
             path.display()
         ))
     })?;
+    if let Some(key) = storage_key {
+        key.apply(&connection)?;
+    }
     connection
         .busy_timeout(Duration::from_secs(5))
         .map_err(|error| storage_error(format!("failed to set restore busy timeout: {error}")))?;
@@ -1615,7 +1791,7 @@ pub fn restore_backup(
     backup_dir: &Path,
     destination_database: &Path,
 ) -> Result<RestoreReport, ContextError> {
-    restore_backup_internal(backup_dir, destination_database, None)
+    restore_backup_internal(backup_dir, destination_database, None, None)
 }
 
 /// Restore a backup only after it passes integrity and trusted-signature
@@ -1625,18 +1801,42 @@ pub fn restore_backup_with_trust(
     destination_database: &Path,
     trust: &BackupTrustRoot,
 ) -> Result<RestoreReport, ContextError> {
-    restore_backup_internal(backup_dir, destination_database, Some(trust))
+    restore_backup_internal(backup_dir, destination_database, Some(trust), None)
+}
+
+/// Restore an encrypted backup while authenticating both the snapshot and any
+/// existing destination with the independently retained storage key.
+pub fn restore_backup_with_storage_key(
+    backup_dir: &Path,
+    destination_database: &Path,
+    storage_key: &StorageEncryptionKey,
+) -> Result<RestoreReport, ContextError> {
+    restore_backup_internal(backup_dir, destination_database, None, Some(storage_key))
+}
+
+/// Restore an encrypted, signed backup only after both storage-key and
+/// trusted-signature verification succeed.
+pub fn restore_backup_with_storage_key_and_trust(
+    backup_dir: &Path,
+    destination_database: &Path,
+    storage_key: &StorageEncryptionKey,
+    trust: &BackupTrustRoot,
+) -> Result<RestoreReport, ContextError> {
+    restore_backup_internal(
+        backup_dir,
+        destination_database,
+        Some(trust),
+        Some(storage_key),
+    )
 }
 
 fn restore_backup_internal(
     backup_dir: &Path,
     destination_database: &Path,
     trust: Option<&BackupTrustRoot>,
+    storage_key: Option<&StorageEncryptionKey>,
 ) -> Result<RestoreReport, ContextError> {
-    let manifest = match trust {
-        Some(trust) => verify_backup_authenticity(backup_dir, trust)?,
-        None => verify_backup(backup_dir)?,
-    };
+    let manifest = verify_backup_internal(backup_dir, trust, storage_key)?;
     let parent = destination_database
         .parent()
         .ok_or_else(|| storage_error("restore destination must have a parent directory"))?;
@@ -1675,7 +1875,7 @@ fn restore_backup_internal(
     let mut stage_guard = StagingFile::new(stage.clone());
     copy_to_new_file(&backup_dir.join(BACKUP_DATABASE_FILE), &stage)?;
     let stage_result = (|| {
-        let (_connection, metadata) = open_verified_database(&stage)?;
+        let (_connection, metadata) = open_verified_database(&stage, storage_key)?;
         if metadata.installation_id != manifest.installation_id {
             return Err(storage_error(
                 "restore staging database installation identity changed during copy",
@@ -1696,7 +1896,7 @@ fn restore_backup_internal(
         &format!(".rollback-{}", uuid::Uuid::new_v4()),
     );
     if replaced_existing {
-        checkpoint_existing_database(destination_database)?;
+        checkpoint_existing_database(destination_database, storage_key)?;
         reject_existing_path(&rollback, "restore rollback file")?;
         fs::rename(destination_database, &rollback).map_err(|error| {
             storage_error(format!(
@@ -1727,7 +1927,7 @@ fn restore_backup_internal(
             return Err(storage_error("injected failure after restore publication"));
         }
         sync_directory(parent)?;
-        let (_connection, metadata) = open_verified_database(destination_database)?;
+        let (_connection, metadata) = open_verified_database(destination_database, storage_key)?;
         if metadata.installation_id != manifest.installation_id
             || sha256_file(destination_database)? != manifest.sha256
         {
@@ -1750,7 +1950,7 @@ fn restore_backup_internal(
                     "restore failed ({error}); automatic rollback also failed: {rollback_error}"
                 ))
             })?;
-            let _ = open_verified_database(destination_database)?;
+            let _ = open_verified_database(destination_database, storage_key)?;
         }
         sync_directory(parent)?;
         return Err(error);
@@ -1872,6 +2072,10 @@ mod tests {
             .unwrap()
     }
 
+    fn encrypted_test_key(key_id: &str, fill: u8) -> StorageEncryptionKey {
+        StorageEncryptionKey::from_bytes(key_id, [fill; 32]).unwrap()
+    }
+
     #[test]
     fn online_backup_includes_wal_state_and_verifies() {
         let directory = TestDirectory::new("online");
@@ -1889,6 +2093,185 @@ mod tests {
             Some("present")
         );
         assert!(!companion_path(&backup_dir.join(BACKUP_DATABASE_FILE), "-wal").exists());
+    }
+
+    #[test]
+    fn legacy_v1_plaintext_and_signed_manifests_remain_verifiable() {
+        let directory = TestDirectory::new("legacy-manifest");
+        let database = directory.path.join("source.db");
+        let manager = SqliteContextManager::new(&database).unwrap();
+        let backup_root = directory.path.join("backups");
+        let backup_dir = backup_root.join("legacy_001");
+        let mut manifest = manager.create_backup(&backup_root, "legacy_001").unwrap();
+        manifest.format_version = LEGACY_BACKUP_FORMAT_VERSION;
+        let (signer, _) = BackupSigningKey::generate("legacy-signer").unwrap();
+        signer.sign_manifest(&mut manifest).unwrap();
+        fs::write(
+            backup_dir.join(BACKUP_MANIFEST_FILE),
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            verify_backup_authenticity(&backup_dir, &signer.trust_root()).unwrap(),
+            manifest
+        );
+
+        manifest.authenticity = None;
+        manifest.encryption = Some(BackupEncryption {
+            format_version: BACKUP_ENCRYPTION_FORMAT_VERSION,
+            algorithm: BACKUP_ENCRYPTION_ALGORITHM.into(),
+            key_id: "invalid-v1-encryption".into(),
+        });
+        fs::write(
+            backup_dir.join(BACKUP_MANIFEST_FILE),
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+        assert!(verify_backup(&backup_dir)
+            .unwrap_err()
+            .to_string()
+            .contains("legacy backup format cannot declare"));
+    }
+
+    #[test]
+    fn encrypted_backup_verification_retention_and_fresh_host_restore_require_the_key() {
+        let directory = TestDirectory::new("encrypted-lifecycle");
+        let database = directory.path.join("source.db");
+        let manager = SqliteContextManager::new_encrypted(
+            &database,
+            encrypted_test_key("storage-generation-1", 0x31),
+        )
+        .unwrap();
+        let secret = "backup-secret-that-must-remain-encrypted";
+        seed(&manager, "encrypted-backup-proof", secret);
+
+        let backup_root = directory.path.join("backups");
+        let manifest = manager.create_backup(&backup_root, "backup_001").unwrap();
+        assert_eq!(
+            manifest.encryption,
+            Some(BackupEncryption {
+                format_version: BACKUP_ENCRYPTION_FORMAT_VERSION,
+                algorithm: BACKUP_ENCRYPTION_ALGORITHM.into(),
+                key_id: "storage-generation-1".into(),
+            })
+        );
+        let backup_dir = backup_root.join("backup_001");
+        let backup_database = backup_dir.join(BACKUP_DATABASE_FILE);
+        let backup_bytes = fs::read(&backup_database).unwrap();
+        assert!(!backup_bytes
+            .windows(secret.len())
+            .any(|window| window == secret.as_bytes()));
+        let unkeyed_error = verify_backup(&backup_dir).unwrap_err().to_string();
+        assert!(unkeyed_error.contains("supply that independently retained key"));
+        let wrong_error = verify_backup_with_storage_key(
+            &backup_dir,
+            &encrypted_test_key("storage-generation-wrong", 0x42),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(wrong_error.contains("not supplied key"));
+        assert_eq!(
+            verify_backup_with_storage_key(
+                &backup_dir,
+                &encrypted_test_key("storage-generation-1", 0x31)
+            )
+            .unwrap(),
+            manifest
+        );
+        let unkeyed_connection = Connection::open(&backup_database).unwrap();
+        assert!(unkeyed_connection
+            .query_row("SELECT count(*) FROM sqlite_schema", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .is_err());
+
+        manager.create_backup(&backup_root, "backup_002").unwrap();
+        let retention = manager
+            .apply_backup_retention(
+                &backup_root,
+                BackupRetentionPolicy {
+                    keep_latest: 1,
+                    max_age_seconds: 60,
+                },
+                true,
+            )
+            .unwrap();
+        assert!(retention.skipped.is_empty(), "{:?}", retention.skipped);
+        assert_eq!(retention.retained.len(), 2);
+
+        let restored = directory.path.join("fresh-host/agent_os.db");
+        restore_backup_with_storage_key(
+            &backup_dir,
+            &restored,
+            &encrypted_test_key("storage-generation-1", 0x31),
+        )
+        .unwrap();
+        let restored_manager = SqliteContextManager::new_encrypted(
+            &restored,
+            encrypted_test_key("storage-generation-1", 0x31),
+        )
+        .unwrap();
+        let restored_value: String = restored_manager
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT value FROM agent_kv WHERE key = 'encrypted-backup-proof'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(restored_value, secret);
+    }
+
+    #[test]
+    fn retention_uses_explicit_retired_keys_after_database_rotation() {
+        let directory = TestDirectory::new("retired-key-retention");
+        let database = directory.path.join("source.db");
+        let backup_root = directory.path.join("backups");
+        {
+            let manager = SqliteContextManager::new_encrypted(
+                &database,
+                encrypted_test_key("storage-generation-1", 0x51),
+            )
+            .unwrap();
+            manager.create_backup(&backup_root, "old_key").unwrap();
+        }
+        crate::storage_encryption::rotate_database_encryption_key(
+            &database,
+            &encrypted_test_key("storage-generation-1", 0x51),
+            &encrypted_test_key("storage-generation-2", 0x52),
+        )
+        .unwrap();
+        std::thread::sleep(Duration::from_millis(1_100));
+        let manager = SqliteContextManager::new_encrypted_with_retired_keys(
+            &database,
+            encrypted_test_key("storage-generation-2", 0x52),
+            vec![encrypted_test_key("storage-generation-1", 0x51)],
+        )
+        .unwrap();
+        manager.create_backup(&backup_root, "current_key").unwrap();
+        let report = manager
+            .apply_backup_retention(
+                &backup_root,
+                BackupRetentionPolicy {
+                    keep_latest: 1,
+                    max_age_seconds: 1,
+                },
+                false,
+            )
+            .unwrap();
+        assert!(report.skipped.is_empty(), "{:?}", report.skipped);
+        assert_eq!(
+            report
+                .deleted
+                .iter()
+                .map(|entry| entry.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["old_key"]
+        );
+        assert!(!backup_root.join("old_key").exists());
+        assert!(backup_root.join("current_key").exists());
     }
 
     #[test]

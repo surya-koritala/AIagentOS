@@ -10,6 +10,21 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
 
 ## [Unreleased]
 
+- Added SQLCipher whole-database encryption for #123. Operator-custodied
+  256-bit key documents (created and validated as owner-only files on Unix) now
+  protect SQLite pages, WAL state, and
+  online backups without interpolating key bytes into SQL. Required production
+  configuration fails closed for missing, unsafe, or wrong keys; manifests
+  record only the non-secret key generation. `agentctl` now generates storage
+  keys, performs confirmed offline plaintext export migration and key rotation,
+  and verifies/restores encrypted and independently signed backups on a fresh
+  host. The rootless Compose profile keeps keys in a separate volume and
+  exposes encryption health through structured startup logs and a bounded
+  Prometheus gauge. Restart, plaintext-page absence, wrong/missing/retired key,
+  lease, migration, rotation, retention, signed recovery, CLI, and entrypoint
+  regressions cover the slice. Remote immutable retention, key-vault/HSM
+  integration, crash/power-loss qualification, and measured recovery drills
+  remain open in #123.
 - Added a versioned storage data inventory for #123. A schema-enforced catalog
   classifies every logical SQLite object plus supported file, ephemeral, and
   external boundary by owner, tenant key, sensitivity, retention, encryption,

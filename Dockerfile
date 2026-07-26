@@ -19,8 +19,8 @@
 #   * reqwest 0.12 uses default (native-tls) features -> openssl-sys, so the
 #     BUILD stage needs libssl-dev + pkg-config + a C toolchain, and the
 #     RUNTIME stage needs libssl3 + ca-certificates (for HTTPS to LLM APIs).
-#   * rusqlite is built with the `bundled` feature -> SQLite is statically
-#     linked, so NO system libsqlite3 is required at runtime.
+#   * rusqlite bundles SQLCipher plus vendored OpenSSL -> encrypted SQLite is
+#     statically linked, so NO system libsqlite3/sqlcipher is required at runtime.
 
 ############################
 # Stage 1 — builder
@@ -73,13 +73,14 @@ RUN apt-get update \
 # Non-root user. HOME=/data so the `dirs` crate resolves XDG paths under the
 # mounted volume; we also pin XDG_* explicitly so config + db live in /data.
 RUN useradd --create-home --home-dir /data --uid 10001 --shell /usr/sbin/nologin agentos \
-    && mkdir -p /data/config/ai-agent-os /data/share/ai-agent-os /backups \
-    && chown -R agentos:agentos /data /backups
+    && mkdir -p /data/config/ai-agent-os /data/share/ai-agent-os /backups /keys \
+    && chown -R agentos:agentos /data /backups /keys
 
 # Copy the produced binaries from the builder. `agent-server` is the primary
 # wire-service entry surface (long-lived JSON syscall protocol over TCP).
 COPY --from=builder /build/target/release/agent         /usr/local/bin/agent
 COPY --from=builder /build/target/release/agent-server  /usr/local/bin/agent-server
+COPY --from=builder /build/target/release/agentctl       /usr/local/bin/agentctl
 COPY --from=builder /build/target/release/os-demo       /usr/local/bin/os-demo
 COPY --from=builder /build/target/release/os-benchmark  /usr/local/bin/os-benchmark
 COPY --from=builder /build/target/release/stress-test   /usr/local/bin/stress-test
@@ -99,9 +100,9 @@ ENV HOME=/data \
     AGENTOS_MODEL=llama3.2 \
     OLLAMA_BASE_URL=http://localhost:11434
 
-# /data holds config.toml + agent_os.db. Compose mounts a separately governed
-# volume at the pre-created, non-root-writable /backups path.
-VOLUME ["/data", "/backups"]
+# /data holds config.toml + encrypted agent_os.db. Backups and the operator-
+# custodied storage key use separate mount/lifecycle boundaries.
+VOLUME ["/data", "/backups", "/keys"]
 WORKDIR /data
 
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]

@@ -10,6 +10,16 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
 
 ## [Unreleased]
 
+- Added the first distributed-control-plane foundation: every kernel now owns
+  a durable Ed25519 node identity and generation-fenced active/draining/
+  quarantined state with placement metadata and audit history. `ClusterClient`
+  proves node possession, rejects duplicate identities/agent ownership,
+  rebuilds routing after restart, skips unavailable nodes, and supports
+  fail-closed region/residency/model/sandbox/label placement. The server and
+  SDK can require mutual TLS client certificates; multi-node restart, stale
+  control, placement, duplicate identity, admission, and mTLS regressions are
+  included. Membership consensus, ownership migration, global quotas, and
+  policy/package convergence remain open in #122.
 - Added pre-auth wire protocol discovery with exhaustive JSON Schemas, stable
   feature identifiers, v1/v2/MCP golden fixtures, typed SDK errors, agent
   enforcement introspection, credential-safe debug output, bounded

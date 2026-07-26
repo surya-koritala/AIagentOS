@@ -223,6 +223,26 @@
     "op": "node_info"
   },
   {
+    "challenge_hex": "00",
+    "op": "prove_node_identity"
+  },
+  {
+    "availability": "active",
+    "expected_generation": 1,
+    "op": "set_node_availability",
+    "reason": "fixture"
+  },
+  {
+    "expected_generation": 1,
+    "op": "set_node_profile",
+    "profile": {},
+    "reason": "fixture"
+  },
+  {
+    "limit": 1,
+    "op": "list_node_control_audit"
+  },
+  {
     "op": "metrics"
   },
   {

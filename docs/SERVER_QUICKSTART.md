@@ -101,6 +101,9 @@ docker compose down        # keeps named volumes
   connection.
 - `AGENT_SERVER_TLS_CERT` / `AGENT_SERVER_TLS_KEY` — terminate TLS (rustls) on
   the TCP bind.
+- `AGENT_SERVER_TLS_CLIENT_CA` — require a client certificate chaining to this
+  PEM CA bundle. This requires the TLS cert/key variables and rejects peers
+  before the syscall protocol handshake.
 - `AGENT_SERVER_UNIX` — bind a Unix-domain socket instead of TCP.
 
 ## Observability

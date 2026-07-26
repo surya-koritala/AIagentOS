@@ -12,6 +12,8 @@
 //!   AGENT_SERVER_TOKEN=secret agent-server      # require auth before any syscall
 //!   AGENT_SERVER_TLS_CERT=cert.pem AGENT_SERVER_TLS_KEY=key.pem agent-server
 //!                                       # terminate TLS (rustls) on the TCP bind
+//!   AGENT_SERVER_TLS_CLIENT_CA=cluster-ca.pem
+//!                                       # require trusted client certificates
 //!   AGENT_SERVER_ALLOW_INSECURE_REMOTE=1 # explicit development-only override
 
 #[path = "../logging.rs"]
@@ -61,6 +63,21 @@ async fn main() {
     let allow_insecure_remote = std::env::var("AGENT_SERVER_ALLOW_INSECURE_REMOTE")
         .ok()
         .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "yes"));
+    let tls_client_ca = std::env::var("AGENT_SERVER_TLS_CLIENT_CA")
+        .ok()
+        .filter(|value| !value.is_empty());
+    if tls_client_ca.is_some() && tls.is_none() {
+        eprintln!(
+            "agent-server: AGENT_SERVER_TLS_CLIENT_CA requires AGENT_SERVER_TLS_CERT and AGENT_SERVER_TLS_KEY"
+        );
+        std::process::exit(1);
+    }
+    if tls_client_ca.is_some() && unix_path.is_some() {
+        eprintln!(
+            "agent-server: AGENT_SERVER_TLS_CLIENT_CA applies only to TCP TLS and cannot be combined with AGENT_SERVER_UNIX"
+        );
+        std::process::exit(1);
+    }
     if unix_path.is_none() {
         if let Err(error) =
             validate_tcp_security(&addr, token.is_some(), tls.is_some(), allow_insecure_remote)
@@ -164,11 +181,29 @@ async fn main() {
                     eprintln!("agent-server: failed to read TLS key {key_path}: {e}");
                     std::process::exit(1);
                 });
-                let config = kernel::syscall_server::server_config_from_pem(&cert_pem, &key_pem)
-                    .unwrap_or_else(|e| {
-                        eprintln!("agent-server: invalid TLS cert/key: {e}");
-                        std::process::exit(1);
-                    });
+                let config = match tls_client_ca.as_deref() {
+                    Some(client_ca_path) => {
+                        let client_ca_pem =
+                            std::fs::read(client_ca_path).unwrap_or_else(|error| {
+                                eprintln!(
+                                    "agent-server: failed to read TLS client CA {client_ca_path}: {error}"
+                                );
+                                std::process::exit(1);
+                            });
+                        kernel::syscall_server::server_config_from_pem_with_client_ca(
+                            &cert_pem,
+                            &key_pem,
+                            &client_ca_pem,
+                        )
+                    }
+                    None => {
+                        kernel::syscall_server::server_config_from_pem(&cert_pem, &key_pem)
+                    }
+                }
+                .unwrap_or_else(|e| {
+                    eprintln!("agent-server: invalid TLS configuration: {e}");
+                    std::process::exit(1);
+                });
                 SyscallServer::bind_tls(kernel, addr.as_str(), config)
                     .await
                     .unwrap_or_else(|e| {

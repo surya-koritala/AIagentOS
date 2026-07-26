@@ -95,6 +95,7 @@ impl App {
                 audited: metrics.gate.audited,
             };
             self.node = NodeLoad {
+                control: None,
                 agent_count: metrics.agent_count as usize,
                 running_agents: metrics.running_agents as usize,
                 live_agents: metrics.live_agents as usize,

@@ -22,8 +22,11 @@ pub const WIRE_FEATURES: &[&str] = &[
     "bounded_json_frames",
     "connection_keepalive",
     "context_pressure",
+    "durable_node_identity",
     "durable_generation_checkpoints",
     "memory_lifecycle",
+    "mutual_tls",
+    "node_admission_control",
     "operator_control",
     "protocol_description",
     "request_deadlines",
@@ -391,6 +394,30 @@ const REQUEST_VARIANTS: &[Variant] = &[
         fields: &[],
     },
     Variant {
+        tag: "prove_node_identity",
+        fields: &[Field::required("challenge_hex", S)],
+    },
+    Variant {
+        tag: "set_node_availability",
+        fields: &[
+            Field::required("availability", S),
+            Field::required("expected_generation", I),
+            Field::required("reason", S),
+        ],
+    },
+    Variant {
+        tag: "set_node_profile",
+        fields: &[
+            Field::required("profile", O),
+            Field::required("expected_generation", I),
+            Field::required("reason", S),
+        ],
+    },
+    Variant {
+        tag: "list_node_control_audit",
+        fields: &[Field::optional("limit", I)],
+    },
+    Variant {
         tag: "metrics",
         fields: &[],
     },
@@ -467,7 +494,13 @@ pub fn conformance_request_fixtures(protocol_version: u32) -> Result<Vec<Value>,
             protocol_version >= 2
                 || !matches!(
                     variant.tag,
-                    "send_message_stream" | "cancel_request" | "ping"
+                    "send_message_stream"
+                        | "cancel_request"
+                        | "ping"
+                        | "prove_node_identity"
+                        | "set_node_availability"
+                        | "set_node_profile"
+                        | "list_node_control_audit"
                 )
         })
         .map(|variant| {
@@ -487,9 +520,10 @@ pub fn conformance_request_fixtures(protocol_version: u32) -> Result<Vec<Value>,
                     ("fact_id", JsonKind::String) => {
                         Value::String("00000000-0000-0000-0000-000000000003".into())
                     }
-                    ("public_key_hex" | "archive_hex", JsonKind::String) => {
+                    ("public_key_hex" | "archive_hex" | "challenge_hex", JsonKind::String) => {
                         Value::String("00".into())
                     }
+                    ("availability", JsonKind::String) => Value::String("active".into()),
                     ("valid_from", JsonKind::String) => {
                         Value::String("2026-01-01T00:00:00Z".into())
                     }
@@ -727,7 +761,25 @@ const REPLY_VARIANTS: &[Variant] = &[
             Field::required("llm_requests_in_flight", I),
             Field::required("llm_requests_waiting", I),
             Field::required("llm_core_capacity", I),
+            Field::optional("control", O),
         ],
+    },
+    Variant {
+        tag: "node_identity_proof",
+        fields: &[
+            Field::required("node_id", S),
+            Field::required("fingerprint", S),
+            Field::required("public_key", S),
+            Field::required("signature_hex", S),
+        ],
+    },
+    Variant {
+        tag: "node_control_updated",
+        fields: &[Field::required("control", O)],
+    },
+    Variant {
+        tag: "node_control_audit",
+        fields: &[Field::required("entries", A)],
     },
     Variant {
         tag: "metrics",
@@ -1104,7 +1156,7 @@ mod tests {
             }
         }
         assert_eq!(conformance_request_fixtures(1).unwrap().len(), 58);
-        assert_eq!(conformance_request_fixtures(2).unwrap().len(), 61);
+        assert_eq!(conformance_request_fixtures(2).unwrap().len(), 65);
         assert!(conformance_request_fixtures(0).is_err());
         assert!(conformance_request_fixtures(PROTOCOL_VERSION + 1).is_err());
     }

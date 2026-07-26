@@ -29,6 +29,7 @@ use tokio::io::AsyncBufReadExt;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream, ToSocketAddrs};
 use tokio::sync::Semaphore;
+use tracing::Instrument;
 
 use crate::agent::AgentKernel;
 use crate::auth::{Principal, Role};
@@ -1564,6 +1565,93 @@ pub async fn dispatch(kernel: &AgentKernelImpl, call: Syscall) -> SyscallReply {
 /// tenant principal is centrally authorized before operation-specific routing;
 /// trusted open/shared-secret connections use `None` as the system caller.
 pub async fn dispatch_scoped(
+    kernel: &AgentKernelImpl,
+    call: Syscall,
+    principal: Option<&Principal>,
+) -> SyscallReply {
+    let (_, action, _) = syscall_policy(&call);
+    let subsystem = crate::telemetry::RequestSubsystem::from_action(action);
+    let correlation_id = uuid::Uuid::new_v4();
+    let tenant_scoped = principal.is_some();
+    let mut observation = kernel.request_telemetry.start(subsystem);
+    let started = std::time::Instant::now();
+    let span = tracing::info_span!(
+        target: "agentos::request",
+        "agentos.request",
+        correlation_id = %correlation_id,
+        action,
+        subsystem = subsystem.as_str(),
+        tenant_scoped
+    );
+
+    async {
+        let kernel_span = tracing::info_span!(
+            target: "agentos::request",
+            "kernel.dispatch",
+            component = "kernel"
+        );
+        let reply = async {
+            let component = trace_component(action);
+            let component_span = tracing::info_span!(
+                target: "agentos::request",
+                "kernel.component",
+                component
+            );
+            dispatch_scoped_inner(kernel, call, principal)
+                .instrument(component_span)
+                .await
+        }
+        .instrument(kernel_span)
+        .await;
+        let outcome = request_outcome(&reply);
+        observation.finish(outcome);
+        tracing::info!(
+            target: "agentos::request",
+            outcome = outcome.as_str(),
+            duration_ms = started.elapsed().as_secs_f64() * 1_000.0,
+            "request completed"
+        );
+        reply
+    }
+    .instrument(span)
+    .await
+}
+
+fn trace_component(action: &str) -> &'static str {
+    if matches!(action, "agent.send_message" | "agent.send_message_stream") {
+        "provider"
+    } else if action == "agent.call_tool" {
+        "tool"
+    } else if matches!(
+        action.split_once('.').map_or(action, |(prefix, _)| prefix),
+        "checkpoint" | "context" | "memory" | "snapshot" | "storage"
+    ) {
+        "persistence"
+    } else {
+        "kernel"
+    }
+}
+
+fn request_outcome(reply: &SyscallReply) -> crate::telemetry::RequestOutcome {
+    let code = match reply {
+        SyscallReply::Error { message } => Some(WireErrorCode::classify(message).0),
+        SyscallReply::TypedError { code, .. } | SyscallReply::StreamFailed { code, .. } => {
+            Some(*code)
+        }
+        _ => None,
+    };
+    match code {
+        None => crate::telemetry::RequestOutcome::Success,
+        Some(WireErrorCode::Timeout) => crate::telemetry::RequestOutcome::TimedOut,
+        Some(WireErrorCode::Cancelled) => crate::telemetry::RequestOutcome::Cancelled,
+        Some(WireErrorCode::Unavailable | WireErrorCode::Provider | WireErrorCode::Internal) => {
+            crate::telemetry::RequestOutcome::Failed
+        }
+        Some(_) => crate::telemetry::RequestOutcome::Rejected,
+    }
+}
+
+async fn dispatch_scoped_inner(
     kernel: &AgentKernelImpl,
     call: Syscall,
     principal: Option<&Principal>,
@@ -3223,12 +3311,76 @@ async fn dispatch_message_stream<W>(
 where
     W: AsyncWrite + Unpin,
 {
+    let correlation_id = uuid::Uuid::new_v4();
+    let subsystem = crate::telemetry::RequestSubsystem::Agent;
+    let mut observation = kernel.request_telemetry.start(subsystem);
+    let started = std::time::Instant::now();
+    let span = tracing::info_span!(
+        target: "agentos::request",
+        "agentos.request",
+        correlation_id = %correlation_id,
+        action = "agent.send_message_stream",
+        subsystem = subsystem.as_str(),
+        tenant_scoped = principal.is_some()
+    );
+    async {
+        let kernel_span = tracing::info_span!(
+            target: "agentos::request",
+            "kernel.dispatch",
+            component = "kernel"
+        );
+        let result = dispatch_message_stream_inner(
+            kernel,
+            request_id,
+            agent_id,
+            message,
+            principal,
+            write,
+            negotiated_version,
+        )
+        .instrument(tracing::info_span!(
+            target: "agentos::request",
+            "kernel.component",
+            component = "provider"
+        ))
+        .instrument(kernel_span)
+        .await;
+        let outcome = match &result {
+            Ok(outcome) => *outcome,
+            Err(_) => crate::telemetry::RequestOutcome::Cancelled,
+        };
+        observation.finish(outcome);
+        tracing::info!(
+            target: "agentos::request",
+            outcome = outcome.as_str(),
+            duration_ms = started.elapsed().as_secs_f64() * 1_000.0,
+            "stream request completed"
+        );
+        result.map(|_| ())
+    }
+    .instrument(span)
+    .await
+}
+
+async fn dispatch_message_stream_inner<W>(
+    kernel: &AgentKernelImpl,
+    request_id: String,
+    agent_id: String,
+    message: String,
+    principal: Option<&Principal>,
+    write: &mut W,
+    negotiated_version: u32,
+) -> std::io::Result<crate::telemetry::RequestOutcome>
+where
+    W: AsyncWrite + Unpin,
+{
     if negotiated_version < 2 {
         let reply = SyscallReply::Error {
             message: "incompatible wire-protocol version: message streaming requires v2".into(),
         }
         .into_public_wire(negotiated_version);
-        return write_bounded_json(write, &reply, MAX_WIRE_FRAME_BYTES).await;
+        write_bounded_json(write, &reply, MAX_WIRE_FRAME_BYTES).await?;
+        return Ok(crate::telemetry::RequestOutcome::Rejected);
     }
     let call = Syscall::SendMessageStream {
         request_id: request_id.clone(),
@@ -3236,12 +3388,14 @@ where
         message: message.clone(),
     };
     if let Err(reply) = authorize(kernel, principal, &call).await {
-        return write_bounded_json(
+        let outcome = request_outcome(&reply);
+        write_bounded_json(
             write,
             &reply.into_public_wire(negotiated_version),
             MAX_WIRE_FRAME_BYTES,
         )
-        .await;
+        .await?;
+        return Ok(outcome);
     }
     let parsed_agent = match uuid::Uuid::parse_str(&agent_id) {
         Ok(agent) => agent,
@@ -3250,7 +3404,8 @@ where
                 message: format!("invalid agent id: {agent_id}"),
             }
             .into_public_wire(negotiated_version);
-            return write_bounded_json(write, &reply, MAX_WIRE_FRAME_BYTES).await;
+            write_bounded_json(write, &reply, MAX_WIRE_FRAME_BYTES).await?;
+            return Ok(crate::telemetry::RequestOutcome::Rejected);
         }
     };
     if request_id.is_empty() || request_id.len() > 128 {
@@ -3258,7 +3413,8 @@ where
             message: "invalid request id: expected 1..=128 bytes".into(),
         }
         .into_public_wire(negotiated_version);
-        return write_bounded_json(write, &reply, MAX_WIRE_FRAME_BYTES).await;
+        write_bounded_json(write, &reply, MAX_WIRE_FRAME_BYTES).await?;
+        return Ok(crate::telemetry::RequestOutcome::Rejected);
     }
 
     // A bounded channel makes the socket writer the backpressure boundary:
@@ -3297,7 +3453,8 @@ where
                     message: "stream request timed out".into(),
                     retryable: true,
                 };
-                return write_bounded_json(write, &reply, MAX_WIRE_FRAME_BYTES).await;
+                write_bounded_json(write, &reply, MAX_WIRE_FRAME_BYTES).await?;
+                return Ok(crate::telemetry::RequestOutcome::TimedOut);
             }
         };
 
@@ -3341,7 +3498,9 @@ where
                         }
                     }
                 };
-                return write_bounded_json(write, &reply, MAX_WIRE_FRAME_BYTES).await;
+                let outcome = request_outcome(&reply);
+                write_bounded_json(write, &reply, MAX_WIRE_FRAME_BYTES).await?;
+                return Ok(outcome);
             }
         }
     }
@@ -4142,6 +4301,55 @@ mod tests {
             WireErrorCode::classify("cgroup token quota exceeded"),
             (WireErrorCode::QuotaExceeded, true)
         );
+    }
+
+    #[tokio::test]
+    async fn dispatch_records_bounded_request_outcomes() {
+        let kernel = AgentKernelImpl::new().expect("kernel new");
+
+        assert!(matches!(
+            dispatch(&kernel, Syscall::Ping).await,
+            SyscallReply::Pong
+        ));
+        assert!(matches!(
+            dispatch(
+                &kernel,
+                Syscall::PauseAgent {
+                    agent_id: "not-a-uuid".into(),
+                },
+            )
+            .await,
+            SyscallReply::Error { .. }
+        ));
+
+        let snapshot = kernel.request_telemetry.snapshot();
+        assert_eq!(snapshot.in_flight, 0);
+        assert_eq!(
+            snapshot
+                .samples
+                .iter()
+                .find(|sample| sample.subsystem == "protocol" && sample.outcome == "success")
+                .unwrap()
+                .requests,
+            1
+        );
+        assert_eq!(
+            snapshot
+                .samples
+                .iter()
+                .find(|sample| sample.subsystem == "agent" && sample.outcome == "rejected")
+                .unwrap()
+                .requests,
+            1
+        );
+        assert!(snapshot.samples.iter().all(|sample| {
+            crate::telemetry::RequestSubsystem::ALL
+                .iter()
+                .any(|subsystem| subsystem.as_str() == sample.subsystem)
+                && crate::telemetry::RequestOutcome::ALL
+                    .iter()
+                    .any(|outcome| outcome.as_str() == sample.outcome)
+        }));
     }
 
     #[tokio::test]

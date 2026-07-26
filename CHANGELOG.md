@@ -10,6 +10,17 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
 
 ## [Unreleased]
 
+- Added production observability contract v1 under #125. Every Prometheus
+  family now has a machine-checked name, type, unit, and bounded label catalog;
+  dispatched and streaming syscalls record fixed-subsystem outcomes and latency
+  histograms while server-generated correlation IDs remain only in redacted
+  structured spans. JSON logs include the wire→kernel→provider/tool/persistence
+  span path, and checked-in release-candidate SLO targets, an importable
+  Grafana dashboard, Prometheus alerts, and alert runbooks cover availability,
+  timeout/latency, quota health, backup freshness, and queue saturation. The
+  24-hour soak, chaos/fault/leak runs,
+  alert-delivery validation, privacy export controls, game day, exact-RC
+  report, and independent review remain open.
 - Added independently retained exact backup recovery anchors under #123.
   `agentctl backup-anchor-create` fully verifies a signed plaintext or SQLCipher
   backup and publishes an owner-only, non-overwriting anchor outside the backup

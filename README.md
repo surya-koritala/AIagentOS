@@ -394,8 +394,11 @@ cargo run --package os-benchmark --bin os-benchmark --locked
 cargo run --package os-benchmark --bin memory-qualification --locked
 ```
 
-Sustained-load methodology, SLOs, chaos testing, and publishable performance
-qualification remain tracked by [#125](https://github.com/surya-koritala/AIagentOS/issues/125).
+The versioned [production observability contract](docs/OBSERVABILITY.md) now
+defines bounded metrics, request correlation, release-candidate SLO targets,
+checked-in Prometheus alerts, and their runbooks. The 24-hour soak, chaos,
+game-day, and publishable performance qualification still remain tracked by
+[#125](https://github.com/surya-koritala/AIagentOS/issues/125).
 
 ## Architecture Docs
 
@@ -404,6 +407,7 @@ qualification remain tracked by [#125](https://github.com/surya-koritala/AIagent
 - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — Linux kernel → AI Agent OS mapping
 - [`docs/POLICY.md`](docs/POLICY.md) — authoring, validating, and explaining MAC policy
 - [`docs/ACCOUNTING.md`](docs/ACCOUNTING.md) — usage, pricing, quotas, and metrics contract
+- [`docs/OBSERVABILITY.md`](docs/OBSERVABILITY.md) — SLOs, traces, metrics, alerts, and runbooks
 - [`docs/COMPLETE_SPEC.md`](docs/COMPLETE_SPEC.md) — long-form implementation spec
 - [`docs/FULL_ROADMAP.md`](docs/FULL_ROADMAP.md) — long-form vision roadmap
 

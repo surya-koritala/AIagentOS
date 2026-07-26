@@ -25,6 +25,9 @@ use std::time::Instant;
 use crate::agent::AgentKernel;
 use crate::observability::{MetricScope, ObservabilityEngine};
 use crate::syscall_gate::GateStats;
+use crate::telemetry::{
+    RequestTelemetrySnapshot, REQUEST_DURATION_BUCKETS_MICROSECONDS, TELEMETRY_CONTRACT_VERSION,
+};
 use crate::AgentKernelImpl;
 
 /// Bounded lifecycle outcomes for one operation. These counters are
@@ -175,6 +178,10 @@ fn process_start() -> Instant {
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct MetricsSnapshot {
+    /// Versioned metric-name/type/unit/label contract.
+    pub telemetry_contract_version: u32,
+    /// Bounded request outcomes and cumulative wall-clock duration.
+    pub requests: RequestTelemetrySnapshot,
     /// Syscall-gate enforcement counters.
     pub gate: GateStats,
     /// Total agents the kernel hosts.
@@ -304,6 +311,8 @@ impl MetricsSnapshot {
             .map(|init| init.metrics())
             .unwrap_or_default();
         Self {
+            telemetry_contract_version: TELEMETRY_CONTRACT_VERSION,
+            requests: kernel.request_telemetry.snapshot(),
             gate,
             agent_count,
             running_agents: running,
@@ -378,6 +387,61 @@ impl MetricsSnapshot {
     /// `# HELP`/`# TYPE` headers, so the output is stable enough to assert on.
     pub fn render_prometheus(&self) -> String {
         let mut out = String::with_capacity(2048);
+
+        out.push_str(
+            "# HELP agentos_telemetry_contract_info Version of the stable AgentOS telemetry contract.\n",
+        );
+        out.push_str("# TYPE agentos_telemetry_contract_info gauge\n");
+        out.push_str(&format!(
+            "agentos_telemetry_contract_info{{version=\"{}\"}} 1\n",
+            self.telemetry_contract_version
+        ));
+        out.push_str("# HELP agentos_requests_in_flight Requests currently executing.\n");
+        out.push_str("# TYPE agentos_requests_in_flight gauge\n");
+        out.push_str(&format!(
+            "agentos_requests_in_flight {}\n",
+            self.requests.in_flight
+        ));
+        out.push_str(
+            "# HELP agentos_requests_total Completed requests by bounded subsystem and outcome.\n",
+        );
+        out.push_str("# TYPE agentos_requests_total counter\n");
+        out.push_str(
+            "# HELP agentos_request_duration_seconds Wall-clock request latency by bounded subsystem and outcome.\n",
+        );
+        out.push_str("# TYPE agentos_request_duration_seconds histogram\n");
+        for sample in &self.requests.samples {
+            out.push_str(&format!(
+                "agentos_requests_total{{subsystem=\"{}\",outcome=\"{}\"}} {}\n",
+                sample.subsystem, sample.outcome, sample.requests
+            ));
+            out.push_str(&format!(
+                "agentos_request_duration_seconds_sum{{subsystem=\"{}\",outcome=\"{}\"}} {:.6}\n",
+                sample.subsystem,
+                sample.outcome,
+                sample.duration_microseconds_total as f64 / 1_000_000.0
+            ));
+            out.push_str(&format!(
+                "agentos_request_duration_seconds_count{{subsystem=\"{}\",outcome=\"{}\"}} {}\n",
+                sample.subsystem, sample.outcome, sample.requests
+            ));
+            for (boundary, count) in REQUEST_DURATION_BUCKETS_MICROSECONDS
+                .iter()
+                .zip(&sample.duration_bucket_counts)
+            {
+                out.push_str(&format!(
+                    "agentos_request_duration_seconds_bucket{{subsystem=\"{}\",outcome=\"{}\",le=\"{:.3}\"}} {}\n",
+                    sample.subsystem,
+                    sample.outcome,
+                    *boundary as f64 / 1_000_000.0,
+                    count
+                ));
+            }
+            out.push_str(&format!(
+                "agentos_request_duration_seconds_bucket{{subsystem=\"{}\",outcome=\"{}\",le=\"+Inf\"}} {}\n",
+                sample.subsystem, sample.outcome, sample.requests
+            ));
+        }
 
         // --- Syscall-gate enforcement: one counter family, labelled by result.
         out.push_str(
@@ -828,7 +892,21 @@ mod tests {
     use super::*;
 
     fn sample() -> MetricsSnapshot {
+        let request_telemetry = crate::telemetry::RequestTelemetry::default();
+        let mut requests = request_telemetry.snapshot();
+        let successful_agent_request = requests
+            .samples
+            .iter_mut()
+            .find(|sample| sample.subsystem == "agent" && sample.outcome == "success")
+            .unwrap();
+        successful_agent_request.requests = 3;
+        successful_agent_request.duration_microseconds_total = 125_000;
+        successful_agent_request.duration_bucket_counts =
+            vec![0, 0, 0, 0, 2, 3, 3, 3, 3, 3, 3, 3, 3];
+        requests.in_flight = 2;
         MetricsSnapshot {
+            telemetry_contract_version: TELEMETRY_CONTRACT_VERSION,
+            requests,
             gate: GateStats {
                 allowed: 5,
                 denied_capability: 2,
@@ -928,6 +1006,10 @@ mod tests {
     fn render_has_help_and_type_headers() {
         let text = sample().render_prometheus();
         // Each family carries a HELP + TYPE line.
+        assert!(text.contains("# TYPE agentos_telemetry_contract_info gauge"));
+        assert!(text.contains("# TYPE agentos_requests_in_flight gauge"));
+        assert!(text.contains("# TYPE agentos_requests_total counter"));
+        assert!(text.contains("# TYPE agentos_request_duration_seconds histogram"));
         assert!(text.contains("# HELP agentos_syscall_gate_total"));
         assert!(text.contains("# TYPE agentos_syscall_gate_total counter"));
         assert!(text.contains("# TYPE agentos_agents gauge"));
@@ -961,6 +1043,15 @@ mod tests {
     #[test]
     fn render_reflects_snapshot_values() {
         let text = sample().render_prometheus();
+        assert!(text.contains("agentos_telemetry_contract_info{version=\"1\"} 1"));
+        assert!(text.contains("agentos_requests_in_flight 2"));
+        assert!(text.contains("agentos_requests_total{subsystem=\"agent\",outcome=\"success\"} 3"));
+        assert!(text.contains(
+            "agentos_request_duration_seconds_sum{subsystem=\"agent\",outcome=\"success\"} 0.125000"
+        ));
+        assert!(text.contains(
+            "agentos_request_duration_seconds_bucket{subsystem=\"agent\",outcome=\"success\",le=\"0.250\"} 3"
+        ));
         assert!(text.contains("agentos_syscall_gate_total{result=\"allowed\"} 5"));
         assert!(text.contains("agentos_syscall_gate_total{result=\"denied_capability\"} 2"));
         assert!(text.contains("agentos_syscall_gate_total{result=\"denied_mac\"} 1"));
@@ -1013,6 +1104,175 @@ mod tests {
     fn render_is_deterministic() {
         let s = sample();
         assert_eq!(s.render_prometheus(), s.render_prometheus());
+    }
+
+    #[test]
+    fn rendered_metric_families_match_versioned_contract() {
+        let contract: toml::Value = toml::from_str(include_str!(
+            "../../../observability/telemetry-contract-v1.toml"
+        ))
+        .expect("telemetry contract parses");
+        assert_eq!(
+            contract
+                .get("contract_version")
+                .and_then(toml::Value::as_integer),
+            Some(i64::from(TELEMETRY_CONTRACT_VERSION))
+        );
+
+        let expected = contract
+            .get("metric")
+            .and_then(toml::Value::as_array)
+            .expect("metric catalog")
+            .iter()
+            .map(|metric| {
+                let table = metric.as_table().expect("metric table");
+                (
+                    table["name"].as_str().unwrap().to_string(),
+                    table["type"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let rendered = sample()
+            .render_prometheus()
+            .lines()
+            .filter_map(|line| {
+                let mut fields = line.split_whitespace();
+                if fields.next() == Some("#") && fields.next() == Some("TYPE") {
+                    Some((
+                        fields.next().unwrap().to_string(),
+                        fields.next().unwrap().to_string(),
+                    ))
+                } else {
+                    None
+                }
+            })
+            .collect::<std::collections::BTreeMap<_, _>>();
+        assert_eq!(rendered, expected);
+
+        let exposition = sample().render_prometheus();
+        let catalog = contract["metric"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|metric| {
+                let table = metric.as_table().unwrap();
+                let name = table["name"].as_str().unwrap().to_string();
+                let labels = table["labels"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|label| label.as_str().unwrap().to_string())
+                    .collect::<std::collections::BTreeSet<_>>();
+                let allowed = table
+                    .get("allowed_label_values")
+                    .and_then(toml::Value::as_table)
+                    .map(|values| {
+                        values
+                            .iter()
+                            .map(|(label, values)| {
+                                (
+                                    label.clone(),
+                                    values
+                                        .as_array()
+                                        .unwrap()
+                                        .iter()
+                                        .map(|value| value.as_str().unwrap().to_string())
+                                        .collect::<std::collections::BTreeSet<_>>(),
+                                )
+                            })
+                            .collect::<std::collections::BTreeMap<_, _>>()
+                    })
+                    .unwrap_or_default();
+                assert!(
+                    table["unit"].as_str().is_some_and(|unit| !unit.is_empty()),
+                    "{name} must declare a unit"
+                );
+                assert_eq!(
+                    labels,
+                    allowed.keys().cloned().collect(),
+                    "{name} must enumerate every label value"
+                );
+                (name, (labels, allowed))
+            })
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let dashboard: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../observability/grafana-dashboard.json"
+        ))
+        .expect("Grafana dashboard parses");
+        assert!(
+            dashboard["panels"]
+                .as_array()
+                .is_some_and(|panels| panels.len() >= 10),
+            "operations dashboard must retain the core production panels"
+        );
+        for (asset, contents) in [
+            (
+                "Grafana dashboard",
+                include_str!("../../../observability/grafana-dashboard.json"),
+            ),
+            (
+                "Prometheus rules",
+                include_str!("../../../observability/prometheus-rules.yml"),
+            ),
+        ] {
+            for reference in contents
+                .split(|character: char| {
+                    !(character.is_ascii_alphanumeric() || matches!(character, '_' | ':'))
+                })
+                .filter(|token| token.starts_with("agentos_"))
+            {
+                assert!(
+                    catalog.keys().any(|family| {
+                        reference == family
+                            || ["_bucket", "_sum", "_count"]
+                                .iter()
+                                .any(|suffix| reference == format!("{family}{suffix}"))
+                    }),
+                    "{asset} references uncatalogued metric {reference}"
+                );
+            }
+        }
+        for line in exposition.lines().filter(|line| !line.starts_with('#')) {
+            let metric_and_labels = line.split_whitespace().next().unwrap();
+            let raw_name = metric_and_labels
+                .split_once('{')
+                .map_or(metric_and_labels, |(name, _)| name);
+            let family = catalog
+                .keys()
+                .find(|family| {
+                    raw_name == family.as_str()
+                        || ["_bucket", "_sum", "_count"]
+                            .iter()
+                            .any(|suffix| raw_name == format!("{family}{suffix}"))
+                })
+                .unwrap_or_else(|| panic!("uncatalogued metric sample {raw_name}"));
+            let (labels, allowed) = &catalog[family];
+            if let Some((_, encoded)) = metric_and_labels.split_once('{') {
+                for pair in encoded.trim_end_matches('}').split(',') {
+                    let (key, value) = pair.split_once('=').expect("metric label assignment");
+                    let value = value.trim_matches('"');
+                    assert!(
+                        labels.contains(key),
+                        "{family} emitted undeclared label {key}"
+                    );
+                    assert!(
+                        allowed[key].contains(value),
+                        "{family} emitted undeclared {key} value {value}"
+                    );
+                }
+            }
+        }
+
+        for forbidden in contract["forbidden_label_classes"]
+            .as_array()
+            .expect("forbidden labels")
+        {
+            let forbidden = forbidden.as_str().unwrap();
+            assert!(
+                !exposition.contains(&format!("{forbidden}=\"")),
+                "forbidden high-cardinality label {forbidden} entered metrics"
+            );
+        }
     }
 
     #[tokio::test]

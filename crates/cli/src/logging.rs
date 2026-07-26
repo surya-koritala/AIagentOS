@@ -24,7 +24,11 @@ pub fn init_logging() {
         let _ = tracing_subscriber::fmt()
             .json()
             .with_env_filter(filter)
-            .with_current_span(false)
+            // Correlation IDs and the bounded component path live on spans.
+            // Include both the leaf and its parents in machine-readable logs
+            // so an operator can follow wire → kernel → provider/tool/storage.
+            .with_current_span(true)
+            .with_span_list(true)
             .try_init();
     } else {
         let _ = tracing_subscriber::fmt()

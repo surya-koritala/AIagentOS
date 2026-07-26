@@ -149,7 +149,10 @@ so the kernel's structured logs actually emit:
 - `RUST_LOG` — env-filter directive; defaults to `info` when unset (e.g.
   `RUST_LOG=kernel=debug,info`).
 - `LOG_FORMAT=json` (or `AGENT_LOG_FORMAT=json`) — emit machine-readable JSON
-  log lines for ingestion. Any other value keeps the human-readable format.
+  log lines for ingestion, including the current correlation span and its
+  wire→kernel→component parent path. Any other value keeps the human-readable
+  format. Request IDs, credentials, prompts, contents, arguments, paths, and
+  URLs are not metric labels.
 
 ### Metrics
 
@@ -157,6 +160,9 @@ The kernel renders a Prometheus text exposition (format version `0.0.4`) from
 the syscall-gate enforcement counters, agent counts, backup maintenance
 health, system token/api totals, and process uptime. There are two ways to read
 it:
+
+The complete compatibility and privacy contract, SLO targets, alert rules, and
+runbooks are in [`OBSERVABILITY.md`](OBSERVABILITY.md).
 
 - **Over the wire** — the `metrics` syscall (`{"op":"metrics"}`) returns the
   exposition in a `metrics` reply; the SDK exposes it as

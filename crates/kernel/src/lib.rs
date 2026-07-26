@@ -60,6 +60,7 @@ pub mod sandbox;
 pub mod scheduler;
 mod schema;
 pub mod shell;
+pub mod storage;
 pub mod syscall_gate;
 pub mod syscall_interface;
 pub mod syscall_server;
@@ -1219,6 +1220,10 @@ pub struct AgentKernelImpl {
     pub agent_manager: Arc<AgentManager>,
     pub scheduler: Arc<PriorityScheduler>,
     pub context_manager: Arc<SqliteContextManager>,
+    /// Root-kernel ownership lease. Unlike the shared context manager, this is
+    /// released as soon as the file-backed kernel itself stops, even if a
+    /// cancelled background task briefly retains a subsystem reference.
+    _storage_lease: Option<std::fs::File>,
     /// Durable cryptographic node identity plus generation-fenced
     /// active/draining/quarantined admission state.
     pub cluster_control: Arc<crate::cluster_control::ClusterControl>,
@@ -1373,14 +1378,20 @@ impl AgentKernelImpl {
         if let Some(parent) = db_path.parent() {
             std::fs::create_dir_all(parent).ok();
         }
-        let context_manager =
-            Arc::new(SqliteContextManager::new(db_path).map_err(KernelError::Context)?);
+        let storage_lease =
+            crate::storage::acquire_storage_lease(db_path).map_err(KernelError::Context)?;
+        let context_manager = Arc::new(
+            SqliteContextManager::new_without_storage_lease(db_path)
+                .map_err(KernelError::Context)?,
+        );
         let security = crate::config::Config::default();
-        let kernel = Self::with_context_manager(
+        let kernel = Self::with_context_manager_clock_and_lease(
             context_manager,
             &security.budgets,
             security.mac_enforcing,
             &security.mac_rules,
+            Arc::new(crate::quota_clock::SystemQuotaClock::new()),
+            Some(storage_lease),
         )?;
         // Bring back any agents persisted by a previous run on this DB so a
         // restart restores the full registry (and re-arms enforcement).
@@ -1399,8 +1410,12 @@ impl AgentKernelImpl {
         if let Some(parent) = db_path.parent() {
             std::fs::create_dir_all(parent).ok();
         }
-        let context_manager =
-            Arc::new(SqliteContextManager::new(&db_path).map_err(KernelError::Context)?);
+        let storage_lease =
+            crate::storage::acquire_storage_lease(&db_path).map_err(KernelError::Context)?;
+        let context_manager = Arc::new(
+            SqliteContextManager::new_without_storage_lease(&db_path)
+                .map_err(KernelError::Context)?,
+        );
         // Resolve the effective MAC config: a `policy_file`, when set,
         // supersedes the inline `mac_enforcing`/`mac_rules`. A malformed or
         // unreadable policy file fails startup with a clear message.
@@ -1411,11 +1426,13 @@ impl AgentKernelImpl {
                 "MAC enforcement is DISABLED by local configuration; tool policy is permissive"
             );
         }
-        let kernel = Self::with_context_manager(
+        let kernel = Self::with_context_manager_clock_and_lease(
             context_manager,
             &config.budgets,
             mac_enforcing,
             &mac_rules,
+            Arc::new(crate::quota_clock::SystemQuotaClock::new()),
+            Some(storage_lease),
         )?;
         if let Some(service_dir) = &config.service_dir {
             *kernel
@@ -1469,6 +1486,24 @@ impl AgentKernelImpl {
         mac_enforcing: bool,
         mac_rules: &[crate::mac::PolicyRule],
         quota_clock: Arc<dyn crate::quota_clock::QuotaClock>,
+    ) -> Result<Self, KernelError> {
+        Self::with_context_manager_clock_and_lease(
+            context_manager,
+            budgets,
+            mac_enforcing,
+            mac_rules,
+            quota_clock,
+            None,
+        )
+    }
+
+    fn with_context_manager_clock_and_lease(
+        context_manager: Arc<SqliteContextManager>,
+        budgets: &crate::config::BudgetConfig,
+        mac_enforcing: bool,
+        mac_rules: &[crate::mac::PolicyRule],
+        quota_clock: Arc<dyn crate::quota_clock::QuotaClock>,
+        storage_lease: Option<std::fs::File>,
     ) -> Result<Self, KernelError> {
         budgets.validate().map_err(|error| {
             KernelError::Policy(format!("invalid budget configuration: {error}"))
@@ -1563,6 +1598,7 @@ impl AgentKernelImpl {
             agent_manager,
             scheduler: Arc::new(PriorityScheduler::new()),
             context_manager,
+            _storage_lease: storage_lease,
             cluster_control,
             permission_manager,
             sandbox_manager,

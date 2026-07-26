@@ -532,6 +532,9 @@ pub struct SqliteContextManager {
     /// crate-visible so transactional modules such as the package supply chain
     /// can participate in the same backup, restore, and durability boundary.
     pub(crate) conn: Mutex<Connection>,
+    /// Process-lifetime exclusive lease for the database path. Offline restore
+    /// acquires the same lease and therefore cannot race a running kernel.
+    _storage_lease: Option<std::fs::File>,
     storage_limits: RwLock<ContextStorageLimits>,
     /// Pluggable embedder used for the long-term-memory store/query/ranking
     /// path. Defaults to [`crate::memory_manager::default_embedder`]; swap it
@@ -547,6 +550,15 @@ pub struct SqliteContextManager {
 impl SqliteContextManager {
     /// Create a new SqliteContextManager with the given database path.
     pub fn new(db_path: &Path) -> Result<Self, ContextError> {
+        Self::open_file(db_path, true)
+    }
+
+    fn open_file(db_path: &Path, acquire_lease: bool) -> Result<Self, ContextError> {
+        let storage_lease = if acquire_lease {
+            Some(crate::storage::acquire_storage_lease(db_path)?)
+        } else {
+            None
+        };
         let conn =
             Connection::open(db_path).map_err(|e| ContextError::StorageError(e.to_string()))?;
         let schema_version = crate::schema::preflight(&conn)?;
@@ -593,6 +605,7 @@ impl SqliteContextManager {
         }
         let mgr = Self {
             conn: Mutex::new(conn),
+            _storage_lease: storage_lease,
             storage_limits: RwLock::new(ContextStorageLimits::default()),
             embedder: crate::memory_manager::default_embedder(),
             #[cfg(test)]
@@ -604,6 +617,10 @@ impl SqliteContextManager {
         Ok(mgr)
     }
 
+    pub(crate) fn new_without_storage_lease(db_path: &Path) -> Result<Self, ContextError> {
+        Self::open_file(db_path, false)
+    }
+
     /// Create an in-memory context manager (for testing).
     pub fn in_memory() -> Result<Self, ContextError> {
         let conn =
@@ -611,6 +628,7 @@ impl SqliteContextManager {
         let schema_version = crate::schema::preflight(&conn)?;
         let mgr = Self {
             conn: Mutex::new(conn),
+            _storage_lease: None,
             storage_limits: RwLock::new(ContextStorageLimits::default()),
             embedder: crate::memory_manager::default_embedder(),
             #[cfg(test)]
@@ -4967,7 +4985,18 @@ impl SqliteContextManager {
     /// graceful shutdown; best-effort (a busy DB simply checkpoints later).
     pub fn checkpoint(&self) -> Result<(), ContextError> {
         let conn = self.conn.lock().unwrap();
-        let _ = conn.pragma_update(None, "wal_checkpoint", "TRUNCATE");
+        let (busy, _log_pages, _checkpointed_pages): (i64, i64, i64) = conn
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .map_err(|error| {
+                ContextError::StorageError(format!("SQLite WAL checkpoint failed: {error}"))
+            })?;
+        if busy != 0 {
+            return Err(ContextError::StorageError(
+                "SQLite WAL checkpoint could not complete because the database is busy".into(),
+            ));
+        }
         Ok(())
     }
 }
@@ -6932,6 +6961,7 @@ mod tests {
         .unwrap();
         let mgr = SqliteContextManager {
             conn: Mutex::new(conn),
+            _storage_lease: None,
             storage_limits: RwLock::new(ContextStorageLimits::default()),
             embedder: crate::memory_manager::default_embedder(),
             fail_next_agent_save: AtomicBool::new(false),
@@ -7336,8 +7366,10 @@ mod tests {
     #[test]
     fn two_sqlite_handles_reserve_atomically_against_one_limit() {
         let database = QuotaTestDatabase::new("concurrent");
-        let first = Arc::new(SqliteContextManager::new(&database.path).unwrap());
-        let second = Arc::new(SqliteContextManager::new(&database.path).unwrap());
+        let first =
+            Arc::new(SqliteContextManager::new_without_storage_lease(&database.path).unwrap());
+        let second =
+            Arc::new(SqliteContextManager::new_without_storage_lease(&database.path).unwrap());
         let barrier = Arc::new(std::sync::Barrier::new(20));
         let mut threads = Vec::new();
         for index in 0..20 {
@@ -8223,8 +8255,10 @@ mod tests {
     #[test]
     fn concurrent_siblings_cannot_race_past_shared_parent_limit() {
         let database = QuotaTestDatabase::new("cgroup-siblings");
-        let first = Arc::new(SqliteContextManager::new(&database.path).unwrap());
-        let second = Arc::new(SqliteContextManager::new(&database.path).unwrap());
+        let first =
+            Arc::new(SqliteContextManager::new_without_storage_lease(&database.path).unwrap());
+        let second =
+            Arc::new(SqliteContextManager::new_without_storage_lease(&database.path).unwrap());
         let barrier = Arc::new(std::sync::Barrier::new(20));
         let mut threads = Vec::new();
         for index in 0..20 {
@@ -8616,8 +8650,10 @@ mod tests {
     #[test]
     fn independent_sqlite_handles_cannot_race_past_context_storage_limit() {
         let database = QuotaTestDatabase::new("context-storage-race");
-        let first = Arc::new(SqliteContextManager::new(&database.path).unwrap());
-        let second = Arc::new(SqliteContextManager::new(&database.path).unwrap());
+        let first =
+            Arc::new(SqliteContextManager::new_without_storage_lease(&database.path).unwrap());
+        let second =
+            Arc::new(SqliteContextManager::new_without_storage_lease(&database.path).unwrap());
         let limits = ContextStorageLimits {
             per_agent_bytes: 0,
             per_tenant_bytes: 100,

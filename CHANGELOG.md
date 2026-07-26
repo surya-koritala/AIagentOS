@@ -10,6 +10,16 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
 
 ## [Unreleased]
 
+- Added WAL-consistent online SQLite backup, bounded manifest parsing,
+  SHA-256/size/schema/installation verification, and offline atomic restore.
+  File-backed kernels now hold a process-lifetime storage lease so restore
+  cannot race a running owner. Restore stages and verifies the snapshot,
+  checkpoints and preserves an existing database, atomically publishes the
+  replacement, and automatically rolls back any failed publication. Concurrent
+  writer, WAL inclusion, tamper, future-schema, fresh-host, owner-exclusion, and
+  injected rollback regressions cover the kernel primitive. System-authorized
+  API/SDK/CLI workflows, retention, encryption, and complete deletion remain
+  #123.
 - Added the first #123 durability foundation: the kernel SQLite store now has
   an explicit AI Agent OS application ID, monotonic schema version, installation
   metadata, and migration ledger. Startup checks integrity and rejects corrupt,

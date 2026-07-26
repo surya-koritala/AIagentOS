@@ -229,6 +229,8 @@ pub struct MetricsSnapshot {
     pub quota_denied_cgroup_tokens: u64,
     pub quota_denied_migration_fence: u64,
     pub quota_storage_healthy: bool,
+    /// Whether the kernel-owned SQLite store is protected by SQLCipher.
+    pub storage_encryption_enabled: bool,
     /// Automatic local-backup health. No filesystem path is used as a label.
     pub backup_scheduler_enabled: bool,
     pub backup_signing_enabled: bool,
@@ -344,6 +346,10 @@ impl MetricsSnapshot {
             quota_denied_cgroup_tokens: quota.denied_cgroup_tokens,
             quota_denied_migration_fence: quota.denied_migration_fence,
             quota_storage_healthy: quota.healthy,
+            storage_encryption_enabled: kernel
+                .context_manager
+                .storage_encryption_key_id()
+                .is_some(),
             backup_scheduler_enabled: backup.enabled,
             backup_signing_enabled: backup.signing_key_id.is_some(),
             backup_attempts_total: backup.attempts_total,
@@ -672,6 +678,14 @@ impl MetricsSnapshot {
         }
 
         out.push_str(
+            "# HELP agentos_storage_encryption_enabled Whether the kernel SQLite store is protected by SQLCipher.\n",
+        );
+        out.push_str("# TYPE agentos_storage_encryption_enabled gauge\n");
+        out.push_str(&format!(
+            "agentos_storage_encryption_enabled {}\n",
+            u8::from(self.storage_encryption_enabled)
+        ));
+        out.push_str(
             "# HELP agentos_backup_scheduler_enabled Whether automatic verified local backups are enabled.\n",
         );
         out.push_str("# TYPE agentos_backup_scheduler_enabled gauge\n");
@@ -866,6 +880,7 @@ mod tests {
             quota_denied_cgroup_tokens: 8,
             quota_denied_migration_fence: 9,
             quota_storage_healthy: true,
+            storage_encryption_enabled: true,
             backup_scheduler_enabled: true,
             backup_signing_enabled: true,
             backup_attempts_total: 7,
@@ -930,6 +945,7 @@ mod tests {
         assert!(text.contains("# TYPE agentos_provider_quota_usage gauge"));
         assert!(text.contains("# TYPE agentos_quota_receipts gauge"));
         assert!(text.contains("# TYPE agentos_quota_denied_total counter"));
+        assert!(text.contains("# TYPE agentos_storage_encryption_enabled gauge"));
         assert!(text.contains("# TYPE agentos_backup_scheduler_enabled gauge"));
         assert!(text.contains("# TYPE agentos_backup_signing_enabled gauge"));
         assert!(text.contains("# TYPE agentos_backup_attempts_total counter"));
@@ -969,6 +985,7 @@ mod tests {
         assert!(
             text.contains("agentos_quota_denied_total{scope=\"cgroup\",dimension=\"tokens\"} 8")
         );
+        assert!(text.contains("agentos_storage_encryption_enabled 1"));
         assert!(text.contains("agentos_backup_scheduler_enabled 1"));
         assert!(text.contains("agentos_backup_signing_enabled 1"));
         assert!(text.contains("agentos_backup_attempts_total 7"));

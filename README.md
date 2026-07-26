@@ -140,10 +140,13 @@ cargo run -p agent-cli --bin agentctl --locked -- \
   --addr 127.0.0.1:7777 --token "$AGENT_SERVER_TOKEN" data-inventory
 ```
 
-The Compose server enables automatic hourly integrity-verified backups in the
-separate `agentos-backups` volume, runs one backup at startup, keeps at least
-24, and expires additional backups after seven days. Inspect its bounded
-health:
+The Compose server creates or reuses an owner-only SQLCipher key in the separate
+`agentos-keys` volume, fails closed if that key cannot authenticate persistent
+state, and encrypts the database, WAL, and backups. It also enables automatic
+hourly integrity-verified backups in `agentos-backups`, runs one at startup,
+keeps at least 24, and expires additional backups after seven days. Back up the
+key volume independently: an encrypted backup intentionally does not contain
+its decryption key. Inspect bounded health:
 
 ```bash
 cargo run -p agent-cli --bin agentctl --locked -- \
@@ -178,12 +181,14 @@ deliberately offline and refuses to run while a kernel owns the destination:
 ```bash
 cargo run -p agent-cli --bin agentctl --locked -- \
   backup-verify /var/lib/agentos/backups/nightly_2026_07_25 \
+  --storage-key /etc/agentos/storage-keys/storage-generation-1.json \
   --require-signature /srv/recovery/agentos-trust/release-2026.1.json
 
 # Stop agent-server first. The confirmation flag cannot bypass the lock.
 cargo run -p agent-cli --bin agentctl --locked -- \
   backup-restore /var/lib/agentos/backups/nightly_2026_07_25 \
   /var/lib/agentos/agent_os.db \
+  --storage-key /etc/agentos/storage-keys/storage-generation-1.json \
   --require-signature /srv/recovery/agentos-trust/release-2026.1.json \
   --confirm-offline
 ```

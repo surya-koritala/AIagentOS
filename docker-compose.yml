@@ -85,11 +85,19 @@ services:
       AGENTOS_BACKUP_RUN_ON_START: "true"
       AGENTOS_BACKUP_KEEP_LATEST: "24"
       AGENTOS_BACKUP_MAX_AGE_SECONDS: "604800"
+      # Production-profile persistence is fail-closed SQLCipher. The key is
+      # generated once in a separate volume and is never copied into backups.
+      AGENTOS_STORAGE_ENCRYPTION_REQUIRED: "true"
+      AGENTOS_STORAGE_KEY_PATH: "/keys/storage.json"
+      AGENTOS_STORAGE_KEY_ID: "container-storage-1"
+      AGENTOS_STORAGE_KEY_AUTO_GENERATE: "true"
     volumes:
       # Persists agent_os.db + the rendered config.toml across restarts.
       - agentos-data:/data
       # Separate lifecycle and mount boundary for verified local backups.
       - agentos-backups:/backups
+      # Custody and replicate this volume separately from data and backups.
+      - agentos-keys:/keys
     healthcheck:
       # Prove the server actually ANSWERS a syscall, not just that the port is
       # open: send the exact newline-JSON `node_info` request and require a
@@ -150,9 +158,14 @@ services:
       HOME: "/data"
       XDG_CONFIG_HOME: "/data/config"
       XDG_DATA_HOME: "/data/share"
+      AGENTOS_STORAGE_ENCRYPTION_REQUIRED: "true"
+      AGENTOS_STORAGE_KEY_PATH: "/keys/storage.json"
+      AGENTOS_STORAGE_KEY_ID: "container-storage-1"
+      AGENTOS_STORAGE_KEY_AUTO_GENERATE: "true"
     volumes:
       # Persists agent_os.db and the rendered config.toml across runs.
       - agentos-data:/data
+      - agentos-keys:/keys
     # Keep STDIN open + allocate a TTY so the interactive `agent` REPL works
     # when launched via `docker compose run agentos agent`.
     stdin_open: true
@@ -165,3 +178,4 @@ volumes:
   ollama-models:
   agentos-data:
   agentos-backups:
+  agentos-keys:

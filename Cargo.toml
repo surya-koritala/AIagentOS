@@ -25,7 +25,7 @@ serde_json = "1"
 toml = "1.1"
 thiserror = "2"
 anyhow = "1"
-rusqlite = { version = "0.32", features = ["backup", "bundled"] }
+rusqlite = { version = "0.32", features = ["backup", "bundled-sqlcipher-vendored-openssl"] }
 reqwest = { version = "0.12", features = ["json", "stream", "multipart"] }
 tokio-tungstenite = "0.24"
 wasmtime = "47.0.2"
@@ -49,5 +49,6 @@ rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"]
 # in the dependency tree via rustls/rcgen (the "ring" feature above), so this
 # adds no new transitive weight — it just exposes `ring::digest` to the kernel.
 ring = "0.17"
+zeroize = "1"
 cap-std = "4.0.2"
 semver = { version = "1", features = ["serde"] }

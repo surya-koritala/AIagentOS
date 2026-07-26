@@ -62,6 +62,7 @@ pub mod scheduler;
 mod schema;
 pub mod shell;
 pub mod storage;
+pub mod storage_encryption;
 pub mod syscall_gate;
 pub mod syscall_interface;
 pub mod syscall_server;
@@ -1421,6 +1422,9 @@ impl AgentKernelImpl {
         config.backup.validate().map_err(|error| {
             KernelError::Policy(format!("invalid scheduled-backup configuration: {error}"))
         })?;
+        config.storage_encryption.validate().map_err(|error| {
+            KernelError::Policy(format!("invalid storage-encryption configuration: {error}"))
+        })?;
         set_max_browse_chars(config.max_browse_chars);
         let db_path = config.data_dir.join("agent_os.db");
         if let Some(parent) = db_path.parent() {
@@ -1428,9 +1432,45 @@ impl AgentKernelImpl {
         }
         let storage_lease =
             crate::storage::acquire_storage_lease(&db_path).map_err(KernelError::Context)?;
-        let context_manager = Arc::new(
-            SqliteContextManager::new_without_storage_lease(&db_path)
+        let context_manager = Arc::new(match config.storage_encryption.key_path.as_deref() {
+            Some(key_path) => {
+                let key = crate::storage_encryption::load_storage_encryption_key(key_path)
+                    .map_err(KernelError::Context)?;
+                let mut key_ids = std::collections::BTreeSet::new();
+                key_ids.insert(key.key_id().to_owned());
+                let mut retired_keys =
+                    Vec::with_capacity(config.storage_encryption.retired_key_paths.len());
+                for retired_path in &config.storage_encryption.retired_key_paths {
+                    let retired =
+                        crate::storage_encryption::load_storage_encryption_key(retired_path)
+                            .map_err(KernelError::Context)?;
+                    if !key_ids.insert(retired.key_id().to_owned()) {
+                        return Err(KernelError::Policy(format!(
+                            "storage encryption key id {:?} is configured more than once",
+                            retired.key_id()
+                        )));
+                    }
+                    retired_keys.push(retired);
+                }
+                SqliteContextManager::new_without_storage_lease_encrypted(
+                    &db_path,
+                    key,
+                    retired_keys,
+                )
+                .map_err(KernelError::Context)?
+            }
+            None => SqliteContextManager::new_without_storage_lease(&db_path)
                 .map_err(KernelError::Context)?,
+        });
+        tracing::info!(
+            target: "agentos::storage",
+            storage_encryption_enabled = context_manager.storage_encryption_key_id().is_some(),
+            storage_encryption_key_id = context_manager
+                .storage_encryption_key_id()
+                .unwrap_or("none"),
+            retired_storage_encryption_keys =
+                context_manager.retired_storage_encryption_key_count(),
+            "kernel storage encryption configuration applied"
         );
         // Resolve the effective MAC config: a `policy_file`, when set,
         // supersedes the inline `mac_enforcing`/`mac_rules`. A malformed or
@@ -5267,6 +5307,103 @@ mod tests {
             Some(expected_backup_root.as_str())
         );
         drop(kernel);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn encrypted_config_persists_restarts_and_rejects_wrong_or_missing_keys() {
+        let root =
+            std::env::temp_dir().join(format!("agentos-encrypted-config-{}", uuid::Uuid::new_v4()));
+        let key_dir = root.join("operator-keys");
+        std::fs::create_dir_all(&key_dir).unwrap();
+        let key_path = key_dir.join("storage.json");
+        crate::storage_encryption::generate_storage_encryption_key_file(
+            "storage-generation-1",
+            &key_path,
+        )
+        .unwrap();
+        let config = crate::config::Config {
+            data_dir: root.join("data"),
+            storage_encryption: crate::config::StorageEncryptionConfig {
+                required: true,
+                key_path: Some(key_path.clone()),
+                retired_key_paths: Vec::new(),
+            },
+            ..crate::config::Config::default()
+        };
+        let database_path = config.data_dir.join("agent_os.db");
+        let secret = "sensitive-agent-context-must-not-appear-in-sqlite-pages";
+
+        {
+            let kernel = AgentKernelImpl::from_config(&config).unwrap();
+            assert_eq!(
+                kernel.context_manager.storage_encryption_key_id(),
+                Some("storage-generation-1")
+            );
+            kernel
+                .context_manager
+                .conn
+                .lock()
+                .unwrap()
+                .execute_batch(&format!(
+                    "CREATE TABLE encryption_restart_probe (value TEXT NOT NULL);
+                     INSERT INTO encryption_restart_probe VALUES ('{secret}');"
+                ))
+                .unwrap();
+        }
+
+        let encrypted_bytes = std::fs::read(&database_path).unwrap();
+        assert!(
+            !encrypted_bytes
+                .windows(secret.len())
+                .any(|window| window == secret.as_bytes()),
+            "sensitive context must not be visible in encrypted SQLite pages"
+        );
+
+        {
+            let restarted = AgentKernelImpl::from_config(&config).unwrap();
+            let persisted: String = restarted
+                .context_manager
+                .conn
+                .lock()
+                .unwrap()
+                .query_row("SELECT value FROM encryption_restart_probe", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(persisted, secret);
+        }
+        let stable_database = std::fs::read(&database_path).unwrap();
+
+        let wrong_key_path = key_dir.join("wrong.json");
+        crate::storage_encryption::generate_storage_encryption_key_file(
+            "storage-generation-wrong",
+            &wrong_key_path,
+        )
+        .unwrap();
+        let mut wrong_config = config.clone();
+        wrong_config.storage_encryption.key_path = Some(wrong_key_path);
+        let wrong_error = AgentKernelImpl::from_config(&wrong_config)
+            .err()
+            .expect("a wrong storage key must fail startup");
+        assert!(
+            wrong_error.to_string().contains("cannot authenticate"),
+            "{wrong_error}"
+        );
+        assert_eq!(std::fs::read(&database_path).unwrap(), stable_database);
+
+        std::fs::remove_file(&key_path).unwrap();
+        let missing_error = AgentKernelImpl::from_config(&config)
+            .err()
+            .expect("a missing required storage key must fail startup");
+        assert!(
+            missing_error
+                .to_string()
+                .contains("failed to open storage key"),
+            "{missing_error}"
+        );
+        assert_eq!(std::fs::read(&database_path).unwrap(), stable_database);
+
         std::fs::remove_dir_all(root).ok();
     }
 

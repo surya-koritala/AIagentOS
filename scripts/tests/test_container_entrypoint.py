@@ -113,6 +113,107 @@ class ContainerEntrypointTests(unittest.TestCase):
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn("error:", result.stderr)
 
+    def test_renders_required_storage_encryption_with_separate_key(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            storage_key = root / "keys" / "storage.json"
+            storage_key.parent.mkdir()
+            storage_key.write_text('{"test":"operator-custodied"}')
+            storage_key.chmod(0o600)
+            retired_key = storage_key.parent / "retired.json"
+            retired_key.write_text('{"test":"retired"}')
+            retired_key.chmod(0o600)
+            result = self.run_entrypoint(
+                root,
+                AGENTOS_STORAGE_ENCRYPTION_REQUIRED="true",
+                AGENTOS_STORAGE_KEY_PATH=str(storage_key),
+                AGENTOS_STORAGE_RETIRED_KEY_PATHS=str(retired_key),
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            config = tomllib.loads(result.stdout)
+            self.assertEqual(
+                config["storage_encryption"],
+                {
+                    "required": True,
+                    "key_path": str(storage_key),
+                    "retired_key_paths": [str(retired_key)],
+                },
+            )
+
+    def test_rejects_missing_relative_or_injectable_storage_key_policy(self):
+        invalid = (
+            {"AGENTOS_STORAGE_ENCRYPTION_REQUIRED": "true"},
+            {
+                "AGENTOS_STORAGE_ENCRYPTION_REQUIRED": "true",
+                "AGENTOS_STORAGE_KEY_PATH": "relative/storage.json",
+            },
+            {
+                "AGENTOS_STORAGE_KEY_PATH": '/keys/key"\nrequired = false',
+            },
+            {"AGENTOS_STORAGE_KEY_AUTO_GENERATE": "sometimes"},
+            {"AGENTOS_STORAGE_RETIRED_KEY_PATHS": "/keys/old.json"},
+            {
+                "AGENTOS_STORAGE_KEY_PATH": "/keys/current.json",
+                "AGENTOS_STORAGE_RETIRED_KEY_PATHS": "relative/old.json",
+            },
+            {
+                "AGENTOS_STORAGE_KEY_PATH": "/keys/current.json",
+                "AGENTOS_STORAGE_RETIRED_KEY_PATHS": "/keys/current.json",
+            },
+        )
+        for overrides in invalid:
+            with self.subTest(overrides=overrides), tempfile.TemporaryDirectory() as directory:
+                result = self.run_entrypoint(Path(directory), **overrides)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("error:", result.stderr)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            result = self.run_entrypoint(
+                root,
+                AGENTOS_STORAGE_KEY_PATH=str(root / "keys" / "storage.json"),
+                AGENTOS_STORAGE_KEY_ID='bad"\nkey_path="/tmp/other"',
+                AGENTOS_STORAGE_KEY_AUTO_GENERATE="true",
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("error:", result.stderr)
+
+    def test_auto_generation_is_one_time_and_uses_operator_key_command(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            bin_dir = root / "bin"
+            bin_dir.mkdir()
+            stub = bin_dir / "agentctl"
+            stub.write_text(
+                "#!/bin/sh\n"
+                "[ \"$1\" = storage-key-generate ] || exit 9\n"
+                "printf '{\"generated\":true}\\n' > \"$3\"\n"
+                "chmod 600 \"$3\"\n"
+            )
+            stub.chmod(0o700)
+            storage_key = root / "keys" / "storage.json"
+            result = self.run_entrypoint(
+                root,
+                PATH=f"{bin_dir}:{os.environ.get('PATH', '')}",
+                AGENTOS_STORAGE_ENCRYPTION_REQUIRED="true",
+                AGENTOS_STORAGE_KEY_PATH=str(storage_key),
+                AGENTOS_STORAGE_KEY_ID="container-generation-1",
+                AGENTOS_STORAGE_KEY_AUTO_GENERATE="true",
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(storage_key.read_text(), '{"generated":true}\n')
+
+            # A second boot must reuse the file, not invoke key generation.
+            stub.write_text("#!/bin/sh\nexit 8\n")
+            stub.chmod(0o700)
+            second = self.run_entrypoint(
+                root,
+                PATH=f"{bin_dir}:{os.environ.get('PATH', '')}",
+                AGENTOS_STORAGE_ENCRYPTION_REQUIRED="true",
+                AGENTOS_STORAGE_KEY_PATH=str(storage_key),
+                AGENTOS_STORAGE_KEY_AUTO_GENERATE="true",
+            )
+            self.assertEqual(second.returncode, 0, second.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -80,7 +80,10 @@ macro_rules! sqlite_entry {
             tenant_key: $tenant_key,
             sensitivity: $sensitivity,
             retention: $retention,
-            encryption: $encryption,
+            encryption: concat!(
+                "SQLCipher whole-database encryption when configured; otherwise ",
+                $encryption
+            ),
             backup: "included in every verified database backup",
             deletion: $deletion,
         }
@@ -516,9 +519,20 @@ pub const NON_SQLITE_DATA_INVENTORY: &[StaticDataInventoryEntry] = &[
         "same mixed tenancy as database",
         "may contain any recently committed database page",
         "for active database lifetime; checkpointed by SQLite",
-        "not encrypted; owner-only file permissions",
+        "encrypted with the database by SQLCipher when configured; otherwise owner-only file permissions",
         "not copied directly; online backup consolidates committed state",
         "removed only with an offline database retirement"
+    ),
+    boundary_entry!(
+        "file/storage-encryption-key",
+        "durable-file",
+        "system operator",
+        "none",
+        "cryptographic secret protecting database, WAL, and encrypted backups",
+        "retain through database and dependent-backup lifetime",
+        "owner-only Unix permissions; raw key bytes never enter SQL text",
+        "never embedded in or copied with database backups",
+        "rotate offline; retire only after every dependent backup expires"
     ),
     boundary_entry!(
         "file/operator-configuration",
@@ -571,7 +585,7 @@ pub const NON_SQLITE_DATA_INVENTORY: &[StaticDataInventoryEntry] = &[
         "same mixed tenancy as database snapshot",
         "contains all database sensitivity classes",
         "configured keep-latest and maximum-age policy",
-        "not encrypted; optional Ed25519 authenticity only",
+        "inherits SQLCipher encryption and key id from encrypted source; optional Ed25519 authenticity is independent",
         "is the local backup artifact",
         "confirmed verified-retention operation; remote copies are separate"
     ),

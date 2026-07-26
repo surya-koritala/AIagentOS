@@ -316,6 +316,9 @@
     "op": "enforce_storage_backup_retention"
   },
   {
+    "op": "storage_backup_status"
+  },
+  {
     "confirm": true,
     "op": "erase_data",
     "target": {

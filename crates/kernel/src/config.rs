@@ -67,6 +67,67 @@ pub enum ConfigLoadError {
     },
     #[error("invalid budget configuration in {path}: {message}")]
     Budget { path: PathBuf, message: String },
+    #[error("invalid scheduled-backup configuration in {path}: {message}")]
+    Backup { path: PathBuf, message: String },
+}
+
+/// Operator policy for automatic, verified local backups.
+///
+/// The scheduler is disabled unless explicitly enabled. A configured root must
+/// be absolute so daemon startup never makes backup placement depend on its
+/// working directory. Remote replication remains an operator responsibility.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct BackupScheduleConfig {
+    pub enabled: bool,
+    pub root: Option<PathBuf>,
+    pub interval_seconds: u64,
+    pub run_on_start: bool,
+    pub keep_latest: usize,
+    pub max_age_seconds: u64,
+}
+
+impl Default for BackupScheduleConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            root: None,
+            interval_seconds: 60 * 60,
+            run_on_start: true,
+            keep_latest: 24,
+            max_age_seconds: 7 * 24 * 60 * 60,
+        }
+    }
+}
+
+impl BackupScheduleConfig {
+    pub fn validate(&self) -> Result<(), String> {
+        if !self.enabled {
+            return Ok(());
+        }
+        let root = self.root.as_deref().ok_or_else(|| {
+            "backup.root is required when scheduled backups are enabled".to_string()
+        })?;
+        if !root.is_absolute() {
+            return Err(format!(
+                "backup.root must be an absolute path (got {})",
+                root.display()
+            ));
+        }
+        if self.interval_seconds == 0 {
+            return Err("backup.interval_seconds must be greater than zero".into());
+        }
+        if self.keep_latest == 0 {
+            return Err("backup.keep_latest must be at least one".into());
+        }
+        if self.max_age_seconds == 0 {
+            return Err("backup.max_age_seconds must be greater than zero".into());
+        }
+        if self.max_age_seconds < self.interval_seconds {
+            return Err("backup.max_age_seconds must be at least backup.interval_seconds".into());
+        }
+        Ok(())
+    }
 }
 
 /// Application configuration.
@@ -131,6 +192,9 @@ pub struct Config {
     /// the server starts them after provider registration.
     #[serde(default)]
     pub service_dir: Option<PathBuf>,
+    /// Disabled-by-default automatic local backup and retention policy.
+    #[serde(default)]
+    pub backup: BackupScheduleConfig,
 }
 
 /// Resource budgets applied at agent creation and to the shared rate limiter.
@@ -347,6 +411,7 @@ impl Default for Config {
             mac_rules: default_mac_rules(),
             policy_file: None,
             service_dir: None,
+            backup: BackupScheduleConfig::default(),
         }
     }
 }
@@ -541,6 +606,13 @@ impl Config {
                 path: path.to_path_buf(),
                 message,
             })?;
+        config
+            .backup
+            .validate()
+            .map_err(|message| ConfigLoadError::Backup {
+                path: path.to_path_buf(),
+                message,
+            })?;
         Ok(config)
     }
 
@@ -556,6 +628,12 @@ impl Config {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 format!("invalid budget configuration: {error}"),
+            )
+        })?;
+        self.backup.validate().map_err(|error| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("invalid scheduled-backup configuration: {error}"),
             )
         })?;
         let content = toml::to_string_pretty(self).map_err(std::io::Error::other)?;
@@ -704,6 +782,76 @@ mod tests {
         assert_eq!(parsed.budgets.max_output_tokens_per_request, 2_048);
         assert_eq!(parsed.budgets.max_tool_calls, 7);
         assert_eq!(parsed.budgets.max_concurrent_tool_calls, 2);
+    }
+
+    #[test]
+    fn scheduled_backups_default_off_and_validate_production_policy() {
+        let legacy =
+            "llm_provider = \"local\"\ndefault_model = \"m\"\ndata_dir = \"/tmp/x\"\n[api_keys]\n";
+        let config = Config::from_toml(legacy).unwrap();
+        assert!(!config.backup.enabled);
+        assert!(config.backup.root.is_none());
+
+        let root = std::env::temp_dir().join(format!("agentos-backups-{}", uuid::Uuid::new_v4()));
+        // Let the TOML serializer escape platform-specific separators (notably
+        // Windows backslashes) instead of interpolating a raw path into a
+        // basic TOML string.
+        let root_toml = toml::Value::String(root.to_string_lossy().into_owned()).to_string();
+        let configured = format!(
+            r#"
+llm_provider = "local"
+default_model = "m"
+data_dir = "/tmp/x"
+[api_keys]
+[backup]
+enabled = true
+root = {}
+interval_seconds = 60
+run_on_start = false
+keep_latest = 3
+max_age_seconds = 3600
+"#,
+            root_toml
+        );
+        let config = Config::from_toml(&configured).unwrap();
+        assert!(config.backup.enabled);
+        assert_eq!(config.backup.root.as_deref(), Some(root.as_path()));
+        assert_eq!(config.backup.keep_latest, 3);
+        assert!(!config.backup.run_on_start);
+    }
+
+    #[test]
+    fn scheduled_backup_config_fails_closed_when_unsafe_or_incomplete() {
+        let mut config = Config::default();
+        config.backup.enabled = true;
+        assert!(config.backup.validate().unwrap_err().contains("root"));
+
+        config.backup.root = Some(PathBuf::from("relative/backups"));
+        assert!(config.backup.validate().unwrap_err().contains("absolute"));
+
+        config.backup.root = Some(std::env::temp_dir().join("agentos-backups"));
+        config.backup.interval_seconds = 0;
+        assert!(config
+            .backup
+            .validate()
+            .unwrap_err()
+            .contains("interval_seconds"));
+
+        config.backup.interval_seconds = 60;
+        config.backup.keep_latest = 0;
+        assert!(config
+            .backup
+            .validate()
+            .unwrap_err()
+            .contains("keep_latest"));
+
+        config.backup.keep_latest = 1;
+        config.backup.max_age_seconds = 30;
+        assert!(config
+            .backup
+            .validate()
+            .unwrap_err()
+            .contains("at least backup.interval_seconds"));
     }
 
     #[test]

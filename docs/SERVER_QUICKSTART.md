@@ -92,6 +92,20 @@ Tear down without deleting state:
 docker compose down        # keeps named volumes
 ```
 
+The server profile also mounts `agentos-backups` at `/backups` and enables a
+verified startup backup plus hourly maintenance. It always keeps 24 backups and
+expires additional backups after seven days. Inspect the scheduler through the
+system-only client:
+
+```bash
+cargo run -p agent-cli --bin agentctl --locked -- \
+  --addr 127.0.0.1:7777 --token "$AGENT_SERVER_TOKEN" backup-status
+```
+
+The backup volume is separate from live state but remains on the same Docker
+host. Replicate verified backups to another failure domain before treating them
+as node-loss disaster recovery.
+
 ## Optional hardening
 
 `agent-server` honors these environment variables (see
@@ -119,8 +133,9 @@ so the kernel's structured logs actually emit:
 ### Metrics
 
 The kernel renders a Prometheus text exposition (format version `0.0.4`) from
-the syscall-gate enforcement counters, agent counts, system token/api totals,
-and process uptime. There are two ways to read it:
+the syscall-gate enforcement counters, agent counts, backup maintenance
+health, system token/api totals, and process uptime. There are two ways to read
+it:
 
 - **Over the wire** — the `metrics` syscall (`{"op":"metrics"}`) returns the
   exposition in a `metrics` reply; the SDK exposes it as
@@ -153,6 +168,10 @@ agentos_agents 3
 # HELP agentos_running_agents Agents currently executing a turn.
 # TYPE agentos_running_agents gauge
 agentos_running_agents 1
+# TYPE agentos_backup_successes_total counter
+agentos_backup_successes_total 4
+# TYPE agentos_backup_consecutive_failures gauge
+agentos_backup_consecutive_failures 0
 # HELP agentos_tokens_consumed_total Tokens consumed across all agents.
 # TYPE agentos_tokens_consumed_total counter
 agentos_tokens_consumed_total 1280

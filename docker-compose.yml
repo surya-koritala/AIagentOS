@@ -77,9 +77,19 @@ services:
       # Start the in-process Prometheus /metrics endpoint on 0.0.0.0:9090.
       # Unset to disable it (no extra port is opened then).
       AGENT_SERVER_METRICS_ADDR: "0.0.0.0:9090"
+      # Automatic WAL-consistent backups are written to a separate named
+      # volume, retained hourly for seven days while always keeping 24.
+      AGENTOS_BACKUP_ENABLED: "true"
+      AGENTOS_BACKUP_ROOT: "/backups"
+      AGENTOS_BACKUP_INTERVAL_SECONDS: "3600"
+      AGENTOS_BACKUP_RUN_ON_START: "true"
+      AGENTOS_BACKUP_KEEP_LATEST: "24"
+      AGENTOS_BACKUP_MAX_AGE_SECONDS: "604800"
     volumes:
       # Persists agent_os.db + the rendered config.toml across restarts.
       - agentos-data:/data
+      # Separate lifecycle and mount boundary for verified local backups.
+      - agentos-backups:/backups
     healthcheck:
       # Prove the server actually ANSWERS a syscall, not just that the port is
       # open: send the exact newline-JSON `node_info` request and require a
@@ -154,3 +164,4 @@ services:
 volumes:
   ollama-models:
   agentos-data:
+  agentos-backups:

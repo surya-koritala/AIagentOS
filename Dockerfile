@@ -73,8 +73,8 @@ RUN apt-get update \
 # Non-root user. HOME=/data so the `dirs` crate resolves XDG paths under the
 # mounted volume; we also pin XDG_* explicitly so config + db live in /data.
 RUN useradd --create-home --home-dir /data --uid 10001 --shell /usr/sbin/nologin agentos \
-    && mkdir -p /data/config/ai-agent-os /data/share/ai-agent-os \
-    && chown -R agentos:agentos /data
+    && mkdir -p /data/config/ai-agent-os /data/share/ai-agent-os /backups \
+    && chown -R agentos:agentos /data /backups
 
 # Copy the produced binaries from the builder. `agent-server` is the primary
 # wire-service entry surface (long-lived JSON syscall protocol over TCP).
@@ -99,8 +99,9 @@ ENV HOME=/data \
     AGENTOS_MODEL=llama3.2 \
     OLLAMA_BASE_URL=http://localhost:11434
 
-# /data holds config.toml (XDG_CONFIG_HOME) and agent_os.db (XDG_DATA_HOME).
-VOLUME ["/data"]
+# /data holds config.toml + agent_os.db. Compose mounts a separately governed
+# volume at the pre-created, non-root-writable /backups path.
+VOLUME ["/data", "/backups"]
 WORKDIR /data
 
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]

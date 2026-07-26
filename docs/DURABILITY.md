@@ -8,9 +8,10 @@ This document describes the guarantees implemented today. The kernel backup
 and offline restore primitives plus authenticated SDK/CLI entry points are
 integrated. Transactional storage erasure, non-identifying deletion receipts,
 and live-resource-coordinated system operator erasure through the wire, SDK,
-and CLI are integrated. Verified local-backup retention is integrated.
-Scheduled backup/recovery, remote retention, and encryption are not yet
-production-qualified.
+and CLI are integrated. Verified local-backup retention and disabled-by-default
+automatic local backup maintenance are integrated. Restore remains an explicit
+offline operator action. Remote retention, automated disaster recovery,
+encryption, and measured recovery objectives are not yet production-qualified.
 
 ## Database identity and version
 
@@ -114,6 +115,51 @@ retained, and skipped entries. This feature applies only to verified backups in
 the named local root; scheduling, remote/object-store lifecycle, and external
 workspace/provider deletion remain separate operator responsibilities.
 
+## Automatic local backups
+
+`agent-server` starts one backup-maintenance loop when `[backup].enabled` is
+true. The root must be absolute; interval, retention age, and `keep_latest`
+must be positive, and the retention age cannot be shorter than the interval.
+Invalid policy fails startup before creating the data directory. Defaults keep
+the scheduler disabled, so an upgrade never starts writing to an unchosen path.
+
+```toml
+[backup]
+enabled = true
+root = "/var/lib/agentos-backups"
+interval_seconds = 3600
+run_on_start = true
+keep_latest = 24
+max_age_seconds = 604800
+```
+
+Each tick moves the blocking SQLite backup work off the asynchronous runtime,
+publishes a uniquely named verified snapshot, then runs confirmed retention
+under the same publication lock. If backup or retention fails, the server keeps
+running, preserves previously published backups, emits a structured error, and
+increments bounded health counters. A retention failure never rolls back or
+deletes the new verified backup; the next cycle can retry cleanup.
+
+The system-only `storage_backup_status` operation, typed
+`KernelClient::storage_backup_status`, and `agentctl backup-status` report the
+policy, attempts, successes, failures, consecutive failures, deleted count,
+last timestamps, last backup name, and a bounded diagnostic. Prometheus exports
+the same health without path labels:
+
+- `agentos_backup_scheduler_enabled`
+- `agentos_backup_attempts_total`
+- `agentos_backup_successes_total`
+- `agentos_backup_failures_total`
+- `agentos_backup_retention_deleted_total`
+- `agentos_backup_consecutive_failures`
+- `agentos_backup_last_success_unixtime_seconds`
+
+The Compose profile enables hourly backups on a separate `agentos-backups`
+volume. A separate mount protects against deletion of the live data volume, but
+it is still local to one Docker host. Operators must replicate verified
+snapshots to an independently governed failure domain to claim node-loss
+recovery.
+
 ## Offline restore
 
 `storage::restore_backup` is intentionally offline. Every file-backed kernel
@@ -148,8 +194,9 @@ fails before changing it. Both commands emit versioned manifest/report JSON so
 automation can retain recovery evidence.
 
 Fresh-host and replacement restore are supported by this CLI workflow.
-Scheduled backup/recovery, remote object storage, and measured recovery
-objectives remain future work.
+Automatic local backup creation is supported; recovery remains deliberately
+offline and operator-initiated. Remote object storage, automated recovery, and
+measured recovery objectives remain future work.
 
 ## Data ownership and erasure contract
 
@@ -234,8 +281,8 @@ admission accounting, checkpoints, and agent rehydration.
 
 The following remain open under issue #123:
 
-- scheduled backup/recovery, remote object storage retention, and a measured
-  recovery runbook;
+- remote object storage retention, automated recovery orchestration, and a
+  measured recovery runbook;
 - signed manifests or external authenticity/immutability controls;
 - corruption recovery beyond fail-closed startup detection;
 - encryption at rest and key rotation;

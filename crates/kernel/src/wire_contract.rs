@@ -34,6 +34,7 @@ pub const WIRE_FEATURES: &[&str] = &[
     "protocol_description",
     "request_deadlines",
     "request_id_cancellation",
+    "scheduled_backups",
     "graceful_connection_close",
     "service_supervision",
     "signed_packages",
@@ -504,6 +505,10 @@ const REQUEST_VARIANTS: &[Variant] = &[
         ],
     },
     Variant {
+        tag: "storage_backup_status",
+        fields: &[],
+    },
+    Variant {
         tag: "erase_data",
         fields: &[Field::required("target", O), Field::required("confirm", B)],
     },
@@ -555,6 +560,7 @@ pub fn conformance_request_fixtures(protocol_version: u32) -> Result<Vec<Value>,
                     "send_message_stream"
                         | "cancel_request"
                         | "enforce_storage_backup_retention"
+                        | "storage_backup_status"
                         | "ping"
                         | "erase_data"
                         | "prove_node_identity"
@@ -915,6 +921,10 @@ const REPLY_VARIANTS: &[Variant] = &[
         fields: &[Field::required("report", O)],
     },
     Variant {
+        tag: "storage_backup_status",
+        fields: &[Field::required("maintenance", O)],
+    },
+    Variant {
         tag: "data_erased",
         fields: &[Field::required("receipt", ON)],
     },
@@ -1269,7 +1279,7 @@ mod tests {
             }
         }
         assert_eq!(conformance_request_fixtures(1).unwrap().len(), 59);
-        assert_eq!(conformance_request_fixtures(2).unwrap().len(), 73);
+        assert_eq!(conformance_request_fixtures(2).unwrap().len(), 74);
         assert!(conformance_request_fixtures(0).is_err());
         assert!(conformance_request_fixtures(PROTOCOL_VERSION + 1).is_err());
     }

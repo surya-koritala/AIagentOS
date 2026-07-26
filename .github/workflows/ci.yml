@@ -207,7 +207,7 @@ jobs:
           if-no-files-found: error
 
   container-smoke:
-    name: Container startup, health, persistence, and non-root
+    name: Container startup, health, persistence, backups, and non-root
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -218,8 +218,13 @@ jobs:
       - name: Boot and verify syscall health
         run: |
           docker volume create agentos-ci-data
+          docker volume create agentos-ci-backups
           docker run -d --name agentos-ci -p 127.0.0.1:7777:7777 \
-            -e AGENT_SERVER_ALLOW_INSECURE_REMOTE=1 -v agentos-ci-data:/data \
+            -e AGENT_SERVER_ALLOW_INSECURE_REMOTE=1 \
+            -e AGENTOS_BACKUP_ENABLED=true \
+            -e AGENTOS_BACKUP_RUN_ON_START=true \
+            -v agentos-ci-data:/data \
+            -v agentos-ci-backups:/backups \
             agentos:ci agent-server 0.0.0.0:7777
           for i in $(seq 1 30); do
             if printf '{"op":"node_info"}\n' | nc -w2 127.0.0.1 7777 | grep -q '"status":"node_info"'; then
@@ -230,6 +235,25 @@ jobs:
           done
           test "${healthy:-0}" = "1"
           test "$(docker exec agentos-ci id -u)" = "10001"
+      - name: Verify scheduled backup publication and operator status
+        run: |
+          for i in $(seq 1 30); do
+            backup_reply="$(printf '{"op":"storage_backup_status"}\n' | nc -w2 127.0.0.1 7777 || true)"
+            if jq -e '
+              .status == "storage_backup_status"
+              and .maintenance.enabled == true
+              and .maintenance.successes_total >= 1
+              and .maintenance.failures_total == 0
+              and (.maintenance.last_backup_name | startswith("scheduled_"))
+            ' <<< "$backup_reply" >/dev/null 2>&1; then
+              backup_ready=1
+              break
+            fi
+            sleep 1
+          done
+          test "${backup_ready:-0}" = "1"
+          test "$(docker exec agentos-ci sh -c \
+            'find /backups -mindepth 2 -maxdepth 2 -type f -name manifest.json | wc -l')" -ge 1
       - name: Verify persistent data survives restart
         run: |
           create_reply="$(printf '{"op":"create_agent","name":"persistence","task":"ci","provider":"stub","profile":"standard","priority":3}\n' | nc -w5 127.0.0.1 7777)"
@@ -250,12 +274,23 @@ jobs:
           get_reply="$(printf '{"op":"storage_get","agent_id":"%s","key":"ci-proof"}\n' "$agent_id" | nc -w5 127.0.0.1 7777)"
           test "$(jq -r .status <<< "$get_reply")" = "storage_value"
           test "$(jq -r .value <<< "$get_reply")" = "survived"
+          for i in $(seq 1 30); do
+            backup_count="$(docker exec agentos-ci sh -c \
+              'find /backups -mindepth 2 -maxdepth 2 -type f -name manifest.json | wc -l')"
+            if test "$backup_count" -ge 2; then
+              restarted_backup_ready=1
+              break
+            fi
+            sleep 1
+          done
+          test "${restarted_backup_ready:-0}" = "1"
       - name: Diagnostics
         if: always()
         run: |
           docker logs agentos-ci || true
           docker rm -f agentos-ci || true
           docker volume rm agentos-ci-data || true
+          docker volume rm agentos-ci-backups || true
 
   required:
     name: Required release gates

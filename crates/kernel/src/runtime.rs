@@ -8,7 +8,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::time::interval;
+use tokio::time::{interval, interval_at, Instant};
 
 use crate::agent_struct::AgentId;
 use crate::AgentKernelImpl;
@@ -41,11 +41,15 @@ impl KernelRuntime {
             .generation
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
             .saturating_add(1);
-        vec![
+        let mut handles = vec![
             self.spawn_scheduler_observer(generation),
             self.spawn_agent_watchdog(generation),
             self.spawn_service_supervisor(generation),
-        ]
+        ];
+        if self.kernel.backup_maintenance.config().enabled {
+            handles.push(self.spawn_backup_maintenance(generation));
+        }
+        handles
     }
 
     /// Stop all background threads. Loops exit on next tick.
@@ -123,6 +127,58 @@ impl KernelRuntime {
                 tick.tick().await;
                 if let Err(error) = kernel.service_supervisor_sweep().await {
                     tracing::error!(error = %error, "service supervisor sweep failed");
+                }
+            }
+        })
+    }
+
+    /// Configured verified backup and retention loop.
+    ///
+    /// SQLite backup work is blocking and therefore runs outside Tokio worker
+    /// threads. A failed cycle is retained in bounded status/metrics and does
+    /// not stop the server or remove the last successful backup.
+    fn spawn_backup_maintenance(&self, generation: u64) -> tokio::task::JoinHandle<()> {
+        let kernel = self.kernel.clone();
+        let running = self.running.clone();
+        let active_generation = self.generation.clone();
+        let config = kernel.backup_maintenance.config();
+        let cadence = Duration::from_secs(config.interval_seconds);
+        let first = if config.run_on_start {
+            Instant::now()
+        } else {
+            Instant::now() + cadence
+        };
+
+        tokio::spawn(async move {
+            let mut tick = interval_at(first, cadence);
+            while running.load(std::sync::atomic::Ordering::SeqCst)
+                && active_generation.load(std::sync::atomic::Ordering::SeqCst) == generation
+            {
+                tick.tick().await;
+                if !running.load(std::sync::atomic::Ordering::SeqCst)
+                    || active_generation.load(std::sync::atomic::Ordering::SeqCst) != generation
+                {
+                    break;
+                }
+                let maintenance = kernel.backup_maintenance.clone();
+                let manager = kernel.context_manager.clone();
+                match tokio::task::spawn_blocking(move || maintenance.run_cycle(&manager)).await {
+                    Ok(Ok(report)) => {
+                        tracing::info!(
+                            backup = %report.backup.created_at,
+                            deleted = report.retention.deleted.len(),
+                            "scheduled backup maintenance completed"
+                        );
+                    }
+                    Ok(Err(error)) => {
+                        tracing::error!(error = %error, "scheduled backup maintenance failed");
+                    }
+                    Err(error) => {
+                        kernel
+                            .backup_maintenance
+                            .record_worker_failure(&format!("backup worker failed: {error}"));
+                        tracing::error!(error = %error, "scheduled backup worker failed");
+                    }
                 }
             }
         })
@@ -367,5 +423,45 @@ mod tests {
 
         runtime.stop();
         kernel.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn runtime_runs_configured_startup_backup_without_blocking_workers() {
+        let root =
+            std::env::temp_dir().join(format!("agentos-runtime-backup-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let kernel =
+            Arc::new(crate::AgentKernelImpl::with_db_path(&root.join("agent_os.db")).unwrap());
+        kernel
+            .backup_maintenance
+            .configure(crate::config::BackupScheduleConfig {
+                enabled: true,
+                root: Some(root.join("backups")),
+                interval_seconds: 60,
+                run_on_start: true,
+                keep_latest: 2,
+                max_age_seconds: 3_600,
+            })
+            .unwrap();
+        let runtime = kernel.start_runtime();
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if kernel.backup_maintenance.status().successes_total == 1 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("startup backup did not complete");
+
+        let status = kernel.backup_maintenance.status();
+        let name = status.last_backup_name.expect("published backup name");
+        crate::storage::verify_backup(&root.join("backups").join(name)).unwrap();
+        runtime.stop();
+        kernel.shutdown().await.unwrap();
+        drop(kernel);
+        std::fs::remove_dir_all(root).ok();
     }
 }

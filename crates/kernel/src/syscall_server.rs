@@ -473,6 +473,9 @@ pub enum Syscall {
         dry_run: bool,
         confirm: bool,
     },
+    /// Read automatic backup policy and bounded process-local health. The root
+    /// path and failure diagnostic are system-operator information.
+    StorageBackupStatus,
     /// Irreversibly erase one classified data boundary. This is system-only and
     /// requires an explicit confirmation bit on the wire so a generic client
     /// cannot turn an inspection command into deletion by argument drift.
@@ -1043,6 +1046,10 @@ pub enum SyscallReply {
     StorageBackupRetention {
         report: crate::storage::BackupRetentionReport,
     },
+    /// Current automatic backup policy and bounded health.
+    StorageBackupStatus {
+        maintenance: crate::storage::BackupMaintenanceStatus,
+    },
     /// Privacy-safe durable proof of a committed erasure. `None` means the
     /// requested subject already had no classified durable or live state.
     DataErased {
@@ -1290,6 +1297,7 @@ fn syscall_policy(call: &Syscall) -> (AccessLevel, &'static str, Option<&str>) {
         Syscall::EnforceStorageBackupRetention { .. } => {
             (AccessLevel::System, "storage.backup.retention", None)
         }
+        Syscall::StorageBackupStatus => (AccessLevel::System, "storage.backup.status", None),
         Syscall::EraseData { .. } => (AccessLevel::System, "storage.data.erase", None),
         Syscall::ListServices => (AccessLevel::System, "service.list", None),
         Syscall::StartService { .. } => (AccessLevel::System, "service.start", None),
@@ -1515,6 +1523,7 @@ fn quarantine_recovery_call(call: &Syscall) -> bool {
             | Syscall::ListOperatorTunableAudit { .. }
             | Syscall::CreateStorageBackup { .. }
             | Syscall::EnforceStorageBackupRetention { .. }
+            | Syscall::StorageBackupStatus
             | Syscall::EraseData { .. }
             | Syscall::ListServices
             | Syscall::ListServiceHistory { .. }
@@ -3035,6 +3044,9 @@ pub async fn dispatch_scoped(
                 },
             }
         }
+        Syscall::StorageBackupStatus => SyscallReply::StorageBackupStatus {
+            maintenance: kernel.backup_maintenance.status(),
+        },
         Syscall::EraseData { target, confirm } => {
             if !confirm {
                 return SyscallReply::Error {
@@ -5998,6 +6010,7 @@ memory = ["remember this"]
                 },
                 AccessLevel::System,
             ),
+            (Syscall::StorageBackupStatus, AccessLevel::System),
             (
                 Syscall::EraseData {
                     target: DataErasureTarget::Agent {
@@ -6079,7 +6092,7 @@ memory = ["remember this"]
                     .to_string()
             })
             .collect::<std::collections::HashSet<_>>();
-        assert_eq!(calls.len(), 73);
+        assert_eq!(calls.len(), 74);
         assert_eq!(fixture_tags, schema_tags);
     }
 
@@ -6213,6 +6226,13 @@ memory = ["remember this"]
             SyscallReply::Error { message } if message.contains("explicit confirmation")
         ));
         assert!(root.join("one").exists());
+        assert_authorization_denied(
+            dispatch_scoped(&kernel, Syscall::StorageBackupStatus, Some(&admin)).await,
+        );
+        assert!(matches!(
+            dispatch(&kernel, Syscall::StorageBackupStatus).await,
+            SyscallReply::StorageBackupStatus { maintenance } if !maintenance.enabled
+        ));
         let _ = std::fs::remove_dir_all(root);
     }
 

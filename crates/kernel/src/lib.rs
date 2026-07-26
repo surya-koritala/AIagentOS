@@ -1220,6 +1220,8 @@ pub struct AgentKernelImpl {
     pub agent_manager: Arc<AgentManager>,
     pub scheduler: Arc<PriorityScheduler>,
     pub context_manager: Arc<SqliteContextManager>,
+    /// Automatic verified-backup policy, health, and bounded operator status.
+    pub backup_maintenance: Arc<crate::storage::BackupMaintenance>,
     /// Root-kernel ownership lease. Unlike the shared context manager, this is
     /// released as soon as the file-backed kernel itself stops, even if a
     /// cancelled background task briefly retains a subsystem reference.
@@ -1415,6 +1417,9 @@ impl AgentKernelImpl {
         config.budgets.validate().map_err(|error| {
             KernelError::Policy(format!("invalid budget configuration: {error}"))
         })?;
+        config.backup.validate().map_err(|error| {
+            KernelError::Policy(format!("invalid scheduled-backup configuration: {error}"))
+        })?;
         set_max_browse_chars(config.max_browse_chars);
         let db_path = config.data_dir.join("agent_os.db");
         if let Some(parent) = db_path.parent() {
@@ -1444,6 +1449,7 @@ impl AgentKernelImpl {
             Arc::new(crate::quota_clock::SystemQuotaClock::new()),
             Some(storage_lease),
         )?;
+        kernel.backup_maintenance.configure(config.backup.clone())?;
         if let Some(service_dir) = &config.service_dir {
             *kernel
                 .service_directory
@@ -1608,6 +1614,7 @@ impl AgentKernelImpl {
             agent_manager,
             scheduler: Arc::new(PriorityScheduler::new()),
             context_manager,
+            backup_maintenance: Arc::new(crate::storage::BackupMaintenance::default()),
             _storage_lease: storage_lease,
             cluster_control,
             permission_manager,
@@ -5214,6 +5221,51 @@ mod tests {
             !root.exists(),
             "validation must run before data-directory side effects"
         );
+    }
+
+    #[test]
+    fn scheduled_backup_config_is_applied_and_invalid_policy_has_no_storage_side_effect() {
+        let root =
+            std::env::temp_dir().join(format!("agentos-backup-config-{}", uuid::Uuid::new_v4()));
+        let invalid = crate::config::Config {
+            data_dir: root.join("invalid-data"),
+            backup: crate::config::BackupScheduleConfig {
+                enabled: true,
+                root: None,
+                ..crate::config::BackupScheduleConfig::default()
+            },
+            ..crate::config::Config::default()
+        };
+        let error = AgentKernelImpl::from_config(&invalid)
+            .err()
+            .expect("missing scheduled backup root must fail startup");
+        assert!(error.to_string().contains("backup.root"));
+        assert!(!root.exists());
+
+        let config = crate::config::Config {
+            data_dir: root.join("data"),
+            backup: crate::config::BackupScheduleConfig {
+                enabled: true,
+                root: Some(root.join("backups")),
+                interval_seconds: 300,
+                run_on_start: false,
+                keep_latest: 4,
+                max_age_seconds: 86_400,
+            },
+            ..crate::config::Config::default()
+        };
+        let kernel = AgentKernelImpl::from_config(&config).unwrap();
+        let status = kernel.backup_maintenance.status();
+        let expected_backup_root = root.join("backups").to_string_lossy().into_owned();
+        assert!(status.enabled);
+        assert_eq!(status.interval_seconds, 300);
+        assert_eq!(status.keep_latest, 4);
+        assert_eq!(
+            status.backup_root.as_deref(),
+            Some(expected_backup_root.as_str())
+        );
+        drop(kernel);
+        std::fs::remove_dir_all(root).ok();
     }
 
     #[tokio::test]

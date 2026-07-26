@@ -229,6 +229,14 @@ pub struct MetricsSnapshot {
     pub quota_denied_cgroup_tokens: u64,
     pub quota_denied_migration_fence: u64,
     pub quota_storage_healthy: bool,
+    /// Automatic local-backup health. No filesystem path is used as a label.
+    pub backup_scheduler_enabled: bool,
+    pub backup_attempts_total: u64,
+    pub backup_successes_total: u64,
+    pub backup_failures_total: u64,
+    pub backup_retention_deleted_total: u64,
+    pub backup_consecutive_failures: u64,
+    pub backup_last_success_unixtime_seconds: u64,
     /// Lifecycle requests and bounded outcomes by operation.
     pub lifecycle: LifecycleMetricsSnapshot,
     /// Kernel-owned service-supervisor state and bounded counters.
@@ -279,6 +287,13 @@ impl MetricsSnapshot {
         let turns = kernel.turn_admission.metrics();
         let llm = kernel.llm_scheduler.metrics();
         let quota = kernel.rate_limiter.stats();
+        let backup = kernel.backup_maintenance.status();
+        let backup_last_success_unixtime_seconds = backup
+            .last_success_at
+            .as_deref()
+            .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+            .and_then(|value| u64::try_from(value.timestamp()).ok())
+            .unwrap_or(0);
         let services = kernel
             .os
             .init
@@ -328,6 +343,13 @@ impl MetricsSnapshot {
             quota_denied_cgroup_tokens: quota.denied_cgroup_tokens,
             quota_denied_migration_fence: quota.denied_migration_fence,
             quota_storage_healthy: quota.healthy,
+            backup_scheduler_enabled: backup.enabled,
+            backup_attempts_total: backup.attempts_total,
+            backup_successes_total: backup.successes_total,
+            backup_failures_total: backup.failures_total,
+            backup_retention_deleted_total: backup.retention_deleted_total,
+            backup_consecutive_failures: backup.consecutive_failures,
+            backup_last_success_unixtime_seconds,
             lifecycle: kernel.lifecycle_counters.snapshot(),
             service_configured: services.configured,
             service_desired: services.desired,
@@ -648,6 +670,57 @@ impl MetricsSnapshot {
         }
 
         out.push_str(
+            "# HELP agentos_backup_scheduler_enabled Whether automatic verified local backups are enabled.\n",
+        );
+        out.push_str("# TYPE agentos_backup_scheduler_enabled gauge\n");
+        out.push_str(&format!(
+            "agentos_backup_scheduler_enabled {}\n",
+            u8::from(self.backup_scheduler_enabled)
+        ));
+        for (metric, help, value) in [
+            (
+                "attempts",
+                "Automatic backup maintenance cycles attempted.",
+                self.backup_attempts_total,
+            ),
+            (
+                "successes",
+                "Automatic backup maintenance cycles completed.",
+                self.backup_successes_total,
+            ),
+            (
+                "failures",
+                "Automatic backup maintenance cycles that failed.",
+                self.backup_failures_total,
+            ),
+            (
+                "retention_deleted",
+                "Verified backups deleted by automatic retention.",
+                self.backup_retention_deleted_total,
+            ),
+        ] {
+            out.push_str(&format!("# HELP agentos_backup_{metric}_total {help}\n"));
+            out.push_str(&format!("# TYPE agentos_backup_{metric}_total counter\n"));
+            out.push_str(&format!("agentos_backup_{metric}_total {value}\n"));
+        }
+        out.push_str(
+            "# HELP agentos_backup_consecutive_failures Consecutive automatic backup maintenance failures.\n",
+        );
+        out.push_str("# TYPE agentos_backup_consecutive_failures gauge\n");
+        out.push_str(&format!(
+            "agentos_backup_consecutive_failures {}\n",
+            self.backup_consecutive_failures
+        ));
+        out.push_str(
+            "# HELP agentos_backup_last_success_unixtime_seconds Unix timestamp of the last successful automatic backup; zero means none this process.\n",
+        );
+        out.push_str("# TYPE agentos_backup_last_success_unixtime_seconds gauge\n");
+        out.push_str(&format!(
+            "agentos_backup_last_success_unixtime_seconds {}\n",
+            self.backup_last_success_unixtime_seconds
+        ));
+
+        out.push_str(
             "# HELP agentos_lifecycle_operations_total Agent lifecycle operations by operation and bounded outcome.\n",
         );
         out.push_str("# TYPE agentos_lifecycle_operations_total counter\n");
@@ -783,6 +856,13 @@ mod tests {
             quota_denied_cgroup_tokens: 8,
             quota_denied_migration_fence: 9,
             quota_storage_healthy: true,
+            backup_scheduler_enabled: true,
+            backup_attempts_total: 7,
+            backup_successes_total: 5,
+            backup_failures_total: 2,
+            backup_retention_deleted_total: 11,
+            backup_consecutive_failures: 1,
+            backup_last_success_unixtime_seconds: 1_700_000_000,
             lifecycle: LifecycleMetricsSnapshot {
                 pause: LifecycleOperationMetrics {
                     requested: 3,
@@ -839,6 +919,10 @@ mod tests {
         assert!(text.contains("# TYPE agentos_provider_quota_usage gauge"));
         assert!(text.contains("# TYPE agentos_quota_receipts gauge"));
         assert!(text.contains("# TYPE agentos_quota_denied_total counter"));
+        assert!(text.contains("# TYPE agentos_backup_scheduler_enabled gauge"));
+        assert!(text.contains("# TYPE agentos_backup_attempts_total counter"));
+        assert!(text.contains("# TYPE agentos_backup_consecutive_failures gauge"));
+        assert!(text.contains("# TYPE agentos_backup_last_success_unixtime_seconds gauge"));
         assert!(text.contains("# TYPE agentos_lifecycle_operations_total counter"));
         assert!(text.contains("# TYPE agentos_lifecycle_duration_seconds summary"));
         assert!(text.contains("# TYPE agentos_tokens_consumed_total counter"));
@@ -873,6 +957,13 @@ mod tests {
         assert!(
             text.contains("agentos_quota_denied_total{scope=\"cgroup\",dimension=\"tokens\"} 8")
         );
+        assert!(text.contains("agentos_backup_scheduler_enabled 1"));
+        assert!(text.contains("agentos_backup_attempts_total 7"));
+        assert!(text.contains("agentos_backup_successes_total 5"));
+        assert!(text.contains("agentos_backup_failures_total 2"));
+        assert!(text.contains("agentos_backup_retention_deleted_total 11"));
+        assert!(text.contains("agentos_backup_consecutive_failures 1"));
+        assert!(text.contains("agentos_backup_last_success_unixtime_seconds 1700000000"));
         assert!(text.contains(
             "agentos_lifecycle_operations_total{operation=\"pause\",outcome=\"timed_out\"} 1"
         ));

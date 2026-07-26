@@ -793,6 +793,10 @@ mod tests {
         assert!(config.backup.root.is_none());
 
         let root = std::env::temp_dir().join(format!("agentos-backups-{}", uuid::Uuid::new_v4()));
+        // Let the TOML serializer escape platform-specific separators (notably
+        // Windows backslashes) instead of interpolating a raw path into a
+        // basic TOML string.
+        let root_toml = toml::Value::String(root.to_string_lossy().into_owned()).to_string();
         let configured = format!(
             r#"
 llm_provider = "local"
@@ -801,13 +805,13 @@ data_dir = "/tmp/x"
 [api_keys]
 [backup]
 enabled = true
-root = "{}"
+root = {}
 interval_seconds = 60
 run_on_start = false
 keep_latest = 3
 max_age_seconds = 3600
 "#,
-            root.display()
+            root_toml
         );
         let config = Config::from_toml(&configured).unwrap();
         assert!(config.backup.enabled);

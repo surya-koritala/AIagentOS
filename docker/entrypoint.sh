@@ -28,6 +28,8 @@ set -eu
 : "${AGENTOS_BACKUP_RUN_ON_START:=true}"
 : "${AGENTOS_BACKUP_KEEP_LATEST:=24}"
 : "${AGENTOS_BACKUP_MAX_AGE_SECONDS:=604800}"
+: "${AGENTOS_BACKUP_SIGNING_KEY_PATH:=}"
+: "${AGENTOS_BACKUP_SIGNING_KEY_ID:=}"
 
 case "$AGENTOS_BACKUP_ENABLED" in
     1|true|yes) BACKUP_ENABLED=true ;;
@@ -70,6 +72,35 @@ do
             ;;
     esac
 done
+if [ -n "$AGENTOS_BACKUP_SIGNING_KEY_PATH" ] || [ -n "$AGENTOS_BACKUP_SIGNING_KEY_ID" ]; then
+    if [ -z "$AGENTOS_BACKUP_SIGNING_KEY_PATH" ] || [ -z "$AGENTOS_BACKUP_SIGNING_KEY_ID" ]; then
+        echo "error: AGENTOS_BACKUP_SIGNING_KEY_PATH and AGENTOS_BACKUP_SIGNING_KEY_ID must be set together" >&2
+        exit 1
+    fi
+    case "$AGENTOS_BACKUP_SIGNING_KEY_PATH" in
+        /*) ;;
+        *)
+            echo "error: AGENTOS_BACKUP_SIGNING_KEY_PATH must be an absolute path" >&2
+            exit 1
+            ;;
+    esac
+    case "$AGENTOS_BACKUP_SIGNING_KEY_PATH" in
+        *[!A-Za-z0-9._/-]*)
+            echo "error: AGENTOS_BACKUP_SIGNING_KEY_PATH contains unsupported characters" >&2
+            exit 1
+            ;;
+    esac
+    case "$AGENTOS_BACKUP_SIGNING_KEY_ID" in
+        ''|*[!A-Za-z0-9._-]*)
+            echo "error: AGENTOS_BACKUP_SIGNING_KEY_ID contains unsupported characters" >&2
+            exit 1
+            ;;
+    esac
+    if [ -L "$AGENTOS_BACKUP_SIGNING_KEY_PATH" ] || [ ! -f "$AGENTOS_BACKUP_SIGNING_KEY_PATH" ] || [ ! -r "$AGENTOS_BACKUP_SIGNING_KEY_PATH" ]; then
+        echo "error: AGENTOS_BACKUP_SIGNING_KEY_PATH must be a readable regular file, not a symlink" >&2
+        exit 1
+    fi
+fi
 if [ "$BACKUP_ENABLED" = true ]; then
     if [ -L "$AGENTOS_BACKUP_ROOT" ]; then
         echo "error: AGENTOS_BACKUP_ROOT must not be a symlink" >&2
@@ -108,6 +139,11 @@ run_on_start = $BACKUP_RUN_ON_START
 keep_latest = $AGENTOS_BACKUP_KEEP_LATEST
 max_age_seconds = $AGENTOS_BACKUP_MAX_AGE_SECONDS
 EOF
+if [ -n "$AGENTOS_BACKUP_SIGNING_KEY_PATH" ]; then
+    printf 'signing_key_path = "%s"\nsigning_key_id = "%s"\n' \
+        "$AGENTOS_BACKUP_SIGNING_KEY_PATH" \
+        "$AGENTOS_BACKUP_SIGNING_KEY_ID" >> "$CONFIG_FILE"
+fi
 
 # Convenience: allow `docker run <image> agent ...`, `os-demo`, etc. to be
 # passed as the bare binary name. Anything else is exec'd verbatim.

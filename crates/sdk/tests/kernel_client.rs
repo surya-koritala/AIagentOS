@@ -655,6 +655,14 @@ async fn system_operator_can_create_and_verify_online_backup_via_sdk() {
     std::fs::create_dir_all(&root).expect("create test root");
     let database = root.join("agent_os.db");
     let backup_root = root.join("backups");
+    let private_key = root.join("backup-signing.pk8");
+    let public_trust = root.join("backup-trust.json");
+    let trust = kernel::storage::generate_backup_signing_key_files(
+        "sdk-release-2026.1",
+        &private_key,
+        &public_trust,
+    )
+    .expect("generate backup signing identity");
     let kernel = Arc::new(AgentKernelImpl::with_db_path(&database).expect("persistent kernel"));
     kernel
         .backup_maintenance
@@ -665,6 +673,8 @@ async fn system_operator_can_create_and_verify_online_backup_via_sdk() {
             run_on_start: false,
             keep_latest: 2,
             max_age_seconds: 3_600,
+            signing_key_path: Some(private_key),
+            signing_key_id: Some("sdk-release-2026.1".into()),
         })
         .expect("configure backup maintenance");
     let server = SyscallServer::bind(Arc::clone(&kernel), "127.0.0.1:0")
@@ -685,12 +695,14 @@ async fn system_operator_can_create_and_verify_online_backup_via_sdk() {
         status.backup_root.as_deref(),
         Some(expected_backup_root.as_str())
     );
+    assert_eq!(status.signing_key_id.as_deref(), Some("sdk-release-2026.1"));
     let manifest = client
         .create_storage_backup(backup_root.to_string_lossy(), "operator_001")
         .await
         .expect("create_storage_backup");
     assert_eq!(
-        kernel::storage::verify_backup(&backup_root.join("operator_001")).unwrap(),
+        kernel::storage::verify_backup_authenticity(&backup_root.join("operator_001"), &trust)
+            .unwrap(),
         manifest
     );
     tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;

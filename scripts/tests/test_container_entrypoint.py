@@ -59,11 +59,53 @@ class ContainerEntrypointTests(unittest.TestCase):
             },
         )
 
+    def test_renders_paired_backup_signing_identity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            signing_key = root / "backup-signing.pk8"
+            signing_key.write_bytes(b"test-key-material")
+            signing_key.chmod(0o600)
+            result = self.run_entrypoint(
+                root,
+                AGENTOS_BACKUP_SIGNING_KEY_PATH=str(signing_key),
+                AGENTOS_BACKUP_SIGNING_KEY_ID="release-2026.1",
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            config = tomllib.loads(result.stdout)
+            self.assertEqual(
+                config["backup"]["signing_key_path"], str(signing_key)
+            )
+            self.assertEqual(
+                config["backup"]["signing_key_id"], "release-2026.1"
+            )
+
     def test_rejects_relative_or_injectable_root_and_non_numeric_policy(self):
         invalid = (
             {"AGENTOS_BACKUP_ROOT": "relative/backups"},
             {"AGENTOS_BACKUP_ROOT": '/backups"\nenabled = false'},
             {"AGENTOS_BACKUP_INTERVAL_SECONDS": "1h"},
+        )
+        for overrides in invalid:
+            with self.subTest(overrides=overrides), tempfile.TemporaryDirectory() as directory:
+                result = self.run_entrypoint(Path(directory), **overrides)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("error:", result.stderr)
+
+    def test_rejects_unpaired_or_unsafe_backup_signing_identity(self):
+        invalid = (
+            {"AGENTOS_BACKUP_SIGNING_KEY_ID": "release-1"},
+            {
+                "AGENTOS_BACKUP_SIGNING_KEY_PATH": "relative/key.pk8",
+                "AGENTOS_BACKUP_SIGNING_KEY_ID": "release-1",
+            },
+            {
+                "AGENTOS_BACKUP_SIGNING_KEY_PATH": "/missing/key.pk8",
+                "AGENTOS_BACKUP_SIGNING_KEY_ID": "release-1",
+            },
+            {
+                "AGENTOS_BACKUP_SIGNING_KEY_PATH": "/tmp/key.pk8",
+                "AGENTOS_BACKUP_SIGNING_KEY_ID": 'bad"\nenabled=false',
+            },
         )
         for overrides in invalid:
             with self.subTest(overrides=overrides), tempfile.TemporaryDirectory() as directory:

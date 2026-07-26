@@ -130,9 +130,10 @@ exec 3<>/dev/tcp/127.0.0.1/7777; printf '{"op":"node_info"}\n' >&3; head -1 <&3
 
 ### Back up and recover persistent state
 
-The Compose server enables automatic hourly verified backups in the separate
-`agentos-backups` volume, runs one backup at startup, keeps at least 24, and
-expires additional backups after seven days. Inspect its bounded health:
+The Compose server enables automatic hourly integrity-verified backups in the
+separate `agentos-backups` volume, runs one backup at startup, keeps at least
+24, and expires additional backups after seven days. Inspect its bounded
+health:
 
 ```bash
 cargo run -p agent-cli --bin agentctl --locked -- \
@@ -148,17 +149,33 @@ cargo run -p agent-cli --bin agentctl --locked -- \
   backup-create /var/lib/agentos/backups nightly_2026_07_25
 ```
 
-Verification is read-only. Restore is deliberately offline and refuses to run
-while a kernel owns the destination database:
+For production, generate an operator signing identity once, retain the public
+trust JSON in an independent recovery location, and mount the owner-only
+private key into the server:
 
 ```bash
 cargo run -p agent-cli --bin agentctl --locked -- \
-  backup-verify /var/lib/agentos/backups/nightly_2026_07_25
+  backup-key-generate release-2026.1 \
+  /etc/agentos/backup-keys/release-2026.1.pk8 \
+  /srv/recovery/agentos-trust/release-2026.1.json
+```
+
+Set `AGENTOS_BACKUP_SIGNING_KEY_PATH` and
+`AGENTOS_BACKUP_SIGNING_KEY_ID=release-2026.1` together. New scheduled and live
+operator backups will be signed. Verification is read-only; trusted restore is
+deliberately offline and refuses to run while a kernel owns the destination:
+
+```bash
+cargo run -p agent-cli --bin agentctl --locked -- \
+  backup-verify /var/lib/agentos/backups/nightly_2026_07_25 \
+  --require-signature /srv/recovery/agentos-trust/release-2026.1.json
 
 # Stop agent-server first. The confirmation flag cannot bypass the lock.
 cargo run -p agent-cli --bin agentctl --locked -- \
   backup-restore /var/lib/agentos/backups/nightly_2026_07_25 \
-  /var/lib/agentos/agent_os.db --confirm-offline
+  /var/lib/agentos/agent_os.db \
+  --require-signature /srv/recovery/agentos-trust/release-2026.1.json \
+  --confirm-offline
 ```
 
 Automatic backup configuration, exact durability boundaries, manifest checks,

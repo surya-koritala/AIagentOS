@@ -355,3 +355,101 @@ fn verify_and_offline_restore_commands_complete_a_fresh_host_roundtrip() {
         .expect("backup restored database");
     assert_eq!(restored_manifest.installation_id, manifest.installation_id);
 }
+
+#[test]
+fn signed_backup_cli_requires_external_trust_for_verified_restore() {
+    let root = TestRoot::new();
+    let source = root.0.join("source.db");
+    let backup_root = root.0.join("backups");
+    let backup_dir = backup_root.join("signed_001");
+    let destination = root.0.join("fresh-host/agent_os.db");
+    let private_key = root.0.join("backup-signing.pk8");
+    let public_trust = root.0.join("backup-trust.json");
+
+    let keygen = Command::new(env!("CARGO_BIN_EXE_agentctl"))
+        .arg("backup-key-generate")
+        .arg("cli-release-2026.1")
+        .arg(&private_key)
+        .arg(&public_trust)
+        .output()
+        .expect("run backup-key-generate");
+    assert!(
+        keygen.status.success(),
+        "backup-key-generate failed: {}",
+        String::from_utf8_lossy(&keygen.stderr)
+    );
+    let trust: kernel::storage::BackupTrustRoot =
+        serde_json::from_slice(&keygen.stdout).expect("trust root JSON");
+    assert_eq!(trust.key_id, "cli-release-2026.1");
+
+    {
+        let kernel = kernel::AgentKernelImpl::with_db_path(&source).expect("source kernel");
+        let signer = kernel::storage::load_backup_signing_key(&private_key, "cli-release-2026.1")
+            .expect("load generated signing key");
+        kernel
+            .context_manager
+            .create_signed_backup(&backup_root, "signed_001", &signer)
+            .expect("signed source backup");
+    }
+
+    let verify = Command::new(env!("CARGO_BIN_EXE_agentctl"))
+        .arg("backup-verify")
+        .arg(&backup_dir)
+        .arg("--require-signature")
+        .arg(&public_trust)
+        .output()
+        .expect("run signature-required backup-verify");
+    assert!(
+        verify.status.success(),
+        "trusted backup-verify failed: {}",
+        String::from_utf8_lossy(&verify.stderr)
+    );
+    let manifest: kernel::storage::BackupManifest =
+        serde_json::from_slice(&verify.stdout).expect("signed manifest JSON");
+    assert_eq!(
+        manifest.authenticity.as_ref().expect("authenticity").key_id,
+        trust.key_id
+    );
+
+    let unsigned_root = root.0.join("unsigned-backups");
+    let unsigned_dir = unsigned_root.join("unsigned_001");
+    {
+        let kernel = kernel::AgentKernelImpl::with_db_path(&source).expect("source kernel");
+        kernel
+            .context_manager
+            .create_backup(&unsigned_root, "unsigned_001")
+            .expect("unsigned source backup");
+    }
+    let unsigned_verify = Command::new(env!("CARGO_BIN_EXE_agentctl"))
+        .arg("backup-verify")
+        .arg(&unsigned_dir)
+        .arg("--require-signature")
+        .arg(&public_trust)
+        .output()
+        .expect("verify unsigned backup with signature required");
+    assert!(!unsigned_verify.status.success());
+    assert!(
+        String::from_utf8_lossy(&unsigned_verify.stderr).contains("backup is unsigned"),
+        "unexpected unsigned verification error: {}",
+        String::from_utf8_lossy(&unsigned_verify.stderr)
+    );
+
+    let restore = Command::new(env!("CARGO_BIN_EXE_agentctl"))
+        .arg("backup-restore")
+        .arg(&backup_dir)
+        .arg(&destination)
+        .arg("--require-signature")
+        .arg(&public_trust)
+        .arg("--confirm-offline")
+        .output()
+        .expect("run trusted backup-restore");
+    assert!(
+        restore.status.success(),
+        "trusted backup-restore failed: {}",
+        String::from_utf8_lossy(&restore.stderr)
+    );
+    let report: kernel::storage::RestoreReport =
+        serde_json::from_slice(&restore.stdout).expect("restore report JSON");
+    assert_eq!(report.manifest, manifest);
+    kernel::AgentKernelImpl::with_db_path(&destination).expect("boot trusted restored database");
+}

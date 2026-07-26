@@ -7,14 +7,15 @@ use agent_cli::OperatorClient;
 fn usage() -> ! {
     eprintln!(
         "usage: agentctl [--addr HOST:PORT] [--token TOKEN] \
-         <list|inspect|pressure|tunables|tunable-set|tunable-rollback|tunable-history|status|pause|resume|stop|kill|wait|services|service-start|service-stop|service-restart|service-reload|service-history|backup-create|backup-retention|backup-status|backup-verify|backup-restore|erase-agent|erase-user|erase-tenant> [ARGS...]\n\
+         <list|inspect|pressure|tunables|tunable-set|tunable-rollback|tunable-history|status|pause|resume|stop|kill|wait|services|service-start|service-stop|service-restart|service-reload|service-history|backup-create|backup-retention|backup-status|backup-key-generate|backup-verify|backup-restore|erase-agent|erase-user|erase-tenant> [ARGS...]\n\
          \n\
          storage commands:\n\
            agentctl [SERVER OPTIONS] backup-create BACKUP_ROOT NAME\n\
            agentctl [SERVER OPTIONS] backup-retention BACKUP_ROOT KEEP_LATEST MAX_AGE_SECONDS <--dry-run|--confirm>\n\
            agentctl [SERVER OPTIONS] backup-status\n\
-           agentctl backup-verify BACKUP_DIR\n\
-           agentctl backup-restore BACKUP_DIR DATABASE --confirm-offline\n\
+           agentctl backup-key-generate KEY_ID PRIVATE_KEY_FILE PUBLIC_TRUST_FILE\n\
+           agentctl backup-verify BACKUP_DIR [--require-signature PUBLIC_TRUST_FILE]\n\
+           agentctl backup-restore BACKUP_DIR DATABASE [--require-signature PUBLIC_TRUST_FILE] --confirm-offline\n\
            agentctl [SERVER OPTIONS] erase-agent AGENT_ID --confirm\n\
            agentctl [SERVER OPTIONS] erase-user USER_ID --confirm\n\
            agentctl [SERVER OPTIONS] erase-tenant TENANT_ID --confirm"
@@ -42,26 +43,72 @@ async fn main() {
     // remain offline: the storage lease rejects replacement while a kernel
     // owns the destination database.
     match command.as_str() {
-        "backup-verify" => {
-            let backup_dir = args.next().unwrap_or_else(|| usage());
+        "backup-key-generate" => {
+            let key_id = args.next().unwrap_or_else(|| usage());
+            let private_key = args.next().unwrap_or_else(|| usage());
+            let public_trust = args.next().unwrap_or_else(|| usage());
             if args.next().is_some() {
                 usage();
             }
-            let manifest = kernel::storage::verify_backup(std::path::Path::new(&backup_dir))
-                .unwrap_or_else(|error| fail_storage(error));
+            let trust = kernel::storage::generate_backup_signing_key_files(
+                &key_id,
+                std::path::Path::new(&private_key),
+                std::path::Path::new(&public_trust),
+            )
+            .unwrap_or_else(|error| fail_storage(error));
+            print_json(&trust, "backup trust root");
+            return;
+        }
+        "backup-verify" => {
+            let backup_dir = args.next().unwrap_or_else(|| usage());
+            let manifest = match args.next().as_deref() {
+                None => kernel::storage::verify_backup(std::path::Path::new(&backup_dir)),
+                Some("--require-signature") => {
+                    let trust_path = args.next().unwrap_or_else(|| usage());
+                    if args.next().is_some() {
+                        usage();
+                    }
+                    let trust =
+                        kernel::storage::load_backup_trust_root(std::path::Path::new(&trust_path))
+                            .unwrap_or_else(|error| fail_storage(error));
+                    kernel::storage::verify_backup_authenticity(
+                        std::path::Path::new(&backup_dir),
+                        &trust,
+                    )
+                }
+                Some(_) => usage(),
+            }
+            .unwrap_or_else(|error| fail_storage(error));
             print_json(&manifest, "backup manifest");
             return;
         }
         "backup-restore" => {
             let backup_dir = args.next().unwrap_or_else(|| usage());
             let database = args.next().unwrap_or_else(|| usage());
-            if args.next().as_deref() != Some("--confirm-offline") || args.next().is_some() {
-                usage();
+            let report = match args.next().as_deref() {
+                Some("--confirm-offline") if args.next().is_none() => {
+                    kernel::storage::restore_backup(
+                        std::path::Path::new(&backup_dir),
+                        std::path::Path::new(&database),
+                    )
+                }
+                Some("--require-signature") => {
+                    let trust_path = args.next().unwrap_or_else(|| usage());
+                    if args.next().as_deref() != Some("--confirm-offline") || args.next().is_some()
+                    {
+                        usage();
+                    }
+                    let trust =
+                        kernel::storage::load_backup_trust_root(std::path::Path::new(&trust_path))
+                            .unwrap_or_else(|error| fail_storage(error));
+                    kernel::storage::restore_backup_with_trust(
+                        std::path::Path::new(&backup_dir),
+                        std::path::Path::new(&database),
+                        &trust,
+                    )
+                }
+                _ => usage(),
             }
-            let report = kernel::storage::restore_backup(
-                std::path::Path::new(&backup_dir),
-                std::path::Path::new(&database),
-            )
             .unwrap_or_else(|error| fail_storage(error));
             print_json(&report, "restore report");
             return;

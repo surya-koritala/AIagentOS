@@ -5251,6 +5251,7 @@ mod tests {
                 run_on_start: false,
                 keep_latest: 4,
                 max_age_seconds: 86_400,
+                ..crate::config::BackupScheduleConfig::default()
             },
             ..crate::config::Config::default()
         };

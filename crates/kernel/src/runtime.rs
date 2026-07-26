@@ -441,6 +441,7 @@ mod tests {
                 run_on_start: true,
                 keep_latest: 2,
                 max_age_seconds: 3_600,
+                ..crate::config::BackupScheduleConfig::default()
             })
             .unwrap();
         let runtime = kernel.start_runtime();

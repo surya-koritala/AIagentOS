@@ -392,6 +392,13 @@ cargo run --package os-benchmark --bin os-benchmark --locked
 
 # Deterministic exact-vs-ANN retrieval gate (JSON output; no model/network)
 cargo run --package os-benchmark --bin memory-qualification --locked
+
+# Validate the versioned eight-profile capacity suite
+cargo run --package os-benchmark --bin capacity-qualification --locked -- --validate
+
+# Non-publishable development smoke across every capacity profile
+cargo run --package os-benchmark --bin capacity-qualification --locked -- \
+  --all --smoke --output target/qualification/capacity-smoke.json
 ```
 
 The versioned [production observability contract](docs/OBSERVABILITY.md) now
@@ -399,6 +406,11 @@ defines bounded metrics, request correlation, release-candidate SLO targets,
 checked-in Prometheus alerts, and their runbooks. The 24-hour soak, chaos,
 game-day, and publishable performance qualification still remain tracked by
 [#125](https://github.com/surya-koritala/AIagentOS/issues/125).
+The [capacity qualification guide](docs/CAPACITY_QUALIFICATION.md) defines the
+strict idle, many-agent, long-context, tool-heavy, provider-latency,
+tenant-contention, signed-package, and restart workload suite. Fixture results
+are always labeled non-publishable until an exact release candidate is run on
+the intended deployment and completes the remaining #125 proof.
 
 ## Architecture Docs
 
@@ -408,6 +420,7 @@ game-day, and publishable performance qualification still remain tracked by
 - [`docs/POLICY.md`](docs/POLICY.md) — authoring, validating, and explaining MAC policy
 - [`docs/ACCOUNTING.md`](docs/ACCOUNTING.md) — usage, pricing, quotas, and metrics contract
 - [`docs/OBSERVABILITY.md`](docs/OBSERVABILITY.md) — SLOs, traces, metrics, alerts, and runbooks
+- [`docs/CAPACITY_QUALIFICATION.md`](docs/CAPACITY_QUALIFICATION.md) — reproducible workload profiles and sizing method
 - [`docs/COMPLETE_SPEC.md`](docs/COMPLETE_SPEC.md) — long-form implementation spec
 - [`docs/FULL_ROADMAP.md`](docs/FULL_ROADMAP.md) — long-form vision roadmap
 

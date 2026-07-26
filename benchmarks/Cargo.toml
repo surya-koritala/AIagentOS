@@ -29,9 +29,19 @@ path = "src/bin/governance-demo.rs"
 name = "memory-qualification"
 path = "src/bin/memory-qualification.rs"
 
+[[bin]]
+name = "capacity-qualification"
+path = "src/bin/capacity-qualification.rs"
+
 [dependencies]
 kernel = { path = "../crates/kernel", version = "=0.3.0" }
 adapters = { path = "../crates/adapters", version = "=0.3.0" }
+agent-sdk = { path = "../crates/sdk", version = "=0.3.0" }
 tokio = { version = "1", features = ["full"] }
 uuid = { version = "1", features = ["v4"] }
-serde_json = "1"
+async-trait = { workspace = true }
+chrono = { workspace = true }
+semver = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }

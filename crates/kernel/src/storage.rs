@@ -411,7 +411,10 @@ impl SqliteContextManager {
                     })?;
             }
             set_owner_only_file(&database_path)?;
-            File::open(&database_path)
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&database_path)
                 .and_then(|file| file.sync_all())
                 .map_err(|error| {
                     storage_error(format!(
@@ -420,7 +423,10 @@ impl SqliteContextManager {
                     ))
                 })?;
 
-            let (_verified, metadata) = open_verified_database(&database_path)?;
+            let (verified, metadata) = open_verified_database(&database_path)?;
+            // Windows does not allow the staging directory to be renamed while
+            // this read-only SQLite handle remains open.
+            drop(verified);
             let byte_count = require_regular_file(&database_path, "backup database")?;
             let manifest = BackupManifest {
                 format_version: BACKUP_FORMAT_VERSION,
@@ -487,7 +493,10 @@ fn checkpoint_existing_database(path: &Path) -> Result<(), ContextError> {
         ));
     }
     drop(connection);
-    File::open(path)
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
         .and_then(|file| file.sync_all())
         .map_err(|error| {
             storage_error(format!(

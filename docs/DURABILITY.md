@@ -8,10 +8,12 @@ This document describes the guarantees implemented today. The kernel backup
 and offline restore primitives plus authenticated SDK/CLI entry points are
 integrated. Transactional storage erasure, non-identifying deletion receipts,
 and live-resource-coordinated system operator erasure through the wire, SDK,
-and CLI are integrated. Verified local-backup retention and disabled-by-default
-automatic local backup maintenance are integrated. Restore remains an explicit
-offline operator action. Remote retention, automated disaster recovery,
-encryption, and measured recovery objectives are not yet production-qualified.
+and CLI are integrated. Verified local-backup retention, disabled-by-default
+automatic local backup maintenance, and optional Ed25519 manifest authenticity
+with independently retained public trust are integrated. Restore remains an
+explicit offline operator action. Remote retention, automated disaster
+recovery, encryption, and measured recovery objectives are not yet
+production-qualified.
 
 ## Database identity and version
 
@@ -65,13 +67,14 @@ Each backup directory contains:
 
 - `agent_os.db`, a standalone SQLite snapshot without a required WAL sidecar;
 - `manifest.json`, containing the format version, application ID, schema
-  version, installation ID, timestamp, byte count, and SHA-256 digest.
+  version, installation ID, timestamp, byte count, SHA-256 digest, and—when
+  configured—an Ed25519 key identifier, public-key fingerprint, and signature.
 
 `storage::verify_backup` rejects unknown manifest fields, unsupported backup or
 schema versions, symlinked inputs, size or hash changes, corrupt SQLite pages,
-foreign-key violations, and mismatched installation metadata. SHA-256 detects
-accidental or uncoordinated modification; it is not an authenticity signature
-against an attacker who can replace both the database and manifest.
+foreign-key violations, and mismatched installation metadata. This
+integrity-only operation deliberately remains compatible with existing unsigned
+backups. It does not establish signer identity.
 
 A trusted system operator can create a live backup through the running server:
 
@@ -83,6 +86,60 @@ agentctl --addr 127.0.0.1:7777 --token "$AGENT_SERVER_TOKEN" \
 `BACKUP_ROOT` is a path on the server host, not the client host. Tenant-bound
 credentials, including tenant administrators, cannot invoke this operation.
 The SDK exposes the same operation as `KernelClient::create_storage_backup`.
+
+## Signed authenticity and key rotation
+
+Production operators can generate an Ed25519 PKCS#8 signing key and a versioned
+public trust file:
+
+```bash
+install -d -m 700 /etc/agentos/backup-keys /srv/recovery/agentos-trust
+agentctl backup-key-generate release-2026.1 \
+  /etc/agentos/backup-keys/release-2026.1.pk8 \
+  /srv/recovery/agentos-trust/release-2026.1.json
+```
+
+The private file is created without overwrite and must remain owner-only on
+Unix. Keep the public trust JSON outside the backup failure domain; it is not
+embedded in the backup. Configure the private identity using an absolute path:
+
+```toml
+[backup]
+enabled = true
+root = "/var/lib/agentos-backups"
+interval_seconds = 3600
+run_on_start = true
+keep_latest = 24
+max_age_seconds = 604800
+# Recommended for production; omit both fields only for integrity-only backups.
+signing_key_path = "/etc/agentos/backup-keys/release-2026.1.pk8"
+signing_key_id = "release-2026.1"
+```
+
+Startup loads and validates the configured key before publishing the new
+policy. Scheduled backups and live system-operator `backup-create` calls then
+use the same signer. Status exposes only the key ID, never the private path or
+key bytes. Container deployments can supply the paired
+`AGENTOS_BACKUP_SIGNING_KEY_PATH` and `AGENTOS_BACKUP_SIGNING_KEY_ID`
+environment variables; the key path must be a mounted regular non-symlink file.
+
+Require the external trust file during qualification and recovery:
+
+```bash
+agentctl backup-verify /var/lib/agentos-backups/nightly_2026_07_25 \
+  --require-signature /srv/recovery/agentos-trust/release-2026.1.json
+agentctl backup-restore /var/lib/agentos-backups/nightly_2026_07_25 \
+  /var/lib/agentos/agent_os.db \
+  --require-signature /srv/recovery/agentos-trust/release-2026.1.json \
+  --confirm-offline
+```
+
+These commands reject unsigned backups, the wrong key ID or public key, and any
+signed-manifest modification before restore mutates the destination. For
+rotation, generate a new key ID, retain the old public trust files for every
+backup still inside retention, update both configuration fields together, and
+restart or reload the owning kernel configuration. Removing an old trust file
+before its backups expire makes those backups intentionally unverifiable.
 
 ## Verified local-backup retention
 
@@ -147,6 +204,7 @@ last timestamps, last backup name, and a bounded diagnostic. Prometheus exports
 the same health without path labels:
 
 - `agentos_backup_scheduler_enabled`
+- `agentos_backup_signing_enabled`
 - `agentos_backup_attempts_total`
 - `agentos_backup_successes_total`
 - `agentos_backup_failures_total`
@@ -179,13 +237,16 @@ If cleanup of the obsolete rollback file cannot be made durable, restore still
 returns a successful report with `rollback_retained = true` so the operator is
 not told that the already-verified replacement failed.
 
-Verify a backup without changing any state, then stop the server and restore it
-to the configured database path:
+Verify a signed backup without changing any state, then stop the server and
+restore it to the configured database path:
 
 ```bash
-agentctl backup-verify /var/lib/agentos/backups/nightly_2026_07_25
+agentctl backup-verify /var/lib/agentos/backups/nightly_2026_07_25 \
+  --require-signature /srv/recovery/agentos-trust/release-2026.1.json
 agentctl backup-restore /var/lib/agentos/backups/nightly_2026_07_25 \
-  /var/lib/agentos/agent_os.db --confirm-offline
+  /var/lib/agentos/agent_os.db \
+  --require-signature /srv/recovery/agentos-trust/release-2026.1.json \
+  --confirm-offline
 ```
 
 The confirmation flag makes the destructive intent explicit; it does not
@@ -283,7 +344,7 @@ The following remain open under issue #123:
 
 - remote object storage retention, automated recovery orchestration, and a
   measured recovery runbook;
-- signed manifests or external authenticity/immutability controls;
+- independent immutable/remote retention controls and released trust fixtures;
 - corruption recovery beyond fail-closed startup detection;
 - encryption at rest and key rotation;
 - measured deletion/retention enforcement across external workspaces,

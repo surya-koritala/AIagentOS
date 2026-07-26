@@ -231,6 +231,7 @@ pub struct MetricsSnapshot {
     pub quota_storage_healthy: bool,
     /// Automatic local-backup health. No filesystem path is used as a label.
     pub backup_scheduler_enabled: bool,
+    pub backup_signing_enabled: bool,
     pub backup_attempts_total: u64,
     pub backup_successes_total: u64,
     pub backup_failures_total: u64,
@@ -344,6 +345,7 @@ impl MetricsSnapshot {
             quota_denied_migration_fence: quota.denied_migration_fence,
             quota_storage_healthy: quota.healthy,
             backup_scheduler_enabled: backup.enabled,
+            backup_signing_enabled: backup.signing_key_id.is_some(),
             backup_attempts_total: backup.attempts_total,
             backup_successes_total: backup.successes_total,
             backup_failures_total: backup.failures_total,
@@ -677,6 +679,14 @@ impl MetricsSnapshot {
             "agentos_backup_scheduler_enabled {}\n",
             u8::from(self.backup_scheduler_enabled)
         ));
+        out.push_str(
+            "# HELP agentos_backup_signing_enabled Whether backup manifests are signed by a configured operator identity.\n",
+        );
+        out.push_str("# TYPE agentos_backup_signing_enabled gauge\n");
+        out.push_str(&format!(
+            "agentos_backup_signing_enabled {}\n",
+            u8::from(self.backup_signing_enabled)
+        ));
         for (metric, help, value) in [
             (
                 "attempts",
@@ -857,6 +867,7 @@ mod tests {
             quota_denied_migration_fence: 9,
             quota_storage_healthy: true,
             backup_scheduler_enabled: true,
+            backup_signing_enabled: true,
             backup_attempts_total: 7,
             backup_successes_total: 5,
             backup_failures_total: 2,
@@ -920,6 +931,7 @@ mod tests {
         assert!(text.contains("# TYPE agentos_quota_receipts gauge"));
         assert!(text.contains("# TYPE agentos_quota_denied_total counter"));
         assert!(text.contains("# TYPE agentos_backup_scheduler_enabled gauge"));
+        assert!(text.contains("# TYPE agentos_backup_signing_enabled gauge"));
         assert!(text.contains("# TYPE agentos_backup_attempts_total counter"));
         assert!(text.contains("# TYPE agentos_backup_consecutive_failures gauge"));
         assert!(text.contains("# TYPE agentos_backup_last_success_unixtime_seconds gauge"));
@@ -958,6 +970,7 @@ mod tests {
             text.contains("agentos_quota_denied_total{scope=\"cgroup\",dimension=\"tokens\"} 8")
         );
         assert!(text.contains("agentos_backup_scheduler_enabled 1"));
+        assert!(text.contains("agentos_backup_signing_enabled 1"));
         assert!(text.contains("agentos_backup_attempts_total 7"));
         assert!(text.contains("agentos_backup_successes_total 5"));
         assert!(text.contains("agentos_backup_failures_total 2"));

@@ -106,6 +106,15 @@ The backup volume is separate from live state but remains on the same Docker
 host. Replicate verified backups to another failure domain before treating them
 as node-loss disaster recovery.
 
+The development Compose profile does not ship a signing secret. For production,
+generate one with `agentctl backup-key-generate`, retain the public trust JSON
+outside the backup host, mount the private PKCS#8 file read-only, and set
+`AGENTOS_BACKUP_SIGNING_KEY_PATH` plus `AGENTOS_BACKUP_SIGNING_KEY_ID`
+together. The entrypoint rejects unpaired, relative, missing, or symlinked key
+paths. Use `backup-verify --require-signature TRUST.json` and
+`backup-restore ... --require-signature TRUST.json --confirm-offline` for
+recovery qualification.
+
 ## Optional hardening
 
 `agent-server` honors these environment variables (see
@@ -170,6 +179,8 @@ agentos_agents 3
 agentos_running_agents 1
 # TYPE agentos_backup_successes_total counter
 agentos_backup_successes_total 4
+# TYPE agentos_backup_signing_enabled gauge
+agentos_backup_signing_enabled 1
 # TYPE agentos_backup_consecutive_failures gauge
 agentos_backup_consecutive_failures 0
 # HELP agentos_tokens_consumed_total Tokens consumed across all agents.

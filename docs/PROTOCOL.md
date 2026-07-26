@@ -244,8 +244,13 @@ read the configured policy and bounded process-local maintenance health:
 
 The `storage_backup_status` reply carries a `maintenance` object with bounded
 attempt/success/failure counters, consecutive failures, timestamps, the last
-published name, and a bounded diagnostic. Tenant credentials are denied. The
-same values are available without filesystem-path labels in Prometheus.
+published name, configured signing key ID (never private key material), and a
+bounded diagnostic. When a signing identity is configured, both scheduled
+backups and the system-only `create_storage_backup` operation return manifests
+with Ed25519 authenticity metadata. Verification still requires a separately
+retained public trust file; the server never returns it as trusted material.
+Tenant credentials are denied. The same bounded health values are available
+without filesystem-path labels in Prometheus.
 An agent-only erasure reopens the unaffected tenant credentials after the
 operation. Successful user and tenant erasure leaves their credentials revoked.
 Failure before the durable commit reopens still-valid credentials so the

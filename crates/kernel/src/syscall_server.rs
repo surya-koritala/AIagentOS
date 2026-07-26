@@ -2996,8 +2996,13 @@ pub async fn dispatch_scoped(
         }
         Syscall::CreateStorageBackup { backup_root, name } => {
             let context_manager = Arc::clone(&kernel.context_manager);
+            let backup_maintenance = Arc::clone(&kernel.backup_maintenance);
             match tokio::task::spawn_blocking(move || {
-                context_manager.create_backup(std::path::Path::new(&backup_root), &name)
+                backup_maintenance.create_backup(
+                    &context_manager,
+                    std::path::Path::new(&backup_root),
+                    &name,
+                )
             })
             .await
             {

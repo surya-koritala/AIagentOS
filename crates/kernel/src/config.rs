@@ -85,6 +85,11 @@ pub struct BackupScheduleConfig {
     pub run_on_start: bool,
     pub keep_latest: usize,
     pub max_age_seconds: u64,
+    /// Optional owner-only Ed25519 PKCS#8 key used by both scheduled and
+    /// system-operator-created backups.
+    pub signing_key_path: Option<PathBuf>,
+    /// Stable public identifier recorded in signed manifests.
+    pub signing_key_id: Option<String>,
 }
 
 impl Default for BackupScheduleConfig {
@@ -96,12 +101,42 @@ impl Default for BackupScheduleConfig {
             run_on_start: true,
             keep_latest: 24,
             max_age_seconds: 7 * 24 * 60 * 60,
+            signing_key_path: None,
+            signing_key_id: None,
         }
     }
 }
 
 impl BackupScheduleConfig {
     pub fn validate(&self) -> Result<(), String> {
+        match (&self.signing_key_path, &self.signing_key_id) {
+            (None, None) => {}
+            (Some(path), Some(key_id)) => {
+                if !path.is_absolute() {
+                    return Err(format!(
+                        "backup.signing_key_path must be an absolute path (got {})",
+                        path.display()
+                    ));
+                }
+                if key_id.is_empty()
+                    || key_id.len() > 96
+                    || !key_id.bytes().all(|byte| {
+                        byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.')
+                    })
+                {
+                    return Err(
+                        "backup.signing_key_id must be 1-96 ASCII letters, digits, '-', '_' or '.'"
+                            .into(),
+                    );
+                }
+            }
+            _ => {
+                return Err(
+                    "backup.signing_key_path and backup.signing_key_id must be configured together"
+                        .into(),
+                )
+            }
+        }
         if !self.enabled {
             return Ok(());
         }
@@ -823,6 +858,27 @@ max_age_seconds = 3600
     #[test]
     fn scheduled_backup_config_fails_closed_when_unsafe_or_incomplete() {
         let mut config = Config::default();
+        config.backup.signing_key_path =
+            Some(std::env::temp_dir().join("agentos-backup-signing.pk8"));
+        assert!(config
+            .backup
+            .validate()
+            .unwrap_err()
+            .contains("configured together"));
+
+        config.backup.signing_key_id = Some("release\ninjection".into());
+        assert!(config
+            .backup
+            .validate()
+            .unwrap_err()
+            .contains("ASCII letters"));
+
+        config.backup.signing_key_id = Some("release-2026.1".into());
+        config.backup.signing_key_path = Some(PathBuf::from("relative/backup.pk8"));
+        assert!(config.backup.validate().unwrap_err().contains("absolute"));
+
+        config.backup.signing_key_path = None;
+        config.backup.signing_key_id = None;
         config.backup.enabled = true;
         assert!(config.backup.validate().unwrap_err().contains("root"));
 
@@ -852,6 +908,26 @@ max_age_seconds = 3600
             .validate()
             .unwrap_err()
             .contains("at least backup.interval_seconds"));
+    }
+
+    #[test]
+    fn backup_signing_identity_roundtrips_without_becoming_enabled_by_default() {
+        let mut config = Config::default();
+        let signing_key_path = std::env::temp_dir().join("agentos-backup-signing.pk8");
+        config.backup.signing_key_path = Some(signing_key_path.clone());
+        config.backup.signing_key_id = Some("release-2026.1".into());
+
+        let encoded = toml::to_string_pretty(&config).unwrap();
+        let parsed = Config::from_toml(&encoded).unwrap();
+        assert!(!parsed.backup.enabled);
+        assert_eq!(
+            parsed.backup.signing_key_path.as_deref(),
+            Some(signing_key_path.as_path())
+        );
+        assert_eq!(
+            parsed.backup.signing_key_id.as_deref(),
+            Some("release-2026.1")
+        );
     }
 
     #[test]

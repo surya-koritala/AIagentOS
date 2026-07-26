@@ -10,6 +10,16 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
 
 ## [Unreleased]
 
+- Added optional Ed25519 backup authenticity for #123. An owner-only
+  operator-generated PKCS#8 key signs both scheduled and live operator backup
+  manifests; verification and offline restore can require a matching,
+  independently retained versioned public trust file. Configuration and the
+  container entrypoint fail closed on incomplete or unsafe identities, status
+  and Prometheus expose signing enablement without secret paths, and key
+  generation never overwrites existing material. Tamper, wrong-key, unsigned,
+  permissions, rotation/configuration, scheduled, SDK, CLI, restore, and
+  container regressions cover the path. Remote immutable retention, encryption,
+  automated recovery, and measured RPO/RTO remain open in #123.
 - Added automatic verified local backups for #123. A fail-closed `[backup]`
   policy controls startup execution, interval, absolute backup root, and safe
   retention; blocking SQLite work runs off the async runtime and failures

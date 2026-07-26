@@ -12,7 +12,9 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use chrono::Utc;
-use ring::digest::{Context as DigestContext, SHA256};
+use ring::digest::{self, Context as DigestContext, SHA256};
+use ring::rand;
+use ring::signature::{self, KeyPair};
 use rusqlite::{Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
 
@@ -26,7 +28,157 @@ const BACKUP_DATABASE_SHM_FILE: &str = "agent_os.db-shm";
 const BACKUP_DATABASE_WAL_FILE: &str = "agent_os.db-wal";
 const BACKUP_MANIFEST_FILE: &str = "manifest.json";
 const MAX_MANIFEST_BYTES: u64 = 64 * 1024;
+const MAX_BACKUP_KEY_BYTES: u64 = 16 * 1024;
 const MAX_BACKUP_ROOT_ENTRIES: usize = 10_000;
+const BACKUP_AUTHENTICITY_FORMAT_VERSION: u32 = 1;
+const BACKUP_TRUST_FORMAT_VERSION: u32 = 1;
+const BACKUP_SIGNATURE_ALGORITHM: &str = "ed25519";
+const BACKUP_SIGNING_DOMAIN: &[u8] = b"AIAGENTOS-BACKUP-MANIFEST-V1\0";
+
+/// Optional cryptographic authenticity proof embedded in a backup manifest.
+///
+/// The public key is deliberately not embedded: verification must use an
+/// independently retained [`BackupTrustRoot`] rather than trusting key material
+/// supplied by the same backup being verified.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BackupAuthenticity {
+    pub format_version: u32,
+    pub algorithm: String,
+    pub key_id: String,
+    pub public_key_sha256: String,
+    pub signature_hex: String,
+}
+
+/// Versioned public trust material retained outside the backup failure domain.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BackupTrustRoot {
+    pub format_version: u32,
+    pub algorithm: String,
+    pub key_id: String,
+    pub public_key_hex: String,
+}
+
+/// In-memory Ed25519 backup signing identity.
+///
+/// Secret PKCS#8 bytes are never serialized by this type.
+pub struct BackupSigningKey {
+    key_id: String,
+    key_pair: signature::Ed25519KeyPair,
+}
+
+impl BackupSigningKey {
+    /// Import a bounded Ed25519 PKCS#8 document.
+    pub fn from_pkcs8(key_id: impl Into<String>, pkcs8: &[u8]) -> Result<Self, ContextError> {
+        let key_id = key_id.into();
+        validate_backup_key_id(&key_id)?;
+        if pkcs8.is_empty() || pkcs8.len() as u64 > MAX_BACKUP_KEY_BYTES {
+            return Err(storage_error("backup signing key has an invalid size"));
+        }
+        let key_pair = signature::Ed25519KeyPair::from_pkcs8(pkcs8)
+            .map_err(|_| storage_error("backup signing key is not valid Ed25519 PKCS#8"))?;
+        Ok(Self { key_id, key_pair })
+    }
+
+    /// Generate a key and return both the identity and its secret PKCS#8 bytes.
+    pub fn generate(key_id: impl Into<String>) -> Result<(Self, Vec<u8>), ContextError> {
+        let key_id = key_id.into();
+        validate_backup_key_id(&key_id)?;
+        let pkcs8 = signature::Ed25519KeyPair::generate_pkcs8(&rand::SystemRandom::new())
+            .map_err(|_| storage_error("failed to generate Ed25519 backup signing key"))?;
+        let key = Self::from_pkcs8(key_id, pkcs8.as_ref())?;
+        Ok((key, pkcs8.as_ref().to_vec()))
+    }
+
+    pub fn key_id(&self) -> &str {
+        &self.key_id
+    }
+
+    pub fn trust_root(&self) -> BackupTrustRoot {
+        BackupTrustRoot {
+            format_version: BACKUP_TRUST_FORMAT_VERSION,
+            algorithm: BACKUP_SIGNATURE_ALGORITHM.into(),
+            key_id: self.key_id.clone(),
+            public_key_hex: hex_encode(self.key_pair.public_key().as_ref()),
+        }
+    }
+
+    fn sign_manifest(&self, manifest: &mut BackupManifest) -> Result<(), ContextError> {
+        if manifest.authenticity.is_some() {
+            return Err(storage_error("backup manifest is already signed"));
+        }
+        let trust = self.trust_root();
+        let public_key = trust.public_key()?;
+        let fingerprint = sha256_bytes(&public_key);
+        let message = backup_signing_message(manifest, &self.key_id, &fingerprint)?;
+        manifest.authenticity = Some(BackupAuthenticity {
+            format_version: BACKUP_AUTHENTICITY_FORMAT_VERSION,
+            algorithm: BACKUP_SIGNATURE_ALGORITHM.into(),
+            key_id: self.key_id.clone(),
+            public_key_sha256: fingerprint,
+            signature_hex: hex_encode(self.key_pair.sign(&message).as_ref()),
+        });
+        Ok(())
+    }
+}
+
+impl BackupTrustRoot {
+    fn public_key(&self) -> Result<Vec<u8>, ContextError> {
+        if self.format_version != BACKUP_TRUST_FORMAT_VERSION {
+            return Err(storage_error(format!(
+                "unsupported backup trust format version {}",
+                self.format_version
+            )));
+        }
+        if self.algorithm != BACKUP_SIGNATURE_ALGORITHM {
+            return Err(storage_error(format!(
+                "unsupported backup signature algorithm {:?}",
+                self.algorithm
+            )));
+        }
+        validate_backup_key_id(&self.key_id)?;
+        let public_key = hex_decode(&self.public_key_hex)
+            .ok_or_else(|| storage_error("backup trust public key is not valid hexadecimal"))?;
+        if public_key.len() != 32 {
+            return Err(storage_error(
+                "backup trust public key must contain exactly 32 bytes",
+            ));
+        }
+        Ok(public_key)
+    }
+
+    fn verify_manifest(&self, manifest: &BackupManifest) -> Result<(), ContextError> {
+        let authenticity = manifest.authenticity.as_ref().ok_or_else(|| {
+            storage_error("backup is unsigned but a trusted signature is required")
+        })?;
+        validate_authenticity(authenticity)?;
+        if authenticity.key_id != self.key_id {
+            return Err(storage_error(format!(
+                "backup was signed by key {:?}, not trusted key {:?}",
+                authenticity.key_id, self.key_id
+            )));
+        }
+        let public_key = self.public_key()?;
+        let fingerprint = sha256_bytes(&public_key);
+        if authenticity.public_key_sha256 != fingerprint {
+            return Err(storage_error(
+                "backup signing-key fingerprint does not match the trusted public key",
+            ));
+        }
+        let signature = hex_decode(&authenticity.signature_hex)
+            .ok_or_else(|| storage_error("backup signature is not valid hexadecimal"))?;
+        if signature.len() != 64 {
+            return Err(storage_error(
+                "backup Ed25519 signature must contain exactly 64 bytes",
+            ));
+        }
+        let message = backup_signing_message(manifest, &self.key_id, &fingerprint)?;
+        signature::UnparsedPublicKey::new(&signature::ED25519, public_key)
+            .verify(&message, &signature)
+            .map_err(|_| storage_error("backup manifest signature is invalid"))
+    }
+}
 
 /// Integrity and compatibility metadata published beside a SQLite snapshot.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -40,6 +192,8 @@ pub struct BackupManifest {
     pub created_at: String,
     pub byte_count: u64,
     pub sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authenticity: Option<BackupAuthenticity>,
 }
 
 /// Result of an offline restore.
@@ -112,6 +266,7 @@ pub struct BackupMaintenanceStatus {
     pub run_on_start: bool,
     pub keep_latest: usize,
     pub max_age_seconds: u64,
+    pub signing_key_id: Option<String>,
     pub attempts_total: u64,
     pub successes_total: u64,
     pub failures_total: u64,
@@ -130,6 +285,7 @@ pub struct BackupMaintenanceStatus {
 /// resets on process restart and is exported without per-path metric labels.
 pub struct BackupMaintenance {
     config: std::sync::RwLock<BackupScheduleConfig>,
+    signer: std::sync::RwLock<Option<std::sync::Arc<BackupSigningKey>>>,
     status: std::sync::Mutex<BackupMaintenanceStatus>,
 }
 
@@ -143,9 +299,11 @@ impl Default for BackupMaintenance {
 impl BackupMaintenance {
     pub fn new(config: BackupScheduleConfig) -> Result<Self, ContextError> {
         config.validate().map_err(storage_error)?;
+        let signer = load_configured_backup_signer(&config)?;
         let status = Self::status_for_config(&config);
         Ok(Self {
             config: std::sync::RwLock::new(config),
+            signer: std::sync::RwLock::new(signer.map(std::sync::Arc::new)),
             status: std::sync::Mutex::new(status),
         })
     }
@@ -161,17 +319,26 @@ impl BackupMaintenance {
             run_on_start: config.run_on_start,
             keep_latest: config.keep_latest,
             max_age_seconds: config.max_age_seconds,
+            signing_key_id: config.signing_key_id.clone(),
             ..BackupMaintenanceStatus::default()
         }
     }
 
     pub fn configure(&self, config: BackupScheduleConfig) -> Result<(), ContextError> {
         config.validate().map_err(storage_error)?;
+        // Load and validate the private key before publishing any part of the
+        // new configuration. A bad rotation therefore leaves the old signer
+        // and policy intact.
+        let signer = load_configured_backup_signer(&config)?;
         let next_status = Self::status_for_config(&config);
         *self
             .config
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = config;
+        *self
+            .signer
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = signer.map(std::sync::Arc::new);
         *self
             .status
             .lock()
@@ -184,6 +351,25 @@ impl BackupMaintenance {
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
+    }
+
+    /// Create a manual or scheduled backup using the configured signing key,
+    /// if one is present.
+    pub fn create_backup(
+        &self,
+        manager: &SqliteContextManager,
+        backup_root: &Path,
+        name: &str,
+    ) -> Result<BackupManifest, ContextError> {
+        let signer = self
+            .signer
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        match signer {
+            Some(signer) => manager.create_signed_backup(backup_root, name, &signer),
+            None => manager.create_backup(backup_root, name),
+        }
     }
 
     pub fn status(&self) -> BackupMaintenanceStatus {
@@ -226,7 +412,7 @@ impl BackupMaintenance {
             uuid::Uuid::new_v4().simple()
         );
         let result = (|| {
-            let backup = manager.create_backup(root, &name)?;
+            let backup = self.create_backup(manager, root, &name)?;
             let retention = manager.apply_backup_retention(
                 root,
                 BackupRetentionPolicy {
@@ -275,6 +461,274 @@ impl BackupMaintenance {
         status.last_failure_at = Some(now);
         status.last_error = Some(bounded_text(message));
     }
+}
+
+fn load_configured_backup_signer(
+    config: &BackupScheduleConfig,
+) -> Result<Option<BackupSigningKey>, ContextError> {
+    match (&config.signing_key_path, &config.signing_key_id) {
+        (Some(path), Some(key_id)) => load_backup_signing_key(path, key_id).map(Some),
+        (None, None) => Ok(None),
+        _ => Err(storage_error(
+            "backup signing_key_path and signing_key_id must be configured together",
+        )),
+    }
+}
+
+fn validate_backup_key_id(key_id: &str) -> Result<(), ContextError> {
+    if key_id.is_empty()
+        || key_id.len() > 96
+        || !key_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    {
+        return Err(storage_error(
+            "backup signing key id must be 1-96 ASCII letters, digits, '-', '_' or '.'",
+        ));
+    }
+    Ok(())
+}
+
+fn sha256_bytes(bytes: &[u8]) -> String {
+    hex_encode(digest::digest(&SHA256, bytes).as_ref())
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        use std::fmt::Write as _;
+        let _ = write!(encoded, "{byte:02x}");
+    }
+    encoded
+}
+
+fn hex_decode(value: &str) -> Option<Vec<u8>> {
+    if !value.len().is_multiple_of(2) || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    value
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|pair| {
+            let text = std::str::from_utf8(pair).ok()?;
+            u8::from_str_radix(text, 16).ok()
+        })
+        .collect()
+}
+
+fn validate_authenticity(authenticity: &BackupAuthenticity) -> Result<(), ContextError> {
+    if authenticity.format_version != BACKUP_AUTHENTICITY_FORMAT_VERSION {
+        return Err(storage_error(format!(
+            "unsupported backup authenticity format version {}",
+            authenticity.format_version
+        )));
+    }
+    if authenticity.algorithm != BACKUP_SIGNATURE_ALGORITHM {
+        return Err(storage_error(format!(
+            "unsupported backup signature algorithm {:?}",
+            authenticity.algorithm
+        )));
+    }
+    validate_backup_key_id(&authenticity.key_id)?;
+    if hex_decode(&authenticity.public_key_sha256).is_none_or(|fingerprint| fingerprint.len() != 32)
+    {
+        return Err(storage_error(
+            "backup signing-key fingerprint must be a 32-byte SHA-256 value",
+        ));
+    }
+    if hex_decode(&authenticity.signature_hex).is_none_or(|signature| signature.len() != 64) {
+        return Err(storage_error(
+            "backup Ed25519 signature must contain exactly 64 bytes",
+        ));
+    }
+    Ok(())
+}
+
+fn backup_signing_message(
+    manifest: &BackupManifest,
+    key_id: &str,
+    fingerprint: &str,
+) -> Result<Vec<u8>, ContextError> {
+    validate_backup_key_id(key_id)?;
+    let mut unsigned = manifest.clone();
+    unsigned.authenticity = None;
+    let payload = serde_json::to_vec(&unsigned).map_err(|error| {
+        storage_error(format!("failed to encode backup signing payload: {error}"))
+    })?;
+    let key_len = u32::try_from(key_id.len())
+        .map_err(|_| storage_error("backup signing key id is too long"))?;
+    let fingerprint_len = u32::try_from(fingerprint.len())
+        .map_err(|_| storage_error("backup signing-key fingerprint is too long"))?;
+    let payload_len = u64::try_from(payload.len())
+        .map_err(|_| storage_error("backup signing payload is too large"))?;
+    let mut message = Vec::with_capacity(
+        BACKUP_SIGNING_DOMAIN.len() + key_id.len() + fingerprint.len() + payload.len() + 16,
+    );
+    message.extend_from_slice(BACKUP_SIGNING_DOMAIN);
+    message.extend_from_slice(&key_len.to_be_bytes());
+    message.extend_from_slice(key_id.as_bytes());
+    message.extend_from_slice(&fingerprint_len.to_be_bytes());
+    message.extend_from_slice(fingerprint.as_bytes());
+    message.extend_from_slice(&payload_len.to_be_bytes());
+    message.extend_from_slice(&payload);
+    Ok(message)
+}
+
+fn read_bounded_regular_file(
+    path: &Path,
+    label: &str,
+    max_bytes: u64,
+    owner_only: bool,
+) -> Result<Vec<u8>, ContextError> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+    }
+    let mut file = options.open(path).map_err(|error| {
+        storage_error(format!(
+            "failed to open {label} {} as a regular non-symlink file: {error}",
+            path.display()
+        ))
+    })?;
+    let metadata = file.metadata().map_err(|error| {
+        storage_error(format!(
+            "failed to inspect opened {label} {}: {error}",
+            path.display()
+        ))
+    })?;
+    if !metadata.is_file() {
+        return Err(storage_error(format!(
+            "{label} {} must be a regular file",
+            path.display()
+        )));
+    }
+    #[cfg(unix)]
+    if owner_only {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o077 != 0 {
+            return Err(storage_error(format!(
+                "{label} {} must not be accessible by group or other users",
+                path.display()
+            )));
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = owner_only;
+    let size = metadata.len();
+    if size == 0 || size > max_bytes {
+        return Err(storage_error(format!(
+            "{label} {} must be between 1 and {max_bytes} bytes",
+            path.display()
+        )));
+    }
+    let mut bytes = Vec::with_capacity(size as usize);
+    file.read_to_end(&mut bytes).map_err(|error| {
+        storage_error(format!(
+            "failed to read {label} {}: {error}",
+            path.display()
+        ))
+    })?;
+    Ok(bytes)
+}
+
+/// Load an owner-only Ed25519 PKCS#8 backup signing key from disk.
+pub fn load_backup_signing_key(
+    path: &Path,
+    key_id: &str,
+) -> Result<BackupSigningKey, ContextError> {
+    validate_backup_key_id(key_id)?;
+    let bytes = read_bounded_regular_file(path, "backup signing key", MAX_BACKUP_KEY_BYTES, true)?;
+    BackupSigningKey::from_pkcs8(key_id, &bytes)
+}
+
+/// Read and validate a versioned public backup trust root.
+pub fn load_backup_trust_root(path: &Path) -> Result<BackupTrustRoot, ContextError> {
+    let bytes = read_bounded_regular_file(path, "backup trust root", MAX_MANIFEST_BYTES, false)?;
+    let trust: BackupTrustRoot = serde_json::from_slice(&bytes).map_err(|error| {
+        storage_error(format!(
+            "failed to parse backup trust root {}: {error}",
+            path.display()
+        ))
+    })?;
+    trust.public_key()?;
+    Ok(trust)
+}
+
+fn write_new_owner_only_file(path: &Path, bytes: &[u8], label: &str) -> Result<(), ContextError> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| storage_error(format!("{label} path must have a parent directory")))?;
+    require_real_directory(parent, &format!("{label} parent"))?;
+
+    let mut options = OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path).map_err(|error| {
+        storage_error(format!(
+            "failed to create {label} {}: {error}",
+            path.display()
+        ))
+    })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(fs::Permissions::from_mode(0o600))
+            .map_err(|error| {
+                storage_error(format!(
+                    "failed to protect opened {label} {}: {error}",
+                    path.display()
+                ))
+            })?;
+    }
+    #[cfg(not(unix))]
+    set_owner_only_file(path)?;
+    file.write_all(bytes)
+        .and_then(|()| file.sync_all())
+        .map_err(|error| {
+            storage_error(format!(
+                "failed to persist {label} {}: {error}",
+                path.display()
+            ))
+        })?;
+    sync_directory(parent)
+}
+
+/// Generate a new backup signing key and independently retainable public trust
+/// file. Existing files are never overwritten.
+pub fn generate_backup_signing_key_files(
+    key_id: &str,
+    private_key_path: &Path,
+    trust_root_path: &Path,
+) -> Result<BackupTrustRoot, ContextError> {
+    validate_backup_key_id(key_id)?;
+    if private_key_path == trust_root_path {
+        return Err(storage_error(
+            "backup private key and public trust root must use different files",
+        ));
+    }
+    reject_existing_path(private_key_path, "backup private key")?;
+    reject_existing_path(trust_root_path, "backup public trust root")?;
+
+    let (key, private_bytes) = BackupSigningKey::generate(key_id)?;
+    let trust = key.trust_root();
+    let mut trust_bytes = serde_json::to_vec_pretty(&trust)
+        .map_err(|error| storage_error(format!("failed to encode backup trust root: {error}")))?;
+    trust_bytes.push(b'\n');
+    write_new_owner_only_file(private_key_path, &private_bytes, "backup private key")?;
+    if let Err(error) =
+        write_new_owner_only_file(trust_root_path, &trust_bytes, "backup public trust root")
+    {
+        let _ = fs::remove_file(private_key_path);
+        return Err(error);
+    }
+    Ok(trust)
 }
 
 fn bounded_backup_error(error: &ContextError) -> String {
@@ -613,6 +1067,9 @@ pub fn verify_backup(backup_dir: &Path) -> Result<BackupManifest, ContextError> 
     }
     chrono::DateTime::parse_from_rfc3339(&manifest.created_at)
         .map_err(|error| storage_error(format!("backup creation timestamp is invalid: {error}")))?;
+    if let Some(authenticity) = &manifest.authenticity {
+        validate_authenticity(authenticity)?;
+    }
 
     let database_path = backup_dir.join(BACKUP_DATABASE_FILE);
     let byte_count = require_regular_file(&database_path, "backup database")?;
@@ -636,6 +1093,17 @@ pub fn verify_backup(backup_dir: &Path) -> Result<BackupManifest, ContextError> 
             "backup manifest identity does not match the SQLite storage metadata",
         ));
     }
+    Ok(manifest)
+}
+
+/// Verify backup integrity and require an Ed25519 signature from an
+/// independently supplied trust root.
+pub fn verify_backup_authenticity(
+    backup_dir: &Path,
+    trust: &BackupTrustRoot,
+) -> Result<BackupManifest, ContextError> {
+    let manifest = verify_backup(backup_dir)?;
+    trust.verify_manifest(&manifest)?;
     Ok(manifest)
 }
 
@@ -785,6 +1253,25 @@ impl SqliteContextManager {
         backup_root: &Path,
         name: &str,
     ) -> Result<BackupManifest, ContextError> {
+        self.create_backup_internal(backup_root, name, None)
+    }
+
+    /// Create and atomically publish a signed WAL-consistent online backup.
+    pub fn create_signed_backup(
+        &self,
+        backup_root: &Path,
+        name: &str,
+        signer: &BackupSigningKey,
+    ) -> Result<BackupManifest, ContextError> {
+        self.create_backup_internal(backup_root, name, Some(signer))
+    }
+
+    fn create_backup_internal(
+        &self,
+        backup_root: &Path,
+        name: &str,
+        signer: Option<&BackupSigningKey>,
+    ) -> Result<BackupManifest, ContextError> {
         validate_backup_name(name)?;
         prepare_backup_root(backup_root)?;
         let _publication_lock = acquire_backup_publication_lock(backup_root)?;
@@ -838,7 +1325,7 @@ impl SqliteContextManager {
             // this read-only SQLite handle remains open.
             drop(verified);
             let byte_count = require_regular_file(&database_path, "backup database")?;
-            let manifest = BackupManifest {
+            let mut manifest = BackupManifest {
                 format_version: BACKUP_FORMAT_VERSION,
                 database_file: BACKUP_DATABASE_FILE.to_string(),
                 application_id: metadata.application_id,
@@ -847,7 +1334,11 @@ impl SqliteContextManager {
                 created_at: Utc::now().to_rfc3339(),
                 byte_count,
                 sha256: sha256_file(&database_path)?,
+                authenticity: None,
             };
+            if let Some(signer) = signer {
+                signer.sign_manifest(&mut manifest)?;
+            }
             write_manifest(&staging_dir.join(BACKUP_MANIFEST_FILE), &manifest)?;
             sync_directory(&staging_dir)?;
             #[cfg(test)]
@@ -1124,7 +1615,28 @@ pub fn restore_backup(
     backup_dir: &Path,
     destination_database: &Path,
 ) -> Result<RestoreReport, ContextError> {
-    let manifest = verify_backup(backup_dir)?;
+    restore_backup_internal(backup_dir, destination_database, None)
+}
+
+/// Restore a backup only after it passes integrity and trusted-signature
+/// verification.
+pub fn restore_backup_with_trust(
+    backup_dir: &Path,
+    destination_database: &Path,
+    trust: &BackupTrustRoot,
+) -> Result<RestoreReport, ContextError> {
+    restore_backup_internal(backup_dir, destination_database, Some(trust))
+}
+
+fn restore_backup_internal(
+    backup_dir: &Path,
+    destination_database: &Path,
+    trust: Option<&BackupTrustRoot>,
+) -> Result<RestoreReport, ContextError> {
+    let manifest = match trust {
+        Some(trust) => verify_backup_authenticity(backup_dir, trust)?,
+        None => verify_backup(backup_dir)?,
+    };
     let parent = destination_database
         .parent()
         .ok_or_else(|| storage_error("restore destination must have a parent directory"))?;
@@ -1485,6 +1997,7 @@ mod tests {
             run_on_start: true,
             keep_latest: 1,
             max_age_seconds: 60,
+            ..BackupScheduleConfig::default()
         })
         .unwrap();
         let report = maintenance.run_cycle(&manager).unwrap();
@@ -1525,6 +2038,7 @@ mod tests {
             run_on_start: true,
             keep_latest: 1,
             max_age_seconds: 60,
+            ..BackupScheduleConfig::default()
         })
         .unwrap();
 
@@ -1751,6 +2265,173 @@ mod tests {
         let manifest_path = backup_dir.join(BACKUP_MANIFEST_FILE);
         fs::write(&manifest_path, b"{\"format_version\":1,\"unknown\":true}").unwrap();
         assert!(verify_backup(&backup_dir).is_err());
+    }
+
+    #[test]
+    fn signed_backup_requires_the_independently_retained_matching_trust_root() {
+        let directory = TestDirectory::new("signed");
+        let manager = SqliteContextManager::new(&directory.path.join("source.db")).unwrap();
+        seed(&manager, "signed-proof", "present");
+        let (signer, _) = BackupSigningKey::generate("release-2026.1").unwrap();
+        let (wrong_signer, _) = BackupSigningKey::generate("release-other").unwrap();
+        let root = directory.path.join("backups");
+        let manifest = manager
+            .create_signed_backup(&root, "signed_001", &signer)
+            .unwrap();
+        let backup_dir = root.join("signed_001");
+
+        assert_eq!(verify_backup(&backup_dir).unwrap(), manifest);
+        assert_eq!(
+            verify_backup_authenticity(&backup_dir, &signer.trust_root()).unwrap(),
+            manifest
+        );
+        assert!(
+            verify_backup_authenticity(&backup_dir, &wrong_signer.trust_root())
+                .unwrap_err()
+                .to_string()
+                .contains("not trusted key")
+        );
+
+        // Hash-only verification cannot detect a rewritten but internally
+        // consistent metadata field. Trusted signature verification must.
+        let manifest_path = backup_dir.join(BACKUP_MANIFEST_FILE);
+        let mut rewritten = read_manifest(&manifest_path).unwrap();
+        rewritten.created_at = (Utc::now() - chrono::Duration::hours(1)).to_rfc3339();
+        fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&rewritten).unwrap(),
+        )
+        .unwrap();
+        assert!(verify_backup(&backup_dir).is_ok());
+        assert!(
+            verify_backup_authenticity(&backup_dir, &signer.trust_root())
+                .unwrap_err()
+                .to_string()
+                .contains("signature is invalid")
+        );
+    }
+
+    #[test]
+    fn unsigned_backup_is_rejected_when_authenticity_is_required() {
+        let directory = TestDirectory::new("unsigned");
+        let manager = SqliteContextManager::new(&directory.path.join("source.db")).unwrap();
+        let root = directory.path.join("backups");
+        manager.create_backup(&root, "unsigned_001").unwrap();
+        let (signer, _) = BackupSigningKey::generate("release-2026.1").unwrap();
+        let error = verify_backup_authenticity(&root.join("unsigned_001"), &signer.trust_root())
+            .unwrap_err();
+        assert!(error.to_string().contains("unsigned"));
+    }
+
+    #[test]
+    fn generated_signing_files_are_loadable_non_overwriting_and_drive_maintenance() {
+        let directory = TestDirectory::new("signing-files");
+        let private_key = directory.path.join("backup-signing.pk8");
+        let trust_file = directory.path.join("backup-trust.json");
+        let trust =
+            generate_backup_signing_key_files("release-2026.1", &private_key, &trust_file).unwrap();
+        assert_eq!(load_backup_trust_root(&trust_file).unwrap(), trust);
+        assert_eq!(
+            load_backup_signing_key(&private_key, "release-2026.1")
+                .unwrap()
+                .trust_root(),
+            trust
+        );
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&private_key, directory.path.join("signing-link.pk8"))
+                .unwrap();
+            assert!(load_backup_signing_key(
+                &directory.path.join("signing-link.pk8"),
+                "release-2026.1"
+            )
+            .is_err());
+        }
+        assert!(generate_backup_signing_key_files(
+            "release-2026.2",
+            &private_key,
+            &directory.path.join("other-trust.json"),
+        )
+        .is_err());
+
+        let manager = SqliteContextManager::new(&directory.path.join("source.db")).unwrap();
+        let root = directory.path.join("backups");
+        let maintenance = BackupMaintenance::new(BackupScheduleConfig {
+            enabled: true,
+            root: Some(root.clone()),
+            interval_seconds: 60,
+            run_on_start: true,
+            keep_latest: 1,
+            max_age_seconds: 60,
+            signing_key_path: Some(private_key.clone()),
+            signing_key_id: Some("release-2026.1".into()),
+        })
+        .unwrap();
+        let report = maintenance.run_cycle(&manager).unwrap();
+        assert_eq!(
+            maintenance.status().signing_key_id.as_deref(),
+            Some("release-2026.1")
+        );
+        let name = maintenance.status().last_backup_name.unwrap();
+        assert_eq!(
+            verify_backup_authenticity(&root.join(name), &trust).unwrap(),
+            report.backup
+        );
+        assert!(maintenance
+            .configure(BackupScheduleConfig {
+                signing_key_path: Some(directory.path.join("missing-rotation.pk8")),
+                signing_key_id: Some("release-2026.2".into()),
+                ..maintenance.config()
+            })
+            .is_err());
+        assert_eq!(
+            maintenance.status().signing_key_id.as_deref(),
+            Some("release-2026.1")
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&private_key, fs::Permissions::from_mode(0o644)).unwrap();
+            let error = match load_backup_signing_key(&private_key, "release-2026.1") {
+                Ok(_) => panic!("group- or other-readable signing key must be rejected"),
+                Err(error) => error,
+            };
+            assert!(error.to_string().contains("group or other"));
+        }
+    }
+
+    #[test]
+    fn trusted_restore_rejects_wrong_key_before_mutation_and_accepts_matching_key() {
+        let directory = TestDirectory::new("trusted-restore");
+        let source_manager = SqliteContextManager::new(&directory.path.join("source.db")).unwrap();
+        seed(&source_manager, "trusted-restore", "survived");
+        let (signer, _) = BackupSigningKey::generate("release-2026.1").unwrap();
+        let (wrong, _) = BackupSigningKey::generate("release-other").unwrap();
+        let backup_root = directory.path.join("backups");
+        source_manager
+            .create_signed_backup(&backup_root, "signed_restore", &signer)
+            .unwrap();
+        let destination = directory.path.join("fresh/agent_os.db");
+        assert!(restore_backup_with_trust(
+            &backup_root.join("signed_restore"),
+            &destination,
+            &wrong.trust_root(),
+        )
+        .is_err());
+        assert!(!destination.exists());
+
+        let report = restore_backup_with_trust(
+            &backup_root.join("signed_restore"),
+            &destination,
+            &signer.trust_root(),
+        )
+        .unwrap();
+        assert!(!report.replaced_existing);
+        assert_eq!(
+            value(&destination, "trusted-restore").as_deref(),
+            Some("survived")
+        );
     }
 
     #[test]

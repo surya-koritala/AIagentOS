@@ -1057,15 +1057,16 @@ impl SqliteContextManager {
     }
 
     fn init_schema(&self, schema_version: i64) -> Result<(), ContextError> {
-        let mut conn = self
+        let mut connection = self
             .conn
             .lock()
             .map_err(|_| quota_error("SQLite connection mutex is poisoned"))?;
-        conn.pragma_update(None, "foreign_keys", "ON")
+        connection
+            .pragma_update(None, "foreign_keys", "ON")
             .map_err(|error| {
                 quota_error(format!("failed to enable SQLite foreign keys: {error}"))
             })?;
-        let foreign_keys: i64 = conn
+        let foreign_keys: i64 = connection
             .pragma_query_value(None, "foreign_keys", |row| row.get(0))
             .map_err(|error| {
                 quota_error(format!("failed to verify SQLite foreign keys: {error}"))
@@ -1075,6 +1076,14 @@ impl SqliteContextManager {
                 "SQLite foreign-key enforcement did not remain enabled",
             ));
         }
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| {
+                quota_error(format!(
+                    "failed to start atomic schema migration transaction: {error}"
+                ))
+            })?;
+        let conn = &transaction;
         let quota_schema_exists = conn
             .query_row(
                 "SELECT 1 FROM sqlite_master
@@ -1708,14 +1717,12 @@ impl SqliteContextManager {
             ("embedding_dim", "INTEGER NOT NULL DEFAULT 0"),
             ("content_hash", "TEXT NOT NULL DEFAULT ''"),
         ] {
-            crate::schema::add_column_if_missing(&conn, "facts", column, definition)?;
+            crate::schema::add_column_if_missing(conn, "facts", column, definition)?;
         }
         if hierarchy_schema_upgrade_needed && hierarchy_database_has_rows {
-            // Commit the fence before changing the schema. If the process dies
-            // after ALTER TABLE (or a later index migration fails), the next
-            // startup sees the durable fence even though `scope_order` now
-            // exists and cannot mistake the migration for complete.
-            Self::install_current_quota_migration_fence(&mut conn)?;
+            // The fence and the schema change share one transaction. A process
+            // exit or later error therefore publishes both or neither.
+            Self::install_current_quota_migration_fence(conn)?;
         }
         // Tenant scoping for the agent registry. Added via ALTER so an older DB
         // (created before tenancy) upgrades in place: legacy agents land in the
@@ -1749,14 +1756,14 @@ impl SqliteContextManager {
                 ))
             })?;
             crate::schema::add_column_if_missing(
-                &conn,
+                conn,
                 "agents",
                 "tenant_id",
                 "TEXT NOT NULL DEFAULT 'default'",
             )?;
-            crate::schema::add_column_if_missing(&conn, "usage_log", "provider", "TEXT")?;
+            crate::schema::add_column_if_missing(conn, "usage_log", "provider", "TEXT")?;
             crate::schema::add_column_if_missing(
-                &conn,
+                conn,
                 "usage_log",
                 "tool_calls",
                 "INTEGER NOT NULL DEFAULT 0",
@@ -1772,7 +1779,7 @@ impl SqliteContextManager {
                 ("estimated_requests", "INTEGER NOT NULL DEFAULT 0"),
                 ("cost_micros", "INTEGER NOT NULL DEFAULT 0"),
             ] {
-                crate::schema::add_column_if_missing(&conn, "usage_log", column, definition)?;
+                crate::schema::add_column_if_missing(conn, "usage_log", column, definition)?;
             }
             // Older rows only stored a floating-point USD estimate. Backfill
             // once into the exact integer unit used by enforcement. New rows
@@ -1894,25 +1901,24 @@ impl SqliteContextManager {
             // honest backfill after upgrade, so fence just the current fixed
             // epoch instead of reopening unknown capacity. Fresh/empty
             // databases do not receive this fence.
-            Self::install_current_quota_migration_fence(&mut conn)?;
+            Self::install_current_quota_migration_fence(conn)?;
         }
-        crate::schema::complete_migration(&mut conn, schema_version)?;
+        crate::schema::complete_migration(conn, schema_version)?;
+        transaction.commit().map_err(|error| {
+            quota_error(format!(
+                "failed to commit atomic schema migration transaction: {error}"
+            ))
+        })?;
+        crate::schema::verify(&connection)?;
         Ok(())
     }
 
-    fn install_current_quota_migration_fence(conn: &mut Connection) -> Result<(), ContextError> {
+    fn install_current_quota_migration_fence(conn: &Connection) -> Result<(), ContextError> {
         let now_seconds = Utc::now().timestamp();
         let current_epoch = u64::try_from(now_seconds)
             .map_err(|_| quota_error("system clock is before the Unix epoch"))?
             / PROVIDER_RATE_EPOCH_SECONDS;
-        let tx = conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(|error| {
-                quota_error(format!(
-                    "failed to start quota migration transaction: {error}"
-                ))
-            })?;
-        let stored_floor = tx
+        let stored_floor = conn
             .query_row(
                 "SELECT epoch FROM quota_epoch_floor WHERE singleton = 1",
                 [],
@@ -1931,12 +1937,12 @@ impl SqliteContextManager {
         // clock step would make the lower wall-clock fence irrelevant.
         let effective_epoch = stored_floor.unwrap_or(0).max(current_epoch);
         let effective_epoch_blob = u64_blob(effective_epoch);
-        tx.execute(
+        conn.execute(
             "INSERT OR IGNORE INTO quota_migration_fence(epoch) VALUES (?1)",
             params![effective_epoch_blob.as_slice()],
         )
         .map_err(|error| quota_error(format!("failed to install legacy quota fence: {error}")))?;
-        tx.execute(
+        conn.execute(
             "INSERT INTO quota_epoch_floor(singleton, epoch) VALUES (1, ?1)
              ON CONFLICT(singleton) DO UPDATE SET epoch = CASE
                  WHEN quota_epoch_floor.epoch < excluded.epoch
@@ -1944,9 +1950,6 @@ impl SqliteContextManager {
             params![effective_epoch_blob.as_slice()],
         )
         .map_err(|error| quota_error(format!("failed to initialize quota epoch floor: {error}")))?;
-        tx.commit().map_err(|error| {
-            quota_error(format!("failed to commit quota migration fence: {error}"))
-        })?;
         Ok(())
     }
 
@@ -8828,7 +8831,7 @@ mod tests {
     }
 
     #[test]
-    fn released_v1_store_upgrades_to_v2_with_receipt_schema_and_ledger() {
+    fn schema_v1_layout_upgrades_to_v2_with_receipt_schema_and_ledger() {
         let database = QuotaTestDatabase::new("schema-v1-to-v2");
         {
             let manager = SqliteContextManager::new(&database.path).unwrap();
@@ -8869,6 +8872,206 @@ mod tests {
         assert_eq!(migration_name, "add-privacy-safe-deletion-receipts");
         assert_eq!(receipt_table, 1);
         crate::schema::verify(&connection).unwrap();
+    }
+
+    #[derive(Debug, serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct ReleasedStorageFixtureManifest {
+        format_version: u32,
+        release: Vec<ReleasedStorageFixture>,
+    }
+
+    #[derive(Debug, serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct ReleasedStorageFixture {
+        tag: String,
+        source_commit: String,
+        sql_file: String,
+        sql_sha256: String,
+        legacy_schema_version: i64,
+        agent_id: String,
+        context_marker: String,
+        memory_marker: String,
+        conversation_marker: String,
+        usage_tokens: i64,
+        usage_cost_micros: i64,
+        tenant_id: Option<String>,
+        kv_marker: Option<String>,
+    }
+
+    fn released_storage_fixture_root() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/storage")
+    }
+
+    fn sha256_hex(bytes: &[u8]) -> String {
+        ring::digest::digest(&ring::digest::SHA256, bytes)
+            .as_ref()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn every_published_release_fixture_upgrades_atomically_and_retains_state() {
+        let root = released_storage_fixture_root();
+        let manifest_text = std::fs::read_to_string(root.join("releases.toml")).unwrap();
+        let manifest: ReleasedStorageFixtureManifest = toml::from_str(&manifest_text).unwrap();
+        assert_eq!(manifest.format_version, 1);
+        assert_eq!(
+            manifest
+                .release
+                .iter()
+                .map(|fixture| fixture.tag.as_str())
+                .collect::<Vec<_>>(),
+            ["v0.1.0", "v0.2.0", "v0.3.0"],
+            "the fixture manifest must enumerate every immutable published tag"
+        );
+        assert_eq!(
+            manifest.release.last().map(|fixture| fixture.tag.as_str()),
+            Some(concat!("v", env!("CARGO_PKG_VERSION"))),
+            "a release version bump must add its immutable storage fixture before tagging"
+        );
+
+        for fixture in manifest.release {
+            assert_eq!(fixture.source_commit.len(), 40, "{}", fixture.tag);
+            assert!(
+                fixture
+                    .source_commit
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit()),
+                "{} has an invalid source commit",
+                fixture.tag
+            );
+            let fixture_file = std::path::Path::new(&fixture.sql_file);
+            assert_eq!(
+                fixture_file.components().count(),
+                1,
+                "{} fixture path must be one local filename",
+                fixture.tag
+            );
+            assert_eq!(
+                fixture_file.extension().and_then(std::ffi::OsStr::to_str),
+                Some("sql"),
+                "{} fixture must be reviewable SQL",
+                fixture.tag
+            );
+            let sql = std::fs::read(root.join(fixture_file)).unwrap();
+            assert_eq!(
+                sha256_hex(&sql),
+                fixture.sql_sha256,
+                "{} fixture changed without updating its reviewed digest",
+                fixture.tag
+            );
+
+            let database = QuotaTestDatabase::new(&format!("release-{}", fixture.tag));
+            {
+                let connection = Connection::open(&database.path).unwrap();
+                connection
+                    .execute_batch(std::str::from_utf8(&sql).unwrap())
+                    .unwrap();
+                assert_eq!(
+                    crate::schema::preflight(&connection).unwrap(),
+                    fixture.legacy_schema_version,
+                    "{} fixture does not reproduce its released version",
+                    fixture.tag
+                );
+            }
+
+            {
+                let manager = SqliteContextManager::new(&database.path)
+                    .unwrap_or_else(|error| panic!("{} upgrade failed: {error}", fixture.tag));
+                let agent_id = uuid::Uuid::parse_str(&fixture.agent_id).unwrap();
+                let context = manager.get_context(agent_id).await.unwrap();
+                assert_eq!(
+                    context
+                        .conversation_history
+                        .first()
+                        .map(|message| message.content.as_str()),
+                    Some(fixture.context_marker.as_str()),
+                    "{} context was not retained",
+                    fixture.tag
+                );
+
+                let connection = manager.conn.lock().unwrap();
+                crate::schema::verify(&connection).unwrap();
+                let migration_count: i64 = connection
+                    .query_row("SELECT COUNT(*) FROM schema_migrations", [], |row| {
+                        row.get(0)
+                    })
+                    .unwrap();
+                assert_eq!(
+                    migration_count,
+                    crate::schema::CURRENT_SCHEMA_VERSION,
+                    "{} did not record every schema migration",
+                    fixture.tag
+                );
+                let memory: String = connection
+                    .query_row(
+                        "SELECT content FROM facts WHERE agent_id = ?1",
+                        [&fixture.agent_id],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(memory, fixture.memory_marker, "{}", fixture.tag);
+                let conversation: String = connection
+                    .query_row("SELECT content FROM conversations_fts LIMIT 1", [], |row| {
+                        row.get(0)
+                    })
+                    .unwrap();
+                assert_eq!(
+                    conversation, fixture.conversation_marker,
+                    "{} FTS state was not retained",
+                    fixture.tag
+                );
+                let (tokens, cost_micros): (i64, i64) = connection
+                    .query_row(
+                        "SELECT tokens_used, cost_micros FROM usage_log WHERE agent_id = ?1",
+                        [&fixture.agent_id],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .unwrap();
+                assert_eq!(tokens, fixture.usage_tokens, "{}", fixture.tag);
+                assert_eq!(
+                    cost_micros, fixture.usage_cost_micros,
+                    "{} legacy cost was not backfilled exactly",
+                    fixture.tag
+                );
+                if let Some(tenant_id) = &fixture.tenant_id {
+                    let (agent_tenant, kv): (String, String) = connection
+                        .query_row(
+                            "SELECT agents.tenant_id, agent_kv.value
+                             FROM agents
+                             JOIN agent_kv ON agent_kv.agent_id = agents.id
+                             WHERE agents.id = ?1 AND agent_kv.key = 'release-proof'",
+                            [&fixture.agent_id],
+                            |row| Ok((row.get(0)?, row.get(1)?)),
+                        )
+                        .unwrap();
+                    assert_eq!(&agent_tenant, tenant_id, "{}", fixture.tag);
+                    assert_eq!(
+                        Some(kv.as_str()),
+                        fixture.kv_marker.as_deref(),
+                        "{} tenant-scoped KV state was not retained",
+                        fixture.tag
+                    );
+                }
+            }
+
+            let reopened = SqliteContextManager::new(&database.path).unwrap();
+            let connection = reopened.conn.lock().unwrap();
+            crate::schema::verify(&connection).unwrap();
+            let migration_count: i64 = connection
+                .query_row("SELECT COUNT(*) FROM schema_migrations", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(
+                migration_count,
+                crate::schema::CURRENT_SCHEMA_VERSION,
+                "{} idempotent reopen duplicated migration history",
+                fixture.tag
+            );
+        }
     }
 
     #[test]
@@ -9166,6 +9369,22 @@ mod tests {
         }
     }
 
+    fn logical_sqlite_schema(connection: &Connection) -> Vec<(String, String, String)> {
+        let mut statement = connection
+            .prepare(
+                "SELECT type, name, COALESCE(sql, '')
+                 FROM sqlite_schema
+                 WHERE name NOT LIKE 'sqlite_%'
+                 ORDER BY type, name",
+            )
+            .unwrap();
+        statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    }
+
     #[test]
     fn pr140_quota_schema_upgrade_fences_unknown_cgroup_usage() {
         let database = QuotaTestDatabase::new("pr140-hierarchy-migration");
@@ -9245,20 +9464,26 @@ mod tests {
     }
 
     #[test]
-    fn pr140_hierarchy_fence_survives_failure_after_scope_order_alter() {
+    fn pr140_hierarchy_migration_rolls_back_every_change_after_late_failure() {
         let database = QuotaTestDatabase::new("pr140-interrupted-hierarchy");
-        {
+        let schema_before = {
             let conn = Connection::open(&database.path).unwrap();
             create_pr140_quota_schema(&conn, true);
-        }
+            logical_sqlite_schema(&conn)
+        };
 
         let error = SqliteContextManager::new(&database.path)
             .err()
             .expect("duplicate scope orders must fail the index migration");
         assert!(error.to_string().contains("scope-order index"));
 
-        let durable_fence = {
+        {
             let conn = Connection::open(&database.path).unwrap();
+            assert_eq!(
+                logical_sqlite_schema(&conn),
+                schema_before,
+                "a late migration failure must roll back the complete logical schema"
+            );
             let application_id: i64 = conn
                 .pragma_query_value(None, "application_id", |row| row.get(0))
                 .unwrap();
@@ -9274,21 +9499,40 @@ mod tests {
                 .unwrap()
                 .map(Result::unwrap)
                 .any(|column| column == "scope_order");
-            assert!(has_scope_order, "failure must happen after ALTER TABLE");
-            let value: Vec<u8> = conn
-                .query_row("SELECT epoch FROM quota_migration_fence", [], |row| {
-                    row.get(0)
-                })
+            assert!(
+                !has_scope_order,
+                "the late failure must roll back the earlier ALTER TABLE"
+            );
+            let migration_fence_exists = conn
+                .query_row(
+                    "SELECT 1 FROM sqlite_schema
+                     WHERE type = 'table' AND name = 'quota_migration_fence'",
+                    [],
+                    |_| Ok(()),
+                )
+                .optional()
                 .unwrap();
+            assert!(
+                migration_fence_exists.is_none(),
+                "the late failure must roll back newly created schema"
+            );
             conn.execute(
                 "DELETE FROM quota_receipt_scopes WHERE scope_kind = 'cgroup'",
                 [],
             )
             .unwrap();
-            parse_u64_blob(value, "interrupted PR140 migration fence").unwrap()
-        };
+        }
 
         let manager = SqliteContextManager::new(&database.path).unwrap();
+        let durable_fence = {
+            let conn = manager.conn.lock().unwrap();
+            let value: Vec<u8> = conn
+                .query_row("SELECT epoch FROM quota_migration_fence", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            parse_u64_blob(value, "retried PR140 migration fence").unwrap()
+        };
         assert!(matches!(
             manager
                 .reserve_provider_rate(uuid::Uuid::new_v4(), durable_fence, 10, 100, 1)

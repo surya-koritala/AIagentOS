@@ -1,0 +1,44 @@
+format_version = 1
+
+[[release]]
+tag = "v0.1.0"
+source_commit = "0b515f358ccff684118ae566b321ca4c299cbc49"
+sql_file = "v0.1.0.sql"
+sql_sha256 = "df0018d934856b028b8fc9a1d6be7ae3be5e4a8ad84619081946eeb64500dae0"
+legacy_schema_version = 0
+agent_id = "00000000-0000-0000-0000-000000000101"
+context_marker = "v0.1-context"
+memory_marker = "v0.1-memory"
+conversation_marker = "v0.1-conversation"
+usage_tokens = 17
+usage_cost_micros = 125000
+
+[[release]]
+tag = "v0.2.0"
+source_commit = "b70685ec2c3cba48c14ac8448a0358490d31e8bc"
+sql_file = "v0.2.0.sql"
+sql_sha256 = "eeffdbf3763f7550ab98c7ab8aaa60bff683986c87325e3feb61e86e8b3c265f"
+legacy_schema_version = 0
+agent_id = "00000000-0000-0000-0000-000000000201"
+context_marker = "v0.2-context"
+memory_marker = "v0.2-memory"
+conversation_marker = "v0.2-conversation"
+usage_tokens = 23
+usage_cost_micros = 250000
+tenant_id = "tenant-v020"
+kv_marker = "v0.2-kv"
+
+[[release]]
+tag = "v0.3.0"
+source_commit = "534e37e3c962c1fea5ef5e21971ab876e9b283bc"
+sql_file = "v0.3.0.sql"
+sql_sha256 = "bd11209f66f8cb89dd1f1015514740426290a76e3beabe223f810cf86720d5a6"
+legacy_schema_version = 0
+agent_id = "00000000-0000-0000-0000-000000000301"
+context_marker = "v0.3-context"
+memory_marker = "v0.3-memory"
+conversation_marker = "v0.3-conversation"
+usage_tokens = 31
+usage_cost_micros = 375000
+tenant_id = "tenant-v030"
+kv_marker = "v0.3-kv"

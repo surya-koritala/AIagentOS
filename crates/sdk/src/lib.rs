@@ -42,7 +42,9 @@ use tokio::net::ToSocketAddrs;
 // Re-export the kernel wire types that appear in this crate's public API, so
 // SDK consumers can name them without depending on the kernel directly.
 pub use kernel::cluster_control::{
-    NodeAvailability, NodeControlAudit, NodeControlStatus, NodeIdentity, NodeProfile,
+    ClusterJoinChallenge, ClusterMember, ClusterMemberRegistration, ClusterMemberState,
+    ClusterMembershipAudit, ClusterMembershipSnapshot, NodeAvailability, NodeControlAudit,
+    NodeControlStatus, NodeIdentity, NodeProfile,
 };
 pub use kernel::context::ContextPressureStats;
 pub use kernel::init_system::{ServiceHistoryEntry, ServiceRuntimeInfo};
@@ -853,6 +855,83 @@ impl KernelClient {
         match self.call(Syscall::ListNodeControlAudit { limit }).await? {
             SyscallReply::NodeControlAudit { entries } => Ok(entries),
             other => Err(unexpected("NodeControlAudit", &other)),
+        }
+    }
+
+    pub async fn issue_cluster_join_challenge(
+        &mut self,
+        ttl_seconds: u64,
+    ) -> Result<ClusterJoinChallenge, SdkError> {
+        match self
+            .call(Syscall::IssueClusterJoinChallenge { ttl_seconds })
+            .await?
+        {
+            SyscallReply::ClusterJoinChallenge { challenge } => Ok(challenge),
+            other => Err(unexpected("ClusterJoinChallenge", &other)),
+        }
+    }
+
+    pub async fn register_cluster_member(
+        &mut self,
+        registration: ClusterMemberRegistration,
+        challenge_hex: impl Into<String>,
+        signature_hex: impl Into<String>,
+        expected_generation: Option<u64>,
+        reason: impl Into<String>,
+    ) -> Result<ClusterMember, SdkError> {
+        match self
+            .call(Syscall::RegisterClusterMember {
+                registration,
+                challenge_hex: challenge_hex.into(),
+                signature_hex: signature_hex.into(),
+                expected_generation,
+                reason: reason.into(),
+            })
+            .await?
+        {
+            SyscallReply::ClusterMemberUpdated { member } => Ok(member),
+            other => Err(unexpected("ClusterMemberUpdated", &other)),
+        }
+    }
+
+    pub async fn set_cluster_member_state(
+        &mut self,
+        node_id: impl Into<String>,
+        state: ClusterMemberState,
+        expected_generation: u64,
+        reason: impl Into<String>,
+    ) -> Result<ClusterMember, SdkError> {
+        match self
+            .call(Syscall::SetClusterMemberState {
+                node_id: node_id.into(),
+                state,
+                expected_generation,
+                reason: reason.into(),
+            })
+            .await?
+        {
+            SyscallReply::ClusterMemberUpdated { member } => Ok(member),
+            other => Err(unexpected("ClusterMemberUpdated", &other)),
+        }
+    }
+
+    pub async fn cluster_membership(&mut self) -> Result<ClusterMembershipSnapshot, SdkError> {
+        match self.call(Syscall::GetClusterMembership).await? {
+            SyscallReply::ClusterMembership { membership } => Ok(membership),
+            other => Err(unexpected("ClusterMembership", &other)),
+        }
+    }
+
+    pub async fn cluster_membership_audit(
+        &mut self,
+        limit: usize,
+    ) -> Result<Vec<ClusterMembershipAudit>, SdkError> {
+        match self
+            .call(Syscall::ListClusterMembershipAudit { limit })
+            .await?
+        {
+            SyscallReply::ClusterMembershipAudit { entries } => Ok(entries),
+            other => Err(unexpected("ClusterMembershipAudit", &other)),
         }
     }
 

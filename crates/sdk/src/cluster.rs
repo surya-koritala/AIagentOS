@@ -16,8 +16,9 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::{
-    AgentSummary, KernelClient, MessageResult, MessageStreamEvent, NodeAvailability, NodeLoad,
-    SdkError, WireErrorCode,
+    AgentSummary, ClusterMember, ClusterMemberRegistration, ClusterMemberState,
+    ClusterMembershipSnapshot, KernelClient, MessageResult, MessageStreamEvent, NodeAvailability,
+    NodeLoad, SdkError, WireErrorCode,
 };
 
 /// One kernel node in the cluster: its stable id, transport address, and client.
@@ -86,6 +87,62 @@ pub struct ClusterClient {
 }
 
 impl ClusterClient {
+    /// Admit one connected node through an authority-issued, one-time challenge.
+    ///
+    /// The node signs a domain-separated payload covering its durable identity,
+    /// endpoint, software version, and protocol window. A returning member must
+    /// supply its current generation; new members pass `None`.
+    pub async fn admit_node(
+        authority: &mut KernelClient,
+        node: &mut KernelClient,
+        endpoint: impl Into<String>,
+        expected_generation: Option<u64>,
+        reason: impl Into<String>,
+    ) -> Result<ClusterMember, SdkError> {
+        let endpoint = endpoint.into();
+        let challenge = authority.issue_cluster_join_challenge(30).await?;
+        let load = node.node_info().await?;
+        let control = load.control.ok_or_else(|| {
+            SdkError::Kernel("cluster membership requires durable node identity support".into())
+        })?;
+        let protocol = node.hello().await?;
+        let registration = ClusterMemberRegistration {
+            node_id: control.identity.node_id,
+            fingerprint: control.identity.fingerprint,
+            public_key: control.identity.public_key,
+            endpoint,
+            server_version: protocol.server_version,
+            min_protocol_version: protocol.min_protocol_version,
+            protocol_version: protocol.protocol_version,
+        };
+        let payload = kernel::cluster_control::membership_join_payload(
+            &challenge.cluster_id,
+            &challenge.challenge_hex,
+            &registration,
+        )
+        .map_err(|error| SdkError::Kernel(error.to_string()))?;
+        let proof = node.prove_node_identity(hex_encode(&payload)).await?;
+        if proof.node_id != registration.node_id
+            || proof.fingerprint != registration.fingerprint
+            || proof.public_key != registration.public_key
+        {
+            return Err(SdkError::Wire {
+                code: WireErrorCode::Conflict,
+                message: "node identity changed while completing cluster admission".into(),
+                retryable: false,
+            });
+        }
+        authority
+            .register_cluster_member(
+                registration,
+                challenge.challenge_hex,
+                proof.signature_hex,
+                expected_generation,
+                reason,
+            )
+            .await
+    }
+
     /// Connect to every node, prove each durable identity, reject duplicates,
     /// and reconstruct the ownership directory from durable node listings.
     pub async fn connect(addrs: &[String]) -> Result<Self, SdkError> {
@@ -125,6 +182,51 @@ impl ClusterClient {
         token: impl Into<String>,
     ) -> Result<Self, SdkError> {
         Self::connect_tls_with_token(addrs, server_name.into(), config, Some(token.into())).await
+    }
+
+    /// Discover the active authority membership over authenticated connections.
+    ///
+    /// Construction validates every durable identity and endpoint against one
+    /// atomic membership snapshot, then re-reads the authority generation. A
+    /// concurrent membership change fails with a retryable conflict instead of
+    /// returning a cluster assembled from mixed revisions.
+    pub async fn connect_discovered_authenticated(
+        authority_addr: impl AsRef<str>,
+        token: impl Into<String>,
+    ) -> Result<Self, SdkError> {
+        let authority_addr = authority_addr.as_ref();
+        let token = token.into();
+        let mut authority = KernelClient::connect(authority_addr).await?;
+        authority.authenticate(&token).await?;
+        let snapshot = authority.cluster_membership().await?;
+        let addrs = active_member_endpoints(&snapshot)?;
+        let cluster = Self::connect_authenticated(&addrs, token).await?;
+        cluster.validate_membership(&snapshot)?;
+        let confirmed = authority.cluster_membership().await?;
+        ensure_unchanged_membership(&snapshot, &confirmed)?;
+        Ok(cluster)
+    }
+
+    /// TLS/mTLS variant of [`connect_discovered_authenticated`](Self::connect_discovered_authenticated).
+    pub async fn connect_discovered_tls_authenticated(
+        authority_addr: impl AsRef<str>,
+        server_name: impl Into<String>,
+        config: rustls::ClientConfig,
+        token: impl Into<String>,
+    ) -> Result<Self, SdkError> {
+        let authority_addr = authority_addr.as_ref();
+        let server_name = server_name.into();
+        let token = token.into();
+        let mut authority =
+            KernelClient::connect_tls(authority_addr, server_name.clone(), config.clone()).await?;
+        authority.authenticate(&token).await?;
+        let snapshot = authority.cluster_membership().await?;
+        let addrs = active_member_endpoints(&snapshot)?;
+        let cluster = Self::connect_tls_authenticated(&addrs, server_name, config, token).await?;
+        cluster.validate_membership(&snapshot)?;
+        let confirmed = authority.cluster_membership().await?;
+        ensure_unchanged_membership(&snapshot, &confirmed)?;
+        Ok(cluster)
     }
 
     async fn connect_with_token(addrs: &[String], token: Option<String>) -> Result<Self, SdkError> {
@@ -427,6 +529,89 @@ impl ClusterClient {
     /// Mutable access to a node by id (for node-specific calls).
     pub fn node(&mut self, id: &str) -> Option<&mut NodeHandle> {
         self.nodes.iter_mut().find(|n| n.id == id)
+    }
+
+    fn validate_membership(&self, snapshot: &ClusterMembershipSnapshot) -> Result<(), SdkError> {
+        let active: HashMap<&str, &ClusterMember> = snapshot
+            .members
+            .iter()
+            .filter(|member| member.state == ClusterMemberState::Active)
+            .map(|member| (member.node_id.as_str(), member))
+            .collect();
+        if self.nodes.len() != active.len() {
+            return Err(membership_conflict(
+                format!(
+                    "authority advertised {} active nodes but {} connected",
+                    active.len(),
+                    self.nodes.len()
+                ),
+                false,
+            ));
+        }
+        for node in &self.nodes {
+            let Some(member) = active.get(node.id.as_str()) else {
+                return Err(membership_conflict(
+                    format!(
+                        "node {} is not active in authority generation {}",
+                        node.id, snapshot.generation
+                    ),
+                    false,
+                ));
+            };
+            if node.fingerprint.as_deref() != Some(member.fingerprint.as_str())
+                || node.address != member.endpoint
+            {
+                return Err(membership_conflict(
+                    format!(
+                        "node {} does not match its authorized identity and endpoint",
+                        node.id
+                    ),
+                    false,
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+fn active_member_endpoints(snapshot: &ClusterMembershipSnapshot) -> Result<Vec<String>, SdkError> {
+    let endpoints: Vec<String> = snapshot
+        .members
+        .iter()
+        .filter(|member| member.state == ClusterMemberState::Active)
+        .map(|member| member.endpoint.clone())
+        .collect();
+    if endpoints.is_empty() {
+        return Err(SdkError::Wire {
+            code: WireErrorCode::Unavailable,
+            message: "cluster authority has no active members".into(),
+            retryable: true,
+        });
+    }
+    Ok(endpoints)
+}
+
+fn ensure_unchanged_membership(
+    initial: &ClusterMembershipSnapshot,
+    confirmed: &ClusterMembershipSnapshot,
+) -> Result<(), SdkError> {
+    if initial.cluster_id != confirmed.cluster_id
+        || initial.generation != confirmed.generation
+        || initial.members != confirmed.members
+    {
+        return Err(membership_conflict(
+            "cluster membership changed during discovery; retry from a fresh snapshot",
+            true,
+        ));
+    }
+    Ok(())
+}
+
+fn membership_conflict(message: impl Into<String>, retryable: bool) -> SdkError {
+    SdkError::Wire {
+        code: WireErrorCode::Conflict,
+        message: message.into(),
+        retryable,
     }
 }
 

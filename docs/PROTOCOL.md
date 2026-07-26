@@ -41,9 +41,9 @@ compatibility behavior, and transport limits:
 
 The schemas use JSON Schema draft 2020-12 and cover every top-level request,
 reply, and stream-event tag. The authorization/schema regression constructs
-all 61 current syscalls and rejects either a missing schema operation or an
+all 70 current syscalls and rejects either a missing schema operation or an
 undocumented extra. Deterministic golden request arrays cover all 58 v1
-operations and all 61 v2 operations. Domain payload examples and
+operations and all 70 v2 operations. Domain payload examples and
 previous-version shapes are retained under `protocol/`.
 
 ## Compatibility policy
@@ -213,13 +213,39 @@ construction or explicit `rebuild_owners`, the cluster lists durable node state
 and reconstructs agent routing. Duplicate agent ownership is a non-routable
 `conflict`; the client never guesses an owner.
 
-This is not yet a consensus or lease protocol. Discovery uses an explicit
-address list, and there is no authoritative membership service, automatic
-ownership migration, partition fencing, cluster-wide quota transaction,
+### Authorized membership and discovery
+
+A designated protocol-v2 kernel can act as the durable membership authority.
+Membership operations are system-scoped; production callers should use both a
+system authentication token and mutual TLS.
+
+1. The authority issues a random 32-byte challenge valid for 5–300 seconds.
+2. The joining node signs a domain-separated payload covering the authority
+   cluster ID, challenge, durable identity, endpoint, software version, and
+   protocol support window.
+3. The authority verifies and consumes the challenge exactly once, rejects
+   incompatible versions and duplicate identities/endpoints, and commits the
+   active member plus audit evidence in one SQLite transaction.
+4. Clean leave and terminal identity revocation use per-member generation
+   compare-and-set fences. A left node needs a fresh challenged join; a revoked
+   identity cannot rejoin.
+
+`get_cluster_membership` returns one atomic cluster ID/generation/member
+snapshot. `ClusterClient::connect_discovered_authenticated` and its TLS variant
+dial only active endpoints, prove every identity, require exact endpoint and
+fingerprint matches, then re-read the authority. If membership changed while
+connections were assembled, construction fails with a retryable `conflict`.
+The authority identity, membership, generations, and audit survive authority
+restart.
+
+This is not yet a consensus, lease, or partition-tolerant membership protocol.
+The designated authority is a single consistency point with no quorum failover;
+there is no ownership lease/fencing token enforced by agent mutations,
+automatic migration, partition fencing, cluster-wide quota transaction,
 policy/package convergence, rolling-upgrade coordinator, or disaster-recovery
-controller. Individual client-certificate revocation currently requires
-replacing the trust configuration and restarting affected listeners. Those
-requirements remain tracked by #122.
+controller. Identity revocation is enforced by discovery, but live TLS client
+certificate rotation/revocation still requires replacing trust configuration
+and restarting affected listeners. Those requirements remain tracked by #122.
 
 ## Conformance evidence
 
@@ -230,7 +256,7 @@ Versioned fixtures:
 - `protocol/v2/hello.json`
 - `protocol/v2/typed-error.json`
 - `protocol/v2/describe-protocol-request.json`
-- `protocol/v2/requests.json` (all 65 v2 operations)
+- `protocol/v2/requests.json` (all 70 v2 operations)
 - `protocol/v2/send-message-stream.json`
 - `protocol/v2/stream-event.json`
 - `protocol/v2/stream-completed.json`

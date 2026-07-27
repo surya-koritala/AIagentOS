@@ -231,6 +231,13 @@ qualification boundary. Its protected exact-RC target-service workflow retains
 replayable public trust/anchor fixtures without private keys or credentials;
 an actual eligible target run is still required.
 
+Real power-loss, torn-write, and storage-device-loss proof uses the separate
+[destructive storage profile qualification](docs/STORAGE_PROFILE_QUALIFICATION.md).
+That protected gate recalculates the published 300-second RPO and 3,600-second
+RTO objectives from externally collected, independently reviewed evidence. The
+gate is implemented, but no eligible target exercise has been published; CI
+fault fixtures are never presented as physical-storage proof.
+
 If the configured database itself is corrupt and normal restore refuses to
 checkpoint it, keep the server stopped and use the separate forensic path. The
 expected installation UUID must come from independently retained installation

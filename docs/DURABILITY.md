@@ -715,6 +715,15 @@ proves rollback, capacity restoration, retry, `quick_check`, and reopen. See
 single ext4 fixture does not substitute for destructive capacity tests on every
 supported deployment profile or filesystem.
 
+The protected
+[destructive storage profile qualification](STORAGE_PROFILE_QUALIFICATION.md)
+adds a fail-closed evidence contract for an actual out-of-band host power cut,
+block-level torn write, storage-device detachment, and measured RPO/RTO on the
+supported single-node Linux profile. It validates externally collected,
+independently reviewed exact-RC evidence; it does not inject those dangerous
+faults from CI. The gate is implemented, but no eligible target exercise has
+yet been published, so these scenarios remain an open qualification item.
+
 All three schema-wide erasure transactions have real process-exit regressions
 at every statement boundary: 17 agent, 5 user, and 28 tenant boundaries. The
 agent matrix covers FTS, each owned data table, service references, cgroup quota

@@ -1215,6 +1215,8 @@ fn require_real_directory(path: &Path, label: &str) -> Result<(), ContextError> 
 }
 
 fn set_owner_only_directory(path: &Path) -> Result<(), ContextError> {
+    #[cfg(not(unix))]
+    let _ = path;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;

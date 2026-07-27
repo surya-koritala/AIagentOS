@@ -1,0 +1,141 @@
+name: Destructive storage profile qualification
+
+# This protected manual gate validates evidence produced by an external
+# destructive test harness. It never initiates a power cut, torn write, or
+# device detachment from GitHub Actions, and it never substitutes fixtures.
+on:
+  workflow_dispatch:
+    inputs:
+      release_candidate:
+        description: Existing vX.Y.Z-rc.N or vX.Y.Z tag pointing at this workflow ref
+        required: true
+        type: string
+      environment_id:
+        description: Stable non-secret target deployment identifier
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: destructive-storage-profile-qualification
+  cancel-in-progress: false
+
+env:
+  AGENTOS_RELEASE_CANDIDATE: ${{ inputs.release_candidate }}
+  AGENTOS_QUALIFICATION_ENVIRONMENT: ${{ inputs.environment_id }}
+  AGENTOS_STORAGE_PROFILE_EVIDENCE_DIR: ${{ vars.AGENTOS_STORAGE_PROFILE_EVIDENCE_DIR }}
+  AGENTOS_STORAGE_PROFILE_ID: single-node-linux-rootless-container-cli
+
+jobs:
+  exact-release-candidate-destructive-storage:
+    name: Exact-RC destructive target storage evidence
+    runs-on: [self-hosted, linux, x64, agentos-destructive-storage]
+    timeout-minutes: 15
+    environment: destructive-storage-qualification
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+      - name: Validate the checked-in evidence contract
+        run: python3 scripts/storage_profile_qualification.py --validate
+      - name: Bind the release-candidate tag to this exact commit
+        run: |
+          [[ "$AGENTOS_RELEASE_CANDIDATE" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-rc\.[1-9][0-9]*)?$ ]]
+          test "$(git rev-parse "refs/tags/${AGENTOS_RELEASE_CANDIDATE}^{commit}")" = "$GITHUB_SHA"
+      - name: Require protected externally collected evidence
+        run: |
+          test -n "$AGENTOS_STORAGE_PROFILE_EVIDENCE_DIR"
+          [[ "$AGENTOS_STORAGE_PROFILE_EVIDENCE_DIR" = /* ]]
+          test -d "$AGENTOS_STORAGE_PROFILE_EVIDENCE_DIR"
+          test ! -L "$AGENTOS_STORAGE_PROFILE_EVIDENCE_DIR"
+          evidence_dir="$(realpath "$AGENTOS_STORAGE_PROFILE_EVIDENCE_DIR")"
+          case "$evidence_dir" in
+            "$GITHUB_WORKSPACE"|"$GITHUB_WORKSPACE"/*)
+              echo "Evidence must remain outside the source checkout" >&2
+              exit 1
+              ;;
+          esac
+          observation="${evidence_dir}/storage-observation.json"
+          review="${evidence_dir}/storage-review.json"
+          test -f "$observation"
+          test ! -L "$observation"
+          test -f "$review"
+          test ! -L "$review"
+          test "$(stat -c %s "$observation")" -gt 0
+          test "$(stat -c %s "$observation")" -le 524288
+          test "$(stat -c %s "$review")" -gt 0
+          test "$(stat -c %s "$review")" -le 524288
+      - name: Validate exact-RC target observations and independent review
+        run: |
+          mkdir -p target/qualification
+          python3 scripts/storage_profile_qualification.py \
+            --observation "${AGENTOS_STORAGE_PROFILE_EVIDENCE_DIR}/storage-observation.json" \
+            --review "${AGENTOS_STORAGE_PROFILE_EVIDENCE_DIR}/storage-review.json" \
+            --expected-commit "$GITHUB_SHA" \
+            --expected-environment "$AGENTOS_QUALIFICATION_ENVIRONMENT" \
+            --release-candidate "$AGENTOS_RELEASE_CANDIDATE" \
+            --output target/qualification/storage-profile.json \
+            --require-eligible
+      - name: Verify bounded published evidence
+        run: |
+          report=target/qualification/storage-profile.json
+          test "$(jq -r .schema_version "$report")" = "1"
+          test "$(jq -r .qualification_class "$report")" = \
+            "exact_release_candidate_destructive_storage_profile"
+          test "$(jq -r .release_candidate "$report")" = "$AGENTOS_RELEASE_CANDIDATE"
+          test "$(jq -r .source.commit "$report")" = "$GITHUB_SHA"
+          test "$(jq -r .source.dirty "$report")" = "false"
+          test "$(jq -r .environment.environment_id "$report")" = \
+            "$AGENTOS_QUALIFICATION_ENVIRONMENT"
+          test "$(jq -r .profile.profile_id "$report")" = "$AGENTOS_STORAGE_PROFILE_ID"
+          test "$(jq -r .profile.target_rpo_seconds "$report")" = "300"
+          test "$(jq -r .profile.target_rto_seconds "$report")" = "3600"
+          test "$(jq -r .destructive_storage_profile_completed "$report")" = "true"
+          test "$(jq -r .storage_profile_proof_eligible "$report")" = "true"
+          test "$(jq -r .production_claim_allowed "$report")" = "false"
+          test "$(jq -r .review.reviewer_independent "$report")" = "true"
+          test "$(jq -r .review.decision "$report")" = "approved"
+          test "$(jq '.scenarios | length' "$report")" = "3"
+          jq -e '
+            ([.scenarios[].scenario_id]
+              == ["host-power-loss", "torn-write", "device-loss"])
+            and ([.scenarios[].fault_mechanism]
+              == ["out_of_band_power_cut", "block_level_torn_write",
+                  "storage_device_detached"])
+            and all(.scenarios[];
+              .passed
+              and .rpo_seconds <= .target_rpo_seconds
+              and .rto_seconds <= .target_rto_seconds
+              and all(.checks[]; . == true))
+            and (.scenarios[1].recovery_source == "immutable-remote-backup")
+            and (.scenarios[2].recovery_source == "immutable-remote-backup")
+          ' "$report"
+      - name: Publish summary
+        if: always()
+        run: |
+          {
+            printf '### Exact-RC destructive storage profile qualification\n\n'
+            printf -- '- Commit: `%s`\n' "$GITHUB_SHA"
+            printf -- '- Release candidate: `%s`\n' "$AGENTOS_RELEASE_CANDIDATE"
+            printf -- '- Environment: `%s`\n' "$AGENTOS_QUALIFICATION_ENVIRONMENT"
+            printf -- '- Profile: `%s`\n' "$AGENTOS_STORAGE_PROFILE_ID"
+            if test -f target/qualification/storage-profile.json; then
+              printf -- '- Evidence eligible: `%s`\n' \
+                "$(jq -r .storage_profile_proof_eligible target/qualification/storage-profile.json)"
+              printf -- '- Production claim allowed: `%s`\n' \
+                "$(jq -r .production_claim_allowed target/qualification/storage-profile.json)"
+            else
+              printf -- '- Status: `failed before report publication`\n'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Retain bounded non-secret report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: storage-profile-${{ inputs.release_candidate }}-${{ github.sha }}
+          path: target/qualification/storage-profile.json
+          if-no-files-found: warn
+          retention-days: 90

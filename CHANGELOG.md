@@ -10,6 +10,16 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
 
 ## [Unreleased]
 
+- Added a fail-closed exact-RC destructive storage-profile evidence gate under
+  #123 for the supported single-node Linux deployment. It accepts only bounded
+  external observations of an out-of-band power cut, block-level torn write,
+  and storage-device detachment, recalculates the 300-second RPO and
+  3,600-second RTO targets, and requires a hash-bound independent review with
+  no open findings. A protected self-hosted workflow retains only the
+  non-secret report and never injects dangerous faults or substitutes SIGKILL,
+  synthetic SQLite failure, or disposable CI storage. The gate and regressions
+  are implemented, but no eligible target exercise exists yet, so production
+  qualification remains false.
 - Added the protected exact-RC target object-store qualification path under
   #123. It requires a non-loopback HTTPS service and dedicated protected
   credentials, binds the run to an existing release tag and clean commit,

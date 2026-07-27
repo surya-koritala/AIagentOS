@@ -450,6 +450,37 @@ fn release_blocking_workflows_keep_their_security_contract() {
         );
     }
 
+    let storage_profile =
+        read_workspace_file(".github/workflows/storage-profile-qualification.yml");
+    assert!(
+        storage_profile.contains("workflow_dispatch:")
+            && !storage_profile.contains("pull_request:")
+            && !storage_profile.contains("schedule:"),
+        "destructive storage qualification must remain an explicit protected gate"
+    );
+    for proof in [
+        "runs-on: [self-hosted, linux, x64, agentos-destructive-storage]",
+        "environment: destructive-storage-qualification",
+        "AGENTOS_STORAGE_PROFILE_EVIDENCE_DIR: ${{ vars.AGENTOS_STORAGE_PROFILE_EVIDENCE_DIR }}",
+        "single-node-linux-rootless-container-cli",
+        "refs/tags/${AGENTOS_RELEASE_CANDIDATE}^{commit}",
+        "scripts/storage_profile_qualification.py --validate",
+        "--expected-commit \"$GITHUB_SHA\"",
+        "--require-eligible",
+        "exact_release_candidate_destructive_storage_profile",
+        "out_of_band_power_cut",
+        "block_level_torn_write",
+        "storage_device_detached",
+        "storage_profile_proof_eligible",
+        "production_claim_allowed",
+        "retention-days: 90",
+    ] {
+        assert!(
+            storage_profile.contains(proof),
+            "destructive storage workflow lost {proof:?}"
+        );
+    }
+
     let live = read_workspace_file(".github/workflows/live-provider-qualification.yml");
     assert!(
         live.contains("workflow_dispatch:") && !live.contains("pull_request:"),

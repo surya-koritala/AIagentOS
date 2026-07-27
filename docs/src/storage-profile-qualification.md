@@ -1,0 +1,1 @@
+{{#include ../STORAGE_PROFILE_QUALIFICATION.md}}

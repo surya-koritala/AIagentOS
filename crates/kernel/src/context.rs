@@ -835,6 +835,32 @@ fn crash_multi_table_mutation_after_step_for_test(step: &str) {
 #[inline]
 fn crash_multi_table_mutation_after_step_for_test(_step: &str) {}
 
+#[cfg(test)]
+thread_local! {
+    static QUOTA_MUTATION_STEP_FOR_TEST: std::cell::Cell<usize> = const {
+        std::cell::Cell::new(0)
+    };
+}
+
+#[cfg(test)]
+fn crash_quota_mutation_after_step_for_test(statement: &str) {
+    let target = std::env::var("AIAGENTOS_TEST_EXIT_QUOTA_AFTER_STEP")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok());
+    QUOTA_MUTATION_STEP_FOR_TEST.with(|counter| {
+        let step = counter.get().saturating_add(1);
+        counter.set(step);
+        if target == Some(step) {
+            eprintln!("terminating after quota mutation {step}: {statement}");
+            std::process::exit(87);
+        }
+    });
+}
+
+#[cfg(not(test))]
+#[inline]
+fn crash_quota_mutation_after_step_for_test(_statement: &str) {}
+
 fn persist_deletion_receipt(
     transaction: &Transaction<'_>,
     subject_kind: DeletionSubjectKind,
@@ -2104,6 +2130,7 @@ impl SqliteContextManager {
             params![blob.as_slice()],
         )
         .map_err(|error| quota_error(format!("failed to persist quota epoch floor: {error}")))?;
+        crash_quota_mutation_after_step_for_test("quota_epoch_floor upsert");
         Ok(effective)
     }
 
@@ -2515,6 +2542,7 @@ impl SqliteContextManager {
                 "failed to update trusted quota scope aggregate: {error}"
             ))
         })?;
+        crash_quota_mutation_after_step_for_test("quota_epochs aggregate upsert");
         Ok(())
     }
 
@@ -2616,6 +2644,7 @@ impl SqliteContextManager {
             .map_err(|error| {
                 quota_error(format!("failed to delete empty quota scope epoch: {error}"))
             })?;
+            crash_quota_mutation_after_step_for_test("quota_epochs empty aggregate delete");
         } else {
             let requests = u64_blob(usage.requests);
             let tokens = u64_blob(usage.tokens);
@@ -2637,6 +2666,7 @@ impl SqliteContextManager {
             .map_err(|error| {
                 quota_error(format!("failed to write quota scope aggregate: {error}"))
             })?;
+            crash_quota_mutation_after_step_for_test("quota_epochs recomputed aggregate upsert");
         }
         Ok(usage)
     }
@@ -3034,6 +3064,7 @@ impl SqliteContextManager {
         .map_err(|error| {
             quota_error(format!("failed to insert provider quota receipt: {error}"))
         })?;
+        crash_quota_mutation_after_step_for_test("quota_receipts reservation insert");
         tx.execute(
             "INSERT INTO quota_receipt_scopes
                 (receipt_id, scope_order, scope_kind, scope_id,
@@ -3053,6 +3084,7 @@ impl SqliteContextManager {
                 "failed to associate provider quota receipt: {error}"
             ))
         })?;
+        crash_quota_mutation_after_step_for_test("quota_receipt_scopes provider insert");
         for (index, constraint) in cgroups.iter().enumerate() {
             let scope_order = i64::try_from(index + 1)
                 .map_err(|_| quota_error("too many cgroup quota scopes"))?;
@@ -3076,6 +3108,7 @@ impl SqliteContextManager {
                     constraint.scope_id
                 ))
             })?;
+            crash_quota_mutation_after_step_for_test("quota_receipt_scopes cgroup insert");
         }
         Self::write_scope_epoch_aggregate(
             &tx,
@@ -3173,11 +3206,13 @@ impl SqliteContextManager {
             params![receipt_id.to_string(), epoch_blob.as_slice()],
         )
         .map_err(|error| quota_error(format!("failed to tombstone refunded receipt: {error}")))?;
+        crash_quota_mutation_after_step_for_test("quota_refunded_receipts refund insert");
         tx.execute(
             "DELETE FROM quota_receipts WHERE id = ?1",
             [receipt_id.to_string()],
         )
         .map_err(|error| quota_error(format!("failed to refund quota receipt: {error}")))?;
+        crash_quota_mutation_after_step_for_test("quota_receipts refund delete");
         for scope in &scopes {
             Self::replace_scope_epoch_contribution(
                 &tx,
@@ -3300,6 +3335,7 @@ impl SqliteContextManager {
                 .map_err(|error| {
                     quota_error(format!("failed to reconcile quota receipt: {error}"))
                 })?;
+                crash_quota_mutation_after_step_for_test("quota_receipts reconcile update");
                 tx.execute(
                     "UPDATE quota_receipt_scopes
                      SET actual_requests = CASE
@@ -3318,6 +3354,7 @@ impl SqliteContextManager {
                 .map_err(|error| {
                     quota_error(format!("failed to reconcile provider quota scope: {error}"))
                 })?;
+                crash_quota_mutation_after_step_for_test("quota_receipt_scopes reconcile update");
                 for scope in &scopes {
                     Self::replace_scope_epoch_contribution(
                         &tx,
@@ -3402,6 +3439,7 @@ impl SqliteContextManager {
             ],
         )
         .map_err(|error| quota_error(format!("failed to insert direct token charge: {error}")))?;
+        crash_quota_mutation_after_step_for_test("quota_receipts direct charge insert");
         tx.execute(
             "INSERT INTO quota_receipt_scopes
                 (receipt_id, scope_order, scope_kind, scope_id,
@@ -3419,6 +3457,7 @@ impl SqliteContextManager {
         .map_err(|error| {
             quota_error(format!("failed to associate direct token charge: {error}"))
         })?;
+        crash_quota_mutation_after_step_for_test("quota_receipt_scopes direct charge insert");
         Self::write_scope_epoch_aggregate(
             &tx,
             &provider_scope,
@@ -3531,10 +3570,16 @@ impl SqliteContextManager {
                             "failed to tombstone recovered reservation: {error}"
                         ))
                     })?;
+                    crash_quota_mutation_after_step_for_test(
+                        "quota_refunded_receipts recovery insert",
+                    );
                     tx.execute("DELETE FROM quota_receipts WHERE id = ?1", [id.to_string()])
                         .map_err(|error| {
                             quota_error(format!("failed to refund recovered reservation: {error}"))
                         })?;
+                    crash_quota_mutation_after_step_for_test(
+                        "quota_receipts recovery refund delete",
+                    );
                     recovery.refunded_reserved = recovery.refunded_reserved.saturating_add(1);
                 }
                 ProviderRateReceiptState::InFlight => {
@@ -3547,6 +3592,9 @@ impl SqliteContextManager {
                             "failed to retain recovered in-flight estimate: {error}"
                         ))
                     })?;
+                    crash_quota_mutation_after_step_for_test(
+                        "quota_receipts recovery estimate update",
+                    );
                     recovery.retained_in_flight_estimates =
                         recovery.retained_in_flight_estimates.saturating_add(1);
                 }
@@ -3629,21 +3677,25 @@ impl SqliteContextManager {
                 params![epoch_blob.as_slice()],
             )
             .map_err(|error| quota_error(format!("failed to prune completed receipts: {error}")))?;
+            crash_quota_mutation_after_step_for_test("quota_receipts prune delete");
             tx.execute(
                 "DELETE FROM quota_epochs WHERE epoch = ?1",
                 params![epoch_blob.as_slice()],
             )
             .map_err(|error| quota_error(format!("failed to prune quota epoch: {error}")))?;
+            crash_quota_mutation_after_step_for_test("quota_epochs prune delete");
             tx.execute(
                 "DELETE FROM quota_refunded_receipts WHERE epoch = ?1",
                 params![epoch_blob.as_slice()],
             )
             .map_err(|error| quota_error(format!("failed to prune refund tombstones: {error}")))?;
+            crash_quota_mutation_after_step_for_test("quota_refunded_receipts prune delete");
             tx.execute(
                 "DELETE FROM quota_migration_fence WHERE epoch = ?1",
                 params![epoch_blob.as_slice()],
             )
             .map_err(|error| quota_error(format!("failed to prune migration fence: {error}")))?;
+            crash_quota_mutation_after_step_for_test("quota_migration_fence prune delete");
             pruned = pruned.saturating_add(1);
         }
         Self::commit_quota_transaction(tx)?;
@@ -9745,6 +9797,328 @@ mod tests {
             .expect("multi-table crash helper requires an operation");
         run_context_multi_table_operation(std::path::Path::new(&database), &operation);
         panic!("multi-table crash helper did not terminate at the requested statement");
+    }
+
+    const QUOTA_CRASH_EPOCH: u64 = 500;
+    const QUOTA_CRASH_PRUNE_FIRST_EPOCH: u64 = 480;
+    const QUOTA_CRASH_PRUNE_SECOND_EPOCH: u64 = 481;
+    const QUOTA_CRASH_RECEIPT: uuid::Uuid = uuid::Uuid::from_u128(0x510);
+    const QUOTA_CRASH_SECOND_RECEIPT: uuid::Uuid = uuid::Uuid::from_u128(0x511);
+    const QUOTA_CRASH_FIRST_TOMBSTONE: uuid::Uuid = uuid::Uuid::from_u128(0x512);
+    const QUOTA_CRASH_SECOND_TOMBSTONE: uuid::Uuid = uuid::Uuid::from_u128(0x513);
+
+    const QUOTA_MULTI_TABLE_CRASH_CASES: &[(&str, usize)] = &[
+        ("reserve", 8),
+        ("refund", 5),
+        ("reconcile", 5),
+        ("direct_charge", 4),
+        ("recovery", 7),
+        ("prune", 8),
+    ];
+
+    fn quota_crash_scopes() -> [CgroupQuotaConstraint; 2] {
+        [
+            cgroup_constraint("/", 10_000),
+            cgroup_constraint("/tenant/crash-matrix", 10_000),
+        ]
+    }
+
+    fn reset_quota_mutation_steps_for_test() {
+        QUOTA_MUTATION_STEP_FOR_TEST.with(|counter| counter.set(0));
+    }
+
+    fn quota_mutation_steps_for_test() -> usize {
+        QUOTA_MUTATION_STEP_FOR_TEST.with(std::cell::Cell::get)
+    }
+
+    fn seed_quota_multi_table_operation(path: &std::path::Path, operation: &str) {
+        let manager = SqliteContextManager::new(path).unwrap();
+        let scopes = quota_crash_scopes();
+        match operation {
+            "reserve" | "direct_charge" => {}
+            "refund" => {
+                expect_provider_reservation(
+                    manager
+                        .reserve_provider_rate_with_cgroups(
+                            QUOTA_CRASH_RECEIPT,
+                            QUOTA_CRASH_EPOCH,
+                            100,
+                            100_000,
+                            300,
+                            &scopes,
+                        )
+                        .unwrap(),
+                );
+            }
+            "reconcile" => {
+                expect_provider_reservation(
+                    manager
+                        .reserve_provider_rate_with_cgroups(
+                            QUOTA_CRASH_RECEIPT,
+                            QUOTA_CRASH_EPOCH,
+                            100,
+                            100_000,
+                            300,
+                            &scopes,
+                        )
+                        .unwrap(),
+                );
+                manager
+                    .mark_provider_rate_invoked(QUOTA_CRASH_RECEIPT)
+                    .unwrap();
+            }
+            "recovery" => {
+                for receipt in [QUOTA_CRASH_RECEIPT, QUOTA_CRASH_SECOND_RECEIPT] {
+                    expect_provider_reservation(
+                        manager
+                            .reserve_provider_rate_with_cgroups(
+                                receipt,
+                                QUOTA_CRASH_EPOCH,
+                                100,
+                                100_000,
+                                300,
+                                &scopes,
+                            )
+                            .unwrap(),
+                    );
+                }
+                manager
+                    .mark_provider_rate_invoked(QUOTA_CRASH_SECOND_RECEIPT)
+                    .unwrap();
+            }
+            "prune" => {
+                manager
+                    .charge_provider_rate_tokens(
+                        QUOTA_CRASH_RECEIPT,
+                        QUOTA_CRASH_PRUNE_FIRST_EPOCH,
+                        40,
+                    )
+                    .unwrap();
+                expect_provider_reservation(
+                    manager
+                        .reserve_provider_rate(
+                            QUOTA_CRASH_SECOND_RECEIPT,
+                            QUOTA_CRASH_PRUNE_SECOND_EPOCH,
+                            100,
+                            100_000,
+                            60,
+                        )
+                        .unwrap(),
+                );
+                manager
+                    .mark_provider_rate_invoked(QUOTA_CRASH_SECOND_RECEIPT)
+                    .unwrap();
+                manager
+                    .retain_provider_rate_estimate(QUOTA_CRASH_SECOND_RECEIPT)
+                    .unwrap();
+                let connection = manager.conn.lock().unwrap();
+                for (receipt, epoch) in [
+                    (QUOTA_CRASH_FIRST_TOMBSTONE, QUOTA_CRASH_PRUNE_FIRST_EPOCH),
+                    (QUOTA_CRASH_SECOND_TOMBSTONE, QUOTA_CRASH_PRUNE_SECOND_EPOCH),
+                ] {
+                    let epoch = u64_blob(epoch);
+                    connection
+                        .execute(
+                            "INSERT INTO quota_refunded_receipts(id, epoch) VALUES (?1, ?2)",
+                            params![receipt.to_string(), epoch.as_slice()],
+                        )
+                        .unwrap();
+                    connection
+                        .execute(
+                            "INSERT INTO quota_migration_fence(epoch) VALUES (?1)",
+                            params![epoch.as_slice()],
+                        )
+                        .unwrap();
+                }
+            }
+            unknown => panic!("unknown quota crash operation {unknown}"),
+        }
+    }
+
+    fn run_quota_multi_table_operation(path: &std::path::Path, operation: &str) {
+        let manager = SqliteContextManager::new(path).unwrap();
+        let scopes = quota_crash_scopes();
+        match operation {
+            "reserve" => {
+                expect_provider_reservation(
+                    manager
+                        .reserve_provider_rate_with_cgroups(
+                            QUOTA_CRASH_RECEIPT,
+                            QUOTA_CRASH_EPOCH,
+                            100,
+                            100_000,
+                            300,
+                            &scopes,
+                        )
+                        .unwrap(),
+                );
+            }
+            "refund" => manager
+                .refund_provider_rate_before_invocation(QUOTA_CRASH_RECEIPT)
+                .unwrap(),
+            "reconcile" => manager
+                .reconcile_provider_rate_attempts(QUOTA_CRASH_RECEIPT, 1, 125)
+                .unwrap(),
+            "direct_charge" => manager
+                .charge_provider_rate_tokens(QUOTA_CRASH_RECEIPT, QUOTA_CRASH_EPOCH, 125)
+                .unwrap(),
+            "recovery" => {
+                let recovery = manager
+                    .recover_provider_rate_state(QUOTA_CRASH_EPOCH)
+                    .unwrap();
+                assert_eq!(recovery.refunded_reserved, 1);
+                assert_eq!(recovery.retained_in_flight_estimates, 1);
+            }
+            "prune" => assert_eq!(
+                manager
+                    .prune_provider_rate_epochs(QUOTA_CRASH_PRUNE_SECOND_EPOCH + 1)
+                    .unwrap(),
+                2
+            ),
+            unknown => panic!("unknown quota crash operation {unknown}"),
+        }
+    }
+
+    fn assert_quota_multi_table_operation_committed(path: &std::path::Path, operation: &str) {
+        let manager = SqliteContextManager::new(path).unwrap();
+        {
+            let mut connection = manager.conn.lock().unwrap();
+            let transaction = connection.transaction().unwrap();
+            SqliteContextManager::validate_all_provider_epochs(&transaction).unwrap();
+            transaction.commit().unwrap();
+        }
+        let connection = manager.conn.lock().unwrap();
+        let count = |sql: &str| {
+            connection
+                .query_row(sql, [], |row| row.get::<_, i64>(0))
+                .unwrap()
+        };
+        match operation {
+            "reserve" => {
+                assert_eq!(count("SELECT COUNT(*) FROM quota_receipts"), 1);
+                assert_eq!(count("SELECT COUNT(*) FROM quota_receipt_scopes"), 3);
+                assert_eq!(count("SELECT COUNT(*) FROM quota_epochs"), 3);
+                assert_eq!(count("SELECT COUNT(*) FROM quota_epoch_floor"), 1);
+            }
+            "refund" => {
+                assert_eq!(count("SELECT COUNT(*) FROM quota_receipts"), 0);
+                assert_eq!(count("SELECT COUNT(*) FROM quota_receipt_scopes"), 0);
+                assert_eq!(count("SELECT COUNT(*) FROM quota_refunded_receipts"), 1);
+                assert_eq!(count("SELECT COUNT(*) FROM quota_epochs"), 3);
+            }
+            "reconcile" => {
+                assert_eq!(
+                    count(
+                        "SELECT COUNT(*) FROM quota_receipts
+                         WHERE state = 'reconciled'
+                           AND CAST(actual_tokens AS BLOB) = x'000000000000007D'"
+                    ),
+                    1
+                );
+                assert_eq!(
+                    count(
+                        "SELECT COUNT(*) FROM quota_receipt_scopes
+                         WHERE actual_tokens IS NOT NULL"
+                    ),
+                    3
+                );
+                assert_eq!(count("SELECT COUNT(*) FROM quota_epochs"), 3);
+            }
+            "direct_charge" => {
+                assert_eq!(
+                    count(
+                        "SELECT COUNT(*) FROM quota_receipts
+                         WHERE state = 'reconciled'"
+                    ),
+                    1
+                );
+                assert_eq!(count("SELECT COUNT(*) FROM quota_receipt_scopes"), 1);
+                assert_eq!(count("SELECT COUNT(*) FROM quota_epochs"), 1);
+                assert_eq!(count("SELECT COUNT(*) FROM quota_epoch_floor"), 1);
+            }
+            "recovery" => {
+                assert_eq!(
+                    count(
+                        "SELECT COUNT(*) FROM quota_receipts
+                         WHERE state = 'estimated'"
+                    ),
+                    1
+                );
+                assert_eq!(count("SELECT COUNT(*) FROM quota_receipt_scopes"), 3);
+                assert_eq!(count("SELECT COUNT(*) FROM quota_refunded_receipts"), 1);
+                assert_eq!(count("SELECT COUNT(*) FROM quota_epochs"), 3);
+            }
+            "prune" => {
+                assert_eq!(count("SELECT COUNT(*) FROM quota_receipts"), 0);
+                assert_eq!(count("SELECT COUNT(*) FROM quota_receipt_scopes"), 0);
+                assert_eq!(count("SELECT COUNT(*) FROM quota_epochs"), 0);
+                assert_eq!(count("SELECT COUNT(*) FROM quota_refunded_receipts"), 0);
+                assert_eq!(count("SELECT COUNT(*) FROM quota_migration_fence"), 0);
+                assert_eq!(count("SELECT COUNT(*) FROM quota_epoch_floor"), 1);
+            }
+            unknown => panic!("unknown quota crash operation {unknown}"),
+        }
+        crate::schema::verify(&connection).unwrap();
+        let quick_check: String = connection
+            .query_row("PRAGMA quick_check", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(quick_check, "ok");
+    }
+
+    #[test]
+    fn process_exit_at_every_quota_multi_table_statement_preserves_atomicity() {
+        for (operation, expected_steps) in QUOTA_MULTI_TABLE_CRASH_CASES {
+            let database = QuotaTestDatabase::new(&format!("quota-crash-{operation}"));
+            seed_quota_multi_table_operation(&database.path, operation);
+            let baseline = logical_database_fingerprints(&database.path);
+
+            for step in 1..=*expected_steps {
+                let child = std::process::Command::new(std::env::current_exe().unwrap())
+                    .arg("--ignored")
+                    .arg("quota_multi_table_mutation_crash_child_only")
+                    .env("AIAGENTOS_TEST_QUOTA_CRASH_DB", &database.path)
+                    .env("AIAGENTOS_TEST_QUOTA_CRASH_OPERATION", operation)
+                    .env("AIAGENTOS_TEST_EXIT_QUOTA_AFTER_STEP", step.to_string())
+                    .status()
+                    .unwrap();
+                assert_eq!(
+                    child.code(),
+                    Some(87),
+                    "{operation} child did not terminate at mutation {step}"
+                );
+                assert_eq!(
+                    logical_database_fingerprints(&database.path),
+                    baseline,
+                    "process exit after {operation} mutation {step} left partial quota state"
+                );
+            }
+
+            reset_quota_mutation_steps_for_test();
+            run_quota_multi_table_operation(&database.path, operation);
+            assert_eq!(
+                quota_mutation_steps_for_test(),
+                *expected_steps,
+                "{operation} mutation inventory changed without updating the crash matrix"
+            );
+            assert_ne!(
+                logical_database_fingerprints(&database.path),
+                baseline,
+                "{operation} did not publish its complete quota transaction"
+            );
+            assert_quota_multi_table_operation_committed(&database.path, operation);
+        }
+    }
+
+    #[test]
+    #[ignore = "child-process helper for quota multi-table crash regression"]
+    fn quota_multi_table_mutation_crash_child_only() {
+        let Some(database) = std::env::var_os("AIAGENTOS_TEST_QUOTA_CRASH_DB") else {
+            return;
+        };
+        let operation = std::env::var("AIAGENTOS_TEST_QUOTA_CRASH_OPERATION")
+            .expect("quota crash helper requires an operation");
+        run_quota_multi_table_operation(std::path::Path::new(&database), &operation);
+        panic!("quota crash helper did not terminate at the requested mutation");
     }
 
     fn expect_provider_reservation(outcome: ProviderRateReserveOutcome) -> ProviderRateReservation {

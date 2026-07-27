@@ -754,9 +754,28 @@ write failure as a transaction failure instead of committing an unindexed
 conversation.
 
 This matrix proves process-termination atomicity for those context workflows.
-It does not yet qualify the separate quota/accounting, package-registry, or
-cluster-control multi-table transactions, interruption inside external side
-effects, host power loss, torn writes, or device loss.
+The quota/accounting matrix below extends that coverage further. These matrices
+do not yet qualify package-registry or cluster-control multi-table
+transactions, interruption inside external side effects, host power loss,
+torn writes, or device loss.
+
+A fourth file-backed matrix qualifies 37 statement boundaries across six
+multi-table quota/accounting workflows: hierarchical request/token reservation,
+pre-invocation refund, actual-usage reconciliation, direct token charging,
+restart recovery, and completed-epoch pruning. The matrix covers the monotonic
+epoch floor, affine receipts, ordered provider/cgroup scopes, trusted
+aggregates, refund tombstones, migration fences, and the accounting root/event
+state maintained by SQLite triggers. Each numbered boundary is inventory
+checked so adding or removing a write without updating the matrix fails the
+test.
+
+After every forced exit, schema verification and `quick_check` must pass and
+the canonical fingerprint of every durable table must equal the pre-operation
+baseline. A clean retry must then commit the complete logical operation and
+pass cross-receipt/aggregate validation. This proves process-termination
+atomicity for these quota/accounting workflows. It does not yet qualify the
+package-registry or cluster-control multi-table transactions, host power loss,
+torn writes, or device loss.
 
 The following remain open under issue #123:
 
@@ -768,6 +787,6 @@ The following remain open under issue #123:
   filesystem, and extended crash qualification beyond the disposable ext4
   `ENOSPC` run, deterministic interrupted-encryption recovery, and the
   erasure transaction/coordinator and context-mutation matrices covered above;
-- process-exit statement-boundary matrices for the remaining quota/accounting,
-  package-registry, and cluster-control multi-table transactions;
+- process-exit statement-boundary matrices for the remaining package-registry
+  and cluster-control multi-table transactions;
 - measured RPO/RTO on supported deployment profiles.

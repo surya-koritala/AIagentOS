@@ -366,6 +366,13 @@ fn release_blocking_workflows_keep_their_security_contract() {
     for proof in [
         "schedule:",
         "RUSTUP_TOOLCHAIN: nightly-2026-07-20",
+        "Exact-commit deterministic fault matrix",
+        "RUSTUP_TOOLCHAIN: 1.97.1",
+        "--bin resilience-qualification -- --validate",
+        "--all --output target/qualification/deterministic-fault-matrix.json",
+        "deterministic-fault-matrix-${{ github.sha }}",
+        "all(.scenarios[].checks[]; . == true)",
+        "rootless-sandbox-crash-${{ github.sha }}",
         "MIRIFLAGS: -Zmiri-disable-isolation",
         "cargo miri test",
         "-Zsanitizer=address",
@@ -373,6 +380,7 @@ fn release_blocking_workflows_keep_their_security_contract() {
         "cargo fuzz run wire_syscall --target x86_64-unknown-linux-gnu",
         "cargo fuzz run wire_transport --target x86_64-unknown-linux-gnu",
         "-max_len=262144",
+        "timeout-minutes: 25",
     ] {
         assert!(
             extended.contains(proof),

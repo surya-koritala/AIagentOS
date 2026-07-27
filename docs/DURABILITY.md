@@ -694,8 +694,24 @@ before the transaction is excluded; every durable identity/version field
 remains included. A final retry for each scope must remove the complete seeded
 subject and commit exactly one private receipt. This proves all-or-nothing
 recovery for the agent, user, and tenant SQLite erasure transactions. It does
-not cover kernel process termination around live-resource quiescence, host
-power loss, torn writes, device loss, published backups, or external systems.
+not by itself cover the surrounding live-resource coordinator.
+
+A second file-backed child-process matrix exits at 15 supported hot-erasure
+boundaries: five agent, four user, and six tenant points. The points cover
+credential fencing/drain completion, the service-stop loop, acquisition of the
+global request and operator-mutation barriers, live-agent quiescence and
+resource removal, the handoff after the SQLite erasure commit, and final
+user/tenant auth revocation. The tenant fixture includes a supervised service
+and multiple live agents.
+
+After every forced coordinator exit, a new kernel opens the same database,
+performs normal lifecycle/tenancy rehydration, retries the same erasure, and
+must leave the subject absent with exactly one private deletion receipt.
+Agent retries also prove the process-local agent registry and syscall-gate
+registration are absent. This qualifies process termination between the
+documented coordinator stages. It does not emulate interruption inside one
+opaque cleanup call, host power loss, torn writes, device loss, published
+backups, or provider/workspace systems outside the kernel process.
 
 The following remain open under issue #123:
 
@@ -706,5 +722,5 @@ The following remain open under issue #123:
 - power-loss, torn-write, device-loss, object-store, other deployment
   filesystem, and extended crash qualification beyond the disposable ext4
   `ENOSPC` run, deterministic interrupted-encryption recovery, and the
-  erasure transaction matrices covered above;
+  erasure transaction/coordinator matrices covered above;
 - measured RPO/RTO on supported deployment profiles.

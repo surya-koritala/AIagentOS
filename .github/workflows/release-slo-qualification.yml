@@ -1,0 +1,109 @@
+name: Release candidate SLO qualification
+
+# Target measurements are supplied through a fixed directory on the
+# repository-owned qualification runner. Missing evidence leaves this workflow
+# failed/not_run; GitHub-hosted fixtures are never substituted.
+on:
+  workflow_dispatch:
+    inputs:
+      release_candidate:
+        description: Existing vX.Y.Z-rc.N or vX.Y.Z tag pointing at this workflow ref
+        required: true
+        type: string
+      environment_id:
+        description: Stable non-secret deployment/runner shape identifier
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-slo-qualification
+  cancel-in-progress: false
+
+env:
+  AGENTOS_SLO_EVIDENCE_DIR: ${{ vars.AGENTOS_SLO_EVIDENCE_DIR }}
+  AGENTOS_QUALIFICATION_ENVIRONMENT: ${{ inputs.environment_id }}
+  AGENTOS_RELEASE_CANDIDATE: ${{ inputs.release_candidate }}
+
+jobs:
+  exact-release-candidate-slo:
+    name: Exact-release-candidate SLO report
+    runs-on: [self-hosted, linux, x64, agentos-capacity]
+    timeout-minutes: 15
+    environment: capacity-qualification
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+      - name: Validate checked-in SLO contract
+        run: python3 scripts/release_slo_qualification.py --validate
+      - name: Bind the release-candidate tag to this exact commit
+        run: |
+          [[ "$AGENTOS_RELEASE_CANDIDATE" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-rc\.[1-9][0-9]*)?$ ]]
+          test "$(git rev-parse "refs/tags/${AGENTOS_RELEASE_CANDIDATE}^{commit}")" = "$GITHUB_SHA"
+      - name: Require the protected target evidence drop
+        run: |
+          test -n "$AGENTOS_SLO_EVIDENCE_DIR"
+          for name in slo-observation.json resource-soak.json incident-drill.json; do
+            path="${AGENTOS_SLO_EVIDENCE_DIR}/${name}"
+            test -f "$path"
+            test ! -L "$path"
+          done
+      - name: Generate and require an eligible exact-RC report
+        run: |
+          mkdir -p target/qualification
+          python3 scripts/release_slo_qualification.py \
+            --observation "${AGENTOS_SLO_EVIDENCE_DIR}/slo-observation.json" \
+            --resource-soak "${AGENTOS_SLO_EVIDENCE_DIR}/resource-soak.json" \
+            --incident-drill "${AGENTOS_SLO_EVIDENCE_DIR}/incident-drill.json" \
+            --expected-commit "$GITHUB_SHA" \
+            --expected-environment "$AGENTOS_QUALIFICATION_ENVIRONMENT" \
+            --release-candidate "$AGENTOS_RELEASE_CANDIDATE" \
+            --output target/qualification/release-slo-report.json \
+            --require-eligible
+      - name: Verify the retained classification
+        run: |
+          report=target/qualification/release-slo-report.json
+          test "$(jq -r .schema_version "$report")" = "1"
+          test "$(jq -r .qualification_class "$report")" = "exact_release_candidate_slo_report"
+          test "$(jq -r .release_candidate "$report")" = "$AGENTOS_RELEASE_CANDIDATE"
+          test "$(jq -r .source.commit "$report")" = "$GITHUB_SHA"
+          test "$(jq -r .source.dirty "$report")" = "false"
+          test "$(jq -r .environment.environment_id "$report")" = "$AGENTOS_QUALIFICATION_ENVIRONMENT"
+          test "$(jq -r .report_generated "$report")" = "true"
+          test "$(jq -r .release_slo_proof_eligible "$report")" = "true"
+          test "$(jq -r .production_claim_allowed "$report")" = "false"
+          test "$(jq '.targets | length' "$report")" = "9"
+          test "$(jq '.failed_targets | length' "$report")" = "0"
+          test "$(jq '.eligibility_blockers | length' "$report")" = "0"
+          jq -e 'all(.targets[]; .passed == true)' "$report"
+      - name: Publish summary
+        if: always()
+        run: |
+          {
+            printf '### Exact-release-candidate SLO report\n\n'
+            printf -- '- Commit: `%s`\n' "$GITHUB_SHA"
+            printf -- '- Release candidate: `%s`\n' "$AGENTOS_RELEASE_CANDIDATE"
+            printf -- '- Environment: `%s`\n' "$AGENTOS_QUALIFICATION_ENVIRONMENT"
+            if test -f target/qualification/release-slo-report.json; then
+              printf -- '- Report generated: `%s`\n' \
+                "$(jq -r .report_generated target/qualification/release-slo-report.json)"
+              printf -- '- SLO proof eligible: `%s`\n' \
+                "$(jq -r .release_slo_proof_eligible target/qualification/release-slo-report.json)"
+              printf -- '- Production claim allowed: `%s`\n' \
+                "$(jq -r .production_claim_allowed target/qualification/release-slo-report.json)"
+            else
+              printf -- '- Status: `failed before report publication`\n'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Retain the bounded SLO report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-slo-${{ inputs.release_candidate }}-${{ github.sha }}
+          path: target/qualification/release-slo-report.json
+          if-no-files-found: warn
+          retention-days: 90

@@ -85,6 +85,17 @@ behavior. Release evidence must state request volume, subsystem mix, hardware,
 provider/model, configuration, dataset, start/end timestamps, code SHA, and all
 alert firings. Low-volume windows are not proof.
 
+The fail-closed
+[`release_slo_qualification.py`](../scripts/release_slo_qualification.py)
+evaluator and protected
+[`Release candidate SLO qualification`](../.github/workflows/release-slo-qualification.yml)
+workflow implement this calculation. The minimum proof volumes, strict input
+schema, exact-tag binding, evidence handoff, and retained report fields are
+documented in
+[`RELEASE_SLO_QUALIFICATION.md`](RELEASE_SLO_QUALIFICATION.md). Checked-in unit
+fixtures prove the evaluator's rejection behavior; they are not release SLO
+results. No exact release candidate has an eligible retained report yet.
+
 The checked-in rules at
 [`observability/prometheus-rules.yml`](../observability/prometheus-rules.yml)
 implement fast operational signals. They do not replace the 30-day SLO report,

@@ -10,6 +10,16 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
 
 ## [Unreleased]
 
+- Added process-exit atomicity qualification for eleven high-value context
+  mutations under #123. Twenty-six child-process exits cover conversation and
+  search-index persistence, context-spill store/purge/delete, operator-tunable
+  ensure/update/rollback with audit history, service runtime/history
+  publication, and user/tenant identity revocation. Every exit must reopen with
+  the exact pre-transaction contents of every durable table; clean retries must
+  publish all related rows and pass schema verification plus `quick_check`.
+  Conversation search-index failures now abort the transaction instead of
+  being silently ignored. Quota, package-registry, and cluster-control
+  transaction matrices, power loss, and torn writes remain open.
 - Added fail-closed managed-backup erasure under #123. Every server-created
   backup is now constrained to the configured `backup.root`. Agent, user, and
   tenant hot deletion exclusively locks that root, preflights every entry,

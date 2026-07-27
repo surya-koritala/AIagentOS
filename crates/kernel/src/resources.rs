@@ -7,6 +7,8 @@ use std::sync::Arc;
 
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
+use tokio::sync::OwnedSemaphorePermit;
+use tokio_util::sync::CancellationToken;
 
 use crate::permissions::{AccessDecision, ActionOutcome, PermissionSystem};
 use crate::sandbox::{SandboxAction, SandboxManager};
@@ -264,6 +266,14 @@ pub struct ResourceCapability {
 }
 
 /// A pluggable resource provider.
+///
+/// Provider futures are a kernel security boundary. Implementations must not
+/// detach side effects from the returned future, and dropping the future must
+/// stop or synchronously own cleanup for any operation that can mutate external
+/// state. The broker supplies cancellation through `execute_controlled`, waits
+/// for a bounded drain, and then aborts a non-cooperative future. Providers that
+/// need asynchronous cleanup should override `execute_controlled`, observe the
+/// token, and return only after that cleanup is complete.
 #[async_trait::async_trait]
 pub trait ResourceProvider: Send + Sync {
     fn resource_type(&self) -> ResourceType;
@@ -273,6 +283,23 @@ pub trait ResourceProvider: Send + Sync {
         operation: &str,
         params: &serde_json::Value,
     ) -> Result<serde_json::Value, ResourceError>;
+
+    async fn execute_controlled(
+        &self,
+        operation: &str,
+        params: &serde_json::Value,
+        cancellation: &CancellationToken,
+    ) -> Result<serde_json::Value, ResourceError> {
+        tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => {
+                Err(ResourceError::OperationFailed(
+                    "resource provider execution cancelled".into(),
+                ))
+            }
+            result = self.execute(operation, params) => result,
+        }
+    }
 }
 
 /// The Resource Broker trait.
@@ -280,18 +307,110 @@ pub trait ResourceProvider: Send + Sync {
 pub trait ResourceBroker: Send + Sync {
     async fn execute(&self, request: ResourceRequest) -> Result<ResourceResponse, ResourceError>;
     fn list_capabilities(&self) -> Vec<ResourceCapability>;
-    fn register_provider(&self, provider: Box<dyn ResourceProvider>);
+    fn register_provider(&self, provider: Box<dyn ResourceProvider>) -> Result<(), ResourceError>;
 }
 
 /// Concrete resource broker implementation with permission validation.
 pub struct ResourceBrokerImpl {
-    providers: DashMap<ResourceType, Box<dyn ResourceProvider>>,
+    providers: DashMap<ResourceType, Arc<dyn ResourceProvider>>,
     permission_system: Arc<dyn PermissionSystem>,
     sandbox_manager: Option<Arc<dyn SandboxManager>>,
     admission: DashMap<ResourceType, Arc<tokio::sync::Semaphore>>,
     waiting: AtomicUsize,
     max_waiters: usize,
     require_gate_admission: bool,
+}
+
+const PROVIDER_EXECUTION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+const PROVIDER_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+type ProviderJoinResult = Result<Result<serde_json::Value, ResourceError>, tokio::task::JoinError>;
+
+/// Owns the isolated provider task until it has completed or a bounded drain
+/// reaper has taken responsibility for it. This makes cancellation of the
+/// broker future cancellation of the provider operation as well; Tokio's
+/// default detached-on-`JoinHandle`-drop behavior is never used here.
+struct ProviderTaskGuard {
+    cancellation: CancellationToken,
+    handle: Option<tokio::task::JoinHandle<Result<serde_json::Value, ResourceError>>>,
+}
+
+impl ProviderTaskGuard {
+    fn new(
+        provider: Arc<dyn ResourceProvider>,
+        operation: String,
+        parameters: serde_json::Value,
+        permit: OwnedSemaphorePermit,
+    ) -> Self {
+        let cancellation = CancellationToken::new();
+        let provider_cancellation = cancellation.clone();
+        let handle = tokio::spawn(async move {
+            let _permit = permit;
+            provider
+                .execute_controlled(&operation, &parameters, &provider_cancellation)
+                .await
+        });
+        Self {
+            cancellation,
+            handle: Some(handle),
+        }
+    }
+
+    async fn join(&mut self) -> ProviderJoinResult {
+        self.handle
+            .as_mut()
+            .expect("provider task handle is present until guard drop")
+            .await
+    }
+
+    async fn cancel_and_drain(&mut self) {
+        self.cancellation.cancel();
+        let drained = tokio::time::timeout(PROVIDER_DRAIN_TIMEOUT, self.join()).await;
+        if drained.is_err() {
+            if let Some(handle) = self.handle.as_mut() {
+                handle.abort();
+                let _ = handle.await;
+            }
+        }
+        self.handle.take();
+    }
+}
+
+impl Drop for ProviderTaskGuard {
+    fn drop(&mut self) {
+        let Some(mut handle) = self.handle.take() else {
+            return;
+        };
+        self.cancellation.cancel();
+        if handle.is_finished() {
+            return;
+        }
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                if tokio::time::timeout(PROVIDER_DRAIN_TIMEOUT, &mut handle)
+                    .await
+                    .is_err()
+                {
+                    handle.abort();
+                    let _ = handle.await;
+                }
+            });
+        } else {
+            handle.abort();
+        }
+    }
+}
+
+fn provider_join_result(result: ProviderJoinResult) -> Result<serde_json::Value, ResourceError> {
+    match result {
+        Ok(result) => result,
+        Err(error) if error.is_panic() => Err(ResourceError::OperationFailed(
+            "resource provider panicked; operation was isolated".into(),
+        )),
+        Err(_) => Err(ResourceError::OperationFailed(
+            "resource provider task was cancelled".into(),
+        )),
+    }
 }
 
 impl ResourceBrokerImpl {
@@ -497,11 +616,22 @@ impl ResourceBroker for ResourceBrokerImpl {
         }
 
         // Dispatch to provider
-        let provider = self.providers.get(&request.resource_type).ok_or_else(|| {
-            ResourceError::ProviderNotFound(format!("{:?}", request.resource_type))
+        let provider = self
+            .providers
+            .get(&request.resource_type)
+            .map(|entry| Arc::clone(entry.value()))
+            .ok_or_else(|| {
+                ResourceError::ProviderNotFound(format!("{:?}", request.resource_type))
+            })?;
+        let supported_operations = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            provider.supported_operations()
+        }))
+        .map_err(|_| {
+            ResourceError::OperationFailed(
+                "resource provider panicked while reporting operations".into(),
+            )
         })?;
-        if !provider
-            .supported_operations()
+        if !supported_operations
             .iter()
             .any(|operation| operation == &request.operation)
         {
@@ -548,6 +678,7 @@ impl ResourceBroker for ResourceBrokerImpl {
         // its tool guard while a side effect still runs. Keep ownership until
         // the edit transaction finishes. Other provider operations retain the
         // bounded 30-second execution contract.
+        let mut permit = Some(permit);
         let capability_filesystem = match sandbox {
             Some((sandbox_id, ref isolation))
                 if request.resource_type == ResourceType::Filesystem
@@ -624,12 +755,24 @@ impl ResourceBroker for ResourceBrokerImpl {
                 .execute(&request.operation, &request.parameters)
                 .await
         } else {
-            tokio::time::timeout(
-                std::time::Duration::from_secs(30),
-                provider.execute(&request.operation, &request.parameters),
-            )
-            .await
-            .unwrap_or(Err(ResourceError::Timeout))
+            let mut task = ProviderTaskGuard::new(
+                provider,
+                request.operation.clone(),
+                request.parameters.clone(),
+                permit
+                    .take()
+                    .expect("generic provider execution owns its admission permit"),
+            );
+            match tokio::time::timeout(PROVIDER_EXECUTION_TIMEOUT, task.join()).await {
+                Ok(result) => {
+                    task.handle.take();
+                    provider_join_result(result)
+                }
+                Err(_) => {
+                    task.cancel_and_drain().await;
+                    Err(ResourceError::Timeout)
+                }
+            }
         };
         drop(permit);
 
@@ -668,17 +811,41 @@ impl ResourceBroker for ResourceBrokerImpl {
     fn list_capabilities(&self) -> Vec<ResourceCapability> {
         self.providers
             .iter()
-            .map(|entry| ResourceCapability {
-                resource_type: entry.value().resource_type(),
-                operations: entry.value().supported_operations(),
-                description: format!("{:?} provider", entry.value().resource_type()),
+            .filter_map(|entry| {
+                let provider = Arc::clone(entry.value());
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let resource_type = provider.resource_type();
+                    ResourceCapability {
+                        operations: provider.supported_operations(),
+                        description: format!("{resource_type:?} provider"),
+                        resource_type,
+                    }
+                }))
+                .ok()
             })
             .collect()
     }
 
-    fn register_provider(&self, provider: Box<dyn ResourceProvider>) {
-        let rt = provider.resource_type();
-        self.providers.insert(rt, provider);
+    fn register_provider(&self, provider: Box<dyn ResourceProvider>) -> Result<(), ResourceError> {
+        let rt =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| provider.resource_type()))
+                .map_err(|_| {
+                    ResourceError::OperationFailed(
+                        "resource provider panicked while reporting its type".into(),
+                    )
+                })?;
+        match self.providers.entry(rt) {
+            dashmap::mapref::entry::Entry::Occupied(_) => {
+                Err(ResourceError::OperationFailed(
+                    "resource provider replacement is disabled; restart with an audited configuration change"
+                        .into(),
+                ))
+            }
+            dashmap::mapref::entry::Entry::Vacant(entry) => {
+                entry.insert(Arc::from(provider));
+                Ok(())
+            }
+        }
     }
 }
 
@@ -798,6 +965,82 @@ mod tests {
         }
     }
 
+    struct PanickingApplicationProvider;
+
+    #[async_trait::async_trait]
+    impl ResourceProvider for PanickingApplicationProvider {
+        fn resource_type(&self) -> ResourceType {
+            ResourceType::Application
+        }
+
+        fn supported_operations(&self) -> Vec<String> {
+            vec!["launch".into()]
+        }
+
+        async fn execute(
+            &self,
+            _operation: &str,
+            _params: &serde_json::Value,
+        ) -> Result<serde_json::Value, ResourceError> {
+            panic!("provider-controlled secret must not escape the isolation boundary")
+        }
+    }
+
+    struct ProviderFutureDrop(Arc<AtomicUsize>);
+
+    impl Drop for ProviderFutureDrop {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    struct NeverEndingApplicationProvider {
+        entered: Arc<tokio::sync::Notify>,
+        dropped: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl ResourceProvider for NeverEndingApplicationProvider {
+        fn resource_type(&self) -> ResourceType {
+            ResourceType::Application
+        }
+
+        fn supported_operations(&self) -> Vec<String> {
+            vec!["launch".into()]
+        }
+
+        async fn execute(
+            &self,
+            _operation: &str,
+            _params: &serde_json::Value,
+        ) -> Result<serde_json::Value, ResourceError> {
+            let _drop = ProviderFutureDrop(self.dropped.clone());
+            self.entered.notify_one();
+            std::future::pending().await
+        }
+    }
+
+    struct PanickingMetadataProvider;
+
+    #[async_trait::async_trait]
+    impl ResourceProvider for PanickingMetadataProvider {
+        fn resource_type(&self) -> ResourceType {
+            panic!("metadata panic")
+        }
+
+        fn supported_operations(&self) -> Vec<String> {
+            vec![]
+        }
+
+        async fn execute(
+            &self,
+            _operation: &str,
+            _params: &serde_json::Value,
+        ) -> Result<serde_json::Value, ResourceError> {
+            unreachable!("metadata panic must prevent registration")
+        }
+    }
+
     #[async_trait::async_trait]
     impl ResourceProvider for CountingProvider {
         fn resource_type(&self) -> ResourceType {
@@ -862,7 +1105,7 @@ mod tests {
     async fn execute_with_permission() {
         let perms = Arc::new(PermissionManager::new());
         let broker = ResourceBrokerImpl::new_unconfined(perms.clone());
-        broker.register_provider(Box::new(MockProvider));
+        broker.register_provider(Box::new(MockProvider)).unwrap();
 
         let agent_id = uuid::Uuid::new_v4();
         perms.assign_profile(agent_id, &"standard".to_string());
@@ -881,10 +1124,119 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn provider_panic_is_redacted_and_releases_admission_permit() {
+        let permissions = Arc::new(PermissionManager::new());
+        let broker = ResourceBrokerImpl::new_unconfined(permissions.clone());
+        broker
+            .register_provider(Box::new(PanickingApplicationProvider))
+            .unwrap();
+        let agent = uuid::Uuid::new_v4();
+        permissions.assign_profile(agent, &"full-access".into());
+
+        let response = broker
+            .execute(ResourceRequest {
+                agent_id: agent,
+                resource_type: ResourceType::Application,
+                operation: "launch".into(),
+                parameters: serde_json::json!({"command": "fixture"}),
+                sandbox_context: None,
+                gate_admission: None,
+            })
+            .await
+            .unwrap();
+
+        assert!(!response.success);
+        let error = response.error.unwrap();
+        assert!(error.contains("provider panicked"));
+        assert!(!error.contains("provider-controlled secret"));
+        assert_eq!(
+            broker
+                .admission
+                .get(&ResourceType::Application)
+                .unwrap()
+                .available_permits(),
+            8,
+            "provider panic must not strand an application permit"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelling_broker_future_drains_provider_and_releases_permit() {
+        let permissions = Arc::new(PermissionManager::new());
+        let broker = Arc::new(ResourceBrokerImpl::new_unconfined(permissions.clone()));
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let dropped = Arc::new(AtomicUsize::new(0));
+        broker
+            .register_provider(Box::new(NeverEndingApplicationProvider {
+                entered: entered.clone(),
+                dropped: dropped.clone(),
+            }))
+            .unwrap();
+        let agent = uuid::Uuid::new_v4();
+        permissions.assign_profile(agent, &"full-access".into());
+        let broker_task = broker.clone();
+
+        let request = tokio::spawn(async move {
+            broker_task
+                .execute(ResourceRequest {
+                    agent_id: agent,
+                    resource_type: ResourceType::Application,
+                    operation: "launch".into(),
+                    parameters: serde_json::json!({"command": "fixture"}),
+                    sandbox_context: None,
+                    gate_admission: None,
+                })
+                .await
+        });
+        entered.notified().await;
+        request.abort();
+        let _ = request.await;
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while dropped.load(Ordering::SeqCst) != 1 {
+                tokio::task::yield_now().await;
+            }
+            while broker
+                .admission
+                .get(&ResourceType::Application)
+                .unwrap()
+                .available_permits()
+                != 8
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("provider cancellation must drain before the bounded deadline");
+    }
+
+    #[test]
+    fn registration_rejects_panicking_metadata_and_runtime_replacement() {
+        let permissions = Arc::new(PermissionManager::new());
+        let broker = ResourceBrokerImpl::new_unconfined(permissions);
+        assert!(broker
+            .register_provider(Box::new(PanickingMetadataProvider))
+            .unwrap_err()
+            .to_string()
+            .contains("panicked while reporting its type"));
+
+        let original_calls = Arc::new(AtomicUsize::new(0));
+        broker
+            .register_provider(Box::new(CountingProvider(original_calls)))
+            .unwrap();
+        let replacement_calls = Arc::new(AtomicUsize::new(0));
+        let error = broker
+            .register_provider(Box::new(DeleteProvider(replacement_calls.clone())))
+            .unwrap_err();
+        assert!(error.to_string().contains("replacement is disabled"));
+        assert_eq!(replacement_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
     async fn execute_denied_by_permission() {
         let perms = Arc::new(PermissionManager::new());
         let broker = ResourceBrokerImpl::new_unconfined(perms.clone());
-        broker.register_provider(Box::new(MockProvider));
+        broker.register_provider(Box::new(MockProvider)).unwrap();
 
         let agent_id = uuid::Uuid::new_v4();
         perms.assign_profile(agent_id, &"read-only".to_string());
@@ -906,7 +1258,7 @@ mod tests {
     async fn list_capabilities_after_register() {
         let perms = Arc::new(PermissionManager::new());
         let broker = ResourceBrokerImpl::new_unconfined(perms);
-        broker.register_provider(Box::new(MockProvider));
+        broker.register_provider(Box::new(MockProvider)).unwrap();
         let caps = broker.list_capabilities();
         assert_eq!(caps.len(), 1);
         assert_eq!(caps[0].resource_type, ResourceType::Filesystem);
@@ -939,7 +1291,9 @@ mod tests {
         let sandboxes = Arc::new(SandboxManagerImpl::new());
         let broker = ResourceBrokerImpl::new(perms.clone(), sandboxes.clone());
         let calls = Arc::new(AtomicUsize::new(0));
-        broker.register_provider(Box::new(CountingProvider(calls.clone())));
+        broker
+            .register_provider(Box::new(CountingProvider(calls.clone())))
+            .unwrap();
         let agent = uuid::Uuid::new_v4();
         perms.assign_profile(agent, &"full-access".to_string());
         let root = std::env::temp_dir().join(format!("agentos-broker-{}", uuid::Uuid::new_v4()));
@@ -982,7 +1336,9 @@ mod tests {
         let sandboxes = Arc::new(SandboxManagerImpl::new());
         let broker = ResourceBrokerImpl::new(perms.clone(), sandboxes.clone());
         let provider_calls = Arc::new(AtomicUsize::new(0));
-        broker.register_provider(Box::new(CountingProvider(provider_calls.clone())));
+        broker
+            .register_provider(Box::new(CountingProvider(provider_calls.clone())))
+            .unwrap();
         let agent = uuid::Uuid::new_v4();
         perms.assign_profile(agent, &"full-access".to_string());
         let root =
@@ -1034,7 +1390,7 @@ mod tests {
         let perms = Arc::new(PermissionManager::new());
         let sandboxes = Arc::new(SandboxManagerImpl::new());
         let broker = ResourceBrokerImpl::new(perms.clone(), sandboxes);
-        broker.register_provider(Box::new(MockProvider));
+        broker.register_provider(Box::new(MockProvider)).unwrap();
         let agent = uuid::Uuid::new_v4();
         perms.assign_profile(agent, &"full-access".to_string());
         let result = broker
@@ -1059,11 +1415,13 @@ mod tests {
         let sandboxes = Arc::new(SandboxManagerImpl::new());
         let broker = ResourceBrokerImpl::new(permissions.clone(), sandboxes.clone());
         let calls = Arc::new(AtomicUsize::new(0));
-        broker.register_provider(Box::new(BlindProvider {
-            resource_type: ResourceType::Network,
-            advertised: vec!["get".into()],
-            calls: calls.clone(),
-        }));
+        broker
+            .register_provider(Box::new(BlindProvider {
+                resource_type: ResourceType::Network,
+                advertised: vec!["get".into()],
+                calls: calls.clone(),
+            }))
+            .unwrap();
 
         let agent = uuid::Uuid::new_v4();
         permissions.assign_profile(agent, &"full-access".into());
@@ -1122,11 +1480,13 @@ mod tests {
             (ResourceType::Browser, "navigate"),
             (ResourceType::Peripheral, "capture_image"),
         ] {
-            broker.register_provider(Box::new(BlindProvider {
-                resource_type,
-                advertised: vec![operation.into()],
-                calls: calls.clone(),
-            }));
+            broker
+                .register_provider(Box::new(BlindProvider {
+                    resource_type,
+                    advertised: vec![operation.into()],
+                    calls: calls.clone(),
+                }))
+                .unwrap();
         }
 
         let untrusted = uuid::Uuid::new_v4();
@@ -1264,16 +1624,20 @@ mod tests {
             ResourceBrokerImpl::new(permissions.clone(), Arc::new(SandboxManagerImpl::new()));
         let application_calls = Arc::new(AtomicUsize::new(0));
         let ipc_calls = Arc::new(AtomicUsize::new(0));
-        broker.register_provider(Box::new(BlindProvider {
-            resource_type: ResourceType::Application,
-            advertised: vec!["launch".into()],
-            calls: application_calls.clone(),
-        }));
-        broker.register_provider(Box::new(BlindProvider {
-            resource_type: ResourceType::Ipc,
-            advertised: vec!["send".into()],
-            calls: ipc_calls.clone(),
-        }));
+        broker
+            .register_provider(Box::new(BlindProvider {
+                resource_type: ResourceType::Application,
+                advertised: vec!["launch".into()],
+                calls: application_calls.clone(),
+            }))
+            .unwrap();
+        broker
+            .register_provider(Box::new(BlindProvider {
+                resource_type: ResourceType::Ipc,
+                advertised: vec!["send".into()],
+                calls: ipc_calls.clone(),
+            }))
+            .unwrap();
         let attacker = uuid::Uuid::new_v4();
         let victim = uuid::Uuid::new_v4();
         permissions.assign_profile(attacker, &"full-access".into());
@@ -1320,11 +1684,13 @@ mod tests {
         let permissions = Arc::new(PermissionManager::new());
         let broker = ResourceBrokerImpl::new_unconfined(permissions.clone());
         let calls = Arc::new(AtomicUsize::new(0));
-        broker.register_provider(Box::new(BlindProvider {
-            resource_type: ResourceType::Application,
-            advertised: vec!["launch".into()],
-            calls: calls.clone(),
-        }));
+        broker
+            .register_provider(Box::new(BlindProvider {
+                resource_type: ResourceType::Application,
+                advertised: vec!["launch".into()],
+                calls: calls.clone(),
+            }))
+            .unwrap();
         let agent = uuid::Uuid::new_v4();
         permissions.assign_profile(agent, &"full-access".into());
 
@@ -1381,7 +1747,9 @@ mod tests {
         let sandboxes = Arc::new(SandboxManagerImpl::new());
         let broker = ResourceBrokerImpl::new(permissions.clone(), sandboxes.clone());
         let calls = Arc::new(AtomicUsize::new(0));
-        broker.register_provider(Box::new(DeleteProvider(calls.clone())));
+        broker
+            .register_provider(Box::new(DeleteProvider(calls.clone())))
+            .unwrap();
 
         let agent = uuid::Uuid::new_v4();
         permissions.assign_profile(agent, &"standard".into());
@@ -1507,10 +1875,12 @@ mod tests {
         let broker = Arc::new(ResourceBrokerImpl::new_unconfined(permissions.clone()));
         let current = Arc::new(AtomicUsize::new(0));
         let maximum = Arc::new(AtomicUsize::new(0));
-        broker.register_provider(Box::new(SlowApplicationProvider {
-            current,
-            maximum: maximum.clone(),
-        }));
+        broker
+            .register_provider(Box::new(SlowApplicationProvider {
+                current,
+                maximum: maximum.clone(),
+            }))
+            .unwrap();
 
         let mut tasks = Vec::new();
         for _ in 0..24 {

@@ -1688,7 +1688,7 @@ mod tests {
                 Ok(serde_json::json!({"content": "hello world"}))
             }
         }
-        broker.register_provider(Box::new(MockFs));
+        broker.register_provider(Box::new(MockFs)).unwrap();
         Arc::new(broker)
     }
 
@@ -1721,7 +1721,9 @@ mod tests {
                 Ok(serde_json::json!({"content": "counted"}))
             }
         }
-        broker.register_provider(Box::new(CountingFs { executions }));
+        broker
+            .register_provider(Box::new(CountingFs { executions }))
+            .unwrap();
         Arc::new(broker)
     }
 
@@ -3897,7 +3899,9 @@ mod tests {
                 Ok(serde_json::json!({"content": "hello world"}))
             }
         }
-        broker.register_provider(Box::new(CancelFs { cancel }));
+        broker
+            .register_provider(Box::new(CancelFs { cancel }))
+            .unwrap();
         Arc::new(broker)
     }
 

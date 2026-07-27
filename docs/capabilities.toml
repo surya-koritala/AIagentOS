@@ -313,12 +313,12 @@ maturity = "integrated"
 release = "v0.9"
 tracking_issue = 124
 kernel_modules = ["github", "vision", "voice"]
-source_paths = ["crates/resources/src/lib.rs", "crates/kernel/src/lib.rs"]
-public_entry_points = ["crates/kernel/src/syscall_server.rs::CallTool"]
-runtime_call_paths = ["crates/kernel/src/lib.rs::BuiltinFilesystemProvider"]
-test_evidence = ["tests/src/os_enforcement.rs", "tests/src/edge_cases.rs"]
+source_paths = ["crates/resources/src/lib.rs", "crates/kernel/src/lib.rs", "crates/kernel/src/resources.rs"]
+public_entry_points = ["crates/kernel/src/resources.rs::ResourceProvider", "crates/kernel/src/resources.rs::ResourceBroker", "crates/kernel/src/syscall_server.rs::CallTool"]
+runtime_call_paths = ["crates/kernel/src/resources.rs::ResourceBrokerImpl::execute", "crates/kernel/src/lib.rs::BuiltinFilesystemProvider", "crates/kernel/src/lib.rs::BuiltinNetworkProvider", "crates/kernel/src/lib.rs::BuiltinAppProvider"]
+test_evidence = ["crates/kernel/src/resources.rs::tests::provider_panic_is_redacted_and_releases_admission_permit", "crates/kernel/src/resources.rs::tests::cancelling_broker_future_drains_provider_and_releases_permit", "crates/kernel/src/resources.rs::tests::registration_rejects_panicking_metadata_and_runtime_replacement", "crates/kernel/src/lib.rs::tests::dropping_application_provider_kills_descendant_process_tree", "tests/src/os_enforcement.rs", "tests/src/edge_cases.rs"]
 platforms = ["linux", "macos", "windows"]
-limitations = ["Provider isolation and platform support vary; browser is feature-gated and peripheral/computer-use behavior is incomplete or placeholder-only. Generic timeout cancellation does not yet prove that every provider side effect has stopped before lifecycle and credential guards drain; that completion contract remains tracked by #124."]
+limitations = ["Generic resource-provider operations run in kernel-owned tasks: broker cancellation signals a provider token, waits five seconds for drain, then aborts; the admission permit remains task-owned until completion. Async panics and panicking provider metadata are converted to redacted errors, application future drop kills its process group/tree, and runtime registration refuses replacement of an existing resource class. This is an enforceable future-ownership contract, not evidence that an unaudited third-party provider never detaches work before returning; only reviewed implementations can be promoted. Filesystem transaction cancellation still follows its separate complete-before-release path. Browser isolation and egress, application platform support, peripheral human grants, computer-use review, full input/output bounds, and the live provider security matrix remain open in #124; this capability is not production-qualified."]
 
 [[capability]]
 id = "production-operations"

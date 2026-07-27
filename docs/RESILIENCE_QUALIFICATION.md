@@ -57,6 +57,13 @@ cargo run --release --package os-benchmark \
 Named scenarios can be selected with repeated `--scenario NAME`. Non-smoke
 debug runs are rejected unless `--allow-debug` is supplied.
 
+The scheduled or manually dispatched `Extended security tests` workflow also
+runs all seven scenarios in release mode on GitHub-hosted Linux. It rejects
+dirty or mismatched source, debug/smoke output, missing scenarios, failed
+scenario checks, and any artifact that permits a production claim. A passing
+report is retained for 90 days as
+`deterministic-fault-matrix-<exact-commit>`.
+
 ## Evidence and claim boundary
 
 Every report binds the complete scenario configuration to the exact Git commit,
@@ -70,11 +77,11 @@ failures. Fixture reports always contain:
 }
 ```
 
-This suite proves deterministic product behavior and prevents regressions. Its
-disk capacity limit, independent SQLite lock, and loopback TCP partition are
-controlled fault fixtures; they are not evidence about the target host's
-filesystem, routing, proxy, TLS, or external provider. Production qualification
-still requires:
+This suite and its retained workflow artifact prove deterministic product
+behavior and prevent regressions. The disk capacity limit, independent SQLite
+lock, and loopback TCP partition are controlled fault fixtures; they are not
+evidence about the target host's filesystem, routing, proxy, TLS, or external
+provider. Production qualification still requires:
 
 - an actually completed 24-hour target run from the checked-in
   [resource/leak soak harness](SOAK_QUALIFICATION.md), with its retained RSS,

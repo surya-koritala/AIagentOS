@@ -429,6 +429,8 @@ The [resilience qualification guide](docs/RESILIENCE_QUALIFICATION.md) covers
 turn overload, slow clients, provider outage, exact-request cancellation
 storms, disk-full rollback, prolonged database locks, and provider-network
 partition recovery, including the explicit `max_waiting_turns` admission limit.
+The extended-security workflow retains a fail-closed release-mode report for
+all seven deterministic scenarios, bound to the exact clean commit.
 The [resource and leak soak guide](docs/SOAK_QUALIFICATION.md) defines the
 separate 24-hour target-host run, retained process/SQLite/admission samples,
 proof eligibility, and the exact work that remains after the harness exists.

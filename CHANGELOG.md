@@ -10,6 +10,14 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
 
 ## [Unreleased]
 
+- Retained exact-commit deterministic fault evidence for #125. The extended
+  security workflow now executes all seven public TCP/SDK resilience scenarios
+  in release mode, rejects source/build/scenario/check mismatches, and uploads
+  the fail-closed JSON report for 90 days. The artifact proves the controlled
+  provider-outage, cancellation-storm, SQLite disk-full and writer-lock, and
+  loopback network-partition fixtures; target-host/TLS/proxy/provider chaos is
+  still a separate production gate. The fuzz job now reserves enough time for
+  cold compilation plus both bounded two-minute wire fuzz cases.
 - Completed the deterministic fault-injection matrix infrastructure for #125.
   The release resilience suite now drives real public TCP/SDK storage writes
   against a live SQLite page limit and a held writer lock, proving typed

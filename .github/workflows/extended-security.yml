@@ -18,6 +18,63 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  deterministic-fault-matrix:
+    name: Exact-commit deterministic fault matrix
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      # Keep the release fixture on the repository's supported stable
+      # toolchain even though the instrumentation jobs below require nightly.
+      RUSTUP_TOOLCHAIN: 1.97.1
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
+        with:
+          toolchain: 1.97.1
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - name: Validate fault fixture contract
+        run: >-
+          cargo run --release --locked --package os-benchmark
+          --bin resilience-qualification -- --validate
+      - name: Exercise every deterministic fault and recovery path
+        run: |
+          mkdir -p target/qualification
+          cargo run --release --locked --package os-benchmark \
+            --bin resilience-qualification -- \
+            --all --output target/qualification/deterministic-fault-matrix.json
+      - name: Verify exact-source fault evidence
+        run: |
+          report=target/qualification/deterministic-fault-matrix.json
+          test "$(jq -r .schema_version "$report")" = "1"
+          test "$(jq -r .qualification_class "$report")" = "deterministic_resilience_fixture"
+          test "$(jq -r .passed "$report")" = "true"
+          test "$(jq -r .production_claim_allowed "$report")" = "false"
+          test "$(jq -r .build_profile "$report")" = "release"
+          test "$(jq -r .smoke_scaled "$report")" = "false"
+          test "$(jq -r .source.commit "$report")" = "$GITHUB_SHA"
+          test "$(jq -r .source.dirty "$report")" = "false"
+          jq -e '
+            [.scenarios[].name] == [
+              "turn-overload",
+              "slow-clients",
+              "provider-outage",
+              "cancellation-storm",
+              "disk-full",
+              "database-lock",
+              "network-partition"
+            ]
+            and all(.scenarios[]; .passed == true)
+            and all(.scenarios[].checks[]; . == true)
+          ' "$report"
+      - name: Retain deterministic fault qualification evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: deterministic-fault-matrix-${{ github.sha }}
+          path: target/qualification/deterministic-fault-matrix.json
+          if-no-files-found: error
+          retention-days: 90
+
   rootless-container-sandbox:
     name: Rootless container sandbox breakout and cleanup
     runs-on: ubuntu-latest
@@ -111,7 +168,10 @@ jobs:
   fuzz:
     name: Wire-protocol fuzz smoke
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # A cold hosted runner can spend more than 11 minutes compiling both
+    # libFuzzer targets; retain enough time for both bounded 120-second runs
+    # and evidence publication.
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c

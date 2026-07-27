@@ -400,7 +400,7 @@ fn release_blocking_workflows_keep_their_security_contract() {
         "automated_technical_controls_only",
         "human_game_day_completed",
         "game_day_proof_eligible",
-        "incident-drill-${{ github.sha }}",
+        "incident-drill-${{ env.QUALIFICATION_SHA }}",
         "retention-days: 90",
     ] {
         assert!(

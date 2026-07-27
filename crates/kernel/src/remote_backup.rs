@@ -1230,6 +1230,7 @@ fn set_owner_only_directory(path: &Path) -> Result<(), ContextError> {
     Ok(())
 }
 
+#[cfg(unix)]
 fn sync_directory(path: &Path) -> Result<(), ContextError> {
     fs::File::open(path)
         .and_then(|directory| directory.sync_all())
@@ -1239,6 +1240,11 @@ fn sync_directory(path: &Path) -> Result<(), ContextError> {
                 path.display()
             ))
         })
+}
+
+#[cfg(not(unix))]
+fn sync_directory(_path: &Path) -> Result<(), ContextError> {
+    Ok(())
 }
 
 fn sha256_bytes(bytes: &[u8]) -> String {

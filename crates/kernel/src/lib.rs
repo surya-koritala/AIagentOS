@@ -2731,6 +2731,21 @@ impl AgentKernelImpl {
         Ok(())
     }
 
+    async fn begin_managed_backup_erasure(
+        &self,
+    ) -> Result<Option<crate::storage::BackupErasureGuard>, KernelError> {
+        let manager = Arc::clone(&self.context_manager);
+        let maintenance = Arc::clone(&self.backup_maintenance);
+        tokio::task::spawn_blocking(move || maintenance.begin_erasure_purge(&manager))
+            .await
+            .map_err(|error| {
+                KernelError::Context(ContextError::StorageError(format!(
+                    "managed backup erasure worker failed: {error}"
+                )))
+            })?
+            .map_err(KernelError::Context)
+    }
+
     /// Erase one agent through the supported hot-operation boundary.
     ///
     /// Tenant credentials are briefly fenced and drained, service ownership is
@@ -2776,13 +2791,19 @@ impl AgentKernelImpl {
             let _erasure = self.erasure_barrier.write().await;
             let _operator_mutation = self.operator_control.mutation_guard().await;
             crash_live_erasure_after_step_for_test("agent.barriers_acquired");
+            let backup_erasure = self.begin_managed_backup_erasure().await?;
+            let managed_backups_deleted = backup_erasure
+                .as_ref()
+                .map_or(0, crate::storage::BackupErasureGuard::deleted_count);
+            crash_live_erasure_after_step_for_test("agent.backups_purged");
             self.prepare_live_agent_for_erasure(agent_id).await?;
             crash_live_erasure_after_step_for_test("agent.live_resources_removed");
             let receipt = self
                 .context_manager
-                .erase_agent_data(agent_id)
+                .erase_agent_data_after_backup_purge(agent_id, managed_backups_deleted)
                 .map_err(KernelError::Context)?;
             crash_live_erasure_after_step_for_test("agent.sqlite_committed");
+            drop(backup_erasure);
             Ok(receipt)
         }
         .await;
@@ -2810,7 +2831,21 @@ impl AgentKernelImpl {
 
         let _erasure = self.erasure_barrier.write().await;
         crash_live_erasure_after_step_for_test("user.barrier_acquired");
-        let receipt = match self.context_manager.erase_user_data(user_id) {
+        let backup_erasure = match self.begin_managed_backup_erasure().await {
+            Ok(guard) => guard,
+            Err(error) => {
+                self.credential_leases.reopen_many(&live_identities);
+                return Err(error);
+            }
+        };
+        let managed_backups_deleted = backup_erasure
+            .as_ref()
+            .map_or(0, crate::storage::BackupErasureGuard::deleted_count);
+        crash_live_erasure_after_step_for_test("user.backups_purged");
+        let receipt = match self
+            .context_manager
+            .erase_user_data_after_backup_purge(user_id, managed_backups_deleted)
+        {
             Ok(receipt) => receipt,
             Err(error) => {
                 self.credential_leases.reopen_many(&live_identities);
@@ -2818,6 +2853,7 @@ impl AgentKernelImpl {
             }
         };
         crash_live_erasure_after_step_for_test("user.sqlite_committed");
+        drop(backup_erasure);
         self.auth.write().await.revoke_user(user_id);
         crash_live_erasure_after_step_for_test("user.auth_revoked");
         Ok(receipt)
@@ -2862,13 +2898,21 @@ impl AgentKernelImpl {
             let _erasure = self.erasure_barrier.write().await;
             let _operator_mutation = self.operator_control.mutation_guard().await;
             crash_live_erasure_after_step_for_test("tenant.barriers_acquired");
+            let backup_erasure = self.begin_managed_backup_erasure().await?;
+            let managed_backups_deleted = backup_erasure
+                .as_ref()
+                .map_or(0, crate::storage::BackupErasureGuard::deleted_count);
+            crash_live_erasure_after_step_for_test("tenant.backups_purged");
             let agent_ids = self.context_manager.list_agents_for_tenant(tenant_id)?;
             for agent_id in agent_ids {
                 self.prepare_live_agent_for_erasure(agent_id).await?;
             }
             crash_live_erasure_after_step_for_test("tenant.live_agents_removed");
-            let receipt = self.context_manager.erase_tenant_data(tenant_id)?;
+            let receipt = self
+                .context_manager
+                .erase_tenant_data_after_backup_purge(tenant_id, managed_backups_deleted)?;
             crash_live_erasure_after_step_for_test("tenant.sqlite_committed");
+            drop(backup_erasure);
             self.auth.write().await.revoke_tenant(tenant_id);
             crash_live_erasure_after_step_for_test("tenant.auth_revoked");
             Ok(receipt)
@@ -5373,6 +5417,164 @@ mod tests {
         std::fs::remove_dir_all(root).ok();
     }
 
+    #[tokio::test]
+    async fn hot_erasure_purges_managed_backups_before_agent_user_and_tenant_commits() {
+        let root = std::env::temp_dir().join(format!(
+            "agentos-managed-backup-erasure-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let backup_root = root.join("backups");
+        let config = crate::config::Config {
+            data_dir: root.join("data"),
+            backup: crate::config::BackupScheduleConfig {
+                root: Some(backup_root.clone()),
+                ..crate::config::BackupScheduleConfig::default()
+            },
+            ..crate::config::Config::default()
+        };
+        let kernel = AgentKernelImpl::from_config(&config).unwrap();
+        let tenant = kernel.create_tenant("managed-erasure").await.unwrap();
+        let user = kernel
+            .register_user(
+                &tenant,
+                "managed-erasure-user",
+                "managed-erasure@example.test",
+                crate::auth::Role::User,
+            )
+            .await
+            .unwrap();
+        let agent = kernel
+            .create_agent_for_tenant(&tenant, lifecycle_test_config("managed-erasure-agent"))
+            .await
+            .unwrap()
+            .id;
+
+        kernel
+            .backup_maintenance
+            .create_backup(&kernel.context_manager, &backup_root, "before_agent")
+            .unwrap();
+        let agent_receipt = kernel
+            .erase_agent_data(agent)
+            .await
+            .unwrap()
+            .expect("agent data existed");
+        assert_eq!(
+            agent_receipt.deleted_rows.get("managed_backup_copies"),
+            Some(&1)
+        );
+        assert!(!backup_root.join("before_agent").exists());
+
+        kernel
+            .backup_maintenance
+            .create_backup(&kernel.context_manager, &backup_root, "before_user")
+            .unwrap();
+        let user_receipt = kernel
+            .erase_user_data(&user)
+            .await
+            .unwrap()
+            .expect("user data existed");
+        assert_eq!(
+            user_receipt.deleted_rows.get("managed_backup_copies"),
+            Some(&1)
+        );
+        assert!(!backup_root.join("before_user").exists());
+
+        kernel
+            .backup_maintenance
+            .create_backup(&kernel.context_manager, &backup_root, "before_tenant")
+            .unwrap();
+        let tenant_receipt = kernel
+            .erase_tenant_data(&tenant)
+            .await
+            .unwrap()
+            .expect("tenant data existed");
+        assert_eq!(
+            tenant_receipt.deleted_rows.get("managed_backup_copies"),
+            Some(&1)
+        );
+        assert!(!backup_root.join("before_tenant").exists());
+        let status = kernel.backup_maintenance.status();
+        assert_eq!(status.erasure_purge_attempts_total, 3);
+        assert_eq!(status.erasure_purge_successes_total, 3);
+        assert_eq!(status.erasure_purge_failures_total, 0);
+        assert_eq!(status.erasure_purge_deleted_total, 3);
+
+        drop(kernel);
+        let restarted = AgentKernelImpl::from_config(&config).unwrap();
+        assert!(restarted
+            .context_manager
+            .agent_tenant(agent)
+            .unwrap()
+            .is_none());
+        assert!(restarted.auth.read().await.get_user(&user).is_none());
+        assert!(restarted.auth.read().await.get_tenant(&tenant).is_none());
+        restarted
+            .backup_maintenance
+            .create_backup(
+                &restarted.context_manager,
+                &backup_root,
+                "post_erasure_clean",
+            )
+            .unwrap();
+        assert!(backup_root.join("post_erasure_clean").exists());
+        drop(restarted);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn unsafe_managed_backup_root_aborts_before_live_or_durable_erasure() {
+        let root = std::env::temp_dir().join(format!(
+            "agentos-managed-backup-refusal-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let backup_root = root.join("backups");
+        let config = crate::config::Config {
+            data_dir: root.join("data"),
+            backup: crate::config::BackupScheduleConfig {
+                root: Some(backup_root.clone()),
+                ..crate::config::BackupScheduleConfig::default()
+            },
+            ..crate::config::Config::default()
+        };
+        let kernel = AgentKernelImpl::from_config(&config).unwrap();
+        let tenant = kernel.create_tenant("managed-refusal").await.unwrap();
+        let agent = kernel
+            .create_agent_for_tenant(&tenant, lifecycle_test_config("managed-refusal-agent"))
+            .await
+            .unwrap()
+            .id;
+        kernel
+            .backup_maintenance
+            .create_backup(&kernel.context_manager, &backup_root, "known_backup")
+            .unwrap();
+        std::fs::write(backup_root.join("operator_notes"), b"unknown root entry").unwrap();
+
+        let error = kernel.erase_agent_data(agent).await.unwrap_err();
+        assert!(error.to_string().contains("not a real backup directory"));
+        assert_eq!(
+            kernel.context_manager.agent_tenant(agent).unwrap(),
+            Some(tenant)
+        );
+        assert!(kernel.agent_manager.get_agent_state(agent).is_some());
+        assert!(kernel.syscall_gate.agent_info(agent).is_some());
+        assert!(backup_root.join("known_backup").exists());
+        let status = kernel.backup_maintenance.status();
+        assert_eq!(status.erasure_purge_attempts_total, 1);
+        assert_eq!(status.erasure_purge_successes_total, 0);
+        assert_eq!(status.erasure_purge_failures_total, 1);
+        assert_eq!(status.erasure_purge_deleted_total, 0);
+
+        std::fs::remove_file(backup_root.join("operator_notes")).unwrap();
+        let receipt = kernel
+            .erase_agent_data(agent)
+            .await
+            .unwrap()
+            .expect("agent data existed on retry");
+        assert_eq!(receipt.deleted_rows.get("managed_backup_copies"), Some(&1));
+        drop(kernel);
+        std::fs::remove_dir_all(root).ok();
+    }
+
     #[test]
     fn encrypted_config_persists_restarts_and_rejects_wrong_or_missing_keys() {
         let root =
@@ -5492,6 +5694,21 @@ mod tests {
             let path = root.join("agent_os.db");
             Self { root, path }
         }
+
+        fn config(&self) -> crate::config::Config {
+            crate::config::Config {
+                data_dir: self.root.clone(),
+                backup: crate::config::BackupScheduleConfig {
+                    root: Some(self.root.join("backups")),
+                    ..crate::config::BackupScheduleConfig::default()
+                },
+                ..crate::config::Config::default()
+            }
+        }
+
+        fn backup_root(&self) -> std::path::PathBuf {
+            self.root.join("backups")
+        }
     }
 
     impl Drop for LiveErasureCrashDatabase {
@@ -5517,10 +5734,10 @@ mod tests {
     }
 
     async fn seed_live_erasure_crash_database(
-        path: &std::path::Path,
+        database: &LiveErasureCrashDatabase,
         scope: &str,
     ) -> (String, String, AgentId) {
-        let kernel = AgentKernelImpl::with_db_path(path).unwrap();
+        let kernel = AgentKernelImpl::from_config(&database.config()).unwrap();
         let tenant = kernel
             .create_tenant(&format!("{scope}-live-erasure"))
             .await
@@ -5538,7 +5755,10 @@ mod tests {
         let agent = kernel
             .create_agent_for_tenant(
                 &tenant,
-                isolated_live_erasure_config(path, &format!("{scope}-live-erasure-agent")),
+                isolated_live_erasure_config(
+                    &database.path,
+                    &format!("{scope}-live-erasure-agent"),
+                ),
             )
             .await
             .unwrap()
@@ -5547,12 +5767,20 @@ mod tests {
             kernel
                 .create_agent_for_tenant(
                     &tenant,
-                    isolated_live_erasure_config(path, "tenant-live-erasure-sibling"),
+                    isolated_live_erasure_config(&database.path, "tenant-live-erasure-sibling"),
                 )
                 .await
                 .unwrap();
         }
         kernel.context_manager.checkpoint().unwrap();
+        kernel
+            .backup_maintenance
+            .create_backup(
+                &kernel.context_manager,
+                &database.backup_root(),
+                "before_erasure",
+            )
+            .unwrap();
         (tenant, user, agent)
     }
 
@@ -5629,12 +5857,14 @@ mod tests {
         "agent.credentials_drained",
         "agent.services_stopped",
         "agent.barriers_acquired",
+        "agent.backups_purged",
         "agent.live_resources_removed",
         "agent.sqlite_committed",
     ];
     const USER_LIVE_ERASURE_CRASH_STEPS: &[&str] = &[
         "user.credentials_drained",
         "user.barrier_acquired",
+        "user.backups_purged",
         "user.sqlite_committed",
         "user.auth_revoked",
     ];
@@ -5642,6 +5872,7 @@ mod tests {
         "tenant.credentials_drained",
         "tenant.services_stopped",
         "tenant.barriers_acquired",
+        "tenant.backups_purged",
         "tenant.live_agents_removed",
         "tenant.sqlite_committed",
         "tenant.auth_revoked",
@@ -5652,10 +5883,10 @@ mod tests {
         for step in AGENT_LIVE_ERASURE_CRASH_STEPS {
             let database = LiveErasureCrashDatabase::new("agent", step);
             let (_tenant, _user, agent) =
-                seed_live_erasure_crash_database(&database.path, "agent").await;
+                seed_live_erasure_crash_database(&database, "agent").await;
             run_live_erasure_crash_child(&database, "agent", &agent.to_string(), step);
 
-            let kernel = AgentKernelImpl::with_db_path(&database.path).unwrap();
+            let kernel = AgentKernelImpl::from_config(&database.config()).unwrap();
             let _ = kernel.erase_agent_data(agent).await.unwrap();
             assert!(kernel
                 .context_manager
@@ -5665,27 +5896,28 @@ mod tests {
             assert!(kernel.agent_manager.get_agent_state(agent).is_none());
             assert!(kernel.syscall_gate.agent_info(agent).is_none());
             assert_eq!(deletion_receipt_count(&kernel, "agent"), 1);
+            assert!(!database.backup_root().join("before_erasure").exists());
         }
 
         for step in USER_LIVE_ERASURE_CRASH_STEPS {
             let database = LiveErasureCrashDatabase::new("user", step);
-            let (_tenant, user, _agent) =
-                seed_live_erasure_crash_database(&database.path, "user").await;
+            let (_tenant, user, _agent) = seed_live_erasure_crash_database(&database, "user").await;
             run_live_erasure_crash_child(&database, "user", &user, step);
 
-            let kernel = AgentKernelImpl::with_db_path(&database.path).unwrap();
+            let kernel = AgentKernelImpl::from_config(&database.config()).unwrap();
             let _ = kernel.erase_user_data(&user).await.unwrap();
             assert!(kernel.auth.read().await.get_user(&user).is_none());
             assert_eq!(deletion_receipt_count(&kernel, "user"), 1);
+            assert!(!database.backup_root().join("before_erasure").exists());
         }
 
         for step in TENANT_LIVE_ERASURE_CRASH_STEPS {
             let database = LiveErasureCrashDatabase::new("tenant", step);
             let (tenant, _user, _agent) =
-                seed_live_erasure_crash_database(&database.path, "tenant").await;
+                seed_live_erasure_crash_database(&database, "tenant").await;
             run_live_erasure_crash_child(&database, "tenant", &tenant, step);
 
-            let kernel = AgentKernelImpl::with_db_path(&database.path).unwrap();
+            let kernel = AgentKernelImpl::from_config(&database.config()).unwrap();
             let _ = kernel.erase_tenant_data(&tenant).await.unwrap();
             assert!(kernel.auth.read().await.get_tenant(&tenant).is_none());
             assert!(kernel
@@ -5694,6 +5926,7 @@ mod tests {
                 .unwrap()
                 .is_empty());
             assert_eq!(deletion_receipt_count(&kernel, "tenant"), 1);
+            assert!(!database.backup_root().join("before_erasure").exists());
         }
     }
 
@@ -5707,7 +5940,24 @@ mod tests {
             .expect("live erasure crash helper requires a scope");
         let subject = std::env::var("AIAGENTOS_TEST_LIVE_ERASURE_SUBJECT")
             .expect("live erasure crash helper requires a subject");
-        let kernel = AgentKernelImpl::with_db_path(std::path::Path::new(&database)).unwrap();
+        let database_path = std::path::Path::new(&database);
+        let config = crate::config::Config {
+            data_dir: database_path
+                .parent()
+                .expect("live erasure database has a parent")
+                .to_path_buf(),
+            backup: crate::config::BackupScheduleConfig {
+                root: Some(
+                    database_path
+                        .parent()
+                        .expect("live erasure database has a parent")
+                        .join("backups"),
+                ),
+                ..crate::config::BackupScheduleConfig::default()
+            },
+            ..crate::config::Config::default()
+        };
+        let kernel = AgentKernelImpl::from_config(&config).unwrap();
         if scope == "tenant" {
             kernel
                 .os

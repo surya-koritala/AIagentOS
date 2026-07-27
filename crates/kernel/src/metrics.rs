@@ -245,6 +245,10 @@ pub struct MetricsSnapshot {
     pub backup_successes_total: u64,
     pub backup_failures_total: u64,
     pub backup_retention_deleted_total: u64,
+    pub backup_erasure_purge_attempts_total: u64,
+    pub backup_erasure_purge_successes_total: u64,
+    pub backup_erasure_purge_failures_total: u64,
+    pub backup_erasure_purge_deleted_total: u64,
     pub backup_consecutive_failures: u64,
     pub backup_last_success_unixtime_seconds: u64,
     /// Lifecycle requests and bounded outcomes by operation.
@@ -365,6 +369,10 @@ impl MetricsSnapshot {
             backup_successes_total: backup.successes_total,
             backup_failures_total: backup.failures_total,
             backup_retention_deleted_total: backup.retention_deleted_total,
+            backup_erasure_purge_attempts_total: backup.erasure_purge_attempts_total,
+            backup_erasure_purge_successes_total: backup.erasure_purge_successes_total,
+            backup_erasure_purge_failures_total: backup.erasure_purge_failures_total,
+            backup_erasure_purge_deleted_total: backup.erasure_purge_deleted_total,
             backup_consecutive_failures: backup.consecutive_failures,
             backup_last_success_unixtime_seconds,
             lifecycle: kernel.lifecycle_counters.snapshot(),
@@ -786,6 +794,26 @@ impl MetricsSnapshot {
                 "Verified backups deleted by automatic retention.",
                 self.backup_retention_deleted_total,
             ),
+            (
+                "erasure_purge_attempts",
+                "Managed-backup purge attempts before live data erasure.",
+                self.backup_erasure_purge_attempts_total,
+            ),
+            (
+                "erasure_purge_successes",
+                "Managed-backup purges completed before live data erasure.",
+                self.backup_erasure_purge_successes_total,
+            ),
+            (
+                "erasure_purge_failures",
+                "Managed-backup purges that failed closed before live data erasure.",
+                self.backup_erasure_purge_failures_total,
+            ),
+            (
+                "erasure_purge_deleted",
+                "Verified managed backups deleted before live data erasure.",
+                self.backup_erasure_purge_deleted_total,
+            ),
         ] {
             out.push_str(&format!("# HELP agentos_backup_{metric}_total {help}\n"));
             out.push_str(&format!("# TYPE agentos_backup_{metric}_total counter\n"));
@@ -965,6 +993,10 @@ mod tests {
             backup_successes_total: 5,
             backup_failures_total: 2,
             backup_retention_deleted_total: 11,
+            backup_erasure_purge_attempts_total: 13,
+            backup_erasure_purge_successes_total: 12,
+            backup_erasure_purge_failures_total: 1,
+            backup_erasure_purge_deleted_total: 17,
             backup_consecutive_failures: 1,
             backup_last_success_unixtime_seconds: 1_700_000_000,
             lifecycle: LifecycleMetricsSnapshot {
@@ -1031,6 +1063,10 @@ mod tests {
         assert!(text.contains("# TYPE agentos_backup_scheduler_enabled gauge"));
         assert!(text.contains("# TYPE agentos_backup_signing_enabled gauge"));
         assert!(text.contains("# TYPE agentos_backup_attempts_total counter"));
+        assert!(text.contains("# TYPE agentos_backup_erasure_purge_attempts_total counter"));
+        assert!(text.contains("# TYPE agentos_backup_erasure_purge_successes_total counter"));
+        assert!(text.contains("# TYPE agentos_backup_erasure_purge_failures_total counter"));
+        assert!(text.contains("# TYPE agentos_backup_erasure_purge_deleted_total counter"));
         assert!(text.contains("# TYPE agentos_backup_consecutive_failures gauge"));
         assert!(text.contains("# TYPE agentos_backup_last_success_unixtime_seconds gauge"));
         assert!(text.contains("# TYPE agentos_lifecycle_operations_total counter"));
@@ -1083,6 +1119,10 @@ mod tests {
         assert!(text.contains("agentos_backup_successes_total 5"));
         assert!(text.contains("agentos_backup_failures_total 2"));
         assert!(text.contains("agentos_backup_retention_deleted_total 11"));
+        assert!(text.contains("agentos_backup_erasure_purge_attempts_total 13"));
+        assert!(text.contains("agentos_backup_erasure_purge_successes_total 12"));
+        assert!(text.contains("agentos_backup_erasure_purge_failures_total 1"));
+        assert!(text.contains("agentos_backup_erasure_purge_deleted_total 17"));
         assert!(text.contains("agentos_backup_consecutive_failures 1"));
         assert!(text.contains("agentos_backup_last_success_unixtime_seconds 1700000000"));
         assert!(text.contains(

@@ -616,7 +616,7 @@ pub const NON_SQLITE_DATA_INVENTORY: &[StaticDataInventoryEntry] = &[
         "configured keep-latest and maximum-age policy",
         "inherits SQLCipher encryption and key id from encrypted source; optional Ed25519 authenticity is independent",
         "is the local backup artifact",
-        "confirmed verified-retention operation; remote copies are separate"
+        "confirmed retention or fail-closed complete managed-root purge before subject erasure; remote copies are separate"
     ),
     boundary_entry!(
         "file/corrupt-recovery-journal-and-quarantine",

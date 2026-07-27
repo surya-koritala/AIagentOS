@@ -153,14 +153,23 @@ cargo run -p agent-cli --bin agentctl --locked -- \
   --addr 127.0.0.1:7777 --token "$AGENT_SERVER_TOKEN" backup-status
 ```
 
-Create a consistent backup while the server is running. The backup root is on
-the server host and requires trusted system-operator access:
+Create a consistent backup while the server is running. The supplied path must
+exactly match the server's configured `backup.root`; the server will not publish
+untracked snapshots to arbitrary host paths. The operation requires trusted
+system-operator access:
 
 ```bash
 cargo run -p agent-cli --bin agentctl --locked -- \
   --addr 127.0.0.1:7777 --token "$AGENT_SERVER_TOKEN" \
   backup-create /var/lib/agentos/backups nightly_2026_07_25
 ```
+
+Confirmed agent, user, or tenant erasure first locks this managed root and
+removes every verified backup for the installation. If any entry is unknown,
+unsafe, corrupt, foreign, or cannot be opened with a configured active/retired
+storage key, erasure fails before the live database is changed. Replicated or
+offline-created copies remain governed by their external retention/deletion
+policy.
 
 For production, generate an operator signing identity once, retain the public
 trust JSON in an independent recovery location, and mount the owner-only

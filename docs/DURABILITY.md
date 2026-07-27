@@ -677,18 +677,25 @@ proves rollback, capacity restoration, retry, `quick_check`, and reopen. See
 single ext4 fixture does not substitute for destructive capacity tests on every
 supported deployment profile or filesystem.
 
-Agent erasure also has a real process-exit regression at every one of its 17
-transaction statement boundaries: FTS, each owned data table, service
-references, cgroup quota records, the agent identity, and the deletion receipt.
-After each forced child-process exit, a fresh connection validates the schema
-and `quick_check` and compares a canonical value fingerprint of every durable
-table. The expected `storage_meta.upgraded_at` refresh performed before the
-transaction is excluded; every durable identity/version field remains included.
-A final retry must remove the complete seeded subject and commit exactly one
-private receipt. This proves all-or-nothing recovery for the agent-erasure
-SQLite transaction. It does not yet cover the separate user/tenant erasure
-matrices, kernel process termination around live-resource quiescence, host power
-loss, torn writes, device loss, published backups, or external systems.
+All three schema-wide erasure transactions have real process-exit regressions
+at every statement boundary: 17 agent, 5 user, and 28 tenant boundaries. The
+agent matrix covers FTS, each owned data table, service references, cgroup quota
+records, the agent identity, and the deletion receipt. The user matrix covers
+sessions, API keys, package rate limits, the user identity, and the receipt
+while proving pseudonymous transparency/audit evidence remains. The tenant
+matrix covers agent data and indexes, services, package supply-chain state,
+identities and credentials, tenant quota scopes, agent and tenant identities,
+and the receipt.
+
+After each of the 50 forced child-process exits, a fresh connection validates
+the schema and `quick_check` and compares a canonical value fingerprint of
+every durable table. The expected `storage_meta.upgraded_at` refresh performed
+before the transaction is excluded; every durable identity/version field
+remains included. A final retry for each scope must remove the complete seeded
+subject and commit exactly one private receipt. This proves all-or-nothing
+recovery for the agent, user, and tenant SQLite erasure transactions. It does
+not cover kernel process termination around live-resource quiescence, host
+power loss, torn writes, device loss, published backups, or external systems.
 
 The following remain open under issue #123:
 
@@ -699,5 +706,5 @@ The following remain open under issue #123:
 - power-loss, torn-write, device-loss, object-store, other deployment
   filesystem, and extended crash qualification beyond the disposable ext4
   `ENOSPC` run, deterministic interrupted-encryption recovery, and the
-  agent-erasure transaction matrix covered above;
+  erasure transaction matrices covered above;
 - measured RPO/RTO on supported deployment profiles.

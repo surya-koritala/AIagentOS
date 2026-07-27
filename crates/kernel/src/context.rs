@@ -6426,6 +6426,11 @@ impl SqliteContextManager {
                 )
                 .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
             record_deleted_rows(&mut deleted_rows, table, deleted);
+            crash_erasure_after_step_for_test(match table {
+                "sessions" => "user.sessions",
+                "api_keys" => "user.api_keys",
+                _ => unreachable!("user erasure table list is closed"),
+            });
         }
         let deleted = tx
             .execute(
@@ -6434,10 +6439,12 @@ impl SqliteContextManager {
             )
             .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
         record_deleted_rows(&mut deleted_rows, "package_rate_limits", deleted);
+        crash_erasure_after_step_for_test("user.package_rate_limits");
         let deleted = tx
             .execute("DELETE FROM users WHERE id = ?1", params![user_id])
             .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
         record_deleted_rows(&mut deleted_rows, "users", deleted);
+        crash_erasure_after_step_for_test("user.users");
 
         if deleted_rows.is_empty() {
             return Ok(None);
@@ -6452,6 +6459,7 @@ impl SqliteContextManager {
                 "previously published operator backups until their retention expiry".to_string(),
             ],
         )?;
+        crash_erasure_after_step_for_test("user.deletion_receipt");
         tx.commit()
             .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
         Ok(Some(receipt))
@@ -6778,6 +6786,7 @@ impl SqliteContextManager {
             )
             .map_err(|error| ContextError::StorageError(error.to_string()))?;
         record_deleted_rows(&mut deleted_rows, "conversations_fts", deleted);
+        crash_erasure_after_step_for_test("tenant.conversations_fts");
 
         for table in ["service_runtime", "service_history"] {
             let cleared = transaction
@@ -6794,6 +6803,11 @@ impl SqliteContextManager {
                 format!("{table}.agent_reference"),
                 cleared,
             );
+            crash_erasure_after_step_for_test(match table {
+                "service_runtime" => "tenant.service_runtime",
+                "service_history" => "tenant.service_history",
+                _ => unreachable!("tenant service table list is closed"),
+            });
         }
 
         for table in [
@@ -6812,6 +6826,16 @@ impl SqliteContextManager {
                 )
                 .map_err(|error| ContextError::StorageError(error.to_string()))?;
             record_deleted_rows(&mut deleted_rows, table, deleted);
+            crash_erasure_after_step_for_test(match table {
+                "contexts" => "tenant.contexts",
+                "facts" => "tenant.facts",
+                "conversations" => "tenant.conversations",
+                "usage_log" => "tenant.usage_log",
+                "agent_kv" => "tenant.agent_kv",
+                "context_pressure" => "tenant.context_pressure",
+                "context_snapshots" => "tenant.context_snapshots",
+                _ => unreachable!("tenant agent table list is closed"),
+            });
         }
         for table in ["context_spills", "generation_checkpoints"] {
             let deleted = transaction
@@ -6824,6 +6848,11 @@ impl SqliteContextManager {
                 )
                 .map_err(|error| ContextError::StorageError(error.to_string()))?;
             record_deleted_rows(&mut deleted_rows, table, deleted);
+            crash_erasure_after_step_for_test(match table {
+                "context_spills" => "tenant.context_spills",
+                "generation_checkpoints" => "tenant.generation_checkpoints",
+                _ => unreachable!("tenant dual-scope table list is closed"),
+            });
         }
 
         for table in [
@@ -6846,6 +6875,20 @@ impl SqliteContextManager {
                 )
                 .map_err(|error| ContextError::StorageError(error.to_string()))?;
             record_deleted_rows(&mut deleted_rows, table, deleted);
+            crash_erasure_after_step_for_test(match table {
+                "loaded_package_instances" => "tenant.loaded_package_instances",
+                "package_trust_keys" => "tenant.package_trust_keys",
+                "package_artifacts" => "tenant.package_artifacts",
+                "package_installations" => "tenant.package_installations",
+                "package_install_history" => "tenant.package_install_history",
+                "package_rate_limits" => "tenant.package_rate_limits",
+                "package_transparency" => "tenant.package_transparency",
+                "package_audit" => "tenant.package_audit",
+                "sessions" => "tenant.sessions",
+                "api_keys" => "tenant.api_keys",
+                "users" => "tenant.users",
+                _ => unreachable!("tenant-owned table list is closed"),
+            });
         }
 
         let tenant_scope = format!("/tenant/{}", quota_scope_segment(tenant_id));
@@ -6860,6 +6903,7 @@ impl SqliteContextManager {
             )
             .map_err(|error| ContextError::StorageError(error.to_string()))?;
         record_deleted_rows(&mut deleted_rows, "quota_receipt_scopes", deleted);
+        crash_erasure_after_step_for_test("tenant.quota_receipt_scopes");
         let deleted = transaction
             .execute(
                 "DELETE FROM quota_epochs
@@ -6870,15 +6914,18 @@ impl SqliteContextManager {
             )
             .map_err(|error| ContextError::StorageError(error.to_string()))?;
         record_deleted_rows(&mut deleted_rows, "quota_epochs", deleted);
+        crash_erasure_after_step_for_test("tenant.quota_epochs");
 
         let deleted = transaction
             .execute("DELETE FROM agents WHERE tenant_id = ?1", [tenant_id])
             .map_err(|error| ContextError::StorageError(error.to_string()))?;
         record_deleted_rows(&mut deleted_rows, "agents", deleted);
+        crash_erasure_after_step_for_test("tenant.agents");
         let deleted = transaction
             .execute("DELETE FROM tenants WHERE id = ?1", [tenant_id])
             .map_err(|error| ContextError::StorageError(error.to_string()))?;
         record_deleted_rows(&mut deleted_rows, "tenants", deleted);
+        crash_erasure_after_step_for_test("tenant.tenants");
 
         if deleted_rows.is_empty() {
             return Ok(None);
@@ -6894,6 +6941,7 @@ impl SqliteContextManager {
                 "previously published operator backups until their retention expiry".to_string(),
             ],
         )?;
+        crash_erasure_after_step_for_test("tenant.deletion_receipt");
         transaction
             .commit()
             .map_err(|error| ContextError::StorageError(error.to_string()))?;
@@ -8458,6 +8506,378 @@ mod tests {
                 params![quota_receipt.to_string(), &agent_scope, one.as_slice()],
             )
             .unwrap();
+    }
+
+    fn seed_user_erasure_crash_fixture(path: &std::path::Path, tenant: &str, user: &str) {
+        let manager = SqliteContextManager::new(path).unwrap();
+        let now = Utc::now().to_rfc3339();
+        let connection = manager.conn.lock().unwrap();
+        connection
+            .execute(
+                "INSERT INTO tenants (id, name, created_at)
+                 VALUES (?1, 'Crash qualification tenant', ?2)",
+                params![tenant, &now],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO users
+                 (id, tenant_id, username, email, role, created_at)
+                 VALUES (?1, ?2, 'crash-user', 'crash@example.test', 'admin', ?3)",
+                params![user, tenant, &now],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO api_keys
+                 (key_hash, name, user_id, tenant_id, created_at)
+                 VALUES ('crash-key', 'crash key', ?1, ?2, ?3)",
+                params![user, tenant, &now],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO sessions (token_hash, user_id, tenant_id, expires_at)
+                 VALUES ('crash-session', ?1, ?2, ?3)",
+                params![user, tenant, &now],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO package_rate_limits
+                 (tenant_id, actor, window_started_at, requests)
+                 VALUES (?1, ?2, 1, 1)",
+                params![tenant, user],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO package_transparency
+                 (tenant_id, action, name, version, digest, previous_hash,
+                  entry_hash, actor, created_at)
+                 VALUES (?1, 'publish', 'crash-pkg', '1.0.0', 'crash-digest',
+                         'crash-previous', 'crash-entry', ?2, ?3)",
+                params![tenant, user, &now],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO package_audit
+                 (tenant_id, actor, action, outcome, created_at)
+                 VALUES (?1, ?2, 'publish', 'allowed', ?3)",
+                params![tenant, user, &now],
+            )
+            .unwrap();
+    }
+
+    async fn seed_tenant_erasure_crash_fixture(
+        path: &std::path::Path,
+        tenant: &str,
+        user: &str,
+        agent: AgentId,
+    ) {
+        seed_user_erasure_crash_fixture(path, tenant, user);
+        {
+            let manager = SqliteContextManager::new(path).unwrap();
+            let now = Utc::now().to_rfc3339();
+            let connection = manager.conn.lock().unwrap();
+            connection
+                .execute(
+                    "INSERT INTO package_trust_keys
+                     (tenant_id, key_id, publisher, public_key, status,
+                      valid_from, created_at)
+                     VALUES (?1, 'crash-key-id', 'crash-publisher', ?2,
+                             'trusted', ?3, ?3)",
+                    params![tenant, vec![7_u8; 32], &now],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO package_artifacts
+                     (tenant_id, name, version, publisher, digest, archive,
+                      manifest_json, published_at)
+                     VALUES (?1, 'crash-pkg', '1.0.0', 'crash-publisher',
+                             'crash-artifact-digest', ?2, '{}', ?3)",
+                    params![tenant, vec![1_u8, 2, 3], &now],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO package_installations
+                     (tenant_id, name, version, digest, lock_json,
+                      manifest_json, installed_at)
+                     VALUES (?1, 'crash-pkg', '1.0.0',
+                             'crash-artifact-digest', '{}', '{}', ?2)",
+                    params![tenant, &now],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO package_install_history
+                     (tenant_id, name, snapshot_json, action, created_at)
+                     VALUES (?1, 'crash-pkg', '{}', 'install', ?2)",
+                    params![tenant, &now],
+                )
+                .unwrap();
+        }
+        seed_agent_erasure_crash_fixture(path, agent, tenant).await;
+    }
+
+    const USER_ERASURE_CRASH_STEPS: &[&str] = &[
+        "user.sessions",
+        "user.api_keys",
+        "user.package_rate_limits",
+        "user.users",
+        "user.deletion_receipt",
+    ];
+
+    #[test]
+    fn process_exit_at_every_user_erasure_mutation_rolls_back_all_tables() {
+        let database = QuotaTestDatabase::new("user-erasure-process-exit");
+        let tenant = "user-crash-qualification-tenant";
+        let user = uuid::Uuid::new_v4().to_string();
+        seed_user_erasure_crash_fixture(&database.path, tenant, &user);
+        let baseline = logical_database_fingerprints(&database.path);
+
+        for step in USER_ERASURE_CRASH_STEPS {
+            let child = std::process::Command::new(std::env::current_exe().unwrap())
+                .arg("--ignored")
+                .arg("user_erasure_crash_child_only")
+                .env("AIAGENTOS_TEST_ERASURE_DB", &database.path)
+                .env("AIAGENTOS_TEST_ERASURE_USER", &user)
+                .env("AIAGENTOS_TEST_EXIT_ERASURE_AFTER_STEP", step)
+                .status()
+                .unwrap();
+            assert_eq!(
+                child.code(),
+                Some(87),
+                "child did not terminate at crash point {step}"
+            );
+            assert_eq!(
+                logical_database_fingerprints(&database.path),
+                baseline,
+                "process exit after {step} left a partial durable mutation"
+            );
+        }
+
+        let manager = SqliteContextManager::new(&database.path).unwrap();
+        assert!(manager.erase_user_data(&user).unwrap().is_some());
+        let connection = manager.conn.lock().unwrap();
+        crate::schema::verify(&connection).unwrap();
+        let quick_check: String = connection
+            .query_row("PRAGMA quick_check", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(quick_check, "ok");
+        for (table, column) in [
+            ("sessions", "user_id"),
+            ("api_keys", "user_id"),
+            ("package_rate_limits", "actor"),
+            ("users", "id"),
+        ] {
+            let remaining: i64 = connection
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM {table} WHERE {column} = ?1"),
+                    [&user],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(remaining, 0, "{table} retained the erased user");
+        }
+        for table in ["package_transparency", "package_audit"] {
+            let retained: i64 = connection
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM {table} WHERE actor = ?1"),
+                    [&user],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(retained, 1, "{table} lost retained security evidence");
+        }
+        let receipt_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM deletion_receipts
+                 WHERE subject_kind = 'user'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(receipt_count, 1);
+    }
+
+    #[test]
+    #[ignore = "child-process helper for user-erasure crash regression"]
+    fn user_erasure_crash_child_only() {
+        let Some(database) = std::env::var_os("AIAGENTOS_TEST_ERASURE_DB") else {
+            return;
+        };
+        let user = std::env::var("AIAGENTOS_TEST_ERASURE_USER")
+            .expect("user erasure crash helper requires a user id");
+        let manager = SqliteContextManager::new(std::path::Path::new(&database)).unwrap();
+        let _ = manager.erase_user_data(&user).unwrap();
+        panic!("user erasure crash helper did not terminate at the requested mutation");
+    }
+
+    const TENANT_ERASURE_CRASH_STEPS: &[&str] = &[
+        "tenant.conversations_fts",
+        "tenant.service_runtime",
+        "tenant.service_history",
+        "tenant.contexts",
+        "tenant.facts",
+        "tenant.conversations",
+        "tenant.usage_log",
+        "tenant.agent_kv",
+        "tenant.context_pressure",
+        "tenant.context_snapshots",
+        "tenant.context_spills",
+        "tenant.generation_checkpoints",
+        "tenant.loaded_package_instances",
+        "tenant.package_trust_keys",
+        "tenant.package_artifacts",
+        "tenant.package_installations",
+        "tenant.package_install_history",
+        "tenant.package_rate_limits",
+        "tenant.package_transparency",
+        "tenant.package_audit",
+        "tenant.sessions",
+        "tenant.api_keys",
+        "tenant.users",
+        "tenant.quota_receipt_scopes",
+        "tenant.quota_epochs",
+        "tenant.agents",
+        "tenant.tenants",
+        "tenant.deletion_receipt",
+    ];
+
+    #[tokio::test]
+    async fn process_exit_at_every_tenant_erasure_mutation_rolls_back_all_tables() {
+        let database = QuotaTestDatabase::new("tenant-erasure-process-exit");
+        let tenant = "tenant-crash-qualification";
+        let user = uuid::Uuid::new_v4().to_string();
+        let agent = uuid::Uuid::new_v4();
+        seed_tenant_erasure_crash_fixture(&database.path, tenant, &user, agent).await;
+        let baseline = logical_database_fingerprints(&database.path);
+
+        for step in TENANT_ERASURE_CRASH_STEPS {
+            let child = std::process::Command::new(std::env::current_exe().unwrap())
+                .arg("--ignored")
+                .arg("tenant_erasure_crash_child_only")
+                .env("AIAGENTOS_TEST_ERASURE_DB", &database.path)
+                .env("AIAGENTOS_TEST_ERASURE_TENANT", tenant)
+                .env("AIAGENTOS_TEST_EXIT_ERASURE_AFTER_STEP", step)
+                .status()
+                .unwrap();
+            assert_eq!(
+                child.code(),
+                Some(87),
+                "child did not terminate at crash point {step}"
+            );
+            assert_eq!(
+                logical_database_fingerprints(&database.path),
+                baseline,
+                "process exit after {step} left a partial durable mutation"
+            );
+        }
+
+        let manager = SqliteContextManager::new(&database.path).unwrap();
+        assert!(manager.erase_tenant_data(tenant).unwrap().is_some());
+        let connection = manager.conn.lock().unwrap();
+        crate::schema::verify(&connection).unwrap();
+        let quick_check: String = connection
+            .query_row("PRAGMA quick_check", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(quick_check, "ok");
+        for table in [
+            "context_spills",
+            "generation_checkpoints",
+            "loaded_package_instances",
+            "package_trust_keys",
+            "package_artifacts",
+            "package_installations",
+            "package_install_history",
+            "package_rate_limits",
+            "package_transparency",
+            "package_audit",
+            "sessions",
+            "api_keys",
+            "users",
+            "agents",
+        ] {
+            let remaining: i64 = connection
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM {table} WHERE tenant_id = ?1"),
+                    [tenant],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(remaining, 0, "{table} retained the erased tenant");
+        }
+        for table in [
+            "contexts",
+            "facts",
+            "conversations",
+            "usage_log",
+            "agent_kv",
+            "context_pressure",
+            "context_snapshots",
+        ] {
+            let remaining: i64 = connection
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM {table} WHERE agent_id = ?1"),
+                    [agent.to_string()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(remaining, 0, "{table} retained the tenant agent");
+        }
+        for table in ["service_runtime", "service_history"] {
+            let remaining: i64 = connection
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM {table} WHERE agent_id = ?1"),
+                    [agent.to_string()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(remaining, 0, "{table} retained the tenant agent reference");
+        }
+        let tenant_rows: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM tenants WHERE id = ?1",
+                [tenant],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let fts_rows: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM conversations_fts
+                 WHERE conversation_id = 'crash-qualification-conversation'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let receipt_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM deletion_receipts
+                 WHERE subject_kind = 'tenant'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(tenant_rows, 0);
+        assert_eq!(fts_rows, 0);
+        assert_eq!(receipt_count, 1);
+    }
+
+    #[test]
+    #[ignore = "child-process helper for tenant-erasure crash regression"]
+    fn tenant_erasure_crash_child_only() {
+        let Some(database) = std::env::var_os("AIAGENTOS_TEST_ERASURE_DB") else {
+            return;
+        };
+        let tenant = std::env::var("AIAGENTOS_TEST_ERASURE_TENANT")
+            .expect("tenant erasure crash helper requires a tenant id");
+        let manager = SqliteContextManager::new(std::path::Path::new(&database)).unwrap();
+        let _ = manager.erase_tenant_data(&tenant).unwrap();
+        panic!("tenant erasure crash helper did not terminate at the requested mutation");
     }
 
     const AGENT_ERASURE_CRASH_STEPS: &[&str] = &[

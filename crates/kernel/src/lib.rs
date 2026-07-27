@@ -1366,6 +1366,16 @@ impl Drop for ActiveTurnRegistration<'_> {
     }
 }
 
+#[cfg(test)]
+fn crash_live_erasure_after_step_for_test(step: &str) {
+    if std::env::var("AIAGENTOS_TEST_EXIT_LIVE_ERASURE_AFTER_STEP").as_deref() == Ok(step) {
+        std::process::exit(88);
+    }
+}
+
+#[cfg(not(test))]
+fn crash_live_erasure_after_step_for_test(_step: &str) {}
+
 impl AgentKernelImpl {
     const WATCHDOG_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
     #[cfg(not(test))]
@@ -2745,6 +2755,7 @@ impl AgentKernelImpl {
         };
         self.drain_credentials_for_erasure(&live_identities, &identities)
             .await?;
+        crash_live_erasure_after_step_for_test("agent.credentials_drained");
 
         let result = async {
             let service_names = self
@@ -2760,13 +2771,19 @@ impl AgentKernelImpl {
             for service_name in service_names {
                 self.stop_service_inner(&service_name, false).await?;
             }
+            crash_live_erasure_after_step_for_test("agent.services_stopped");
 
             let _erasure = self.erasure_barrier.write().await;
             let _operator_mutation = self.operator_control.mutation_guard().await;
+            crash_live_erasure_after_step_for_test("agent.barriers_acquired");
             self.prepare_live_agent_for_erasure(agent_id).await?;
-            self.context_manager
+            crash_live_erasure_after_step_for_test("agent.live_resources_removed");
+            let receipt = self
+                .context_manager
                 .erase_agent_data(agent_id)
-                .map_err(KernelError::Context)
+                .map_err(KernelError::Context)?;
+            crash_live_erasure_after_step_for_test("agent.sqlite_committed");
+            Ok(receipt)
         }
         .await;
         self.credential_leases.reopen_many(&live_identities);
@@ -2789,8 +2806,10 @@ impl AgentKernelImpl {
         };
         self.drain_credentials_for_erasure(&live_identities, &identities)
             .await?;
+        crash_live_erasure_after_step_for_test("user.credentials_drained");
 
         let _erasure = self.erasure_barrier.write().await;
+        crash_live_erasure_after_step_for_test("user.barrier_acquired");
         let receipt = match self.context_manager.erase_user_data(user_id) {
             Ok(receipt) => receipt,
             Err(error) => {
@@ -2798,7 +2817,9 @@ impl AgentKernelImpl {
                 return Err(KernelError::Context(error));
             }
         };
+        crash_live_erasure_after_step_for_test("user.sqlite_committed");
         self.auth.write().await.revoke_user(user_id);
+        crash_live_erasure_after_step_for_test("user.auth_revoked");
         Ok(receipt)
     }
 
@@ -2819,6 +2840,7 @@ impl AgentKernelImpl {
         };
         self.drain_credentials_for_erasure(&live_identities, &identities)
             .await?;
+        crash_live_erasure_after_step_for_test("tenant.credentials_drained");
 
         let result = async {
             let service_names = {
@@ -2835,15 +2857,20 @@ impl AgentKernelImpl {
             for service_name in service_names {
                 self.stop_service_inner(&service_name, false).await?;
             }
+            crash_live_erasure_after_step_for_test("tenant.services_stopped");
 
             let _erasure = self.erasure_barrier.write().await;
             let _operator_mutation = self.operator_control.mutation_guard().await;
+            crash_live_erasure_after_step_for_test("tenant.barriers_acquired");
             let agent_ids = self.context_manager.list_agents_for_tenant(tenant_id)?;
             for agent_id in agent_ids {
                 self.prepare_live_agent_for_erasure(agent_id).await?;
             }
+            crash_live_erasure_after_step_for_test("tenant.live_agents_removed");
             let receipt = self.context_manager.erase_tenant_data(tenant_id)?;
+            crash_live_erasure_after_step_for_test("tenant.sqlite_committed");
             self.auth.write().await.revoke_tenant(tenant_id);
+            crash_live_erasure_after_step_for_test("tenant.auth_revoked");
             Ok(receipt)
         }
         .await;
@@ -5447,6 +5474,271 @@ mod tests {
     async fn in_memory_kernel_uses_production_mac_defaults() {
         let kernel = AgentKernelImpl::new().unwrap();
         assert!(kernel.syscall_gate.mac_is_enforcing().await);
+    }
+
+    struct LiveErasureCrashDatabase {
+        root: std::path::PathBuf,
+        path: std::path::PathBuf,
+    }
+
+    impl LiveErasureCrashDatabase {
+        fn new(scope: &str, step: &str) -> Self {
+            let safe_step = step.replace('.', "-");
+            let root = std::env::temp_dir().join(format!(
+                "agentos-live-erasure-{scope}-{safe_step}-{}",
+                uuid::Uuid::new_v4()
+            ));
+            std::fs::create_dir_all(&root).unwrap();
+            let path = root.join("agent_os.db");
+            Self { root, path }
+        }
+    }
+
+    impl Drop for LiveErasureCrashDatabase {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.root).ok();
+        }
+    }
+
+    fn isolated_live_erasure_config(path: &std::path::Path, name: &str) -> AgentConfig {
+        let mut config = lifecycle_test_config(name);
+        config.sandbox_config = Some(SandboxConfig {
+            workspace_dir: path
+                .parent()
+                .expect("live erasure database has a parent")
+                .join(format!("workspace-{}", uuid::Uuid::new_v4())),
+            allowed_network_hosts: Some(Vec::new()),
+            max_disk_usage_bytes: Some(100 * 1024 * 1024),
+            max_memory_bytes: Some(256 * 1024 * 1024),
+            isolation_level: IsolationLevel::Filesystem,
+            container_image: None,
+        });
+        config
+    }
+
+    async fn seed_live_erasure_crash_database(
+        path: &std::path::Path,
+        scope: &str,
+    ) -> (String, String, AgentId) {
+        let kernel = AgentKernelImpl::with_db_path(path).unwrap();
+        let tenant = kernel
+            .create_tenant(&format!("{scope}-live-erasure"))
+            .await
+            .unwrap();
+        let user = kernel
+            .register_user(
+                &tenant,
+                "live-erasure-user",
+                &format!("{scope}-live-erasure@example.test"),
+                crate::auth::Role::User,
+            )
+            .await
+            .unwrap();
+        let _session = kernel.open_session(&user).await.unwrap();
+        let agent = kernel
+            .create_agent_for_tenant(
+                &tenant,
+                isolated_live_erasure_config(path, &format!("{scope}-live-erasure-agent")),
+            )
+            .await
+            .unwrap()
+            .id;
+        if scope == "tenant" {
+            kernel
+                .create_agent_for_tenant(
+                    &tenant,
+                    isolated_live_erasure_config(path, "tenant-live-erasure-sibling"),
+                )
+                .await
+                .unwrap();
+        }
+        kernel.context_manager.checkpoint().unwrap();
+        (tenant, user, agent)
+    }
+
+    fn tenant_live_erasure_service(
+        tenant_id: &str,
+        database_path: &std::path::Path,
+    ) -> crate::init_system::ServiceDef {
+        let sandbox = isolated_live_erasure_config(database_path, "tenant-live-erasure-service")
+            .sandbox_config;
+        crate::init_system::ServiceDef {
+            name: "tenant-live-erasure-service".into(),
+            description: Some("live erasure crash qualification service".into()),
+            exec: crate::init_system::ExecConfig {
+                provider: "stub".into(),
+                system_prompt: "exercise tenant service shutdown before erasure".into(),
+                tools: Vec::new(),
+                model: None,
+            },
+            service: crate::init_system::ServiceConfig::default(),
+            dependencies: crate::init_system::DependencyConfig::default(),
+            resources: crate::init_system::ResourceConfig::default(),
+            policy: crate::init_system::ServicePolicyConfig {
+                tenant_id: tenant_id.into(),
+                sandbox,
+                ..crate::init_system::ServicePolicyConfig::default()
+            },
+            health: crate::init_system::HealthConfig::default(),
+        }
+    }
+
+    fn run_live_erasure_crash_child(
+        database: &LiveErasureCrashDatabase,
+        scope: &str,
+        subject: &str,
+        step: &str,
+    ) {
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--ignored")
+            .arg("live_erasure_crash_child_only")
+            .env("AIAGENTOS_TEST_EXIT_LIVE_ERASURE_AFTER_STEP", step)
+            .env("AIAGENTOS_TEST_LIVE_ERASURE_DATABASE", &database.path)
+            .env("AIAGENTOS_TEST_LIVE_ERASURE_SCOPE", scope)
+            .env("AIAGENTOS_TEST_LIVE_ERASURE_SUBJECT", subject)
+            // Rehydration reconciles the process-local managed workspace root.
+            // Give every crash child its own root so it cannot classify a
+            // concurrently running test process's workspaces as orphaned.
+            .env("TMPDIR", &database.root)
+            .env("TMP", &database.root)
+            .env("TEMP", &database.root)
+            .status()
+            .unwrap();
+        assert_eq!(
+            child.code(),
+            Some(88),
+            "child did not terminate at live erasure crash point {step}"
+        );
+    }
+
+    fn deletion_receipt_count(kernel: &AgentKernelImpl, subject_kind: &str) -> i64 {
+        kernel
+            .context_manager
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM deletion_receipts WHERE subject_kind = ?1",
+                [subject_kind],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    const AGENT_LIVE_ERASURE_CRASH_STEPS: &[&str] = &[
+        "agent.credentials_drained",
+        "agent.services_stopped",
+        "agent.barriers_acquired",
+        "agent.live_resources_removed",
+        "agent.sqlite_committed",
+    ];
+    const USER_LIVE_ERASURE_CRASH_STEPS: &[&str] = &[
+        "user.credentials_drained",
+        "user.barrier_acquired",
+        "user.sqlite_committed",
+        "user.auth_revoked",
+    ];
+    const TENANT_LIVE_ERASURE_CRASH_STEPS: &[&str] = &[
+        "tenant.credentials_drained",
+        "tenant.services_stopped",
+        "tenant.barriers_acquired",
+        "tenant.live_agents_removed",
+        "tenant.sqlite_committed",
+        "tenant.auth_revoked",
+    ];
+
+    #[tokio::test]
+    async fn process_exit_at_every_live_erasure_coordinator_boundary_is_retryable() {
+        for step in AGENT_LIVE_ERASURE_CRASH_STEPS {
+            let database = LiveErasureCrashDatabase::new("agent", step);
+            let (_tenant, _user, agent) =
+                seed_live_erasure_crash_database(&database.path, "agent").await;
+            run_live_erasure_crash_child(&database, "agent", &agent.to_string(), step);
+
+            let kernel = AgentKernelImpl::with_db_path(&database.path).unwrap();
+            let _ = kernel.erase_agent_data(agent).await.unwrap();
+            assert!(kernel
+                .context_manager
+                .agent_tenant(agent)
+                .unwrap()
+                .is_none());
+            assert!(kernel.agent_manager.get_agent_state(agent).is_none());
+            assert!(kernel.syscall_gate.agent_info(agent).is_none());
+            assert_eq!(deletion_receipt_count(&kernel, "agent"), 1);
+        }
+
+        for step in USER_LIVE_ERASURE_CRASH_STEPS {
+            let database = LiveErasureCrashDatabase::new("user", step);
+            let (_tenant, user, _agent) =
+                seed_live_erasure_crash_database(&database.path, "user").await;
+            run_live_erasure_crash_child(&database, "user", &user, step);
+
+            let kernel = AgentKernelImpl::with_db_path(&database.path).unwrap();
+            let _ = kernel.erase_user_data(&user).await.unwrap();
+            assert!(kernel.auth.read().await.get_user(&user).is_none());
+            assert_eq!(deletion_receipt_count(&kernel, "user"), 1);
+        }
+
+        for step in TENANT_LIVE_ERASURE_CRASH_STEPS {
+            let database = LiveErasureCrashDatabase::new("tenant", step);
+            let (tenant, _user, _agent) =
+                seed_live_erasure_crash_database(&database.path, "tenant").await;
+            run_live_erasure_crash_child(&database, "tenant", &tenant, step);
+
+            let kernel = AgentKernelImpl::with_db_path(&database.path).unwrap();
+            let _ = kernel.erase_tenant_data(&tenant).await.unwrap();
+            assert!(kernel.auth.read().await.get_tenant(&tenant).is_none());
+            assert!(kernel
+                .context_manager
+                .list_agents_for_tenant(&tenant)
+                .unwrap()
+                .is_empty());
+            assert_eq!(deletion_receipt_count(&kernel, "tenant"), 1);
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "child-process helper for live-erasure coordinator crash regression"]
+    async fn live_erasure_crash_child_only() {
+        let Some(database) = std::env::var_os("AIAGENTOS_TEST_LIVE_ERASURE_DATABASE") else {
+            return;
+        };
+        let scope = std::env::var("AIAGENTOS_TEST_LIVE_ERASURE_SCOPE")
+            .expect("live erasure crash helper requires a scope");
+        let subject = std::env::var("AIAGENTOS_TEST_LIVE_ERASURE_SUBJECT")
+            .expect("live erasure crash helper requires a subject");
+        let kernel = AgentKernelImpl::with_db_path(std::path::Path::new(&database)).unwrap();
+        if scope == "tenant" {
+            kernel
+                .os
+                .init
+                .lock()
+                .await
+                .replace_definitions(vec![tenant_live_erasure_service(
+                    &subject,
+                    std::path::Path::new(&database),
+                )])
+                .unwrap();
+            kernel
+                .start_service("tenant-live-erasure-service")
+                .await
+                .unwrap();
+        }
+        match scope.as_str() {
+            "agent" => {
+                let agent = uuid::Uuid::parse_str(&subject)
+                    .expect("agent erasure crash helper requires an agent UUID");
+                let _ = kernel.erase_agent_data(agent).await.unwrap();
+            }
+            "user" => {
+                let _ = kernel.erase_user_data(&subject).await.unwrap();
+            }
+            "tenant" => {
+                let _ = kernel.erase_tenant_data(&subject).await.unwrap();
+            }
+            other => panic!("unsupported live erasure crash scope {other:?}"),
+        }
+        panic!("live erasure crash helper did not terminate at the requested boundary");
     }
 
     #[tokio::test]

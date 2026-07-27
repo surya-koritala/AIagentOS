@@ -10,14 +10,25 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
 
 ## [Unreleased]
 
+- Added real process-exit qualification around the supported hot-erasure
+  coordinator under #123. Fifteen child-process crash points cover credential
+  fencing, supervised-service shutdown, request/operator barriers, live-agent
+  quiescence and cleanup, the SQLite commit handoff, and final auth revocation
+  across agent, user, and tenant deletion. Every crash is followed by a
+  file-backed kernel restart and idempotent retry that must remove the subject,
+  leave no live agent boundary, and retain exactly one private receipt. This
+  qualifies process-local erasure coordination; external providers/workspaces,
+  published backups, power loss, torn writes, and opaque cleanup interruption
+  inside a single boundary remain open.
 - Added real process-exit fault injection at every statement boundary in all
   three schema-wide erasure transactions under #123: 17 agent, 5 user, and 28
   tenant boundaries. Fifty child-process crash points now prove that SQLite
   recovery preserves the canonical contents of every durable table, schema
   verification, and `quick_check`, followed by clean retries that commit each
   deletion and exactly one private receipt. This qualifies the SQLite erasure
-  transactions only; live-resource quiescence crash windows, power loss, torn
-  writes, backup copies, and external-system deletion remain open.
+  transactions only; the separate coordinator matrix covers the surrounding
+  hot-erasure boundaries, while power loss, torn writes, backup copies, and
+  external-system deletion remain open.
 - Added destructive Linux host-filesystem exhaustion qualification under #123.
   A guarded release harness accepts only an explicitly marked 32–128 MiB
   disposable filesystem, fills it to a real host `ENOSPC`, proves the failed

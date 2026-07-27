@@ -44,7 +44,9 @@ jobs:
           echo "AGENTOS_SANDBOX_TEST_IMAGE=${QUALIFICATION_IMAGE}" >> "$GITHUB_ENV"
       - name: Exercise live breakout, cancellation, and crash cleanup
         env:
-          AGENTOS_SANDBOX_EVIDENCE_PATH: target/qualification/rootless-sandbox-crash.json
+          # Rust test processes run from the package directory, so use an
+          # absolute workspace path that the following workflow steps share.
+          AGENTOS_SANDBOX_EVIDENCE_PATH: ${{ github.workspace }}/target/qualification/rootless-sandbox-crash.json
         run: |
           mkdir -p target/qualification
           cargo test -p kernel \

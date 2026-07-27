@@ -1713,6 +1713,11 @@ mod tests {
         let agent_id = uuid::Uuid::new_v4();
         let sid = mgr.create_managed_sandbox(agent_id, &config).unwrap();
 
+        // Model an external cleanup after the capability has been revoked.
+        // Windows correctly refuses to remove a directory while this handle
+        // is open, whereas Unix permits unlinking it underneath the handle.
+        let state = mgr.sandboxes.get(&sid).unwrap().clone();
+        state.workspace.lock().unwrap().take();
         std::fs::remove_dir_all(&workspace).unwrap();
         mgr.destroy_sandbox(sid).unwrap();
 

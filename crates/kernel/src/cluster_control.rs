@@ -29,6 +29,32 @@ const MAX_MEMBER_VERSION_BYTES: usize = 256;
 const MIN_JOIN_CHALLENGE_TTL_SECONDS: u64 = 5;
 const MAX_JOIN_CHALLENGE_TTL_SECONDS: u64 = 300;
 
+#[cfg(test)]
+thread_local! {
+    static CLUSTER_MUTATION_STEP_FOR_TEST: std::cell::Cell<usize> = const {
+        std::cell::Cell::new(0)
+    };
+}
+
+#[cfg(test)]
+fn crash_cluster_mutation_after_step_for_test(statement: &str) {
+    let target = std::env::var("AIAGENTOS_TEST_EXIT_CLUSTER_AFTER_STEP")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok());
+    CLUSTER_MUTATION_STEP_FOR_TEST.with(|counter| {
+        let step = counter.get().saturating_add(1);
+        counter.set(step);
+        if target == Some(step) {
+            eprintln!("terminating after cluster mutation {step}: {statement}");
+            std::process::exit(86);
+        }
+    });
+}
+
+#[cfg(not(test))]
+#[inline]
+fn crash_cluster_mutation_after_step_for_test(_statement: &str) {}
+
 /// Whether a node can receive new placement or mutable workload traffic.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -264,11 +290,12 @@ impl ClusterControl {
                         .map_err(|error| {
                             storage_error(format!("persist cluster identity: {error}"))
                         })?;
+                    crash_cluster_mutation_after_step_for_test("identity.insert");
                     identity
                 }
             };
             let now = Utc::now().to_rfc3339();
-            transaction
+            let initialized_control = transaction
                 .execute(
                     "INSERT OR IGNORE INTO cluster_node_control
                      (singleton, availability, generation, profile_json, reason, updated_at)
@@ -283,7 +310,10 @@ impl ClusterControl {
                 .map_err(|error| {
                     storage_error(format!("initialize cluster node control: {error}"))
                 })?;
-            transaction
+            if initialized_control == 1 {
+                crash_cluster_mutation_after_step_for_test("node_control.initialize");
+            }
+            let initialized_authority = transaction
                 .execute(
                     "INSERT OR IGNORE INTO cluster_membership_authority
                      (singleton, cluster_id, generation, created_at)
@@ -293,6 +323,9 @@ impl ClusterControl {
                 .map_err(|error| {
                     storage_error(format!("initialize cluster membership authority: {error}"))
                 })?;
+            if initialized_authority == 1 {
+                crash_cluster_mutation_after_step_for_test("membership_authority.initialize");
+            }
             transaction
                 .commit()
                 .map_err(|error| storage_error(format!("commit cluster identity: {error}")))?;
@@ -445,6 +478,7 @@ impl ClusterControl {
         if changed != 1 {
             return Err(storage_error("node-control revision conflict"));
         }
+        crash_cluster_mutation_after_step_for_test("node_control.update");
         transaction
             .execute(
                 "INSERT INTO cluster_node_control_audit
@@ -460,6 +494,7 @@ impl ClusterControl {
                 ],
             )
             .map_err(|error| storage_error(format!("audit node control: {error}")))?;
+        crash_cluster_mutation_after_step_for_test("node_control.audit");
         transaction
             .commit()
             .map_err(|error| storage_error(format!("commit node control: {error}")))?;
@@ -754,6 +789,7 @@ impl ClusterControl {
                 ],
             )
             .map_err(|error| storage_error(format!("persist cluster member: {error}")))?;
+        crash_cluster_mutation_after_step_for_test("membership.member");
         let consumed = transaction
             .execute(
                 "UPDATE cluster_join_challenges SET consumed_at = ?1
@@ -764,6 +800,7 @@ impl ClusterControl {
         if consumed != 1 {
             return Err(storage_error("cluster join challenge was already consumed"));
         }
+        crash_cluster_mutation_after_step_for_test("membership.challenge");
         let advanced = transaction
             .execute(
                 "UPDATE cluster_membership_authority SET generation = ?1
@@ -778,6 +815,7 @@ impl ClusterControl {
         if advanced != 1 {
             return Err(storage_error("cluster membership revision conflict"));
         }
+        crash_cluster_mutation_after_step_for_test("membership.authority");
         transaction
             .execute(
                 "INSERT INTO cluster_membership_audit
@@ -795,6 +833,7 @@ impl ClusterControl {
                 ],
             )
             .map_err(|error| storage_error(format!("audit cluster member join: {error}")))?;
+        crash_cluster_mutation_after_step_for_test("membership.audit");
         transaction
             .commit()
             .map_err(|error| storage_error(format!("commit cluster join: {error}")))?;
@@ -884,6 +923,7 @@ impl ClusterControl {
         if changed != 1 {
             return Err(storage_error("cluster member revision conflict"));
         }
+        crash_cluster_mutation_after_step_for_test("member_state.member");
         let authority_changed = transaction
             .execute(
                 "UPDATE cluster_membership_authority SET generation = ?1
@@ -898,6 +938,7 @@ impl ClusterControl {
         if authority_changed != 1 {
             return Err(storage_error("cluster membership revision conflict"));
         }
+        crash_cluster_mutation_after_step_for_test("member_state.authority");
         transaction
             .execute(
                 "INSERT INTO cluster_membership_audit
@@ -916,6 +957,7 @@ impl ClusterControl {
                 ],
             )
             .map_err(|error| storage_error(format!("audit cluster member state: {error}")))?;
+        crash_cluster_mutation_after_step_for_test("member_state.audit");
         transaction
             .commit()
             .map_err(|error| storage_error(format!("commit cluster member state: {error}")))?;
@@ -1389,6 +1431,510 @@ fn storage_error(message: impl Into<String>) -> ContextError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const CLUSTER_CRASH_CASES: &[(&str, usize)] = &[
+        ("initialize", 3),
+        ("transition", 2),
+        ("profile", 2),
+        ("join", 4),
+        ("rejoin", 4),
+        ("leave", 3),
+        ("revoke", 3),
+    ];
+    const CLUSTER_MUTATION_TABLES: &[&str] = &[
+        "cluster_node_identity",
+        "cluster_node_control",
+        "cluster_node_control_audit",
+        "cluster_membership_authority",
+        "cluster_join_challenges",
+        "cluster_members",
+        "cluster_membership_audit",
+    ];
+
+    struct ClusterCrashDatabase {
+        authority_path: std::path::PathBuf,
+        member_path: std::path::PathBuf,
+    }
+
+    impl ClusterCrashDatabase {
+        fn new(operation: &str, step: usize) -> Self {
+            let id = uuid::Uuid::new_v4();
+            Self {
+                authority_path: std::env::temp_dir().join(format!(
+                    "aiagentos-cluster-crash-authority-{operation}-{step}-{id}.db"
+                )),
+                member_path: std::env::temp_dir().join(format!(
+                    "aiagentos-cluster-crash-member-{operation}-{step}-{id}.db"
+                )),
+            }
+        }
+    }
+
+    impl Drop for ClusterCrashDatabase {
+        fn drop(&mut self) {
+            remove_cluster_crash_database(&self.authority_path);
+            remove_cluster_crash_database(&self.member_path);
+        }
+    }
+
+    #[derive(Debug, Default, Serialize, Deserialize)]
+    struct ClusterCrashInput {
+        challenge_hex: Option<String>,
+        signature_hex: Option<String>,
+        node_id: Option<String>,
+        expected_generation: Option<u64>,
+    }
+
+    fn remove_cluster_crash_database(path: &std::path::Path) {
+        let _ = std::fs::remove_file(path);
+        for suffix in ["-wal", "-shm"] {
+            let mut sidecar = path.as_os_str().to_os_string();
+            sidecar.push(suffix);
+            let _ = std::fs::remove_file(std::path::PathBuf::from(sidecar));
+        }
+    }
+
+    fn reset_cluster_mutation_steps_for_test() {
+        CLUSTER_MUTATION_STEP_FOR_TEST.with(|counter| counter.set(0));
+    }
+
+    fn cluster_mutation_steps_for_test() -> usize {
+        CLUSTER_MUTATION_STEP_FOR_TEST.with(std::cell::Cell::get)
+    }
+
+    fn prepare_cluster_crash_join(
+        authority: &ClusterControl,
+        member: &ClusterControl,
+        expected_generation: Option<u64>,
+    ) -> ClusterCrashInput {
+        let registration = member_registration(member, "member.internal:7443");
+        let challenge = authority.issue_join_challenge(300).unwrap();
+        let signature = sign_join(authority, member, &challenge, &registration);
+        ClusterCrashInput {
+            challenge_hex: Some(challenge.challenge_hex),
+            signature_hex: Some(signature),
+            node_id: Some(registration.node_id),
+            expected_generation,
+        }
+    }
+
+    fn register_cluster_crash_member(
+        authority: &ClusterControl,
+        member: &ClusterControl,
+        input: &ClusterCrashInput,
+        reason: &str,
+    ) -> ClusterMember {
+        let registration = member_registration(member, "member.internal:7443");
+        authority
+            .register_member(
+                registration,
+                input
+                    .challenge_hex
+                    .as_deref()
+                    .expect("cluster crash join challenge"),
+                input
+                    .signature_hex
+                    .as_deref()
+                    .expect("cluster crash join signature"),
+                input.expected_generation,
+                1,
+                2,
+                "system",
+                reason,
+            )
+            .unwrap()
+    }
+
+    fn seed_cluster_crash_operation(
+        authority_path: &std::path::Path,
+        member_path: &std::path::Path,
+        operation: &str,
+    ) -> ClusterCrashInput {
+        let authority_store = Arc::new(open_cluster_crash_manager(authority_path));
+        if operation == "initialize" {
+            drop(authority_store);
+            return ClusterCrashInput::default();
+        }
+        let authority = ClusterControl::new(authority_store).unwrap();
+        match operation {
+            "transition" | "profile" => ClusterCrashInput::default(),
+            "join" => {
+                let member =
+                    ClusterControl::new(Arc::new(open_cluster_crash_manager(member_path))).unwrap();
+                prepare_cluster_crash_join(&authority, &member, None)
+            }
+            "rejoin" => {
+                let member =
+                    ClusterControl::new(Arc::new(open_cluster_crash_manager(member_path))).unwrap();
+                let first = prepare_cluster_crash_join(&authority, &member, None);
+                let joined =
+                    register_cluster_crash_member(&authority, &member, &first, "initial admission");
+                let left = authority
+                    .set_member_state(
+                        &joined.node_id,
+                        ClusterMemberState::Left,
+                        joined.generation,
+                        "system",
+                        "maintenance",
+                    )
+                    .unwrap();
+                prepare_cluster_crash_join(&authority, &member, Some(left.generation))
+            }
+            "leave" | "revoke" => {
+                let member =
+                    ClusterControl::new(Arc::new(open_cluster_crash_manager(member_path))).unwrap();
+                let first = prepare_cluster_crash_join(&authority, &member, None);
+                let joined =
+                    register_cluster_crash_member(&authority, &member, &first, "initial admission");
+                ClusterCrashInput {
+                    node_id: Some(joined.node_id),
+                    expected_generation: Some(joined.generation),
+                    ..ClusterCrashInput::default()
+                }
+            }
+            unknown => panic!("unknown cluster crash operation {unknown}"),
+        }
+    }
+
+    fn open_cluster_crash_manager(path: &std::path::Path) -> SqliteContextManager {
+        // This matrix exercises SQLite transaction recovery across a forced
+        // process exit. The exclusive process-ownership lease is deliberately
+        // omitted because fork/exec lease inheritance is qualified separately.
+        SqliteContextManager::new_without_storage_lease(path).unwrap()
+    }
+
+    fn run_cluster_crash_operation(
+        authority_path: &std::path::Path,
+        member_path: &std::path::Path,
+        operation: &str,
+        input: &ClusterCrashInput,
+    ) {
+        let authority_store = Arc::new(open_cluster_crash_manager(authority_path));
+        if operation == "initialize" {
+            ClusterControl::new(authority_store).unwrap();
+            return;
+        }
+        let authority = ClusterControl::new(authority_store).unwrap();
+        match operation {
+            "transition" => {
+                authority
+                    .transition(
+                        NodeAvailability::Draining,
+                        0,
+                        "operator",
+                        "crash-qualified transition",
+                    )
+                    .unwrap();
+            }
+            "profile" => {
+                authority
+                    .set_profile(
+                        NodeProfile {
+                            region: Some("ca-central-1".into()),
+                            models: vec!["qualified-model".into()],
+                            ..NodeProfile::default()
+                        },
+                        0,
+                        "operator",
+                        "crash-qualified profile",
+                    )
+                    .unwrap();
+            }
+            "join" | "rejoin" => {
+                let member =
+                    ClusterControl::new(Arc::new(open_cluster_crash_manager(member_path))).unwrap();
+                register_cluster_crash_member(
+                    &authority,
+                    &member,
+                    input,
+                    if operation == "join" {
+                        "crash-qualified join"
+                    } else {
+                        "crash-qualified rejoin"
+                    },
+                );
+            }
+            "leave" | "revoke" => {
+                authority
+                    .set_member_state(
+                        input.node_id.as_deref().expect("cluster crash node id"),
+                        if operation == "leave" {
+                            ClusterMemberState::Left
+                        } else {
+                            ClusterMemberState::Revoked
+                        },
+                        input
+                            .expected_generation
+                            .expect("cluster crash expected generation"),
+                        "system",
+                        if operation == "leave" {
+                            "crash-qualified leave"
+                        } else {
+                            "crash-qualified revocation"
+                        },
+                    )
+                    .unwrap();
+            }
+            unknown => panic!("unknown cluster crash operation {unknown}"),
+        }
+    }
+
+    fn cluster_table_fingerprints(
+        database: &std::path::Path,
+    ) -> std::collections::BTreeMap<String, String> {
+        let manager = open_cluster_crash_manager(database);
+        let connection = manager.conn.lock().unwrap();
+        let fingerprints = CLUSTER_MUTATION_TABLES
+            .iter()
+            .map(|table| {
+                let mut statement = connection
+                    .prepare(&format!("SELECT * FROM {table}"))
+                    .unwrap();
+                let columns = statement.column_count();
+                let mut query = statement.query([]).unwrap();
+                let mut encoded_rows = Vec::new();
+                while let Some(row) = query.next().unwrap() {
+                    let mut encoded = Vec::new();
+                    for index in 0..columns {
+                        match row.get_ref(index).unwrap() {
+                            rusqlite::types::ValueRef::Null => encoded.push(0),
+                            rusqlite::types::ValueRef::Integer(value) => {
+                                encoded.push(1);
+                                encoded.extend_from_slice(&value.to_be_bytes());
+                            }
+                            rusqlite::types::ValueRef::Real(value) => {
+                                encoded.push(2);
+                                encoded.extend_from_slice(&value.to_bits().to_be_bytes());
+                            }
+                            rusqlite::types::ValueRef::Text(value) => {
+                                encoded.push(3);
+                                encoded.extend_from_slice(
+                                    &u64::try_from(value.len()).unwrap().to_be_bytes(),
+                                );
+                                encoded.extend_from_slice(value);
+                            }
+                            rusqlite::types::ValueRef::Blob(value) => {
+                                encoded.push(4);
+                                encoded.extend_from_slice(
+                                    &u64::try_from(value.len()).unwrap().to_be_bytes(),
+                                );
+                                encoded.extend_from_slice(value);
+                            }
+                        }
+                    }
+                    encoded_rows.push(encoded);
+                }
+                encoded_rows.sort();
+                let mut material = Vec::new();
+                for row in encoded_rows {
+                    material.extend_from_slice(&u64::try_from(row.len()).unwrap().to_be_bytes());
+                    material.extend_from_slice(&row);
+                }
+                (
+                    (*table).to_string(),
+                    hex_encode(ring::digest::digest(&ring::digest::SHA256, &material).as_ref()),
+                )
+            })
+            .collect();
+        drop(connection);
+        drop(manager);
+        fingerprints
+    }
+
+    fn assert_cluster_database_valid(database: &std::path::Path) {
+        let manager = open_cluster_crash_manager(database);
+        let connection = manager.conn.lock().unwrap();
+        crate::schema::verify(&connection).unwrap();
+        let quick_check: String = connection
+            .query_row("PRAGMA quick_check", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(quick_check, "ok");
+    }
+
+    fn assert_cluster_challenge_consumed(database: &std::path::Path, challenge_hex: &str) {
+        let manager = open_cluster_crash_manager(database);
+        let connection = manager.conn.lock().unwrap();
+        let challenge = hex_decode(challenge_hex).unwrap();
+        let consumed: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM cluster_join_challenges
+                 WHERE challenge_hash = ?1 AND consumed_at IS NOT NULL",
+                [sha256_hex(&challenge)],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(consumed, 1);
+    }
+
+    fn assert_cluster_crash_operation_committed(
+        database: &std::path::Path,
+        operation: &str,
+        input: &ClusterCrashInput,
+    ) {
+        let control = ClusterControl::new(Arc::new(open_cluster_crash_manager(database))).unwrap();
+        match operation {
+            "initialize" => {
+                let status = control.status().unwrap();
+                assert_eq!(status.generation, 0);
+                assert_eq!(status.availability, NodeAvailability::Active);
+                assert_eq!(control.membership_snapshot().unwrap().generation, 0);
+                assert!(control.audit(10).unwrap().is_empty());
+                assert!(control.membership_audit(10).unwrap().is_empty());
+            }
+            "transition" => {
+                let status = control.status().unwrap();
+                assert_eq!(status.generation, 1);
+                assert_eq!(status.availability, NodeAvailability::Draining);
+                let audit = control.audit(10).unwrap();
+                assert_eq!(audit.len(), 1);
+                assert_eq!(audit[0].generation, status.generation);
+                assert_eq!(audit[0].current, status.availability);
+            }
+            "profile" => {
+                let status = control.status().unwrap();
+                assert_eq!(status.generation, 1);
+                assert_eq!(status.availability, NodeAvailability::Active);
+                assert_eq!(status.profile.region.as_deref(), Some("ca-central-1"));
+                assert_eq!(status.profile.models, vec!["qualified-model"]);
+                let audit = control.audit(10).unwrap();
+                assert_eq!(audit.len(), 1);
+                assert_eq!(audit[0].previous, NodeAvailability::Active);
+                assert_eq!(audit[0].current, NodeAvailability::Active);
+            }
+            "join" | "rejoin" => {
+                let expected_generation = if operation == "join" { 1 } else { 3 };
+                let snapshot = control.membership_snapshot().unwrap();
+                assert_eq!(snapshot.generation, expected_generation);
+                assert_eq!(snapshot.members.len(), 1);
+                assert_eq!(snapshot.members[0].state, ClusterMemberState::Active);
+                assert_eq!(snapshot.members[0].generation, expected_generation);
+                let audit = control.membership_audit(10).unwrap();
+                assert_eq!(audit.len(), expected_generation as usize);
+                assert_eq!(audit[0].membership_generation, expected_generation);
+                assert_eq!(audit[0].member_generation, expected_generation);
+                assert_eq!(audit[0].current, ClusterMemberState::Active);
+                assert_cluster_challenge_consumed(
+                    database,
+                    input
+                        .challenge_hex
+                        .as_deref()
+                        .expect("committed cluster challenge"),
+                );
+            }
+            "leave" | "revoke" => {
+                let expected_state = if operation == "leave" {
+                    ClusterMemberState::Left
+                } else {
+                    ClusterMemberState::Revoked
+                };
+                let snapshot = control.membership_snapshot().unwrap();
+                assert_eq!(snapshot.generation, 2);
+                assert_eq!(snapshot.members.len(), 1);
+                assert_eq!(snapshot.members[0].state, expected_state);
+                assert_eq!(snapshot.members[0].generation, 2);
+                let audit = control.membership_audit(10).unwrap();
+                assert_eq!(audit.len(), 2);
+                assert_eq!(audit[0].membership_generation, 2);
+                assert_eq!(audit[0].member_generation, 2);
+                assert_eq!(audit[0].current, expected_state);
+            }
+            unknown => panic!("unknown cluster crash operation {unknown}"),
+        }
+        assert_cluster_database_valid(database);
+    }
+
+    #[test]
+    fn process_exit_at_every_cluster_multi_table_statement_preserves_atomicity() {
+        for (operation, expected_steps) in CLUSTER_CRASH_CASES {
+            for step in 1..=*expected_steps {
+                let database = ClusterCrashDatabase::new(operation, step);
+                let input = seed_cluster_crash_operation(
+                    &database.authority_path,
+                    &database.member_path,
+                    operation,
+                );
+                let baseline = cluster_table_fingerprints(&database.authority_path);
+
+                let child = std::process::Command::new(std::env::current_exe().unwrap())
+                    .arg("--ignored")
+                    .arg("cluster_multi_table_mutation_crash_child_only")
+                    .env(
+                        "AIAGENTOS_TEST_CLUSTER_CRASH_AUTHORITY_DB",
+                        &database.authority_path,
+                    )
+                    .env(
+                        "AIAGENTOS_TEST_CLUSTER_CRASH_MEMBER_DB",
+                        &database.member_path,
+                    )
+                    .env("AIAGENTOS_TEST_CLUSTER_CRASH_OPERATION", operation)
+                    .env(
+                        "AIAGENTOS_TEST_CLUSTER_CRASH_INPUT",
+                        serde_json::to_string(&input).unwrap(),
+                    )
+                    .env("AIAGENTOS_TEST_EXIT_CLUSTER_AFTER_STEP", step.to_string())
+                    .status()
+                    .unwrap();
+                assert_eq!(
+                    child.code(),
+                    Some(86),
+                    "{operation} child did not terminate at mutation {step}"
+                );
+                assert_cluster_database_valid(&database.authority_path);
+                assert_eq!(
+                    cluster_table_fingerprints(&database.authority_path),
+                    baseline,
+                    "process exit after {operation} mutation {step} left partial cluster state"
+                );
+
+                reset_cluster_mutation_steps_for_test();
+                run_cluster_crash_operation(
+                    &database.authority_path,
+                    &database.member_path,
+                    operation,
+                    &input,
+                );
+                assert_eq!(
+                    cluster_mutation_steps_for_test(),
+                    *expected_steps,
+                    "{operation} mutation inventory changed without updating the crash matrix"
+                );
+                assert_ne!(
+                    cluster_table_fingerprints(&database.authority_path),
+                    baseline,
+                    "{operation} retry did not publish its complete transaction"
+                );
+                assert_cluster_crash_operation_committed(
+                    &database.authority_path,
+                    operation,
+                    &input,
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "child-process helper for cluster multi-table crash regression"]
+    fn cluster_multi_table_mutation_crash_child_only() {
+        let Some(authority) = std::env::var_os("AIAGENTOS_TEST_CLUSTER_CRASH_AUTHORITY_DB") else {
+            return;
+        };
+        let member = std::env::var_os("AIAGENTOS_TEST_CLUSTER_CRASH_MEMBER_DB")
+            .expect("cluster crash helper requires a member database");
+        let operation = std::env::var("AIAGENTOS_TEST_CLUSTER_CRASH_OPERATION")
+            .expect("cluster crash helper requires an operation");
+        let input: ClusterCrashInput = serde_json::from_str(
+            &std::env::var("AIAGENTOS_TEST_CLUSTER_CRASH_INPUT")
+                .expect("cluster crash helper requires operation input"),
+        )
+        .unwrap();
+        run_cluster_crash_operation(
+            std::path::Path::new(&authority),
+            std::path::Path::new(&member),
+            &operation,
+            &input,
+        );
+        panic!("cluster crash helper did not terminate at the requested mutation");
+    }
 
     #[test]
     fn identity_is_stable_and_proves_private_key_possession() {

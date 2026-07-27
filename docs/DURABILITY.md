@@ -755,9 +755,9 @@ conversation.
 
 This matrix proves process-termination atomicity for those context workflows.
 The quota/accounting and package-registry matrices below extend that coverage
-further. These matrices do not yet qualify cluster-control multi-table
-transactions, interruption inside external side effects, host power loss, torn
-writes, or device loss.
+further, and the sixth matrix qualifies cluster-control multi-table
+transactions. They do not qualify interruption inside external side effects,
+host power loss, torn writes, or device loss.
 
 A fourth file-backed matrix qualifies 37 statement boundaries across six
 multi-table quota/accounting workflows: hierarchical request/token reservation,
@@ -773,9 +773,9 @@ After every forced exit, schema verification and `quick_check` must pass and
 the canonical fingerprint of every durable table must equal the pre-operation
 baseline. A clean retry must then commit the complete logical operation and
 pass cross-receipt/aggregate validation. This proves process-termination
-atomicity for these quota/accounting workflows. It does not yet qualify the
-cluster-control multi-table transactions, host power loss, torn writes, or
-device loss.
+atomicity for these quota/accounting workflows. The separate sixth matrix
+qualifies cluster control; host power loss, torn writes, and device loss remain
+outside this evidence.
 
 A fifth file-backed matrix qualifies 29 statement boundaries across nine
 multi-table package-registry workflows: initial trust, trust supersession,
@@ -795,9 +795,29 @@ table has its exact pre-operation fingerprint. A clean retry must execute the
 inventory-checked number of writes, publish the complete terminal state, verify
 every link and digest in the transparency chain, pass schema verification, and
 pass `quick_check`. This qualifies process-termination atomicity for the
-package-registry transactions; it does not qualify cluster-control
-transactions, external package-repository side effects, host power loss, torn
-writes, or device loss.
+package-registry transactions. The separate sixth matrix qualifies cluster
+control; external package-repository side effects, host power loss, torn
+writes, and device loss remain outside this evidence.
+
+A sixth file-backed matrix qualifies 21 statement boundaries across all seven
+multi-table cluster-control operations: first initialization, availability
+transition, profile update, initial join, rejoin, leave, and revocation. It
+covers the node identity, node control and audit, membership authority, join
+challenge, member, and membership-audit tables. Each numbered boundary is
+inventory checked, so an added or removed transaction write requires an
+explicit matrix update.
+
+After every forced child-process exit, a fresh connection must pass schema
+verification and `quick_check`, and the canonical fingerprint of all seven
+cluster tables must equal the pre-operation baseline. A clean retry must then
+publish the complete generation-fenced operation, matching control and
+membership audits, and challenge consumption where applicable. The matrix
+opens SQLite without the exclusive process-ownership lease because forced
+fork/exec termination is the subject of this transaction test; lease
+inheritance and single-owner exclusion are independently covered by storage
+regressions. This completes the in-process multi-table statement-boundary
+matrix. It does not emulate host power loss, torn writes, device loss, or
+external side effects.
 
 The following remain open under issue #123:
 
@@ -808,7 +828,6 @@ The following remain open under issue #123:
 - power-loss, torn-write, device-loss, object-store, other deployment
   filesystem, and extended crash qualification beyond the disposable ext4
   `ENOSPC` run, deterministic interrupted-encryption recovery, and the
-  erasure transaction/coordinator and context-mutation matrices covered above;
-- process-exit statement-boundary matrices for the remaining cluster-control
-  multi-table transactions;
+  erasure, context, quota/accounting, package-registry, and cluster-control
+  matrices covered above;
 - measured RPO/RTO on supported deployment profiles.

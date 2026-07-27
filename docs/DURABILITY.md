@@ -741,6 +741,23 @@ stages. It does not emulate interruption inside one opaque cleanup or
 managed-backup deletion call, host power loss, torn writes, device loss, or
 provider/workspace systems outside the kernel process.
 
+A third file-backed matrix qualifies 26 statement boundaries across eleven
+high-value multi-table context mutations: conversation plus FTS publication;
+context-spill store, expiry purge, and deletion; operator-tunable ensure,
+update, and rollback plus audit history; service runtime save/remove plus
+history; and user/tenant identity revocation. Each child process terminates
+after one successful SQLite statement but before commit. A fresh connection
+must match the canonical pre-transaction fingerprint of every durable table,
+then a clean retry must publish the complete related state and pass schema
+verification plus `quick_check`. Conversation persistence also treats an FTS
+write failure as a transaction failure instead of committing an unindexed
+conversation.
+
+This matrix proves process-termination atomicity for those context workflows.
+It does not yet qualify the separate quota/accounting, package-registry, or
+cluster-control multi-table transactions, interruption inside external side
+effects, host power loss, torn writes, or device loss.
+
 The following remain open under issue #123:
 
 - remote object storage retention and a measured recovery runbook;
@@ -750,5 +767,7 @@ The following remain open under issue #123:
 - power-loss, torn-write, device-loss, object-store, other deployment
   filesystem, and extended crash qualification beyond the disposable ext4
   `ENOSPC` run, deterministic interrupted-encryption recovery, and the
-  erasure transaction/coordinator matrices covered above;
+  erasure transaction/coordinator and context-mutation matrices covered above;
+- process-exit statement-boundary matrices for the remaining quota/accounting,
+  package-registry, and cluster-control multi-table transactions;
 - measured RPO/RTO on supported deployment profiles.

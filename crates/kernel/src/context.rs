@@ -824,6 +824,17 @@ fn crash_erasure_after_step_for_test(step: &str) {
 #[inline]
 fn crash_erasure_after_step_for_test(_step: &str) {}
 
+#[cfg(test)]
+fn crash_multi_table_mutation_after_step_for_test(step: &str) {
+    if std::env::var("AIAGENTOS_TEST_EXIT_MULTI_TABLE_AFTER_STEP").as_deref() == Ok(step) {
+        std::process::exit(86);
+    }
+}
+
+#[cfg(not(test))]
+#[inline]
+fn crash_multi_table_mutation_after_step_for_test(_step: &str) {}
+
 fn persist_deletion_receipt(
     transaction: &Transaction<'_>,
     subject_kind: DeletionSubjectKind,
@@ -4100,6 +4111,7 @@ impl SqliteContextManager {
             "INSERT OR REPLACE INTO conversations (id, agent_id, messages_json, created_at, updated_at) VALUES (?1, ?2, ?3, COALESCE((SELECT created_at FROM conversations WHERE id=?1), ?4), ?4)",
             rusqlite::params![id, agent_id.to_string(), json, now],
         ).map_err(|e| ContextError::PersistenceFailed(e.to_string()))?;
+        crash_multi_table_mutation_after_step_for_test("conversation.conversations");
         let text_content: String = messages
             .iter()
             .map(|m| m.content.as_str())
@@ -4109,7 +4121,8 @@ impl SqliteContextManager {
             "INSERT OR REPLACE INTO conversations_fts (conversation_id, content) VALUES (?1, ?2)",
             rusqlite::params![id, text_content],
         )
-        .ok();
+        .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
+        crash_multi_table_mutation_after_step_for_test("conversation.conversations_fts");
         transaction
             .commit()
             .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
@@ -4521,12 +4534,14 @@ impl SqliteContextManager {
                 params![now],
             )
             .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
+        crash_multi_table_mutation_after_step_for_test("spill_purge.agent_kv");
         transaction
             .execute(
                 "DELETE FROM context_spills WHERE expires_at <= ?1",
                 params![now],
             )
             .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
+        crash_multi_table_mutation_after_step_for_test("spill_purge.context_spills");
         transaction
             .commit()
             .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
@@ -4598,6 +4613,7 @@ impl SqliteContextManager {
                 params![agent_id.to_string(), key, value, now.to_rfc3339()],
             )
             .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
+        crash_multi_table_mutation_after_step_for_test("spill_store.agent_kv");
         transaction
             .execute(
                 "INSERT OR REPLACE INTO context_spills
@@ -4614,6 +4630,7 @@ impl SqliteContextManager {
                 ],
             )
             .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
+        crash_multi_table_mutation_after_step_for_test("spill_store.context_spills");
         transaction
             .commit()
             .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
@@ -4710,12 +4727,14 @@ impl SqliteContextManager {
                 params![agent_id.to_string(), key],
             )
             .map_err(|e| ContextError::PersistenceFailed(e.to_string()))?;
+        crash_multi_table_mutation_after_step_for_test("kv_delete.context_spills");
         let affected = transaction
             .execute(
                 "DELETE FROM agent_kv WHERE agent_id = ?1 AND key = ?2",
                 params![agent_id.to_string(), key],
             )
             .map_err(|e| ContextError::PersistenceFailed(e.to_string()))?;
+        crash_multi_table_mutation_after_step_for_test("kv_delete.agent_kv");
         transaction
             .commit()
             .map_err(|e| ContextError::PersistenceFailed(e.to_string()))?;
@@ -5684,6 +5703,7 @@ impl SqliteContextManager {
             )
             .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
         if inserted > 0 {
+            crash_multi_table_mutation_after_step_for_test("tunable_ensure.operator_tunables");
             tx.execute(
                 "INSERT INTO operator_tunable_audit
                  (name, revision, previous_value, requested_value, effective_value,
@@ -5692,6 +5712,7 @@ impl SqliteContextManager {
                 params![name, value, actor, now],
             )
             .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
+            crash_multi_table_mutation_after_step_for_test("tunable_ensure.operator_tunable_audit");
         }
         tx.commit()
             .map_err(|error| ContextError::PersistenceFailed(error.to_string()))
@@ -5775,6 +5796,7 @@ impl SqliteContextManager {
             params![value, revision, &now, actor, name],
         )
         .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
+        crash_multi_table_mutation_after_step_for_test("tunable_set.operator_tunables");
         tx.execute(
             "INSERT INTO operator_tunable_audit
              (name, revision, previous_value, requested_value, effective_value,
@@ -5783,6 +5805,7 @@ impl SqliteContextManager {
             params![name, revision, current.0, value, actor, &now],
         )
         .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
+        crash_multi_table_mutation_after_step_for_test("tunable_set.operator_tunable_audit");
         tx.commit()
             .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
         Ok(crate::operator_control::StoredOperatorTunable {
@@ -5858,6 +5881,7 @@ impl SqliteContextManager {
             params![target_value, revision, &now, actor, name],
         )
         .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
+        crash_multi_table_mutation_after_step_for_test("tunable_rollback.operator_tunables");
         tx.execute(
             "INSERT INTO operator_tunable_audit
              (name, revision, previous_value, requested_value, effective_value,
@@ -5874,6 +5898,7 @@ impl SqliteContextManager {
             ],
         )
         .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
+        crash_multi_table_mutation_after_step_for_test("tunable_rollback.operator_tunable_audit");
         tx.commit()
             .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
         Ok(crate::operator_control::StoredOperatorTunable {
@@ -6111,6 +6136,7 @@ impl SqliteContextManager {
                 ],
             )
             .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
+        crash_multi_table_mutation_after_step_for_test("service_save.service_runtime");
         transaction
             .execute(
                 "INSERT INTO service_history
@@ -6126,6 +6152,7 @@ impl SqliteContextManager {
                 ],
             )
             .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
+        crash_multi_table_mutation_after_step_for_test("service_save.service_history");
         transaction
             .execute(
                 "DELETE FROM service_history
@@ -6137,6 +6164,7 @@ impl SqliteContextManager {
                 params![runtime.name],
             )
             .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
+        crash_multi_table_mutation_after_step_for_test("service_save.history_retention");
         transaction
             .commit()
             .map_err(|error| ContextError::PersistenceFailed(error.to_string()))
@@ -6214,6 +6242,7 @@ impl SqliteContextManager {
         transaction
             .execute("DELETE FROM service_runtime WHERE name = ?1", params![name])
             .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
+        crash_multi_table_mutation_after_step_for_test("service_remove.service_runtime");
         transaction
             .execute(
                 "INSERT INTO service_history
@@ -6228,6 +6257,7 @@ impl SqliteContextManager {
                 ],
             )
             .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
+        crash_multi_table_mutation_after_step_for_test("service_remove.service_history");
         transaction
             .commit()
             .map_err(|error| ContextError::PersistenceFailed(error.to_string()))
@@ -6410,12 +6440,15 @@ impl SqliteContextManager {
         let mut changed = tx
             .execute("DELETE FROM sessions WHERE user_id = ?1", params![user_id])
             .map_err(|e| ContextError::PersistenceFailed(e.to_string()))?;
+        crash_multi_table_mutation_after_step_for_test("user_revoke.sessions");
         changed += tx
             .execute("DELETE FROM api_keys WHERE user_id = ?1", params![user_id])
             .map_err(|e| ContextError::PersistenceFailed(e.to_string()))?;
+        crash_multi_table_mutation_after_step_for_test("user_revoke.api_keys");
         changed += tx
             .execute("DELETE FROM users WHERE id = ?1", params![user_id])
             .map_err(|e| ContextError::PersistenceFailed(e.to_string()))?;
+        crash_multi_table_mutation_after_step_for_test("user_revoke.users");
         tx.commit()
             .map_err(|e| ContextError::PersistenceFailed(e.to_string()))?;
         Ok(changed > 0)
@@ -6505,18 +6538,22 @@ impl SqliteContextManager {
                 params![tenant_id],
             )
             .map_err(|e| ContextError::PersistenceFailed(e.to_string()))?;
+        crash_multi_table_mutation_after_step_for_test("tenant_revoke.sessions");
         changed += tx
             .execute(
                 "DELETE FROM api_keys WHERE tenant_id = ?1",
                 params![tenant_id],
             )
             .map_err(|e| ContextError::PersistenceFailed(e.to_string()))?;
+        crash_multi_table_mutation_after_step_for_test("tenant_revoke.api_keys");
         changed += tx
             .execute("DELETE FROM users WHERE tenant_id = ?1", params![tenant_id])
             .map_err(|e| ContextError::PersistenceFailed(e.to_string()))?;
+        crash_multi_table_mutation_after_step_for_test("tenant_revoke.users");
         changed += tx
             .execute("DELETE FROM tenants WHERE id = ?1", params![tenant_id])
             .map_err(|e| ContextError::PersistenceFailed(e.to_string()))?;
+        crash_multi_table_mutation_after_step_for_test("tenant_revoke.tenants");
         tx.commit()
             .map_err(|e| ContextError::PersistenceFailed(e.to_string()))?;
         Ok(changed > 0)
@@ -9281,6 +9318,433 @@ mod tests {
             shm.push("-shm");
             let _ = std::fs::remove_file(std::path::PathBuf::from(shm));
         }
+    }
+
+    const MULTI_TABLE_AGENT: AgentId = uuid::Uuid::from_u128(0x41);
+    const MULTI_TABLE_TENANT: &str = "multi-table-crash-tenant";
+    const MULTI_TABLE_USER: &str = "00000000-0000-0000-0000-000000000042";
+    const MULTI_TABLE_TUNABLE: &str = "crash_matrix_tunable";
+    const MULTI_TABLE_SERVICE: &str = "crash-matrix-service";
+    const MULTI_TABLE_SPILL_KEY: &str = "context_spill:crash-matrix";
+
+    const CONTEXT_MULTI_TABLE_CRASH_CASES: &[(&str, &[&str])] = &[
+        (
+            "conversation",
+            &[
+                "conversation.conversations",
+                "conversation.conversations_fts",
+            ],
+        ),
+        (
+            "spill_purge",
+            &["spill_purge.agent_kv", "spill_purge.context_spills"],
+        ),
+        (
+            "spill_store",
+            &["spill_store.agent_kv", "spill_store.context_spills"],
+        ),
+        (
+            "kv_delete",
+            &["kv_delete.context_spills", "kv_delete.agent_kv"],
+        ),
+        (
+            "tunable_ensure",
+            &[
+                "tunable_ensure.operator_tunables",
+                "tunable_ensure.operator_tunable_audit",
+            ],
+        ),
+        (
+            "tunable_set",
+            &[
+                "tunable_set.operator_tunables",
+                "tunable_set.operator_tunable_audit",
+            ],
+        ),
+        (
+            "tunable_rollback",
+            &[
+                "tunable_rollback.operator_tunables",
+                "tunable_rollback.operator_tunable_audit",
+            ],
+        ),
+        (
+            "service_save",
+            &[
+                "service_save.service_runtime",
+                "service_save.service_history",
+                "service_save.history_retention",
+            ],
+        ),
+        (
+            "service_remove",
+            &[
+                "service_remove.service_runtime",
+                "service_remove.service_history",
+            ],
+        ),
+        (
+            "user_revoke",
+            &[
+                "user_revoke.sessions",
+                "user_revoke.api_keys",
+                "user_revoke.users",
+            ],
+        ),
+        (
+            "tenant_revoke",
+            &[
+                "tenant_revoke.sessions",
+                "tenant_revoke.api_keys",
+                "tenant_revoke.users",
+                "tenant_revoke.tenants",
+            ],
+        ),
+    ];
+
+    fn seed_multi_table_agent(manager: &SqliteContextManager) {
+        let now = Utc::now();
+        manager
+            .save_agent(&PersistedAgent {
+                id: MULTI_TABLE_AGENT,
+                session_id: uuid::Uuid::from_u128(0x43),
+                tenant_id: MULTI_TABLE_TENANT.to_string(),
+                name: "multi-table crash agent".into(),
+                task: "prove atomic mutation recovery".into(),
+                llm_provider: "stub".into(),
+                permission_profile: "standard".into(),
+                priority: 3,
+                status: "\"Stopped\"".into(),
+                sandbox_config_json: None,
+                created_at: now,
+                last_activity_at: now,
+            })
+            .unwrap();
+    }
+
+    fn multi_table_service_runtime() -> crate::init_system::ServiceRuntimeInfo {
+        crate::init_system::ServiceRuntimeInfo {
+            name: MULTI_TABLE_SERVICE.to_string(),
+            status: crate::init_system::ServiceStatus::Running,
+            desired_running: true,
+            ready: true,
+            healthy: true,
+            last_transition_at: Utc::now().to_rfc3339(),
+            definition_revision: "crash-matrix-revision".into(),
+            ..crate::init_system::ServiceRuntimeInfo::default()
+        }
+    }
+
+    fn seed_multi_table_identity(manager: &SqliteContextManager) {
+        let now = Utc::now().to_rfc3339();
+        let connection = manager.conn.lock().unwrap();
+        connection
+            .execute(
+                "INSERT INTO tenants (id, name, created_at) VALUES (?1, ?2, ?3)",
+                params![MULTI_TABLE_TENANT, "Crash matrix tenant", &now],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO users
+                 (id, tenant_id, username, email, role, created_at)
+                 VALUES (?1, ?2, ?3, ?4, 'admin', ?5)",
+                params![
+                    MULTI_TABLE_USER,
+                    MULTI_TABLE_TENANT,
+                    "crash-matrix-user",
+                    "crash-matrix@example.test",
+                    &now
+                ],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO api_keys
+                 (key_hash, name, user_id, tenant_id, created_at)
+                 VALUES ('crash-matrix-key', 'crash matrix', ?1, ?2, ?3)",
+                params![MULTI_TABLE_USER, MULTI_TABLE_TENANT, &now],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO sessions (token_hash, user_id, tenant_id, expires_at)
+                 VALUES ('crash-matrix-session', ?1, ?2, '2999-01-01T00:00:00Z')",
+                params![MULTI_TABLE_USER, MULTI_TABLE_TENANT],
+            )
+            .unwrap();
+    }
+
+    fn seed_context_multi_table_operation(path: &std::path::Path, operation: &str) {
+        let manager = SqliteContextManager::new(path).unwrap();
+        match operation {
+            "conversation" | "spill_store" => seed_multi_table_agent(&manager),
+            "spill_purge" | "kv_delete" => {
+                seed_multi_table_agent(&manager);
+                let expires_at = if operation == "spill_purge" {
+                    "2000-01-01T00:00:00Z"
+                } else {
+                    "2999-01-01T00:00:00Z"
+                };
+                let connection = manager.conn.lock().unwrap();
+                connection
+                    .execute(
+                        "INSERT INTO agent_kv (agent_id, key, value, updated_at)
+                         VALUES (?1, ?2, 'crash matrix spill', ?3)",
+                        params![
+                            MULTI_TABLE_AGENT.to_string(),
+                            MULTI_TABLE_SPILL_KEY,
+                            Utc::now().to_rfc3339()
+                        ],
+                    )
+                    .unwrap();
+                connection
+                    .execute(
+                        "INSERT INTO context_spills
+                         (agent_id, key, tenant_id, sha256, byte_count, created_at, expires_at)
+                         VALUES (?1, ?2, ?3, ?4, 18, ?5, ?6)",
+                        params![
+                            MULTI_TABLE_AGENT.to_string(),
+                            MULTI_TABLE_SPILL_KEY,
+                            MULTI_TABLE_TENANT,
+                            sha256("crash matrix spill"),
+                            Utc::now().to_rfc3339(),
+                            expires_at
+                        ],
+                    )
+                    .unwrap();
+            }
+            "tunable_ensure" => {}
+            "tunable_set" => manager
+                .ensure_operator_tunable(MULTI_TABLE_TUNABLE, 10, "seed")
+                .unwrap(),
+            "tunable_rollback" => {
+                manager
+                    .ensure_operator_tunable(MULTI_TABLE_TUNABLE, 10, "seed")
+                    .unwrap();
+                manager
+                    .set_operator_tunable(MULTI_TABLE_TUNABLE, 20, 1, "seed")
+                    .unwrap();
+            }
+            "service_save" => {}
+            "service_remove" => manager
+                .save_service_runtime(
+                    &multi_table_service_runtime(),
+                    "seeded",
+                    Some("seed for crash matrix"),
+                )
+                .unwrap(),
+            "user_revoke" | "tenant_revoke" => seed_multi_table_identity(&manager),
+            unknown => panic!("unknown multi-table crash operation {unknown}"),
+        }
+    }
+
+    fn run_context_multi_table_operation(path: &std::path::Path, operation: &str) {
+        if operation == "spill_purge" {
+            let mut connection = rusqlite::Connection::open(path).unwrap();
+            SqliteContextManager::purge_expired_spills_locked(&mut connection).unwrap();
+            return;
+        }
+        let manager = SqliteContextManager::new(path).unwrap();
+        match operation {
+            "conversation" => manager
+                .save_conversation(
+                    "crash-matrix-conversation",
+                    MULTI_TABLE_AGENT,
+                    &[crate::connector::StandardMessage::user(
+                        "atomic conversation persistence",
+                    )],
+                )
+                .unwrap(),
+            "spill_store" => manager
+                .store_context_spill(
+                    MULTI_TABLE_AGENT,
+                    MULTI_TABLE_SPILL_KEY,
+                    "crash matrix spill",
+                    &sha256("crash matrix spill"),
+                )
+                .unwrap(),
+            "kv_delete" => {
+                assert!(manager
+                    .kv_delete(MULTI_TABLE_AGENT, MULTI_TABLE_SPILL_KEY)
+                    .unwrap());
+            }
+            "tunable_ensure" => manager
+                .ensure_operator_tunable(MULTI_TABLE_TUNABLE, 10, "crash-matrix")
+                .unwrap(),
+            "tunable_set" => {
+                manager
+                    .set_operator_tunable(MULTI_TABLE_TUNABLE, 20, 1, "crash-matrix")
+                    .unwrap();
+            }
+            "tunable_rollback" => {
+                manager
+                    .rollback_operator_tunable(MULTI_TABLE_TUNABLE, 1, 2, "crash-matrix")
+                    .unwrap();
+            }
+            "service_save" => manager
+                .save_service_runtime(
+                    &multi_table_service_runtime(),
+                    "started",
+                    Some("crash matrix"),
+                )
+                .unwrap(),
+            "service_remove" => manager
+                .remove_service_runtime(MULTI_TABLE_SERVICE, "crash matrix")
+                .unwrap(),
+            "user_revoke" => {
+                assert!(manager.revoke_user_identity(MULTI_TABLE_USER).unwrap());
+            }
+            "tenant_revoke" => {
+                assert!(manager.revoke_tenant_identity(MULTI_TABLE_TENANT).unwrap());
+            }
+            unknown => panic!("unknown multi-table crash operation {unknown}"),
+        }
+    }
+
+    fn assert_context_multi_table_operation_committed(path: &std::path::Path, operation: &str) {
+        let manager = SqliteContextManager::new(path).unwrap();
+        let connection = manager.conn.lock().unwrap();
+        let count = |sql: &str| {
+            connection
+                .query_row(sql, [], |row| row.get::<_, i64>(0))
+                .unwrap()
+        };
+        match operation {
+            "conversation" => {
+                assert_eq!(
+                    count(
+                        "SELECT COUNT(*) FROM conversations
+                         WHERE id = 'crash-matrix-conversation'"
+                    ),
+                    1
+                );
+                assert_eq!(
+                    count(
+                        "SELECT COUNT(*) FROM conversations_fts
+                         WHERE conversation_id = 'crash-matrix-conversation'"
+                    ),
+                    1
+                );
+            }
+            "spill_store" => {
+                assert_eq!(count("SELECT COUNT(*) FROM agent_kv"), 1);
+                assert_eq!(count("SELECT COUNT(*) FROM context_spills"), 1);
+            }
+            "spill_purge" | "kv_delete" => {
+                assert_eq!(count("SELECT COUNT(*) FROM agent_kv"), 0);
+                assert_eq!(count("SELECT COUNT(*) FROM context_spills"), 0);
+            }
+            "tunable_ensure" => {
+                assert_eq!(
+                    count(
+                        "SELECT COUNT(*) FROM operator_tunables
+                         WHERE name = 'crash_matrix_tunable' AND revision = 1"
+                    ),
+                    1
+                );
+                assert_eq!(count("SELECT COUNT(*) FROM operator_tunable_audit"), 1);
+            }
+            "tunable_set" => {
+                assert_eq!(
+                    count(
+                        "SELECT COUNT(*) FROM operator_tunables
+                         WHERE name = 'crash_matrix_tunable' AND value = 20 AND revision = 2"
+                    ),
+                    1
+                );
+                assert_eq!(count("SELECT COUNT(*) FROM operator_tunable_audit"), 2);
+            }
+            "tunable_rollback" => {
+                assert_eq!(
+                    count(
+                        "SELECT COUNT(*) FROM operator_tunables
+                         WHERE name = 'crash_matrix_tunable' AND value = 10 AND revision = 3"
+                    ),
+                    1
+                );
+                assert_eq!(count("SELECT COUNT(*) FROM operator_tunable_audit"), 3);
+            }
+            "service_save" => {
+                assert_eq!(count("SELECT COUNT(*) FROM service_runtime"), 1);
+                assert_eq!(count("SELECT COUNT(*) FROM service_history"), 1);
+            }
+            "service_remove" => {
+                assert_eq!(count("SELECT COUNT(*) FROM service_runtime"), 0);
+                assert_eq!(count("SELECT COUNT(*) FROM service_history"), 2);
+            }
+            "user_revoke" => {
+                assert_eq!(count("SELECT COUNT(*) FROM sessions"), 0);
+                assert_eq!(count("SELECT COUNT(*) FROM api_keys"), 0);
+                assert_eq!(count("SELECT COUNT(*) FROM users"), 0);
+                assert_eq!(count("SELECT COUNT(*) FROM tenants"), 1);
+            }
+            "tenant_revoke" => {
+                for table in ["sessions", "api_keys", "users", "tenants"] {
+                    assert_eq!(
+                        count(&format!("SELECT COUNT(*) FROM {table}")),
+                        0,
+                        "{table} retained a revoked tenant identity"
+                    );
+                }
+            }
+            unknown => panic!("unknown multi-table crash operation {unknown}"),
+        }
+        crate::schema::verify(&connection).unwrap();
+        let quick_check: String = connection
+            .query_row("PRAGMA quick_check", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(quick_check, "ok");
+    }
+
+    #[test]
+    fn process_exit_at_every_context_multi_table_statement_preserves_atomicity() {
+        for (operation, steps) in CONTEXT_MULTI_TABLE_CRASH_CASES {
+            let database = QuotaTestDatabase::new(operation);
+            seed_context_multi_table_operation(&database.path, operation);
+            let baseline = logical_database_fingerprints(&database.path);
+
+            for step in *steps {
+                let child = std::process::Command::new(std::env::current_exe().unwrap())
+                    .arg("--ignored")
+                    .arg("context_multi_table_mutation_crash_child_only")
+                    .env("AIAGENTOS_TEST_MULTI_TABLE_DB", &database.path)
+                    .env("AIAGENTOS_TEST_MULTI_TABLE_OPERATION", operation)
+                    .env("AIAGENTOS_TEST_EXIT_MULTI_TABLE_AFTER_STEP", step)
+                    .status()
+                    .unwrap();
+                assert_eq!(
+                    child.code(),
+                    Some(86),
+                    "{operation} child did not terminate at {step}"
+                );
+                assert_eq!(
+                    logical_database_fingerprints(&database.path),
+                    baseline,
+                    "process exit after {operation}:{step} left a partial mutation"
+                );
+            }
+
+            run_context_multi_table_operation(&database.path, operation);
+            assert_ne!(
+                logical_database_fingerprints(&database.path),
+                baseline,
+                "{operation} did not publish its complete transaction"
+            );
+            assert_context_multi_table_operation_committed(&database.path, operation);
+        }
+    }
+
+    #[test]
+    #[ignore = "child-process helper for context multi-table crash regression"]
+    fn context_multi_table_mutation_crash_child_only() {
+        let Some(database) = std::env::var_os("AIAGENTOS_TEST_MULTI_TABLE_DB") else {
+            return;
+        };
+        let operation = std::env::var("AIAGENTOS_TEST_MULTI_TABLE_OPERATION")
+            .expect("multi-table crash helper requires an operation");
+        run_context_multi_table_operation(std::path::Path::new(&database), &operation);
+        panic!("multi-table crash helper did not terminate at the requested statement");
     }
 
     fn expect_provider_reservation(outcome: ProviderRateReserveOutcome) -> ProviderRateReservation {

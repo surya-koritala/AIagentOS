@@ -10,6 +10,15 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
 
 ## [Unreleased]
 
+- Added process-exit atomicity qualification for the durable package registry
+  under #123. Twenty-nine child-process exits cover initial and superseding
+  trust roots, revocation, artifact publish/yank with transparency and audit
+  chains, dependency installs and upgrades, rollback, and removal. Every
+  boundary is inventory checked; an exit must retain the deliberately separate
+  rate-limit admission while restoring the exact pre-transaction contents of
+  every package mutation table. Clean retries verify terminal state, the full
+  transparency hash chain, schema ownership, and `quick_check`. Cluster-control
+  transaction matrices, power loss, and torn writes remain open.
 - Added process-exit atomicity qualification for durable quota/accounting
   workflows under #123. Thirty-seven child-process exits cover hierarchical
   reservation, pre-invocation refund, actual-usage reconciliation, direct token
@@ -18,8 +27,8 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
   migration fences, and trigger-maintained accounting integrity state. Every
   exit must reopen with the exact pre-transaction contents of every durable
   table; clean retries must publish complete state and pass schema verification
-  plus `quick_check`. Package-registry and cluster-control transaction matrices,
-  power loss, and torn writes remain open.
+  plus `quick_check`. Cluster-control transaction matrices, power loss, and
+  torn writes remain open.
 - Added process-exit atomicity qualification for eleven high-value context
   mutations under #123. Twenty-six child-process exits cover conversation and
   search-index persistence, context-spill store/purge/delete, operator-tunable
@@ -28,8 +37,9 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
   the exact pre-transaction contents of every durable table; clean retries must
   publish all related rows and pass schema verification plus `quick_check`.
   Conversation search-index failures now abort the transaction instead of
-  being silently ignored. Quota, package-registry, and cluster-control
-  transaction matrices, power loss, and torn writes remain open.
+  being silently ignored. The quota/accounting and package-registry matrices
+  are covered by later entries; cluster-control transactions, power loss, and
+  torn writes remain open.
 - Added fail-closed managed-backup erasure under #123. Every server-created
   backup is now constrained to the configured `backup.root`. Agent, user, and
   tenant hot deletion exclusively locks that root, preflights every entry,

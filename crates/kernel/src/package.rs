@@ -29,6 +29,32 @@ const MAX_TOTAL_FILE_BYTES: usize = 8 * 1024 * 1024;
 const REGISTRY_REQUESTS_PER_MINUTE: i64 = 120;
 const SIGNING_DOMAIN: &[u8] = b"AIAgentOS signed package v1\0";
 
+#[cfg(test)]
+thread_local! {
+    static PACKAGE_MUTATION_STEP_FOR_TEST: std::cell::Cell<usize> = const {
+        std::cell::Cell::new(0)
+    };
+}
+
+#[cfg(test)]
+fn crash_package_mutation_after_step_for_test(statement: &str) {
+    let target = std::env::var("AIAGENTOS_TEST_EXIT_PACKAGE_AFTER_STEP")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok());
+    PACKAGE_MUTATION_STEP_FOR_TEST.with(|counter| {
+        let step = counter.get().saturating_add(1);
+        counter.set(step);
+        if target == Some(step) {
+            eprintln!("terminating after package mutation {step}: {statement}");
+            std::process::exit(85);
+        }
+    });
+}
+
+#[cfg(not(test))]
+#[inline]
+fn crash_package_mutation_after_step_for_test(_statement: &str) {}
+
 /// Metadata that participates in dependency resolution and policy admission.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -837,6 +863,7 @@ impl PackageRegistry {
             if updated != 1 {
                 return Err(PackageError::NotFound);
             }
+            crash_package_mutation_after_step_for_test("trust_key.supersede");
         }
         transaction
             .execute(
@@ -861,6 +888,7 @@ impl PackageRegistry {
                     persistence(error)
                 }
             })?;
+        crash_package_mutation_after_step_for_test("trust_key.insert");
         write_audit(
             &transaction,
             tenant_id,
@@ -901,6 +929,7 @@ impl PackageRegistry {
         if updated != 1 {
             return Err(PackageError::NotFound);
         }
+        crash_package_mutation_after_step_for_test("revoke_key.update");
         write_audit(
             &transaction,
             tenant_id,
@@ -975,6 +1004,7 @@ impl PackageRegistry {
                     persistence(error)
                 }
             })?;
+        crash_package_mutation_after_step_for_test("publish.artifact");
         append_transparency(
             &transaction,
             tenant_id,
@@ -1038,6 +1068,7 @@ impl PackageRegistry {
                 params![tenant_id, name, version.to_string()],
             )
             .map_err(persistence)?;
+        crash_package_mutation_after_step_for_test("yank.artifact");
         append_transparency(
             &transaction,
             tenant_id,
@@ -1280,6 +1311,7 @@ impl PackageRegistry {
                     ],
                 )
                 .map_err(persistence)?;
+            crash_package_mutation_after_step_for_test("install.history");
             let installed_at = Utc::now().to_rfc3339();
             let lock_json = serde_json::to_string(&lock)
                 .map_err(|error| PackageError::Persistence(error.to_string()))?;
@@ -1305,6 +1337,7 @@ impl PackageRegistry {
                     ],
                 )
                 .map_err(persistence)?;
+            crash_package_mutation_after_step_for_test("install.installation");
             if locked.name == name {
                 root = Some(InstalledPackage {
                     tenant_id: tenant_id.to_string(),
@@ -1381,6 +1414,7 @@ impl PackageRegistry {
                 params![tenant_id, name, current_json, Utc::now().to_rfc3339()],
             )
             .map_err(persistence)?;
+        crash_package_mutation_after_step_for_test("rollback.history");
         let restored_payload =
             self.verified_payload_by_digest(&transaction, tenant_id, &snapshot.digest)?;
         transaction
@@ -1402,12 +1436,14 @@ impl PackageRegistry {
                 ],
             )
             .map_err(persistence)?;
+        crash_package_mutation_after_step_for_test("rollback.installation");
         transaction
             .execute(
                 "DELETE FROM package_install_history WHERE id = ?1",
                 [history_id],
             )
             .map_err(persistence)?;
+        crash_package_mutation_after_step_for_test("rollback.consume_history");
         write_audit(
             &transaction,
             tenant_id,
@@ -1469,6 +1505,7 @@ impl PackageRegistry {
                 params![tenant_id, name],
             )
             .map_err(persistence)?;
+        crash_package_mutation_after_step_for_test("remove.installation");
         write_audit(
             &transaction,
             tenant_id,
@@ -1683,6 +1720,7 @@ fn append_transparency(
             ],
         )
         .map_err(persistence)?;
+    crash_package_mutation_after_step_for_test("transparency.append");
     Ok(())
 }
 
@@ -1716,6 +1754,7 @@ fn write_audit(
             ],
         )
         .map_err(persistence)?;
+    crash_package_mutation_after_step_for_test("audit.append");
     Ok(())
 }
 
@@ -1921,6 +1960,7 @@ fn is_constraint(error: &rusqlite::Error) -> bool {
 mod tests {
     use super::*;
     use crate::context::DEFAULT_TENANT;
+    use std::collections::BTreeMap;
     use std::thread;
 
     fn payload(name: &str, version: &str, publisher: &str) -> PackagePayload {
@@ -2424,6 +2464,701 @@ mod tests {
             rejected.publish("tenant-a", "attacker", b"not-an-archive"),
             Err(PackageError::RateLimited)
         ));
+    }
+
+    const PACKAGE_CRASH_TENANT: &str = "tenant-a";
+    const PACKAGE_CRASH_CASES: &[(&str, usize)] = &[
+        ("trust", 2),
+        ("trust_supersede", 3),
+        ("revoke", 2),
+        ("publish", 3),
+        ("yank", 3),
+        ("install", 5),
+        ("upgrade", 5),
+        ("rollback", 4),
+        ("remove", 2),
+    ];
+    const PACKAGE_MUTATION_TABLES: &[&str] = &[
+        "loaded_package_instances",
+        "package_trust_keys",
+        "package_artifacts",
+        "package_installations",
+        "package_install_history",
+        "package_transparency",
+        "package_audit",
+    ];
+
+    struct PackageCrashDatabase {
+        path: std::path::PathBuf,
+        archive_path: std::path::PathBuf,
+    }
+
+    impl PackageCrashDatabase {
+        fn new(operation: &str, step: usize) -> Self {
+            let id = uuid::Uuid::new_v4();
+            Self {
+                path: std::env::temp_dir().join(format!(
+                    "aiagentos-package-crash-{operation}-{step}-{id}.db"
+                )),
+                archive_path: std::env::temp_dir().join(format!(
+                    "aiagentos-package-crash-{operation}-{step}-{id}.agent"
+                )),
+            }
+        }
+    }
+
+    impl Drop for PackageCrashDatabase {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.path);
+            let mut wal = self.path.as_os_str().to_os_string();
+            wal.push("-wal");
+            let _ = std::fs::remove_file(std::path::PathBuf::from(wal));
+            let mut shm = self.path.as_os_str().to_os_string();
+            shm.push("-shm");
+            let _ = std::fs::remove_file(std::path::PathBuf::from(shm));
+            let _ = std::fs::remove_file(&self.archive_path);
+        }
+    }
+
+    fn reset_package_mutation_steps_for_test() {
+        PACKAGE_MUTATION_STEP_FOR_TEST.with(|counter| counter.set(0));
+    }
+
+    fn package_mutation_steps_for_test() -> usize {
+        PACKAGE_MUTATION_STEP_FOR_TEST.with(std::cell::Cell::get)
+    }
+
+    fn package_crash_actor(operation: &str) -> &'static str {
+        match operation {
+            "trust" | "trust_supersede" | "revoke" => "system",
+            "publish" | "yank" => "alice",
+            "install" | "upgrade" | "rollback" | "remove" => "operator",
+            unknown => panic!("unknown package crash operation {unknown}"),
+        }
+    }
+
+    fn package_crash_payload(
+        name: &str,
+        version: &str,
+        dependency: Option<(&str, &str)>,
+    ) -> PackagePayload {
+        let mut package = payload(name, version, "alice");
+        if let Some((dependency_name, requirement)) = dependency {
+            package.package.dependencies.push(PackageDep {
+                name: dependency_name.to_string(),
+                requirement: VersionReq::parse(requirement).unwrap(),
+                optional: false,
+            });
+        }
+        package
+    }
+
+    fn publish_package_crash_archive(
+        registry: &PackageRegistry,
+        key: &PackageSigningKey,
+        name: &str,
+        version: &str,
+        dependency: Option<(&str, &str)>,
+    ) {
+        let archive =
+            PackageArchive::sign(package_crash_payload(name, version, dependency), key).unwrap();
+        registry
+            .publish(PACKAGE_CRASH_TENANT, "alice", &archive)
+            .unwrap();
+    }
+
+    fn seed_package_crash_operation(
+        database: &std::path::Path,
+        archive_path: &std::path::Path,
+        operation: &str,
+    ) {
+        let store = Arc::new(SqliteContextManager::new(database).unwrap());
+        let registry = PackageRegistry::from_store(store);
+        match operation {
+            "trust" => {}
+            "trust_supersede" => {
+                let (old, _) = PackageSigningKey::generate("alice", "crash-old").unwrap();
+                registry
+                    .trust_key(
+                        PACKAGE_CRASH_TENANT,
+                        "system",
+                        &PackageTrustInput {
+                            publisher: "alice".into(),
+                            key_id: old.key_id().into(),
+                            public_key: old.public_key(),
+                            valid_from: Utc::now() - chrono::Duration::minutes(1),
+                            valid_until: None,
+                            supersedes: None,
+                        },
+                    )
+                    .unwrap();
+            }
+            "revoke" => {
+                let (key, _) = PackageSigningKey::generate("alice", "crash-revoke").unwrap();
+                registry
+                    .trust_key(
+                        PACKAGE_CRASH_TENANT,
+                        "system",
+                        &PackageTrustInput {
+                            publisher: "alice".into(),
+                            key_id: key.key_id().into(),
+                            public_key: key.public_key(),
+                            valid_from: Utc::now() - chrono::Duration::minutes(1),
+                            valid_until: None,
+                            supersedes: None,
+                        },
+                    )
+                    .unwrap();
+            }
+            "publish" | "yank" | "install" | "upgrade" | "rollback" | "remove" => {
+                let (key, _) = PackageSigningKey::generate("alice", "crash-release").unwrap();
+                registry
+                    .trust_key(
+                        PACKAGE_CRASH_TENANT,
+                        "system",
+                        &PackageTrustInput {
+                            publisher: "alice".into(),
+                            key_id: key.key_id().into(),
+                            public_key: key.public_key(),
+                            valid_from: Utc::now() - chrono::Duration::minutes(1),
+                            valid_until: None,
+                            supersedes: None,
+                        },
+                    )
+                    .unwrap();
+                match operation {
+                    "publish" => {
+                        let archive = PackageArchive::sign(
+                            package_crash_payload("publish-target", "1.0.0", None),
+                            &key,
+                        )
+                        .unwrap();
+                        std::fs::write(archive_path, archive).unwrap();
+                    }
+                    "yank" => {
+                        publish_package_crash_archive(&registry, &key, "yank-target", "1.0.0", None)
+                    }
+                    "install" => {
+                        publish_package_crash_archive(&registry, &key, "base", "1.0.0", None);
+                        publish_package_crash_archive(
+                            &registry,
+                            &key,
+                            "app",
+                            "1.0.0",
+                            Some(("base", "=1.0.0")),
+                        );
+                    }
+                    "upgrade" => {
+                        for version in ["1.0.0", "2.0.0"] {
+                            publish_package_crash_archive(&registry, &key, "base", version, None);
+                            publish_package_crash_archive(
+                                &registry,
+                                &key,
+                                "app",
+                                version,
+                                Some(("base", &format!("={version}"))),
+                            );
+                        }
+                        registry
+                            .install(
+                                PACKAGE_CRASH_TENANT,
+                                "operator",
+                                "app",
+                                &VersionReq::parse("=1.0.0").unwrap(),
+                                &InstallPolicy::tenant_default(),
+                            )
+                            .unwrap();
+                    }
+                    "rollback" => {
+                        for version in ["1.0.0", "2.0.0"] {
+                            publish_package_crash_archive(&registry, &key, "runner", version, None);
+                        }
+                        for requirement in ["=1.0.0", "=2.0.0"] {
+                            registry
+                                .install(
+                                    PACKAGE_CRASH_TENANT,
+                                    "operator",
+                                    "runner",
+                                    &VersionReq::parse(requirement).unwrap(),
+                                    &InstallPolicy::tenant_default(),
+                                )
+                                .unwrap();
+                        }
+                    }
+                    "remove" => {
+                        publish_package_crash_archive(&registry, &key, "runner", "1.0.0", None);
+                        registry
+                            .install(
+                                PACKAGE_CRASH_TENANT,
+                                "operator",
+                                "runner",
+                                &VersionReq::STAR,
+                                &InstallPolicy::tenant_default(),
+                            )
+                            .unwrap();
+                    }
+                    _ => {}
+                }
+            }
+            unknown => panic!("unknown package crash operation {unknown}"),
+        }
+    }
+
+    fn run_package_crash_operation(
+        database: &std::path::Path,
+        archive_path: &std::path::Path,
+        operation: &str,
+    ) {
+        let registry =
+            PackageRegistry::from_store(Arc::new(SqliteContextManager::new(database).unwrap()));
+        match operation {
+            "trust" => registry
+                .trust_key(
+                    PACKAGE_CRASH_TENANT,
+                    "system",
+                    &PackageTrustInput {
+                        publisher: "alice".into(),
+                        key_id: "crash-new".into(),
+                        public_key: vec![7; 32],
+                        valid_from: Utc::now() - chrono::Duration::minutes(1),
+                        valid_until: None,
+                        supersedes: None,
+                    },
+                )
+                .unwrap(),
+            "trust_supersede" => registry
+                .trust_key(
+                    PACKAGE_CRASH_TENANT,
+                    "system",
+                    &PackageTrustInput {
+                        publisher: "alice".into(),
+                        key_id: "crash-new".into(),
+                        public_key: vec![8; 32],
+                        valid_from: Utc::now() - chrono::Duration::minutes(1),
+                        valid_until: None,
+                        supersedes: Some("crash-old".into()),
+                    },
+                )
+                .unwrap(),
+            "revoke" => registry
+                .revoke_key(PACKAGE_CRASH_TENANT, "system", "crash-revoke")
+                .unwrap(),
+            "publish" => {
+                registry
+                    .publish(
+                        PACKAGE_CRASH_TENANT,
+                        "alice",
+                        &std::fs::read(archive_path).unwrap(),
+                    )
+                    .unwrap();
+            }
+            "yank" => registry
+                .yank(
+                    PACKAGE_CRASH_TENANT,
+                    "alice",
+                    "yank-target",
+                    &Version::parse("1.0.0").unwrap(),
+                )
+                .unwrap(),
+            "install" => {
+                registry
+                    .install(
+                        PACKAGE_CRASH_TENANT,
+                        "operator",
+                        "app",
+                        &VersionReq::STAR,
+                        &InstallPolicy::tenant_default(),
+                    )
+                    .unwrap();
+            }
+            "upgrade" => {
+                registry
+                    .install(
+                        PACKAGE_CRASH_TENANT,
+                        "operator",
+                        "app",
+                        &VersionReq::parse("=2.0.0").unwrap(),
+                        &InstallPolicy::tenant_default(),
+                    )
+                    .unwrap();
+            }
+            "rollback" => {
+                registry
+                    .rollback(PACKAGE_CRASH_TENANT, "operator", "runner")
+                    .unwrap();
+            }
+            "remove" => registry
+                .remove(PACKAGE_CRASH_TENANT, "operator", "runner")
+                .unwrap(),
+            unknown => panic!("unknown package crash operation {unknown}"),
+        }
+    }
+
+    fn package_table_fingerprints(database: &std::path::Path) -> BTreeMap<String, String> {
+        let manager = SqliteContextManager::new(database).unwrap();
+        let connection = manager.conn.lock().unwrap();
+        PACKAGE_MUTATION_TABLES
+            .iter()
+            .map(|table| {
+                let mut statement = connection
+                    .prepare(&format!("SELECT * FROM {table}"))
+                    .unwrap();
+                let columns = statement.column_count();
+                let mut query = statement.query([]).unwrap();
+                let mut encoded_rows = Vec::new();
+                while let Some(row) = query.next().unwrap() {
+                    let mut encoded = Vec::new();
+                    for index in 0..columns {
+                        match row.get_ref(index).unwrap() {
+                            rusqlite::types::ValueRef::Null => encoded.push(0),
+                            rusqlite::types::ValueRef::Integer(value) => {
+                                encoded.push(1);
+                                encoded.extend_from_slice(&value.to_be_bytes());
+                            }
+                            rusqlite::types::ValueRef::Real(value) => {
+                                encoded.push(2);
+                                encoded.extend_from_slice(&value.to_bits().to_be_bytes());
+                            }
+                            rusqlite::types::ValueRef::Text(value) => {
+                                encoded.push(3);
+                                encoded.extend_from_slice(
+                                    &u64::try_from(value.len()).unwrap().to_be_bytes(),
+                                );
+                                encoded.extend_from_slice(value);
+                            }
+                            rusqlite::types::ValueRef::Blob(value) => {
+                                encoded.push(4);
+                                encoded.extend_from_slice(
+                                    &u64::try_from(value.len()).unwrap().to_be_bytes(),
+                                );
+                                encoded.extend_from_slice(value);
+                            }
+                        }
+                    }
+                    encoded_rows.push(encoded);
+                }
+                encoded_rows.sort();
+                let mut material = Vec::new();
+                for row in encoded_rows {
+                    material.extend_from_slice(&u64::try_from(row.len()).unwrap().to_be_bytes());
+                    material.extend_from_slice(&row);
+                }
+                (
+                    (*table).to_string(),
+                    hex_encode(digest::digest(&digest::SHA256, &material).as_ref()),
+                )
+            })
+            .collect()
+    }
+
+    fn package_rate_state(database: &std::path::Path, actor: &str) -> Option<(i64, i64)> {
+        let manager = SqliteContextManager::new(database).unwrap();
+        let connection = manager.conn.lock().unwrap();
+        connection
+            .query_row(
+                "SELECT window_started_at, requests FROM package_rate_limits
+                 WHERE tenant_id = ?1 AND actor = ?2",
+                params![PACKAGE_CRASH_TENANT, actor],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .unwrap()
+    }
+
+    fn assert_package_rate_admission(
+        before: Option<(i64, i64)>,
+        after: Option<(i64, i64)>,
+        operation: &str,
+    ) {
+        let (after_window, after_requests) =
+            after.unwrap_or_else(|| panic!("{operation} did not retain rate admission"));
+        match before {
+            None => assert_eq!(after_requests, 1, "{operation} rate admission mismatch"),
+            Some((before_window, before_requests)) if after_window == before_window => assert_eq!(
+                after_requests,
+                before_requests + 1,
+                "{operation} rate admission did not increment"
+            ),
+            Some((before_window, _)) => {
+                assert!(
+                    after_window > before_window,
+                    "{operation} rate window moved backwards"
+                );
+                assert_eq!(
+                    after_requests, 1,
+                    "{operation} new rate window did not reset"
+                );
+            }
+        }
+    }
+
+    fn assert_package_transparency_chain(connection: &rusqlite::Connection) {
+        let mut statement = connection
+            .prepare(
+                "SELECT action, name, version, digest, previous_hash, entry_hash,
+                        actor, created_at
+                 FROM package_transparency
+                 WHERE tenant_id = ?1 ORDER BY sequence",
+            )
+            .unwrap();
+        let rows = statement
+            .query_map([PACKAGE_CRASH_TENANT], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, String>(7)?,
+                ))
+            })
+            .unwrap();
+        let mut previous = "0".repeat(64);
+        for row in rows {
+            let (action, name, version, package_digest, stored_previous, entry_hash, actor, at) =
+                row.unwrap();
+            assert_eq!(stored_previous, previous);
+            let material = format!(
+                "{stored_previous}\0{PACKAGE_CRASH_TENANT}\0{action}\0{name}\0{version}\0{package_digest}\0{actor}\0{at}"
+            );
+            assert_eq!(
+                entry_hash,
+                hex_encode(digest::digest(&digest::SHA256, material.as_bytes()).as_ref())
+            );
+            previous = entry_hash;
+        }
+    }
+
+    fn assert_package_crash_operation_committed(database: &std::path::Path, operation: &str) {
+        let manager = SqliteContextManager::new(database).unwrap();
+        let connection = manager.conn.lock().unwrap();
+        let count = |sql: &str| {
+            connection
+                .query_row(sql, [], |row| row.get::<_, i64>(0))
+                .unwrap()
+        };
+        match operation {
+            "trust" => assert_eq!(
+                count(
+                    "SELECT COUNT(*) FROM package_trust_keys
+                     WHERE key_id = 'crash-new' AND superseded_by IS NULL"
+                ),
+                1
+            ),
+            "trust_supersede" => {
+                assert_eq!(
+                    count(
+                        "SELECT COUNT(*) FROM package_trust_keys
+                         WHERE key_id = 'crash-old' AND superseded_by = 'crash-new'"
+                    ),
+                    1
+                );
+                assert_eq!(
+                    count(
+                        "SELECT COUNT(*) FROM package_trust_keys
+                         WHERE key_id = 'crash-new'"
+                    ),
+                    1
+                );
+            }
+            "revoke" => assert_eq!(
+                count(
+                    "SELECT COUNT(*) FROM package_trust_keys
+                     WHERE key_id = 'crash-revoke' AND status = 'revoked'"
+                ),
+                1
+            ),
+            "publish" => {
+                assert_eq!(
+                    count(
+                        "SELECT COUNT(*) FROM package_artifacts
+                         WHERE name = 'publish-target'"
+                    ),
+                    1
+                );
+                assert_eq!(
+                    count(
+                        "SELECT COUNT(*) FROM package_transparency
+                         WHERE action = 'publish' AND name = 'publish-target'"
+                    ),
+                    1
+                );
+            }
+            "yank" => {
+                assert_eq!(
+                    count(
+                        "SELECT COUNT(*) FROM package_artifacts
+                         WHERE name = 'yank-target' AND yanked = 1"
+                    ),
+                    1
+                );
+                assert_eq!(
+                    count(
+                        "SELECT COUNT(*) FROM package_transparency
+                         WHERE action = 'yank' AND name = 'yank-target'"
+                    ),
+                    1
+                );
+            }
+            "install" => {
+                assert_eq!(
+                    count(
+                        "SELECT COUNT(*) FROM package_installations
+                         WHERE name IN ('app', 'base') AND version = '1.0.0'"
+                    ),
+                    2
+                );
+                assert_eq!(
+                    count(
+                        "SELECT COUNT(*) FROM package_install_history
+                         WHERE action = 'install'"
+                    ),
+                    2
+                );
+            }
+            "upgrade" => {
+                assert_eq!(
+                    count(
+                        "SELECT COUNT(*) FROM package_installations
+                         WHERE name IN ('app', 'base') AND version = '2.0.0'"
+                    ),
+                    2
+                );
+                assert_eq!(
+                    count(
+                        "SELECT COUNT(*) FROM package_install_history
+                         WHERE action = 'upgrade'"
+                    ),
+                    2
+                );
+            }
+            "rollback" => {
+                assert_eq!(
+                    count(
+                        "SELECT COUNT(*) FROM package_installations
+                         WHERE name = 'runner' AND version = '1.0.0'"
+                    ),
+                    1
+                );
+                assert_eq!(
+                    count(
+                        "SELECT COUNT(*) FROM package_install_history
+                         WHERE action = 'rollback'"
+                    ),
+                    1
+                );
+            }
+            "remove" => assert_eq!(
+                count(
+                    "SELECT COUNT(*) FROM package_installations
+                     WHERE name = 'runner'"
+                ),
+                0
+            ),
+            unknown => panic!("unknown package crash operation {unknown}"),
+        }
+        assert_eq!(
+            count(&format!(
+                "SELECT COUNT(*) FROM package_audit WHERE action = '{}'",
+                match operation {
+                    "trust" | "trust_supersede" => "trust-key",
+                    "revoke" => "revoke-key",
+                    "publish" => "publish",
+                    "yank" => "yank",
+                    "install" | "upgrade" => "install",
+                    "rollback" => "rollback",
+                    "remove" => "remove",
+                    _ => unreachable!(),
+                }
+            )),
+            if matches!(operation, "trust_supersede" | "upgrade") {
+                2
+            } else {
+                1
+            },
+            "{operation} terminal audit mismatch"
+        );
+        assert_package_transparency_chain(&connection);
+        crate::schema::verify(&connection).unwrap();
+        let quick_check: String = connection
+            .query_row("PRAGMA quick_check", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(quick_check, "ok");
+    }
+
+    #[test]
+    fn process_exit_at_every_package_multi_table_statement_preserves_atomicity() {
+        for (operation, expected_steps) in PACKAGE_CRASH_CASES {
+            for step in 1..=*expected_steps {
+                let database = PackageCrashDatabase::new(operation, step);
+                seed_package_crash_operation(&database.path, &database.archive_path, operation);
+                let baseline = package_table_fingerprints(&database.path);
+                let actor = package_crash_actor(operation);
+                let rate_before = package_rate_state(&database.path, actor);
+
+                let child = std::process::Command::new(std::env::current_exe().unwrap())
+                    .arg("--ignored")
+                    .arg("package_multi_table_mutation_crash_child_only")
+                    .env("AIAGENTOS_TEST_PACKAGE_CRASH_DB", &database.path)
+                    .env(
+                        "AIAGENTOS_TEST_PACKAGE_CRASH_ARCHIVE",
+                        &database.archive_path,
+                    )
+                    .env("AIAGENTOS_TEST_PACKAGE_CRASH_OPERATION", operation)
+                    .env("AIAGENTOS_TEST_EXIT_PACKAGE_AFTER_STEP", step.to_string())
+                    .status()
+                    .unwrap();
+                assert_eq!(
+                    child.code(),
+                    Some(85),
+                    "{operation} child did not terminate at mutation {step}"
+                );
+                assert_package_rate_admission(
+                    rate_before,
+                    package_rate_state(&database.path, actor),
+                    operation,
+                );
+                assert_eq!(
+                    package_table_fingerprints(&database.path),
+                    baseline,
+                    "process exit after {operation} mutation {step} left partial package state"
+                );
+
+                reset_package_mutation_steps_for_test();
+                run_package_crash_operation(&database.path, &database.archive_path, operation);
+                assert_eq!(
+                    package_mutation_steps_for_test(),
+                    *expected_steps,
+                    "{operation} mutation inventory changed without updating the crash matrix"
+                );
+                assert_ne!(
+                    package_table_fingerprints(&database.path),
+                    baseline,
+                    "{operation} retry did not publish its complete transaction"
+                );
+                assert_package_crash_operation_committed(&database.path, operation);
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "child-process helper for package multi-table crash regression"]
+    fn package_multi_table_mutation_crash_child_only() {
+        let Some(database) = std::env::var_os("AIAGENTOS_TEST_PACKAGE_CRASH_DB") else {
+            return;
+        };
+        let archive = std::env::var_os("AIAGENTOS_TEST_PACKAGE_CRASH_ARCHIVE")
+            .expect("package crash helper requires an archive path");
+        let operation = std::env::var("AIAGENTOS_TEST_PACKAGE_CRASH_OPERATION")
+            .expect("package crash helper requires an operation");
+        run_package_crash_operation(
+            std::path::Path::new(&database),
+            std::path::Path::new(&archive),
+            &operation,
+        );
+        panic!("package crash helper did not terminate at the requested mutation");
     }
 
     #[test]

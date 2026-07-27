@@ -15,6 +15,7 @@
   - [Capacity Qualification](./capacity-qualification.md)
   - [Resilience Qualification](./resilience-qualification.md)
   - [Resource and Leak Soak](./soak-qualification.md)
+  - [Incident Response](./incident-response.md)
   - [Public Wire Protocol](./protocol.md)
   - [Agent Service Supervisor](./services.md)
   - [Secondary Capability Disposition](./secondary-capabilities.md)

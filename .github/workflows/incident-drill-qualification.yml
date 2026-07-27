@@ -1,0 +1,67 @@
+name: Incident drill qualification
+
+on:
+  schedule:
+    - cron: "41 5 * * 2"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: incident-drill-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  automated-technical-controls:
+    name: Exact-commit automated incident technical controls
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
+        with:
+          toolchain: 1.97.1
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - name: Validate the fixed incident catalog
+        run: python3 scripts/incident_drill_qualification.py --validate
+      - name: Exercise every automated incident control
+        run: |
+          mkdir -p target/qualification
+          python3 scripts/incident_drill_qualification.py \
+            --output target/qualification/incident-drill.json
+      - name: Verify exact-source automated evidence
+        run: |
+          report=target/qualification/incident-drill.json
+          test "$(jq -r .schema_version "$report")" = "1"
+          test "$(jq -r .qualification_class "$report")" = "automated_incident_drill_fixture"
+          test "$(jq -r .proof_scope "$report")" = "automated_technical_controls_only"
+          test "$(jq -r .passed "$report")" = "true"
+          test "$(jq -r .automated_drill_passed "$report")" = "true"
+          test "$(jq -r .human_game_day_completed "$report")" = "false"
+          test "$(jq -r .game_day_proof_eligible "$report")" = "false"
+          test "$(jq -r .production_claim_allowed "$report")" = "false"
+          test "$(jq -r .source.commit "$report")" = "$GITHUB_SHA"
+          test "$(jq -r .source.dirty "$report")" = "false"
+          test "$(jq -r .environment.os "$report")" = "linux"
+          jq -e '
+            [.scenarios[].scenario_id] == [
+              "credential-compromise",
+              "tenant-leak",
+              "malicious-package",
+              "node-loss",
+              "corrupt-database",
+              "provider-outage"
+            ]
+            and all(.scenarios[]; .passed == true)
+            and all(.scenarios[].commands[]; .passed == true)
+            and all(.scenarios[].commands[]; .evidence_valid == true)
+          ' "$report"
+      - name: Retain automated incident evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: incident-drill-${{ github.sha }}
+          path: target/qualification/incident-drill.json
+          if-no-files-found: error
+          retention-days: 90

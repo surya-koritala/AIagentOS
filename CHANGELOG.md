@@ -10,6 +10,22 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
 
 ## [Unreleased]
 
+- Added operator-triggered immutable remote backup publication and recovery
+  under #123. `agentctl` now streams an independently signed and anchor-bound
+  backup to an S3-compatible bucket using SigV4, requires server-reported
+  `COMPLIANCE` Object Lock retention and immutable version IDs, retains a
+  bounded publication receipt, and recovers those exact versions even after
+  current-key delete markers. Recovery rechecks lock metadata, size, SHA-256,
+  signature, encryption key, schema, installation identity, and independent
+  anchor before atomically publishing a local backup, while reporting elapsed
+  time and recovery-point age without credentials. Redirects, unsafe
+  endpoints, missing confirmation, wrong/short retention, unversioned objects,
+  receipt substitution, existing destinations, and databases above the
+  documented 5 GiB single-object limit fail closed. A fixed-digest disposable
+  MinIO workflow qualifies the exact-commit protocol path. Release archives now
+  include the `agentctl` recovery binary and check it for reproducibility;
+  independent target-service recovery, released trust fixtures, destructive
+  device profiles, and supported-profile RPO/RTO remain open.
 - Removed fabricated success behavior from placeholder resource operations
   under #124. Application providers advertise only implemented one-shot
   `launch`; `close`, `send_input`, and `read_output` now return a typed

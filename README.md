@@ -221,6 +221,14 @@ prove independent or immutable custody.
 The command keeps the old database as rollback until the restored configuration
 boots the full kernel and every persisted agent is re-admitted to enforcement.
 
+For off-host retention, publish that signed, anchor-bound backup to a versioned
+S3-compatible Object Lock bucket and later fetch the exact locked versions using
+the retained publication receipt. The implementation requires compliance-mode
+retention and never treats the object store as a trust root. See
+[`docs/REMOTE_BACKUP_QUALIFICATION.md`](docs/REMOTE_BACKUP_QUALIFICATION.md) for
+the bucket policy, credentials, CLI commands, measured recovery report, and
+qualification boundary.
+
 If the configured database itself is corrupt and normal restore refuses to
 checkpoint it, keep the server stopped and use the separate forensic path. The
 expected installation UUID must come from independently retained installation

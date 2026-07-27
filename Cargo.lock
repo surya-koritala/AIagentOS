@@ -48,6 +48,7 @@ version = "0.3.0"
 dependencies = [
  "adapters",
  "agent-sdk",
+ "chrono",
  "dirs 5.0.1",
  "kernel",
  "libc",
@@ -57,6 +58,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "wiremock",
 ]
 
 [[package]]
@@ -3393,6 +3395,7 @@ version = "0.3.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "base64 0.22.1",
  "cap-std",
  "chrono",
  "dashmap",
@@ -3417,6 +3420,7 @@ dependencies = [
  "uuid",
  "wasmtime",
  "windows-sys 0.61.2",
+ "wiremock",
  "zeroize",
 ]
 

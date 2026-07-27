@@ -524,8 +524,18 @@ qualification.
 Fresh-host and replacement recovery are supported by this workflow. The fresh
 host must receive the exact storage-key generation and configuration required by
 the manifest; key material is intentionally absent from the backup. Recovery
-remains deliberately offline and operator-initiated. Remote object storage and
-measured recovery objectives remain future work.
+remains deliberately offline and operator-initiated.
+
+Signed backups can also be published to an S3-compatible, versioned Object Lock
+bucket and fetched by exact immutable version. The remote path requires the
+independently retained trust root, recovery anchor, and publication receipt;
+records measured download time and recovery-point age; and refuses an
+unlocked, shortened-retention, wrong-version, oversized, redirected, or
+integrity-mismatched object. See
+[Remote immutable backups](REMOTE_BACKUP_QUALIFICATION.md) for the bucket
+contract and operator commands. A disposable exact-commit MinIO workflow is
+regression evidence only; independent target-service recovery, released trust
+fixtures, and supported-profile RPO/RTO remain open under issue #123.
 
 ## Corrupt database recovery
 
@@ -821,8 +831,10 @@ external side effects.
 
 The following remain open under issue #123:
 
-- remote object storage retention and a measured recovery runbook;
-- independent immutable/remote retention controls and released trust fixtures;
+- an independently operated target-service run of the implemented remote
+  Object Lock recovery path, with reviewed retained evidence;
+- released public trust/anchor/receipt fixtures and independently governed
+  immutable retention controls;
 - measured deletion/retention enforcement across external workspaces,
   providers, remote backup copies, and object stores;
 - power-loss, torn-write, device-loss, object-store, other deployment

@@ -26,10 +26,10 @@ use crate::ContextError;
 
 const LEGACY_BACKUP_FORMAT_VERSION: u32 = 1;
 const BACKUP_FORMAT_VERSION: u32 = 2;
-const BACKUP_DATABASE_FILE: &str = "agent_os.db";
+pub(crate) const BACKUP_DATABASE_FILE: &str = "agent_os.db";
 const BACKUP_DATABASE_SHM_FILE: &str = "agent_os.db-shm";
 const BACKUP_DATABASE_WAL_FILE: &str = "agent_os.db-wal";
-const BACKUP_MANIFEST_FILE: &str = "manifest.json";
+pub(crate) const BACKUP_MANIFEST_FILE: &str = "manifest.json";
 const MAX_MANIFEST_BYTES: u64 = 64 * 1024;
 const MAX_BACKUP_KEY_BYTES: u64 = 16 * 1024;
 const MAX_BACKUP_ROOT_ENTRIES: usize = 10_000;

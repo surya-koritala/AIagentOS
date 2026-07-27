@@ -41,6 +41,10 @@ path = "src/bin/resilience-qualification.rs"
 name = "soak-qualification"
 path = "src/bin/soak-qualification.rs"
 
+[[bin]]
+name = "remote-backup-qualification"
+path = "src/bin/remote-backup-qualification.rs"
+
 [dependencies]
 kernel = { path = "../crates/kernel", version = "=0.3.0", features = ["qualification"] }
 adapters = { path = "../crates/adapters", version = "=0.3.0" }

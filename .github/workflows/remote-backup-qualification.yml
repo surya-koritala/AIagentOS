@@ -1,0 +1,120 @@
+name: Remote immutable backup qualification
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  schedule:
+    - cron: "41 7 * * 4"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  QUALIFICATION_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+  MINIO_SERVER_IMAGE: minio/minio@sha256:a1a8bd4ac40ad7881a245bab97323e18f971e4d4cba2c2007ec1bedd21cbaba2
+  MINIO_CLIENT_IMAGE: minio/mc@sha256:eb4ea9884b77704230e2423e9004d2fa738dc272876b9cc41a297d29443b8780
+  AWS_ACCESS_KEY_ID: agentosqualifier
+  AWS_SECRET_ACCESS_KEY: agentosqualificationsecret
+  AWS_REGION: us-east-1
+
+concurrency:
+  group: remote-backup-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  disposable-object-lock-recovery:
+    name: Exact-commit S3 object-lock publication and recovery
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.QUALIFICATION_SHA }}
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
+        with:
+          toolchain: 1.97.1
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - name: Validate the checked-in qualification contract
+        run: >-
+          cargo run --release --locked --package os-benchmark
+          --bin remote-backup-qualification -- --validate
+      - name: Start an immutable disposable S3-compatible store
+        run: |
+          docker pull "$MINIO_SERVER_IMAGE"
+          docker pull "$MINIO_CLIENT_IMAGE"
+          docker volume create agentos-remote-backup-data
+          docker run -d --name agentos-remote-backup \
+            -p 127.0.0.1:9000:9000 \
+            -e "MINIO_ROOT_USER=$AWS_ACCESS_KEY_ID" \
+            -e "MINIO_ROOT_PASSWORD=$AWS_SECRET_ACCESS_KEY" \
+            -v agentos-remote-backup-data:/data \
+            "$MINIO_SERVER_IMAGE" server /data --address :9000
+          for attempt in $(seq 1 60); do
+            if curl --fail --silent --show-error \
+              http://127.0.0.1:9000/minio/health/ready >/dev/null; then
+              ready=1
+              break
+            fi
+            sleep 1
+          done
+          test "${ready:-0}" = "1"
+          docker run --rm --network host \
+            -e "MC_HOST_target=http://${AWS_ACCESS_KEY_ID}:${AWS_SECRET_ACCESS_KEY}@127.0.0.1:9000" \
+            "$MINIO_CLIENT_IMAGE" mb --with-lock target/agentos-qualified-backups
+      - name: Publish, hide current keys, and recover exact locked versions
+        run: |
+          mkdir -p target/qualification
+          cargo run --release --locked --package os-benchmark \
+            --bin remote-backup-qualification -- \
+            --endpoint http://127.0.0.1:9000 \
+            --bucket agentos-qualified-backups \
+            --prefix "${QUALIFICATION_SHA}/recovery-001" \
+            --state-dir target/qualification/remote-backup-state \
+            --output target/qualification/remote-backup.json \
+            --server-image-digest "${MINIO_SERVER_IMAGE#*@}" \
+            --client-image-digest "${MINIO_CLIENT_IMAGE#*@}"
+      - name: Verify exact-source retained evidence
+        run: |
+          report=target/qualification/remote-backup.json
+          test "$(jq -r .schema_version "$report")" = "1"
+          test "$(jq -r .qualification_class "$report")" = "disposable_s3_object_lock_recovery"
+          test "$(jq -r .proof_scope "$report")" = \
+            "disposable_minio_s3_api_compliance_lock_and_exact_version_recovery"
+          test "$(jq -r .passed "$report")" = "true"
+          test "$(jq -r .production_claim_allowed "$report")" = "false"
+          test "$(jq -r .build_profile "$report")" = "release"
+          test "$(jq -r .source.commit "$report")" = "$QUALIFICATION_SHA"
+          test "$(jq -r .source.dirty "$report")" = "false"
+          test "$(jq -r .environment.os "$report")" = "linux"
+          test "$(jq -r .environment.architecture "$report")" = "x86_64"
+          test "$(jq -r .environment.server_image_digest "$report")" = "${MINIO_SERVER_IMAGE#*@}"
+          test "$(jq -r .environment.client_image_digest "$report")" = "${MINIO_CLIENT_IMAGE#*@}"
+          test "$(jq '.publication.objects | length' "$report")" = "2"
+          test "$(jq '.recovery.objects | length' "$report")" = "2"
+          test "$(jq '.delete_marker_version_ids | length' "$report")" = "2"
+          jq -e '
+            all(.checks[]; . == true)
+            and all(.publication.objects[];
+              .retention_mode == "COMPLIANCE"
+              and (.version_id | length) > 0
+              and .version_id != "null")
+            and (.recovery.downloaded_bytes > 0)
+            and (.recovery.recovery_point_age_seconds < 86400)
+          ' "$report"
+      - name: Retain bounded recovery evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: remote-backup-${{ env.QUALIFICATION_SHA }}
+          path: target/qualification/remote-backup.json
+          if-no-files-found: error
+          retention-days: 90
+      - name: Diagnostics and cleanup
+        if: always()
+        run: |
+          docker logs agentos-remote-backup || true
+          docker rm -f agentos-remote-backup || true
+          docker volume rm agentos-remote-backup-data || true

@@ -1,0 +1,110 @@
+name: Human incident game-day qualification
+
+# Raw timelines, participant identifiers, findings, and reviewer attestations
+# stay in the operator-controlled evidence store. Only the bounded, hash-bound
+# qualification report is uploaded.
+on:
+  workflow_dispatch:
+    inputs:
+      release_candidate:
+        description: Existing vX.Y.Z-rc.N or vX.Y.Z tag pointing at this workflow ref
+        required: true
+        type: string
+      environment_id:
+        description: Stable non-secret target deployment identifier
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: human-game-day-qualification
+  cancel-in-progress: false
+
+env:
+  AGENTOS_GAME_DAY_EVIDENCE_DIR: ${{ vars.AGENTOS_GAME_DAY_EVIDENCE_DIR }}
+  AGENTOS_QUALIFICATION_ENVIRONMENT: ${{ inputs.environment_id }}
+  AGENTOS_RELEASE_CANDIDATE: ${{ inputs.release_candidate }}
+
+jobs:
+  exact-release-candidate-game-day:
+    name: Exact-release-candidate human game day
+    runs-on: [self-hosted, linux, x64, agentos-capacity]
+    timeout-minutes: 15
+    environment: capacity-qualification
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+      - name: Validate checked-in game-day contract
+        run: python3 scripts/game_day_qualification.py --validate
+      - name: Bind the release-candidate tag to this exact commit
+        run: |
+          [[ "$AGENTOS_RELEASE_CANDIDATE" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-rc\.[1-9][0-9]*)?$ ]]
+          test "$(git rev-parse "refs/tags/${AGENTOS_RELEASE_CANDIDATE}^{commit}")" = "$GITHUB_SHA"
+      - name: Require the protected raw evidence drop
+        run: |
+          test -n "$AGENTOS_GAME_DAY_EVIDENCE_DIR"
+          for name in game-day-observation.json game-day-review.json; do
+            path="${AGENTOS_GAME_DAY_EVIDENCE_DIR}/${name}"
+            test -f "$path"
+            test ! -L "$path"
+          done
+      - name: Generate and require an eligible human game-day report
+        run: |
+          mkdir -p target/qualification
+          python3 scripts/game_day_qualification.py \
+            --observation "${AGENTOS_GAME_DAY_EVIDENCE_DIR}/game-day-observation.json" \
+            --review "${AGENTOS_GAME_DAY_EVIDENCE_DIR}/game-day-review.json" \
+            --expected-commit "$GITHUB_SHA" \
+            --expected-environment "$AGENTOS_QUALIFICATION_ENVIRONMENT" \
+            --release-candidate "$AGENTOS_RELEASE_CANDIDATE" \
+            --output target/qualification/game-day.json \
+            --require-eligible
+      - name: Verify the retained classification
+        run: |
+          report=target/qualification/game-day.json
+          test "$(jq -r .schema_version "$report")" = "1"
+          test "$(jq -r .qualification_class "$report")" = "exact_release_candidate_human_game_day"
+          test "$(jq -r .release_candidate "$report")" = "$AGENTOS_RELEASE_CANDIDATE"
+          test "$(jq -r .source.commit "$report")" = "$GITHUB_SHA"
+          test "$(jq -r .source.dirty "$report")" = "false"
+          test "$(jq -r .environment.environment_id "$report")" = "$AGENTOS_QUALIFICATION_ENVIRONMENT"
+          test "$(jq -r .human_game_day_completed "$report")" = "true"
+          test "$(jq -r .game_day_proof_eligible "$report")" = "true"
+          test "$(jq -r .review.reviewer_independent "$report")" = "true"
+          test "$(jq -r .review.decision "$report")" = "approved"
+          test "$(jq -r .production_claim_allowed "$report")" = "false"
+          test "$(jq '.scenarios | length' "$report")" = "6"
+          test "$(jq '.failed_scenarios | length' "$report")" = "0"
+          test "$(jq '.eligibility_blockers | length' "$report")" = "0"
+          jq -e 'all(.scenarios[]; .passed == true)' "$report"
+      - name: Publish summary
+        if: always()
+        run: |
+          {
+            printf '### Exact-release-candidate human game day\n\n'
+            printf -- '- Commit: `%s`\n' "$GITHUB_SHA"
+            printf -- '- Release candidate: `%s`\n' "$AGENTOS_RELEASE_CANDIDATE"
+            printf -- '- Environment: `%s`\n' "$AGENTOS_QUALIFICATION_ENVIRONMENT"
+            if test -f target/qualification/game-day.json; then
+              printf -- '- Human game day completed: `%s`\n' \
+                "$(jq -r .human_game_day_completed target/qualification/game-day.json)"
+              printf -- '- Game-day proof eligible: `%s`\n' \
+                "$(jq -r .game_day_proof_eligible target/qualification/game-day.json)"
+              printf -- '- Production claim allowed: `%s`\n' \
+                "$(jq -r .production_claim_allowed target/qualification/game-day.json)"
+            else
+              printf -- '- Status: `failed before report publication`\n'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Retain the bounded game-day report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: game-day-${{ inputs.release_candidate }}-${{ github.sha }}
+          path: target/qualification/game-day.json
+          if-no-files-found: warn
+          retention-days: 90

@@ -1,3 +1,4 @@
+import hashlib
 import json
 import os
 import subprocess
@@ -21,6 +22,22 @@ ENVIRONMENT = "staging-x64-8cpu-32g"
 RELEASE_CANDIDATE = "v1.0.0-rc.1"
 START = "2026-01-01T00:00:00Z"
 END = "2026-01-31T00:00:00Z"
+SCENARIO_IDS = (
+    "credential-compromise",
+    "tenant-leak",
+    "malicious-package",
+    "node-loss",
+    "corrupt-database",
+    "provider-outage",
+)
+REVIEW_CHECK_IDS = (
+    "exact_release_candidate_exercised",
+    "timeline_and_measurements_reviewed",
+    "runbook_steps_reviewed",
+    "rpo_rto_results_reviewed",
+    "tenant_boundaries_preserved",
+    "raw_evidence_retained",
+)
 
 
 def valid_observation():
@@ -159,15 +176,91 @@ def valid_incident():
                     }
                 ],
             }
-            for scenario_id in (
-                "credential-compromise",
-                "tenant-leak",
-                "malicious-package",
-                "node-loss",
-                "corrupt-database",
-                "provider-outage",
-            )
+            for scenario_id in SCENARIO_IDS
         ],
+    }
+
+
+def valid_game_day():
+    return {
+        "schema_version": 1,
+        "suite": "agentos-v1-human-game-day",
+        "generated_at": "2026-02-01T00:00:00Z",
+        "qualification_class": "exact_release_candidate_human_game_day",
+        "proof_scope": "human_runbook_execution_and_independent_review",
+        "release_candidate": RELEASE_CANDIDATE,
+        "source": {"commit": COMMIT, "dirty": False},
+        "environment": {
+            "environment_id": ENVIRONMENT,
+            "deployment_mode": "single-node",
+            "os": "linux",
+            "arch": "x86_64",
+            "configuration_sha256": "3" * 64,
+        },
+        "exercise": {
+            "exercise_id": "gameday-2026-01",
+            "started_at": "2026-01-31T12:00:00Z",
+            "ended_at": "2026-01-31T18:00:00Z",
+            "duration_seconds": 21_600,
+            "participant_count": 3,
+            "participant_roles": [
+                "incident_commander",
+                "observer",
+                "operator",
+            ],
+        },
+        "evidence": {
+            "observation_sha256": "4" * 64,
+            "independent_review_sha256": "5" * 64,
+            "review_attestation_sha256": "6" * 64,
+        },
+        "review": {
+            "reviewed_at": "2026-02-01T00:00:00Z",
+            "reviewer_independent": True,
+            "decision": "approved",
+            "reviewed_checks": {check_id: True for check_id in REVIEW_CHECK_IDS},
+            "open_finding_count": 0,
+            "checks": {
+                "reviewer_independent": True,
+                "review_approved": True,
+                "every_review_check_passed": True,
+                "zero_open_findings": True,
+            },
+            "passed": True,
+        },
+        "scenarios": [
+            {
+                "scenario_id": scenario_id,
+                "elapsed_seconds": 2_100,
+                "rto_seconds": 2_100,
+                "target_rto_seconds": 3_600,
+                "observed_data_loss_seconds": 0,
+                "target_rpo_seconds": 300,
+                "runbook_steps_total": 8,
+                "runbook_steps_completed": 8,
+                "unexpected_tenant_accesses": 0,
+                "unresolved_findings": 0,
+                "evidence_sha256": "7" * 64,
+                "checks": {
+                    "positive_recovery_interval": True,
+                    "rto_met": True,
+                    "rpo_met": True,
+                    "all_runbook_steps_completed": True,
+                    "zero_unexpected_tenant_accesses": True,
+                    "zero_unresolved_findings": True,
+                },
+                "failed_checks": [],
+                "passed": True,
+            }
+            for scenario_id in SCENARIO_IDS
+        ],
+        "failed_scenarios": [],
+        "eligibility_blockers": [],
+        "passed": True,
+        "human_game_day_completed": True,
+        "game_day_proof_eligible": True,
+        "production_claim_allowed": False,
+        "caveats": ["fixture for release SLO validator regression"],
     }
 
 
@@ -178,9 +271,22 @@ class EvidenceWorkspace:
         self.observation = self.root / "observation.json"
         self.soak = self.root / "soak.json"
         self.incident = self.root / "incident.json"
-        self.write(valid_observation(), valid_soak(), valid_incident())
+        self.game_day = self.root / "game-day.json"
+        self.write(
+            valid_observation(), valid_soak(), valid_incident(), valid_game_day()
+        )
 
-    def write(self, observation, soak, incident):
+    def write(self, observation, soak, incident, game_day=None, *, bind_game_day=True):
+        if game_day is None:
+            game_day = valid_game_day()
+        game_day_bytes = json.dumps(
+            game_day, sort_keys=True, separators=(",", ":")
+        ).encode()
+        self.game_day.write_bytes(game_day_bytes)
+        if bind_game_day:
+            observation["slis"]["tenant_isolation"][
+                "game_day_evidence_sha256"
+            ] = hashlib.sha256(game_day_bytes).hexdigest()
         self.observation.write_text(json.dumps(observation), encoding="utf-8")
         self.soak.write_text(json.dumps(soak), encoding="utf-8")
         self.incident.write_text(json.dumps(incident), encoding="utf-8")
@@ -190,6 +296,7 @@ class EvidenceWorkspace:
             self.observation,
             self.soak,
             self.incident,
+            self.game_day,
             expected_commit=COMMIT,
             expected_environment=ENVIRONMENT,
             release_candidate=RELEASE_CANDIDATE,
@@ -270,7 +377,9 @@ class ReleaseSloQualificationTests(unittest.TestCase):
         observation["slis"]["tenant_isolation"]["adversarial_attempts"] = 1
         observation["slis"]["tenant_isolation"]["game_day_completed"] = False
         observation["slis"]["tenant_isolation"]["game_day_evidence_sha256"] = None
-        self.workspace.write(observation, valid_soak(), valid_incident())
+        self.workspace.write(
+            observation, valid_soak(), valid_incident(), bind_game_day=False
+        )
         report = self.workspace.evaluate()
         self.assertEqual(report["failed_targets"], list(TARGET_IDS))
 
@@ -294,15 +403,69 @@ class ReleaseSloQualificationTests(unittest.TestCase):
     def test_game_day_completion_requires_bound_evidence(self):
         observation = valid_observation()
         observation["slis"]["tenant_isolation"]["game_day_evidence_sha256"] = None
-        self.workspace.write(observation, valid_soak(), valid_incident())
+        self.workspace.write(
+            observation, valid_soak(), valid_incident(), bind_game_day=False
+        )
         with self.assertRaisesRegex(QualificationError, "must be a bounded"):
             self.workspace.evaluate()
 
         observation = valid_observation()
         observation["slis"]["tenant_isolation"]["game_day_completed"] = False
-        self.workspace.write(observation, valid_soak(), valid_incident())
+        self.workspace.write(
+            observation, valid_soak(), valid_incident(), bind_game_day=False
+        )
         with self.assertRaisesRegex(QualificationError, "cannot cite"):
             self.workspace.evaluate()
+
+    def test_game_day_report_must_be_exactly_bound_and_eligible(self):
+        game_day = valid_game_day()
+        self.workspace.write(
+            valid_observation(), valid_soak(), valid_incident(), game_day
+        )
+        game_day["review"]["decision"] = "rejected"
+        self.workspace.game_day.write_text(json.dumps(game_day), encoding="utf-8")
+        report = self.workspace.evaluate()
+        self.assertIn(
+            "human_game_day.exact_report_binding",
+            report["eligibility_blockers"],
+        )
+        self.assertIn(
+            "human_game_day.independent_review_passed",
+            report["eligibility_blockers"],
+        )
+
+    def test_game_day_measurements_are_recalculated(self):
+        game_day = valid_game_day()
+        game_day["scenarios"][0]["rto_seconds"] = 7_200
+        self.workspace.write(
+            valid_observation(), valid_soak(), valid_incident(), game_day
+        )
+        report = self.workspace.evaluate()
+        self.assertIn(
+            "human_game_day.every_scenario_passed",
+            report["eligibility_blockers"],
+        )
+
+    def test_game_day_requires_same_source_and_environment(self):
+        for key, value, message in (
+            ("source", {"commit": "9" * 40, "dirty": False}, "does not match"),
+            (
+                "environment",
+                {
+                    **valid_game_day()["environment"],
+                    "environment_id": "other-target",
+                },
+                "does not match",
+            ),
+        ):
+            with self.subTest(key=key):
+                game_day = valid_game_day()
+                game_day[key] = value
+                self.workspace.write(
+                    valid_observation(), valid_soak(), valid_incident(), game_day
+                )
+                with self.assertRaisesRegex(QualificationError, message):
+                    self.workspace.evaluate()
 
     def test_checkpoint_outcomes_cannot_exceed_attempts(self):
         observation = valid_observation()
@@ -391,6 +554,7 @@ class ReleaseSloQualificationTests(unittest.TestCase):
                 self.workspace.observation,
                 self.workspace.soak,
                 self.workspace.incident,
+                self.workspace.game_day,
                 expected_commit=COMMIT,
                 expected_environment=ENVIRONMENT,
                 release_candidate="main",
@@ -480,6 +644,8 @@ class ReleaseSloQualificationTests(unittest.TestCase):
             str(self.workspace.soak),
             "--incident-drill",
             str(self.workspace.incident),
+            "--game-day",
+            str(self.workspace.game_day),
             "--expected-commit",
             COMMIT,
             "--expected-environment",
@@ -511,6 +677,8 @@ class ReleaseSloQualificationTests(unittest.TestCase):
         )
         self.assertIn('refs/tags/${AGENTOS_RELEASE_CANDIDATE}^{commit}', workflow)
         self.assertIn("--require-eligible", workflow)
+        self.assertIn("--game-day", workflow)
+        self.assertIn("game-day.json", workflow)
         self.assertIn('test ! -L "$path"', workflow)
         self.assertIn("production_claim_allowed", workflow)
         capabilities = (root / "docs/capabilities.toml").read_text(encoding="utf-8")

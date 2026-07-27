@@ -440,7 +440,7 @@ python3 scripts/incident_drill_qualification.py \
 The versioned [production observability contract](docs/OBSERVABILITY.md) now
 defines bounded metrics, request correlation, release-candidate SLO targets,
 checked-in Prometheus alerts, and their runbooks. The 24-hour soak, chaos,
-game-day, and publishable performance qualification still remain tracked by
+executed human game-day, and publishable performance qualification still remain tracked by
 [#125](https://github.com/surya-koritala/AIagentOS/issues/125).
 The [capacity qualification guide](docs/CAPACITY_QUALIFICATION.md) defines the
 strict idle, many-agent, long-context, tool-heavy, provider-latency,
@@ -462,7 +462,10 @@ The [incident-response runbook](docs/INCIDENT_RESPONSE.md) defines containment,
 evidence preservation, recovery, and verification for credential compromise,
 tenant leak, malicious package, node loss, corrupt database, and provider
 outage. Its retained automated drill proves deterministic technical controls;
-it does not replace the required human game day.
+it does not replace the required human game day. The
+[human game-day qualification guide](docs/GAME_DAY_QUALIFICATION.md) defines
+the protected exact-RC observation, independent review, and bounded report
+that must be produced when people run the exercise.
 
 ## Architecture Docs
 
@@ -475,6 +478,7 @@ it does not replace the required human game day.
 - [`docs/CAPACITY_QUALIFICATION.md`](docs/CAPACITY_QUALIFICATION.md) — reproducible workload profiles and sizing method
 - [`docs/RESILIENCE_QUALIFICATION.md`](docs/RESILIENCE_QUALIFICATION.md) — overload, slow-peer, and dependency-failure evidence
 - [`docs/SOAK_QUALIFICATION.md`](docs/SOAK_QUALIFICATION.md) — 24-hour target resource/leak evidence contract
+- [`docs/GAME_DAY_QUALIFICATION.md`](docs/GAME_DAY_QUALIFICATION.md) — exact-RC human incident exercise and independent-review evidence contract
 - [`docs/INCIDENT_RESPONSE.md`](docs/INCIDENT_RESPONSE.md) — six incident playbooks and automated drill boundary
 - [`docs/COMPLETE_SPEC.md`](docs/COMPLETE_SPEC.md) — long-form implementation spec
 - [`docs/FULL_ROADMAP.md`](docs/FULL_ROADMAP.md) — long-form vision roadmap

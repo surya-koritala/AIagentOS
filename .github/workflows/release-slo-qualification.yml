@@ -47,7 +47,7 @@ jobs:
       - name: Require the protected target evidence drop
         run: |
           test -n "$AGENTOS_SLO_EVIDENCE_DIR"
-          for name in slo-observation.json resource-soak.json incident-drill.json; do
+          for name in slo-observation.json resource-soak.json incident-drill.json game-day.json; do
             path="${AGENTOS_SLO_EVIDENCE_DIR}/${name}"
             test -f "$path"
             test ! -L "$path"
@@ -59,6 +59,7 @@ jobs:
             --observation "${AGENTOS_SLO_EVIDENCE_DIR}/slo-observation.json" \
             --resource-soak "${AGENTOS_SLO_EVIDENCE_DIR}/resource-soak.json" \
             --incident-drill "${AGENTOS_SLO_EVIDENCE_DIR}/incident-drill.json" \
+            --game-day "${AGENTOS_SLO_EVIDENCE_DIR}/game-day.json" \
             --expected-commit "$GITHUB_SHA" \
             --expected-environment "$AGENTOS_QUALIFICATION_ENVIRONMENT" \
             --release-candidate "$AGENTOS_RELEASE_CANDIDATE" \
@@ -79,6 +80,8 @@ jobs:
           test "$(jq '.targets | length' "$report")" = "9"
           test "$(jq '.failed_targets | length' "$report")" = "0"
           test "$(jq '.eligibility_blockers | length' "$report")" = "0"
+          test "$(jq -r .prerequisites.human_game_day.passed "$report")" = "true"
+          jq -e '.evidence.human_game_day_sha256 | test("^[0-9a-f]{64}$")' "$report"
           jq -e 'all(.targets[]; .passed == true)' "$report"
       - name: Publish summary
         if: always()

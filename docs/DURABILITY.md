@@ -670,8 +670,12 @@ A deterministic `SQLITE_FULL` regression constrains SQLite's page budget,
 attempts a transaction that must grow the database, and verifies the failed
 transaction leaves no partial row while previously committed data survives
 integrity verification and reopen. This qualifies SQLite's transactional
-failure behavior; it does not substitute for destructive host-filesystem
-capacity tests on every supported deployment profile.
+failure behavior. A separate guarded Linux qualification fills an explicitly
+marked 32–128 MiB disposable filesystem until the host returns `ENOSPC`, then
+proves rollback, capacity restoration, retry, `quick_check`, and reopen. See
+[Host storage fault qualification](HOST_STORAGE_FAULT_QUALIFICATION.md). This
+single ext4 fixture does not substitute for destructive capacity tests on every
+supported deployment profile or filesystem.
 
 The following remain open under issue #123:
 
@@ -679,7 +683,8 @@ The following remain open under issue #123:
 - independent immutable/remote retention controls and released trust fixtures;
 - measured deletion/retention enforcement across external workspaces,
   providers, remote backup copies, and object stores;
-- host-filesystem disk-full, power-loss, object-store, and extended crash
-  qualification beyond the deterministic interrupted-encryption process-exit
-  recovery covered above;
+- power-loss, torn-write, device-loss, object-store, other deployment
+  filesystem, and extended crash qualification beyond the disposable ext4
+  `ENOSPC` run and deterministic interrupted-encryption process-exit recovery
+  covered above;
 - measured RPO/RTO on supported deployment profiles.

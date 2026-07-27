@@ -1,0 +1,1 @@
+{{#include ../HOST_STORAGE_FAULT_QUALIFICATION.md}}

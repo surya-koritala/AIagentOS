@@ -1,0 +1,90 @@
+name: Host storage fault qualification
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  schedule:
+    - cron: "23 6 * * 3"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  QUALIFICATION_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+
+concurrency:
+  group: host-storage-fault-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  disposable-filesystem-enospc:
+    name: Exact-commit disposable-filesystem ENOSPC recovery
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.QUALIFICATION_SHA }}
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
+        with:
+          toolchain: 1.97.1
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - name: Validate the checked-in qualification contract
+        run: >-
+          cargo run --release --locked --package os-benchmark
+          --bin host-storage-qualification -- --validate
+      - name: Exercise real host-filesystem exhaustion and recovery
+        env:
+          AGENTOS_DESTRUCTIVE_STORAGE_QUALIFICATION: I_UNDERSTAND_THIS_DISPOSABLE_FILESYSTEM_WILL_BE_FILLED
+        run: |
+          set -euo pipefail
+          image="${RUNNER_TEMP}/agentos-host-storage-fault.img"
+          mount_point="${RUNNER_TEMP}/agentos-host-storage-fault-mount"
+          mkdir -p "${mount_point}" target/qualification
+          truncate -s 96M "${image}"
+          mkfs.ext4 -F -m 0 "${image}"
+          sudo mount -o loop,nosuid,nodev,noexec "${image}" "${mount_point}"
+          cleanup() {
+            sudo umount "${mount_point}" || true
+          }
+          trap cleanup EXIT
+          sudo chown "$(id -u):$(id -g)" "${mount_point}"
+          printf 'AIAGENTOS_DISPOSABLE_STORAGE_QUALIFICATION_V1\n' \
+            > "${mount_point}/.agentos-disposable-storage"
+          cargo run --release --locked --package os-benchmark \
+            --bin host-storage-qualification -- \
+            --root "${mount_point}" \
+            --output target/qualification/host-storage-fault.json
+      - name: Verify exact-source retained evidence
+        run: |
+          report=target/qualification/host-storage-fault.json
+          test "$(jq -r .schema_version "$report")" = "1"
+          test "$(jq -r .qualification_class "$report")" = "destructive_host_filesystem_enospc"
+          test "$(jq -r .proof_scope "$report")" = "small_disposable_linux_filesystem_enospc_only"
+          test "$(jq -r .passed "$report")" = "true"
+          test "$(jq -r .production_claim_allowed "$report")" = "false"
+          test "$(jq -r .build_profile "$report")" = "release"
+          test "$(jq -r .source.commit "$report")" = "$QUALIFICATION_SHA"
+          test "$(jq -r .source.dirty "$report")" = "false"
+          test "$(jq -r .environment.os "$report")" = "linux"
+          test "$(jq -r .environment.architecture "$report")" = "x86_64"
+          jq -e '
+            (.environment.filesystem_total_bytes >= 33554432)
+            and (.environment.filesystem_total_bytes <= 134217728)
+            and (.environment.filesystem_available_exhausted_bytes < 262144)
+            and (.environment.filesystem_available_recovered_bytes
+                 > .environment.filesystem_available_exhausted_bytes)
+            and (.observations.filler_bytes_written > 0)
+            and all(.checks[]; . == true)
+          ' "$report"
+      - name: Retain host storage fault evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: host-storage-fault-${{ env.QUALIFICATION_SHA }}
+          path: target/qualification/host-storage-fault.json
+          if-no-files-found: error
+          retention-days: 90

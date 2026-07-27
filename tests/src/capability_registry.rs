@@ -422,6 +422,34 @@ fn release_blocking_workflows_keep_their_security_contract() {
         );
     }
 
+    let target_remote =
+        read_workspace_file(".github/workflows/target-remote-backup-qualification.yml");
+    assert!(
+        target_remote.contains("workflow_dispatch:")
+            && !target_remote.contains("pull_request:")
+            && !target_remote.contains("schedule:"),
+        "target remote-backup qualification must remain an explicit protected gate"
+    );
+    for proof in [
+        "runs-on: [self-hosted, linux, x64, agentos-capacity]",
+        "environment: capacity-qualification",
+        "refs/tags/${AGENTOS_RELEASE_CANDIDATE}^{commit}",
+        "AGENTOS_TARGET_REMOTE_ENDPOINT: ${{ vars.AGENTOS_TARGET_REMOTE_ENDPOINT }}",
+        "AWS_ACCESS_KEY_ID: ${{ secrets.AGENTOS_TARGET_REMOTE_ACCESS_KEY_ID }}",
+        "--mode target-service",
+        "--expected-commit \"$GITHUB_SHA\"",
+        "target_remote_object_store_recovery",
+        "target_remote_recovery_proof_eligible",
+        "public_recovery_fixture",
+        "production_claim_allowed",
+        "retention-days: 90",
+    ] {
+        assert!(
+            target_remote.contains(proof),
+            "target remote-backup workflow lost {proof:?}"
+        );
+    }
+
     let live = read_workspace_file(".github/workflows/live-provider-qualification.yml");
     assert!(
         live.contains("workflow_dispatch:") && !live.contains("pull_request:"),

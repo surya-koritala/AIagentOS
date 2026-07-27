@@ -69,9 +69,11 @@ jobs:
           mkdir -p target/qualification
           cargo run --release --locked --package os-benchmark \
             --bin remote-backup-qualification -- \
+            --mode disposable-minio \
             --endpoint http://127.0.0.1:9000 \
             --bucket agentos-qualified-backups \
             --prefix "${QUALIFICATION_SHA}/recovery-001" \
+            --region "$AWS_REGION" \
             --state-dir target/qualification/remote-backup-state \
             --output target/qualification/remote-backup.json \
             --server-image-digest "${MINIO_SERVER_IMAGE#*@}" \
@@ -81,10 +83,12 @@ jobs:
           report=target/qualification/remote-backup.json
           test "$(jq -r .schema_version "$report")" = "1"
           test "$(jq -r .qualification_class "$report")" = "disposable_s3_object_lock_recovery"
+          test "$(jq -r .environment.qualification_mode "$report")" = "disposable-minio"
           test "$(jq -r .proof_scope "$report")" = \
             "disposable_minio_s3_api_compliance_lock_and_exact_version_recovery"
           test "$(jq -r .passed "$report")" = "true"
           test "$(jq -r .production_claim_allowed "$report")" = "false"
+          test "$(jq -r .target_remote_recovery_proof_eligible "$report")" = "false"
           test "$(jq -r .build_profile "$report")" = "release"
           test "$(jq -r .source.commit "$report")" = "$QUALIFICATION_SHA"
           test "$(jq -r .source.dirty "$report")" = "false"
@@ -95,6 +99,8 @@ jobs:
           test "$(jq '.publication.objects | length' "$report")" = "2"
           test "$(jq '.recovery.objects | length' "$report")" = "2"
           test "$(jq '.delete_marker_version_ids | length' "$report")" = "2"
+          test "$(jq -r .public_recovery_fixture.trust_root.key_id "$report")" = \
+            "$(jq -r .public_recovery_fixture.recovery_anchor.signing_key_id "$report")"
           jq -e '
             all(.checks[]; . == true)
             and all(.publication.objects[];

@@ -10,6 +10,15 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
 
 ## [Unreleased]
 
+- Added the protected exact-RC target object-store qualification path under
+  #123. It requires a non-loopback HTTPS service and dedicated protected
+  credentials, binds the run to an existing release tag and clean commit,
+  exercises compliance retention, delete-marker survival, exact-version
+  download, authenticated restore, and enforcement-state recovery, and retains
+  measured timings with replayable non-secret public trust/anchor fixtures.
+  The disposable MinIO regression remains separately classified. The target
+  workflow is implemented but has not yet produced an independently approved
+  artifact, so no production claim is made.
 - Added a fail-closed human incident game-day evidence contract under #125.
   The protected workflow validates a one-hour staffed exercise for all six
   runbooks against one exact release candidate and target environment,

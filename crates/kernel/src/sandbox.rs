@@ -1692,12 +1692,16 @@ mod tests {
         std::fs::create_dir_all(&orphan).unwrap();
         std::fs::create_dir_all(&unrelated).unwrap();
         let active = HashSet::from([workspace.clone()]);
-        assert!(
-            mgr.reconcile_managed_workspaces(&active).unwrap() >= 1,
-            "the injected orphan and any older crash leftovers must be removed"
-        );
+        // Kernel tests share the process-wide managed root. A concurrent
+        // kernel rehydration may remove this orphan before this call acquires
+        // the reconciliation lock, so the per-call count is not an ownership
+        // proof. The durable postcondition is that the orphan is absent.
+        mgr.reconcile_managed_workspaces(&active).unwrap();
         assert!(workspace.exists());
-        assert!(!orphan.exists());
+        assert!(
+            !orphan.exists(),
+            "the injected orphan must be absent after reconciliation"
+        );
         assert!(unrelated.exists());
 
         mgr.destroy_sandbox(sid).unwrap();

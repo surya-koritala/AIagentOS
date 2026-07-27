@@ -534,8 +534,11 @@ unlocked, shortened-retention, wrong-version, oversized, redirected, or
 integrity-mismatched object. See
 [Remote immutable backups](REMOTE_BACKUP_QUALIFICATION.md) for the bucket
 contract and operator commands. A disposable exact-commit MinIO workflow is
-regression evidence only; independent target-service recovery, released trust
-fixtures, and supported-profile RPO/RTO remain open under issue #123.
+regression evidence only. A separate protected exact-RC workflow now requires a
+real non-loopback HTTPS service and retains the public trust root plus exact
+recovery anchor alongside measured recovery evidence. It has not yet produced
+an independently approved target artifact, so target-service recovery and
+supported-profile RPO/RTO remain open under issue #123.
 
 ## Corrupt database recovery
 
@@ -831,10 +834,9 @@ external side effects.
 
 The following remain open under issue #123:
 
-- an independently operated target-service run of the implemented remote
-  Object Lock recovery path, with reviewed retained evidence;
-- released public trust/anchor/receipt fixtures and independently governed
-  immutable retention controls;
+- an eligible independently operated exact-RC run of the implemented protected
+  target-service Object Lock workflow, followed by review of its retained
+  public trust/anchor/receipt fixtures and immutable-retention controls;
 - measured deletion/retention enforcement across external workspaces,
   providers, remote backup copies, and object stores;
 - power-loss, torn-write, device-loss, object-store, other deployment

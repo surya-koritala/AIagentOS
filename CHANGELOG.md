@@ -10,6 +10,16 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
 
 ## [Unreleased]
 
+- Added process-exit atomicity qualification for durable quota/accounting
+  workflows under #123. Thirty-seven child-process exits cover hierarchical
+  reservation, pre-invocation refund, actual-usage reconciliation, direct token
+  charging, restart recovery, and completed-epoch pruning across the monotonic
+  floor, receipts, ordered scopes, trusted aggregates, refund tombstones,
+  migration fences, and trigger-maintained accounting integrity state. Every
+  exit must reopen with the exact pre-transaction contents of every durable
+  table; clean retries must publish complete state and pass schema verification
+  plus `quick_check`. Package-registry and cluster-control transaction matrices,
+  power loss, and torn writes remain open.
 - Added process-exit atomicity qualification for eleven high-value context
   mutations under #123. Twenty-six child-process exits cover conversation and
   search-index persistence, context-spill store/purge/delete, operator-tunable

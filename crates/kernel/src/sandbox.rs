@@ -957,18 +957,20 @@ impl SandboxManager for SandboxManagerImpl {
         drop(workspace);
         if state.managed_workspace {
             if let Err(error) = std::fs::remove_dir_all(&state.workspace_dir) {
-                let reopened = Dir::open_ambient_dir(&state.workspace_dir, ambient_authority())
-                    .map_err(|reopen_error| {
-                        SandboxError::DestructionFailed(format!(
-                            "{error}; sandbox capability could not be restored: {reopen_error}"
-                        ))
-                    })?;
-                *state.workspace.lock().map_err(|_| {
-                    SandboxError::DestructionFailed(
-                        "sandbox capability could not be restored".into(),
-                    )
-                })? = Some(reopened);
-                return Err(SandboxError::DestructionFailed(error.to_string()));
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    let reopened = Dir::open_ambient_dir(&state.workspace_dir, ambient_authority())
+                        .map_err(|reopen_error| {
+                            SandboxError::DestructionFailed(format!(
+                                "{error}; sandbox capability could not be restored: {reopen_error}"
+                            ))
+                        })?;
+                    *state.workspace.lock().map_err(|_| {
+                        SandboxError::DestructionFailed(
+                            "sandbox capability could not be restored".into(),
+                        )
+                    })? = Some(reopened);
+                    return Err(SandboxError::DestructionFailed(error.to_string()));
+                }
             }
             managed_registry
                 .as_mut()
@@ -1701,6 +1703,27 @@ mod tests {
         mgr.destroy_sandbox(sid).unwrap();
         assert!(!workspace.exists());
         std::fs::remove_dir_all(unrelated).unwrap();
+    }
+
+    #[test]
+    fn managed_sandbox_destruction_accepts_an_already_absent_workspace() {
+        let mgr = SandboxManagerImpl::new();
+        let config = SandboxManagerImpl::default_config();
+        let workspace = config.workspace_dir.clone();
+        let agent_id = uuid::Uuid::new_v4();
+        let sid = mgr.create_managed_sandbox(agent_id, &config).unwrap();
+
+        // Model an external cleanup after the capability has been revoked.
+        // Windows correctly refuses to remove a directory while this handle
+        // is open, whereas Unix permits unlinking it underneath the handle.
+        let state = mgr.sandboxes.get(&sid).unwrap().clone();
+        state.workspace.lock().unwrap().take();
+        std::fs::remove_dir_all(&workspace).unwrap();
+        mgr.destroy_sandbox(sid).unwrap();
+
+        assert!(!workspace.exists());
+        assert!(mgr.get_sandbox_for_agent(agent_id).is_none());
+        assert_eq!(mgr.structural_counts(), (0, 0));
     }
 
     #[cfg(unix)]

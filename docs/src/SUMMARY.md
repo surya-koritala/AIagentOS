@@ -15,6 +15,7 @@
   - [Capacity Qualification](./capacity-qualification.md)
   - [Resilience Qualification](./resilience-qualification.md)
   - [Resource and Leak Soak](./soak-qualification.md)
+  - [Release-candidate SLO Qualification](./release-slo-qualification.md)
   - [Incident Response](./incident-response.md)
   - [Public Wire Protocol](./protocol.md)
   - [Agent Service Supervisor](./services.md)

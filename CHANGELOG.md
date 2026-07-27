@@ -10,6 +10,14 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
 
 ## [Unreleased]
 
+- Added a fail-closed exact-release-candidate SLO report under #125. A strict
+  evaluator recalculates all nine documented SLOs from raw target counts and
+  measurements, enforces 24-hour/30-day windows and minimum proof volumes, and
+  rejects malformed, fixture, dirty, short, mixed-commit, mixed-environment,
+  short-soak, incomplete-incident, and unresolved-alert evidence. A protected
+  self-hosted workflow binds an existing release tag to the exact commit and
+  retains only the bounded report plus input hashes. The implementation and its
+  tests do not claim that a real target has supplied an eligible report.
 - Fixed two queue-saturation alerts that could never match their `waiting` and
   `capacity` series because those series carry different `state` labels. A
   checksum-pinned Prometheus 3.13.1 suite now parses the production rules and

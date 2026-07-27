@@ -10,6 +10,11 @@ on:
 permissions:
   contents: read
 
+env:
+  # pull_request defaults GITHUB_SHA to a synthetic merge ref. Qualification
+  # must bind the submitted head itself; scheduled/manual runs bind github.sha.
+  QUALIFICATION_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+
 concurrency:
   group: incident-drill-${{ github.ref }}
   cancel-in-progress: true
@@ -21,6 +26,8 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.QUALIFICATION_SHA }}
       - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
         with:
           toolchain: 1.97.1
@@ -43,7 +50,7 @@ jobs:
           test "$(jq -r .human_game_day_completed "$report")" = "false"
           test "$(jq -r .game_day_proof_eligible "$report")" = "false"
           test "$(jq -r .production_claim_allowed "$report")" = "false"
-          test "$(jq -r .source.commit "$report")" = "$GITHUB_SHA"
+          test "$(jq -r .source.commit "$report")" = "$QUALIFICATION_SHA"
           test "$(jq -r .source.dirty "$report")" = "false"
           test "$(jq -r .environment.os "$report")" = "linux"
           jq -e '
@@ -63,7 +70,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: incident-drill-${{ github.sha }}
+          name: incident-drill-${{ env.QUALIFICATION_SHA }}
           path: target/qualification/incident-drill.json
           if-no-files-found: error
           retention-days: 90

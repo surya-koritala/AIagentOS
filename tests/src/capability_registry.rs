@@ -391,6 +391,8 @@ fn release_blocking_workflows_keep_their_security_contract() {
     let incident = read_workspace_file(".github/workflows/incident-drill-qualification.yml");
     for proof in [
         "pull_request:",
+        "QUALIFICATION_SHA: ${{ github.event.pull_request.head.sha || github.sha }}",
+        "ref: ${{ env.QUALIFICATION_SHA }}",
         "Exact-commit automated incident technical controls",
         "python3 scripts/incident_drill_qualification.py --validate",
         "--output target/qualification/incident-drill.json",

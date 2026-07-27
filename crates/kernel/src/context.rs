@@ -5473,7 +5473,15 @@ impl SqliteContextManager {
         &self,
         agent_id: AgentId,
     ) -> Result<Option<DeletionReceipt>, ContextError> {
-        self.erase_agent_data_with_receipt(agent_id, true)
+        self.erase_agent_data_with_receipt(agent_id, true, 0)
+    }
+
+    pub(crate) fn erase_agent_data_after_backup_purge(
+        &self,
+        agent_id: AgentId,
+        managed_backups_deleted: usize,
+    ) -> Result<Option<DeletionReceipt>, ContextError> {
+        self.erase_agent_data_with_receipt(agent_id, true, managed_backups_deleted)
     }
 
     /// Transactionally remove every durable row owned by an agent whose
@@ -5481,7 +5489,7 @@ impl SqliteContextManager {
     /// while seeding memory). Normal stop/kill intentionally does not call this
     /// because terminal history is retained.
     pub fn purge_agent_data(&self, agent_id: AgentId) -> Result<(), ContextError> {
-        self.erase_agent_data_with_receipt(agent_id, false)
+        self.erase_agent_data_with_receipt(agent_id, false, 0)
             .map(|_| ())
     }
 
@@ -5489,6 +5497,7 @@ impl SqliteContextManager {
         &self,
         agent_id: AgentId,
         record_receipt: bool,
+        managed_backups_deleted: usize,
     ) -> Result<Option<DeletionReceipt>, ContextError> {
         if agent_id.is_nil() {
             return Err(ContextError::PersistenceFailed(
@@ -5602,6 +5611,11 @@ impl SqliteContextManager {
         if deleted_rows.is_empty() {
             return Ok(None);
         }
+        record_deleted_rows(
+            &mut deleted_rows,
+            "managed_backup_copies",
+            managed_backups_deleted,
+        );
         let receipt = if record_receipt {
             Some(persist_deletion_receipt(
                 &tx,
@@ -5610,8 +5624,7 @@ impl SqliteContextManager {
                 vec![
                     "shared provider and tenant quota aggregates".to_string(),
                     "non-identifying quota receipt and refund tombstones".to_string(),
-                    "previously published operator backups until their retention expiry"
-                        .to_string(),
+                    "backup copies outside the configured managed root".to_string(),
                 ],
             )?)
         } else {
@@ -6413,6 +6426,14 @@ impl SqliteContextManager {
     /// entries retain only the now-pseudonymous actor id so their security
     /// chain remains verifiable.
     pub fn erase_user_data(&self, user_id: &str) -> Result<Option<DeletionReceipt>, ContextError> {
+        self.erase_user_data_after_backup_purge(user_id, 0)
+    }
+
+    pub(crate) fn erase_user_data_after_backup_purge(
+        &self,
+        user_id: &str,
+        managed_backups_deleted: usize,
+    ) -> Result<Option<DeletionReceipt>, ContextError> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -6449,6 +6470,11 @@ impl SqliteContextManager {
         if deleted_rows.is_empty() {
             return Ok(None);
         }
+        record_deleted_rows(
+            &mut deleted_rows,
+            "managed_backup_copies",
+            managed_backups_deleted,
+        );
         let receipt = persist_deletion_receipt(
             &tx,
             DeletionSubjectKind::User,
@@ -6456,7 +6482,7 @@ impl SqliteContextManager {
             vec![
                 "tenant-owned agents and runtime data".to_string(),
                 "pseudonymous package transparency and security audit actor references".to_string(),
-                "previously published operator backups until their retention expiry".to_string(),
+                "backup copies outside the configured managed root".to_string(),
             ],
         )?;
         crash_erasure_after_step_for_test("user.deletion_receipt");
@@ -6767,6 +6793,14 @@ impl SqliteContextManager {
         &self,
         tenant_id: &str,
     ) -> Result<Option<DeletionReceipt>, ContextError> {
+        self.erase_tenant_data_after_backup_purge(tenant_id, 0)
+    }
+
+    pub(crate) fn erase_tenant_data_after_backup_purge(
+        &self,
+        tenant_id: &str,
+        managed_backups_deleted: usize,
+    ) -> Result<Option<DeletionReceipt>, ContextError> {
         let mut conn = self
             .conn
             .lock()
@@ -6930,6 +6964,11 @@ impl SqliteContextManager {
         if deleted_rows.is_empty() {
             return Ok(None);
         }
+        record_deleted_rows(
+            &mut deleted_rows,
+            "managed_backup_copies",
+            managed_backups_deleted,
+        );
         let receipt = persist_deletion_receipt(
             &transaction,
             DeletionSubjectKind::Tenant,
@@ -6938,7 +6977,7 @@ impl SqliteContextManager {
                 "system-wide provider quota aggregates".to_string(),
                 "non-identifying quota receipt and refund tombstones".to_string(),
                 "operator, cluster, and schema state".to_string(),
-                "previously published operator backups until their retention expiry".to_string(),
+                "backup copies outside the configured managed root".to_string(),
             ],
         )?;
         crash_erasure_after_step_for_test("tenant.deletion_receipt");

@@ -194,17 +194,19 @@ impl BackupScheduleConfig {
                 )
             }
         }
+        if let Some(root) = self.root.as_deref() {
+            if !root.is_absolute() {
+                return Err(format!(
+                    "backup.root must be an absolute path (got {})",
+                    root.display()
+                ));
+            }
+        }
         if !self.enabled {
             return Ok(());
         }
-        let root = self.root.as_deref().ok_or_else(|| {
-            "backup.root is required when scheduled backups are enabled".to_string()
-        })?;
-        if !root.is_absolute() {
-            return Err(format!(
-                "backup.root must be an absolute path (got {})",
-                root.display()
-            ));
+        if self.root.is_none() {
+            return Err("backup.root is required when scheduled backups are enabled".to_string());
         }
         if self.interval_seconds == 0 {
             return Err("backup.interval_seconds must be greater than zero".into());

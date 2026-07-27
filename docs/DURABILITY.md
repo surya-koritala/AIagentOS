@@ -12,6 +12,8 @@ and CLI are integrated. Verified local-backup retention, disabled-by-default
 automatic local backup maintenance, optional Ed25519 manifest authenticity,
 exact independently retained recovery-point anchors, and SQLCipher
 whole-database encryption with operator-custodied keys are integrated.
+Server-created backups are constrained to one configured managed root; hot
+subject erasure purges that root under the publication lock before committing.
 Authenticated configured-host disaster recovery, plaintext migration, and
 storage-key rotation remain explicit offline operator actions. Remote
 retention, measured recovery objectives, and independent release qualification
@@ -410,6 +412,12 @@ retained, and skipped entries. This feature applies only to verified backups in
 the named local root; scheduling, remote/object-store lifecycle, and external
 workspace/provider deletion remain separate operator responsibilities.
 
+The server-side `create_storage_backup` operation accepts only the exact
+configured `backup.root`. This prevents a live system operator from creating an
+untracked snapshot outside the root that hot erasure governs. Direct offline
+library-created snapshots and replicas copied by infrastructure are external
+copies and require an independent lifecycle policy.
+
 ## Automatic local backups
 
 `agent-server` starts one backup-maintenance loop when `[backup].enabled` is
@@ -448,6 +456,10 @@ the same health without path labels:
 - `agentos_backup_successes_total`
 - `agentos_backup_failures_total`
 - `agentos_backup_retention_deleted_total`
+- `agentos_backup_erasure_purge_attempts_total`
+- `agentos_backup_erasure_purge_successes_total`
+- `agentos_backup_erasure_purge_failures_total`
+- `agentos_backup_erasure_purge_deleted_total`
 - `agentos_backup_consecutive_failures`
 - `agentos_backup_last_success_unixtime_seconds`
 
@@ -621,10 +633,22 @@ implemented. User erasure retains the now-pseudonymous actor UUID in per-tenant
 package transparency/audit chains; deleting the tenant removes those chains.
 
 All kernel SQLite tables are included in verified backups. Published backups
-are immutable snapshots and are not retroactively changed by a live-database
-erasure. Operators can enforce the verified local-backup retention policy, but
-must separately govern remote copies and external systems. The database is
-protected with owner-only permissions on Unix. Configured production
+remain immutable: hot erasure does not edit snapshots in place. Instead, every
+server-created backup belongs to the configured managed root. Before an agent,
+user, or tenant SQLite erasure commits, the kernel exclusively locks that root,
+preflights every entry, deletes every verified backup for the current
+installation, and holds publication fenced through the database commit. A
+corrupt, foreign, unknown, augmented, symlinked, or unavailable-key entry
+aborts erasure before the live database changes; the operation never skips a
+possibly recoverable copy. Only a successfully committed erasure returns a
+success receipt. The receipt counts removed managed backup copies without
+identifying their path or the subject. The next startup or scheduled cycle
+creates a clean post-erasure recovery point.
+
+Direct offline library snapshots, infrastructure replicas, remote object-store
+copies, and other systems outside the configured root remain under their
+independent deletion policy. The database is protected with owner-only
+permissions on Unix. Configured production
 deployments additionally use SQLCipher whole-database encryption; offline
 encryption migration and key rotation are supported. Provider configuration
 files, agent workspaces, remote provider data, and external object stores are
@@ -655,9 +679,10 @@ agentctl --addr 127.0.0.1:7777 --token "$AGENT_SERVER_TOKEN" \
 ```
 
 These commands return a privacy-safe receipt or `null` when no classified data
-existed. Provider configuration files, external workspaces, remote provider
-data, published backups, and external object stores remain outside this
-operation and require their own retention/deletion controls.
+existed. The configured managed backup root is included as described above.
+Provider configuration files, external workspaces, remote provider data,
+offline-created backup copies, replicas, and external object stores remain
+outside this operation and require their own retention/deletion controls.
 
 ## Current durability boundary
 
@@ -696,22 +721,25 @@ subject and commit exactly one private receipt. This proves all-or-nothing
 recovery for the agent, user, and tenant SQLite erasure transactions. It does
 not by itself cover the surrounding live-resource coordinator.
 
-A second file-backed child-process matrix exits at 15 supported hot-erasure
-boundaries: five agent, four user, and six tenant points. The points cover
+A second file-backed child-process matrix exits at 18 supported hot-erasure
+boundaries: six agent, five user, and seven tenant points. The points cover
 credential fencing/drain completion, the service-stop loop, acquisition of the
-global request and operator-mutation barriers, live-agent quiescence and
+global request and operator-mutation barriers, completion of the managed-backup
+purge while its publication lock remains held, live-agent quiescence and
 resource removal, the handoff after the SQLite erasure commit, and final
-user/tenant auth revocation. The tenant fixture includes a supervised service
-and multiple live agents.
+user/tenant auth revocation. Every fixture begins with a verified managed
+backup; the tenant fixture also includes a supervised service and multiple live
+agents.
 
 After every forced coordinator exit, a new kernel opens the same database,
 performs normal lifecycle/tenancy rehydration, retries the same erasure, and
 must leave the subject absent with exactly one private deletion receipt.
 Agent retries also prove the process-local agent registry and syscall-gate
-registration are absent. This qualifies process termination between the
-documented coordinator stages. It does not emulate interruption inside one
-opaque cleanup call, host power loss, torn writes, device loss, published
-backups, or provider/workspace systems outside the kernel process.
+registration are absent, and every scope proves the pre-erasure managed backup
+is gone. This qualifies process termination between the documented coordinator
+stages. It does not emulate interruption inside one opaque cleanup or
+managed-backup deletion call, host power loss, torn writes, device loss, or
+provider/workspace systems outside the kernel process.
 
 The following remain open under issue #123:
 

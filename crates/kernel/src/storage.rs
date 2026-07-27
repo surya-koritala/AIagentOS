@@ -427,6 +427,33 @@ pub struct BackupRetentionReport {
     pub skipped: Vec<BackupRetentionIssue>,
 }
 
+/// Exclusive proof that every backup in the configured managed root was
+/// verified and removed before a live subject erasure commits.
+///
+/// The publication lock remains held for this value's lifetime, so neither a
+/// scheduled nor an operator-triggered backup can capture the subject between
+/// the purge and the SQLite deletion transaction.
+#[derive(Debug)]
+pub struct BackupErasureGuard {
+    _publication_lock: File,
+    root: PathBuf,
+    deleted: Vec<BackupRetentionEntry>,
+}
+
+impl BackupErasureGuard {
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    pub fn deleted(&self) -> &[BackupRetentionEntry] {
+        &self.deleted
+    }
+
+    pub fn deleted_count(&self) -> usize {
+        self.deleted.len()
+    }
+}
+
 /// Result of one automatic backup and retention cycle.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ScheduledBackupReport {
@@ -448,6 +475,10 @@ pub struct BackupMaintenanceStatus {
     pub successes_total: u64,
     pub failures_total: u64,
     pub retention_deleted_total: u64,
+    pub erasure_purge_attempts_total: u64,
+    pub erasure_purge_successes_total: u64,
+    pub erasure_purge_failures_total: u64,
+    pub erasure_purge_deleted_total: u64,
     pub consecutive_failures: u64,
     pub last_attempt_at: Option<String>,
     pub last_success_at: Option<String>,
@@ -538,6 +569,19 @@ impl BackupMaintenance {
         backup_root: &Path,
         name: &str,
     ) -> Result<BackupManifest, ContextError> {
+        let config = self.config();
+        let managed_root = config.root.as_deref().ok_or_else(|| {
+            storage_error(
+                "server-side backup creation requires backup.root to name the managed backup root",
+            )
+        })?;
+        if backup_root != managed_root {
+            return Err(storage_error(format!(
+                "server-side backup root {} does not match configured managed root {}",
+                backup_root.display(),
+                managed_root.display()
+            )));
+        }
         let signer = self
             .signer
             .read()
@@ -546,6 +590,53 @@ impl BackupMaintenance {
         match signer {
             Some(signer) => manager.create_signed_backup(backup_root, name, &signer),
             None => manager.create_backup(backup_root, name),
+        }
+    }
+
+    /// Remove every verified backup from the configured managed root and keep
+    /// its publication lock held until the caller completes live erasure.
+    ///
+    /// A missing configured root means that this kernel cannot create managed
+    /// server-side backups, so there is no managed root to purge. Any unsafe,
+    /// corrupt, foreign, or unknown root entry fails closed before a live
+    /// deletion transaction can begin.
+    pub fn begin_erasure_purge(
+        &self,
+        manager: &SqliteContextManager,
+    ) -> Result<Option<BackupErasureGuard>, ContextError> {
+        let Some(root) = self.config().root else {
+            return Ok(None);
+        };
+        {
+            let mut status = self
+                .status
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            status.erasure_purge_attempts_total =
+                status.erasure_purge_attempts_total.saturating_add(1);
+        }
+        match manager.begin_managed_backup_erasure(&root) {
+            Ok(guard) => {
+                let mut status = self
+                    .status
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                status.erasure_purge_successes_total =
+                    status.erasure_purge_successes_total.saturating_add(1);
+                status.erasure_purge_deleted_total = status
+                    .erasure_purge_deleted_total
+                    .saturating_add(guard.deleted_count() as u64);
+                Ok(Some(guard))
+            }
+            Err(error) => {
+                let mut status = self
+                    .status
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                status.erasure_purge_failures_total =
+                    status.erasure_purge_failures_total.saturating_add(1);
+                Err(error)
+            }
         }
     }
 
@@ -2656,6 +2747,137 @@ impl SqliteContextManager {
             skipped,
         })
     }
+
+    /// Preflight and remove every backup from one managed installation root.
+    ///
+    /// Unlike age-based retention, erasure cannot skip an entry and continue:
+    /// an unverified directory might still contain recoverable subject data.
+    /// The complete root is therefore validated before the first deletion, and
+    /// any unknown, unsafe, corrupt, foreign, or unavailable-key entry aborts
+    /// the operation while the live database remains untouched.
+    pub fn begin_managed_backup_erasure(
+        &self,
+        backup_root: &Path,
+    ) -> Result<BackupErasureGuard, ContextError> {
+        prepare_backup_root(backup_root)?;
+        let publication_lock = acquire_backup_publication_lock(backup_root)?;
+        let installation_id = {
+            let connection = self
+                .conn
+                .lock()
+                .map_err(|_| storage_error("SQLite connection mutex is poisoned"))?;
+            crate::schema::read_storage_metadata(&connection)?.installation_id
+        };
+        let mut verified = Vec::new();
+        let mut scanned = 0_usize;
+
+        for entry in fs::read_dir(backup_root).map_err(|error| {
+            storage_error(format!(
+                "failed to enumerate managed backup root {}: {error}",
+                backup_root.display()
+            ))
+        })? {
+            let entry = entry.map_err(|error| {
+                storage_error(format!(
+                    "failed to enumerate managed backup root {}: {error}",
+                    backup_root.display()
+                ))
+            })?;
+            scanned += 1;
+            if scanned > MAX_BACKUP_ROOT_ENTRIES {
+                return Err(storage_error(format!(
+                    "managed backup root exceeds the scan limit of {MAX_BACKUP_ROOT_ENTRIES} entries"
+                )));
+            }
+            let name = bounded_entry_name(&entry);
+            if name == ".agentos-backup.lock" {
+                continue;
+            }
+            validate_backup_name(&name).map_err(|_| {
+                storage_error(format!(
+                    "managed backup root contains unknown entry {name:?}; erasure is refused"
+                ))
+            })?;
+            let metadata = fs::symlink_metadata(entry.path()).map_err(|error| {
+                storage_error(format!(
+                    "failed to inspect managed backup entry {name:?}: {error}"
+                ))
+            })?;
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                return Err(storage_error(format!(
+                    "managed backup entry {name:?} is not a real backup directory"
+                )));
+            }
+            let declared_manifest = read_manifest(&entry.path().join(BACKUP_MANIFEST_FILE))
+                .map_err(|error| {
+                    storage_error(format!(
+                        "managed backup {name:?} cannot be verified for erasure: {error}"
+                    ))
+                })?;
+            let verification_key =
+                self.backup_key_for_manifest(&declared_manifest)
+                    .map_err(|error| {
+                        storage_error(format!(
+                            "managed backup {name:?} cannot be verified for erasure: {error}"
+                        ))
+                    })?;
+            let manifest = verify_backup_internal(&entry.path(), None, verification_key.as_deref())
+                .map_err(|error| {
+                    storage_error(format!(
+                        "managed backup {name:?} cannot be verified for erasure: {error}"
+                    ))
+                })?;
+            if manifest.installation_id != installation_id {
+                return Err(storage_error(format!(
+                    "managed backup {name:?} belongs to a different installation; erasure is refused"
+                )));
+            }
+            require_removable_backup_contents(&entry.path()).map_err(|error| {
+                storage_error(format!(
+                    "managed backup {name:?} cannot be removed safely: {error}"
+                ))
+            })?;
+            verified.push((
+                BackupRetentionEntry {
+                    name,
+                    created_at: manifest.created_at.clone(),
+                    byte_count: manifest.byte_count,
+                },
+                manifest,
+            ));
+        }
+
+        verified.sort_by(|(left, _), (right, _)| left.name.cmp(&right.name));
+        let mut deleted = Vec::with_capacity(verified.len());
+        for (entry, manifest) in &verified {
+            let verification_key = self.backup_key_for_manifest(manifest)?;
+            delete_verified_backup(backup_root, entry, manifest, verification_key.as_deref())?;
+            deleted.push(entry.clone());
+        }
+
+        for entry in fs::read_dir(backup_root).map_err(|error| {
+            storage_error(format!(
+                "failed to verify managed backup root after erasure purge: {error}"
+            ))
+        })? {
+            let entry = entry.map_err(|error| {
+                storage_error(format!(
+                    "failed to verify managed backup root after erasure purge: {error}"
+                ))
+            })?;
+            if bounded_entry_name(&entry) != ".agentos-backup.lock" {
+                return Err(storage_error(
+                    "managed backup root changed during erasure purge",
+                ));
+            }
+        }
+        sync_directory(backup_root)?;
+        Ok(BackupErasureGuard {
+            _publication_lock: publication_lock,
+            root: backup_root.to_path_buf(),
+            deleted,
+        })
+    }
 }
 
 fn checkpoint_existing_database(
@@ -4031,6 +4253,88 @@ mod tests {
     }
 
     #[test]
+    fn managed_erasure_purges_every_verified_backup_and_holds_publication_lock() {
+        let directory = TestDirectory::new("managed-erasure");
+        let manager = SqliteContextManager::new(&directory.path.join("source.db")).unwrap();
+        let root = directory.path.join("backups");
+        manager.create_backup(&root, "first").unwrap();
+        manager.create_backup(&root, "second").unwrap();
+
+        let guard = manager.begin_managed_backup_erasure(&root).unwrap();
+        assert_eq!(
+            guard
+                .deleted()
+                .iter()
+                .map(|entry| entry.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["first", "second"]
+        );
+        assert!(!root.join("first").exists());
+        assert!(!root.join("second").exists());
+        let error = manager.create_backup(&root, "racing").unwrap_err();
+        assert!(error.to_string().contains("another backup publication"));
+
+        drop(guard);
+        manager.create_backup(&root, "clean").unwrap();
+        assert!(root.join("clean").exists());
+    }
+
+    #[test]
+    fn managed_erasure_fails_closed_before_deleting_any_backup_on_unknown_or_foreign_entry() {
+        let directory = TestDirectory::new("managed-erasure-refusal");
+        let manager = SqliteContextManager::new(&directory.path.join("source.db")).unwrap();
+        let foreign = SqliteContextManager::new(&directory.path.join("foreign.db")).unwrap();
+        let root = directory.path.join("backups");
+        manager.create_backup(&root, "owned").unwrap();
+        foreign.create_backup(&root, "foreign").unwrap();
+
+        let error = manager.begin_managed_backup_erasure(&root).unwrap_err();
+        assert!(error.to_string().contains("different installation"));
+        assert!(root.join("owned").exists());
+        assert!(root.join("foreign").exists());
+
+        fs::remove_dir_all(root.join("foreign")).unwrap();
+        fs::write(root.join("operator_notes"), b"not a backup").unwrap();
+        let error = manager.begin_managed_backup_erasure(&root).unwrap_err();
+        assert!(error.to_string().contains("not a real backup directory"));
+        assert!(root.join("owned").exists());
+        assert!(root.join("operator_notes").exists());
+    }
+
+    #[test]
+    fn managed_erasure_uses_retired_storage_keys_to_remove_rotated_backups() {
+        let directory = TestDirectory::new("managed-erasure-retired-key");
+        let database = directory.path.join("source.db");
+        let root = directory.path.join("backups");
+        {
+            let manager = SqliteContextManager::new_encrypted(
+                &database,
+                encrypted_test_key("storage-generation-1", 0x61),
+            )
+            .unwrap();
+            manager.create_backup(&root, "old_key").unwrap();
+        }
+        crate::storage_encryption::rotate_database_encryption_key(
+            &database,
+            &encrypted_test_key("storage-generation-1", 0x61),
+            &encrypted_test_key("storage-generation-2", 0x62),
+        )
+        .unwrap();
+        let manager = SqliteContextManager::new_encrypted_with_retired_keys(
+            &database,
+            encrypted_test_key("storage-generation-2", 0x62),
+            vec![encrypted_test_key("storage-generation-1", 0x61)],
+        )
+        .unwrap();
+        manager.create_backup(&root, "current_key").unwrap();
+
+        let guard = manager.begin_managed_backup_erasure(&root).unwrap();
+        assert_eq!(guard.deleted_count(), 2);
+        assert!(!root.join("old_key").exists());
+        assert!(!root.join("current_key").exists());
+    }
+
+    #[test]
     fn online_backup_remains_consistent_while_an_external_writer_commits() {
         let directory = TestDirectory::new("writer");
         let database = directory.path.join("source.db");
@@ -4160,6 +4464,35 @@ mod tests {
         assert_eq!(status.consecutive_failures, 0);
         assert!(status.last_success_at.is_some());
         assert!(status.last_error.is_none());
+    }
+
+    #[test]
+    fn server_backup_creation_requires_the_exact_configured_managed_root() {
+        let directory = TestDirectory::new("managed-root");
+        let manager = SqliteContextManager::new(&directory.path.join("source.db")).unwrap();
+        let requested = directory.path.join("requested");
+        let unconfigured = BackupMaintenance::default();
+        let error = unconfigured
+            .create_backup(&manager, &requested, "unconfigured")
+            .unwrap_err();
+        assert!(error.to_string().contains("backup.root"));
+        assert!(!requested.exists());
+
+        let configured_root = directory.path.join("configured");
+        let maintenance = BackupMaintenance::new(BackupScheduleConfig {
+            root: Some(configured_root.clone()),
+            ..BackupScheduleConfig::default()
+        })
+        .unwrap();
+        let error = maintenance
+            .create_backup(&manager, &requested, "wrong_root")
+            .unwrap_err();
+        assert!(error.to_string().contains("does not match configured"));
+        assert!(!requested.exists());
+        maintenance
+            .create_backup(&manager, &configured_root, "managed")
+            .unwrap();
+        assert!(configured_root.join("managed").exists());
     }
 
     #[test]

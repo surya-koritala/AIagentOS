@@ -232,6 +232,11 @@ requests to finish before taking a global erasure barrier. Agent and tenant
 erasure also disables supervised owners, quiesces turns and external tool
 calls, removes live scheduler, executor, sandbox, namespace, cgroup, gate, and
 observability state, and only then commits the classified SQLite transaction.
+When `backup.root` is configured, every subject scope also exclusively locks
+that managed root, verifies and removes every current-installation backup, and
+keeps publication fenced through the SQLite commit. Any unknown, corrupt,
+foreign, unsafe, or unavailable-key entry fails the request before durable
+erasure.
 
 ## Backup retention
 
@@ -264,12 +269,15 @@ read the configured policy and bounded process-local maintenance health:
 The `storage_backup_status` reply carries a `maintenance` object with bounded
 attempt/success/failure counters, consecutive failures, timestamps, the last
 published name, configured signing key ID (never private key material), and a
-bounded diagnostic. When a signing identity is configured, both scheduled
-backups and the system-only `create_storage_backup` operation return manifests
-with Ed25519 authenticity metadata. Verification still requires a separately
-retained public trust file; the server never returns it as trusted material.
-Tenant credentials are denied. The same bounded health values are available
-without filesystem-path labels in Prometheus.
+bounded diagnostic. It also reports managed-erasure purge attempts, successes,
+failures, and deleted-copy counts. When a signing identity is configured, both
+scheduled backups and the system-only `create_storage_backup` operation return
+manifests with Ed25519 authenticity metadata. That operation accepts only the
+exact configured `backup.root`, preventing untracked server-side snapshots.
+Verification still requires a separately retained public trust file; the
+server never returns it as trusted material. Tenant credentials are denied. The
+same bounded health values are available without filesystem-path labels in
+Prometheus.
 An agent-only erasure reopens the unaffected tenant credentials after the
 operation. Successful user and tenant erasure leaves their credentials revoked.
 Failure before the durable commit reopens still-valid credentials so the

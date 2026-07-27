@@ -262,6 +262,30 @@ unit = "backups"
 labels = []
 
 [[metric]]
+name = "agentos_backup_erasure_purge_attempts_total"
+type = "counter"
+unit = "attempts"
+labels = []
+
+[[metric]]
+name = "agentos_backup_erasure_purge_successes_total"
+type = "counter"
+unit = "attempts"
+labels = []
+
+[[metric]]
+name = "agentos_backup_erasure_purge_failures_total"
+type = "counter"
+unit = "attempts"
+labels = []
+
+[[metric]]
+name = "agentos_backup_erasure_purge_deleted_total"
+type = "counter"
+unit = "backups"
+labels = []
+
+[[metric]]
 name = "agentos_backup_consecutive_failures"
 type = "gauge"
 unit = "attempts"

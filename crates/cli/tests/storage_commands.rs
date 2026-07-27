@@ -25,6 +25,13 @@ async fn backup_create_command_uses_the_live_system_operator_api() {
     let database = root.0.join("agent_os.db");
     let backup_root = root.0.join("backups");
     let kernel = Arc::new(kernel::AgentKernelImpl::with_db_path(&database).expect("kernel"));
+    kernel
+        .backup_maintenance
+        .configure(kernel::config::BackupScheduleConfig {
+            root: Some(backup_root.clone()),
+            ..kernel::config::BackupScheduleConfig::default()
+        })
+        .expect("configure managed backup root");
     let server = kernel::syscall_server::SyscallServer::bind(Arc::clone(&kernel), "127.0.0.1:0")
         .await
         .expect("bind");

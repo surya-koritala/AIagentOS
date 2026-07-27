@@ -106,6 +106,16 @@ The backup volume is separate from live state but remains on the same Docker
 host. Replicate verified backups to another failure domain before treating them
 as node-loss disaster recovery.
 
+The running server creates backups only in its configured `/backups` managed
+root. A confirmed agent, user, or tenant erasure locks that root, verifies and
+removes every current-installation backup, and only then commits live deletion.
+An unknown, corrupt, foreign, augmented, symlinked, or unavailable-key entry
+causes erasure to fail closed before the database changes. The next startup or
+scheduled cycle publishes a clean post-erasure recovery point. Any replica
+copied outside this root must implement the same deletion request through its
+independent object-store lifecycle; AI Agent OS cannot erase an unconfigured
+external copy.
+
 The profile also mounts `agentos-keys` at `/keys`. On first boot the entrypoint
 creates `/keys/storage.json` without overwrite; subsequent boots require that
 exact key and SQLCipher-authenticate the database before schema access. Export

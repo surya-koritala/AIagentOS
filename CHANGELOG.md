@@ -10,16 +10,27 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
 
 ## [Unreleased]
 
+- Added fail-closed managed-backup erasure under #123. Every server-created
+  backup is now constrained to the configured `backup.root`. Agent, user, and
+  tenant hot deletion exclusively locks that root, preflights every entry,
+  removes every verified backup for the current installation, and keeps backup
+  publication fenced until the SQLite erasure commits. Unknown, corrupt,
+  foreign, symlinked, augmented, or unavailable-key entries abort before live
+  data is deleted. Privacy-safe receipts count removed managed backup copies,
+  and bounded metrics expose purge attempts, successes, failures, and deleted
+  backups. External replicas and operator-created offline copies remain under
+  their independent lifecycle policy.
 - Added real process-exit qualification around the supported hot-erasure
-  coordinator under #123. Fifteen child-process crash points cover credential
-  fencing, supervised-service shutdown, request/operator barriers, live-agent
-  quiescence and cleanup, the SQLite commit handoff, and final auth revocation
-  across agent, user, and tenant deletion. Every crash is followed by a
-  file-backed kernel restart and idempotent retry that must remove the subject,
-  leave no live agent boundary, and retain exactly one private receipt. This
-  qualifies process-local erasure coordination; external providers/workspaces,
-  published backups, power loss, torn writes, and opaque cleanup interruption
-  inside a single boundary remain open.
+  coordinator under #123. Eighteen child-process crash points cover credential
+  fencing, supervised-service shutdown, request/operator barriers, completion
+  of the managed-backup purge, live-agent quiescence and cleanup, the SQLite
+  commit handoff, and final auth revocation across agent, user, and tenant
+  deletion. Every crash is followed by a file-backed configured-kernel restart
+  and idempotent retry that must remove the subject, leave no live agent
+  boundary or pre-erasure managed backup, and retain exactly one private
+  receipt. This qualifies process-local erasure coordination; external
+  providers/workspaces, interruption inside an opaque purge/cleanup call,
+  power loss, and torn writes remain open.
 - Added real process-exit fault injection at every statement boundary in all
   three schema-wide erasure transactions under #123: 17 agent, 5 user, and 28
   tenant boundaries. Fifty child-process crash points now prove that SQLite

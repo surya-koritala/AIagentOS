@@ -17,6 +17,7 @@
   - [Host Storage Fault Qualification](./host-storage-fault-qualification.md)
   - [Remote Immutable Backups](./remote-backup-qualification.md)
   - [Resource and Leak Soak](./soak-qualification.md)
+  - [Human Incident Game Day](./game-day-qualification.md)
   - [Release-candidate SLO Qualification](./release-slo-qualification.md)
   - [Incident Response](./incident-response.md)
   - [Public Wire Protocol](./protocol.md)

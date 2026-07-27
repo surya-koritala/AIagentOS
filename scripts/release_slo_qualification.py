@@ -57,6 +57,33 @@ INCIDENT_SCENARIO_IDS = (
     "corrupt-database",
     "provider-outage",
 )
+GAME_DAY_REVIEW_CHECK_IDS = (
+    "exact_release_candidate_exercised",
+    "timeline_and_measurements_reviewed",
+    "runbook_steps_reviewed",
+    "rpo_rto_results_reviewed",
+    "tenant_boundaries_preserved",
+    "raw_evidence_retained",
+)
+GAME_DAY_SCENARIO_CHECK_IDS = (
+    "positive_recovery_interval",
+    "rto_met",
+    "rpo_met",
+    "all_runbook_steps_completed",
+    "zero_unexpected_tenant_accesses",
+    "zero_unresolved_findings",
+)
+GAME_DAY_REVIEW_RESULT_CHECK_IDS = (
+    "reviewer_independent",
+    "review_approved",
+    "every_review_check_passed",
+    "zero_open_findings",
+)
+GAME_DAY_REQUIRED_PARTICIPANT_ROLES = {
+    "incident_commander",
+    "operator",
+    "observer",
+}
 
 TARGET_CONTRACT = {
     "availability": {
@@ -849,10 +876,197 @@ def _validate_incident(
     }
 
 
+def _validate_game_day(
+    report: dict[str, Any],
+    expected_commit: str,
+    expected_environment: str,
+    release_candidate: str,
+    *,
+    report_sha256: str,
+    observed_evidence_sha256: str | None,
+) -> dict[str, Any]:
+    _validate_source(report.get("source"), expected_commit, "game_day.source")
+    if report.get("schema_version") != 1:
+        raise QualificationError("human game-day schema version is unsupported")
+    if (
+        report.get("qualification_class")
+        != "exact_release_candidate_human_game_day"
+    ):
+        raise QualificationError("human game-day classification is unsupported")
+    if (
+        report.get("proof_scope")
+        != "human_runbook_execution_and_independent_review"
+    ):
+        raise QualificationError("human game-day proof scope is unsupported")
+    if report.get("release_candidate") != release_candidate:
+        raise QualificationError("human game-day release candidate does not match")
+    environment = _object(report.get("environment"), "game_day.environment")
+    if environment.get("environment_id") != expected_environment:
+        raise QualificationError("human game-day environment does not match target")
+    if environment.get("deployment_mode") != "single-node":
+        raise QualificationError("human game-day deployment mode is unsupported")
+    if environment.get("os") != "linux":
+        raise QualificationError("human game-day operating system is unsupported")
+    if environment.get("arch") not in {"x86_64", "aarch64"}:
+        raise QualificationError("human game-day architecture is unsupported")
+    configuration_sha = environment.get("configuration_sha256")
+    if not isinstance(configuration_sha, str) or not SHA256_RE.fullmatch(
+        configuration_sha
+    ):
+        raise QualificationError("human game-day configuration digest is invalid")
+
+    exercise = _object(report.get("exercise"), "game_day.exercise")
+    duration = _number(
+        exercise.get("duration_seconds"),
+        "game_day.exercise.duration_seconds",
+    )
+    participant_count = _integer(
+        exercise.get("participant_count"),
+        "game_day.exercise.participant_count",
+    )
+    participant_roles = exercise.get("participant_roles")
+    roles_valid = (
+        isinstance(participant_roles, list)
+        and all(
+            isinstance(role, str) and role and len(role) <= 100
+            for role in participant_roles
+        )
+    )
+    if (
+        duration < 3_600
+        or participant_count < 3
+        or not roles_valid
+        or not GAME_DAY_REQUIRED_PARTICIPANT_ROLES.issubset(
+            set(participant_roles)
+        )
+    ):
+        exercise_valid = False
+    else:
+        exercise_valid = True
+
+    scenarios = report.get("scenarios")
+    if not isinstance(scenarios, list):
+        raise QualificationError("game_day.scenarios must be an array")
+    scenario_ids: list[Any] = []
+    scenario_passes: list[bool] = []
+    for index, scenario_value in enumerate(scenarios):
+        scenario = _object(scenario_value, f"game_day.scenarios[{index}]")
+        scenario_ids.append(scenario.get("scenario_id"))
+        failed_checks = scenario.get("failed_checks")
+        scenario_checks = scenario.get("checks")
+        exact_checks = (
+            isinstance(scenario_checks, dict)
+            and set(scenario_checks) == set(GAME_DAY_SCENARIO_CHECK_IDS)
+            and all(value is True for value in scenario_checks.values())
+        )
+        rto = scenario.get("rto_seconds")
+        target_rto = scenario.get("target_rto_seconds")
+        data_loss = scenario.get("observed_data_loss_seconds")
+        target_rpo = scenario.get("target_rpo_seconds")
+        steps_total = scenario.get("runbook_steps_total")
+        steps_completed = scenario.get("runbook_steps_completed")
+        evidence_sha = scenario.get("evidence_sha256")
+        measurements_valid = (
+            isinstance(rto, (int, float))
+            and not isinstance(rto, bool)
+            and math.isfinite(rto)
+            and rto > 0
+            and isinstance(target_rto, (int, float))
+            and not isinstance(target_rto, bool)
+            and math.isfinite(target_rto)
+            and target_rto > 0
+            and rto <= target_rto
+            and isinstance(data_loss, (int, float))
+            and not isinstance(data_loss, bool)
+            and math.isfinite(data_loss)
+            and data_loss >= 0
+            and isinstance(target_rpo, (int, float))
+            and not isinstance(target_rpo, bool)
+            and math.isfinite(target_rpo)
+            and target_rpo >= 0
+            and data_loss <= target_rpo
+            and isinstance(steps_total, int)
+            and not isinstance(steps_total, bool)
+            and steps_total >= 1
+            and steps_completed == steps_total
+            and scenario.get("unexpected_tenant_accesses") == 0
+            and scenario.get("unresolved_findings") == 0
+            and isinstance(evidence_sha, str)
+            and SHA256_RE.fullmatch(evidence_sha) is not None
+        )
+        scenario_passes.append(
+            scenario.get("passed") is True
+            and isinstance(failed_checks, list)
+            and not failed_checks
+            and exact_checks
+            and measurements_valid
+        )
+    review = _object(report.get("review"), "game_day.review")
+    review_checks = _object(review.get("checks"), "game_day.review.checks")
+    reviewed_checks = _object(
+        review.get("reviewed_checks"), "game_day.review.reviewed_checks"
+    )
+    exact_review_checks = (
+        set(review_checks) == set(GAME_DAY_REVIEW_RESULT_CHECK_IDS)
+        and all(value is True for value in review_checks.values())
+        and set(reviewed_checks) == set(GAME_DAY_REVIEW_CHECK_IDS)
+        and all(value is True for value in reviewed_checks.values())
+    )
+    evidence = _object(report.get("evidence"), "game_day.evidence")
+    evidence_keys = {
+        "observation_sha256",
+        "independent_review_sha256",
+        "review_attestation_sha256",
+    }
+    child_hashes_valid = all(
+        isinstance(evidence.get(key), str)
+        and SHA256_RE.fullmatch(evidence[key]) is not None
+        for key in evidence_keys
+    ) and set(evidence) == evidence_keys
+    checks = [
+        ("exact_report_binding", observed_evidence_sha256 == report_sha256),
+        ("child_report_passed", report.get("passed") is True),
+        (
+            "human_game_day_completed",
+            report.get("human_game_day_completed") is True,
+        ),
+        ("child_proof_eligible", report.get("game_day_proof_eligible") is True),
+        (
+            "child_production_claim_false",
+            report.get("production_claim_allowed") is False,
+        ),
+        ("exercise_requirements_met", exercise_valid),
+        ("exact_scenarios_present", tuple(scenario_ids) == INCIDENT_SCENARIO_IDS),
+        ("every_scenario_passed", bool(scenarios) and all(scenario_passes)),
+        (
+            "independent_review_passed",
+            review.get("passed") is True
+            and review.get("reviewer_independent") is True
+            and review.get("decision") == "approved"
+            and review.get("open_finding_count") == 0
+            and exact_review_checks,
+        ),
+        ("child_evidence_hashes_valid", child_hashes_valid),
+        (
+            "zero_child_blockers",
+            report.get("failed_scenarios") == []
+            and report.get("eligibility_blockers") == [],
+        ),
+    ]
+    failed = [check_id for check_id, passed in checks if not passed]
+    return {
+        "passed": not failed,
+        "failed_checks": failed,
+        "scenario_count": len(scenarios),
+        "report_sha256": report_sha256,
+    }
+
+
 def evaluate(
     observation_path: Path,
     soak_path: Path,
     incident_path: Path,
+    game_day_path: Path,
     *,
     expected_commit: str,
     expected_environment: str,
@@ -871,11 +1085,25 @@ def evaluate(
     observation, observation_sha = _load_json(observation_path, "observation")
     soak, soak_sha = _load_json(soak_path, "resource soak")
     incident, incident_sha = _load_json(incident_path, "incident drill")
+    game_day, game_day_sha = _load_json(game_day_path, "human game day")
     metadata, targets = _validate_observation(
         observation, expected_commit, expected_environment, release_candidate
     )
     soak_result = _validate_soak(soak, expected_commit, expected_environment)
     incident_result = _validate_incident(incident, expected_commit)
+    tenant_isolation = next(
+        target for target in targets if target["target_id"] == "tenant_isolation"
+    )
+    game_day_result = _validate_game_day(
+        game_day,
+        expected_commit,
+        expected_environment,
+        release_candidate,
+        report_sha256=game_day_sha,
+        observed_evidence_sha256=tenant_isolation["observed"][
+            "game_day_evidence_sha256"
+        ],
+    )
 
     failed_targets = [
         result["target_id"] for result in targets if result["passed"] is not True
@@ -889,6 +1117,10 @@ def evaluate(
     eligibility_blockers.extend(
         f"incident_drill.{check_id}"
         for check_id in incident_result["failed_checks"]
+    )
+    eligibility_blockers.extend(
+        f"human_game_day.{check_id}"
+        for check_id in game_day_result["failed_checks"]
     )
     eligible = not eligibility_blockers
     return {
@@ -908,12 +1140,14 @@ def evaluate(
             "observation_sha256": observation_sha,
             "resource_soak_sha256": soak_sha,
             "incident_drill_sha256": incident_sha,
+            "human_game_day_sha256": game_day_sha,
             "same_clean_source_commit": True,
             "same_target_environment": True,
         },
         "prerequisites": {
             "resource_soak": soak_result,
             "incident_drill": incident_result,
+            "human_game_day": game_day_result,
         },
         "targets": targets,
         "failed_targets": failed_targets,
@@ -951,6 +1185,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--observation", type=Path)
     parser.add_argument("--resource-soak", type=Path)
     parser.add_argument("--incident-drill", type=Path)
+    parser.add_argument("--game-day", type=Path)
     parser.add_argument("--expected-commit")
     parser.add_argument("--expected-environment")
     parser.add_argument("--release-candidate")
@@ -964,6 +1199,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 args.observation,
                 args.resource_soak,
                 args.incident_drill,
+                args.game_day,
                 args.expected_commit,
                 args.expected_environment,
                 args.release_candidate,
@@ -980,6 +1216,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             "--observation": args.observation,
             "--resource-soak": args.resource_soak,
             "--incident-drill": args.incident_drill,
+            "--game-day": args.game_day,
             "--expected-commit": args.expected_commit,
             "--expected-environment": args.expected_environment,
             "--release-candidate": args.release_candidate,
@@ -992,6 +1229,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             args.observation,
             args.resource_soak,
             args.incident_drill,
+            args.game_day,
             expected_commit=args.expected_commit,
             expected_environment=args.expected_environment,
             release_candidate=args.release_candidate,

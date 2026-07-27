@@ -8,7 +8,7 @@ commit, or mixed environment into production evidence.
 
 ## Required evidence drop
 
-The protected `agentos-capacity` runner reads three regular, non-symlink JSON
+The protected `agentos-capacity` runner reads four regular, non-symlink JSON
 files from the fixed directory configured by the
 `AGENTOS_SLO_EVIDENCE_DIR` repository environment variable:
 
@@ -17,6 +17,7 @@ files from the fixed directory configured by the
 | `slo-observation.json` | Export from the intended target deployment for the exact release-candidate commit |
 | `resource-soak.json` | Eligible 24-hour `target_resource_soak` report for the same commit and environment |
 | `incident-drill.json` | Passing automated incident-control report for the same clean commit |
+| `game-day.json` | Eligible bounded human game-day report for the same exact release candidate, clean commit, and environment |
 
 The workflow never uploads these raw files. It retains only the bounded
 calculated report and their SHA-256 digests. Keep the raw evidence in the
@@ -65,7 +66,7 @@ finite, timestamps must be UTC, and each claimed sub-window must fit inside the
 | `auth_sandbox_denial` | `adversarial_attempts`, `unexpected_allows` | at least 100 attempts, zero unexpected allows |
 | `data_durability` | healthy/unhealthy ledger seconds, verified-backup age, restore result | 30 healthy days, zero unhealthy seconds, backup no older than 25h, restore passes |
 | `checkpoint_recovery` | `attempted`, `recovered`, `safe_rejected`, cross-tenant recoveries | at least 100 fully accounted attempts, zero cross-tenant recovery |
-| `tenant_isolation` | adversarial attempts, confirmed violations, game-day result and evidence SHA-256 | at least 100 attempts, zero violations, game day completed with bound evidence |
+| `tenant_isolation` | adversarial attempts, confirmed violations, game-day result and evidence SHA-256 | at least 100 attempts, zero violations, eligible independently reviewed game day with an exact report-hash binding |
 
 Policy and quota rejections are recorded but excluded from LLM/tool success
 denominators. Every alert firing must be listed with its bounded name, severity,
@@ -85,6 +86,7 @@ python3 scripts/release_slo_qualification.py \
   --observation /controlled/evidence/slo-observation.json \
   --resource-soak /controlled/evidence/resource-soak.json \
   --incident-drill /controlled/evidence/incident-drill.json \
+  --game-day /controlled/evidence/game-day.json \
   --expected-commit 0123456789abcdef0123456789abcdef01234567 \
   --expected-environment staging-x64-8cpu-32g \
   --release-candidate v1.0.0-rc.1 \
@@ -96,6 +98,12 @@ The output sets `report_generated: true` whenever all input schemas are valid.
 Target failures produce a report with `release_slo_proof_eligible: false` and
 named blockers; `--require-eligible` then exits non-zero. Malformed or
 misclassified evidence fails before a report can be trusted.
+
+The human game-day prerequisite is independently rechecked for its exact
+scenario inventory, one-hour minimum and staffed roles, RPO/RTO and runbook
+measurements, tenant-boundary outcomes, separate approved review, child
+evidence hashes, and zero findings. See
+[Human incident game-day qualification](GAME_DAY_QUALIFICATION.md).
 
 Even an eligible SLO report keeps `production_claim_allowed: false`. Release
 publication, supported-platform gates, external Alertmanager delivery, security

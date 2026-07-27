@@ -288,6 +288,10 @@ Even a passing artifact has
 `human_game_day_completed = false`, `game_day_proof_eligible = false`, and
 `production_claim_allowed = false`. It does not prove alerts reached an
 operator, roles were staffed, decisions and communications were correct, or
-RPO/RTO targets were met. Issue #125's game-day proof remains open until people
-exercise an exact release candidate on the target deployment, retain a UTC
-timeline and artifacts, remediate findings, and obtain independent sign-off.
+RPO/RTO targets were met. The
+[human game-day qualification](GAME_DAY_QUALIFICATION.md) now defines and
+validates that protected evidence, including exact-RC/environment binding,
+staffed roles, UTC timelines, recalculated outcomes, and a separate review.
+Issue #125's game-day proof remains open until people actually run that gate on
+the target deployment and retain an eligible artifact; the checked-in
+validator does not claim that exercise has happened.

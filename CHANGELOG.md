@@ -10,6 +10,15 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
 
 ## [Unreleased]
 
+- Added a fail-closed human incident game-day evidence contract under #125.
+  The protected workflow validates a one-hour staffed exercise for all six
+  runbooks against one exact release candidate and target environment,
+  recalculates RPO/RTO, runbook, finding, and tenant-boundary outcomes, and
+  requires a separate reviewer bound to the exact raw observation. Only a
+  bounded hash-linked report is retained. Release-SLO qualification now
+  requires and independently checks that exact report instead of trusting a
+  `game_day_completed` flag. The tooling is regression-tested; a real target
+  game day and eligible artifact have not yet been run.
 - Added operator-triggered immutable remote backup publication and recovery
   under #123. `agentctl` now streams an independently signed and anchor-bound
   backup to an S3-compatible bucket using SigV4, requires server-reported

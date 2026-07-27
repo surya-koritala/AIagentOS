@@ -767,10 +767,10 @@ pub const NON_SQLITE_DATA_INVENTORY: &[StaticDataInventoryEntry] = &[
         "recovery operator",
         "same mixed tenancy as database snapshot",
         "contains all database sensitivity classes",
-        "external object-store lifecycle policy",
-        "external encryption policy; signed manifest may prove authenticity",
+        "operator object-store lifecycle policy; CLI publication requires versioned COMPLIANCE retention",
+        "source SQLCipher policy plus TLS; independently trusted signed manifest proves authenticity",
         "external disaster-recovery copy",
-        "external lifecycle/deletion policy; not erased locally"
+        "external lifecycle/deletion policy; exact-version receipt supports recovery but copies are not erased locally"
     ),
     boundary_entry!(
         "external/log-metric-and-trace-sinks",

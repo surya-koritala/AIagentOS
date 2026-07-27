@@ -21,7 +21,7 @@ uuid = { workspace = true }
 chrono = { workspace = true }
 tracing = { workspace = true }
 wasmtime = { workspace = true }
-tokio-util = { workspace = true }
+tokio-util = { workspace = true, features = ["io"] }
 rusqlite = { workspace = true }
 toml = { workspace = true }
 dirs = { workspace = true }
@@ -31,6 +31,7 @@ libc = "0.2"
 tokio-rustls = { workspace = true }
 rustls = { workspace = true }
 ring = { workspace = true }
+base64 = { workspace = true }
 zeroize = { workspace = true }
 cap-std = { workspace = true }
 semver = { workspace = true }
@@ -44,3 +45,4 @@ windows-sys = { version = "0.61", features = [
 [dev-dependencies]
 proptest = { workspace = true }
 rcgen = { workspace = true }
+wiremock = { workspace = true }

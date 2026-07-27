@@ -82,7 +82,7 @@ jobs:
       - name: Prove binaries are byte-for-byte reproducible
         run: |
           reproducible=1
-          for binary in agent agent-server agent-tui; do
+          for binary in agent agent-server agent-tui agentctl; do
             first="target-a/${{ matrix.target }}/release/${binary}${{ matrix.extension }}"
             second="target-b/${{ matrix.target }}/release/${binary}${{ matrix.extension }}"
             if ! cmp -s "$first" "$second"; then
@@ -96,7 +96,7 @@ jobs:
       - name: Create deterministic archive
         run: |
           mkdir -p dist/stage
-          for binary in agent agent-server agent-tui; do
+          for binary in agent agent-server agent-tui agentctl; do
             cp "target-a/${{ matrix.target }}/release/${binary}${{ matrix.extension }}" dist/stage/
           done
           artifact="agentos-${ARTIFACT_VERSION}-${{ matrix.target }}.zip"

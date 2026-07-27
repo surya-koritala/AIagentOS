@@ -7,7 +7,7 @@ use agent_cli::OperatorClient;
 fn usage() -> ! {
     eprintln!(
         "usage: agentctl [--addr HOST:PORT] [--token TOKEN] \
-         <list|inspect|pressure|tunables|tunable-set|tunable-rollback|tunable-history|status|pause|resume|stop|kill|wait|services|service-start|service-stop|service-restart|service-reload|service-history|backup-create|backup-retention|backup-status|data-inventory|backup-key-generate|backup-anchor-create|backup-verify|backup-restore|backup-disaster-recover|backup-corruption-recover|storage-key-generate|storage-encrypt|storage-encrypt-recover|storage-key-rotate|storage-portable-export|storage-portable-verify|storage-portable-import|erase-agent|erase-user|erase-tenant> [ARGS...]\n\
+         <list|inspect|pressure|tunables|tunable-set|tunable-rollback|tunable-history|status|pause|resume|stop|kill|wait|services|service-start|service-stop|service-restart|service-reload|service-history|backup-create|backup-retention|backup-status|data-inventory|backup-key-generate|backup-anchor-create|backup-verify|backup-restore|backup-disaster-recover|backup-corruption-recover|backup-remote-publish|backup-remote-fetch|storage-key-generate|storage-encrypt|storage-encrypt-recover|storage-key-rotate|storage-portable-export|storage-portable-verify|storage-portable-import|erase-agent|erase-user|erase-tenant> [ARGS...]\n\
          \n\
          storage commands:\n\
            agentctl [SERVER OPTIONS] backup-create BACKUP_ROOT NAME\n\
@@ -20,6 +20,8 @@ fn usage() -> ! {
            agentctl backup-restore BACKUP_DIR DATABASE [--storage-key KEY_FILE] [--require-signature PUBLIC_TRUST_FILE] [--require-anchor ANCHOR_FILE] --confirm-offline\n\
            agentctl backup-disaster-recover BACKUP_DIR CONFIG_FILE PUBLIC_TRUST_FILE ANCHOR_FILE --confirm-offline\n\
            agentctl backup-corruption-recover BACKUP_DIR CONFIG_FILE PUBLIC_TRUST_FILE ANCHOR_FILE EXPECTED_INSTALLATION_ID --confirm-offline\n\
+           agentctl backup-remote-publish BACKUP_DIR PUBLIC_TRUST_FILE ANCHOR_FILE ENDPOINT BUCKET PREFIX RETAIN_UNTIL [--region REGION] [--storage-key KEY_FILE] [--allow-loopback-http] --confirm-compliance-lock\n\
+           agentctl backup-remote-fetch ENDPOINT BUCKET PREFIX PUBLICATION_REPORT DEST_BACKUP_DIR PUBLIC_TRUST_FILE ANCHOR_FILE [--region REGION] [--storage-key KEY_FILE] [--allow-loopback-http]\n\
            agentctl storage-key-generate KEY_ID KEY_FILE\n\
            agentctl storage-encrypt DATABASE KEY_FILE --confirm-offline\n\
            agentctl storage-encrypt-recover DATABASE KEY_FILE --confirm-offline\n\
@@ -40,6 +42,59 @@ struct BackupFileOptions {
     trust_root: Option<String>,
     recovery_anchor: Option<String>,
     confirmed_offline: bool,
+}
+
+struct RemoteBackupOptions {
+    region: String,
+    storage_key: Option<String>,
+    allow_loopback_http: bool,
+    confirmed_compliance_lock: bool,
+}
+
+impl Default for RemoteBackupOptions {
+    fn default() -> Self {
+        Self {
+            region: std::env::var("AWS_REGION")
+                .or_else(|_| std::env::var("AWS_DEFAULT_REGION"))
+                .unwrap_or_else(|_| "us-east-1".into()),
+            storage_key: None,
+            allow_loopback_http: false,
+            confirmed_compliance_lock: false,
+        }
+    }
+}
+
+fn parse_remote_backup_options(
+    values: impl IntoIterator<Item = String>,
+    compliance_confirmation_required: bool,
+) -> RemoteBackupOptions {
+    let mut values = values.into_iter();
+    let mut parsed = RemoteBackupOptions::default();
+    let mut region_set = false;
+    while let Some(value) = values.next() {
+        match value.as_str() {
+            "--region" if !region_set => {
+                parsed.region = values.next().unwrap_or_else(|| usage());
+                region_set = true;
+            }
+            "--storage-key" if parsed.storage_key.is_none() => {
+                parsed.storage_key = Some(values.next().unwrap_or_else(|| usage()));
+            }
+            "--allow-loopback-http" if !parsed.allow_loopback_http => {
+                parsed.allow_loopback_http = true;
+            }
+            "--confirm-compliance-lock"
+                if compliance_confirmation_required && !parsed.confirmed_compliance_lock =>
+            {
+                parsed.confirmed_compliance_lock = true;
+            }
+            _ => usage(),
+        }
+    }
+    if compliance_confirmation_required && !parsed.confirmed_compliance_lock {
+        usage();
+    }
+    parsed
 }
 
 fn parse_backup_file_options(
@@ -350,6 +405,105 @@ async fn main() {
             )
             .unwrap_or_else(|error| fail_storage(error));
             print_json(&report, "corrupt storage recovery report");
+            return;
+        }
+        "backup-remote-publish" => {
+            let backup_dir = args.next().unwrap_or_else(|| usage());
+            let public_trust = args.next().unwrap_or_else(|| usage());
+            let anchor_file = args.next().unwrap_or_else(|| usage());
+            let endpoint = args.next().unwrap_or_else(|| usage());
+            let bucket = args.next().unwrap_or_else(|| usage());
+            let prefix = args.next().unwrap_or_else(|| usage());
+            let retain_until = args.next().unwrap_or_else(|| usage());
+            let options = parse_remote_backup_options(args.collect::<Vec<_>>(), true);
+            let retain_until = chrono::DateTime::parse_from_rfc3339(&retain_until)
+                .map(|value| value.with_timezone(&chrono::Utc))
+                .unwrap_or_else(|error| {
+                    fail_operator(format!(
+                        "RETAIN_UNTIL must be an RFC3339 timestamp: {error}"
+                    ))
+                });
+            let storage_key = options.storage_key.as_deref().map(|path| {
+                kernel::storage_encryption::load_storage_encryption_key(std::path::Path::new(path))
+                    .unwrap_or_else(|error| fail_storage(error))
+            });
+            let trust =
+                kernel::storage::load_backup_trust_root(std::path::Path::new(&public_trust))
+                    .unwrap_or_else(|error| fail_storage(error));
+            let anchor = kernel::storage::load_independent_backup_recovery_anchor(
+                std::path::Path::new(&backup_dir),
+                std::path::Path::new(&anchor_file),
+            )
+            .unwrap_or_else(|error| fail_storage(error));
+            let config = kernel::remote_backup::RemoteBackupConfig::new(
+                &endpoint,
+                &bucket,
+                &prefix,
+                &options.region,
+                options.allow_loopback_http,
+            )
+            .unwrap_or_else(|error| fail_storage(error));
+            let credentials = kernel::remote_backup::S3Credentials::from_env()
+                .unwrap_or_else(|error| fail_storage(error));
+            let report = kernel::remote_backup::publish_remote_backup(
+                std::path::Path::new(&backup_dir),
+                storage_key.as_ref(),
+                &trust,
+                &anchor,
+                &config,
+                &credentials,
+                retain_until,
+            )
+            .await
+            .unwrap_or_else(|error| fail_storage(error));
+            print_json(&report, "remote backup publication report");
+            return;
+        }
+        "backup-remote-fetch" => {
+            let endpoint = args.next().unwrap_or_else(|| usage());
+            let bucket = args.next().unwrap_or_else(|| usage());
+            let prefix = args.next().unwrap_or_else(|| usage());
+            let publication_report = args.next().unwrap_or_else(|| usage());
+            let destination = args.next().unwrap_or_else(|| usage());
+            let public_trust = args.next().unwrap_or_else(|| usage());
+            let anchor_file = args.next().unwrap_or_else(|| usage());
+            let options = parse_remote_backup_options(args.collect::<Vec<_>>(), false);
+            let storage_key = options.storage_key.as_deref().map(|path| {
+                kernel::storage_encryption::load_storage_encryption_key(std::path::Path::new(path))
+                    .unwrap_or_else(|error| fail_storage(error))
+            });
+            let trust =
+                kernel::storage::load_backup_trust_root(std::path::Path::new(&public_trust))
+                    .unwrap_or_else(|error| fail_storage(error));
+            let anchor =
+                kernel::storage::load_backup_recovery_anchor(std::path::Path::new(&anchor_file))
+                    .unwrap_or_else(|error| fail_storage(error));
+            let publication = kernel::remote_backup::load_remote_backup_publication_report(
+                std::path::Path::new(&publication_report),
+            )
+            .unwrap_or_else(|error| fail_storage(error));
+            let config = kernel::remote_backup::RemoteBackupConfig::new(
+                &endpoint,
+                &bucket,
+                &prefix,
+                &options.region,
+                options.allow_loopback_http,
+            )
+            .unwrap_or_else(|error| fail_storage(error));
+            let credentials = kernel::remote_backup::S3Credentials::from_env()
+                .unwrap_or_else(|error| fail_storage(error));
+            let report = kernel::remote_backup::fetch_remote_backup(
+                std::path::Path::new(&destination),
+                storage_key.as_ref(),
+                &trust,
+                &anchor,
+                &publication,
+                &config,
+                &credentials,
+            )
+            .await
+            .unwrap_or_else(|error| fail_storage(error));
+            print_json(&report, "remote backup recovery report");
             return;
         }
         "storage-portable-export" => {

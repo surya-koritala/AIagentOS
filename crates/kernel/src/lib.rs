@@ -56,6 +56,7 @@ pub mod procfs;
 pub mod production;
 pub mod quota_clock;
 pub mod rate_limit;
+pub mod remote_backup;
 pub mod resources;
 pub mod runtime;
 pub mod sandbox;

@@ -1633,17 +1633,6 @@ mod tests {
             (ResourceType::Network, "delete", SecurityAction::Network),
             (ResourceType::Network, "browse", SecurityAction::Network),
             (ResourceType::Application, "launch", SecurityAction::Execute),
-            (ResourceType::Application, "close", SecurityAction::Execute),
-            (
-                ResourceType::Application,
-                "send_input",
-                SecurityAction::Execute,
-            ),
-            (
-                ResourceType::Application,
-                "read_output",
-                SecurityAction::Execute,
-            ),
             (
                 ResourceType::Application,
                 "install",
@@ -1701,22 +1690,6 @@ mod tests {
             (ResourceType::Ipc, "discover", SecurityAction::Ipc),
             (
                 ResourceType::Peripheral,
-                "capture_image",
-                SecurityAction::Read,
-            ),
-            (
-                ResourceType::Peripheral,
-                "record_audio",
-                SecurityAction::Read,
-            ),
-            (
-                ResourceType::Peripheral,
-                "play_audio",
-                SecurityAction::Write,
-            ),
-            (ResourceType::Peripheral, "print", SecurityAction::Write),
-            (
-                ResourceType::Peripheral,
                 "credential",
                 SecurityAction::CredentialAccess,
             ),
@@ -1759,6 +1732,51 @@ mod tests {
             assert!(matches!(
                 ToolRegistry::validate_binding(&mismatched),
                 Err(ToolRegistrationError::ProviderTargetMismatch { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn placeholder_provider_operations_cannot_be_published_as_tools() {
+        for (resource_type, operation, action) in [
+            (ResourceType::Application, "close", SecurityAction::Execute),
+            (
+                ResourceType::Application,
+                "send_input",
+                SecurityAction::Execute,
+            ),
+            (
+                ResourceType::Application,
+                "read_output",
+                SecurityAction::Execute,
+            ),
+            (
+                ResourceType::Peripheral,
+                "capture_image",
+                SecurityAction::Read,
+            ),
+            (
+                ResourceType::Peripheral,
+                "record_audio",
+                SecurityAction::Read,
+            ),
+            (
+                ResourceType::Peripheral,
+                "play_audio",
+                SecurityAction::Write,
+            ),
+            (ResourceType::Peripheral, "print", SecurityAction::Write),
+        ] {
+            assert!(matches!(
+                ToolRegistry::validate_binding(&operation_binding(
+                    resource_type.clone(),
+                    operation,
+                    action
+                )),
+                Err(ToolRegistrationError::UnsupportedOperation {
+                    resource_type: rejected,
+                    operation: rejected_operation,
+                }) if rejected == resource_type && rejected_operation == operation
             ));
         }
     }

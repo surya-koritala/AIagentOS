@@ -189,7 +189,7 @@ impl PermissionManager {
                     },
                     PermissionRule {
                         resource_type: ResourceType::Application,
-                        operations: vec!["launch".to_string(), "read_output".to_string()],
+                        operations: vec!["launch".to_string()],
                         targets: None,
                         decision: AccessDecision::Allowed,
                     },
@@ -244,12 +244,7 @@ impl PermissionManager {
                     },
                     PermissionRule {
                         resource_type: ResourceType::Application,
-                        operations: vec![
-                            "launch".to_string(),
-                            "close".to_string(),
-                            "send_input".to_string(),
-                            "read_output".to_string(),
-                        ],
+                        operations: vec!["launch".to_string()],
                         targets: None,
                         decision: AccessDecision::Allowed,
                     },
@@ -489,6 +484,26 @@ mod tests {
             mgr.check_access(id, &ResourceType::Filesystem, "write", None),
             AccessDecision::Allowed
         );
+    }
+
+    #[test]
+    fn predefined_profiles_do_not_grant_unavailable_application_operations() {
+        let mgr = PermissionManager::new();
+        for profile in ["standard", "elevated"] {
+            let id = uuid::Uuid::new_v4();
+            mgr.assign_profile(id, &profile.to_string());
+            assert_eq!(
+                mgr.check_access(id, &ResourceType::Application, "launch", Some("example")),
+                AccessDecision::Allowed
+            );
+            for operation in ["close", "send_input", "read_output"] {
+                assert_eq!(
+                    mgr.check_access(id, &ResourceType::Application, operation, Some("example")),
+                    AccessDecision::Denied,
+                    "{profile} must not grant unavailable {operation}"
+                );
+            }
+        }
     }
 
     #[test]

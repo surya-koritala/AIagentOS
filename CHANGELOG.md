@@ -10,6 +10,13 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
 
 ## [Unreleased]
 
+- Added real process-exit fault injection at every statement boundary in the
+  schema-wide agent-erasure transaction under #123. Seventeen child-process
+  crash points now prove that SQLite recovery preserves the canonical contents
+  of every durable table, schema verification, and `quick_check`, followed by a
+  clean retry that commits the deletion and exactly one private receipt. This
+  qualifies agent-erasure transaction atomicity only; user/tenant mutation
+  matrices, power loss, torn writes, and external-system deletion remain open.
 - Added destructive Linux host-filesystem exhaustion qualification under #123.
   A guarded release harness accepts only an explicitly marked 32–128 MiB
   disposable filesystem, fills it to a real host `ENOSPC`, proves the failed

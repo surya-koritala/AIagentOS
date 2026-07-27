@@ -76,37 +76,6 @@ mod tests {
         );
         kernel.register_provider(Arc::new(adapter)).unwrap();
 
-        // Register filesystem provider so read_file actually works
-        use kernel::resources::{ResourceBroker, ResourceProvider, ResourceType};
-        use kernel::ResourceError;
-        struct RealFs;
-        #[async_trait::async_trait]
-        impl ResourceProvider for RealFs {
-            fn resource_type(&self) -> ResourceType {
-                ResourceType::Filesystem
-            }
-            fn supported_operations(&self) -> Vec<String> {
-                vec!["read".into(), "write".into(), "list".into()]
-            }
-            async fn execute(
-                &self,
-                operation: &str,
-                params: &serde_json::Value,
-            ) -> Result<serde_json::Value, ResourceError> {
-                let path = params["path"].as_str().unwrap_or("");
-                match operation {
-                    "read" => {
-                        let content = tokio::fs::read_to_string(path)
-                            .await
-                            .map_err(|e| ResourceError::OperationFailed(e.to_string()))?;
-                        Ok(serde_json::json!({"content": content}))
-                    }
-                    _ => Ok(serde_json::json!({})),
-                }
-            }
-        }
-        kernel.resource_broker.register_provider(Box::new(RealFs));
-
         // Create agent
         let config = AgentConfig {
             name: "test-agent".into(),
@@ -114,9 +83,9 @@ mod tests {
             llm_provider: "azure-openai".into(),
             permission_profile: "full-access".into(), // skip permission checks for test
             priority: Priority::default(),
-            // This test intentionally exercises a host fixture provider. Real
-            // wire/package agents cannot select Trusted; they receive a managed
-            // per-agent workspace by default.
+            // This test intentionally exercises the real built-in filesystem
+            // provider against a host fixture. Real wire/package agents cannot
+            // select Trusted; they receive a managed workspace by default.
             sandbox_config: Some(SandboxConfig {
                 workspace_dir: std::env::temp_dir(),
                 allowed_network_hosts: None,

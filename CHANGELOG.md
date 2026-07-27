@@ -10,6 +10,19 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
 
 ## [Unreleased]
 
+- Isolated resource-provider execution under #124. Generic provider operations
+  now run in kernel-owned tasks with a cooperative cancellation token, a
+  five-second drain window, forced-abort fallback, and admission-permit
+  ownership that lasts until provider cleanup completes. Provider panics and
+  panicking metadata are contained behind redacted errors instead of unwinding
+  the kernel path, while cancellation of the broker future drains the provider
+  rather than detaching its task. Runtime registration now refuses to replace
+  an existing resource class; changing a built-in provider requires a reviewed
+  restart/configuration change. Regressions prove panic containment, permit
+  recovery, cancellation cleanup, process-tree cleanup, and replacement
+  refusal. This contract does not make unaudited third-party detached side
+  effects trustworthy, and browser/peripheral production qualification remains
+  open.
 - Added deterministic bounded-memory evidence for backpressure under #125.
   Delayed-provider overload and slow-client saturation now run in four
   independent waves, retain baseline/peak/settled process RSS observations,

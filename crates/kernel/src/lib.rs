@@ -1625,9 +1625,15 @@ impl AgentKernelImpl {
         ));
 
         // Register built-in resource providers
-        resource_broker.register_provider(Box::new(BuiltinFilesystemProvider));
-        resource_broker.register_provider(Box::new(BuiltinNetworkProvider));
-        resource_broker.register_provider(Box::new(BuiltinAppProvider));
+        resource_broker
+            .register_provider(Box::new(BuiltinFilesystemProvider))
+            .expect("built-in filesystem provider registration must be unique");
+        resource_broker
+            .register_provider(Box::new(BuiltinNetworkProvider))
+            .expect("built-in network provider registration must be unique");
+        resource_broker
+            .register_provider(Box::new(BuiltinAppProvider))
+            .expect("built-in application provider registration must be unique");
 
         let cgroups = Arc::new(CgroupManager::new());
         let syscall_gate = Arc::new(SyscallGate::with_mac(
@@ -1671,11 +1677,13 @@ impl AgentKernelImpl {
         // Route the Ipc resource type to the kernel's IpcManager (messaging +
         // delegation) and give it the agent directory for discovery / name
         // resolution, all through the broker.
-        resource_broker.register_provider(Box::new(IpcResourceProvider {
-            ipc: ipc.clone(),
-            gate: syscall_gate.clone(),
-            agents: agent_manager.clone(),
-        }));
+        resource_broker
+            .register_provider(Box::new(IpcResourceProvider {
+                ipc: ipc.clone(),
+                gate: syscall_gate.clone(),
+                agents: agent_manager.clone(),
+            }))
+            .expect("built-in IPC provider registration must be unique");
 
         // Register the full default toolset on the shared registry: built-ins
         // (registered in `ToolRegistry::new`) plus the advanced (browse_url),

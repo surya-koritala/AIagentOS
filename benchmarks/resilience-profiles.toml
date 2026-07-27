@@ -6,11 +6,15 @@ operations = 12
 max_concurrent = 2
 max_waiting = 4
 provider_delay_ms = 250
+memory_waves = 4
+max_rss_growth_bytes = 67108864
 
 [slow_clients]
 connection_limit = 4
 excess_connections = 8
 idle_timeout_ms = 250
+memory_waves = 4
+max_rss_growth_bytes = 67108864
 
 [provider_outage]
 operations = 8

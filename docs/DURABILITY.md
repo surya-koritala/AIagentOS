@@ -754,10 +754,10 @@ write failure as a transaction failure instead of committing an unindexed
 conversation.
 
 This matrix proves process-termination atomicity for those context workflows.
-The quota/accounting matrix below extends that coverage further. These matrices
-do not yet qualify package-registry or cluster-control multi-table
-transactions, interruption inside external side effects, host power loss,
-torn writes, or device loss.
+The quota/accounting and package-registry matrices below extend that coverage
+further. These matrices do not yet qualify cluster-control multi-table
+transactions, interruption inside external side effects, host power loss, torn
+writes, or device loss.
 
 A fourth file-backed matrix qualifies 37 statement boundaries across six
 multi-table quota/accounting workflows: hierarchical request/token reservation,
@@ -774,8 +774,30 @@ the canonical fingerprint of every durable table must equal the pre-operation
 baseline. A clean retry must then commit the complete logical operation and
 pass cross-receipt/aggregate validation. This proves process-termination
 atomicity for these quota/accounting workflows. It does not yet qualify the
-package-registry or cluster-control multi-table transactions, host power loss,
-torn writes, or device loss.
+cluster-control multi-table transactions, host power loss, torn writes, or
+device loss.
+
+A fifth file-backed matrix qualifies 29 statement boundaries across nine
+multi-table package-registry workflows: initial trust, trust supersession,
+revocation, artifact publication, artifact yanking, dependency installation,
+dependency upgrade, rollback, and removal. It covers trust and artifact state,
+installation snapshots and current locks, the append-only transparency hash
+chain, and terminal security audit records. The dependency fixtures mutate two
+packages in one transaction, so the looped history and installation writes are
+also part of the checked inventory.
+
+Package request admission intentionally updates `package_rate_limits` in a
+separate committed transaction before archive parsing or the semantic
+transaction. This is required so malformed and rejected requests still consume
+rate capacity. After every forced process exit, the regression therefore proves
+that exactly one rate admission remains while every transaction-owned package
+table has its exact pre-operation fingerprint. A clean retry must execute the
+inventory-checked number of writes, publish the complete terminal state, verify
+every link and digest in the transparency chain, pass schema verification, and
+pass `quick_check`. This qualifies process-termination atomicity for the
+package-registry transactions; it does not qualify cluster-control
+transactions, external package-repository side effects, host power loss, torn
+writes, or device loss.
 
 The following remain open under issue #123:
 
@@ -787,6 +809,6 @@ The following remain open under issue #123:
   filesystem, and extended crash qualification beyond the disposable ext4
   `ENOSPC` run, deterministic interrupted-encryption recovery, and the
   erasure transaction/coordinator and context-mutation matrices covered above;
-- process-exit statement-boundary matrices for the remaining package-registry
-  and cluster-control multi-table transactions;
+- process-exit statement-boundary matrices for the remaining cluster-control
+  multi-table transactions;
 - measured RPO/RTO on supported deployment profiles.

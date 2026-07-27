@@ -10,6 +10,14 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
 
 ## [Unreleased]
 
+- Added destructive Linux host-filesystem exhaustion qualification under #123.
+  A guarded release harness accepts only an explicitly marked 32–128 MiB
+  disposable filesystem, fills it to a real host `ENOSPC`, proves the failed
+  SQLite mutation rolls back without losing the prior commit, restores
+  capacity, retries, runs `quick_check`, and reopens with the exact expected
+  state. An exact-commit workflow retains the bounded report. The artifact
+  explicitly does not prove power-loss, torn-write, device-loss, remote-store,
+  or every deployment-filesystem behavior.
 - Added a fail-closed exact-release-candidate SLO report under #125. A strict
   evaluator recalculates all nine documented SLOs from raw target counts and
   measurements, enforces 24-hour/30-day windows and minimum proof volumes, and

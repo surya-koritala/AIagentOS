@@ -426,8 +426,9 @@ tenant-contention, signed-package, and restart workload suite. Fixture results
 are always labeled non-publishable until an exact release candidate is run on
 the intended deployment and completes the remaining #125 proof.
 The [resilience qualification guide](docs/RESILIENCE_QUALIFICATION.md) covers
-turn overload, slow clients, provider outage, and an exact-request cancellation
-storm, including the explicit `max_waiting_turns` admission limit.
+turn overload, slow clients, provider outage, exact-request cancellation
+storms, disk-full rollback, prolonged database locks, and provider-network
+partition recovery, including the explicit `max_waiting_turns` admission limit.
 The [resource and leak soak guide](docs/SOAK_QUALIFICATION.md) defines the
 separate 24-hour target-host run, retained process/SQLite/admission samples,
 proof eligibility, and the exact work that remains after the harness exists.

@@ -510,6 +510,70 @@ mod tests {
             "startup reconciliation must remove crash-orphaned sandboxes"
         );
 
+        if let Ok(evidence_path) = std::env::var("AGENTOS_SANDBOX_EVIDENCE_PATH") {
+            let evidence_path = std::path::PathBuf::from(evidence_path);
+            let source_commit = std::env::var("GITHUB_SHA")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+                .or_else(|| {
+                    std::process::Command::new("git")
+                        .args(["rev-parse", "HEAD"])
+                        .output()
+                        .ok()
+                        .filter(|output| output.status.success())
+                        .and_then(|output| String::from_utf8(output.stdout).ok())
+                        .map(|output| output.trim().to_string())
+                })
+                .expect("sandbox evidence requires an exact source commit");
+            let source_dirty = std::process::Command::new("git")
+                .args(["status", "--porcelain"])
+                .output()
+                .ok()
+                .filter(|output| output.status.success())
+                .map(|output| !output.stdout.is_empty())
+                .expect("sandbox evidence requires a readable Git worktree");
+            let evidence = serde_json::json!({
+                "schema_version": 1,
+                "suite": "agentos-v1-live-rootless-sandbox",
+                "generated_at": chrono::Utc::now().to_rfc3339(),
+                "qualification_class": "live_rootless_linux_sandbox",
+                "production_claim_allowed": false,
+                "source": {
+                    "commit": source_commit,
+                    "dirty": source_dirty
+                },
+                "environment": {
+                    "operating_system": "linux",
+                    "container_runtime": "rootless-docker",
+                    "image": image
+                },
+                "checks": {
+                    "rootless_daemon_verified": true,
+                    "digest_pinned_image_verified": true,
+                    "zero_effective_capabilities": true,
+                    "no_new_privileges": true,
+                    "read_only_root": true,
+                    "network_denied": true,
+                    "private_workspace_write": true,
+                    "cancellation_cleanup": true,
+                    "crash_orphan_cleanup": true
+                },
+                "passed": true
+            });
+            if let Some(parent) = evidence_path.parent() {
+                std::fs::create_dir_all(parent).expect("create sandbox evidence directory");
+            }
+            std::fs::write(
+                &evidence_path,
+                format!(
+                    "{}\n",
+                    serde_json::to_string_pretty(&evidence)
+                        .expect("serialize sandbox qualification evidence")
+                ),
+            )
+            .expect("write sandbox qualification evidence");
+        }
+
         std::fs::remove_dir_all(workspace).unwrap();
     }
 }

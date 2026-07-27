@@ -21,3 +21,13 @@ max_concurrent = 4
 max_waiting = 16
 start_timeout_ms = 5000
 settle_timeout_ms = 5000
+
+[disk_full]
+payload_bytes = 786432
+
+[database_lock]
+busy_timeout_ms = 7000
+
+[network_partition]
+operations = 1
+recovery_wait_ms = 31000

@@ -43,10 +43,30 @@ jobs:
           docker pull "${QUALIFICATION_IMAGE}"
           echo "AGENTOS_SANDBOX_TEST_IMAGE=${QUALIFICATION_IMAGE}" >> "$GITHUB_ENV"
       - name: Exercise live breakout, cancellation, and crash cleanup
-        run: >-
-          cargo test -p kernel
-          docker_sandbox::tests::live_rootless_container_blocks_escape_and_cleans_cancellation_and_crash
-          --locked -- --ignored --exact --nocapture
+        env:
+          AGENTOS_SANDBOX_EVIDENCE_PATH: target/qualification/rootless-sandbox-crash.json
+        run: |
+          mkdir -p target/qualification
+          cargo test -p kernel \
+            docker_sandbox::tests::live_rootless_container_blocks_escape_and_cleans_cancellation_and_crash \
+            --locked -- --ignored --exact --nocapture
+      - name: Verify exact-source sandbox evidence
+        run: |
+          test "$(jq -r .passed target/qualification/rootless-sandbox-crash.json)" = "true"
+          test "$(jq -r .production_claim_allowed target/qualification/rootless-sandbox-crash.json)" = "false"
+          test "$(jq -r .qualification_class target/qualification/rootless-sandbox-crash.json)" = "live_rootless_linux_sandbox"
+          test "$(jq -r .source.commit target/qualification/rootless-sandbox-crash.json)" = "$GITHUB_SHA"
+          test "$(jq -r .source.dirty target/qualification/rootless-sandbox-crash.json)" = "false"
+          test "$(jq -r .environment.image target/qualification/rootless-sandbox-crash.json)" = "$AGENTOS_SANDBOX_TEST_IMAGE"
+          test "$(jq '[.checks[] | select(. == true)] | length' target/qualification/rootless-sandbox-crash.json)" = "9"
+      - name: Retain rootless sandbox qualification evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: rootless-sandbox-crash-${{ github.sha }}
+          path: target/qualification/rootless-sandbox-crash.json
+          if-no-files-found: error
+          retention-days: 90
 
   miri:
     name: Miri (unsafe/concurrency smoke)

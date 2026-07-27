@@ -880,6 +880,52 @@ impl SqliteContextManager {
         Self::open_file(db_path, true, None, Vec::new())
     }
 
+    /// Exhaust the live SQLite connection's page budget for the checked-in
+    /// resilience qualification. This seam is absent from normal kernel builds
+    /// and deliberately operates on the same connection used by public storage
+    /// syscalls, avoiding a mock or a second-connection approximation.
+    #[cfg(feature = "qualification")]
+    pub fn qualification_exhaust_storage(&self) -> Result<(i64, i64), ContextError> {
+        let connection = self.conn.lock().map_err(|error| {
+            ContextError::StorageError(format!("lock qualification database: {error}"))
+        })?;
+        connection
+            .execute_batch("VACUUM; PRAGMA wal_checkpoint(TRUNCATE);")
+            .map_err(|error| {
+                ContextError::StorageError(format!(
+                    "prepare storage exhaustion qualification: {error}"
+                ))
+            })?;
+        let page_count: i64 = connection
+            .pragma_query_value(None, "page_count", |row| row.get(0))
+            .map_err(|error| ContextError::StorageError(error.to_string()))?;
+        let free_pages: i64 = connection
+            .pragma_query_value(None, "freelist_count", |row| row.get(0))
+            .map_err(|error| ContextError::StorageError(error.to_string()))?;
+        connection
+            .pragma_update(None, "max_page_count", page_count)
+            .map_err(|error| {
+                ContextError::StorageError(format!("set storage exhaustion page limit: {error}"))
+            })?;
+        Ok((page_count, free_pages))
+    }
+
+    /// Restore SQLite's supported maximum after
+    /// [`qualification_exhaust_storage`](Self::qualification_exhaust_storage).
+    #[cfg(feature = "qualification")]
+    pub fn qualification_restore_storage_capacity(&self) -> Result<(), ContextError> {
+        let connection = self.conn.lock().map_err(|error| {
+            ContextError::StorageError(format!("lock qualification database: {error}"))
+        })?;
+        connection
+            .pragma_update(None, "max_page_count", 2_147_483_646_i64)
+            .map_err(|error| {
+                ContextError::StorageError(format!(
+                    "restore qualification database capacity: {error}"
+                ))
+            })
+    }
+
     /// Create a manager for a SQLCipher-encrypted database.
     pub fn new_encrypted(
         db_path: &Path,

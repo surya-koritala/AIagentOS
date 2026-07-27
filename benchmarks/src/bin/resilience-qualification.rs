@@ -24,15 +24,20 @@ use kernel::metrics::MetricsSnapshot;
 use kernel::syscall_server::{SyscallServer, WireConnectionSnapshot};
 use kernel::{AgentKernelImpl, ConnectorError, ProviderId};
 use serde::{Deserialize, Serialize};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpListener;
 use tokio::sync::Barrier;
 use tokio::task::{JoinHandle, JoinSet};
 
 const DEFAULT_CONFIG: &str = include_str!("../../resilience-profiles.toml");
-const SCENARIOS: [&str; 4] = [
+const SCENARIOS: [&str; 7] = [
     "turn-overload",
     "slow-clients",
     "provider-outage",
     "cancellation-storm",
+    "disk-full",
+    "database-lock",
+    "network-partition",
 ];
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -44,6 +49,9 @@ struct SuiteConfig {
     slow_clients: SlowClientsConfig,
     provider_outage: ProviderOutageConfig,
     cancellation_storm: CancellationStormConfig,
+    disk_full: DiskFullConfig,
+    database_lock: DatabaseLockConfig,
+    network_partition: NetworkPartitionConfig,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -77,6 +85,25 @@ struct CancellationStormConfig {
     max_waiting: u32,
     start_timeout_ms: u64,
     settle_timeout_ms: u64,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct DiskFullConfig {
+    payload_bytes: usize,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct DatabaseLockConfig {
+    busy_timeout_ms: u64,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct NetworkPartitionConfig {
+    operations: usize,
+    recovery_wait_ms: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -208,6 +235,22 @@ fn validate_config(config: &SuiteConfig) -> Result<(), String> {
     {
         return Err(
             "cancellation storm requires non-zero operations/timeouts and waiting capacity for every operation"
+                .into(),
+        );
+    }
+    if config.disk_full.payload_bytes < 64 * 1024 || config.disk_full.payload_bytes > 900 * 1024 {
+        return Err("disk full payload_bytes must be between 65536 and 921600".into());
+    }
+    if config.database_lock.busy_timeout_ms < 5_500 || config.database_lock.busy_timeout_ms > 30_000
+    {
+        return Err("database lock busy_timeout_ms must be between 5500 and 30000".into());
+    }
+    if config.network_partition.operations != 1
+        || config.network_partition.recovery_wait_ms < 30_000
+        || config.network_partition.recovery_wait_ms > 60_000
+    {
+        return Err(
+            "network partition requires one operation and a 30000-60000ms circuit recovery wait"
                 .into(),
         );
     }
@@ -508,6 +551,137 @@ impl LlmProviderAdapter for CancellationProvider {
 
     fn translate_from_provider(&self, value: &serde_json::Value) -> Option<StandardMessage> {
         Some(StandardMessage::assistant(value.get("content")?.as_str()?))
+    }
+}
+
+struct NetworkPartitionProvider {
+    id: ProviderId,
+    endpoint: std::net::SocketAddr,
+}
+
+struct NetworkPartitionSession {
+    id: ProviderId,
+    endpoint: std::net::SocketAddr,
+}
+
+#[async_trait::async_trait]
+impl LlmSession for NetworkPartitionSession {
+    async fn send(&self, messages: Vec<StandardMessage>) -> Result<LlmResponse, ConnectorError> {
+        self.send_with_tools(messages, &[]).await
+    }
+
+    async fn send_with_tools(
+        &self,
+        messages: Vec<StandardMessage>,
+        _tools: &[ToolDefinition],
+    ) -> Result<LlmResponse, ConnectorError> {
+        let mut stream = tokio::net::TcpStream::connect(self.endpoint)
+            .await
+            .map_err(|error| {
+                ConnectorError::ConnectionFailed(format!(
+                    "provider network partition connect failed: {error}"
+                ))
+            })?;
+        stream.write_all(b"agentos").await.map_err(|error| {
+            ConnectorError::ConnectionFailed(format!(
+                "provider network partition write failed: {error}"
+            ))
+        })?;
+        let mut response = [0_u8; 2];
+        stream.read_exact(&mut response).await.map_err(|error| {
+            ConnectorError::ConnectionFailed(format!(
+                "provider network partition response failed: {error}"
+            ))
+        })?;
+        if response != *b"ok" {
+            return Err(ConnectorError::ProtocolError(
+                "network fixture returned an invalid provider response".into(),
+            ));
+        }
+        let input = messages
+            .iter()
+            .map(|message| message.content.len().div_ceil(4))
+            .sum::<usize>()
+            .min(u32::MAX as usize) as u32;
+        Ok(LlmResponse {
+            content: "network recovered".into(),
+            finish_reason: Some("stop".into()),
+            tokens_used: input.saturating_add(4),
+            usage: kernel::connector::LlmUsage::reported(input, 4, 0),
+            tool_calls: Vec::new(),
+        })
+    }
+
+    fn provider_id(&self) -> &ProviderId {
+        &self.id
+    }
+
+    fn model_id(&self) -> &str {
+        "loopback-network-partition-v1"
+    }
+
+    fn enforces_max_output_tokens(&self) -> bool {
+        true
+    }
+}
+
+#[async_trait::async_trait]
+impl LlmProviderAdapter for NetworkPartitionProvider {
+    fn id(&self) -> &ProviderId {
+        &self.id
+    }
+
+    fn name(&self) -> &str {
+        "resilience-network-partition-provider"
+    }
+
+    fn provider_type(&self) -> ProviderType {
+        ProviderType::Local
+    }
+
+    async fn is_available(&self) -> bool {
+        true
+    }
+
+    async fn create_session(&self) -> Result<Box<dyn LlmSession>, ConnectorError> {
+        Ok(Box::new(NetworkPartitionSession {
+            id: self.id.clone(),
+            endpoint: self.endpoint,
+        }))
+    }
+
+    fn translate_to_provider(&self, message: &StandardMessage) -> serde_json::Value {
+        serde_json::json!({"role": message.role, "content": message.content})
+    }
+
+    fn translate_from_provider(&self, value: &serde_json::Value) -> Option<StandardMessage> {
+        Some(StandardMessage::assistant(value.get("content")?.as_str()?))
+    }
+}
+
+struct TemporaryState {
+    directory: PathBuf,
+}
+
+impl TemporaryState {
+    fn new(label: &str) -> Result<Self, String> {
+        let directory = std::env::temp_dir().join(format!(
+            "aiagentos-resilience-{label}-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir(&directory)
+            .map_err(|error| format!("create {}: {error}", directory.display()))?;
+        Ok(Self { directory })
+    }
+
+    fn database(&self) -> PathBuf {
+        self.directory.join("agent_os.db")
+    }
+}
+
+impl Drop for TemporaryState {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.directory);
     }
 }
 
@@ -1177,6 +1351,460 @@ async fn cancellation_storm(config: &CancellationStormConfig) -> Result<Scenario
     ))
 }
 
+async fn restart_and_read(
+    database: &Path,
+    agent_id: &str,
+    key: &str,
+) -> Result<Option<String>, String> {
+    let kernel = Arc::new(
+        AgentKernelImpl::with_db_path(database)
+            .map_err(|error| format!("restart kernel: {error}"))?,
+    );
+    let (address, _, task) = start_server(Arc::clone(&kernel), 4, Duration::from_secs(30)).await?;
+    let mut client = KernelClient::connect(address)
+        .await
+        .map_err(|error| format!("restart client: {error}"))?;
+    let value = client
+        .storage_get(agent_id, key)
+        .await
+        .map_err(|error| format!("restart storage read: {error}"))?;
+    client
+        .close()
+        .await
+        .map_err(|error| format!("restart client close: {error}"))?;
+    stop_server(task).await;
+    kernel
+        .shutdown()
+        .await
+        .map_err(|error| format!("restart shutdown: {error}"))?;
+    Ok(value)
+}
+
+async fn disk_full(config: &DiskFullConfig) -> Result<ScenarioResult, String> {
+    let state = TemporaryState::new("disk-full")?;
+    let database = state.database();
+    let kernel = Arc::new(
+        AgentKernelImpl::with_db_path(&database)
+            .map_err(|error| format!("create durable kernel: {error}"))?,
+    );
+    let (address, wire, task) =
+        start_server(Arc::clone(&kernel), 4, Duration::from_secs(30)).await?;
+    let mut client = KernelClient::connect(address)
+        .await
+        .map_err(|error| error.to_string())?;
+    let agent_id = client
+        .create_agent(
+            "disk-full",
+            "public durable storage capacity failure qualification",
+            None,
+            Some("read-only".into()),
+            Some(3),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    client
+        .storage_put(&agent_id, "baseline", "committed-before-disk-full")
+        .await
+        .map_err(|error| error.to_string())?;
+    let (page_count, free_pages) = kernel
+        .context_manager
+        .qualification_exhaust_storage()
+        .map_err(|error| error.to_string())?;
+
+    let started = Instant::now();
+    let payload = "x".repeat(config.payload_bytes);
+    let failure = client
+        .storage_put(&agent_id, "must-rollback", payload)
+        .await;
+    let failure_is_typed = matches!(
+        failure,
+        Err(SdkError::Wire {
+            code: WireErrorCode::Unavailable,
+            retryable: true,
+            ..
+        })
+    );
+    let baseline_during_pressure = client
+        .storage_get(&agent_id, "baseline")
+        .await
+        .map_err(|error| error.to_string())?;
+    let failed_value_absent = client
+        .storage_get(&agent_id, "must-rollback")
+        .await
+        .map_err(|error| error.to_string())?
+        .is_none();
+    kernel
+        .context_manager
+        .qualification_restore_storage_capacity()
+        .map_err(|error| error.to_string())?;
+    client
+        .storage_put(&agent_id, "recovered", "written-after-capacity-restored")
+        .await
+        .map_err(|error| format!("post-capacity retry: {error}"))?;
+    let recovered_value = client
+        .storage_get(&agent_id, "recovered")
+        .await
+        .map_err(|error| error.to_string())?;
+    let control_plane_responsive = client.ping().await.is_ok();
+    let client_closed = client.close().await.is_ok();
+    let wire_drained = wait_for_wire(&wire, Duration::from_secs(2), |snapshot| {
+        snapshot.active == 0
+    })
+    .await;
+    let final_wire = wire.snapshot();
+    stop_server(task).await;
+    kernel.shutdown().await.map_err(|error| error.to_string())?;
+    drop(kernel);
+
+    let connection = rusqlite::Connection::open(&database).map_err(|error| error.to_string())?;
+    let quick_check: String = connection
+        .query_row("PRAGMA quick_check", [], |row| row.get(0))
+        .map_err(|error| format!("database quick_check: {error}"))?;
+    drop(connection);
+
+    let baseline_after_restart = restart_and_read(&database, &agent_id, "baseline").await?;
+    let recovered_after_restart = restart_and_read(&database, &agent_id, "recovered").await?;
+
+    let mut checks = BTreeMap::new();
+    checks.insert("fixture_has_no_free_pages".into(), free_pages == 0);
+    checks.insert("disk_full_is_typed_retryable".into(), failure_is_typed);
+    checks.insert(
+        "previous_commit_preserved".into(),
+        baseline_during_pressure.as_deref() == Some("committed-before-disk-full"),
+    );
+    checks.insert("failed_transaction_rolled_back".into(), failed_value_absent);
+    checks.insert(
+        "retry_succeeds_after_capacity_restored".into(),
+        recovered_value.as_deref() == Some("written-after-capacity-restored"),
+    );
+    checks.insert("database_integrity_preserved".into(), quick_check == "ok");
+    checks.insert(
+        "restart_preserves_commits".into(),
+        baseline_after_restart.as_deref() == Some("committed-before-disk-full")
+            && recovered_after_restart.as_deref() == Some("written-after-capacity-restored"),
+    );
+    checks.insert(
+        "control_and_wire_recover".into(),
+        control_plane_responsive && client_closed && wire_drained && final_wire.active == 0,
+    );
+    let observed = BTreeMap::from([
+        ("database_page_count".into(), page_count.max(0) as u64),
+        ("database_free_pages".into(), free_pages.max(0) as u64),
+        ("injected_payload_bytes".into(), config.payload_bytes as u64),
+        ("final_active_connections".into(), final_wire.active as u64),
+    ]);
+    Ok(result("disk-full", started, checks, observed, Vec::new()))
+}
+
+async fn database_lock(config: &DatabaseLockConfig) -> Result<ScenarioResult, String> {
+    let state = TemporaryState::new("database-lock")?;
+    let database = state.database();
+    let kernel = Arc::new(
+        AgentKernelImpl::with_db_path(&database)
+            .map_err(|error| format!("create durable kernel: {error}"))?,
+    );
+    let (address, wire, task) =
+        start_server(Arc::clone(&kernel), 6, Duration::from_secs(30)).await?;
+    let mut control = KernelClient::connect(address)
+        .await
+        .map_err(|error| error.to_string())?;
+    let agent_id = control
+        .create_agent(
+            "database-lock",
+            "public durable database lock qualification",
+            None,
+            Some("read-only".into()),
+            Some(3),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    control
+        .storage_put(&agent_id, "baseline", "committed-before-lock")
+        .await
+        .map_err(|error| error.to_string())?;
+
+    let connection = rusqlite::Connection::open(&database).map_err(|error| error.to_string())?;
+    connection
+        .execute_batch("PRAGMA busy_timeout=0; BEGIN IMMEDIATE;")
+        .map_err(|error| format!("hold database writer lock: {error}"))?;
+    let mut writer = KernelClient::connect(address)
+        .await
+        .map_err(|error| error.to_string())?;
+    let writer_agent = agent_id.clone();
+    let started = Instant::now();
+    let mut blocked_write = tokio::spawn(async move {
+        let result = writer
+            .storage_put(writer_agent, "blocked-write", "must-time-out")
+            .await;
+        let closed = writer.close().await.is_ok();
+        (result, closed)
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let ping_started = Instant::now();
+    let control_plane_responsive = control.ping().await.is_ok();
+    let ping_latency_ms = ping_started.elapsed().as_millis() as u64;
+
+    let (write_result, writer_closed, settled) = match tokio::time::timeout(
+        Duration::from_millis(config.busy_timeout_ms),
+        &mut blocked_write,
+    )
+    .await
+    {
+        Ok(Ok((result, closed))) => (Some(result), closed, true),
+        Ok(Err(error)) => {
+            return Err(format!("database lock writer task failed: {error}"));
+        }
+        Err(_) => {
+            blocked_write.abort();
+            let _ = blocked_write.await;
+            (None, false, false)
+        }
+    };
+    let lock_is_typed = matches!(
+        write_result,
+        Some(Err(SdkError::Wire {
+            code: WireErrorCode::Conflict,
+            retryable: true,
+            ..
+        }))
+    );
+    connection
+        .execute_batch("ROLLBACK;")
+        .map_err(|error| format!("release database writer lock: {error}"))?;
+
+    control
+        .storage_put(&agent_id, "recovered", "written-after-lock-release")
+        .await
+        .map_err(|error| format!("post-lock retry: {error}"))?;
+    let baseline = control
+        .storage_get(&agent_id, "baseline")
+        .await
+        .map_err(|error| error.to_string())?;
+    let blocked_absent = control
+        .storage_get(&agent_id, "blocked-write")
+        .await
+        .map_err(|error| error.to_string())?
+        .is_none();
+    let recovered = control
+        .storage_get(&agent_id, "recovered")
+        .await
+        .map_err(|error| error.to_string())?;
+    let control_closed = control.close().await.is_ok();
+    let wire_drained = wait_for_wire(&wire, Duration::from_secs(2), |snapshot| {
+        snapshot.active == 0
+    })
+    .await;
+    let final_wire = wire.snapshot();
+    let quick_check: String = connection
+        .query_row("PRAGMA quick_check", [], |row| row.get(0))
+        .map_err(|error| format!("database quick_check: {error}"))?;
+    drop(connection);
+    stop_server(task).await;
+    kernel.shutdown().await.map_err(|error| error.to_string())?;
+    drop(kernel);
+    let baseline_after_restart = restart_and_read(&database, &agent_id, "baseline").await?;
+    let recovered_after_restart = restart_and_read(&database, &agent_id, "recovered").await?;
+
+    let mut checks = BTreeMap::new();
+    checks.insert("lock_failure_settles_before_deadline".into(), settled);
+    checks.insert("lock_is_typed_retryable_conflict".into(), lock_is_typed);
+    checks.insert(
+        "control_plane_stays_responsive".into(),
+        control_plane_responsive && ping_latency_ms < 2_000,
+    );
+    checks.insert("blocked_client_closes".into(), writer_closed);
+    checks.insert(
+        "previous_commit_preserved".into(),
+        baseline.as_deref() == Some("committed-before-lock"),
+    );
+    checks.insert("timed_out_write_absent".into(), blocked_absent);
+    checks.insert(
+        "retry_succeeds_after_lock_release".into(),
+        recovered.as_deref() == Some("written-after-lock-release"),
+    );
+    checks.insert("database_integrity_preserved".into(), quick_check == "ok");
+    checks.insert(
+        "restart_preserves_commits".into(),
+        baseline_after_restart.as_deref() == Some("committed-before-lock")
+            && recovered_after_restart.as_deref() == Some("written-after-lock-release"),
+    );
+    checks.insert(
+        "wire_permits_drained".into(),
+        control_closed && wire_drained && final_wire.active == 0,
+    );
+    let observed = BTreeMap::from([
+        ("configured_deadline_ms".into(), config.busy_timeout_ms),
+        ("control_ping_latency_ms".into(), ping_latency_ms),
+        ("final_active_connections".into(), final_wire.active as u64),
+    ]);
+    Ok(result(
+        "database-lock",
+        started,
+        checks,
+        observed,
+        Vec::new(),
+    ))
+}
+
+async fn network_partition(config: &NetworkPartitionConfig) -> Result<ScenarioResult, String> {
+    let partitioned = Arc::new(AtomicBool::new(true));
+    let accepted = Arc::new(AtomicU64::new(0));
+    let dropped = Arc::new(AtomicU64::new(0));
+    let replied = Arc::new(AtomicU64::new(0));
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .map_err(|error| error.to_string())?;
+    let endpoint = listener.local_addr().map_err(|error| error.to_string())?;
+    let fixture_partitioned = Arc::clone(&partitioned);
+    let fixture_accepted = Arc::clone(&accepted);
+    let fixture_dropped = Arc::clone(&dropped);
+    let fixture_replied = Arc::clone(&replied);
+    let fixture = tokio::spawn(async move {
+        loop {
+            let (mut stream, _) = listener.accept().await?;
+            fixture_accepted.fetch_add(1, Ordering::Relaxed);
+            if fixture_partitioned.load(Ordering::Acquire) {
+                fixture_dropped.fetch_add(1, Ordering::Relaxed);
+                drop(stream);
+                continue;
+            }
+            let mut request = [0_u8; 7];
+            stream.read_exact(&mut request).await?;
+            if request == *b"agentos" {
+                stream.write_all(b"ok").await?;
+                fixture_replied.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        #[allow(unreachable_code)]
+        Ok::<(), std::io::Error>(())
+    });
+
+    let mut budgets = BudgetConfig {
+        rpm: 10_000,
+        tpm: 100_000_000,
+        ..BudgetConfig::default()
+    };
+    budgets.agent_tokens_per_min = budgets.tpm;
+    let kernel = Arc::new(qualification_kernel(&budgets)?);
+    let provider = "resilience-network-partition";
+    kernel
+        .register_provider(Arc::new(NetworkPartitionProvider {
+            id: provider.into(),
+            endpoint,
+        }))
+        .map_err(|error| error.to_string())?;
+    // Keep the public connection alive beyond the 30-second provider circuit
+    // cooldown so the recovery attempt proves the same SDK session remains
+    // usable; slow-client reaping is qualified separately.
+    let (address, wire, task) =
+        start_server(Arc::clone(&kernel), 4, Duration::from_secs(90)).await?;
+    let mut client = KernelClient::connect(address)
+        .await
+        .map_err(|error| error.to_string())?;
+    let agent_id = client
+        .create_agent(
+            "network-partition",
+            "provider transport partition and recovery qualification",
+            Some(provider.into()),
+            Some("read-only".into()),
+            Some(3),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    let started = Instant::now();
+    let mut typed_failures = 0_u64;
+    let mut unexpected = 0_u64;
+    let mut notes = Vec::new();
+    for _ in 0..config.operations {
+        match client
+            .send_message(&agent_id, "request across a partitioned provider socket")
+            .await
+        {
+            Err(SdkError::Wire {
+                code: WireErrorCode::Provider,
+                retryable: true,
+                ..
+            }) => typed_failures += 1,
+            outcome => {
+                unexpected += 1;
+                if notes.len() < 5 {
+                    notes.push(format!("unexpected partition outcome: {outcome:?}"));
+                }
+            }
+        }
+    }
+    partitioned.store(false, Ordering::Release);
+    tokio::time::sleep(Duration::from_millis(config.recovery_wait_ms)).await;
+    let recovered = client
+        .send_message(&agent_id, "provider network has recovered")
+        .await
+        .is_ok();
+    let control_plane_responsive = client.ping().await.is_ok();
+    let final_metrics = MetricsSnapshot::collect(&kernel);
+    let client_closed = client.close().await.is_ok();
+    let wire_drained = wait_for_wire(&wire, Duration::from_secs(2), |snapshot| {
+        snapshot.active == 0
+    })
+    .await;
+    let final_wire = wire.snapshot();
+    stop_server(task).await;
+    kernel.shutdown().await.map_err(|error| error.to_string())?;
+    fixture.abort();
+    let _ = fixture.await;
+
+    let observed_accepted = accepted.load(Ordering::Relaxed);
+    let observed_dropped = dropped.load(Ordering::Relaxed);
+    let observed_replied = replied.load(Ordering::Relaxed);
+    let mut checks = BTreeMap::new();
+    checks.insert(
+        "partition_failures_are_typed_retryable".into(),
+        typed_failures == config.operations as u64 && unexpected == 0,
+    );
+    checks.insert(
+        "real_socket_connections_were_dropped".into(),
+        observed_dropped >= config.operations as u64,
+    );
+    checks.insert("provider_recovers_without_restart".into(), recovered);
+    checks.insert(
+        "recovery_crossed_same_socket_fixture".into(),
+        observed_replied >= 1 && observed_accepted == observed_dropped + observed_replied,
+    );
+    checks.insert("control_plane_responsive".into(), control_plane_responsive);
+    checks.insert(
+        "turn_llm_and_quota_gauges_drained".into(),
+        final_metrics.active_turns == 0
+            && final_metrics.waiting_turns == 0
+            && final_metrics.llm_requests_in_flight == 0
+            && final_metrics.llm_requests_waiting == 0
+            && final_metrics.quota_reserved_receipts == 0
+            && final_metrics.quota_in_flight_receipts == 0,
+    );
+    checks.insert(
+        "wire_permits_drained".into(),
+        client_closed && wire_drained && final_wire.active == 0,
+    );
+    let observed = BTreeMap::from([
+        (
+            "logical_partition_requests".into(),
+            config.operations as u64,
+        ),
+        ("circuit_recovery_wait_ms".into(), config.recovery_wait_ms),
+        ("typed_partition_failures".into(), typed_failures),
+        ("unexpected_outcomes".into(), unexpected),
+        ("fixture_connections_accepted".into(), observed_accepted),
+        ("fixture_connections_dropped".into(), observed_dropped),
+        ("fixture_responses_sent".into(), observed_replied),
+        ("final_active_connections".into(), final_wire.active as u64),
+    ]);
+    Ok(result(
+        "network-partition",
+        started,
+        checks,
+        observed,
+        notes,
+    ))
+}
+
 fn command_output(program: &str, args: &[&str]) -> Option<String> {
     Command::new(program)
         .args(args)
@@ -1241,6 +1869,9 @@ async fn run() -> Result<(), String> {
             "slow-clients" => slow_clients(&config.slow_clients).await?,
             "provider-outage" => provider_outage(&config.provider_outage).await?,
             "cancellation-storm" => cancellation_storm(&config.cancellation_storm).await?,
+            "disk-full" => disk_full(&config.disk_full).await?,
+            "database-lock" => database_lock(&config.database_lock).await?,
+            "network-partition" => network_partition(&config.network_partition).await?,
             _ => unreachable!("selected scenario is validated"),
         });
     }
@@ -1262,9 +1893,10 @@ async fn run() -> Result<(), String> {
         scenarios: results,
         passed,
         caveats: vec![
-            "Deterministic fault fixtures validate AgentOS behavior, not an external provider or network.",
+            "Deterministic fault fixtures validate AgentOS behavior, not an external provider, target network, or target filesystem.",
             "A smoke or local artifact is regression evidence, not the required 24-hour production soak.",
-            "Production readiness still requires the full fault matrix, target-host resources, SLO evaluation, and independent game-day review.",
+            "Sandbox crash recovery is qualified separately on a live rootless Linux runner.",
+            "Production readiness still requires target-host resources, SLO evaluation, alert delivery, and independent game-day review.",
         ],
     };
     let json =
@@ -1294,7 +1926,7 @@ mod tests {
     fn checked_in_suite_is_complete_and_valid() {
         let config: SuiteConfig = toml::from_str(DEFAULT_CONFIG).unwrap();
         validate_config(&config).unwrap();
-        assert_eq!(SCENARIOS.len(), 4);
+        assert_eq!(SCENARIOS.len(), 7);
     }
 
     #[test]
@@ -1316,6 +1948,9 @@ mod tests {
             cancellation_storm(&config.cancellation_storm)
                 .await
                 .unwrap(),
+            disk_full(&config.disk_full).await.unwrap(),
+            database_lock(&config.database_lock).await.unwrap(),
+            network_partition(&config.network_partition).await.unwrap(),
         ] {
             assert!(result.passed, "{} failed: {:?}", result.name, result);
         }

@@ -7,6 +7,7 @@ rust-version.workspace = true
 
 [features]
 fuzzing = []
+qualification = []
 
 [dependencies]
 tokio = { workspace = true }

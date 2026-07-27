@@ -84,9 +84,12 @@ duration of at least 24 hours, and every check passing can set:
 ```
 
 `production_claim_allowed` remains false because this artifact satisfies only
-the resource/leak-soak proof within issue #125. Disk-full, database-lock,
-sandbox-crash, and network-partition injection, exact-release SLO evaluation,
-an exercised incident game day, and independent review remain separate gates.
+the resource/leak-soak proof within issue #125. The deterministic resilience
+suite covers disk-full, database-lock, and network-partition behavior, while
+the extended-security workflow retains live sandbox-crash evidence. Successful
+exact-commit execution and review of those artifacts, exact-release SLO
+evaluation, an exercised incident game day, and independent review remain
+separate gates.
 
 The checked-in workflow is executable proof infrastructure. Until its
 exact-release 24-hour artifact is actually retained and reviewed,

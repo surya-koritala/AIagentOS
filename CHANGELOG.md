@@ -10,6 +10,14 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
 
 ## [Unreleased]
 
+- Added deterministic bounded-memory evidence for backpressure under #125.
+  Delayed-provider overload and slow-client saturation now run in four
+  independent waves, retain baseline/peak/settled process RSS observations,
+  and fail when either peak footprint or post-warmup growth exceeds the
+  reviewed 64 MiB ceiling. The exact-commit Linux workflow rejects missing RSS
+  checks or undersized evidence. This proves the controlled regression
+  fixture; the actual 24-hour target-host soak, real TLS/proxy/provider path,
+  exact-RC SLO report, and human game day remain open.
 - Added process-exit atomicity qualification for durable cluster control under
   #123. Twenty-one child-process exits cover first initialization, availability
   transition, profile update, initial join, rejoin, leave, and revocation

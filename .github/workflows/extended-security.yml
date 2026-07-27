@@ -65,6 +65,22 @@ jobs:
             ]
             and all(.scenarios[]; .passed == true)
             and all(.scenarios[].checks[]; . == true)
+            and (
+              .scenarios[]
+              | select(.name == "turn-overload")
+              | .checks.provider_backpressure_peak_rss_bounded == true
+                and .checks.provider_backpressure_steady_rss_bounded == true
+                and .observed.memory_waves >= 4
+                and .observed.rss_samples >= 5
+            )
+            and (
+              .scenarios[]
+              | select(.name == "slow-clients")
+              | .checks.slow_client_peak_rss_bounded == true
+                and .checks.slow_client_steady_rss_bounded == true
+                and .observed.memory_waves >= 4
+                and .observed.rss_samples >= 5
+            )
           ' "$report"
       - name: Retain deterministic fault qualification evidence
         if: always()

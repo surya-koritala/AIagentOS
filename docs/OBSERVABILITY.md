@@ -179,12 +179,13 @@ its routing, residency, cancellation, and credential policies are qualified.
 ## Evidence still required
 
 Production qualification remains open until an exact release candidate passes
-the 24-hour sustained-load profile, overload and slow-client/provider tests,
-fault injection, memory/file-descriptor leak checks, privacy disable/export
-verification, target Alertmanager routing/receiver delivery tests, a human
-incident game day, and independent review. The Prometheus unit suite proves
-rule evaluation but cannot prove an external page or ticket arrived. The
-deterministic six-scenario incident drill is regression evidence, not
-operator/game-day proof. Results must be attached to issue #125 with the exact
-commit and workflow run. Missing infrastructure or credentials are `not_run`,
-never pass.
+the 24-hour sustained-load and resource/leak profile, real slow-client/provider
+tests through the target TLS/proxy path, privacy disable/export verification,
+target Alertmanager routing/receiver delivery tests, a human incident game day,
+and independent review. The controlled four-wave backpressure fixture already
+proves bounded admission plus its reviewed RSS ceiling; it does not replace the
+long-duration target result. The Prometheus unit suite proves rule evaluation
+but cannot prove an external page or ticket arrived. The deterministic
+six-scenario incident drill is regression evidence, not operator/game-day
+proof. Results must be attached to issue #125 with the exact commit and
+workflow run. Missing infrastructure or credentials are `not_run`, never pass.

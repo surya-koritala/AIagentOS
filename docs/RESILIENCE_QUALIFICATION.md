@@ -12,8 +12,8 @@ is the strict schema-v1 configuration for seven scenarios.
 
 | Scenario | What must remain true |
 |---|---|
-| `turn-overload` | Active turns never exceed `max_concurrent`; waiting turns never exceed `max_waiting_turns`; excess work receives a stable retryable overload result; turn and quota gauges drain; the server remains responsive. |
-| `slow-clients` | Accepted connections never exceed the configured limit; excess peers are closed before protocol admission; idle peers are reaped; every permit returns; a fresh health client succeeds. |
+| `turn-overload` | Active turns never exceed `max_concurrent`; waiting turns never exceed `max_waiting_turns`; excess work receives a stable retryable overload result; turn and quota gauges drain; the server remains responsive. Four delayed-provider waves retain baseline, peak, and settled RSS and enforce both peak-footprint and steady-growth limits. |
+| `slow-clients` | Accepted connections never exceed the configured limit; excess peers are closed before protocol admission; idle peers are reaped; every permit returns; a fresh health client succeeds. Four saturation/reap waves retain the same bounded-RSS evidence. |
 | `provider-outage` | Provider failures are classified as unavailable; the control plane remains responsive; turn, LLM, and quota-receipt gauges return to zero. |
 | `cancellation-storm` | Every exact public stream request is cancelled from a second connection; queued and active provider work settles before deadline; request registrations and all turn, LLM, quota, and wire permits drain. |
 | `disk-full` | A feature-gated qualification seam applies SQLite's page limit to the same live connection used by public storage syscalls. The SDK receives a retryable `Unavailable` error, the transaction rolls back, prior commits survive, retry succeeds after capacity restoration, `quick_check` passes, and both commits survive restart. |
@@ -29,6 +29,16 @@ The syscall server also exposes a cloneable, server-local
 `WireConnectionMetrics` read handle. Its snapshot contains only bounded,
 non-identifying counters: capacity, active and peak connections, admitted and
 rejected totals, handshake and idle timeouts, and I/O failures.
+
+The two backpressure scenarios use the reviewed 64 MiB
+`max_rss_growth_bytes` ceiling. On Linux and macOS they sample RSS before the
+first wave, during peak load, and after every wave. Both peak growth from the
+baseline and settled growth from the first completed wave to the last must
+remain within the ceiling. The retained Linux workflow requires four waves,
+five RSS samples, and all four memory checks; an unsupported or missing
+measurement cannot qualify the artifact. The ceiling is also fail-closed at
+256 MiB in the profile validator so an accidental extreme value cannot turn
+the fixture into a no-op.
 
 ## Commands
 
@@ -60,8 +70,9 @@ debug runs are rejected unless `--allow-debug` is supplied.
 The scheduled or manually dispatched `Extended security tests` workflow also
 runs all seven scenarios in release mode on GitHub-hosted Linux. It rejects
 dirty or mismatched source, debug/smoke output, missing scenarios, failed
-scenario checks, and any artifact that permits a production claim. A passing
-report is retained for 90 days as
+scenario checks, missing backpressure RSS measurements, fewer than four memory
+waves, and any artifact that permits a production claim. A passing report is
+retained for 90 days as
 `deterministic-fault-matrix-<exact-commit>`.
 
 ## Evidence and claim boundary
@@ -81,7 +92,10 @@ This suite and its retained workflow artifact prove deterministic product
 behavior and prevent regressions. The disk capacity limit, independent SQLite
 lock, and loopback TCP partition are controlled fault fixtures; they are not
 evidence about the target host's filesystem, routing, proxy, TLS, or external
-provider. Production qualification still requires:
+provider. The four-wave fixture demonstrates that the configured admission
+bounds also constrain process-memory growth under controlled delayed-provider
+and slow-client pressure. It is not a long-duration leak claim. Production
+qualification still requires:
 
 - an actually completed 24-hour target run from the checked-in
   [resource/leak soak harness](SOAK_QUALIFICATION.md), with its retained RSS,

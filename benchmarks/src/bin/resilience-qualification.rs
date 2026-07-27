@@ -39,6 +39,7 @@ const SCENARIOS: [&str; 7] = [
     "database-lock",
     "network-partition",
 ];
+const MAX_CONFIGURED_RSS_GROWTH_BYTES: u64 = 256 * 1024 * 1024;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -61,6 +62,8 @@ struct TurnOverloadConfig {
     max_concurrent: u32,
     max_waiting: u32,
     provider_delay_ms: u64,
+    memory_waves: usize,
+    max_rss_growth_bytes: u64,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -69,6 +72,8 @@ struct SlowClientsConfig {
     connection_limit: usize,
     excess_connections: usize,
     idle_timeout_ms: u64,
+    memory_waves: usize,
+    max_rss_growth_bytes: u64,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -213,15 +218,28 @@ fn validate_config(config: &SuiteConfig) -> Result<(), String> {
     if overload.operations <= overload.max_concurrent as usize + overload.max_waiting as usize {
         return Err("turn overload operations must exceed active plus waiting capacity".into());
     }
-    if overload.provider_delay_ms == 0 {
-        return Err("turn overload provider_delay_ms must be non-zero".into());
+    if overload.provider_delay_ms == 0
+        || overload.memory_waves < 2
+        || overload.max_rss_growth_bytes == 0
+        || overload.max_rss_growth_bytes > MAX_CONFIGURED_RSS_GROWTH_BYTES
+    {
+        return Err(
+            "turn overload requires a non-zero delay, at least two memory waves, and a finite RSS growth limit"
+                .into(),
+        );
     }
     let clients = &config.slow_clients;
     if clients.connection_limit == 0
         || clients.excess_connections == 0
         || clients.idle_timeout_ms == 0
+        || clients.memory_waves < 2
+        || clients.max_rss_growth_bytes == 0
+        || clients.max_rss_growth_bytes > MAX_CONFIGURED_RSS_GROWTH_BYTES
     {
-        return Err("slow clients requires finite non-zero limits and timeout".into());
+        return Err(
+            "slow clients requires finite non-zero limits, a timeout, at least two memory waves, and an RSS growth limit"
+                .into(),
+        );
     }
     if config.provider_outage.operations == 0 {
         return Err("provider outage operations must be non-zero".into());
@@ -260,6 +278,8 @@ fn validate_config(config: &SuiteConfig) -> Result<(), String> {
 fn smoke_scale(config: &SuiteConfig) -> SuiteConfig {
     let mut scaled = config.clone();
     scaled.turn_overload.provider_delay_ms = 50;
+    scaled.turn_overload.memory_waves = 2;
+    scaled.slow_clients.memory_waves = 2;
     scaled.provider_outage.operations = scaled.provider_outage.operations.min(2);
     scaled.cancellation_storm.operations = scaled.cancellation_storm.operations.min(4);
     scaled.cancellation_storm.max_concurrent = scaled.cancellation_storm.max_concurrent.min(2);
@@ -736,6 +756,51 @@ fn result(
     }
 }
 
+#[cfg(target_os = "linux")]
+fn process_rss_bytes() -> Option<u64> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    let line = status.lines().find(|line| line.starts_with("VmRSS:"))?;
+    line.split_whitespace()
+        .nth(1)?
+        .parse::<u64>()
+        .ok()
+        .map(|kilobytes| kilobytes.saturating_mul(1024))
+}
+
+#[cfg(target_os = "macos")]
+fn process_rss_bytes() -> Option<u64> {
+    let pid = std::process::id().to_string();
+    command_output("ps", &["-o", "rss=", "-p", &pid])
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .map(|kilobytes| kilobytes.saturating_mul(1024))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn process_rss_bytes() -> Option<u64> {
+    None
+}
+
+fn retain_peak(peak: &mut Option<u64>, sample: Option<u64>) {
+    if let Some(sample) = sample {
+        *peak = Some(peak.unwrap_or(0).max(sample));
+    }
+}
+
+fn rss_deltas(
+    baseline: Option<u64>,
+    peak: Option<u64>,
+    settled_samples: &[u64],
+) -> (Option<u64>, Option<u64>) {
+    let peak_delta = peak
+        .zip(baseline)
+        .map(|(peak, baseline)| peak.saturating_sub(baseline));
+    let steady_growth = settled_samples
+        .last()
+        .zip(settled_samples.first())
+        .map(|(last, first)| last.saturating_sub(*first));
+    (peak_delta, steady_growth)
+}
+
 async fn turn_overload(config: &TurnOverloadConfig) -> Result<ScenarioResult, String> {
     let mut budgets = BudgetConfig {
         max_concurrent: config.max_concurrent,
@@ -779,71 +844,84 @@ async fn turn_overload(config: &TurnOverloadConfig) -> Result<ScenarioResult, St
     }
     setup.close().await.map_err(|error| error.to_string())?;
 
-    let mut clients = Vec::with_capacity(config.operations);
-    for _ in 0..config.operations {
-        clients.push(
-            KernelClient::connect(address)
-                .await
-                .map_err(|error| error.to_string())?,
-        );
-    }
-    let barrier = Arc::new(Barrier::new(config.operations + 1));
+    let baseline_rss = process_rss_bytes();
     let done = Arc::new(AtomicBool::new(false));
     let monitor_kernel = Arc::clone(&kernel);
     let monitor_done = Arc::clone(&done);
     let monitor = tokio::spawn(async move {
         let mut peak_active = 0;
         let mut peak_waiting = 0;
+        let mut peak_rss = process_rss_bytes();
         while !monitor_done.load(Ordering::Relaxed) {
             let snapshot = MetricsSnapshot::collect(&monitor_kernel);
             peak_active = peak_active.max(snapshot.active_turns);
             peak_waiting = peak_waiting.max(snapshot.waiting_turns);
-            tokio::task::yield_now().await;
+            retain_peak(&mut peak_rss, process_rss_bytes());
+            tokio::time::sleep(Duration::from_millis(5)).await;
         }
-        (peak_active, peak_waiting)
+        retain_peak(&mut peak_rss, process_rss_bytes());
+        (peak_active, peak_waiting, peak_rss)
     });
 
     let started = Instant::now();
-    let mut workers = JoinSet::new();
-    for (mut client, agent_id) in clients.into_iter().zip(agents) {
-        let barrier = Arc::clone(&barrier);
-        workers.spawn(async move {
-            barrier.wait().await;
-            client
-                .send_message(agent_id, "overload qualification")
-                .await
-                .map(|_| ())
-                .map_err(|error| error.to_string())
-        });
-    }
-    barrier.wait().await;
     let mut successes = 0_u64;
     let mut overload_rejections = 0_u64;
     let mut unexpected_failures = 0_u64;
     let mut notes = Vec::new();
-    while let Some(joined) = workers.join_next().await {
-        match joined.map_err(|error| error.to_string())? {
-            Ok(()) => successes += 1,
-            Err(error) if error.contains("Turn admission queue is full") => {
-                overload_rejections += 1;
-            }
-            Err(error) => {
-                unexpected_failures += 1;
-                if notes.len() < 5 {
-                    notes.push(error);
+    let mut settled_rss = Vec::with_capacity(config.memory_waves);
+    for _ in 0..config.memory_waves {
+        let mut clients = Vec::with_capacity(config.operations);
+        for _ in 0..config.operations {
+            clients.push(
+                KernelClient::connect(address)
+                    .await
+                    .map_err(|error| error.to_string())?,
+            );
+        }
+        let barrier = Arc::new(Barrier::new(config.operations + 1));
+        let mut workers = JoinSet::new();
+        for (mut client, agent_id) in clients.into_iter().zip(agents.iter().cloned()) {
+            let barrier = Arc::clone(&barrier);
+            workers.spawn(async move {
+                barrier.wait().await;
+                let outcome = client
+                    .send_message(agent_id, "overload qualification")
+                    .await
+                    .map(|_| ())
+                    .map_err(|error| error.to_string());
+                let _ = client.close().await;
+                outcome
+            });
+        }
+        barrier.wait().await;
+        while let Some(joined) = workers.join_next().await {
+            match joined.map_err(|error| error.to_string())? {
+                Ok(()) => successes += 1,
+                Err(error) if error.contains("Turn admission queue is full") => {
+                    overload_rejections += 1;
+                }
+                Err(error) => {
+                    unexpected_failures += 1;
+                    if notes.len() < 5 {
+                        notes.push(error);
+                    }
                 }
             }
         }
+        if let Some(rss) = process_rss_bytes() {
+            settled_rss.push(rss);
+        }
     }
     done.store(true, Ordering::Relaxed);
-    let (peak_active, peak_waiting) = monitor.await.map_err(|error| error.to_string())?;
+    let (peak_active, peak_waiting, peak_rss) = monitor.await.map_err(|error| error.to_string())?;
+    let (peak_rss_delta, steady_rss_growth) = rss_deltas(baseline_rss, peak_rss, &settled_rss);
     let final_metrics = MetricsSnapshot::collect(&kernel);
     let mut recovery = KernelClient::connect(address)
         .await
         .map_err(|error| error.to_string())?;
     let recovery_ok = recovery.ping().await.is_ok() && recovery.close().await.is_ok();
 
-    let expected = config.operations as u64;
+    let expected = (config.operations as u64).saturating_mul(config.memory_waves as u64);
     let mut checks = BTreeMap::new();
     checks.insert(
         "all_requests_accounted".into(),
@@ -868,6 +946,20 @@ async fn turn_overload(config: &TurnOverloadConfig) -> Result<ScenarioResult, St
         final_metrics.quota_reserved_receipts == 0 && final_metrics.quota_in_flight_receipts == 0,
     );
     checks.insert("server_recovers".into(), recovery_ok);
+    if let Some(growth) = peak_rss_delta {
+        checks.insert(
+            "provider_backpressure_peak_rss_bounded".into(),
+            growth <= config.max_rss_growth_bytes,
+        );
+    } else {
+        notes.push("process RSS is unavailable on this operating system".into());
+    }
+    if let Some(growth) = steady_rss_growth {
+        checks.insert(
+            "provider_backpressure_steady_rss_bounded".into(),
+            growth <= config.max_rss_growth_bytes,
+        );
+    }
     let observed = BTreeMap::from([
         ("successful_requests".into(), successes),
         ("overload_rejections".into(), overload_rejections),
@@ -882,6 +974,35 @@ async fn turn_overload(config: &TurnOverloadConfig) -> Result<ScenarioResult, St
             "configured_waiting_turn_limit".into(),
             u64::from(config.max_waiting),
         ),
+        ("memory_waves".into(), config.memory_waves as u64),
+        (
+            "rss_samples".into(),
+            settled_rss
+                .len()
+                .saturating_add(usize::from(baseline_rss.is_some())) as u64,
+        ),
+        (
+            "baseline_rss_bytes".into(),
+            baseline_rss.unwrap_or(u64::MAX),
+        ),
+        ("peak_rss_bytes".into(), peak_rss.unwrap_or(u64::MAX)),
+        (
+            "first_settled_rss_bytes".into(),
+            settled_rss.first().copied().unwrap_or(u64::MAX),
+        ),
+        (
+            "last_settled_rss_bytes".into(),
+            settled_rss.last().copied().unwrap_or(u64::MAX),
+        ),
+        (
+            "peak_rss_growth_bytes".into(),
+            peak_rss_delta.unwrap_or(u64::MAX),
+        ),
+        (
+            "steady_rss_growth_bytes".into(),
+            steady_rss_growth.unwrap_or(u64::MAX),
+        ),
+        ("max_rss_growth_bytes".into(), config.max_rss_growth_bytes),
     ]);
     stop_server(task).await;
     kernel.shutdown().await.map_err(|error| error.to_string())?;
@@ -914,34 +1035,48 @@ async fn slow_clients(config: &SlowClientsConfig) -> Result<ScenarioResult, Stri
     )
     .await?;
     let started = Instant::now();
-    let mut holders = Vec::with_capacity(config.connection_limit);
-    for _ in 0..config.connection_limit {
-        holders.push(
-            KernelClient::connect(address)
-                .await
-                .map_err(|error| error.to_string())?,
-        );
-    }
-    let saturated = wait_for_wire(&metrics, Duration::from_secs(2), |snapshot| {
-        snapshot.active == config.connection_limit
-    })
-    .await;
+    let baseline_rss = process_rss_bytes();
+    let mut peak_rss = baseline_rss;
+    let mut settled_rss = Vec::with_capacity(config.memory_waves);
+    let mut all_saturated = true;
+    let mut all_reaped = true;
     let mut excess_rejected = 0_u64;
-    for _ in 0..config.excess_connections {
-        match KernelClient::connect(address).await {
-            Ok(mut client) => {
-                if client.ping().await.is_err() {
-                    excess_rejected += 1;
+    for wave in 0..config.memory_waves {
+        let mut holders = Vec::with_capacity(config.connection_limit);
+        for _ in 0..config.connection_limit {
+            holders.push(
+                KernelClient::connect(address)
+                    .await
+                    .map_err(|error| error.to_string())?,
+            );
+        }
+        all_saturated &= wait_for_wire(&metrics, Duration::from_secs(2), |snapshot| {
+            snapshot.active == config.connection_limit
+        })
+        .await;
+        retain_peak(&mut peak_rss, process_rss_bytes());
+        for _ in 0..config.excess_connections {
+            match KernelClient::connect(address).await {
+                Ok(mut client) => {
+                    if client.ping().await.is_err() {
+                        excess_rejected += 1;
+                    }
                 }
+                Err(_) => excess_rejected += 1,
             }
-            Err(_) => excess_rejected += 1,
+        }
+        retain_peak(&mut peak_rss, process_rss_bytes());
+        let expected_timeouts = (wave + 1).saturating_mul(config.connection_limit) as u64;
+        all_reaped &= wait_for_wire(&metrics, Duration::from_secs(5), |snapshot| {
+            snapshot.active == 0 && snapshot.idle_timeouts_total >= expected_timeouts
+        })
+        .await;
+        drop(holders);
+        if let Some(rss) = process_rss_bytes() {
+            settled_rss.push(rss);
         }
     }
-    let reaped = wait_for_wire(&metrics, Duration::from_secs(5), |snapshot| {
-        snapshot.active == 0 && snapshot.idle_timeouts_total >= config.connection_limit as u64
-    })
-    .await;
-    drop(holders);
+    let (peak_rss_delta, steady_rss_growth) = rss_deltas(baseline_rss, peak_rss, &settled_rss);
     let mut recovery = KernelClient::connect(address)
         .await
         .map_err(|error| error.to_string())?;
@@ -953,18 +1088,34 @@ async fn slow_clients(config: &SlowClientsConfig) -> Result<ScenarioResult, Stri
     let final_metrics = metrics.snapshot();
 
     let mut checks = BTreeMap::new();
-    checks.insert("connection_limit_reached".into(), saturated);
+    checks.insert("connection_limit_reached_each_wave".into(), all_saturated);
     checks.insert(
         "all_excess_connections_rejected".into(),
-        excess_rejected == config.excess_connections as u64,
+        excess_rejected
+            == (config.excess_connections as u64).saturating_mul(config.memory_waves as u64),
     );
     checks.insert(
         "active_connections_bounded".into(),
         final_metrics.peak_active <= config.connection_limit,
     );
-    checks.insert("slow_connections_reaped".into(), reaped);
+    checks.insert("slow_connections_reaped_each_wave".into(), all_reaped);
     checks.insert("permits_drained".into(), drained);
     checks.insert("server_recovers".into(), recovery_ok);
+    let mut notes = Vec::new();
+    if let Some(growth) = peak_rss_delta {
+        checks.insert(
+            "slow_client_peak_rss_bounded".into(),
+            growth <= config.max_rss_growth_bytes,
+        );
+    } else {
+        notes.push("process RSS is unavailable on this operating system".into());
+    }
+    if let Some(growth) = steady_rss_growth {
+        checks.insert(
+            "slow_client_steady_rss_bounded".into(),
+            growth <= config.max_rss_growth_bytes,
+        );
+    }
     let observed = BTreeMap::from([
         ("connection_capacity".into(), final_metrics.capacity as u64),
         (
@@ -979,16 +1130,39 @@ async fn slow_clients(config: &SlowClientsConfig) -> Result<ScenarioResult, Stri
             "final_active_connections".into(),
             final_metrics.active as u64,
         ),
+        ("memory_waves".into(), config.memory_waves as u64),
+        (
+            "rss_samples".into(),
+            settled_rss
+                .len()
+                .saturating_add(usize::from(baseline_rss.is_some())) as u64,
+        ),
+        (
+            "baseline_rss_bytes".into(),
+            baseline_rss.unwrap_or(u64::MAX),
+        ),
+        ("peak_rss_bytes".into(), peak_rss.unwrap_or(u64::MAX)),
+        (
+            "first_settled_rss_bytes".into(),
+            settled_rss.first().copied().unwrap_or(u64::MAX),
+        ),
+        (
+            "last_settled_rss_bytes".into(),
+            settled_rss.last().copied().unwrap_or(u64::MAX),
+        ),
+        (
+            "peak_rss_growth_bytes".into(),
+            peak_rss_delta.unwrap_or(u64::MAX),
+        ),
+        (
+            "steady_rss_growth_bytes".into(),
+            steady_rss_growth.unwrap_or(u64::MAX),
+        ),
+        ("max_rss_growth_bytes".into(), config.max_rss_growth_bytes),
     ]);
     stop_server(task).await;
     kernel.shutdown().await.map_err(|error| error.to_string())?;
-    Ok(result(
-        "slow-clients",
-        started,
-        checks,
-        observed,
-        Vec::new(),
-    ))
+    Ok(result("slow-clients", started, checks, observed, notes))
 }
 
 async fn provider_outage(config: &ProviderOutageConfig) -> Result<ScenarioResult, String> {
@@ -1936,6 +2110,21 @@ mod tests {
         assert!(validate_config(&config)
             .unwrap_err()
             .contains("finite non-zero"));
+    }
+
+    #[test]
+    fn validator_rejects_missing_or_extreme_memory_proof() {
+        let mut config: SuiteConfig = toml::from_str(DEFAULT_CONFIG).unwrap();
+        config.turn_overload.memory_waves = 1;
+        assert!(validate_config(&config)
+            .unwrap_err()
+            .contains("at least two memory waves"));
+
+        let mut config: SuiteConfig = toml::from_str(DEFAULT_CONFIG).unwrap();
+        config.slow_clients.max_rss_growth_bytes = MAX_CONFIGURED_RSS_GROWTH_BYTES + 1;
+        assert!(validate_config(&config)
+            .unwrap_err()
+            .contains("RSS growth limit"));
     }
 
     #[tokio::test]

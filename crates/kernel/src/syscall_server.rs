@@ -846,6 +846,16 @@ impl WireErrorCode {
             // "durable provider rate-limit accounting is unavailable" is an
             // infrastructure failure, not proof that a quota was exceeded.
             (Self::Unavailable, true)
+        } else if message.contains("database or disk is full") || message.contains("disk full") {
+            // SQLite reports ENOSPC as SQLITE_FULL. Once an operator restores
+            // capacity, the unchanged request can be retried safely.
+            (Self::Unavailable, true)
+        } else if message.contains("database is locked")
+            || message.contains("database table is locked")
+        {
+            // A bounded SQLite busy timeout has elapsed. Surface contention as
+            // a retryable conflict instead of an opaque internal failure.
+            (Self::Conflict, true)
         } else if message.contains("cancel") {
             // Rate-limit cancellation messages also contain "admission"; keep
             // this ahead of quota classification.
@@ -4464,6 +4474,22 @@ mod tests {
         assert_eq!(
             WireErrorCode::classify("cgroup token quota exceeded"),
             (WireErrorCode::QuotaExceeded, true)
+        );
+    }
+
+    #[test]
+    fn durable_storage_pressure_has_stable_retryable_wire_categories() {
+        assert_eq!(
+            WireErrorCode::classify("storage put failed: storage error: database or disk is full"),
+            (WireErrorCode::Unavailable, true)
+        );
+        assert_eq!(
+            WireErrorCode::classify("storage put failed: storage error: database is locked"),
+            (WireErrorCode::Conflict, true)
+        );
+        assert_eq!(
+            WireErrorCode::classify("storage put failed: storage error: database table is locked"),
+            (WireErrorCode::Conflict, true)
         );
     }
 

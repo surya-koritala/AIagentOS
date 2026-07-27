@@ -44,6 +44,14 @@ digest. Its ignored-by-default live test then:
 4. creates a simulated crash orphan and proves startup reconciliation removes
    its process, mount, and network namespace.
 
+The test writes `target/qualification/rootless-sandbox-crash.json` only after
+all live assertions pass. The workflow rejects an artifact unless it names the
+exact clean checkout commit, the immutable image, the live-rootless
+qualification class, all nine checks, and `production_claim_allowed: false`.
+The artifact is retained for 90 days. A workflow definition is evidence
+infrastructure, not a passing result: the relevant issue criterion can be
+credited only to a successful exact-commit run whose artifact is available.
+
 Ordinary CI retains deterministic contract tests on Linux, macOS, and Windows;
 the live job is isolated because those platforms do not all provide a rootless
 Linux daemon.

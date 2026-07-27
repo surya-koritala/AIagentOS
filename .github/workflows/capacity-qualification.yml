@@ -72,7 +72,7 @@ jobs:
           test "$(jq -r .production_claim_allowed target/qualification/resilience-baseline.json)" = "false"
           test "$(jq -r .source.dirty target/qualification/resilience-baseline.json)" = "false"
           test "$(jq -r .source.commit target/qualification/resilience-baseline.json)" = "$GITHUB_SHA"
-          test "$(jq '.scenarios | length' target/qualification/resilience-baseline.json)" = "4"
+          test "$(jq '.scenarios | length' target/qualification/resilience-baseline.json)" = "7"
       - name: Validate target soak contract
         run: >-
           cargo run --release --locked --package os-benchmark

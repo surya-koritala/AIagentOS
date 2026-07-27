@@ -10,6 +10,17 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
 
 ## [Unreleased]
 
+- Completed the deterministic fault-injection matrix infrastructure for #125.
+  The release resilience suite now drives real public TCP/SDK storage writes
+  against a live SQLite page limit and a held writer lock, proving typed
+  retryable failures, rollback, integrity, recovery, and restart persistence.
+  A loopback provider transport drops real TCP connections, waits through the
+  production circuit-breaker cooldown, and proves automatic reconnect plus
+  complete turn/LLM/quota/wire drainage. The live rootless Linux sandbox test
+  now emits and retains exact-commit JSON evidence for cancellation and
+  crash-orphan cleanup. These deterministic and live-run artifacts still
+  forbid a production claim; the target 24-hour run, exact-RC SLO evaluation,
+  alert delivery, game day, and independent review remain open.
 - Added cancellation-storm and target resource/leak qualification under #125.
   The public TCP/SDK resilience suite now cancels concurrent exact request IDs
   from separate control connections and proves active provider cancellation,

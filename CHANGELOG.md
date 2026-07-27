@@ -10,6 +10,16 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
 
 ## [Unreleased]
 
+- Removed fabricated success behavior from placeholder resource operations
+  under #124. Application providers advertise only implemented one-shot
+  `launch`; `close`, `send_input`, and `read_output` now return a typed
+  unsupported error. The peripheral placeholder advertises no operations and
+  every call fails typed-unsupported. Empty providers are omitted from
+  capability discovery, unsupported aliases cannot enter local or shared tool
+  registries, and predefined permission profiles no longer grant nonexistent
+  application operations. Peripheral/application-control support remains
+  unavailable until real operator policy and platform implementations are
+  qualified.
 - Isolated resource-provider execution under #124. Generic provider operations
   now run in kernel-owned tasks with a cooperative cancellation token, a
   five-second drain window, forced-abort fallback, and admission-permit

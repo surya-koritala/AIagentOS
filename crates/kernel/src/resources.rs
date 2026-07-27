@@ -69,9 +69,6 @@ pub(crate) fn provider_target_spec(
             Some(ProviderTargetSpec::Argument("url"))
         }
         (ResourceType::Application, "launch") => Some(ProviderTargetSpec::Argument("command")),
-        (ResourceType::Application, "close" | "send_input" | "read_output") => {
-            Some(ProviderTargetSpec::Argument("application"))
-        }
         (ResourceType::Application, "install" | "uninstall") => {
             Some(ProviderTargetSpec::Argument("package"))
         }
@@ -84,18 +81,6 @@ pub(crate) fn provider_target_spec(
         }
         (ResourceType::Ipc, "receive") => Some(ProviderTargetSpec::Constant("ipc:self")),
         (ResourceType::Ipc, "discover") => Some(ProviderTargetSpec::Constant("ipc:namespace")),
-        (ResourceType::Peripheral, "capture_image") => {
-            Some(ProviderTargetSpec::Constant("peripheral:capture_image"))
-        }
-        (ResourceType::Peripheral, "record_audio") => {
-            Some(ProviderTargetSpec::Constant("peripheral:record_audio"))
-        }
-        (ResourceType::Peripheral, "play_audio") => {
-            Some(ProviderTargetSpec::Constant("peripheral:play_audio"))
-        }
-        (ResourceType::Peripheral, "print") => {
-            Some(ProviderTargetSpec::Constant("peripheral:print"))
-        }
         (ResourceType::Peripheral, "credential" | "credential_access" | "read_credential") => {
             Some(ProviderTargetSpec::Argument("credential"))
         }
@@ -120,9 +105,10 @@ pub(crate) fn provider_target(
                 ))
             }),
         Some(ProviderTargetSpec::Constant(target)) => Ok(target.to_string()),
-        None => Err(ResourceError::OperationFailed(format!(
-            "unsupported provider operation {resource_type:?}/{operation}"
-        ))),
+        None => Err(ResourceError::UnsupportedOperation {
+            resource: format!("{resource_type:?}"),
+            operation: operation.to_string(),
+        }),
     }
 }
 
@@ -635,10 +621,10 @@ impl ResourceBroker for ResourceBrokerImpl {
             .iter()
             .any(|operation| operation == &request.operation)
         {
-            return Err(ResourceError::OperationFailed(format!(
-                "provider does not advertise operation '{}'",
-                request.operation
-            )));
+            return Err(ResourceError::UnsupportedOperation {
+                resource: format!("{:?}", request.resource_type),
+                operation: request.operation.clone(),
+            });
         }
 
         let registered = self
@@ -815,13 +801,15 @@ impl ResourceBroker for ResourceBrokerImpl {
                 let provider = Arc::clone(entry.value());
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     let resource_type = provider.resource_type();
-                    ResourceCapability {
-                        operations: provider.supported_operations(),
+                    let operations = provider.supported_operations();
+                    (!operations.is_empty()).then(|| ResourceCapability {
+                        operations,
                         description: format!("{resource_type:?} provider"),
                         resource_type,
-                    }
+                    })
                 }))
                 .ok()
+                .flatten()
             })
             .collect()
     }
@@ -917,6 +905,8 @@ mod tests {
         advertised: Vec<String>,
         calls: Arc<AtomicUsize>,
     }
+
+    struct EmptyPeripheralProvider(Arc<AtomicUsize>);
 
     fn with_test_gate_proof(
         mut request: ResourceRequest,
@@ -1101,6 +1091,26 @@ mod tests {
         }
     }
 
+    #[async_trait::async_trait]
+    impl ResourceProvider for EmptyPeripheralProvider {
+        fn resource_type(&self) -> ResourceType {
+            ResourceType::Peripheral
+        }
+
+        fn supported_operations(&self) -> Vec<String> {
+            Vec::new()
+        }
+
+        async fn execute(
+            &self,
+            _operation: &str,
+            _params: &serde_json::Value,
+        ) -> Result<serde_json::Value, ResourceError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(serde_json::json!({"unexpected": true}))
+        }
+    }
+
     #[tokio::test]
     async fn execute_with_permission() {
         let perms = Arc::new(PermissionManager::new());
@@ -1262,6 +1272,42 @@ mod tests {
         let caps = broker.list_capabilities();
         assert_eq!(caps.len(), 1);
         assert_eq!(caps[0].resource_type, ResourceType::Filesystem);
+    }
+
+    #[tokio::test]
+    async fn empty_provider_is_not_advertised_and_stub_dispatch_is_typed_unsupported() {
+        let permissions = Arc::new(PermissionManager::new());
+        let broker = ResourceBrokerImpl::new_unconfined(permissions.clone());
+        let calls = Arc::new(AtomicUsize::new(0));
+        broker
+            .register_provider(Box::new(EmptyPeripheralProvider(calls.clone())))
+            .unwrap();
+        assert!(
+            broker.list_capabilities().is_empty(),
+            "a provider with no real operations must not appear available"
+        );
+
+        let agent = uuid::Uuid::new_v4();
+        permissions.assign_profile(agent, &"full-access".into());
+        let error = broker
+            .execute(ResourceRequest {
+                agent_id: agent,
+                resource_type: ResourceType::Peripheral,
+                operation: "capture_image".into(),
+                parameters: serde_json::json!({}),
+                sandbox_context: None,
+                gate_admission: None,
+            })
+            .await
+            .expect_err("placeholder operation must fail before provider dispatch");
+        assert_eq!(
+            error,
+            ResourceError::UnsupportedOperation {
+                resource: "Peripheral".into(),
+                operation: "capture_image".into(),
+            }
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
@@ -1478,7 +1524,6 @@ mod tests {
         for (resource_type, operation) in [
             (ResourceType::Application, "launch"),
             (ResourceType::Browser, "navigate"),
-            (ResourceType::Peripheral, "capture_image"),
         ] {
             broker
                 .register_provider(Box::new(BlindProvider {
@@ -1519,11 +1564,6 @@ mod tests {
                 "navigate",
                 serde_json::json!({"url": "https://example.com"}),
             ),
-            (
-                ResourceType::Peripheral,
-                "capture_image",
-                serde_json::json!({}),
-            ),
         ] {
             let denied = broker
                 .execute(with_test_gate_proof(
@@ -1543,18 +1583,15 @@ mod tests {
         assert_eq!(
             calls.load(Ordering::SeqCst),
             0,
-            "untrusted application, browser, and peripheral requests must not reach providers"
+            "untrusted application and browser requests must not reach providers"
         );
         let audit = permissions.get_audit_log(None);
-        assert_eq!(audit.len(), 3);
+        assert_eq!(audit.len(), 2);
         assert!(audit.iter().all(|entry| {
             entry.agent_id == untrusted
                 && entry.decision == AccessDecision::Denied
                 && entry.outcome == ActionOutcome::Failure
-                && matches!(
-                    entry.resource.as_str(),
-                    "Application" | "Browser" | "Peripheral"
-                )
+                && matches!(entry.resource.as_str(), "Application" | "Browser")
                 && !entry.resource.contains("example.com")
                 && !entry.resource.contains("echo")
         }));
@@ -1587,11 +1624,6 @@ mod tests {
                 "navigate",
                 serde_json::json!({"url": "https://operator.example"}),
             ),
-            (
-                ResourceType::Peripheral,
-                "capture_image",
-                serde_json::json!({}),
-            ),
         ] {
             let response = broker
                 .execute(with_test_gate_proof(
@@ -1609,7 +1641,7 @@ mod tests {
                 .unwrap();
             assert!(response.success, "{operation} trusted operator call");
         }
-        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
 
         sandboxes.destroy_sandbox(untrusted_sandbox).unwrap();
         sandboxes.destroy_sandbox(trusted_sandbox).unwrap();
@@ -1675,27 +1707,13 @@ mod tests {
         assert_eq!(ipc_calls.load(Ordering::SeqCst), 0);
     }
 
-    #[tokio::test]
-    async fn shared_application_alias_cannot_reach_launch_provider() {
-        use crate::connector::ToolCall;
-        use crate::tool_registry_share::{SharedToolDef, SharedToolRegistry};
-        use crate::tools::{SecurityAction, ToolRegistry, ToolSecurity};
-
-        let permissions = Arc::new(PermissionManager::new());
-        let broker = ResourceBrokerImpl::new_unconfined(permissions.clone());
-        let calls = Arc::new(AtomicUsize::new(0));
-        broker
-            .register_provider(Box::new(BlindProvider {
-                resource_type: ResourceType::Application,
-                advertised: vec!["launch".into()],
-                calls: calls.clone(),
-            }))
-            .unwrap();
-        let agent = uuid::Uuid::new_v4();
-        permissions.assign_profile(agent, &"full-access".into());
+    #[test]
+    fn shared_application_alias_cannot_be_published() {
+        use crate::tool_registry_share::{ShareError, SharedToolDef, SharedToolRegistry};
+        use crate::tools::{SecurityAction, ToolSecurity};
 
         let mut shared = SharedToolRegistry::new();
-        shared
+        let error = shared
             .publish(
                 SharedToolDef::new(
                     "remote_close",
@@ -1713,26 +1731,10 @@ mod tests {
                     "required": ["application", "command"]
                 })),
             )
-            .unwrap();
-        let registry = ToolRegistry::new();
-        assert!(shared.install_into("remote_close", &registry));
-        let request = registry
-            .resolve(
-                agent,
-                &ToolCall {
-                    id: "remote".into(),
-                    name: "remote_close".into(),
-                    arguments: serde_json::json!({
-                        "application": "benign-session",
-                        "command": "must-not-execute"
-                    }),
-                },
-            )
-            .unwrap();
-
-        let error = broker.execute(request).await.unwrap_err();
-        assert!(error.to_string().contains("does not advertise operation"));
-        assert_eq!(calls.load(Ordering::SeqCst), 0);
+            .expect_err("unsupported application aliases must fail before publication");
+        assert!(
+            matches!(error, ShareError::Invalid(message) if message.contains("operation 'close' is not supported"))
+        );
     }
 
     #[tokio::test]

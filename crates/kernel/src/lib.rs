@@ -382,6 +382,9 @@ pub enum ResourceError {
     #[error("Resource provider not found: {0}")]
     ProviderNotFound(String),
 
+    #[error("Unsupported resource operation: {resource}.{operation}")]
+    UnsupportedOperation { resource: String, operation: String },
+
     #[error("Resource operation failed: {0}")]
     OperationFailed(String),
 
@@ -1120,9 +1123,10 @@ impl ResourceProvider for BuiltinAppProvider {
         params: &serde_json::Value,
     ) -> Result<serde_json::Value, ResourceError> {
         if operation != "launch" {
-            return Err(ResourceError::OperationFailed(format!(
-                "Unknown application op: {operation}"
-            )));
+            return Err(ResourceError::UnsupportedOperation {
+                resource: "Application".into(),
+                operation: operation.into(),
+            });
         }
         let cmd = params
             .get("command")
@@ -7604,6 +7608,24 @@ mod tests {
         assert_eq!(result["created"], true);
         assert!(path.is_dir());
         std::fs::remove_dir(&path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn builtin_application_provider_exposes_only_launch() {
+        let provider = BuiltinAppProvider;
+        assert_eq!(provider.supported_operations(), vec!["launch"]);
+        for operation in ["close", "send_input", "read_output"] {
+            assert_eq!(
+                provider
+                    .execute(operation, &serde_json::json!({}))
+                    .await
+                    .expect_err("unimplemented application operation must fail"),
+                ResourceError::UnsupportedOperation {
+                    resource: "Application".into(),
+                    operation: operation.into(),
+                }
+            );
+        }
     }
 
     #[cfg(unix)]

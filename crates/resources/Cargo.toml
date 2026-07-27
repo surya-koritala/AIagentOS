@@ -6,7 +6,7 @@ license.workspace = true
 rust-version.workspace = true
 
 [features]
-# Default lean: kernel + filesystem + network + application providers.
+# Default lean: kernel + filesystem + network + one-shot application launch.
 # Heavy web tooling is opt-in.
 default = []
 # Headless browser automation (chromiumoxide, ~50 MB compiled).

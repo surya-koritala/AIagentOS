@@ -1,4 +1,7 @@
-//! Application resource provider — launch/close apps, send input, read output.
+//! Application resource provider.
+//!
+//! Only one-shot command launch is implemented. Stateful process interaction
+//! is intentionally not advertised until it has real lifecycle semantics.
 
 use kernel::resources::{ResourceProvider, ResourceType};
 use kernel::ResourceError;
@@ -12,12 +15,7 @@ impl ResourceProvider for ApplicationProvider {
     }
 
     fn supported_operations(&self) -> Vec<String> {
-        vec![
-            "launch".into(),
-            "close".into(),
-            "send_input".into(),
-            "read_output".into(),
-        ]
+        vec!["launch".into()]
     }
 
     async fn execute(
@@ -52,18 +50,35 @@ impl ResourceProvider for ApplicationProvider {
                     "exit_code": output.status.code(),
                 }))
             }
-            "read_output" => {
-                // Stub: would read from a running process
-                Ok(serde_json::json!({"output": ""}))
-            }
-            "close" | "send_input" => {
-                // Stub: would interact with a running process
-                Ok(serde_json::json!({"success": true}))
-            }
-            _ => Err(ResourceError::OperationFailed(format!(
-                "Unknown operation: {}",
-                operation
-            ))),
+            _ => Err(ResourceError::UnsupportedOperation {
+                resource: "Application".into(),
+                operation: operation.into(),
+            }),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn stateful_process_stubs_are_typed_unsupported_and_not_advertised() {
+        let provider = ApplicationProvider;
+        assert_eq!(provider.supported_operations(), vec!["launch"]);
+
+        for operation in ["close", "send_input", "read_output"] {
+            let error = provider
+                .execute(operation, &serde_json::json!({}))
+                .await
+                .expect_err("placeholder application operation must fail");
+            assert_eq!(
+                error,
+                ResourceError::UnsupportedOperation {
+                    resource: "Application".into(),
+                    operation: operation.into(),
+                }
+            );
         }
     }
 }

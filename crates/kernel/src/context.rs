@@ -813,6 +813,17 @@ fn record_deleted_rows(
     }
 }
 
+#[cfg(test)]
+fn crash_erasure_after_step_for_test(step: &str) {
+    if std::env::var("AIAGENTOS_TEST_EXIT_ERASURE_AFTER_STEP").as_deref() == Ok(step) {
+        std::process::exit(87);
+    }
+}
+
+#[cfg(not(test))]
+#[inline]
+fn crash_erasure_after_step_for_test(_step: &str) {}
+
 fn persist_deletion_receipt(
     transaction: &Transaction<'_>,
     subject_kind: DeletionSubjectKind,
@@ -5499,6 +5510,7 @@ impl SqliteContextManager {
             )
             .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
         record_deleted_rows(&mut deleted_rows, "conversations_fts", deleted);
+        crash_erasure_after_step_for_test("agent.conversations_fts");
 
         for table in [
             "contexts",
@@ -5519,6 +5531,19 @@ impl SqliteContextManager {
                 )
                 .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
             record_deleted_rows(&mut deleted_rows, table, deleted);
+            crash_erasure_after_step_for_test(match table {
+                "contexts" => "agent.contexts",
+                "facts" => "agent.facts",
+                "conversations" => "agent.conversations",
+                "usage_log" => "agent.usage_log",
+                "agent_kv" => "agent.agent_kv",
+                "context_spills" => "agent.context_spills",
+                "context_snapshots" => "agent.context_snapshots",
+                "generation_checkpoints" => "agent.generation_checkpoints",
+                "context_pressure" => "agent.context_pressure",
+                "loaded_package_instances" => "agent.loaded_package_instances",
+                _ => unreachable!("agent erasure table list is closed"),
+            });
         }
 
         let cleared = tx
@@ -5532,6 +5557,7 @@ impl SqliteContextManager {
             "service_runtime.agent_reference",
             cleared,
         );
+        crash_erasure_after_step_for_test("agent.service_runtime");
         let cleared = tx
             .execute(
                 "UPDATE service_history SET agent_id = NULL WHERE agent_id = ?1",
@@ -5543,6 +5569,7 @@ impl SqliteContextManager {
             "service_history.agent_reference",
             cleared,
         );
+        crash_erasure_after_step_for_test("agent.service_history");
 
         let agent_scope_suffix = format!("/agent/{agent_id}");
         let deleted = tx
@@ -5554,6 +5581,7 @@ impl SqliteContextManager {
             )
             .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
         record_deleted_rows(&mut deleted_rows, "quota_receipt_scopes", deleted);
+        crash_erasure_after_step_for_test("agent.quota_receipt_scopes");
         let deleted = tx
             .execute(
                 "DELETE FROM quota_epochs
@@ -5563,11 +5591,13 @@ impl SqliteContextManager {
             )
             .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
         record_deleted_rows(&mut deleted_rows, "quota_epochs", deleted);
+        crash_erasure_after_step_for_test("agent.quota_epochs");
 
         let deleted = tx
             .execute("DELETE FROM agents WHERE id = ?1", params![&id])
             .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
         record_deleted_rows(&mut deleted_rows, "agents", deleted);
+        crash_erasure_after_step_for_test("agent.agents");
 
         if deleted_rows.is_empty() {
             return Ok(None);
@@ -5587,6 +5617,7 @@ impl SqliteContextManager {
         } else {
             None
         };
+        crash_erasure_after_step_for_test("agent.deletion_receipt");
         tx.commit()
             .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
         Ok(receipt)
@@ -8164,6 +8195,373 @@ mod tests {
         assert_eq!(erased_scope_rows, 0);
         assert_eq!(shared_provider_rows, 1);
         assert_eq!(accounting_receipt_rows, 1);
+    }
+
+    fn update_fingerprint_value(
+        digest: &mut ring::digest::Context,
+        value: rusqlite::types::ValueRef<'_>,
+    ) {
+        use rusqlite::types::ValueRef;
+
+        match value {
+            ValueRef::Null => digest.update(&[0]),
+            ValueRef::Integer(value) => {
+                digest.update(&[1]);
+                digest.update(&value.to_le_bytes());
+            }
+            ValueRef::Real(value) => {
+                digest.update(&[2]);
+                digest.update(&value.to_bits().to_le_bytes());
+            }
+            ValueRef::Text(value) => {
+                digest.update(&[3]);
+                digest.update(&(value.len() as u64).to_le_bytes());
+                digest.update(value);
+            }
+            ValueRef::Blob(value) => {
+                digest.update(&[4]);
+                digest.update(&(value.len() as u64).to_le_bytes());
+                digest.update(value);
+            }
+        }
+    }
+
+    fn logical_database_fingerprints(path: &std::path::Path) -> BTreeMap<String, String> {
+        let connection = Connection::open(path).unwrap();
+        crate::schema::verify(&connection).unwrap();
+        let quick_check: String = connection
+            .query_row("PRAGMA quick_check", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(quick_check, "ok");
+
+        let tables = {
+            let mut statement = connection
+                .prepare(
+                    "SELECT name FROM sqlite_schema
+                     WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
+                     ORDER BY name",
+                )
+                .unwrap();
+            statement
+                .query_map([], |row| row.get::<_, String>(0))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        let mut fingerprints = BTreeMap::new();
+        for table in tables {
+            let mut digest = ring::digest::Context::new(&ring::digest::SHA256);
+            digest.update(&(table.len() as u64).to_le_bytes());
+            digest.update(table.as_bytes());
+            let quoted_table = format!("\"{}\"", table.replace('"', "\"\""));
+            // Opening an already-current store refreshes only this operational
+            // timestamp. Fingerprint the durable identity/version fields while
+            // excluding that expected pre-transaction startup write.
+            let (selection, column_count) = if table == "storage_meta" {
+                (
+                    "singleton, application_id, schema_version, \
+                     min_reader_schema_version, installation_id, created_at"
+                        .to_string(),
+                    6,
+                )
+            } else {
+                (
+                    "*".to_string(),
+                    connection
+                        .prepare(&format!("PRAGMA table_info({quoted_table})"))
+                        .unwrap()
+                        .query_map([], |_| Ok(()))
+                        .unwrap()
+                        .count(),
+                )
+            };
+            assert!(column_count > 0, "{table} has no visible columns");
+            let order = (1..=column_count)
+                .map(|column| column.to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let mut statement = connection
+                .prepare(&format!(
+                    "SELECT {selection} FROM {quoted_table} ORDER BY {order}"
+                ))
+                .unwrap();
+            let mut rows = statement.query([]).unwrap();
+            while let Some(row) = rows.next().unwrap() {
+                digest.update(&[0xff]);
+                for column in 0..column_count {
+                    update_fingerprint_value(&mut digest, row.get_ref(column).unwrap());
+                }
+            }
+            let fingerprint = digest
+                .finish()
+                .as_ref()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect();
+            fingerprints.insert(table, fingerprint);
+        }
+        fingerprints
+    }
+
+    async fn seed_agent_erasure_crash_fixture(
+        path: &std::path::Path,
+        agent: AgentId,
+        tenant: &str,
+    ) {
+        let manager = SqliteContextManager::new(path).unwrap();
+        let now = Utc::now();
+        manager
+            .save_agent(&PersistedAgent {
+                id: agent,
+                session_id: uuid::Uuid::new_v4(),
+                tenant_id: tenant.to_string(),
+                name: "crash qualification agent".into(),
+                task: "prove transaction rollback".into(),
+                llm_provider: "stub".into(),
+                permission_profile: "standard".into(),
+                priority: 3,
+                status: "\"Stopped\"".into(),
+                sandbox_config_json: None,
+                created_at: now,
+                last_activity_at: now,
+            })
+            .unwrap();
+        manager.create_context(agent).await.unwrap();
+        manager
+            .store_fact(
+                agent,
+                Fact {
+                    id: uuid::Uuid::new_v4(),
+                    content: "crash qualification memory".into(),
+                    category: FactCategory::Fact,
+                    created_at: now,
+                    last_accessed_at: now,
+                    embedding: None,
+                },
+            )
+            .await
+            .unwrap();
+        manager
+            .save_conversation(
+                "crash-qualification-conversation",
+                agent,
+                &[crate::connector::StandardMessage::user(
+                    "crash qualification prompt",
+                )],
+            )
+            .unwrap();
+        manager
+            .log_usage(
+                agent,
+                &UsageRecord {
+                    tokens_used: 1,
+                    input_tokens: 1,
+                    output_tokens: 0,
+                    cached_tokens: 0,
+                    llm_requests: 1,
+                    retries: 0,
+                    provider_latency_ms: 1,
+                    provider_reported_requests: 1,
+                    estimated_requests: 0,
+                    provider: "stub".into(),
+                    model: "stub".into(),
+                    tool_calls: 0,
+                    estimated_cost_usd: 0.000_001,
+                    cost_micros: 1,
+                },
+            )
+            .unwrap();
+        manager.kv_put(agent, "crash-proof", "retained").unwrap();
+        manager
+            .store_context_spill(
+                agent,
+                &format!("context_spill:crash:{agent}"),
+                "crash qualification spill",
+                &sha256("crash qualification spill"),
+            )
+            .unwrap();
+        manager
+            .snapshot_context(agent, "crash-qualification-snapshot")
+            .unwrap();
+        manager
+            .save_generation_checkpoint(
+                tenant,
+                "stub",
+                "stub",
+                &sample_generation_checkpoint(agent),
+                std::time::Duration::from_secs(60),
+            )
+            .unwrap();
+
+        let agent_scope = format!("/tenant/{tenant}/profile/standard/agent/{agent}");
+        let quota_receipt = uuid::Uuid::new_v4();
+        let connection = manager.conn.lock().unwrap();
+        connection
+            .execute(
+                "INSERT INTO context_pressure
+                 (agent_id, active_tokens, budget_tokens, updated_at)
+                 VALUES (?1, 1, 10, ?2)",
+                params![agent.to_string(), now.to_rfc3339()],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO loaded_package_instances
+                 (agent_id, tenant_id, name, provider, profile, loaded_at)
+                 VALUES (?1, ?2, 'pkg', 'stub', 'standard', ?3)",
+                params![agent.to_string(), tenant, now.to_rfc3339()],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO service_runtime
+                 (name, definition_revision, status, agent_id, restart_count,
+                  restart_attempts_total, desired_running, ready, healthy,
+                  restart_exhausted, last_transition_at, dependency_blocks)
+                 VALUES ('crash-svc', 'rev', '\"Running\"', ?1, 0, 0,
+                         0, 0, 0, 0, ?2, 0)",
+                params![agent.to_string(), now.to_rfc3339()],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO service_history
+                 (name, event, status, agent_id, created_at)
+                 VALUES ('crash-svc', 'started', '\"Running\"', ?1, ?2)",
+                params![agent.to_string(), now.to_rfc3339()],
+            )
+            .unwrap();
+        let epoch = u64_blob(1);
+        let one = u64_blob(1);
+        connection
+            .execute(
+                "INSERT INTO quota_epochs
+                 (scope_kind, scope_id, epoch, requests, tokens)
+                 VALUES ('cgroup', ?1, ?2, ?3, ?3)",
+                params![&agent_scope, epoch.as_slice(), one.as_slice()],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO quota_receipts
+                 (id, receipt_kind, epoch, state, reserved_requests, reserved_tokens)
+                 VALUES (?1, 'provider_rate', ?2, 'reserved', ?3, ?3)",
+                params![quota_receipt.to_string(), epoch.as_slice(), one.as_slice()],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO quota_receipt_scopes
+                 (receipt_id, scope_order, scope_kind, scope_id,
+                  reserved_requests, reserved_tokens)
+                 VALUES (?1, 0, 'cgroup', ?2, ?3, ?3)",
+                params![quota_receipt.to_string(), &agent_scope, one.as_slice()],
+            )
+            .unwrap();
+    }
+
+    const AGENT_ERASURE_CRASH_STEPS: &[&str] = &[
+        "agent.conversations_fts",
+        "agent.contexts",
+        "agent.facts",
+        "agent.conversations",
+        "agent.usage_log",
+        "agent.agent_kv",
+        "agent.context_spills",
+        "agent.context_snapshots",
+        "agent.generation_checkpoints",
+        "agent.context_pressure",
+        "agent.loaded_package_instances",
+        "agent.service_runtime",
+        "agent.service_history",
+        "agent.quota_receipt_scopes",
+        "agent.quota_epochs",
+        "agent.agents",
+        "agent.deletion_receipt",
+    ];
+
+    #[tokio::test]
+    async fn process_exit_at_every_agent_erasure_mutation_rolls_back_all_tables() {
+        let database = QuotaTestDatabase::new("agent-erasure-process-exit");
+        let agent = uuid::Uuid::new_v4();
+        let tenant = "crash-qualification-tenant";
+        seed_agent_erasure_crash_fixture(&database.path, agent, tenant).await;
+        let baseline = logical_database_fingerprints(&database.path);
+
+        for step in AGENT_ERASURE_CRASH_STEPS {
+            let child = std::process::Command::new(std::env::current_exe().unwrap())
+                .arg("--ignored")
+                .arg("agent_erasure_crash_child_only")
+                .env("AIAGENTOS_TEST_ERASURE_DB", &database.path)
+                .env("AIAGENTOS_TEST_ERASURE_AGENT", agent.to_string())
+                .env("AIAGENTOS_TEST_EXIT_ERASURE_AFTER_STEP", step)
+                .status()
+                .unwrap();
+            assert_eq!(
+                child.code(),
+                Some(87),
+                "child did not terminate at crash point {step}"
+            );
+            assert_eq!(
+                logical_database_fingerprints(&database.path),
+                baseline,
+                "process exit after {step} left a partial durable mutation"
+            );
+        }
+
+        let manager = SqliteContextManager::new(&database.path).unwrap();
+        assert!(manager.erase_agent_data(agent).unwrap().is_some());
+        let connection = manager.conn.lock().unwrap();
+        crate::schema::verify(&connection).unwrap();
+        let quick_check: String = connection
+            .query_row("PRAGMA quick_check", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(quick_check, "ok");
+        let remaining: i64 = connection
+            .query_row(
+                "SELECT
+                   (SELECT COUNT(*) FROM agents WHERE id = ?1) +
+                   (SELECT COUNT(*) FROM contexts WHERE agent_id = ?1) +
+                   (SELECT COUNT(*) FROM facts WHERE agent_id = ?1) +
+                   (SELECT COUNT(*) FROM conversations WHERE agent_id = ?1) +
+                   (SELECT COUNT(*) FROM usage_log WHERE agent_id = ?1) +
+                   (SELECT COUNT(*) FROM agent_kv WHERE agent_id = ?1) +
+                   (SELECT COUNT(*) FROM context_spills WHERE agent_id = ?1) +
+                   (SELECT COUNT(*) FROM context_snapshots WHERE agent_id = ?1) +
+                   (SELECT COUNT(*) FROM generation_checkpoints WHERE agent_id = ?1) +
+                   (SELECT COUNT(*) FROM context_pressure WHERE agent_id = ?1) +
+                   (SELECT COUNT(*) FROM loaded_package_instances WHERE agent_id = ?1) +
+                   (SELECT COUNT(*) FROM service_runtime WHERE agent_id = ?1) +
+                   (SELECT COUNT(*) FROM service_history WHERE agent_id = ?1)",
+                [agent.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let receipt_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM deletion_receipts
+                 WHERE subject_kind = 'agent'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(remaining, 0);
+        assert_eq!(receipt_count, 1);
+    }
+
+    #[test]
+    #[ignore = "child-process helper for agent-erasure crash regression"]
+    fn agent_erasure_crash_child_only() {
+        let Some(database) = std::env::var_os("AIAGENTOS_TEST_ERASURE_DB") else {
+            return;
+        };
+        let agent = std::env::var("AIAGENTOS_TEST_ERASURE_AGENT")
+            .ok()
+            .and_then(|value| uuid::Uuid::parse_str(&value).ok())
+            .expect("agent erasure crash helper requires a valid agent id");
+        let manager = SqliteContextManager::new(std::path::Path::new(&database)).unwrap();
+        let _ = manager.erase_agent_data(agent).unwrap();
+        panic!("agent erasure crash helper did not terminate at the requested mutation");
     }
 
     #[test]

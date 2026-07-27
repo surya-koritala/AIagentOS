@@ -1,5 +1,10 @@
 # AI Agent OS — Docker Runbook
 
+For credential compromise, tenant leak, malicious package, node/process loss,
+corrupt database, and provider outage, use the separate
+[incident-response runbook](INCIDENT_RESPONSE.md). Preserve evidence and follow
+its containment steps before ordinary troubleshooting.
+
 Two ways to run AI Agent OS in a container, ordered by how much they need:
 
 | Tier | What runs | LLM needed? | Keys needed? | Proves |

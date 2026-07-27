@@ -388,6 +388,40 @@ fn release_blocking_workflows_keep_their_security_contract() {
         );
     }
 
+    let incident = read_workspace_file(".github/workflows/incident-drill-qualification.yml");
+    for proof in [
+        "pull_request:",
+        "QUALIFICATION_SHA: ${{ github.event.pull_request.head.sha || github.sha }}",
+        "ref: ${{ env.QUALIFICATION_SHA }}",
+        "Exact-commit automated incident technical controls",
+        "python3 scripts/incident_drill_qualification.py --validate",
+        "--output target/qualification/incident-drill.json",
+        "automated_incident_drill_fixture",
+        "automated_technical_controls_only",
+        "human_game_day_completed",
+        "game_day_proof_eligible",
+        "incident-drill-${{ env.QUALIFICATION_SHA }}",
+        "retention-days: 90",
+    ] {
+        assert!(
+            incident.contains(proof),
+            "incident qualification workflow lost {proof:?}"
+        );
+    }
+    for scenario in [
+        "credential-compromise",
+        "tenant-leak",
+        "malicious-package",
+        "node-loss",
+        "corrupt-database",
+        "provider-outage",
+    ] {
+        assert!(
+            incident.contains(scenario),
+            "incident qualification workflow lost scenario {scenario:?}"
+        );
+    }
+
     let live = read_workspace_file(".github/workflows/live-provider-qualification.yml");
     assert!(
         live.contains("workflow_dispatch:") && !live.contains("pull_request:"),

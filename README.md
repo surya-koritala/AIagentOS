@@ -413,6 +413,11 @@ export AGENTOS_QUALIFICATION_ENVIRONMENT="local-smoke"
 cargo run --package os-benchmark --bin soak-qualification --locked -- \
   --smoke --state-dir target/qualification/resource-soak-smoke-state \
   --output target/qualification/resource-soak-smoke.json
+
+# Validate and run all six automated incident technical-control drills
+python3 scripts/incident_drill_qualification.py --validate
+python3 scripts/incident_drill_qualification.py \
+  --output target/qualification/incident-drill.json
 ```
 
 The versioned [production observability contract](docs/OBSERVABILITY.md) now
@@ -434,6 +439,11 @@ all seven deterministic scenarios, bound to the exact clean commit.
 The [resource and leak soak guide](docs/SOAK_QUALIFICATION.md) defines the
 separate 24-hour target-host run, retained process/SQLite/admission samples,
 proof eligibility, and the exact work that remains after the harness exists.
+The [incident-response runbook](docs/INCIDENT_RESPONSE.md) defines containment,
+evidence preservation, recovery, and verification for credential compromise,
+tenant leak, malicious package, node loss, corrupt database, and provider
+outage. Its retained automated drill proves deterministic technical controls;
+it does not replace the required human game day.
 
 ## Architecture Docs
 
@@ -446,6 +456,7 @@ proof eligibility, and the exact work that remains after the harness exists.
 - [`docs/CAPACITY_QUALIFICATION.md`](docs/CAPACITY_QUALIFICATION.md) — reproducible workload profiles and sizing method
 - [`docs/RESILIENCE_QUALIFICATION.md`](docs/RESILIENCE_QUALIFICATION.md) — overload, slow-peer, and dependency-failure evidence
 - [`docs/SOAK_QUALIFICATION.md`](docs/SOAK_QUALIFICATION.md) — 24-hour target resource/leak evidence contract
+- [`docs/INCIDENT_RESPONSE.md`](docs/INCIDENT_RESPONSE.md) — six incident playbooks and automated drill boundary
 - [`docs/COMPLETE_SPEC.md`](docs/COMPLETE_SPEC.md) — long-form implementation spec
 - [`docs/FULL_ROADMAP.md`](docs/FULL_ROADMAP.md) — long-form vision roadmap
 

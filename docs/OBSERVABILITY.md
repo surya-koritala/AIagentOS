@@ -94,6 +94,12 @@ The importable
 uses only contract-v1 families and includes request success/rate/p95, queues,
 gate decisions, durability, backup, and lifecycle panels.
 
+Credential compromise, tenant leak, malicious package, node/process loss,
+corrupt database, and provider outage have containment and recovery procedures
+in [`INCIDENT_RESPONSE.md`](INCIDENT_RESPONSE.md). Its scheduled automated drill
+retains exact-commit technical-control evidence while explicitly remaining
+ineligible as proof of a human game day.
+
 ## Alert runbooks
 
 ### Availability budget burn
@@ -158,6 +164,8 @@ its routing, residency, cancellation, and credential policies are qualified.
 Production qualification remains open until an exact release candidate passes
 the 24-hour sustained-load profile, overload and slow-client/provider tests,
 fault injection, memory/file-descriptor leak checks, privacy disable/export
-verification, alert delivery tests, an incident game day, and independent
-review. Results must be attached to issue #125 with the exact commit and
-workflow run. Missing infrastructure or credentials are `not_run`, never pass.
+verification, alert delivery tests, a human incident game day, and independent
+review. The deterministic six-scenario incident drill is regression evidence,
+not operator/game-day proof. Results must be attached to issue #125 with the
+exact commit and workflow run. Missing infrastructure or credentials are
+`not_run`, never pass.

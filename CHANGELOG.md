@@ -10,6 +10,12 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
 
 ## [Unreleased]
 
+- Added six incident-response playbooks and a fail-closed automated drill for
+  #125 covering credential compromise, tenant leak, malicious package, abrupt
+  node loss, corrupt database, and provider outage. The fixed command catalog
+  rejects empty Cargo filters and invalid child fault evidence, retains only
+  non-sensitive command results in an exact-commit workflow artifact, and
+  explicitly remains ineligible as proof of alert delivery or a human game day.
 - Retained exact-commit deterministic fault evidence for #125. The extended
   security workflow now executes all seven public TCP/SDK resilience scenarios
   in release mode, rejects source/build/scenario/check mismatches, and uploads

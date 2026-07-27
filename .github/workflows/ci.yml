@@ -38,6 +38,8 @@ jobs:
         run: cargo test -p integration-tests capability_registry --locked
       - name: Critical coverage verifier regressions
         run: python -m unittest discover -s scripts/tests -p "test_*.py"
+      - name: Prometheus alert syntax, firing, hold, and recovery regressions
+        run: scripts/run_promtool_tests.sh
       - name: Below-production retained capabilities have open qualification work
         env:
           GH_TOKEN: ${{ github.token }}

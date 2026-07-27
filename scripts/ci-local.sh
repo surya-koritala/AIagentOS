@@ -12,6 +12,7 @@ python3 scripts/verify_workflow_action_pins.py
 cargo clippy --workspace --exclude tauri-app --all-targets --locked -- -D warnings
 cargo test -p integration-tests capability_registry --locked
 python3 -m unittest discover -s scripts/tests -p "test_*.py"
+scripts/run_promtool_tests.sh
 cargo test --workspace --exclude tauri-app --doc --locked
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --exclude tauri-app --no-deps --locked
 mdbook build docs

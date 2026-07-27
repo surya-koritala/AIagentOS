@@ -10,6 +10,13 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
 
 ## [Unreleased]
 
+- Fixed two queue-saturation alerts that could never match their `waiting` and
+  `capacity` series because those series carry different `state` labels. A
+  checksum-pinned Prometheus 3.13.1 suite now parses the production rules and
+  proves all nine alerts remain inactive before their hold time, fire with the
+  documented labels and runbook, and clear after recovery. This validates the
+  checked-in rule engine behavior; target Alertmanager routing and receiver
+  delivery remain open under #125.
 - Added six incident-response playbooks and a fail-closed automated drill for
   #125 covering credential compromise, tenant leak, malicious package, abrupt
   node loss, corrupt database, and provider outage. The fixed command catalog

@@ -89,6 +89,12 @@ The checked-in rules at
 [`observability/prometheus-rules.yml`](../observability/prometheus-rules.yml)
 implement fast operational signals. They do not replace the 30-day SLO report,
 24-hour soak, fault injection, or release game day required by issue #125.
+The checksum-pinned Prometheus 3.13.1 regression suite at
+[`observability/prometheus-rule-tests.yml`](../observability/prometheus-rule-tests.yml)
+parses the production rules and proves that every alert remains inactive before
+its configured `for` interval, fires at the threshold, and clears when the
+underlying signal recovers. This qualifies PromQL evaluation and rule state
+transitions, not delivery through a deployment's Alertmanager receiver.
 The importable
 [`observability/grafana-dashboard.json`](../observability/grafana-dashboard.json)
 uses only contract-v1 families and includes request success/rate/p95, queues,
@@ -164,8 +170,10 @@ its routing, residency, cancellation, and credential policies are qualified.
 Production qualification remains open until an exact release candidate passes
 the 24-hour sustained-load profile, overload and slow-client/provider tests,
 fault injection, memory/file-descriptor leak checks, privacy disable/export
-verification, alert delivery tests, a human incident game day, and independent
-review. The deterministic six-scenario incident drill is regression evidence,
-not operator/game-day proof. Results must be attached to issue #125 with the
-exact commit and workflow run. Missing infrastructure or credentials are
-`not_run`, never pass.
+verification, target Alertmanager routing/receiver delivery tests, a human
+incident game day, and independent review. The Prometheus unit suite proves
+rule evaluation but cannot prove an external page or ticket arrived. The
+deterministic six-scenario incident drill is regression evidence, not
+operator/game-day proof. Results must be attached to issue #125 with the exact
+commit and workflow run. Missing infrastructure or credentials are `not_run`,
+never pass.

@@ -70,7 +70,7 @@ groups:
           summary: No successful scheduled AgentOS backup in 25 hours
           runbook_url: docs/OBSERVABILITY.md#backup-stale
       - alert: AgentOSTurnQueueSaturated
-        expr: agentos_turn_admission{state="waiting"} > agentos_turn_admission{state="capacity"}
+        expr: agentos_turn_admission{state="waiting"} > ignoring(state) agentos_turn_admission{state="capacity"}
         for: 15m
         labels:
           severity: ticket
@@ -79,7 +79,7 @@ groups:
           summary: AgentOS turn waiters exceed configured capacity
           runbook_url: docs/OBSERVABILITY.md#turn-queue-saturation
       - alert: AgentOSProviderQueueSaturated
-        expr: agentos_llm_cores{state="waiting"} > agentos_llm_cores{state="capacity"}
+        expr: agentos_llm_cores{state="waiting"} > ignoring(state) agentos_llm_cores{state="capacity"}
         for: 15m
         labels:
           severity: ticket

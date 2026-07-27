@@ -1,0 +1,232 @@
+rule_files:
+  - prometheus-rules.yml
+
+evaluation_interval: 1m
+group_eval_order:
+  - agentos-slo-v1
+
+tests:
+  - name: availability budget burn fires after its hold and recovers
+    interval: 1m
+    input_series:
+      - series: 'agentos_requests_total{outcome="success"}'
+        values: '0+1x20 120+100x15'
+      - series: 'agentos_requests_total{outcome="failed"}'
+        values: '0+1x20 20+0x15'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: AgentOSAvailabilityBudgetBurn
+        exp_alerts: []
+      - eval_time: 12m
+        alertname: AgentOSAvailabilityBudgetBurn
+        exp_alerts:
+          - exp_labels:
+              severity: page
+              contract: "v1"
+            exp_annotations:
+              summary: AgentOS eligible-request success is below 99.5%
+              runbook_url: docs/OBSERVABILITY.md#availability-budget-burn
+      - eval_time: 26m
+        alertname: AgentOSAvailabilityBudgetBurn
+        exp_alerts: []
+
+  - name: request timeout rate fires after its hold and recovers
+    interval: 1m
+    input_series:
+      - series: 'agentos_requests_total{outcome="success"}'
+        values: '0+98x20 2118+100x15'
+      - series: 'agentos_requests_total{outcome="timed_out"}'
+        values: '0+2x20 40+0x15'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: AgentOSRequestTimeoutRate
+        exp_alerts: []
+      - eval_time: 11m
+        alertname: AgentOSRequestTimeoutRate
+        exp_alerts:
+          - exp_labels:
+              severity: page
+              contract: "v1"
+            exp_annotations:
+              summary: More than 1% of eligible AgentOS requests are timing out
+              runbook_url: docs/OBSERVABILITY.md#request-timeouts
+      - eval_time: 26m
+        alertname: AgentOSRequestTimeoutRate
+        exp_alerts: []
+
+  - name: control-plane latency fires after its hold and recovers
+    interval: 1m
+    input_series:
+      - series: 'agentos_request_duration_seconds_bucket{subsystem="control",outcome="success",le="0.5"}'
+        values: '0+1x25 125+100x15'
+      - series: 'agentos_request_duration_seconds_bucket{subsystem="control",outcome="success",le="1"}'
+        values: '0+2x25 150+100x15'
+      - series: 'agentos_request_duration_seconds_bucket{subsystem="control",outcome="success",le="2"}'
+        values: '0+10x25 350+100x15'
+      - series: 'agentos_request_duration_seconds_bucket{subsystem="control",outcome="success",le="+Inf"}'
+        values: '0+10x25 350+100x15'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: AgentOSControlPlaneP95Latency
+        exp_alerts: []
+      - eval_time: 16m
+        alertname: AgentOSControlPlaneP95Latency
+        exp_alerts:
+          - exp_labels:
+              severity: ticket
+              contract: "v1"
+            exp_annotations:
+              summary: AgentOS control-plane p95 latency exceeds one second
+              runbook_url: docs/OBSERVABILITY.md#control-plane-latency
+      - eval_time: 31m
+        alertname: AgentOSControlPlaneP95Latency
+        exp_alerts: []
+
+  - name: agent-turn latency fires after its hold and recovers
+    interval: 1m
+    input_series:
+      - series: 'agentos_request_duration_seconds_bucket{subsystem="agent",outcome="success",le="10"}'
+        values: '0+1x45 145+100x25'
+      - series: 'agentos_request_duration_seconds_bucket{subsystem="agent",outcome="success",le="30"}'
+        values: '0+2x45 190+100x25'
+      - series: 'agentos_request_duration_seconds_bucket{subsystem="agent",outcome="success",le="60"}'
+        values: '0+10x45 550+100x25'
+      - series: 'agentos_request_duration_seconds_bucket{subsystem="agent",outcome="success",le="+Inf"}'
+        values: '0+10x45 550+100x25'
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: AgentOSAgentTurnP95Latency
+        exp_alerts: []
+      - eval_time: 31m
+        alertname: AgentOSAgentTurnP95Latency
+        exp_alerts:
+          - exp_labels:
+              severity: ticket
+              contract: "v1"
+            exp_annotations:
+              summary: AgentOS agent-operation p95 latency exceeds 30 seconds
+              runbook_url: docs/OBSERVABILITY.md#agent-turn-latency
+      - eval_time: 62m
+        alertname: AgentOSAgentTurnP95Latency
+        exp_alerts: []
+
+  - name: quota ledger alert fires after its hold and recovers
+    interval: 1m
+    input_series:
+      - series: agentos_quota_storage_healthy
+        values: '0+0x3 1+0x5'
+    alert_rule_test:
+      - eval_time: 0m
+        alertname: AgentOSQuotaLedgerUnhealthy
+        exp_alerts: []
+      - eval_time: 2m
+        alertname: AgentOSQuotaLedgerUnhealthy
+        exp_alerts:
+          - exp_labels:
+              severity: page
+              contract: "v1"
+            exp_annotations:
+              summary: Durable quota accounting is unhealthy
+              runbook_url: docs/OBSERVABILITY.md#quota-ledger-unhealthy
+      - eval_time: 4m
+        alertname: AgentOSQuotaLedgerUnhealthy
+        exp_alerts: []
+
+  - name: backup failure alert fires after its hold and recovers
+    interval: 1m
+    input_series:
+      - series: agentos_backup_scheduler_enabled
+        values: '1+0x15'
+      - series: agentos_backup_consecutive_failures
+        values: '1+0x8 0+0x7'
+    alert_rule_test:
+      - eval_time: 4m
+        alertname: AgentOSBackupFailures
+        exp_alerts: []
+      - eval_time: 5m
+        alertname: AgentOSBackupFailures
+        exp_alerts:
+          - exp_labels:
+              severity: page
+              contract: "v1"
+            exp_annotations:
+              summary: Scheduled AgentOS backups are failing
+              runbook_url: docs/OBSERVABILITY.md#backup-failures
+      - eval_time: 9m
+        alertname: AgentOSBackupFailures
+        exp_alerts: []
+
+  - name: stale backup alert fires after its hold and recovers
+    interval: 1m
+    start_timestamp: 200000
+    input_series:
+      - series: agentos_backup_scheduler_enabled
+        values: '1+0x25'
+      - series: agentos_backup_last_success_unixtime_seconds
+        values: '100000+0x14 200900+0x10'
+      - series: agentos_process_uptime_seconds
+        values: '100000+60x25'
+    alert_rule_test:
+      - eval_time: 9m
+        alertname: AgentOSBackupStale
+        exp_alerts: []
+      - eval_time: 10m
+        alertname: AgentOSBackupStale
+        exp_alerts:
+          - exp_labels:
+              severity: page
+              contract: "v1"
+            exp_annotations:
+              summary: No successful scheduled AgentOS backup in 25 hours
+              runbook_url: docs/OBSERVABILITY.md#backup-stale
+      - eval_time: 15m
+        alertname: AgentOSBackupStale
+        exp_alerts: []
+
+  - name: turn queue saturation fires after its hold and recovers
+    interval: 1m
+    input_series:
+      - series: 'agentos_turn_admission{state="waiting"}'
+        values: '20+0x20 5+0x10'
+      - series: 'agentos_turn_admission{state="capacity"}'
+        values: '10+0x30'
+    alert_rule_test:
+      - eval_time: 14m
+        alertname: AgentOSTurnQueueSaturated
+        exp_alerts: []
+      - eval_time: 15m
+        alertname: AgentOSTurnQueueSaturated
+        exp_alerts:
+          - exp_labels:
+              severity: ticket
+              contract: "v1"
+            exp_annotations:
+              summary: AgentOS turn waiters exceed configured capacity
+              runbook_url: docs/OBSERVABILITY.md#turn-queue-saturation
+      - eval_time: 21m
+        alertname: AgentOSTurnQueueSaturated
+        exp_alerts: []
+
+  - name: provider queue saturation fires after its hold and recovers
+    interval: 1m
+    input_series:
+      - series: 'agentos_llm_cores{state="waiting"}'
+        values: '20+0x20 5+0x10'
+      - series: 'agentos_llm_cores{state="capacity"}'
+        values: '10+0x30'
+    alert_rule_test:
+      - eval_time: 14m
+        alertname: AgentOSProviderQueueSaturated
+        exp_alerts: []
+      - eval_time: 15m
+        alertname: AgentOSProviderQueueSaturated
+        exp_alerts:
+          - exp_labels:
+              severity: ticket
+              contract: "v1"
+            exp_annotations:
+              summary: AgentOS provider waiters exceed configured LLM capacity
+              runbook_url: docs/OBSERVABILITY.md#provider-queue-saturation
+      - eval_time: 21m
+        alertname: AgentOSProviderQueueSaturated
+        exp_alerts: []

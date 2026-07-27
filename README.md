@@ -227,7 +227,9 @@ the retained publication receipt. The implementation requires compliance-mode
 retention and never treats the object store as a trust root. See
 [`docs/REMOTE_BACKUP_QUALIFICATION.md`](docs/REMOTE_BACKUP_QUALIFICATION.md) for
 the bucket policy, credentials, CLI commands, measured recovery report, and
-qualification boundary.
+qualification boundary. Its protected exact-RC target-service workflow retains
+replayable public trust/anchor fixtures without private keys or credentials;
+an actual eligible target run is still required.
 
 If the configured database itself is corrupt and normal restore refuses to
 checkpoint it, keep the server stopped and use the separate forensic path. The

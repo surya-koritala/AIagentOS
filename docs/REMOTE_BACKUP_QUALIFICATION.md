@@ -19,7 +19,10 @@ Provision a dedicated bucket before publication:
   permissions for exact versions;
 - use a bucket policy that denies ordinary `DeleteObject` and
   `DeleteObjectVersion` access, with separately controlled break-glass
-  administration; and
+  administration. The dedicated target-qualification identity is the only
+  exception: it needs `DeleteObject` on its unique `qualifications/` prefixes
+  to create current-key delete markers, but must never receive
+  `DeleteObjectVersion` or retention-bypass permission; and
 - use TLS with a trusted certificate. Plain HTTP is accepted only with
   `--allow-loopback-http` and a syntactic loopback endpoint for disposable
   qualification.
@@ -104,6 +107,44 @@ independent-review evidence.
 After fetch, keep the server stopped and run `backup-disaster-recover` with the
 same trust root and anchor to replace and boot-qualify the configured database.
 
+## Protected target-service qualification
+
+The manual `Target remote backup qualification` workflow exercises this path
+against the declared non-loopback HTTPS service for one exact existing release
+candidate. It never substitutes the disposable MinIO fixture. Configure the
+protected `capacity-qualification` environment with:
+
+| Kind | Name | Meaning |
+| --- | --- | --- |
+| Variable | `AGENTOS_TARGET_REMOTE_ENDPOINT` | Origin-only HTTPS S3-compatible endpoint |
+| Variable | `AGENTOS_TARGET_REMOTE_BUCKET` | Dedicated versioned Object Lock bucket |
+| Variable | `AGENTOS_TARGET_REMOTE_REGION` | SigV4 region |
+| Secret | `AGENTOS_TARGET_REMOTE_ACCESS_KEY_ID` | Dedicated qualification access key |
+| Secret | `AGENTOS_TARGET_REMOTE_SECRET_ACCESS_KEY` | Dedicated qualification secret |
+| Secret | `AGENTOS_TARGET_REMOTE_SESSION_TOKEN` | Optional short-lived session token |
+
+Dispatch the workflow from the exact `vX.Y.Z-rc.N` or `vX.Y.Z` tag and provide
+stable non-secret deployment and service-profile identifiers. The job proves
+the tag resolves to its checked-out commit, requires a clean release build,
+publishes a unique prefix with two days of compliance retention, creates
+current-key delete markers, fetches the exact locked versions, restores and
+opens the database, and records measured publication, download, recovery-point
+age, and restore results.
+
+The retained bounded JSON embeds the non-secret `BackupTrustRoot` and exact
+`BackupRecoveryAnchor` under `public_recovery_fixture`. Those released fixtures
+allow an independent reviewer to replay signature, installation, database, and
+manifest identity checks without the private signing key, storage key, or
+object-store credentials. The private signing key exists only in the
+disposable runner state and is not uploaded.
+
+`target_remote_recovery_proof_eligible: true` means the target-service
+measurement contract passed. `production_claim_allowed` remains false until
+the artifact, service separation, bucket policy, retention custody, and
+remaining durability/release gates receive independent approval. If protected
+credentials, the runner, or the target service are absent, the gate is
+failed/not-run rather than passed.
+
 ## Checked-in qualification boundary
 
 `.github/workflows/remote-backup-qualification.yml` runs the release-mode path
@@ -114,6 +155,8 @@ checks an application value. The retained JSON is exact-commit regression
 evidence.
 
 That disposable fixture is not an independent remote failure domain and cannot
-complete issue #123 by itself. Production promotion still requires a measured
-run on the declared remote service, released independently reviewed trust
-fixtures, destructive supported-profile tests, and published RPO/RTO.
+complete issue #123 by itself. The protected target-service workflow and
+released-fixture report contract are implemented, but production promotion
+still requires an eligible exact-RC target run and independent review,
+destructive supported-profile tests, external deletion/retention evidence, and
+published RPO/RTO.

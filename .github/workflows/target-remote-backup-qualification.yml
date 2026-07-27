@@ -1,0 +1,145 @@
+name: Target remote backup qualification
+
+# This protected manual gate uses a dedicated non-loopback HTTPS object store.
+# Missing target configuration or credentials is a failed/not-run
+# qualification; disposable MinIO is never substituted.
+on:
+  workflow_dispatch:
+    inputs:
+      release_candidate:
+        description: Existing vX.Y.Z-rc.N or vX.Y.Z tag pointing at this workflow ref
+        required: true
+        type: string
+      environment_id:
+        description: Stable non-secret target deployment identifier
+        required: true
+        type: string
+      service_id:
+        description: Stable non-secret remote object-store profile identifier
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: target-remote-backup-qualification
+  cancel-in-progress: false
+
+env:
+  AGENTOS_RELEASE_CANDIDATE: ${{ inputs.release_candidate }}
+  AGENTOS_QUALIFICATION_ENVIRONMENT: ${{ inputs.environment_id }}
+  AGENTOS_REMOTE_SERVICE_ID: ${{ inputs.service_id }}
+  AGENTOS_TARGET_REMOTE_ENDPOINT: ${{ vars.AGENTOS_TARGET_REMOTE_ENDPOINT }}
+  AGENTOS_TARGET_REMOTE_BUCKET: ${{ vars.AGENTOS_TARGET_REMOTE_BUCKET }}
+  AWS_REGION: ${{ vars.AGENTOS_TARGET_REMOTE_REGION }}
+  AWS_ACCESS_KEY_ID: ${{ secrets.AGENTOS_TARGET_REMOTE_ACCESS_KEY_ID }}
+  AWS_SECRET_ACCESS_KEY: ${{ secrets.AGENTOS_TARGET_REMOTE_SECRET_ACCESS_KEY }}
+  AWS_SESSION_TOKEN: ${{ secrets.AGENTOS_TARGET_REMOTE_SESSION_TOKEN }}
+
+jobs:
+  exact-release-candidate-target-recovery:
+    name: Exact-RC target object-store recovery
+    runs-on: [self-hosted, linux, x64, agentos-capacity]
+    timeout-minutes: 30
+    environment: capacity-qualification
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
+        with:
+          toolchain: 1.97.1
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - name: Validate the checked-in qualification contract
+        run: >-
+          cargo run --release --locked --package os-benchmark
+          --bin remote-backup-qualification -- --validate
+      - name: Bind the release-candidate tag to this exact commit
+        run: |
+          [[ "$AGENTOS_RELEASE_CANDIDATE" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-rc\.[1-9][0-9]*)?$ ]]
+          test "$(git rev-parse "refs/tags/${AGENTOS_RELEASE_CANDIDATE}^{commit}")" = "$GITHUB_SHA"
+      - name: Require protected target service configuration
+        run: |
+          test -n "$AGENTOS_TARGET_REMOTE_ENDPOINT"
+          test -n "$AGENTOS_TARGET_REMOTE_BUCKET"
+          test -n "$AWS_REGION"
+          test -n "$AWS_ACCESS_KEY_ID"
+          test -n "$AWS_SECRET_ACCESS_KEY"
+          [[ "$AGENTOS_TARGET_REMOTE_ENDPOINT" == https://* ]]
+      - name: Publish and recover exact locked versions from the target service
+        run: |
+          mkdir -p target/qualification
+          cargo run --release --locked --package os-benchmark \
+            --bin remote-backup-qualification -- \
+            --mode target-service \
+            --endpoint "$AGENTOS_TARGET_REMOTE_ENDPOINT" \
+            --bucket "$AGENTOS_TARGET_REMOTE_BUCKET" \
+            --prefix "qualifications/${AGENTOS_RELEASE_CANDIDATE}/${GITHUB_SHA}/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
+            --region "$AWS_REGION" \
+            --state-dir target/qualification/target-remote-backup-state \
+            --output target/qualification/target-remote-backup.json \
+            --expected-commit "$GITHUB_SHA" \
+            --release-candidate "$AGENTOS_RELEASE_CANDIDATE" \
+            --environment-id "$AGENTOS_QUALIFICATION_ENVIRONMENT" \
+            --service-id "$AGENTOS_REMOTE_SERVICE_ID"
+      - name: Verify exact-RC bounded evidence
+        run: |
+          report=target/qualification/target-remote-backup.json
+          test "$(jq -r .schema_version "$report")" = "1"
+          test "$(jq -r .qualification_class "$report")" = "target_remote_object_store_recovery"
+          test "$(jq -r .proof_scope "$report")" = \
+            "exact_release_candidate_target_service_compliance_lock_and_measured_recovery"
+          test "$(jq -r .release_candidate "$report")" = "$AGENTOS_RELEASE_CANDIDATE"
+          test "$(jq -r .source.commit "$report")" = "$GITHUB_SHA"
+          test "$(jq -r .source.dirty "$report")" = "false"
+          test "$(jq -r .environment.qualification_mode "$report")" = "target-service"
+          test "$(jq -r .environment.environment_id "$report")" = "$AGENTOS_QUALIFICATION_ENVIRONMENT"
+          test "$(jq -r .environment.service_id "$report")" = "$AGENTOS_REMOTE_SERVICE_ID"
+          test "$(jq -r .environment.os "$report")" = "linux"
+          test "$(jq -r .environment.architecture "$report")" = "x86_64"
+          test "$(jq -r .passed "$report")" = "true"
+          test "$(jq -r .target_remote_recovery_proof_eligible "$report")" = "true"
+          test "$(jq -r .production_claim_allowed "$report")" = "false"
+          test "$(jq '.publication.objects | length' "$report")" = "2"
+          test "$(jq '.recovery.objects | length' "$report")" = "2"
+          test "$(jq '.delete_marker_version_ids | length' "$report")" = "2"
+          test "$(jq -r .public_recovery_fixture.trust_root.key_id "$report")" = \
+            "$(jq -r .public_recovery_fixture.recovery_anchor.signing_key_id "$report")"
+          jq -e '
+            all(.checks[]; . == true)
+            and all(.publication.objects[];
+              .retention_mode == "COMPLIANCE"
+              and (.version_id | length) > 0
+              and .version_id != "null")
+            and (.recovery.downloaded_bytes > 0)
+            and (.recovery.recovery_elapsed_ms > 0)
+            and (.recovery.recovery_point_age_seconds < 86400)
+          ' "$report"
+      - name: Publish summary
+        if: always()
+        run: |
+          {
+            printf '### Exact-RC target remote backup qualification\n\n'
+            printf -- '- Commit: `%s`\n' "$GITHUB_SHA"
+            printf -- '- Release candidate: `%s`\n' "$AGENTOS_RELEASE_CANDIDATE"
+            printf -- '- Environment: `%s`\n' "$AGENTOS_QUALIFICATION_ENVIRONMENT"
+            printf -- '- Service profile: `%s`\n' "$AGENTOS_REMOTE_SERVICE_ID"
+            if test -f target/qualification/target-remote-backup.json; then
+              printf -- '- Target proof eligible: `%s`\n' \
+                "$(jq -r .target_remote_recovery_proof_eligible target/qualification/target-remote-backup.json)"
+              printf -- '- Production claim allowed: `%s`\n' \
+                "$(jq -r .production_claim_allowed target/qualification/target-remote-backup.json)"
+            else
+              printf -- '- Status: `failed before report publication`\n'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Retain bounded report and public recovery fixtures
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: target-remote-backup-${{ inputs.release_candidate }}-${{ github.sha }}
+          path: target/qualification/target-remote-backup.json
+          if-no-files-found: warn
+          retention-days: 90

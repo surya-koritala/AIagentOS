@@ -1,11 +1,11 @@
 //! Built-in resource providers for the AI Agent OS.
 //!
-//! Lean by default: network and one-shot application launch remain experimental
-//! standalone helpers. Filesystem and peripheral compatibility types advertise
-//! no operations because they lack kernel-owned sandbox or operator-grant
-//! authority. The HTML-scraping `browser` and headless-browser `playwright`
-//! providers are gated behind cargo features so a vanilla build doesn't pull
-//! ~50 MB of optional code.
+//! Lean by default: one-shot application launch remains an experimental
+//! standalone helper. Filesystem, network, and peripheral compatibility types
+//! advertise no operations because they lack kernel-owned sandbox or
+//! operator-grant authority. The HTML-scraping `browser` and headless-browser
+//! `playwright` helpers are gated behind cargo features so a vanilla build
+//! doesn't pull ~50 MB of optional code.
 
 pub mod application;
 pub mod filesystem;

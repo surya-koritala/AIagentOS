@@ -8,7 +8,7 @@
 //! `tokenizers`) is Rust, so it cross-compiles to `aarch64`/`armv7` and runs on
 //! a Raspberry Pi or any headless edge box.
 //!
-//! It plugs into the unchanged [`LlmProviderAdapter`] seam, so the kernel,
+//! It plugs into the unchanged [`kernel::connector::LlmProviderAdapter`] seam, so the kernel,
 //! syscall gate, scheduler and persistence treat it exactly like any cloud
 //! provider — the only difference is where the tokens are produced.
 //!

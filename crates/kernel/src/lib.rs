@@ -905,84 +905,70 @@ impl ResourceProvider for BuiltinNetworkProvider {
         operation: &str,
         params: &serde_json::Value,
     ) -> Result<serde_json::Value, ResourceError> {
+        if !matches!(operation, "get" | "post" | "browse") {
+            return Err(ResourceError::UnsupportedOperation {
+                resource: "Network".into(),
+                operation: operation.into(),
+            });
+        }
+        SandboxManagerImpl::validate_network_parameters(operation, params)
+            .map_err(|error| ResourceError::OperationFailed(error.to_string()))?;
         let url = params
             .get("url")
             .and_then(|v| v.as_str())
             .ok_or_else(|| ResourceError::OperationFailed("Missing 'url'".into()))?;
+        let parsed = reqwest::Url::parse(url)
+            .map_err(|_| ResourceError::OperationFailed("invalid network target".into()))?;
+        if !matches!(parsed.scheme(), "http" | "https")
+            || !parsed.username().is_empty()
+            || parsed.password().is_some()
+            || parsed.fragment().is_some()
+        {
+            return Err(ResourceError::OperationFailed(
+                "network target scheme, credentials, or fragment denied".into(),
+            ));
+        }
         // Redirects are disabled deliberately. The sandbox validates the
         // caller-supplied URL before dispatch; automatically following a 3xx
         // would let an allowlisted host redirect the provider to a private or
-        // otherwise unapproved destination. DNS rebinding remains separate
-        // host-isolation qualification work.
+        // otherwise unapproved destination. Ambient proxy configuration is
+        // also disabled so an operator request cannot silently delegate its
+        // destination or credentials to a host proxy.
         let client = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
+            .no_proxy()
+            .timeout(std::time::Duration::from_secs(30))
             .build()
             .map_err(|e| ResourceError::OperationFailed(e.to_string()))?;
-        match operation {
-            "get" => {
-                let resp = client
-                    .get(url)
-                    .send()
-                    .await
-                    .map_err(|e| ResourceError::OperationFailed(e.to_string()))?;
-                let status = resp.status().as_u16();
-                let body = resp
-                    .text()
-                    .await
-                    .map_err(|e| ResourceError::OperationFailed(e.to_string()))?;
-                Ok(serde_json::json!({"status": status, "body": body}))
-            }
+        let response = match operation {
+            "get" => client
+                .get(url)
+                .send()
+                .await
+                .map_err(|e| ResourceError::OperationFailed(e.to_string()))?,
             "post" => {
                 let body = params
                     .get("body")
                     .cloned()
                     .unwrap_or(serde_json::Value::Null);
-                let resp = client
+                client
                     .post(url)
                     .json(&body)
                     .send()
                     .await
-                    .map_err(|e| ResourceError::OperationFailed(e.to_string()))?;
-                let status = resp.status().as_u16();
-                let text = resp
-                    .text()
-                    .await
-                    .map_err(|e| ResourceError::OperationFailed(e.to_string()))?;
-                Ok(serde_json::json!({"status": status, "body": text}))
+                    .map_err(|e| ResourceError::OperationFailed(e.to_string()))?
             }
-            "browse" => {
-                let resp = client
-                    .get(url)
-                    .header("User-Agent", "Mozilla/5.0 AIAgentOS/1.0")
-                    .send()
-                    .await
-                    .map_err(|e| ResourceError::OperationFailed(e.to_string()))?;
-                let html = resp
-                    .text()
-                    .await
-                    .map_err(|e| ResourceError::OperationFailed(e.to_string()))?;
-                let mut in_tag = false;
-                let mut text = String::new();
-                for c in html.chars() {
-                    match c {
-                        '<' => in_tag = true,
-                        '>' => in_tag = false,
-                        _ if !in_tag => text.push(c),
-                        _ => {}
-                    }
-                }
-                let clean: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
-                let truncated: String = clean
-                    .chars()
-                    .take(MAX_BROWSE_CHARS.load(std::sync::atomic::Ordering::Relaxed))
-                    .collect();
-                Ok(serde_json::json!({"content": truncated}))
-            }
-            _ => Err(ResourceError::OperationFailed(format!(
-                "Unknown op: {}",
-                operation
-            ))),
-        }
+            "browse" => client
+                .get(url)
+                .header("User-Agent", "Mozilla/5.0 AIAgentOS/1.0")
+                .send()
+                .await
+                .map_err(|e| ResourceError::OperationFailed(e.to_string()))?,
+            _ => unreachable!("supported network operation checked before validation"),
+        };
+        SandboxManagerImpl::bounded_network_response(response, operation == "browse")
+            .await
+            .map_err(|error| ResourceError::OperationFailed(error.to_string()))
     }
 }
 
@@ -6203,6 +6189,92 @@ mod tests {
             !server.await.unwrap(),
             "provider followed an unapproved redirect target"
         );
+    }
+
+    #[tokio::test]
+    async fn builtin_network_provider_bounds_data_and_rejects_ambient_channels() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        for (operation, parameters) in [
+            (
+                "get",
+                serde_json::json!({
+                    "url": "https://example.invalid",
+                    "headers": {"authorization": "secret"}
+                }),
+            ),
+            (
+                "get",
+                serde_json::json!({
+                    "url": "https://example.invalid",
+                    "cookies": {"session": "secret"}
+                }),
+            ),
+            (
+                "post",
+                serde_json::json!({
+                    "url": "https://example.invalid",
+                    "body": "x".repeat(crate::sandbox::MAX_NETWORK_REQUEST_BYTES)
+                }),
+            ),
+        ] {
+            assert!(
+                BuiltinNetworkProvider
+                    .execute(operation, &parameters)
+                    .await
+                    .is_err(),
+                "unsupported or oversized operator network input must fail before transport"
+            );
+        }
+        assert_eq!(
+            BuiltinNetworkProvider
+                .execute(
+                    "put",
+                    &serde_json::json!({"url": "https://example.invalid"})
+                )
+                .await
+                .unwrap_err(),
+            ResourceError::UnsupportedOperation {
+                resource: "Network".into(),
+                operation: "put".into(),
+            }
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let oversized = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            crate::sandbox::MAX_NETWORK_RESPONSE_BYTES + 1
+        )
+        .into_bytes();
+        let invalid_utf8 =
+            b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\nConnection: close\r\n\r\n\xff".to_vec();
+        let server = tokio::spawn(async move {
+            for response in [oversized, invalid_utf8] {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = [0_u8; 2048];
+                let _ = stream.read(&mut request).await.unwrap();
+                stream.write_all(&response).await.unwrap();
+            }
+        });
+
+        let oversized_error = BuiltinNetworkProvider
+            .execute(
+                "get",
+                &serde_json::json!({"url": format!("http://{address}/oversized")}),
+            )
+            .await
+            .unwrap_err();
+        assert!(oversized_error.to_string().contains("response exceeded"));
+        let encoding_error = BuiltinNetworkProvider
+            .execute(
+                "get",
+                &serde_json::json!({"url": format!("http://{address}/invalid-utf8")}),
+            )
+            .await
+            .unwrap_err();
+        assert!(encoding_error.to_string().contains("valid UTF-8"));
+        server.await.unwrap();
     }
 
     #[tokio::test]

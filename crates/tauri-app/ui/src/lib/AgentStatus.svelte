@@ -1,45 +1,210 @@
 <script>
-  export let agents = [];
+  export let state;
+
+  const availability = provider => {
+    if (provider.probe_timed_out) return 'Probe timed out';
+    if (provider.circuit_open) return 'Circuit open';
+    return provider.available ? 'Available' : 'Unavailable';
+  };
 </script>
 
-<section class="agent-status" aria-labelledby="agent-status-heading">
-  <h1 id="agent-status-heading">Agent status</h1>
-  <p class="scope-note">
-    Current state from the latest operator snapshot. This view is not an event history.
-  </p>
-  {#if agents.length === 0}
-    <p class="empty">No agents are present in the current operator snapshot.</p>
-  {:else}
-    <ul class="status-list">
-      {#each agents as agent}
-        <li class="status-item">
-          <span
-            class="dot"
-            aria-hidden="true"
-            class:running={agent.state === 'Running'}
-            class:paused={agent.state === 'Paused'}
-            class:stopped={agent.state === 'Stopped'}
-          ></span>
-          <span class="agent-name">{agent.name}</span>
-          <span class="state">{agent.state}</span>
-        </li>
-      {/each}
-    </ul>
-  {/if}
+<section class="operations" aria-labelledby="operations-heading">
+  <header>
+    <h1 id="operations-heading">Operations</h1>
+    <p>
+      Atomic {state.scope}-scope snapshot from {state.kernelVersion}
+      (protocol {state.protocolVersion}, {state.consistency} consistency).
+      This view is not an event history.
+    </p>
+  </header>
+
+  <dl class="summary">
+    <div>
+      <dt>Agents</dt>
+      <dd>{state.agents.length} / {state.totalVisibleAgents}</dd>
+    </div>
+    <div>
+      <dt>Providers available</dt>
+      <dd>{state.providers.filter(provider => provider.available && !provider.circuit_open).length} / {state.providers.length}</dd>
+    </div>
+    <div>
+      <dt>Gate decisions</dt>
+      <dd>{state.scopedGate.allowed} allowed · {state.scopedGate.denied} denied</dd>
+    </div>
+    <div>
+      <dt>Loaded packages</dt>
+      <dd>{state.packages.length}</dd>
+    </div>
+  </dl>
+
+  <section aria-labelledby="agent-enforcement-heading">
+    <h2 id="agent-enforcement-heading">Agent enforcement</h2>
+    {#if state.agents.length === 0}
+      <p class="empty">No agents are present in this caller scope.</p>
+    {:else}
+      <ul class="agent-grid">
+        {#each state.agents as agent}
+          <li>
+            <div class="title-row">
+              <span class="dot" aria-hidden="true" class:running={agent.state === 'Running'} class:paused={agent.state === 'Paused'} class:stopped={agent.state === 'Stopped'}></span>
+              <strong>{agent.name}</strong>
+              <span class="pill">{agent.state}</span>
+            </div>
+            <dl class="details">
+              <div><dt>Scheduler</dt><dd>{agent.scheduler_state}</dd></div>
+              <div><dt>Sandbox</dt><dd>{agent.sandbox_active ? 'Active' : 'Inactive'}</dd></div>
+              <div><dt>Priority</dt><dd>{agent.priority}</dd></div>
+              <div><dt>Checkpoints</dt><dd>{agent.checkpoint_count}</dd></div>
+              <div><dt>Context</dt><dd>{agent.context_active_tokens} / {agent.context_budget_tokens} tokens</dd></div>
+              <div><dt>Spill storage</dt><dd>{agent.stored_spill_bytes.toLocaleString()} bytes</dd></div>
+              <div><dt>Namespaces</dt><dd>{agent.namespace_count}</dd></div>
+              <div><dt>Gate</dt><dd>{agent.gate.allowed} allowed · {agent.gate.denied} denied · {agent.gate.audited} audited</dd></div>
+            </dl>
+            <p class="capabilities">
+              <span>Capabilities:</span>
+              {agent.capabilities.length ? agent.capabilities.join(', ') : 'none'}
+            </p>
+            {#if agent.cgroup}
+              <p class="cgroup">
+                Cgroup {agent.cgroup.id} ({agent.cgroup.scope}):
+                {agent.cgroup.active_tool_calls}/{agent.cgroup.concurrent_tool_limit} tools,
+                {agent.cgroup.context_tokens}/{agent.cgroup.context_token_limit} context tokens,
+                {agent.cgroup.agent_count}/{agent.cgroup.agent_limit} agents.
+              </p>
+            {/if}
+          </li>
+        {/each}
+      </ul>
+    {/if}
+  </section>
+
+  <section aria-labelledby="providers-heading">
+    <h2 id="providers-heading">Provider health</h2>
+    {#if state.providers.length === 0}
+      <p class="empty">No providers are registered in this caller scope.</p>
+    {:else}
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Provider</th><th>Status</th><th>API family</th><th>Failures</th><th>Probe</th></tr></thead>
+          <tbody>
+            {#each state.providers as provider}
+              <tr>
+                <th scope="row">{provider.name}<small>{provider.id} · {provider.provider_type}</small></th>
+                <td>{availability(provider)}</td>
+                <td>{provider.api_family}</td>
+                <td>{provider.consecutive_failures}</td>
+                <td>{provider.probe_duration_ms == null ? 'Not sampled' : `${provider.probe_duration_ms} ms`}</td>
+              </tr>
+            {/each}
+          </tbody>
+        </table>
+      </div>
+    {/if}
+  </section>
+
+  <section aria-labelledby="services-heading">
+    <h2 id="services-heading">Services</h2>
+    {#if state.services === null}
+      <p class="unavailable">Service supervision is unavailable for this caller scope.</p>
+    {:else if state.services.length === 0}
+      <p class="empty">No supervised services are configured.</p>
+    {:else}
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Service</th><th>State</th><th>Ready</th><th>Healthy</th><th>Restarts</th><th>Last failure</th></tr></thead>
+          <tbody>
+            {#each state.services as service}
+              <tr>
+                <th scope="row">{service.name}</th>
+                <td>{service.state}</td>
+                <td>{service.ready ? 'Yes' : 'No'}</td>
+                <td>{service.healthy ? 'Yes' : 'No'}</td>
+                <td>{service.restart_count}</td>
+                <td>{service.last_failure || 'None'}</td>
+              </tr>
+            {/each}
+          </tbody>
+        </table>
+      </div>
+    {/if}
+  </section>
+
+  <section aria-labelledby="packages-heading">
+    <h2 id="packages-heading">Loaded packages</h2>
+    {#if state.packages.length === 0}
+      <p class="empty">No package-created agents are loaded in this caller scope.</p>
+    {:else}
+      <ul class="compact-list">
+        {#each state.packages as packageInstance}
+          <li>
+            <strong>{packageInstance.name}</strong>
+            <span>{packageInstance.agent_state} · {packageInstance.provider} · {packageInstance.profile}</span>
+          </li>
+        {/each}
+      </ul>
+    {/if}
+  </section>
+
+  <section aria-labelledby="tunables-heading">
+    <h2 id="tunables-heading">Operator tunables</h2>
+    {#if state.tunables === null}
+      <p class="unavailable">Operator tunables are unavailable for this caller scope.</p>
+    {:else if state.tunables.length === 0}
+      <p class="empty">No live operator tunables are registered.</p>
+    {:else}
+      <dl class="tunable-list">
+        {#each state.tunables as tunable}
+          <div>
+            <dt>{tunable.name}</dt>
+            <dd>{tunable.value} · revision {tunable.revision} · {tunable.persisted ? 'persisted' : 'runtime only'}</dd>
+            <p>{tunable.description}</p>
+          </div>
+        {/each}
+      </dl>
+    {/if}
+  </section>
 </section>
 
 <style>
-  .agent-status { padding: 1.5rem; overflow-y: auto; }
+  .operations { padding: 1.5rem; overflow-y: auto; }
+  header p { max-width: 54rem; color: #b9b9c8; line-height: 1.5; }
   h1 { margin: 0 0 0.5rem; font-size: 1.3rem; }
-  .scope-note { max-width: 46rem; margin: 0 0 1.25rem; color: #b9b9c8; line-height: 1.5; }
-  .empty { color: #b9b9c8; font-size: 0.85rem; }
-  .status-list { display: flex; flex-direction: column; gap: 0.5rem; padding: 0; margin: 0; list-style: none; }
-  .status-item { display: flex; align-items: center; gap: 0.75rem; min-height: 44px; padding: 0.6rem 0.75rem; background: #1a1a2e; border: 1px solid #3f3f5a; border-radius: 8px; }
-  .dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
-  .dot { background: #a7a7b8; }
+  h2 { margin: 1.75rem 0 0.75rem; font-size: 1rem; color: #d8d8e3; }
+  .summary { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 0.75rem; margin: 1.25rem 0; }
+  .summary div, .agent-grid > li, .compact-list li, .tunable-list > div { background: #1a1a2e; border: 1px solid #3f3f5a; border-radius: 8px; }
+  .summary div { padding: 0.8rem; }
+  .summary dt, .details dt { color: #b9b9c8; font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.04em; }
+  .summary dd { margin: 0.3rem 0 0; font-weight: 650; }
+  .agent-grid, .compact-list { padding: 0; margin: 0; list-style: none; }
+  .agent-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 0.75rem; }
+  .agent-grid > li { padding: 0.9rem; }
+  .title-row { display: flex; align-items: center; gap: 0.55rem; }
+  .pill { margin-left: auto; padding: 0.15rem 0.45rem; border-radius: 999px; background: #2c2c45; font-size: 0.72rem; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: #a7a7b8; }
   .dot.running { background: #4ade80; }
   .dot.paused { background: #fbbf24; }
   .dot.stopped { background: #f87171; }
-  .agent-name { font-size: 0.85rem; font-weight: 500; }
-  .state { margin-left: auto; font-size: 0.8rem; color: #b9b9c8; }
+  .details { display: grid; grid-template-columns: 1fr 1fr; gap: 0.55rem; margin: 0.9rem 0; }
+  .details dd { margin: 0.15rem 0 0; font-size: 0.8rem; }
+  .capabilities, .cgroup { margin: 0.5rem 0 0; color: #b9b9c8; font-size: 0.78rem; line-height: 1.45; }
+  .capabilities span { color: #d8d8e3; }
+  .table-wrap { overflow-x: auto; }
+  table { width: 100%; border-collapse: collapse; background: #1a1a2e; border: 1px solid #3f3f5a; font-size: 0.8rem; }
+  th, td { padding: 0.65rem; border-bottom: 1px solid #34344b; text-align: left; }
+  thead th { color: #b9b9c8; font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.04em; }
+  tbody th { font-weight: 600; }
+  small { display: block; margin-top: 0.2rem; color: #a7a7b8; font-weight: 400; }
+  .compact-list { display: grid; gap: 0.5rem; }
+  .compact-list li { display: flex; justify-content: space-between; gap: 1rem; padding: 0.7rem; }
+  .compact-list span { color: #b9b9c8; }
+  .tunable-list { display: grid; gap: 0.5rem; margin: 0; }
+  .tunable-list > div { padding: 0.75rem; }
+  .tunable-list dd { margin: 0.3rem 0; color: #b9b9c8; }
+  .tunable-list p { margin: 0; color: #a7a7b8; font-size: 0.78rem; }
+  .empty { color: #b9b9c8; font-size: 0.85rem; }
+  .unavailable { padding: 0.75rem; border: 1px solid #6b531c; border-radius: 8px; background: #352a12; color: #fde68a; }
+  @media (max-width: 700px) {
+    .details { grid-template-columns: 1fr; }
+    .compact-list li { flex-direction: column; }
+  }
 </style>

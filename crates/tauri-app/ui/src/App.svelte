@@ -111,7 +111,7 @@
         {:else if view === 'settings'}
           <Settings />
         {:else if view === 'status'}
-          <AgentStatus {agents} />
+          <AgentStatus state={operatorState} />
         {/if}
       </main>
       {#if view === 'chat' && activeAgentId}

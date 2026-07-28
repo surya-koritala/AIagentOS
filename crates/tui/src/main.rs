@@ -277,6 +277,19 @@ fn render_header(f: &mut Frame, area: Rect, app: &App) {
         Span::raw("   "),
         Span::styled(
             format!(
+                "providers:{} available:{} packages:{}",
+                app.providers.len(),
+                app.providers
+                    .iter()
+                    .filter(|provider| provider.available && !provider.circuit_open)
+                    .count(),
+                app.packages.len()
+            ),
+            Style::default().fg(Color::Blue),
+        ),
+        Span::raw("   "),
+        Span::styled(
+            format!(
                 "gate allowed:{} denied:{}",
                 app.gate.allowed,
                 app.gate.denied_capability
@@ -331,7 +344,7 @@ fn render_body(f: &mut Frame, area: Rect, app: &App) {
         .highlight_symbol("› ");
     f.render_stateful_widget(list, cols[0], &mut state);
 
-    let detail = match app.selected_agent() {
+    let mut detail = match app.selected_agent() {
         Some(a) => {
             let mut lines = vec![
                 Line::from(vec![
@@ -348,6 +361,65 @@ fn render_body(f: &mut Frame, area: Rect, app: &App) {
                 ]),
                 Line::from(""),
             ];
+            if let Some(agent) = app.selected_agent_detail() {
+                lines.push(Line::from(format!(
+                    "scheduler={} sandbox={} priority={} checkpoints={}",
+                    agent.scheduler_state,
+                    agent.sandbox_active,
+                    agent.priority,
+                    agent.checkpoint_count
+                )));
+                lines.push(Line::from(format!(
+                    "capabilities: {}",
+                    if agent.capabilities.is_empty() {
+                        "none".into()
+                    } else {
+                        agent.capabilities.join(", ")
+                    }
+                )));
+                lines.push(Line::from(format!(
+                    "namespaces={} context={}/{} tokens spills={} bytes",
+                    agent.namespace_details.len().max(agent.namespaces.len()),
+                    agent.context_pressure.active_tokens,
+                    agent.context_pressure.budget_tokens,
+                    agent.context_pressure.stored_spill_bytes
+                )));
+                lines.push(Line::from(format!(
+                    "gate allowed={} denied={} audited={}",
+                    agent.gate_decisions.allowed,
+                    agent.gate_decisions.denied_capability
+                        + agent.gate_decisions.denied_mac
+                        + agent.gate_decisions.denied_approval
+                        + agent.gate_decisions.denied_cgroup
+                        + agent.gate_decisions.denied_namespace
+                        + agent.gate_decisions.denied_unknown,
+                    agent.gate_decisions.audited
+                )));
+                if let Some(cgroup) = &agent.cgroup {
+                    lines.push(Line::from(format!(
+                        "cgroup {} ({}) tpm={}/context={} tools={}/{} agents={}/{}",
+                        cgroup.id,
+                        cgroup.scope,
+                        cgroup.tokens_per_minute_limit,
+                        cgroup.context_token_limit,
+                        cgroup.active_tool_calls,
+                        cgroup.concurrent_tool_limit,
+                        cgroup.agent_count,
+                        cgroup.agent_limit
+                    )));
+                }
+                if let Some(package) = app
+                    .packages
+                    .iter()
+                    .find(|package| package.agent_id == agent.id)
+                {
+                    lines.push(Line::from(format!(
+                        "package: {} · provider={} · profile={}",
+                        package.name, package.provider, package.profile
+                    )));
+                }
+                lines.push(Line::from(""));
+            }
             if let Some(out) = &app.last_output {
                 lines.push(Line::from(Span::styled(
                     "last turn output:",
@@ -396,12 +468,72 @@ fn render_body(f: &mut Frame, area: Rect, app: &App) {
             lines
         }
     };
+    append_operator_summary(&mut detail, app);
     f.render_widget(
         Paragraph::new(detail)
             .block(Block::default().borders(Borders::ALL).title(" detail "))
             .wrap(Wrap { trim: true }),
         cols[1],
     );
+}
+
+fn append_operator_summary(lines: &mut Vec<Line<'static>>, app: &App) {
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        format!(
+            "operator · scope={} · kernel={} · protocol={} · agents={}/{}{}",
+            app.snapshot_scope,
+            app.kernel_version,
+            app.protocol_version,
+            app.agents.len(),
+            app.total_visible_agents,
+            if app.agents_truncated {
+                " (truncated)"
+            } else {
+                ""
+            }
+        ),
+        Style::default().add_modifier(Modifier::BOLD),
+    )));
+    let providers = app
+        .providers
+        .iter()
+        .map(|provider| {
+            let state = if provider.probe_timed_out {
+                "timeout"
+            } else if provider.circuit_open {
+                "circuit-open"
+            } else if provider.available {
+                "available"
+            } else {
+                "unavailable"
+            };
+            format!("{}={state}", provider.id)
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    lines.push(Line::from(format!(
+        "providers: {}",
+        if providers.is_empty() {
+            "none registered"
+        } else {
+            providers.as_str()
+        }
+    )));
+    let tunables = app
+        .tunables
+        .iter()
+        .map(|tunable| format!("{}={}@r{}", tunable.name, tunable.value, tunable.revision))
+        .collect::<Vec<_>>()
+        .join(", ");
+    lines.push(Line::from(format!(
+        "tunables: {}",
+        if tunables.is_empty() {
+            "unavailable"
+        } else {
+            tunables.as_str()
+        }
+    )));
 }
 
 fn render_footer(f: &mut Frame, area: Rect, app: &App) {

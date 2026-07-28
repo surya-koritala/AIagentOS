@@ -10,6 +10,15 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
 
 ## [Unreleased]
 
+- Expanded the focused TUI and desktop Operations view without bypassing the
+  public operator snapshot. Both now retain scope, version, truncation, agent
+  enforcement/context/cgroup data, provider health, loaded-package instances,
+  services, tunables, and scoped gate counters. Scope-protected services,
+  tunables, and global metrics remain explicitly unavailable instead of being
+  rendered as zero or empty evidence. Projection, stale-state, compiler
+  accessibility, frontend-build, and Rust regression checks cover the new
+  surface. Policy explanation/audit workflows, exact-artifact accessibility,
+  and signed updater qualification remain open under #126.
 - Added complete signed-package lifecycle coverage to the canonical `agentctl`
   public SDK/wire path: trust and revoke publisher keys, publish and yank
   signed archives, safely fetch without overwriting an existing file, search,

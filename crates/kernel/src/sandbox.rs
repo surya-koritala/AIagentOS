@@ -21,6 +21,11 @@ use crate::{AgentId, IsolationLevel, SandboxConfig, SandboxError, SandboxId};
 const MAX_FILESYSTEM_PATH_BYTES: usize = 4 * 1024;
 const MAX_FILESYSTEM_CONTENT_BYTES: usize = 4 * 1024 * 1024;
 const MAX_FILESYSTEM_LIST_ENTRIES: usize = 4_096;
+pub(crate) const MAX_NETWORK_URL_BYTES: usize = 4 * 1024;
+pub(crate) const MAX_NETWORK_REQUEST_BYTES: usize = 1024 * 1024;
+pub(crate) const MAX_NETWORK_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
+const MAX_NETWORK_JSON_DEPTH: usize = 64;
+const MAX_NETWORK_JSON_NODES: usize = 65_536;
 #[cfg(test)]
 type FilesystemTestPause = (Arc<AtomicBool>, Arc<AtomicBool>, Arc<AtomicBool>);
 
@@ -1089,6 +1094,110 @@ impl SandboxManagerImpl {
         }
     }
 
+    fn json_string_encoded_len(value: &str) -> usize {
+        value.chars().fold(2_usize, |length, character| {
+            length.saturating_add(match character {
+                '"' | '\\' => 2,
+                '\u{08}' | '\u{09}' | '\u{0a}' | '\u{0c}' | '\u{0d}' => 2,
+                character if character.is_control() => 6,
+                character => character.len_utf8(),
+            })
+        })
+    }
+
+    fn bounded_json_len(
+        value: &serde_json::Value,
+        depth: usize,
+        nodes: &mut usize,
+    ) -> Result<usize, SandboxError> {
+        if depth > MAX_NETWORK_JSON_DEPTH {
+            return Err(SandboxError::BoundaryViolation(
+                "network request body nesting limit exceeded".into(),
+            ));
+        }
+        *nodes = nodes.saturating_add(1);
+        if *nodes > MAX_NETWORK_JSON_NODES {
+            return Err(SandboxError::BoundaryViolation(
+                "network request body node limit exceeded".into(),
+            ));
+        }
+        let length = match value {
+            serde_json::Value::Null => 4,
+            serde_json::Value::Bool(true) => 4,
+            serde_json::Value::Bool(false) => 5,
+            serde_json::Value::Number(number) => number.to_string().len(),
+            serde_json::Value::String(value) => Self::json_string_encoded_len(value),
+            serde_json::Value::Array(values) => {
+                let mut length = 2_usize.saturating_add(values.len().saturating_sub(1));
+                for value in values {
+                    length =
+                        length.saturating_add(Self::bounded_json_len(value, depth + 1, nodes)?);
+                    if length > MAX_NETWORK_REQUEST_BYTES {
+                        break;
+                    }
+                }
+                length
+            }
+            serde_json::Value::Object(values) => {
+                let mut length = 2_usize.saturating_add(values.len().saturating_sub(1));
+                for (key, value) in values {
+                    length = length
+                        .saturating_add(Self::json_string_encoded_len(key))
+                        .saturating_add(1)
+                        .saturating_add(Self::bounded_json_len(value, depth + 1, nodes)?);
+                    if length > MAX_NETWORK_REQUEST_BYTES {
+                        break;
+                    }
+                }
+                length
+            }
+        };
+        Ok(length)
+    }
+
+    pub(crate) fn validate_network_parameters(
+        operation: &str,
+        parameters: &serde_json::Value,
+    ) -> Result<(), SandboxError> {
+        let parameters = parameters.as_object().ok_or_else(|| {
+            SandboxError::BoundaryViolation("network parameters must be an object".into())
+        })?;
+        let permits_body = match operation {
+            "get" | "browse" | "delete" => false,
+            "post" | "put" => true,
+            _ => {
+                return Err(SandboxError::BoundaryViolation(
+                    "unsupported sandbox network operation".into(),
+                ))
+            }
+        };
+        for key in parameters.keys() {
+            if key != "url" && !(permits_body && key == "body") {
+                return Err(SandboxError::BoundaryViolation(format!(
+                    "unsupported network parameter: {key}"
+                )));
+            }
+        }
+        let target = parameters
+            .get("url")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| SandboxError::BoundaryViolation("network target denied".into()))?;
+        if target.is_empty() || target.len() > MAX_NETWORK_URL_BYTES || target.contains('\0') {
+            return Err(SandboxError::BoundaryViolation(
+                "network target exceeds the supported bound".into(),
+            ));
+        }
+        if let Some(body) = parameters.get("body") {
+            let mut nodes = 0;
+            if Self::bounded_json_len(body, 0, &mut nodes)? > MAX_NETWORK_REQUEST_BYTES {
+                return Err(SandboxError::BoundaryViolation(format!(
+                    "network request body exceeds {MAX_NETWORK_REQUEST_BYTES} bytes"
+                )));
+            }
+        }
+        Ok(())
+    }
+
     fn network_target(
         state: &SandboxState,
         target: &str,
@@ -1098,9 +1207,10 @@ impl SandboxManagerImpl {
         if !matches!(url.scheme(), "http" | "https")
             || !url.username().is_empty()
             || url.password().is_some()
+            || url.fragment().is_some()
         {
             return Err(SandboxError::BoundaryViolation(
-                "network target scheme or credentials denied".into(),
+                "network target scheme, credentials, or fragment denied".into(),
             ));
         }
         let host = url
@@ -1160,6 +1270,7 @@ impl SandboxManagerImpl {
                 "trusted network requests must use an operator provider".into(),
             ));
         }
+        Self::validate_network_parameters(operation, parameters)?;
         let target = parameters
             .get("url")
             .and_then(serde_json::Value::as_str)
@@ -1207,27 +1318,43 @@ impl SandboxManagerImpl {
                 ))
             }
         };
-        let mut response = request
+        let response = request
             .send()
             .await
             .map_err(|_| SandboxError::BoundaryViolation("network request failed".into()))?;
+        Self::bounded_network_response(response, operation == "browse").await
+    }
+
+    pub(crate) async fn bounded_network_response(
+        mut response: reqwest::Response,
+        browse: bool,
+    ) -> Result<serde_json::Value, SandboxError> {
         let status = response.status().as_u16();
-        const MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
+        if response
+            .content_length()
+            .is_some_and(|length| length > MAX_NETWORK_RESPONSE_BYTES as u64)
+        {
+            return Err(SandboxError::BoundaryViolation(format!(
+                "network response exceeded {MAX_NETWORK_RESPONSE_BYTES} bytes"
+            )));
+        }
         let mut body = Vec::new();
         while let Some(chunk) = response
             .chunk()
             .await
             .map_err(|_| SandboxError::BoundaryViolation("network response failed".into()))?
         {
-            if body.len().saturating_add(chunk.len()) > MAX_RESPONSE_BYTES {
-                return Err(SandboxError::BoundaryViolation(
-                    "network response exceeded sandbox limit".into(),
-                ));
+            if body.len().saturating_add(chunk.len()) > MAX_NETWORK_RESPONSE_BYTES {
+                return Err(SandboxError::BoundaryViolation(format!(
+                    "network response exceeded {MAX_NETWORK_RESPONSE_BYTES} bytes"
+                )));
             }
             body.extend_from_slice(&chunk);
         }
-        let text = String::from_utf8_lossy(&body).to_string();
-        if operation == "browse" {
+        let text = String::from_utf8(body).map_err(|_| {
+            SandboxError::BoundaryViolation("network response must be valid UTF-8".into())
+        })?;
+        if browse {
             let mut in_tag = false;
             let mut visible = String::new();
             for character in text.chars() {
@@ -1715,6 +1842,7 @@ mod tests {
             "https://user:secret@api.openai.com/",
             "https://api.openai.com:8443/",
             "http://api.openai.com:443/",
+            "https://api.openai.com/v1#untransmitted-fragment",
         ] {
             assert!(
                 mgr.intercept_action(sid, &SandboxAction::NetworkAccess(target.into()))
@@ -1722,6 +1850,70 @@ mod tests {
                 "{target} must be denied"
             );
         }
+    }
+
+    #[test]
+    fn network_parameters_are_strict_bounded_and_exclude_ambient_channels() {
+        assert!(SandboxManagerImpl::validate_network_parameters(
+            "get",
+            &serde_json::json!({"url": "https://example.com/path?query=value"}),
+        )
+        .is_ok());
+        assert!(SandboxManagerImpl::validate_network_parameters(
+            "post",
+            &serde_json::json!({
+                "url": "https://example.com/path",
+                "body": {"message": "bounded"}
+            }),
+        )
+        .is_ok());
+
+        for unsupported in [
+            serde_json::json!({"url": "https://example.com", "body": "not valid for GET"}),
+            serde_json::json!({"url": "https://example.com", "headers": {"authorization": "x"}}),
+            serde_json::json!({"url": "https://example.com", "cookies": {"session": "x"}}),
+            serde_json::json!({"url": "https://example.com", "upload_path": "secret.txt"}),
+            serde_json::json!({"url": "https://example.com", "download_path": "response.bin"}),
+            serde_json::json!({"url": "https://example.com", "websocket": true}),
+        ] {
+            assert!(
+                SandboxManagerImpl::validate_network_parameters("get", &unsupported).is_err(),
+                "unsupported credential, transfer, or protocol channel must fail closed"
+            );
+        }
+
+        let oversized_url = format!("https://example.com/{}", "x".repeat(MAX_NETWORK_URL_BYTES));
+        assert!(SandboxManagerImpl::validate_network_parameters(
+            "get",
+            &serde_json::json!({"url": oversized_url}),
+        )
+        .is_err());
+        assert!(SandboxManagerImpl::validate_network_parameters(
+            "post",
+            &serde_json::json!({
+                "url": "https://example.com",
+                "body": "x".repeat(MAX_NETWORK_REQUEST_BYTES)
+            }),
+        )
+        .is_err());
+
+        let mut too_deep = serde_json::Value::Null;
+        for _ in 0..=MAX_NETWORK_JSON_DEPTH {
+            too_deep = serde_json::json!([too_deep]);
+        }
+        assert!(SandboxManagerImpl::validate_network_parameters(
+            "post",
+            &serde_json::json!({"url": "https://example.com", "body": too_deep}),
+        )
+        .is_err());
+        assert!(SandboxManagerImpl::validate_network_parameters(
+            "post",
+            &serde_json::json!({
+                "url": "https://example.com",
+                "body": vec![serde_json::Value::Null; MAX_NETWORK_JSON_NODES + 1]
+            }),
+        )
+        .is_err());
     }
 
     #[tokio::test]

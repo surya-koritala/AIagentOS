@@ -8,7 +8,7 @@ does not claim that every host integration is sandboxed.
 | Surface | Untrusted-agent behavior | Evidence |
 |---|---|---|
 | Filesystem | A private, kernel-owned workspace directory capability; handle-relative I/O; synced atomic create/replace; strict UTF-8, path/content/list bounds; regular-file and final-symlink checks; byte quota; traversal/ancestor-rename denial; cross-agent isolation; teardown; and restart orphan reconciliation | `sandbox.rs`, `resources.rs`, `sandbox_props.rs`, `lifecycle_coordinator.rs` |
-| HTTP(S) | Explicit hostname allowlist; credentials and non-default ports denied; every A/AAAA answer must be public; checked addresses are pinned into a no-proxy, no-redirect client | `sandbox.rs`, `resources.rs` |
+| HTTP(S) | Explicit hostname allowlist; credentials, fragments, and non-default ports denied; every A/AAAA answer must be public; checked addresses are pinned into a no-proxy, no-redirect client; URL, JSON body, response, nesting, and node counts are bounded | `sandbox.rs`, `resources.rs` |
 | Linux process | One fresh digest-pinned container per call on a verified rootless Docker daemon; read-only root, no network, no capabilities, no-new-privileges, PID/CPU/memory/swap/open-file/output limits, bounded `tmpfs`, and only the agent workspace mounted writable | `docker_sandbox.rs`, protected `rootless-container-sandbox` workflow job |
 | Raw wire, Rust SDK, package tools, custom tools, MCP server, and model executor | One immutable tool declaration and gate proof reaches the same `ResourceBroker`; the broker derives the sandbox from the kernel-owned agent identity before any provider runs | `sandbox_surfaces.rs` plus in-module executor/MCP/tool tests |
 
@@ -19,7 +19,9 @@ rooted at that workspace; trusted mode does not grant ambient host-file access.
 Packages, prompts, MCP metadata, SDK requests, and wire requests cannot select
 trusted mode or supply a valid gate proof/sandbox identity. The standalone
 `resources::FilesystemProvider` advertises no operations and returns typed
-unsupported errors because it cannot carry kernel-owned sandbox authority.
+unsupported errors because it cannot carry kernel-owned sandbox authority. The
+standalone `resources::NetworkProvider` does the same because it cannot carry
+the kernel's DNS, egress, lifecycle, or size-bound authority.
 
 Filesystem text operations accept at most 4 MiB, paths at most 4,096 UTF-8
 bytes, and directory listings at most 4,096 entries. Reads, edits, writes, and
@@ -40,6 +42,14 @@ a thread blocked inside a host filesystem syscall, so a stalled syscall may
 retain one permit until the host call returns. It cannot cause the broker to
 advertise that capacity as free, and sandbox teardown still waits on the same
 operation lock.
+
+HTTP URLs accept at most 4 KiB. JSON request bodies accept at most 1 MiB, 64
+levels, and 65,536 values; responses accept at most 4 MiB and must be valid
+UTF-8. Only `url` and, for `post`, `body` are accepted by the default agent
+provider. Caller-supplied headers, credentials, cookies, filesystem
+upload/download paths, WebSocket mode, and redirects are not supported and
+fail before transport. These controls are deterministic contract evidence, not
+the still-missing live target-egress and rebinding qualification in #124.
 
 ## Explicitly unsupported for untrusted agents
 

@@ -1,11 +1,14 @@
-//! Network resource provider — HTTP requests via reqwest.
+//! Standalone network provider compatibility type.
+//!
+//! Agent HTTP requires kernel-owned sandbox identity, allowlisted and pinned
+//! DNS answers, bounded request/response data, and broker lifecycle ownership.
+//! This standalone type cannot carry that authority, so it deliberately
+//! advertises no operations and fails closed.
 
 use kernel::resources::{ResourceProvider, ResourceType};
 use kernel::ResourceError;
 
-pub struct NetworkProvider {
-    client: reqwest::Client,
-}
+pub struct NetworkProvider;
 
 impl Default for NetworkProvider {
     fn default() -> Self {
@@ -15,9 +18,7 @@ impl Default for NetworkProvider {
 
 impl NetworkProvider {
     pub fn new() -> Self {
-        Self {
-            client: reqwest::Client::new(),
-        }
+        Self
     }
 }
 
@@ -28,51 +29,45 @@ impl ResourceProvider for NetworkProvider {
     }
 
     fn supported_operations(&self) -> Vec<String> {
-        vec!["get".into(), "post".into(), "put".into(), "delete".into()]
+        Vec::new()
     }
 
     async fn execute(
         &self,
         operation: &str,
-        params: &serde_json::Value,
+        _params: &serde_json::Value,
     ) -> Result<serde_json::Value, ResourceError> {
-        let url = params
-            .get("url")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| ResourceError::OperationFailed("Missing 'url' parameter".into()))?;
+        Err(ResourceError::UnsupportedOperation {
+            resource: "Network".into(),
+            operation: operation.into(),
+        })
+    }
+}
 
-        let response = match operation {
-            "get" => self.client.get(url).send().await,
-            "post" => {
-                let body = params
-                    .get("body")
-                    .cloned()
-                    .unwrap_or(serde_json::Value::Null);
-                self.client.post(url).json(&body).send().await
-            }
-            "put" => {
-                let body = params
-                    .get("body")
-                    .cloned()
-                    .unwrap_or(serde_json::Value::Null);
-                self.client.put(url).json(&body).send().await
-            }
-            "delete" => self.client.delete(url).send().await,
-            _ => {
-                return Err(ResourceError::OperationFailed(format!(
-                    "Unknown operation: {}",
-                    operation
-                )))
-            }
-        };
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-        let resp = response.map_err(|e| ResourceError::OperationFailed(e.to_string()))?;
-        let status = resp.status().as_u16();
-        let body = resp
-            .text()
-            .await
-            .map_err(|e| ResourceError::OperationFailed(e.to_string()))?;
+    #[tokio::test]
+    async fn standalone_network_fails_closed_without_sandbox_authority() {
+        let provider = NetworkProvider::new();
+        assert!(provider.supported_operations().is_empty());
 
-        Ok(serde_json::json!({"status": status, "body": body}))
+        for operation in ["get", "post", "put", "delete", "browse"] {
+            let error = provider
+                .execute(
+                    operation,
+                    &serde_json::json!({"url": "https://example.invalid"}),
+                )
+                .await
+                .expect_err("standalone ambient network operation must fail");
+            assert_eq!(
+                error,
+                ResourceError::UnsupportedOperation {
+                    resource: "Network".into(),
+                    operation: operation.into(),
+                }
+            );
+        }
     }
 }

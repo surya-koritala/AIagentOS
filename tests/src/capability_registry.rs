@@ -256,6 +256,88 @@ fn registry_is_complete_and_honest() {
 }
 
 #[test]
+fn provider_matrix_names_every_resource_provider_implementation_and_status() {
+    let matrix = read_workspace_file("docs/PROVIDER_MATRIX.md");
+    let summary = read_workspace_file("docs/src/SUMMARY.md");
+    assert!(summary.contains("./provider-matrix.md"));
+    for status in ["Experimental", "E2E verified", "Production-qualified"] {
+        assert!(
+            matrix.contains(status),
+            "provider matrix must define the required {status} status"
+        );
+    }
+
+    let root = workspace_root();
+    let provider_sources = [
+        "crates/kernel/src/lib.rs",
+        "crates/resources/src/application.rs",
+        "crates/resources/src/filesystem.rs",
+        "crates/resources/src/network.rs",
+        "crates/resources/src/peripheral.rs",
+    ];
+    let mut implementations = BTreeMap::<String, BTreeSet<String>>::new();
+    for relative in provider_sources {
+        let source = std::fs::read_to_string(root.join(relative)).unwrap();
+        let mut implementation = None;
+        let mut operations = false;
+        for line in source.lines() {
+            if let Some(name) = line
+                .trim()
+                .strip_prefix("impl ResourceProvider for ")
+                .and_then(|value| value.strip_suffix(" {"))
+            {
+                implementation = Some(name.to_string());
+                implementations.entry(name.to_string()).or_default();
+                operations = false;
+                continue;
+            }
+            if implementation.is_some() && line.contains("fn supported_operations(") {
+                operations = true;
+                continue;
+            }
+            if operations && line.contains("async fn execute(") {
+                operations = false;
+                continue;
+            }
+            if operations {
+                let Some(name) = implementation.as_ref() else {
+                    continue;
+                };
+                for (index, value) in line.split('"').enumerate() {
+                    if index % 2 == 1 {
+                        implementations
+                            .get_mut(name)
+                            .expect("provider implementation was registered")
+                            .insert(value.to_string());
+                    }
+                }
+            }
+        }
+    }
+    assert!(!implementations.is_empty());
+    for (implementation, operations) in implementations {
+        let row = matrix
+            .lines()
+            .find(|line| line.contains(&format!("`{implementation}`")))
+            .unwrap_or_else(|| {
+                panic!("provider matrix does not name ResourceProvider implementation {implementation}")
+            });
+        for operation in operations {
+            assert!(
+                row.contains(&format!("`{operation}`")),
+                "provider matrix row for {implementation} omits advertised operation {operation}"
+            );
+        }
+        assert!(
+            row.contains("Experimental")
+                || row.contains("E2E verified")
+                || row.contains("Production-qualified"),
+            "provider matrix row for {implementation} has no recognized status"
+        );
+    }
+}
+
+#[test]
 fn false_production_claim_is_rejected() {
     let root = workspace_root();
     let false_claim = Capability {

@@ -658,18 +658,14 @@ impl ResourceBroker for ResourceBrokerImpl {
         .map_err(|_| ResourceError::OperationFailed("resource admission closed".into()))?;
         drop(waiting);
 
-        // Transactional filesystem edits run on a blocking worker internally.
-        // Dropping that worker future on the generic timeout does not stop the
-        // underlying file mutation, which could let lifecycle cleanup release
-        // its tool guard while a side effect still runs. Keep ownership until
-        // the edit transaction finishes. Other provider operations retain the
-        // bounded 30-second execution contract.
+        // Filesystem operations run synchronously under the sandbox's
+        // operation lock on a blocking worker. Dropping that worker future
+        // does not stop an in-flight mutation, so keep ownership until the
+        // capability operation finishes. Other providers retain the bounded
+        // execution contract below.
         let mut permit = Some(permit);
         let capability_filesystem = match sandbox {
-            Some((sandbox_id, ref isolation))
-                if request.resource_type == ResourceType::Filesystem
-                    && *isolation != IsolationLevel::Trusted =>
-            {
+            Some((sandbox_id, _)) if request.resource_type == ResourceType::Filesystem => {
                 Some(sandbox_id)
             }
             _ => None,
@@ -736,10 +732,6 @@ impl ResourceBroker for ResourceBrokerImpl {
                 "container execution timed out".into(),
             )))
             .map_err(|error| ResourceError::OperationFailed(error.to_string()))
-        } else if request.resource_type == ResourceType::Filesystem && request.operation == "edit" {
-            provider
-                .execute(&request.operation, &request.parameters)
-                .await
         } else {
             let mut task = ProviderTaskGuard::new(
                 provider,
@@ -1429,6 +1421,81 @@ mod tests {
         );
         sandboxes.destroy_sandbox(sandbox).unwrap();
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn trusted_agent_filesystem_is_still_confined_to_workspace_capability() {
+        let perms = Arc::new(PermissionManager::new());
+        let sandboxes = Arc::new(SandboxManagerImpl::new());
+        let broker = ResourceBrokerImpl::new(perms.clone(), sandboxes.clone());
+        let provider_calls = Arc::new(AtomicUsize::new(0));
+        broker
+            .register_provider(Box::new(CountingProvider(provider_calls.clone())))
+            .unwrap();
+        let agent = uuid::Uuid::new_v4();
+        perms.assign_profile(agent, &"full-access".to_string());
+        let root =
+            std::env::temp_dir().join(format!("agentos-broker-trusted-{}", uuid::Uuid::new_v4()));
+        let outside = std::env::temp_dir().join(format!(
+            "agentos-broker-trusted-outside-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let sandbox = sandboxes
+            .create_sandbox(
+                agent,
+                &SandboxConfig {
+                    workspace_dir: root.clone(),
+                    allowed_network_hosts: None,
+                    max_disk_usage_bytes: None,
+                    max_memory_bytes: None,
+                    isolation_level: IsolationLevel::Trusted,
+                    container_image: None,
+                },
+            )
+            .unwrap();
+        std::fs::write(root.join("inside.txt"), "trusted capability content").unwrap();
+        std::fs::write(&outside, "ambient secret").unwrap();
+
+        let inside = broker
+            .execute(with_test_gate_proof(
+                ResourceRequest {
+                    agent_id: agent,
+                    resource_type: ResourceType::Filesystem,
+                    operation: "read".into(),
+                    parameters: serde_json::json!({"path": root.join("inside.txt")}),
+                    sandbox_context: Some(sandbox),
+                    gate_admission: None,
+                },
+                false,
+            ))
+            .await
+            .unwrap();
+        assert!(inside.success);
+        assert_eq!(inside.data["content"], "trusted capability content");
+
+        let escaped = broker
+            .execute(with_test_gate_proof(
+                ResourceRequest {
+                    agent_id: agent,
+                    resource_type: ResourceType::Filesystem,
+                    operation: "read".into(),
+                    parameters: serde_json::json!({"path": outside}),
+                    sandbox_context: Some(sandbox),
+                    gate_admission: None,
+                },
+                false,
+            ))
+            .await;
+        assert!(escaped.is_err());
+        assert_eq!(
+            provider_calls.load(Ordering::SeqCst),
+            0,
+            "trusted agents must not reach an ambient filesystem provider"
+        );
+
+        sandboxes.destroy_sandbox(sandbox).unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+        std::fs::remove_file(outside).unwrap();
     }
 
     #[tokio::test]

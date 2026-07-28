@@ -720,86 +720,11 @@ impl ResourceProvider for BuiltinFilesystemProvider {
     async fn execute(
         &self,
         operation: &str,
-        params: &serde_json::Value,
+        _params: &serde_json::Value,
     ) -> Result<serde_json::Value, ResourceError> {
-        let path = params
-            .get("path")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| ResourceError::OperationFailed("Missing 'path'".into()))?;
-        match operation {
-            "read" => {
-                let content = tokio::fs::read_to_string(path)
-                    .await
-                    .map_err(|e| ResourceError::OperationFailed(e.to_string()))?;
-                Ok(serde_json::json!({"content": content}))
-            }
-            "write" | "create" => {
-                let content = params.get("content").and_then(|v| v.as_str()).unwrap_or("");
-                tokio::fs::write(path, content)
-                    .await
-                    .map_err(|e| ResourceError::OperationFailed(e.to_string()))?;
-                Ok(serde_json::json!({"written": true}))
-            }
-            "create_dir" => {
-                tokio::fs::create_dir_all(path)
-                    .await
-                    .map_err(|e| ResourceError::OperationFailed(e.to_string()))?;
-                Ok(serde_json::json!({"created": true}))
-            }
-            "edit" => {
-                // Precise find→replace via the transactional editing engine
-                // (atomic apply + rollback on failure). EditTransaction is
-                // synchronous std::fs, so run it on the blocking pool to avoid
-                // stalling an async runtime worker on large files / slow disks.
-                let search = params
-                    .get("search")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| ResourceError::OperationFailed("Missing 'search'".into()))?
-                    .to_string();
-                let replace = params
-                    .get("replace")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let path = path.to_string();
-                let results = tokio::task::spawn_blocking(move || {
-                    let mut tx = crate::editing::EditTransaction::new();
-                    tx.add(crate::editing::FileEdit {
-                        path: std::path::PathBuf::from(path),
-                        operation: crate::editing::EditOperation::Replace { search, replace },
-                    });
-                    tx.apply()
-                })
-                .await
-                .map_err(|e| ResourceError::OperationFailed(e.to_string()))?
-                .map_err(ResourceError::OperationFailed)?;
-                Ok(serde_json::json!({"edited": true, "detail": results}))
-            }
-            "delete" => {
-                tokio::fs::remove_file(path)
-                    .await
-                    .map_err(|e| ResourceError::OperationFailed(e.to_string()))?;
-                Ok(serde_json::json!({"deleted": true}))
-            }
-            "list" => {
-                let mut entries = Vec::new();
-                let mut dir = tokio::fs::read_dir(path)
-                    .await
-                    .map_err(|e| ResourceError::OperationFailed(e.to_string()))?;
-                while let Some(entry) = dir
-                    .next_entry()
-                    .await
-                    .map_err(|e| ResourceError::OperationFailed(e.to_string()))?
-                {
-                    entries.push(entry.file_name().to_string_lossy().to_string());
-                }
-                Ok(serde_json::json!({"entries": entries}))
-            }
-            _ => Err(ResourceError::OperationFailed(format!(
-                "Unknown op: {}",
-                operation
-            ))),
-        }
+        Err(ResourceError::OperationFailed(format!(
+            "filesystem operation '{operation}' requires sandbox capability execution"
+        )))
     }
 }
 
@@ -7597,18 +7522,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn filesystem_provider_creates_directories_without_process_execution() {
-        let path = std::env::temp_dir().join(format!("agentos-mkdir-{}", uuid::Uuid::new_v4()));
-        let result = BuiltinFilesystemProvider
+    async fn filesystem_provider_requires_sandbox_capability_execution() {
+        let provider = BuiltinFilesystemProvider;
+        assert!(provider
+            .supported_operations()
+            .contains(&"create_dir".to_string()));
+        let error = provider
             .execute(
                 "create_dir",
-                &serde_json::json!({"path": path.to_string_lossy()}),
+                &serde_json::json!({"path": "/tmp/ambient-denied"}),
             )
             .await
-            .unwrap();
-        assert_eq!(result["created"], true);
-        assert!(path.is_dir());
-        std::fs::remove_dir(&path).unwrap();
+            .expect_err("provider must not reopen an ambient host path");
+        assert!(matches!(error, ResourceError::OperationFailed(_)));
     }
 
     #[tokio::test]

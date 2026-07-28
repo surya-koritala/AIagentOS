@@ -41,8 +41,8 @@ revoked credential cannot fall back to system authority.
 | Malicious or injected prompt asks for a dangerous tool | The LLM can request but cannot grant capabilities. The binding's typed action/capabilities, MAC policy, approval requirement, and sandbox are enforced outside the model. |
 | Malicious package or custom/MCP tool understates its risk | Registration requires resource type, operation, action, individual known capabilities, a required string/constant extractor, namespace visibility, approval, and sandbox policy. Provider/action contradictions are rejected; remote MCP metadata has no implicit trust, and one invalid or conflicting discovery entry prevents the entire MCP batch from being published. |
 | Compromised provider fabricates a tool name or arguments | Unknown names fail closed. The registered declaration, not the name supplied by the provider, drives authorization. |
-| Path/URL tricks, alternate keys, non-string values, traversal, encoded separators | Each declaration names one typed resource extractor. Missing/wrong-type fields are denied; filesystem `.`/separator aliases are normalized and parent traversal is rejected before MAC, approval, and proof creation. Non-trusted filesystem operations are then executed relative to a kernel-owned directory capability, rather than reopening the authorized host pathname in a provider. |
-| Symlink, special file, or rename changes a filesystem target after authorization | Non-trusted read/write/create/edit/delete/list operations use the retained workspace directory capability. Capability-relative resolution rejects ancestor escapes; final symlinks and non-regular text targets are rejected; bounded writes use synced same-directory staging plus atomic publication. |
+| Path/URL tricks, alternate keys, non-string values, traversal, encoded separators | Each declaration names one typed resource extractor. Missing/wrong-type fields are denied; filesystem `.`/separator aliases are normalized and parent traversal is rejected before MAC, approval, and proof creation. Every agent filesystem operation, including an explicitly trusted agent, is then executed relative to a kernel-owned directory capability rather than reopening the authorized host pathname in a provider. |
+| Symlink, special file, or rename changes a filesystem target after authorization | All agent read/write/create/edit/delete/list operations use the retained workspace directory capability. Capability-relative resolution rejects ancestor escapes; final symlinks and non-regular text targets are rejected; bounded writes use synced same-directory staging plus atomic publication. |
 | Allowlisted hostname resolves to local infrastructure or changes between policy and connect | The sandbox resolves all A/AAAA answers, rejects the request if any address is non-public, pins the validated addresses into a no-proxy HTTP client, permits only the scheme's default port, and disables redirects. |
 | Untrusted command escapes into the server process | Filesystem sandboxes deny commands. Native `Process` mode is rejected as unsupported. Linux `Container` mode requires a rootless daemon and locally verified digest-pinned image, and applies network-none, read-only root, capability drop, `no-new-privileges`, PID/memory/CPU/output limits, and label-scoped cleanup. macOS and Windows reject container mode. |
 | Outbound MCP configuration launches an ambient-authority host child | Direct host MCP launch is disabled. MCP tool declarations may still be published only through the validated registry; an outbound child must wait for an agent-bound isolated backend. |
@@ -80,13 +80,13 @@ MAC evaluates the declaration's typed extractor; filesystem targets first
 receive platform lexical normalization and reject parent traversal so the gate,
 approval contract, and immutable agent-request proof share one identity. It does
 not treat model-supplied alternate keys, non-string values, or an MCP server's
-claimed classification as equivalent. For non-trusted agents, the broker does
-not delegate filesystem or HTTP authority to a provider: filesystem operations
-use a retained directory capability, and HTTP uses validated, pinned DNS answers
-with proxies and redirects disabled. Browser subresources, WebSockets, outbound
-MCP children, untrusted peripherals, native process execution, and
-macOS/Windows process/container isolation are outside the supported untrusted
-runtime and fail closed.
+claimed classification as equivalent. The broker never delegates agent
+filesystem authority to a provider, including in trusted mode: filesystem
+operations use a retained directory capability. For non-trusted agents, HTTP
+uses validated, pinned DNS answers with proxies and redirects disabled. Browser
+subresources, WebSockets, outbound MCP children, untrusted peripherals, native
+process execution, and macOS/Windows process/container isolation are outside
+the supported untrusted runtime and fail closed.
 
 Package code, MCP servers, and resource providers are potential deputies, not
 authorization authorities. They receive only a call that already passed tenant

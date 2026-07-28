@@ -13,9 +13,13 @@ does not claim that every host integration is sandboxed.
 | Raw wire, Rust SDK, package tools, custom tools, MCP server, and model executor | One immutable tool declaration and gate proof reaches the same `ResourceBroker`; the broker derives the sandbox from the kernel-owned agent identity before any provider runs | `sandbox_surfaces.rs` plus in-module executor/MCP/tool tests |
 
 Every live agent receives a managed filesystem sandbox when an in-process
-operator does not provide a narrower explicit configuration. Packages, prompts,
-MCP metadata, SDK requests, and wire requests cannot select trusted mode or
-supply a valid gate proof/sandbox identity.
+operator does not provide an explicit workspace. Even an explicitly trusted
+agent performs filesystem tool calls through the retained directory capability
+rooted at that workspace; trusted mode does not grant ambient host-file access.
+Packages, prompts, MCP metadata, SDK requests, and wire requests cannot select
+trusted mode or supply a valid gate proof/sandbox identity. The standalone
+`resources::FilesystemProvider` advertises no operations and returns typed
+unsupported errors because it cannot carry kernel-owned sandbox authority.
 
 Filesystem text operations accept at most 4 MiB, paths at most 4,096 UTF-8
 bytes, and directory listings at most 4,096 entries. Reads, edits, writes, and
@@ -27,7 +31,9 @@ private (`0700`) on Unix. Listings are sorted, reject non-UTF-8 names, and
 report each entry's file, directory, symlink, or other type. These limits are
 part of the provider contract, not evidence that every host filesystem or
 non-Unix directory-entry durability behavior has completed live production
-qualification.
+qualification. Broker-future cancellation while a bounded blocking filesystem
+operation is already in progress also remains part of the broader provider
+lifecycle qualification in issue #124.
 
 ## Explicitly unsupported for untrusted agents
 
@@ -39,8 +45,9 @@ qualification.
   profile.
 
 These paths fail before provider invocation. They do not fall back to ambient
-host execution. `IsolationLevel::Trusted` is an in-process operator boundary,
-not a package or remote-agent option.
+host execution. `IsolationLevel::Trusted` is an in-process operator boundary
+for the explicitly supported non-filesystem surfaces, not a package or
+remote-agent option and not an ambient filesystem bypass.
 
 ## Live Linux qualification
 

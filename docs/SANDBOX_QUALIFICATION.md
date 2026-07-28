@@ -118,15 +118,20 @@ digest. Its ignored-by-default live test then:
 1. verifies rootless daemon and local image digest checks;
 2. checks zero effective capabilities, `NoNewPrivs`, read-only root, network
    denial, and private workspace write access;
-3. cancels a long-running container and proves the labeled process/container is
+3. passes shell metacharacters as a literal argv value and proves no implicit
+   shell evaluates them;
+4. exceeds the stdout ceiling and proves the call fails closed while removing
+   its container;
+5. cancels a long-running container and proves the labeled process/container is
    gone before the call returns; and
-4. creates a simulated crash orphan and proves startup reconciliation removes
+6. creates a simulated crash orphan and proves startup reconciliation removes
    its process, mount, and network namespace.
 
 The test writes `target/qualification/rootless-sandbox-crash.json` only after
 all live assertions pass. The workflow rejects an artifact unless it names the
 exact clean checkout commit, the immutable image, the live-rootless
-qualification class, all nine checks, and `production_claim_allowed: false`.
+qualification class, all twelve checks, and
+`production_claim_allowed: false`.
 The artifact is retained for 90 days. A workflow definition is evidence
 infrastructure, not a passing result: the relevant issue criterion can be
 credited only to a successful exact-commit run whose artifact is available.
@@ -134,6 +139,26 @@ credited only to a successful exact-commit run whose artifact is available.
 Ordinary CI retains deterministic contract tests on Linux, macOS, and Windows;
 the live job is isolated because those platforms do not all provide a rootless
 Linux daemon.
+
+## Combined provider security evidence
+
+The same protected workflow executes exact kernel tests for atomic/private
+filesystem behavior, symlink-swap races, cross-agent denial, provider panic
+isolation, generic request/response bounds, cross-surface sandbox parity, and
+the explicitly unavailable browser-profile surface. A fail-closed collector
+accepts each check only when its log contains the named Rust test's passing
+event and an exact one-test successful harness result. It hashes every retained
+log and refuses dirty source trees, missing tests, duplicate checks, malformed
+commits, non-UTF-8 evidence, and oversized logs.
+
+The final job downloads the exact-commit rootless, network, and core artifacts,
+rejects a missing, failed, dirty, or mismatched component, hashes each component
+report, and derives a combined artifact. The combined checks cover literal-argv
+injection, traversal/symlink races, metadata SSRF, redirects, DNS rebinding,
+large output, hung-process cleanup, browser-profile de-scope, cross-agent
+access, provider panic, generic envelopes, and cross-surface policy. The
+artifact remains `production_claim_allowed: false`; it is proof of the
+restricted live-provider suite, not a substitute for independent review.
 
 ## Residual qualification
 

@@ -3,12 +3,15 @@
 
 use std::sync::Arc;
 
+use adapters::azure_openai::AzureOpenAiAdapter;
 use agent_sdk::KernelClient;
 use kernel::auth::Role;
 use kernel::mcp_server::{McpClient, McpServer};
 use kernel::sandbox::SandboxManager;
 use kernel::syscall_server::{Syscall, SyscallClient, SyscallReply, SyscallServer};
 use kernel::{AgentConfig, AgentKernelImpl, Priority};
+use wiremock::matchers::{method, path_regex};
+use wiremock::{Mock, MockServer, ResponseTemplate};
 
 fn assert_sandbox_denial(message: &str, surface: &str) {
     let normalized = message.to_ascii_lowercase();
@@ -49,6 +52,103 @@ value = "echo"
 input = { type = "string", required = true }
 "#
     .to_string()
+}
+
+#[tokio::test]
+async fn llm_executor_tool_calls_share_the_fail_closed_sandbox() {
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path_regex("/openai/deployments/.*/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "sandbox-executor-call",
+                        "type": "function",
+                        "function": {
+                            "name": "git_status",
+                            "arguments": "{\"directory\":\".\"}"
+                        }
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
+        })))
+        .up_to_n_times(1)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path_regex("/openai/deployments/.*/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "The kernel refused the host-process request."
+                },
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 20, "completion_tokens": 5, "total_tokens": 25}
+        })))
+        .mount(&mock_server)
+        .await;
+
+    let kernel = AgentKernelImpl::new().expect("kernel");
+    kernel
+        .register_provider(Arc::new(AzureOpenAiAdapter::new(
+            mock_server.uri(),
+            "gpt-4o".into(),
+            "qualification-key".into(),
+        )))
+        .expect("register provider");
+    let agent = kernel
+        .create_agent_full(AgentConfig {
+            name: "surface-llm-executor".into(),
+            task: "prove executor sandbox propagation".into(),
+            llm_provider: "azure-openai".into(),
+            permission_profile: "full-access".into(),
+            priority: Priority::default(),
+            sandbox_config: None,
+        })
+        .await
+        .expect("create executor agent");
+    assert!(
+        kernel
+            .sandbox_manager
+            .get_sandbox_for_agent(agent.id)
+            .is_some(),
+        "LLM-driven agents must receive the managed sandbox default"
+    );
+
+    let output = kernel
+        .send_message(agent.id, "Run git status on the host")
+        .await
+        .expect("executor should recover from a denied tool call");
+    assert_eq!(
+        output.content,
+        "The kernel refused the host-process request."
+    );
+    assert_eq!(output.tool_calls_made, 1);
+
+    let requests = mock_server
+        .received_requests()
+        .await
+        .expect("request recording enabled");
+    assert_eq!(requests.len(), 2, "one tool round and one recovery round");
+    let recovery_body: serde_json::Value =
+        serde_json::from_slice(&requests[1].body).expect("recovery request JSON");
+    let tool_result = recovery_body["messages"]
+        .as_array()
+        .expect("messages array")
+        .iter()
+        .find(|message| message["role"] == "tool")
+        .and_then(|message| message["content"].as_str())
+        .expect("kernel denial returned to the LLM");
+    assert_sandbox_denial(tool_result, "LLM executor");
 }
 
 #[tokio::test]

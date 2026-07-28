@@ -10,7 +10,7 @@ does not claim that every host integration is sandboxed.
 | Filesystem | A private, kernel-owned workspace directory capability; handle-relative I/O; synced atomic create/replace; strict UTF-8, path/content/list bounds; regular-file and final-symlink checks; byte quota; traversal/ancestor-rename denial; cross-agent isolation; teardown; and restart orphan reconciliation | `sandbox.rs`, `resources.rs`, `sandbox_props.rs`, `lifecycle_coordinator.rs` |
 | HTTP(S) | Explicit hostname allowlist; credentials, fragments, and non-default ports denied; every A/AAAA answer must be public; checked addresses are pinned into a no-proxy, no-redirect client; URL, JSON body, response, nesting, and node counts are bounded | `sandbox.rs`, `resources.rs` |
 | Linux process | One fresh digest-pinned container per call on a verified rootless Docker daemon; strict bounded literal argv; fixed `/workspace` cwd; no caller environment/stdin; 30-second timeout; strict-UTF-8 output bounds; read-only root, no network, no capabilities, no-new-privileges, PID/CPU/memory/swap/open-file limits, bounded `tmpfs`, and only the agent workspace mounted writable | `docker_sandbox.rs`, protected `rootless-container-sandbox` workflow job |
-| Raw wire, Rust SDK, package tools, custom tools, MCP server, and model executor | One immutable tool declaration and gate proof reaches the same `ResourceBroker`; the broker derives the sandbox from the kernel-owned agent identity before any provider runs | `sandbox_surfaces.rs` plus in-module executor/MCP/tool tests |
+| Raw wire, Rust SDK, package tools, custom tools, MCP server, and model executor | One immutable tool declaration and gate proof reaches the same `ResourceBroker`; the broker derives the sandbox from the kernel-owned agent identity before any provider runs | `sandbox_surfaces.rs`, including a wiremock-backed LLM tool-call and recovery round, plus in-module executor/MCP/tool tests |
 
 Every live agent receives a managed filesystem sandbox when an in-process
 operator does not provide an explicit workspace. Even an explicitly trusted
@@ -51,8 +51,9 @@ levels, and 65,536 values; responses accept at most 4 MiB and must be valid
 UTF-8. Only `url` and, for `post`, `body` are accepted by the default agent
 provider. Caller-supplied headers, credentials, cookies, filesystem
 upload/download paths, WebSocket mode, and redirects are not supported and
-fail before transport. These controls are deterministic contract evidence, not
-the still-missing live target-egress and rebinding qualification in #124.
+fail before transport. The controlled live Linux qualification below proves
+that target pinning, no-proxy transport, redirect refusal, SSRF rejection, and
+DNS-rebinding rejection hold during real socket I/O.
 
 Application launch accepts only `command` and `args`. Commands are limited to 4
 KiB; there may be at most 1,024 arguments, each at most 64 KiB and at most 1 MiB
@@ -76,6 +77,29 @@ These paths fail before provider invocation. They do not fall back to ambient
 host execution. `IsolationLevel::Trusted` is an in-process operator boundary
 for the explicitly supported non-filesystem surfaces, not a package or
 remote-agent option and not an ambient filesystem bypass.
+
+## Live network qualification
+
+The protected extended-security workflow creates a controlled Linux egress
+topology with a public-looking loopback address, a private sentinel, an ambient
+HTTP proxy pointed at that sentinel, and a hostname whose answer changes from
+public to private during the request. Its ignored-by-default live test proves:
+
+1. the permitted request reaches the pinned public address without using the
+   ambient proxy;
+2. an HTTP redirect is returned to the caller but is not followed;
+3. the DNS change cannot redirect the in-flight connection to the private
+   sentinel;
+4. a subsequent private DNS answer is rejected before a connection; and
+5. metadata SSRF, URL credentials, fragments, and non-default ports fail before
+   transport.
+
+The test writes `target/qualification/network-egress.json` only after all live
+assertions pass. The workflow rejects evidence unless it names the exact clean
+checkout commit, the `live_linux_network_egress` qualification class, the
+configured ambient proxy, all ten checks, and
+`production_claim_allowed: false`. The retained
+`network-egress-<commit>` artifact expires after 90 days.
 
 ## Live Linux qualification
 

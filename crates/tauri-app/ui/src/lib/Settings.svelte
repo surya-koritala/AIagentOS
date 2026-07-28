@@ -7,6 +7,8 @@
   let config = {};
   let provider = 'azure-openai';
   let configuredProviders = [];
+  let credentialStoreAvailable = true;
+  let providerCredential = '';
   let azureEndpoint = '';
   let azureDeployment = 'gpt-4o';
   let localEndpoint = 'http://localhost:11434';
@@ -18,6 +20,7 @@
       config = await invoke('load_config');
       provider = config.llm_provider || 'azure-openai';
       configuredProviders = config.configured_providers || [];
+      credentialStoreAvailable = config.credential_store_available !== false;
       azureEndpoint = config.azure_endpoint || '';
       azureDeployment = config.azure_deployment || 'gpt-4o';
       localEndpoint = config.local_endpoint || 'http://localhost:11434';
@@ -27,15 +30,35 @@
   async function save() {
     saving = true;
     message = '';
+    const submittedCredential = providerCredential;
+    providerCredential = '';
     try {
       await invoke('save_config', {
         llmProvider: provider,
+        providerCredential: submittedCredential || null,
         defaultModel: azureDeployment,
         azureEndpoint,
         azureDeployment,
         localEndpoint,
       });
       message = '✓ Saved successfully';
+      await loadSettings();
+    } catch (e) {
+      message = `✗ Error: ${e}`;
+    }
+    saving = false;
+  }
+
+  async function removeStoredCredential() {
+    saving = true;
+    message = '';
+    providerCredential = '';
+    try {
+      const removed = await invoke('delete_provider_credential', { provider });
+      message = removed
+        ? '✓ Stored credential removed'
+        : '✓ No stored credential was present';
+      await loadSettings();
     } catch (e) {
       message = `✗ Error: ${e}`;
     }
@@ -68,21 +91,40 @@
     {#if provider === 'local'}
       <label>Ollama URL <input bind:value={localEndpoint} placeholder="http://localhost:11434" /></label>
     {:else}
+      <label>
+        Provider credential
+        <input
+          type="password"
+          bind:value={providerCredential}
+          autocomplete="new-password"
+          placeholder={configuredProviders.includes(provider) ? 'Leave blank to keep the current source' : 'Enter a credential'}
+          disabled={!credentialStoreAvailable}
+        />
+      </label>
       <p class="credential-status">
-        Credentials are never returned to this UI or saved by it.
+        Credentials are sent only to the native app and are never returned to this screen.
         {#if configuredProviders.includes(provider)}
-          The selected provider has a credential source configured outside this screen.
+          The selected provider is configured. Enter a new value to rotate its stored credential.
+        {:else if !credentialStoreAvailable}
+          The platform credential store is unavailable. Set {provider === 'azure-openai' ? 'AZURE_OPENAI_API_KEY' : provider === 'openai' ? 'OPENAI_API_KEY' : 'ANTHROPIC_API_KEY'} before starting the app.
         {:else}
-          Set {provider === 'azure-openai' ? 'AZURE_OPENAI_API_KEY' : provider === 'openai' ? 'OPENAI_API_KEY' : 'ANTHROPIC_API_KEY'} before starting the app.
+          The credential will be stored by the operating system, not in the AgentOS config file.
         {/if}
       </p>
+      {#if configuredProviders.includes(provider) && credentialStoreAvailable}
+        <button class="secondary" on:click={removeStoredCredential} disabled={saving}>
+          Remove stored credential
+        </button>
+      {/if}
     {/if}
 
     {#if message}
       <div class="message" class:success={message.startsWith('✓')}>{message}</div>
     {/if}
 
-    <button on:click={save} disabled={saving}>{saving ? 'Saving...' : 'Save Settings'}</button>
+    <button on:click={save} disabled={saving || (provider !== 'local' && !configuredProviders.includes(provider) && !providerCredential.trim())}>
+      {saving ? 'Saving...' : 'Save Settings'}
+    </button>
   </section>
 
   <section>
@@ -101,6 +143,7 @@
   select, input { display: block; width: 100%; margin-top: 0.25rem; padding: 0.5rem 0.75rem; border-radius: 8px; border: 1px solid #333; background: #12121f; color: #eee; font-size: 0.85rem; box-sizing: border-box; }
   button { width: 100%; padding: 0.6rem; border-radius: 8px; border: none; background: #4a90d9; color: white; font-weight: 600; cursor: pointer; margin-top: 0.5rem; }
   button:disabled { opacity: 0.5; }
+  button.secondary { background: transparent; color: #fca5a5; border: 1px solid #7f1d1d; margin-bottom: 0.5rem; }
   .message { margin-top: 0.5rem; font-size: 0.8rem; color: #f87171; }
   .message.success { color: #4ade80; }
   .hint { font-size: 0.75rem; color: #555; margin: 0.25rem 0; }

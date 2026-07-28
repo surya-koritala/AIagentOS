@@ -14,6 +14,8 @@ use tokio::sync::Mutex;
 
 #[cfg(feature = "desktop-shell")]
 pub mod commands;
+#[cfg(feature = "desktop-shell")]
+pub mod credentials;
 
 /// Serializable agent row consumed by the Svelte UI.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]

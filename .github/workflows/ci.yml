@@ -119,7 +119,13 @@ jobs:
         run: >-
           sudo apt-get update && sudo apt-get install -y
           libgtk-3-dev libwebkit2gtk-4.1-dev
-          libayatana-appindicator3-dev librsvg2-dev
+          libayatana-appindicator3-dev librsvg2-dev gnome-keyring
+      - name: Start disposable Linux Secret Service
+        if: runner.os == 'Linux'
+        shell: bash
+        run: >-
+          gnome-keyring-daemon --components=secrets --daemonize --unlock
+          <<< 'agentos-ci-disposable-keyring'
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: tauri-ui-dist
@@ -127,6 +133,11 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - name: Tauri command and backend warnings are errors
         run: cargo clippy -p tauri-app --all-targets --locked -- -D warnings
+      - name: Native credential store create, rotate, read, and delete
+        run: >-
+          cargo test -p tauri-app
+          credentials::tests::native_platform_store_round_trip
+          --locked -- --ignored --exact
 
   frontend:
     name: Frontend build and vulnerability gate

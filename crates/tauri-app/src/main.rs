@@ -5,10 +5,10 @@
 use agent_cli::providers::register_providers;
 use kernel::{config::Config, AgentKernelImpl};
 use std::sync::Arc;
-use tauri_app::{commands, AppState, DesktopClient};
+use tauri_app::{commands, credentials::hydrate_provider_credentials, AppState, DesktopClient};
 
 fn main() {
-    let config = match Config::try_load() {
+    let mut config = match Config::try_load() {
         Ok(config) => config,
         Err(error) => {
             eprintln!("Failed to load configuration: {error}");
@@ -18,6 +18,9 @@ fn main() {
     let kernel =
         Arc::new(AgentKernelImpl::from_config(&config).expect("Failed to initialize kernel"));
 
+    // Hydration happens only after kernel construction. The in-memory values
+    // are used to register providers and are never saved back to Config.
+    hydrate_provider_credentials(&mut config);
     register_providers(&kernel, &config);
 
     // Start the scheduler observer that publishes the CFS pick into procfs,
@@ -40,6 +43,7 @@ fn main() {
             commands::get_metrics,
             commands::load_config,
             commands::save_config,
+            commands::delete_provider_credential,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -2,52 +2,10 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use adapters::anthropic::AnthropicAdapter;
-use adapters::azure_openai::AzureOpenAiAdapter;
-use adapters::local::LocalLlmAdapter;
-use adapters::openai::OpenAiAdapter;
+use agent_cli::providers::register_providers;
 use kernel::{config::Config, AgentKernelImpl};
 use std::sync::Arc;
 use tauri_app::{commands, AppState, DesktopClient};
-
-fn register_providers(kernel: &AgentKernelImpl, config: &Config) {
-    match config.llm_provider.as_str() {
-        "azure-openai" => {
-            if let (Some(endpoint), Some(ref key)) =
-                (&config.azure_endpoint, config.get_api_key("azure-openai"))
-            {
-                let deployment = config.azure_deployment.as_deref().unwrap_or("gpt-4o");
-                let adapter = AzureOpenAiAdapter::new(
-                    endpoint.clone(),
-                    deployment.to_string(),
-                    key.to_string(),
-                );
-                let _ = kernel.register_provider(Arc::new(adapter));
-            }
-        }
-        "openai" => {
-            if let Some(key) = config.get_api_key("openai") {
-                let adapter = OpenAiAdapter::new(key.to_string());
-                let _ = kernel.register_provider(Arc::new(adapter));
-            }
-        }
-        "anthropic" => {
-            if let Some(key) = config.get_api_key("anthropic") {
-                let adapter = AnthropicAdapter::new(key.to_string());
-                let _ = kernel.register_provider(Arc::new(adapter));
-            }
-        }
-        "local" => {
-            let url = config
-                .get_api_key("local")
-                .unwrap_or("http://localhost:11434");
-            let model = config.default_model.clone();
-            let adapter = LocalLlmAdapter::new(url.to_string(), model);
-            let _ = kernel.register_provider(Arc::new(adapter));
-        }
-        _ => {}
-    }
-}
 
 fn main() {
     let config = match Config::try_load() {

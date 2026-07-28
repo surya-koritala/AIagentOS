@@ -8,6 +8,12 @@ use std::ops::{Deref, DerefMut};
 
 use agent_sdk::{KernelClient, SdkError};
 
+/// Provider registration shared by every first-party host surface.
+///
+/// Keeping this in the library prevents the server, interactive CLI, and
+/// desktop shell from drifting on credential-source or endpoint behavior.
+pub mod providers;
+
 /// An authenticated (or deliberately unauthenticated) `agentctl` session.
 ///
 /// Deref access keeps the binary's command handlers on the typed SDK without

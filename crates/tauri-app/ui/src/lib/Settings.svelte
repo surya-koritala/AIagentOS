@@ -6,9 +6,10 @@
 
   let config = {};
   let provider = 'azure-openai';
-  let apiKey = '';
+  let configuredProviders = [];
   let azureEndpoint = '';
   let azureDeployment = 'gpt-4o';
+  let localEndpoint = 'http://localhost:11434';
   let saving = false;
   let message = '';
 
@@ -16,9 +17,10 @@
     try {
       config = await invoke('load_config');
       provider = config.llm_provider || 'azure-openai';
-      apiKey = config.api_keys?.[provider] || '';
+      configuredProviders = config.configured_providers || [];
       azureEndpoint = config.azure_endpoint || '';
       azureDeployment = config.azure_deployment || 'gpt-4o';
+      localEndpoint = config.local_endpoint || 'http://localhost:11434';
     } catch (e) {}
   }
 
@@ -26,7 +28,13 @@
     saving = true;
     message = '';
     try {
-      await invoke('save_config', { llmProvider: provider, apiKey, defaultModel: azureDeployment });
+      await invoke('save_config', {
+        llmProvider: provider,
+        defaultModel: azureDeployment,
+        azureEndpoint,
+        azureDeployment,
+        localEndpoint,
+      });
       message = '✓ Saved successfully';
     } catch (e) {
       message = `✗ Error: ${e}`;
@@ -57,14 +65,18 @@
       <label>Deployment <input bind:value={azureDeployment} placeholder="gpt-4o" /></label>
     {/if}
 
-    <label>
-      {provider === 'local' ? 'URL' : 'API Key'}
-      {#if provider === 'local'}
-        <input bind:value={apiKey} placeholder="http://localhost:11434" />
-      {:else}
-        <input bind:value={apiKey} type="password" placeholder="sk-..." />
-      {/if}
-    </label>
+    {#if provider === 'local'}
+      <label>Ollama URL <input bind:value={localEndpoint} placeholder="http://localhost:11434" /></label>
+    {:else}
+      <p class="credential-status">
+        Credentials are never returned to this UI or saved by it.
+        {#if configuredProviders.includes(provider)}
+          The selected provider has a credential source configured outside this screen.
+        {:else}
+          Set {provider === 'azure-openai' ? 'AZURE_OPENAI_API_KEY' : provider === 'openai' ? 'OPENAI_API_KEY' : 'ANTHROPIC_API_KEY'} before starting the app.
+        {/if}
+      </p>
+    {/if}
 
     {#if message}
       <div class="message" class:success={message.startsWith('✓')}>{message}</div>
@@ -92,4 +104,5 @@
   .message { margin-top: 0.5rem; font-size: 0.8rem; color: #f87171; }
   .message.success { color: #4ade80; }
   .hint { font-size: 0.75rem; color: #555; margin: 0.25rem 0; }
+  .credential-status { font-size: 0.8rem; color: #999; line-height: 1.5; }
 </style>

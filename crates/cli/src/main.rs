@@ -9,6 +9,7 @@
 use std::io::{self, BufRead, Read, Write};
 use std::sync::Arc;
 
+use agent_cli::providers::register_providers;
 use kernel::config::Config;
 use kernel::connector::AgentConnector;
 use kernel::execution::{AgentExecutor, StreamEvent};
@@ -18,9 +19,6 @@ use tokio::sync::mpsc;
 
 mod logging;
 mod policy_cmd;
-mod providers;
-use providers::register_providers;
-
 /// Read project context (README, Cargo.toml) for the system prompt.
 fn project_context() -> String {
     let mut ctx = String::new();

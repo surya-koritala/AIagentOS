@@ -346,9 +346,9 @@ kernel_modules = []
 source_paths = ["crates/cli", "crates/tui", "crates/tauri-app"]
 public_entry_points = ["crates/cli/src/main.rs", "crates/tui/src/main.rs", "crates/tauri-app/src/main.rs"]
 runtime_call_paths = ["crates/sdk/src/lib.rs::KernelClient"]
-test_evidence = ["crates/tui/tests/refresh.rs", "crates/sdk/tests/kernel_client.rs", "crates/tauri-app/src/lib.rs", "tests/src/client_conformance.rs"]
+test_evidence = ["crates/tui/tests/refresh.rs", "crates/sdk/tests/kernel_client.rs", "crates/tauri-app/src/lib.rs::tests::embedded_desktop_reaches_the_kernel_only_through_its_wire_client", "crates/tauri-app/src/commands.rs::tests::desktop_config_view_never_serializes_provider_credentials", "crates/tauri-app/src/commands.rs::tests::production_manifest_does_not_enable_tauri_devtools", "tests/src/client_conformance.rs"]
 platforms = ["linux", "macos", "windows"]
-limitations = ["Every client now crosses the typed authorization boundary and passes the shared tenant/role behavior suite. Feature breadth, accessibility, and a user-facing external credential-management experience remain #126."]
+limitations = ["Every client crosses the typed authorization boundary and passes the shared tenant/role behavior suite. The desktop config IPC exposes only a non-secret projection, never accepts a new cloud-provider secret, reports configured providers by name only, and uses the same environment/legacy-config provider registration path as the CLI and server. Production Tauri builds do not enable devtools. Legacy plaintext credentials are still accepted for compatibility but are never returned to the UI; platform credential storage, feature breadth, accessibility, signed desktop distribution, and a complete user-facing credential-management experience remain #126."]
 
 [[capability]]
 id = "secondary-modules"

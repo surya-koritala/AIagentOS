@@ -721,6 +721,8 @@ fn desktop_release_foundation_is_versioned_and_fail_closed() {
         "bundles: deb,appimage",
         "bundles: app,dmg",
         "bundles: msi,nsis",
+        "OPENSSL_SRC_PERL: ${{ matrix.perl }}",
+        "perl: C:/Strawberry/perl/bin/perl.exe",
         "cargo tauri build --ci --no-sign",
         "release-desktop-${{ matrix.platform }}",
     ] {

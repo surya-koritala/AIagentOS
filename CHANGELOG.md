@@ -17,7 +17,9 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
   MSI/NSIS qualification installers with SBOM, checksums, Sigstore signatures,
   and provenance. Public tags remain deliberately blocked until native signing,
   macOS notarization, signed updater, clean-host upgrade/rollback evidence, and
-  the supported platform matrix are complete.
+  the supported platform matrix are complete. Windows release builds explicitly
+  select the complete Strawberry Perl runtime so Git Bash cannot break vendored
+  OpenSSL configuration by shadowing it with an incomplete Perl installation.
 - Established a WCAG 2.2 AA-oriented desktop accessibility baseline with a
   keyboard skip link, visible focus, semantic landmarks and current navigation,
   named controls, modal focus containment, live operation/conversation status,

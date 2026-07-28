@@ -693,6 +693,59 @@ fn desktop_accessibility_baseline_is_explicit_and_honest() {
 }
 
 #[test]
+fn desktop_release_foundation_is_versioned_and_fail_closed() {
+    let distribution = read_workspace_file("docs/DESKTOP_DISTRIBUTION.md");
+    let normalized_distribution = distribution
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    for contract in [
+        "**qualification artifacts only**",
+        "Production requirement still open",
+        "do not replace native platform signing",
+        "public `v*` tag is deliberately rejected",
+        "failed-update, and rollback tests",
+    ] {
+        assert!(
+            normalized_distribution.contains(contract),
+            "desktop distribution contract lost {contract:?}"
+        );
+    }
+
+    let release = read_workspace_file(".github/workflows/release.yml");
+    for contract in [
+        "desktop-release-contract:",
+        "python3 scripts/verify_desktop_release.py",
+        "if: startsWith(github.ref, 'refs/tags/v')",
+        "exit 1",
+        "bundles: deb,appimage",
+        "bundles: app,dmg",
+        "bundles: msi,nsis",
+        "cargo tauri build --ci --no-sign",
+        "release-desktop-${{ matrix.platform }}",
+    ] {
+        assert!(
+            release.contains(contract),
+            "desktop release workflow lost {contract:?}"
+        );
+    }
+
+    let verifier = read_workspace_file("scripts/verify_desktop_release.py");
+    for contract in [
+        "member_versions",
+        "release tag",
+        "REQUIRED_PNGS",
+        "icon.ico",
+        "icon.icns",
+    ] {
+        assert!(
+            verifier.contains(contract),
+            "desktop release verifier lost {contract:?}"
+        );
+    }
+}
+
+#[test]
 fn release_blocking_workflows_keep_their_security_contract() {
     let ci = read_workspace_file(".github/workflows/ci.yml");
     for os in ["ubuntu-latest", "macos-latest", "windows-latest"] {

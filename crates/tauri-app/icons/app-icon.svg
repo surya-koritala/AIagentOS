@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" role="img" aria-labelledby="title desc">
+  <title id="title">AI Agent OS application icon</title>
+  <desc id="desc">A circuit-inspired letter A on a dark blue rounded square.</desc>
+  <defs>
+    <linearGradient id="background" x1="128" y1="96" x2="896" y2="928" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#0f172a"/>
+      <stop offset="0.55" stop-color="#172554"/>
+      <stop offset="1" stop-color="#1d4ed8"/>
+    </linearGradient>
+    <linearGradient id="mark" x1="256" y1="768" x2="768" y2="224" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#e0f2fe"/>
+      <stop offset="1" stop-color="#ffffff"/>
+    </linearGradient>
+  </defs>
+  <rect x="32" y="32" width="960" height="960" rx="224" fill="url(#background)"/>
+  <rect x="56" y="56" width="912" height="912" rx="200" fill="none" stroke="#60a5fa" stroke-opacity="0.28" stroke-width="16"/>
+  <path d="M258 778 512 226 766 778" fill="none" stroke="url(#mark)" stroke-width="104" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M382 584H642" fill="none" stroke="#38bdf8" stroke-width="76" stroke-linecap="round"/>
+  <circle cx="258" cy="778" r="40" fill="#facc15"/>
+  <circle cx="512" cy="226" r="40" fill="#facc15"/>
+  <circle cx="766" cy="778" r="40" fill="#facc15"/>
+  <circle cx="382" cy="584" r="24" fill="#0f172a" stroke="#bae6fd" stroke-width="12"/>
+  <circle cx="642" cy="584" r="24" fill="#0f172a" stroke="#bae6fd" stroke-width="12"/>
+</svg>

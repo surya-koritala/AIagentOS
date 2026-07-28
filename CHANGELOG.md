@@ -10,6 +10,14 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
 
 ## [Unreleased]
 
+- Added a fail-closed desktop release foundation under #126. Workspace, Tauri,
+  UI, lockfile, and release-tag versions must now agree; a code-rendered source
+  SVG generates validated multi-resolution PNG, ICO, and ICNS assets; and the
+  release workflow builds native Linux Debian/AppImage, macOS DMG, and Windows
+  MSI/NSIS qualification installers with SBOM, checksums, Sigstore signatures,
+  and provenance. Public tags remain deliberately blocked until native signing,
+  macOS notarization, signed updater, clean-host upgrade/rollback evidence, and
+  the supported platform matrix are complete.
 - Established a WCAG 2.2 AA-oriented desktop accessibility baseline with a
   keyboard skip link, visible focus, semantic landmarks and current navigation,
   named controls, modal focus containment, live operation/conversation status,

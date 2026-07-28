@@ -10,6 +10,14 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
 
 ## [Unreleased]
 
+- Added complete signed-package lifecycle coverage to the canonical `agentctl`
+  public SDK/wire path: trust and revoke publisher keys, publish and yank
+  signed archives, safely fetch without overwriting an existing file, search,
+  install/upgrade, roll back, remove, list, and run installed packages.
+  Destructive key, version, rollback, and removal operations require the exact
+  target after `--confirm`. A real TCP, multi-process regression proves the
+  end-to-end lifecycle, tenant-isolated discovery and execution, byte-identical
+  fetches, transactional upgrade/rollback, and overwrite refusal.
 - Expanded the canonical `agentctl` operator over the existing public SDK/wire
   boundary. It now supports tenant-scoped agent creation and messages, ordered
   NDJSON streaming, exact request cancellation from a second process,
@@ -18,8 +26,8 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
   regression exercises those commands with a tenant credential, proves
   foreign-agent isolation and system-only metrics authorization, and cancels a
   live slow-provider stream. SDK result views used by scriptable clients are
-  now serializable without redefining wire types. Package-management breadth,
-  rendered desktop/TUI breadth, exact-artifact accessibility, and signed
+  now serializable without redefining wire types. Policy explanation/audit
+  views, rendered desktop/TUI breadth, exact-artifact accessibility, and signed
   updater qualification remain open under #126.
 - Added a fail-closed desktop release foundation under #126. Workspace, Tauri,
   UI, lockfile, and release-tag versions must now agree; a code-rendered source

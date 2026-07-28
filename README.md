@@ -128,6 +128,33 @@ exec 3<>/dev/tcp/127.0.0.1/7777; printf '{"op":"node_info"}\n' >&3; head -1 <&3
 # -> {"status":"node_info","agent_count":0,"running_agents":0}
 ```
 
+### Manage signed agent packages
+
+`agentctl` uses the authenticated public wire API for the complete signed
+package lifecycle. Trust a publisher's raw Ed25519 public key, publish its
+bounded `.agent` archive, install an exact version, and run it:
+
+```bash
+cargo run -p agent-cli --bin agentctl --locked -- \
+  --addr 127.0.0.1:7777 --token "$AGENT_SERVER_TOKEN" \
+  package-trust-key publisher-id release-1 publisher.ed25519.pub \
+  2026-01-01T00:00:00Z
+cargo run -p agent-cli --bin agentctl --locked -- \
+  --addr 127.0.0.1:7777 --token "$AGENT_SERVER_TOKEN" \
+  package-publish example-agent-1.0.0.agent
+cargo run -p agent-cli --bin agentctl --locked -- \
+  --addr 127.0.0.1:7777 --token "$AGENT_SERVER_TOKEN" \
+  package-install example-agent =1.0.0
+cargo run -p agent-cli --bin agentctl --locked -- \
+  --addr 127.0.0.1:7777 --token "$AGENT_SERVER_TOKEN" \
+  package-run example-agent
+```
+
+Search, fetch, list, upgrade, rollback, yank, remove, and key revocation are
+also exposed. Fetch refuses to overwrite an existing output file. Revocation,
+yanking, rollback, and removal require `--confirm` plus the exact target; run
+`agentctl` without a command for the full usage contract.
+
 ### Back up and recover persistent state
 
 Inspect the versioned storage policy before provisioning retention and recovery.

@@ -6,7 +6,7 @@
 
 use std::ops::{Deref, DerefMut};
 
-use agent_sdk::{KernelClient, SdkError};
+use agent_sdk::{ConnectionProfile, KernelClient, SdkError};
 
 /// Provider registration shared by every first-party host surface.
 ///
@@ -26,11 +26,21 @@ pub struct OperatorClient {
 impl OperatorClient {
     /// Connect to `addr` and optionally authenticate before returning.
     pub async fn connect(addr: &str, token: Option<&str>) -> Result<Self, SdkError> {
-        let mut inner = KernelClient::connect(addr).await?;
-        if let Some(token) = token {
-            inner.authenticate(token).await?;
-        }
+        Self::connect_profile(&ConnectionProfile::plaintext(addr), token).await
+    }
+
+    /// Connect through the shared secure first-party profile.
+    pub async fn connect_profile(
+        profile: &ConnectionProfile,
+        token: Option<&str>,
+    ) -> Result<Self, SdkError> {
+        let inner = profile.connect(token).await?;
         Ok(Self { inner })
+    }
+
+    /// Rotate the authenticated credential without rebuilding the client.
+    pub async fn rotate_auth(&mut self, token: impl Into<String>) -> Result<(), SdkError> {
+        self.inner.authenticate(token).await
     }
 }
 

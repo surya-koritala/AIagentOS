@@ -105,6 +105,23 @@ AGENT_SERVER_TOKEN=secret cargo run --package agent-cli --bin agentctl -- list
 AGENT_SERVER_TOKEN=secret cargo run --package agent-tui -- --addr 127.0.0.1:7777
 ```
 
+For a remote TLS listener, `agentctl` and `agent-tui` use the same non-secret
+connection profile. The CA bundle and DNS name are both required; disabling
+certificate or hostname verification is not supported:
+
+```bash
+AGENTOS_ADDR=agentos.example.com:7777 \
+AGENTOS_TLS_CA=/etc/agentos/client-ca.pem \
+AGENTOS_TLS_SERVER_NAME=agentos.example.com \
+AGENTOS_CONNECT_TIMEOUT_MS=10000 \
+AGENT_SERVER_TOKEN=secret \
+cargo run --package agent-cli --bin agentctl -- list
+```
+
+The profile negotiates the wire version before use and reports incompatible
+servers explicitly. Tokens are never part of the profile; clients can refresh
+authentication on an existing connection. The timeout must be 1–60000 ms.
+
 The packaged desktop starts an ephemeral loopback syscall service protected by
 a random per-process secret. Its Tauri commands use the same typed SDK path;
 they do not call lifecycle or tool methods directly on the kernel.

@@ -17,6 +17,7 @@
 use std::io;
 use std::time::Duration;
 
+use agent_sdk::ConnectionProfile;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -30,10 +31,11 @@ use agent_tui::{
 };
 
 fn main() -> io::Result<()> {
-    let (addr, token) = connection_options();
+    let (profile, token) = connection_options();
+    let addr = profile.address.clone();
 
     let rt = tokio::runtime::Runtime::new()?;
-    let mut client = match rt.block_on(TuiClient::connect(&addr, token.as_deref())) {
+    let mut client = match rt.block_on(TuiClient::connect_profile(&profile, token.as_deref())) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("agent-tui: could not connect to {addr}: {e}");
@@ -53,23 +55,26 @@ fn main() -> io::Result<()> {
     result
 }
 
-fn connection_options() -> (String, Option<String>) {
-    let mut addr = std::env::var("AGENTOS_ADDR").unwrap_or_else(|_| "127.0.0.1:7777".to_string());
+fn connection_options() -> (ConnectionProfile, Option<String>) {
+    let mut profile = ConnectionProfile::from_env().unwrap_or_else(|error| {
+        eprintln!("agent-tui: {error}");
+        std::process::exit(2);
+    });
     let mut token = std::env::var("AGENT_SERVER_TOKEN").ok();
     let mut positional_addr = false;
     let mut args = std::env::args().skip(1);
     while let Some(argument) = args.next() {
         match argument.as_str() {
-            "--addr" => addr = args.next().unwrap_or_else(|| usage()),
+            "--addr" => profile.address = args.next().unwrap_or_else(|| usage()),
             "--token" => token = Some(args.next().unwrap_or_else(|| usage())),
             value if !value.starts_with('-') && !positional_addr => {
-                addr = value.to_string();
+                profile.address = value.to_string();
                 positional_addr = true;
             }
             _ => usage(),
         }
     }
-    (addr, token)
+    (profile, token)
 }
 
 fn usage() -> ! {

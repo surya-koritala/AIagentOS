@@ -37,6 +37,7 @@
 //! ```
 
 use kernel::syscall_server::{DataErasureTarget, Syscall, SyscallClient, SyscallReply};
+use std::{path::PathBuf, time::Duration};
 use tokio::net::ToSocketAddrs;
 
 // Re-export the kernel wire types that appear in this crate's public API, so
@@ -108,6 +109,10 @@ pub use patterns::{
 /// variant that doesn't match the syscall that was sent.
 #[derive(Debug, thiserror::Error)]
 pub enum SdkError {
+    /// Invalid local client configuration, before any network request is made.
+    #[error("client configuration error: {0}")]
+    Configuration(String),
+
     /// The kernel answered with [`SyscallReply::Error`] — e.g. a gate denial,
     /// an unknown tool, or an invalid agent id.
     #[error("kernel error: {0}")]
@@ -180,6 +185,174 @@ impl SdkError {
                 ..
             }
         )
+    }
+}
+
+/// Transport settings shared by every first-party operator client.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConnectionTransport {
+    /// Plain TCP, intended for loopback or an otherwise secured local path.
+    Plaintext,
+    /// TLS with an explicit PEM trust bundle and verified DNS server name.
+    Tls {
+        server_name: String,
+        ca_certificates: PathBuf,
+    },
+}
+
+/// A non-secret, reusable connection profile.
+///
+/// Tokens are supplied only when connecting or rotating authentication, so a
+/// profile is safe to log and persist.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConnectionProfile {
+    pub address: String,
+    pub transport: ConnectionTransport,
+    pub connect_timeout: Duration,
+}
+
+impl ConnectionProfile {
+    pub const DEFAULT_ADDRESS: &'static str = "127.0.0.1:7777";
+    pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+    pub const MAX_CONNECT_TIMEOUT: Duration = Duration::from_secs(60);
+
+    pub fn plaintext(address: impl Into<String>) -> Self {
+        Self {
+            address: address.into(),
+            transport: ConnectionTransport::Plaintext,
+            connect_timeout: Self::DEFAULT_CONNECT_TIMEOUT,
+        }
+    }
+
+    /// Load the common first-party profile from environment variables.
+    ///
+    /// `AGENTOS_TLS_CA` enables verified TLS and requires
+    /// `AGENTOS_TLS_SERVER_NAME`. Authentication remains separate in
+    /// `AGENT_SERVER_TOKEN`, preventing accidental token rendering.
+    pub fn from_env() -> Result<Self, SdkError> {
+        let address =
+            std::env::var("AGENTOS_ADDR").unwrap_or_else(|_| Self::DEFAULT_ADDRESS.to_string());
+        let connect_timeout = match std::env::var("AGENTOS_CONNECT_TIMEOUT_MS") {
+            Ok(raw) => {
+                let millis = raw.parse::<u64>().map_err(|_| {
+                    SdkError::Configuration(
+                        "AGENTOS_CONNECT_TIMEOUT_MS must be a positive integer".into(),
+                    )
+                })?;
+                let timeout = Duration::from_millis(millis);
+                if timeout.is_zero() || timeout > Self::MAX_CONNECT_TIMEOUT {
+                    return Err(SdkError::Configuration(
+                        "AGENTOS_CONNECT_TIMEOUT_MS must be between 1 and 60000".into(),
+                    ));
+                }
+                timeout
+            }
+            Err(_) => Self::DEFAULT_CONNECT_TIMEOUT,
+        };
+        let transport = match std::env::var("AGENTOS_TLS_CA") {
+            Ok(path) if !path.trim().is_empty() => {
+                let server_name = std::env::var("AGENTOS_TLS_SERVER_NAME").map_err(|_| {
+                    SdkError::Configuration(
+                        "AGENTOS_TLS_SERVER_NAME is required when AGENTOS_TLS_CA is set".into(),
+                    )
+                })?;
+                if server_name.trim().is_empty() {
+                    return Err(SdkError::Configuration(
+                        "AGENTOS_TLS_SERVER_NAME cannot be empty".into(),
+                    ));
+                }
+                ConnectionTransport::Tls {
+                    server_name,
+                    ca_certificates: PathBuf::from(path),
+                }
+            }
+            _ => {
+                if std::env::var_os("AGENTOS_TLS_SERVER_NAME").is_some() {
+                    return Err(SdkError::Configuration(
+                        "AGENTOS_TLS_CA is required when AGENTOS_TLS_SERVER_NAME is set".into(),
+                    ));
+                }
+                ConnectionTransport::Plaintext
+            }
+        };
+        Ok(Self {
+            address,
+            transport,
+            connect_timeout,
+        })
+    }
+
+    /// Connect, negotiate protocol compatibility, and optionally authenticate.
+    pub async fn connect(&self, token: Option<&str>) -> Result<KernelClient, SdkError> {
+        let connect = async {
+            let mut client = match &self.transport {
+                ConnectionTransport::Plaintext => KernelClient::connect(&self.address).await?,
+                ConnectionTransport::Tls {
+                    server_name,
+                    ca_certificates,
+                } => {
+                    use rustls::pki_types::{pem::PemObject, CertificateDer};
+
+                    let _ = rustls::crypto::ring::default_provider().install_default();
+                    let mut roots = rustls::RootCertStore::empty();
+                    let certificates = CertificateDer::pem_file_iter(ca_certificates)
+                        .map_err(|error| {
+                            SdkError::Configuration(format!(
+                                "failed to open TLS CA bundle {}: {error}",
+                                ca_certificates.display()
+                            ))
+                        })?
+                        .collect::<Result<Vec<_>, _>>()
+                        .map_err(|error| {
+                            SdkError::Configuration(format!(
+                                "failed to parse TLS CA bundle {}: {error}",
+                                ca_certificates.display()
+                            ))
+                        })?;
+                    if certificates.is_empty() {
+                        return Err(SdkError::Configuration(format!(
+                            "TLS CA bundle {} contains no certificates",
+                            ca_certificates.display()
+                        )));
+                    }
+                    roots.add_parsable_certificates(certificates);
+                    if roots.is_empty() {
+                        return Err(SdkError::Configuration(format!(
+                            "TLS CA bundle {} contains no trusted certificates",
+                            ca_certificates.display()
+                        )));
+                    }
+                    let config = rustls::ClientConfig::builder()
+                        .with_root_certificates(roots)
+                        .with_no_client_auth();
+                    KernelClient::connect_tls(&self.address, server_name.clone(), config).await?
+                }
+            };
+            if let Some(token) = token {
+                client.authenticate(token).await?;
+            }
+            Ok(client)
+        };
+        tokio::time::timeout(self.connect_timeout, connect)
+            .await
+            .map_err(|_| {
+                SdkError::Transport(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!(
+                        "connection profile timed out after {} ms",
+                        self.connect_timeout.as_millis()
+                    ),
+                ))
+            })?
+    }
+
+    /// Replace the authenticated credential on an existing connection.
+    pub async fn rotate_auth(
+        &self,
+        client: &mut KernelClient,
+        token: impl Into<String>,
+    ) -> Result<(), SdkError> {
+        client.authenticate(token).await
     }
 }
 
@@ -2434,9 +2607,11 @@ mod protocol_tests {
 #[cfg(test)]
 mod tls_tests {
     use super::*;
+    use kernel::auth::Role;
     use kernel::syscall_server::SyscallServer;
     use kernel::AgentKernelImpl;
     use std::sync::Arc;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
     /// The SDK's `connect_tls` dials a TLS-terminated kernel node and drives it
     /// through the typed client over the encrypted transport.
@@ -2482,5 +2657,148 @@ mod tls_tests {
             "agent created over the SDK TLS client should be listed: {agents:?}"
         );
         crate::protocol_tests::assert_public_lifecycle_contract(&mut client, "tls").await;
+    }
+
+    #[tokio::test]
+    async fn secure_profile_verifies_tls_and_supports_auth_refresh() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
+            .expect("generate self-signed cert");
+        let cert_der = cert.cert.der().clone();
+        let key_der = rustls::pki_types::PrivateKeyDer::try_from(cert.signing_key.serialize_der())
+            .expect("private key der");
+        let server_config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert_der], key_der)
+            .expect("server config");
+        let kernel = Arc::new(AgentKernelImpl::new().expect("kernel new"));
+        let tenant = kernel
+            .create_tenant("profile-tenant")
+            .await
+            .expect("tenant");
+        let user = kernel
+            .register_user(
+                &tenant,
+                "profile-reader",
+                "profile-reader@example.invalid",
+                Role::ReadOnly,
+            )
+            .await
+            .expect("user");
+        let first_key = kernel
+            .issue_api_key(&user, "first")
+            .await
+            .expect("first key");
+        let rotated_key = kernel
+            .issue_api_key(&user, "rotated")
+            .await
+            .expect("rotated key");
+        let server = SyscallServer::bind_tls(Arc::clone(&kernel), "127.0.0.1:0", server_config)
+            .await
+            .expect("bind TLS");
+        let address = server.local_addr().expect("server address");
+        tokio::spawn(server.serve());
+
+        let directory =
+            std::env::temp_dir().join(format!("agentos-profile-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).expect("profile fixture directory");
+        let ca = directory.join("ca.pem");
+        std::fs::write(&ca, cert.cert.pem()).expect("write CA");
+        let profile = ConnectionProfile {
+            address: address.to_string(),
+            transport: ConnectionTransport::Tls {
+                server_name: "localhost".into(),
+                ca_certificates: ca,
+            },
+            connect_timeout: Duration::from_secs(5),
+        };
+
+        let mut client = profile
+            .connect(Some(&first_key))
+            .await
+            .expect("verified authenticated profile");
+        client.list_agents().await.expect("authenticated read");
+        profile
+            .rotate_auth(&mut client, rotated_key)
+            .await
+            .expect("refresh credential");
+        assert!(kernel
+            .revoke_api_key(&first_key)
+            .await
+            .expect("revoke old key"));
+        client
+            .list_agents()
+            .await
+            .expect("read after old credential revocation");
+
+        let wrong_name = ConnectionProfile {
+            transport: ConnectionTransport::Tls {
+                server_name: "wrong.example".into(),
+                ca_certificates: directory.join("ca.pem"),
+            },
+            ..profile
+        };
+        let error = match wrong_name.connect(Some(&first_key)).await {
+            Ok(_) => panic!("hostname mismatch must fail closed"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, SdkError::Transport(_)));
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test]
+    async fn profile_timeout_and_protocol_skew_fail_clearly() {
+        let silent = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind silent peer");
+        let silent_address = silent.local_addr().expect("silent address");
+        tokio::spawn(async move {
+            let _connection = silent.accept().await.expect("accept silent client");
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        });
+        let timeout_profile = ConnectionProfile {
+            address: silent_address.to_string(),
+            transport: ConnectionTransport::Plaintext,
+            connect_timeout: Duration::from_millis(25),
+        };
+        let timeout = match timeout_profile.connect(None).await {
+            Ok(_) => panic!("silent peer must time out"),
+            Err(error) => error,
+        };
+        assert!(matches!(timeout, SdkError::Transport(_)));
+        assert!(timeout.to_string().contains("25 ms"));
+
+        let future = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind future peer");
+        let future_address = future.local_addr().expect("future address");
+        tokio::spawn(async move {
+            let (stream, _) = future.accept().await.expect("accept future client");
+            let (read, mut write) = stream.into_split();
+            let mut request = String::new();
+            BufReader::new(read)
+                .read_line(&mut request)
+                .await
+                .expect("read hello");
+            let reply = SyscallReply::Hello {
+                protocol_version: PROTOCOL_VERSION + 2,
+                min_protocol_version: PROTOCOL_VERSION + 1,
+                server_version: "future-test".into(),
+                features: Vec::new(),
+            };
+            write
+                .write_all(format!("{}\n", serde_json::to_string(&reply).unwrap()).as_bytes())
+                .await
+                .expect("write future hello");
+        });
+        let skew = match ConnectionProfile::plaintext(future_address.to_string())
+            .connect(None)
+            .await
+        {
+            Ok(_) => panic!("future protocol must be rejected"),
+            Err(error) => error,
+        };
+        assert!(matches!(skew, SdkError::IncompatibleProtocol { .. }));
+        assert!(skew.to_string().contains("future-test"));
     }
 }

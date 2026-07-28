@@ -176,7 +176,7 @@ jobs:
           sudo ip address add 11.0.0.1/32 dev lo
           sudo sysctl -q -w net.ipv4.ip_unprivileged_port_start=0
           printf '11.0.0.1 rebind.agentos.invalid\n' | sudo tee -a /etc/hosts >/dev/null
-          cargo test -p kernel \
+          cargo test -p kernel --features qualification \
             sandbox::tests::live_network_egress_blocks_ssrf_redirects_and_dns_rebinding \
             --locked --no-run
           (
@@ -194,7 +194,7 @@ jobs:
           ) &
           switch_pid=$!
           env HTTP_PROXY=http://127.0.0.1:80 CARGO_NET_OFFLINE=true \
-            cargo test -p kernel \
+            cargo test -p kernel --features qualification \
             sandbox::tests::live_network_egress_blocks_ssrf_redirects_and_dns_rebinding \
             --locked -- --ignored --exact --nocapture
           wait "${switch_pid}"

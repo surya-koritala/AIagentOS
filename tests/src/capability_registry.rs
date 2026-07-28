@@ -456,6 +456,7 @@ fn release_blocking_workflows_keep_their_security_contract() {
         "all(.scenarios[].checks[]; . == true)",
         "rootless-sandbox-crash-${{ github.sha }}",
         "Live network SSRF and DNS-rebinding controls",
+        "--features qualification",
         "sandbox::tests::live_network_egress_blocks_ssrf_redirects_and_dns_rebinding",
         "network-egress-${{ github.sha }}",
         "live_linux_network_egress",

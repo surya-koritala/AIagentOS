@@ -6,11 +6,23 @@
 
   let step = 1;
   let provider = 'azure-openai';
-  let apiKey = '';
+  let configuredProviders = [];
   let azureEndpoint = '';
   let azureDeployment = 'gpt-4o';
+  let localEndpoint = 'http://localhost:11434';
   let testing = false;
   let testResult = null;
+
+  async function loadSettings() {
+    try {
+      const config = await invoke('load_config');
+      configuredProviders = config.configured_providers || [];
+      provider = config.llm_provider || provider;
+      azureEndpoint = config.azure_endpoint || '';
+      azureDeployment = config.azure_deployment || azureDeployment;
+      localEndpoint = config.local_endpoint || localEndpoint;
+    } catch (e) {}
+  }
 
   async function testAndSave() {
     testing = true;
@@ -18,8 +30,10 @@
     try {
       await invoke('save_config', {
         llmProvider: provider,
-        apiKey,
         defaultModel: provider === 'azure-openai' ? azureDeployment : null,
+        azureEndpoint,
+        azureDeployment,
+        localEndpoint,
       });
       testResult = 'success';
       step = 2;
@@ -32,6 +46,8 @@
   function complete() {
     dispatch('complete');
   }
+
+  loadSettings();
 </script>
 
 <div class="modal-overlay">
@@ -60,28 +76,30 @@
           Deployment Name
           <input bind:value={azureDeployment} placeholder="gpt-4o" />
         </label>
-        <label>
-          API Key
-          <input bind:value={apiKey} type="password" placeholder="Your Azure OpenAI API key" />
-        </label>
       {:else if provider === 'local'}
         <label>
           Ollama URL
-          <input bind:value={apiKey} placeholder="http://localhost:11434" />
+          <input bind:value={localEndpoint} placeholder="http://localhost:11434" />
         </label>
-      {:else}
-        <label>
-          API Key
-          <input bind:value={apiKey} type="password" placeholder="sk-..." />
-        </label>
+      {/if}
+
+      {#if provider !== 'local'}
+        <p class="credential-note">
+          Provider secrets never cross the desktop UI boundary.
+          {#if configuredProviders.includes(provider)}
+            A credential source is configured outside this screen.
+          {:else}
+            Set {provider === 'azure-openai' ? 'AZURE_OPENAI_API_KEY' : provider === 'openai' ? 'OPENAI_API_KEY' : 'ANTHROPIC_API_KEY'} before starting the app.
+          {/if}
+        </p>
       {/if}
 
       {#if testResult && testResult !== 'success'}
         <div class="result error">{testResult}</div>
       {/if}
 
-      <button class="primary" on:click={testAndSave} disabled={testing || !apiKey.trim()}>
-        {testing ? 'Connecting...' : 'Connect & Continue →'}
+      <button class="primary" on:click={testAndSave} disabled={testing || (provider !== 'local' && !configuredProviders.includes(provider))}>
+        {testing ? 'Saving...' : 'Save & Continue →'}
       </button>
 
     {:else}
@@ -107,5 +125,6 @@
   .primary:hover { opacity: 0.9; }
   .primary:disabled { opacity: 0.4; cursor: not-allowed; }
   .result.error { margin-top: 0.5rem; padding: 0.6rem; border-radius: 8px; font-size: 0.8rem; background: #2a1a1a; color: #f87171; border: 1px solid #3a2020; }
+  .credential-note { font-size: 0.8rem; color: #999; margin-bottom: 1rem; }
   .success-icon { font-size: 3rem; color: #4ade80; text-align: center; margin-bottom: 1rem; background: #1a3a2e; width: 80px; height: 80px; border-radius: 50%; display: flex; align-items: center; justify-content: center; margin: 0 auto 1.5rem; }
 </style>

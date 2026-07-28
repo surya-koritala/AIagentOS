@@ -6101,7 +6101,7 @@ dependencies = [
 name = "tauri-app"
 version = "0.3.0"
 dependencies = [
- "adapters",
+ "agent-cli",
  "agent-sdk",
  "kernel",
  "serde",

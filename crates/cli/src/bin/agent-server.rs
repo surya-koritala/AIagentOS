@@ -18,15 +18,12 @@
 
 #[path = "../logging.rs"]
 mod logging;
-#[path = "../providers.rs"]
-mod providers;
-
 use std::sync::Arc;
 
+use agent_cli::providers::register_providers;
 use kernel::config::Config;
 use kernel::syscall_server::SyscallServer;
 use kernel::AgentKernelImpl;
-use providers::register_providers;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 

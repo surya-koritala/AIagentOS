@@ -4054,6 +4054,30 @@ mod tests {
         StorageEncryptionKey::from_bytes(key_id, [fill; 32]).unwrap()
     }
 
+    fn create_backup_after_inherited_test_lock_drains(
+        manager: &SqliteContextManager,
+        root: &Path,
+        name: &str,
+    ) -> BackupManifest {
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            match manager.create_backup(root, name) {
+                Ok(manifest) => return manifest,
+                Err(error)
+                    if error.to_string().contains("another backup publication")
+                        && std::time::Instant::now() < deadline =>
+                {
+                    // Process-exit regressions run in parallel in this test
+                    // binary. A child forked while this test held the advisory
+                    // lock can retain the inherited descriptor until exec.
+                    // Production remains fail-fast; only test setup retries.
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("backup test setup never became idle: {error}"),
+            }
+        }
+    }
+
     #[test]
     fn online_backup_includes_wal_state_and_verifies() {
         let directory = TestDirectory::new("online");
@@ -4258,7 +4282,7 @@ mod tests {
         let manager = SqliteContextManager::new(&directory.path.join("source.db")).unwrap();
         let root = directory.path.join("backups");
         manager.create_backup(&root, "first").unwrap();
-        manager.create_backup(&root, "second").unwrap();
+        create_backup_after_inherited_test_lock_drains(&manager, &root, "second");
 
         // The kernel suite runs process-exit regressions in parallel. A child
         // forked during the immediately preceding publication can retain the
@@ -4296,7 +4320,7 @@ mod tests {
         assert!(error.to_string().contains("another backup publication"));
 
         drop(guard);
-        manager.create_backup(&root, "clean").unwrap();
+        create_backup_after_inherited_test_lock_drains(&manager, &root, "clean");
         assert!(root.join("clean").exists());
     }
 

@@ -20,6 +20,8 @@
     input = '';
     messages = [...messages, { role: 'user', content: userMsg }];
     loading = true;
+    const operation = 'waiting for agent turn';
+    dispatch('operation', { label: operation, active: true });
 
     try {
       const response = await invoke('send_message', { agentId, message: userMsg });
@@ -32,8 +34,10 @@
       dispatch('messageSent');
     } catch (e) {
       messages = [...messages, { role: 'error', content: String(e) }];
+    } finally {
+      loading = false;
+      dispatch('operation', { label: operation, active: false });
     }
-    loading = false;
   }
 
   function handleKeydown(e) {

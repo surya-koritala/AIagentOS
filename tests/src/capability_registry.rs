@@ -578,6 +578,63 @@ fn reconnect_contract_is_bounded_and_fail_closed() {
 }
 
 #[test]
+fn operator_ui_state_contract_is_visible_and_regressed() {
+    let protocol = read_workspace_file("docs/PROTOCOL.md");
+    for contract in [
+        "**stale** with the transport error",
+        "**partial**, not stale",
+        "reconnected state",
+        "renders the exact operation as in",
+        "stable endpoint switching",
+    ] {
+        assert!(
+            protocol.contains(contract),
+            "operator UI protocol lost {contract:?}"
+        );
+    }
+
+    let tui = read_workspace_file("crates/tui/src/app.rs");
+    for contract in [
+        "pub enum DataFreshness",
+        "DataFreshness::Partial",
+        "DataFreshness::Stale",
+        "RECONNECTED #",
+        "WORKING:",
+    ] {
+        assert!(
+            tui.contains(contract),
+            "TUI freshness state lost {contract:?}"
+        );
+    }
+    let frontend = read_workspace_file("crates/tauri-app/ui/src/lib/operatorState.js");
+    for contract in [
+        "phase: 'stale'",
+        "phase: warnings.length > 0 ? 'partial' : 'fresh'",
+        "generation > state.reconnectGeneration",
+        "operation: String(label)",
+    ] {
+        assert!(
+            frontend.contains(contract),
+            "desktop operator reducer lost {contract:?}"
+        );
+    }
+    assert!(
+        read_workspace_file("crates/tauri-app/ui/src/App.svelte")
+            .contains("invoke('get_operator_view')"),
+        "desktop UI no longer consumes the atomic operator view"
+    );
+    assert!(
+        read_workspace_file("crates/tauri-app/tests/operator_reconnect.rs")
+            .contains("desktop_operator_view_recovers_after_server_replacement"),
+        "server-replacement UI regression was removed"
+    );
+    assert!(
+        read_workspace_file(".github/workflows/ci.yml").contains("run: npm test"),
+        "frontend operator state regressions are no longer blocking CI"
+    );
+}
+
+#[test]
 fn release_blocking_workflows_keep_their_security_contract() {
     let ci = read_workspace_file(".github/workflows/ci.yml");
     for os in ["ubuntu-latest", "macos-latest", "windows-latest"] {

@@ -9,9 +9,13 @@
   const dispatch = createEventDispatcher();
   let newAgentName = '';
   let showNewAgent = false;
+  let creating = false;
 
   async function createAgent() {
-    if (!newAgentName.trim()) return;
+    if (!newAgentName.trim() || creating) return;
+    const operation = 'creating agent';
+    creating = true;
+    dispatch('operation', { label: operation, active: true });
     try {
       const id = await invoke('create_agent', { name: newAgentName.trim(), task: 'General assistant' });
       newAgentName = '';
@@ -19,6 +23,9 @@
       dispatch('created', { id });
     } catch (e) {
       alert(`Failed: ${e}`);
+    } finally {
+      creating = false;
+      dispatch('operation', { label: operation, active: false });
     }
   }
 </script>
@@ -53,7 +60,7 @@
         placeholder="Agent name..."
         on:keydown={(e) => e.key === 'Enter' && createAgent()}
       />
-      <button on:click={createAgent}>Create</button>
+      <button on:click={createAgent} disabled={creating}>{creating ? 'Creating…' : 'Create'}</button>
     </div>
   {/if}
 

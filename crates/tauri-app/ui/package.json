@@ -5,6 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
+    "test": "node --test src/**/*.test.js",
     "check": "svelte-check --fail-on-warnings --no-tsconfig",
     "build": "vite build",
     "preview": "vite preview"

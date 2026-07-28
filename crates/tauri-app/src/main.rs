@@ -41,6 +41,7 @@ fn main() {
             commands::stop_agent,
             commands::list_agents,
             commands::get_metrics,
+            commands::get_operator_view,
             commands::load_config,
             commands::save_config,
             commands::delete_provider_credential,

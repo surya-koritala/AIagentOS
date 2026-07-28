@@ -158,6 +158,8 @@ jobs:
         run: npm audit --audit-level=high
       - name: Svelte types and accessibility warnings are errors
         run: npm run check
+      - name: Operator UI state regressions
+        run: npm test
       - name: Production frontend build
         run: npm run build
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

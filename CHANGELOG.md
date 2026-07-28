@@ -10,6 +10,23 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
 
 ## [Unreleased]
 
+- Made operator clients honest under degraded connections. The TUI and desktop
+  now retain and label last-known-good data as stale, distinguish scoped
+  partial views without inventing global zeroes, expose successful reconnect
+  generations after server replacement, and render long-running agent,
+  lifecycle, service, and refresh operations before blocking. Atomic desktop
+  views, reducer tests, loopback response-loss tests, and a stable-endpoint
+  server-replacement regression are blocking CI.
+- Added bounded profile-backed reconnect for the SDK and first-party clients.
+  Protocol and authentication negotiation are restored after transport loss;
+  explicitly classified reads may be replayed once, while package, lifecycle,
+  tool, turn, and every other mutation fail with an indeterminate-outcome error
+  and are never replayed automatically. Real response-loss regressions prove
+  package, lifecycle, and tool side effects occur exactly once.
+- Required exact target-bound confirmation for CLI force-stop and agent, user,
+  or tenant erasure operations. The TUI force-stop flow freezes the original
+  agent selection and shows its name, full identifier, and force-stop impact
+  before accepting the second confirmation.
 - Hardened on-device GGUF qualification under #120 into a fail-closed exact-RC
   evidence gate. A strict runner binds a provisioned model, tokenizer, hardware
   profile, resource limits, existing release tag, and clean commit by digest;

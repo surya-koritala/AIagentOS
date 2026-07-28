@@ -723,6 +723,8 @@ fn desktop_release_foundation_is_versioned_and_fail_closed() {
         "bundles: msi,nsis",
         "OPENSSL_SRC_PERL: ${{ matrix.perl }}",
         "perl: C:/Strawberry/perl/bin/perl.exe",
+        "CARGO_TARGET_DIR=target-repro cargo build",
+        "mv target-repro target-a",
         "cargo tauri build --ci --no-sign",
         "release-desktop-${{ matrix.platform }}",
     ] {
@@ -731,6 +733,10 @@ fn desktop_release_foundation_is_versioned_and_fail_closed() {
             "desktop release workflow lost {contract:?}"
         );
     }
+    assert!(
+        !release.contains("CARGO_TARGET_DIR=target-b"),
+        "release builds must not embed a different target path in the second binary"
+    );
 
     let verifier = read_workspace_file("scripts/verify_desktop_release.py");
     for contract in [

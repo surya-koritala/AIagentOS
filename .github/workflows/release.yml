@@ -179,16 +179,17 @@ jobs:
             rustflags="${rustflags} -C link-arg=/Brepro"
           fi
           echo "RUSTFLAGS=${rustflags}" >> "$GITHUB_ENV"
-      - name: Build twice from isolated target directories
+      - name: Build twice from clean target directories at one stable path
         run: |
-          CARGO_TARGET_DIR=target-a cargo build --release --locked --target "${{ matrix.target }}" -p agent-cli --bins -p agent-tui
-          CARGO_TARGET_DIR=target-b cargo build --release --locked --target "${{ matrix.target }}" -p agent-cli --bins -p agent-tui
+          CARGO_TARGET_DIR=target-repro cargo build --release --locked --target "${{ matrix.target }}" -p agent-cli --bins -p agent-tui
+          mv target-repro target-a
+          CARGO_TARGET_DIR=target-repro cargo build --release --locked --target "${{ matrix.target }}" -p agent-cli --bins -p agent-tui
       - name: Prove binaries are byte-for-byte reproducible
         run: |
           reproducible=1
           for binary in agent agent-server agent-tui agentctl; do
             first="target-a/${{ matrix.target }}/release/${binary}${{ matrix.extension }}"
-            second="target-b/${{ matrix.target }}/release/${binary}${{ matrix.extension }}"
+            second="target-repro/${{ matrix.target }}/release/${binary}${{ matrix.extension }}"
             if ! cmp -s "$first" "$second"; then
               echo "::error title=Non-reproducible release binary::${binary}${{ matrix.extension }} differs between isolated builds"
               sha256sum "$first" "$second"

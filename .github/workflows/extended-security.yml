@@ -143,6 +143,81 @@ jobs:
           if-no-files-found: error
           retention-days: 90
 
+  network-egress:
+    name: Live network SSRF and DNS-rebinding controls
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
+        with:
+          toolchain: 1.97.1
+      - name: Exercise a controlled live egress topology
+        env:
+          AGENTOS_NETWORK_TEST_HOST: rebind.agentos.invalid
+          AGENTOS_NETWORK_PUBLIC_ADDRESS: 11.0.0.1:80
+          AGENTOS_NETWORK_PRIVATE_ADDRESS: 127.0.0.1:80
+          AGENTOS_NETWORK_SWITCH_READY: ${{ github.workspace }}/target/qualification/network-switch-ready
+          AGENTOS_NETWORK_SWITCH_COMPLETE: ${{ github.workspace }}/target/qualification/network-switch-complete
+          AGENTOS_NETWORK_EVIDENCE_PATH: ${{ github.workspace }}/target/qualification/network-egress.json
+        run: |
+          set -euo pipefail
+          mkdir -p target/qualification
+          hosts_backup="$(mktemp)"
+          original_unprivileged_port_start="$(sysctl -n net.ipv4.ip_unprivileged_port_start)"
+          sudo cp /etc/hosts "${hosts_backup}"
+          cleanup() {
+            sudo cp "${hosts_backup}" /etc/hosts
+            sudo ip address delete 11.0.0.1/32 dev lo >/dev/null 2>&1 || true
+            sudo sysctl -q -w "net.ipv4.ip_unprivileged_port_start=${original_unprivileged_port_start}" || true
+            rm -f "${hosts_backup}"
+          }
+          trap cleanup EXIT
+          sudo ip address add 11.0.0.1/32 dev lo
+          sudo sysctl -q -w net.ipv4.ip_unprivileged_port_start=0
+          printf '11.0.0.1 rebind.agentos.invalid\n' | sudo tee -a /etc/hosts >/dev/null
+          cargo test -p kernel --features qualification \
+            sandbox::tests::live_network_egress_blocks_ssrf_redirects_and_dns_rebinding \
+            --locked --no-run
+          (
+            for _ in $(seq 1 400); do
+              if test -f "${AGENTOS_NETWORK_SWITCH_READY}"; then
+                break
+              fi
+              sleep 0.025
+            done
+            test -f "${AGENTOS_NETWORK_SWITCH_READY}"
+            grep -v 'rebind.agentos.invalid' /etc/hosts > target/qualification/hosts-rebound
+            printf '127.0.0.1 rebind.agentos.invalid\n' >> target/qualification/hosts-rebound
+            sudo cp target/qualification/hosts-rebound /etc/hosts
+            touch "${AGENTOS_NETWORK_SWITCH_COMPLETE}"
+          ) &
+          switch_pid=$!
+          env HTTP_PROXY=http://127.0.0.1:80 CARGO_NET_OFFLINE=true \
+            cargo test -p kernel --features qualification \
+            sandbox::tests::live_network_egress_blocks_ssrf_redirects_and_dns_rebinding \
+            --locked -- --ignored --exact --nocapture
+          wait "${switch_pid}"
+      - name: Verify exact-source network evidence
+        run: |
+          report=target/qualification/network-egress.json
+          test "$(jq -r .schema_version "${report}")" = "1"
+          test "$(jq -r .passed "${report}")" = "true"
+          test "$(jq -r .production_claim_allowed "${report}")" = "false"
+          test "$(jq -r .qualification_class "${report}")" = "live_linux_network_egress"
+          test "$(jq -r .source.commit "${report}")" = "$GITHUB_SHA"
+          test "$(jq -r .source.dirty "${report}")" = "false"
+          test "$(jq -r .environment.ambient_proxy_configured "${report}")" = "true"
+          test "$(jq '[.checks[] | select(. == true)] | length' "${report}")" = "10"
+      - name: Retain live network qualification evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: network-egress-${{ github.sha }}
+          path: target/qualification/network-egress.json
+          if-no-files-found: error
+          retention-days: 90
+
   miri:
     name: Miri (unsafe/concurrency smoke)
     runs-on: ubuntu-latest

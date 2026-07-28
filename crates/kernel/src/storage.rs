@@ -4260,7 +4260,28 @@ mod tests {
         manager.create_backup(&root, "first").unwrap();
         manager.create_backup(&root, "second").unwrap();
 
-        let guard = manager.begin_managed_backup_erasure(&root).unwrap();
+        // The kernel suite runs process-exit regressions in parallel. A child
+        // forked during the immediately preceding publication can retain the
+        // advisory lock briefly until exec closes inherited descriptors. Keep
+        // the production API fail-fast, but give this test's setup a bounded
+        // window to reach its intended no-other-publication precondition.
+        let guard = {
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            loop {
+                match manager.begin_managed_backup_erasure(&root) {
+                    Ok(guard) => break guard,
+                    Err(error)
+                        if error.to_string().contains("another backup publication")
+                            && std::time::Instant::now() < deadline =>
+                    {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => {
+                        panic!("managed erasure setup never became idle: {error}");
+                    }
+                }
+            }
+        };
         assert_eq!(
             guard
                 .deleted()

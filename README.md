@@ -97,8 +97,11 @@ The scheduling states, fairness unit, queue bounds, and Linux EEVDF differences
 are documented in [docs/SCHEDULER.md](docs/SCHEDULER.md).
 The token estimate, pinned-state, durable spill, page-in, and backpressure
 contract is documented in [docs/CONTEXT_PRESSURE.md](docs/CONTEXT_PRESSURE.md).
-The tenant-safe live snapshot used by the SDK, `agentctl`, and TUI is documented
-in [docs/OPERATIONS_API.md](docs/OPERATIONS_API.md).
+The tenant-safe live snapshot used by the SDK, `agentctl`, TUI, and desktop is
+documented in [docs/OPERATIONS_API.md](docs/OPERATIONS_API.md). The focused TUI
+and desktop Operations views expose scope-safe agent enforcement and context
+pressure, provider health, loaded packages, services, tunables, and gate
+counters; protected sections are shown as unavailable rather than fabricated.
 Declarative service boot ordering and the current supervision boundary are in
 [docs/SERVICES.md](docs/SERVICES.md).
 

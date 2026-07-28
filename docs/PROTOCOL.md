@@ -190,17 +190,19 @@ return the underlying transport error without automatic reconnect.
 The TUI and desktop never silently replace a failed refresh with empty or zero
 data. They retain the last successful public operator view and label it
 **stale** with the transport error until a refresh succeeds. A successful
-tenant-scoped snapshot that intentionally omits global metrics or services is
-**partial**, not stale, and the omitted sections render as unavailable rather
-than as invented zeroes.
+tenant-scoped snapshot that intentionally omits global metrics, services, or
+operator tunables is **partial**, not stale, and the omitted sections render as
+unavailable rather than as invented zeroes.
 
 Profile-backed refreshes expose the SDK reconnect generation. When a read-only
 operator snapshot recovers against a replacement server, both clients render a
 reconnected state and apply the replacement server's new snapshot. The desktop
 polls while configured and also offers an explicit retry from stale or partial
-states. Its `get_operator_view` command projects agents, optional metrics,
-scope warnings, capture time, and reconnect generation from one atomic public
-snapshot.
+states. Its `get_operator_view` command projects agent
+enforcement/context/cgroup details, provider health, loaded packages, optional
+services and tunables, scoped gate counters, optional metrics, scope/version
+metadata, capture time, and reconnect generation from one atomic public
+snapshot. The TUI projects the same fields into its focused terminal view.
 
 Before an exposed agent turn, lifecycle transition, service action, creation,
 or refresh blocks on I/O, the client renders the exact operation as in

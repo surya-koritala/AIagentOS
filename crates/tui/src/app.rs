@@ -4,8 +4,9 @@
 //! how keys mutate it*.
 
 use agent_sdk::{
-    AgentSummary, GateStats, KernelClient, NodeLoad, OperatorServiceSnapshot, OperatorSnapshot,
-    SdkError,
+    AgentSummary, GateStats, KernelClient, NodeLoad, OperatorAgentSnapshot,
+    OperatorPackageSnapshot, OperatorServiceSnapshot, OperatorSnapshot, OperatorTunable,
+    ProviderSummary, SdkError,
 };
 
 /// Input modes — the UI is modal (vim-ish): Normal navigates, the others edit a
@@ -123,9 +124,18 @@ impl OperatorUiState {
 pub struct App {
     pub addr: String,
     pub agents: Vec<AgentSummary>,
+    pub agent_details: Vec<OperatorAgentSnapshot>,
     pub gate: GateStats,
     pub node: NodeLoad,
+    pub providers: Vec<ProviderSummary>,
+    pub packages: Vec<OperatorPackageSnapshot>,
+    pub tunables: Vec<OperatorTunable>,
     pub services: Vec<OperatorServiceSnapshot>,
+    pub snapshot_scope: String,
+    pub kernel_version: String,
+    pub protocol_version: u32,
+    pub total_visible_agents: usize,
+    pub agents_truncated: bool,
     pub selected: usize,
     pub selected_service: usize,
     pub mode: Mode,
@@ -142,9 +152,18 @@ impl App {
         Self {
             addr: addr.into(),
             agents: Vec::new(),
+            agent_details: Vec::new(),
             gate: GateStats::default(),
             node: NodeLoad::default(),
+            providers: Vec::new(),
+            packages: Vec::new(),
+            tunables: Vec::new(),
             services: Vec::new(),
+            snapshot_scope: "unknown".into(),
+            kernel_version: "unknown".into(),
+            protocol_version: 0,
+            total_visible_agents: 0,
+            agents_truncated: false,
             selected: 0,
             selected_service: 0,
             mode: Mode::Normal,
@@ -169,6 +188,16 @@ impl App {
                 }
                 if snapshot.services.is_none() {
                     missing_sections.push("services".to_string());
+                }
+                if snapshot.tunables.is_none() {
+                    missing_sections.push("operator tunables".to_string());
+                }
+                if snapshot.agents_truncated {
+                    missing_sections.push(format!(
+                        "agent list truncated ({}/{})",
+                        snapshot.agents.len(),
+                        snapshot.total_visible_agents
+                    ));
                 }
                 self.apply_operator_snapshot(snapshot);
                 let reconnect_generation = client.reconnect_generation();
@@ -211,7 +240,16 @@ impl App {
     /// prove the displayed counters against the exact same wire fixture used
     /// by other clients.
     pub fn apply_operator_snapshot(&mut self, snapshot: OperatorSnapshot) {
+        self.snapshot_scope = snapshot.scope.clone();
+        self.kernel_version = snapshot.kernel_version.clone();
+        self.protocol_version = snapshot.protocol_version;
+        self.total_visible_agents = snapshot.total_visible_agents;
+        self.agents_truncated = snapshot.agents_truncated;
+        self.providers = snapshot.providers.clone();
+        self.packages = snapshot.packages.clone();
+        self.tunables = snapshot.tunables.clone().unwrap_or_default();
         self.services = snapshot.services.clone().unwrap_or_default();
+        self.agent_details = snapshot.agents.clone();
         self.agents = snapshot
             .agents
             .into_iter()
@@ -280,6 +318,11 @@ impl App {
 
     pub fn selected_agent(&self) -> Option<&AgentSummary> {
         self.agents.get(self.selected)
+    }
+
+    pub fn selected_agent_detail(&self) -> Option<&OperatorAgentSnapshot> {
+        let id = &self.selected_agent()?.id;
+        self.agent_details.iter().find(|agent| &agent.id == id)
     }
 
     pub fn selected_service(&self) -> Option<&OperatorServiceSnapshot> {
@@ -558,6 +601,68 @@ mod tests {
         assert_eq!(a.operator_state.label(), "WORKING: waiting for agent turn");
         a.finish_operation();
         assert_eq!(a.operator_state.label(), "LOADING");
+    }
+
+    #[test]
+    fn operator_snapshot_projection_keeps_public_scope_safe_sections() {
+        let mut a = app();
+        a.apply_operator_snapshot(OperatorSnapshot {
+            captured_at: "2026-07-28T00:00:00Z".into(),
+            consistency: "atomic".into(),
+            scope: "global".into(),
+            kernel_version: "0.3.0".into(),
+            protocol_version: 2,
+            agents: Vec::new(),
+            total_visible_agents: 4,
+            agents_truncated: true,
+            providers: vec![ProviderSummary {
+                id: "stub".into(),
+                name: "Stub".into(),
+                provider_type: "Local".into(),
+                available: true,
+                circuit_open: false,
+                consecutive_failures: 0,
+                capabilities: Default::default(),
+                routing_policy: Default::default(),
+                sampled_at: Some("2026-07-28T00:00:00Z".into()),
+                probe_duration_ms: Some(2),
+                probe_timed_out: false,
+            }],
+            packages: vec![OperatorPackageSnapshot {
+                agent_id: "agent-1".into(),
+                tenant_id: "tenant-1".into(),
+                name: "reviewer".into(),
+                provider: "stub".into(),
+                profile: "safe".into(),
+                loaded_at: "2026-07-28T00:00:00Z".into(),
+                agent_state: "Running".into(),
+            }],
+            scoped_gate_decisions: Default::default(),
+            tunables: Some(vec![OperatorTunable {
+                name: "kernel.max_agents".into(),
+                value: 10,
+                revision: 2,
+                minimum: 0,
+                maximum: 100,
+                persisted: true,
+                updated_at: "2026-07-28T00:00:00Z".into(),
+                updated_by: "operator".into(),
+                description: "limit".into(),
+            }]),
+            services: Some(vec![dummy_service("worker")]),
+            system_metrics: None,
+            global_spend_usd: None,
+        });
+
+        assert_eq!(a.snapshot_scope, "global");
+        assert_eq!(a.kernel_version, "0.3.0");
+        assert_eq!(a.protocol_version, 2);
+        assert_eq!(a.total_visible_agents, 4);
+        assert!(a.agents_truncated);
+        assert_eq!(a.providers[0].id, "stub");
+        assert_eq!(a.packages[0].name, "reviewer");
+        assert_eq!(a.tunables[0].name, "kernel.max_agents");
+        assert_eq!(a.services[0].name, "worker");
     }
 
     #[test]

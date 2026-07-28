@@ -672,15 +672,27 @@ impl SandboxManagerImpl {
     fn sync_parent_directory(workspace: &Dir, relative: &Path) -> Result<(), SandboxError> {
         #[cfg(unix)]
         {
+            use cap_std::fs::OpenOptionsExt;
+
             let parent = relative.parent().unwrap_or_else(|| Path::new("."));
             let parent = if parent.as_os_str().is_empty() {
                 Path::new(".")
             } else {
                 parent
             };
+            // `Dir::open_dir` intentionally uses an `O_PATH` capability on
+            // Linux when directory enumeration is not requested. `fsync`
+            // rejects that descriptor, so open a real read-only directory
+            // descriptor while retaining capability-relative resolution and
+            // final-component no-follow semantics.
+            let mut options = OpenOptions::new();
+            options
+                .read(true)
+                .custom_flags(libc::O_DIRECTORY)
+                ._cap_fs_ext_follow(FollowSymlinks::No);
             workspace
-                .open_dir(parent)
-                .and_then(|directory| directory.into_std_file().sync_all())
+                .open_with(parent, &options)
+                .and_then(|directory| directory.into_std().sync_all())
                 .map_err(|error| Self::filesystem_error("directory sync", error))?;
         }
         #[cfg(not(unix))]

@@ -4,16 +4,22 @@
 //! network allowlist checking, and platform-aware isolation.
 
 use std::collections::HashSet;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 #[cfg(test)]
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
+use cap_primitives::fs::FollowSymlinks;
 use cap_std::ambient_authority;
-use cap_std::fs::Dir;
+use cap_std::fs::{Dir, OpenOptions};
 use dashmap::DashMap;
 
 use crate::{AgentId, IsolationLevel, SandboxConfig, SandboxError, SandboxId};
+
+const MAX_FILESYSTEM_PATH_BYTES: usize = 4 * 1024;
+const MAX_FILESYSTEM_CONTENT_BYTES: usize = 4 * 1024 * 1024;
+const MAX_FILESYSTEM_LIST_ENTRIES: usize = 4_096;
 
 /// The Sandbox Manager trait.
 #[async_trait::async_trait]
@@ -555,23 +561,261 @@ impl SandboxManagerImpl {
     fn enforce_write_quota(
         state: &SandboxState,
         workspace: &Dir,
-        relative: &Path,
+        replaced_len: u64,
         new_len: u64,
     ) -> Result<(), SandboxError> {
         let Some(limit) = state.max_disk_usage_bytes else {
             return Ok(());
         };
         let current = Self::directory_usage(workspace)?;
-        let replaced_len = workspace
-            .metadata(relative)
-            .ok()
-            .filter(|metadata| metadata.is_file())
-            .map(|metadata| metadata.len())
-            .unwrap_or(0);
         if current.saturating_sub(replaced_len).saturating_add(new_len) > limit {
             return Err(SandboxError::BoundaryViolation(
                 "sandbox disk quota exceeded".into(),
             ));
+        }
+        Ok(())
+    }
+
+    fn validate_filesystem_path(path: &str) -> Result<(), SandboxError> {
+        if path.is_empty() || path.len() > MAX_FILESYSTEM_PATH_BYTES || path.contains('\0') {
+            return Err(SandboxError::BoundaryViolation(
+                "sandbox filesystem target denied".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn filesystem_content(parameters: &serde_json::Value) -> Result<&str, SandboxError> {
+        let content = parameters
+            .get("content")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| {
+                SandboxError::BoundaryViolation(
+                    "sandbox filesystem content must be a UTF-8 string".into(),
+                )
+            })?;
+        if content.len() > MAX_FILESYSTEM_CONTENT_BYTES {
+            return Err(SandboxError::BoundaryViolation(format!(
+                "sandbox filesystem content exceeds {MAX_FILESYSTEM_CONTENT_BYTES} bytes"
+            )));
+        }
+        Ok(content)
+    }
+
+    fn regular_metadata(
+        workspace: &Dir,
+        relative: &Path,
+        operation: &str,
+    ) -> Result<cap_std::fs::Metadata, SandboxError> {
+        let metadata = workspace
+            .symlink_metadata(relative)
+            .map_err(|error| Self::filesystem_error(operation, error))?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(SandboxError::BoundaryViolation(format!(
+                "sandbox filesystem {operation} requires a regular non-symlink file"
+            )));
+        }
+        Ok(metadata)
+    }
+
+    fn read_regular_utf8(
+        workspace: &Dir,
+        relative: &Path,
+        operation: &str,
+    ) -> Result<String, SandboxError> {
+        let path_metadata = Self::regular_metadata(workspace, relative, operation)?;
+        if path_metadata.len() > MAX_FILESYSTEM_CONTENT_BYTES as u64 {
+            return Err(SandboxError::BoundaryViolation(format!(
+                "sandbox filesystem {operation} exceeds {MAX_FILESYSTEM_CONTENT_BYTES} bytes"
+            )));
+        }
+        let mut options = OpenOptions::new();
+        options.read(true)._cap_fs_ext_follow(FollowSymlinks::No);
+        #[cfg(unix)]
+        {
+            use cap_std::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NONBLOCK);
+        }
+        let file = workspace
+            .open_with(relative, &options)
+            .map_err(|error| Self::filesystem_error(operation, error))?;
+        let metadata = file
+            .metadata()
+            .map_err(|error| Self::filesystem_error(operation, error))?;
+        if !metadata.is_file() {
+            return Err(SandboxError::BoundaryViolation(format!(
+                "sandbox filesystem {operation} requires a regular non-symlink file"
+            )));
+        }
+        if metadata.len() > MAX_FILESYSTEM_CONTENT_BYTES as u64 {
+            return Err(SandboxError::BoundaryViolation(format!(
+                "sandbox filesystem {operation} exceeds {MAX_FILESYSTEM_CONTENT_BYTES} bytes"
+            )));
+        }
+
+        let mut bytes = Vec::with_capacity(metadata.len() as usize);
+        file.take(MAX_FILESYSTEM_CONTENT_BYTES as u64 + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|error| Self::filesystem_error(operation, error))?;
+        if bytes.len() > MAX_FILESYSTEM_CONTENT_BYTES {
+            return Err(SandboxError::BoundaryViolation(format!(
+                "sandbox filesystem {operation} exceeds {MAX_FILESYSTEM_CONTENT_BYTES} bytes"
+            )));
+        }
+        String::from_utf8(bytes).map_err(|_| {
+            SandboxError::BoundaryViolation(format!(
+                "sandbox filesystem {operation} requires UTF-8 content"
+            ))
+        })
+    }
+
+    fn sync_parent_directory(workspace: &Dir, relative: &Path) -> Result<(), SandboxError> {
+        #[cfg(unix)]
+        {
+            let parent = relative.parent().unwrap_or_else(|| Path::new("."));
+            let parent = if parent.as_os_str().is_empty() {
+                Path::new(".")
+            } else {
+                parent
+            };
+            workspace
+                .open_dir(parent)
+                .and_then(|directory| directory.into_std_file().sync_all())
+                .map_err(|error| Self::filesystem_error("directory sync", error))?;
+        }
+        #[cfg(not(unix))]
+        let _ = (workspace, relative);
+        Ok(())
+    }
+
+    fn stage_file(
+        workspace: &Dir,
+        relative: &Path,
+        content: &str,
+        permissions: Option<cap_std::fs::Permissions>,
+    ) -> Result<PathBuf, SandboxError> {
+        let parent = relative.parent().unwrap_or_else(|| Path::new(""));
+        let temporary = parent.join(format!(".aiagentos-write-{}", uuid::Uuid::new_v4()));
+        let result = (|| {
+            let mut options = OpenOptions::new();
+            options
+                .write(true)
+                .create_new(true)
+                ._cap_fs_ext_follow(FollowSymlinks::No);
+            #[cfg(unix)]
+            {
+                use cap_std::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            let mut file = workspace
+                .open_with(&temporary, &options)
+                .map_err(|error| Self::filesystem_error("stage", error))?;
+            file.write_all(content.as_bytes())
+                .map_err(|error| Self::filesystem_error("stage", error))?;
+            if let Some(permissions) = permissions {
+                file.set_permissions(permissions)
+                    .map_err(|error| Self::filesystem_error("stage permissions", error))?;
+            }
+            file.sync_all()
+                .map_err(|error| Self::filesystem_error("stage sync", error))?;
+            Ok(())
+        })();
+        if let Err(error) = result {
+            let _ = workspace.remove_file(&temporary);
+            return Err(error);
+        }
+        Ok(temporary)
+    }
+
+    fn atomic_write(
+        state: &SandboxState,
+        workspace: &Dir,
+        relative: &Path,
+        content: &str,
+    ) -> Result<(), SandboxError> {
+        let (replaced_len, permissions) = match workspace.symlink_metadata(relative) {
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+                return Err(SandboxError::BoundaryViolation(
+                    "sandbox filesystem write requires a regular non-symlink target".into(),
+                ))
+            }
+            Ok(metadata) => (metadata.len(), Some(metadata.permissions())),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => (0, None),
+            Err(error) => return Err(Self::filesystem_error("write metadata", error)),
+        };
+        Self::enforce_write_quota(state, workspace, replaced_len, content.len() as u64)?;
+        let temporary = Self::stage_file(workspace, relative, content, permissions)?;
+        if let Err(error) = workspace.rename(&temporary, workspace, relative) {
+            let _ = workspace.remove_file(&temporary);
+            return Err(Self::filesystem_error("write commit", error));
+        }
+        Self::sync_parent_directory(workspace, relative)
+    }
+
+    fn atomic_create(
+        state: &SandboxState,
+        workspace: &Dir,
+        relative: &Path,
+        content: &str,
+    ) -> Result<(), SandboxError> {
+        match workspace.symlink_metadata(relative) {
+            Ok(_) => {
+                return Err(SandboxError::BoundaryViolation(
+                    "sandbox filesystem create target already exists".into(),
+                ))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(Self::filesystem_error("create metadata", error)),
+        }
+        Self::enforce_write_quota(state, workspace, 0, content.len() as u64)?;
+        let temporary = Self::stage_file(workspace, relative, content, None)?;
+        if let Err(error) = workspace.hard_link(&temporary, workspace, relative) {
+            let _ = workspace.remove_file(&temporary);
+            return Err(Self::filesystem_error("create commit", error));
+        }
+        if let Err(error) = workspace.remove_file(&temporary) {
+            return Err(Self::filesystem_error("create cleanup", error));
+        }
+        Self::sync_parent_directory(workspace, relative)
+    }
+
+    fn create_private_directory_tree(workspace: &Dir, relative: &Path) -> Result<(), SandboxError> {
+        let mut current = PathBuf::new();
+        for component in relative.components() {
+            match component {
+                std::path::Component::CurDir => continue,
+                std::path::Component::Normal(component) => current.push(component),
+                _ => {
+                    return Err(SandboxError::BoundaryViolation(
+                        "sandbox create directory target denied".into(),
+                    ))
+                }
+            }
+            match workspace.symlink_metadata(&current) {
+                Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+                    return Err(SandboxError::BoundaryViolation(
+                        "sandbox create directory target must contain only real directories".into(),
+                    ))
+                }
+                Ok(_) => continue,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(Self::filesystem_error("create directory metadata", error))
+                }
+            }
+            workspace
+                .create_dir(&current)
+                .map_err(|error| Self::filesystem_error("create directory", error))?;
+            #[cfg(unix)]
+            {
+                use cap_std::fs::PermissionsExt;
+                workspace
+                    .set_permissions(&current, cap_std::fs::Permissions::from_mode(0o700))
+                    .map_err(|error| {
+                        Self::filesystem_error("create directory permissions", error)
+                    })?;
+            }
+            Self::sync_parent_directory(workspace, &current)?;
         }
         Ok(())
     }
@@ -601,29 +845,25 @@ impl SandboxManagerImpl {
             .ok_or_else(|| {
                 SandboxError::BoundaryViolation("sandbox filesystem target denied".into())
             })?;
+        Self::validate_filesystem_path(supplied)?;
         let relative = Self::relative_capability_path(state, Path::new(supplied))?;
         match operation {
             "read" => {
-                let content = workspace
-                    .read_to_string(&relative)
-                    .map_err(|error| Self::filesystem_error("read", error))?;
+                let content = Self::read_regular_utf8(workspace, &relative, "read")?;
                 Ok(serde_json::json!({"content": content}))
             }
-            "write" | "create" => {
-                let content = parameters
-                    .get("content")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("");
-                Self::enforce_write_quota(state, workspace, &relative, content.len() as u64)?;
-                workspace
-                    .write(&relative, content)
-                    .map_err(|error| Self::filesystem_error("write", error))?;
+            "write" => {
+                let content = Self::filesystem_content(parameters)?;
+                Self::atomic_write(state, workspace, &relative, content)?;
+                Ok(serde_json::json!({"written": true}))
+            }
+            "create" => {
+                let content = Self::filesystem_content(parameters)?;
+                Self::atomic_create(state, workspace, &relative, content)?;
                 Ok(serde_json::json!({"written": true}))
             }
             "create_dir" => {
-                workspace
-                    .create_dir_all(&relative)
-                    .map_err(|error| Self::filesystem_error("create directory", error))?;
+                Self::create_private_directory_tree(workspace, &relative)?;
                 Ok(serde_json::json!({"created": true}))
             }
             "edit" => {
@@ -639,45 +879,79 @@ impl SandboxManagerImpl {
                     .get("replace")
                     .and_then(serde_json::Value::as_str)
                     .unwrap_or("");
-                let content = workspace
-                    .read_to_string(&relative)
-                    .map_err(|error| Self::filesystem_error("edit read", error))?;
+                if replace.len() > MAX_FILESYSTEM_CONTENT_BYTES {
+                    return Err(SandboxError::BoundaryViolation(
+                        "sandbox edit replacement exceeds filesystem content limit".into(),
+                    ));
+                }
+                let content = Self::read_regular_utf8(workspace, &relative, "edit read")?;
                 if !content.contains(search) {
                     return Err(SandboxError::BoundaryViolation(
                         "sandbox edit search text was not found".into(),
                     ));
                 }
                 let updated = content.replacen(search, replace, 1);
-                Self::enforce_write_quota(state, workspace, &relative, updated.len() as u64)?;
-
-                let parent = relative.parent().unwrap_or_else(|| Path::new(""));
-                let temporary = parent.join(format!(".aiagentos-edit-{}", uuid::Uuid::new_v4()));
-                workspace
-                    .write(&temporary, &updated)
-                    .map_err(|error| Self::filesystem_error("edit write", error))?;
-                if let Err(error) = workspace.rename(&temporary, workspace, &relative) {
-                    let _ = workspace.remove_file(&temporary);
-                    return Err(Self::filesystem_error("edit commit", error));
+                if updated.len() > MAX_FILESYSTEM_CONTENT_BYTES {
+                    return Err(SandboxError::BoundaryViolation(format!(
+                        "sandbox edit result exceeds {MAX_FILESYSTEM_CONTENT_BYTES} bytes"
+                    )));
                 }
+                Self::atomic_write(state, workspace, &relative, &updated)?;
                 Ok(serde_json::json!({"edited": true}))
             }
             "delete" => {
+                Self::regular_metadata(workspace, &relative, "delete")?;
                 workspace
                     .remove_file(&relative)
                     .map_err(|error| Self::filesystem_error("delete", error))?;
+                Self::sync_parent_directory(workspace, &relative)?;
                 Ok(serde_json::json!({"deleted": true}))
             }
             "list" => {
-                let entries = workspace
+                let metadata = workspace
+                    .symlink_metadata(&relative)
+                    .map_err(|error| Self::filesystem_error("list", error))?;
+                if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                    return Err(SandboxError::BoundaryViolation(
+                        "sandbox filesystem list requires a real directory".into(),
+                    ));
+                }
+                let mut entries = workspace
                     .read_dir(&relative)
-                    .map_err(|error| Self::filesystem_error("list", error))?
-                    .map(|entry| {
-                        entry
-                            .map(|entry| entry.file_name().to_string_lossy().to_string())
-                            .map_err(|error| Self::filesystem_error("list", error))
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-                Ok(serde_json::json!({"entries": entries}))
+                    .map_err(|error| Self::filesystem_error("list", error))?;
+                let mut details = Vec::new();
+                for entry in entries.by_ref() {
+                    if details.len() == MAX_FILESYSTEM_LIST_ENTRIES {
+                        return Err(SandboxError::BoundaryViolation(format!(
+                            "sandbox filesystem list exceeds {MAX_FILESYSTEM_LIST_ENTRIES} entries"
+                        )));
+                    }
+                    let entry = entry.map_err(|error| Self::filesystem_error("list", error))?;
+                    let name = entry.file_name().into_string().map_err(|_| {
+                        SandboxError::BoundaryViolation(
+                            "sandbox filesystem list requires UTF-8 entry names".into(),
+                        )
+                    })?;
+                    let file_type = entry
+                        .file_type()
+                        .map_err(|error| Self::filesystem_error("list", error))?;
+                    let kind = if file_type.is_file() {
+                        "file"
+                    } else if file_type.is_dir() {
+                        "directory"
+                    } else if file_type.is_symlink() {
+                        "symlink"
+                    } else {
+                        "other"
+                    };
+                    details.push(serde_json::json!({"name": name, "kind": kind}));
+                }
+                details.sort_by(|left, right| left["name"].as_str().cmp(&right["name"].as_str()));
+                let names = details
+                    .iter()
+                    .filter_map(|entry| entry["name"].as_str())
+                    .collect::<Vec<_>>();
+                Ok(serde_json::json!({"entries": names, "details": details}))
             }
             _ => Err(SandboxError::BoundaryViolation(
                 "unsupported sandbox filesystem operation".into(),
@@ -1604,6 +1878,234 @@ mod tests {
             serde_json::json!({"deleted": true})
         );
         assert!(!root.join("nested/note.txt").exists());
+
+        mgr.destroy_sandbox(sid).unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn capability_file_create_and_replace_are_atomic_private_and_bounded() {
+        use std::io::Read as _;
+        use std::os::unix::fs::PermissionsExt;
+
+        let mgr = SandboxManagerImpl::new();
+        let config = SandboxConfig {
+            max_disk_usage_bytes: Some((MAX_FILESYSTEM_CONTENT_BYTES * 2) as u64),
+            ..test_config()
+        };
+        let root = config.workspace_dir.clone();
+        let sid = mgr.create_sandbox(uuid::Uuid::new_v4(), &config).unwrap();
+
+        mgr.execute_filesystem(
+            sid,
+            "create_dir",
+            &serde_json::json!({"path": "private/nested"}),
+        )
+        .unwrap();
+        for directory in ["private", "private/nested"] {
+            assert_eq!(
+                std::fs::metadata(root.join(directory))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o700
+            );
+        }
+
+        mgr.execute_filesystem(
+            sid,
+            "create",
+            &serde_json::json!({"path": "note.txt", "content": "old"}),
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::metadata(root.join("note.txt"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+
+        let create_again = mgr.execute_filesystem(
+            sid,
+            "create",
+            &serde_json::json!({"path": "note.txt", "content": "must not replace"}),
+        );
+        assert!(create_again.is_err());
+        assert_eq!(
+            std::fs::read_to_string(root.join("note.txt")).unwrap(),
+            "old"
+        );
+
+        std::fs::set_permissions(
+            root.join("note.txt"),
+            std::fs::Permissions::from_mode(0o640),
+        )
+        .unwrap();
+        let mut old_handle = std::fs::File::open(root.join("note.txt")).unwrap();
+        mgr.execute_filesystem(
+            sid,
+            "write",
+            &serde_json::json!({"path": "note.txt", "content": "new"}),
+        )
+        .unwrap();
+        let mut old_snapshot = String::new();
+        old_handle.read_to_string(&mut old_snapshot).unwrap();
+        assert_eq!(
+            old_snapshot, "old",
+            "an open handle must retain the pre-rename file instead of observing truncation"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("note.txt")).unwrap(),
+            "new"
+        );
+        assert_eq!(
+            std::fs::metadata(root.join("note.txt"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o640
+        );
+        assert!(
+            std::fs::read_dir(&root).unwrap().all(|entry| !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".aiagentos-write-")),
+            "successful publications must not leak staging files"
+        );
+
+        let oversized = "x".repeat(MAX_FILESYSTEM_CONTENT_BYTES + 1);
+        assert!(mgr
+            .execute_filesystem(
+                sid,
+                "write",
+                &serde_json::json!({"path": "note.txt", "content": oversized}),
+            )
+            .is_err());
+        assert_eq!(
+            std::fs::read_to_string(root.join("note.txt")).unwrap(),
+            "new"
+        );
+        std::fs::write(
+            root.join("oversized.txt"),
+            vec![b'x'; MAX_FILESYSTEM_CONTENT_BYTES + 1],
+        )
+        .unwrap();
+        assert!(mgr
+            .execute_filesystem(sid, "read", &serde_json::json!({"path": "oversized.txt"}),)
+            .is_err());
+        assert!(mgr
+            .execute_filesystem(
+                sid,
+                "read",
+                &serde_json::json!({"path": "x".repeat(MAX_FILESYSTEM_PATH_BYTES + 1)}),
+            )
+            .is_err());
+
+        mgr.destroy_sandbox(sid).unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn capability_file_io_rejects_symlinks_special_files_and_invalid_utf8() {
+        use std::os::unix::fs::symlink;
+
+        let mgr = SandboxManagerImpl::new();
+        let config = test_config();
+        let root = config.workspace_dir.clone();
+        let sid = mgr.create_sandbox(uuid::Uuid::new_v4(), &config).unwrap();
+        std::fs::write(root.join("target.txt"), "sentinel").unwrap();
+        symlink("target.txt", root.join("link.txt")).unwrap();
+
+        for operation in ["read", "write", "delete"] {
+            let parameters = if operation == "write" {
+                serde_json::json!({"path": "link.txt", "content": "changed"})
+            } else {
+                serde_json::json!({"path": "link.txt"})
+            };
+            assert!(
+                mgr.execute_filesystem(sid, operation, &parameters).is_err(),
+                "{operation} must reject a final symlink"
+            );
+        }
+        assert_eq!(
+            std::fs::read_to_string(root.join("target.txt")).unwrap(),
+            "sentinel"
+        );
+        assert!(root.join("link.txt").is_symlink());
+
+        std::fs::write(root.join("binary.bin"), [0xff, 0xfe]).unwrap();
+        assert!(mgr
+            .execute_filesystem(sid, "read", &serde_json::json!({"path": "binary.bin"}),)
+            .is_err());
+
+        use std::os::unix::ffi::OsStrExt;
+        let fifo_path = root.join("agent.pipe");
+        let fifo = std::ffi::CString::new(fifo_path.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        for operation in ["read", "delete"] {
+            assert!(mgr
+                .execute_filesystem(sid, operation, &serde_json::json!({"path": "agent.pipe"}),)
+                .is_err());
+        }
+        assert!(fifo_path.exists());
+
+        mgr.destroy_sandbox(sid).unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn capability_directory_listing_is_deterministic_typed_and_bounded() {
+        let mgr = SandboxManagerImpl::new();
+        let config = test_config();
+        let root = config.workspace_dir.clone();
+        let sid = mgr.create_sandbox(uuid::Uuid::new_v4(), &config).unwrap();
+        std::fs::write(root.join("z.txt"), "z").unwrap();
+        std::fs::create_dir(root.join("a-dir")).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("z.txt", root.join("m-link")).unwrap();
+
+        let listing = mgr
+            .execute_filesystem(sid, "list", &serde_json::json!({"path": "."}))
+            .unwrap();
+        #[cfg(unix)]
+        assert_eq!(
+            listing,
+            serde_json::json!({
+                "entries": ["a-dir", "m-link", "z.txt"],
+                "details": [
+                    {"name": "a-dir", "kind": "directory"},
+                    {"name": "m-link", "kind": "symlink"},
+                    {"name": "z.txt", "kind": "file"}
+                ]
+            })
+        );
+        #[cfg(not(unix))]
+        assert_eq!(
+            listing,
+            serde_json::json!({
+                "entries": ["a-dir", "z.txt"],
+                "details": [
+                    {"name": "a-dir", "kind": "directory"},
+                    {"name": "z.txt", "kind": "file"}
+                ]
+            })
+        );
+
+        let crowded = root.join("crowded");
+        std::fs::create_dir(&crowded).unwrap();
+        for index in 0..=MAX_FILESYSTEM_LIST_ENTRIES {
+            std::fs::write(crowded.join(index.to_string()), []).unwrap();
+        }
+        assert!(mgr
+            .execute_filesystem(sid, "list", &serde_json::json!({"path": "crowded"}))
+            .is_err());
 
         mgr.destroy_sandbox(sid).unwrap();
         std::fs::remove_dir_all(root).unwrap();

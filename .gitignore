@@ -41,6 +41,8 @@ fuzz/artifacts/
 
 # Frontend build output (regenerated)
 crates/tauri-app/ui/dist/
+crates/tauri-app/ui/playwright-report/
+crates/tauri-app/ui/test-results/
 .claude/
 
 # Generated Tauri schemas and local coverage output

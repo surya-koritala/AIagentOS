@@ -25,7 +25,9 @@ cargo deny check advisories bans licenses sources
   npm ci
   npm audit --audit-level=high
   npm run check
-  npm run build
+  npm test
+  npx playwright install chromium
+  npm run test:a11y
 )
 
 cargo clippy -p tauri-app --all-targets --locked -- -D warnings

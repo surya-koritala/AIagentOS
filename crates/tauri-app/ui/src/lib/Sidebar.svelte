@@ -128,4 +128,10 @@
   .dot.paused { background: #fbbf24; }
   .name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .empty-agents { margin: 0.5rem 0.75rem; color: #a7a7b8; font-size: 0.8rem; }
+  @media (max-width: 700px) {
+    .sidebar { width: 100%; border-right: 0; border-bottom: 1px solid #1e1e33; }
+    nav { display: grid; grid-template-columns: repeat(3, 1fr); }
+    .nav-item { justify-content: center; padding-inline: 0.35rem; }
+    .agent-list { max-height: 9rem; }
+  }
 </style>

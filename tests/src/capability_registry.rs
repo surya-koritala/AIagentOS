@@ -664,6 +664,10 @@ fn desktop_accessibility_baseline_is_explicit_and_honest() {
         "targets **WCAG 2.2 Level AA**",
         "not a completed certification claim",
         "`svelte-check --fail-on-warnings`",
+        "Playwright Chromium",
+        "`@axe-core/playwright`",
+        "320 CSS-pixel viewport",
+        "exact native-webview testing",
         "do not replace assistive-technology testing",
         "Narrator on Windows",
         "VoiceOver on macOS",
@@ -709,6 +713,29 @@ fn desktop_accessibility_baseline_is_explicit_and_honest() {
             .contains("Svelte types and accessibility warnings are errors"),
         "Svelte accessibility diagnostics are no longer blocking CI"
     );
+    let rendered = read_workspace_file("crates/tauri-app/ui/tests/rendered/accessibility.spec.js");
+    for contract in [
+        "AxeBuilder",
+        "Skip to main content",
+        "setup dialog is named, axe-clean, and contains keyboard focus",
+        "width: 320",
+        "reducedMotion: 'reduce'",
+    ] {
+        assert!(
+            rendered.contains(contract),
+            "rendered desktop accessibility regression lost {contract:?}"
+        );
+    }
+    let workflow = read_workspace_file(".github/workflows/ci.yml");
+    for contract in [
+        "npx playwright install --with-deps chromium",
+        "npm run test:a11y",
+    ] {
+        assert!(
+            workflow.contains(contract),
+            "rendered desktop accessibility gate is no longer blocking CI: {contract:?}"
+        );
+    }
 }
 
 #[test]

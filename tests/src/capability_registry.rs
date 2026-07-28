@@ -502,6 +502,25 @@ fn canonical_client_contract_is_explicit_and_honest() {
         agentctl.contains("OperatorClient::connect_profile"),
         "canonical operator client no longer uses the shared public client"
     );
+    for command in [
+        "policy-validate POLICY_FILE",
+        "policy-explain POLICY_FILE",
+        "gate-stats",
+        "node-control-audit [LIMIT]",
+        "cluster-membership-audit [LIMIT]",
+    ] {
+        assert!(
+            agentctl.contains(command),
+            "canonical operator client lost policy/audit command {command:?}"
+        );
+    }
+    assert!(
+        agentctl.contains("policy::explain_file")
+            && agentctl.contains(".gate_stats()")
+            && agentctl.contains(".node_control_audit(limit)")
+            && agentctl.contains(".cluster_membership_audit(limit)"),
+        "canonical policy/audit commands must use the shared policy and SDK paths"
+    );
     for surface in ["crates/tui/src/lib.rs", "crates/tauri-app/src/lib.rs"] {
         assert!(
             read_workspace_file(surface).contains("ConnectionProfile"),

@@ -10,6 +10,13 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
 
 ## [Unreleased]
 
+- Added bounded, offline, machine-readable policy validation and explanation
+  to the canonical `agentctl` surface, sharing the runtime `PolicyDocument` and
+  MAC evaluator. Added live SDK-backed gate-counter, node-control-audit, and
+  cluster-membership-audit commands with bounded limits. Real process/TCP
+  regressions prove the offline commands never connect, explanations match the
+  engine, trusted-system reads succeed, and tenant Admin and ReadOnly
+  credentials receive the same payload-free authorization denial.
 - Expanded the focused TUI and desktop Operations view without bypassing the
   public operator snapshot. Both now retain scope, version, truncation, agent
   enforcement/context/cgroup data, provider health, loaded-package instances,

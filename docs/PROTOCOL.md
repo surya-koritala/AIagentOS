@@ -47,6 +47,15 @@ the exact active request. Global Prometheus metrics still require a trusted
 system operator; a tenant credential cannot use the command to bypass that
 wire authorization.
 
+Policy authoring is available from the same canonical binary without a server:
+`policy-validate POLICY_FILE` and `policy-explain POLICY_FILE --subject ...
+--action ... --object ...` read a bounded UTF-8 TOML document, use the runtime
+`PolicyDocument`/MAC evaluator, and emit JSON. Live `gate-stats`,
+`node-control-audit [LIMIT]`, and `cluster-membership-audit [LIMIT]` map
+directly to `KernelClient`. Those audit reads remain trusted-system operations:
+tenant credentials are denied even when their role is `Admin`, and denials
+emit no audit payload.
+
 The signed-package lifecycle is also available through the same canonical
 client: `package-trust-key`, `package-revoke-key`, `package-publish`,
 `package-yank`, `package-fetch`, `package-search`, `package-install`,

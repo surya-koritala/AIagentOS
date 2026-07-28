@@ -9,8 +9,12 @@ that policy without editing Rust.
 
 The Linux analogue is SELinux: you author a policy module, a tool validates it
 (`checkpolicy`), and another explains decisions (`sesearch` / `audit2why`). Here
-the policy is a TOML document, `agent policy validate` checks it, and `agent
-policy explain` answers "would this be allowed, and which rule decides?".
+the policy is a TOML document, `agentctl policy-validate` checks it, and
+`agentctl policy-explain` answers "would this be allowed, and which rule
+decides?". Both commands are bounded, offline, and emit JSON for automation.
+The embedded `agent` developer shell retains human-oriented `agent policy
+validate` / `agent policy explain` aliases, but `agentctl` is the canonical
+operator surface.
 
 ## The document format
 
@@ -88,14 +92,21 @@ matches, `default` decides. Because matching is first-match-wins:
 ## Validating a policy
 
 ```bash
-agent policy validate path/to/policy.toml
+agentctl policy-validate path/to/policy.toml
 ```
 
-Prints whether the document is valid, its mode and default, and any **lint
-warnings** (legal but probably-mistaken policies):
+Prints a machine-readable report with the document version, mode, explicit
+default, rule count, and any **lint warnings** (legal but probably-mistaken
+policies):
 
-```
-[OK] policy is valid - version 1, enforcing, default = Deny, 3 rule(s)
+```json
+{
+  "version": 1,
+  "enforcing": true,
+  "default": "deny",
+  "rule_count": 3,
+  "warnings": []
+}
 ```
 
 Lints include permissive mode, a non-deny terminal default, an enforcing policy
@@ -129,14 +140,21 @@ accidentally making an unrelated tool appear covered.
 ## Explaining a decision (dry-run)
 
 ```bash
-agent policy explain path/to/policy.toml \
+agentctl policy-explain path/to/policy.toml \
   --subject profile:read-only --action read --object /home/u/notes
 ```
 
-```
-query: subject=profile:read-only action=read object=/home/u/notes
-=> ALLOW
-  decided by rule #0 (readers-read)
+```json
+{
+  "subject": "profile:read-only",
+  "action": "read",
+  "object": "/home/u/notes",
+  "decision": "allow",
+  "matched_rule": 0,
+  "matched_name": "readers-read",
+  "used_default": false,
+  "default": "deny"
+}
 ```
 
 `explain` evaluates the document the same way the live engine will — they share
@@ -144,10 +162,8 @@ one matching implementation, so the explanation can never disagree with what
 gets enforced (a property test pins this). When no rule matches it tells you the
 default decided:
 
-```
-=> DENY
-  decided by default (no rule matched) - default = Deny
-```
+`decision` is `deny`, `matched_rule` and `matched_name` are `null`, and
+`used_default` is `true`.
 
 ## Deploying a policy
 

@@ -3,13 +3,13 @@
 use std::io::{Read, Write};
 use std::time::Duration;
 
-use agent_cli::OperatorClient;
+use agent_cli::{policy, OperatorClient};
 use agent_sdk::ConnectionProfile;
 
 fn usage() -> ! {
     eprintln!(
         "usage: agentctl [--addr HOST:PORT] [--token TOKEN] \
-         <create|list|inspect|message|stream|cancel|checkpoints|checkpoint-resume|checkpoint-delete|capabilities|providers|metrics|protocol|package-trust-key|package-revoke-key|package-publish|package-yank|package-fetch|package-search|package-install|package-rollback|package-remove|packages|package-run|pressure|tunables|tunable-set|tunable-rollback|tunable-history|status|pause|resume|stop|kill|wait|services|service-start|service-stop|service-restart|service-reload|service-history|backup-create|backup-retention|backup-status|data-inventory|backup-key-generate|backup-anchor-create|backup-verify|backup-restore|backup-disaster-recover|backup-corruption-recover|backup-remote-publish|backup-remote-fetch|storage-key-generate|storage-encrypt|storage-encrypt-recover|storage-key-rotate|storage-portable-export|storage-portable-verify|storage-portable-import|erase-agent|erase-user|erase-tenant> [ARGS...]\n\
+         <create|list|inspect|message|stream|cancel|checkpoints|checkpoint-resume|checkpoint-delete|capabilities|providers|metrics|protocol|policy-validate|policy-explain|gate-stats|node-control-audit|cluster-membership-audit|package-trust-key|package-revoke-key|package-publish|package-yank|package-fetch|package-search|package-install|package-rollback|package-remove|packages|package-run|pressure|tunables|tunable-set|tunable-rollback|tunable-history|status|pause|resume|stop|kill|wait|services|service-start|service-stop|service-restart|service-reload|service-history|backup-create|backup-retention|backup-status|data-inventory|backup-key-generate|backup-anchor-create|backup-verify|backup-restore|backup-disaster-recover|backup-corruption-recover|backup-remote-publish|backup-remote-fetch|storage-key-generate|storage-encrypt|storage-encrypt-recover|storage-key-rotate|storage-portable-export|storage-portable-verify|storage-portable-import|erase-agent|erase-user|erase-tenant> [ARGS...]\n\
          \n\
          public runtime commands:\n\
            agentctl [SERVER OPTIONS] create NAME TASK [PROVIDER [PROFILE [PRIORITY]]]\n\
@@ -23,6 +23,15 @@ fn usage() -> ! {
            agentctl [SERVER OPTIONS] providers\n\
            agentctl [SERVER OPTIONS] metrics\n\
            agentctl [SERVER OPTIONS] protocol\n\
+         \n\
+         policy authoring commands (offline, machine-readable):\n\
+           agentctl policy-validate POLICY_FILE\n\
+           agentctl policy-explain POLICY_FILE --subject SUBJECT --action ACTION --object OBJECT\n\
+         \n\
+         system audit commands:\n\
+           agentctl [SERVER OPTIONS] gate-stats\n\
+           agentctl [SERVER OPTIONS] node-control-audit [LIMIT]\n\
+           agentctl [SERVER OPTIONS] cluster-membership-audit [LIMIT]\n\
          \n\
          signed package commands:\n\
            agentctl [SERVER OPTIONS] package-trust-key PUBLISHER KEY_ID PUBLIC_KEY_FILE VALID_FROM [--valid-until RFC3339] [--supersedes KEY_ID]\n\
@@ -84,6 +93,50 @@ struct RemoteBackupOptions {
 struct PackageTrustOptions {
     valid_until: Option<String>,
     supersedes: Option<String>,
+}
+
+#[derive(Default)]
+struct PolicyExplainOptions {
+    subject: Option<String>,
+    action: Option<String>,
+    object: Option<String>,
+}
+
+fn parse_policy_explain_options(values: impl IntoIterator<Item = String>) -> PolicyExplainOptions {
+    let mut values = values.into_iter();
+    let mut parsed = PolicyExplainOptions::default();
+    while let Some(value) = values.next() {
+        match value.as_str() {
+            "--subject" if parsed.subject.is_none() => {
+                parsed.subject = Some(values.next().unwrap_or_else(|| usage()));
+            }
+            "--action" if parsed.action.is_none() => {
+                parsed.action = Some(values.next().unwrap_or_else(|| usage()));
+            }
+            "--object" if parsed.object.is_none() => {
+                parsed.object = Some(values.next().unwrap_or_else(|| usage()));
+            }
+            _ => usage(),
+        }
+    }
+    if parsed.subject.is_none() || parsed.action.is_none() || parsed.object.is_none() {
+        usage();
+    }
+    parsed
+}
+
+fn parse_audit_limit(values: impl IntoIterator<Item = String>) -> usize {
+    let mut values = values.into_iter();
+    let limit = values
+        .next()
+        .as_deref()
+        .unwrap_or("100")
+        .parse::<usize>()
+        .unwrap_or_else(|_| usage());
+    if !(1..=1_000).contains(&limit) || values.next().is_some() {
+        usage();
+    }
+    limit
 }
 
 fn parse_package_trust_options(values: impl IntoIterator<Item = String>) -> PackageTrustOptions {
@@ -204,15 +257,12 @@ fn parse_portable_file_options(
 #[tokio::main]
 async fn main() {
     let mut args = std::env::args().skip(1).peekable();
-    let mut profile = ConnectionProfile::from_env().unwrap_or_else(|error| {
-        eprintln!("agentctl: {error}");
-        std::process::exit(2);
-    });
+    let mut address_override = None;
     let mut token = std::env::var("AGENT_SERVER_TOKEN").ok();
 
     while matches!(args.peek().map(String::as_str), Some("--addr" | "--token")) {
         match args.next().as_deref() {
-            Some("--addr") => profile.address = args.next().unwrap_or_else(|| usage()),
+            Some("--addr") => address_override = Some(args.next().unwrap_or_else(|| usage())),
             Some("--token") => token = Some(args.next().unwrap_or_else(|| usage())),
             _ => unreachable!(),
         }
@@ -220,10 +270,33 @@ async fn main() {
 
     let command = args.next().unwrap_or_else(|| usage());
 
-    // Verification and restore operate directly on local files. Restore must
-    // remain offline: the storage lease rejects replacement while a kernel
-    // owns the destination database.
+    // Policy authoring, verification, and restore operate directly on local
+    // files and must not depend on a live connection profile. Restore remains
+    // offline: the storage lease rejects replacement while a kernel owns the
+    // destination database.
     match command.as_str() {
+        "policy-validate" => {
+            let path = args.next().unwrap_or_else(|| usage());
+            if args.next().is_some() {
+                usage();
+            }
+            let report = policy::validate_file(path).unwrap_or_else(|error| fail_operator(error));
+            print_json(&report, "policy validation report");
+            return;
+        }
+        "policy-explain" => {
+            let path = args.next().unwrap_or_else(|| usage());
+            let options = parse_policy_explain_options(args.collect::<Vec<_>>());
+            let report = policy::explain_file(
+                path,
+                options.subject.expect("validated subject"),
+                options.action.expect("validated action"),
+                options.object.expect("validated object"),
+            )
+            .unwrap_or_else(|error| fail_operator(error));
+            print_json(&report, "policy explanation report");
+            return;
+        }
         "backup-key-generate" => {
             let key_id = args.next().unwrap_or_else(|| usage());
             let private_key = args.next().unwrap_or_else(|| usage());
@@ -686,6 +759,13 @@ async fn main() {
         _ => {}
     }
 
+    let mut profile = ConnectionProfile::from_env().unwrap_or_else(|error| {
+        eprintln!("agentctl: {error}");
+        std::process::exit(2);
+    });
+    if let Some(address) = address_override {
+        profile.address = address;
+    }
     let mut client = OperatorClient::connect_profile(&profile, token.as_deref())
         .await
         .unwrap_or_else(|error| {
@@ -884,6 +964,35 @@ async fn main() {
             }
             let protocol = client.hello().await.unwrap_or_else(|error| fail(error));
             print_json(&protocol, "protocol description");
+            return;
+        }
+        "gate-stats" => {
+            if args.next().is_some() {
+                usage();
+            }
+            let stats = client
+                .gate_stats()
+                .await
+                .unwrap_or_else(|error| fail(error));
+            print_json(&stats, "gate enforcement counters");
+            return;
+        }
+        "node-control-audit" => {
+            let limit = parse_audit_limit(args.collect::<Vec<_>>());
+            let entries = client
+                .node_control_audit(limit)
+                .await
+                .unwrap_or_else(|error| fail(error));
+            print_json(&entries, "node control audit");
+            return;
+        }
+        "cluster-membership-audit" => {
+            let limit = parse_audit_limit(args.collect::<Vec<_>>());
+            let entries = client
+                .cluster_membership_audit(limit)
+                .await
+                .unwrap_or_else(|error| fail(error));
+            print_json(&entries, "cluster membership audit");
             return;
         }
         "package-trust-key" => {

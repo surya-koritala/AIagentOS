@@ -77,6 +77,26 @@ leave runtime and durable state unchanged. Rollback restores an earlier
 effective value but creates a new monotonic revision. Bootstrap, applied set,
 rollback, invalid, stale, and unauthorized attempts are durable audit entries.
 
+## System audit views
+
+The canonical CLI exposes the public system audit reads without opening the
+database or an in-process kernel:
+
+```bash
+agentctl --addr 127.0.0.1:7777 --token "$AGENT_SERVER_TOKEN" gate-stats
+agentctl --addr 127.0.0.1:7777 --token "$AGENT_SERVER_TOKEN" node-control-audit 100
+agentctl --addr 127.0.0.1:7777 --token "$AGENT_SERVER_TOKEN" cluster-membership-audit 100
+agentctl --addr 127.0.0.1:7777 --token "$AGENT_SERVER_TOKEN" tunable-history
+agentctl --addr 127.0.0.1:7777 --token "$AGENT_SERVER_TOKEN" service-history
+```
+
+Limits default to 100 and the dedicated node/cluster commands accept
+`1..=1000`. Gate counters are process-local snapshots; node-control,
+cluster-membership, tunable, and service history are the corresponding typed
+public audit records. These are global views and therefore require an open
+trusted-system connection or configured shared-secret operator credential.
+Tenant API keys cannot read them, including tenant `Admin` keys.
+
 ## Package view and limitations
 
 The package view records non-sensitive loaded instances. The signed package

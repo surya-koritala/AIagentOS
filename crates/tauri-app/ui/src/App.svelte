@@ -7,7 +7,7 @@
   import Dashboard from './lib/Dashboard.svelte';
   import AgentDetail from './lib/AgentDetail.svelte';
   import Settings from './lib/Settings.svelte';
-  import ActivityFeed from './lib/ActivityFeed.svelte';
+  import AgentStatus from './lib/AgentStatus.svelte';
   import {
     applyOperatorView,
     beginOperation,
@@ -20,7 +20,7 @@
 
   let showSetup = false;
   let activeAgentId = null;
-  let view = 'dashboard'; // 'dashboard' | 'chat' | 'settings' | 'activity'
+  let view = 'dashboard'; // 'dashboard' | 'chat' | 'settings' | 'status'
   let operatorState = createOperatorState();
   let agents = [];
   let metrics = null;
@@ -70,10 +70,11 @@
   });
 </script>
 
-<main>
+<div class="app-shell">
   {#if showSetup}
     <SetupModal on:complete={onSetupComplete} />
   {:else}
+    <a class="skip-link" href="#main-content">Skip to main content</a>
     <div class="app-layout">
       <Sidebar
         {agents} {activeAgentId} {view}
@@ -82,9 +83,9 @@
         on:operation={onOperation}
         on:dashboard={() => { view = 'dashboard'; activeAgentId = null; }}
         on:settings={() => { view = 'settings'; }}
-        on:activity={() => { view = 'activity'; }}
+        on:activity={() => { view = 'status'; }}
       />
-      <div class="content">
+      <main class="content" id="main-content" tabindex="-1">
         <div
           class="status-banner"
           class:stale={operatorState.phase === 'stale'}
@@ -109,12 +110,12 @@
           />
         {:else if view === 'settings'}
           <Settings />
-        {:else if view === 'activity'}
-          <ActivityFeed {agents} />
+        {:else if view === 'status'}
+          <AgentStatus {agents} />
         {/if}
-      </div>
+      </main>
       {#if view === 'chat' && activeAgentId}
-        <div class="detail-sidebar">
+        <aside class="detail-sidebar" aria-label="Selected agent details">
           <AgentDetail
             agentId={activeAgentId}
             {agents}
@@ -122,17 +123,22 @@
             on:refresh={refreshOperator}
             on:operation={onOperation}
           />
-        </div>
+        </aside>
       {/if}
     </div>
   {/if}
-</main>
+</div>
 
 <style>
   :global(*) { box-sizing: border-box; }
   :global(body) { margin: 0; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0f0f1a; color: #e8e8f0; font-size: 14px; }
   :global(::selection) { background: #4a90d9; color: white; }
-  main { height: 100vh; display: flex; }
+  :global(:focus-visible) { outline: 3px solid #facc15 !important; outline-offset: 3px; }
+  :global(button), :global(input), :global(select), :global(textarea) { font: inherit; }
+  :global(.visually-hidden) { position: absolute !important; width: 1px !important; height: 1px !important; padding: 0 !important; margin: -1px !important; overflow: hidden !important; clip: rect(0, 0, 0, 0) !important; white-space: nowrap !important; border: 0 !important; }
+  .app-shell { min-height: 100vh; display: flex; }
+  .skip-link { position: fixed; z-index: 1000; top: 0.5rem; left: 0.5rem; padding: 0.75rem 1rem; border-radius: 8px; background: #facc15; color: #111827; font-weight: 700; transform: translateY(-150%); }
+  .skip-link:focus { transform: translateY(0); }
   .app-layout { display: flex; width: 100%; height: 100%; }
   .content { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
   .detail-sidebar { width: 280px; border-left: 1px solid #1e1e33; overflow-y: auto; }
@@ -141,6 +147,14 @@
   .status-banner.partial { background: #352a12; border-color: #6b531c; color: #fde68a; }
   .status-banner.working { background: #172b46; border-color: #28568a; color: #bfdbfe; }
   .status-banner.reconnected { background: #172f2b; border-color: #297566; color: #99f6e4; }
-  .status-banner button { border: 1px solid currentColor; border-radius: 6px; background: transparent; color: inherit; padding: 0.3rem 0.65rem; cursor: pointer; }
+  .status-banner button { min-width: 44px; min-height: 36px; border: 1px solid currentColor; border-radius: 6px; background: transparent; color: inherit; padding: 0.3rem 0.65rem; cursor: pointer; }
   .status-banner button:disabled { opacity: 0.5; cursor: wait; }
+  @media (prefers-reduced-motion: reduce) {
+    :global(*), :global(*::before), :global(*::after) {
+      animation-duration: 0.01ms !important;
+      animation-iteration-count: 1 !important;
+      scroll-behavior: auto !important;
+      transition-duration: 0.01ms !important;
+    }
+  }
 </style>

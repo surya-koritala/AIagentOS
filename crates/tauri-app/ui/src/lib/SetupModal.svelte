@@ -1,6 +1,6 @@
 <script>
   import { invoke } from '@tauri-apps/api/core';
-  import { createEventDispatcher } from 'svelte';
+  import { createEventDispatcher, onMount, tick } from 'svelte';
 
   const dispatch = createEventDispatcher();
 
@@ -14,6 +14,30 @@
   let localEndpoint = 'http://localhost:11434';
   let testing = false;
   let testResult = null;
+  let modal;
+  let firstControl;
+
+  function focusableControls() {
+    if (!modal) return [];
+    return Array.from(modal.querySelectorAll(
+      'button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])'
+    ));
+  }
+
+  function trapFocus(event) {
+    if (event.key !== 'Tab') return;
+    const controls = focusableControls();
+    if (controls.length === 0) return;
+    const first = controls[0];
+    const last = controls[controls.length - 1];
+    if (event.shiftKey && document.activeElement === first) {
+      event.preventDefault();
+      last.focus();
+    } else if (!event.shiftKey && document.activeElement === last) {
+      event.preventDefault();
+      first.focus();
+    }
+  }
 
   async function loadSettings() {
     try {
@@ -43,6 +67,8 @@
       });
       testResult = 'success';
       step = 2;
+      await tick();
+      firstControl?.focus();
     } catch (e) {
       testResult = `Failed: ${e}`;
     }
@@ -54,18 +80,33 @@
   }
 
   loadSettings();
+
+  onMount(async () => {
+    await tick();
+    firstControl?.focus();
+  });
 </script>
 
 <div class="modal-overlay">
-  <div class="modal">
+  <div
+    class="modal"
+    bind:this={modal}
+    role="dialog"
+    tabindex="-1"
+    aria-modal="true"
+    aria-labelledby="setup-title"
+    aria-describedby="setup-description"
+    aria-busy={testing}
+    on:keydown={trapFocus}
+  >
     {#if step === 1}
       <div class="step-indicator">Step 1 of 2</div>
-      <h1>Welcome to AI Agent OS</h1>
-      <p>Connect your LLM provider to get started.</p>
+      <h1 id="setup-title">Welcome to AI Agent OS</h1>
+      <p id="setup-description">Connect your LLM provider to get started.</p>
 
       <label>
         Provider
-        <select bind:value={provider}>
+        <select bind:this={firstControl} bind:value={provider}>
           <option value="azure-openai">Azure OpenAI (recommended)</option>
           <option value="openai">OpenAI</option>
           <option value="anthropic">Anthropic</option>
@@ -113,7 +154,7 @@
       {/if}
 
       {#if testResult && testResult !== 'success'}
-        <div class="result error">{testResult}</div>
+        <div class="result error" role="alert">{testResult}</div>
       {/if}
 
       <button
@@ -126,27 +167,27 @@
 
     {:else}
       <div class="step-indicator">Step 2 of 2</div>
-      <div class="success-icon">✓</div>
-      <h1>You're all set!</h1>
-      <p>Your {provider === 'azure-openai' ? 'Azure OpenAI' : provider} connection is configured. Create an agent to start working.</p>
-      <button class="primary" on:click={complete}>Launch Dashboard →</button>
+      <div class="success-icon" aria-hidden="true">✓</div>
+      <h1 id="setup-title">You're all set!</h1>
+      <p id="setup-description">Your {provider === 'azure-openai' ? 'Azure OpenAI' : provider} connection is configured. Create an agent to start working.</p>
+      <button class="primary" bind:this={firstControl} on:click={complete}>Launch Dashboard →</button>
     {/if}
   </div>
 </div>
 
 <style>
   .modal-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.8); display: flex; align-items: center; justify-content: center; backdrop-filter: blur(4px); }
-  .modal { background: #16162a; border: 1px solid #2a2a44; border-radius: 20px; padding: 2.5rem; width: 440px; max-width: 90vw; }
-  .step-indicator { font-size: 0.75rem; color: #4a90d9; text-transform: uppercase; letter-spacing: 0.1em; margin-bottom: 1rem; }
+  .modal { background: #16162a; border: 1px solid #4a4a68; border-radius: 20px; padding: 2.5rem; width: 440px; max-width: 90vw; max-height: 90vh; overflow-y: auto; }
+  .step-indicator { font-size: 0.75rem; color: #8bc5ff; text-transform: uppercase; letter-spacing: 0.1em; margin-bottom: 1rem; }
   h1 { margin: 0 0 0.5rem; font-size: 1.5rem; }
-  p { color: #777; margin: 0 0 1.5rem; line-height: 1.5; }
-  label { display: block; margin-bottom: 1rem; font-size: 0.8rem; color: #999; }
-  select, input { display: block; width: 100%; margin-top: 0.3rem; padding: 0.6rem 0.75rem; border-radius: 8px; border: 1px solid #333; background: #1a1a2e; color: #eee; font-size: 0.9rem; }
-  select:focus, input:focus { outline: none; border-color: #4a90d9; }
-  .primary { width: 100%; padding: 0.75rem; border-radius: 10px; border: none; background: linear-gradient(135deg, #4a90d9, #6366f1); color: white; font-weight: 600; font-size: 0.95rem; cursor: pointer; margin-top: 0.5rem; }
+  p { color: #b9b9c8; margin: 0 0 1.5rem; line-height: 1.5; }
+  label { display: block; margin-bottom: 1rem; font-size: 0.8rem; color: #c7c7d2; }
+  select, input { display: block; width: 100%; min-height: 44px; margin-top: 0.3rem; padding: 0.6rem 0.75rem; border-radius: 8px; border: 1px solid #66667a; background: #1a1a2e; color: #eee; font-size: 0.9rem; }
+  select:focus, input:focus { border-color: #8bc5ff; }
+  .primary { width: 100%; min-height: 44px; padding: 0.75rem; border-radius: 10px; border: none; background: linear-gradient(135deg, #3276bd, #4f46c7); color: white; font-weight: 600; font-size: 0.95rem; cursor: pointer; margin-top: 0.5rem; }
   .primary:hover { opacity: 0.9; }
   .primary:disabled { opacity: 0.4; cursor: not-allowed; }
-  .result.error { margin-top: 0.5rem; padding: 0.6rem; border-radius: 8px; font-size: 0.8rem; background: #2a1a1a; color: #f87171; border: 1px solid #3a2020; }
-  .credential-note { font-size: 0.8rem; color: #999; margin-bottom: 1rem; }
+  .result.error { margin-top: 0.5rem; padding: 0.6rem; border-radius: 8px; font-size: 0.8rem; background: #2a1a1a; color: #fca5a5; border: 1px solid #7f1d1d; }
+  .credential-note { font-size: 0.8rem; color: #c7c7d2; margin-bottom: 1rem; }
   .success-icon { font-size: 3rem; color: #4ade80; text-align: center; margin-bottom: 1rem; background: #1a3a2e; width: 80px; height: 80px; border-radius: 50%; display: flex; align-items: center; justify-content: center; margin: 0 auto 1.5rem; }
 </style>

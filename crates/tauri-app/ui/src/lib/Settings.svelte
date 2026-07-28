@@ -1,8 +1,5 @@
 <script>
   import { invoke } from '@tauri-apps/api/core';
-  import { createEventDispatcher } from 'svelte';
-
-  const dispatch = createEventDispatcher();
 
   let config = {};
   let provider = 'azure-openai';
@@ -119,7 +116,11 @@
     {/if}
 
     {#if message}
-      <div class="message" class:success={message.startsWith('✓')}>{message}</div>
+      <div
+        class="message"
+        class:success={message.startsWith('✓')}
+        role={message.startsWith('✓') ? 'status' : 'alert'}
+      >{message}</div>
     {/if}
 
     <button on:click={save} disabled={saving || (provider !== 'local' && !configuredProviders.includes(provider) && !providerCredential.trim())}>
@@ -137,15 +138,15 @@
 <style>
   .settings { padding: 2rem; max-width: 600px; overflow-y: auto; }
   h2 { margin: 0 0 1.5rem; font-size: 1.3rem; }
-  h3 { font-size: 0.85rem; color: #888; text-transform: uppercase; letter-spacing: 0.05em; margin: 1.5rem 0 0.75rem; }
-  section { background: #1a1a2e; border: 1px solid #2a2a44; border-radius: 12px; padding: 1.25rem; margin-bottom: 1rem; }
-  label { display: block; margin-bottom: 0.75rem; font-size: 0.8rem; color: #999; }
-  select, input { display: block; width: 100%; margin-top: 0.25rem; padding: 0.5rem 0.75rem; border-radius: 8px; border: 1px solid #333; background: #12121f; color: #eee; font-size: 0.85rem; box-sizing: border-box; }
-  button { width: 100%; padding: 0.6rem; border-radius: 8px; border: none; background: #4a90d9; color: white; font-weight: 600; cursor: pointer; margin-top: 0.5rem; }
+  h3 { font-size: 0.85rem; color: #b9b9c8; text-transform: uppercase; letter-spacing: 0.05em; margin: 1.5rem 0 0.75rem; }
+  section { background: #1a1a2e; border: 1px solid #3f3f5a; border-radius: 12px; padding: 1.25rem; margin-bottom: 1rem; }
+  label { display: block; margin-bottom: 0.75rem; font-size: 0.8rem; color: #c7c7d2; }
+  select, input { display: block; width: 100%; min-height: 44px; margin-top: 0.25rem; padding: 0.5rem 0.75rem; border-radius: 8px; border: 1px solid #66667a; background: #12121f; color: #eee; font-size: 0.85rem; box-sizing: border-box; }
+  button { width: 100%; min-height: 44px; padding: 0.6rem; border-radius: 8px; border: none; background: #3276bd; color: white; font-weight: 600; cursor: pointer; margin-top: 0.5rem; }
   button:disabled { opacity: 0.5; }
   button.secondary { background: transparent; color: #fca5a5; border: 1px solid #7f1d1d; margin-bottom: 0.5rem; }
   .message { margin-top: 0.5rem; font-size: 0.8rem; color: #f87171; }
-  .message.success { color: #4ade80; }
-  .hint { font-size: 0.75rem; color: #555; margin: 0.25rem 0; }
-  .credential-status { font-size: 0.8rem; color: #999; line-height: 1.5; }
+  .message.success { color: #86efac; }
+  .hint { font-size: 0.75rem; color: #b9b9c8; margin: 0.25rem 0; }
+  .credential-status { font-size: 0.8rem; color: #c7c7d2; line-height: 1.5; }
 </style>

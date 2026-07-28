@@ -2447,7 +2447,7 @@ mod tls_tests {
         let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
             .expect("generate self-signed cert");
         let cert_der = cert.cert.der().clone();
-        let key_der = rustls::pki_types::PrivateKeyDer::try_from(cert.key_pair.serialize_der())
+        let key_der = rustls::pki_types::PrivateKeyDer::try_from(cert.signing_key.serialize_der())
             .expect("private key der");
 
         let server_config = rustls::ServerConfig::builder()

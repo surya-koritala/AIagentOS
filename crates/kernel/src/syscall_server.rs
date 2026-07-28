@@ -5993,7 +5993,7 @@ memory = ["remember this"]
         let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
             .expect("generate self-signed cert");
         let cert_der = cert.cert.der().clone();
-        let key_der = rustls::pki_types::PrivateKeyDer::try_from(cert.key_pair.serialize_der())
+        let key_der = rustls::pki_types::PrivateKeyDer::try_from(cert.signing_key.serialize_der())
             .expect("private key der");
 
         let server_config = rustls::ServerConfig::builder()
@@ -6014,7 +6014,7 @@ memory = ["remember this"]
 
         server_config_from_pem(
             cert.cert.pem().as_bytes(),
-            cert.key_pair.serialize_pem().as_bytes(),
+            cert.signing_key.serialize_pem().as_bytes(),
         )
         .expect("PEM certificate and key should build a server config");
     }
@@ -6024,7 +6024,7 @@ memory = ["remember this"]
         let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
             .expect("generate self-signed cert");
         let cert_pem = cert.cert.pem();
-        let key_pem = cert.key_pair.serialize_pem();
+        let key_pem = cert.signing_key.serialize_pem();
 
         let missing_cert = server_config_from_pem(b"", key_pem.as_bytes())
             .expect_err("missing certificate should fail");

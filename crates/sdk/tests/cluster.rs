@@ -73,8 +73,8 @@ fn mutual_tls_configs() -> (
     rustls::ClientConfig,
 ) {
     use rcgen::{
-        BasicConstraints, CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair,
-        KeyUsagePurpose,
+        BasicConstraints, CertificateParams, CertifiedIssuer, ExtendedKeyUsagePurpose, IsCa,
+        KeyPair, KeyUsagePurpose,
     };
 
     let _ = rustls::crypto::ring::default_provider().install_default();
@@ -86,21 +86,21 @@ fn mutual_tls_configs() -> (
         KeyUsagePurpose::KeyCertSign,
         KeyUsagePurpose::CrlSign,
     ];
-    let ca_cert = ca_params.self_signed(&ca_key).expect("self-sign CA");
+    let ca_cert = CertifiedIssuer::self_signed(ca_params, ca_key).expect("self-sign CA");
 
     let server_key = KeyPair::generate().expect("generate server key");
     let mut server_params =
         CertificateParams::new(vec!["localhost".to_string()]).expect("server params");
     server_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
     let server_cert = server_params
-        .signed_by(&server_key, &ca_cert, &ca_key)
+        .signed_by(&server_key, &ca_cert)
         .expect("sign server certificate");
 
     let client_key = KeyPair::generate().expect("generate client key");
     let mut client_params = CertificateParams::new(Vec::<String>::new()).expect("client params");
     client_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
     let client_cert = client_params
-        .signed_by(&client_key, &ca_cert, &ca_key)
+        .signed_by(&client_key, &ca_cert)
         .expect("sign client certificate");
 
     let server = kernel::syscall_server::server_config_from_pem_with_client_ca(

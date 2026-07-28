@@ -204,6 +204,8 @@
   .empty { color: #b9b9c8; font-size: 0.85rem; }
   .unavailable { padding: 0.75rem; border: 1px solid #6b531c; border-radius: 8px; background: #352a12; color: #fde68a; }
   @media (max-width: 700px) {
+    .operations { padding: 1rem; }
+    .agent-grid { grid-template-columns: 1fr; }
     .details { grid-template-columns: 1fr; }
     .compact-list li { flex-direction: column; }
   }

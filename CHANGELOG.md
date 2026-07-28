@@ -10,6 +10,15 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
 
 ## [Unreleased]
 
+- Added rendered accessibility regression coverage for the production desktop
+  frontend bundle. Lockfile-pinned Playwright Chromium and axe now scan the
+  dashboard, operations, settings, and setup states against WCAG A/AA rules and
+  prove skip-link keyboard behavior, visible focus, modal focus containment,
+  320 CSS-pixel page reflow, and reduced-motion suppression in blocking CI.
+  Responsive shell, navigation, dashboard, and operator-card layouts now avoid
+  page-level horizontal scrolling at the narrow regression viewport. Exact
+  native-webview, text-scaling, signed-artifact, and platform screen-reader
+  qualification remain open under #126.
 - Added bounded, offline, machine-readable policy validation and explanation
   to the canonical `agentctl` surface, sharing the runtime `PolicyDocument` and
   MAC evaluator. Added live SDK-backed gate-counter, node-control-audit, and

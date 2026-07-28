@@ -160,8 +160,10 @@ jobs:
         run: npm run check
       - name: Operator UI state regressions
         run: npm test
-      - name: Production frontend build
-        run: npm run build
+      - name: Install pinned Chromium accessibility runtime
+        run: npx playwright install --with-deps chromium
+      - name: Rendered production UI accessibility regressions
+        run: npm run test:a11y
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: tauri-ui-dist

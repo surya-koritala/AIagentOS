@@ -86,4 +86,8 @@
   @media (max-width: 900px) {
     .stats { grid-template-columns: repeat(2, 1fr); }
   }
+  @media (max-width: 500px) {
+    .dashboard { padding: 1rem; }
+    .agent-grid { grid-template-columns: 1fr; }
+  }
 </style>

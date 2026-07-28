@@ -157,4 +157,9 @@
       transition-duration: 0.01ms !important;
     }
   }
+  @media (max-width: 700px) {
+    .app-layout { flex-direction: column; height: auto; min-height: 100vh; }
+    .content { overflow: visible; }
+    .detail-sidebar { width: 100%; border-left: 0; border-top: 1px solid #1e1e33; }
+  }
 </style>

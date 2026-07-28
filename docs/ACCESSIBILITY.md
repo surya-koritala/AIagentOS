@@ -24,17 +24,30 @@ cd crates/tauri-app/ui
 npm ci
 npm run check
 npm test
-npm run build
+npx playwright install --with-deps chromium
+npm run test:a11y
 ```
 
 `svelte-check --fail-on-warnings` treats Svelte compiler accessibility
 diagnostics as failures. `accessibility.test.js` retains source-level contracts
 for keyboard focus, reduced motion, modal semantics and focus containment,
 control names, live regions, current navigation state, and the prohibition on
-simulated activity. The production build must also succeed.
+simulated activity.
+
+`npm run test:a11y` builds the production frontend bundle, serves that exact
+bundle on loopback, and uses a lockfile-pinned Playwright Chromium with
+`@axe-core/playwright`. A deterministic in-page Tauri IPC fixture supplies
+non-secret setup and operator snapshots. The rendered suite scans the dashboard,
+operator status, settings, and setup dialog against WCAG 2 A/AA, 2.1 A/AA, and
+2.2 AA axe rules. It also proves keyboard skip-link navigation, visible focus,
+setup-dialog focus containment, page-level reflow at a 320 CSS-pixel viewport,
+and reduced-motion suppression. Browser traces and screenshots are retained only
+for failed CI cases.
 
 These checks prevent known regressions but do not replace assistive-technology
-testing, visual contrast measurement, zoom/reflow inspection, or user testing.
+testing, exact native-webview testing, platform text scaling, visual inspection,
+or user testing. Automated contrast and reflow checks reduce risk; the manual
+matrix below remains authoritative for the signed release candidate.
 
 ## Manual release checklist
 

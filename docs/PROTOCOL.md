@@ -144,6 +144,25 @@ the next client operation must reconnect. Closing a transport during an
 in-flight request is not a cancellation signal—stream cancellation remains the
 explicit request-id operation described below.
 
+### Reconnect and replay safety
+
+A `ConnectionProfile` session used by the SDK, `agentctl`, TUI, and desktop
+renegotiates the protocol and restores its latest successfully authenticated
+credential after a broken transport. An explicitly enumerated read-only
+operation may then be replayed once. A second transport failure is returned to
+the caller; reconnect never loops without a bound. New protocol operations are
+non-replayable by default until they are deliberately classified as read-only.
+
+Side-effecting requests are never replayed automatically. If a connection
+breaks after a package mutation, lifecycle transition, tool call, agent turn,
+or any other mutable request may have reached the server, the SDK returns
+`SdkError::IndeterminateMutation`, marks the connection for recovery, and
+requires the caller to inspect authoritative state before deciding what to do.
+Streaming turns follow the same rule and never restart after a lost frame.
+The next operation reconnects, but it does not resubmit the earlier mutation.
+Direct `KernelClient::connect` sessions have no stored profile and continue to
+return the underlying transport error without automatic reconnect.
+
 ### Message streaming and request cancellation
 
 Protocol v2 advertises `token_streaming` and `request_id_cancellation`. Start a

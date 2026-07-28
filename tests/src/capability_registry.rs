@@ -544,6 +544,40 @@ fn high_risk_client_actions_keep_target_bound_confirmation() {
 }
 
 #[test]
+fn reconnect_contract_is_bounded_and_fail_closed() {
+    let protocol = read_workspace_file("docs/PROTOCOL.md");
+    for contract in [
+        "may then be replayed once.",
+        "non-replayable by default",
+        "Side-effecting requests are never replayed automatically.",
+        "`SdkError::IndeterminateMutation`",
+        "it does not resubmit the earlier mutation.",
+    ] {
+        assert!(
+            protocol.contains(contract),
+            "reconnect protocol lost fail-closed contract {contract:?}"
+        );
+    }
+
+    let sdk = read_workspace_file("crates/sdk/src/lib.rs");
+    for contract in [
+        "fn safe_to_replay_after_reconnect",
+        "Err(SdkError::IndeterminateMutation { operation, source })",
+        "self.reconnect().await?",
+    ] {
+        assert!(
+            sdk.contains(contract),
+            "SDK reconnect implementation lost {contract:?}"
+        );
+    }
+    assert!(
+        read_workspace_file("crates/sdk/tests/reconnect.rs")
+            .contains("reconnect_replays_reads_but_never_package_lifecycle_or_tool_mutations"),
+        "response-loss duplicate-prevention regression was removed"
+    );
+}
+
+#[test]
 fn release_blocking_workflows_keep_their_security_contract() {
     let ci = read_workspace_file(".github/workflows/ci.yml");
     for os in ["ubuntu-latest", "macos-latest", "windows-latest"] {

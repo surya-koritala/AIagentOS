@@ -481,6 +481,36 @@ fn release_blocking_workflows_keep_their_security_contract() {
         );
     }
 
+    let external_deletion =
+        read_workspace_file(".github/workflows/external-deletion-qualification.yml");
+    assert!(
+        external_deletion.contains("workflow_dispatch:")
+            && !external_deletion.contains("pull_request:")
+            && !external_deletion.contains("schedule:"),
+        "external deletion qualification must remain an explicit protected gate"
+    );
+    for proof in [
+        "runs-on: [self-hosted, linux, x64, agentos-external-data]",
+        "environment: external-data-qualification",
+        "AGENTOS_EXTERNAL_DELETION_EVIDENCE_DIR: ${{ vars.AGENTOS_EXTERNAL_DELETION_EVIDENCE_DIR }}",
+        "single-node-linux-rootless-container-cli",
+        "refs/tags/${AGENTOS_RELEASE_CANDIDATE}^{commit}",
+        "scripts/external_deletion_qualification.py --validate",
+        "--expected-commit \"$GITHUB_SHA\"",
+        "--require-eligible",
+        "exact_release_candidate_external_deletion_retention",
+        "external/remote-backup-copies",
+        "immutable-retention-then-delete",
+        "external_deletion_retention_proof_eligible",
+        "production_claim_allowed",
+        "retention-days: 90",
+    ] {
+        assert!(
+            external_deletion.contains(proof),
+            "external deletion workflow lost {proof:?}"
+        );
+    }
+
     let live = read_workspace_file(".github/workflows/live-provider-qualification.yml");
     assert!(
         live.contains("workflow_dispatch:") && !live.contains("pull_request:"),
@@ -565,6 +595,7 @@ fn release_blocking_workflows_keep_their_security_contract() {
     for workflow in [
         ".github/workflows/ci.yml",
         ".github/workflows/extended-security.yml",
+        ".github/workflows/external-deletion-qualification.yml",
         ".github/workflows/live-provider-qualification.yml",
         ".github/workflows/release.yml",
     ] {

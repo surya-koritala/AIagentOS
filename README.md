@@ -171,6 +171,14 @@ storage key, erasure fails before the live database is changed. Replicated or
 offline-created copies remain governed by their external retention/deletion
 policy.
 
+The versioned
+[external deletion and retention qualification](docs/EXTERNAL_DELETION_QUALIFICATION.md)
+maps every external-system inventory entry to a configured lifecycle exercise
+or an exact-configuration `not-configured` disposition. Its protected exact-RC
+gate recalculates deletion timelines and requires fresh-principal absence plus
+independent review. The gate is implemented, but no eligible target exercise
+has been published; it does not make external deletion automatic.
+
 For production, generate an operator signing identity once, retain the public
 trust JSON in an independent recovery location, and mount the owner-only
 private key into the server:

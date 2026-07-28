@@ -751,6 +751,17 @@ pub const NON_SQLITE_DATA_INVENTORY: &[StaticDataInventoryEntry] = &[
         "forced cleanup on cancellation/stop/erasure or process exit"
     ),
     boundary_entry!(
+        "external/workspace-copies-and-mounts",
+        "external-system",
+        "external storage operator and requesting tenant",
+        "external workspace policy and requesting tenant",
+        "tool inputs, outputs, repository content, and generated artifacts",
+        "external workspace retention policy",
+        "external transport and storage policy; outside kernel control",
+        "excluded from AI Agent OS backup",
+        "external workspace deletion policy; not erased by local hot-delete"
+    ),
+    boundary_entry!(
         "external/provider-request-and-retention",
         "external-system",
         "provider account and requesting tenant",
@@ -887,5 +898,35 @@ mod tests {
         assert!(encoded.len() < 128 * 1024);
         let decoded: StorageDataInventory = serde_json::from_slice(&encoded).unwrap();
         assert_eq!(decoded, inventory);
+    }
+
+    #[test]
+    fn external_boundary_qualification_contract_matches_inventory() {
+        let contract: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../config/external-data-boundaries.json"
+        ))
+        .unwrap();
+        assert_eq!(contract["schema_version"], 1);
+        assert_eq!(
+            contract["profile_id"],
+            "single-node-linux-rootless-container-cli"
+        );
+        let contract_ids: BTreeSet<&str> = contract["boundaries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry["boundary_id"].as_str().unwrap())
+            .collect();
+        let inventory = storage_data_inventory();
+        let inventory_ids: BTreeSet<&str> = inventory
+            .entries
+            .iter()
+            .filter(|entry| entry.persistence == "external-system")
+            .map(|entry| entry.id.as_str())
+            .collect();
+        assert_eq!(
+            contract_ids, inventory_ids,
+            "every external data boundary must have one qualification disposition"
+        );
     }
 }

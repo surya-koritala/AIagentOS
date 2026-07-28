@@ -1,0 +1,143 @@
+name: External deletion and retention qualification
+
+# This protected manual gate validates evidence collected from the target
+# deployment and its real external services. It does not call provider APIs,
+# inject credentials, or turn fixtures and policy documents into proof.
+on:
+  workflow_dispatch:
+    inputs:
+      release_candidate:
+        description: Existing vX.Y.Z-rc.N or vX.Y.Z tag pointing at this workflow ref
+        required: true
+        type: string
+      environment_id:
+        description: Stable non-secret target deployment identifier
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: external-deletion-qualification
+  cancel-in-progress: false
+
+env:
+  AGENTOS_RELEASE_CANDIDATE: ${{ inputs.release_candidate }}
+  AGENTOS_QUALIFICATION_ENVIRONMENT: ${{ inputs.environment_id }}
+  AGENTOS_EXTERNAL_DELETION_EVIDENCE_DIR: ${{ vars.AGENTOS_EXTERNAL_DELETION_EVIDENCE_DIR }}
+  AGENTOS_STORAGE_PROFILE_ID: single-node-linux-rootless-container-cli
+
+jobs:
+  exact-release-candidate-external-deletion:
+    name: Exact-RC external deletion and retention evidence
+    runs-on: [self-hosted, linux, x64, agentos-external-data]
+    timeout-minutes: 15
+    environment: external-data-qualification
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+      - name: Validate the checked-in boundary contract
+        run: python3 scripts/external_deletion_qualification.py --validate
+      - name: Bind the release-candidate tag to this exact commit
+        run: |
+          [[ "$AGENTOS_RELEASE_CANDIDATE" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-rc\.[1-9][0-9]*)?$ ]]
+          test "$(git rev-parse "refs/tags/${AGENTOS_RELEASE_CANDIDATE}^{commit}")" = "$GITHUB_SHA"
+      - name: Require protected externally collected evidence
+        run: |
+          test -n "$AGENTOS_EXTERNAL_DELETION_EVIDENCE_DIR"
+          [[ "$AGENTOS_EXTERNAL_DELETION_EVIDENCE_DIR" = /* ]]
+          test -d "$AGENTOS_EXTERNAL_DELETION_EVIDENCE_DIR"
+          test ! -L "$AGENTOS_EXTERNAL_DELETION_EVIDENCE_DIR"
+          evidence_dir="$(realpath "$AGENTOS_EXTERNAL_DELETION_EVIDENCE_DIR")"
+          case "$evidence_dir" in
+            "$GITHUB_WORKSPACE"|"$GITHUB_WORKSPACE"/*)
+              echo "Evidence must remain outside the source checkout" >&2
+              exit 1
+              ;;
+          esac
+          observation="${evidence_dir}/external-deletion-observation.json"
+          review="${evidence_dir}/external-deletion-review.json"
+          test -f "$observation"
+          test ! -L "$observation"
+          test -f "$review"
+          test ! -L "$review"
+          test "$(stat -c %s "$observation")" -gt 0
+          test "$(stat -c %s "$observation")" -le 524288
+          test "$(stat -c %s "$review")" -gt 0
+          test "$(stat -c %s "$review")" -le 524288
+      - name: Validate exact-RC target observations and independent review
+        run: |
+          mkdir -p target/qualification
+          python3 scripts/external_deletion_qualification.py \
+            --observation \
+              "${AGENTOS_EXTERNAL_DELETION_EVIDENCE_DIR}/external-deletion-observation.json" \
+            --review \
+              "${AGENTOS_EXTERNAL_DELETION_EVIDENCE_DIR}/external-deletion-review.json" \
+            --expected-commit "$GITHUB_SHA" \
+            --expected-environment "$AGENTOS_QUALIFICATION_ENVIRONMENT" \
+            --release-candidate "$AGENTOS_RELEASE_CANDIDATE" \
+            --output target/qualification/external-deletion.json \
+            --require-eligible
+      - name: Verify bounded published evidence
+        run: |
+          report=target/qualification/external-deletion.json
+          test "$(jq -r .schema_version "$report")" = "1"
+          test "$(jq -r .qualification_class "$report")" = \
+            "exact_release_candidate_external_deletion_retention"
+          test "$(jq -r .release_candidate "$report")" = "$AGENTOS_RELEASE_CANDIDATE"
+          test "$(jq -r .source.commit "$report")" = "$GITHUB_SHA"
+          test "$(jq -r .source.dirty "$report")" = "false"
+          test "$(jq -r .environment.environment_id "$report")" = \
+            "$AGENTOS_QUALIFICATION_ENVIRONMENT"
+          test "$(jq -r .profile.profile_id "$report")" = "$AGENTOS_STORAGE_PROFILE_ID"
+          test "$(jq -r .profile.maximum_completion_seconds "$report")" = "2592000"
+          test "$(jq -r .external_boundary_inventory_complete "$report")" = "true"
+          test "$(jq -r .external_deletion_retention_proof_eligible "$report")" = "true"
+          test "$(jq -r .production_claim_allowed "$report")" = "false"
+          test "$(jq -r .review.reviewer_independent "$report")" = "true"
+          test "$(jq -r .review.decision "$report")" = "approved"
+          jq -e '
+            ([.systems[].boundary_id] | unique | length) == 6
+            and any(.systems[];
+              .boundary_id == "external/remote-backup-copies"
+              and .status == "configured"
+              and .lifecycle_mode == "immutable-retention-then-delete"
+              and .passed)
+            and all(.systems[];
+              .passed
+              and (if .status == "configured"
+                   then all(.checks[]; . == true)
+                   else .configuration_absence_verified == true
+                   end))
+          ' "$report"
+      - name: Publish summary
+        if: always()
+        run: |
+          {
+            printf '### Exact-RC external deletion and retention qualification\n\n'
+            printf -- '- Commit: `%s`\n' "$GITHUB_SHA"
+            printf -- '- Release candidate: `%s`\n' "$AGENTOS_RELEASE_CANDIDATE"
+            printf -- '- Environment: `%s`\n' "$AGENTOS_QUALIFICATION_ENVIRONMENT"
+            printf -- '- Profile: `%s`\n' "$AGENTOS_STORAGE_PROFILE_ID"
+            if test -f target/qualification/external-deletion.json; then
+              printf -- '- Evidence eligible: `%s`\n' \
+                "$(jq -r .external_deletion_retention_proof_eligible \
+                  target/qualification/external-deletion.json)"
+              printf -- '- Production claim allowed: `%s`\n' \
+                "$(jq -r .production_claim_allowed \
+                  target/qualification/external-deletion.json)"
+            else
+              printf -- '- Status: `failed before report publication`\n'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Retain bounded non-secret report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: external-deletion-${{ inputs.release_candidate }}-${{ github.sha }}
+          path: target/qualification/external-deletion.json
+          if-no-files-found: warn
+          retention-days: 90

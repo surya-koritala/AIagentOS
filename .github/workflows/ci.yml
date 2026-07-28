@@ -75,7 +75,7 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
         run: cargo doc --workspace --exclude tauri-app --no-deps --locked
-      - uses: taiki-e/install-action@7572810d7dd469b651bb7793945692cf78da5dd7
+      - uses: taiki-e/install-action@41049aa56687c35e0afa74eed4f09cec4f9afabf
         with:
           tool: mdbook@0.4.52
       - name: Documentation book builds
@@ -174,7 +174,7 @@ jobs:
         with:
           toolchain: 1.97.1
           components: llvm-tools-preview
-      - uses: taiki-e/install-action@7572810d7dd469b651bb7793945692cf78da5dd7
+      - uses: taiki-e/install-action@41049aa56687c35e0afa74eed4f09cec4f9afabf
         with:
           tool: cargo-llvm-cov@0.8.7
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2

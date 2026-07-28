@@ -1,6 +1,6 @@
 //! Small operator CLI for the public agent lifecycle API.
 
-use std::io::Write;
+use std::io::{Read, Write};
 use std::time::Duration;
 
 use agent_cli::OperatorClient;
@@ -9,7 +9,7 @@ use agent_sdk::ConnectionProfile;
 fn usage() -> ! {
     eprintln!(
         "usage: agentctl [--addr HOST:PORT] [--token TOKEN] \
-         <create|list|inspect|message|stream|cancel|checkpoints|checkpoint-resume|checkpoint-delete|capabilities|providers|metrics|protocol|pressure|tunables|tunable-set|tunable-rollback|tunable-history|status|pause|resume|stop|kill|wait|services|service-start|service-stop|service-restart|service-reload|service-history|backup-create|backup-retention|backup-status|data-inventory|backup-key-generate|backup-anchor-create|backup-verify|backup-restore|backup-disaster-recover|backup-corruption-recover|backup-remote-publish|backup-remote-fetch|storage-key-generate|storage-encrypt|storage-encrypt-recover|storage-key-rotate|storage-portable-export|storage-portable-verify|storage-portable-import|erase-agent|erase-user|erase-tenant> [ARGS...]\n\
+         <create|list|inspect|message|stream|cancel|checkpoints|checkpoint-resume|checkpoint-delete|capabilities|providers|metrics|protocol|package-trust-key|package-revoke-key|package-publish|package-yank|package-fetch|package-search|package-install|package-rollback|package-remove|packages|package-run|pressure|tunables|tunable-set|tunable-rollback|tunable-history|status|pause|resume|stop|kill|wait|services|service-start|service-stop|service-restart|service-reload|service-history|backup-create|backup-retention|backup-status|data-inventory|backup-key-generate|backup-anchor-create|backup-verify|backup-restore|backup-disaster-recover|backup-corruption-recover|backup-remote-publish|backup-remote-fetch|storage-key-generate|storage-encrypt|storage-encrypt-recover|storage-key-rotate|storage-portable-export|storage-portable-verify|storage-portable-import|erase-agent|erase-user|erase-tenant> [ARGS...]\n\
          \n\
          public runtime commands:\n\
            agentctl [SERVER OPTIONS] create NAME TASK [PROVIDER [PROFILE [PRIORITY]]]\n\
@@ -23,6 +23,19 @@ fn usage() -> ! {
            agentctl [SERVER OPTIONS] providers\n\
            agentctl [SERVER OPTIONS] metrics\n\
            agentctl [SERVER OPTIONS] protocol\n\
+         \n\
+         signed package commands:\n\
+           agentctl [SERVER OPTIONS] package-trust-key PUBLISHER KEY_ID PUBLIC_KEY_FILE VALID_FROM [--valid-until RFC3339] [--supersedes KEY_ID]\n\
+           agentctl [SERVER OPTIONS] package-revoke-key KEY_ID --confirm KEY_ID\n\
+           agentctl [SERVER OPTIONS] package-publish ARCHIVE_FILE\n\
+           agentctl [SERVER OPTIONS] package-yank NAME VERSION --confirm NAME@VERSION\n\
+           agentctl [SERVER OPTIONS] package-fetch NAME VERSION OUTPUT_FILE\n\
+           agentctl [SERVER OPTIONS] package-search QUERY\n\
+           agentctl [SERVER OPTIONS] package-install NAME [REQUIREMENT]\n\
+           agentctl [SERVER OPTIONS] package-rollback NAME --confirm NAME\n\
+           agentctl [SERVER OPTIONS] package-remove NAME --confirm NAME\n\
+           agentctl [SERVER OPTIONS] packages\n\
+           agentctl [SERVER OPTIONS] package-run NAME\n\
          \n\
          storage commands:\n\
            agentctl [SERVER OPTIONS] backup-create BACKUP_ROOT NAME\n\
@@ -65,6 +78,29 @@ struct RemoteBackupOptions {
     storage_key: Option<String>,
     allow_loopback_http: bool,
     confirmed_compliance_lock: bool,
+}
+
+#[derive(Default)]
+struct PackageTrustOptions {
+    valid_until: Option<String>,
+    supersedes: Option<String>,
+}
+
+fn parse_package_trust_options(values: impl IntoIterator<Item = String>) -> PackageTrustOptions {
+    let mut values = values.into_iter();
+    let mut parsed = PackageTrustOptions::default();
+    while let Some(value) = values.next() {
+        match value.as_str() {
+            "--valid-until" if parsed.valid_until.is_none() => {
+                parsed.valid_until = Some(values.next().unwrap_or_else(|| usage()));
+            }
+            "--supersedes" if parsed.supersedes.is_none() => {
+                parsed.supersedes = Some(values.next().unwrap_or_else(|| usage()));
+            }
+            _ => usage(),
+        }
+    }
+    parsed
 }
 
 impl Default for RemoteBackupOptions {
@@ -850,6 +886,172 @@ async fn main() {
             print_json(&protocol, "protocol description");
             return;
         }
+        "package-trust-key" => {
+            let publisher = args.next().unwrap_or_else(|| usage());
+            let key_id = args.next().unwrap_or_else(|| usage());
+            let public_key_file = args.next().unwrap_or_else(|| usage());
+            let valid_from = args.next().unwrap_or_else(|| usage());
+            let options = parse_package_trust_options(args.collect::<Vec<_>>());
+            let public_key = read_bounded_file(&public_key_file, 4 * 1024, "package public key");
+            client
+                .trust_package_key(
+                    publisher,
+                    &key_id,
+                    &public_key,
+                    valid_from,
+                    options.valid_until,
+                    options.supersedes,
+                )
+                .await
+                .unwrap_or_else(|error| fail(error));
+            print_json(
+                &serde_json::json!({ "key_id": key_id, "status": "trusted" }),
+                "package trust result",
+            );
+            return;
+        }
+        "package-revoke-key" => {
+            let key_id = args.next().unwrap_or_else(|| usage());
+            require_target_confirmation(&mut args, &key_id);
+            client
+                .revoke_package_key(&key_id)
+                .await
+                .unwrap_or_else(|error| fail(error));
+            print_json(
+                &serde_json::json!({ "key_id": key_id, "status": "revoked" }),
+                "package key revocation result",
+            );
+            return;
+        }
+        "package-publish" => {
+            let archive_file = args.next().unwrap_or_else(|| usage());
+            if args.next().is_some() {
+                usage();
+            }
+            let archive = read_bounded_file(
+                &archive_file,
+                kernel::package::MAX_ARCHIVE_BYTES,
+                "signed package archive",
+            );
+            let package = client
+                .publish_package(&archive)
+                .await
+                .unwrap_or_else(|error| fail(error));
+            print_json(&package, "published package");
+            return;
+        }
+        "package-yank" => {
+            let name = args.next().unwrap_or_else(|| usage());
+            let version = args.next().unwrap_or_else(|| usage());
+            let target = format!("{name}@{version}");
+            require_target_confirmation(&mut args, &target);
+            client
+                .yank_package(&name, &version)
+                .await
+                .unwrap_or_else(|error| fail(error));
+            print_json(
+                &serde_json::json!({ "package": name, "version": version, "yanked": true }),
+                "package yank result",
+            );
+            return;
+        }
+        "package-fetch" => {
+            let name = args.next().unwrap_or_else(|| usage());
+            let version = args.next().unwrap_or_else(|| usage());
+            let output_file = args.next().unwrap_or_else(|| usage());
+            if args.next().is_some() {
+                usage();
+            }
+            let archive = client
+                .fetch_package(&name, &version)
+                .await
+                .unwrap_or_else(|error| fail(error));
+            write_new_file(&output_file, &archive, "fetched package archive");
+            print_json(
+                &serde_json::json!({
+                    "package": name,
+                    "version": version,
+                    "output": output_file,
+                    "bytes": archive.len(),
+                }),
+                "package fetch result",
+            );
+            return;
+        }
+        "package-search" => {
+            let query = args.next().unwrap_or_else(|| usage());
+            if args.next().is_some() {
+                usage();
+            }
+            let packages = client
+                .search_packages(query)
+                .await
+                .unwrap_or_else(|error| fail(error));
+            print_json(&packages, "package search results");
+            return;
+        }
+        "package-install" => {
+            let name = args.next().unwrap_or_else(|| usage());
+            let requirement = args.next().unwrap_or_else(|| "*".into());
+            if args.next().is_some() {
+                usage();
+            }
+            let package = client
+                .install_package(name, requirement)
+                .await
+                .unwrap_or_else(|error| fail(error));
+            print_json(&package, "installed package");
+            return;
+        }
+        "package-rollback" => {
+            let name = args.next().unwrap_or_else(|| usage());
+            require_target_confirmation(&mut args, &name);
+            let package = client
+                .rollback_package(name)
+                .await
+                .unwrap_or_else(|error| fail(error));
+            print_json(&package, "rolled-back package");
+            return;
+        }
+        "package-remove" => {
+            let name = args.next().unwrap_or_else(|| usage());
+            require_target_confirmation(&mut args, &name);
+            client
+                .remove_package(&name)
+                .await
+                .unwrap_or_else(|error| fail(error));
+            print_json(
+                &serde_json::json!({ "package": name, "removed": true }),
+                "package removal result",
+            );
+            return;
+        }
+        "packages" => {
+            if args.next().is_some() {
+                usage();
+            }
+            let packages = client
+                .list_installed_packages()
+                .await
+                .unwrap_or_else(|error| fail(error));
+            print_json(&packages, "installed packages");
+            return;
+        }
+        "package-run" => {
+            let name = args.next().unwrap_or_else(|| usage());
+            if args.next().is_some() {
+                usage();
+            }
+            let id = client
+                .run_installed_package(&name)
+                .await
+                .unwrap_or_else(|error| fail(error));
+            print_json(
+                &serde_json::json!({ "package": name, "agent_id": id }),
+                "package run result",
+            );
+            return;
+        }
         "pressure" => {
             let stats = client
                 .context_pressure(args.next().unwrap_or_else(|| usage()))
@@ -1201,6 +1403,37 @@ fn print_json(value: &impl serde::Serialize, label: &str) {
             agent_sdk::SdkError::Kernel(format!("{label} encoding failed: {error}"))
         ))
     );
+}
+
+fn read_bounded_file(path: &str, max_bytes: usize, label: &str) -> Vec<u8> {
+    let file = std::fs::File::open(path)
+        .unwrap_or_else(|error| fail_operator(format!("failed to open {label} {path}: {error}")));
+    let limit = u64::try_from(max_bytes)
+        .unwrap_or(u64::MAX)
+        .saturating_add(1);
+    let mut bytes = Vec::new();
+    file.take(limit)
+        .read_to_end(&mut bytes)
+        .unwrap_or_else(|error| fail_operator(format!("failed to read {label} {path}: {error}")));
+    if bytes.len() > max_bytes {
+        fail_operator(format!("{label} {path} exceeds the {max_bytes}-byte limit"));
+    }
+    bytes
+}
+
+fn write_new_file(path: &str, bytes: &[u8], label: &str) {
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .unwrap_or_else(|error| {
+            fail_operator(format!(
+                "failed to create {label} {path} without overwriting an existing file: {error}"
+            ))
+        });
+    file.write_all(bytes)
+        .and_then(|()| file.sync_all())
+        .unwrap_or_else(|error| fail_operator(format!("failed to write {label} {path}: {error}")));
 }
 
 fn require_target_confirmation<I>(args: &mut std::iter::Peekable<I>, target: &str)

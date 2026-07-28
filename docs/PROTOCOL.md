@@ -47,6 +47,17 @@ the exact active request. Global Prometheus metrics still require a trusted
 system operator; a tenant credential cannot use the command to bypass that
 wire authorization.
 
+The signed-package lifecycle is also available through the same canonical
+client: `package-trust-key`, `package-revoke-key`, `package-publish`,
+`package-yank`, `package-fetch`, `package-search`, `package-install`,
+`package-rollback`, `package-remove`, `packages`, and `package-run`. Trust,
+publication, installation, rollback, removal, and execution retain the wire
+protocol's administrator authorization; search, fetch, and installed-package
+listing retain their read-only authorization. Fetch creates a new output file
+and refuses to overwrite an existing path. Revocation, yanking, rollback, and
+removal require `--confirm` followed by the exact key, `name@version`, or
+package name so scripts cannot accidentally confirm a different target.
+
 ## Version and feature negotiation
 
 The wire protocol is versioned independently from the crate. Protocol v2 serves

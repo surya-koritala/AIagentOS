@@ -238,9 +238,9 @@ release = "v0.6"
 tracking_issue = 119
 kernel_modules = ["agent_package", "agentpkg", "package", "tool_registry_share"]
 source_paths = ["crates/kernel/src/package.rs", "crates/kernel/src/agent_package.rs", "crates/kernel/src/context.rs", "docs/AGENT_PACKAGE.md"]
-public_entry_points = ["crates/kernel/src/syscall_server.rs::Syscall::PublishPackage", "crates/kernel/src/syscall_server.rs::Syscall::InstallPackage", "crates/kernel/src/syscall_server.rs::Syscall::RunInstalledPackage", "crates/sdk/src/lib.rs::KernelClient::publish_package", "crates/sdk/src/lib.rs::KernelClient::install_package", "crates/sdk/src/lib.rs::KernelClient::run_installed_package"]
+public_entry_points = ["crates/kernel/src/syscall_server.rs::Syscall::PublishPackage", "crates/kernel/src/syscall_server.rs::Syscall::InstallPackage", "crates/kernel/src/syscall_server.rs::Syscall::RunInstalledPackage", "crates/sdk/src/lib.rs::KernelClient::publish_package", "crates/sdk/src/lib.rs::KernelClient::install_package", "crates/sdk/src/lib.rs::KernelClient::run_installed_package", "crates/cli/src/bin/agentctl.rs"]
 runtime_call_paths = ["crates/kernel/src/syscall_server.rs", "crates/kernel/src/package.rs::PackageRegistry", "crates/kernel/src/agent_package.rs::load_package_for_tenant"]
-test_evidence = ["crates/kernel/src/package.rs", "crates/kernel/src/agent_package.rs", "tests/src/package_supply_chain_e2e.rs"]
+test_evidence = ["crates/kernel/src/package.rs", "crates/kernel/src/agent_package.rs", "tests/src/package_supply_chain_e2e.rs", "crates/cli/tests/package_commands.rs"]
 platforms = ["linux", "macos", "windows"]
 limitations = ["Packages are declarative data and do not carry native executable code. The authenticated kernel wire protocol is the remote registry transport; federation and public anonymous mirrors are not included. Marketplace ratings/download counters are excluded from v1. Independent penetration testing and the final release decision remain tracked by #127."]
 

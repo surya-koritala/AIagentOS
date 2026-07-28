@@ -547,6 +547,52 @@ mod tests {
             .await
             .is_empty());
 
+        let literal_agent = uuid::Uuid::new_v4();
+        let literal_argument = "literal; touch /workspace/injected-by-shell";
+        let literal = execute_hardened(
+            literal_agent,
+            &workspace,
+            &image,
+            Some(64 * 1024 * 1024),
+            "/bin/echo",
+            &[literal_argument.into()],
+        )
+        .await
+        .expect("literal argv execution");
+        assert_eq!(literal["stdout"], format!("{literal_argument}\n"));
+        assert!(
+            !workspace.join("injected-by-shell").exists(),
+            "arguments must never receive implicit shell interpretation"
+        );
+        assert!(
+            listed_containers(&format!("label=aiagentos.agent={literal_agent}"))
+                .await
+                .is_empty(),
+            "literal argv execution must remove its container"
+        );
+
+        let oversized_agent = uuid::Uuid::new_v4();
+        let oversized = execute_hardened(
+            oversized_agent,
+            &workspace,
+            &image,
+            Some(64 * 1024 * 1024),
+            "/bin/sh",
+            &["-c".into(), "yes x | head -c 1048577".into()],
+        )
+        .await
+        .expect_err("oversized stdout must fail closed");
+        assert!(
+            oversized.contains("stdout exceeded sandbox limit"),
+            "unexpected oversized stdout result: {oversized}"
+        );
+        assert!(
+            listed_containers(&format!("label=aiagentos.agent={oversized_agent}"))
+                .await
+                .is_empty(),
+            "oversized stdout must still remove its container"
+        );
+
         let cancelled_agent = uuid::Uuid::new_v4();
         let cancelled = tokio::time::timeout(
             std::time::Duration::from_millis(750),
@@ -654,7 +700,10 @@ mod tests {
                     "read_only_root": true,
                     "network_denied": true,
                     "private_workspace_write": true,
+                    "literal_argv_no_implicit_shell": true,
+                    "stdout_limit_enforced": true,
                     "cancellation_cleanup": true,
+                    "hung_process_cleanup": true,
                     "crash_orphan_cleanup": true
                 },
                 "passed": true

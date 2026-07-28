@@ -133,6 +133,18 @@ pub enum SdkError {
     #[error("transport error: {0}")]
     Transport(#[from] std::io::Error),
 
+    /// The request was side-effecting and the transport failed after dispatch
+    /// may have begun. The client deliberately does not replay it: callers must
+    /// reconnect, inspect authoritative state, and reconcile explicitly.
+    #[error(
+        "{operation} outcome is indeterminate after a transport failure; the request was not replayed: {source}"
+    )]
+    IndeterminateMutation {
+        operation: &'static str,
+        #[source]
+        source: std::io::Error,
+    },
+
     /// The kernel replied with a variant that doesn't correspond to the
     /// syscall that was issued. Indicates a protocol mismatch.
     #[error("unexpected reply for {expected}: {got}")]
@@ -284,6 +296,15 @@ impl ConnectionProfile {
 
     /// Connect, negotiate protocol compatibility, and optionally authenticate.
     pub async fn connect(&self, token: Option<&str>) -> Result<KernelClient, SdkError> {
+        let mut client = self.connect_once(token).await?;
+        client.reconnect = Some(ReconnectSettings {
+            profile: self.clone(),
+            token: token.map(ToOwned::to_owned),
+        });
+        Ok(client)
+    }
+
+    async fn connect_once(&self, token: Option<&str>) -> Result<KernelClient, SdkError> {
         let connect = async {
             let mut client = match &self.transport {
                 ConnectionTransport::Plaintext => KernelClient::connect(&self.address).await?,
@@ -329,7 +350,7 @@ impl ConnectionProfile {
                 }
             };
             if let Some(token) = token {
-                client.authenticate(token).await?;
+                client.authenticate_once(token).await?;
             }
             Ok(client)
         };
@@ -464,6 +485,15 @@ pub struct Metrics {
 /// address and [`connect`](Self::connect) again for concurrent callers.
 pub struct KernelClient {
     inner: SyscallClient,
+    reconnect: Option<ReconnectSettings>,
+    needs_reconnect: bool,
+    reconnect_generation: u64,
+}
+
+#[derive(Clone)]
+struct ReconnectSettings {
+    profile: ConnectionProfile,
+    token: Option<String>,
 }
 
 impl KernelClient {
@@ -471,6 +501,9 @@ impl KernelClient {
     pub async fn connect(addr: impl ToSocketAddrs) -> Result<Self, SdkError> {
         let mut client = Self {
             inner: SyscallClient::connect(addr).await?,
+            reconnect: None,
+            needs_reconnect: false,
+            reconnect_generation: 0,
         };
         client.hello().await?;
         Ok(client)
@@ -487,6 +520,9 @@ impl KernelClient {
     ) -> Result<Self, SdkError> {
         let mut client = Self {
             inner: SyscallClient::connect_tls(addr, server_name, config).await?,
+            reconnect: None,
+            needs_reconnect: false,
+            reconnect_generation: 0,
         };
         client.hello().await?;
         Ok(client)
@@ -494,7 +530,66 @@ impl KernelClient {
 
     /// Build a [`KernelClient`] from an already-connected [`SyscallClient`].
     pub fn from_client(inner: SyscallClient) -> Self {
-        Self { inner }
+        Self {
+            inner,
+            reconnect: None,
+            needs_reconnect: false,
+            reconnect_generation: 0,
+        }
+    }
+
+    /// Number of successful transport recoveries performed by a connection
+    /// profile. Direct `KernelClient::connect` sessions remain at zero.
+    pub fn reconnect_generation(&self) -> u64 {
+        self.reconnect_generation
+    }
+
+    /// Re-establish a profile-backed connection, renegotiate the protocol, and
+    /// restore the latest successfully authenticated credential.
+    pub async fn reconnect(&mut self) -> Result<(), SdkError> {
+        let settings = self.reconnect.clone().ok_or_else(|| {
+            SdkError::Configuration(
+                "this client was not created from a reconnectable connection profile".into(),
+            )
+        })?;
+        let replacement = settings
+            .profile
+            .connect_once(settings.token.as_deref())
+            .await?;
+        self.inner = replacement.inner;
+        self.needs_reconnect = false;
+        self.reconnect_generation = self.reconnect_generation.saturating_add(1);
+        Ok(())
+    }
+
+    async fn ensure_connected(&mut self) -> Result<(), SdkError> {
+        if self.needs_reconnect {
+            self.reconnect().await?;
+        }
+        Ok(())
+    }
+
+    async fn authenticate_once(&mut self, token: &str) -> Result<(), SdkError> {
+        match self
+            .inner
+            .call(Syscall::Authenticate {
+                token: token.to_string(),
+            })
+            .await?
+        {
+            SyscallReply::Authenticated => Ok(()),
+            SyscallReply::Error { message } => Err(SdkError::Kernel(message)),
+            SyscallReply::TypedError {
+                code,
+                message,
+                retryable,
+            } => Err(SdkError::Wire {
+                code,
+                message,
+                retryable,
+            }),
+            other => Err(unexpected("Authenticated", &other)),
+        }
     }
 
     /// Create an agent through the full kernel path (gate registration, cgroup,
@@ -714,16 +809,39 @@ impl KernelClient {
         F: FnMut(&MessageStreamEvent),
     {
         let request_id = request_id.into();
-        self.inner
+        self.ensure_connected().await?;
+        if let Err(source) = self
+            .inner
             .send(&Syscall::SendMessageStream {
                 request_id: request_id.clone(),
                 agent_id: agent_id.into(),
                 message: message.into(),
             })
-            .await?;
+            .await
+        {
+            if self.reconnect.is_some() {
+                self.needs_reconnect = true;
+                return Err(SdkError::IndeterminateMutation {
+                    operation: "streaming agent turn",
+                    source,
+                });
+            }
+            return Err(SdkError::Transport(source));
+        }
         let mut next_sequence = 0_u64;
         loop {
-            match self.inner.read_reply().await? {
+            let reply = match self.inner.read_reply().await {
+                Ok(reply) => reply,
+                Err(source) if self.reconnect.is_some() => {
+                    self.needs_reconnect = true;
+                    return Err(SdkError::IndeterminateMutation {
+                        operation: "streaming agent turn",
+                        source,
+                    });
+                }
+                Err(source) => return Err(SdkError::Transport(source)),
+            };
+            match reply {
                 SyscallReply::StreamEvent {
                     request_id: reply_id,
                     sequence,
@@ -1863,13 +1981,19 @@ impl KernelClient {
     /// Authenticate the connection with the server's shared secret. Required
     /// before any other syscall when the server is configured with a token.
     pub async fn authenticate(&mut self, token: impl Into<String>) -> Result<(), SdkError> {
+        let token = token.into();
         match self
             .call(Syscall::Authenticate {
-                token: token.into(),
+                token: token.clone(),
             })
             .await?
         {
-            SyscallReply::Authenticated => Ok(()),
+            SyscallReply::Authenticated => {
+                if let Some(reconnect) = self.reconnect.as_mut() {
+                    reconnect.token = Some(token);
+                }
+                Ok(())
+            }
             other => Err(unexpected("Authenticated", &other)),
         }
     }
@@ -1887,7 +2011,29 @@ impl KernelClient {
     /// Issue a raw syscall and fold [`SyscallReply::Error`] into [`SdkError`].
     /// Lower-level escape hatch behind every typed method above.
     pub async fn call(&mut self, call: Syscall) -> Result<SyscallReply, SdkError> {
-        match self.inner.call(call).await? {
+        self.ensure_connected().await?;
+        let replay_safe = safe_to_replay_after_reconnect(&call);
+        let operation = mutation_operation_name(&call);
+        let reply = match self.inner.call(call.clone()).await {
+            Ok(reply) => reply,
+            Err(source) if self.reconnect.is_none() => return Err(SdkError::Transport(source)),
+            Err(source) if !replay_safe => {
+                self.needs_reconnect = true;
+                return Err(SdkError::IndeterminateMutation { operation, source });
+            }
+            Err(_) => {
+                self.needs_reconnect = true;
+                self.reconnect().await?;
+                match self.inner.call(call).await {
+                    Ok(reply) => reply,
+                    Err(source) => {
+                        self.needs_reconnect = true;
+                        return Err(SdkError::Transport(source));
+                    }
+                }
+            }
+        };
+        match reply {
             SyscallReply::Error { message } => Err(SdkError::Kernel(message)),
             SyscallReply::TypedError {
                 code,
@@ -1900,6 +2046,60 @@ impl KernelClient {
             }),
             reply => Ok(reply),
         }
+    }
+}
+
+fn safe_to_replay_after_reconnect(call: &Syscall) -> bool {
+    matches!(
+        call,
+        Syscall::ListAgents
+            | Syscall::GetAgentStatus { .. }
+            | Syscall::WaitAgent { .. }
+            | Syscall::ListGenerationCheckpoints { .. }
+            | Syscall::GateStats
+            | Syscall::AgentInfo { .. }
+            | Syscall::ListProviders
+            | Syscall::MemoryQuery { .. }
+            | Syscall::StorageGet { .. }
+            | Syscall::StorageList { .. }
+            | Syscall::ContextPressure { .. }
+            | Syscall::ListSnapshots { .. }
+            | Syscall::Hello { .. }
+            | Syscall::Authenticate { .. }
+            | Syscall::DescribeProtocol
+            | Syscall::Ping
+            | Syscall::FetchPackage { .. }
+            | Syscall::SearchPackages { .. }
+            | Syscall::ListInstalledPackages
+            | Syscall::NodeInfo
+            | Syscall::ProveNodeIdentity { .. }
+            | Syscall::ListNodeControlAudit { .. }
+            | Syscall::GetClusterMembership
+            | Syscall::ListClusterMembershipAudit { .. }
+            | Syscall::Metrics
+            | Syscall::OperatorSnapshot
+            | Syscall::ListOperatorTunables
+            | Syscall::ListOperatorTunableAudit { .. }
+            | Syscall::StorageBackupStatus
+            | Syscall::StorageDataInventory
+            | Syscall::ListServices
+            | Syscall::ListServiceHistory { .. }
+            | Syscall::EnforceStorageBackupRetention { dry_run: true, .. }
+    )
+}
+
+fn mutation_operation_name(call: &Syscall) -> &'static str {
+    match call {
+        Syscall::InstallPackage { .. } => "package installation",
+        Syscall::RollbackPackage { .. } => "package rollback",
+        Syscall::RemovePackage { .. } => "package removal",
+        Syscall::PauseAgent { .. } => "agent pause",
+        Syscall::ResumeAgent { .. } => "agent resume",
+        Syscall::StopAgent { .. } => "agent stop",
+        Syscall::KillAgent { .. } => "agent kill",
+        Syscall::CallTool { .. } => "tool call",
+        Syscall::SendMessage { .. } | Syscall::SendMessageStream { .. } => "agent turn",
+        _ => "side-effecting syscall",
     }
 }
 

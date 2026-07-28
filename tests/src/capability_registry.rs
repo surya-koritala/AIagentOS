@@ -256,7 +256,7 @@ fn registry_is_complete_and_honest() {
 }
 
 #[test]
-fn provider_matrix_names_every_resource_provider_implementation_and_status() {
+fn provider_matrix_names_every_resource_provider_status_and_platform_contract() {
     let matrix = read_workspace_file("docs/PROVIDER_MATRIX.md");
     let summary = read_workspace_file("docs/src/SUMMARY.md");
     assert!(summary.contains("./provider-matrix.md"));
@@ -264,6 +264,67 @@ fn provider_matrix_names_every_resource_provider_implementation_and_status() {
         assert!(
             matrix.contains(status),
             "provider matrix must define the required {status} status"
+        );
+    }
+    let expected_platform_rows = [
+        ("`BuiltinFilesystemProvider`", "Linux; macOS; Windows"),
+        ("`BuiltinNetworkProvider`", "Linux; macOS; Windows"),
+        (
+            "`BuiltinAppProvider`",
+            "Linux host; digest-pinned Alpine container",
+        ),
+        ("`IpcResourceProvider`", "Linux; macOS; Windows"),
+        ("Kernel browser provider", "None — unavailable"),
+        ("Kernel peripheral provider", "None — unavailable"),
+        ("Kernel computer-use provider", "None — unavailable"),
+        (
+            "`FilesystemProvider` (`resources` crate)",
+            "None — unavailable",
+        ),
+        (
+            "`NetworkProvider` (`resources` crate)",
+            "None — unavailable",
+        ),
+        (
+            "`ApplicationProvider` (`resources` crate)",
+            "None — unavailable",
+        ),
+        (
+            "`PeripheralProvider` (`resources` crate)",
+            "None — unavailable",
+        ),
+        (
+            "Feature-gated HTML/playwright helpers",
+            "Trusted operator process; feature-dependent",
+        ),
+    ];
+    for (provider, expected_platforms) in expected_platform_rows {
+        let row = matrix
+            .lines()
+            .find(|line| line.contains(provider))
+            .unwrap_or_else(|| panic!("provider matrix does not name {provider}"));
+        let cells = row
+            .split('|')
+            .map(str::trim)
+            .filter(|cell| !cell.is_empty())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            cells.len(),
+            5,
+            "provider matrix row for {provider} must have five columns: {row}"
+        );
+        assert_eq!(
+            cells[3].trim_matches('*'),
+            expected_platforms,
+            "provider matrix row for {provider} has a stale or ambiguous platform contract"
+        );
+    }
+
+    let ci = read_workspace_file(".github/workflows/ci.yml");
+    for runner in ["ubuntu-latest", "macos-latest", "windows-latest"] {
+        assert!(
+            ci.contains(runner),
+            "CI must exercise provider contracts on {runner}"
         );
     }
 
@@ -333,6 +394,12 @@ fn provider_matrix_names_every_resource_provider_implementation_and_status() {
                 || row.contains("E2E verified")
                 || row.contains("Production-qualified"),
             "provider matrix row for {implementation} has no recognized status"
+        );
+        assert!(
+            expected_platform_rows
+                .iter()
+                .any(|(provider, _)| row.contains(provider)),
+            "provider matrix row for {implementation} has no validated platform contract"
         );
     }
 }

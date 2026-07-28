@@ -7,6 +7,8 @@
   let step = 1;
   let provider = 'azure-openai';
   let configuredProviders = [];
+  let credentialStoreAvailable = true;
+  let providerCredential = '';
   let azureEndpoint = '';
   let azureDeployment = 'gpt-4o';
   let localEndpoint = 'http://localhost:11434';
@@ -17,6 +19,7 @@
     try {
       const config = await invoke('load_config');
       configuredProviders = config.configured_providers || [];
+      credentialStoreAvailable = config.credential_store_available !== false;
       provider = config.llm_provider || provider;
       azureEndpoint = config.azure_endpoint || '';
       azureDeployment = config.azure_deployment || azureDeployment;
@@ -27,9 +30,12 @@
   async function testAndSave() {
     testing = true;
     testResult = null;
+    const submittedCredential = providerCredential;
+    providerCredential = '';
     try {
       await invoke('save_config', {
         llmProvider: provider,
+        providerCredential: submittedCredential || null,
         defaultModel: provider === 'azure-openai' ? azureDeployment : null,
         azureEndpoint,
         azureDeployment,
@@ -84,12 +90,24 @@
       {/if}
 
       {#if provider !== 'local'}
+        <label>
+          Provider credential
+          <input
+            type="password"
+            bind:value={providerCredential}
+            autocomplete="new-password"
+            placeholder={configuredProviders.includes(provider) ? 'Leave blank to keep the current source' : 'Enter a credential'}
+            disabled={!credentialStoreAvailable}
+          />
+        </label>
         <p class="credential-note">
-          Provider secrets never cross the desktop UI boundary.
+          Provider secrets are sent only to the native app and are never returned to this screen.
           {#if configuredProviders.includes(provider)}
-            A credential source is configured outside this screen.
+            A credential source is already configured; leave the field blank to keep it.
+          {:else if !credentialStoreAvailable}
+            The platform credential store is unavailable. Set {provider === 'azure-openai' ? 'AZURE_OPENAI_API_KEY' : provider === 'openai' ? 'OPENAI_API_KEY' : 'ANTHROPIC_API_KEY'} before starting the app.
           {:else}
-            Set {provider === 'azure-openai' ? 'AZURE_OPENAI_API_KEY' : provider === 'openai' ? 'OPENAI_API_KEY' : 'ANTHROPIC_API_KEY'} before starting the app.
+            The credential will be stored by the operating system, not in the AgentOS config file.
           {/if}
         </p>
       {/if}
@@ -98,7 +116,11 @@
         <div class="result error">{testResult}</div>
       {/if}
 
-      <button class="primary" on:click={testAndSave} disabled={testing || (provider !== 'local' && !configuredProviders.includes(provider))}>
+      <button
+        class="primary"
+        on:click={testAndSave}
+        disabled={testing || (provider !== 'local' && !configuredProviders.includes(provider) && !providerCredential.trim())}
+      >
         {testing ? 'Saving...' : 'Save & Continue →'}
       </button>
 

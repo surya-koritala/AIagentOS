@@ -12,7 +12,13 @@ required-features = ["desktop-shell"]
 
 [features]
 default = ["desktop-shell"]
-desktop-shell = ["dep:agent-cli", "dep:tauri", "dep:tauri-build"]
+desktop-shell = [
+    "dep:agent-cli",
+    "dep:keyring",
+    "dep:tauri",
+    "dep:tauri-build",
+    "dep:zeroize",
+]
 
 [dependencies]
 kernel = { path = "../kernel", version = "=0.3.0" }
@@ -24,6 +30,8 @@ serde_json = { workspace = true }
 uuid = { workspace = true }
 tauri = { workspace = true, optional = true }
 tracing = { workspace = true }
+zeroize = { workspace = true, optional = true }
+keyring = { version = "=4.1.5", optional = true }
 
 [build-dependencies]
 tauri-build = { workspace = true, optional = true }

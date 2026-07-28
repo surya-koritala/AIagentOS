@@ -31,6 +31,7 @@ cargo deny check advisories bans licenses sources
 )
 
 cargo clippy -p tauri-app --all-targets --locked -- -D warnings
+cargo test -p tauri-app --all-targets --locked
 cargo llvm-cov --workspace --exclude tauri-app --all-targets --locked \
   --lcov --output-path lcov.info --fail-under-lines 60 -- --test-threads=1
 python3 scripts/check_critical_coverage.py lcov.info

@@ -5,7 +5,10 @@
 use agent_cli::providers::register_providers;
 use kernel::{config::Config, AgentKernelImpl};
 use std::sync::Arc;
-use tauri_app::{commands, credentials::hydrate_provider_credentials, AppState, DesktopClient};
+use tauri_app::{
+    commands, credentials::hydrate_provider_credentials, AppState, DesktopClient,
+    DesktopUpdateState,
+};
 
 fn main() {
     let mut config = match Config::try_load() {
@@ -32,7 +35,9 @@ fn main() {
             .expect("Failed to start authenticated desktop kernel client");
 
     tauri::Builder::default()
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(AppState { client })
+        .manage(DesktopUpdateState::default())
         .invoke_handler(tauri::generate_handler![
             commands::create_agent,
             commands::send_message,
@@ -51,6 +56,8 @@ fn main() {
             commands::list_agents,
             commands::get_metrics,
             commands::get_operator_view,
+            commands::check_for_update,
+            commands::install_update,
             commands::load_config,
             commands::save_config,
             commands::delete_provider_credential,

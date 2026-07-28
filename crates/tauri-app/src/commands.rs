@@ -6,12 +6,18 @@ use crate::{
         CLOUD_DESKTOP_PROVIDERS, SUPPORTED_DESKTOP_PROVIDERS,
     },
     AppState, DesktopMetricsView, DesktopOperatorView, DesktopService, DesktopServiceHistory,
+    DesktopUpdateState,
 };
 use kernel::config::Config;
 use serde::Serialize;
 use std::path::PathBuf;
-use tauri::{ipc::Channel, State};
+use tauri::{ipc::Channel, AppHandle, State};
+use tauri_plugin_updater::{Update, UpdaterExt};
 use zeroize::Zeroizing;
+
+const MAX_UPDATE_VERSION_BYTES: usize = 128;
+const MAX_UPDATE_TARGET_BYTES: usize = 128;
+const MAX_UPDATE_NOTES_BYTES: usize = 64 * 1024;
 
 /// Non-secret configuration that may cross the desktop IPC boundary.
 ///
@@ -29,6 +35,53 @@ pub struct DesktopConfigView {
     pub local_endpoint: String,
     pub configured_providers: Vec<String>,
     pub credential_store_available: bool,
+}
+
+/// Bounded, non-secret update metadata that may cross the desktop IPC boundary.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DesktopUpdateView {
+    pub current_version: String,
+    pub version: String,
+    pub target: String,
+    pub published_at: Option<String>,
+    pub notes: Option<String>,
+}
+
+impl DesktopUpdateView {
+    fn try_from_update(update: &Update) -> Result<Self, String> {
+        validate_update_field(
+            "current update version",
+            &update.current_version,
+            MAX_UPDATE_VERSION_BYTES,
+        )?;
+        validate_update_field("update version", &update.version, MAX_UPDATE_VERSION_BYTES)?;
+        validate_update_field("update target", &update.target, MAX_UPDATE_TARGET_BYTES)?;
+        if update
+            .body
+            .as_ref()
+            .is_some_and(|notes| notes.len() > MAX_UPDATE_NOTES_BYTES)
+        {
+            return Err(format!(
+                "update notes exceed the {MAX_UPDATE_NOTES_BYTES}-byte limit"
+            ));
+        }
+        Ok(Self {
+            current_version: update.current_version.clone(),
+            version: update.version.clone(),
+            target: update.target.clone(),
+            published_at: update.date.map(|date| date.to_string()),
+            notes: update.body.clone(),
+        })
+    }
+}
+
+fn validate_update_field(label: &str, value: &str, maximum: usize) -> Result<(), String> {
+    if value.is_empty() || value.len() > maximum || value.chars().any(char::is_control) {
+        return Err(format!(
+            "{label} is empty, oversized, or contains control characters"
+        ));
+    }
+    Ok(())
 }
 
 impl DesktopConfigView {
@@ -354,6 +407,53 @@ pub async fn get_operator_view(state: State<'_, AppState>) -> Result<DesktopOper
 }
 
 #[tauri::command]
+pub async fn check_for_update(app: AppHandle) -> Result<Option<DesktopUpdateView>, String> {
+    let update = app
+        .updater()
+        .map_err(|error| format!("updater configuration is invalid: {error}"))?
+        .check()
+        .await
+        .map_err(|error| format!("signed update check failed: {error}"))?;
+    update
+        .as_ref()
+        .map(DesktopUpdateView::try_from_update)
+        .transpose()
+}
+
+#[tauri::command]
+pub async fn install_update(
+    app: AppHandle,
+    update_state: State<'_, DesktopUpdateState>,
+    expected_version: String,
+) -> Result<(), String> {
+    validate_update_field(
+        "expected update version",
+        &expected_version,
+        MAX_UPDATE_VERSION_BYTES,
+    )?;
+    let _install_guard = update_state.begin_install().map_err(str::to_string)?;
+    let update = app
+        .updater()
+        .map_err(|error| format!("updater configuration is invalid: {error}"))?
+        .check()
+        .await
+        .map_err(|error| format!("signed update check failed: {error}"))?
+        .ok_or_else(|| "the reviewed update is no longer available".to_string())?;
+    DesktopUpdateView::try_from_update(&update)?;
+    if update.version != expected_version {
+        return Err(format!(
+            "the available update changed from {expected_version} to {}; review it before installing",
+            update.version
+        ));
+    }
+    update
+        .download_and_install(|_, _| {}, || {})
+        .await
+        .map_err(|error| format!("signed update verification or installation failed: {error}"))?;
+    app.restart()
+}
+
+#[tauri::command]
 pub fn load_config() -> Result<DesktopConfigView, String> {
     let config = Config::try_load().map_err(|error| error.to_string())?;
     let store = NativeProviderCredentialStore::default();
@@ -651,5 +751,13 @@ mod tests {
             validate_service_control_confirmation(" worker", " worker").unwrap_err(),
             "service name must be a non-empty exact target"
         );
+    }
+
+    #[test]
+    fn update_metadata_fields_are_bounded_before_crossing_ipc() {
+        assert!(validate_update_field("version", "1.2.3", 128).is_ok());
+        assert!(validate_update_field("version", "", 128).is_err());
+        assert!(validate_update_field("version", "1.2.3\nforged", 128).is_err());
+        assert!(validate_update_field("version", &"a".repeat(129), 128).is_err());
     }
 }

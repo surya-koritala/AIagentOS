@@ -133,6 +133,8 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - name: Tauri command and backend warnings are errors
         run: cargo clippy -p tauri-app --all-targets --locked -- -D warnings
+      - name: Desktop backend, updater signature, and reconnect regressions
+        run: cargo test -p tauri-app --all-targets --locked
       - name: Native credential store create, rotate, read, and delete
         run: >-
           cargo test -p tauri-app

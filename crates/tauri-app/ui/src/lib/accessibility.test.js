@@ -100,3 +100,18 @@ test('service supervision retains public commands and frozen exact-target confir
   assert.match(status, /may block dependent services/);
   assert.match(status, /can interrupt in-flight work/);
 });
+
+test('software update requires review and exact-version confirmation', () => {
+  const settings = source('Settings.svelte');
+
+  for (const contract of [
+    "invoke('check_for_update')",
+    "invoke('install_update', { expectedVersion })",
+    'Review install {availableUpdate.version}',
+    'Confirm update {availableUpdate.version}',
+    '`Confirm install ${availableUpdate.version}`',
+    'must match the updater signature built into this app',
+  ]) {
+    assert.ok(settings.includes(contract), `software updater lost ${contract}`);
+  }
+});

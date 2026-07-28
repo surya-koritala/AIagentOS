@@ -874,8 +874,11 @@ fn desktop_release_foundation_is_versioned_and_fail_closed() {
         "**qualification artifacts only**",
         "Production requirement still open",
         "do not replace native platform signing",
+        "signed-updater foundation",
+        "TAURI_SIGNING_PRIVATE_KEY",
+        "automatic downgrade is not enabled",
         "public `v*` tag is deliberately rejected",
-        "failed-update, and rollback tests",
+        "failed-update, and operator-led rollback evidence",
     ] {
         assert!(
             normalized_distribution.contains(contract),
@@ -896,7 +899,12 @@ fn desktop_release_foundation_is_versioned_and_fail_closed() {
         "perl: C:/Strawberry/perl/bin/perl.exe",
         "CARGO_TARGET_DIR=target-repro cargo build",
         "mv target-repro target-a",
-        "cargo tauri build --ci --no-sign",
+        "TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}",
+        "TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}",
+        "Require the protected updater signing identity",
+        "cargo tauri build --ci --bundles",
+        "scripts/build_desktop_update_manifest.py",
+        "--output dist/latest.json",
         "release-desktop-${{ matrix.platform }}",
     ] {
         assert!(
@@ -908,6 +916,10 @@ fn desktop_release_foundation_is_versioned_and_fail_closed() {
         !release.contains("CARGO_TARGET_DIR=target-b"),
         "release builds must not embed a different target path in the second binary"
     );
+    assert!(
+        !release.contains("cargo tauri build --ci --no-sign"),
+        "desktop release qualification must never suppress updater signatures"
+    );
 
     let verifier = read_workspace_file("scripts/verify_desktop_release.py");
     for contract in [
@@ -916,12 +928,70 @@ fn desktop_release_foundation_is_versioned_and_fail_closed() {
         "REQUIRED_PNGS",
         "icon.ico",
         "icon.icns",
+        "createUpdaterArtifacts",
+        "updater public key",
+        "dangerousInsecureTransportProtocol",
+        "desktop updater plugin must remain exactly pinned",
     ] {
         assert!(
             verifier.contains(contract),
             "desktop release verifier lost {contract:?}"
         );
     }
+
+    let tauri_config = read_workspace_file("crates/tauri-app/tauri.conf.json");
+    for contract in [
+        "\"createUpdaterArtifacts\": true",
+        "https://github.com/surya-koritala/AIagentOS/releases/latest/download/latest.json",
+        "\"installMode\": \"passive\"",
+    ] {
+        assert!(
+            tauri_config.contains(contract),
+            "desktop updater configuration lost {contract:?}"
+        );
+    }
+
+    let updater_test = read_workspace_file("crates/tauri-app/tests/updater_signature.rs");
+    for contract in [
+        "checked_in_updater_identity_verifies_a_real_tauri_signature",
+        "tampered updater bytes must fail signature verification",
+    ] {
+        assert!(
+            updater_test.contains(contract),
+            "desktop updater signature regression lost {contract:?}"
+        );
+    }
+
+    let commands = read_workspace_file("crates/tauri-app/src/commands.rs");
+    for contract in [
+        "expected_version",
+        "the available update changed",
+        "download_and_install",
+        "signed update verification or installation failed",
+    ] {
+        assert!(
+            commands.contains(contract),
+            "desktop updater IPC contract lost {contract:?}"
+        );
+    }
+
+    let settings = read_workspace_file("crates/tauri-app/ui/src/lib/Settings.svelte");
+    for contract in [
+        "Confirm update {availableUpdate.version}",
+        "invoke('install_update', { expectedVersion })",
+        "Automatic downgrade is not available",
+    ] {
+        assert!(
+            settings.contains(contract),
+            "desktop updater review flow lost {contract:?}"
+        );
+    }
+
+    let ci = read_workspace_file(".github/workflows/ci.yml");
+    assert!(
+        ci.contains("cargo test -p tauri-app --all-targets --locked"),
+        "desktop updater signature regression is no longer exercised on platform CI"
+    );
 }
 
 #[test]

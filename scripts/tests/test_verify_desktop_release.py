@@ -70,6 +70,23 @@ class DesktopReleaseValidationTests(unittest.TestCase):
         failures = validate(self.root)
         self.assertIn("icons/icon.icns is missing or invalid", failures)
 
+    def test_rejects_missing_or_dangerous_updater_contract(self):
+        config_path = self.root / "crates/tauri-app/tauri.conf.json"
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        config["bundle"]["createUpdaterArtifacts"] = False
+        config["plugins"]["updater"]["pubkey"] = "not-base64"
+        config["plugins"]["updater"]["endpoints"] = ["http://example.invalid/latest.json"]
+        config["plugins"]["updater"]["dangerousInsecureTransportProtocol"] = True
+        config["plugins"]["updater"]["windows"]["installMode"] = "quiet"
+        config_path.write_text(json.dumps(config), encoding="utf-8")
+
+        failures = validate(self.root)
+        self.assertTrue(any("must create Tauri v2 updater artifacts" in item for item in failures))
+        self.assertTrue(any("public key is not valid Tauri base64" in item for item in failures))
+        self.assertTrue(any("canonical HTTPS latest.json" in item for item in failures))
+        self.assertTrue(any("dangerousInsecureTransportProtocol" in item for item in failures))
+        self.assertTrue(any("passive Windows install mode" in item for item in failures))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,16 +1,18 @@
 name: On-device GGUF qualification
 
-# A repository-owned runner supplies licensed model weights. GitHub-hosted
-# runners never download an arbitrary model or claim real inference coverage.
+# This protected workflow qualifies one provisioned model/tokenizer pair against
+# one exact tagged release candidate. It retains only bounded metadata and
+# digests: paths, prompts, generated text, credentials, and weights are never
+# uploaded.
 on:
   workflow_dispatch:
     inputs:
-      model_path:
-        description: Absolute path to a provisioned GGUF model on the runner
+      release_candidate:
+        description: Existing vX.Y.Z or vX.Y.Z-rc.N tag pointing at this exact commit
         required: true
         type: string
-      tokenizer_path:
-        description: Absolute path to the matching tokenizer.json
+      environment_id:
+        description: Stable non-fixture identifier for the protected runner environment
         required: true
         type: string
       model_id:
@@ -28,68 +30,189 @@ on:
         required: true
         default: "4096"
         type: string
+      max_model_bytes:
+        description: Maximum accepted GGUF size in bytes
+        required: true
+        default: "17179869184"
+        type: string
+      max_rss_bytes:
+        description: Maximum process peak RSS in bytes
+        required: true
+        default: "8589934592"
+        type: string
+      max_load_seconds:
+        description: Maximum model load duration in seconds
+        required: true
+        default: "600"
+        type: string
+      max_generation_seconds:
+        description: Maximum bounded generation duration in seconds
+        required: true
+        default: "180"
+        type: string
+      max_cancellation_seconds:
+        description: Maximum cancellation and worker-drain duration in seconds
+        required: true
+        default: "10"
+        type: string
 
 permissions:
   contents: read
 
 concurrency:
-  group: on-device-qualification
+  group: on-device-qualification-${{ inputs.release_candidate }}
   cancel-in-progress: false
 
 jobs:
-  real-model:
-    name: Real GGUF CPU inference
+  exact-release-candidate:
+    name: Exact-RC real GGUF CPU evidence
     runs-on: [self-hosted, linux, x64, agentos-model]
     timeout-minutes: 45
     environment: model-qualification
     env:
-      AGENTOS_GGUF_MODEL: ${{ inputs.model_path }}
-      AGENTOS_TOKENIZER: ${{ inputs.tokenizer_path }}
-      AGENTOS_MODEL_ID: ${{ inputs.model_id }}
-      AGENTOS_CHAT_TEMPLATE: ${{ inputs.chat_template }}
-      AGENTOS_MAX_CONTEXT_TOKENS: ${{ inputs.max_context_tokens }}
-      AGENTOS_MAX_NEW_TOKENS: "32"
-      RAYON_NUM_THREADS: "4"
+      # These protected environment variables keep runner topology and licensed
+      # weight locations out of dispatch history and retained artifacts.
+      AGENTOS_GGUF_MODEL: ${{ vars.AGENTOS_GGUF_MODEL }}
+      AGENTOS_TOKENIZER: ${{ vars.AGENTOS_TOKENIZER }}
+      AGENTOS_ON_DEVICE_HARDWARE_ID: ${{ vars.AGENTOS_ON_DEVICE_HARDWARE_ID }}
+      RAYON_NUM_THREADS: ${{ vars.AGENTOS_ON_DEVICE_RAYON_THREADS || '4' }}
+      QUALIFICATION_OUTPUT: target/qualification/on-device.json
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
         with:
           toolchain: 1.97.1
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-      - name: Validate provisioned model inputs
+      - name: Bind protected inputs to the exact tagged source
+        env:
+          RELEASE_CANDIDATE: ${{ inputs.release_candidate }}
+          ENVIRONMENT_ID: ${{ inputs.environment_id }}
+          MODEL_ID: ${{ inputs.model_id }}
+          MAX_CONTEXT_TOKENS: ${{ inputs.max_context_tokens }}
+          MAX_MODEL_BYTES: ${{ inputs.max_model_bytes }}
+          MAX_RSS_BYTES: ${{ inputs.max_rss_bytes }}
+          MAX_LOAD_SECONDS: ${{ inputs.max_load_seconds }}
+          MAX_GENERATION_SECONDS: ${{ inputs.max_generation_seconds }}
+          MAX_CANCELLATION_SECONDS: ${{ inputs.max_cancellation_seconds }}
         run: |
-          test -f "$AGENTOS_GGUF_MODEL"
-          test -r "$AGENTOS_GGUF_MODEL"
-          test -f "$AGENTOS_TOKENIZER"
-          test -r "$AGENTOS_TOKENIZER"
-          [[ "$AGENTOS_MAX_CONTEXT_TOKENS" =~ ^[1-9][0-9]{0,6}$ ]]
-          [[ "$AGENTOS_MODEL_ID" =~ ^[A-Za-z0-9._:/+-]+$ ]]
-      - name: Exercise real load, tokenize, prefill, decode, and detokenize
+          set -euo pipefail
+          [[ "$RELEASE_CANDIDATE" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-rc\.[1-9][0-9]*)?$ ]]
+          [[ "$ENVIRONMENT_ID" =~ ^[A-Za-z0-9][A-Za-z0-9._:@+-]{0,99}$ ]]
+          [[ "$MODEL_ID" =~ ^[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,99}$ ]]
+          [[ "$AGENTOS_ON_DEVICE_HARDWARE_ID" =~ ^[A-Za-z0-9][A-Za-z0-9._:@+-]{0,99}$ ]]
+          [[ "$RAYON_NUM_THREADS" =~ ^[1-9][0-9]{0,2}$ ]]
+          for value in \
+            "$MAX_CONTEXT_TOKENS" "$MAX_MODEL_BYTES" "$MAX_RSS_BYTES" \
+            "$MAX_LOAD_SECONDS" "$MAX_GENERATION_SECONDS" \
+            "$MAX_CANCELLATION_SECONDS"
+          do
+            [[ "$value" =~ ^[1-9][0-9]*$ ]]
+          done
+          [[ "$AGENTOS_GGUF_MODEL" = /* ]]
+          [[ "$AGENTOS_TOKENIZER" = /* ]]
+          [[ ! -L "$AGENTOS_GGUF_MODEL" && -f "$AGENTOS_GGUF_MODEL" && -r "$AGENTOS_GGUF_MODEL" ]]
+          [[ ! -L "$AGENTOS_TOKENIZER" && -f "$AGENTOS_TOKENIZER" && -r "$AGENTOS_TOKENIZER" ]]
+          [[ "$AGENTOS_GGUF_MODEL" != "$GITHUB_WORKSPACE"/* ]]
+          [[ "$AGENTOS_TOKENIZER" != "$GITHUB_WORKSPACE"/* ]]
+          git fetch --force origin "refs/tags/$RELEASE_CANDIDATE:refs/tags/$RELEASE_CANDIDATE"
+          test "$(git rev-parse "refs/tags/$RELEASE_CANDIDATE^{commit}")" = "$GITHUB_SHA"
+          test -z "$(git status --porcelain)"
+      - name: Validate the qualification contract
         run: >-
-          /usr/bin/time -v -o on-device-resources.txt
-          cargo test -p adapters --features candle
-          on_device_generates_tokens --locked -- --ignored --nocapture
-      - name: Record non-sensitive qualification metadata
+          cargo run -p adapters --example on_device_qualification
+          --features candle --locked -- --validate
+      - name: Qualify load, generation, cancellation drain, and resources
+        env:
+          RELEASE_CANDIDATE: ${{ inputs.release_candidate }}
+          ENVIRONMENT_ID: ${{ inputs.environment_id }}
+          MODEL_ID: ${{ inputs.model_id }}
+          CHAT_TEMPLATE: ${{ inputs.chat_template }}
+          MAX_CONTEXT_TOKENS: ${{ inputs.max_context_tokens }}
+          MAX_MODEL_BYTES: ${{ inputs.max_model_bytes }}
+          MAX_RSS_BYTES: ${{ inputs.max_rss_bytes }}
+          MAX_LOAD_SECONDS: ${{ inputs.max_load_seconds }}
+          MAX_GENERATION_SECONDS: ${{ inputs.max_generation_seconds }}
+          MAX_CANCELLATION_SECONDS: ${{ inputs.max_cancellation_seconds }}
         run: |
-          jq -n \
-            --arg model "$AGENTOS_MODEL_ID" \
-            --arg template "$AGENTOS_CHAT_TEMPLATE" \
-            --arg context "$AGENTOS_MAX_CONTEXT_TOKENS" \
-            --arg runner_os "$RUNNER_OS" \
-            '{
-              schema_version: 1,
-              status: "passed",
-              device: "cpu",
-              model: $model,
-              chat_template: $template,
-              max_context_tokens: ($context | tonumber),
-              runner_os: $runner_os
-            }' > on-device-qualification.json
+          set -euo pipefail
+          cargo run -p adapters --example on_device_qualification \
+            --features candle --locked -- \
+            --model "$AGENTOS_GGUF_MODEL" \
+            --tokenizer "$AGENTOS_TOKENIZER" \
+            --model-id "$MODEL_ID" \
+            --chat-template "$CHAT_TEMPLATE" \
+            --max-context-tokens "$MAX_CONTEXT_TOKENS" \
+            --max-model-bytes "$MAX_MODEL_BYTES" \
+            --max-rss-bytes "$MAX_RSS_BYTES" \
+            --max-load-seconds "$MAX_LOAD_SECONDS" \
+            --max-generation-seconds "$MAX_GENERATION_SECONDS" \
+            --max-cancellation-seconds "$MAX_CANCELLATION_SECONDS" \
+            --expected-commit "$GITHUB_SHA" \
+            --release-candidate "$RELEASE_CANDIDATE" \
+            --environment-id "$ENVIRONMENT_ID" \
+            --hardware-id "$AGENTOS_ON_DEVICE_HARDWARE_ID" \
+            --output "$GITHUB_WORKSPACE/$QUALIFICATION_OUTPUT"
+      - name: Verify bounded exact-RC evidence
+        env:
+          RELEASE_CANDIDATE: ${{ inputs.release_candidate }}
+          ENVIRONMENT_ID: ${{ inputs.environment_id }}
+          MODEL_ID: ${{ inputs.model_id }}
+          CHAT_TEMPLATE: ${{ inputs.chat_template }}
+          MAX_CONTEXT_TOKENS: ${{ inputs.max_context_tokens }}
+          MAX_MODEL_BYTES: ${{ inputs.max_model_bytes }}
+          MAX_RSS_BYTES: ${{ inputs.max_rss_bytes }}
+          MAX_LOAD_SECONDS: ${{ inputs.max_load_seconds }}
+          MAX_GENERATION_SECONDS: ${{ inputs.max_generation_seconds }}
+          MAX_CANCELLATION_SECONDS: ${{ inputs.max_cancellation_seconds }}
+        run: |
+          set -euo pipefail
+          test "$(wc -c < "$QUALIFICATION_OUTPUT")" -le 524288
+          jq -e \
+            --arg commit "$GITHUB_SHA" \
+            --arg release "$RELEASE_CANDIDATE" \
+            --arg environment "$ENVIRONMENT_ID" \
+            --arg hardware "$AGENTOS_ON_DEVICE_HARDWARE_ID" \
+            --arg model "$MODEL_ID" \
+            --arg template "$CHAT_TEMPLATE" \
+            --arg context "$MAX_CONTEXT_TOKENS" \
+            --arg model_bytes "$MAX_MODEL_BYTES" \
+            --arg rss "$MAX_RSS_BYTES" \
+            --arg load "$MAX_LOAD_SECONDS" \
+            --arg generation "$MAX_GENERATION_SECONDS" \
+            --arg cancellation "$MAX_CANCELLATION_SECONDS" \
+            '
+              .schema_version == 1 and
+              .qualification_class == "exact_release_candidate_on_device_gguf" and
+              .release_candidate == $release and
+              .source.commit == $commit and .source.dirty == false and
+              .environment.environment_id == $environment and
+              .environment.hardware_id == $hardware and
+              .environment.os == "linux" and .environment.arch == "x86_64" and
+              .model.model_id == $model and .model.chat_template == $template and
+              .model.max_context_tokens == ($context | tonumber) and
+              (.model.model_sha256 | test("^[0-9a-f]{64}$")) and
+              (.model.tokenizer_sha256 | test("^[0-9a-f]{64}$")) and
+              (.environment.configuration_sha256 | test("^[0-9a-f]{64}$")) and
+              .targets.max_model_bytes == ($model_bytes | tonumber) and
+              .targets.max_rss_bytes == ($rss | tonumber) and
+              .targets.max_load_seconds == ($load | tonumber) and
+              .targets.max_generation_seconds == ($generation | tonumber) and
+              .targets.max_cancellation_seconds == ($cancellation | tonumber) and
+              .checks.bounded_generation == true and
+              .checks.cancellation_worker_drained == true and
+              .checks.load_within_target == true and
+              .checks.peak_rss_within_target == true and
+              .checks.provisioned_inputs_stable == true and
+              .checks.supported_cpu_profile == true and
+              .on_device_proof_eligible == true and .passed == true and
+              .production_claim_allowed == false
+            ' "$QUALIFICATION_OUTPUT"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: on-device-qualification
-          path: |
-            on-device-qualification.json
-            on-device-resources.txt
+          name: on-device-qualification-${{ inputs.release_candidate }}-${{ github.sha }}
+          path: target/qualification/on-device.json
           if-no-files-found: error
-          retention-days: 30
+          retention-days: 90

@@ -36,6 +36,17 @@ projections are separately checked against the same raw snapshot. Feature
 breadth, accessibility, and signed desktop distribution remain release criteria
 rather than implied parity.
 
+`agentctl` exposes the public runtime path without bypasses: `create`,
+`message`, `stream`, `cancel`, `checkpoints`, `checkpoint-resume`,
+`checkpoint-delete`, `capabilities`, `providers`, `metrics`, and `protocol`
+map directly to `KernelClient`. A tenant API key therefore scopes creation,
+listing, messages, checkpoints, and enforcement details to that tenant.
+`stream` writes newline-delimited JSON event and completion records and flushes
+each event so a second `agentctl cancel REQUEST_ID AGENT_ID` process can cancel
+the exact active request. Global Prometheus metrics still require a trusted
+system operator; a tenant credential cannot use the command to bypass that
+wire authorization.
+
 ## Version and feature negotiation
 
 The wire protocol is versioned independently from the crate. Protocol v2 serves

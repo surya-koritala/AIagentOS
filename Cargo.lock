@@ -60,6 +60,7 @@ version = "0.3.0"
 dependencies = [
  "adapters",
  "agent-sdk",
+ "async-trait",
  "chrono",
  "dirs",
  "kernel",
@@ -82,6 +83,7 @@ dependencies = [
  "kernel",
  "rcgen",
  "rustls",
+ "serde",
  "serde_json",
  "thiserror 2.0.18",
  "tokio",

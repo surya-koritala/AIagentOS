@@ -14,12 +14,15 @@ use cap_primitives::fs::FollowSymlinks;
 use cap_std::ambient_authority;
 use cap_std::fs::{Dir, OpenOptions};
 use dashmap::DashMap;
+use tokio_util::sync::CancellationToken;
 
 use crate::{AgentId, IsolationLevel, SandboxConfig, SandboxError, SandboxId};
 
 const MAX_FILESYSTEM_PATH_BYTES: usize = 4 * 1024;
 const MAX_FILESYSTEM_CONTENT_BYTES: usize = 4 * 1024 * 1024;
 const MAX_FILESYSTEM_LIST_ENTRIES: usize = 4_096;
+#[cfg(test)]
+type FilesystemTestPause = (Arc<AtomicBool>, Arc<AtomicBool>, Arc<AtomicBool>);
 
 /// The Sandbox Manager trait.
 #[async_trait::async_trait]
@@ -52,6 +55,24 @@ pub trait SandboxManager: Send + Sync {
         operation: &str,
         parameters: &serde_json::Value,
     ) -> Result<serde_json::Value, SandboxError>;
+    /// Execute a filesystem operation with cooperative cancellation. Concrete
+    /// managers should stop before the next irreversible mutation after
+    /// cancellation is observed. The default preserves compatibility for
+    /// external managers while failing before dispatch when already cancelled.
+    fn execute_filesystem_controlled(
+        &self,
+        sandbox_id: SandboxId,
+        operation: &str,
+        parameters: &serde_json::Value,
+        cancellation: &CancellationToken,
+    ) -> Result<serde_json::Value, SandboxError> {
+        if cancellation.is_cancelled() {
+            return Err(SandboxError::BoundaryViolation(
+                "sandbox filesystem execution cancelled".into(),
+            ));
+        }
+        self.execute_filesystem(sandbox_id, operation, parameters)
+    }
     /// Execute HTTP through a client bound to the policy-validated DNS answers.
     /// Redirects and ambient proxy configuration are disabled.
     async fn execute_network(
@@ -114,6 +135,8 @@ pub struct SandboxManagerImpl {
     agent_sandboxes: DashMap<AgentId, SandboxId>,
     #[cfg(test)]
     fail_next_destroy: AtomicBool,
+    #[cfg(test)]
+    filesystem_pause: Mutex<Option<FilesystemTestPause>>,
 }
 
 impl Default for SandboxManagerImpl {
@@ -136,12 +159,32 @@ impl SandboxManagerImpl {
             agent_sandboxes: DashMap::new(),
             #[cfg(test)]
             fail_next_destroy: AtomicBool::new(false),
+            #[cfg(test)]
+            filesystem_pause: Mutex::new(None),
         }
     }
 
     #[cfg(test)]
     pub(crate) fn fail_next_destroy_for_test(&self) {
         self.fail_next_destroy.store(true, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pause_next_filesystem_for_test(
+        &self,
+    ) -> (Arc<AtomicBool>, Arc<AtomicBool>, Arc<AtomicBool>) {
+        let entered = Arc::new(AtomicBool::new(false));
+        let release = Arc::new(AtomicBool::new(false));
+        let cancellation_observed = Arc::new(AtomicBool::new(false));
+        *self
+            .filesystem_pause
+            .lock()
+            .expect("filesystem test pause lock") = Some((
+            entered.clone(),
+            release.clone(),
+            cancellation_observed.clone(),
+        ));
+        (entered, release, cancellation_observed)
     }
 
     /// Secure default used by all production agent-creation paths that do not
@@ -529,12 +572,49 @@ impl SandboxManagerImpl {
         ))
     }
 
-    fn directory_usage(dir: &Dir) -> Result<u64, SandboxError> {
+    fn filesystem_checkpoint(cancellation: Option<&CancellationToken>) -> Result<(), SandboxError> {
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            return Err(SandboxError::BoundaryViolation(
+                "sandbox filesystem execution cancelled".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn pause_filesystem_for_test(
+        &self,
+        cancellation: &CancellationToken,
+    ) -> Result<(), SandboxError> {
+        let pause = self
+            .filesystem_pause
+            .lock()
+            .map_err(|_| SandboxError::BoundaryViolation("sandbox filesystem unavailable".into()))?
+            .take();
+        let Some((entered, release, cancellation_observed)) = pause else {
+            return Ok(());
+        };
+        entered.store(true, Ordering::Release);
+        while !release.load(Ordering::Acquire) {
+            if cancellation.is_cancelled() {
+                cancellation_observed.store(true, Ordering::Release);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        Self::filesystem_checkpoint(Some(cancellation))
+    }
+
+    fn directory_usage(
+        dir: &Dir,
+        cancellation: Option<&CancellationToken>,
+    ) -> Result<u64, SandboxError> {
+        Self::filesystem_checkpoint(cancellation)?;
         let mut usage = 0_u64;
         let entries = dir
             .entries()
             .map_err(|error| Self::filesystem_error("quota scan", error))?;
         for entry in entries {
+            Self::filesystem_checkpoint(cancellation)?;
             let entry = entry.map_err(|error| Self::filesystem_error("quota scan", error))?;
             let file_type = entry
                 .file_type()
@@ -546,7 +626,7 @@ impl SandboxManagerImpl {
                 let child = dir
                     .open_dir(entry.file_name())
                     .map_err(|error| Self::filesystem_error("quota scan", error))?;
-                usage = usage.saturating_add(Self::directory_usage(&child)?);
+                usage = usage.saturating_add(Self::directory_usage(&child, cancellation)?);
             } else if file_type.is_file() {
                 usage = usage.saturating_add(
                     entry
@@ -564,11 +644,12 @@ impl SandboxManagerImpl {
         workspace: &Dir,
         replaced_len: u64,
         new_len: u64,
+        cancellation: Option<&CancellationToken>,
     ) -> Result<(), SandboxError> {
         let Some(limit) = state.max_disk_usage_bytes else {
             return Ok(());
         };
-        let current = Self::directory_usage(workspace)?;
+        let current = Self::directory_usage(workspace, cancellation)?;
         if current.saturating_sub(replaced_len).saturating_add(new_len) > limit {
             return Err(SandboxError::BoundaryViolation(
                 "sandbox disk quota exceeded".into(),
@@ -623,7 +704,9 @@ impl SandboxManagerImpl {
         workspace: &Dir,
         relative: &Path,
         operation: &str,
+        cancellation: Option<&CancellationToken>,
     ) -> Result<String, SandboxError> {
+        Self::filesystem_checkpoint(cancellation)?;
         let path_metadata = Self::regular_metadata(workspace, relative, operation)?;
         if path_metadata.len() > MAX_FILESYSTEM_CONTENT_BYTES as u64 {
             return Err(SandboxError::BoundaryViolation(format!(
@@ -637,6 +720,7 @@ impl SandboxManagerImpl {
             use cap_std::fs::OpenOptionsExt;
             options.custom_flags(libc::O_NONBLOCK);
         }
+        Self::filesystem_checkpoint(cancellation)?;
         let file = workspace
             .open_with(relative, &options)
             .map_err(|error| Self::filesystem_error(operation, error))?;
@@ -655,9 +739,11 @@ impl SandboxManagerImpl {
         }
 
         let mut bytes = Vec::with_capacity(metadata.len() as usize);
+        Self::filesystem_checkpoint(cancellation)?;
         file.take(MAX_FILESYSTEM_CONTENT_BYTES as u64 + 1)
             .read_to_end(&mut bytes)
             .map_err(|error| Self::filesystem_error(operation, error))?;
+        Self::filesystem_checkpoint(cancellation)?;
         if bytes.len() > MAX_FILESYSTEM_CONTENT_BYTES {
             return Err(SandboxError::BoundaryViolation(format!(
                 "sandbox filesystem {operation} exceeds {MAX_FILESYSTEM_CONTENT_BYTES} bytes"
@@ -706,10 +792,12 @@ impl SandboxManagerImpl {
         relative: &Path,
         content: &str,
         permissions: Option<cap_std::fs::Permissions>,
+        cancellation: Option<&CancellationToken>,
     ) -> Result<PathBuf, SandboxError> {
         let parent = relative.parent().unwrap_or_else(|| Path::new(""));
         let temporary = parent.join(format!(".aiagentos-write-{}", uuid::Uuid::new_v4()));
         let result = (|| {
+            Self::filesystem_checkpoint(cancellation)?;
             let mut options = OpenOptions::new();
             options
                 .write(true)
@@ -723,14 +811,18 @@ impl SandboxManagerImpl {
             let mut file = workspace
                 .open_with(&temporary, &options)
                 .map_err(|error| Self::filesystem_error("stage", error))?;
+            Self::filesystem_checkpoint(cancellation)?;
             file.write_all(content.as_bytes())
                 .map_err(|error| Self::filesystem_error("stage", error))?;
+            Self::filesystem_checkpoint(cancellation)?;
             if let Some(permissions) = permissions {
                 file.set_permissions(permissions)
                     .map_err(|error| Self::filesystem_error("stage permissions", error))?;
             }
+            Self::filesystem_checkpoint(cancellation)?;
             file.sync_all()
                 .map_err(|error| Self::filesystem_error("stage sync", error))?;
+            Self::filesystem_checkpoint(cancellation)?;
             Ok(())
         })();
         if let Err(error) = result {
@@ -745,7 +837,9 @@ impl SandboxManagerImpl {
         workspace: &Dir,
         relative: &Path,
         content: &str,
+        cancellation: Option<&CancellationToken>,
     ) -> Result<(), SandboxError> {
+        Self::filesystem_checkpoint(cancellation)?;
         let (replaced_len, permissions) = match workspace.symlink_metadata(relative) {
             Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
                 return Err(SandboxError::BoundaryViolation(
@@ -756,8 +850,18 @@ impl SandboxManagerImpl {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => (0, None),
             Err(error) => return Err(Self::filesystem_error("write metadata", error)),
         };
-        Self::enforce_write_quota(state, workspace, replaced_len, content.len() as u64)?;
-        let temporary = Self::stage_file(workspace, relative, content, permissions)?;
+        Self::enforce_write_quota(
+            state,
+            workspace,
+            replaced_len,
+            content.len() as u64,
+            cancellation,
+        )?;
+        let temporary = Self::stage_file(workspace, relative, content, permissions, cancellation)?;
+        if let Err(error) = Self::filesystem_checkpoint(cancellation) {
+            let _ = workspace.remove_file(&temporary);
+            return Err(error);
+        }
         if let Err(error) = workspace.rename(&temporary, workspace, relative) {
             let _ = workspace.remove_file(&temporary);
             return Err(Self::filesystem_error("write commit", error));
@@ -770,7 +874,9 @@ impl SandboxManagerImpl {
         workspace: &Dir,
         relative: &Path,
         content: &str,
+        cancellation: Option<&CancellationToken>,
     ) -> Result<(), SandboxError> {
+        Self::filesystem_checkpoint(cancellation)?;
         match workspace.symlink_metadata(relative) {
             Ok(_) => {
                 return Err(SandboxError::BoundaryViolation(
@@ -780,8 +886,12 @@ impl SandboxManagerImpl {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(Self::filesystem_error("create metadata", error)),
         }
-        Self::enforce_write_quota(state, workspace, 0, content.len() as u64)?;
-        let temporary = Self::stage_file(workspace, relative, content, None)?;
+        Self::enforce_write_quota(state, workspace, 0, content.len() as u64, cancellation)?;
+        let temporary = Self::stage_file(workspace, relative, content, None, cancellation)?;
+        if let Err(error) = Self::filesystem_checkpoint(cancellation) {
+            let _ = workspace.remove_file(&temporary);
+            return Err(error);
+        }
         if let Err(error) = workspace.hard_link(&temporary, workspace, relative) {
             let _ = workspace.remove_file(&temporary);
             return Err(Self::filesystem_error("create commit", error));
@@ -792,9 +902,14 @@ impl SandboxManagerImpl {
         Self::sync_parent_directory(workspace, relative)
     }
 
-    fn create_private_directory_tree(workspace: &Dir, relative: &Path) -> Result<(), SandboxError> {
+    fn create_private_directory_tree(
+        workspace: &Dir,
+        relative: &Path,
+        cancellation: Option<&CancellationToken>,
+    ) -> Result<(), SandboxError> {
         let mut current = PathBuf::new();
         for component in relative.components() {
+            Self::filesystem_checkpoint(cancellation)?;
             match component {
                 std::path::Component::CurDir => continue,
                 std::path::Component::Normal(component) => current.push(component),
@@ -816,6 +931,7 @@ impl SandboxManagerImpl {
                     return Err(Self::filesystem_error("create directory metadata", error))
                 }
             }
+            Self::filesystem_checkpoint(cancellation)?;
             workspace
                 .create_dir(&current)
                 .map_err(|error| Self::filesystem_error("create directory", error))?;
@@ -837,13 +953,16 @@ impl SandboxManagerImpl {
         state: &SandboxState,
         operation: &str,
         parameters: &serde_json::Value,
+        cancellation: Option<&CancellationToken>,
     ) -> Result<serde_json::Value, SandboxError> {
         let _operation = state.operation_lock.lock().map_err(|_| {
             SandboxError::BoundaryViolation("sandbox filesystem unavailable".into())
         })?;
+        Self::filesystem_checkpoint(cancellation)?;
         let workspace = state.workspace.lock().map_err(|_| {
             SandboxError::BoundaryViolation("sandbox filesystem unavailable".into())
         })?;
+        Self::filesystem_checkpoint(cancellation)?;
         let workspace = workspace.as_ref().ok_or_else(|| {
             SandboxError::BoundaryViolation("sandbox filesystem unavailable".into())
         })?;
@@ -857,21 +976,21 @@ impl SandboxManagerImpl {
         let relative = Self::relative_capability_path(state, Path::new(supplied))?;
         match operation {
             "read" => {
-                let content = Self::read_regular_utf8(workspace, &relative, "read")?;
+                let content = Self::read_regular_utf8(workspace, &relative, "read", cancellation)?;
                 Ok(serde_json::json!({"content": content}))
             }
             "write" => {
                 let content = Self::filesystem_content(parameters)?;
-                Self::atomic_write(state, workspace, &relative, content)?;
+                Self::atomic_write(state, workspace, &relative, content, cancellation)?;
                 Ok(serde_json::json!({"written": true}))
             }
             "create" => {
                 let content = Self::filesystem_content(parameters)?;
-                Self::atomic_create(state, workspace, &relative, content)?;
+                Self::atomic_create(state, workspace, &relative, content, cancellation)?;
                 Ok(serde_json::json!({"written": true}))
             }
             "create_dir" => {
-                Self::create_private_directory_tree(workspace, &relative)?;
+                Self::create_private_directory_tree(workspace, &relative, cancellation)?;
                 Ok(serde_json::json!({"created": true}))
             }
             "edit" => {
@@ -892,7 +1011,8 @@ impl SandboxManagerImpl {
                         "sandbox edit replacement exceeds filesystem content limit".into(),
                     ));
                 }
-                let content = Self::read_regular_utf8(workspace, &relative, "edit read")?;
+                let content =
+                    Self::read_regular_utf8(workspace, &relative, "edit read", cancellation)?;
                 if !content.contains(search) {
                     return Err(SandboxError::BoundaryViolation(
                         "sandbox edit search text was not found".into(),
@@ -904,11 +1024,12 @@ impl SandboxManagerImpl {
                         "sandbox edit result exceeds {MAX_FILESYSTEM_CONTENT_BYTES} bytes"
                     )));
                 }
-                Self::atomic_write(state, workspace, &relative, &updated)?;
+                Self::atomic_write(state, workspace, &relative, &updated, cancellation)?;
                 Ok(serde_json::json!({"edited": true}))
             }
             "delete" => {
                 Self::regular_metadata(workspace, &relative, "delete")?;
+                Self::filesystem_checkpoint(cancellation)?;
                 workspace
                     .remove_file(&relative)
                     .map_err(|error| Self::filesystem_error("delete", error))?;
@@ -929,6 +1050,7 @@ impl SandboxManagerImpl {
                     .map_err(|error| Self::filesystem_error("list", error))?;
                 let mut details = Vec::new();
                 for entry in entries.by_ref() {
+                    Self::filesystem_checkpoint(cancellation)?;
                     if details.len() == MAX_FILESYSTEM_LIST_ENTRIES {
                         return Err(SandboxError::BoundaryViolation(format!(
                             "sandbox filesystem list exceeds {MAX_FILESYSTEM_LIST_ENTRIES} entries"
@@ -1332,7 +1454,24 @@ impl SandboxManager for SandboxManagerImpl {
             .sandboxes
             .get(&sandbox_id)
             .ok_or_else(|| SandboxError::BoundaryViolation("Sandbox not found".to_string()))?;
-        Self::execute_filesystem_inner(&state, operation, parameters)
+        Self::execute_filesystem_inner(&state, operation, parameters, None)
+    }
+
+    fn execute_filesystem_controlled(
+        &self,
+        sandbox_id: SandboxId,
+        operation: &str,
+        parameters: &serde_json::Value,
+        cancellation: &CancellationToken,
+    ) -> Result<serde_json::Value, SandboxError> {
+        Self::filesystem_checkpoint(Some(cancellation))?;
+        #[cfg(test)]
+        self.pause_filesystem_for_test(cancellation)?;
+        let state = self
+            .sandboxes
+            .get(&sandbox_id)
+            .ok_or_else(|| SandboxError::BoundaryViolation("Sandbox not found".to_string()))?;
+        Self::execute_filesystem_inner(&state, operation, parameters, Some(cancellation))
     }
 
     async fn execute_network(

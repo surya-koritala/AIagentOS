@@ -399,6 +399,96 @@ fn provider_join_result(result: ProviderJoinResult) -> Result<serde_json::Value,
     }
 }
 
+/// Owns a capability-filesystem blocking task. The admission permit moves into
+/// the worker, so cancelling the broker future cannot make capacity available
+/// while host I/O is still running. Cancellation is cooperative because Rust
+/// cannot safely kill a blocking thread; after a bounded foreground drain, a
+/// reaper keeps ownership of the join handle while the worker stops at a
+/// filesystem checkpoint.
+struct FilesystemTaskGuard {
+    cancellation: CancellationToken,
+    handle: Option<tokio::task::JoinHandle<Result<serde_json::Value, ResourceError>>>,
+}
+
+impl FilesystemTaskGuard {
+    fn new(
+        manager: Arc<dyn SandboxManager>,
+        sandbox_id: SandboxId,
+        operation: String,
+        parameters: serde_json::Value,
+        permit: OwnedSemaphorePermit,
+    ) -> Self {
+        let cancellation = CancellationToken::new();
+        let worker_cancellation = cancellation.clone();
+        let handle = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            manager
+                .execute_filesystem_controlled(
+                    sandbox_id,
+                    &operation,
+                    &parameters,
+                    &worker_cancellation,
+                )
+                .map_err(|error| ResourceError::OperationFailed(error.to_string()))
+        });
+        Self {
+            cancellation,
+            handle: Some(handle),
+        }
+    }
+
+    async fn join(&mut self) -> ProviderJoinResult {
+        self.handle
+            .as_mut()
+            .expect("filesystem task handle is present until guard drop")
+            .await
+    }
+
+    fn reap(&mut self) {
+        let Some(handle) = self.handle.take() else {
+            return;
+        };
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                let _ = handle.await;
+            });
+        }
+        // Without a runtime, dropping a blocking JoinHandle detaches the
+        // worker. The worker still owns the permit until its real completion.
+    }
+
+    async fn cancel_and_drain(&mut self) {
+        self.cancellation.cancel();
+        if tokio::time::timeout(PROVIDER_DRAIN_TIMEOUT, self.join())
+            .await
+            .is_ok()
+        {
+            self.handle.take();
+        } else {
+            self.reap();
+        }
+    }
+}
+
+impl Drop for FilesystemTaskGuard {
+    fn drop(&mut self) {
+        self.cancellation.cancel();
+        self.reap();
+    }
+}
+
+fn filesystem_join_result(result: ProviderJoinResult) -> Result<serde_json::Value, ResourceError> {
+    match result {
+        Ok(result) => result,
+        Err(error) if error.is_panic() => Err(ResourceError::OperationFailed(
+            "sandbox filesystem task panicked; operation was isolated".into(),
+        )),
+        Err(_) => Err(ResourceError::OperationFailed(
+            "sandbox filesystem task was cancelled".into(),
+        )),
+    }
+}
+
 impl ResourceBrokerImpl {
     pub fn new(
         permission_system: Arc<dyn PermissionSystem>,
@@ -658,11 +748,9 @@ impl ResourceBroker for ResourceBrokerImpl {
         .map_err(|_| ResourceError::OperationFailed("resource admission closed".into()))?;
         drop(waiting);
 
-        // Filesystem operations run synchronously under the sandbox's
-        // operation lock on a blocking worker. Dropping that worker future
-        // does not stop an in-flight mutation, so keep ownership until the
-        // capability operation finishes. Other providers retain the bounded
-        // execution contract below.
+        // Capability filesystem work is synchronous host I/O. Its blocking
+        // worker owns both cooperative cancellation and the admission permit;
+        // dropping this broker future cannot detach capacity ownership.
         let mut permit = Some(permit);
         let capability_filesystem = match sandbox {
             Some((sandbox_id, _)) if request.resource_type == ResourceType::Filesystem => {
@@ -693,15 +781,25 @@ impl ResourceBroker for ResourceBrokerImpl {
                     .as_ref()
                     .expect("sandbox identity came from a sandbox manager"),
             );
-            let operation = request.operation.clone();
-            let parameters = request.parameters.clone();
-            tokio::task::spawn_blocking(move || {
-                manager
-                    .execute_filesystem(sandbox_id, &operation, &parameters)
-                    .map_err(|error| ResourceError::OperationFailed(error.to_string()))
-            })
-            .await
-            .map_err(|error| ResourceError::OperationFailed(error.to_string()))?
+            let mut task = FilesystemTaskGuard::new(
+                manager,
+                sandbox_id,
+                request.operation.clone(),
+                request.parameters.clone(),
+                permit
+                    .take()
+                    .expect("filesystem worker owns its admission permit"),
+            );
+            match tokio::time::timeout(PROVIDER_EXECUTION_TIMEOUT, task.join()).await {
+                Ok(result) => {
+                    task.handle.take();
+                    filesystem_join_result(result)
+                }
+                Err(_) => {
+                    task.cancel_and_drain().await;
+                    Err(ResourceError::Timeout)
+                }
+            }
         } else if let Some(sandbox_id) = capability_network {
             let manager = Arc::clone(
                 self.sandbox_manager
@@ -1210,6 +1308,126 @@ mod tests {
         })
         .await
         .expect("provider cancellation must drain before the bounded deadline");
+    }
+
+    #[tokio::test]
+    async fn cancelling_filesystem_broker_future_stops_before_mutation_and_releases_permit() {
+        let permissions = Arc::new(PermissionManager::new());
+        let sandboxes = Arc::new(SandboxManagerImpl::new());
+        let broker = Arc::new(ResourceBrokerImpl::new(
+            permissions.clone(),
+            sandboxes.clone(),
+        ));
+        let provider_calls = Arc::new(AtomicUsize::new(0));
+        broker
+            .register_provider(Box::new(BlindProvider {
+                resource_type: ResourceType::Filesystem,
+                advertised: vec!["write".into()],
+                calls: provider_calls.clone(),
+            }))
+            .unwrap();
+        let agent = uuid::Uuid::new_v4();
+        permissions.assign_profile(agent, &"full-access".into());
+        let root = std::env::temp_dir().join(format!(
+            "agentos-cancel-filesystem-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let sandbox = sandboxes
+            .create_sandbox(
+                agent,
+                &SandboxConfig {
+                    workspace_dir: root.clone(),
+                    allowed_network_hosts: Some(Vec::new()),
+                    max_disk_usage_bytes: None,
+                    max_memory_bytes: None,
+                    isolation_level: IsolationLevel::Filesystem,
+                    container_image: None,
+                },
+            )
+            .unwrap();
+        let (entered, release, cancellation_observed) = sandboxes.pause_next_filesystem_for_test();
+        let request_broker = broker.clone();
+        let request = tokio::spawn(async move {
+            request_broker
+                .execute(with_test_gate_proof(
+                    ResourceRequest {
+                        agent_id: agent,
+                        resource_type: ResourceType::Filesystem,
+                        operation: "write".into(),
+                        parameters: serde_json::json!({
+                            "path": "cancelled.txt",
+                            "content": "must not be committed"
+                        }),
+                        sandbox_context: Some(sandbox),
+                        gate_admission: None,
+                    },
+                    true,
+                ))
+                .await
+        });
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !entered.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("filesystem worker must enter the controlled pause");
+        assert_eq!(
+            broker
+                .admission
+                .get(&ResourceType::Filesystem)
+                .unwrap()
+                .available_permits(),
+            63,
+            "the blocking worker must own its filesystem permit"
+        );
+
+        request.abort();
+        let _ = request.await;
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !cancellation_observed.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("filesystem worker must observe broker cancellation");
+        assert_eq!(
+            broker
+                .admission
+                .get(&ResourceType::Filesystem)
+                .unwrap()
+                .available_permits(),
+            63,
+            "observing cancellation must not release capacity before worker exit"
+        );
+
+        release.store(true, Ordering::Release);
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while broker
+                .admission
+                .get(&ResourceType::Filesystem)
+                .unwrap()
+                .available_permits()
+                != 64
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cancelled filesystem worker must drain and release its permit");
+
+        assert!(
+            !root.join("cancelled.txt").exists(),
+            "cancellation before the mutation checkpoint must prevent publication"
+        );
+        assert_eq!(
+            provider_calls.load(Ordering::SeqCst),
+            0,
+            "filesystem cancellation must not fall back to an ambient provider"
+        );
+        sandboxes.destroy_sandbox(sandbox).unwrap();
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

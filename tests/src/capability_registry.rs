@@ -511,6 +511,39 @@ fn canonical_client_contract_is_explicit_and_honest() {
 }
 
 #[test]
+fn high_risk_client_actions_keep_target_bound_confirmation() {
+    let agentctl = read_workspace_file("crates/cli/src/bin/agentctl.rs");
+    for contract in [
+        "kill AGENT_ID --confirm AGENT_ID",
+        "erase-agent AGENT_ID --confirm AGENT_ID",
+        "erase-user USER_ID --confirm USER_ID",
+        "erase-tenant TENANT_ID --confirm TENANT_ID",
+        "require_target_confirmation(&mut args, &agent_id)",
+        "require_target_confirmation(&mut args, &target)",
+        "require_target_confirmation(&mut args, &user_id)",
+        "require_target_confirmation(&mut args, &tenant_id)",
+    ] {
+        assert!(
+            agentctl.contains(contract),
+            "canonical CLI lost target-bound destructive contract {contract:?}"
+        );
+    }
+
+    let tui = read_workspace_file("crates/tui/src/app.rs");
+    for contract in [
+        "Mode::ConfirmKill",
+        "self.pending_kill = Some((agent.id.clone(), agent.name.clone()))",
+        "will be force-stopped",
+        "self.pending_kill.take()",
+    ] {
+        assert!(
+            tui.contains(contract),
+            "TUI lost target-bound destructive contract {contract:?}"
+        );
+    }
+}
+
+#[test]
 fn release_blocking_workflows_keep_their_security_contract() {
     let ci = read_workspace_file(".github/workflows/ci.yml");
     for os in ["ubuntu-latest", "macos-latest", "windows-latest"] {

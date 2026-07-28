@@ -178,11 +178,67 @@ async fn erasure_commands_require_confirmation_and_use_live_operator_api() {
         })
         .await
         .expect("create agent");
+    let kill_target = kernel
+        .create_agent_full(kernel::AgentConfig {
+            name: "cli-kill-confirmation".into(),
+            task: "must name exact target".into(),
+            llm_provider: "stub".into(),
+            permission_profile: "standard".into(),
+            priority: kernel::Priority::default(),
+            sandbox_config: None,
+        })
+        .await
+        .expect("create kill target");
     let server = kernel::syscall_server::SyscallServer::bind(Arc::clone(&kernel), "127.0.0.1:0")
         .await
         .expect("bind");
     let addr = server.local_addr().expect("server address");
     let server_task = tokio::spawn(server.serve());
+
+    let unconfirmed_kill = Command::new(env!("CARGO_BIN_EXE_agentctl"))
+        .arg("--addr")
+        .arg(addr.to_string())
+        .arg("kill")
+        .arg(kill_target.id.to_string())
+        .output()
+        .expect("run unconfirmed kill");
+    assert_eq!(unconfirmed_kill.status.code(), Some(2));
+    assert_ne!(
+        kernel.agent_manager.get_agent_state(kill_target.id),
+        Some(kernel::AgentState::Stopped)
+    );
+    let mismatched_kill = Command::new(env!("CARGO_BIN_EXE_agentctl"))
+        .arg("--addr")
+        .arg(addr.to_string())
+        .arg("kill")
+        .arg(kill_target.id.to_string())
+        .arg("--confirm")
+        .arg(agent.id.to_string())
+        .output()
+        .expect("run mismatched kill");
+    assert_eq!(mismatched_kill.status.code(), Some(2));
+    assert_ne!(
+        kernel.agent_manager.get_agent_state(kill_target.id),
+        Some(kernel::AgentState::Stopped)
+    );
+    let confirmed_kill = Command::new(env!("CARGO_BIN_EXE_agentctl"))
+        .arg("--addr")
+        .arg(addr.to_string())
+        .arg("kill")
+        .arg(kill_target.id.to_string())
+        .arg("--confirm")
+        .arg(kill_target.id.to_string())
+        .output()
+        .expect("run confirmed kill");
+    assert!(
+        confirmed_kill.status.success(),
+        "kill failed: {}",
+        String::from_utf8_lossy(&confirmed_kill.stderr)
+    );
+    assert_eq!(
+        kernel.agent_manager.get_agent_state(kill_target.id),
+        Some(kernel::AgentState::Stopped)
+    );
 
     let agent_id = agent.id;
     let unconfirmed = tokio::task::spawn_blocking(move || {
@@ -203,6 +259,22 @@ async fn erasure_commands_require_confirmation_and_use_live_operator_api() {
         .unwrap()
         .is_some());
 
+    let mismatched = Command::new(env!("CARGO_BIN_EXE_agentctl"))
+        .arg("--addr")
+        .arg(addr.to_string())
+        .arg("erase-agent")
+        .arg(agent.id.to_string())
+        .arg("--confirm")
+        .arg(uuid::Uuid::new_v4().to_string())
+        .output()
+        .expect("run mismatched erase-agent");
+    assert_eq!(mismatched.status.code(), Some(2));
+    assert!(kernel
+        .context_manager
+        .agent_tenant(agent.id)
+        .unwrap()
+        .is_some());
+
     let confirmed = tokio::task::spawn_blocking(move || {
         Command::new(env!("CARGO_BIN_EXE_agentctl"))
             .arg("--addr")
@@ -210,6 +282,7 @@ async fn erasure_commands_require_confirmation_and_use_live_operator_api() {
             .arg("erase-agent")
             .arg(agent.id.to_string())
             .arg("--confirm")
+            .arg(agent.id.to_string())
             .output()
             .expect("run confirmed erase-agent")
     })
@@ -249,6 +322,7 @@ async fn erasure_commands_require_confirmation_and_use_live_operator_api() {
         .arg("erase-user")
         .arg(&user_id)
         .arg("--confirm")
+        .arg(&user_id)
         .output()
         .expect("run erase-user");
     assert!(
@@ -286,6 +360,7 @@ async fn erasure_commands_require_confirmation_and_use_live_operator_api() {
         .arg("erase-tenant")
         .arg(&tenant_id)
         .arg("--confirm")
+        .arg(&tenant_id)
         .output()
         .expect("run erase-tenant");
     assert!(

@@ -276,6 +276,7 @@ fn provider_matrix_names_every_resource_provider_status_and_platform_contract() 
         ("`IpcResourceProvider`", "Linux; macOS; Windows"),
         ("Kernel browser provider", "None — unavailable"),
         ("Kernel peripheral provider", "None — unavailable"),
+        ("Kernel computer-use provider", "None — unavailable"),
         (
             "`FilesystemProvider` (`resources` crate)",
             "None — unavailable",

@@ -10,6 +10,19 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
 
 ## [Unreleased]
 
+- Added a fail-closed desktop release foundation under #126. Workspace, Tauri,
+  UI, lockfile, and release-tag versions must now agree; a code-rendered source
+  SVG generates validated multi-resolution PNG, ICO, and ICNS assets; and the
+  release workflow builds native Linux Debian/AppImage, macOS DMG, and Windows
+  MSI/NSIS qualification installers with SBOM, checksums, Sigstore signatures,
+  and provenance. Public tags remain deliberately blocked until native signing,
+  macOS notarization, signed updater, clean-host upgrade/rollback evidence, and
+  the supported platform matrix are complete. Windows release builds explicitly
+  select the complete Strawberry Perl runtime so Git Bash cannot break vendored
+  OpenSSL configuration by shadowing it with an incomplete Perl installation.
+  Reproducibility builds now use two clean output trees through one stable
+  logical target path, preventing Rust, ELF, Mach-O, and PE linker metadata from
+  embedding the prior `target-a`/`target-b` test-harness difference.
 - Established a WCAG 2.2 AA-oriented desktop accessibility baseline with a
   keyboard skip link, visible focus, semantic landmarks and current navigation,
   named controls, modal focus containment, live operation/conversation status,

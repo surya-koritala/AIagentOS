@@ -74,6 +74,11 @@ cannot publish a GitHub Release. A `v*` tag runs the same workflow and
 5. **Supply-chain evidence** — each platform archive has a CycloneDX SBOM, the
    container has an SPDX SBOM, every asset appears in `SHA256SUMS`, and assets
    are keyless-signed with Sigstore and covered by GitHub build provenance.
+6. **Desktop installer qualification** — Linux Debian/AppImage, macOS DMG, and
+   Windows MSI/NSIS installers build from the production frontend on their
+   native platform, carry a CycloneDX SBOM, and enter the same checksum,
+   Sigstore, and provenance bundle. These are qualification artifacts, not a
+   substitute for native platform trust.
 
 Only then does the workflow publish a GitHub Release whose notes are the matching
 `CHANGELOG.md` section. Verify a downloaded release with:
@@ -91,6 +96,11 @@ gh attestation verify agentos-vX.Y.Z-x86_64-unknown-linux-gnu.zip \
 
 This is how "are we building the right product?" gets enforced mechanically: a
 release that can't contain a rogue agent or boot a server doesn't ship.
+
+Public tags are currently blocked by the desktop release contract. Native
+platform signing, macOS notarization, signed updater metadata, clean-host
+upgrade/rollback evidence, and the supported-platform matrix must land before
+that block can be removed. See [desktop distribution](docs/DESKTOP_DISTRIBUTION.md).
 
 ## Repository merge policy
 

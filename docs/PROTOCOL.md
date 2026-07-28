@@ -10,6 +10,32 @@ syscall-gate, sandbox, accounting, and audit path.
 
 The numbered in-process syscall prototype is not part of this contract.
 
+## Canonical clients and parity
+
+There is one canonical operator client: **`agentctl`**. It is the
+non-interactive, scriptable reference for public administrative operations.
+There is one canonical programmatic client: **`agent_sdk::KernelClient`**. The
+wire schema remains the ultimate compatibility authority; neither client may
+invent a privileged operation outside it.
+
+| Surface | Intended role | Feature-parity expectation |
+|---|---|---|
+| `agentctl` | Canonical headless operator client | New public administrative operations land here first or declare an explicit tracked exception. It must preserve typed errors, authorization, confirmations, and machine-readable output. |
+| Rust SDK (`KernelClient`) | Canonical typed programmatic client | Covers the public wire contract and is the shared implementation boundary for first-party remote clients. |
+| `agent-tui` | Focused interactive operator view | May expose a deliberate subset, but shared operations must match `agentctl` authorization, target identity, state, errors, and metrics. Missing breadth is not called parity. |
+| Tauri/Svelte desktop | Focused end-user/operator application | May expose a deliberate subset, but its backend must use `KernelClient`; shared operations follow the same security and state contract. |
+| `agent` | Embedded single-agent developer shell | Not an operator client and not a feature-parity target. It hosts a kernel in-process for an interactive conversation. Administrative automation belongs in `agentctl`. |
+| Raw JSON / MCP | Interoperability surfaces | Must match protocol authorization and typed failure semantics; they do not define first-party UX breadth. |
+
+“Parity” means behavioral parity for an operation a surface exposes, not an
+identical menu on every surface. Shared conformance tests therefore require
+the CLI, TUI state model, desktop backend, SDK, raw protocol, and MCP adapter to
+agree on authentication, tenant visibility, allowed owner behavior, foreign
+denial, failed re-authentication, and read-only mutation denial. Metrics
+projections are separately checked against the same raw snapshot. Feature
+breadth, reconnect/idempotency, accessibility, and signed desktop distribution
+remain release criteria rather than implied parity.
+
 ## Version and feature negotiation
 
 The wire protocol is versioned independently from the crate. Protocol v2 serves

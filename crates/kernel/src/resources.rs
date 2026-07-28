@@ -14,6 +14,13 @@ use crate::permissions::{AccessDecision, ActionOutcome, PermissionSystem};
 use crate::sandbox::{SandboxAction, SandboxManager};
 use crate::{AgentId, IsolationLevel, ResourceError, SandboxId};
 
+pub(crate) const MAX_RESOURCE_OPERATION_BYTES: usize = 128;
+pub(crate) const MAX_RESOURCE_JSON_DEPTH: usize = 64;
+pub(crate) const MAX_RESOURCE_JSON_NODES: usize = 65_536;
+pub(crate) const MAX_RESOURCE_JSON_STRING_BYTES: usize = 4 * 1024 * 1024;
+pub(crate) const MAX_RESOURCE_JSON_TOTAL_STRING_BYTES: usize = 8 * 1024 * 1024;
+pub(crate) const MAX_RESOURCE_ERROR_BYTES: usize = 16 * 1024;
+
 /// Resource types available to agents.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ResourceType {
@@ -186,6 +193,7 @@ pub(crate) fn request_identity(
     operation: &str,
     parameters: &serde_json::Value,
 ) -> Result<String, String> {
+    validate_resource_request(operation, parameters).map_err(|error| error.to_string())?;
     let serialized = serde_json::to_vec(&serde_json::json!({
         "version": 1,
         "agent_id": agent_id,
@@ -195,6 +203,78 @@ pub(crate) fn request_identity(
     }))
     .map_err(|error| format!("provider request serialization failed: {error}"))?;
     Ok(opaque_identity(&serialized))
+}
+
+fn validate_resource_request(
+    operation: &str,
+    parameters: &serde_json::Value,
+) -> Result<(), ResourceError> {
+    if operation.len() > MAX_RESOURCE_OPERATION_BYTES || operation.contains('\0') {
+        return Err(ResourceError::OperationFailed(format!(
+            "resource operation exceeds {MAX_RESOURCE_OPERATION_BYTES} bytes or contains NUL"
+        )));
+    }
+    validate_resource_json(parameters, "resource request parameters")
+}
+
+fn validate_resource_json(value: &serde_json::Value, surface: &str) -> Result<(), ResourceError> {
+    let mut stack = vec![(value, 0_usize)];
+    let mut nodes = 0_usize;
+    let mut string_bytes = 0_usize;
+    while let Some((value, depth)) = stack.pop() {
+        if depth > MAX_RESOURCE_JSON_DEPTH {
+            return Err(ResourceError::OperationFailed(format!(
+                "{surface} exceed the maximum JSON depth of {MAX_RESOURCE_JSON_DEPTH}"
+            )));
+        }
+        nodes = nodes.saturating_add(1);
+        if nodes > MAX_RESOURCE_JSON_NODES {
+            return Err(ResourceError::OperationFailed(format!(
+                "{surface} exceed the maximum JSON node count of {MAX_RESOURCE_JSON_NODES}"
+            )));
+        }
+        match value {
+            serde_json::Value::String(value) => {
+                if value.len() > MAX_RESOURCE_JSON_STRING_BYTES {
+                    return Err(ResourceError::OperationFailed(format!(
+                        "{surface} contain a string larger than {MAX_RESOURCE_JSON_STRING_BYTES} bytes"
+                    )));
+                }
+                string_bytes = string_bytes.saturating_add(value.len());
+            }
+            serde_json::Value::Array(values) => {
+                stack.extend(values.iter().map(|value| (value, depth + 1)));
+            }
+            serde_json::Value::Object(values) => {
+                for (key, value) in values {
+                    if key.len() > MAX_RESOURCE_JSON_STRING_BYTES {
+                        return Err(ResourceError::OperationFailed(format!(
+                            "{surface} contain a key larger than {MAX_RESOURCE_JSON_STRING_BYTES} bytes"
+                        )));
+                    }
+                    string_bytes = string_bytes.saturating_add(key.len());
+                    stack.push((value, depth + 1));
+                }
+            }
+            serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {
+            }
+        }
+        if string_bytes > MAX_RESOURCE_JSON_TOTAL_STRING_BYTES {
+            return Err(ResourceError::OperationFailed(format!(
+                "{surface} exceed {MAX_RESOURCE_JSON_TOTAL_STRING_BYTES} total string bytes"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn bounded_resource_error(error: &ResourceError) -> String {
+    let diagnostic = error.to_string();
+    if diagnostic.len() <= MAX_RESOURCE_ERROR_BYTES {
+        diagnostic
+    } else {
+        "resource provider returned an oversized error diagnostic".into()
+    }
 }
 
 /// Non-cloneable, request-bound evidence of a successful syscall-gate verdict.
@@ -607,6 +687,7 @@ impl ResourceBroker for ResourceBrokerImpl {
         &self,
         mut request: ResourceRequest,
     ) -> Result<ResourceResponse, ResourceError> {
+        validate_resource_request(&request.operation, &request.parameters)?;
         let admission_approved = match request.gate_admission.take() {
             Some(proof) => Some(proof.verify(&request)?),
             None if !self.require_gate_admission => None,
@@ -852,6 +933,11 @@ impl ResourceBroker for ResourceBrokerImpl {
         };
         drop(permit);
 
+        let result = result.and_then(|data| {
+            validate_resource_json(&data, "resource provider response")?;
+            Ok(data)
+        });
+
         match result {
             Ok(data) => {
                 self.permission_system.log_action(
@@ -878,7 +964,7 @@ impl ResourceBroker for ResourceBrokerImpl {
                 Ok(ResourceResponse {
                     success: false,
                     data: serde_json::Value::Null,
-                    error: Some(e.to_string()),
+                    error: Some(bounded_resource_error(&e)),
                 })
             }
         }
@@ -984,6 +1070,172 @@ mod tests {
         ) -> Result<serde_json::Value, ResourceError> {
             Ok(serde_json::json!({"op": operation, "params": params, "result": "ok"}))
         }
+    }
+
+    #[derive(Clone)]
+    enum BoundedProviderOutcome {
+        Data(serde_json::Value),
+        Error(String),
+    }
+
+    struct BoundedProvider {
+        outcome: BoundedProviderOutcome,
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl ResourceProvider for BoundedProvider {
+        fn resource_type(&self) -> ResourceType {
+            ResourceType::Filesystem
+        }
+
+        fn supported_operations(&self) -> Vec<String> {
+            vec!["read".into()]
+        }
+
+        async fn execute(
+            &self,
+            _operation: &str,
+            _params: &serde_json::Value,
+        ) -> Result<serde_json::Value, ResourceError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            match &self.outcome {
+                BoundedProviderOutcome::Data(data) => Ok(data.clone()),
+                BoundedProviderOutcome::Error(error) => {
+                    Err(ResourceError::OperationFailed(error.clone()))
+                }
+            }
+        }
+    }
+
+    fn bounded_provider_broker(
+        outcome: BoundedProviderOutcome,
+    ) -> (ResourceBrokerImpl, uuid::Uuid, Arc<AtomicUsize>) {
+        let permissions = Arc::new(PermissionManager::new());
+        let agent = uuid::Uuid::new_v4();
+        permissions.assign_profile(agent, &"full-access".into());
+        let broker = ResourceBrokerImpl::new_unconfined(permissions);
+        let calls = Arc::new(AtomicUsize::new(0));
+        broker
+            .register_provider(Box::new(BoundedProvider {
+                outcome,
+                calls: calls.clone(),
+            }))
+            .unwrap();
+        (broker, agent, calls)
+    }
+
+    fn unconfined_read_request(
+        agent_id: uuid::Uuid,
+        parameters: serde_json::Value,
+    ) -> ResourceRequest {
+        ResourceRequest {
+            agent_id,
+            resource_type: ResourceType::Filesystem,
+            operation: "read".into(),
+            parameters,
+            sandbox_context: None,
+            gate_admission: None,
+        }
+    }
+
+    #[test]
+    fn generic_resource_json_bounds_cover_depth_nodes_and_string_bytes() {
+        validate_resource_json(
+            &serde_json::Value::String("x".repeat(MAX_RESOURCE_JSON_STRING_BYTES)),
+            "boundary",
+        )
+        .unwrap();
+        assert!(validate_resource_json(
+            &serde_json::Value::String("x".repeat(MAX_RESOURCE_JSON_STRING_BYTES + 1)),
+            "oversized string",
+        )
+        .is_err());
+
+        let mut deep = serde_json::Value::Null;
+        for _ in 0..=MAX_RESOURCE_JSON_DEPTH {
+            deep = serde_json::Value::Array(vec![deep]);
+        }
+        assert!(validate_resource_json(&deep, "deep value").is_err());
+
+        let too_many_nodes =
+            serde_json::Value::Array(vec![serde_json::Value::Null; MAX_RESOURCE_JSON_NODES]);
+        assert!(validate_resource_json(&too_many_nodes, "wide value").is_err());
+
+        let large_strings = serde_json::Value::Array(vec![
+            serde_json::Value::String("x".repeat(MAX_RESOURCE_JSON_STRING_BYTES)),
+            serde_json::Value::String("y".repeat(MAX_RESOURCE_JSON_STRING_BYTES)),
+            serde_json::Value::String("z".into()),
+        ]);
+        assert!(validate_resource_json(&large_strings, "aggregate strings").is_err());
+
+        let oversized_parameters =
+            serde_json::Value::String("x".repeat(MAX_RESOURCE_JSON_STRING_BYTES + 1));
+        assert!(request_identity(
+            uuid::Uuid::new_v4(),
+            &ResourceType::Filesystem,
+            "read",
+            &oversized_parameters,
+        )
+        .is_err());
+        assert!(validate_resource_request(
+            &"x".repeat(MAX_RESOURCE_OPERATION_BYTES + 1),
+            &serde_json::Value::Null,
+        )
+        .is_err());
+    }
+
+    #[tokio::test]
+    async fn broker_rejects_unbounded_requests_responses_and_error_diagnostics() {
+        let (broker, agent, calls) =
+            bounded_provider_broker(BoundedProviderOutcome::Data(serde_json::Value::Null));
+        let error = broker
+            .execute(unconfined_read_request(
+                agent,
+                serde_json::json!({
+                    "path": ".",
+                    "payload": "x".repeat(MAX_RESOURCE_JSON_STRING_BYTES + 1),
+                }),
+            ))
+            .await
+            .expect_err("oversized request must fail before provider dispatch");
+        assert!(error.to_string().contains("string larger"));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+        let (broker, agent, calls) = bounded_provider_broker(BoundedProviderOutcome::Data(
+            serde_json::Value::String("x".repeat(MAX_RESOURCE_JSON_STRING_BYTES + 1)),
+        ));
+        let response = broker
+            .execute(unconfined_read_request(
+                agent,
+                serde_json::json!({"path": "."}),
+            ))
+            .await
+            .unwrap();
+        assert!(!response.success);
+        assert!(response.error.unwrap().contains("string larger"));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        let (broker, agent, calls) = bounded_provider_broker(BoundedProviderOutcome::Error(
+            "secret diagnostic".repeat(MAX_RESOURCE_ERROR_BYTES),
+        ));
+        let response = broker
+            .execute(unconfined_read_request(
+                agent,
+                serde_json::json!({"path": "."}),
+            ))
+            .await
+            .unwrap();
+        assert!(!response.success);
+        assert_eq!(
+            response.error.as_deref(),
+            Some("resource provider returned an oversized error diagnostic")
+        );
+        assert!(
+            response.error.unwrap().len() <= MAX_RESOURCE_ERROR_BYTES,
+            "provider diagnostics must remain bounded"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     struct CountingProvider(Arc<AtomicUsize>);

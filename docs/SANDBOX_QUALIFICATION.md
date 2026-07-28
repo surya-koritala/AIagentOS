@@ -26,6 +26,14 @@ The standalone `resources::ApplicationProvider` and the kernel metadata
 provider also cannot launch a host process; application execution is dispatched
 only to the container backend for a container-isolated sandbox.
 
+Before any provider runs, the resource broker bounds the operation name and
+the JSON request envelope. It applies the same depth, node, individual-string,
+and aggregate-string bounds to successful provider output before returning it,
+and replaces oversized provider error diagnostics with a fixed non-sensitive
+error. These provider-independent controls sit outside the stricter
+filesystem, HTTP, and application contracts below. Admission queues,
+per-resource concurrency, admission wait, and execution time are also bounded.
+
 Filesystem text operations accept at most 4 MiB, paths at most 4,096 UTF-8
 bytes, and directory listings at most 4,096 entries. Reads, edits, writes, and
 deletes reject final symlinks and non-regular files. `create` never replaces an

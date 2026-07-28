@@ -26,6 +26,10 @@ pub(crate) const MAX_NETWORK_REQUEST_BYTES: usize = 1024 * 1024;
 pub(crate) const MAX_NETWORK_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_NETWORK_JSON_DEPTH: usize = 64;
 const MAX_NETWORK_JSON_NODES: usize = 65_536;
+pub(crate) const MAX_PROCESS_COMMAND_BYTES: usize = 4 * 1024;
+pub(crate) const MAX_PROCESS_ARGUMENTS: usize = 1_024;
+pub(crate) const MAX_PROCESS_ARGUMENT_BYTES: usize = 64 * 1024;
+pub(crate) const MAX_PROCESS_ARGUMENT_BYTES_TOTAL: usize = 1024 * 1024;
 #[cfg(test)]
 type FilesystemTestPause = (Arc<AtomicBool>, Arc<AtomicBool>, Arc<AtomicBool>);
 
@@ -1376,6 +1380,68 @@ impl SandboxManagerImpl {
         }
     }
 
+    fn validate_process_parameters(
+        parameters: &serde_json::Value,
+    ) -> Result<(String, Vec<String>), SandboxError> {
+        let parameters = parameters.as_object().ok_or_else(|| {
+            SandboxError::BoundaryViolation("process parameters must be an object".into())
+        })?;
+        for key in parameters.keys() {
+            if !matches!(key.as_str(), "command" | "args") {
+                return Err(SandboxError::BoundaryViolation(format!(
+                    "unsupported process parameter: {key}"
+                )));
+            }
+        }
+        let program = parameters
+            .get("command")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| SandboxError::BoundaryViolation("process command denied".into()))?;
+        if program.trim().is_empty()
+            || program.len() > MAX_PROCESS_COMMAND_BYTES
+            || program.contains('\0')
+        {
+            return Err(SandboxError::BoundaryViolation(
+                "process command exceeds the supported bound".into(),
+            ));
+        }
+        let arguments = parameters
+            .get("args")
+            .map(|value| {
+                value.as_array().ok_or_else(|| {
+                    SandboxError::BoundaryViolation("process args must be an array".into())
+                })
+            })
+            .transpose()?
+            .cloned()
+            .unwrap_or_default();
+        if arguments.len() > MAX_PROCESS_ARGUMENTS {
+            return Err(SandboxError::BoundaryViolation(format!(
+                "process argument count exceeds {MAX_PROCESS_ARGUMENTS}"
+            )));
+        }
+        let mut total_bytes = 0_usize;
+        let mut validated = Vec::with_capacity(arguments.len());
+        for argument in arguments {
+            let argument = argument.as_str().ok_or_else(|| {
+                SandboxError::BoundaryViolation("process arguments must be strings".into())
+            })?;
+            if argument.len() > MAX_PROCESS_ARGUMENT_BYTES || argument.contains('\0') {
+                return Err(SandboxError::BoundaryViolation(format!(
+                    "process argument exceeds {MAX_PROCESS_ARGUMENT_BYTES} bytes"
+                )));
+            }
+            total_bytes = total_bytes.saturating_add(argument.len());
+            if total_bytes > MAX_PROCESS_ARGUMENT_BYTES_TOTAL {
+                return Err(SandboxError::BoundaryViolation(format!(
+                    "process arguments exceed {MAX_PROCESS_ARGUMENT_BYTES_TOTAL} bytes"
+                )));
+            }
+            validated.push(argument.to_string());
+        }
+        Ok((program.to_string(), validated))
+    }
+
     async fn execute_process_inner(
         state: &SandboxState,
         parameters: &serde_json::Value,
@@ -1385,27 +1451,7 @@ impl SandboxManagerImpl {
                 "isolated process backend unavailable".into(),
             ));
         }
-        let program = parameters
-            .get("command")
-            .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| SandboxError::BoundaryViolation("process command denied".into()))?;
-        let arguments = parameters
-            .get("args")
-            .and_then(serde_json::Value::as_array)
-            .map(|arguments| {
-                arguments
-                    .iter()
-                    .map(|argument| {
-                        argument.as_str().map(str::to_string).ok_or_else(|| {
-                            SandboxError::BoundaryViolation(
-                                "process arguments must be strings".into(),
-                            )
-                        })
-                    })
-                    .collect::<Result<Vec<_>, _>>()
-            })
-            .transpose()?
-            .unwrap_or_default();
+        let (program, arguments) = Self::validate_process_parameters(parameters)?;
         let image = state
             .container_image
             .as_deref()
@@ -1423,7 +1469,7 @@ impl SandboxManagerImpl {
                 &state.workspace_dir,
                 image,
                 state.max_memory_bytes,
-                program,
+                &program,
                 &arguments,
             )
             .await
@@ -1914,6 +1960,65 @@ mod tests {
             }),
         )
         .is_err());
+    }
+
+    #[test]
+    fn process_parameters_are_strict_bounded_and_exclude_ambient_channels() {
+        assert!(
+            SandboxManagerImpl::validate_process_parameters(&serde_json::json!({
+                "command": "/usr/bin/tool",
+                "args": ["literal;not-a-shell", "--flag=value"]
+            }))
+            .is_ok()
+        );
+
+        for unsupported in [
+            serde_json::json!({"command": "tool", "env": {"SECRET": "ambient"}}),
+            serde_json::json!({"command": "tool", "cwd": "/host"}),
+            serde_json::json!({"command": "tool", "stdin": "secret"}),
+            serde_json::json!({"command": "tool", "shell": true}),
+            serde_json::json!({"command": "tool", "timeout_seconds": 3_600}),
+            serde_json::json!({"command": "tool", "max_output_bytes": usize::MAX}),
+        ] {
+            assert!(
+                SandboxManagerImpl::validate_process_parameters(&unsupported).is_err(),
+                "ambient process channel must fail before container execution"
+            );
+        }
+        assert!(
+            SandboxManagerImpl::validate_process_parameters(&serde_json::json!({
+                "command": "tool",
+                "args": [7]
+            }))
+            .is_err()
+        );
+        assert!(
+            SandboxManagerImpl::validate_process_parameters(&serde_json::json!({
+                "command": "x".repeat(MAX_PROCESS_COMMAND_BYTES + 1)
+            }))
+            .is_err()
+        );
+        assert!(
+            SandboxManagerImpl::validate_process_parameters(&serde_json::json!({
+                "command": "tool",
+                "args": vec![""; MAX_PROCESS_ARGUMENTS + 1]
+            }))
+            .is_err()
+        );
+        assert!(
+            SandboxManagerImpl::validate_process_parameters(&serde_json::json!({
+                "command": "tool",
+                "args": ["x".repeat(MAX_PROCESS_ARGUMENT_BYTES + 1)]
+            }))
+            .is_err()
+        );
+        assert!(
+            SandboxManagerImpl::validate_process_parameters(&serde_json::json!({
+                "command": "tool",
+                "args": vec!["x".repeat(MAX_PROCESS_ARGUMENT_BYTES); 17]
+            }))
+            .is_err()
+        );
     }
 
     #[tokio::test]

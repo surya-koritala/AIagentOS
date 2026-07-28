@@ -19,6 +19,16 @@ does not mean production-qualified.
 | Standalone `PeripheralProvider` (`resources` crate) | capture, audio, print, and other device operations | **Experimental — unavailable** | **None — unavailable** | Advertises no operations and returns typed `UnsupportedOperation`; it has no human/operator grant authority. |
 | Feature-gated HTML/playwright helpers | browse/search/navigation helper functions | **Experimental** | **Trusted operator process; feature-dependent** | These are direct trusted-application helpers, not `ResourceProvider` implementations and not runtime discovery entries. They are excluded from the v1 runtime support promise and do not substitute for the kernel network or browser boundary. |
 
+Every brokered provider call also has one provider-independent envelope:
+operation names are limited to 128 bytes; request parameters and successful
+response data are limited to 64 JSON levels, 65,536 values, 4 MiB per string,
+and 8 MiB of aggregate string/key data. Provider error diagnostics are limited
+to 16 KiB and replaced with a non-sensitive fixed error when oversized. The
+broker additionally enforces a 30-second admission wait, a 30-second execution
+deadline, at most 1,024 queued calls, and per-resource concurrency limits. The
+provider-specific limits in the table remain authoritative when they are
+stricter.
+
 No provider is currently **Production-qualified**. Promotion requires the
 provider’s remaining #124 criteria, target-platform/live-path evidence, and
 the independent #127 security and release review. Runtime discovery remains

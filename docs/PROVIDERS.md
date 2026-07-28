@@ -110,6 +110,24 @@ therefore qualified only by the protected
 `on-device-qualification.yml` workflow on a repository-owned runner. Model
 weights are never fetched by pull-request CI.
 
+The workflow accepts only an existing `vX.Y.Z` or `vX.Y.Z-rc.N` tag that points
+to its exact clean checkout. Protected environment variables supply absolute,
+non-symlink model and tokenizer paths plus a stable hardware ID; paths, prompts,
+generated text, and weights never enter dispatch history or the artifact. The
+bounded report binds the source commit and release candidate to SHA-256 model,
+tokenizer, and configuration identities. It records load, bounded generation,
+peak RSS, and cancellation latency against explicit targets.
+
+Cancellation qualification is stronger than observing an API error: the
+adapter signals its blocking inference worker and waits for that worker to
+finish before returning cancellation or timeout. Failure to drain within the
+bounded cleanup interval fails closed. The retained report still sets
+`production_claim_allowed` to false. It becomes usable on-device proof only
+after the exact artifact and runner provenance are independently reviewed, and
+whole-product promotion still requires every other release gate. This
+repository has implemented and regression-tested the gate, but has not yet
+published an independently approved real-model artifact.
+
 ## Durable retrieval memory
 
 Facts persist the embedding model ID, version, dimension, content hash, and
@@ -154,8 +172,10 @@ construction and sustained 100k+ latency/soak goals remain part of
 - `live-provider-qualification.yml` runs fixtures and then one bounded contract
   for each cloud/local service every night or on manual dispatch. Missing
   credentials/endpoints emit a `not_run` artifact.
-- `on-device-qualification.yml` runs a provisioned real GGUF model on a
-  repository-owned CPU runner and records non-sensitive resource evidence.
+- `on-device-qualification.yml` binds a provisioned real GGUF model and
+  tokenizer to one exact tagged release candidate, verifies bounded load,
+  generation, cancellation drain, and peak RSS on a repository-owned CPU
+  runner, and retains only non-sensitive digest-bound evidence for 90 days.
 - Pull-request CI runs adapter fixtures, memory correctness/concurrency tests,
   the exact-vs-ANN quality gate, Clippy, and the full workspace regressions.
 

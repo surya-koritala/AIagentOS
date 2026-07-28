@@ -34,6 +34,7 @@
 //! ```
 
 use std::sync::Mutex;
+use std::time::Duration;
 
 use candle_core::quantized::gguf_file;
 use candle_core::{Device, Tensor};
@@ -393,6 +394,30 @@ struct OnDeviceSession {
     engine: std::sync::Arc<Engine>,
 }
 
+type InferenceResult = Result<(String, u32), ConnectorError>;
+const INFERENCE_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+
+async fn drain_inference_worker(
+    worker: &mut tokio::task::JoinHandle<InferenceResult>,
+    provider_id: &ProviderId,
+    timeout: Duration,
+) -> Result<(), ConnectorError> {
+    match tokio::time::timeout(timeout, &mut *worker).await {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(error)) => Err(ConnectorError::ConnectionFailed(format!(
+            "on-device inference cleanup task failed: {error}"
+        ))),
+        Err(_) => Err(ConnectorError::timeout(
+            provider_id.clone(),
+            format!(
+                "on-device inference worker did not drain within {} ms",
+                timeout.as_millis()
+            ),
+            None,
+        )),
+    }
+}
+
 #[async_trait::async_trait]
 impl LlmSession for OnDeviceSession {
     async fn send(&self, messages: Vec<StandardMessage>) -> Result<LlmResponse, ConnectorError> {
@@ -439,29 +464,37 @@ impl LlmSession for OnDeviceSession {
         let mut worker = tokio::task::spawn_blocking(move || {
             engine.generate(&prompt, max_output_tokens, &worker_provider, &worker_token)
         });
-        let joined = async {
-            (&mut worker)
-                .await
-                .map_err(|e| ConnectorError::ConnectionFailed(format!("inference task: {e}")))?
-        };
-        tokio::pin!(joined);
         let result = match options.timeout {
             Some(timeout) => {
                 tokio::select! {
                     biased;
                     _ = cancellation.cancelled() => {
                         worker_cancel.cancel();
+                        drain_inference_worker(
+                            &mut worker,
+                            &provider_id,
+                            INFERENCE_DRAIN_TIMEOUT,
+                        ).await?;
                         Err(ConnectorError::cancelled(provider_id.clone(), None))
                     }
                     _ = tokio::time::sleep(timeout) => {
                         worker_cancel.cancel();
+                        drain_inference_worker(
+                            &mut worker,
+                            &provider_id,
+                            INFERENCE_DRAIN_TIMEOUT,
+                        ).await?;
                         Err(ConnectorError::timeout(
                             provider_id.clone(),
                             format!("on-device inference exceeded {} ms", timeout.as_millis()),
                             None,
                         ))
                     }
-                    result = &mut joined => result,
+                    result = &mut worker => {
+                        result.map_err(|error| ConnectorError::ConnectionFailed(
+                            format!("inference task: {error}")
+                        ))?
+                    },
                 }
             }
             None => {
@@ -469,9 +502,18 @@ impl LlmSession for OnDeviceSession {
                     biased;
                     _ = cancellation.cancelled() => {
                         worker_cancel.cancel();
+                        drain_inference_worker(
+                            &mut worker,
+                            &provider_id,
+                            INFERENCE_DRAIN_TIMEOUT,
+                        ).await?;
                         Err(ConnectorError::cancelled(provider_id.clone(), None))
                     }
-                    result = &mut joined => result,
+                    result = &mut worker => {
+                        result.map_err(|error| ConnectorError::ConnectionFailed(
+                            format!("inference task: {error}")
+                        ))?
+                    },
                 }
             }
         };
@@ -625,6 +667,49 @@ mod tests {
             Err(ConnectorError::ProtocolError(_))
         ));
         let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn cancellation_drain_waits_for_blocking_worker_cleanup() {
+        let provider_id = "on-device".to_string();
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let worker_token = cancellation.clone();
+        let cleaned = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let worker_cleaned = cleaned.clone();
+        let mut worker = tokio::task::spawn_blocking(move || {
+            while !worker_token.is_cancelled() {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            worker_cleaned.store(true, std::sync::atomic::Ordering::SeqCst);
+            Err(ConnectorError::cancelled("on-device".into(), None))
+        });
+
+        cancellation.cancel();
+        drain_inference_worker(&mut worker, &provider_id, Duration::from_secs(1))
+            .await
+            .expect("cooperative worker should drain");
+        assert!(
+            cleaned.load(std::sync::atomic::Ordering::SeqCst),
+            "cancellation must not return before the blocking worker cleans up"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_drain_timeout_fails_closed() {
+        let provider_id = "on-device".to_string();
+        let mut worker = tokio::task::spawn_blocking(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            Ok(("completed after cleanup deadline".to_string(), 1))
+        });
+
+        assert!(matches!(
+            drain_inference_worker(&mut worker, &provider_id, Duration::from_millis(1)).await,
+            Err(ConnectorError::Timeout(_))
+        ));
+        worker
+            .await
+            .expect("test worker should remain joinable after the timeout")
+            .expect("test worker should complete cleanly");
     }
 
     /// Real end-to-end generation. Skipped unless a model is provisioned on the

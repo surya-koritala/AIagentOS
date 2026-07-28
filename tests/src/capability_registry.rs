@@ -553,6 +553,44 @@ fn release_blocking_workflows_keep_their_security_contract() {
         "live-provider jobs must select only their credential and endpoint secrets"
     );
 
+    let on_device = read_workspace_file(".github/workflows/on-device-qualification.yml");
+    assert!(
+        on_device.contains("workflow_dispatch:") && !on_device.contains("pull_request:"),
+        "provisioned model qualification must remain a protected explicit gate"
+    );
+    for proof in [
+        "environment: model-qualification",
+        "ref: ${{ github.sha }}",
+        "AGENTOS_GGUF_MODEL: ${{ vars.AGENTOS_GGUF_MODEL }}",
+        "AGENTOS_TOKENIZER: ${{ vars.AGENTOS_TOKENIZER }}",
+        "AGENTOS_ON_DEVICE_HARDWARE_ID",
+        "refs/tags/$RELEASE_CANDIDATE^{commit}",
+        "--example on_device_qualification",
+        "--expected-commit \"$GITHUB_SHA\"",
+        "exact_release_candidate_on_device_gguf",
+        "model_sha256",
+        "tokenizer_sha256",
+        "cancellation_worker_drained",
+        "on_device_proof_eligible",
+        "production_claim_allowed == false",
+        "retention-days: 90",
+    ] {
+        assert!(
+            on_device.contains(proof),
+            "on-device qualification workflow lost {proof:?}"
+        );
+    }
+    for forbidden in [
+        "inputs.model_path",
+        "inputs.tokenizer_path",
+        "on-device-resources.txt",
+    ] {
+        assert!(
+            !on_device.contains(forbidden),
+            "on-device qualification must not retain or dispatch sensitive input {forbidden:?}"
+        );
+    }
+
     let release = read_workspace_file(".github/workflows/release.yml");
     for proof in [
         "workflow_dispatch:",
@@ -597,6 +635,7 @@ fn release_blocking_workflows_keep_their_security_contract() {
         ".github/workflows/extended-security.yml",
         ".github/workflows/external-deletion-qualification.yml",
         ".github/workflows/live-provider-qualification.yml",
+        ".github/workflows/on-device-qualification.yml",
         ".github/workflows/release.yml",
     ] {
         for line in read_workspace_file(workflow).lines() {

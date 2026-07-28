@@ -10,6 +10,15 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
 
 ## [Unreleased]
 
+- Hardened on-device GGUF qualification under #120 into a fail-closed exact-RC
+  evidence gate. A strict runner binds a provisioned model, tokenizer, hardware
+  profile, resource limits, existing release tag, and clean commit by digest;
+  measures real load, bounded generation, peak RSS, and cancellation latency;
+  and never records paths, prompts, generated text, or weights. Cancellation
+  and timeout now wait for the blocking inference worker to drain before
+  returning. Protected paths moved out of dispatch history, and the bounded
+  report is retained for independent review. The gate and regressions are
+  implemented, but no independently approved real-model artifact exists yet.
 - Added a fail-closed exact-RC external deletion and retention evidence gate
   under #123. A versioned contract now covers all six external-system inventory
   boundaries, requires real immutable-retention-then-delete evidence for remote

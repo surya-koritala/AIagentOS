@@ -14,4 +14,4 @@ kernel = { path = "../crates/kernel", version = "=0.3.0" }
 adapters = { path = "../crates/adapters", version = "=0.3.0" }
 tokio = { version = "1", features = ["full"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
-dirs = "5"
+dirs = "6"

@@ -31,9 +31,15 @@ private (`0700`) on Unix. Listings are sorted, reject non-UTF-8 names, and
 report each entry's file, directory, symlink, or other type. These limits are
 part of the provider contract, not evidence that every host filesystem or
 non-Unix directory-entry durability behavior has completed live production
-qualification. Broker-future cancellation while a bounded blocking filesystem
-operation is already in progress also remains part of the broader provider
-lifecycle qualification in issue #124.
+qualification. Blocking filesystem workers own their admission permits until
+the worker actually exits. Broker cancellation signals the worker, waits for a
+bounded foreground drain, and leaves a reaper owning any still-running worker;
+capability operations check cancellation before publication, deletion,
+directory creation, and throughout quota/list scans. Rust cannot forcibly kill
+a thread blocked inside a host filesystem syscall, so a stalled syscall may
+retain one permit until the host call returns. It cannot cause the broker to
+advertise that capacity as free, and sandbox teardown still waits on the same
+operation lock.
 
 ## Explicitly unsupported for untrusted agents
 

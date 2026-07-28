@@ -10,10 +10,15 @@ use std::process::Stdio;
 
 use tokio::io::AsyncReadExt;
 
+use crate::sandbox::{
+    MAX_PROCESS_ARGUMENTS, MAX_PROCESS_ARGUMENT_BYTES, MAX_PROCESS_ARGUMENT_BYTES_TOTAL,
+    MAX_PROCESS_COMMAND_BYTES,
+};
 use crate::AgentId;
 
 const SANDBOX_LABEL: &str = "aiagentos.sandbox=true";
 const MAX_OUTPUT_BYTES: u64 = 1024 * 1024;
+const EXECUTION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 const DEFAULT_MEMORY_BYTES: u64 = 256 * 1024 * 1024;
 const DEFAULT_PIDS_LIMIT: u32 = 64;
 
@@ -38,6 +43,36 @@ fn container_name(agent_id: AgentId) -> String {
     )
 }
 
+fn validate_command(program: &str, arguments: &[String]) -> Result<(), String> {
+    if program.trim().is_empty()
+        || program.len() > MAX_PROCESS_COMMAND_BYTES
+        || program.contains('\0')
+    {
+        return Err("container program is invalid or exceeds its bound".into());
+    }
+    if arguments.len() > MAX_PROCESS_ARGUMENTS {
+        return Err("container argument count exceeded its bound".into());
+    }
+    let mut total_bytes = 0_usize;
+    for argument in arguments {
+        if argument.len() > MAX_PROCESS_ARGUMENT_BYTES || argument.contains('\0') {
+            return Err("container argument is invalid or exceeds its bound".into());
+        }
+        total_bytes = total_bytes.saturating_add(argument.len());
+        if total_bytes > MAX_PROCESS_ARGUMENT_BYTES_TOTAL {
+            return Err("container argument bytes exceeded their bound".into());
+        }
+    }
+    Ok(())
+}
+
+fn decode_output(bytes: Vec<u8>, stream: &str) -> Result<String, String> {
+    if bytes.len() as u64 > MAX_OUTPUT_BYTES {
+        return Err(format!("container {stream} exceeded sandbox limit"));
+    }
+    String::from_utf8(bytes).map_err(|_| format!("container {stream} must be valid UTF-8"))
+}
+
 fn hardened_run_args(
     name: &str,
     agent_id: AgentId,
@@ -48,12 +83,7 @@ fn hardened_run_args(
     arguments: &[String],
 ) -> Result<Vec<String>, String> {
     validate_digest_image(image)?;
-    if program.trim().is_empty() || program.contains('\0') {
-        return Err("container program is invalid".into());
-    }
-    if arguments.iter().any(|argument| argument.contains('\0')) {
-        return Err("container argument is invalid".into());
-    }
+    validate_command(program, arguments)?;
     let workspace = workspace
         .to_str()
         .ok_or_else(|| "container workspace must be valid UTF-8".to_string())?;
@@ -250,10 +280,22 @@ pub async fn execute_hardened(
         let mut output = Vec::new();
         stderr.read_to_end(&mut output).await.map(|_| output)
     });
-    let status = child
-        .wait()
-        .await
-        .map_err(|_| "container execution failed".to_string())?;
+    let status = match tokio::time::timeout(EXECUTION_TIMEOUT, child.wait()).await {
+        Ok(Ok(status)) => status,
+        Ok(Err(_)) => {
+            stdout_read.abort();
+            stderr_read.abort();
+            cleanup.cleanup().await?;
+            return Err("container execution failed".into());
+        }
+        Err(_) => {
+            stdout_read.abort();
+            stderr_read.abort();
+            cleanup.cleanup().await?;
+            let _ = child.kill().await;
+            return Err("container execution timed out after 30 seconds".into());
+        }
+    };
     let stdout = stdout_read
         .await
         .map_err(|_| "container stdout task failed".to_string())?
@@ -264,12 +306,11 @@ pub async fn execute_hardened(
         .map_err(|_| "container stderr read failed".to_string())?;
     cleanup.cleanup().await?;
 
-    if stdout.len() as u64 > MAX_OUTPUT_BYTES || stderr.len() as u64 > MAX_OUTPUT_BYTES {
-        return Err("container output exceeded sandbox limit".into());
-    }
+    let stdout = decode_output(stdout, "stdout")?;
+    let stderr = decode_output(stderr, "stderr")?;
     Ok(serde_json::json!({
-        "stdout": String::from_utf8_lossy(&stdout),
-        "stderr": String::from_utf8_lossy(&stderr),
+        "stdout": stdout,
+        "stderr": stderr,
         "exit_code": status.code(),
     }))
 }
@@ -379,6 +420,64 @@ mod tests {
             "host credentials and environment variables must not be inherited"
         );
         assert_eq!(args.last().unwrap(), "hello; touch /escaped");
+    }
+
+    #[test]
+    fn command_contract_rejects_unbounded_or_ambient_inputs() {
+        let agent = uuid::Uuid::new_v4();
+        let workspace = Path::new("/private/workspace");
+        for (program, arguments) in [
+            ("", vec![]),
+            ("tool", vec!["x".repeat(MAX_PROCESS_ARGUMENT_BYTES + 1)]),
+            ("tool", vec!["x".repeat(MAX_PROCESS_ARGUMENT_BYTES); 17]),
+        ] {
+            assert!(hardened_run_args(
+                "test-container",
+                agent,
+                workspace,
+                PINNED,
+                None,
+                program,
+                &arguments,
+            )
+            .is_err());
+        }
+        assert!(hardened_run_args(
+            "test-container",
+            agent,
+            workspace,
+            PINNED,
+            None,
+            &"x".repeat(MAX_PROCESS_COMMAND_BYTES + 1),
+            &[],
+        )
+        .is_err());
+        assert!(hardened_run_args(
+            "test-container",
+            agent,
+            workspace,
+            PINNED,
+            None,
+            "tool",
+            &vec![String::new(); MAX_PROCESS_ARGUMENTS + 1],
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn output_contract_is_bounded_and_strict_utf8() {
+        assert_eq!(
+            decode_output(b"bounded".to_vec(), "stdout").unwrap(),
+            "bounded"
+        );
+        assert!(
+            decode_output(vec![b'x'; MAX_OUTPUT_BYTES as usize + 1], "stdout")
+                .unwrap_err()
+                .contains("exceeded")
+        );
+        assert!(decode_output(vec![0xff], "stderr")
+            .unwrap_err()
+            .contains("valid UTF-8"));
     }
 
     #[cfg(target_os = "linux")]

@@ -974,53 +974,6 @@ impl ResourceProvider for BuiltinNetworkProvider {
 
 struct BuiltinAppProvider;
 
-/// Cancelling an application tool must terminate the complete process tree,
-/// not only the direct shell/launcher child.
-struct ProcessTreeGuard {
-    pid: u32,
-    armed: bool,
-}
-
-impl ProcessTreeGuard {
-    fn new(pid: u32) -> Self {
-        Self { pid, armed: true }
-    }
-
-    fn disarm(&mut self) {
-        self.armed = false;
-    }
-}
-
-impl Drop for ProcessTreeGuard {
-    fn drop(&mut self) {
-        if !self.armed {
-            return;
-        }
-        #[cfg(unix)]
-        {
-            // The child is placed in a new process group whose id equals its
-            // pid. A negative pid targets every descendant that inherited the
-            // group, including background grandchildren.
-            if let Ok(pid) = libc::pid_t::try_from(self.pid) {
-                // SAFETY: `kill` does not dereference memory; the negative,
-                // validated process-group id is scoped to the spawned child.
-                unsafe {
-                    libc::kill(-pid, libc::SIGKILL);
-                }
-            }
-        }
-        #[cfg(windows)]
-        {
-            // `taskkill /T` is the platform process-tree primitive. The child
-            // also has Tokio's kill-on-drop enabled as a direct-child fallback.
-            let pid = self.pid.to_string();
-            let _ = std::process::Command::new("taskkill")
-                .args(["/PID", pid.as_str(), "/T", "/F"])
-                .status();
-        }
-    }
-}
-
 #[async_trait::async_trait]
 impl ResourceProvider for BuiltinAppProvider {
     fn resource_type(&self) -> ResourceType {
@@ -1040,39 +993,10 @@ impl ResourceProvider for BuiltinAppProvider {
                 operation: operation.into(),
             });
         }
-        let cmd = params
-            .get("command")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| ResourceError::OperationFailed("Missing 'command'".into()))?;
-        let args: Vec<&str> = params
-            .get("args")
-            .and_then(|v| v.as_array())
-            .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
-            .unwrap_or_default();
-        let mut command = tokio::process::Command::new(cmd);
-        command.args(&args).kill_on_drop(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::process::CommandExt;
-            command.as_std_mut().process_group(0);
-        }
-        let child = command
-            .spawn()
-            .map_err(|e| ResourceError::OperationFailed(e.to_string()))?;
-        let pid = child.id().ok_or_else(|| {
-            ResourceError::OperationFailed("spawned application has no process id".into())
-        })?;
-        let mut process_tree = ProcessTreeGuard::new(pid);
-        let output = child.wait_with_output().await;
-        if output.is_ok() {
-            process_tree.disarm();
-        }
-        let output = output.map_err(|e| ResourceError::OperationFailed(e.to_string()))?;
-        Ok(serde_json::json!({
-            "stdout": String::from_utf8_lossy(&output.stdout).to_string(),
-            "stderr": String::from_utf8_lossy(&output.stderr).to_string(),
-            "exit_code": output.status.code(),
-        }))
+        let _ = params;
+        Err(ResourceError::OperationFailed(
+            "application launch requires kernel-owned container capability execution".into(),
+        ))
     }
 }
 
@@ -7613,6 +7537,14 @@ mod tests {
     async fn builtin_application_provider_exposes_only_launch() {
         let provider = BuiltinAppProvider;
         assert_eq!(provider.supported_operations(), vec!["launch"]);
+        let error = provider
+            .execute(
+                "launch",
+                &serde_json::json!({"command": "ambient-host-denied"}),
+            )
+            .await
+            .expect_err("provider metadata must not launch a host process directly");
+        assert!(error.to_string().contains("container capability execution"));
         for operation in ["close", "send_input", "read_output"] {
             assert_eq!(
                 provider
@@ -7627,31 +7559,23 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
     #[tokio::test]
-    async fn dropping_application_provider_kills_descendant_process_tree() {
-        let marker =
-            std::env::temp_dir().join(format!("agentos-kill-on-drop-{}", uuid::Uuid::new_v4()));
-        let parameters = serde_json::json!({
-            "command": "/bin/sh",
-            "args": [
-                "-c",
-                "(sleep 0.3; touch \"$1\") & wait",
-                "agentos-child",
-                marker.to_string_lossy()
-            ]
-        });
-        let task =
-            tokio::spawn(async move { BuiltinAppProvider.execute("launch", &parameters).await });
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        task.abort();
-        let _ = task.await;
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-
-        assert!(
-            !marker.exists(),
-            "a dropped process tool must kill background descendants before their delayed side effect"
-        );
+    async fn direct_application_provider_never_runs_an_ambient_host_command() {
+        let marker = std::env::temp_dir().join(format!(
+            "agentos-ambient-process-denied-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let result = BuiltinAppProvider
+            .execute(
+                "launch",
+                &serde_json::json!({
+                    "command": "/bin/sh",
+                    "args": ["-c", "touch \"$1\"", "agentos-child", marker.to_string_lossy()]
+                }),
+            )
+            .await;
+        assert!(result.is_err());
+        assert!(!marker.exists());
     }
 
     #[test]

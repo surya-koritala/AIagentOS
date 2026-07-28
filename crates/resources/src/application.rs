@@ -1,7 +1,9 @@
-//! Application resource provider.
+//! Standalone application provider compatibility type.
 //!
-//! Only one-shot command launch is implemented. Stateful process interaction
-//! is intentionally not advertised until it has real lifecycle semantics.
+//! Agent command execution requires kernel-owned sandbox identity, a
+//! digest-pinned rootless container, bounded input/output, and broker lifecycle
+//! ownership. This standalone type cannot carry that authority, so it
+//! deliberately advertises no operations and fails closed.
 
 use kernel::resources::{ResourceProvider, ResourceType};
 use kernel::ResourceError;
@@ -15,46 +17,18 @@ impl ResourceProvider for ApplicationProvider {
     }
 
     fn supported_operations(&self) -> Vec<String> {
-        vec!["launch".into()]
+        Vec::new()
     }
 
     async fn execute(
         &self,
         operation: &str,
-        params: &serde_json::Value,
+        _params: &serde_json::Value,
     ) -> Result<serde_json::Value, ResourceError> {
-        match operation {
-            "launch" => {
-                let cmd = params
-                    .get("command")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| {
-                        ResourceError::OperationFailed("Missing 'command' parameter".into())
-                    })?;
-                let args: Vec<&str> = params
-                    .get("args")
-                    .and_then(|v| v.as_array())
-                    .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
-                    .unwrap_or_default();
-
-                let mut command = tokio::process::Command::new(cmd);
-                command.args(&args).kill_on_drop(true);
-                let output = command
-                    .output()
-                    .await
-                    .map_err(|e| ResourceError::OperationFailed(e.to_string()))?;
-
-                Ok(serde_json::json!({
-                    "stdout": String::from_utf8_lossy(&output.stdout).to_string(),
-                    "stderr": String::from_utf8_lossy(&output.stderr).to_string(),
-                    "exit_code": output.status.code(),
-                }))
-            }
-            _ => Err(ResourceError::UnsupportedOperation {
-                resource: "Application".into(),
-                operation: operation.into(),
-            }),
-        }
+        Err(ResourceError::UnsupportedOperation {
+            resource: "Application".into(),
+            operation: operation.into(),
+        })
     }
 }
 
@@ -63,15 +37,18 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn stateful_process_stubs_are_typed_unsupported_and_not_advertised() {
+    async fn standalone_application_fails_closed_without_sandbox_authority() {
         let provider = ApplicationProvider;
-        assert_eq!(provider.supported_operations(), vec!["launch"]);
+        assert!(provider.supported_operations().is_empty());
 
-        for operation in ["close", "send_input", "read_output"] {
+        for operation in ["launch", "close", "send_input", "read_output"] {
             let error = provider
-                .execute(operation, &serde_json::json!({}))
+                .execute(
+                    operation,
+                    &serde_json::json!({"command": "ambient-host-denied"}),
+                )
                 .await
-                .expect_err("placeholder application operation must fail");
+                .expect_err("standalone ambient application operation must fail");
             assert_eq!(
                 error,
                 ResourceError::UnsupportedOperation {

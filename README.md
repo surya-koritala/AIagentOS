@@ -158,6 +158,30 @@ also exposed. Fetch refuses to overwrite an existing output file. Revocation,
 yanking, rollback, and removal require `--confirm` plus the exact target; run
 `agentctl` without a command for the full usage contract.
 
+### Validate policy and inspect system audits
+
+Canonical policy authoring is offline and machine-readable; it uses the same
+MAC evaluator as the runtime:
+
+```bash
+agentctl policy-validate config/policy.toml
+agentctl policy-explain config/policy.toml \
+  --subject profile:read-only --action read --object /workspace/notes
+```
+
+Trusted system operators can inspect live gate counters and durable node or
+cluster audit records through the public SDK/wire path:
+
+```bash
+agentctl --addr 127.0.0.1:7777 --token "$AGENT_SERVER_TOKEN" gate-stats
+agentctl --addr 127.0.0.1:7777 --token "$AGENT_SERVER_TOKEN" node-control-audit 100
+agentctl --addr 127.0.0.1:7777 --token "$AGENT_SERVER_TOKEN" cluster-membership-audit 100
+```
+
+Tenant API keys, including tenant Admin keys, cannot read these global views.
+See [docs/POLICY.md](docs/POLICY.md) and
+[docs/OPERATIONS_API.md](docs/OPERATIONS_API.md).
+
 ### Back up and recover persistent state
 
 Inspect the versioned storage policy before provisioning retention and recovery.
@@ -440,7 +464,10 @@ replay, namespace/tenant isolation, and public-path behavior are covered by
 `crates/kernel/src/tools.rs`, `crates/kernel/src/syscall_gate.rs`,
 `tests/src/gate_adversarial_props.rs`, and `tests/src/os_enforcement.rs`.
 
-The MAC policy at step 2 is **authorable as a declarative document** — operators write rules in TOML, validate and dry-run them with `agent policy validate` / `agent policy explain`, and point the kernel at a `policy_file`. See [docs/POLICY.md](docs/POLICY.md).
+The MAC policy at step 2 is **authorable as a declarative document** —
+operators write rules in TOML, validate and dry-run them with canonical
+`agentctl policy-validate` / `agentctl policy-explain` JSON commands, and point
+the kernel at a `policy_file`. See [docs/POLICY.md](docs/POLICY.md).
 
 ## Demos and benchmarks
 

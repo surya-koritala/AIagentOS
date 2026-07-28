@@ -11,7 +11,7 @@
 //!
 //! Returns the process exit code (0 = success, 2 = usage error, 1 = failure).
 
-use kernel::mac::MacDecision;
+use agent_cli::policy;
 use kernel::policy::PolicyDocument;
 
 /// Dispatch a `policy` subcommand. `args` is the full process argv; this is
@@ -50,15 +50,8 @@ fn load(path: Option<&String>) -> Result<PolicyDocument, i32> {
             return Err(2);
         }
     };
-    let content = match std::fs::read_to_string(path) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("agent policy: cannot read {path}: {e}");
-            return Err(1);
-        }
-    };
-    PolicyDocument::from_toml(&content).map_err(|e| {
-        eprintln!("\x1b[31m[x] invalid policy {path}: {e}\x1b[0m");
+    policy::load_policy(path).map_err(|e| {
+        eprintln!("\x1b[31m[x] {e}\x1b[0m");
         1
     })
 }
@@ -68,7 +61,7 @@ fn validate(path: Option<&String>) -> i32 {
         Ok(d) => d,
         Err(code) => return code,
     };
-    let lints = doc.lint_with_tool_catalog();
+    let report = policy::validate_document(&doc);
     let mode = if doc.enforcing {
         "enforcing"
     } else {
@@ -80,11 +73,14 @@ fn validate(path: Option<&String>) -> i32 {
         doc.default,
         doc.rules.len()
     );
-    if lints.is_empty() {
+    if report.warnings.is_empty() {
         0
     } else {
-        println!("\n\x1b[33m{} lint warning(s):\x1b[0m", lints.len());
-        for l in &lints {
+        println!(
+            "\n\x1b[33m{} lint warning(s):\x1b[0m",
+            report.warnings.len()
+        );
+        for l in &report.warnings {
             match l.rule_index {
                 Some(i) => println!("  \x1b[33m![rule #{i}]\x1b[0m {}", l.message),
                 None => println!("  \x1b[33m!\x1b[0m {}", l.message),
@@ -119,11 +115,12 @@ fn explain(args: &[String]) -> i32 {
             return 2;
         }
     };
-    let e = doc.explain(subject, action, object);
-    let (color, verdict) = match e.decision {
-        MacDecision::Allow => ("\x1b[32m", "ALLOW"),
-        MacDecision::Deny => ("\x1b[31m", "DENY"),
-        MacDecision::Audit => ("\x1b[33m", "AUDIT"),
+    let e = policy::explain_document(&doc, subject, action, object);
+    let (color, verdict) = match e.decision.as_str() {
+        "allow" => ("\x1b[32m", "ALLOW"),
+        "deny" => ("\x1b[31m", "DENY"),
+        "audit" => ("\x1b[33m", "AUDIT"),
+        _ => unreachable!("shared policy reports return a canonical decision"),
     };
     println!("query: subject={subject} action={action} object={object}");
     println!("{color}=> {verdict}\x1b[0m");

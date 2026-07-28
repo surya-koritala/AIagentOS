@@ -4,7 +4,8 @@
 //! how keys mutate it*.
 
 use agent_sdk::{
-    AgentSummary, GateStats, KernelClient, NodeLoad, OperatorServiceSnapshot, SdkError,
+    AgentSummary, GateStats, KernelClient, NodeLoad, OperatorServiceSnapshot, OperatorSnapshot,
+    SdkError,
 };
 
 /// Input modes — the UI is modal (vim-ish): Normal navigates, the others edit a
@@ -73,6 +74,16 @@ impl App {
     /// Pull fresh state from the kernel: agent list, gate counters, node load.
     pub async fn refresh(&mut self, client: &mut KernelClient) -> Result<(), SdkError> {
         let snapshot = client.operator_snapshot().await?;
+        self.apply_operator_snapshot(snapshot);
+        Ok(())
+    }
+
+    /// Apply one raw public operator snapshot to the render-free TUI model.
+    ///
+    /// Keeping this projection separate from transport lets conformance tests
+    /// prove the displayed counters against the exact same wire fixture used
+    /// by other clients.
+    pub fn apply_operator_snapshot(&mut self, snapshot: OperatorSnapshot) {
         self.services = snapshot.services.clone().unwrap_or_default();
         self.agents = snapshot
             .agents
@@ -138,7 +149,6 @@ impl App {
         if self.selected_service >= self.services.len() {
             self.selected_service = self.services.len().saturating_sub(1);
         }
-        Ok(())
     }
 
     pub fn selected_agent(&self) -> Option<&AgentSummary> {

@@ -89,3 +89,6 @@ mod service_supervisor;
 
 #[cfg(test)]
 mod client_conformance;
+
+#[cfg(test)]
+mod client_metrics_parity;

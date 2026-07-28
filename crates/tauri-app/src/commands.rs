@@ -5,7 +5,7 @@ use crate::{
         validate_cloud_provider, NativeProviderCredentialStore, ProviderCredentialStore,
         CLOUD_DESKTOP_PROVIDERS, SUPPORTED_DESKTOP_PROVIDERS,
     },
-    AppState,
+    AppState, DesktopMetricsView,
 };
 use kernel::config::Config;
 use serde::Serialize;
@@ -170,18 +170,13 @@ pub async fn list_agents(state: State<'_, AppState>) -> Result<serde_json::Value
 }
 
 #[tauri::command]
-pub async fn get_metrics(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
+pub async fn get_metrics(state: State<'_, AppState>) -> Result<DesktopMetricsView, String> {
     let snapshot = state
         .client
         .operator_snapshot()
         .await
         .map_err(|error| error.to_string())?;
-    let metrics = snapshot.system_metrics.unwrap_or_default();
-    Ok(serde_json::json!({
-        "tokens_consumed": metrics.tokens_consumed,
-        "api_calls_made": metrics.api_calls_made,
-        "time_elapsed_ms": metrics.uptime_seconds.saturating_mul(1_000),
-    }))
+    DesktopMetricsView::try_from_operator_snapshot(&snapshot).map_err(str::to_string)
 }
 
 #[tauri::command]

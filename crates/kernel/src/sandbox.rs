@@ -2062,7 +2062,7 @@ mod tests {
     /// it requires a Linux network namespace with a public-looking loopback
     /// address and a controlled host-name switch. The extended-security
     /// workflow supplies that topology and runs this test explicitly.
-    #[cfg(all(target_os = "linux", feature = "qualification"))]
+    #[cfg(all(target_os = "linux", feature = "qualification", not(coverage)))]
     #[tokio::test]
     #[ignore = "requires the controlled AGENTOS_NETWORK_* qualification topology"]
     async fn live_network_egress_blocks_ssrf_redirects_and_dns_rebinding() {

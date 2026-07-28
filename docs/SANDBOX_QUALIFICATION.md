@@ -7,7 +7,7 @@ does not claim that every host integration is sandboxed.
 
 | Surface | Untrusted-agent behavior | Evidence |
 |---|---|---|
-| Filesystem | A private, kernel-owned workspace directory capability; handle-relative I/O, byte quota, traversal/symlink/rename-race denial, cross-agent isolation, teardown, and restart orphan reconciliation | `sandbox.rs`, `resources.rs`, `sandbox_props.rs`, `lifecycle_coordinator.rs` |
+| Filesystem | A private, kernel-owned workspace directory capability; handle-relative I/O; synced atomic create/replace; strict UTF-8, path/content/list bounds; regular-file and final-symlink checks; byte quota; traversal/ancestor-rename denial; cross-agent isolation; teardown; and restart orphan reconciliation | `sandbox.rs`, `resources.rs`, `sandbox_props.rs`, `lifecycle_coordinator.rs` |
 | HTTP(S) | Explicit hostname allowlist; credentials and non-default ports denied; every A/AAAA answer must be public; checked addresses are pinned into a no-proxy, no-redirect client | `sandbox.rs`, `resources.rs` |
 | Linux process | One fresh digest-pinned container per call on a verified rootless Docker daemon; read-only root, no network, no capabilities, no-new-privileges, PID/CPU/memory/swap/open-file/output limits, bounded `tmpfs`, and only the agent workspace mounted writable | `docker_sandbox.rs`, protected `rootless-container-sandbox` workflow job |
 | Raw wire, Rust SDK, package tools, custom tools, MCP server, and model executor | One immutable tool declaration and gate proof reaches the same `ResourceBroker`; the broker derives the sandbox from the kernel-owned agent identity before any provider runs | `sandbox_surfaces.rs` plus in-module executor/MCP/tool tests |
@@ -16,6 +16,18 @@ Every live agent receives a managed filesystem sandbox when an in-process
 operator does not provide a narrower explicit configuration. Packages, prompts,
 MCP metadata, SDK requests, and wire requests cannot select trusted mode or
 supply a valid gate proof/sandbox identity.
+
+Filesystem text operations accept at most 4 MiB, paths at most 4,096 UTF-8
+bytes, and directory listings at most 4,096 entries. Reads, edits, writes, and
+deletes reject final symlinks and non-regular files. `create` never replaces an
+existing entry; `write` and `edit` publish a synced same-directory staging file
+with an atomic rename, preserve existing permissions, and sync the containing
+directory on Unix. New files are private (`0600`) and new directories are
+private (`0700`) on Unix. Listings are sorted, reject non-UTF-8 names, and
+report each entry's file, directory, symlink, or other type. These limits are
+part of the provider contract, not evidence that every host filesystem or
+non-Unix directory-entry durability behavior has completed live production
+qualification.
 
 ## Explicitly unsupported for untrusted agents
 

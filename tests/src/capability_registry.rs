@@ -473,6 +473,44 @@ fn user_facing_status_docs_defer_to_the_registry() {
 }
 
 #[test]
+fn canonical_client_contract_is_explicit_and_honest() {
+    let protocol = read_workspace_file("docs/PROTOCOL.md");
+    for required in [
+        "There is one canonical operator client: **`agentctl`**",
+        "There is one canonical programmatic client: **`agent_sdk::KernelClient`**",
+        "| `agentctl` | Canonical headless operator client |",
+        "| `agent-tui` | Focused interactive operator view |",
+        "| Tauri/Svelte desktop | Focused end-user/operator application |",
+        "| `agent` | Embedded single-agent developer shell |",
+        "Not an operator client and not a feature-parity target.",
+        "“Parity” means behavioral parity for an operation a surface exposes",
+        "Missing breadth is not called parity.",
+    ] {
+        assert!(
+            protocol.contains(required),
+            "canonical client contract lost {required:?}"
+        );
+    }
+
+    let interactive = read_workspace_file("crates/cli/src/main.rs");
+    assert!(
+        interactive.contains("AgentKernelImpl::from_config"),
+        "embedded agent shell changed shape; revisit its documented client role"
+    );
+    let agentctl = read_workspace_file("crates/cli/src/bin/agentctl.rs");
+    assert!(
+        agentctl.contains("OperatorClient::connect_profile"),
+        "canonical operator client no longer uses the shared public client"
+    );
+    for surface in ["crates/tui/src/lib.rs", "crates/tauri-app/src/lib.rs"] {
+        assert!(
+            read_workspace_file(surface).contains("ConnectionProfile"),
+            "{surface} no longer exposes the shared public connection boundary"
+        );
+    }
+}
+
+#[test]
 fn release_blocking_workflows_keep_their_security_contract() {
     let ci = read_workspace_file(".github/workflows/ci.yml");
     for os in ["ubuntu-latest", "macos-latest", "windows-latest"] {

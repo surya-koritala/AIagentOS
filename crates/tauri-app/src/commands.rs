@@ -5,7 +5,7 @@ use crate::{
         validate_cloud_provider, NativeProviderCredentialStore, ProviderCredentialStore,
         CLOUD_DESKTOP_PROVIDERS, SUPPORTED_DESKTOP_PROVIDERS,
     },
-    AppState, DesktopMetricsView,
+    AppState, DesktopMetricsView, DesktopOperatorView,
 };
 use kernel::config::Config;
 use serde::Serialize;
@@ -177,6 +177,15 @@ pub async fn get_metrics(state: State<'_, AppState>) -> Result<DesktopMetricsVie
         .await
         .map_err(|error| error.to_string())?;
     DesktopMetricsView::try_from_operator_snapshot(&snapshot).map_err(str::to_string)
+}
+
+#[tauri::command]
+pub async fn get_operator_view(state: State<'_, AppState>) -> Result<DesktopOperatorView, String> {
+    state
+        .client
+        .operator_view()
+        .await
+        .map_err(|error| error.to_string())
 }
 
 #[tauri::command]

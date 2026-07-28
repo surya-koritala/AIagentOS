@@ -42,6 +42,46 @@ pub struct DesktopMetricsView {
     pub time_elapsed_ms: u64,
 }
 
+/// One atomic desktop refresh payload with explicit scope omissions and the
+/// SDK reconnect generation that produced it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DesktopOperatorView {
+    pub captured_at: String,
+    pub agents: Vec<DesktopAgent>,
+    pub metrics: Option<DesktopMetricsView>,
+    pub warnings: Vec<String>,
+    pub reconnect_generation: u64,
+}
+
+impl DesktopOperatorView {
+    fn from_operator_snapshot(snapshot: OperatorSnapshot, reconnect_generation: u64) -> Self {
+        let metrics = DesktopMetricsView::try_from_operator_snapshot(&snapshot).ok();
+        let mut warnings = Vec::new();
+        if metrics.is_none() {
+            warnings.push(
+                "Global metrics are unavailable for this caller scope; agent data is current."
+                    .to_string(),
+            );
+        }
+        Self {
+            captured_at: snapshot.captured_at,
+            agents: snapshot
+                .agents
+                .into_iter()
+                .map(|agent| DesktopAgent {
+                    id: agent.id,
+                    name: agent.name,
+                    state: agent.state,
+                    priority: agent.priority,
+                })
+                .collect(),
+            metrics,
+            warnings,
+            reconnect_generation,
+        }
+    }
+}
+
 impl DesktopMetricsView {
     pub fn try_from_operator_snapshot(snapshot: &OperatorSnapshot) -> Result<Self, &'static str> {
         let metrics = snapshot
@@ -173,6 +213,15 @@ impl DesktopClient {
         self.inner.lock().await.operator_snapshot().await
     }
 
+    pub async fn operator_view(&self) -> Result<DesktopOperatorView, SdkError> {
+        let mut client = self.inner.lock().await;
+        let snapshot = client.operator_snapshot().await?;
+        Ok(DesktopOperatorView::from_operator_snapshot(
+            snapshot,
+            client.reconnect_generation(),
+        ))
+    }
+
     pub async fn list_agents(&self) -> Result<Vec<DesktopAgent>, SdkError> {
         Ok(self
             .operator_snapshot()
@@ -237,5 +286,31 @@ mod tests {
             .expect("updated list")
             .iter()
             .any(|agent| agent.id == id));
+    }
+
+    #[test]
+    fn scoped_operator_view_is_partial_instead_of_inventing_global_zeroes() {
+        let snapshot = OperatorSnapshot {
+            captured_at: "2026-07-28T00:00:00Z".into(),
+            consistency: "atomic".into(),
+            scope: "tenant".into(),
+            kernel_version: "test".into(),
+            protocol_version: 2,
+            agents: Vec::new(),
+            total_visible_agents: 0,
+            agents_truncated: false,
+            providers: Vec::new(),
+            packages: Vec::new(),
+            scoped_gate_decisions: Default::default(),
+            tunables: None,
+            services: None,
+            system_metrics: None,
+            global_spend_usd: None,
+        };
+
+        let view = DesktopOperatorView::from_operator_snapshot(snapshot, 3);
+        assert_eq!(view.reconnect_generation, 3);
+        assert!(view.metrics.is_none());
+        assert_eq!(view.warnings.len(), 1);
     }
 }

@@ -98,7 +98,12 @@ fn run(
                 }
                 if let Some(k) = map_key(key.code) {
                     if let Some(action) = app.on_key(k) {
+                        if action != UiAction::Quit {
+                            app.begin_operation(action.operation_label());
+                            terminal.draw(|f| ui(f, app))?;
+                        }
                         perform(action, app, client, rt);
+                        app.finish_operation();
                     }
                 }
             }
@@ -122,7 +127,7 @@ fn perform(action: UiAction, app: &mut App, client: &mut TuiClient, rt: &tokio::
                 Ok(id) => app.status = format!("created {name} ({id})"),
                 Err(e) => app.status = format!("create failed: {e}"),
             }
-            let _ = rt.block_on(app.refresh(client));
+            refresh_after_action(app, client, rt);
         }
         UiAction::SendMessage { agent_id, message } => {
             match rt.block_on(client.send_message(agent_id, message)) {
@@ -132,65 +137,75 @@ fn perform(action: UiAction, app: &mut App, client: &mut TuiClient, rt: &tokio::
                 }
                 Err(e) => app.status = format!("send failed: {e}"),
             }
-            let _ = rt.block_on(app.refresh(client));
+            refresh_after_action(app, client, rt);
         }
         UiAction::PauseAgent { agent_id } => {
             app.status = match rt.block_on(client.pause_agent(agent_id)) {
                 Ok(state) => format!("agent state: {state}"),
                 Err(error) => format!("pause failed: {error}"),
             };
-            let _ = rt.block_on(app.refresh(client));
+            refresh_after_action(app, client, rt);
         }
         UiAction::ResumeAgent { agent_id } => {
             app.status = match rt.block_on(client.resume_agent(agent_id)) {
                 Ok(state) => format!("agent state: {state}"),
                 Err(error) => format!("resume failed: {error}"),
             };
-            let _ = rt.block_on(app.refresh(client));
+            refresh_after_action(app, client, rt);
         }
         UiAction::StopAgent { agent_id } => {
             app.status = match rt.block_on(client.stop_agent(agent_id)) {
                 Ok(state) => format!("agent state: {state}"),
                 Err(error) => format!("stop failed: {error}"),
             };
-            let _ = rt.block_on(app.refresh(client));
+            refresh_after_action(app, client, rt);
         }
         UiAction::KillAgent { agent_id } => {
             app.status = match rt.block_on(client.kill_agent(agent_id)) {
                 Ok(state) => format!("agent state: {state}"),
                 Err(error) => format!("kill failed: {error}"),
             };
-            let _ = rt.block_on(app.refresh(client));
+            refresh_after_action(app, client, rt);
         }
         UiAction::StartService { name } => {
             app.status = match rt.block_on(client.start_service(name.clone())) {
                 Ok(service) => format!("service {}: {:?}", service.name, service.status),
                 Err(error) => format!("service start failed: {error}"),
             };
-            let _ = rt.block_on(app.refresh(client));
+            refresh_after_action(app, client, rt);
         }
         UiAction::StopService { name } => {
             app.status = match rt.block_on(client.stop_service(name.clone())) {
                 Ok(service) => format!("service {}: {:?}", service.name, service.status),
                 Err(error) => format!("service stop failed: {error}"),
             };
-            let _ = rt.block_on(app.refresh(client));
+            refresh_after_action(app, client, rt);
         }
         UiAction::RestartService { name } => {
             app.status = match rt.block_on(client.restart_service(name.clone())) {
                 Ok(service) => format!("service {}: {:?}", service.name, service.status),
                 Err(error) => format!("service restart failed: {error}"),
             };
-            let _ = rt.block_on(app.refresh(client));
+            refresh_after_action(app, client, rt);
         }
         UiAction::ReloadServices => {
             app.status = match rt.block_on(client.reload_services()) {
                 Ok(order) => format!("services reloaded: {}", order.join(" → ")),
                 Err(error) => format!("service reload failed: {error}"),
             };
-            let _ = rt.block_on(app.refresh(client));
+            refresh_after_action(app, client, rt);
         }
     }
+}
+
+fn refresh_after_action(app: &mut App, client: &mut TuiClient, rt: &tokio::runtime::Runtime) {
+    let outcome = app.status.clone();
+    app.status = match rt.block_on(app.refresh(client)) {
+        Ok(()) => outcome,
+        Err(error) => {
+            format!("{outcome}; refresh failed, showing last known data: {error}")
+        }
+    };
 }
 
 fn map_key(code: KeyCode) -> Option<Key> {
@@ -221,9 +236,21 @@ fn ui(f: &mut Frame, app: &App) {
 }
 
 fn render_header(f: &mut Frame, area: Rect, app: &App) {
+    let operator_style = if app.operator_state.operation.is_some() {
+        Style::default().fg(Color::Cyan)
+    } else {
+        match app.operator_state.freshness {
+            agent_tui::app::DataFreshness::Loading => Style::default().fg(Color::Yellow),
+            agent_tui::app::DataFreshness::Fresh => Style::default().fg(Color::Green),
+            agent_tui::app::DataFreshness::Partial => Style::default().fg(Color::Yellow),
+            agent_tui::app::DataFreshness::Stale => Style::default().fg(Color::Red),
+        }
+    }
+    .add_modifier(Modifier::BOLD);
     let line = Line::from(vec![
         Span::styled("AI Agent OS", Style::default().add_modifier(Modifier::BOLD)),
         Span::raw(format!("  @ {}   ", app.addr)),
+        Span::styled(format!("{}   ", app.operator_state.label()), operator_style),
         Span::styled(
             format!(
                 "agents:{} running:{}",

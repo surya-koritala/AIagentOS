@@ -39,6 +39,86 @@ pub enum UiAction {
     ReloadServices,
 }
 
+impl UiAction {
+    /// Stable, user-facing label rendered before the event loop begins an
+    /// operation that may take long enough to be noticeable.
+    pub fn operation_label(&self) -> &'static str {
+        match self {
+            Self::Quit => "quit",
+            Self::Refresh => "refreshing operator data",
+            Self::CreateAgent { .. } => "creating agent",
+            Self::SendMessage { .. } => "waiting for agent turn",
+            Self::PauseAgent { .. } => "pausing agent",
+            Self::ResumeAgent { .. } => "resuming agent",
+            Self::StopAgent { .. } => "stopping agent",
+            Self::KillAgent { .. } => "force-stopping agent",
+            Self::StartService { .. } => "starting service",
+            Self::StopService { .. } => "stopping service",
+            Self::RestartService { .. } => "restarting service",
+            Self::ReloadServices => "reloading services",
+        }
+    }
+}
+
+/// Freshness of the last public operator snapshot retained by the TUI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DataFreshness {
+    Loading,
+    Fresh,
+    Partial,
+    Stale,
+}
+
+/// Connection, freshness, and in-flight state rendered independently of the
+/// current footer message. Last-known-good data remains in `App` when a refresh
+/// fails; this metadata prevents cached values from looking current.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OperatorUiState {
+    pub freshness: DataFreshness,
+    pub last_success_at: Option<String>,
+    pub missing_sections: Vec<String>,
+    pub last_error: Option<String>,
+    pub reconnect_generation: u64,
+    pub reconnected: bool,
+    pub operation: Option<String>,
+}
+
+impl Default for OperatorUiState {
+    fn default() -> Self {
+        Self {
+            freshness: DataFreshness::Loading,
+            last_success_at: None,
+            missing_sections: Vec::new(),
+            last_error: None,
+            reconnect_generation: 0,
+            reconnected: false,
+            operation: None,
+        }
+    }
+}
+
+impl OperatorUiState {
+    pub fn label(&self) -> String {
+        if let Some(operation) = &self.operation {
+            return format!("WORKING: {operation}");
+        }
+        match self.freshness {
+            DataFreshness::Loading => "LOADING".into(),
+            DataFreshness::Fresh if self.reconnected => {
+                format!("RECONNECTED #{}", self.reconnect_generation)
+            }
+            DataFreshness::Fresh => "FRESH".into(),
+            DataFreshness::Partial if self.reconnected => format!(
+                "RECONNECTED #{} · PARTIAL: {}",
+                self.reconnect_generation,
+                self.missing_sections.join(", ")
+            ),
+            DataFreshness::Partial => format!("PARTIAL: {}", self.missing_sections.join(", ")),
+            DataFreshness::Stale => "STALE — showing last known data".into(),
+        }
+    }
+}
+
 /// All UI state.
 pub struct App {
     pub addr: String,
@@ -53,6 +133,7 @@ pub struct App {
     pub status: String,
     pending_kill: Option<(String, String)>,
     pub last_output: Option<String>,
+    pub operator_state: OperatorUiState,
     pub should_quit: bool,
 }
 
@@ -71,15 +152,57 @@ impl App {
             status: "r refresh · c/m/p/s/X agents · [/ ] service · u start · d stop · R restart · L reload · q quit".into(),
             pending_kill: None,
             last_output: None,
+            operator_state: OperatorUiState::default(),
             should_quit: false,
         }
     }
 
     /// Pull fresh state from the kernel: agent list, gate counters, node load.
     pub async fn refresh(&mut self, client: &mut KernelClient) -> Result<(), SdkError> {
-        let snapshot = client.operator_snapshot().await?;
-        self.apply_operator_snapshot(snapshot);
-        Ok(())
+        let generation_before = client.reconnect_generation();
+        match client.operator_snapshot().await {
+            Ok(snapshot) => {
+                let captured_at = snapshot.captured_at.clone();
+                let mut missing_sections = Vec::new();
+                if snapshot.system_metrics.is_none() {
+                    missing_sections.push("global metrics".to_string());
+                }
+                if snapshot.services.is_none() {
+                    missing_sections.push("services".to_string());
+                }
+                self.apply_operator_snapshot(snapshot);
+                let reconnect_generation = client.reconnect_generation();
+                self.operator_state = OperatorUiState {
+                    freshness: if missing_sections.is_empty() {
+                        DataFreshness::Fresh
+                    } else {
+                        DataFreshness::Partial
+                    },
+                    last_success_at: Some(captured_at),
+                    missing_sections,
+                    last_error: None,
+                    reconnect_generation,
+                    reconnected: reconnect_generation > generation_before,
+                    operation: self.operator_state.operation.take(),
+                };
+                Ok(())
+            }
+            Err(error) => {
+                self.operator_state.freshness = DataFreshness::Stale;
+                self.operator_state.missing_sections.clear();
+                self.operator_state.last_error = Some(error.to_string());
+                self.operator_state.reconnected = false;
+                Err(error)
+            }
+        }
+    }
+
+    pub fn begin_operation(&mut self, label: impl Into<String>) {
+        self.operator_state.operation = Some(label.into());
+    }
+
+    pub fn finish_operation(&mut self) {
+        self.operator_state.operation = None;
     }
 
     /// Apply one raw public operator snapshot to the render-free TUI model.
@@ -419,6 +542,22 @@ mod tests {
     fn refresh_key_requests_refresh() {
         let mut a = app();
         assert_eq!(a.on_key(Key::Char('r')), Some(UiAction::Refresh));
+    }
+
+    #[test]
+    fn long_running_operation_is_explicit_until_finished() {
+        let mut a = app();
+        assert_eq!(a.operator_state.freshness, DataFreshness::Loading);
+        a.begin_operation(
+            UiAction::SendMessage {
+                agent_id: "agent-1".into(),
+                message: "work".into(),
+            }
+            .operation_label(),
+        );
+        assert_eq!(a.operator_state.label(), "WORKING: waiting for agent turn");
+        a.finish_operation();
+        assert_eq!(a.operator_state.label(), "LOADING");
     }
 
     #[test]

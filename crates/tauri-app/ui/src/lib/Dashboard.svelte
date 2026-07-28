@@ -2,7 +2,7 @@
   import { createEventDispatcher } from 'svelte';
 
   export let agents = [];
-  export let metrics = {};
+  export let metrics = null;
 
   const dispatch = createEventDispatcher();
 </script>
@@ -23,11 +23,11 @@
       <span class="stat-label">Active</span>
     </div>
     <div class="stat-card">
-      <span class="stat-value">{metrics.tokens_consumed?.toLocaleString() || 0}</span>
+      <span class="stat-value">{metrics ? metrics.tokens_consumed.toLocaleString() : 'Unavailable'}</span>
       <span class="stat-label">Tokens Used</span>
     </div>
     <div class="stat-card">
-      <span class="stat-value">{metrics.api_calls_made || 0}</span>
+      <span class="stat-value">{metrics ? metrics.api_calls_made : 'Unavailable'}</span>
       <span class="stat-label">API Calls</span>
     </div>
   </div>

@@ -3,35 +3,30 @@
   import { createEventDispatcher } from 'svelte';
 
   export let agentId = null;
+  export let agents = [];
+  export let metrics = null;
 
   const dispatch = createEventDispatcher();
   let agent = null;
-  let activityLog = [];
-  let metrics = null;
+  let busy = false;
+  let actionError = null;
 
-  $: if (agentId) loadAgentDetails();
+  $: agent = agents.find(candidate => candidate.id === agentId) || null;
 
-  async function loadAgentDetails() {
+  async function runLifecycle(command, label) {
+    if (!agentId || busy) return;
+    busy = true;
+    actionError = null;
+    dispatch('operation', { label, active: true });
     try {
-      const agents = await invoke('list_agents');
-      agent = agents.find(a => a.id === agentId);
-      metrics = await invoke('get_metrics');
-    } catch (e) {}
-  }
-
-  async function pauseAgent() {
-    await invoke('pause_agent', { agentId });
-    await loadAgentDetails();
-  }
-
-  async function resumeAgent() {
-    await invoke('resume_agent', { agentId });
-    await loadAgentDetails();
-  }
-
-  async function stopAgent() {
-    await invoke('stop_agent', { agentId });
-    await loadAgentDetails();
+      await invoke(command, { agentId });
+      dispatch('refresh');
+    } catch (error) {
+      actionError = String(error);
+    } finally {
+      busy = false;
+      dispatch('operation', { label, active: false });
+    }
   }
 </script>
 
@@ -46,13 +41,15 @@
 
   <div class="actions">
     {#if agent.state === 'Running'}
-      <button class="btn-warn" on:click={pauseAgent}>⏸ Pause</button>
-      <button class="btn-danger" on:click={stopAgent}>⏹ Stop</button>
+      <button class="btn-warn" on:click={() => runLifecycle('pause_agent', 'pausing agent')} disabled={busy}>⏸ Pause</button>
+      <button class="btn-danger" on:click={() => runLifecycle('stop_agent', 'stopping agent')} disabled={busy}>⏹ Stop</button>
     {:else if agent.state === 'Paused'}
-      <button class="btn-primary" on:click={resumeAgent}>▶ Resume</button>
-      <button class="btn-danger" on:click={stopAgent}>⏹ Stop</button>
+      <button class="btn-primary" on:click={() => runLifecycle('resume_agent', 'resuming agent')} disabled={busy}>▶ Resume</button>
+      <button class="btn-danger" on:click={() => runLifecycle('stop_agent', 'stopping agent')} disabled={busy}>⏹ Stop</button>
     {/if}
   </div>
+  {#if busy}<p class="operation-status" role="status">Operation in progress…</p>{/if}
+  {#if actionError}<p class="action-error" role="alert">{actionError}</p>{/if}
 
   <div class="info-grid">
     <div class="info-card">
@@ -61,11 +58,11 @@
     </div>
     <div class="info-card">
       <span class="label">Tokens Used</span>
-      <span class="value">{metrics?.tokens_consumed?.toLocaleString() || 0}</span>
+      <span class="value">{metrics ? metrics.tokens_consumed.toLocaleString() : 'Unavailable'}</span>
     </div>
     <div class="info-card">
       <span class="label">API Calls</span>
-      <span class="value">{metrics?.api_calls_made || 0}</span>
+      <span class="value">{metrics ? metrics.api_calls_made : 'Unavailable'}</span>
     </div>
   </div>
 </div>
@@ -80,6 +77,9 @@
   .state-badge.paused { background: #4a3a1a; color: #fbbf24; }
   .actions { display: flex; gap: 0.5rem; margin-bottom: 1.5rem; }
   .actions button { padding: 0.4rem 1rem; border-radius: 8px; border: none; cursor: pointer; font-size: 0.8rem; }
+  .actions button:disabled { opacity: 0.5; cursor: wait; }
+  .operation-status { color: #93c5fd; font-size: 0.8rem; }
+  .action-error { color: #fca5a5; font-size: 0.8rem; overflow-wrap: anywhere; }
   .btn-primary { background: #4a90d9; color: white; }
   .btn-warn { background: #92600a; color: #fbbf24; }
   .btn-danger { background: #6b1a1a; color: #f87171; }

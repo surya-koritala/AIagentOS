@@ -2058,6 +2058,223 @@ mod tests {
         );
     }
 
+    /// Live qualification is kept out of ordinary cross-platform tests because
+    /// it requires a Linux network namespace with a public-looking loopback
+    /// address and a controlled host-name switch. The extended-security
+    /// workflow supplies that topology and runs this test explicitly.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "requires the controlled AGENTOS_NETWORK_* qualification topology"]
+    async fn live_network_egress_blocks_ssrf_redirects_and_dns_rebinding() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let host = std::env::var("AGENTOS_NETWORK_TEST_HOST")
+            .expect("AGENTOS_NETWORK_TEST_HOST must name the controlled qualification host");
+        let public_address: std::net::SocketAddr = std::env::var("AGENTOS_NETWORK_PUBLIC_ADDRESS")
+            .expect("AGENTOS_NETWORK_PUBLIC_ADDRESS must name the controlled public listener")
+            .parse()
+            .expect("AGENTOS_NETWORK_PUBLIC_ADDRESS must be a socket address");
+        let private_address: std::net::SocketAddr =
+            std::env::var("AGENTOS_NETWORK_PRIVATE_ADDRESS")
+                .expect("AGENTOS_NETWORK_PRIVATE_ADDRESS must name the private sentinel")
+                .parse()
+                .expect("AGENTOS_NETWORK_PRIVATE_ADDRESS must be a socket address");
+        let switch_ready = std::path::PathBuf::from(
+            std::env::var("AGENTOS_NETWORK_SWITCH_READY")
+                .expect("AGENTOS_NETWORK_SWITCH_READY must be configured"),
+        );
+        let switch_complete = std::path::PathBuf::from(
+            std::env::var("AGENTOS_NETWORK_SWITCH_COMPLETE")
+                .expect("AGENTOS_NETWORK_SWITCH_COMPLETE must be configured"),
+        );
+
+        let initial_answers = tokio::net::lookup_host((host.as_str(), public_address.port()))
+            .await
+            .expect("resolve controlled public answer")
+            .collect::<Vec<_>>();
+        assert!(
+            !initial_answers.is_empty()
+                && initial_answers
+                    .iter()
+                    .all(|address| address.ip() == public_address.ip()),
+            "qualification host must initially resolve only to the controlled public address"
+        );
+
+        let public_listener = tokio::net::TcpListener::bind(public_address)
+            .await
+            .expect("bind controlled public listener");
+        let private_listener = tokio::net::TcpListener::bind(private_address)
+            .await
+            .expect("bind private SSRF sentinel");
+        let response_host = host.clone();
+        let public_server = tokio::spawn(async move {
+            let (mut stream, _) =
+                tokio::time::timeout(std::time::Duration::from_secs(10), public_listener.accept())
+                    .await
+                    .expect("public request timed out")
+                    .expect("accept public request");
+            let mut request = [0_u8; 4096];
+            let read = stream
+                .read(&mut request)
+                .await
+                .expect("read public request");
+            assert!(
+                String::from_utf8_lossy(&request[..read]).starts_with("GET /"),
+                "qualification must exercise a real HTTP GET"
+            );
+            std::fs::write(&switch_ready, b"ready\n").expect("publish DNS switch marker");
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                while !switch_complete.exists() {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("controlled DNS switch did not complete");
+            stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 302 Found\r\nLocation: http://{response_host}/private\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .expect("write controlled redirect");
+        });
+
+        let manager = SandboxManagerImpl::new();
+        let agent = uuid::Uuid::new_v4();
+        let config = SandboxConfig {
+            allowed_network_hosts: Some(vec![host.clone()]),
+            ..test_config()
+        };
+        let sandbox = manager.create_sandbox(agent, &config).unwrap();
+        let response = manager
+            .execute_network(
+                sandbox,
+                "get",
+                &serde_json::json!({"url": format!("http://{host}/")}),
+            )
+            .await
+            .expect("the pinned public request must complete");
+        assert_eq!(response["status"], 302);
+        public_server.await.expect("public server task");
+
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(500),
+                private_listener.accept()
+            )
+            .await
+            .is_err(),
+            "redirect or DNS rebinding reached the private sentinel"
+        );
+
+        let rebound = manager
+            .execute_network(
+                sandbox,
+                "get",
+                &serde_json::json!({"url": format!("http://{host}/after-rebind")}),
+            )
+            .await
+            .expect_err("a new request must reject the rebound private answer");
+        assert!(
+            rebound.to_string().contains("denied address"),
+            "unexpected rebound denial: {rebound}"
+        );
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(250),
+                private_listener.accept()
+            )
+            .await
+            .is_err(),
+            "private DNS rejection must occur before a connection"
+        );
+
+        let denied_targets = [
+            "http://169.254.169.254/latest/meta-data/".to_string(),
+            format!("http://user:secret@{host}/"),
+            format!("http://{host}:8080/"),
+            format!("http://{host}/#fragment"),
+        ];
+        for denied in denied_targets {
+            assert!(
+                manager
+                    .execute_network(sandbox, "get", &serde_json::json!({"url": &denied}))
+                    .await
+                    .is_err(),
+                "{denied} must fail before network dispatch"
+            );
+        }
+
+        if let Ok(evidence_path) = std::env::var("AGENTOS_NETWORK_EVIDENCE_PATH") {
+            let evidence_path = std::path::PathBuf::from(evidence_path);
+            let source_commit = std::env::var("GITHUB_SHA")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+                .or_else(|| {
+                    std::process::Command::new("git")
+                        .args(["rev-parse", "HEAD"])
+                        .output()
+                        .ok()
+                        .filter(|output| output.status.success())
+                        .and_then(|output| String::from_utf8(output.stdout).ok())
+                        .map(|output| output.trim().to_string())
+                })
+                .expect("network evidence requires an exact source commit");
+            let source_dirty = std::process::Command::new("git")
+                .args(["status", "--porcelain"])
+                .output()
+                .ok()
+                .filter(|output| output.status.success())
+                .map(|output| !output.stdout.is_empty())
+                .expect("network evidence requires a readable Git worktree");
+            let evidence = serde_json::json!({
+                "schema_version": 1,
+                "suite": "agentos-v1-live-network-egress",
+                "generated_at": chrono::Utc::now().to_rfc3339(),
+                "qualification_class": "live_linux_network_egress",
+                "production_claim_allowed": false,
+                "source": {
+                    "commit": source_commit,
+                    "dirty": source_dirty
+                },
+                "environment": {
+                    "operating_system": "linux",
+                    "controlled_host": host,
+                    "controlled_public_address": public_address.to_string(),
+                    "private_sentinel": private_address.to_string(),
+                    "ambient_proxy_configured": std::env::var_os("HTTP_PROXY").is_some()
+                },
+                "checks": {
+                    "public_dns_answer_exercised": true,
+                    "connection_pinned_to_admitted_answer": true,
+                    "ambient_proxy_ignored": true,
+                    "redirect_not_followed": true,
+                    "dns_rebinding_denied": true,
+                    "private_dns_answer_denied_before_connect": true,
+                    "metadata_ssrf_denied": true,
+                    "url_credentials_denied": true,
+                    "nondefault_port_denied": true,
+                    "url_fragment_denied": true
+                },
+                "passed": true
+            });
+            if let Some(parent) = evidence_path.parent() {
+                std::fs::create_dir_all(parent).expect("create network evidence directory");
+            }
+            std::fs::write(
+                &evidence_path,
+                format!(
+                    "{}\n",
+                    serde_json::to_string_pretty(&evidence)
+                        .expect("serialize network qualification evidence")
+                ),
+            )
+            .expect("write network qualification evidence");
+        }
+    }
+
     #[test]
     fn private_link_local_and_special_use_addresses_are_not_public() {
         for address in [

@@ -26,6 +26,35 @@ pub struct DesktopAgent {
     pub priority: u8,
 }
 
+/// Non-secret global metrics shown by the desktop dashboard.
+///
+/// The capture timestamp and telemetry contract version make it explicit
+/// which raw operator snapshot the values came from.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DesktopMetricsView {
+    pub captured_at: String,
+    pub telemetry_contract_version: u32,
+    pub tokens_consumed: u64,
+    pub api_calls_made: u64,
+    pub time_elapsed_ms: u64,
+}
+
+impl DesktopMetricsView {
+    pub fn try_from_operator_snapshot(snapshot: &OperatorSnapshot) -> Result<Self, &'static str> {
+        let metrics = snapshot
+            .system_metrics
+            .as_ref()
+            .ok_or("global metrics are unavailable for this caller scope")?;
+        Ok(Self {
+            captured_at: snapshot.captured_at.clone(),
+            telemetry_contract_version: metrics.telemetry_contract_version,
+            tokens_consumed: metrics.tokens_consumed,
+            api_calls_made: metrics.api_calls_made,
+            time_elapsed_ms: metrics.uptime_seconds.saturating_mul(1_000),
+        })
+    }
+}
+
 /// A serialized, single-connection desktop session.
 ///
 /// Tauri commands may run concurrently, while one wire connection is ordered

@@ -30,9 +30,10 @@ fn usage() -> ! {
            agentctl storage-portable-export DATABASE BUNDLE_DIR [--storage-key KEY_FILE] --confirm-offline\n\
            agentctl storage-portable-verify BUNDLE_DIR\n\
            agentctl storage-portable-import BUNDLE_DIR DATABASE [--storage-key KEY_FILE] --confirm-offline\n\
-           agentctl [SERVER OPTIONS] erase-agent AGENT_ID --confirm\n\
-           agentctl [SERVER OPTIONS] erase-user USER_ID --confirm\n\
-           agentctl [SERVER OPTIONS] erase-tenant TENANT_ID --confirm"
+           agentctl [SERVER OPTIONS] kill AGENT_ID --confirm AGENT_ID\n\
+           agentctl [SERVER OPTIONS] erase-agent AGENT_ID --confirm AGENT_ID\n\
+           agentctl [SERVER OPTIONS] erase-user USER_ID --confirm USER_ID\n\
+           agentctl [SERVER OPTIONS] erase-tenant TENANT_ID --confirm TENANT_ID"
     );
     std::process::exit(2);
 }
@@ -849,12 +850,11 @@ async fn main() {
             return;
         }
         "erase-agent" => {
-            let agent_id = args
-                .next()
-                .unwrap_or_else(|| usage())
+            let target = args.next().unwrap_or_else(|| usage());
+            let agent_id = target
                 .parse::<kernel::AgentId>()
                 .unwrap_or_else(|_| usage());
-            require_erasure_confirmation(&mut args);
+            require_target_confirmation(&mut args, &target);
             let receipt = client
                 .erase_agent_data(agent_id, agent_sdk::CONFIRM_DATA_ERASURE)
                 .await
@@ -864,7 +864,7 @@ async fn main() {
         }
         "erase-user" => {
             let user_id = args.next().unwrap_or_else(|| usage());
-            require_erasure_confirmation(&mut args);
+            require_target_confirmation(&mut args, &user_id);
             let receipt = client
                 .erase_user_data(user_id, agent_sdk::CONFIRM_DATA_ERASURE)
                 .await
@@ -874,7 +874,7 @@ async fn main() {
         }
         "erase-tenant" => {
             let tenant_id = args.next().unwrap_or_else(|| usage());
-            require_erasure_confirmation(&mut args);
+            require_target_confirmation(&mut args, &tenant_id);
             let receipt = client
                 .erase_tenant_data(tenant_id, agent_sdk::CONFIRM_DATA_ERASURE)
                 .await
@@ -979,9 +979,9 @@ async fn main() {
                 .await
         }
         "kill" => {
-            client
-                .kill_agent(args.next().unwrap_or_else(|| usage()))
-                .await
+            let agent_id = args.next().unwrap_or_else(|| usage());
+            require_target_confirmation(&mut args, &agent_id);
+            client.kill_agent(agent_id).await
         }
         "wait" => {
             let id = args.next().unwrap_or_else(|| usage());
@@ -1025,11 +1025,14 @@ fn print_json(value: &impl serde::Serialize, label: &str) {
     );
 }
 
-fn require_erasure_confirmation<I>(args: &mut std::iter::Peekable<I>)
+fn require_target_confirmation<I>(args: &mut std::iter::Peekable<I>, target: &str)
 where
     I: Iterator<Item = String>,
 {
-    if args.next().as_deref() != Some("--confirm") || args.next().is_some() {
+    if args.next().as_deref() != Some("--confirm")
+        || args.next().as_deref() != Some(target)
+        || args.next().is_some()
+    {
         usage();
     }
 }

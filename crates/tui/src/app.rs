@@ -17,6 +17,8 @@ pub enum Mode {
     CreateAgent,
     /// Typing a message to send to the selected agent.
     SendMessage,
+    /// Waiting for a second uppercase `X` for one exact selected agent.
+    ConfirmKill,
 }
 
 /// An action the event loop should perform asynchronously (the pure key handler
@@ -49,6 +51,7 @@ pub struct App {
     pub mode: Mode,
     pub input: String,
     pub status: String,
+    pending_kill: Option<(String, String)>,
     pub last_output: Option<String>,
     pub should_quit: bool,
 }
@@ -66,6 +69,7 @@ impl App {
             mode: Mode::Normal,
             input: String::new(),
             status: "r refresh · c/m/p/s/X agents · [/ ] service · u start · d stop · R restart · L reload · q quit".into(),
+            pending_kill: None,
             last_output: None,
             should_quit: false,
         }
@@ -184,6 +188,7 @@ impl App {
         match self.mode {
             Mode::Normal => self.on_key_normal(key),
             Mode::CreateAgent | Mode::SendMessage => self.on_key_editing(key),
+            Mode::ConfirmKill => self.on_key_confirm_kill(key),
         }
     }
 
@@ -232,9 +237,19 @@ impl App {
             Key::Char('s') => self.selected_agent().map(|agent| UiAction::StopAgent {
                 agent_id: agent.id.clone(),
             }),
-            Key::Char('X') => self.selected_agent().map(|agent| UiAction::KillAgent {
-                agent_id: agent.id.clone(),
-            }),
+            Key::Char('X') => {
+                if let Some(agent) = self.selected_agent().cloned() {
+                    self.mode = Mode::ConfirmKill;
+                    self.pending_kill = Some((agent.id.clone(), agent.name.clone()));
+                    self.status = format!(
+                        "confirm kill — {} ({}) will be force-stopped; press X again or Esc",
+                        agent.name, agent.id
+                    );
+                } else {
+                    self.status = "no agent selected".into();
+                }
+                None
+            }
             Key::Char('[') => {
                 self.move_service_selection(-1);
                 None
@@ -284,6 +299,33 @@ impl App {
         }
     }
 
+    fn on_key_confirm_kill(&mut self, key: Key) -> Option<UiAction> {
+        match key {
+            Key::Char('X') => {
+                let target = self.pending_kill.take().map(|(agent_id, _)| agent_id);
+                self.mode = Mode::Normal;
+                self.status = "kill submitted".into();
+                target.map(|agent_id| UiAction::KillAgent { agent_id })
+            }
+            Key::Esc => {
+                self.pending_kill = None;
+                self.mode = Mode::Normal;
+                self.status = "kill cancelled".into();
+                None
+            }
+            _ => {
+                self.status = "kill not submitted — press X to confirm exact target or Esc".into();
+                None
+            }
+        }
+    }
+
+    pub fn pending_kill(&self) -> Option<(&str, &str)> {
+        self.pending_kill
+            .as_ref()
+            .map(|(agent_id, name)| (agent_id.as_str(), name.as_str()))
+    }
+
     fn submit(&mut self) -> Option<UiAction> {
         let action = match self.mode {
             Mode::CreateAgent => {
@@ -313,7 +355,7 @@ impl App {
                 }
                 UiAction::SendMessage { agent_id, message }
             }
-            Mode::Normal => return None,
+            Mode::Normal | Mode::ConfirmKill => return None,
         };
         self.mode = Mode::Normal;
         self.input.clear();
@@ -507,10 +549,42 @@ mod tests {
                 agent_id: "paused".into()
             })
         );
+        assert_eq!(a.on_key(Key::Char('X')), None);
+        assert_eq!(a.mode, Mode::ConfirmKill);
+        assert!(a.status.contains("paused"));
         assert_eq!(
             a.on_key(Key::Char('X')),
             Some(UiAction::KillAgent {
                 agent_id: "paused".into()
+            })
+        );
+        assert_eq!(a.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn kill_confirmation_is_target_bound_and_cancellable() {
+        let mut a = app();
+        a.agents = vec![
+            dummy_agent("agent-exact", "critical-agent"),
+            dummy_agent("agent-other", "other-agent"),
+        ];
+
+        assert_eq!(a.on_key(Key::Char('X')), None);
+        assert_eq!(a.mode, Mode::ConfirmKill);
+        assert!(a.status.contains("critical-agent"));
+        assert!(a.status.contains("agent-exact"));
+        a.selected = 1;
+        assert_eq!(a.on_key(Key::Char('j')), None);
+        assert_eq!(a.mode, Mode::ConfirmKill);
+        assert_eq!(a.on_key(Key::Esc), None);
+        assert_eq!(a.mode, Mode::Normal);
+        a.selected = 0;
+        assert_eq!(a.on_key(Key::Char('X')), None);
+        a.selected = 1;
+        assert_eq!(
+            a.on_key(Key::Char('X')),
+            Some(UiAction::KillAgent {
+                agent_id: "agent-exact".into()
             })
         );
     }

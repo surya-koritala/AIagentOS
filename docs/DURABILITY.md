@@ -684,15 +684,18 @@ valid. Operators can use the typed SDK or:
 
 ```bash
 agentctl --addr 127.0.0.1:7777 --token "$AGENT_SERVER_TOKEN" \
-  erase-agent 00000000-0000-0000-0000-000000000001 --confirm
+  erase-agent 00000000-0000-0000-0000-000000000001 \
+  --confirm 00000000-0000-0000-0000-000000000001
 agentctl --addr 127.0.0.1:7777 --token "$AGENT_SERVER_TOKEN" \
-  erase-user USER_ID --confirm
+  erase-user USER_ID --confirm USER_ID
 agentctl --addr 127.0.0.1:7777 --token "$AGENT_SERVER_TOKEN" \
-  erase-tenant TENANT_ID --confirm
+  erase-tenant TENANT_ID --confirm TENANT_ID
 ```
 
 These commands return a privacy-safe receipt or `null` when no classified data
-existed. The configured managed backup root is included as described above.
+existed. Repeating the exact target after `--confirm` prevents a stale or
+mistyped confirmation from authorizing a different subject. The configured
+managed backup root is included as described above.
 Provider configuration files, external workspaces, remote provider data,
 offline-created backup copies, replicas, and external object stores remain
 outside this operation and require their own retention/deletion controls.

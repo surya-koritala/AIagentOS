@@ -312,8 +312,12 @@ operator can inspect and retry safely.
 The reply is `data_erased` with a nullable `receipt`. `null` means no classified
 data existed. A receipt is durable and contains no subject identifier, tenant,
 actor, reason, prompt, path, or deleted value. The typed SDK requires the
-explicit `CONFIRM_DATA_ERASURE` proof value; `agentctl` requires a trailing
-`--confirm`.
+explicit `CONFIRM_DATA_ERASURE` proof value. For both data erasure and forced
+agent termination, `agentctl` requires `--confirm` followed by the exact target
+identifier. A different identifier fails before any wire request. The TUI
+binds an uppercase-`X` confirmation mode to the displayed agent name and full
+identifier, states that the action force-stops the agent, and requires a second
+uppercase `X`; changing selection while the prompt is open cannot retarget it.
 
 ## Distributed node contract
 

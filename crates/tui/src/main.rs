@@ -390,6 +390,16 @@ fn render_footer(f: &mut Frame, area: Rect, app: &App) {
             Span::raw(app.input.clone()),
             Span::styled("▏", Style::default().add_modifier(Modifier::SLOW_BLINK)),
         ]),
+        Mode::ConfirmKill => {
+            let (agent_id, name) = app.pending_kill().unwrap_or(("missing target", "unknown"));
+            Line::from(vec![
+                Span::styled(
+                    "CONFIRM FORCE-STOP ",
+                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(format!("{name} ({agent_id}) · X confirm · Esc cancel")),
+            ])
+        }
     };
     f.render_widget(
         Paragraph::new(content).block(Block::default().borders(Borders::ALL)),

@@ -296,7 +296,10 @@ Connect with the SDK or any client speaking newline-delimited JSON syscalls.
 See [the public protocol contract](docs/PROTOCOL.md) for version negotiation,
 machine-readable schemas, typed errors, ordered token streaming, exact-request
 cancellation, framing/deadline limits, and conformance fixtures;
-[docs/SERVER_QUICKSTART.md](docs/SERVER_QUICKSTART.md) covers deployment.
+[docs/SERVER_QUICKSTART.md](docs/SERVER_QUICKSTART.md) covers deployment. The
+desktop client's WCAG 2.2 AA target, automated gates, remaining manual
+qualification, and exact-artifact release checklist are documented in
+[docs/ACCESSIBILITY.md](docs/ACCESSIBILITY.md).
 
 ### From source
 

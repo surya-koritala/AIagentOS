@@ -635,6 +635,64 @@ fn operator_ui_state_contract_is_visible_and_regressed() {
 }
 
 #[test]
+fn desktop_accessibility_baseline_is_explicit_and_honest() {
+    let qualification = read_workspace_file("docs/ACCESSIBILITY.md");
+    let normalized_qualification = qualification
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    for contract in [
+        "targets **WCAG 2.2 Level AA**",
+        "not a completed certification claim",
+        "`svelte-check --fail-on-warnings`",
+        "do not replace assistive-technology testing",
+        "Narrator on Windows",
+        "VoiceOver on macOS",
+        "remains below Production-qualified",
+    ] {
+        assert!(
+            normalized_qualification.contains(contract),
+            "desktop accessibility qualification lost {contract:?}"
+        );
+    }
+
+    let app = read_workspace_file("crates/tauri-app/ui/src/App.svelte");
+    for contract in [
+        "Skip to main content",
+        ":global(:focus-visible)",
+        "@media (prefers-reduced-motion: reduce)",
+    ] {
+        assert!(
+            app.contains(contract),
+            "desktop shell lost accessibility contract {contract:?}"
+        );
+    }
+
+    let status = read_workspace_file("crates/tauri-app/ui/src/lib/AgentStatus.svelte");
+    assert!(
+        status.contains("This view is not an event history."),
+        "desktop agent-status view must disclose its snapshot scope"
+    );
+    for fabricated in ["Simulated activity feed", "time: 'now'", "Activity Feed"] {
+        assert!(
+            !status.contains(fabricated),
+            "desktop must not present fabricated activity contract {fabricated:?}"
+        );
+    }
+
+    let frontend_test = read_workspace_file("crates/tauri-app/ui/src/lib/accessibility.test.js");
+    assert!(
+        frontend_test.contains("no fabricated activity"),
+        "frontend accessibility source-contract regression was removed"
+    );
+    assert!(
+        read_workspace_file(".github/workflows/ci.yml")
+            .contains("Svelte types and accessibility warnings are errors"),
+        "Svelte accessibility diagnostics are no longer blocking CI"
+    );
+}
+
+#[test]
 fn release_blocking_workflows_keep_their_security_contract() {
     let ci = read_workspace_file(".github/workflows/ci.yml");
     for os in ["ubuntu-latest", "macos-latest", "windows-latest"] {

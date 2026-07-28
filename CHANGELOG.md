@@ -10,6 +10,17 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
 
 ## [Unreleased]
 
+- Established a WCAG 2.2 AA-oriented desktop accessibility baseline with a
+  keyboard skip link, visible focus, semantic landmarks and current navigation,
+  named controls, modal focus containment, live operation/conversation status,
+  text-backed state, minimum control targets, and reduced-motion handling.
+  Blocking Svelte diagnostics and source-contract regressions retain these
+  behaviors. The former simulated activity feed now truthfully renders only the
+  latest operator snapshot and discloses that it is not event history. Manual
+  exact-artifact keyboard, contrast, zoom/reflow, and platform screen-reader
+  qualification remains open under #126, so no completed accessibility claim
+  is made. The desktop entry point now uses the Svelte 5 mount API instead of
+  crashing at launch through the removed legacy component constructor.
 - Made operator clients honest under degraded connections. The TUI and desktop
   now retain and label last-known-good data as stale, distinguish scoped
   partial views without inventing global zeroes, expose successful reconnect

@@ -344,14 +344,21 @@ impl SandboxManagerImpl {
         } else {
             None
         };
+        if !config.workspace_dir.is_absolute() {
+            return Err(SandboxError::CreationFailed(
+                "sandbox workspace must be an absolute path".into(),
+            ));
+        }
         let workspace_dir = if config.isolation_level == IsolationLevel::Trusted {
-            config.workspace_dir.clone()
+            // Trusted operator policy may relax network/process controls, but
+            // agent filesystem tools still receive only a directory
+            // capability rooted here. Create an absent explicit workspace,
+            // then pin its canonical identity before any request is admitted.
+            std::fs::create_dir_all(&config.workspace_dir)
+                .map_err(|error| SandboxError::CreationFailed(error.to_string()))?;
+            std::fs::canonicalize(&config.workspace_dir)
+                .map_err(|error| SandboxError::CreationFailed(error.to_string()))?
         } else {
-            if !config.workspace_dir.is_absolute() {
-                return Err(SandboxError::CreationFailed(
-                    "sandbox workspace must be an absolute path".into(),
-                ));
-            }
             #[cfg(unix)]
             let existed = config.workspace_dir.exists();
             if managed_workspace
@@ -406,14 +413,10 @@ impl SandboxManagerImpl {
                     .map_err(|error| SandboxError::CreationFailed(error.to_string()))?;
             }
         }
-        let workspace = if config.isolation_level == IsolationLevel::Trusted {
-            None
-        } else {
-            Some(
-                Dir::open_ambient_dir(&workspace_dir, ambient_authority())
-                    .map_err(|error| SandboxError::CreationFailed(error.to_string()))?,
-            )
-        };
+        let workspace = Some(
+            Dir::open_ambient_dir(&workspace_dir, ambient_authority())
+                .map_err(|error| SandboxError::CreationFailed(error.to_string()))?,
+        );
         let sandbox_id = uuid::Uuid::new_v4();
         let allowed_hosts = config
             .allowed_network_hosts
@@ -480,9 +483,7 @@ impl SandboxManagerImpl {
         } else {
             state.workspace_dir.join(path)
         };
-        if state.isolation_level != IsolationLevel::Trusted
-            && !Self::is_within_boundary(&state.workspace_dir, &target)
-        {
+        if !Self::is_within_boundary(&state.workspace_dir, &target) {
             return Err(SandboxError::BoundaryViolation(format!(
                 "Path {:?} is outside sandbox boundary {:?}",
                 path, state.workspace_dir
@@ -837,11 +838,6 @@ impl SandboxManagerImpl {
         operation: &str,
         parameters: &serde_json::Value,
     ) -> Result<serde_json::Value, SandboxError> {
-        if state.isolation_level == IsolationLevel::Trusted {
-            return Err(SandboxError::BoundaryViolation(
-                "trusted filesystem requests must use an operator provider".into(),
-            ));
-        }
         let _operation = state.operation_lock.lock().map_err(|_| {
             SandboxError::BoundaryViolation("sandbox filesystem unavailable".into())
         })?;
@@ -2174,8 +2170,26 @@ mod tests {
             ..test_config()
         };
         let trusted_id = mgr.create_sandbox(uuid::Uuid::new_v4(), &trusted).unwrap();
+        std::fs::write(
+            trusted.workspace_dir.join("inside.txt"),
+            "trusted workspace",
+        )
+        .unwrap();
+        assert_eq!(
+            mgr.execute_filesystem(
+                trusted_id,
+                "read",
+                &serde_json::json!({"path": "inside.txt"}),
+            )
+            .unwrap()["content"],
+            "trusted workspace"
+        );
         assert!(mgr
-            .execute_filesystem(trusted_id, "read", &serde_json::json!({"path": "anything"}),)
+            .execute_filesystem(
+                trusted_id,
+                "read",
+                &serde_json::json!({"path": "../outside.txt"}),
+            )
             .is_err());
         assert!(mgr
             .execute_network(

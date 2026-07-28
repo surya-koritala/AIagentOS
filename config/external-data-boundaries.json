@@ -1,0 +1,59 @@
+{
+  "schema_version": 1,
+  "profile_id": "single-node-linux-rootless-container-cli",
+  "maximum_completion_seconds": 2592000,
+  "required_configured_boundaries": [
+    "external/remote-backup-copies"
+  ],
+  "boundaries": [
+    {
+      "boundary_id": "external/workspace-copies-and-mounts",
+      "eligible_modes": [
+        "delete-api",
+        "bounded-retention",
+        "not-configured"
+      ]
+    },
+    {
+      "boundary_id": "external/provider-request-and-retention",
+      "eligible_modes": [
+        "delete-api",
+        "bounded-retention",
+        "zero-data-retention",
+        "not-configured"
+      ]
+    },
+    {
+      "boundary_id": "external/remote-backup-copies",
+      "eligible_modes": [
+        "immutable-retention-then-delete"
+      ]
+    },
+    {
+      "boundary_id": "external/log-metric-and-trace-sinks",
+      "eligible_modes": [
+        "delete-api",
+        "bounded-retention",
+        "zero-data-retention",
+        "not-configured"
+      ]
+    },
+    {
+      "boundary_id": "external/container-model-and-package-registries",
+      "eligible_modes": [
+        "delete-api",
+        "bounded-retention",
+        "not-configured"
+      ]
+    },
+    {
+      "boundary_id": "external/browser-peripheral-and-tool-services",
+      "eligible_modes": [
+        "delete-api",
+        "bounded-retention",
+        "zero-data-retention",
+        "not-configured"
+      ]
+    }
+  ]
+}

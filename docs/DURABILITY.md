@@ -724,6 +724,16 @@ independently reviewed exact-RC evidence; it does not inject those dangerous
 faults from CI. The gate is implemented, but no eligible target exercise has
 yet been published, so these scenarios remain an open qualification item.
 
+The protected
+[external deletion and retention qualification](EXTERNAL_DELETION_QUALIFICATION.md)
+binds the exact target configuration to a versioned contract covering every
+external-system inventory entry. It recalculates configured-system deletion or
+post-retention completion, requires fresh-principal absence and zero residual
+objects, and requires a separate hash-bound review. Remote backup copies must
+demonstrate immutable retention followed by final deletion; absent integrations
+may use `not-configured` only for the exact hashed configuration. The gate is
+implemented, but no eligible target exercise has yet been published.
+
 All three schema-wide erasure transactions have real process-exit regressions
 at every statement boundary: 17 agent, 5 user, and 28 tenant boundaries. The
 agent matrix covers FTS, each owned data table, service references, cgroup quota
@@ -846,8 +856,9 @@ The following remain open under issue #123:
 - an eligible independently operated exact-RC run of the implemented protected
   target-service Object Lock workflow, followed by review of its retained
   public trust/anchor/receipt fixtures and immutable-retention controls;
-- measured deletion/retention enforcement across external workspaces,
-  providers, remote backup copies, and object stores;
+- an eligible independently reviewed exact-RC run of the implemented external
+  deletion/retention workflow against every configured target service,
+  including immutable remote-backup expiry and final deletion;
 - power-loss, torn-write, device-loss, object-store, other deployment
   filesystem, and extended crash qualification beyond the disposable ext4
   `ENOSPC` run, deterministic interrupted-encryption recovery, and the

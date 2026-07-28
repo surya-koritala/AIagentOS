@@ -17,6 +17,7 @@
   - [Host Storage Fault Qualification](./host-storage-fault-qualification.md)
   - [Destructive Storage Profile Qualification](./storage-profile-qualification.md)
   - [Remote Immutable Backups](./remote-backup-qualification.md)
+  - [External Deletion and Retention Qualification](./external-deletion-qualification.md)
   - [Resource and Leak Soak](./soak-qualification.md)
   - [Human Incident Game Day](./game-day-qualification.md)
   - [Release-candidate SLO Qualification](./release-slo-qualification.md)

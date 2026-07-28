@@ -10,6 +10,16 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
 
 ## [Unreleased]
 
+- Added a fail-closed exact-RC external deletion and retention evidence gate
+  under #123. A versioned contract now covers all six external-system inventory
+  boundaries, requires real immutable-retention-then-delete evidence for remote
+  backup copies, and permits `not-configured` only for an exact hashed target
+  configuration. The validator recalculates bounded lifecycle completion,
+  requires fresh-principal absence, zero residual objects and cross-tenant
+  access, and binds a separate eight-check review to the exact observation.
+  The protected self-hosted workflow retains only a bounded non-secret report.
+  The gate and regressions are implemented, but no eligible target exercise
+  exists yet, so production qualification remains false.
 - Added a fail-closed exact-RC destructive storage-profile evidence gate under
   #123 for the supported single-node Linux deployment. It accepts only bounded
   external observations of an out-of-band power cut, block-level torn write,

@@ -3,6 +3,7 @@
 use std::time::Duration;
 
 use agent_cli::OperatorClient;
+use agent_sdk::ConnectionProfile;
 
 fn usage() -> ! {
     eprintln!(
@@ -152,12 +153,15 @@ fn parse_portable_file_options(
 #[tokio::main]
 async fn main() {
     let mut args = std::env::args().skip(1).peekable();
-    let mut addr = std::env::var("AGENTOS_ADDR").unwrap_or_else(|_| "127.0.0.1:7777".into());
+    let mut profile = ConnectionProfile::from_env().unwrap_or_else(|error| {
+        eprintln!("agentctl: {error}");
+        std::process::exit(2);
+    });
     let mut token = std::env::var("AGENT_SERVER_TOKEN").ok();
 
     while matches!(args.peek().map(String::as_str), Some("--addr" | "--token")) {
         match args.next().as_deref() {
-            Some("--addr") => addr = args.next().unwrap_or_else(|| usage()),
+            Some("--addr") => profile.address = args.next().unwrap_or_else(|| usage()),
             Some("--token") => token = Some(args.next().unwrap_or_else(|| usage())),
             _ => unreachable!(),
         }
@@ -631,10 +635,13 @@ async fn main() {
         _ => {}
     }
 
-    let mut client = OperatorClient::connect(&addr, token.as_deref())
+    let mut client = OperatorClient::connect_profile(&profile, token.as_deref())
         .await
         .unwrap_or_else(|error| {
-            eprintln!("agentctl: could not connect to {addr}: {error}");
+            eprintln!(
+                "agentctl: could not connect to {}: {error}",
+                profile.address
+            );
             std::process::exit(1);
         });
 

@@ -7,7 +7,10 @@
 
 use std::sync::Arc;
 
-use agent_sdk::{AgentEnforcementInfo, KernelClient, MessageResult, OperatorSnapshot, SdkError};
+use agent_sdk::{
+    AgentEnforcementInfo, ConnectionProfile, KernelClient, MessageResult, OperatorSnapshot,
+    SdkError,
+};
 use kernel::{syscall_server::SyscallServer, AgentKernelImpl};
 use serde::Serialize;
 use tokio::sync::Mutex;
@@ -66,10 +69,14 @@ pub struct DesktopClient {
 impl DesktopClient {
     /// Connect to an existing syscall service and optionally authenticate.
     pub async fn connect(addr: &str, token: Option<&str>) -> Result<Self, SdkError> {
-        let mut inner = KernelClient::connect(addr).await?;
-        if let Some(token) = token {
-            inner.authenticate(token).await?;
-        }
+        Self::connect_profile(&ConnectionProfile::plaintext(addr), token).await
+    }
+
+    pub async fn connect_profile(
+        profile: &ConnectionProfile,
+        token: Option<&str>,
+    ) -> Result<Self, SdkError> {
+        let inner = profile.connect(token).await?;
         Ok(Self {
             inner: Mutex::new(inner),
         })

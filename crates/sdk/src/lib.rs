@@ -378,7 +378,7 @@ impl ConnectionProfile {
 }
 
 /// Result of a [`KernelClient::send_message`] / [`Agent::send`] turn.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct MessageResult {
     /// The agent's textual output for the turn.
     pub content: String,
@@ -390,7 +390,7 @@ pub struct MessageResult {
 
 /// Result of a durable lifecycle operation. `checkpoint_id` is present when a
 /// pause captured resumable work (or a resumed turn paused again).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct LifecycleResult {
     pub state: String,
     pub checkpoint_id: Option<String>,
@@ -400,7 +400,7 @@ pub struct LifecycleResult {
 }
 
 /// Snapshot of the syscall gate's enforcement counters.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct GateStats {
     pub allowed: u64,
     pub denied_capability: u64,
@@ -413,7 +413,7 @@ pub struct GateStats {
 }
 
 /// One agent's gate-enforced process identity and granted namespaces.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct AgentEnforcementInfo {
     pub pid: u64,
     pub capabilities: Vec<String>,
@@ -452,7 +452,7 @@ pub struct NodeIdentityProof {
 }
 
 /// The server's wire-protocol support window (reply to `hello`).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct ProtocolInfo {
     /// The newest wire-protocol version the server speaks.
     pub protocol_version: u32,
@@ -467,7 +467,7 @@ pub struct ProtocolInfo {
 /// The kernel's operational metrics (reply to `metrics`). Carries the rendered
 /// Prometheus text exposition plus a couple of the headline numbers as typed
 /// fields.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct Metrics {
     /// The full `text/plain; version=0.0.4` Prometheus exposition.
     pub prometheus: String,

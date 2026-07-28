@@ -210,7 +210,7 @@ kernel_modules = ["agentps", "event_loop", "observability", "operator_control", 
 source_paths = ["crates/kernel/src/operator_control.rs", "crates/kernel/src/syscall_server.rs", "crates/kernel/src/context.rs", "docs/OPERATIONS_API.md"]
 public_entry_points = ["crates/kernel/src/syscall_server.rs::Syscall::OperatorSnapshot", "crates/kernel/src/syscall_server.rs::Syscall::SetOperatorTunable", "crates/sdk/src/lib.rs::KernelClient::operator_snapshot", "crates/sdk/src/lib.rs::KernelClient::set_operator_tunable", "crates/cli/src/bin/agentctl.rs"]
 runtime_call_paths = ["crates/kernel/src/syscall_server.rs::dispatch_scoped", "crates/kernel/src/operator_control.rs::OperatorControl::set", "crates/kernel/src/metrics.rs::MetricsSnapshot::collect"]
-test_evidence = ["crates/kernel/src/operator_control.rs", "crates/kernel/src/syscall_server.rs", "crates/sdk/tests/kernel_client.rs", "crates/tui/src/app.rs"]
+test_evidence = ["crates/kernel/src/operator_control.rs", "crates/kernel/src/syscall_server.rs", "crates/sdk/tests/kernel_client.rs", "crates/cli/tests/runtime_commands.rs", "crates/tui/src/app.rs"]
 platforms = ["linux", "macos", "windows"]
 limitations = ["The operator package view intentionally contains only non-sensitive loaded-instance metadata; signed registry, trust, lock, and audit state is accessed through the dedicated package API. Provider health is availability/timeout evidence; provider contract and circuit-breaker qualification remains #120. Gate decision counters are process-local and reset on restart. Legacy ProcFs/Sysctl helpers are not public sources of truth or host mounts."]
 

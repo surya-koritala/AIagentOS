@@ -1,5 +1,6 @@
 //! Small operator CLI for the public agent lifecycle API.
 
+use std::io::Write;
 use std::time::Duration;
 
 use agent_cli::OperatorClient;
@@ -8,7 +9,20 @@ use agent_sdk::ConnectionProfile;
 fn usage() -> ! {
     eprintln!(
         "usage: agentctl [--addr HOST:PORT] [--token TOKEN] \
-         <list|inspect|pressure|tunables|tunable-set|tunable-rollback|tunable-history|status|pause|resume|stop|kill|wait|services|service-start|service-stop|service-restart|service-reload|service-history|backup-create|backup-retention|backup-status|data-inventory|backup-key-generate|backup-anchor-create|backup-verify|backup-restore|backup-disaster-recover|backup-corruption-recover|backup-remote-publish|backup-remote-fetch|storage-key-generate|storage-encrypt|storage-encrypt-recover|storage-key-rotate|storage-portable-export|storage-portable-verify|storage-portable-import|erase-agent|erase-user|erase-tenant> [ARGS...]\n\
+         <create|list|inspect|message|stream|cancel|checkpoints|checkpoint-resume|checkpoint-delete|capabilities|providers|metrics|protocol|pressure|tunables|tunable-set|tunable-rollback|tunable-history|status|pause|resume|stop|kill|wait|services|service-start|service-stop|service-restart|service-reload|service-history|backup-create|backup-retention|backup-status|data-inventory|backup-key-generate|backup-anchor-create|backup-verify|backup-restore|backup-disaster-recover|backup-corruption-recover|backup-remote-publish|backup-remote-fetch|storage-key-generate|storage-encrypt|storage-encrypt-recover|storage-key-rotate|storage-portable-export|storage-portable-verify|storage-portable-import|erase-agent|erase-user|erase-tenant> [ARGS...]\n\
+         \n\
+         public runtime commands:\n\
+           agentctl [SERVER OPTIONS] create NAME TASK [PROVIDER [PROFILE [PRIORITY]]]\n\
+           agentctl [SERVER OPTIONS] message AGENT_ID MESSAGE\n\
+           agentctl [SERVER OPTIONS] stream REQUEST_ID AGENT_ID MESSAGE\n\
+           agentctl [SERVER OPTIONS] cancel REQUEST_ID AGENT_ID\n\
+           agentctl [SERVER OPTIONS] checkpoints AGENT_ID\n\
+           agentctl [SERVER OPTIONS] checkpoint-resume AGENT_ID CHECKPOINT_ID\n\
+           agentctl [SERVER OPTIONS] checkpoint-delete AGENT_ID CHECKPOINT_ID\n\
+           agentctl [SERVER OPTIONS] capabilities AGENT_ID\n\
+           agentctl [SERVER OPTIONS] providers\n\
+           agentctl [SERVER OPTIONS] metrics\n\
+           agentctl [SERVER OPTIONS] protocol\n\
          \n\
          storage commands:\n\
            agentctl [SERVER OPTIONS] backup-create BACKUP_ROOT NAME\n\
@@ -647,7 +661,28 @@ async fn main() {
         });
 
     let result = match command.as_str() {
+        "create" => {
+            let name = args.next().unwrap_or_else(|| usage());
+            let task = args.next().unwrap_or_else(|| usage());
+            let provider = args.next();
+            let profile = args.next();
+            let priority = args
+                .next()
+                .map(|value| value.parse::<u8>().unwrap_or_else(|_| usage()));
+            if args.next().is_some() {
+                usage();
+            }
+            let id = client
+                .create_agent(name, task, provider, profile, priority)
+                .await
+                .unwrap_or_else(|error| fail(error));
+            print_json(&serde_json::json!({ "id": id }), "created agent");
+            return;
+        }
         "list" => {
+            if args.next().is_some() {
+                usage();
+            }
             let agents = client
                 .list_agents()
                 .await
@@ -670,6 +705,149 @@ async fn main() {
                     )))
                 })
             );
+            return;
+        }
+        "message" => {
+            let agent_id = args.next().unwrap_or_else(|| usage());
+            let message = args.next().unwrap_or_else(|| usage());
+            if args.next().is_some() {
+                usage();
+            }
+            let result = client
+                .send_message(agent_id, message)
+                .await
+                .unwrap_or_else(|error| fail(error));
+            print_json(&result, "message result");
+            return;
+        }
+        "stream" => {
+            let request_id = args.next().unwrap_or_else(|| usage());
+            let agent_id = args.next().unwrap_or_else(|| usage());
+            let message = args.next().unwrap_or_else(|| usage());
+            if args.next().is_some() {
+                usage();
+            }
+            let result = client
+                .send_message_stream(request_id.clone(), agent_id, message, |event| {
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "type": "event",
+                            "request_id": request_id,
+                            "event": event,
+                        })
+                    );
+                    let _ = std::io::stdout().flush();
+                })
+                .await
+                .unwrap_or_else(|error| fail(error));
+            println!(
+                "{}",
+                serde_json::json!({
+                    "type": "completed",
+                    "request_id": request_id,
+                    "result": result,
+                })
+            );
+            return;
+        }
+        "cancel" => {
+            let request_id = args.next().unwrap_or_else(|| usage());
+            let agent_id = args.next().unwrap_or_else(|| usage());
+            if args.next().is_some() {
+                usage();
+            }
+            let accepted = client
+                .cancel_request(request_id.clone(), agent_id)
+                .await
+                .unwrap_or_else(|error| fail(error));
+            print_json(
+                &serde_json::json!({
+                    "request_id": request_id,
+                    "accepted": accepted,
+                }),
+                "cancellation result",
+            );
+            return;
+        }
+        "checkpoints" => {
+            let agent_id = args.next().unwrap_or_else(|| usage());
+            if args.next().is_some() {
+                usage();
+            }
+            let checkpoints = client
+                .list_generation_checkpoints(agent_id)
+                .await
+                .unwrap_or_else(|error| fail(error));
+            print_json(&checkpoints, "generation checkpoints");
+            return;
+        }
+        "checkpoint-resume" => {
+            let agent_id = args.next().unwrap_or_else(|| usage());
+            let checkpoint_id = args.next().unwrap_or_else(|| usage());
+            if args.next().is_some() {
+                usage();
+            }
+            let result = client
+                .resume_generation_checkpoint(agent_id, checkpoint_id)
+                .await
+                .unwrap_or_else(|error| fail(error));
+            print_json(&result, "checkpoint resume result");
+            return;
+        }
+        "checkpoint-delete" => {
+            let agent_id = args.next().unwrap_or_else(|| usage());
+            let checkpoint_id = args.next().unwrap_or_else(|| usage());
+            if args.next().is_some() {
+                usage();
+            }
+            let existed = client
+                .delete_generation_checkpoint(agent_id, checkpoint_id)
+                .await
+                .unwrap_or_else(|error| fail(error));
+            print_json(
+                &serde_json::json!({ "deleted": existed }),
+                "checkpoint deletion result",
+            );
+            return;
+        }
+        "capabilities" => {
+            let agent_id = args.next().unwrap_or_else(|| usage());
+            if args.next().is_some() {
+                usage();
+            }
+            let info = client
+                .agent_info(agent_id)
+                .await
+                .unwrap_or_else(|error| fail(error));
+            print_json(&info, "agent capabilities");
+            return;
+        }
+        "providers" => {
+            if args.next().is_some() {
+                usage();
+            }
+            let providers = client
+                .list_providers()
+                .await
+                .unwrap_or_else(|error| fail(error));
+            print_json(&providers, "provider health");
+            return;
+        }
+        "metrics" => {
+            if args.next().is_some() {
+                usage();
+            }
+            let metrics = client.metrics().await.unwrap_or_else(|error| fail(error));
+            print!("{}", metrics.prometheus);
+            return;
+        }
+        "protocol" => {
+            if args.next().is_some() {
+                usage();
+            }
+            let protocol = client.hello().await.unwrap_or_else(|error| fail(error));
+            print_json(&protocol, "protocol description");
             return;
         }
         "pressure" => {

@@ -35,3 +35,4 @@ tracing-subscriber = { workspace = true }
 [dev-dependencies]
 uuid = { workspace = true }
 wiremock = { workspace = true }
+async-trait = { workspace = true }

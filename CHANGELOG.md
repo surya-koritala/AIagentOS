@@ -10,6 +10,17 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
 
 ## [Unreleased]
 
+- Expanded the canonical `agentctl` operator over the existing public SDK/wire
+  boundary. It now supports tenant-scoped agent creation and messages, ordered
+  NDJSON streaming, exact request cancellation from a second process,
+  generation checkpoint list/resume/delete, enforcement capabilities,
+  provider health, protocol features, and Prometheus metrics. A real TCP
+  regression exercises those commands with a tenant credential, proves
+  foreign-agent isolation and system-only metrics authorization, and cancels a
+  live slow-provider stream. SDK result views used by scriptable clients are
+  now serializable without redefining wire types. Package-management breadth,
+  rendered desktop/TUI breadth, exact-artifact accessibility, and signed
+  updater qualification remain open under #126.
 - Added a fail-closed desktop release foundation under #126. Workspace, Tauri,
   UI, lockfile, and release-tag versions must now agree; a code-rendered source
   SVG generates validated multi-resolution PNG, ICO, and ICNS assets; and the

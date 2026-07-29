@@ -83,8 +83,11 @@ commands rather than pruning independently on one replica. OpenRaft's complete
 storage-v2 conformance suite, file-backed vote/committed/log/state/snapshot
 restart persistence, barrier idempotency, snapshot transfer and rollback
 protection, durable-pointer monotonicity, and malformed-record rejection run in
-the kernel test suite. This is storage qualification, not a claim that peer
-transport, election, or quorum authority is active.
+the kernel test suite. The separate `cluster_runtime` module executes this
+storage behind bounded mTLS peer RPCs; a three-node regression covers election,
+replication, leader failover, restart catch-up, and old-term fencing. The
+production server still does not construct that runtime or route public
+authority commands through it, so this is not a product quorum-authority claim.
 
 ## Authenticated accounting integrity
 

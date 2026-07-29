@@ -16,6 +16,7 @@ pub mod cfs;
 pub mod cgroups;
 pub mod cluster_consensus;
 pub mod cluster_control;
+pub mod cluster_runtime;
 pub mod config;
 pub mod connector;
 pub mod context;
@@ -3820,12 +3821,20 @@ impl AgentKernelImpl {
                 self.persist_service_transition(name, "started", None)
                     .await?;
                 let remaining = startup_timeout.saturating_sub(startup_started.elapsed());
+                let readiness_delay =
+                    std::time::Duration::from_millis(state.def.health.readiness_delay_ms);
+                if remaining.is_zero() || readiness_delay >= remaining {
+                    let reason =
+                        format!("startup exceeded {}ms", state.def.health.startup_timeout_ms);
+                    self.fail_service_start(name, handle.id, "startup_timeout", &reason)
+                        .await?;
+                    return Err(KernelError::LifecycleTimeout(format!(
+                        "service '{name}' {reason}"
+                    )));
+                }
                 let readiness = tokio::time::timeout(remaining, async {
-                    if state.def.health.readiness_delay_ms > 0 {
-                        tokio::time::sleep(std::time::Duration::from_millis(
-                            state.def.health.readiness_delay_ms,
-                        ))
-                        .await;
+                    if !readiness_delay.is_zero() {
+                        tokio::time::sleep(readiness_delay).await;
                     }
                     self.get_agent_status(handle.id)
                 })

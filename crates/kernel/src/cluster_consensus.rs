@@ -1,9 +1,10 @@
 //! Durable consensus storage for the distributed control plane.
 //!
 //! This module implements OpenRaft's storage-v2 contracts inside the kernel's
-//! existing SQLite durability boundary. It is intentionally a substrate: peer
-//! transport, elections, and routing membership/ownership mutations through a
-//! live quorum are separate integration stages.
+//! existing SQLite durability boundary. The authenticated peer transport and
+//! executable election runtime live in `cluster_runtime`; routing production
+//! membership and ownership mutations through that quorum remains a separate
+//! integration stage.
 
 // OpenRaft's required StorageError is intentionally larger than Clippy's
 // generic Result threshold. Storage-v2 implementations cannot replace or box
@@ -43,6 +44,15 @@ pub struct ClusterRaftNode {
     pub server_name: String,
     /// Lowercase SHA-256 fingerprint of the exact accepted server leaf.
     pub tls_certificate_sha256: String,
+    /// Lowercase SHA-256 fingerprint of the exact accepted client leaf.
+    ///
+    /// This is separate from the server fingerprint so operators can use
+    /// least-privilege certificates with distinct server-auth and client-auth
+    /// extended key usages. Older durable membership values deserialize this
+    /// as empty and remain valid storage, but the live peer runtime rejects an
+    /// empty fingerprint.
+    #[serde(default)]
+    pub tls_client_certificate_sha256: String,
     /// Base64 or PEM encoded Ed25519 membership identity public key.
     pub identity_public_key: String,
 }

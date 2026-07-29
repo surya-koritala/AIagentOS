@@ -223,6 +223,17 @@ async fn canonical_agentctl_system_audits_are_live_and_tenant_credentials_are_de
         assert_success(&output, label);
         assert!(json(&output).is_array(), "{label} must return a JSON array");
     }
+    let rollout = agentctl(
+        &address,
+        Some(system_token),
+        &["cluster-certificate-rollout-audit", "25"],
+    );
+    assert!(
+        !rollout.status.success(),
+        "legacy single-authority mode must not manufacture rollout audit"
+    );
+    assert!(String::from_utf8_lossy(&rollout.stderr)
+        .contains("requires the replicated cluster_raft authority"));
 
     for invalid_limit in ["0", "1001", "not-a-number"] {
         let output = agentctl(
@@ -247,6 +258,7 @@ async fn canonical_agentctl_system_audits_are_live_and_tenant_credentials_are_de
             vec!["gate-stats"],
             vec!["node-control-audit", "25"],
             vec!["cluster-membership-audit", "25"],
+            vec!["cluster-certificate-rollout-audit", "25"],
         ] {
             let output = agentctl(&address, Some(token), &command);
             assert!(

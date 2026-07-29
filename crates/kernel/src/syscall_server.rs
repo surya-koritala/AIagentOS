@@ -566,6 +566,35 @@ pub enum Syscall {
         expected_generation: Option<u64>,
         reason: String,
     },
+    /// Stage a bounded replacement application-listener certificate. The
+    /// candidate registration must carry a fresh challenged identity proof.
+    PrepareClusterMemberCertificateRollout {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        operation_id: Option<String>,
+        registration: crate::cluster_control::ClusterMemberRegistration,
+        challenge_hex: String,
+        signature_hex: String,
+        expected_generation: u64,
+        prepare_ttl_seconds: u64,
+        minimum_overlap_seconds: u64,
+        reason: String,
+    },
+    /// Remove an unactivated certificate candidate.
+    AbortClusterMemberCertificateRollout {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        operation_id: Option<String>,
+        node_id: String,
+        expected_generation: u64,
+        reason: String,
+    },
+    /// Remove the retired previous certificate after the overlap deadline.
+    FinalizeClusterMemberCertificateRollout {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        operation_id: Option<String>,
+        node_id: String,
+        expected_generation: u64,
+        reason: String,
+    },
     /// Generation-fenced clean leave or terminal identity revocation.
     SetClusterMemberState {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -579,6 +608,11 @@ pub enum Syscall {
     GetClusterMembership,
     /// Read the durable membership mutation history.
     ListClusterMembershipAudit {
+        #[serde(default = "default_tunable_audit_limit")]
+        limit: usize,
+    },
+    /// Read the durable certificate-rollout transition history.
+    ListClusterCertificateRolloutAudit {
         #[serde(default = "default_tunable_audit_limit")]
         limit: usize,
     },
@@ -1284,6 +1318,12 @@ pub enum SyscallReply {
     ClusterMemberUpdated {
         member: crate::cluster_control::ClusterMember,
     },
+    /// Member and optional live rollout after a successful staged mutation.
+    ClusterCertificateRolloutUpdated {
+        member: crate::cluster_control::ClusterMember,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rollout: Option<crate::cluster_control::ClusterCertificateRollout>,
+    },
     /// Atomic authority discovery view.
     ClusterMembership {
         membership: crate::cluster_control::ClusterMembershipSnapshot,
@@ -1291,6 +1331,10 @@ pub enum SyscallReply {
     /// Durable membership audit entries.
     ClusterMembershipAudit {
         entries: Vec<crate::cluster_control::ClusterMembershipAudit>,
+    },
+    /// Durable certificate-rollout audit entries.
+    ClusterCertificateRolloutAudit {
+        entries: Vec<crate::cluster_control::ClusterCertificateRolloutAudit>,
     },
     /// Durable authority ownership record after a claim/renew/release, or an
     /// optional record for an explicit lookup.
@@ -1586,12 +1630,24 @@ fn syscall_policy(call: &Syscall) -> (AccessLevel, &'static str, Option<&str>) {
         Syscall::RegisterClusterMember { .. } => {
             (AccessLevel::System, "cluster.membership.join", None)
         }
+        Syscall::PrepareClusterMemberCertificateRollout { .. } => {
+            (AccessLevel::System, "cluster.certificate.prepare", None)
+        }
+        Syscall::AbortClusterMemberCertificateRollout { .. } => {
+            (AccessLevel::System, "cluster.certificate.abort", None)
+        }
+        Syscall::FinalizeClusterMemberCertificateRollout { .. } => {
+            (AccessLevel::System, "cluster.certificate.finalize", None)
+        }
         Syscall::SetClusterMemberState { .. } => {
             (AccessLevel::System, "cluster.membership.state.set", None)
         }
         Syscall::GetClusterMembership => (AccessLevel::System, "cluster.membership.snapshot", None),
         Syscall::ListClusterMembershipAudit { .. } => {
             (AccessLevel::System, "cluster.membership.audit", None)
+        }
+        Syscall::ListClusterCertificateRolloutAudit { .. } => {
+            (AccessLevel::System, "cluster.certificate.audit", None)
         }
         Syscall::ClaimClusterAgentOwnership { .. } => {
             (AccessLevel::System, "cluster.ownership.claim", None)
@@ -1914,9 +1970,13 @@ fn quarantine_recovery_call(call: &Syscall) -> bool {
             | Syscall::ListNodeControlAudit { .. }
             | Syscall::IssueClusterJoinChallenge { .. }
             | Syscall::RegisterClusterMember { .. }
+            | Syscall::PrepareClusterMemberCertificateRollout { .. }
+            | Syscall::AbortClusterMemberCertificateRollout { .. }
+            | Syscall::FinalizeClusterMemberCertificateRollout { .. }
             | Syscall::SetClusterMemberState { .. }
             | Syscall::GetClusterMembership
             | Syscall::ListClusterMembershipAudit { .. }
+            | Syscall::ListClusterCertificateRolloutAudit { .. }
             | Syscall::ClaimClusterAgentOwnership { .. }
             | Syscall::RenewClusterAgentOwnership { .. }
             | Syscall::ReleaseClusterAgentOwnership { .. }
@@ -3397,6 +3457,125 @@ async fn dispatch_scoped_inner_with_fence(
                 }
             }
         }
+        Syscall::PrepareClusterMemberCertificateRollout {
+            operation_id,
+            registration,
+            challenge_hex,
+            signature_hex,
+            expected_generation,
+            prepare_ttl_seconds,
+            minimum_overlap_seconds,
+            reason,
+        } => {
+            let actor = principal
+                .map(|principal| principal.user_id.as_str())
+                .unwrap_or("system");
+            let authority = match configured_cluster_authority(kernel) {
+                Ok(authority) => authority,
+                Err(error) => return authority_io_error(error),
+            };
+            let Some(authority) = authority else {
+                return SyscallReply::Error {
+                    message: "certificate rollout requires the replicated cluster_raft authority"
+                        .into(),
+                };
+            };
+            match authority
+                .commit(AuthorityCommand::PrepareMemberCertificateRollout {
+                    operation_id: authority_operation_id(operation_id),
+                    registration,
+                    challenge_hex,
+                    signature_hex,
+                    expected_generation,
+                    prepare_ttl_seconds,
+                    minimum_overlap_seconds,
+                    actor: actor.to_owned(),
+                    reason,
+                    proposed_at: chrono::Utc::now(),
+                })
+                .await
+            {
+                Ok(AuthorityResponse::CertificateRolloutUpdated {
+                    member, rollout, ..
+                }) => SyscallReply::ClusterCertificateRolloutUpdated { member, rollout },
+                Ok(response) => authority_command_error(response),
+                Err(error) => authority_io_error(error),
+            }
+        }
+        Syscall::AbortClusterMemberCertificateRollout {
+            operation_id,
+            node_id,
+            expected_generation,
+            reason,
+        } => {
+            let actor = principal
+                .map(|principal| principal.user_id.as_str())
+                .unwrap_or("system");
+            let authority = match configured_cluster_authority(kernel) {
+                Ok(authority) => authority,
+                Err(error) => return authority_io_error(error),
+            };
+            let Some(authority) = authority else {
+                return SyscallReply::Error {
+                    message: "certificate rollout requires the replicated cluster_raft authority"
+                        .into(),
+                };
+            };
+            match authority
+                .commit(AuthorityCommand::AbortMemberCertificateRollout {
+                    operation_id: authority_operation_id(operation_id),
+                    node_id,
+                    expected_generation,
+                    actor: actor.to_owned(),
+                    reason,
+                    proposed_at: chrono::Utc::now(),
+                })
+                .await
+            {
+                Ok(AuthorityResponse::CertificateRolloutUpdated {
+                    member, rollout, ..
+                }) => SyscallReply::ClusterCertificateRolloutUpdated { member, rollout },
+                Ok(response) => authority_command_error(response),
+                Err(error) => authority_io_error(error),
+            }
+        }
+        Syscall::FinalizeClusterMemberCertificateRollout {
+            operation_id,
+            node_id,
+            expected_generation,
+            reason,
+        } => {
+            let actor = principal
+                .map(|principal| principal.user_id.as_str())
+                .unwrap_or("system");
+            let authority = match configured_cluster_authority(kernel) {
+                Ok(authority) => authority,
+                Err(error) => return authority_io_error(error),
+            };
+            let Some(authority) = authority else {
+                return SyscallReply::Error {
+                    message: "certificate rollout requires the replicated cluster_raft authority"
+                        .into(),
+                };
+            };
+            match authority
+                .commit(AuthorityCommand::FinalizeMemberCertificateRollout {
+                    operation_id: authority_operation_id(operation_id),
+                    node_id,
+                    expected_generation,
+                    actor: actor.to_owned(),
+                    reason,
+                    proposed_at: chrono::Utc::now(),
+                })
+                .await
+            {
+                Ok(AuthorityResponse::CertificateRolloutUpdated {
+                    member, rollout, ..
+                }) => SyscallReply::ClusterCertificateRolloutUpdated { member, rollout },
+                Ok(response) => authority_command_error(response),
+                Err(error) => authority_io_error(error),
+            }
+        }
         Syscall::SetClusterMemberState {
             operation_id,
             node_id,
@@ -3491,6 +3670,31 @@ async fn dispatch_scoped_inner_with_fence(
                         message: error.to_string(),
                     },
                 }
+            }
+        }
+        Syscall::ListClusterCertificateRolloutAudit { limit } => {
+            let authority = match configured_cluster_authority(kernel) {
+                Ok(authority) => authority,
+                Err(error) => return authority_io_error(error),
+            };
+            let Some(authority) = authority else {
+                return SyscallReply::Error {
+                    message:
+                        "certificate rollout audit requires the replicated cluster_raft authority"
+                            .into(),
+                };
+            };
+            match authority.linearizable_view().await {
+                Ok(view) => {
+                    let entries = view
+                        .certificate_rollout_audit
+                        .into_iter()
+                        .rev()
+                        .take(limit.clamp(1, 1_000))
+                        .collect();
+                    SyscallReply::ClusterCertificateRolloutAudit { entries }
+                }
+                Err(error) => authority_io_error(error),
             }
         }
         Syscall::ClaimClusterAgentOwnership {
@@ -5581,9 +5785,13 @@ impl SyscallServer {
                                 | Syscall::ListNodeControlAudit { .. }
                                 | Syscall::IssueClusterJoinChallenge { .. }
                                 | Syscall::RegisterClusterMember { .. }
+                                | Syscall::PrepareClusterMemberCertificateRollout { .. }
+                                | Syscall::AbortClusterMemberCertificateRollout { .. }
+                                | Syscall::FinalizeClusterMemberCertificateRollout { .. }
                                 | Syscall::SetClusterMemberState { .. }
                                 | Syscall::GetClusterMembership
                                 | Syscall::ListClusterMembershipAudit { .. }
+                                | Syscall::ListClusterCertificateRolloutAudit { .. }
                                 | Syscall::ClaimClusterAgentOwnership { .. }
                                 | Syscall::RenewClusterAgentOwnership { .. }
                                 | Syscall::ReleaseClusterAgentOwnership { .. }
@@ -8832,6 +9040,46 @@ memory = ["remember this"]
                 AccessLevel::System,
             ),
             (
+                Syscall::PrepareClusterMemberCertificateRollout {
+                    operation_id: None,
+                    registration: crate::cluster_control::ClusterMemberRegistration {
+                        node_id: "00000000-0000-0000-0000-000000000004".into(),
+                        fingerprint: "00".repeat(32),
+                        public_key: "00".repeat(32),
+                        tls_server_certificate_fingerprint: Some("11".repeat(32)),
+                        endpoint: "127.0.0.1:7443".into(),
+                        server_version: "0.3.0".into(),
+                        min_protocol_version: 1,
+                        protocol_version: 2,
+                    },
+                    challenge_hex: "00".into(),
+                    signature_hex: "00".into(),
+                    expected_generation: 1,
+                    prepare_ttl_seconds: 30,
+                    minimum_overlap_seconds: 30,
+                    reason: "test".into(),
+                },
+                AccessLevel::System,
+            ),
+            (
+                Syscall::AbortClusterMemberCertificateRollout {
+                    operation_id: None,
+                    node_id: "00000000-0000-0000-0000-000000000004".into(),
+                    expected_generation: 2,
+                    reason: "test".into(),
+                },
+                AccessLevel::System,
+            ),
+            (
+                Syscall::FinalizeClusterMemberCertificateRollout {
+                    operation_id: None,
+                    node_id: "00000000-0000-0000-0000-000000000004".into(),
+                    expected_generation: 3,
+                    reason: "test".into(),
+                },
+                AccessLevel::System,
+            ),
+            (
                 Syscall::SetClusterMemberState {
                     operation_id: None,
                     node_id: "00000000-0000-0000-0000-000000000004".into(),
@@ -8844,6 +9092,10 @@ memory = ["remember this"]
             (Syscall::GetClusterMembership, AccessLevel::System),
             (
                 Syscall::ListClusterMembershipAudit { limit: 10 },
+                AccessLevel::System,
+            ),
+            (
+                Syscall::ListClusterCertificateRolloutAudit { limit: 10 },
                 AccessLevel::System,
             ),
             (
@@ -9075,7 +9327,7 @@ memory = ["remember this"]
                     .to_string()
             })
             .collect::<std::collections::HashSet<_>>();
-        assert_eq!(calls.len(), 88);
+        assert_eq!(calls.len(), 92);
         assert_eq!(fixture_tags, schema_tags);
     }
 

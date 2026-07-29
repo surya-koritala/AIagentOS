@@ -18,8 +18,9 @@ authority. Under strict, default-off `[cluster_raft]` configuration,
 `agent-server` routes public membership and ownership mutations through the
 replicated deterministic state machine and serves linearizable reads, including
 transparent follower forwarding. The disabled default retains the designated
-single SQLite authority. The voter map remains static, and authority-term
-destination proofs, coordinated certificate rollout, migration, global
+single SQLite authority. Application-listener leaves have a bounded replicated
+prepare/activate/finalize rollout, but the voter map remains static. Raft
+transport trust rotation, authority-term destination proofs, migration, global
 quotas/trust, rolling upgrades, and disaster recovery are not complete.
 
 ---

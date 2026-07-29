@@ -86,16 +86,17 @@ database or an in-process kernel:
 agentctl --addr 127.0.0.1:7777 --token "$AGENT_SERVER_TOKEN" gate-stats
 agentctl --addr 127.0.0.1:7777 --token "$AGENT_SERVER_TOKEN" node-control-audit 100
 agentctl --addr 127.0.0.1:7777 --token "$AGENT_SERVER_TOKEN" cluster-membership-audit 100
+agentctl --addr 127.0.0.1:7777 --token "$AGENT_SERVER_TOKEN" cluster-certificate-rollout-audit 100
 agentctl --addr 127.0.0.1:7777 --token "$AGENT_SERVER_TOKEN" tunable-history
 agentctl --addr 127.0.0.1:7777 --token "$AGENT_SERVER_TOKEN" service-history
 ```
 
 Limits default to 100 and the dedicated node/cluster commands accept
 `1..=1000`. Gate counters are process-local snapshots; node-control,
-cluster-membership, tunable, and service history are the corresponding typed
-public audit records. These are global views and therefore require an open
-trusted-system connection or configured shared-secret operator credential.
-Tenant API keys cannot read them, including tenant `Admin` keys.
+cluster-membership, certificate-rollout, tunable, and service history are the
+corresponding typed public audit records. These are global views and therefore
+require an open trusted-system connection or configured shared-secret operator
+credential. Tenant API keys cannot read them, including tenant `Admin` keys.
 
 ## Package view and limitations
 

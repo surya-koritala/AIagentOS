@@ -99,8 +99,10 @@ fencing, and no-quorum rejection. The production server constructs and owns
 that runtime and routes public membership and ownership authority through it
 when strict `[cluster_raft]` configuration is enabled. The disabled default
 retains the legacy single-node authority. Static voters, destination proof
-terms, cluster-wide certificate coordination, migration, global quota/trust
-convergence, and disaster recovery remain outside this slice.
+terms, Raft transport trust rotation, migration, global quota/trust
+convergence, and disaster recovery remain outside this slice. The replicated
+application authority does persist bounded application-listener certificate
+rollouts and their ordered trust audit.
 
 ## Authenticated accounting integrity
 

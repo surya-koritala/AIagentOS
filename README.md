@@ -181,6 +181,7 @@ cluster audit records through the public SDK/wire path:
 agentctl --addr 127.0.0.1:7777 --token "$AGENT_SERVER_TOKEN" gate-stats
 agentctl --addr 127.0.0.1:7777 --token "$AGENT_SERVER_TOKEN" node-control-audit 100
 agentctl --addr 127.0.0.1:7777 --token "$AGENT_SERVER_TOKEN" cluster-membership-audit 100
+agentctl --addr 127.0.0.1:7777 --token "$AGENT_SERVER_TOKEN" cluster-certificate-rollout-audit 100
 ```
 
 Tenant API keys, including tenant Admin keys, cannot read these global views.

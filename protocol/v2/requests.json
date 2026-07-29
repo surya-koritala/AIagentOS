@@ -279,6 +279,39 @@
     "signature_hex": "00"
   },
   {
+    "challenge_hex": "00",
+    "expected_generation": 1,
+    "minimum_overlap_seconds": 1,
+    "op": "prepare_cluster_member_certificate_rollout",
+    "operation_id": "fixture",
+    "prepare_ttl_seconds": 1,
+    "reason": "fixture",
+    "registration": {
+      "endpoint": "127.0.0.1:7443",
+      "fingerprint": "0000000000000000000000000000000000000000000000000000000000000000",
+      "min_protocol_version": 1,
+      "node_id": "00000000-0000-0000-0000-000000000004",
+      "protocol_version": 2,
+      "public_key": "0000000000000000000000000000000000000000000000000000000000000000",
+      "server_version": "0.3.0"
+    },
+    "signature_hex": "00"
+  },
+  {
+    "expected_generation": 1,
+    "node_id": "fixture",
+    "op": "abort_cluster_member_certificate_rollout",
+    "operation_id": "fixture",
+    "reason": "fixture"
+  },
+  {
+    "expected_generation": 1,
+    "node_id": "fixture",
+    "op": "finalize_cluster_member_certificate_rollout",
+    "operation_id": "fixture",
+    "reason": "fixture"
+  },
+  {
     "expected_generation": 1,
     "node_id": "fixture",
     "op": "set_cluster_member_state",
@@ -292,6 +325,10 @@
   {
     "limit": 1,
     "op": "list_cluster_membership_audit"
+  },
+  {
+    "limit": 1,
+    "op": "list_cluster_certificate_rollout_audit"
   },
   {
     "agent_id": "00000000-0000-0000-0000-000000000001",

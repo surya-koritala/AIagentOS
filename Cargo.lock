@@ -82,6 +82,7 @@ version = "0.3.0"
 dependencies = [
  "adapters",
  "async-trait",
+ "chrono",
  "kernel",
  "rcgen",
  "ring",

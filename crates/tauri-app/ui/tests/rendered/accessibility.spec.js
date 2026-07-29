@@ -43,7 +43,21 @@ const operatorView = {
     },
   ],
   packages: [],
-  services: [],
+  services: [
+    {
+      name: 'research-worker',
+      state: 'Running',
+      agent_id: 'agent-1',
+      restart_count: 1,
+      desired_running: true,
+      ready: true,
+      healthy: true,
+      restart_exhausted: false,
+      last_failure: null,
+      next_restart_at: null,
+      last_transition_at: '2026-07-28T19:55:00Z',
+    },
+  ],
   tunables: [],
   scoped_gate: { allowed: 4, denied: 1, audited: 5 },
   metrics: { tokens_consumed: 128, api_calls_made: 3 },
@@ -61,9 +75,21 @@ const checkpoints = [
   },
 ];
 
+const serviceHistory = [
+  {
+    id: 1,
+    name: 'research-worker',
+    event: 'started',
+    state: 'Running',
+    agent_id: 'agent-1',
+    reason: null,
+    created_at: '2026-07-28T19:55:00Z',
+  },
+];
+
 async function installTauriFixture(page, { setupComplete = true } = {}) {
   await page.addInitScript(
-    ({ complete, snapshot, checkpointFixtures }) => {
+    ({ complete, snapshot, checkpointFixtures, serviceHistoryFixtures }) => {
       const config = {
         setup_complete: complete,
         llm_provider: 'azure-openai',
@@ -84,6 +110,15 @@ async function installTauriFixture(page, { setupComplete = true } = {}) {
             return Promise.resolve({ state: 'Running', output: null });
           }
           if (command === 'delete_checkpoint') return Promise.resolve(true);
+          if (command === 'service_history') {
+            return Promise.resolve(serviceHistoryFixtures);
+          }
+          if (command === 'start_service' || command === 'stop_service' || command === 'restart_service') {
+            return Promise.resolve({
+              ...snapshot.services[0],
+              state: command === 'stop_service' ? 'Inactive' : 'Running',
+            });
+          }
           return Promise.reject(new Error(`Unexpected rendered-test command: ${command}`));
         },
       };
@@ -92,6 +127,7 @@ async function installTauriFixture(page, { setupComplete = true } = {}) {
       complete: setupComplete,
       snapshot: operatorView,
       checkpointFixtures: checkpoints,
+      serviceHistoryFixtures: serviceHistory,
     },
   );
 }
@@ -216,5 +252,37 @@ test('checkpoint controls are axe-clean and require exact-target deletion confir
     .getByRole('textbox', { name: 'Exact checkpoint ID' })
     .fill('11111111-2222-4333-8444-555555555555');
   await expect(permanentDelete).toBeEnabled();
+  await expectWcagAxeClean(page);
+});
+
+test('service controls freeze the target and require exact-name confirmation', async ({ page }) => {
+  await installTauriFixture(page);
+  await page.goto('/');
+  await page.getByRole('button', { name: 'Agent status' }).click();
+
+  await expect(page.getByRole('heading', { name: 'Services' })).toBeVisible();
+  await page.getByRole('button', { name: 'Stop', exact: true }).click();
+  const confirmation = page.getByRole('group', {
+    name: 'Confirm service stop',
+  });
+  await expect(confirmation).toContainText('research-worker');
+  await expect(confirmation).toContainText('may block dependent services');
+
+  const confirmStop = page.getByRole('button', { name: 'Confirm stop' });
+  await expect(confirmStop).toBeDisabled();
+  await page
+    .getByRole('textbox', { name: 'Exact service name' })
+    .fill('research-worker');
+  await expect(confirmStop).toBeEnabled();
+  await expectWcagAxeClean(page);
+
+  await page.getByRole('button', { name: 'Cancel' }).click();
+  await page
+    .getByRole('button', { name: 'View history for research-worker' })
+    .click();
+  await expect(
+    page.getByRole('heading', { name: 'Service history: research-worker' }),
+  ).toBeVisible();
+  await expect(page.getByText('started', { exact: true })).toBeVisible();
   await expectWcagAxeClean(page);
 });

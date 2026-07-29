@@ -1,11 +1,115 @@
 <script>
+  import { invoke } from '@tauri-apps/api/core';
+  import { createEventDispatcher } from 'svelte';
+
   export let state;
+
+  const dispatch = createEventDispatcher();
+  let serviceBusy = null;
+  let serviceError = '';
+  let serviceStatus = '';
+  let pendingServiceControl = null;
+  let serviceConfirmation = '';
+  let serviceHistory = [];
+  let historyTarget = null;
+  let historyLoading = false;
 
   const availability = provider => {
     if (provider.probe_timed_out) return 'Probe timed out';
     if (provider.circuit_open) return 'Circuit open';
     return provider.available ? 'Available' : 'Unavailable';
   };
+
+  const serviceOperationLabel = target => {
+    const verb = target.action === 'start'
+      ? 'starting'
+      : target.action === 'stop'
+        ? 'stopping'
+        : 'restarting';
+    return `${verb} service ${target.name}`;
+  };
+
+  function requestServiceControl(action, service) {
+    const target = {
+      action,
+      name: service.name,
+      state: service.state,
+      agentId: service.agent_id,
+    };
+    serviceError = '';
+    serviceStatus = '';
+    if (action === 'start') {
+      executeServiceControl(target);
+      return;
+    }
+    pendingServiceControl = target;
+    serviceConfirmation = '';
+  }
+
+  function cancelServiceControl() {
+    pendingServiceControl = null;
+    serviceConfirmation = '';
+  }
+
+  async function executeServiceControl(target = pendingServiceControl) {
+    if (
+      !target ||
+      serviceBusy ||
+      (target.action !== 'start' && serviceConfirmation !== target.name)
+    ) return;
+    const frozenTarget = { ...target };
+    serviceBusy = frozenTarget.name;
+    serviceError = '';
+    serviceStatus = `${frozenTarget.action === 'start' ? 'Starting' : frozenTarget.action === 'stop' ? 'Stopping' : 'Restarting'} service ${frozenTarget.name}…`;
+    dispatch('operation', {
+      label: serviceOperationLabel(frozenTarget),
+      active: true,
+    });
+    try {
+      const args = { serviceName: frozenTarget.name };
+      if (frozenTarget.action !== 'start') {
+        args.confirmServiceName = serviceConfirmation;
+      }
+      const updated = await invoke(`${frozenTarget.action}_service`, args);
+      serviceStatus = `Service ${updated.name} is ${updated.state}.`;
+      cancelServiceControl();
+      dispatch('refresh');
+      if (historyTarget === frozenTarget.name) {
+        await loadServiceHistory(frozenTarget.name);
+      }
+    } catch (error) {
+      serviceError = String(error);
+      serviceStatus = '';
+    } finally {
+      serviceBusy = null;
+      dispatch('operation', {
+        label: serviceOperationLabel(frozenTarget),
+        active: false,
+      });
+    }
+  }
+
+  async function loadServiceHistory(serviceName) {
+    if (!serviceName || historyLoading) return;
+    const frozenName = serviceName;
+    historyTarget = frozenName;
+    historyLoading = true;
+    serviceError = '';
+    try {
+      const entries = await invoke('service_history', {
+        serviceName: frozenName,
+        limit: 50,
+      });
+      if (historyTarget === frozenName) serviceHistory = entries;
+    } catch (error) {
+      if (historyTarget === frozenName) {
+        serviceHistory = [];
+        serviceError = String(error);
+      }
+    } finally {
+      historyLoading = false;
+    }
+  }
 </script>
 
 <section class="operations" aria-labelledby="operations-heading">
@@ -111,7 +215,7 @@
     {:else}
       <div class="table-wrap">
         <table>
-          <thead><tr><th>Service</th><th>State</th><th>Ready</th><th>Healthy</th><th>Restarts</th><th>Last failure</th></tr></thead>
+          <thead><tr><th>Service</th><th>State</th><th>Ready</th><th>Healthy</th><th>Restarts</th><th>Last failure</th><th>Controls</th></tr></thead>
           <tbody>
             {#each state.services as service}
               <tr>
@@ -121,11 +225,109 @@
                 <td>{service.healthy ? 'Yes' : 'No'}</td>
                 <td>{service.restart_count}</td>
                 <td>{service.last_failure || 'None'}</td>
+                <td>
+                  <div class="service-actions">
+                    {#if service.state === 'Inactive' || service.state === 'Failed'}
+                      <button
+                        on:click={() => requestServiceControl('start', service)}
+                        disabled={Boolean(serviceBusy)}
+                      >Start</button>
+                    {:else if service.state === 'Running'}
+                      <button
+                        on:click={() => requestServiceControl('restart', service)}
+                        disabled={Boolean(serviceBusy)}
+                      >Restart</button>
+                      <button
+                        class="danger"
+                        on:click={() => requestServiceControl('stop', service)}
+                        disabled={Boolean(serviceBusy)}
+                      >Stop</button>
+                    {:else}
+                      <span>{service.state}…</span>
+                    {/if}
+                    <button
+                      on:click={() => loadServiceHistory(service.name)}
+                      disabled={historyLoading}
+                      aria-label={`View history for ${service.name}`}
+                    >History</button>
+                  </div>
+                </td>
               </tr>
             {/each}
           </tbody>
         </table>
       </div>
+
+      {#if pendingServiceControl}
+        <div class="service-confirmation" role="group" aria-labelledby="service-confirmation-heading">
+          <h3 id="service-confirmation-heading">
+            Confirm service {pendingServiceControl.action}
+          </h3>
+          <p>
+            Target service: <code>{pendingServiceControl.name}</code>
+            (current state {pendingServiceControl.state},
+            owner {pendingServiceControl.agentId || 'none'}).
+            {#if pendingServiceControl.action === 'stop'}
+              Stopping ends its supervised agent and may block dependent services.
+            {:else}
+              Restarting replaces its supervised agent and can interrupt in-flight work.
+            {/if}
+            Type the exact service name to continue.
+          </p>
+          <label for="service-control-confirmation">Exact service name</label>
+          <input
+            id="service-control-confirmation"
+            bind:value={serviceConfirmation}
+            autocomplete="off"
+            spellcheck="false"
+          />
+          <div class="service-actions">
+            <button
+              class="danger"
+              on:click={() => executeServiceControl()}
+              disabled={serviceConfirmation !== pendingServiceControl.name || Boolean(serviceBusy)}
+            >Confirm {pendingServiceControl.action}</button>
+            <button on:click={cancelServiceControl}>Cancel</button>
+          </div>
+        </div>
+      {/if}
+
+      {#if serviceStatus}<p class="operation-status" role="status">{serviceStatus}</p>{/if}
+      {#if serviceError}<p class="operation-error" role="alert">{serviceError}</p>{/if}
+
+      {#if historyTarget}
+        <section class="service-history" aria-labelledby="service-history-heading">
+          <div class="history-heading">
+            <h3 id="service-history-heading">Service history: {historyTarget}</h3>
+            <button
+              on:click={() => loadServiceHistory(historyTarget)}
+              disabled={historyLoading}
+            >Refresh history</button>
+          </div>
+          {#if historyLoading}
+            <p class="operation-status" role="status">Loading service history…</p>
+          {:else if serviceHistory.length === 0}
+            <p class="empty">No retained transitions for this service.</p>
+          {:else}
+            <div class="table-wrap">
+              <table>
+                <thead><tr><th>Time</th><th>Event</th><th>State</th><th>Owner</th><th>Reason</th></tr></thead>
+                <tbody>
+                  {#each serviceHistory as entry}
+                    <tr>
+                      <th scope="row">{entry.created_at}</th>
+                      <td>{entry.event}</td>
+                      <td>{entry.state}</td>
+                      <td>{entry.agent_id || 'None'}</td>
+                      <td>{entry.reason || 'None'}</td>
+                    </tr>
+                  {/each}
+                </tbody>
+              </table>
+            </div>
+          {/if}
+        </section>
+      {/if}
     {/if}
   </section>
 
@@ -203,6 +405,29 @@
   .tunable-list p { margin: 0; color: #a7a7b8; font-size: 0.78rem; }
   .empty { color: #b9b9c8; font-size: 0.85rem; }
   .unavailable { padding: 0.75rem; border: 1px solid #6b531c; border-radius: 8px; background: #352a12; color: #fde68a; }
+  .service-actions { display: flex; flex-wrap: wrap; gap: 0.4rem; align-items: center; }
+  .service-actions button, .history-heading button {
+    min-height: 40px;
+    padding: 0.35rem 0.65rem;
+    border: 1px solid #5b5b76;
+    border-radius: 6px;
+    background: #29293f;
+    color: #e8e8f0;
+    cursor: pointer;
+  }
+  .service-actions button:disabled, .history-heading button:disabled { opacity: 0.5; cursor: wait; }
+  .service-actions .danger { background: #581717; border-color: #991b1b; color: #fecaca; }
+  .service-confirmation { margin-top: 0.9rem; padding: 0.9rem; border: 1px solid #b91c1c; border-radius: 8px; background: #2b1518; }
+  .service-confirmation h3 { margin: 0 0 0.5rem; }
+  .service-confirmation p { color: #fecaca; line-height: 1.45; overflow-wrap: anywhere; }
+  .service-confirmation label { display: block; margin-bottom: 0.35rem; font-weight: 700; }
+  .service-confirmation input { width: 100%; min-height: 44px; border: 1px solid #77778e; border-radius: 7px; background: #11111d; color: #f5f5fa; padding: 0.5rem 0.65rem; }
+  .operation-status { color: #93c5fd; }
+  .operation-error { color: #fca5a5; overflow-wrap: anywhere; }
+  .service-history { margin-top: 1rem; }
+  .history-heading { display: flex; align-items: center; justify-content: space-between; gap: 0.75rem; }
+  .history-heading h3 { margin: 0; }
+  code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
   @media (max-width: 700px) {
     .operations { padding: 1rem; }
     .agent-grid { grid-template-columns: 1fr; }

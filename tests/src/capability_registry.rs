@@ -715,6 +715,65 @@ fn desktop_stream_and_checkpoint_controls_stay_on_the_public_wire_boundary() {
 }
 
 #[test]
+fn desktop_service_controls_stay_target_bound_on_the_public_wire_boundary() {
+    let protocol = read_workspace_file("docs/PROTOCOL.md");
+    let normalized_protocol = protocol.split_whitespace().collect::<Vec<_>>().join(" ");
+    for contract in [
+        "desktop service controls",
+        "authenticated public-wire connection",
+        "require the exact service name",
+        "cannot retarget an open confirmation",
+    ] {
+        assert!(
+            normalized_protocol.contains(contract),
+            "desktop service protocol lost {contract:?}"
+        );
+    }
+
+    let backend = read_workspace_file("crates/tauri-app/src/lib.rs");
+    for contract in [
+        ".start_service(name)",
+        ".stop_service(name)",
+        ".restart_service(name)",
+        ".service_history(name, limit)",
+        "desktop_service_controls_and_history_use_the_public_wire_client",
+    ] {
+        assert!(
+            backend.contains(contract),
+            "desktop service backend lost {contract:?}"
+        );
+    }
+
+    let commands = read_workspace_file("crates/tauri-app/src/commands.rs");
+    for contract in [
+        "pub async fn start_service",
+        "pub async fn stop_service",
+        "pub async fn restart_service",
+        "pub async fn service_history",
+        "validate_service_control_confirmation(&service_name, &confirm_service_name)",
+    ] {
+        assert!(
+            commands.contains(contract),
+            "desktop service command surface lost {contract:?}"
+        );
+    }
+
+    let status = read_workspace_file("crates/tauri-app/ui/src/lib/AgentStatus.svelte");
+    for contract in [
+        "const frozenTarget = { ...target }",
+        "confirmServiceName = serviceConfirmation",
+        "serviceConfirmation !== pendingServiceControl.name",
+        "may block dependent services",
+        "can interrupt in-flight work",
+    ] {
+        assert!(
+            status.contains(contract),
+            "desktop service UI lost {contract:?}"
+        );
+    }
+}
+
+#[test]
 fn desktop_accessibility_baseline_is_explicit_and_honest() {
     let qualification = read_workspace_file("docs/ACCESSIBILITY.md");
     let normalized_qualification = qualification

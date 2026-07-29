@@ -82,3 +82,21 @@ test('stream cancellation and checkpoint deletion retain explicit target contrac
   );
   assert.match(detail, /const targetAgentId = pendingCheckpointDelete\.agentId/);
 });
+
+test('service supervision retains public commands and frozen exact-target confirmation', () => {
+  const app = source('../App.svelte');
+  const status = source('AgentStatus.svelte');
+
+  assert.match(app, /<AgentStatus[\s\S]*on:refresh=\{refreshOperator\}/);
+  assert.match(status, /invoke\(`\$\{frozenTarget\.action\}_service`, args\)/);
+  assert.match(status, /invoke\('service_history'/);
+  assert.match(status, /const frozenTarget = \{ \.\.\.target \}/);
+  assert.match(status, /confirmServiceName = serviceConfirmation/);
+  assert.match(
+    status,
+    /serviceConfirmation !== pendingServiceControl\.name/,
+  );
+  assert.match(status, /Type the exact service name to continue/);
+  assert.match(status, /may block dependent services/);
+  assert.match(status, /can interrupt in-flight work/);
+});

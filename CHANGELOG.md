@@ -10,6 +10,13 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
 
 ## [Unreleased]
 
+- Added desktop service supervision over the authenticated public SDK/wire
+  boundary. Operators can start inactive services, inspect bounded transition
+  history, and stop or restart a frozen service target only after typing its
+  exact name. The confirmation discloses the current owner and dependency or
+  in-flight-work impact. A real embedded loopback regression exercises
+  start/restart/history/stop plus unknown-service failure, while source and
+  rendered axe tests retain target binding and keyboard-accessible controls.
 - Added real ordered message streaming, exact-request cancellation, and durable
   checkpoint controls to the desktop client over the public SDK/wire boundary.
   Streaming, ordinary operator reads, and cancellation use separate

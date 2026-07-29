@@ -10,6 +10,13 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
 
 ## [Unreleased]
 
+- Added desktop operator-tunable update, rollback, and bounded audit history
+  through the authenticated public `KernelClient`. The UI freezes the tunable
+  name, value, revision, and advertised bounds; updates use compare-and-set
+  revision enforcement, while rollback requires an older retained revision and
+  the exact tunable name. Backend validation, system/tenant authorization,
+  stale-revision refusal, production-bundle interaction, and axe regressions
+  retain the contract.
 - Added focused operator-tunable control to the TUI over the public
   `KernelClient` boundary. Operators can select a live tunable, submit a value
   only within its advertised bounds using the frozen expected revision, load

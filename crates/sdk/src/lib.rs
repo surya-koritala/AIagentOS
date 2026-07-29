@@ -578,6 +578,12 @@ impl KernelClient {
         self.reconnect_generation
     }
 
+    /// SHA-256 of the verified TLS server leaf certificate for the current
+    /// transport. Plaintext and Unix connections return `None`.
+    pub fn tls_peer_certificate_fingerprint(&self) -> Option<&str> {
+        self.inner.tls_peer_certificate_fingerprint()
+    }
+
     /// Re-establish a profile-backed connection, renegotiate the protocol, and
     /// restore the latest successfully authenticated credential.
     pub async fn reconnect(&mut self) -> Result<(), SdkError> {
@@ -3096,6 +3102,7 @@ mod protocol_tests {
             node_id: identity.node_id.clone(),
             fingerprint: identity.fingerprint,
             public_key: identity.public_key,
+            tls_server_certificate_fingerprint: None,
             endpoint: "127.0.0.1:7443".into(),
             server_version: env!("CARGO_PKG_VERSION").into(),
             min_protocol_version: 1,

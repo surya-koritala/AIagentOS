@@ -127,6 +127,71 @@ fn mutual_tls_configs() -> (
     (server, anonymous, authenticated)
 }
 
+fn shared_mutual_tls_configs(
+    server_count: usize,
+) -> (Vec<rustls::ServerConfig>, rustls::ClientConfig, Vec<String>) {
+    use rcgen::{
+        BasicConstraints, CertificateParams, CertifiedIssuer, ExtendedKeyUsagePurpose, IsCa,
+        KeyPair, KeyUsagePurpose,
+    };
+
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let ca_key = KeyPair::generate().expect("generate CA key");
+    let mut ca_params = CertificateParams::default();
+    ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    ca_params.key_usages = vec![
+        KeyUsagePurpose::DigitalSignature,
+        KeyUsagePurpose::KeyCertSign,
+        KeyUsagePurpose::CrlSign,
+    ];
+    let ca = CertifiedIssuer::self_signed(ca_params, ca_key).expect("self-sign CA");
+
+    let mut servers = Vec::with_capacity(server_count);
+    let mut fingerprints = Vec::with_capacity(server_count);
+    for _ in 0..server_count {
+        let key = KeyPair::generate().expect("generate server key");
+        let mut params =
+            CertificateParams::new(vec!["localhost".to_string()]).expect("server params");
+        params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+        let certificate = params
+            .signed_by(&key, &ca)
+            .expect("sign server certificate");
+        fingerprints.push(
+            ring::digest::digest(&ring::digest::SHA256, certificate.der().as_ref())
+                .as_ref()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect(),
+        );
+        servers.push(
+            kernel::syscall_server::server_config_from_pem_with_client_ca(
+                certificate.pem().as_bytes(),
+                key.serialize_pem().as_bytes(),
+                ca.pem().as_bytes(),
+            )
+            .expect("mutual TLS server config"),
+        );
+    }
+
+    let client_key = KeyPair::generate().expect("generate client key");
+    let mut client_params = CertificateParams::new(Vec::<String>::new()).expect("client params");
+    client_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
+    let client_certificate = client_params
+        .signed_by(&client_key, &ca)
+        .expect("sign client certificate");
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(ca.der().clone()).expect("trust cluster CA");
+    let client = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_client_auth_cert(
+            vec![client_certificate.der().clone()],
+            rustls::pki_types::PrivateKeyDer::try_from(client_key.serialize_der())
+                .expect("client private key"),
+        )
+        .expect("mutual TLS client config");
+    (servers, client, fingerprints)
+}
+
 /// Spawn `n` independent in-memory kernel nodes; return their dialable addresses.
 async fn spawn_cluster(n: usize) -> Vec<String> {
     let mut addrs = Vec::with_capacity(n);
@@ -590,6 +655,195 @@ async fn cluster_requires_mutual_tls_before_identity_discovery() {
 
     task.abort();
     let _ = task.await;
+}
+
+#[tokio::test]
+async fn membership_binds_rotated_tls_certificate_and_rejects_downgrade_or_old_leaf() {
+    let token = "certificate-binding-system-secret";
+    let (mut server_configs, client_config, fingerprints) = shared_mutual_tls_configs(3);
+    let member_new_config = server_configs.pop().expect("new member config");
+    let member_old_config = server_configs.pop().expect("old member config");
+    let authority_config = server_configs.pop().expect("authority config");
+    let member_old_fingerprint = &fingerprints[1];
+    let member_new_fingerprint = &fingerprints[2];
+
+    let authority_kernel = Arc::new(AgentKernelImpl::new().expect("authority kernel"));
+    let authority_server =
+        SyscallServer::bind_tls(authority_kernel, "127.0.0.1:0", authority_config)
+            .await
+            .expect("bind TLS authority")
+            .with_auth_token(token);
+    let authority_address = authority_server.local_addr().expect("authority address");
+    let authority_task = tokio::spawn(authority_server.serve());
+
+    let member_kernel = Arc::new(AgentKernelImpl::new().expect("member kernel"));
+    let member_server = SyscallServer::bind_tls(
+        Arc::clone(&member_kernel),
+        "127.0.0.1:0",
+        member_old_config.clone(),
+    )
+    .await
+    .expect("bind old TLS member")
+    .with_auth_token(token);
+    let member_address = member_server.local_addr().expect("member address");
+    let member_task = tokio::spawn(member_server.serve());
+
+    let mut authority =
+        KernelClient::connect_tls(authority_address, "localhost", client_config.clone())
+            .await
+            .expect("connect authority");
+    authority.authenticate(token).await.expect("auth authority");
+    let mut member = KernelClient::connect_tls(member_address, "localhost", client_config.clone())
+        .await
+        .expect("connect old member");
+    member.authenticate(token).await.expect("auth old member");
+    assert_eq!(
+        member.tls_peer_certificate_fingerprint(),
+        Some(member_old_fingerprint.as_str())
+    );
+    let joined = ClusterClient::admit_node(
+        &mut authority,
+        &mut member,
+        member_address.to_string(),
+        None,
+        "initial TLS-bound membership",
+    )
+    .await
+    .expect("admit TLS-bound member");
+    assert_eq!(
+        joined.tls_server_certificate_fingerprint.as_deref(),
+        Some(member_old_fingerprint.as_str())
+    );
+
+    let plaintext_server = SyscallServer::bind(Arc::clone(&member_kernel), "127.0.0.1:0")
+        .await
+        .expect("bind plaintext downgrade")
+        .with_auth_token(token);
+    let plaintext_address = plaintext_server
+        .local_addr()
+        .expect("plaintext downgrade address");
+    let plaintext_task = tokio::spawn(plaintext_server.serve());
+    let mut plaintext_member = KernelClient::connect(plaintext_address)
+        .await
+        .expect("connect plaintext downgrade");
+    plaintext_member
+        .authenticate(token)
+        .await
+        .expect("auth plaintext downgrade");
+    let downgrade = ClusterClient::admit_node(
+        &mut authority,
+        &mut plaintext_member,
+        plaintext_address.to_string(),
+        Some(joined.generation),
+        "attempt transport downgrade",
+    )
+    .await
+    .expect_err("a TLS-bound identity cannot rejoin without its certificate binding");
+    assert!(
+        downgrade
+            .to_string()
+            .contains("TLS certificate binding cannot be removed"),
+        "unexpected downgrade error: {downgrade}"
+    );
+    plaintext_task.abort();
+    let _ = plaintext_task.await;
+
+    member_task.abort();
+    let _ = member_task.await;
+    drop(member);
+    let member_server = SyscallServer::bind_tls(
+        Arc::clone(&member_kernel),
+        member_address,
+        member_new_config.clone(),
+    )
+    .await
+    .expect("bind rotated TLS member")
+    .with_auth_token(token);
+    let member_task = tokio::spawn(member_server.serve());
+    let mut rotated = KernelClient::connect_tls(member_address, "localhost", client_config.clone())
+        .await
+        .expect("connect rotated member");
+    rotated
+        .authenticate(token)
+        .await
+        .expect("auth rotated member");
+    let rotated_record = ClusterClient::admit_node(
+        &mut authority,
+        &mut rotated,
+        member_address.to_string(),
+        Some(joined.generation),
+        "rotate server certificate",
+    )
+    .await
+    .expect("re-admit rotated member");
+    assert_eq!(
+        rotated_record.tls_server_certificate_fingerprint.as_deref(),
+        Some(member_new_fingerprint.as_str())
+    );
+    assert_eq!(rotated_record.generation, joined.generation + 1);
+    let rotation_audit = authority
+        .cluster_membership_audit(1)
+        .await
+        .expect("certificate rotation audit");
+    assert_eq!(
+        rotation_audit[0]
+            .previous_tls_server_certificate_fingerprint
+            .as_deref(),
+        Some(member_old_fingerprint.as_str())
+    );
+    assert_eq!(
+        rotation_audit[0]
+            .current_tls_server_certificate_fingerprint
+            .as_deref(),
+        Some(member_new_fingerprint.as_str())
+    );
+
+    member_task.abort();
+    let _ = member_task.await;
+    drop(rotated);
+    let stale_server = SyscallServer::bind_tls(
+        Arc::clone(&member_kernel),
+        member_address,
+        member_old_config,
+    )
+    .await
+    .expect("bind stale certificate at authorized endpoint")
+    .with_auth_token(token);
+    let stale_task = tokio::spawn(stale_server.serve());
+    let stale = match ClusterClient::connect_discovered_tls_authenticated(
+        authority_address.to_string(),
+        "localhost",
+        client_config.clone(),
+        token,
+    )
+    .await
+    {
+        Err(error) => error,
+        Ok(_) => panic!("the superseded leaf certificate must not satisfy membership"),
+    };
+    assert_eq!(stale.wire_code(), Some(WireErrorCode::Conflict));
+    stale_task.abort();
+    let _ = stale_task.await;
+
+    let current_server = SyscallServer::bind_tls(member_kernel, member_address, member_new_config)
+        .await
+        .expect("restore current certificate")
+        .with_auth_token(token);
+    let current_task = tokio::spawn(current_server.serve());
+    let current = ClusterClient::connect_discovered_tls_authenticated(
+        authority_address.to_string(),
+        "localhost",
+        client_config,
+        token,
+    )
+    .await
+    .expect("current certificate and durable identity satisfy membership");
+    assert_eq!(current.node_count(), 1);
+
+    current_task.abort();
+    let _ = current_task.await;
+    authority_task.abort();
+    let _ = authority_task.await;
 }
 
 #[tokio::test]

@@ -38,6 +38,7 @@ pub struct NodeHandle {
     id: String,
     address: String,
     fingerprint: Option<String>,
+    tls_server_certificate_fingerprint: Option<String>,
     client: KernelClient,
 }
 
@@ -53,6 +54,10 @@ impl NodeHandle {
     /// Durable Ed25519 public-key fingerprint, when supported by the node.
     pub fn fingerprint(&self) -> Option<&str> {
         self.fingerprint.as_deref()
+    }
+    /// SHA-256 of the TLS server leaf certificate verified for this connection.
+    pub fn tls_server_certificate_fingerprint(&self) -> Option<&str> {
+        self.tls_server_certificate_fingerprint.as_deref()
     }
     /// Mutable access to the node's typed client.
     pub fn client(&mut self) -> &mut KernelClient {
@@ -201,6 +206,9 @@ impl ClusterClient {
             node_id: control.identity.node_id,
             fingerprint: control.identity.fingerprint,
             public_key: control.identity.public_key,
+            tls_server_certificate_fingerprint: node
+                .tls_peer_certificate_fingerprint()
+                .map(str::to_string),
             endpoint,
             server_version: protocol.server_version,
             min_protocol_version: protocol.min_protocol_version,
@@ -435,6 +443,9 @@ impl ClusterClient {
         let mut nodes = Vec::with_capacity(connections.len());
         let mut identities = HashSet::new();
         for (addr, mut client) in connections {
+            let tls_server_certificate_fingerprint = client
+                .tls_peer_certificate_fingerprint()
+                .map(str::to_string);
             let load = client.node_info().await?;
             let (id, fingerprint) = match load.control {
                 Some(control) => {
@@ -474,6 +485,7 @@ impl ClusterClient {
                 id,
                 address: addr,
                 fingerprint,
+                tls_server_certificate_fingerprint,
                 client,
             });
         }
@@ -1425,6 +1437,8 @@ impl ClusterClient {
                 ));
             };
             if node.fingerprint.as_deref() != Some(member.fingerprint.as_str())
+                || node.tls_server_certificate_fingerprint.as_deref()
+                    != member.tls_server_certificate_fingerprint.as_deref()
                 || node.address != member.endpoint
             {
                 return Err(membership_conflict(

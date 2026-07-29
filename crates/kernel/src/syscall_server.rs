@@ -21,14 +21,15 @@
 //! transports are supported; an optional shared-secret token gates a connection
 //! (required before any other syscall when configured) for non-loopback use.
 
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, RwLock};
 
 use serde::{Deserialize, Serialize};
 #[cfg(test)]
 use tokio::io::AsyncBufReadExt;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream, ToSocketAddrs};
-use tokio::sync::Semaphore;
+use tokio::sync::{watch, Semaphore};
 use tracing::Instrument;
 
 use crate::agent::AgentKernel;
@@ -4459,7 +4460,35 @@ pub fn server_config_from_pem_with_client_ca(
     key_pem: &[u8],
     client_ca_pem: &[u8],
 ) -> std::io::Result<rustls::ServerConfig> {
-    use rustls::pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer};
+    server_config_from_pem_with_client_ca_and_optional_crls(cert_pem, key_pem, client_ca_pem, None)
+}
+
+/// Build a mutually authenticated TLS server config that additionally enforces
+/// one or more PEM certificate revocation lists for the presented client
+/// chain. Revocation status is fail-closed and CRL expiration is enforced.
+pub fn server_config_from_pem_with_client_ca_and_crls(
+    cert_pem: &[u8],
+    key_pem: &[u8],
+    client_ca_pem: &[u8],
+    client_crl_pem: &[u8],
+) -> std::io::Result<rustls::ServerConfig> {
+    server_config_from_pem_with_client_ca_and_optional_crls(
+        cert_pem,
+        key_pem,
+        client_ca_pem,
+        Some(client_crl_pem),
+    )
+}
+
+fn server_config_from_pem_with_client_ca_and_optional_crls(
+    cert_pem: &[u8],
+    key_pem: &[u8],
+    client_ca_pem: &[u8],
+    client_crl_pem: Option<&[u8]>,
+) -> std::io::Result<rustls::ServerConfig> {
+    use rustls::pki_types::{
+        pem::PemObject, CertificateDer, CertificateRevocationListDer, PrivateKeyDer,
+    };
 
     let _ = rustls::crypto::ring::default_provider().install_default();
     let certs = CertificateDer::pem_slice_iter(cert_pem)
@@ -4499,7 +4528,20 @@ pub fn server_config_from_pem_with_client_ca(
             )
         })?;
     }
-    let verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(client_roots))
+    let mut verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(client_roots));
+    if let Some(client_crl_pem) = client_crl_pem {
+        let crls = CertificateRevocationListDer::pem_slice_iter(client_crl_pem)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
+        if crls.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "no certificate revocation lists found in client_crl_pem",
+            ));
+        }
+        verifier = verifier.with_crls(crls).enforce_revocation_expiration();
+    }
+    let verifier = verifier
         .build()
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
     rustls::ServerConfig::builder()
@@ -4508,12 +4550,90 @@ pub fn server_config_from_pem_with_client_ca(
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))
 }
 
+struct TlsReloadState {
+    config: RwLock<Arc<rustls::ServerConfig>>,
+    generation: AtomicU64,
+    generation_tx: watch::Sender<u64>,
+}
+
+/// Cloneable control handle for atomically replacing a live TLS listener's
+/// certificate, private key, and client-auth trust policy.
+///
+/// Build and validate a complete [`rustls::ServerConfig`] before calling
+/// [`reload`](Self::reload). A successful reload affects new handshakes
+/// immediately. Connections admitted under the previous generation finish
+/// their current request and are then closed before another request is read,
+/// so revoked credentials cannot retain an indefinitely reusable session.
+#[derive(Clone)]
+pub struct TlsReloadHandle {
+    inner: Arc<TlsReloadState>,
+}
+
+impl TlsReloadHandle {
+    fn new(config: rustls::ServerConfig) -> Self {
+        let (generation_tx, _) = watch::channel(1);
+        Self {
+            inner: Arc::new(TlsReloadState {
+                config: RwLock::new(Arc::new(config)),
+                generation: AtomicU64::new(1),
+                generation_tx,
+            }),
+        }
+    }
+
+    /// Current listener trust generation. Generation one is the configuration
+    /// supplied to [`SyscallServer::bind_tls`].
+    pub fn generation(&self) -> u64 {
+        self.inner.generation.load(Ordering::Acquire)
+    }
+
+    /// Atomically publish a fully validated replacement configuration.
+    ///
+    /// If generation space is exhausted or the internal lock is poisoned, the
+    /// old configuration remains active and no drain notification is emitted.
+    pub fn reload(&self, config: rustls::ServerConfig) -> std::io::Result<u64> {
+        let mut current = self
+            .inner
+            .config
+            .write()
+            .map_err(|_| std::io::Error::other("TLS reload configuration lock is poisoned"))?;
+        let generation = self.inner.generation.load(Ordering::Relaxed);
+        let next = generation
+            .checked_add(1)
+            .ok_or_else(|| std::io::Error::other("TLS reload generation exhausted"))?;
+        *current = Arc::new(config);
+        self.inner.generation.store(next, Ordering::Release);
+        drop(current);
+        self.inner.generation_tx.send_replace(next);
+        Ok(next)
+    }
+
+    fn snapshot(&self) -> std::io::Result<(u64, Arc<rustls::ServerConfig>, watch::Receiver<u64>)> {
+        let config = self
+            .inner
+            .config
+            .read()
+            .map_err(|_| std::io::Error::other("TLS reload configuration lock is poisoned"))?;
+        let generation = self.inner.generation.load(Ordering::Acquire);
+        Ok((
+            generation,
+            Arc::clone(&config),
+            self.inner.generation_tx.subscribe(),
+        ))
+    }
+}
+
+struct TlsConnectionGeneration {
+    admitted: u64,
+    current: watch::Receiver<u64>,
+}
+
 /// The transport a [`SyscallServer`] is bound to.
 enum Listener {
     Tcp(TcpListener),
     /// TCP listener whose accepted streams are wrapped in a rustls server-side
     /// TLS session before being handed to the (generic) connection handler.
-    Tls(TcpListener, tokio_rustls::TlsAcceptor),
+    Tls(TcpListener, TlsReloadHandle),
     #[cfg(unix)]
     Unix(tokio::net::UnixListener),
 }
@@ -4583,10 +4703,9 @@ impl SyscallServer {
         addr: impl ToSocketAddrs,
         config: rustls::ServerConfig,
     ) -> std::io::Result<Self> {
-        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
         Ok(Self {
             kernel,
-            listener: Listener::Tls(TcpListener::bind(addr).await?, acceptor),
+            listener: Listener::Tls(TcpListener::bind(addr).await?, TlsReloadHandle::new(config)),
             auth_token: None,
             connection_limit: Arc::new(Semaphore::new(DEFAULT_WIRE_MAX_CONNECTIONS)),
             connection_metrics: WireConnectionMetrics::with_capacity(DEFAULT_WIRE_MAX_CONNECTIONS),
@@ -4616,6 +4735,17 @@ impl SyscallServer {
     /// admission counters. Obtain it before moving the server into [`serve`](Self::serve).
     pub fn connection_metrics(&self) -> WireConnectionMetrics {
         self.connection_metrics.clone()
+    }
+
+    /// Return the live TLS control handle, or `None` for plaintext/Unix
+    /// listeners. Obtain it before moving the server into [`serve`](Self::serve).
+    pub fn tls_reload_handle(&self) -> Option<TlsReloadHandle> {
+        match &self.listener {
+            Listener::Tls(_, handle) => Some(handle.clone()),
+            Listener::Tcp(_) => None,
+            #[cfg(unix)]
+            Listener::Unix(_) => None,
+        }
     }
 
     /// Override the established connection idle deadline.
@@ -4663,15 +4793,23 @@ impl SyscallServer {
                     let _connection_permit = connection_permit;
                     let _active_connection = active_connection;
                     let (read, write) = stream.into_split();
-                    if Self::handle(kernel, read, write, auth, idle_timeout, &connection_metrics)
-                        .await
-                        .is_err()
+                    if Self::handle(
+                        kernel,
+                        read,
+                        write,
+                        auth,
+                        idle_timeout,
+                        &connection_metrics,
+                        None,
+                    )
+                    .await
+                    .is_err()
                     {
                         connection_metrics.io_error();
                     }
                 });
             },
-            Listener::Tls(listener, acceptor) => loop {
+            Listener::Tls(listener, reload) => loop {
                 let (stream, _peer) = listener.accept().await?;
                 let Ok(connection_permit) = connection_limit.clone().try_acquire_owned() else {
                     connection_metrics.reject();
@@ -4681,11 +4819,19 @@ impl SyscallServer {
                 let active_connection = connection_metrics.admit();
                 let kernel = self.kernel.clone();
                 let auth = self.auth_token.clone();
-                let acceptor = acceptor.clone();
+                let reload = reload.clone();
                 let connection_metrics = connection_metrics.clone();
                 tokio::spawn(async move {
                     let _connection_permit = connection_permit;
                     let _active_connection = active_connection;
+                    let (generation, config, generation_rx) = match reload.snapshot() {
+                        Ok(snapshot) => snapshot,
+                        Err(_) => {
+                            connection_metrics.io_error();
+                            return;
+                        }
+                    };
+                    let acceptor = tokio_rustls::TlsAcceptor::from(config);
                     // Perform the rustls handshake; a failed handshake drops the
                     // connection without affecting the accept loop.
                     let tls =
@@ -4705,9 +4851,20 @@ impl SyscallServer {
                     // The TLS stream is one AsyncRead+AsyncWrite object; split it
                     // into halves so it drops into the existing generic handler.
                     let (read, write) = tokio::io::split(tls);
-                    if Self::handle(kernel, read, write, auth, idle_timeout, &connection_metrics)
-                        .await
-                        .is_err()
+                    if Self::handle(
+                        kernel,
+                        read,
+                        write,
+                        auth,
+                        idle_timeout,
+                        &connection_metrics,
+                        Some(TlsConnectionGeneration {
+                            admitted: generation,
+                            current: generation_rx,
+                        }),
+                    )
+                    .await
+                    .is_err()
                     {
                         connection_metrics.io_error();
                     }
@@ -4729,9 +4886,17 @@ impl SyscallServer {
                     let _connection_permit = connection_permit;
                     let _active_connection = active_connection;
                     let (read, write) = stream.into_split();
-                    if Self::handle(kernel, read, write, auth, idle_timeout, &connection_metrics)
-                        .await
-                        .is_err()
+                    if Self::handle(
+                        kernel,
+                        read,
+                        write,
+                        auth,
+                        idle_timeout,
+                        &connection_metrics,
+                        None,
+                    )
+                    .await
+                    .is_err()
                     {
                         connection_metrics.io_error();
                     }
@@ -4751,6 +4916,7 @@ impl SyscallServer {
         auth: Option<Arc<String>>,
         idle_timeout: std::time::Duration,
         connection_metrics: &WireConnectionMetrics,
+        mut tls_generation: Option<TlsConnectionGeneration>,
     ) -> std::io::Result<()>
     where
         R: AsyncRead + Unpin,
@@ -4772,12 +4938,39 @@ impl SyscallServer {
             } else {
                 idle_timeout
             };
-            let line = match tokio::time::timeout(
-                timeout,
-                read_bounded_line(&mut reader, MAX_WIRE_FRAME_BYTES),
-            )
-            .await
-            {
+            let read = if let Some(generation) = tls_generation.as_mut() {
+                if *generation.current.borrow() != generation.admitted {
+                    break;
+                }
+                tokio::select! {
+                    biased;
+                    changed = generation.current.changed() => {
+                        if changed.is_err()
+                            || *generation.current.borrow() != generation.admitted
+                        {
+                            None
+                        } else {
+                            continue;
+                        }
+                    },
+                    result = tokio::time::timeout(
+                        timeout,
+                        read_bounded_line(&mut reader, MAX_WIRE_FRAME_BYTES),
+                    ) => Some(result),
+                }
+            } else {
+                Some(
+                    tokio::time::timeout(
+                        timeout,
+                        read_bounded_line(&mut reader, MAX_WIRE_FRAME_BYTES),
+                    )
+                    .await,
+                )
+            };
+            let Some(read) = read else {
+                break;
+            };
+            let line = match read {
                 Ok(Ok(Some(line))) => line,
                 Ok(Ok(None)) => break,
                 Err(_) => {
@@ -5106,6 +5299,7 @@ impl SyscallServer {
 pub struct SyscallClient {
     reader: BufReader<Box<dyn AsyncRead + Unpin + Send>>,
     writer: Box<dyn AsyncWrite + Unpin + Send>,
+    tls_peer_certificate_fingerprint: Option<String>,
 }
 
 impl SyscallClient {
@@ -5163,8 +5357,26 @@ impl SyscallClient {
             .map_err(|_| {
                 std::io::Error::new(std::io::ErrorKind::TimedOut, "TLS handshake timed out")
             })??;
+        let peer_certificate = tls
+            .get_ref()
+            .1
+            .peer_certificates()
+            .and_then(|certificates| certificates.first())
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "TLS peer did not present a certificate",
+                )
+            })?;
+        let fingerprint = ring::digest::digest(&ring::digest::SHA256, peer_certificate.as_ref())
+            .as_ref()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
         let (read, write) = tokio::io::split(tls);
-        Ok(Self::from_halves(Box::new(read), Box::new(write)))
+        let mut client = Self::from_halves(Box::new(read), Box::new(write));
+        client.tls_peer_certificate_fingerprint = Some(fingerprint);
+        Ok(client)
     }
 
     fn from_halves(
@@ -5174,7 +5386,15 @@ impl SyscallClient {
         Self {
             reader: BufReader::new(read),
             writer,
+            tls_peer_certificate_fingerprint: None,
         }
+    }
+
+    /// SHA-256 of the verified TLS peer's leaf certificate DER, when this
+    /// client was connected over TLS. Plaintext and Unix transports return
+    /// `None`.
+    pub fn tls_peer_certificate_fingerprint(&self) -> Option<&str> {
+        self.tls_peer_certificate_fingerprint.as_deref()
     }
 
     /// Authenticate the connection with the server's shared secret. Convenience
@@ -7442,6 +7662,142 @@ memory = ["remember this"]
         (server_config, roots)
     }
 
+    fn mutual_tls_generation() -> (rustls::ServerConfig, rustls::ClientConfig, String) {
+        use rcgen::{
+            BasicConstraints, CertificateParams, CertifiedIssuer, ExtendedKeyUsagePurpose, IsCa,
+            KeyPair, KeyUsagePurpose,
+        };
+
+        let ca_key = KeyPair::generate().expect("generate CA key");
+        let mut ca_params = CertificateParams::default();
+        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        ca_params.key_usages = vec![
+            KeyUsagePurpose::DigitalSignature,
+            KeyUsagePurpose::KeyCertSign,
+            KeyUsagePurpose::CrlSign,
+        ];
+        let ca = CertifiedIssuer::self_signed(ca_params, ca_key).expect("self-sign CA");
+
+        let server_key = KeyPair::generate().expect("generate server key");
+        let mut server_params =
+            CertificateParams::new(vec!["localhost".to_string()]).expect("server params");
+        server_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+        let server_cert = server_params
+            .signed_by(&server_key, &ca)
+            .expect("sign server certificate");
+
+        let client_key = KeyPair::generate().expect("generate client key");
+        let mut client_params =
+            CertificateParams::new(Vec::<String>::new()).expect("client params");
+        client_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
+        let client_cert = client_params
+            .signed_by(&client_key, &ca)
+            .expect("sign client certificate");
+
+        let server = server_config_from_pem_with_client_ca(
+            server_cert.pem().as_bytes(),
+            server_key.serialize_pem().as_bytes(),
+            ca.pem().as_bytes(),
+        )
+        .expect("mutual TLS server config");
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(ca.der().clone()).expect("trust CA");
+        let client = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_client_auth_cert(
+                vec![client_cert.der().clone()],
+                rustls::pki_types::PrivateKeyDer::try_from(client_key.serialize_der())
+                    .expect("client private key"),
+            )
+            .expect("mutual TLS client config");
+        let fingerprint = ring::digest::digest(&ring::digest::SHA256, server_cert.der().as_ref())
+            .as_ref()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        (server, client, fingerprint)
+    }
+
+    fn mutual_tls_client_revocation() -> (
+        rustls::ServerConfig,
+        rustls::ServerConfig,
+        rustls::ClientConfig,
+    ) {
+        use rcgen::{
+            date_time_ymd, BasicConstraints, CertificateParams, CertificateRevocationListParams,
+            CertifiedIssuer, ExtendedKeyUsagePurpose, IsCa, KeyIdMethod, KeyPair, KeyUsagePurpose,
+            RevocationReason, RevokedCertParams, SerialNumber,
+        };
+
+        let ca_key = KeyPair::generate().expect("generate CA key");
+        let mut ca_params = CertificateParams::default();
+        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        ca_params.key_usages = vec![
+            KeyUsagePurpose::DigitalSignature,
+            KeyUsagePurpose::KeyCertSign,
+            KeyUsagePurpose::CrlSign,
+        ];
+        let ca = CertifiedIssuer::self_signed(ca_params, ca_key).expect("self-sign CA");
+
+        let server_key = KeyPair::generate().expect("generate server key");
+        let mut server_params =
+            CertificateParams::new(vec!["localhost".to_string()]).expect("server params");
+        server_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+        let server_cert = server_params
+            .signed_by(&server_key, &ca)
+            .expect("sign server certificate");
+
+        let client_key = KeyPair::generate().expect("generate client key");
+        let client_serial = SerialNumber::from(42_u64);
+        let mut client_params =
+            CertificateParams::new(Vec::<String>::new()).expect("client params");
+        client_params.serial_number = Some(client_serial.clone());
+        client_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
+        let client_cert = client_params
+            .signed_by(&client_key, &ca)
+            .expect("sign client certificate");
+
+        let crl = CertificateRevocationListParams {
+            this_update: date_time_ymd(2026, 1, 1),
+            next_update: date_time_ymd(2040, 1, 1),
+            crl_number: SerialNumber::from(1_u64),
+            issuing_distribution_point: None,
+            revoked_certs: vec![RevokedCertParams {
+                serial_number: client_serial,
+                revocation_time: date_time_ymd(2026, 1, 1),
+                reason_code: Some(RevocationReason::KeyCompromise),
+                invalidity_date: None,
+            }],
+            key_identifier_method: KeyIdMethod::Sha256,
+        }
+        .signed_by(&ca)
+        .expect("sign client CRL");
+        let server = server_config_from_pem_with_client_ca(
+            server_cert.pem().as_bytes(),
+            server_key.serialize_pem().as_bytes(),
+            ca.pem().as_bytes(),
+        )
+        .expect("baseline mTLS server config");
+        let revoked = server_config_from_pem_with_client_ca_and_crls(
+            server_cert.pem().as_bytes(),
+            server_key.serialize_pem().as_bytes(),
+            ca.pem().as_bytes(),
+            crl.pem().expect("encode CRL PEM").as_bytes(),
+        )
+        .expect("revoking mTLS server config");
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(ca.der().clone()).expect("trust CA");
+        let client = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_client_auth_cert(
+                vec![client_cert.der().clone()],
+                rustls::pki_types::PrivateKeyDer::try_from(client_key.serialize_der())
+                    .expect("client private key"),
+            )
+            .expect("mutual TLS client config");
+        (server, revoked, client)
+    }
+
     #[test]
     fn pem_server_config_accepts_certificate_and_private_key() {
         let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
@@ -7570,6 +7926,158 @@ memory = ["remember this"]
             SyscallReply::Agents { .. }
         ));
         client.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn live_tls_reload_rotates_certificates_revokes_old_clients_and_drains_sessions() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let (server_one, client_one, fingerprint_one) = mutual_tls_generation();
+        let (server_two, client_two, fingerprint_two) = mutual_tls_generation();
+
+        let kernel = Arc::new(AgentKernelImpl::new().expect("kernel new"));
+        let server = SyscallServer::bind_tls(kernel, "127.0.0.1:0", server_one)
+            .await
+            .expect("bind TLS");
+        let reload = server.tls_reload_handle().expect("TLS reload handle");
+        assert_eq!(reload.generation(), 1);
+        let addr = server.local_addr().expect("TLS address");
+        let task = tokio::spawn(server.serve());
+
+        let mut old = SyscallClient::connect_tls(addr, "localhost", client_one.clone())
+            .await
+            .expect("generation-one client");
+        assert_eq!(
+            old.tls_peer_certificate_fingerprint(),
+            Some(fingerprint_one.as_str())
+        );
+        assert!(matches!(
+            old.call(Syscall::NodeInfo)
+                .await
+                .expect("old session works"),
+            SyscallReply::NodeInfo { .. }
+        ));
+        let agent_id = match old
+            .call(Syscall::CreateAgent {
+                agent_id: None,
+                ownership_proof: None,
+                name: "tls-drain".into(),
+                task: "prove in-flight request draining".into(),
+                provider: "stub".into(),
+                profile: "standard".into(),
+                priority: 3,
+            })
+            .await
+            .expect("create drain fixture")
+        {
+            SyscallReply::AgentCreated { id } => id,
+            other => panic!("expected AgentCreated, got {other:?}"),
+        };
+        old.send(&Syscall::WaitAgent {
+            agent_id,
+            timeout_ms: 300,
+        })
+        .await
+        .expect("submit bounded in-flight request");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        assert_eq!(reload.reload(server_two).expect("publish TLS reload"), 2);
+        assert_eq!(reload.generation(), 2);
+        assert!(
+            matches!(
+                old.read_reply()
+                    .await
+                    .expect("admitted request must finish before drain"),
+                SyscallReply::Error { .. } | SyscallReply::TypedError { .. }
+            ),
+            "the in-flight wait should complete with its bounded timeout"
+        );
+
+        let old_session = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            old.call(Syscall::NodeInfo),
+        )
+        .await
+        .expect("old session drain is bounded");
+        assert!(
+            old_session.is_err(),
+            "a connection admitted under the revoked generation must close"
+        );
+        assert!(
+            SyscallClient::connect_tls(addr, "localhost", client_one)
+                .await
+                .is_err(),
+            "a newly presented generation-one client certificate must be rejected"
+        );
+
+        let mut current = SyscallClient::connect_tls(addr, "localhost", client_two)
+            .await
+            .expect("generation-two client");
+        assert_eq!(
+            current.tls_peer_certificate_fingerprint(),
+            Some(fingerprint_two.as_str())
+        );
+        assert!(matches!(
+            current
+                .call(Syscall::NodeInfo)
+                .await
+                .expect("new session works"),
+            SyscallReply::NodeInfo { .. }
+        ));
+
+        let invalid = server_config_from_pem(b"not a certificate", b"not a key")
+            .expect_err("invalid reload material must fail validation");
+        assert_eq!(invalid.kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(
+            reload.generation(),
+            2,
+            "failed validation must not alter the active generation"
+        );
+
+        task.abort();
+        let _ = task.await;
+    }
+
+    #[tokio::test]
+    async fn live_tls_reload_enforces_individual_client_crl_revocation() {
+        let (server, revoked, client_config) = mutual_tls_client_revocation();
+        let kernel = Arc::new(AgentKernelImpl::new().expect("kernel new"));
+        let server = SyscallServer::bind_tls(kernel, "127.0.0.1:0", server)
+            .await
+            .expect("bind TLS");
+        let reload = server.tls_reload_handle().expect("TLS reload handle");
+        let addr = server.local_addr().expect("TLS address");
+        let task = tokio::spawn(server.serve());
+
+        let mut admitted = SyscallClient::connect_tls(addr, "localhost", client_config.clone())
+            .await
+            .expect("client is valid before CRL publication");
+        assert!(matches!(
+            admitted
+                .call(Syscall::NodeInfo)
+                .await
+                .expect("pre-revocation request"),
+            SyscallReply::NodeInfo { .. }
+        ));
+        reload.reload(revoked).expect("publish CRL generation");
+        assert!(
+            admitted.call(Syscall::NodeInfo).await.is_err(),
+            "the pre-revocation session must drain"
+        );
+        if let Ok(mut revoked_client) =
+            SyscallClient::connect_tls(addr, "localhost", client_config).await
+        {
+            assert!(
+                revoked_client.call(Syscall::NodeInfo).await.is_err(),
+                "a server-side TLS alert must arrive before any syscall reply"
+            );
+        }
+
+        let empty_crl = server_config_from_pem_with_client_ca_and_crls(b"", b"", b"", b"")
+            .expect_err("missing CRL material must fail");
+        assert_eq!(empty_crl.kind(), std::io::ErrorKind::InvalidInput);
+
+        task.abort();
+        let _ = task.await;
     }
 
     fn assert_authorization_denied(reply: SyscallReply) {
@@ -7903,6 +8411,7 @@ memory = ["remember this"]
                         node_id: "00000000-0000-0000-0000-000000000004".into(),
                         fingerprint: "00".repeat(32),
                         public_key: "00".repeat(32),
+                        tls_server_certificate_fingerprint: None,
                         endpoint: "127.0.0.1:7443".into(),
                         server_version: "0.3.0".into(),
                         min_protocol_version: 1,

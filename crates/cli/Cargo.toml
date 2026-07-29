@@ -31,8 +31,10 @@ dirs = "6"
 libc = "0.2"
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+rustls = { workspace = true }
 
 [dev-dependencies]
 uuid = { workspace = true }
 wiremock = { workspace = true }
 async-trait = { workspace = true }
+rcgen = { workspace = true }

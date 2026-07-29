@@ -196,6 +196,10 @@ pub struct ClusterMemberRegistration {
     pub node_id: String,
     pub fingerprint: String,
     pub public_key: String,
+    /// SHA-256 of the node listener's verified TLS leaf certificate. `None`
+    /// preserves explicitly plaintext legacy membership.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls_server_certificate_fingerprint: Option<String>,
     pub endpoint: String,
     pub server_version: String,
     pub min_protocol_version: u32,
@@ -208,6 +212,8 @@ pub struct ClusterMember {
     pub node_id: String,
     pub fingerprint: String,
     pub public_key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls_server_certificate_fingerprint: Option<String>,
     pub endpoint: String,
     pub server_version: String,
     pub min_protocol_version: u32,
@@ -235,6 +241,10 @@ pub struct ClusterMembershipAudit {
     pub member_generation: u64,
     pub previous: Option<ClusterMemberState>,
     pub current: ClusterMemberState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_tls_server_certificate_fingerprint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_tls_server_certificate_fingerprint: Option<String>,
     pub actor: String,
     pub reason: String,
     pub changed_at: DateTime<Utc>,
@@ -829,7 +839,7 @@ impl ClusterControl {
         }
 
         let now = Utc::now();
-        let (previous, member_generation, joined_at) = match existing {
+        let (previous, previous_tls_fingerprint, member_generation, joined_at) = match existing {
             Some(member) => {
                 let Some(expected) = expected_generation else {
                     return Err(storage_error(format!(
@@ -855,8 +865,16 @@ impl ClusterControl {
                         "cluster member durable identity cannot change during rejoin",
                     ));
                 }
+                if member.tls_server_certificate_fingerprint.is_some()
+                    && registration.tls_server_certificate_fingerprint.is_none()
+                {
+                    return Err(storage_error(
+                        "cluster member TLS certificate binding cannot be removed during rejoin",
+                    ));
+                }
                 (
                     Some(member.state),
+                    member.tls_server_certificate_fingerprint,
                     member
                         .generation
                         .checked_add(1)
@@ -870,7 +888,7 @@ impl ClusterControl {
                         "cluster member revision conflict: node does not exist",
                     ));
                 }
-                (None, 1, now)
+                (None, None, 1, now)
             }
         };
         let membership_generation = u64::try_from(membership_generation)
@@ -884,11 +902,14 @@ impl ClusterControl {
         transaction
             .execute(
                 "INSERT INTO cluster_members
-                 (node_id, fingerprint, public_key, endpoint, server_version,
+                 (node_id, fingerprint, public_key, tls_server_certificate_fingerprint,
+                  endpoint, server_version,
                   min_protocol_version, protocol_version, state, generation,
                   joined_at, updated_at, reason)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'active', ?8, ?9, ?10, ?11)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'active', ?9, ?10, ?11, ?12)
                  ON CONFLICT(node_id) DO UPDATE SET
+                   tls_server_certificate_fingerprint =
+                       excluded.tls_server_certificate_fingerprint,
                    endpoint = excluded.endpoint,
                    server_version = excluded.server_version,
                    min_protocol_version = excluded.min_protocol_version,
@@ -901,6 +922,7 @@ impl ClusterControl {
                     registration.node_id,
                     registration.fingerprint,
                     registration.public_key,
+                    registration.tls_server_certificate_fingerprint,
                     registration.endpoint,
                     registration.server_version,
                     i64::from(registration.min_protocol_version),
@@ -943,13 +965,16 @@ impl ClusterControl {
             .execute(
                 "INSERT INTO cluster_membership_audit
                  (membership_generation, node_id, member_generation, previous_state,
-                  current_state, actor, reason, changed_at)
-                 VALUES (?1, ?2, ?3, ?4, 'active', ?5, ?6, ?7)",
+                  current_state, previous_tls_server_certificate_fingerprint,
+                  current_tls_server_certificate_fingerprint, actor, reason, changed_at)
+                 VALUES (?1, ?2, ?3, ?4, 'active', ?5, ?6, ?7, ?8, ?9)",
                 params![
                     membership_generation_i64,
                     registration.node_id,
                     member_generation_i64,
                     previous.map(ClusterMemberState::as_str),
+                    previous_tls_fingerprint,
+                    registration.tls_server_certificate_fingerprint,
                     actor,
                     reason,
                     now.to_rfc3339(),
@@ -1140,14 +1165,17 @@ impl ClusterControl {
             .execute(
                 "INSERT INTO cluster_membership_audit
                  (membership_generation, node_id, member_generation, previous_state,
-                  current_state, actor, reason, changed_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                  current_state, previous_tls_server_certificate_fingerprint,
+                  current_tls_server_certificate_fingerprint, actor, reason, changed_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                 params![
                     membership_generation_i64,
                     node_id,
                     member_generation_i64,
                     member.state.as_str(),
                     state.as_str(),
+                    member.tls_server_certificate_fingerprint,
+                    member.tls_server_certificate_fingerprint,
                     actor,
                     reason,
                     now.to_rfc3339(),
@@ -1179,7 +1207,8 @@ impl ClusterControl {
             .map_err(|error| storage_error(format!("read cluster membership snapshot: {error}")))?;
         let mut statement = connection
             .prepare(
-                "SELECT node_id, fingerprint, public_key, endpoint, server_version,
+                "SELECT node_id, fingerprint, public_key,
+                        tls_server_certificate_fingerprint, endpoint, server_version,
                         min_protocol_version, protocol_version, state, generation,
                         joined_at, updated_at, reason
                  FROM cluster_members ORDER BY node_id",
@@ -1216,7 +1245,10 @@ impl ClusterControl {
         let mut statement = connection
             .prepare(
                 "SELECT membership_generation, node_id, member_generation,
-                        previous_state, current_state, actor, reason, changed_at
+                        previous_state, current_state,
+                        previous_tls_server_certificate_fingerprint,
+                        current_tls_server_certificate_fingerprint,
+                        actor, reason, changed_at
                  FROM cluster_membership_audit
                  ORDER BY membership_generation DESC LIMIT ?1",
             )
@@ -1229,9 +1261,11 @@ impl ClusterControl {
                     row.get::<_, i64>(2)?,
                     row.get::<_, Option<String>>(3)?,
                     row.get::<_, String>(4)?,
-                    row.get::<_, String>(5)?,
-                    row.get::<_, String>(6)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
                     row.get::<_, String>(7)?,
+                    row.get::<_, String>(8)?,
+                    row.get::<_, String>(9)?,
                 ))
             })
             .map_err(|error| storage_error(format!("query membership audit: {error}")))?;
@@ -1243,6 +1277,8 @@ impl ClusterControl {
                 member_generation,
                 previous,
                 current,
+                previous_tls_server_certificate_fingerprint,
+                current_tls_server_certificate_fingerprint,
                 actor,
                 reason,
                 changed_at,
@@ -1258,6 +1294,8 @@ impl ClusterControl {
                     .map(ClusterMemberState::try_from)
                     .transpose()?,
                 current: ClusterMemberState::try_from(current.as_str())?,
+                previous_tls_server_certificate_fingerprint,
+                current_tls_server_certificate_fingerprint,
                 actor,
                 reason,
                 changed_at: parse_timestamp(&changed_at)?,
@@ -1991,6 +2029,7 @@ type StoredMember = (
     String,
     String,
     String,
+    Option<String>,
     String,
     String,
     i64,
@@ -2016,6 +2055,7 @@ fn member_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredMember> {
         row.get(9)?,
         row.get(10)?,
         row.get(11)?,
+        row.get(12)?,
     ))
 }
 
@@ -2027,6 +2067,7 @@ impl TryFrom<StoredMember> for ClusterMember {
             node_id,
             fingerprint,
             public_key,
+            tls_server_certificate_fingerprint,
             endpoint,
             server_version,
             min_protocol_version,
@@ -2041,6 +2082,7 @@ impl TryFrom<StoredMember> for ClusterMember {
             node_id,
             fingerprint,
             public_key,
+            tls_server_certificate_fingerprint,
             endpoint,
             server_version,
             min_protocol_version: u32::try_from(min_protocol_version)
@@ -2058,6 +2100,7 @@ impl TryFrom<StoredMember> for ClusterMember {
             node_id: member.node_id.clone(),
             fingerprint: member.fingerprint.clone(),
             public_key: member.public_key.clone(),
+            tls_server_certificate_fingerprint: member.tls_server_certificate_fingerprint.clone(),
             endpoint: member.endpoint.clone(),
             server_version: member.server_version.clone(),
             min_protocol_version: member.min_protocol_version,
@@ -2073,7 +2116,8 @@ fn load_member(
 ) -> Result<Option<ClusterMember>, ContextError> {
     connection
         .query_row(
-            "SELECT node_id, fingerprint, public_key, endpoint, server_version,
+            "SELECT node_id, fingerprint, public_key,
+                    tls_server_certificate_fingerprint, endpoint, server_version,
                     min_protocol_version, protocol_version, state, generation,
                     joined_at, updated_at, reason
              FROM cluster_members WHERE node_id = ?1",
@@ -2491,6 +2535,12 @@ pub fn membership_join_payload(
         payload.extend_from_slice(&length.to_be_bytes());
         payload.extend_from_slice(field);
     }
+    if let Some(fingerprint) = registration.tls_server_certificate_fingerprint.as_deref() {
+        let length = u32::try_from(fingerprint.len())
+            .map_err(|_| storage_error("cluster join payload field is too large"))?;
+        payload.extend_from_slice(&length.to_be_bytes());
+        payload.extend_from_slice(fingerprint.as_bytes());
+    }
     Ok(payload)
 }
 
@@ -2562,6 +2612,20 @@ fn validate_member_registration(
     if registration.fingerprint.len() != 64 || sha256_hex(&public_key) != registration.fingerprint {
         return Err(storage_error(
             "cluster member fingerprint does not match its public key",
+        ));
+    }
+    if registration
+        .tls_server_certificate_fingerprint
+        .as_deref()
+        .is_some_and(|fingerprint| {
+            fingerprint.len() != 64
+                || !fingerprint
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        })
+    {
+        return Err(storage_error(
+            "invalid cluster member TLS server certificate fingerprint",
         ));
     }
     validate_member_text(
@@ -3665,6 +3729,7 @@ mod tests {
             node_id: control.identity().node_id.clone(),
             fingerprint: control.identity().fingerprint.clone(),
             public_key: control.identity().public_key.clone(),
+            tls_server_certificate_fingerprint: None,
             endpoint: endpoint.to_string(),
             server_version: "0.3.0-test".to_string(),
             min_protocol_version: 1,

@@ -10,6 +10,15 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
 
 ## [Unreleased]
 
+- Added a system-scoped durable cluster ownership authority: active members can
+  claim bounded leases, exact owner/token pairs can renew or release them, and
+  transfer after release or expiry requires the old token and allocates a
+  strictly greater fencing token. Records, tombstones, and audit survive
+  restart; clean leave cannot strand an active lease, and identity revocation
+  releases every owned record atomically. The controls are exposed through the
+  typed v2 wire/SDK boundary, and schema migration v4 upgrades existing stores
+  atomically. Workload mutations do not enforce these tokens yet, so this is
+  not a partition fence.
 - Published the normative distributed control-plane consistency contract. It
   distinguishes single-authority membership, node-local state, reconstructed
   routing, and missing ownership fencing; defines fail-closed partition, retry,

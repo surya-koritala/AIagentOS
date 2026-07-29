@@ -550,6 +550,42 @@ pub enum Syscall {
         #[serde(default = "default_tunable_audit_limit")]
         limit: usize,
     },
+    /// Claim an unowned, released, or expired agent ownership record. Replacing
+    /// a tombstone or expired lease requires its exact fencing token.
+    ClaimClusterAgentOwnership {
+        agent_id: String,
+        owner_node_id: String,
+        ttl_seconds: u64,
+        #[serde(default)]
+        expected_fencing_token: Option<u64>,
+        reason: String,
+    },
+    /// Renew the exact active owner/token pair without changing its fence.
+    RenewClusterAgentOwnership {
+        agent_id: String,
+        owner_node_id: String,
+        fencing_token: u64,
+        ttl_seconds: u64,
+        reason: String,
+    },
+    /// Release the exact active owner/token pair and retain its tombstone.
+    ReleaseClusterAgentOwnership {
+        agent_id: String,
+        owner_node_id: String,
+        fencing_token: u64,
+        reason: String,
+    },
+    /// Inspect the durable ownership record for one agent.
+    GetClusterAgentOwnership {
+        agent_id: String,
+    },
+    /// Inspect bounded ownership claim/transfer/renew/release evidence.
+    ListClusterAgentOwnershipAudit {
+        #[serde(default)]
+        agent_id: Option<String>,
+        #[serde(default = "default_tunable_audit_limit")]
+        limit: usize,
+    },
     /// Pull the kernel's operational metrics as a Prometheus text exposition
     /// (format version 0.0.4), rendered from the syscall-gate enforcement
     /// counters, agent counts, system token/api totals, and process uptime.
@@ -1154,6 +1190,16 @@ pub enum SyscallReply {
     ClusterMembershipAudit {
         entries: Vec<crate::cluster_control::ClusterMembershipAudit>,
     },
+    /// Durable authority ownership record after a claim/renew/release, or an
+    /// optional record for an explicit lookup.
+    ClusterAgentOwnership {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ownership: Option<crate::cluster_control::ClusterAgentOwnership>,
+    },
+    /// Durable ownership mutation audit entries.
+    ClusterAgentOwnershipAudit {
+        entries: Vec<crate::cluster_control::ClusterAgentOwnershipAudit>,
+    },
     /// The kernel's operational metrics (reply to [`Syscall::Metrics`]). Carries
     /// the rendered Prometheus text exposition plus a couple of the headline
     /// numbers as structured fields, so a client can use either form.
@@ -1431,6 +1477,21 @@ fn syscall_policy(call: &Syscall) -> (AccessLevel, &'static str, Option<&str>) {
         Syscall::ListClusterMembershipAudit { .. } => {
             (AccessLevel::System, "cluster.membership.audit", None)
         }
+        Syscall::ClaimClusterAgentOwnership { .. } => {
+            (AccessLevel::System, "cluster.ownership.claim", None)
+        }
+        Syscall::RenewClusterAgentOwnership { .. } => {
+            (AccessLevel::System, "cluster.ownership.renew", None)
+        }
+        Syscall::ReleaseClusterAgentOwnership { .. } => {
+            (AccessLevel::System, "cluster.ownership.release", None)
+        }
+        Syscall::GetClusterAgentOwnership { .. } => {
+            (AccessLevel::System, "cluster.ownership.get", None)
+        }
+        Syscall::ListClusterAgentOwnershipAudit { .. } => {
+            (AccessLevel::System, "cluster.ownership.audit", None)
+        }
         Syscall::Metrics => (AccessLevel::System, "system.metrics", None),
         Syscall::OperatorSnapshot => (AccessLevel::ReadOnly, "operator.snapshot", None),
         Syscall::ListOperatorTunables => (AccessLevel::System, "operator.tunable.list", None),
@@ -1666,6 +1727,11 @@ fn quarantine_recovery_call(call: &Syscall) -> bool {
             | Syscall::SetClusterMemberState { .. }
             | Syscall::GetClusterMembership
             | Syscall::ListClusterMembershipAudit { .. }
+            | Syscall::ClaimClusterAgentOwnership { .. }
+            | Syscall::RenewClusterAgentOwnership { .. }
+            | Syscall::ReleaseClusterAgentOwnership { .. }
+            | Syscall::GetClusterAgentOwnership { .. }
+            | Syscall::ListClusterAgentOwnershipAudit { .. }
             | Syscall::Metrics
             | Syscall::OperatorSnapshot
             | Syscall::ListOperatorTunables
@@ -2916,6 +2982,101 @@ async fn dispatch_scoped_inner(
         Syscall::ListClusterMembershipAudit { limit } => {
             match kernel.cluster_control.membership_audit(limit) {
                 Ok(entries) => SyscallReply::ClusterMembershipAudit { entries },
+                Err(error) => SyscallReply::Error {
+                    message: error.to_string(),
+                },
+            }
+        }
+        Syscall::ClaimClusterAgentOwnership {
+            agent_id,
+            owner_node_id,
+            ttl_seconds,
+            expected_fencing_token,
+            reason,
+        } => {
+            let actor = principal
+                .map(|principal| principal.user_id.as_str())
+                .unwrap_or("system");
+            match kernel.cluster_control.claim_agent_ownership(
+                &agent_id,
+                &owner_node_id,
+                ttl_seconds,
+                expected_fencing_token,
+                actor,
+                &reason,
+            ) {
+                Ok(ownership) => SyscallReply::ClusterAgentOwnership {
+                    ownership: Some(ownership),
+                },
+                Err(error) => SyscallReply::Error {
+                    message: error.to_string(),
+                },
+            }
+        }
+        Syscall::RenewClusterAgentOwnership {
+            agent_id,
+            owner_node_id,
+            fencing_token,
+            ttl_seconds,
+            reason,
+        } => {
+            let actor = principal
+                .map(|principal| principal.user_id.as_str())
+                .unwrap_or("system");
+            match kernel.cluster_control.renew_agent_ownership(
+                &agent_id,
+                &owner_node_id,
+                fencing_token,
+                ttl_seconds,
+                actor,
+                &reason,
+            ) {
+                Ok(ownership) => SyscallReply::ClusterAgentOwnership {
+                    ownership: Some(ownership),
+                },
+                Err(error) => SyscallReply::Error {
+                    message: error.to_string(),
+                },
+            }
+        }
+        Syscall::ReleaseClusterAgentOwnership {
+            agent_id,
+            owner_node_id,
+            fencing_token,
+            reason,
+        } => {
+            let actor = principal
+                .map(|principal| principal.user_id.as_str())
+                .unwrap_or("system");
+            match kernel.cluster_control.release_agent_ownership(
+                &agent_id,
+                &owner_node_id,
+                fencing_token,
+                actor,
+                &reason,
+            ) {
+                Ok(ownership) => SyscallReply::ClusterAgentOwnership {
+                    ownership: Some(ownership),
+                },
+                Err(error) => SyscallReply::Error {
+                    message: error.to_string(),
+                },
+            }
+        }
+        Syscall::GetClusterAgentOwnership { agent_id } => {
+            match kernel.cluster_control.agent_ownership(&agent_id) {
+                Ok(ownership) => SyscallReply::ClusterAgentOwnership { ownership },
+                Err(error) => SyscallReply::Error {
+                    message: error.to_string(),
+                },
+            }
+        }
+        Syscall::ListClusterAgentOwnershipAudit { agent_id, limit } => {
+            match kernel
+                .cluster_control
+                .agent_ownership_audit(agent_id.as_deref(), limit)
+            {
+                Ok(entries) => SyscallReply::ClusterAgentOwnershipAudit { entries },
                 Err(error) => SyscallReply::Error {
                     message: error.to_string(),
                 },
@@ -4251,6 +4412,11 @@ impl SyscallServer {
                                 | Syscall::SetClusterMemberState { .. }
                                 | Syscall::GetClusterMembership
                                 | Syscall::ListClusterMembershipAudit { .. }
+                                | Syscall::ClaimClusterAgentOwnership { .. }
+                                | Syscall::RenewClusterAgentOwnership { .. }
+                                | Syscall::ReleaseClusterAgentOwnership { .. }
+                                | Syscall::GetClusterAgentOwnership { .. }
+                                | Syscall::ListClusterAgentOwnershipAudit { .. }
                         ) =>
                 {
                     SyscallReply::Error {
@@ -6552,6 +6718,48 @@ memory = ["remember this"]
                 Syscall::ListClusterMembershipAudit { limit: 10 },
                 AccessLevel::System,
             ),
+            (
+                Syscall::ClaimClusterAgentOwnership {
+                    agent_id: "00000000-0000-0000-0000-000000000001".into(),
+                    owner_node_id: "00000000-0000-0000-0000-000000000004".into(),
+                    ttl_seconds: 30,
+                    expected_fencing_token: None,
+                    reason: "test".into(),
+                },
+                AccessLevel::System,
+            ),
+            (
+                Syscall::RenewClusterAgentOwnership {
+                    agent_id: "00000000-0000-0000-0000-000000000001".into(),
+                    owner_node_id: "00000000-0000-0000-0000-000000000004".into(),
+                    fencing_token: 1,
+                    ttl_seconds: 30,
+                    reason: "test".into(),
+                },
+                AccessLevel::System,
+            ),
+            (
+                Syscall::ReleaseClusterAgentOwnership {
+                    agent_id: "00000000-0000-0000-0000-000000000001".into(),
+                    owner_node_id: "00000000-0000-0000-0000-000000000004".into(),
+                    fencing_token: 1,
+                    reason: "test".into(),
+                },
+                AccessLevel::System,
+            ),
+            (
+                Syscall::GetClusterAgentOwnership {
+                    agent_id: "00000000-0000-0000-0000-000000000001".into(),
+                },
+                AccessLevel::System,
+            ),
+            (
+                Syscall::ListClusterAgentOwnershipAudit {
+                    agent_id: None,
+                    limit: 10,
+                },
+                AccessLevel::System,
+            ),
             (Syscall::Metrics, AccessLevel::System),
             (Syscall::OperatorSnapshot, AccessLevel::ReadOnly),
             (Syscall::ListOperatorTunables, AccessLevel::System),
@@ -6678,7 +6886,7 @@ memory = ["remember this"]
                     .to_string()
             })
             .collect::<std::collections::HashSet<_>>();
-        assert_eq!(calls.len(), 77);
+        assert_eq!(calls.len(), 82);
         assert_eq!(fixture_tags, schema_tags);
     }
 
@@ -6844,7 +7052,9 @@ memory = ["remember this"]
             .any(|entry| entry.id == "external/provider-request-and-retention"));
         let encoded = serde_json::to_string(&inventory).unwrap();
         assert!(!encoded.contains("127.0.0.1"));
-        assert!(!encoded.contains("token"));
+        assert!(!encoded.contains("auth_token"));
+        assert!(!encoded.contains("bearer"));
+        assert!(!encoded.contains("credential_value"));
         let _ = std::fs::remove_dir_all(root);
     }
 

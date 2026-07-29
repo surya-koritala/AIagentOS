@@ -130,9 +130,9 @@ compatibility behavior, and transport limits:
 
 The schemas use JSON Schema draft 2020-12 and cover every top-level request,
 reply, and stream-event tag. The authorization/schema regression constructs
-all 75 current syscalls and rejects either a missing schema operation or an
+all 82 current syscalls and rejects either a missing schema operation or an
 undocumented extra. Deterministic golden request arrays cover all 59 v1
-operations and all 75 v2 operations. Domain payload examples and
+operations and all 82 v2 operations. Domain payload examples and
 previous-version shapes are retained under `protocol/`.
 
 ## Compatibility policy
@@ -484,9 +484,29 @@ connections were assembled, construction fails with a retryable `conflict`.
 The authority identity, membership, generations, and audit survive authority
 restart.
 
-This is not yet a consensus, lease, or partition-tolerant membership protocol.
+### Authority ownership lease registry
+
+Protocol-v2 trusted-system callers can claim, renew, release, inspect, and audit
+an agent ownership record on the designated authority. A claim names an active
+member and a 5–300 second TTL. The first claim receives fencing token 1.
+Renewal requires the exact active owner/token pair and keeps the token stable.
+Release retains a tombstone. A later claim requires that exact old token, is
+allowed only after release or expiry, and allocates a strictly greater token.
+Claims for unknown, left, or revoked members fail closed. The record and its
+audit entry commit in one immediate SQLite transaction and survive authority
+restart. Clean leave is rejected while the node has an unexpired active lease;
+terminal identity revocation releases all of that member's records atomically.
+
+These operations establish an authoritative monotonic token; they do not yet
+make the workload plane safe. Agent mutation requests do not carry or validate
+the token, and the authority itself is not replicated. Until destination-side
+enforcement and quorum terms exist, the lease registry is not a partition
+fence and must not be used to automate migration.
+
+This is not yet a consensus or partition-tolerant membership and
+mutation-fencing protocol.
 The designated authority is a single consistency point with no quorum failover;
-there is no ownership lease/fencing token enforced by agent mutations,
+there is no ownership fencing token enforced by agent mutations,
 automatic migration, partition fencing, cluster-wide quota transaction,
 policy/package convergence, rolling-upgrade coordinator, or disaster-recovery
 controller. Identity revocation is enforced by discovery, but live TLS client
@@ -504,7 +524,7 @@ Versioned fixtures:
 - `protocol/v2/hello.json`
 - `protocol/v2/typed-error.json`
 - `protocol/v2/describe-protocol-request.json`
-- `protocol/v2/requests.json` (all 75 v2 operations)
+- `protocol/v2/requests.json` (all 82 v2 operations)
 - `protocol/v2/send-message-stream.json`
 - `protocol/v2/stream-event.json`
 - `protocol/v2/stream-completed.json`

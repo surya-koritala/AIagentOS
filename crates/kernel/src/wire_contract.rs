@@ -20,6 +20,7 @@ use crate::wire_io::{
 pub const WIRE_FEATURES: &[&str] = &[
     "agent_enforcement_introspection",
     "authorized_cluster_membership",
+    "cluster_ownership_leases",
     "backup_retention",
     "bounded_json_frames",
     "connection_keepalive",
@@ -473,6 +474,43 @@ const REQUEST_VARIANTS: &[Variant] = &[
         fields: &[Field::optional("limit", I)],
     },
     Variant {
+        tag: "claim_cluster_agent_ownership",
+        fields: &[
+            Field::required("agent_id", S),
+            Field::required("owner_node_id", S),
+            Field::required("ttl_seconds", I),
+            Field::optional("expected_fencing_token", JsonKind::IntegerOrNull),
+            Field::required("reason", S),
+        ],
+    },
+    Variant {
+        tag: "renew_cluster_agent_ownership",
+        fields: &[
+            Field::required("agent_id", S),
+            Field::required("owner_node_id", S),
+            Field::required("fencing_token", I),
+            Field::required("ttl_seconds", I),
+            Field::required("reason", S),
+        ],
+    },
+    Variant {
+        tag: "release_cluster_agent_ownership",
+        fields: &[
+            Field::required("agent_id", S),
+            Field::required("owner_node_id", S),
+            Field::required("fencing_token", I),
+            Field::required("reason", S),
+        ],
+    },
+    Variant {
+        tag: "get_cluster_agent_ownership",
+        fields: &[Field::required("agent_id", S)],
+    },
+    Variant {
+        tag: "list_cluster_agent_ownership_audit",
+        fields: &[Field::optional("agent_id", N), Field::optional("limit", I)],
+    },
+    Variant {
         tag: "metrics",
         fields: &[],
     },
@@ -594,6 +632,11 @@ pub fn conformance_request_fixtures(protocol_version: u32) -> Result<Vec<Value>,
                         | "set_cluster_member_state"
                         | "get_cluster_membership"
                         | "list_cluster_membership_audit"
+                        | "claim_cluster_agent_ownership"
+                        | "renew_cluster_agent_ownership"
+                        | "release_cluster_agent_ownership"
+                        | "get_cluster_agent_ownership"
+                        | "list_cluster_agent_ownership_audit"
                 )
         })
         .map(|variant| {
@@ -606,6 +649,9 @@ pub fn conformance_request_fixtures(protocol_version: u32) -> Result<Vec<Value>,
                     }
                     ("agent_id", JsonKind::String) => {
                         Value::String("00000000-0000-0000-0000-000000000001".into())
+                    }
+                    ("owner_node_id", JsonKind::String) => {
+                        Value::String("00000000-0000-0000-0000-000000000004".into())
                     }
                     ("checkpoint_id", JsonKind::String) => {
                         Value::String("00000000-0000-0000-0000-000000000002".into())
@@ -908,6 +954,14 @@ const REPLY_VARIANTS: &[Variant] = &[
     },
     Variant {
         tag: "cluster_membership_audit",
+        fields: &[Field::required("entries", A)],
+    },
+    Variant {
+        tag: "cluster_agent_ownership",
+        fields: &[Field::optional("ownership", JsonKind::ObjectOrNull)],
+    },
+    Variant {
+        tag: "cluster_agent_ownership_audit",
         fields: &[Field::required("entries", A)],
     },
     Variant {
@@ -1305,7 +1359,7 @@ mod tests {
             }
         }
         assert_eq!(conformance_request_fixtures(1).unwrap().len(), 61);
-        assert_eq!(conformance_request_fixtures(2).unwrap().len(), 77);
+        assert_eq!(conformance_request_fixtures(2).unwrap().len(), 82);
         assert!(conformance_request_fixtures(0).is_err());
         assert!(conformance_request_fixtures(PROTOCOL_VERSION + 1).is_err());
     }

@@ -18,8 +18,10 @@ Each workload node owns a separate SQLite database under the existing
 single-process storage lease. Agent state is not replicated between nodes.
 `ClusterClient` is a routing client, not a consensus participant: it reconstructs
 an in-memory owner map by listing every connected node and refuses duplicate
-agent identifiers, but no ownership lease or fencing token is enforced by
-agent mutations yet.
+agent identifiers. The designated authority can issue, renew, release, and
+audit a durable expiring ownership record with a monotonically increasing
+per-agent fencing token. Workload nodes do not enforce that token on agent
+mutations yet, so the record is not a partition fence.
 
 Consequently, the current multi-node foundation is appropriate for controlled
 development and qualification. It is not partition tolerant and must not be
@@ -33,7 +35,7 @@ advertised as a production distributed kernel.
 | Node identity | Node-local Ed25519 key in the node SQLite database | Stable across restart; proved by fresh challenge | Live certificate rotation/revocation bound to durable node identity |
 | Node availability and placement profile | Node-local SQLite database | Generation-fenced on one node; discovery reads a point-in-time value | Signed or quorum-observed liveness/capacity with staleness bounds |
 | Agent identity | Owning node SQLite database | Stable on one node; cluster-wide uniqueness is detected only while rebuilding connected nodes | Authority-allocated ownership record with an immutable agent identity |
-| Agent ownership and routing | `ClusterClient` in-memory map rebuilt from node listings | Duplicate ownership fails closed; no durable lease, expiry, or mutation fence | Quorum-committed lease plus monotonically increasing fencing token checked by every mutable node path |
+| Agent ownership and routing | Authority lease registry plus `ClusterClient` in-memory map rebuilt from node listings | Claims require an active member; renew/release require the exact owner/token; transfer requires release or expiry and increments the token; workload mutations do not check it | Quorum-committed authority term plus the fencing token checked by every mutable node path |
 | Agent state and checkpoints | Owning node SQLite database | Transactional on one node; no cross-node replica or migration transaction | Checkpoint/handoff protocol with one committed owner, rollback point, and side-effect boundary |
 | Package metadata and trust roots | Node-local package registry and policy | Transactional per node; no cluster convergence guarantee | Versioned trust epoch distributed atomically or by a documented monotonic convergence protocol |
 | Authorization policy | Node-local kernel configuration and durable policy state | Enforced consistently across local entry points; not synchronized cluster-wide | Tenant policy epoch included in placement and mutation admission |
@@ -56,6 +58,12 @@ advertised as a production distributed kernel.
 - Agent turns, tool calls, cancellation, memory operations, storage operations,
   checkpoints, and lifecycle mutations are authorized and committed by the
   owning node. They do not currently carry an authority ownership fence.
+- Ownership claims are system-scoped authority operations. A new record starts
+  at token 1; renewal preserves the token; release retains a tombstone; and
+  transfer after release or expiry requires the exact old token and allocates a
+  strictly greater token. Unknown, inactive, or revoked owner nodes fail closed.
+  Clean leave is blocked while an unexpired lease remains; terminal member
+  revocation releases every owned record in the same authority transaction.
 - Rebuilding routing lists durable agents on every connected node. Missing
   nodes make the view incomplete; duplicate identifiers make it conflicted.
   The client never selects an arbitrary duplicate owner.
@@ -71,7 +79,7 @@ advertised as a production distributed kernel.
 | Stale route | The routed node may return not-found/unavailable; callers rebuild explicitly and do not guess | Route revision and ownership token verified by the destination |
 | Client retry before visible output | Safe only where the called local API already documents idempotency | Cluster request identity and durable deduplication at the authority and owner |
 | Retry after a side effect or partial model/tool output | Must not happen automatically; the result is terminal unless the operation contract proves idempotency | Side-effect journal and explicit at-most-once or at-least-once contract per operation |
-| Clock skew | Join challenge expiry uses authority time; workload leases do not exist yet | Authority term plus bounded lease clock assumptions or logical-expiry protocol |
+| Clock skew | Join challenge and ownership expiry use authority time; workload nodes do not independently expire or enforce leases | Authority term plus bounded lease clock assumptions or logical-expiry protocol |
 | Authority restart | The same database restores cluster identity, membership generation, and audit | Quorum log recovery and disaster-recovery procedure |
 | Workload restart | The same node database restores its agents and routing can be rebuilt | Ownership lease reacquisition that cannot overlap a previous owner |
 
@@ -119,7 +127,7 @@ passing single-node test is never accepted as substitute evidence.
 
 ## Implementation references
 
-- Membership, identity, generations, and audit:
+- Membership, identity, ownership leases, generations, and audit:
   `crates/kernel/src/cluster_control.rs`
 - Durable cluster tables and single-process storage lease:
   `crates/kernel/src/context.rs` and `crates/kernel/src/storage.rs`

@@ -43,8 +43,9 @@ use tokio::net::ToSocketAddrs;
 // Re-export the kernel wire types that appear in this crate's public API, so
 // SDK consumers can name them without depending on the kernel directly.
 pub use kernel::cluster_control::{
-    ClusterJoinChallenge, ClusterMember, ClusterMemberRegistration, ClusterMemberState,
-    ClusterMembershipAudit, ClusterMembershipSnapshot, NodeAvailability, NodeControlAudit,
+    ClusterAgentOwnership, ClusterAgentOwnershipAudit, ClusterJoinChallenge, ClusterMember,
+    ClusterMemberRegistration, ClusterMemberState, ClusterMembershipAudit,
+    ClusterMembershipSnapshot, ClusterOwnershipState, NodeAvailability, NodeControlAudit,
     NodeControlStatus, NodeIdentity, NodeProfile,
 };
 pub use kernel::context::{ContextPressureStats, DeletionReceipt};
@@ -1244,6 +1245,108 @@ impl KernelClient {
         {
             SyscallReply::ClusterMembershipAudit { entries } => Ok(entries),
             other => Err(unexpected("ClusterMembershipAudit", &other)),
+        }
+    }
+
+    pub async fn claim_cluster_agent_ownership(
+        &mut self,
+        agent_id: impl Into<String>,
+        owner_node_id: impl Into<String>,
+        ttl_seconds: u64,
+        expected_fencing_token: Option<u64>,
+        reason: impl Into<String>,
+    ) -> Result<ClusterAgentOwnership, SdkError> {
+        match self
+            .call(Syscall::ClaimClusterAgentOwnership {
+                agent_id: agent_id.into(),
+                owner_node_id: owner_node_id.into(),
+                ttl_seconds,
+                expected_fencing_token,
+                reason: reason.into(),
+            })
+            .await?
+        {
+            SyscallReply::ClusterAgentOwnership {
+                ownership: Some(ownership),
+            } => Ok(ownership),
+            other => Err(unexpected("ClusterAgentOwnership", &other)),
+        }
+    }
+
+    pub async fn renew_cluster_agent_ownership(
+        &mut self,
+        agent_id: impl Into<String>,
+        owner_node_id: impl Into<String>,
+        fencing_token: u64,
+        ttl_seconds: u64,
+        reason: impl Into<String>,
+    ) -> Result<ClusterAgentOwnership, SdkError> {
+        match self
+            .call(Syscall::RenewClusterAgentOwnership {
+                agent_id: agent_id.into(),
+                owner_node_id: owner_node_id.into(),
+                fencing_token,
+                ttl_seconds,
+                reason: reason.into(),
+            })
+            .await?
+        {
+            SyscallReply::ClusterAgentOwnership {
+                ownership: Some(ownership),
+            } => Ok(ownership),
+            other => Err(unexpected("ClusterAgentOwnership", &other)),
+        }
+    }
+
+    pub async fn release_cluster_agent_ownership(
+        &mut self,
+        agent_id: impl Into<String>,
+        owner_node_id: impl Into<String>,
+        fencing_token: u64,
+        reason: impl Into<String>,
+    ) -> Result<ClusterAgentOwnership, SdkError> {
+        match self
+            .call(Syscall::ReleaseClusterAgentOwnership {
+                agent_id: agent_id.into(),
+                owner_node_id: owner_node_id.into(),
+                fencing_token,
+                reason: reason.into(),
+            })
+            .await?
+        {
+            SyscallReply::ClusterAgentOwnership {
+                ownership: Some(ownership),
+            } => Ok(ownership),
+            other => Err(unexpected("ClusterAgentOwnership", &other)),
+        }
+    }
+
+    pub async fn cluster_agent_ownership(
+        &mut self,
+        agent_id: impl Into<String>,
+    ) -> Result<Option<ClusterAgentOwnership>, SdkError> {
+        match self
+            .call(Syscall::GetClusterAgentOwnership {
+                agent_id: agent_id.into(),
+            })
+            .await?
+        {
+            SyscallReply::ClusterAgentOwnership { ownership } => Ok(ownership),
+            other => Err(unexpected("ClusterAgentOwnership", &other)),
+        }
+    }
+
+    pub async fn cluster_agent_ownership_audit(
+        &mut self,
+        agent_id: Option<String>,
+        limit: usize,
+    ) -> Result<Vec<ClusterAgentOwnershipAudit>, SdkError> {
+        match self
+            .call(Syscall::ListClusterAgentOwnershipAudit { agent_id, limit })
+            .await?
+        {
+            SyscallReply::ClusterAgentOwnershipAudit { entries } => Ok(entries),
+            other => Err(unexpected("ClusterAgentOwnershipAudit", &other)),
         }
     }
 
@@ -2578,6 +2681,111 @@ mod protocol_tests {
         assert_eq!(info.protocol_version, PROTOCOL_VERSION);
         assert!(info.min_protocol_version <= PROTOCOL_VERSION);
         assert!(!info.server_version.is_empty());
+    }
+
+    #[tokio::test]
+    async fn sdk_cluster_ownership_roundtrip_is_exact_and_system_scoped() {
+        let kernel = Arc::new(AgentKernelImpl::new().expect("kernel new"));
+        let control = &kernel.cluster_control;
+        let identity = control.identity().clone();
+        let challenge = control.issue_join_challenge(30).unwrap();
+        let registration = ClusterMemberRegistration {
+            node_id: identity.node_id.clone(),
+            fingerprint: identity.fingerprint,
+            public_key: identity.public_key,
+            endpoint: "127.0.0.1:7443".into(),
+            server_version: env!("CARGO_PKG_VERSION").into(),
+            min_protocol_version: 1,
+            protocol_version: PROTOCOL_VERSION,
+        };
+        let payload = kernel::cluster_control::membership_join_payload(
+            &challenge.cluster_id,
+            &challenge.challenge_hex,
+            &registration,
+        )
+        .unwrap();
+        let signature = control.sign_challenge(&payload).unwrap();
+        let signature_hex: String = signature.iter().map(|byte| format!("{byte:02x}")).collect();
+        control
+            .register_member(
+                registration,
+                &challenge.challenge_hex,
+                &signature_hex,
+                None,
+                1,
+                PROTOCOL_VERSION,
+                "system",
+                "SDK ownership fixture",
+            )
+            .unwrap();
+
+        let server = SyscallServer::bind(Arc::clone(&kernel), "127.0.0.1:0")
+            .await
+            .unwrap();
+        let addr = server.local_addr().unwrap();
+        tokio::spawn(server.serve());
+        let mut client = KernelClient::connect(addr).await.expect("connect");
+        let agent_id = uuid::Uuid::new_v4().to_string();
+
+        let claimed = client
+            .claim_cluster_agent_ownership(
+                &agent_id,
+                &identity.node_id,
+                30,
+                None,
+                "initial placement",
+            )
+            .await
+            .unwrap();
+        assert_eq!(claimed.fencing_token, 1);
+        assert_eq!(
+            client.cluster_agent_ownership(&agent_id).await.unwrap(),
+            Some(claimed.clone())
+        );
+        let stale = client
+            .renew_cluster_agent_ownership(
+                &agent_id,
+                &identity.node_id,
+                claimed.fencing_token + 1,
+                30,
+                "stale token",
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(stale.wire_code(), Some(WireErrorCode::Conflict));
+
+        let renewed = client
+            .renew_cluster_agent_ownership(
+                &agent_id,
+                &identity.node_id,
+                claimed.fencing_token,
+                30,
+                "heartbeat",
+            )
+            .await
+            .unwrap();
+        assert_eq!(renewed.fencing_token, claimed.fencing_token);
+        let released = client
+            .release_cluster_agent_ownership(
+                &agent_id,
+                &identity.node_id,
+                renewed.fencing_token,
+                "drained",
+            )
+            .await
+            .unwrap();
+        assert_eq!(released.state, ClusterOwnershipState::Released);
+        let audit = client
+            .cluster_agent_ownership_audit(Some(agent_id), 10)
+            .await
+            .unwrap();
+        assert_eq!(
+            audit
+                .iter()
+                .map(|entry| entry.operation.as_str())
+                .collect::<Vec<_>>(),
+            vec!["release", "renew", "claim"]
+        );
     }
 
     #[tokio::test]

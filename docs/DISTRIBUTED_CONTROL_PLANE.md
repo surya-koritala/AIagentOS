@@ -19,8 +19,9 @@ behind that mode; it does not make the whole distributed kernel production
 ready.
 
 The kernel now contains a durable OpenRaft storage-v2 substrate and an
-executable, statically configured peer runtime for the next stage. Votes,
-committed and purged pointers, consecutive log entries, deterministic
+executable peer runtime with a digest-pinned static transport-trust catalog
+and a generation-fenced voter subset. Votes, committed and purged pointers,
+consecutive log entries, deterministic
 membership and ownership state, idempotency receipts, applied state and
 membership, and current snapshots share the existing SQLCipher-capable SQLite
 database, WAL,
@@ -56,17 +57,26 @@ compromised node cannot forge tenant/operator authority remains an unchecked
 
 `agent-server` constructs and owns this runtime when `[cluster_raft].enabled`
 is true. Startup reads bounded no-follow PEM inputs, requires owner-only private
-keys on Unix, validates the local certificate fingerprints against the exact
-member record, and fails if an existing durable membership differs from the
-configured static map. A pristine store requires explicit `bootstrap = true`;
-the same setting is restart-safe because an already initialized node is
-verified instead of reinitialized. SIGINT/SIGTERM closes the peer listener and
-OpenRaft task cleanly. Startup also verifies that the local application UUID
-and Ed25519 public key match the durable node identity before the process can
-join the quorum. When durable authority state already exists, application
-endpoint/TLS validation waits for a linearizable quorum read that advances the
-replicated clock; a restarted minority cannot use stale persisted time to
-extend a rollout window.
+keys on Unix and validates the local certificate fingerprints against the
+exact trusted peer record. A pristine store requires explicit `bootstrap =
+true`; the same setting is restart-safe because an already initialized node is
+verified instead of reinitialized. Omitting `voter_ids` at generation zero
+preserves the original all-members-are-voters behavior; an explicit
+generation-zero subset is also supported. Bootstrap commits the complete
+transport catalog and its digest even when some trusted peers begin as
+learners. A later voter change must advance the durable generation by one. The
+current leader first commits the exact generation and target digest into
+OpenRaft membership, catches up every incoming voter as a learner, and then
+completes joint consensus while retaining non-voters as learners. Startup
+resumes only the matching intent or joint configuration and rejects stale,
+skipped, conflicting, foreign-node, transport-catalog, and transport-identity
+state. SIGINT/SIGTERM closes the peer listener and OpenRaft task cleanly.
+Startup also verifies that the
+local application UUID and Ed25519 public key match the durable node identity
+before the process can join the quorum. When durable authority state already
+exists, application endpoint/TLS validation waits for a linearizable quorum
+read that advances the replicated clock; a restarted minority cannot use stale
+persisted time to extend a rollout window.
 
 All voters supply one identical immutable application genesis document. The
 replicated state machine owns challenged join, membership generation and audit,
@@ -87,11 +97,17 @@ overlap ends. Discovery and startup use replicated authority time, and retired
 or aborted candidate fingerprints cannot be reused. Thus a stalled rollout
 automatically narrows trust instead of leaving an unbounded extra leaf.
 
-The OpenRaft voter map is still static and fixed for the lifetime of the
-process. Application membership can change through the replicated state
-machine, and application-listener leaves can rotate through the bounded
-protocol above. Adding/removing consensus voters and rotating the Raft
-transport certificates or trust map safely are not implemented.
+The OpenRaft voter set can now remove or promote peers already present in the
+static transport-trust catalog. Its target is generation-fenced, incoming
+voters catch up as learners, OpenRaft performs joint consensus, and the pinned
+catalog digest rejects additions or identity changes disguised as voter
+updates. Exact restart, stale/skipped/conflicting-generation, and catalog-drift
+regressions cover the durable transition. This does not add or revoke
+transport trust: a peer removed from voting remains a replicated learner in
+the configured mTLS catalog and therefore keeps receiving the Raft log and
+remains inside the trusted control-node boundary. Adding an unknown peer,
+revoking a former peer's control access, or rotating Raft transport
+certificates/CA roots still requires a coordinated transport trust epoch.
 
 Every replicated ownership revision now records the OpenRaft leader term from
 its committed log ID. The managed client copies that term and the lease's exact
@@ -153,6 +169,8 @@ node_id = 1
 authority_cluster_id = "2d1b98c1-6caf-4ed4-b87f-55acde52d1ee"
 listen_addr = "10.0.0.11:8788"
 cluster_name = "production-agentos"
+voter_ids = [1, 2, 3]
+voter_set_generation = 0
 server_certificate_path = "/etc/agentos/raft/node-1-server.pem"
 server_private_key_path = "/etc/agentos/raft/node-1-server-key.pem"
 client_certificate_path = "/etc/agentos/raft/node-1-client.pem"
@@ -171,17 +189,38 @@ tls_client_certificate_sha256 = "<64 lowercase hex characters>"
 identity_public_key = "<64 lowercase hex characters>"
 ```
 
-Add one `[[cluster_raft.members]]` table for every voter. Set `bootstrap =
-true` on the first start of every pristine node using the identical map. After
-the membership is durable, operators may set it to `false`; a pristine or
-mismatched store then fails startup rather than silently forming another
-cluster. Every node must use the same `authority_cluster_id`, application
-identity records, and voter records. Omit
+Add one `[[cluster_raft.members]]` table for every statically trusted Raft
+transport peer. `voter_ids` must be a non-empty subset; omitting it preserves
+the legacy behavior in which every trusted peer votes. Set `bootstrap = true`
+on the first start of every pristine node using generation zero and the
+identical catalog. After the membership is durable, operators may set it to
+`false`; a pristine or mismatched store then fails startup rather than silently
+forming another cluster. Every node must use the same
+`authority_cluster_id`, application identity records, transport catalog, voter
+target, and generation. Omit
 `application_tls_server_certificate_sha256` only for a non-TLS application
 listener; never substitute the Raft transport leaf for a different application
 certificate. This configuration moves public membership and ownership
 authority into the quorum, but does not replicate agent state or make all agent
 operations partition-safe.
+
+To change voters inside the existing catalog, set the same target
+`voter_ids` on every participating process and increment
+`voter_set_generation` from the currently durable value by one. Restart enough
+current voters with that identical configuration at the same time for one of
+them to obtain leadership inside the bounded startup window. This slice is a
+coordinated config-driven startup operation, not a zero-downtime live
+administration endpoint; a sequential rolling edit can time out while only the
+old-configuration leader is active. The target-configured leader persists the
+intent before learner catch-up and joint consensus; a crash at either stage is
+resumed only for that exact target. A removed voter remains a trusted learner
+and continues receiving replicated authority state. Do not remove a peer from
+`members` or change its endpoint, identity, certificate fingerprints, server
+name, or CA as part of this operation. Those are transport-trust changes and
+remain unsupported until the separate trust-epoch protocol is implemented.
+Successful daemon startup prints the converged voter generation, exact voter
+IDs, and pinned transport catalog digest so an operator can compare every node
+without inspecting the database.
 
 `agent-server` reads the platform config path by default. A service manager may
 set `AGENT_SERVER_CONFIG` to an explicit absolute `config.toml` path; relative
@@ -191,7 +230,7 @@ paths are rejected.
 
 | Object | System of record now | Current consistency | Production requirement |
 |---|---|---|---|
-| Cluster identity and membership | Replicated authority state when `[cluster_raft]` is enabled; designated SQLite authority otherwise | Enabled mode commits mutations through a majority, forwards followers to the leader, and uses linearizable reads; application leaves use bounded prepare/activate/finalize trust generations; the voter map remains static | Safe voter membership changes and coordinated Raft transport trust epochs |
+| Cluster identity and membership | Replicated authority state when `[cluster_raft]` is enabled; designated SQLite authority otherwise | Enabled mode commits mutations through a majority, forwards followers to the leader, and uses linearizable reads; application leaves use bounded prepare/activate/finalize trust generations; a generation-fenced voter subset changes through learner catch-up and joint consensus inside the static transport catalog | Coordinated Raft transport trust epochs for catalog additions, trust revocation, and certificate/CA rotation |
 | Node identity | Node-local Ed25519 key plus authority membership certificate fingerprint | Stable across restart; fresh challenges sign both prepare and activation; candidate and previous leaf acceptance expire against replicated time; listener reload drains old sessions | Raft transport certificate/trust rotation and external partition/clock qualification |
 | Node availability and placement profile | Node-local SQLite database | Generation-fenced on one node; discovery reads a point-in-time value | Signed or quorum-observed liveness/capacity with staleness bounds |
 | Agent identity | Authority reservation plus owning-node SQLite database | Managed creation reserves one UUID before exact destination creation; duplicates cannot overwrite a local agent | Quorum-allocated immutable identity and migration-aware placement record |
@@ -259,7 +298,7 @@ paths are rejected.
 
 | Event | Required current behavior | What remains before production |
 |---|---|---|
-| Membership authority loss | Enabled mode elects a replacement while a majority remains; a minority or isolated old leader rejects authority writes and linearizable reads | Safe voter changes, Raft transport trust rotation, and externally qualified partition/latency behavior |
+| Membership authority loss | Enabled mode elects a replacement while a majority remains; a minority or isolated old leader rejects authority writes and linearizable reads; an exact prepared/joint voter change is resumable | Raft transport trust rotation and externally qualified partition/latency behavior |
 | Workload node loss | Calls to that node fail; another node must not recreate or resume its agents automatically; authority leases expire but workload state stays on the failed node | Durable replica/checkpoint and explicit recovery policy |
 | Network partition | Only the authority majority can mutate membership/ownership. A destination admits only its exact installed term/generation/token/expiry and stops new admission at expiry; an already-admitted operation retains its guard through completion | Self-contained authority authentication at the destination plus external partition, delay, and clock qualification |
 | Duplicate agent ownership | Reconciliation compares every node with the durable authority directory, returns a conflict, and publishes neither arbitrary copy | Quorum-backed repair procedure and replicated workload evidence |
@@ -300,9 +339,10 @@ non-migratable.
 
 ## Required implementation sequence
 
-1. Add safe quorum-versioned voter membership changes and Raft transport trust
-   epochs, then bind destination installation to self-contained authority
-   authentication instead of only the trusted system control path.
+1. Add coordinated Raft transport trust epochs, then bind destination
+   installation to self-contained authority authentication instead of only the
+   trusted system control path. Quorum-versioned voter changes inside the
+   existing trust catalog are implemented.
 2. Checkpointed drain/migration with rollback and side-effect classifications.
 3. Cross-node IPC/delegation with end-to-end authorization and audit.
 4. Cluster quota reservations and monotonic policy/package trust epochs.
@@ -321,8 +361,9 @@ passing single-node test is never accepted as substitute evidence.
 - Durable OpenRaft storage-v2 log, replicated membership/ownership authority,
   operation receipts, and snapshots: `crates/kernel/src/cluster_consensus.rs`
 - Strict operator configuration: `crates/kernel/src/config.rs`
-- Bounded mTLS Raft peer RPCs, exact certificate/node binding, daemon
-  lifecycle, and quorum regressions: `crates/kernel/src/cluster_runtime.rs` and
+- Bounded mTLS Raft peer RPCs, exact certificate/node binding,
+  generation-fenced voter changes, daemon lifecycle, and quorum regressions:
+  `crates/kernel/src/cluster_runtime.rs` and
   `crates/cli/src/bin/agent-server.rs`
 - Durable cluster tables and single-process storage lease:
   `crates/kernel/src/context.rs` and `crates/kernel/src/storage.rs`

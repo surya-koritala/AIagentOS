@@ -530,9 +530,11 @@ overlap using quorum-replicated time, never a workload node's local clock.
 
 With `[cluster_raft]` disabled, the compatibility authority retains its older
 single-node direct re-admission behavior and rejects the new rollout controls.
-This protocol coordinates application-listener leaves only. The statically
-configured Raft peer certificates, voter trust map, and safe voter
-reconfiguration are separate pending work in #122.
+This protocol coordinates application-listener leaves only. The OpenRaft voter
+subset can change by an exact durable generation inside the statically
+configured peer catalog, with learner catch-up and joint consensus. Adding or
+revoking catalog trust and rotating Raft peer certificates/CA roots remain
+separate pending work in #122.
 
 ### Authority ownership lease registry
 
@@ -602,10 +604,12 @@ read/write forwarding, majority failover, restart recovery, and no-quorum
 rejection. With `[cluster_raft]` disabled, the designated single-node
 authority remains available for compatibility.
 
-The OpenRaft voter map is static, destination proof installation is an
-authenticated system control operation rather than a self-contained authority
-signature, and creation/claim/fence publication is not one atomic
-cross-database transaction.
+The OpenRaft voter subset is generation-fenced inside a static transport trust
+catalog whose digest is persisted with every node record. Removing a voter
+retains it as a log-replicating learner and does not revoke that peer's
+configured mTLS/control trust. Destination proof installation is an
+authenticated system control operation rather than a self-contained authority signature, and
+creation/claim/fence publication is not one atomic cross-database transaction.
 There is no automatic migration, cluster-wide quota transaction,
 policy/package convergence, rolling-upgrade coordinator, or
 disaster-recovery controller.
@@ -639,11 +643,11 @@ The default frame ceiling is 8 MiB and configurable only from 64 KiB through
 timed. The listener bounds concurrent connections (128 by default, hard maximum
 16,384) and drops excess connections without dispatch. Runtime configuration
 also rejects empty or duplicate endpoints, server/client fingerprints, and
-identity keys. The current trusted member map cannot change without restarting
-the runtime. Startup rejects any configured map that differs from durable
-membership; safe quorum-versioned voter changes and coordinated trust rotation
-are still required before this mode can be called a complete distributed
-kernel.
+identity keys. The current trusted member map cannot change merely by
+restarting the runtime: startup verifies its durable catalog digest and exact
+transport identities. Quorum-versioned voter changes are supported within that
+catalog; coordinated catalog/credential trust epochs are still required before
+this mode can be called a complete distributed kernel.
 
 ## Conformance evidence
 

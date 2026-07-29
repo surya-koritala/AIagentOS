@@ -10,9 +10,10 @@
 //! committed. Public membership and ownership syscalls use it for
 //! majority-backed writes and linearizable reads; followers forward both over
 //! the authenticated peer transport. Application-listener certificate rollout
-//! is coordinated by the authority, while the OpenRaft voter map and transport
-//! trust remain static. Safe voter reconfiguration and Raft transport trust
-//! rotation are later stages.
+//! is coordinated by the authority. OpenRaft voter changes are limited to the
+//! statically trusted transport catalog: an exact generation/digest intent is
+//! committed before learner catch-up and joint consensus, and restart resumes
+//! only that intent. Transport trust rotation remains a later stage.
 
 #![allow(clippy::result_large_err)]
 
@@ -37,7 +38,7 @@ use openraft::raft::{
     AppendEntriesRequest, AppendEntriesResponse, ClientWriteResponse, InstallSnapshotRequest,
     InstallSnapshotResponse, VoteRequest, VoteResponse,
 };
-use openraft::{Config as OpenRaftConfig, Raft, RaftMetrics};
+use openraft::{ChangeMembers, Config as OpenRaftConfig, Raft, RaftMetrics};
 use rustls::pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer, ServerName};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -260,7 +261,12 @@ impl Default for ClusterRaftTransportLimits {
 pub struct ClusterRaftRuntimeConfig {
     pub node_id: ClusterRaftNodeId,
     pub listen_addr: SocketAddr,
+    /// Statically trusted transport catalog. Voters are a non-empty subset.
     pub members: BTreeMap<ClusterRaftNodeId, ClusterRaftNode>,
+    pub transport_catalog_sha256: String,
+    pub voter_ids: BTreeSet<ClusterRaftNodeId>,
+    pub voter_set_generation: u64,
+    pub voter_set_sha256: String,
     pub authority_genesis: AuthorityGenesis,
     pub tls: ClusterRaftTls,
     pub raft: OpenRaftConfig,
@@ -274,6 +280,10 @@ impl fmt::Debug for ClusterRaftRuntimeConfig {
             .field("node_id", &self.node_id)
             .field("listen_addr", &self.listen_addr)
             .field("members", &self.members)
+            .field("transport_catalog_sha256", &self.transport_catalog_sha256)
+            .field("voter_ids", &self.voter_ids)
+            .field("voter_set_generation", &self.voter_set_generation)
+            .field("voter_set_sha256", &self.voter_set_sha256)
             .field("authority_genesis", &self.authority_genesis)
             .field("tls", &self.tls)
             .field("raft", &self.raft)
@@ -333,7 +343,9 @@ impl ClusterRaftRuntimeConfig {
             &client_private_key,
             &peer_ca,
         )?;
-        let members = config
+        let voter_ids = config.desired_voter_ids();
+        let voter_set_sha256 = configured_voter_set_sha256(config.voter_set_generation, &voter_ids);
+        let mut members = config
             .members
             .iter()
             .map(|member| {
@@ -345,10 +357,19 @@ impl ClusterRaftRuntimeConfig {
                         tls_certificate_sha256: member.tls_certificate_sha256.clone(),
                         tls_client_certificate_sha256: member.tls_client_certificate_sha256.clone(),
                         identity_public_key: member.identity_public_key.clone(),
+                        transport_catalog_sha256: String::new(),
+                        voter_set_generation: config.voter_set_generation,
+                        voter_set_sha256: voter_set_sha256.clone(),
                     },
                 )
             })
-            .collect();
+            .collect::<BTreeMap<_, _>>();
+        let transport_catalog_sha256 = configured_transport_catalog_sha256(&members);
+        for member in members.values_mut() {
+            member
+                .transport_catalog_sha256
+                .clone_from(&transport_catalog_sha256);
+        }
         let mut authority_members = config
             .members
             .iter()
@@ -378,6 +399,10 @@ impl ClusterRaftRuntimeConfig {
             node_id: config.node_id,
             listen_addr: config.listen_addr.parse().map_err(invalid_input)?,
             members,
+            transport_catalog_sha256,
+            voter_ids,
+            voter_set_generation: config.voter_set_generation,
+            voter_set_sha256,
             authority_genesis,
             tls,
             raft: OpenRaftConfig {
@@ -406,6 +431,31 @@ impl ClusterRaftRuntimeConfig {
         }
         if self.members.is_empty() || self.members.len() > 31 {
             return Err(invalid_input("Raft membership must contain 1 to 31 nodes"));
+        }
+        if self.voter_ids.is_empty() {
+            return Err(invalid_input("Raft voter set cannot be empty"));
+        }
+        if self
+            .voter_ids
+            .iter()
+            .any(|voter_id| !self.members.contains_key(voter_id))
+        {
+            return Err(invalid_input(
+                "Raft voter set contains a node absent from the trusted catalog",
+            ));
+        }
+        let expected_voter_set_sha256 =
+            configured_voter_set_sha256(self.voter_set_generation, &self.voter_ids);
+        if self.voter_set_sha256 != expected_voter_set_sha256 {
+            return Err(invalid_input(
+                "Raft voter-set digest does not match its generation and voter ids",
+            ));
+        }
+        let expected_transport_catalog_sha256 = configured_transport_catalog_sha256(&self.members);
+        if self.transport_catalog_sha256 != expected_transport_catalog_sha256 {
+            return Err(invalid_input(
+                "Raft transport-catalog digest does not match its trusted members",
+            ));
         }
         validate_authority_genesis(&self.authority_genesis)?;
         let local = self
@@ -498,9 +548,55 @@ impl ClusterRaftRuntimeConfig {
             if !identity_keys.insert(node.identity_public_key.clone()) {
                 return Err(invalid_input("duplicate Raft peer identity public key"));
             }
+            if node.voter_set_generation != self.voter_set_generation
+                || node.voter_set_sha256 != self.voter_set_sha256
+            {
+                return Err(invalid_input(
+                    "Raft trusted catalog contains inconsistent voter-set intent metadata",
+                ));
+            }
+            if node.transport_catalog_sha256 != self.transport_catalog_sha256 {
+                return Err(invalid_input(
+                    "Raft trusted catalog contains inconsistent transport-catalog metadata",
+                ));
+            }
         }
         Ok(())
     }
+}
+
+fn append_digest_field(payload: &mut Vec<u8>, value: &str) {
+    payload.extend_from_slice(&(value.len() as u64).to_be_bytes());
+    payload.extend_from_slice(value.as_bytes());
+}
+
+fn configured_transport_catalog_sha256(
+    members: &BTreeMap<ClusterRaftNodeId, ClusterRaftNode>,
+) -> String {
+    let mut payload = b"AIagentOS OpenRaft transport catalog v1".to_vec();
+    payload.extend_from_slice(&(members.len() as u64).to_be_bytes());
+    for (node_id, node) in members {
+        payload.extend_from_slice(&node_id.to_be_bytes());
+        append_digest_field(&mut payload, &node.endpoint);
+        append_digest_field(&mut payload, &node.server_name);
+        append_digest_field(&mut payload, &node.tls_certificate_sha256);
+        append_digest_field(&mut payload, &node.tls_client_certificate_sha256);
+        append_digest_field(&mut payload, &node.identity_public_key);
+    }
+    crate::cluster_control::sha256_hex(&payload)
+}
+
+fn configured_voter_set_sha256(generation: u64, voters: &BTreeSet<ClusterRaftNodeId>) -> String {
+    if generation == 0 {
+        return String::new();
+    }
+    let mut payload = b"AIagentOS OpenRaft voter set v1".to_vec();
+    payload.extend_from_slice(&generation.to_be_bytes());
+    payload.extend_from_slice(&(voters.len() as u64).to_be_bytes());
+    for voter_id in voters {
+        payload.extend_from_slice(&voter_id.to_be_bytes());
+    }
+    crate::cluster_control::sha256_hex(&payload)
 }
 
 fn validate_authority_genesis(genesis: &AuthorityGenesis) -> io::Result<()> {
@@ -845,7 +941,7 @@ impl RaftNetworkFactory<ClusterRaftTypeConfig> for ClusterNetworkFactory {
         node: &ClusterRaftNode,
     ) -> Self::Network {
         let invalid_target = match self.members.get(&target) {
-            Some(trusted) if trusted == node => None,
+            Some(trusted) if same_transport_identity(trusted, node) => None,
             Some(_) => Some("OpenRaft membership differs from trusted peer configuration".into()),
             None => Some("OpenRaft target is absent from trusted peer configuration".into()),
         };
@@ -860,6 +956,14 @@ impl RaftNetworkFactory<ClusterRaftTypeConfig> for ClusterNetworkFactory {
             invalid_target,
         }
     }
+}
+
+fn same_transport_identity(left: &ClusterRaftNode, right: &ClusterRaftNode) -> bool {
+    left.endpoint == right.endpoint
+        && left.server_name == right.server_name
+        && left.tls_certificate_sha256 == right.tls_certificate_sha256
+        && left.tls_client_certificate_sha256 == right.tls_client_certificate_sha256
+        && left.identity_public_key == right.identity_public_key
 }
 
 impl ClusterNetwork {
@@ -1275,7 +1379,13 @@ fn rpc_call_error_message(error: &RpcCallError) -> &str {
 pub struct ClusterRaftRuntime {
     node_id: ClusterRaftNodeId,
     local_addr: SocketAddr,
+    /// Statically trusted transport catalog. It may include non-voter
+    /// learners, but every durable OpenRaft node must match one entry.
     members: BTreeMap<ClusterRaftNodeId, ClusterRaftNode>,
+    transport_catalog_sha256: String,
+    voter_ids: BTreeSet<ClusterRaftNodeId>,
+    voter_set_generation: u64,
+    voter_set_sha256: String,
     authority_genesis: AuthorityGenesis,
     context: Arc<SqliteContextManager>,
     authority_network: ClusterNetworkFactory,
@@ -1292,6 +1402,10 @@ impl fmt::Debug for ClusterRaftRuntime {
             .field("node_id", &self.node_id)
             .field("local_addr", &self.local_addr)
             .field("members", &self.members)
+            .field("transport_catalog_sha256", &self.transport_catalog_sha256)
+            .field("voter_ids", &self.voter_ids)
+            .field("voter_set_generation", &self.voter_set_generation)
+            .field("voter_set_sha256", &self.voter_set_sha256)
             .field("authority_genesis", &self.authority_genesis)
             .finish_non_exhaustive()
     }
@@ -1366,7 +1480,14 @@ impl ClusterRaftRuntime {
             }
         }
         let initial_metrics = metrics.borrow().clone();
-        if let Err(error) = validate_durable_membership(&initial_metrics, &config.members) {
+        if let Err(error) = inspect_durable_membership(
+            &initial_metrics,
+            &config.members,
+            &config.transport_catalog_sha256,
+            &config.voter_ids,
+            config.voter_set_generation,
+            &config.voter_set_sha256,
+        ) {
             let _ = raft.shutdown().await;
             return Err(error);
         }
@@ -1387,6 +1508,10 @@ impl ClusterRaftRuntime {
             node_id: config.node_id,
             local_addr,
             members: config.members,
+            transport_catalog_sha256: config.transport_catalog_sha256,
+            voter_ids: config.voter_ids,
+            voter_set_generation: config.voter_set_generation,
+            voter_set_sha256: config.voter_set_sha256,
             authority_genesis: config.authority_genesis,
             context,
             authority_network,
@@ -1405,6 +1530,21 @@ impl ClusterRaftRuntime {
         self.local_addr
     }
 
+    /// Exact configured voter set after startup convergence.
+    pub fn voter_ids(&self) -> &BTreeSet<ClusterRaftNodeId> {
+        &self.voter_ids
+    }
+
+    /// Durable operator generation for [`Self::voter_ids`].
+    pub fn voter_set_generation(&self) -> u64 {
+        self.voter_set_generation
+    }
+
+    /// Digest pinning the complete static Raft transport-trust catalog.
+    pub fn transport_catalog_sha256(&self) -> &str {
+        &self.transport_catalog_sha256
+    }
+
     pub fn metrics(&self) -> watch::Receiver<RaftMetrics<ClusterRaftNodeId, ClusterRaftNode>> {
         self.raft.metrics()
     }
@@ -1418,7 +1558,7 @@ impl ClusterRaftRuntime {
         }
     }
 
-    /// Explicitly initialize the cluster with the exact trusted node map.
+    /// Explicitly initialize the cluster with the configured voter subset.
     ///
     /// More than one pristine node may call this with the same map. Operators
     /// must never call it with a different map, because OpenRaft documents that
@@ -1427,50 +1567,206 @@ impl ClusterRaftRuntime {
         &self,
     ) -> Result<(), RaftError<ClusterRaftNodeId, InitializeError<ClusterRaftNodeId, ClusterRaftNode>>>
     {
-        self.raft.initialize(self.members.clone()).await
+        let voters: BTreeMap<ClusterRaftNodeId, ClusterRaftNode> = self
+            .voter_ids
+            .iter()
+            .map(|node_id| {
+                (
+                    *node_id,
+                    self.members
+                        .get(node_id)
+                        .expect("validated voter is in trusted catalog")
+                        .clone(),
+                )
+            })
+            .collect();
+        self.raft.initialize(voters).await
     }
 
-    /// Make the configured membership active, or verify an exact durable
-    /// membership on restart.
+    /// Make the configured voter set active, or verify/resume its exact
+    /// durable generation on restart.
     ///
     /// With `bootstrap = false`, a pristine database fails closed. With
     /// `bootstrap = true`, initialization is attempted only for a pristine
-    /// database. A concurrent identical bootstrap is accepted after the
-    /// resulting durable membership is observed; any different or joint
-    /// membership is rejected.
+    /// generation-zero database. Post-bootstrap changes must advance
+    /// `voter_set_generation` by exactly one. The leader first commits the
+    /// target generation/digest and complete trusted catalog as learner
+    /// metadata, waits for incoming voters to catch up, and then uses
+    /// OpenRaft joint consensus. A restarted leader resumes only that exact
+    /// persisted intent or joint configuration.
     pub async fn ensure_configured_membership(&self, bootstrap: bool) -> io::Result<()> {
-        let metrics = self.metrics();
-        if validate_durable_membership(&metrics.borrow(), &self.members)? {
-            return Ok(());
-        }
-        if !bootstrap {
-            return Err(invalid_input(
-                "Raft storage is pristine; set cluster_raft.bootstrap = true for the initial start",
-            ));
-        }
-        let initialization =
-            tokio::time::timeout(MEMBERSHIP_SETTLE_TIMEOUT, self.initialize()).await;
-        let initialization_failure: String = match &initialization {
-            Ok(Ok(())) => "Raft bootstrap did not publish the configured membership".into(),
-            Ok(Err(error)) => {
-                format!("Raft bootstrap failed and no configured membership appeared: {error}")
-            }
-            Err(_) => "Raft bootstrap timed out".into(),
-        };
+        let mut metrics = self.metrics();
         let deadline = Instant::now() + MEMBERSHIP_SETTLE_TIMEOUT;
+        let mut last_failure = None;
+        let mut bootstrap_attempted = false;
         loop {
-            match validate_durable_membership(&metrics.borrow(), &self.members) {
-                Ok(true) => return Ok(()),
-                Ok(false) if Instant::now() < deadline => {}
-                Ok(false) => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::TimedOut,
-                        initialization_failure.clone(),
-                    ))
+            let progress = inspect_durable_membership(
+                &metrics.borrow(),
+                &self.members,
+                &self.transport_catalog_sha256,
+                &self.voter_ids,
+                self.voter_set_generation,
+                &self.voter_set_sha256,
+            )?;
+            match progress {
+                DurableMembershipProgress::Settled => return Ok(()),
+                DurableMembershipProgress::Pristine => {
+                    if !bootstrap {
+                        return Err(invalid_input(
+                            "Raft storage is pristine; set cluster_raft.bootstrap = true for the initial start",
+                        ));
+                    }
+                    if self.voter_set_generation != 0 {
+                        return Err(invalid_input(
+                            "a pristine Raft cluster must bootstrap voter_set_generation 0",
+                        ));
+                    }
+                    if !bootstrap_attempted {
+                        bootstrap_attempted = true;
+                        match tokio::time::timeout(
+                            deadline.saturating_duration_since(Instant::now()),
+                            self.initialize(),
+                        )
+                        .await
+                        {
+                            Ok(Ok(())) => {}
+                            Ok(Err(error)) => {
+                                last_failure = Some(format!(
+                                    "Raft bootstrap failed and no configured membership appeared: {error}"
+                                ));
+                            }
+                            Err(_) => last_failure = Some("Raft bootstrap timed out".into()),
+                        }
+                    }
                 }
-                Err(error) => return Err(error),
+                DurableMembershipProgress::NeedsCatalog
+                    if metrics.borrow().current_leader == Some(self.node_id) =>
+                {
+                    match tokio::time::timeout(
+                        deadline.saturating_duration_since(Instant::now()),
+                        self.raft
+                            .change_membership(ChangeMembers::SetNodes(self.members.clone()), true),
+                    )
+                    .await
+                    {
+                        Ok(Ok(_)) => {}
+                        Ok(Err(error)) => {
+                            last_failure =
+                                Some(format!("commit trusted transport catalog: {error}"));
+                        }
+                        Err(_) => {
+                            last_failure =
+                                Some("commit trusted transport catalog timed out".into());
+                        }
+                    }
+                }
+                DurableMembershipProgress::NeedsIntent
+                    if metrics.borrow().current_leader == Some(self.node_id) =>
+                {
+                    match tokio::time::timeout(
+                        deadline.saturating_duration_since(Instant::now()),
+                        self.raft
+                            .change_membership(ChangeMembers::SetNodes(self.members.clone()), true),
+                    )
+                    .await
+                    {
+                        Ok(Ok(_)) => {}
+                        Ok(Err(error)) => {
+                            last_failure =
+                                Some(format!("commit voter reconfiguration intent: {error}"));
+                        }
+                        Err(_) => {
+                            last_failure =
+                                Some("commit voter reconfiguration intent timed out".into());
+                        }
+                    }
+                }
+                DurableMembershipProgress::IntentCommitted
+                    if metrics.borrow().current_leader == Some(self.node_id) =>
+                {
+                    let mut failed = false;
+                    for voter_id in &self.voter_ids {
+                        let node = self
+                            .members
+                            .get(voter_id)
+                            .expect("validated voter is in trusted catalog")
+                            .clone();
+                        match tokio::time::timeout(
+                            deadline.saturating_duration_since(Instant::now()),
+                            self.raft.add_learner(*voter_id, node, true),
+                        )
+                        .await
+                        {
+                            Ok(Ok(_)) => {}
+                            Ok(Err(error)) => {
+                                last_failure =
+                                    Some(format!("catch up incoming voter {voter_id}: {error}"));
+                                failed = true;
+                                break;
+                            }
+                            Err(_) => {
+                                last_failure =
+                                    Some(format!("catch up incoming voter {voter_id} timed out"));
+                                failed = true;
+                                break;
+                            }
+                        }
+                    }
+                    if !failed {
+                        match tokio::time::timeout(
+                            deadline.saturating_duration_since(Instant::now()),
+                            self.raft.change_membership(self.voter_ids.clone(), true),
+                        )
+                        .await
+                        {
+                            Ok(Ok(_)) => {}
+                            Ok(Err(error)) => {
+                                last_failure =
+                                    Some(format!("commit joint voter reconfiguration: {error}"));
+                            }
+                            Err(_) => {
+                                last_failure =
+                                    Some("commit joint voter reconfiguration timed out".into());
+                            }
+                        }
+                    }
+                }
+                DurableMembershipProgress::Joint
+                    if metrics.borrow().current_leader == Some(self.node_id) =>
+                {
+                    match tokio::time::timeout(
+                        deadline.saturating_duration_since(Instant::now()),
+                        self.raft.change_membership(self.voter_ids.clone(), true),
+                    )
+                    .await
+                    {
+                        Ok(Ok(_)) => {}
+                        Ok(Err(error)) => {
+                            last_failure =
+                                Some(format!("finish joint voter reconfiguration: {error}"));
+                        }
+                        Err(_) => {
+                            last_failure =
+                                Some("finish joint voter reconfiguration timed out".into());
+                        }
+                    }
+                }
+                DurableMembershipProgress::NeedsCatalog
+                | DurableMembershipProgress::NeedsIntent
+                | DurableMembershipProgress::IntentCommitted
+                | DurableMembershipProgress::Joint => {}
             }
-            tokio::time::sleep(Duration::from_millis(25)).await;
+            if Instant::now() >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    last_failure.unwrap_or_else(|| {
+                        "configured voter set was not committed before the startup deadline".into()
+                    }),
+                ));
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let wait = remaining.min(Duration::from_millis(100));
+            let _ = tokio::time::timeout(wait, metrics.changed()).await;
         }
     }
 
@@ -1578,10 +1874,24 @@ impl ClusterRaftRuntime {
     }
 }
 
-fn validate_durable_membership(
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DurableMembershipProgress {
+    Pristine,
+    NeedsCatalog,
+    Settled,
+    NeedsIntent,
+    IntentCommitted,
+    Joint,
+}
+
+fn inspect_durable_membership(
     metrics: &RaftMetrics<ClusterRaftNodeId, ClusterRaftNode>,
-    expected: &BTreeMap<ClusterRaftNodeId, ClusterRaftNode>,
-) -> io::Result<bool> {
+    trusted: &BTreeMap<ClusterRaftNodeId, ClusterRaftNode>,
+    desired_transport_catalog_sha256: &str,
+    desired_voters: &BTreeSet<ClusterRaftNodeId>,
+    desired_generation: u64,
+    desired_sha256: &str,
+) -> io::Result<DurableMembershipProgress> {
     metrics.running_state.as_ref().map_err(|error| {
         io::Error::other(format!(
             "OpenRaft is not running while membership is validated: {error}"
@@ -1595,30 +1905,191 @@ fn validate_durable_membership(
     let voters = stored.voter_ids().collect::<BTreeSet<_>>();
     if stored.log_id().is_none() {
         if nodes.is_empty() && voters.is_empty() {
-            return Ok(false);
+            return Ok(DurableMembershipProgress::Pristine);
         }
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "durable Raft membership has no log id but is not empty",
         ));
     }
-    if stored.membership().get_joint_config().len() != 1 {
+    if nodes.is_empty() || voters.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "durable Raft membership is joint and cannot be represented by the static operator configuration",
+            "durable Raft membership has a log id but no nodes or voters",
         ));
     }
-    let expected_voters = expected.keys().copied().collect::<BTreeSet<_>>();
-    if voters != expected_voters || nodes != *expected {
+    for (node_id, node) in &nodes {
+        let expected = trusted.get(node_id).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("durable Raft node {node_id} is absent from the trusted catalog"),
+            )
+        })?;
+        if !same_transport_identity(expected, node) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("durable Raft node {node_id} differs from its trusted transport identity"),
+            ));
+        }
+    }
+    let nodes_match_trusted = nodes.len() == trusted.len()
+        && nodes.iter().all(|(node_id, node)| {
+            trusted
+                .get(node_id)
+                .is_some_and(|expected| same_transport_identity(expected, node))
+        });
+    let mut catalog_digests = nodes
+        .values()
+        .map(|node| node.transport_catalog_sha256.as_str())
+        .collect::<BTreeSet<_>>();
+    if catalog_digests.len() != 1 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "durable Raft membership does not exactly match cluster_raft.members",
+            "durable Raft nodes disagree on the transport-catalog digest",
         ));
     }
-    Ok(true)
+    let stored_transport_catalog_sha256 = catalog_digests
+        .pop_first()
+        .expect("non-empty durable node map");
+    if stored_transport_catalog_sha256.is_empty() {
+        if !nodes_match_trusted {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "legacy durable Raft node map does not exactly match the trusted transport catalog",
+            ));
+        }
+    } else {
+        if stored_transport_catalog_sha256.len() != 64
+            || !stored_transport_catalog_sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "durable transport-catalog digest is not lowercase SHA-256",
+            ));
+        }
+        if stored_transport_catalog_sha256 != desired_transport_catalog_sha256 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "configured Raft transport catalog differs from its durable digest",
+            ));
+        }
+    }
+    let mut intents = nodes
+        .values()
+        .map(|node| (node.voter_set_generation, node.voter_set_sha256.as_str()))
+        .collect::<BTreeSet<_>>();
+    if intents.len() != 1 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "durable Raft nodes disagree on voter-set generation or digest",
+        ));
+    }
+    let (stored_generation, stored_sha256) =
+        intents.pop_first().expect("non-empty durable node map");
+    if stored_generation == 0 {
+        if !stored_sha256.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "durable generation-zero voter set has a non-empty digest",
+            ));
+        }
+    } else if stored_sha256.len() != 64
+        || !stored_sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "durable voter-set digest is not lowercase SHA-256",
+        ));
+    }
+
+    let configs = stored.membership().get_joint_config();
+    if configs.is_empty() || configs.len() > 2 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "durable Raft membership has an unsupported joint configuration",
+        ));
+    }
+    if configs.len() == 2 {
+        if !nodes_match_trusted
+            || stored_generation != desired_generation
+            || stored_sha256 != desired_sha256
+            || configs.last() != Some(desired_voters)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "durable joint Raft membership conflicts with the configured voter-set intent",
+            ));
+        }
+        return Ok(DurableMembershipProgress::Joint);
+    }
+
+    if stored_generation == desired_generation {
+        if stored_sha256 != desired_sha256 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "configured voter set reuses a durable generation with a different target",
+            ));
+        }
+        if voters == *desired_voters {
+            if nodes_match_trusted {
+                return Ok(DurableMembershipProgress::Settled);
+            }
+            if stored_generation == 0
+                && stored_transport_catalog_sha256 == desired_transport_catalog_sha256
+            {
+                return Ok(DurableMembershipProgress::NeedsCatalog);
+            }
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "durable voter set is settled without the complete trusted transport catalog",
+            ));
+        }
+        if stored_generation == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "generation-zero voter set cannot change without advancing voter_set_generation",
+            ));
+        }
+        if !nodes_match_trusted {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "durable voter intent does not contain the complete trusted transport catalog",
+            ));
+        }
+        return Ok(DurableMembershipProgress::IntentCommitted);
+    }
+
+    if !nodes_match_trusted {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "durable prior voter generation does not contain the complete trusted transport catalog",
+        ));
+    }
+    if desired_generation
+        != stored_generation
+            .checked_add(1)
+            .ok_or_else(|| invalid_input("durable voter-set generation overflow"))?
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "configured voter-set generation is stale or skips a durable generation",
+        ));
+    }
+    let settled_digest = configured_voter_set_sha256(stored_generation, &voters);
+    if stored_sha256 != settled_digest {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "durable prior voter-set generation is not settled",
+        ));
+    }
+    Ok(DurableMembershipProgress::NeedsIntent)
 }
 
-/// Start the operator-configured runtime and establish its exact membership.
+/// Start the operator-configured runtime and establish its exact voter plan.
 ///
 /// Disabled configuration returns `Ok(None)`. Any certificate, bind,
 /// bootstrap, or durable-membership failure shuts down a partially started
@@ -1911,7 +2382,7 @@ mod tests {
 
     use openraft::network::{RPCOption, RaftNetwork, RaftNetworkFactory};
     use openraft::raft::{VoteRequest, VoteResponse};
-    use openraft::Vote;
+    use openraft::{CommittedLeaderId, LogId, Membership, StoredMembership, Vote};
     use rcgen::{
         BasicConstraints, CertificateParams, CertifiedIssuer, ExtendedKeyUsagePurpose, IsCa,
         KeyPair, KeyUsagePurpose,
@@ -2190,11 +2661,26 @@ mod tests {
         listeners
     }
 
+    async fn rebind_test_listener(addr: SocketAddr, purpose: &str) -> TcpListener {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match TcpListener::bind(addr).await {
+                Ok(listener) => return listener,
+                Err(error)
+                    if error.kind() == io::ErrorKind::AddrInUse && Instant::now() < deadline =>
+                {
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+                Err(error) => panic!("{purpose}: {error}"),
+            }
+        }
+    }
+
     fn member_map(
         peers: &[TestPeer],
         listeners: &[TcpListener],
     ) -> BTreeMap<ClusterRaftNodeId, ClusterRaftNode> {
-        peers
+        let mut members = peers
             .iter()
             .zip(listeners)
             .map(|(peer, listener)| {
@@ -2209,10 +2695,20 @@ mod tests {
                             .client_certificate_sha256()
                             .to_string(),
                         identity_public_key: format!("{:064x}", peer.node_id),
+                        transport_catalog_sha256: String::new(),
+                        voter_set_generation: 0,
+                        voter_set_sha256: String::new(),
                     },
                 )
             })
-            .collect()
+            .collect::<BTreeMap<_, _>>();
+        let transport_catalog_sha256 = configured_transport_catalog_sha256(&members);
+        for member in members.values_mut() {
+            member
+                .transport_catalog_sha256
+                .clone_from(&transport_catalog_sha256);
+        }
+        members
     }
 
     fn runtime_config(
@@ -2246,6 +2742,10 @@ mod tests {
             node_id: peer.node_id,
             listen_addr: listener.local_addr().expect("listener address"),
             members: members.clone(),
+            transport_catalog_sha256: configured_transport_catalog_sha256(members),
+            voter_ids: members.keys().copied().collect(),
+            voter_set_generation: 0,
+            voter_set_sha256: String::new(),
             authority_genesis,
             tls: peer.tls.clone(),
             raft: OpenRaftConfig {
@@ -2263,6 +2763,204 @@ mod tests {
                 ..Default::default()
             },
         }
+    }
+
+    fn set_voter_plan(
+        config: &mut ClusterRaftRuntimeConfig,
+        generation: u64,
+        voter_ids: BTreeSet<ClusterRaftNodeId>,
+    ) {
+        let digest = configured_voter_set_sha256(generation, &voter_ids);
+        config.voter_ids = voter_ids;
+        config.voter_set_generation = generation;
+        config.voter_set_sha256 = digest.clone();
+        for member in config.members.values_mut() {
+            member.voter_set_generation = generation;
+            member.voter_set_sha256.clone_from(&digest);
+        }
+    }
+
+    fn synthetic_members(
+        voter_set_generation: u64,
+        voter_ids: &BTreeSet<ClusterRaftNodeId>,
+    ) -> BTreeMap<ClusterRaftNodeId, ClusterRaftNode> {
+        let voter_set_sha256 = configured_voter_set_sha256(voter_set_generation, voter_ids);
+        let mut members = (1..=3)
+            .map(|node_id| {
+                (
+                    node_id,
+                    ClusterRaftNode {
+                        endpoint: format!("127.0.0.1:{}", 8_000 + node_id),
+                        server_name: format!("node-{node_id}.agentos.test"),
+                        tls_certificate_sha256: format!("{:064x}", node_id),
+                        tls_client_certificate_sha256: format!("{:064x}", node_id + 10),
+                        identity_public_key: format!("{:064x}", node_id + 20),
+                        transport_catalog_sha256: String::new(),
+                        voter_set_generation,
+                        voter_set_sha256: voter_set_sha256.clone(),
+                    },
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let transport_catalog_sha256 = configured_transport_catalog_sha256(&members);
+        for member in members.values_mut() {
+            member
+                .transport_catalog_sha256
+                .clone_from(&transport_catalog_sha256);
+        }
+        members
+    }
+
+    fn membership_metrics(
+        configs: Vec<BTreeSet<ClusterRaftNodeId>>,
+        members: BTreeMap<ClusterRaftNodeId, ClusterRaftNode>,
+    ) -> RaftMetrics<ClusterRaftNodeId, ClusterRaftNode> {
+        let mut metrics = RaftMetrics::new_initial(1);
+        metrics.membership_config = Arc::new(StoredMembership::new(
+            Some(LogId::new(CommittedLeaderId::new(1, 1), 10)),
+            Membership::new(configs, members),
+        ));
+        metrics
+    }
+
+    #[test]
+    fn durable_membership_inspector_resumes_only_the_exact_joint_intent() {
+        let desired = BTreeSet::from([1, 2]);
+        let trusted = synthetic_members(1, &desired);
+        let transport_catalog_sha256 = configured_transport_catalog_sha256(&trusted);
+        let desired_sha256 = configured_voter_set_sha256(1, &desired);
+        let joint = membership_metrics(
+            vec![BTreeSet::from([1, 2, 3]), desired.clone()],
+            trusted.clone(),
+        );
+        assert_eq!(
+            inspect_durable_membership(
+                &joint,
+                &trusted,
+                &transport_catalog_sha256,
+                &desired,
+                1,
+                &desired_sha256,
+            )
+            .expect("exact joint intent"),
+            DurableMembershipProgress::Joint
+        );
+
+        let conflicting = BTreeSet::from([1, 3]);
+        let error = inspect_durable_membership(
+            &joint,
+            &trusted,
+            &transport_catalog_sha256,
+            &conflicting,
+            1,
+            &configured_voter_set_sha256(1, &conflicting),
+        )
+        .expect_err("joint target conflict must fail closed");
+        assert!(error.to_string().contains("conflicts"), "{error}");
+
+        let generation_zero = synthetic_members(0, &BTreeSet::from([1, 2, 3]));
+        let generation_zero_catalog = configured_transport_catalog_sha256(&generation_zero);
+        let uniform = membership_metrics(vec![BTreeSet::from([1, 2, 3])], generation_zero.clone());
+        let skipped = inspect_durable_membership(
+            &uniform,
+            &generation_zero,
+            &generation_zero_catalog,
+            &desired,
+            2,
+            &configured_voter_set_sha256(2, &desired),
+        )
+        .expect_err("skipped generation must fail closed");
+        assert!(skipped.to_string().contains("skips"), "{skipped}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn generation_zero_subset_persists_the_complete_transport_catalog() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let ca = test_ca();
+        let peers = (1..=3)
+            .map(|node_id| test_peer(&ca, node_id))
+            .collect::<Vec<_>>();
+        let initial_listeners = listeners(3).await;
+        let members = member_map(&peers, &initial_listeners);
+        let desired = BTreeSet::from([1, 2]);
+        let mut configs = peers
+            .iter()
+            .zip(&initial_listeners)
+            .map(|(peer, listener)| {
+                runtime_config(peer, listener, &members, "voter-subset-bootstrap-test")
+            })
+            .collect::<Vec<_>>();
+        for config in &mut configs {
+            set_voter_plan(config, 0, desired.clone());
+        }
+        let tempdir = TempDir::new().expect("tempdir");
+        let contexts = (1..=3)
+            .map(|node_id| context(&tempdir, node_id))
+            .collect::<Vec<_>>();
+        let mut runtimes = Vec::new();
+        for ((config, listener), context) in configs
+            .iter()
+            .cloned()
+            .zip(initial_listeners)
+            .zip(&contexts)
+        {
+            runtimes.push(Some(
+                ClusterRaftRuntime::start_on_listener(context.clone(), config, listener)
+                    .await
+                    .expect("start generation-zero voter subset"),
+            ));
+        }
+        let (first, second, third) = tokio::join!(
+            runtimes[0]
+                .as_ref()
+                .expect("node 1")
+                .ensure_configured_membership(true),
+            runtimes[1]
+                .as_ref()
+                .expect("node 2")
+                .ensure_configured_membership(true),
+            runtimes[2]
+                .as_ref()
+                .expect("node 3")
+                .ensure_configured_membership(true),
+        );
+        first.expect("settle node 1 voter subset");
+        second.expect("settle node 2 voter subset");
+        third.expect("settle node 3 learner");
+        for runtime in runtimes.iter().flatten() {
+            assert_eq!(
+                runtime.metrics().borrow().membership_config.nodes().count(),
+                3
+            );
+            assert_eq!(
+                runtime
+                    .metrics()
+                    .borrow()
+                    .membership_config
+                    .voter_ids()
+                    .collect::<BTreeSet<_>>(),
+                desired
+            );
+        }
+        for runtime in runtimes.into_iter().flatten() {
+            runtime.shutdown().await.expect("shutdown voter subset");
+        }
+
+        let conflicting_listener =
+            rebind_test_listener(configs[0].listen_addr, "rebind generation-zero voter").await;
+        let mut conflicting = configs[0].clone();
+        set_voter_plan(&mut conflicting, 0, BTreeSet::from([1, 2, 3]));
+        let conflicting = ClusterRaftRuntime::start_on_listener(
+            contexts[0].clone(),
+            conflicting,
+            conflicting_listener,
+        )
+        .await
+        .expect_err("generation-zero voter target cannot change in place");
+        assert!(
+            conflicting.to_string().contains("generation-zero"),
+            "{conflicting}"
+        );
     }
 
     fn context(tempdir: &TempDir, node_id: ClusterRaftNodeId) -> Arc<SqliteContextManager> {
@@ -2327,6 +3025,226 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn voter_reconfiguration_is_generation_fenced_and_restart_safe() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let ca = test_ca();
+        let peers = (1..=3)
+            .map(|node_id| test_peer(&ca, node_id))
+            .collect::<Vec<_>>();
+        let initial_listeners = listeners(3).await;
+        let members = member_map(&peers, &initial_listeners);
+        let configs = peers
+            .iter()
+            .zip(&initial_listeners)
+            .map(|(peer, listener)| {
+                runtime_config(peer, listener, &members, "voter-reconfiguration-test")
+            })
+            .collect::<Vec<_>>();
+        let tempdir = TempDir::new().expect("tempdir");
+        let contexts = (1..=3)
+            .map(|node_id| context(&tempdir, node_id))
+            .collect::<Vec<_>>();
+        let mut runtimes = Vec::new();
+        for ((config, listener), context) in configs
+            .iter()
+            .cloned()
+            .zip(initial_listeners)
+            .zip(&contexts)
+        {
+            runtimes.push(Some(
+                ClusterRaftRuntime::start_on_listener(context.clone(), config, listener)
+                    .await
+                    .expect("start generation-zero voter"),
+            ));
+        }
+        let (first, second, third) = tokio::join!(
+            runtimes[0].as_ref().expect("node 1").initialize(),
+            runtimes[1].as_ref().expect("node 2").initialize(),
+            runtimes[2].as_ref().expect("node 3").initialize(),
+        );
+        first.expect("initialize node 1");
+        second.expect("initialize node 2");
+        third.expect("initialize node 3");
+        wait_for_leader(&runtimes, None).await;
+        for runtime in runtimes.into_iter().flatten() {
+            runtime.shutdown().await.expect("shutdown initial voter");
+        }
+
+        let desired = BTreeSet::from([1, 2]);
+        let mut generation_one = configs.clone();
+        for config in &mut generation_one {
+            set_voter_plan(config, 1, desired.clone());
+        }
+        let mut reconfigured = Vec::new();
+        for (config, context) in generation_one.iter().cloned().zip(&contexts) {
+            let listener = rebind_test_listener(config.listen_addr, "rebind voter listener").await;
+            reconfigured.push(Some(
+                ClusterRaftRuntime::start_on_listener(context.clone(), config, listener)
+                    .await
+                    .expect("start next-generation voter"),
+            ));
+        }
+        let (first, second, third) = tokio::join!(
+            reconfigured[0]
+                .as_ref()
+                .expect("node 1")
+                .ensure_configured_membership(false),
+            reconfigured[1]
+                .as_ref()
+                .expect("node 2")
+                .ensure_configured_membership(false),
+            reconfigured[2]
+                .as_ref()
+                .expect("node 3")
+                .ensure_configured_membership(false),
+        );
+        first.expect("settle generation one on node 1");
+        second.expect("settle generation one on node 2");
+        third.expect("settle generation one on removed voter");
+
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            let settled = reconfigured.iter().all(|runtime| {
+                runtime.as_ref().is_some_and(|runtime| {
+                    matches!(
+                        inspect_durable_membership(
+                            &runtime.metrics().borrow(),
+                            &runtime.members,
+                            &runtime.transport_catalog_sha256,
+                            &runtime.voter_ids,
+                            runtime.voter_set_generation,
+                            &runtime.voter_set_sha256,
+                        ),
+                        Ok(DurableMembershipProgress::Settled)
+                    )
+                })
+            });
+            if settled {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "generation-one voter set did not reach retained voters"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        for runtime in reconfigured.into_iter().flatten() {
+            runtime
+                .shutdown()
+                .await
+                .expect("shutdown reconfigured voter");
+        }
+
+        let retained_contexts = &contexts[..2];
+        let mut restarted = Vec::new();
+        for (config, context) in generation_one
+            .iter()
+            .take(2)
+            .cloned()
+            .zip(retained_contexts)
+        {
+            let listener =
+                rebind_test_listener(config.listen_addr, "rebind retained voter listener").await;
+            restarted.push(Some(
+                ClusterRaftRuntime::start_on_listener(context.clone(), config, listener)
+                    .await
+                    .expect("restart retained voter"),
+            ));
+        }
+        let restart_leader = wait_for_leader(&restarted, None).await;
+        restarted[(restart_leader - 1) as usize]
+            .as_ref()
+            .expect("retained restart leader")
+            .ensure_configured_membership(false)
+            .await
+            .expect("verify exact generation-one restart");
+        for runtime in restarted.into_iter().flatten() {
+            runtime.shutdown().await.expect("shutdown retained voter");
+        }
+
+        let stale_listener =
+            rebind_test_listener(configs[0].listen_addr, "bind stale-generation listener").await;
+        let stale = ClusterRaftRuntime::start_on_listener(
+            contexts[0].clone(),
+            configs[0].clone(),
+            stale_listener,
+        )
+        .await
+        .expect_err("stale voter generation must fail closed");
+        assert!(stale.to_string().contains("stale"));
+
+        let skipped_listener = rebind_test_listener(
+            generation_one[0].listen_addr,
+            "bind skipped-generation listener",
+        )
+        .await;
+        let mut skipped = generation_one[0].clone();
+        set_voter_plan(&mut skipped, 3, desired.clone());
+        let skipped =
+            ClusterRaftRuntime::start_on_listener(contexts[0].clone(), skipped, skipped_listener)
+                .await
+                .expect_err("skipped voter generation must fail closed");
+        assert!(skipped.to_string().contains("skips"), "{skipped}");
+
+        let conflicting_listener = rebind_test_listener(
+            generation_one[0].listen_addr,
+            "bind conflicting-generation listener",
+        )
+        .await;
+        let mut conflicting = generation_one[0].clone();
+        set_voter_plan(&mut conflicting, 1, BTreeSet::from([1, 3]));
+        let conflicting = ClusterRaftRuntime::start_on_listener(
+            contexts[0].clone(),
+            conflicting,
+            conflicting_listener,
+        )
+        .await
+        .expect_err("reused voter generation with another target must fail closed");
+        assert!(
+            conflicting.to_string().contains("different target"),
+            "{conflicting}"
+        );
+
+        let drift_listener = rebind_test_listener(
+            generation_one[0].listen_addr,
+            "bind transport-drift listener",
+        )
+        .await;
+        let mut transport_drift = generation_one[0].clone();
+        let mut unexpected = transport_drift
+            .members
+            .get(&3)
+            .expect("third trusted member")
+            .clone();
+        unexpected.endpoint = "127.0.0.1:65500".into();
+        unexpected.server_name = "node-4.agentos.test".into();
+        unexpected.tls_certificate_sha256 = "a".repeat(64);
+        unexpected.tls_client_certificate_sha256 = "b".repeat(64);
+        unexpected.identity_public_key = "c".repeat(64);
+        transport_drift.members.insert(4, unexpected);
+        let drift_digest = configured_transport_catalog_sha256(&transport_drift.members);
+        transport_drift
+            .transport_catalog_sha256
+            .clone_from(&drift_digest);
+        for member in transport_drift.members.values_mut() {
+            member.transport_catalog_sha256.clone_from(&drift_digest);
+        }
+        let transport_drift = ClusterRaftRuntime::start_on_listener(
+            contexts[0].clone(),
+            transport_drift,
+            drift_listener,
+        )
+        .await
+        .expect_err("transport-catalog additions require a separate trust protocol");
+        assert!(
+            transport_drift
+                .to_string()
+                .contains("transport catalog differs"),
+            "{transport_drift}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2610,9 +3528,11 @@ mod tests {
             "configured live application endpoints must still match durable membership"
         );
 
-        let restarted_listener = TcpListener::bind(configs[first_leader_index].listen_addr)
-            .await
-            .expect("rebind first leader address");
+        let restarted_listener = rebind_test_listener(
+            configs[first_leader_index].listen_addr,
+            "rebind first leader address",
+        )
+        .await;
         runtimes[first_leader_index] = Some(
             ClusterRaftRuntime::start_on_listener(
                 contexts[first_leader_index].clone(),
@@ -2907,9 +3827,17 @@ mod tests {
             .await
             .expect("restart exact configured runtime")
             .expect("enabled runtime");
-        assert!(
-            validate_durable_membership(&restarted.metrics().borrow(), &restarted.members)
-                .expect("validate restart membership")
+        assert_eq!(
+            inspect_durable_membership(
+                &restarted.metrics().borrow(),
+                &restarted.members,
+                &restarted.transport_catalog_sha256,
+                &restarted.voter_ids,
+                restarted.voter_set_generation,
+                &restarted.voter_set_sha256,
+            )
+            .expect("validate restart membership"),
+            DurableMembershipProgress::Settled
         );
         restarted.shutdown().await.expect("shutdown restart");
         drop(restart_context);
@@ -2926,7 +3854,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("does not exactly match cluster_raft.members"),
+                .contains("differs from its trusted transport identity"),
             "{error}"
         );
     }

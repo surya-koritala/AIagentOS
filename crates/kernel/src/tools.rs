@@ -616,23 +616,25 @@ impl ToolRegistry {
                 binding.security.action.as_str(),
             ));
         }
-        if matches!(
+        if (matches!(
             binding.security.action,
             SecurityAction::Delete | SecurityAction::BrowserAutomation
-        ) && binding.security.approval_policy == ApprovalPolicy::None
+        ) || binding.resource_type == ResourceType::Peripheral)
+            && binding.security.approval_policy == ApprovalPolicy::None
         {
             return Err(ToolRegistrationError::MissingApproval(
                 binding.security.action.as_str(),
             ));
         }
-        if matches!(
+        if (matches!(
             binding.security.action,
             SecurityAction::Execute
                 | SecurityAction::Delete
                 | SecurityAction::PackageInstall
                 | SecurityAction::BrowserAutomation
                 | SecurityAction::CredentialAccess
-        ) && binding.security.sandbox_requirement != SandboxRequirement::Required
+        ) || binding.resource_type == ResourceType::Peripheral)
+            && binding.security.sandbox_requirement != SandboxRequirement::Required
         {
             return Err(ToolRegistrationError::MissingSandbox(
                 binding.security.action.as_str(),
@@ -1381,13 +1383,24 @@ mod tests {
                 ToolSecurity::argument(action, "resource"),
             ),
         };
+        let security = complete_security(security);
+        let security = if resource_type == ResourceType::Peripheral {
+            let security = if security.approval_policy == ApprovalPolicy::None {
+                security.with_approval(ApprovalPolicy::User)
+            } else {
+                security
+            };
+            security.sandboxed()
+        } else {
+            security
+        };
         ToolBinding {
             name: format!("{resource_type:?}-{operation}-{}", action.as_str()),
             description: "operation/action validation fixture".into(),
             parameters_schema,
             resource_type,
             operation: operation.into(),
-            security: complete_security(security),
+            security,
         }
     }
 

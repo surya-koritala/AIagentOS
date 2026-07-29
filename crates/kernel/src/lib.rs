@@ -1216,6 +1216,25 @@ fn crash_live_erasure_after_step_for_test(step: &str) {
 #[cfg(not(test))]
 fn crash_live_erasure_after_step_for_test(_step: &str) {}
 
+/// Non-secret local-operator projection of one exact, single-use tool grant.
+///
+/// This is intentionally absent from remote wire, SDK, package, and MCP
+/// surfaces. The resource is an opaque digest so a visible approval indicator
+/// does not retain or disclose device names, paths, URLs, or typed inputs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolApprovalState {
+    /// Exact agent that would consume the grant.
+    pub agent_id: AgentId,
+    /// Registered tool name.
+    pub tool_name: String,
+    /// Opaque SHA-256 identity of the exact target.
+    pub resource_identity: String,
+    /// Minimum local human authority required by the tool declaration.
+    pub required_policy: crate::tools::ApprovalPolicy,
+    /// Whether a matching unconsumed grant is currently pending.
+    pub granted: bool,
+}
+
 impl AgentKernelImpl {
     const WATCHDOG_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
     #[cfg(not(test))]
@@ -1845,6 +1864,78 @@ impl AgentKernelImpl {
             )));
         }
         Ok(())
+    }
+
+    /// Return the non-secret status of one exact local approval target.
+    pub fn tool_call_approval_state(
+        &self,
+        agent_id: AgentId,
+        tool_name: &str,
+        arguments: &serde_json::Value,
+    ) -> Result<ToolApprovalState, KernelError> {
+        let prepared = self
+            .tool_registry
+            .prepare_execution(agent_id, tool_name, arguments)
+            .map_err(KernelError::Policy)?;
+        let required = prepared.authorization.security.approval_policy;
+        if required == crate::tools::ApprovalPolicy::None {
+            return Err(KernelError::Policy(format!(
+                "tool '{tool_name}' does not require approval"
+            )));
+        }
+        let resource_identity =
+            crate::resources::opaque_identity(prepared.authorization.resource.as_bytes());
+        let granted = self
+            .syscall_gate
+            .tool_approval_granted_contract(
+                agent_id,
+                tool_name,
+                &prepared.authorization.resource,
+                &prepared.approval_contract_digest,
+                required,
+            )
+            .ok_or_else(|| {
+                KernelError::Policy(format!(
+                    "cannot inspect tool approval for unknown agent {agent_id}"
+                ))
+            })?;
+        Ok(ToolApprovalState {
+            agent_id,
+            tool_name: tool_name.to_string(),
+            resource_identity,
+            required_policy: required,
+            granted,
+        })
+    }
+
+    /// Revoke one exact, unconsumed approval from the trusted local UI.
+    pub fn revoke_tool_call_approval(
+        &self,
+        agent_id: AgentId,
+        tool_name: &str,
+        arguments: &serde_json::Value,
+    ) -> Result<bool, KernelError> {
+        let prepared = self
+            .tool_registry
+            .prepare_execution(agent_id, tool_name, arguments)
+            .map_err(KernelError::Policy)?;
+        if prepared.authorization.security.approval_policy == crate::tools::ApprovalPolicy::None {
+            return Err(KernelError::Policy(format!(
+                "tool '{tool_name}' does not require approval"
+            )));
+        }
+        self.syscall_gate
+            .revoke_tool_approval_contract(
+                agent_id,
+                tool_name,
+                &prepared.authorization.resource,
+                &prepared.approval_contract_digest,
+            )
+            .ok_or_else(|| {
+                KernelError::Policy(format!(
+                    "cannot revoke tool approval for unknown agent {agent_id}"
+                ))
+            })
     }
 
     /// Resolve the (Agent, Tool) namespaces for a group, creating them lazily.
@@ -7501,6 +7592,63 @@ mod tests {
                 crate::syscall_gate::GateDenial::ApprovalRequired { .. }
             ))
         ));
+        let initial = kernel
+            .tool_call_approval_state(agent, "run_command", &arguments)
+            .unwrap();
+        assert!(!initial.granted);
+        assert_eq!(initial.required_policy, crate::tools::ApprovalPolicy::User);
+        assert!(!initial.resource_identity.contains("echo"));
+        kernel
+            .approve_tool_call(
+                agent,
+                "run_command",
+                &arguments,
+                crate::tools::ApprovalPolicy::User,
+            )
+            .unwrap();
+        assert!(
+            kernel
+                .tool_call_approval_state(agent, "run_command", &arguments)
+                .unwrap()
+                .granted
+        );
+        let different_arguments = serde_json::json!({"command": "echo", "args": ["different"]});
+        assert!(
+            !kernel
+                .tool_call_approval_state(agent, "run_command", &different_arguments)
+                .unwrap()
+                .granted
+        );
+        assert!(!kernel
+            .revoke_tool_call_approval(agent, "run_command", &different_arguments)
+            .unwrap());
+        assert!(
+            kernel
+                .tool_call_approval_state(agent, "run_command", &arguments)
+                .unwrap()
+                .granted
+        );
+        assert!(kernel
+            .revoke_tool_call_approval(agent, "run_command", &arguments)
+            .unwrap());
+        assert!(
+            !kernel
+                .tool_call_approval_state(agent, "run_command", &arguments)
+                .unwrap()
+                .granted
+        );
+        assert!(!kernel
+            .revoke_tool_call_approval(agent, "run_command", &arguments)
+            .unwrap());
+        assert!(matches!(
+            kernel
+                .tool_registry
+                .authorize_and_acquire_call(&kernel.syscall_gate, agent, "run_command", &arguments)
+                .await,
+            Err(crate::tools::ToolAuthorizationError::Denied(
+                crate::syscall_gate::GateDenial::ApprovalRequired { .. }
+            ))
+        ));
         kernel
             .approve_tool_call(
                 agent,
@@ -7515,6 +7663,12 @@ mod tests {
             .await
             .unwrap();
         drop(guard);
+        assert!(
+            !kernel
+                .tool_call_approval_state(agent, "run_command", &arguments)
+                .unwrap()
+                .granted
+        );
     }
 
     #[tokio::test]

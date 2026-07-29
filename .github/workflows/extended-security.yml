@@ -239,6 +239,29 @@ jobs:
         run: |
           npm ci
           npx --no-install playwright install --with-deps chromium
+      - name: Allow Chromium's user-namespace sandbox through AppArmor
+        run: |
+          set -euo pipefail
+          browser_executable="$(
+            find "${HOME}/.cache/ms-playwright" -type f \
+              -name chrome-headless-shell -perm -u+x -print -quit
+          )"
+          test -n "${browser_executable}"
+          profile=/etc/apparmor.d/agentos-chromium-qualification
+          {
+            printf 'abi <abi/4.0>,\n\n'
+            printf 'include <tunables/global>\n\n'
+            printf '%s flags=(unconfined) {\n' "${browser_executable}"
+            printf '  userns,\n'
+            printf '}\n'
+          } | sudo tee "${profile}" >/dev/null
+          sudo apparmor_parser -r "${profile}"
+          sudo grep -F "${browser_executable} (unconfined)" \
+            /sys/kernel/security/apparmor/profiles
+          printf 'AGENTOS_QUALIFICATION_CHROME=%s\n' "${browser_executable}" \
+            >> "${GITHUB_ENV}"
+          printf 'AGENTOS_QUALIFICATION_APPARMOR_PROFILE=%s\n' "${profile}" \
+            >> "${GITHUB_ENV}"
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - name: Exercise exact live provider and trusted-browser paths
         run: |
@@ -274,13 +297,15 @@ jobs:
             capability_registry::provider_matrix_names_every_resource_provider_status_and_platform_contract \
             provider-matrix
           browser_test=playwright::tests::live_browser_denies_downloads_isolates_sessions_and_removes_profiles
-          browser_executable="$(
-            find "${HOME}/.cache/ms-playwright" -type f \
-              -name chrome-headless-shell -perm -u+x -print -quit
-          )"
-          test -n "${browser_executable}"
+          browser_executable="${AGENTOS_QUALIFICATION_CHROME}"
+          browser_profile="${AGENTOS_QUALIFICATION_APPARMOR_PROFILE}"
+          test -x "${browser_executable}"
+          test -f "${browser_profile}"
           {
             printf 'browser_sha256=%s\n' "$(sha256sum "${browser_executable}" | cut -d ' ' -f 1)"
+            printf 'browser_userns_profile_sha256=%s\n' \
+              "$(sha256sum "${browser_profile}" | cut -d ' ' -f 1)"
+            printf 'browser_sandbox=userns_apparmor_profile\n'
             "${browser_executable}" --version
             env AGENTOS_TEST_CHROME="${browser_executable}" \
               cargo test -p resources --features browser --locked "${browser_test}" \
@@ -289,6 +314,10 @@ jobs:
       - name: Derive exact-source core provider evidence from test events
         run: |
           grep -Eq '^browser_sha256=[0-9a-f]{64}$' \
+            target/qualification/provider-core-logs/browser-profile.log
+          grep -Eq '^browser_userns_profile_sha256=[0-9a-f]{64}$' \
+            target/qualification/provider-core-logs/browser-profile.log
+          grep -Fx 'browser_sandbox=userns_apparmor_profile' \
             target/qualification/provider-core-logs/browser-profile.log
           grep -Eq '^(Google Chrome for Testing|Chromium) [0-9]' \
             target/qualification/provider-core-logs/browser-profile.log

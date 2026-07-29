@@ -19,6 +19,12 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
   teardown purges them. Capture, audio, print, and every kernel peripheral
   provider remain unavailable until a platform backend supplies active-use
   indicators and qualification.
+- The protected Linux browser qualification now installs an exact-path
+  AppArmor profile granting only the `userns` permission Chromium needs for its
+  native process sandbox. This fixes Ubuntu 24.04 hosted-runner launch failure
+  without adding `--no-sandbox`; retained evidence records the browser and
+  profile SHA-256 values.
+
 - Expanded the protected exact-commit provider-security workflow from a
   browser-unavailable assertion to a real two-profile Chromium qualification.
   The lockfile-pinned browser fixture proves cookies do not cross isolated

@@ -1,7 +1,9 @@
 [
   {
+    "agent_id": null,
     "name": "fixture",
     "op": "create_agent",
+    "ownership_proof": null,
     "priority": 1,
     "profile": "fixture",
     "provider": "fixture",
@@ -315,6 +317,11 @@
     "agent_id": "00000000-0000-0000-0000-000000000001",
     "op": "get_cluster_agent_ownership",
     "require_active": true
+  },
+  {
+    "after_agent_id": null,
+    "limit": 1,
+    "op": "list_cluster_agent_ownerships"
   },
   {
     "agent_id": null,

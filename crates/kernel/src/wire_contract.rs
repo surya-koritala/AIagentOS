@@ -155,6 +155,8 @@ const REQUEST_VARIANTS: &[Variant] = &[
     Variant {
         tag: "create_agent",
         fields: &[
+            Field::optional("agent_id", N),
+            Field::optional("ownership_proof", ON),
             Field::required("name", S),
             Field::required("task", S),
             Field::optional("provider", S),
@@ -510,6 +512,13 @@ const REQUEST_VARIANTS: &[Variant] = &[
         ],
     },
     Variant {
+        tag: "list_cluster_agent_ownerships",
+        fields: &[
+            Field::optional("after_agent_id", N),
+            Field::optional("limit", I),
+        ],
+    },
+    Variant {
         tag: "list_cluster_agent_ownership_audit",
         fields: &[Field::optional("agent_id", N), Field::optional("limit", I)],
     },
@@ -677,6 +686,7 @@ pub fn conformance_request_fixtures(protocol_version: u32) -> Result<Vec<Value>,
                         | "renew_cluster_agent_ownership"
                         | "release_cluster_agent_ownership"
                         | "get_cluster_agent_ownership"
+                        | "list_cluster_agent_ownerships"
                         | "list_cluster_agent_ownership_audit"
                         | "install_agent_mutation_fence"
                         | "retire_agent_mutation_fence"
@@ -689,6 +699,12 @@ pub fn conformance_request_fixtures(protocol_version: u32) -> Result<Vec<Value>,
             let mut request = Map::new();
             request.insert("op".into(), Value::String(variant.tag.into()));
             for field in variant.fields {
+                if protocol_version == 1
+                    && variant.tag == "create_agent"
+                    && matches!(field.name, "agent_id" | "ownership_proof")
+                {
+                    continue;
+                }
                 let value = match (field.name, field.kind) {
                     ("protocol_version", JsonKind::Integer) => {
                         Value::Number(protocol_version.into())
@@ -1015,6 +1031,10 @@ const REPLY_VARIANTS: &[Variant] = &[
     Variant {
         tag: "cluster_agent_ownership",
         fields: &[Field::optional("ownership", JsonKind::ObjectOrNull)],
+    },
+    Variant {
+        tag: "cluster_agent_ownerships",
+        fields: &[Field::required("ownerships", A)],
     },
     Variant {
         tag: "cluster_agent_ownership_audit",
@@ -1423,7 +1443,7 @@ mod tests {
             }
         }
         assert_eq!(conformance_request_fixtures(1).unwrap().len(), 61);
-        assert_eq!(conformance_request_fixtures(2).unwrap().len(), 87);
+        assert_eq!(conformance_request_fixtures(2).unwrap().len(), 88);
         assert!(conformance_request_fixtures(0).is_err());
         assert!(conformance_request_fixtures(PROTOCOL_VERSION + 1).is_err());
     }

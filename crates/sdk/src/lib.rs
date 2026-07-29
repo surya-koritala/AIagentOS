@@ -92,12 +92,23 @@ pub struct ConfirmBackupRetention(());
 
 pub const CONFIRM_BACKUP_RETENTION: ConfirmBackupRetention = ConfirmBackupRetention(());
 
+/// Authority-reserved identity and exact destination proof used for one
+/// fail-closed managed creation.
+#[derive(Clone)]
+pub struct ReservedAgentIdentity {
+    /// Canonical UUID committed by the authority reservation.
+    pub agent_id: String,
+    /// Exact active fence already installed on the selected destination.
+    pub ownership_proof: AgentMutationFenceProof,
+}
+
 pub mod cluster;
 pub mod patterns;
 
 pub use cluster::{
-    ClusterClient, NodeHandle, PlacedAgent, Placement, PlacementConstraints,
-    DEFAULT_OWNERSHIP_LEASE_SECONDS,
+    ClusterClient, ClusterMaintenanceConfig, ClusterMaintenanceStatus, ClusterReconciliationReport,
+    NodeHandle, PlacedAgent, Placement, PlacementConstraints, DEFAULT_OWNERSHIP_LEASE_SECONDS,
+    DEFAULT_OWNERSHIP_RENEW_INTERVAL,
 };
 pub use patterns::{
     Decision, DirectiveReasoner, FnPlanner, PlanRun, Planner, PlannerExecutor, ReActLoop,
@@ -628,7 +639,45 @@ impl KernelClient {
         profile: Option<String>,
         priority: Option<u8>,
     ) -> Result<String, SdkError> {
+        self.create_agent_request(None, name, task, provider, profile, priority)
+            .await
+    }
+
+    /// Create an agent using an authority-reserved UUID and its exact
+    /// preinstalled destination fence.
+    pub async fn create_agent_with_id(
+        &mut self,
+        reservation: ReservedAgentIdentity,
+        name: impl Into<String>,
+        task: impl Into<String>,
+        provider: Option<String>,
+        profile: Option<String>,
+        priority: Option<u8>,
+    ) -> Result<String, SdkError> {
+        self.create_agent_request(Some(reservation), name, task, provider, profile, priority)
+            .await
+    }
+
+    async fn create_agent_request(
+        &mut self,
+        reservation: Option<ReservedAgentIdentity>,
+        name: impl Into<String>,
+        task: impl Into<String>,
+        provider: Option<String>,
+        profile: Option<String>,
+        priority: Option<u8>,
+    ) -> Result<String, SdkError> {
+        let (agent_id, ownership_proof) = reservation
+            .map(|reservation| {
+                (
+                    Some(reservation.agent_id),
+                    Some(reservation.ownership_proof),
+                )
+            })
+            .unwrap_or((None, None));
         let call = Syscall::CreateAgent {
+            agent_id,
+            ownership_proof,
             name: name.into(),
             task: task.into(),
             provider: provider.unwrap_or_else(|| "stub".to_string()),
@@ -1582,6 +1631,24 @@ impl KernelClient {
                 ownership: Some(ownership),
             } => Ok(ownership),
             other => Err(unexpected("active ClusterAgentOwnership", &other)),
+        }
+    }
+
+    /// Page through the authority's complete durable ownership directory.
+    pub async fn cluster_agent_ownerships(
+        &mut self,
+        after_agent_id: Option<String>,
+        limit: usize,
+    ) -> Result<Vec<ClusterAgentOwnership>, SdkError> {
+        match self
+            .call(Syscall::ListClusterAgentOwnerships {
+                after_agent_id,
+                limit,
+            })
+            .await?
+        {
+            SyscallReply::ClusterAgentOwnerships { ownerships } => Ok(ownerships),
+            other => Err(unexpected("ClusterAgentOwnerships", &other)),
         }
     }
 
@@ -2552,6 +2619,7 @@ fn safe_to_replay_after_reconnect(call: &Syscall) -> bool {
             | Syscall::GetClusterMembership
             | Syscall::ListClusterMembershipAudit { .. }
             | Syscall::GetClusterAgentOwnership { .. }
+            | Syscall::ListClusterAgentOwnerships { .. }
             | Syscall::ListClusterAgentOwnershipAudit { .. }
             | Syscall::GetAgentMutationFence { .. }
             | Syscall::ListAgentMutationFenceAudit { .. }

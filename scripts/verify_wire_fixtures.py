@@ -32,6 +32,7 @@ V2_ONLY_OPERATIONS = {
     "get_agent_mutation_fence",
     "install_agent_mutation_fence",
     "issue_cluster_join_challenge",
+    "list_cluster_agent_ownerships",
     "list_cluster_agent_ownership_audit",
     "list_cluster_membership_audit",
     "list_agent_mutation_fence_audit",

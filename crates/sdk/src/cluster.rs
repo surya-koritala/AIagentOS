@@ -242,6 +242,70 @@ impl ClusterClient {
             .await
     }
 
+    /// Stage a replacement application-listener certificate while connected
+    /// to the node through its currently authorized leaf.
+    ///
+    /// After this succeeds, reconnect to the candidate leaf and call
+    /// [`Self::admit_node`] with the returned member generation to activate it.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn prepare_node_certificate_rollout(
+        authority: &mut KernelClient,
+        node: &mut KernelClient,
+        endpoint: impl Into<String>,
+        next_tls_server_certificate_fingerprint: impl Into<String>,
+        expected_generation: u64,
+        prepare_ttl_seconds: u64,
+        minimum_overlap_seconds: u64,
+        reason: impl Into<String>,
+    ) -> Result<(ClusterMember, crate::ClusterCertificateRollout), SdkError> {
+        let challenge = authority.issue_cluster_join_challenge(30).await?;
+        let load = node.node_info().await?;
+        let control = load.control.ok_or_else(|| {
+            SdkError::Kernel("certificate rollout requires durable node identity support".into())
+        })?;
+        let protocol = node.hello().await?;
+        let registration = ClusterMemberRegistration {
+            node_id: control.identity.node_id,
+            fingerprint: control.identity.fingerprint,
+            public_key: control.identity.public_key,
+            tls_server_certificate_fingerprint: Some(
+                next_tls_server_certificate_fingerprint.into(),
+            ),
+            endpoint: endpoint.into(),
+            server_version: protocol.server_version,
+            min_protocol_version: protocol.min_protocol_version,
+            protocol_version: protocol.protocol_version,
+        };
+        let payload = kernel::cluster_control::membership_join_payload(
+            &challenge.cluster_id,
+            &challenge.challenge_hex,
+            &registration,
+        )
+        .map_err(|error| SdkError::Kernel(error.to_string()))?;
+        let proof = node.prove_node_identity(hex_encode(&payload)).await?;
+        if proof.node_id != registration.node_id
+            || proof.fingerprint != registration.fingerprint
+            || proof.public_key != registration.public_key
+        {
+            return Err(SdkError::Wire {
+                code: WireErrorCode::Conflict,
+                message: "node identity changed while preparing certificate rollout".into(),
+                retryable: false,
+            });
+        }
+        authority
+            .prepare_cluster_member_certificate_rollout(
+                registration,
+                challenge.challenge_hex,
+                proof.signature_hex,
+                expected_generation,
+                prepare_ttl_seconds,
+                minimum_overlap_seconds,
+                reason,
+            )
+            .await
+    }
+
     /// Connect to every node, prove each durable identity, reject duplicates,
     /// and reconstruct the ownership directory from durable node listings.
     pub async fn connect(addrs: &[String]) -> Result<Self, SdkError> {
@@ -303,6 +367,7 @@ impl ClusterClient {
         cluster.validate_membership(&snapshot)?;
         let confirmed = authority.cluster_membership().await?;
         ensure_unchanged_membership(&snapshot, &confirmed)?;
+        cluster.validate_membership(&confirmed)?;
         cluster.authority = Some(ClusterAuthority {
             client: authority,
             cluster_id: confirmed.cluster_id,
@@ -357,6 +422,7 @@ impl ClusterClient {
         cluster.validate_membership(&snapshot)?;
         let confirmed = authority.cluster_membership().await?;
         ensure_unchanged_membership(&snapshot, &confirmed)?;
+        cluster.validate_membership(&confirmed)?;
         cluster.authority = Some(ClusterAuthority {
             client: authority,
             cluster_id: confirmed.cluster_id,
@@ -1426,6 +1492,18 @@ impl ClusterClient {
                 false,
             ));
         }
+        let mut rollouts = HashMap::new();
+        for rollout in &snapshot.certificate_rollouts {
+            if rollouts.insert(rollout.node_id.as_str(), rollout).is_some() {
+                return Err(membership_conflict(
+                    format!(
+                        "authority advertised duplicate certificate rollouts for node {}",
+                        rollout.node_id
+                    ),
+                    false,
+                ));
+            }
+        }
         for node in &self.nodes {
             let Some(member) = active.get(node.id.as_str()) else {
                 return Err(membership_conflict(
@@ -1436,9 +1514,14 @@ impl ClusterClient {
                     false,
                 ));
             };
+            let tls_matches = tls_binding_is_authorized(
+                node.tls_server_certificate_fingerprint.as_deref(),
+                member.tls_server_certificate_fingerprint.as_deref(),
+                rollouts.get(node.id.as_str()).copied(),
+                snapshot.authority_time,
+            );
             if node.fingerprint.as_deref() != Some(member.fingerprint.as_str())
-                || node.tls_server_certificate_fingerprint.as_deref()
-                    != member.tls_server_certificate_fingerprint.as_deref()
+                || !tls_matches
                 || node.address != member.endpoint
             {
                 return Err(membership_conflict(
@@ -1700,6 +1783,8 @@ fn ensure_unchanged_membership(
 ) -> Result<(), SdkError> {
     if initial.cluster_id != confirmed.cluster_id
         || initial.generation != confirmed.generation
+        || initial.tls_trust_generation != confirmed.tls_trust_generation
+        || initial.certificate_rollouts != confirmed.certificate_rollouts
         || initial.members != confirmed.members
     {
         return Err(membership_conflict(
@@ -1815,6 +1900,20 @@ fn ownership_proof(cluster_id: &str, ownership: &ClusterAgentOwnership) -> Agent
     }
 }
 
+fn tls_binding_is_authorized(
+    observed: Option<&str>,
+    current: Option<&str>,
+    rollout: Option<&crate::ClusterCertificateRollout>,
+    authority_time: Option<chrono::DateTime<chrono::Utc>>,
+) -> bool {
+    observed == current
+        || observed.zip(rollout).zip(authority_time).is_some_and(
+            |((fingerprint, rollout), authority_time)| {
+                rollout.accepts_fingerprint(fingerprint, authority_time)
+            },
+        )
+}
+
 fn destination_fence_matches(
     agent_id: &str,
     proof: &AgentMutationFenceProof,
@@ -1893,4 +1992,77 @@ fn hex_decode(value: &str) -> Option<Vec<u8>> {
             u8::from_str_radix(pair, 16).ok()
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{ClusterCertificateRollout, ClusterCertificateRolloutPhase};
+
+    #[test]
+    fn discovery_uses_replicated_time_and_fails_closed_outside_rollout_windows() {
+        let now = chrono::Utc::now();
+        let old_tls = "a".repeat(64);
+        let next_tls = "b".repeat(64);
+        let mut rollout = ClusterCertificateRollout {
+            node_id: uuid::Uuid::new_v4().to_string(),
+            trust_generation: 1,
+            member_generation: 2,
+            phase: ClusterCertificateRolloutPhase::Prepared,
+            previous_tls_server_certificate_fingerprint: old_tls.clone(),
+            next_tls_server_certificate_fingerprint: next_tls.clone(),
+            minimum_overlap_seconds: 5,
+            prepare_expires_at: now + chrono::TimeDelta::seconds(5),
+            retire_previous_after: None,
+            prepared_at: now,
+            updated_at: now,
+            reason: "test".into(),
+        };
+        assert!(tls_binding_is_authorized(
+            Some(&next_tls),
+            Some(&old_tls),
+            Some(&rollout),
+            Some(now)
+        ));
+        assert!(!tls_binding_is_authorized(
+            Some(&next_tls),
+            Some(&old_tls),
+            Some(&rollout),
+            None
+        ));
+        assert!(!tls_binding_is_authorized(
+            Some(&next_tls),
+            Some(&old_tls),
+            Some(&rollout),
+            Some(rollout.prepare_expires_at)
+        ));
+        assert!(tls_binding_is_authorized(
+            Some(&old_tls),
+            Some(&old_tls),
+            Some(&rollout),
+            Some(rollout.prepare_expires_at)
+        ));
+
+        rollout.phase = ClusterCertificateRolloutPhase::Activated;
+        rollout.member_generation = 3;
+        rollout.retire_previous_after = Some(now + chrono::TimeDelta::seconds(10));
+        assert!(tls_binding_is_authorized(
+            Some(&old_tls),
+            Some(&next_tls),
+            Some(&rollout),
+            Some(now + chrono::TimeDelta::seconds(9))
+        ));
+        assert!(!tls_binding_is_authorized(
+            Some(&old_tls),
+            Some(&next_tls),
+            Some(&rollout),
+            rollout.retire_previous_after
+        ));
+        assert!(tls_binding_is_authorized(
+            Some(&next_tls),
+            Some(&next_tls),
+            Some(&rollout),
+            rollout.retire_previous_after
+        ));
+    }
 }

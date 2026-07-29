@@ -22,11 +22,13 @@ from urllib.parse import urlparse
 MAX_FRAME_BYTES = 8 * 1024 * 1024
 SUPPORTED_VERSIONS = (1, 2)
 V2_ONLY_OPERATIONS = {
+    "abort_cluster_member_certificate_rollout",
     "cancel_request",
     "claim_cluster_agent_ownership",
     "enforce_storage_backup_retention",
     "erase_data",
     "fenced_agent_mutation",
+    "finalize_cluster_member_certificate_rollout",
     "get_cluster_agent_ownership",
     "get_cluster_membership",
     "get_agent_mutation_fence",
@@ -34,11 +36,13 @@ V2_ONLY_OPERATIONS = {
     "issue_cluster_join_challenge",
     "list_cluster_agent_ownerships",
     "list_cluster_agent_ownership_audit",
+    "list_cluster_certificate_rollout_audit",
     "list_cluster_membership_audit",
     "list_agent_mutation_fence_audit",
     "list_node_control_audit",
     "ping",
     "prove_node_identity",
+    "prepare_cluster_member_certificate_rollout",
     "register_cluster_member",
     "release_cluster_agent_ownership",
     "retire_agent_mutation_fence",

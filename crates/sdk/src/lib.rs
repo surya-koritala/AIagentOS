@@ -44,7 +44,8 @@ use tokio::net::ToSocketAddrs;
 // SDK consumers can name them without depending on the kernel directly.
 pub use kernel::cluster_control::{
     AgentMutationFence, AgentMutationFenceAudit, AgentMutationFenceState, ClusterAgentOwnership,
-    ClusterAgentOwnershipAudit, ClusterJoinChallenge, ClusterMember, ClusterMemberRegistration,
+    ClusterAgentOwnershipAudit, ClusterCertificateRollout, ClusterCertificateRolloutAudit,
+    ClusterCertificateRolloutPhase, ClusterJoinChallenge, ClusterMember, ClusterMemberRegistration,
     ClusterMemberState, ClusterMembershipAudit, ClusterMembershipSnapshot, ClusterOwnershipState,
     NodeAvailability, NodeControlAudit, NodeControlStatus, NodeIdentity, NodeProfile,
 };
@@ -1572,6 +1573,142 @@ impl KernelClient {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub async fn prepare_cluster_member_certificate_rollout(
+        &mut self,
+        registration: ClusterMemberRegistration,
+        challenge_hex: impl Into<String>,
+        signature_hex: impl Into<String>,
+        expected_generation: u64,
+        prepare_ttl_seconds: u64,
+        minimum_overlap_seconds: u64,
+        reason: impl Into<String>,
+    ) -> Result<(ClusterMember, ClusterCertificateRollout), SdkError> {
+        self.prepare_cluster_member_certificate_rollout_with_operation_id(
+            uuid::Uuid::new_v4().to_string(),
+            registration,
+            challenge_hex,
+            signature_hex,
+            expected_generation,
+            prepare_ttl_seconds,
+            minimum_overlap_seconds,
+            reason,
+        )
+        .await
+    }
+
+    /// Stage a candidate using a caller-stable UUID for exact retry.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn prepare_cluster_member_certificate_rollout_with_operation_id(
+        &mut self,
+        operation_id: impl Into<String>,
+        registration: ClusterMemberRegistration,
+        challenge_hex: impl Into<String>,
+        signature_hex: impl Into<String>,
+        expected_generation: u64,
+        prepare_ttl_seconds: u64,
+        minimum_overlap_seconds: u64,
+        reason: impl Into<String>,
+    ) -> Result<(ClusterMember, ClusterCertificateRollout), SdkError> {
+        match self
+            .call(Syscall::PrepareClusterMemberCertificateRollout {
+                operation_id: Some(operation_id.into()),
+                registration,
+                challenge_hex: challenge_hex.into(),
+                signature_hex: signature_hex.into(),
+                expected_generation,
+                prepare_ttl_seconds,
+                minimum_overlap_seconds,
+                reason: reason.into(),
+            })
+            .await?
+        {
+            SyscallReply::ClusterCertificateRolloutUpdated {
+                member,
+                rollout: Some(rollout),
+            } => Ok((member, rollout)),
+            other => Err(unexpected("ClusterCertificateRolloutUpdated", &other)),
+        }
+    }
+
+    pub async fn abort_cluster_member_certificate_rollout(
+        &mut self,
+        node_id: impl Into<String>,
+        expected_generation: u64,
+        reason: impl Into<String>,
+    ) -> Result<ClusterMember, SdkError> {
+        self.abort_cluster_member_certificate_rollout_with_operation_id(
+            uuid::Uuid::new_v4().to_string(),
+            node_id,
+            expected_generation,
+            reason,
+        )
+        .await
+    }
+
+    pub async fn abort_cluster_member_certificate_rollout_with_operation_id(
+        &mut self,
+        operation_id: impl Into<String>,
+        node_id: impl Into<String>,
+        expected_generation: u64,
+        reason: impl Into<String>,
+    ) -> Result<ClusterMember, SdkError> {
+        match self
+            .call(Syscall::AbortClusterMemberCertificateRollout {
+                operation_id: Some(operation_id.into()),
+                node_id: node_id.into(),
+                expected_generation,
+                reason: reason.into(),
+            })
+            .await?
+        {
+            SyscallReply::ClusterCertificateRolloutUpdated {
+                member,
+                rollout: None,
+            } => Ok(member),
+            other => Err(unexpected("ClusterCertificateRolloutUpdated", &other)),
+        }
+    }
+
+    pub async fn finalize_cluster_member_certificate_rollout(
+        &mut self,
+        node_id: impl Into<String>,
+        expected_generation: u64,
+        reason: impl Into<String>,
+    ) -> Result<ClusterMember, SdkError> {
+        self.finalize_cluster_member_certificate_rollout_with_operation_id(
+            uuid::Uuid::new_v4().to_string(),
+            node_id,
+            expected_generation,
+            reason,
+        )
+        .await
+    }
+
+    pub async fn finalize_cluster_member_certificate_rollout_with_operation_id(
+        &mut self,
+        operation_id: impl Into<String>,
+        node_id: impl Into<String>,
+        expected_generation: u64,
+        reason: impl Into<String>,
+    ) -> Result<ClusterMember, SdkError> {
+        match self
+            .call(Syscall::FinalizeClusterMemberCertificateRollout {
+                operation_id: Some(operation_id.into()),
+                node_id: node_id.into(),
+                expected_generation,
+                reason: reason.into(),
+            })
+            .await?
+        {
+            SyscallReply::ClusterCertificateRolloutUpdated {
+                member,
+                rollout: None,
+            } => Ok(member),
+            other => Err(unexpected("ClusterCertificateRolloutUpdated", &other)),
+        }
+    }
+
     pub async fn cluster_membership(&mut self) -> Result<ClusterMembershipSnapshot, SdkError> {
         match self.call(Syscall::GetClusterMembership).await? {
             SyscallReply::ClusterMembership { membership } => Ok(membership),
@@ -1589,6 +1726,19 @@ impl KernelClient {
         {
             SyscallReply::ClusterMembershipAudit { entries } => Ok(entries),
             other => Err(unexpected("ClusterMembershipAudit", &other)),
+        }
+    }
+
+    pub async fn cluster_certificate_rollout_audit(
+        &mut self,
+        limit: usize,
+    ) -> Result<Vec<ClusterCertificateRolloutAudit>, SdkError> {
+        match self
+            .call(Syscall::ListClusterCertificateRolloutAudit { limit })
+            .await?
+        {
+            SyscallReply::ClusterCertificateRolloutAudit { entries } => Ok(entries),
+            other => Err(unexpected("ClusterCertificateRolloutAudit", &other)),
         }
     }
 
@@ -2751,6 +2901,7 @@ fn safe_to_replay_after_reconnect(call: &Syscall) -> bool {
             | Syscall::ListNodeControlAudit { .. }
             | Syscall::GetClusterMembership
             | Syscall::ListClusterMembershipAudit { .. }
+            | Syscall::ListClusterCertificateRolloutAudit { .. }
             | Syscall::GetClusterAgentOwnership { .. }
             | Syscall::ListClusterAgentOwnerships { .. }
             | Syscall::ListClusterAgentOwnershipAudit { .. }

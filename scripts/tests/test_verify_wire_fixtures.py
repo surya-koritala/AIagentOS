@@ -60,7 +60,7 @@ class _ContractHandler(socketserver.StreamRequestHandler):
 
 class WireFixtureTests(unittest.TestCase):
     def test_repository_fixture_sets_are_complete_and_versioned(self):
-        self.assertEqual(validate_versioned_fixtures(REPO_ROOT), {1: 61, 2: 88})
+        self.assertEqual(validate_versioned_fixtures(REPO_ROOT), {1: 61, 2: 92})
         v1 = fixture_operations(load_fixture_set(REPO_ROOT, 1), 1)
         v2 = fixture_operations(load_fixture_set(REPO_ROOT, 2), 2)
         self.assertEqual(v2 - v1, V2_ONLY_OPERATIONS)

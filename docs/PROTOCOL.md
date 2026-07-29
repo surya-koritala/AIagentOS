@@ -51,8 +51,9 @@ Policy authoring is available from the same canonical binary without a server:
 `policy-validate POLICY_FILE` and `policy-explain POLICY_FILE --subject ...
 --action ... --object ...` read a bounded UTF-8 TOML document, use the runtime
 `PolicyDocument`/MAC evaluator, and emit JSON. Live `gate-stats`,
-`node-control-audit [LIMIT]`, and `cluster-membership-audit [LIMIT]` map
-directly to `KernelClient`. Those audit reads remain trusted-system operations:
+`node-control-audit [LIMIT]`, `cluster-membership-audit [LIMIT]`, and
+`cluster-certificate-rollout-audit [LIMIT]` map directly to `KernelClient`.
+Those audit reads remain trusted-system operations:
 tenant credentials are denied even when their role is `Admin`, and denials
 emit no audit payload.
 
@@ -130,9 +131,9 @@ compatibility behavior, and transport limits:
 
 The schemas use JSON Schema draft 2020-12 and cover every top-level request,
 reply, and stream-event tag. The authorization/schema regression constructs
-all 88 current syscalls and rejects either a missing schema operation or an
+all 92 current syscalls and rejects either a missing schema operation or an
 undocumented extra. Deterministic golden request arrays cover all 61 v1
-operations and all 88 v2 operations. Domain payload examples and
+operations and all 92 v2 operations. Domain payload examples and
 previous-version shapes are retained under `protocol/`.
 
 ## Compatibility policy
@@ -485,17 +486,53 @@ system authentication token and mutual TLS.
    identity cannot rejoin.
 
 `get_cluster_membership` returns one atomic cluster ID/generation/member
-snapshot. `ClusterClient::connect_discovered_authenticated` and its TLS variant
+snapshot, including replicated authority time and any bounded certificate
+rollout. `ClusterClient::connect_discovered_authenticated` and its TLS variant
 dial only active endpoints, prove every identity, require exact endpoint and
 application-identity fingerprint matches, and require the observed TLS leaf to
-match the signed membership record, then re-read the authority. A fresh
-challenged re-admission by the same durable identity may rotate that leaf; once
-TLS-bound, the identity cannot re-admit without a TLS certificate binding. If
-membership changed while connections were assembled, construction fails with
-a retryable `conflict`. Membership audit records the previous and current TLS
-leaf fingerprints for every join, rotation, leave, or revocation.
+match the current record or its unexpired replicated rollout, then re-read the
+authority. If membership or TLS trust generation changed while connections
+were assembled, construction fails with a retryable `conflict`. Membership
+audit records the previous and current TLS leaf fingerprints for every join,
+rollout transition, leave, or revocation.
 The authority identity, membership, generations, and audit survive authority
 restart.
+
+When `[cluster_raft]` is enabled, an active TLS-bound member cannot replace its
+leaf through a direct re-registration. The staged workflow is:
+
+1. While connected through the current leaf, request a fresh join challenge
+   and have the durable node identity sign a registration containing the
+   candidate fingerprint. `ClusterClient::prepare_node_certificate_rollout`
+   performs this proof flow.
+2. Commit `prepare_cluster_member_certificate_rollout` with exact member
+   generation, a 5–3600 second candidate lifetime, and a 5–3600 second minimum
+   overlap. The current leaf remains valid. The candidate is valid only before
+   the replicated `prepare_expires_at`; expiry narrows trust without another
+   write.
+3. Deploy/reload the candidate listener, connect through it, obtain another
+   fresh challenge, and call the normal challenged registration with the
+   generation returned by prepare. This atomically makes the candidate current
+   and sets `retire_previous_after`.
+4. During the overlap, new startup/discovery validation accepts either current
+   or previous leaf. At the retirement instant it rejects the previous leaf.
+   Existing transport sessions must still be drained by the listener reload
+   mechanism. Finalization removes the completed rollout and is rejected before
+   that instant. Abort is available only while prepared.
+
+Every transition advances membership and TLS trust generations and appends
+durable audit evidence. Candidate fingerprints must be new, distinct,
+lowercase SHA-256 values and cannot be reused after abort, activation,
+retirement, or revocation. A rollout requires an existing TLS binding; it
+cannot silently upgrade a plaintext member. Startup and SDK discovery evaluate
+overlap using quorum-replicated time, never a workload node's local clock.
+`list_cluster_certificate_rollout_audit` exposes bounded recent evidence.
+
+With `[cluster_raft]` disabled, the compatibility authority retains its older
+single-node direct re-admission behavior and rejects the new rollout controls.
+This protocol coordinates application-listener leaves only. The statically
+configured Raft peer certificates, voter trust map, and safe voter
+reconfiguration are separate pending work in #122.
 
 ### Authority ownership lease registry
 
@@ -611,7 +648,7 @@ Versioned fixtures:
 - `protocol/v2/hello.json`
 - `protocol/v2/typed-error.json`
 - `protocol/v2/describe-protocol-request.json`
-- `protocol/v2/requests.json` (all 88 v2 operations)
+- `protocol/v2/requests.json` (all 92 v2 operations)
 - `protocol/v2/send-message-stream.json`
 - `protocol/v2/stream-event.json`
 - `protocol/v2/stream-completed.json`

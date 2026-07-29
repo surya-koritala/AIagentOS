@@ -9,9 +9,10 @@
 //! The daemon installs a cloneable authority handle after identical genesis is
 //! committed. Public membership and ownership syscalls use it for
 //! majority-backed writes and linearizable reads; followers forward both over
-//! the authenticated peer transport. The OpenRaft voter map remains static,
-//! so safe voter reconfiguration and coordinated certificate epochs are later
-//! stages.
+//! the authenticated peer transport. Application-listener certificate rollout
+//! is coordinated by the authority, while the OpenRaft voter map and transport
+//! trust remain static. Safe voter reconfiguration and Raft transport trust
+//! rotation are later stages.
 
 #![allow(clippy::result_large_err)]
 
@@ -582,11 +583,24 @@ fn validate_initialized_authority(
                     ),
                 )
             })?;
+        let configured_tls_is_authorized = durable.tls_server_certificate_fingerprint
+            == configured.tls_server_certificate_fingerprint
+            || configured
+                .tls_server_certificate_fingerprint
+                .as_deref()
+                .zip(
+                    view.membership
+                        .certificate_rollouts
+                        .iter()
+                        .find(|rollout| rollout.node_id == configured.node_id),
+                )
+                .is_some_and(|(fingerprint, rollout)| {
+                    rollout.accepts_fingerprint(fingerprint, view.logical_time)
+                });
         if durable.fingerprint != configured.fingerprint
             || durable.public_key != configured.public_key
             || durable.endpoint != configured.endpoint
-            || durable.tls_server_certificate_fingerprint
-                != configured.tls_server_certificate_fingerprint
+            || !configured_tls_is_authorized
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -749,6 +763,11 @@ struct AuthorityReadBarrier {
     log_id: openraft::LogId<ClusterRaftNodeId>,
 }
 
+type AuthorityWriteResult = Result<
+    ClientWriteResponse<ClusterRaftTypeConfig>,
+    RaftError<ClusterRaftNodeId, ClientWriteError<ClusterRaftNodeId, ClusterRaftNode>>,
+>;
+
 #[derive(Debug, Serialize, Deserialize)]
 struct RpcResponseEnvelope {
     version: u16,
@@ -768,12 +787,7 @@ enum RpcResponse {
             RaftError<ClusterRaftNodeId, openraft::error::InstallSnapshotError>,
         >,
     ),
-    AuthorityWrite(
-        Result<
-            ClientWriteResponse<ClusterRaftTypeConfig>,
-            RaftError<ClusterRaftNodeId, ClientWriteError<ClusterRaftNodeId, ClusterRaftNode>>,
-        >,
-    ),
+    AuthorityWrite(Box<AuthorityWriteResult>),
     AuthorityRead(Result<AuthorityReadBarrier, String>),
 }
 
@@ -1065,11 +1079,15 @@ impl ClusterAuthorityHandle {
                     .forward(leader_id, &leader_node, RpcRequest::AuthorityWrite(command))
                     .await?;
                 match response {
-                    RpcResponse::AuthorityWrite(Ok(response)) => Ok(response.data),
-                    RpcResponse::AuthorityWrite(Err(error)) => Err(io::Error::new(
-                        io::ErrorKind::ConnectionRefused,
-                        format!("replicated authority leader rejected forwarded write: {error}"),
-                    )),
+                    RpcResponse::AuthorityWrite(response) => match *response {
+                        Ok(response) => Ok(response.data),
+                        Err(error) => Err(io::Error::new(
+                            io::ErrorKind::ConnectionRefused,
+                            format!(
+                                "replicated authority leader rejected forwarded write: {error}"
+                            ),
+                        )),
+                    },
                     _ => Err(io::Error::new(
                         io::ErrorKind::InvalidData,
                         "replicated authority forwarding returned the wrong response type",
@@ -1468,9 +1486,25 @@ impl ClusterRaftRuntime {
         let deadline = Instant::now() + AUTHORITY_INITIALIZATION_TIMEOUT;
         let mut submitted = false;
         loop {
-            if let Some(view) = read_replicated_authority_view(&self.context)? {
-                validate_initialized_authority(&view, &self.authority_genesis)?;
-                return Ok(());
+            if read_replicated_authority_view(&self.context)?.is_some() {
+                match self.authority_handle().linearizable_view().await {
+                    Ok(view) => {
+                        validate_initialized_authority(&view, &self.authority_genesis)?;
+                        return Ok(());
+                    }
+                    Err(_) if Instant::now() < deadline => {
+                        tokio::time::sleep(Duration::from_millis(25)).await;
+                        continue;
+                    }
+                    Err(error) => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            format!(
+                                "replicated application authority did not provide a current quorum view before startup deadline: {error}"
+                            ),
+                        ))
+                    }
+                }
             }
             if Instant::now() >= deadline {
                 return Err(io::Error::new(
@@ -1774,7 +1808,7 @@ async fn handle_connection(
         }
         RpcRequest::AuthorityWrite(mut command) => {
             normalize_forwarded_authority_command(&mut command)?;
-            RpcResponse::AuthorityWrite(raft.client_write(command).await)
+            RpcResponse::AuthorityWrite(Box::new(raft.client_write(command).await))
         }
         RpcRequest::AuthorityRead => {
             let view = match raft
@@ -1815,6 +1849,9 @@ fn normalize_forwarded_authority_command(command: &mut AuthorityCommand) -> io::
     let proposed_at = match command {
         AuthorityCommand::IssueJoinChallenge { proposed_at, .. }
         | AuthorityCommand::RegisterMember { proposed_at, .. }
+        | AuthorityCommand::PrepareMemberCertificateRollout { proposed_at, .. }
+        | AuthorityCommand::AbortMemberCertificateRollout { proposed_at, .. }
+        | AuthorityCommand::FinalizeMemberCertificateRollout { proposed_at, .. }
         | AuthorityCommand::SetMemberState { proposed_at, .. }
         | AuthorityCommand::ClaimOwnership { proposed_at, .. }
         | AuthorityCommand::RenewOwnership { proposed_at, .. }
@@ -1938,6 +1975,106 @@ mod tests {
                 .kind(),
             io::ErrorKind::PermissionDenied
         );
+    }
+
+    #[test]
+    fn initialized_authority_accepts_only_time_bounded_rollout_leafs() {
+        use crate::cluster_control::{
+            ClusterCertificateRollout, ClusterCertificateRolloutPhase, ClusterMember,
+            ClusterMemberState, ClusterMembershipSnapshot,
+        };
+
+        let now = chrono::Utc::now();
+        let node_id = Uuid::new_v4().to_string();
+        let cluster_id = Uuid::new_v4().to_string();
+        let old_tls = "a".repeat(64);
+        let next_tls = "b".repeat(64);
+        let seed = AuthorityGenesisMember {
+            node_id: node_id.clone(),
+            fingerprint: "c".repeat(64),
+            public_key: "d".repeat(64),
+            tls_server_certificate_fingerprint: Some(old_tls.clone()),
+            endpoint: "127.0.0.1:7777".into(),
+            server_version: "0.3.0".into(),
+            min_protocol_version: 1,
+            protocol_version: 2,
+        };
+        let genesis = AuthorityGenesis {
+            cluster_id: cluster_id.clone(),
+            members: vec![seed.clone()],
+        };
+        let member = ClusterMember {
+            node_id: node_id.clone(),
+            fingerprint: seed.fingerprint.clone(),
+            public_key: seed.public_key.clone(),
+            tls_server_certificate_fingerprint: Some(old_tls.clone()),
+            endpoint: seed.endpoint.clone(),
+            server_version: seed.server_version.clone(),
+            min_protocol_version: seed.min_protocol_version,
+            protocol_version: seed.protocol_version,
+            state: ClusterMemberState::Active,
+            generation: 2,
+            joined_at: now,
+            updated_at: now,
+            reason: "test".into(),
+        };
+        let rollout = ClusterCertificateRollout {
+            node_id: node_id.clone(),
+            trust_generation: 1,
+            member_generation: 2,
+            phase: ClusterCertificateRolloutPhase::Prepared,
+            previous_tls_server_certificate_fingerprint: old_tls.clone(),
+            next_tls_server_certificate_fingerprint: next_tls.clone(),
+            minimum_overlap_seconds: 5,
+            prepare_expires_at: now + chrono::TimeDelta::seconds(5),
+            retire_previous_after: None,
+            prepared_at: now,
+            updated_at: now,
+            reason: "test".into(),
+        };
+        let mut view = ReplicatedAuthorityView {
+            genesis: genesis.clone(),
+            membership: ClusterMembershipSnapshot {
+                cluster_id,
+                generation: 2,
+                authority_time: Some(now),
+                tls_trust_generation: 1,
+                certificate_rollouts: vec![rollout.clone()],
+                members: vec![member],
+            },
+            membership_audit: Vec::new(),
+            certificate_rollout_audit: Vec::new(),
+            ownerships: Vec::new(),
+            ownership_audit: Vec::new(),
+            logical_time: now,
+        };
+        let mut candidate_config = genesis.clone();
+        candidate_config.members[0].tls_server_certificate_fingerprint = Some(next_tls.clone());
+        validate_initialized_authority(&view, &candidate_config)
+            .expect("prepared candidate is valid before replicated expiry");
+        view.logical_time = rollout.prepare_expires_at;
+        assert!(
+            validate_initialized_authority(&view, &candidate_config).is_err(),
+            "prepared candidate must fail closed at its replicated expiry"
+        );
+
+        view.logical_time = now + chrono::TimeDelta::seconds(6);
+        view.membership.members[0].tls_server_certificate_fingerprint = Some(next_tls);
+        view.membership.members[0].generation = 3;
+        view.membership.certificate_rollouts[0].phase = ClusterCertificateRolloutPhase::Activated;
+        view.membership.certificate_rollouts[0].member_generation = 3;
+        view.membership.certificate_rollouts[0].updated_at = now;
+        view.membership.certificate_rollouts[0].retire_previous_after =
+            Some(now + chrono::TimeDelta::seconds(10));
+        validate_initialized_authority(&view, &genesis)
+            .expect("previous leaf remains valid during activated overlap");
+        view.logical_time = now + chrono::TimeDelta::seconds(10);
+        assert!(
+            validate_initialized_authority(&view, &genesis).is_err(),
+            "previous leaf must fail closed at its replicated retirement deadline"
+        );
+        validate_initialized_authority(&view, &candidate_config)
+            .expect("activated replacement remains current after retirement");
     }
 
     fn test_peer(ca: &CertifiedIssuer<'_, KeyPair>, node_id: ClusterRaftNodeId) -> TestPeer {
@@ -2194,6 +2331,8 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn three_node_mtls_quorum_elects_replicates_fails_over_and_recovers() {
+        use ring::signature::KeyPair as _;
+
         let _ = rustls::crypto::ring::default_provider().install_default();
         let ca = test_ca();
         let peers = (1..=3)
@@ -2201,11 +2340,32 @@ mod tests {
             .collect::<Vec<_>>();
         let initial_listeners = listeners(3).await;
         let members = member_map(&peers, &initial_listeners);
-        let configs = peers
+        let mut configs = peers
             .iter()
             .zip(&initial_listeners)
             .map(|(peer, listener)| runtime_config(peer, listener, &members, "mtls-quorum-test"))
             .collect::<Vec<_>>();
+        let application_pkcs8 =
+            ring::signature::Ed25519KeyPair::generate_pkcs8(&ring::rand::SystemRandom::new())
+                .expect("generate application identity");
+        let application_pair =
+            ring::signature::Ed25519KeyPair::from_pkcs8(application_pkcs8.as_ref())
+                .expect("parse application identity");
+        let application_public_key: String = application_pair
+            .public_key()
+            .as_ref()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        let application_fingerprint =
+            crate::cluster_control::sha256_hex(application_pair.public_key().as_ref());
+        let previous_application_tls = "a".repeat(64);
+        for config in &mut configs {
+            config.authority_genesis.members[0].public_key = application_public_key.clone();
+            config.authority_genesis.members[0].fingerprint = application_fingerprint.clone();
+            config.authority_genesis.members[0].tls_server_certificate_fingerprint =
+                Some(previous_application_tls.clone());
+        }
         let tempdir = TempDir::new().expect("tempdir");
         let contexts = (1..=3)
             .map(|node_id| context(&tempdir, node_id))
@@ -2349,6 +2509,93 @@ mod tests {
             follower_read.logical_time >= read_started_at,
             "linearizable authority reads must commit a current logical-clock floor"
         );
+        let rollout_challenge_hex = "d4".repeat(32);
+        let rollout_handle = runtimes[forwarding_index]
+            .as_ref()
+            .expect("forwarding follower runtime")
+            .authority_handle();
+        let challenge_response = rollout_handle
+            .commit(AuthorityCommand::IssueJoinChallenge {
+                operation_id: Uuid::new_v4().to_string(),
+                challenge_hex: rollout_challenge_hex.clone(),
+                ttl_seconds: 60,
+                proposed_at: chrono::Utc::now(),
+            })
+            .await
+            .expect("forward rollout challenge through follower");
+        let AuthorityResponse::JoinChallengeIssued {
+            log_id: challenge_log_id,
+            ..
+        } = challenge_response
+        else {
+            panic!("expected rollout challenge response");
+        };
+        wait_for_applied(&runtimes, challenge_log_id.index, 2).await;
+        let seed = &configs[0].authority_genesis.members[0];
+        let next_application_tls = "b".repeat(64);
+        let candidate_registration = crate::cluster_control::ClusterMemberRegistration {
+            node_id: seed.node_id.clone(),
+            fingerprint: seed.fingerprint.clone(),
+            public_key: seed.public_key.clone(),
+            tls_server_certificate_fingerprint: Some(next_application_tls.clone()),
+            endpoint: seed.endpoint.clone(),
+            server_version: seed.server_version.clone(),
+            min_protocol_version: seed.min_protocol_version,
+            protocol_version: seed.protocol_version,
+        };
+        let rollout_payload = crate::cluster_control::membership_join_payload(
+            &configs[0].authority_genesis.cluster_id,
+            &rollout_challenge_hex,
+            &candidate_registration,
+        )
+        .expect("build rollout proof");
+        let rollout_signature: String = application_pair
+            .sign(&rollout_payload)
+            .as_ref()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        let prepared_response = rollout_handle
+            .commit(AuthorityCommand::PrepareMemberCertificateRollout {
+                operation_id: Uuid::new_v4().to_string(),
+                registration: candidate_registration,
+                challenge_hex: rollout_challenge_hex,
+                signature_hex: rollout_signature,
+                expected_generation: 1,
+                prepare_ttl_seconds: 60,
+                minimum_overlap_seconds: 5,
+                actor: "test-operator".into(),
+                reason: "prove rollout survives failover".into(),
+                proposed_at: chrono::Utc::now(),
+            })
+            .await
+            .expect("forward certificate rollout through follower");
+        let AuthorityResponse::CertificateRolloutUpdated {
+            member: prepared_member,
+            rollout: Some(prepared_rollout),
+            log_id: rollout_log_id,
+            ..
+        } = prepared_response
+        else {
+            panic!("expected prepared certificate rollout");
+        };
+        assert_eq!(prepared_member.generation, 2);
+        assert_eq!(
+            prepared_rollout.phase,
+            crate::cluster_control::ClusterCertificateRolloutPhase::Prepared
+        );
+        wait_for_applied(&runtimes, rollout_log_id.index, 2).await;
+        let rollout_view = rollout_handle
+            .linearizable_view()
+            .await
+            .expect("read prepared rollout through follower");
+        validate_initialized_authority(&rollout_view, &configs[0].authority_genesis)
+            .expect("current application leaf remains valid during prepare");
+        let mut candidate_genesis = configs[0].authority_genesis.clone();
+        candidate_genesis.members[0].tls_server_certificate_fingerprint =
+            Some(next_application_tls);
+        validate_initialized_authority(&rollout_view, &candidate_genesis)
+            .expect("candidate application leaf is valid before prepare expiry");
         let mut upgraded_binary_genesis = configs[0].authority_genesis.clone();
         for member in &mut upgraded_binary_genesis.members {
             member.server_version = "0.4.0".into();
@@ -2375,7 +2622,7 @@ mod tests {
             .await
             .expect("restart old leader"),
         );
-        wait_for_applied(&runtimes, log_id.index, 3).await;
+        wait_for_applied(&runtimes, rollout_log_id.index, 3).await;
         assert_eq!(
             wait_for_leader(&runtimes, None).await,
             second_leader,
@@ -2396,6 +2643,7 @@ mod tests {
                 .map(|ownership| ownership.fencing_token),
             Some(1)
         );
+        assert_eq!(recovered.membership.certificate_rollouts.len(), 1);
 
         let isolated_leader_index = runtimes
             .iter()
@@ -2415,25 +2663,18 @@ mod tests {
                     .expect("shutdown non-leader runtime");
             }
         }
-        let uncommitted_agent_id = Uuid::new_v4().to_string();
         let isolated_handle = runtimes[isolated_leader_index]
             .as_ref()
             .expect("isolated leader runtime")
             .authority_handle();
         let no_quorum = tokio::time::timeout(
             Duration::from_secs(5),
-            isolated_handle.commit(AuthorityCommand::ClaimOwnership {
+            isolated_handle.commit(AuthorityCommand::AbortMemberCertificateRollout {
                 operation_id: Uuid::new_v4().to_string(),
-                agent_id: uncommitted_agent_id.clone(),
-                owner_node_id: configs[(second_leader - 1) as usize]
-                    .authority_genesis
-                    .members[(second_leader - 1) as usize]
-                    .node_id
-                    .clone(),
-                ttl_seconds: 60,
-                expected_fencing_token: None,
+                node_id: configs[0].authority_genesis.members[0].node_id.clone(),
+                expected_generation: 2,
                 actor: "test-operator".into(),
-                reason: "must not commit without quorum".into(),
+                reason: "must not abort rollout without quorum".into(),
                 proposed_at: chrono::Utc::now(),
             }),
         )
@@ -2447,11 +2688,8 @@ mod tests {
             .expect("read isolated local view")
             .expect("initialized isolated authority view");
         assert!(
-            isolated_view
-                .ownerships
-                .iter()
-                .all(|ownership| ownership.agent_id != uncommitted_agent_id),
-            "uncommitted ownership must not be applied locally"
+            isolated_view.membership.certificate_rollouts.len() == 1,
+            "uncommitted rollout abort must not be applied locally"
         );
 
         for runtime in runtimes.into_iter().flatten() {

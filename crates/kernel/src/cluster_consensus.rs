@@ -32,9 +32,11 @@ use crate::cluster_control::{
     hex_decode, membership_join_payload, ownership_expiry, sha256_hex,
     validate_member_registration, validate_ownership_identity, validate_ownership_request,
     validate_reason, validate_text, ClusterAgentOwnership, ClusterAgentOwnershipAudit,
+    ClusterCertificateRollout, ClusterCertificateRolloutAudit, ClusterCertificateRolloutPhase,
     ClusterControl, ClusterJoinChallenge, ClusterMember, ClusterMemberRegistration,
     ClusterMemberState, ClusterMembershipAudit, ClusterMembershipSnapshot, ClusterOwnershipState,
-    MAX_JOIN_CHALLENGE_TTL_SECONDS, MIN_JOIN_CHALLENGE_TTL_SECONDS,
+    MAX_CERTIFICATE_ROLLOUT_SECONDS, MAX_JOIN_CHALLENGE_TTL_SECONDS,
+    MIN_CERTIFICATE_ROLLOUT_SECONDS, MIN_JOIN_CHALLENGE_TTL_SECONDS,
 };
 use crate::context::SqliteContextManager;
 
@@ -129,6 +131,34 @@ pub enum AuthorityCommand {
         reason: String,
         proposed_at: DateTime<Utc>,
     },
+    PrepareMemberCertificateRollout {
+        operation_id: String,
+        registration: ClusterMemberRegistration,
+        challenge_hex: String,
+        signature_hex: String,
+        expected_generation: u64,
+        prepare_ttl_seconds: u64,
+        minimum_overlap_seconds: u64,
+        actor: String,
+        reason: String,
+        proposed_at: DateTime<Utc>,
+    },
+    AbortMemberCertificateRollout {
+        operation_id: String,
+        node_id: String,
+        expected_generation: u64,
+        actor: String,
+        reason: String,
+        proposed_at: DateTime<Utc>,
+    },
+    FinalizeMemberCertificateRollout {
+        operation_id: String,
+        node_id: String,
+        expected_generation: u64,
+        actor: String,
+        reason: String,
+        proposed_at: DateTime<Utc>,
+    },
     SetMemberState {
         operation_id: String,
         node_id: String,
@@ -177,6 +207,9 @@ impl AuthorityCommand {
             | Self::AdvanceTime { operation_id, .. }
             | Self::IssueJoinChallenge { operation_id, .. }
             | Self::RegisterMember { operation_id, .. }
+            | Self::PrepareMemberCertificateRollout { operation_id, .. }
+            | Self::AbortMemberCertificateRollout { operation_id, .. }
+            | Self::FinalizeMemberCertificateRollout { operation_id, .. }
             | Self::SetMemberState { operation_id, .. }
             | Self::ClaimOwnership { operation_id, .. }
             | Self::RenewOwnership { operation_id, .. }
@@ -242,6 +275,14 @@ pub enum AuthorityResponse {
         log_id: LogId<ClusterRaftNodeId>,
         replayed: bool,
     },
+    CertificateRolloutUpdated {
+        operation_id: String,
+        member: ClusterMember,
+        rollout: Option<ClusterCertificateRollout>,
+        sequence: u64,
+        log_id: LogId<ClusterRaftNodeId>,
+        replayed: bool,
+    },
     OwnershipUpdated {
         operation_id: String,
         ownership: ClusterAgentOwnership,
@@ -303,11 +344,28 @@ struct ReplicatedControlPlaneState {
     membership_generation: u64,
     members: BTreeMap<String, ClusterMember>,
     membership_audit: Vec<ClusterMembershipAudit>,
+    #[serde(default)]
+    tls_trust_generation: u64,
+    #[serde(default)]
+    certificate_rollouts: BTreeMap<String, ClusterCertificateRollout>,
+    #[serde(default)]
+    certificate_rollout_audit: Vec<ClusterCertificateRolloutAudit>,
     join_challenges: BTreeMap<String, ReplicatedJoinChallenge>,
     ownerships: BTreeMap<String, ClusterAgentOwnership>,
     ownership_audit: Vec<ClusterAgentOwnershipAudit>,
     logical_time: DateTime<Utc>,
 }
+
+type MembershipRevisionEvidence = (ClusterMemberState, Option<String>, DateTime<Utc>);
+type CertificateRolloutAuditHead = (
+    Option<ClusterCertificateRolloutPhase>,
+    String,
+    String,
+    u64,
+    u64,
+    DateTime<Utc>,
+    String,
+);
 
 /// Cloneable view read after an OpenRaft linearizability barrier.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -315,6 +373,7 @@ pub struct ReplicatedAuthorityView {
     pub genesis: AuthorityGenesis,
     pub membership: ClusterMembershipSnapshot,
     pub membership_audit: Vec<ClusterMembershipAudit>,
+    pub certificate_rollout_audit: Vec<ClusterCertificateRolloutAudit>,
     pub ownerships: Vec<ClusterAgentOwnership>,
     pub ownership_audit: Vec<ClusterAgentOwnershipAudit>,
     pub logical_time: DateTime<Utc>,
@@ -410,9 +469,13 @@ pub fn read_replicated_authority_view(
         membership: ClusterMembershipSnapshot {
             cluster_id: control.cluster_id,
             generation: control.membership_generation,
+            authority_time: Some(control.logical_time),
+            tls_trust_generation: control.tls_trust_generation,
+            certificate_rollouts: control.certificate_rollouts.into_values().collect(),
             members: control.members.into_values().collect(),
         },
         membership_audit: control.membership_audit,
+        certificate_rollout_audit: control.certificate_rollout_audit,
         ownerships: control.ownerships.into_values().collect(),
         ownership_audit: control.ownership_audit,
         logical_time: control.logical_time,
@@ -626,6 +689,13 @@ fn successful_response_metadata(
             replayed,
             ..
         }
+        | AuthorityResponse::CertificateRolloutUpdated {
+            operation_id,
+            sequence,
+            log_id,
+            replayed,
+            ..
+        }
         | AuthorityResponse::OwnershipUpdated {
             operation_id,
             sequence,
@@ -658,6 +728,11 @@ fn response_matches_command(command: &AuthorityCommand, response: &AuthorityResp
             AuthorityCommand::RegisterMember { .. } | AuthorityCommand::SetMemberState { .. },
             AuthorityResponse::MemberUpdated { .. }
         ) | (
+            AuthorityCommand::PrepareMemberCertificateRollout { .. }
+                | AuthorityCommand::AbortMemberCertificateRollout { .. }
+                | AuthorityCommand::FinalizeMemberCertificateRollout { .. },
+            AuthorityResponse::CertificateRolloutUpdated { .. }
+        ) | (
             AuthorityCommand::ClaimOwnership { .. }
                 | AuthorityCommand::RenewOwnership { .. }
                 | AuthorityCommand::ReleaseOwnership { .. },
@@ -687,8 +762,10 @@ fn validate_control_plane_state(control: &ReplicatedControlPlaneState) -> Result
     }
     if control.join_challenges.len() > 4_096
         || control.members.len() > 100_000
+        || control.certificate_rollouts.len() > control.members.len()
         || control.ownerships.len() > 1_000_000
         || control.membership_audit.len() > 100_000
+        || control.certificate_rollout_audit.len() > 100_000
         || control.ownership_audit.len() > 100_000
     {
         return Err(read_io(
@@ -715,8 +792,18 @@ fn validate_control_plane_state(control: &ReplicatedControlPlaneState) -> Result
             ));
         }
     }
+    let valid_tls_fingerprint = |fingerprint: &str| {
+        fingerprint.len() == 64
+            && fingerprint
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    };
+    let mut historical_tls_owners = BTreeMap::<String, String>::new();
     let mut latest_membership_audit: BTreeMap<String, (u64, ClusterMemberState, Option<String>)> =
         BTreeMap::new();
+    let mut membership_revision_audit: BTreeMap<(String, u64), MembershipRevisionEvidence> =
+        BTreeMap::new();
+    let mut first_membership_tls_revision = BTreeMap::<String, (String, u64, DateTime<Utc>)>::new();
     for (index, audit) in control.membership_audit.iter().enumerate() {
         let expected_global_generation = index as u64 + 1;
         if audit.membership_generation != expected_global_generation
@@ -750,12 +837,48 @@ fn validate_control_plane_state(control: &ReplicatedControlPlaneState) -> Result
                 "replicated membership audit history is not consecutive",
             ));
         }
+        for fingerprint in [
+            audit.previous_tls_server_certificate_fingerprint.as_deref(),
+            audit.current_tls_server_certificate_fingerprint.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if !valid_tls_fingerprint(fingerprint)
+                || historical_tls_owners
+                    .insert(fingerprint.to_owned(), audit.node_id.clone())
+                    .is_some_and(|owner| owner != audit.node_id)
+            {
+                return Err(read_io(
+                    "replicated membership audit reuses an invalid or foreign TLS binding",
+                ));
+            }
+        }
         latest_membership_audit.insert(
             audit.node_id.clone(),
             (
                 audit.member_generation,
                 audit.current,
                 audit.current_tls_server_certificate_fingerprint.clone(),
+            ),
+        );
+        if let Some(fingerprint) = &audit.current_tls_server_certificate_fingerprint {
+            first_membership_tls_revision
+                .entry(fingerprint.clone())
+                .or_insert_with(|| {
+                    (
+                        audit.node_id.clone(),
+                        audit.member_generation,
+                        audit.changed_at,
+                    )
+                });
+        }
+        membership_revision_audit.insert(
+            (audit.node_id.clone(), audit.member_generation),
+            (
+                audit.current,
+                audit.current_tls_server_certificate_fingerprint.clone(),
+                audit.changed_at,
             ),
         );
     }
@@ -811,6 +934,210 @@ fn validate_control_plane_state(control: &ReplicatedControlPlaneState) -> Result
     if latest_membership_audit.len() != control.members.len() {
         return Err(read_io(
             "replicated membership audit references an unknown member",
+        ));
+    }
+    if control.tls_trust_generation != control.certificate_rollout_audit.len() as u64 {
+        return Err(read_io(
+            "replicated TLS trust generation does not match its audit length",
+        ));
+    }
+    let mut seen_rollout_candidates = BTreeSet::new();
+    let mut first_rollout_activation = BTreeMap::<String, (String, u64, DateTime<Utc>)>::new();
+    let mut latest_rollout_audit: BTreeMap<String, CertificateRolloutAuditHead> = BTreeMap::new();
+    for (index, audit) in control.certificate_rollout_audit.iter().enumerate() {
+        let expected_trust_generation = index as u64 + 1;
+        let transition_is_valid = match latest_rollout_audit.get(&audit.node_id) {
+            None | Some((None, ..)) => {
+                audit.previous_phase.is_none()
+                    && audit.current_phase == Some(ClusterCertificateRolloutPhase::Prepared)
+                    && seen_rollout_candidates
+                        .insert(audit.next_tls_server_certificate_fingerprint.clone())
+            }
+            Some((
+                Some(ClusterCertificateRolloutPhase::Prepared),
+                previous_fingerprint,
+                next_fingerprint,
+                ..,
+            )) => {
+                audit.previous_phase == Some(ClusterCertificateRolloutPhase::Prepared)
+                    && matches!(
+                        audit.current_phase,
+                        Some(ClusterCertificateRolloutPhase::Activated) | None
+                    )
+                    && &audit.previous_tls_server_certificate_fingerprint == previous_fingerprint
+                    && &audit.next_tls_server_certificate_fingerprint == next_fingerprint
+            }
+            Some((
+                Some(ClusterCertificateRolloutPhase::Activated),
+                previous_fingerprint,
+                next_fingerprint,
+                ..,
+            )) => {
+                audit.previous_phase == Some(ClusterCertificateRolloutPhase::Activated)
+                    && audit.current_phase.is_none()
+                    && &audit.previous_tls_server_certificate_fingerprint == previous_fingerprint
+                    && &audit.next_tls_server_certificate_fingerprint == next_fingerprint
+            }
+        };
+        let expected_member_tls = match (audit.previous_phase, audit.current_phase) {
+            (_, Some(ClusterCertificateRolloutPhase::Prepared))
+            | (Some(ClusterCertificateRolloutPhase::Prepared), None) => {
+                Some(audit.previous_tls_server_certificate_fingerprint.as_str())
+            }
+            (_, Some(ClusterCertificateRolloutPhase::Activated))
+            | (Some(ClusterCertificateRolloutPhase::Activated), None) => {
+                Some(audit.next_tls_server_certificate_fingerprint.as_str())
+            }
+            _ => None,
+        };
+        let member_revision =
+            membership_revision_audit.get(&(audit.node_id.clone(), audit.member_generation));
+        let revision_matches = member_revision.is_some_and(|(state, tls, changed_at)| {
+            (*state == ClusterMemberState::Active
+                || (audit.current_phase.is_none() && *state == ClusterMemberState::Revoked))
+                && tls.as_deref() == expected_member_tls
+                && *changed_at == audit.changed_at
+        });
+        if audit.trust_generation != expected_trust_generation
+            || audit.member_generation == 0
+            || audit.changed_at > control.logical_time
+            || Uuid::parse_str(&audit.node_id).is_err()
+            || !valid_tls_fingerprint(&audit.previous_tls_server_certificate_fingerprint)
+            || !valid_tls_fingerprint(&audit.next_tls_server_certificate_fingerprint)
+            || audit.previous_tls_server_certificate_fingerprint
+                == audit.next_tls_server_certificate_fingerprint
+            || validate_text(&audit.actor, "replicated certificate rollout audit actor").is_err()
+            || validate_reason(&audit.reason).is_err()
+            || !transition_is_valid
+            || !revision_matches
+            || historical_tls_owners
+                .get(&audit.previous_tls_server_certificate_fingerprint)
+                .is_some_and(|owner| owner != &audit.node_id)
+            || historical_tls_owners
+                .get(&audit.next_tls_server_certificate_fingerprint)
+                .is_some_and(|owner| owner != &audit.node_id)
+        {
+            return Err(read_io(
+                "replicated certificate rollout audit history is invalid",
+            ));
+        }
+        historical_tls_owners.insert(
+            audit.previous_tls_server_certificate_fingerprint.clone(),
+            audit.node_id.clone(),
+        );
+        historical_tls_owners.insert(
+            audit.next_tls_server_certificate_fingerprint.clone(),
+            audit.node_id.clone(),
+        );
+        if audit.current_phase == Some(ClusterCertificateRolloutPhase::Activated)
+            && first_rollout_activation
+                .insert(
+                    audit.next_tls_server_certificate_fingerprint.clone(),
+                    (
+                        audit.node_id.clone(),
+                        audit.member_generation,
+                        audit.changed_at,
+                    ),
+                )
+                .is_some()
+        {
+            return Err(read_io(
+                "replicated certificate rollout candidate has multiple activations",
+            ));
+        }
+        latest_rollout_audit.insert(
+            audit.node_id.clone(),
+            (
+                audit.current_phase,
+                audit.previous_tls_server_certificate_fingerprint.clone(),
+                audit.next_tls_server_certificate_fingerprint.clone(),
+                audit.member_generation,
+                audit.trust_generation,
+                audit.changed_at,
+                audit.reason.clone(),
+            ),
+        );
+    }
+    if seen_rollout_candidates.iter().any(|candidate| {
+        match (
+            first_membership_tls_revision.get(candidate),
+            first_rollout_activation.get(candidate),
+        ) {
+            (None, None) => false,
+            (Some(first_authorized), Some(activated)) => first_authorized != activated,
+            _ => true,
+        }
+    }) {
+        return Err(read_io(
+            "replicated certificate rollout candidate was authorized before its activation",
+        ));
+    }
+    for (node_id, rollout) in &control.certificate_rollouts {
+        let member = control.members.get(node_id);
+        let latest = latest_rollout_audit.get(node_id);
+        let prepare_window_is_valid = rollout
+            .prepared_at
+            .checked_add_signed(TimeDelta::seconds(MIN_CERTIFICATE_ROLLOUT_SECONDS as i64))
+            .is_some_and(|minimum| rollout.prepare_expires_at >= minimum)
+            && rollout
+                .prepared_at
+                .checked_add_signed(TimeDelta::seconds(MAX_CERTIFICATE_ROLLOUT_SECONDS as i64))
+                .is_some_and(|maximum| rollout.prepare_expires_at <= maximum);
+        let retirement_is_valid = match rollout.phase {
+            ClusterCertificateRolloutPhase::Prepared => {
+                rollout.retire_previous_after.is_none()
+                    && rollout.updated_at == rollout.prepared_at
+                    && member
+                        .and_then(|member| member.tls_server_certificate_fingerprint.as_deref())
+                        == Some(rollout.previous_tls_server_certificate_fingerprint.as_str())
+            }
+            ClusterCertificateRolloutPhase::Activated => {
+                rollout.retire_previous_after.is_some_and(|deadline| {
+                    rollout.updated_at.checked_add_signed(TimeDelta::seconds(
+                        rollout.minimum_overlap_seconds as i64,
+                    )) == Some(deadline)
+                }) && member.and_then(|member| member.tls_server_certificate_fingerprint.as_deref())
+                    == Some(rollout.next_tls_server_certificate_fingerprint.as_str())
+            }
+        };
+        if node_id != &rollout.node_id
+            || member.is_none_or(|member| {
+                member.state != ClusterMemberState::Active
+                    || member.generation != rollout.member_generation
+            })
+            || rollout.trust_generation == 0
+            || rollout.minimum_overlap_seconds < MIN_CERTIFICATE_ROLLOUT_SECONDS
+            || rollout.minimum_overlap_seconds > MAX_CERTIFICATE_ROLLOUT_SECONDS
+            || !prepare_window_is_valid
+            || rollout.prepared_at > rollout.updated_at
+            || rollout.updated_at > control.logical_time
+            || !valid_tls_fingerprint(&rollout.previous_tls_server_certificate_fingerprint)
+            || !valid_tls_fingerprint(&rollout.next_tls_server_certificate_fingerprint)
+            || rollout.previous_tls_server_certificate_fingerprint
+                == rollout.next_tls_server_certificate_fingerprint
+            || validate_reason(&rollout.reason).is_err()
+            || !retirement_is_valid
+            || latest
+                != Some(&(
+                    Some(rollout.phase),
+                    rollout.previous_tls_server_certificate_fingerprint.clone(),
+                    rollout.next_tls_server_certificate_fingerprint.clone(),
+                    rollout.member_generation,
+                    rollout.trust_generation,
+                    rollout.updated_at,
+                    rollout.reason.clone(),
+                ))
+        {
+            return Err(read_io(
+                "replicated certificate rollout does not match current member and audit state",
+            ));
+        }
+    }
+    if latest_rollout_audit.iter().any(|(node_id, (phase, ..))| {
+        phase.is_some() != control.certificate_rollouts.contains_key(node_id)
+    }) {
+        return Err(read_io(
+            "replicated certificate rollout audit references inconsistent live state",
         ));
     }
     let mut latest_ownership_audit: BTreeMap<String, (u64, String, u64, ClusterOwnershipState)> =
@@ -1684,6 +2011,21 @@ fn replay_response(response: &AuthorityResponse) -> AuthorityResponse {
             log_id: *log_id,
             replayed: true,
         },
+        AuthorityResponse::CertificateRolloutUpdated {
+            operation_id,
+            member,
+            rollout,
+            sequence,
+            log_id,
+            ..
+        } => AuthorityResponse::CertificateRolloutUpdated {
+            operation_id: operation_id.clone(),
+            member: member.clone(),
+            rollout: rollout.clone(),
+            sequence: *sequence,
+            log_id: *log_id,
+            replayed: true,
+        },
         AuthorityResponse::OwnershipUpdated {
             operation_id,
             ownership,
@@ -1844,6 +2186,100 @@ fn apply_new_authority_command(
             Ok(AuthorityResponse::MemberUpdated {
                 operation_id,
                 member,
+                sequence,
+                log_id,
+                replayed: false,
+            })
+        }
+        AuthorityCommand::PrepareMemberCertificateRollout {
+            registration,
+            challenge_hex,
+            signature_hex,
+            expected_generation,
+            prepare_ttl_seconds,
+            minimum_overlap_seconds,
+            actor,
+            reason,
+            proposed_at,
+            ..
+        } => {
+            let control = control_plane_mut(state)?;
+            let mut next = control.clone();
+            let (member, rollout) = apply_prepare_member_certificate_rollout(
+                &mut next,
+                registration,
+                challenge_hex,
+                signature_hex,
+                *expected_generation,
+                *prepare_ttl_seconds,
+                *minimum_overlap_seconds,
+                actor,
+                reason,
+                *proposed_at,
+            )?;
+            *control = next;
+            Ok(AuthorityResponse::CertificateRolloutUpdated {
+                operation_id,
+                member,
+                rollout: Some(rollout),
+                sequence,
+                log_id,
+                replayed: false,
+            })
+        }
+        AuthorityCommand::AbortMemberCertificateRollout {
+            node_id,
+            expected_generation,
+            actor,
+            reason,
+            proposed_at,
+            ..
+        } => {
+            let control = control_plane_mut(state)?;
+            let mut next = control.clone();
+            let member = apply_finish_member_certificate_rollout(
+                &mut next,
+                node_id,
+                *expected_generation,
+                CertificateRolloutFinish::Abort,
+                actor,
+                reason,
+                *proposed_at,
+            )?;
+            *control = next;
+            Ok(AuthorityResponse::CertificateRolloutUpdated {
+                operation_id,
+                member,
+                rollout: None,
+                sequence,
+                log_id,
+                replayed: false,
+            })
+        }
+        AuthorityCommand::FinalizeMemberCertificateRollout {
+            node_id,
+            expected_generation,
+            actor,
+            reason,
+            proposed_at,
+            ..
+        } => {
+            let control = control_plane_mut(state)?;
+            let mut next = control.clone();
+            let member = apply_finish_member_certificate_rollout(
+                &mut next,
+                node_id,
+                *expected_generation,
+                CertificateRolloutFinish::Finalize,
+                actor,
+                reason,
+                *proposed_at,
+            )?;
+            *control = next;
+            Ok(AuthorityResponse::CertificateRolloutUpdated {
+                operation_id,
+                member,
+                rollout: None,
                 sequence,
                 log_id,
                 replayed: false,
@@ -2098,6 +2534,9 @@ fn validate_and_build_genesis(
         membership_generation,
         members,
         membership_audit,
+        tls_trust_generation: 0,
+        certificate_rollouts: BTreeMap::new(),
+        certificate_rollout_audit: Vec::new(),
         join_challenges: BTreeMap::new(),
         ownerships: BTreeMap::new(),
         ownership_audit: Vec::new(),
@@ -2113,35 +2552,14 @@ fn conflict(error: impl Into<String>) -> (AuthorityRejection, String) {
     (AuthorityRejection::Conflict, error.into())
 }
 
-#[allow(clippy::too_many_arguments)]
-fn apply_register_member(
+fn validate_challenged_registration(
     control: &mut ReplicatedControlPlaneState,
     registration: &ClusterMemberRegistration,
     challenge_hex: &str,
     signature_hex: &str,
-    expected_generation: Option<u64>,
-    authority_min_protocol_version: u32,
-    authority_protocol_version: u32,
-    actor: &str,
-    reason: &str,
     proposed_at: DateTime<Utc>,
-) -> Result<ClusterMember, (AuthorityRejection, String)> {
+) -> Result<(DateTime<Utc>, String), (AuthorityRejection, String)> {
     validate_member_registration(registration).map_err(invalid_command)?;
-    validate_text(actor, "cluster-membership actor").map_err(invalid_command)?;
-    validate_reason(reason).map_err(invalid_command)?;
-    if authority_min_protocol_version == 0
-        || authority_min_protocol_version > authority_protocol_version
-    {
-        return Err(invalid_command("invalid authority protocol window"));
-    }
-    if registration.protocol_version < authority_min_protocol_version
-        || registration.min_protocol_version > authority_protocol_version
-    {
-        return Err(conflict(format!(
-            "incompatible wire-protocol cluster member window: authority v{authority_min_protocol_version}..=v{authority_protocol_version}, member v{}..=v{}",
-            registration.min_protocol_version, registration.protocol_version
-        )));
-    }
     let challenge = hex_decode(challenge_hex)
         .filter(|bytes| bytes.len() == 32)
         .ok_or_else(|| invalid_command("invalid cluster join challenge"))?;
@@ -2167,6 +2585,411 @@ fn apply_register_member(
     if challenge_record.expires_at <= now {
         return Err(conflict("invalid cluster join challenge: expired"));
     }
+    Ok((now, challenge_hash))
+}
+
+fn consume_join_challenge(
+    control: &mut ReplicatedControlPlaneState,
+    challenge_hash: &str,
+    now: DateTime<Utc>,
+) {
+    control
+        .join_challenges
+        .get_mut(challenge_hash)
+        .expect("validated challenge remains present")
+        .consumed_at = Some(now);
+}
+
+fn require_membership_audit_capacity(
+    control: &ReplicatedControlPlaneState,
+) -> Result<(), (AuthorityRejection, String)> {
+    if control.membership_audit.len() >= 100_000 {
+        return Err((
+            AuthorityRejection::CapacityReached,
+            "replicated membership audit capacity is exhausted".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn require_certificate_rollout_audit_capacity(
+    control: &ReplicatedControlPlaneState,
+) -> Result<(), (AuthorityRejection, String)> {
+    if control.certificate_rollout_audit.len() >= 100_000 {
+        return Err((
+            AuthorityRejection::CapacityReached,
+            "replicated certificate rollout audit capacity is exhausted".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn append_member_revision(
+    control: &mut ReplicatedControlPlaneState,
+    previous: &ClusterMember,
+    state: ClusterMemberState,
+    tls_server_certificate_fingerprint: Option<String>,
+    actor: &str,
+    reason: &str,
+    now: DateTime<Utc>,
+) -> Result<ClusterMember, (AuthorityRejection, String)> {
+    require_membership_audit_capacity(control)?;
+    let generation = previous
+        .generation
+        .checked_add(1)
+        .ok_or_else(|| conflict("cluster member generation overflow"))?;
+    let membership_generation = control
+        .membership_generation
+        .checked_add(1)
+        .ok_or_else(|| conflict("membership generation overflow"))?;
+    let updated = ClusterMember {
+        state,
+        generation,
+        tls_server_certificate_fingerprint: tls_server_certificate_fingerprint.clone(),
+        updated_at: now,
+        reason: reason.to_owned(),
+        ..previous.clone()
+    };
+    control
+        .members
+        .insert(previous.node_id.clone(), updated.clone());
+    control.membership_generation = membership_generation;
+    control.membership_audit.push(ClusterMembershipAudit {
+        membership_generation,
+        node_id: previous.node_id.clone(),
+        member_generation: generation,
+        previous: Some(previous.state),
+        current: state,
+        previous_tls_server_certificate_fingerprint: previous
+            .tls_server_certificate_fingerprint
+            .clone(),
+        current_tls_server_certificate_fingerprint: tls_server_certificate_fingerprint,
+        actor: actor.to_owned(),
+        reason: reason.to_owned(),
+        changed_at: now,
+    });
+    Ok(updated)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn append_certificate_rollout_audit(
+    control: &mut ReplicatedControlPlaneState,
+    node_id: &str,
+    member_generation: u64,
+    previous_phase: Option<ClusterCertificateRolloutPhase>,
+    current_phase: Option<ClusterCertificateRolloutPhase>,
+    previous_tls_server_certificate_fingerprint: &str,
+    next_tls_server_certificate_fingerprint: &str,
+    actor: &str,
+    reason: &str,
+    now: DateTime<Utc>,
+) -> Result<u64, (AuthorityRejection, String)> {
+    require_certificate_rollout_audit_capacity(control)?;
+    let trust_generation = control
+        .tls_trust_generation
+        .checked_add(1)
+        .ok_or_else(|| conflict("cluster TLS trust generation overflow"))?;
+    control.tls_trust_generation = trust_generation;
+    control
+        .certificate_rollout_audit
+        .push(ClusterCertificateRolloutAudit {
+            trust_generation,
+            node_id: node_id.to_owned(),
+            member_generation,
+            previous_phase,
+            current_phase,
+            previous_tls_server_certificate_fingerprint:
+                previous_tls_server_certificate_fingerprint.to_owned(),
+            next_tls_server_certificate_fingerprint: next_tls_server_certificate_fingerprint
+                .to_owned(),
+            actor: actor.to_owned(),
+            reason: reason.to_owned(),
+            changed_at: now,
+        });
+    Ok(trust_generation)
+}
+
+fn certificate_fingerprint_was_previously_authorized(
+    control: &ReplicatedControlPlaneState,
+    fingerprint: &str,
+) -> bool {
+    control.membership_audit.iter().any(|audit| {
+        audit.previous_tls_server_certificate_fingerprint.as_deref() == Some(fingerprint)
+            || audit.current_tls_server_certificate_fingerprint.as_deref() == Some(fingerprint)
+    }) || control.certificate_rollout_audit.iter().any(|audit| {
+        audit.previous_tls_server_certificate_fingerprint == fingerprint
+            || audit.next_tls_server_certificate_fingerprint == fingerprint
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_prepare_member_certificate_rollout(
+    control: &mut ReplicatedControlPlaneState,
+    registration: &ClusterMemberRegistration,
+    challenge_hex: &str,
+    signature_hex: &str,
+    expected_generation: u64,
+    prepare_ttl_seconds: u64,
+    minimum_overlap_seconds: u64,
+    actor: &str,
+    reason: &str,
+    proposed_at: DateTime<Utc>,
+) -> Result<(ClusterMember, ClusterCertificateRollout), (AuthorityRejection, String)> {
+    validate_text(actor, "cluster-certificate-rollout actor").map_err(invalid_command)?;
+    validate_reason(reason).map_err(invalid_command)?;
+    if !(MIN_CERTIFICATE_ROLLOUT_SECONDS..=MAX_CERTIFICATE_ROLLOUT_SECONDS)
+        .contains(&prepare_ttl_seconds)
+        || !(MIN_CERTIFICATE_ROLLOUT_SECONDS..=MAX_CERTIFICATE_ROLLOUT_SECONDS)
+            .contains(&minimum_overlap_seconds)
+    {
+        return Err(invalid_command(format!(
+            "invalid certificate rollout window (expected {MIN_CERTIFICATE_ROLLOUT_SECONDS}..={MAX_CERTIFICATE_ROLLOUT_SECONDS} seconds)"
+        )));
+    }
+    require_membership_audit_capacity(control)?;
+    require_certificate_rollout_audit_capacity(control)?;
+    let (now, challenge_hash) = validate_challenged_registration(
+        control,
+        registration,
+        challenge_hex,
+        signature_hex,
+        proposed_at,
+    )?;
+    let member = control
+        .members
+        .get(&registration.node_id)
+        .cloned()
+        .ok_or_else(|| conflict("cluster member not found"))?;
+    if member.state != ClusterMemberState::Active {
+        return Err(conflict(
+            "certificate rollout requires an active cluster member",
+        ));
+    }
+    if member.generation != expected_generation {
+        return Err(conflict(format!(
+            "cluster member revision conflict: expected {expected_generation}, current {}",
+            member.generation
+        )));
+    }
+    if control.certificate_rollouts.contains_key(&member.node_id) {
+        return Err(conflict(
+            "cluster member already has an unfinished certificate rollout",
+        ));
+    }
+    if member.fingerprint != registration.fingerprint
+        || member.public_key != registration.public_key
+        || member.endpoint != registration.endpoint
+        || member.server_version != registration.server_version
+        || member.min_protocol_version != registration.min_protocol_version
+        || member.protocol_version != registration.protocol_version
+    {
+        return Err(conflict(
+            "certificate rollout registration may only change the TLS certificate fingerprint",
+        ));
+    }
+    let previous_fingerprint = member
+        .tls_server_certificate_fingerprint
+        .as_deref()
+        .ok_or_else(|| {
+            conflict("certificate rollout requires an existing TLS-bound application listener")
+        })?;
+    let next_fingerprint = registration
+        .tls_server_certificate_fingerprint
+        .as_deref()
+        .ok_or_else(|| invalid_command("certificate rollout candidate fingerprint is required"))?;
+    if previous_fingerprint == next_fingerprint {
+        return Err(conflict(
+            "certificate rollout candidate must differ from the current fingerprint",
+        ));
+    }
+    if certificate_fingerprint_was_previously_authorized(control, next_fingerprint)
+        || control.members.values().any(|candidate| {
+            candidate.tls_server_certificate_fingerprint.as_deref() == Some(next_fingerprint)
+        })
+    {
+        return Err(conflict(
+            "certificate rollout candidate was already authorized or assigned",
+        ));
+    }
+    let prepare_expires_at = now
+        .checked_add_signed(TimeDelta::seconds(prepare_ttl_seconds as i64))
+        .ok_or_else(|| invalid_command("certificate rollout prepare expiry overflow"))?;
+    let updated = append_member_revision(
+        control,
+        &member,
+        member.state,
+        member.tls_server_certificate_fingerprint.clone(),
+        actor,
+        reason,
+        now,
+    )?;
+    let trust_generation = append_certificate_rollout_audit(
+        control,
+        &member.node_id,
+        updated.generation,
+        None,
+        Some(ClusterCertificateRolloutPhase::Prepared),
+        previous_fingerprint,
+        next_fingerprint,
+        actor,
+        reason,
+        now,
+    )?;
+    let rollout = ClusterCertificateRollout {
+        node_id: member.node_id.clone(),
+        trust_generation,
+        member_generation: updated.generation,
+        phase: ClusterCertificateRolloutPhase::Prepared,
+        previous_tls_server_certificate_fingerprint: previous_fingerprint.to_owned(),
+        next_tls_server_certificate_fingerprint: next_fingerprint.to_owned(),
+        minimum_overlap_seconds,
+        prepare_expires_at,
+        retire_previous_after: None,
+        prepared_at: now,
+        updated_at: now,
+        reason: reason.to_owned(),
+    };
+    control
+        .certificate_rollouts
+        .insert(member.node_id.clone(), rollout.clone());
+    consume_join_challenge(control, &challenge_hash, now);
+    Ok((updated, rollout))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CertificateRolloutFinish {
+    Abort,
+    Finalize,
+}
+
+fn apply_finish_member_certificate_rollout(
+    control: &mut ReplicatedControlPlaneState,
+    node_id: &str,
+    expected_generation: u64,
+    finish: CertificateRolloutFinish,
+    actor: &str,
+    reason: &str,
+    proposed_at: DateTime<Utc>,
+) -> Result<ClusterMember, (AuthorityRejection, String)> {
+    Uuid::parse_str(node_id)
+        .map_err(|_| invalid_command("invalid certificate rollout cluster member node id"))?;
+    validate_text(actor, "cluster-certificate-rollout actor").map_err(invalid_command)?;
+    validate_reason(reason).map_err(invalid_command)?;
+    require_membership_audit_capacity(control)?;
+    require_certificate_rollout_audit_capacity(control)?;
+    let member = control
+        .members
+        .get(node_id)
+        .cloned()
+        .ok_or_else(|| conflict("cluster member not found"))?;
+    if member.state != ClusterMemberState::Active {
+        return Err(conflict(
+            "certificate rollout mutation requires an active cluster member",
+        ));
+    }
+    if member.generation != expected_generation {
+        return Err(conflict(format!(
+            "cluster member revision conflict: expected {expected_generation}, current {}",
+            member.generation
+        )));
+    }
+    let rollout = control
+        .certificate_rollouts
+        .get(node_id)
+        .cloned()
+        .ok_or_else(|| conflict("cluster member has no unfinished certificate rollout"))?;
+    if rollout.member_generation != member.generation {
+        return Err(conflict(
+            "certificate rollout revision differs from the current member revision",
+        ));
+    }
+    let now = advance_authority_time(control, proposed_at)?;
+    match finish {
+        CertificateRolloutFinish::Abort
+            if rollout.phase != ClusterCertificateRolloutPhase::Prepared =>
+        {
+            return Err(conflict(
+                "activated certificate rollout cannot be aborted; wait and finalize it",
+            ));
+        }
+        CertificateRolloutFinish::Finalize
+            if rollout.phase != ClusterCertificateRolloutPhase::Activated =>
+        {
+            return Err(conflict(
+                "prepared certificate rollout cannot be finalized before activation",
+            ));
+        }
+        CertificateRolloutFinish::Finalize
+            if rollout
+                .retire_previous_after
+                .is_none_or(|deadline| now < deadline) =>
+        {
+            return Err(conflict(
+                "certificate rollout overlap has not reached its retirement deadline",
+            ));
+        }
+        _ => {}
+    }
+    let updated = append_member_revision(
+        control,
+        &member,
+        member.state,
+        member.tls_server_certificate_fingerprint.clone(),
+        actor,
+        reason,
+        now,
+    )?;
+    append_certificate_rollout_audit(
+        control,
+        node_id,
+        updated.generation,
+        Some(rollout.phase),
+        None,
+        &rollout.previous_tls_server_certificate_fingerprint,
+        &rollout.next_tls_server_certificate_fingerprint,
+        actor,
+        reason,
+        now,
+    )?;
+    control.certificate_rollouts.remove(node_id);
+    Ok(updated)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_register_member(
+    control: &mut ReplicatedControlPlaneState,
+    registration: &ClusterMemberRegistration,
+    challenge_hex: &str,
+    signature_hex: &str,
+    expected_generation: Option<u64>,
+    authority_min_protocol_version: u32,
+    authority_protocol_version: u32,
+    actor: &str,
+    reason: &str,
+    proposed_at: DateTime<Utc>,
+) -> Result<ClusterMember, (AuthorityRejection, String)> {
+    validate_text(actor, "cluster-membership actor").map_err(invalid_command)?;
+    validate_reason(reason).map_err(invalid_command)?;
+    if authority_min_protocol_version == 0
+        || authority_min_protocol_version > authority_protocol_version
+    {
+        return Err(invalid_command("invalid authority protocol window"));
+    }
+    if registration.protocol_version < authority_min_protocol_version
+        || registration.min_protocol_version > authority_protocol_version
+    {
+        return Err(conflict(format!(
+            "incompatible wire-protocol cluster member window: authority v{authority_min_protocol_version}..=v{authority_protocol_version}, member v{}..=v{}",
+            registration.min_protocol_version, registration.protocol_version
+        )));
+    }
+    let (now, challenge_hash) = validate_challenged_registration(
+        control,
+        registration,
+        challenge_hex,
+        signature_hex,
+        proposed_at,
+    )?;
     if control.members.values().any(|member| {
         member.node_id != registration.node_id
             && (member.fingerprint == registration.fingerprint
@@ -2182,13 +3005,51 @@ fn apply_register_member(
             "cluster member identity, endpoint, or TLS binding already belongs to another node",
         ));
     }
-    if control.membership_audit.len() >= 100_000 {
-        return Err((
-            AuthorityRejection::CapacityReached,
-            "replicated membership audit capacity is exhausted".into(),
-        ));
-    }
+    require_membership_audit_capacity(control)?;
     let existing = control.members.get(&registration.node_id).cloned();
+    let mut activating_rollout = None;
+    if let Some(member) = &existing {
+        let changes_tls = member.tls_server_certificate_fingerprint
+            != registration.tls_server_certificate_fingerprint;
+        match control.certificate_rollouts.get(&member.node_id) {
+            Some(rollout)
+                if member.state == ClusterMemberState::Active
+                    && changes_tls
+                    && rollout.phase == ClusterCertificateRolloutPhase::Prepared
+                    && rollout.member_generation == member.generation
+                    && registration.tls_server_certificate_fingerprint.as_deref()
+                        == Some(&rollout.next_tls_server_certificate_fingerprint)
+                    && now < rollout.prepare_expires_at =>
+            {
+                if member.fingerprint != registration.fingerprint
+                    || member.public_key != registration.public_key
+                    || member.endpoint != registration.endpoint
+                    || member.server_version != registration.server_version
+                    || member.min_protocol_version != registration.min_protocol_version
+                    || member.protocol_version != registration.protocol_version
+                    || member.tls_server_certificate_fingerprint.as_deref()
+                        != Some(&rollout.previous_tls_server_certificate_fingerprint)
+                {
+                    return Err(conflict(
+                        "certificate rollout activation may only change the prepared TLS fingerprint",
+                    ));
+                }
+                require_certificate_rollout_audit_capacity(control)?;
+                activating_rollout = Some(rollout.clone());
+            }
+            Some(_) => {
+                return Err(conflict(
+                    "cluster member registration conflicts with its unfinished certificate rollout",
+                ));
+            }
+            None if member.state == ClusterMemberState::Active && changes_tls => {
+                return Err(conflict(
+                    "active cluster member TLS changes require a prepared certificate rollout",
+                ));
+            }
+            None => {}
+        }
+    }
     let (previous, previous_tls, generation, joined_at) = match existing {
         Some(member) => {
             let expected = expected_generation.ok_or_else(|| {
@@ -2276,11 +3137,33 @@ fn apply_register_member(
         reason: reason.to_owned(),
         changed_at: now,
     });
-    control
-        .join_challenges
-        .get_mut(&challenge_hash)
-        .expect("validated challenge remains present")
-        .consumed_at = Some(now);
+    if let Some(mut rollout) = activating_rollout {
+        let retire_previous_after = now
+            .checked_add_signed(TimeDelta::seconds(rollout.minimum_overlap_seconds as i64))
+            .ok_or_else(|| invalid_command("certificate rollout retirement deadline overflow"))?;
+        let trust_generation = append_certificate_rollout_audit(
+            control,
+            &member.node_id,
+            member.generation,
+            Some(ClusterCertificateRolloutPhase::Prepared),
+            Some(ClusterCertificateRolloutPhase::Activated),
+            &rollout.previous_tls_server_certificate_fingerprint,
+            &rollout.next_tls_server_certificate_fingerprint,
+            actor,
+            reason,
+            now,
+        )?;
+        rollout.trust_generation = trust_generation;
+        rollout.member_generation = member.generation;
+        rollout.phase = ClusterCertificateRolloutPhase::Activated;
+        rollout.retire_previous_after = Some(retire_previous_after);
+        rollout.updated_at = now;
+        rollout.reason = reason.to_owned();
+        control
+            .certificate_rollouts
+            .insert(member.node_id.clone(), rollout);
+    }
+    consume_join_challenge(control, &challenge_hash, now);
     Ok(member)
 }
 
@@ -2320,11 +3203,15 @@ fn apply_set_member_state(
     if member.state == state {
         return Err(conflict("cluster member is already in the requested state"));
     }
-    if control.membership_audit.len() >= 100_000 {
-        return Err((
-            AuthorityRejection::CapacityReached,
-            "replicated membership audit capacity is exhausted".into(),
+    require_membership_audit_capacity(control)?;
+    let certificate_rollout = control.certificate_rollouts.get(node_id).cloned();
+    if state == ClusterMemberState::Left && certificate_rollout.is_some() {
+        return Err(conflict(
+            "cluster member leave conflict: finish its certificate rollout first",
         ));
+    }
+    if state == ClusterMemberState::Revoked && certificate_rollout.is_some() {
+        require_certificate_rollout_audit_capacity(control)?;
     }
     let now = advance_authority_time(control, proposed_at)?;
     let active_owned = control
@@ -2416,6 +3303,21 @@ fn apply_set_member_state(
         reason: reason.to_owned(),
         changed_at: now,
     });
+    if let Some(rollout) = certificate_rollout {
+        append_certificate_rollout_audit(
+            control,
+            node_id,
+            updated.generation,
+            Some(rollout.phase),
+            None,
+            &rollout.previous_tls_server_certificate_fingerprint,
+            &rollout.next_tls_server_certificate_fingerprint,
+            actor,
+            reason,
+            now,
+        )?;
+        control.certificate_rollouts.remove(node_id);
+    }
     Ok(updated)
 }
 
@@ -3023,6 +3925,20 @@ mod tests {
         (pair, public_key, fingerprint)
     }
 
+    fn sign_registration(
+        pair: &ring::signature::Ed25519KeyPair,
+        cluster_id: &str,
+        challenge_hex: &str,
+        registration: &ClusterMemberRegistration,
+    ) -> String {
+        let payload = membership_join_payload(cluster_id, challenge_hex, registration).unwrap();
+        pair.sign(&payload)
+            .as_ref()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    }
+
     #[test]
     fn authority_genesis_rejects_a_tls_leaf_shared_by_two_identities() {
         let (_, first_public_key, first_fingerprint) = test_identity();
@@ -3358,6 +4274,340 @@ mod tests {
         let persisted = load_persistent_state(&connection).unwrap();
         assert_eq!(persisted.authority.sequence, 6);
         assert_eq!(persisted.authority.receipts.len(), 6);
+    }
+
+    #[tokio::test]
+    async fn certificate_rollout_is_bounded_replay_safe_and_never_reuses_retired_leaves() {
+        let context = Arc::new(SqliteContextManager::in_memory().unwrap());
+        let (_, mut state) = open_cluster_raft_storage(context.clone()).unwrap();
+        let started_at = Utc::now();
+        let cluster_id = Uuid::new_v4().to_string();
+        let node_id = Uuid::new_v4().to_string();
+        let (pair, public_key, fingerprint) = test_identity();
+        let old_tls = "a".repeat(64);
+        let new_tls = "b".repeat(64);
+        let genesis = AuthorityGenesis {
+            cluster_id: cluster_id.clone(),
+            members: vec![AuthorityGenesisMember {
+                node_id: node_id.clone(),
+                fingerprint: fingerprint.clone(),
+                public_key: public_key.clone(),
+                tls_server_certificate_fingerprint: Some(old_tls.clone()),
+                endpoint: "127.0.0.1:7777".into(),
+                server_version: "0.3.0".into(),
+                min_protocol_version: 1,
+                protocol_version: 2,
+            }],
+        };
+        state
+            .apply([normal_entry(
+                log_id(1, 1),
+                AuthorityCommand::Initialize {
+                    operation_id: Uuid::new_v4().to_string(),
+                    genesis,
+                    proposed_at: started_at,
+                },
+            )])
+            .await
+            .unwrap();
+
+        let prepare_challenge = "c1".repeat(32);
+        state
+            .apply([normal_entry(
+                log_id(1, 2),
+                AuthorityCommand::IssueJoinChallenge {
+                    operation_id: Uuid::new_v4().to_string(),
+                    challenge_hex: prepare_challenge.clone(),
+                    ttl_seconds: 60,
+                    proposed_at: started_at + TimeDelta::seconds(1),
+                },
+            )])
+            .await
+            .unwrap();
+        let candidate = ClusterMemberRegistration {
+            node_id: node_id.clone(),
+            fingerprint: fingerprint.clone(),
+            public_key: public_key.clone(),
+            tls_server_certificate_fingerprint: Some(new_tls.clone()),
+            endpoint: "127.0.0.1:7777".into(),
+            server_version: "0.3.0".into(),
+            min_protocol_version: 1,
+            protocol_version: 2,
+        };
+        let prepare = AuthorityCommand::PrepareMemberCertificateRollout {
+            operation_id: Uuid::new_v4().to_string(),
+            registration: candidate.clone(),
+            challenge_hex: prepare_challenge.clone(),
+            signature_hex: sign_registration(&pair, &cluster_id, &prepare_challenge, &candidate),
+            expected_generation: 1,
+            prepare_ttl_seconds: 5,
+            minimum_overlap_seconds: 5,
+            actor: "operator".into(),
+            reason: "stage replacement leaf".into(),
+            proposed_at: started_at + TimeDelta::seconds(1),
+        };
+        let prepared = state
+            .apply([normal_entry(log_id(1, 3), prepare.clone())])
+            .await
+            .unwrap();
+        let AuthorityResponse::CertificateRolloutUpdated {
+            member,
+            rollout: Some(rollout),
+            sequence,
+            replayed,
+            ..
+        } = &prepared[0]
+        else {
+            panic!("expected prepared certificate rollout");
+        };
+        assert_eq!(member.generation, 2);
+        assert_eq!(*sequence, 3);
+        assert!(!replayed);
+        assert_eq!(rollout.phase, ClusterCertificateRolloutPhase::Prepared);
+        assert!(rollout.accepts_fingerprint(
+            &new_tls,
+            rollout.prepare_expires_at - TimeDelta::nanoseconds(1)
+        ));
+        assert!(!rollout.accepts_fingerprint(&new_tls, rollout.prepare_expires_at));
+        assert!(rollout.accepts_fingerprint(&old_tls, rollout.prepare_expires_at));
+        {
+            let connection = context.conn.lock().unwrap();
+            let persisted = load_persistent_state(&connection).unwrap();
+            let mut corrupted = persisted.authority.control_plane.unwrap();
+            corrupted.tls_trust_generation += 1;
+            assert!(
+                validate_control_plane_state(&corrupted).is_err(),
+                "rollout trust generation corruption must fail closed"
+            );
+        }
+
+        let mut retry = prepare;
+        if let AuthorityCommand::PrepareMemberCertificateRollout { proposed_at, .. } = &mut retry {
+            *proposed_at = started_at + TimeDelta::seconds(20);
+        }
+        let replayed = state
+            .apply([normal_entry(log_id(1, 4), retry)])
+            .await
+            .unwrap();
+        assert!(matches!(
+            &replayed[0],
+            AuthorityResponse::CertificateRolloutUpdated {
+                sequence: 3,
+                replayed: true,
+                ..
+            }
+        ));
+
+        let activation_challenge = "c2".repeat(32);
+        state
+            .apply([normal_entry(
+                log_id(1, 5),
+                AuthorityCommand::IssueJoinChallenge {
+                    operation_id: Uuid::new_v4().to_string(),
+                    challenge_hex: activation_challenge.clone(),
+                    ttl_seconds: 60,
+                    proposed_at: started_at + TimeDelta::seconds(2),
+                },
+            )])
+            .await
+            .unwrap();
+        let expired_activation = state
+            .apply([normal_entry(
+                log_id(1, 6),
+                AuthorityCommand::RegisterMember {
+                    operation_id: Uuid::new_v4().to_string(),
+                    registration: candidate.clone(),
+                    challenge_hex: activation_challenge.clone(),
+                    signature_hex: sign_registration(
+                        &pair,
+                        &cluster_id,
+                        &activation_challenge,
+                        &candidate,
+                    ),
+                    expected_generation: Some(2),
+                    authority_min_protocol_version: 1,
+                    authority_protocol_version: 2,
+                    actor: "operator".into(),
+                    reason: "attempt expired candidate".into(),
+                    proposed_at: rollout.prepare_expires_at,
+                },
+            )])
+            .await
+            .unwrap();
+        assert!(matches!(
+            &expired_activation[0],
+            AuthorityResponse::Rejected {
+                reason: AuthorityRejection::Conflict,
+                ..
+            }
+        ));
+        let activated = state
+            .apply([normal_entry(
+                log_id(1, 7),
+                AuthorityCommand::RegisterMember {
+                    operation_id: Uuid::new_v4().to_string(),
+                    registration: candidate.clone(),
+                    challenge_hex: activation_challenge.clone(),
+                    signature_hex: sign_registration(
+                        &pair,
+                        &cluster_id,
+                        &activation_challenge,
+                        &candidate,
+                    ),
+                    expected_generation: Some(2),
+                    authority_min_protocol_version: 1,
+                    authority_protocol_version: 2,
+                    actor: "operator".into(),
+                    reason: "activate replacement leaf".into(),
+                    proposed_at: started_at + TimeDelta::seconds(3),
+                },
+            )])
+            .await
+            .unwrap();
+        assert!(matches!(
+            &activated[0],
+            AuthorityResponse::MemberUpdated { member, .. }
+                if member.generation == 3
+                    && member.tls_server_certificate_fingerprint.as_deref()
+                        == Some(new_tls.as_str())
+        ));
+        let view = read_replicated_authority_view(&context).unwrap().unwrap();
+        let rollout = &view.membership.certificate_rollouts[0];
+        assert_eq!(rollout.phase, ClusterCertificateRolloutPhase::Activated);
+        let retirement = rollout.retire_previous_after.unwrap();
+        assert!(rollout.accepts_fingerprint(&old_tls, retirement - TimeDelta::nanoseconds(1)));
+        assert!(!rollout.accepts_fingerprint(&old_tls, retirement));
+        assert!(rollout.accepts_fingerprint(&new_tls, retirement));
+
+        let early = state
+            .apply([normal_entry(
+                log_id(1, 8),
+                AuthorityCommand::FinalizeMemberCertificateRollout {
+                    operation_id: Uuid::new_v4().to_string(),
+                    node_id: node_id.clone(),
+                    expected_generation: 3,
+                    actor: "operator".into(),
+                    reason: "retire old leaf".into(),
+                    proposed_at: started_at + TimeDelta::seconds(7),
+                },
+            )])
+            .await
+            .unwrap();
+        assert!(matches!(
+            &early[0],
+            AuthorityResponse::Rejected {
+                reason: AuthorityRejection::Conflict,
+                ..
+            }
+        ));
+        let finalized = state
+            .apply([normal_entry(
+                log_id(1, 9),
+                AuthorityCommand::FinalizeMemberCertificateRollout {
+                    operation_id: Uuid::new_v4().to_string(),
+                    node_id: node_id.clone(),
+                    expected_generation: 3,
+                    actor: "operator".into(),
+                    reason: "retire old leaf".into(),
+                    proposed_at: started_at + TimeDelta::seconds(8),
+                },
+            )])
+            .await
+            .unwrap();
+        assert!(matches!(
+            &finalized[0],
+            AuthorityResponse::CertificateRolloutUpdated {
+                member,
+                rollout: None,
+                ..
+            } if member.generation == 4
+        ));
+        let view = read_replicated_authority_view(&context).unwrap().unwrap();
+        assert_eq!(view.membership.generation, 4);
+        assert_eq!(view.membership.tls_trust_generation, 3);
+        assert!(view.membership.certificate_rollouts.is_empty());
+        assert_eq!(view.certificate_rollout_audit.len(), 3);
+        drop(state);
+        let (_, mut state) =
+            open_cluster_raft_storage(context.clone()).expect("reopen qualified rollout state");
+
+        let reuse_challenge = "c3".repeat(32);
+        state
+            .apply([normal_entry(
+                log_id(1, 10),
+                AuthorityCommand::IssueJoinChallenge {
+                    operation_id: Uuid::new_v4().to_string(),
+                    challenge_hex: reuse_challenge.clone(),
+                    ttl_seconds: 60,
+                    proposed_at: started_at + TimeDelta::seconds(9),
+                },
+            )])
+            .await
+            .unwrap();
+        let retired_candidate = ClusterMemberRegistration {
+            tls_server_certificate_fingerprint: Some(old_tls),
+            ..candidate
+        };
+        let reuse = state
+            .apply([normal_entry(
+                log_id(1, 11),
+                AuthorityCommand::PrepareMemberCertificateRollout {
+                    operation_id: Uuid::new_v4().to_string(),
+                    registration: retired_candidate.clone(),
+                    challenge_hex: reuse_challenge.clone(),
+                    signature_hex: sign_registration(
+                        &pair,
+                        &cluster_id,
+                        &reuse_challenge,
+                        &retired_candidate,
+                    ),
+                    expected_generation: 4,
+                    prepare_ttl_seconds: 5,
+                    minimum_overlap_seconds: 5,
+                    actor: "operator".into(),
+                    reason: "attempt retired leaf reuse".into(),
+                    proposed_at: started_at + TimeDelta::seconds(10),
+                },
+            )])
+            .await
+            .unwrap();
+        assert!(matches!(
+            &reuse[0],
+            AuthorityResponse::Rejected {
+                reason: AuthorityRejection::Conflict,
+                ..
+            }
+        ));
+        let direct_swap = state
+            .apply([normal_entry(
+                log_id(1, 12),
+                AuthorityCommand::RegisterMember {
+                    operation_id: Uuid::new_v4().to_string(),
+                    registration: retired_candidate.clone(),
+                    challenge_hex: reuse_challenge.clone(),
+                    signature_hex: sign_registration(
+                        &pair,
+                        &cluster_id,
+                        &reuse_challenge,
+                        &retired_candidate,
+                    ),
+                    expected_generation: Some(4),
+                    authority_min_protocol_version: 1,
+                    authority_protocol_version: 2,
+                    actor: "operator".into(),
+                    reason: "attempt unprepared direct swap".into(),
+                    proposed_at: started_at + TimeDelta::seconds(10),
+                },
+            )])
+            .await
+            .unwrap();
+        assert!(matches!(
+            &direct_swap[0],
+            AuthorityResponse::Rejected {
+                reason: AuthorityRejection::Conflict,
+                ..
+            }
+        ));
     }
 
     #[tokio::test]

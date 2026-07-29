@@ -10,6 +10,17 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
 
 ## [Unreleased]
 
+- Added quorum-coordinated, time-bounded application-listener certificate
+  rollout for `[cluster_raft]` authorities. A fresh challenged identity proof
+  prepares a never-before-authorized candidate for 5–3600 seconds; activation
+  requires another fresh challenged registration, then retains the previous
+  leaf only for a replicated 5–3600 second overlap. Prepared rollouts can be
+  aborted, activated rollouts can be finalized only after their retirement
+  deadline, and retired leaves cannot be reused. Membership discovery and
+  configured-authority startup evaluate both windows against replicated
+  authority time. New typed v2/SDK prepare, abort, finalize, and audit controls
+  preserve caller-stable retry IDs. This rotates application listener leaves,
+  not the static Raft voter transport certificates or trust map.
 - Routed public membership and ownership authority through the optional
   production OpenRaft runtime. Identical voter genesis now seeds challenged
   application membership, generation/audit history, ownership
@@ -24,8 +35,8 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
   from Raft transport TLS. State-machine, three-node failover/partition, and
   real daemon TCP lifecycle regressions cover deterministic replay, restart
   recovery, follower forwarding, no-quorum rejection, and clean shutdown.
-  Static voter changes, authority-term destination proofs, coordinated
-  certificate rollout, migration, cross-node IPC, global quotas/trust, rolling
+  Static voter changes and Raft transport trust rotation, authority-term
+  destination proofs, migration, cross-node IPC, global quotas/trust, rolling
   upgrades, and disaster recovery remain #122.
 - Wired the authenticated OpenRaft runtime into the production `agent-server`
   lifecycle behind a default-off, strict `[cluster_raft]` configuration.
@@ -62,7 +73,8 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
   fingerprint, permits authenticated certificate rotation, forbids TLS-to-
   plaintext re-admission, records old/new leaf fingerprints in durable
   membership audit, and rejects a superseded leaf during discovery.
-  Certificate rollout orchestration and quorum authority remain pending #122.
+  Quorum application-listener rollout is now implemented by the replicated
+  authority; Raft transport trust rotation remains pending #122.
 - Added durably reconcilable managed cluster creation. The authority now exposes
   a stable paginated ownership directory; managed placement reserves a UUID,
   preinstalls its exact destination fence, and creates only while that proof is

@@ -20,6 +20,7 @@ use crate::wire_io::{
 pub const WIRE_FEATURES: &[&str] = &[
     "agent_enforcement_introspection",
     "authorized_cluster_membership",
+    "bounded_certificate_rollout",
     "cluster_ownership_leases",
     "backup_retention",
     "bounded_json_frames",
@@ -463,6 +464,37 @@ const REQUEST_VARIANTS: &[Variant] = &[
         ],
     },
     Variant {
+        tag: "prepare_cluster_member_certificate_rollout",
+        fields: &[
+            Field::optional("operation_id", S),
+            Field::required("registration", O),
+            Field::required("challenge_hex", S),
+            Field::required("signature_hex", S),
+            Field::required("expected_generation", I),
+            Field::required("prepare_ttl_seconds", I),
+            Field::required("minimum_overlap_seconds", I),
+            Field::required("reason", S),
+        ],
+    },
+    Variant {
+        tag: "abort_cluster_member_certificate_rollout",
+        fields: &[
+            Field::optional("operation_id", S),
+            Field::required("node_id", S),
+            Field::required("expected_generation", I),
+            Field::required("reason", S),
+        ],
+    },
+    Variant {
+        tag: "finalize_cluster_member_certificate_rollout",
+        fields: &[
+            Field::optional("operation_id", S),
+            Field::required("node_id", S),
+            Field::required("expected_generation", I),
+            Field::required("reason", S),
+        ],
+    },
+    Variant {
         tag: "set_cluster_member_state",
         fields: &[
             Field::optional("operation_id", S),
@@ -478,6 +510,10 @@ const REQUEST_VARIANTS: &[Variant] = &[
     },
     Variant {
         tag: "list_cluster_membership_audit",
+        fields: &[Field::optional("limit", I)],
+    },
+    Variant {
+        tag: "list_cluster_certificate_rollout_audit",
         fields: &[Field::optional("limit", I)],
     },
     Variant {
@@ -687,9 +723,13 @@ pub fn conformance_request_fixtures(protocol_version: u32) -> Result<Vec<Value>,
                         | "list_node_control_audit"
                         | "issue_cluster_join_challenge"
                         | "register_cluster_member"
+                        | "prepare_cluster_member_certificate_rollout"
+                        | "abort_cluster_member_certificate_rollout"
+                        | "finalize_cluster_member_certificate_rollout"
                         | "set_cluster_member_state"
                         | "get_cluster_membership"
                         | "list_cluster_membership_audit"
+                        | "list_cluster_certificate_rollout_audit"
                         | "claim_cluster_agent_ownership"
                         | "renew_cluster_agent_ownership"
                         | "release_cluster_agent_ownership"
@@ -1029,11 +1069,22 @@ const REPLY_VARIANTS: &[Variant] = &[
         fields: &[Field::required("member", O)],
     },
     Variant {
+        tag: "cluster_certificate_rollout_updated",
+        fields: &[
+            Field::required("member", O),
+            Field::optional("rollout", JsonKind::ObjectOrNull),
+        ],
+    },
+    Variant {
         tag: "cluster_membership",
         fields: &[Field::required("membership", O)],
     },
     Variant {
         tag: "cluster_membership_audit",
+        fields: &[Field::required("entries", A)],
+    },
+    Variant {
+        tag: "cluster_certificate_rollout_audit",
         fields: &[Field::required("entries", A)],
     },
     Variant {
@@ -1451,7 +1502,7 @@ mod tests {
             }
         }
         assert_eq!(conformance_request_fixtures(1).unwrap().len(), 61);
-        assert_eq!(conformance_request_fixtures(2).unwrap().len(), 88);
+        assert_eq!(conformance_request_fixtures(2).unwrap().len(), 92);
         assert!(conformance_request_fixtures(0).is_err());
         assert!(conformance_request_fixtures(PROTOCOL_VERSION + 1).is_err());
     }

@@ -28,6 +28,8 @@ const MAX_MEMBER_ENDPOINT_BYTES: usize = 2048;
 const MAX_MEMBER_VERSION_BYTES: usize = 256;
 pub(crate) const MIN_JOIN_CHALLENGE_TTL_SECONDS: u64 = 5;
 pub(crate) const MAX_JOIN_CHALLENGE_TTL_SECONDS: u64 = 300;
+pub(crate) const MIN_CERTIFICATE_ROLLOUT_SECONDS: u64 = 5;
+pub(crate) const MAX_CERTIFICATE_ROLLOUT_SECONDS: u64 = 3_600;
 pub(crate) const MIN_OWNERSHIP_LEASE_TTL_SECONDS: u64 = 5;
 pub(crate) const MAX_OWNERSHIP_LEASE_TTL_SECONDS: u64 = 300;
 
@@ -225,11 +227,73 @@ pub struct ClusterMember {
     pub reason: String,
 }
 
+/// Quorum-coordinated application-listener certificate rollout phase.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClusterCertificateRolloutPhase {
+    /// The current leaf remains authoritative while a bounded candidate leaf
+    /// is staged for publication.
+    Prepared,
+    /// The replacement is current while the previous leaf drains for a
+    /// bounded overlap interval.
+    Activated,
+}
+
+/// Replicated, time-bounded application-listener certificate rollout.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClusterCertificateRollout {
+    pub node_id: String,
+    pub trust_generation: u64,
+    pub member_generation: u64,
+    pub phase: ClusterCertificateRolloutPhase,
+    pub previous_tls_server_certificate_fingerprint: String,
+    pub next_tls_server_certificate_fingerprint: String,
+    pub minimum_overlap_seconds: u64,
+    /// Candidate authorization expires if activation never completes.
+    pub prepare_expires_at: DateTime<Utc>,
+    /// Present only after activation. The previous leaf is unauthorized at or
+    /// after this replicated authority-clock instant.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retire_previous_after: Option<DateTime<Utc>>,
+    pub prepared_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    pub reason: String,
+}
+
+impl ClusterCertificateRollout {
+    /// Evaluate one verified leaf against this rollout using replicated
+    /// authority time. Expiry always narrows trust without requiring another
+    /// mutation to be available.
+    pub fn accepts_fingerprint(&self, fingerprint: &str, authority_time: DateTime<Utc>) -> bool {
+        match self.phase {
+            ClusterCertificateRolloutPhase::Prepared => {
+                fingerprint == self.previous_tls_server_certificate_fingerprint
+                    || (authority_time < self.prepare_expires_at
+                        && fingerprint == self.next_tls_server_certificate_fingerprint)
+            }
+            ClusterCertificateRolloutPhase::Activated => {
+                fingerprint == self.next_tls_server_certificate_fingerprint
+                    || (self
+                        .retire_previous_after
+                        .is_some_and(|deadline| authority_time < deadline)
+                        && fingerprint == self.previous_tls_server_certificate_fingerprint)
+            }
+        }
+    }
+}
+
 /// One transactionally consistent authority view used for discovery.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClusterMembershipSnapshot {
     pub cluster_id: String,
     pub generation: u64,
+    /// Replicated authority time used to evaluate certificate overlap.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authority_time: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub tls_trust_generation: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub certificate_rollouts: Vec<ClusterCertificateRollout>,
     pub members: Vec<ClusterMember>,
 }
 
@@ -245,6 +309,23 @@ pub struct ClusterMembershipAudit {
     pub previous_tls_server_certificate_fingerprint: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub current_tls_server_certificate_fingerprint: Option<String>,
+    pub actor: String,
+    pub reason: String,
+    pub changed_at: DateTime<Utc>,
+}
+
+/// Durable evidence for one certificate-rollout transition.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClusterCertificateRolloutAudit {
+    pub trust_generation: u64,
+    pub node_id: String,
+    pub member_generation: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_phase: Option<ClusterCertificateRolloutPhase>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_phase: Option<ClusterCertificateRolloutPhase>,
+    pub previous_tls_server_certificate_fingerprint: String,
+    pub next_tls_server_certificate_fingerprint: String,
     pub actor: String,
     pub reason: String,
     pub changed_at: DateTime<Utc>,
@@ -1228,6 +1309,9 @@ impl ClusterControl {
             cluster_id,
             generation: u64::try_from(generation)
                 .map_err(|_| storage_error("negative membership generation"))?,
+            authority_time: None,
+            tls_trust_generation: 0,
+            certificate_rollouts: Vec::new(),
             members,
         })
     }

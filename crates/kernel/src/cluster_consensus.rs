@@ -2,9 +2,9 @@
 //!
 //! This module implements OpenRaft's storage-v2 contracts inside the kernel's
 //! existing SQLite durability boundary. The authenticated peer transport and
-//! executable election runtime live in `cluster_runtime`; routing production
-//! membership and ownership mutations through that quorum remains a separate
-//! integration stage.
+//! executable election runtime live in `cluster_runtime`. When the operator
+//! enables that runtime, this deterministic state machine is the authority for
+//! public membership and ownership mutations and snapshots.
 
 // OpenRaft's required StorageError is intentionally larger than Clippy's
 // generic Result threshold. Storage-v2 implementations cannot replace or box
@@ -13,12 +13,12 @@
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
-use std::fmt::Debug;
-use std::io::Cursor;
+use std::fmt::{self, Debug};
+use std::io::{self, Cursor};
 use std::ops::{Bound, RangeBounds};
 use std::sync::Arc;
 
-use chrono::Utc;
+use chrono::{DateTime, TimeDelta, Utc};
 use openraft::storage::{LogFlushed, LogState, RaftLogStorage, RaftStateMachine, Snapshot};
 use openraft::{
     AnyError, Entry, EntryPayload, LogId, OptionalSend, RaftLogReader, RaftSnapshotBuilder,
@@ -28,6 +28,14 @@ use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::cluster_control::{
+    hex_decode, membership_join_payload, ownership_expiry, sha256_hex,
+    validate_member_registration, validate_ownership_identity, validate_ownership_request,
+    validate_reason, validate_text, ClusterAgentOwnership, ClusterAgentOwnershipAudit,
+    ClusterControl, ClusterJoinChallenge, ClusterMember, ClusterMemberRegistration,
+    ClusterMemberState, ClusterMembershipAudit, ClusterMembershipSnapshot, ClusterOwnershipState,
+    MAX_JOIN_CHALLENGE_TTL_SECONDS, MIN_JOIN_CHALLENGE_TTL_SECONDS,
+};
 use crate::context::SqliteContextManager;
 
 /// Stable numeric identifier used by the Raft protocol.
@@ -57,13 +65,38 @@ pub struct ClusterRaftNode {
     pub identity_public_key: String,
 }
 
-/// First deterministic authority command supported by the substrate.
-///
-/// A barrier is useful for proving that a client operation reached the
-/// replicated state machine. Production membership and ownership commands are
-/// added only when their public syscall paths are switched to quorum.
+/// Canonical application-level member seeded into a new authority.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthorityGenesisMember {
+    pub node_id: String,
+    pub fingerprint: String,
+    pub public_key: String,
+    #[serde(default)]
+    pub tls_server_certificate_fingerprint: Option<String>,
+    pub endpoint: String,
+    pub server_version: String,
+    pub min_protocol_version: u32,
+    pub protocol_version: u32,
+}
+
+/// Identical genesis document supplied by every statically configured voter.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthorityGenesis {
+    pub cluster_id: String,
+    pub members: Vec<AuthorityGenesisMember>,
+}
+
+/// Deterministic commands for the replicated membership and ownership
+/// authority. Every command carries a caller-stable operation UUID. Mutations
+/// also carry a proposed wall-clock value; the state machine converts it into
+/// a monotonic replicated authority clock before evaluating expiry.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AuthorityCommand {
+    Initialize {
+        operation_id: String,
+        genesis: AuthorityGenesis,
+        proposed_at: DateTime<Utc>,
+    },
     /// Commit an idempotent sequencing barrier.
     Barrier {
         /// Canonical UUID identifying this logical operation across retries.
@@ -71,6 +104,85 @@ pub enum AuthorityCommand {
         /// Optional compare-and-set against the current authority sequence.
         expected_sequence: Option<u64>,
     },
+    /// Internal quorum-committed logical-clock advancement used before
+    /// authority reads. It does not consume the bounded external-operation
+    /// receipt map and is idempotent for an identical proposed timestamp.
+    AdvanceTime {
+        operation_id: String,
+        proposed_at: DateTime<Utc>,
+    },
+    IssueJoinChallenge {
+        operation_id: String,
+        challenge_hex: String,
+        ttl_seconds: u64,
+        proposed_at: DateTime<Utc>,
+    },
+    RegisterMember {
+        operation_id: String,
+        registration: ClusterMemberRegistration,
+        challenge_hex: String,
+        signature_hex: String,
+        expected_generation: Option<u64>,
+        authority_min_protocol_version: u32,
+        authority_protocol_version: u32,
+        actor: String,
+        reason: String,
+        proposed_at: DateTime<Utc>,
+    },
+    SetMemberState {
+        operation_id: String,
+        node_id: String,
+        state: ClusterMemberState,
+        expected_generation: u64,
+        actor: String,
+        reason: String,
+        proposed_at: DateTime<Utc>,
+    },
+    ClaimOwnership {
+        operation_id: String,
+        agent_id: String,
+        owner_node_id: String,
+        ttl_seconds: u64,
+        expected_fencing_token: Option<u64>,
+        actor: String,
+        reason: String,
+        proposed_at: DateTime<Utc>,
+    },
+    RenewOwnership {
+        operation_id: String,
+        agent_id: String,
+        owner_node_id: String,
+        fencing_token: u64,
+        ttl_seconds: u64,
+        actor: String,
+        reason: String,
+        proposed_at: DateTime<Utc>,
+    },
+    ReleaseOwnership {
+        operation_id: String,
+        agent_id: String,
+        owner_node_id: String,
+        fencing_token: u64,
+        actor: String,
+        reason: String,
+        proposed_at: DateTime<Utc>,
+    },
+}
+
+impl AuthorityCommand {
+    fn operation_id(&self) -> &str {
+        match self {
+            Self::Initialize { operation_id, .. }
+            | Self::Barrier { operation_id, .. }
+            | Self::AdvanceTime { operation_id, .. }
+            | Self::IssueJoinChallenge { operation_id, .. }
+            | Self::RegisterMember { operation_id, .. }
+            | Self::SetMemberState { operation_id, .. }
+            | Self::ClaimOwnership { operation_id, .. }
+            | Self::RenewOwnership { operation_id, .. }
+            | Self::ReleaseOwnership { operation_id, .. } => operation_id,
+        }
+    }
 }
 
 /// Deterministic state-machine rejection. Rejections are application results,
@@ -83,6 +195,10 @@ pub enum AuthorityRejection {
     SequenceMismatch,
     ReceiptCapacityReached,
     SequenceExhausted,
+    NotInitialized,
+    InvalidCommand,
+    Conflict,
+    CapacityReached,
 }
 
 /// Response returned when an authority log entry is applied.
@@ -100,6 +216,39 @@ pub enum AuthorityResponse {
         log_id: LogId<ClusterRaftNodeId>,
         replayed: bool,
     },
+    /// The leader replicated a logical-clock floor before serving a read.
+    AuthorityTimeAdvanced {
+        operation_id: String,
+        logical_time: DateTime<Utc>,
+        log_id: LogId<ClusterRaftNodeId>,
+    },
+    ControlPlaneInitialized {
+        operation_id: String,
+        sequence: u64,
+        log_id: LogId<ClusterRaftNodeId>,
+        replayed: bool,
+    },
+    JoinChallengeIssued {
+        operation_id: String,
+        challenge: ClusterJoinChallenge,
+        sequence: u64,
+        log_id: LogId<ClusterRaftNodeId>,
+        replayed: bool,
+    },
+    MemberUpdated {
+        operation_id: String,
+        member: ClusterMember,
+        sequence: u64,
+        log_id: LogId<ClusterRaftNodeId>,
+        replayed: bool,
+    },
+    OwnershipUpdated {
+        operation_id: String,
+        ownership: ClusterAgentOwnership,
+        sequence: u64,
+        log_id: LogId<ClusterRaftNodeId>,
+        replayed: bool,
+    },
     /// The command was committed by Raft but rejected by deterministic
     /// application validation.
     Rejected {
@@ -107,6 +256,7 @@ pub enum AuthorityResponse {
         sequence: u64,
         log_id: LogId<ClusterRaftNodeId>,
         reason: AuthorityRejection,
+        message: String,
     },
 }
 
@@ -135,6 +285,39 @@ const MAX_SNAPSHOT_ID_BYTES: usize = 255;
 struct AuthorityState {
     sequence: u64,
     receipts: BTreeMap<String, StoredAuthorityReceipt>,
+    #[serde(default)]
+    control_plane: Option<ReplicatedControlPlaneState>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct ReplicatedJoinChallenge {
+    challenge_hex: String,
+    expires_at: DateTime<Utc>,
+    consumed_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct ReplicatedControlPlaneState {
+    genesis: AuthorityGenesis,
+    cluster_id: String,
+    membership_generation: u64,
+    members: BTreeMap<String, ClusterMember>,
+    membership_audit: Vec<ClusterMembershipAudit>,
+    join_challenges: BTreeMap<String, ReplicatedJoinChallenge>,
+    ownerships: BTreeMap<String, ClusterAgentOwnership>,
+    ownership_audit: Vec<ClusterAgentOwnershipAudit>,
+    logical_time: DateTime<Utc>,
+}
+
+/// Cloneable view read after an OpenRaft linearizability barrier.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplicatedAuthorityView {
+    pub genesis: AuthorityGenesis,
+    pub membership: ClusterMembershipSnapshot,
+    pub membership_audit: Vec<ClusterMembershipAudit>,
+    pub ownerships: Vec<ClusterAgentOwnership>,
+    pub ownership_audit: Vec<ClusterAgentOwnershipAudit>,
+    pub logical_time: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -203,6 +386,37 @@ pub fn open_cluster_raft_storage(
         },
         ClusterRaftStateMachine { context },
     ))
+}
+
+/// Read the locally applied replicated control-plane projection.
+///
+/// Callers serving external reads must first complete
+/// `Raft::ensure_linearizable`; this function intentionally performs no
+/// network operation and is also used to observe follower catch-up at startup.
+pub fn read_replicated_authority_view(
+    context: &SqliteContextManager,
+) -> io::Result<Option<ReplicatedAuthorityView>> {
+    let connection = context
+        .conn
+        .lock()
+        .map_err(|error| io::Error::other(format!("lock replicated authority state: {error}")))?;
+    let state = load_persistent_state(&connection)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
+    let Some(control) = state.authority.control_plane else {
+        return Ok(None);
+    };
+    Ok(Some(ReplicatedAuthorityView {
+        genesis: control.genesis,
+        membership: ClusterMembershipSnapshot {
+            cluster_id: control.cluster_id,
+            generation: control.membership_generation,
+            members: control.members.into_values().collect(),
+        },
+        membership_audit: control.membership_audit,
+        ownerships: control.ownerships.into_values().collect(),
+        ownership_audit: control.ownership_audit,
+        logical_time: control.logical_time,
+    }))
 }
 
 fn read_io(message: impl Into<String>) -> AnyError {
@@ -343,33 +557,364 @@ fn validate_authority_state(state: &AuthorityState) -> Result<(), AnyError> {
     let mut sequences = BTreeSet::new();
     let mut log_ids = BTreeSet::new();
     for (operation_id, receipt) in &state.receipts {
-        let AuthorityCommand::Barrier {
-            operation_id: command_id,
-            expected_sequence,
-        } = &receipt.command;
+        let command_id = receipt.command.operation_id();
         if operation_id != command_id || canonical_operation_id(operation_id).is_none() {
             return Err(read_io(format!(
                 "authority receipt key {operation_id:?} does not match a canonical command id"
             )));
         }
-        match &receipt.response {
-            AuthorityResponse::BarrierCommitted {
-                operation_id: response_id,
-                sequence,
-                log_id,
-                replayed: false,
-            } if response_id == operation_id
-                && *sequence > 0
-                && *sequence <= state.sequence
-                && expected_sequence.is_none_or(|expected| expected == sequence - 1)
-                && sequences.insert(*sequence)
-                && log_ids.insert(*log_id) => {}
-            _ => {
-                return Err(read_io(format!(
-                    "authority receipt {operation_id} contains an inconsistent response"
-                )));
-            }
+        let Some((response_id, sequence, log_id, replayed)) =
+            successful_response_metadata(&receipt.response)
+        else {
+            return Err(read_io(format!(
+                "authority receipt {operation_id} does not contain a successful response"
+            )));
+        };
+        let expected_sequence_matches = match &receipt.command {
+            AuthorityCommand::Barrier {
+                expected_sequence, ..
+            } => expected_sequence.is_none_or(|expected| expected == sequence - 1),
+            _ => true,
+        };
+        if response_id != operation_id
+            || replayed
+            || sequence == 0
+            || sequence > state.sequence
+            || !expected_sequence_matches
+            || !response_matches_command(&receipt.command, &receipt.response)
+            || !sequences.insert(sequence)
+            || !log_ids.insert(log_id)
+        {
+            return Err(read_io(format!(
+                "authority receipt {operation_id} contains an inconsistent response"
+            )));
         }
+    }
+    if let Some(control) = &state.control_plane {
+        validate_control_plane_state(control)?;
+    }
+    Ok(())
+}
+
+fn successful_response_metadata(
+    response: &AuthorityResponse,
+) -> Option<(&str, u64, LogId<ClusterRaftNodeId>, bool)> {
+    match response {
+        AuthorityResponse::BarrierCommitted {
+            operation_id,
+            sequence,
+            log_id,
+            replayed,
+        }
+        | AuthorityResponse::ControlPlaneInitialized {
+            operation_id,
+            sequence,
+            log_id,
+            replayed,
+        }
+        | AuthorityResponse::JoinChallengeIssued {
+            operation_id,
+            sequence,
+            log_id,
+            replayed,
+            ..
+        }
+        | AuthorityResponse::MemberUpdated {
+            operation_id,
+            sequence,
+            log_id,
+            replayed,
+            ..
+        }
+        | AuthorityResponse::OwnershipUpdated {
+            operation_id,
+            sequence,
+            log_id,
+            replayed,
+            ..
+        } => Some((operation_id, *sequence, *log_id, *replayed)),
+        AuthorityResponse::MetadataApplied { .. }
+        | AuthorityResponse::AuthorityTimeAdvanced { .. }
+        | AuthorityResponse::Rejected { .. } => None,
+    }
+}
+
+fn response_matches_command(command: &AuthorityCommand, response: &AuthorityResponse) -> bool {
+    matches!(
+        (command, response),
+        (
+            AuthorityCommand::Initialize { .. },
+            AuthorityResponse::ControlPlaneInitialized { .. }
+        ) | (
+            AuthorityCommand::Barrier { .. },
+            AuthorityResponse::BarrierCommitted { .. }
+        ) | (
+            AuthorityCommand::AdvanceTime { .. },
+            AuthorityResponse::AuthorityTimeAdvanced { .. }
+        ) | (
+            AuthorityCommand::IssueJoinChallenge { .. },
+            AuthorityResponse::JoinChallengeIssued { .. }
+        ) | (
+            AuthorityCommand::RegisterMember { .. } | AuthorityCommand::SetMemberState { .. },
+            AuthorityResponse::MemberUpdated { .. }
+        ) | (
+            AuthorityCommand::ClaimOwnership { .. }
+                | AuthorityCommand::RenewOwnership { .. }
+                | AuthorityCommand::ReleaseOwnership { .. },
+            AuthorityResponse::OwnershipUpdated { .. }
+        )
+    )
+}
+
+fn validate_control_plane_state(control: &ReplicatedControlPlaneState) -> Result<(), AnyError> {
+    validate_and_build_genesis(&control.genesis, control.logical_time).map_err(
+        |(_, message)| read_io(format!("invalid immutable authority genesis: {message}")),
+    )?;
+    if control.genesis.cluster_id != control.cluster_id {
+        return Err(read_io(
+            "immutable authority genesis cluster id differs from live authority state",
+        ));
+    }
+    let cluster_id = Uuid::parse_str(&control.cluster_id)
+        .map_err(|_| read_io("replicated authority cluster id is invalid"))?;
+    if cluster_id.to_string() != control.cluster_id {
+        return Err(read_io("replicated authority cluster id is not canonical"));
+    }
+    if control.membership_generation != control.membership_audit.len() as u64 {
+        return Err(read_io(
+            "replicated membership generation does not match its audit length",
+        ));
+    }
+    if control.join_challenges.len() > 4_096
+        || control.members.len() > 100_000
+        || control.ownerships.len() > 1_000_000
+        || control.membership_audit.len() > 100_000
+        || control.ownership_audit.len() > 100_000
+    {
+        return Err(read_io(
+            "replicated authority state exceeds a configured hard capacity",
+        ));
+    }
+    let authority_started_at = control
+        .membership_audit
+        .first()
+        .map(|audit| audit.changed_at)
+        .ok_or_else(|| read_io("replicated authority has no genesis audit"))?;
+    for (challenge_hash, challenge) in &control.join_challenges {
+        let challenge_bytes = hex_decode(&challenge.challenge_hex)
+            .filter(|bytes| bytes.len() == 32)
+            .ok_or_else(|| read_io("replicated join challenge is invalid"))?;
+        if sha256_hex(&challenge_bytes) != *challenge_hash
+            || challenge.expires_at <= authority_started_at
+            || challenge.consumed_at.is_some_and(|consumed| {
+                consumed > control.logical_time || consumed >= challenge.expires_at
+            })
+        {
+            return Err(read_io(
+                "replicated join challenge contains invalid hash or timestamps",
+            ));
+        }
+    }
+    let mut latest_membership_audit: BTreeMap<String, (u64, ClusterMemberState, Option<String>)> =
+        BTreeMap::new();
+    for (index, audit) in control.membership_audit.iter().enumerate() {
+        let expected_global_generation = index as u64 + 1;
+        if audit.membership_generation != expected_global_generation
+            || audit.member_generation == 0
+            || audit.changed_at > control.logical_time
+            || Uuid::parse_str(&audit.node_id).is_err()
+            || validate_text(&audit.actor, "replicated membership audit actor").is_err()
+            || validate_reason(&audit.reason).is_err()
+        {
+            return Err(read_io("replicated membership audit entry is invalid"));
+        }
+        let previous = latest_membership_audit.get(&audit.node_id);
+        let transition_is_valid = match previous {
+            None => {
+                audit.member_generation == 1
+                    && audit.previous.is_none()
+                    && audit.current == ClusterMemberState::Active
+                    && audit.previous_tls_server_certificate_fingerprint.is_none()
+            }
+            Some((generation, state, tls_fingerprint)) => {
+                *state != ClusterMemberState::Revoked
+                    && generation.checked_add(1) == Some(audit.member_generation)
+                    && audit.previous == Some(*state)
+                    && audit.previous_tls_server_certificate_fingerprint == *tls_fingerprint
+                    && !(tls_fingerprint.is_some()
+                        && audit.current_tls_server_certificate_fingerprint.is_none())
+            }
+        };
+        if !transition_is_valid {
+            return Err(read_io(
+                "replicated membership audit history is not consecutive",
+            ));
+        }
+        latest_membership_audit.insert(
+            audit.node_id.clone(),
+            (
+                audit.member_generation,
+                audit.current,
+                audit.current_tls_server_certificate_fingerprint.clone(),
+            ),
+        );
+    }
+    let mut member_fingerprints = BTreeSet::new();
+    let mut member_endpoints = BTreeSet::new();
+    let mut member_tls_fingerprints = BTreeSet::new();
+    for (node_id, member) in &control.members {
+        if node_id != &member.node_id {
+            return Err(read_io("replicated member map key does not match node id"));
+        }
+        validate_member_registration(&ClusterMemberRegistration {
+            node_id: member.node_id.clone(),
+            fingerprint: member.fingerprint.clone(),
+            public_key: member.public_key.clone(),
+            tls_server_certificate_fingerprint: member.tls_server_certificate_fingerprint.clone(),
+            endpoint: member.endpoint.clone(),
+            server_version: member.server_version.clone(),
+            min_protocol_version: member.min_protocol_version,
+            protocol_version: member.protocol_version,
+        })
+        .map_err(|error| read_io(error.to_string()))?;
+        if !member_fingerprints.insert(member.fingerprint.as_str())
+            || !member_endpoints.insert(member.endpoint.as_str())
+            || member
+                .tls_server_certificate_fingerprint
+                .as_deref()
+                .is_some_and(|fingerprint| !member_tls_fingerprints.insert(fingerprint))
+        {
+            return Err(read_io(
+                "replicated membership contains a duplicate identity, endpoint, or TLS binding",
+            ));
+        }
+        if member.generation == 0
+            || member.joined_at > member.updated_at
+            || member.updated_at > control.logical_time
+        {
+            return Err(read_io(
+                "replicated member contains invalid generation or time",
+            ));
+        }
+        if latest_membership_audit.get(node_id)
+            != Some(&(
+                member.generation,
+                member.state,
+                member.tls_server_certificate_fingerprint.clone(),
+            ))
+        {
+            return Err(read_io(
+                "replicated member does not match its latest audit evidence",
+            ));
+        }
+    }
+    if latest_membership_audit.len() != control.members.len() {
+        return Err(read_io(
+            "replicated membership audit references an unknown member",
+        ));
+    }
+    let mut latest_ownership_audit: BTreeMap<String, (u64, String, u64, ClusterOwnershipState)> =
+        BTreeMap::new();
+    for audit in &control.ownership_audit {
+        if audit.generation == 0
+            || audit.fencing_token == 0
+            || audit.changed_at > control.logical_time
+            || validate_ownership_identity(&audit.agent_id, &audit.owner_node_id).is_err()
+            || audit
+                .previous_owner_node_id
+                .as_deref()
+                .is_some_and(|owner| Uuid::parse_str(owner).is_err())
+            || validate_text(&audit.actor, "replicated ownership audit actor").is_err()
+            || validate_reason(&audit.reason).is_err()
+        {
+            return Err(read_io("replicated ownership audit entry is invalid"));
+        }
+        let state = match audit.operation.as_str() {
+            "claim" | "transfer" | "renew" => ClusterOwnershipState::Active,
+            "release" => ClusterOwnershipState::Released,
+            _ => return Err(read_io("replicated ownership audit operation is invalid")),
+        };
+        let previous = latest_ownership_audit.get(&audit.agent_id);
+        let history_is_valid = match previous {
+            None => {
+                audit.operation == "claim"
+                    && audit.generation == 1
+                    && audit.fencing_token == 1
+                    && audit.previous_owner_node_id.is_none()
+            }
+            Some((generation, owner, fencing_token, previous_state)) => {
+                let common = generation.checked_add(1) == Some(audit.generation)
+                    && audit.previous_owner_node_id.as_ref() == Some(owner);
+                common
+                    && match audit.operation.as_str() {
+                        "renew" => {
+                            *previous_state == ClusterOwnershipState::Active
+                                && audit.owner_node_id == *owner
+                                && audit.fencing_token == *fencing_token
+                        }
+                        "release" => {
+                            *previous_state == ClusterOwnershipState::Active
+                                && audit.owner_node_id == *owner
+                                && audit.fencing_token == *fencing_token
+                        }
+                        "transfer" => fencing_token.checked_add(1) == Some(audit.fencing_token),
+                        _ => false,
+                    }
+            }
+        };
+        if !history_is_valid {
+            return Err(read_io(
+                "replicated ownership audit history is not consecutive",
+            ));
+        }
+        latest_ownership_audit.insert(
+            audit.agent_id.clone(),
+            (
+                audit.generation,
+                audit.owner_node_id.clone(),
+                audit.fencing_token,
+                state,
+            ),
+        );
+    }
+    for (agent_id, ownership) in &control.ownerships {
+        if agent_id != &ownership.agent_id
+            || ownership.generation == 0
+            || ownership.fencing_token == 0
+            || ownership.updated_at > control.logical_time
+        {
+            return Err(read_io(
+                "replicated ownership map contains invalid identity, generation, or time",
+            ));
+        }
+        if (ownership.state == ClusterOwnershipState::Active
+            && ownership.lease_expires_at <= ownership.updated_at)
+            || (ownership.state == ClusterOwnershipState::Released
+                && ownership.lease_expires_at != ownership.updated_at)
+        {
+            return Err(read_io(
+                "replicated ownership contains invalid lease timestamps",
+            ));
+        }
+        validate_ownership_identity(&ownership.agent_id, &ownership.owner_node_id)
+            .map_err(|error| read_io(error.to_string()))?;
+        if latest_ownership_audit.get(agent_id)
+            != Some(&(
+                ownership.generation,
+                ownership.owner_node_id.clone(),
+                ownership.fencing_token,
+                ownership.state,
+            ))
+        {
+            return Err(read_io(
+                "replicated ownership does not match its latest audit evidence",
+            ));
+        }
+    }
+    if latest_ownership_audit.len() != control.ownerships.len() {
+        return Err(read_io(
+            "replicated ownership audit references an unknown ownership record",
+        ));
     }
     Ok(())
 }
@@ -381,10 +926,9 @@ fn validate_persistent_state(state: &PersistentState) -> Result<(), AnyError> {
         validate_log_id_at_or_before(*membership_log_id, state.last_applied, "stored membership")?;
     }
     for receipt in state.authority.receipts.values() {
-        let AuthorityResponse::BarrierCommitted { log_id, .. } = &receipt.response else {
-            unreachable!("authority validation accepts only committed barrier receipts")
-        };
-        validate_log_id_at_or_before(*log_id, state.last_applied, "authority receipt")?;
+        let (_, _, log_id, _) = successful_response_metadata(&receipt.response)
+            .expect("validated receipts contain successful responses");
+        validate_log_id_at_or_before(log_id, state.last_applied, "authority receipt")?;
     }
     Ok(())
 }
@@ -972,74 +1516,84 @@ fn apply_authority_command(
     command: AuthorityCommand,
     log_id: LogId<ClusterRaftNodeId>,
 ) -> AuthorityResponse {
-    let AuthorityCommand::Barrier {
-        operation_id,
-        expected_sequence,
-    } = &command;
-    let Some(canonical_id) = canonical_operation_id(operation_id) else {
-        return AuthorityResponse::Rejected {
-            operation_id: operation_id.clone(),
-            sequence: state.sequence,
+    let supplied_id = command.operation_id();
+    let Some(canonical_id) = canonical_operation_id(supplied_id) else {
+        return rejected(
+            supplied_id.to_owned(),
+            state.sequence,
             log_id,
-            reason: AuthorityRejection::InvalidOperationId,
-        };
+            AuthorityRejection::InvalidOperationId,
+            "authority operation_id must be a canonical lowercase UUID",
+        );
     };
-    if let Some(receipt) = state.receipts.get(&canonical_id) {
-        if receipt.command == command {
-            let AuthorityResponse::BarrierCommitted {
-                operation_id,
-                sequence,
+    if let AuthorityCommand::AdvanceTime { proposed_at, .. } = &command {
+        let Some(control) = state.control_plane.as_mut() else {
+            return rejected(
+                canonical_id,
+                state.sequence,
                 log_id,
-                ..
-            } = &receipt.response
-            else {
-                unreachable!("validated receipts contain committed barrier responses")
-            };
-            return AuthorityResponse::BarrierCommitted {
-                operation_id: operation_id.clone(),
-                sequence: *sequence,
-                log_id: *log_id,
-                replayed: true,
-            };
-        }
-        return AuthorityResponse::Rejected {
+                AuthorityRejection::NotInitialized,
+                "replicated authority is not initialized",
+            );
+        };
+        control.logical_time = control.logical_time.max(*proposed_at);
+        return AuthorityResponse::AuthorityTimeAdvanced {
             operation_id: canonical_id,
-            sequence: state.sequence,
+            logical_time: control.logical_time,
             log_id,
-            reason: AuthorityRejection::OperationIdConflict,
         };
     }
-    if expected_sequence.is_some_and(|expected| expected != state.sequence) {
-        return AuthorityResponse::Rejected {
-            operation_id: canonical_id,
-            sequence: state.sequence,
+    if let Some(receipt) = state.receipts.get(&canonical_id) {
+        if commands_are_same_retry(&receipt.command, &command) {
+            return replay_response(&receipt.response);
+        }
+        return rejected(
+            canonical_id,
+            state.sequence,
             log_id,
-            reason: AuthorityRejection::SequenceMismatch,
-        };
+            AuthorityRejection::OperationIdConflict,
+            "authority operation_id is already committed with a different command",
+        );
+    }
+    if let AuthorityCommand::Barrier {
+        expected_sequence, ..
+    } = &command
+    {
+        if expected_sequence.is_some_and(|expected| expected != state.sequence) {
+            return rejected(
+                canonical_id,
+                state.sequence,
+                log_id,
+                AuthorityRejection::SequenceMismatch,
+                "authority sequence compare-and-set failed",
+            );
+        }
     }
     if state.receipts.len() >= MAX_AUTHORITY_RECEIPTS {
-        return AuthorityResponse::Rejected {
-            operation_id: canonical_id,
-            sequence: state.sequence,
+        return rejected(
+            canonical_id,
+            state.sequence,
             log_id,
-            reason: AuthorityRejection::ReceiptCapacityReached,
-        };
+            AuthorityRejection::ReceiptCapacityReached,
+            "authority idempotency receipt capacity is exhausted",
+        );
     }
     let Some(sequence) = state.sequence.checked_add(1) else {
-        return AuthorityResponse::Rejected {
-            operation_id: canonical_id,
-            sequence: state.sequence,
+        return rejected(
+            canonical_id,
+            state.sequence,
             log_id,
-            reason: AuthorityRejection::SequenceExhausted,
-        };
+            AuthorityRejection::SequenceExhausted,
+            "authority sequence is exhausted",
+        );
+    };
+    let response = match apply_new_authority_command(state, &command, sequence, log_id) {
+        Ok(response) => response,
+        Err((reason, message)) => {
+            return rejected(canonical_id, state.sequence, log_id, reason, message)
+        }
     };
     state.sequence = sequence;
-    let response = AuthorityResponse::BarrierCommitted {
-        operation_id: canonical_id.clone(),
-        sequence,
-        log_id,
-        replayed: false,
-    };
     state.receipts.insert(
         canonical_id,
         StoredAuthorityReceipt {
@@ -1048,6 +1602,1049 @@ fn apply_authority_command(
         },
     );
     response
+}
+
+fn rejected(
+    operation_id: String,
+    sequence: u64,
+    log_id: LogId<ClusterRaftNodeId>,
+    reason: AuthorityRejection,
+    message: impl Into<String>,
+) -> AuthorityResponse {
+    AuthorityResponse::Rejected {
+        operation_id,
+        sequence,
+        log_id,
+        reason,
+        message: message.into(),
+    }
+}
+
+fn commands_are_same_retry(previous: &AuthorityCommand, current: &AuthorityCommand) -> bool {
+    fn semantic_value(command: &AuthorityCommand) -> Option<serde_json::Value> {
+        let mut value = serde_json::to_value(command).ok()?;
+        let variant = value.as_object_mut()?.values_mut().next()?;
+        if let Some(fields) = variant.as_object_mut() {
+            fields.remove("proposed_at");
+        }
+        Some(value)
+    }
+    previous.operation_id() == current.operation_id()
+        && semantic_value(previous)
+            .is_some_and(|previous| Some(previous) == semantic_value(current))
+}
+
+fn replay_response(response: &AuthorityResponse) -> AuthorityResponse {
+    match response {
+        AuthorityResponse::BarrierCommitted {
+            operation_id,
+            sequence,
+            log_id,
+            ..
+        } => AuthorityResponse::BarrierCommitted {
+            operation_id: operation_id.clone(),
+            sequence: *sequence,
+            log_id: *log_id,
+            replayed: true,
+        },
+        AuthorityResponse::ControlPlaneInitialized {
+            operation_id,
+            sequence,
+            log_id,
+            ..
+        } => AuthorityResponse::ControlPlaneInitialized {
+            operation_id: operation_id.clone(),
+            sequence: *sequence,
+            log_id: *log_id,
+            replayed: true,
+        },
+        AuthorityResponse::JoinChallengeIssued {
+            operation_id,
+            challenge,
+            sequence,
+            log_id,
+            ..
+        } => AuthorityResponse::JoinChallengeIssued {
+            operation_id: operation_id.clone(),
+            challenge: challenge.clone(),
+            sequence: *sequence,
+            log_id: *log_id,
+            replayed: true,
+        },
+        AuthorityResponse::MemberUpdated {
+            operation_id,
+            member,
+            sequence,
+            log_id,
+            ..
+        } => AuthorityResponse::MemberUpdated {
+            operation_id: operation_id.clone(),
+            member: member.clone(),
+            sequence: *sequence,
+            log_id: *log_id,
+            replayed: true,
+        },
+        AuthorityResponse::OwnershipUpdated {
+            operation_id,
+            ownership,
+            sequence,
+            log_id,
+            ..
+        } => AuthorityResponse::OwnershipUpdated {
+            operation_id: operation_id.clone(),
+            ownership: ownership.clone(),
+            sequence: *sequence,
+            log_id: *log_id,
+            replayed: true,
+        },
+        AuthorityResponse::MetadataApplied { .. }
+        | AuthorityResponse::AuthorityTimeAdvanced { .. }
+        | AuthorityResponse::Rejected { .. } => {
+            unreachable!("only successful normal-command responses are retained")
+        }
+    }
+}
+
+fn apply_new_authority_command(
+    state: &mut AuthorityState,
+    command: &AuthorityCommand,
+    sequence: u64,
+    log_id: LogId<ClusterRaftNodeId>,
+) -> Result<AuthorityResponse, (AuthorityRejection, String)> {
+    let operation_id = command.operation_id().to_owned();
+    match command {
+        AuthorityCommand::Initialize {
+            genesis,
+            proposed_at,
+            ..
+        } => {
+            if state.control_plane.is_some() {
+                return Err((
+                    AuthorityRejection::Conflict,
+                    "replicated authority is already initialized".into(),
+                ));
+            }
+            let control_plane = validate_and_build_genesis(genesis, *proposed_at)?;
+            state.control_plane = Some(control_plane);
+            Ok(AuthorityResponse::ControlPlaneInitialized {
+                operation_id,
+                sequence,
+                log_id,
+                replayed: false,
+            })
+        }
+        AuthorityCommand::Barrier { .. } => Ok(AuthorityResponse::BarrierCommitted {
+            operation_id,
+            sequence,
+            log_id,
+            replayed: false,
+        }),
+        AuthorityCommand::AdvanceTime { .. } => {
+            unreachable!("logical-clock advancement is handled before receipt sequencing")
+        }
+        AuthorityCommand::IssueJoinChallenge {
+            challenge_hex,
+            ttl_seconds,
+            proposed_at,
+            ..
+        } => {
+            let control = control_plane_mut(state)?;
+            let mut next = control.clone();
+            if !(MIN_JOIN_CHALLENGE_TTL_SECONDS..=MAX_JOIN_CHALLENGE_TTL_SECONDS)
+                .contains(ttl_seconds)
+            {
+                return Err((
+                    AuthorityRejection::InvalidCommand,
+                    format!(
+                        "invalid join challenge ttl (expected {MIN_JOIN_CHALLENGE_TTL_SECONDS}..={MAX_JOIN_CHALLENGE_TTL_SECONDS} seconds)"
+                    ),
+                ));
+            }
+            let challenge = hex_decode(challenge_hex)
+                .filter(|bytes| bytes.len() == 32)
+                .ok_or_else(|| {
+                    (
+                        AuthorityRejection::InvalidCommand,
+                        "invalid cluster join challenge".into(),
+                    )
+                })?;
+            let now = advance_authority_time(&mut next, *proposed_at)?;
+            next.join_challenges
+                .retain(|_, record| record.expires_at > now && record.consumed_at.is_none());
+            if next.join_challenges.len() >= 4_096 {
+                return Err((
+                    AuthorityRejection::CapacityReached,
+                    "replicated join challenge capacity is exhausted".into(),
+                ));
+            }
+            let challenge_hash = sha256_hex(&challenge);
+            if next.join_challenges.contains_key(&challenge_hash) {
+                return Err((
+                    AuthorityRejection::Conflict,
+                    "cluster join challenge already exists".into(),
+                ));
+            }
+            let expires_at = now
+                .checked_add_signed(TimeDelta::seconds(*ttl_seconds as i64))
+                .ok_or_else(|| {
+                    (
+                        AuthorityRejection::InvalidCommand,
+                        "cluster join challenge expiry overflow".into(),
+                    )
+                })?;
+            next.join_challenges.insert(
+                challenge_hash,
+                ReplicatedJoinChallenge {
+                    challenge_hex: challenge_hex.clone(),
+                    expires_at,
+                    consumed_at: None,
+                },
+            );
+            let challenge = ClusterJoinChallenge {
+                cluster_id: next.cluster_id.clone(),
+                challenge_hex: challenge_hex.clone(),
+                expires_at,
+            };
+            *control = next;
+            Ok(AuthorityResponse::JoinChallengeIssued {
+                operation_id,
+                challenge,
+                sequence,
+                log_id,
+                replayed: false,
+            })
+        }
+        AuthorityCommand::RegisterMember {
+            registration,
+            challenge_hex,
+            signature_hex,
+            expected_generation,
+            authority_min_protocol_version,
+            authority_protocol_version,
+            actor,
+            reason,
+            proposed_at,
+            ..
+        } => {
+            let control = control_plane_mut(state)?;
+            let mut next = control.clone();
+            let member = apply_register_member(
+                &mut next,
+                registration,
+                challenge_hex,
+                signature_hex,
+                *expected_generation,
+                *authority_min_protocol_version,
+                *authority_protocol_version,
+                actor,
+                reason,
+                *proposed_at,
+            )?;
+            *control = next;
+            Ok(AuthorityResponse::MemberUpdated {
+                operation_id,
+                member,
+                sequence,
+                log_id,
+                replayed: false,
+            })
+        }
+        AuthorityCommand::SetMemberState {
+            node_id,
+            state: requested_state,
+            expected_generation,
+            actor,
+            reason,
+            proposed_at,
+            ..
+        } => {
+            let control = control_plane_mut(state)?;
+            let mut next = control.clone();
+            let member = apply_set_member_state(
+                &mut next,
+                node_id,
+                *requested_state,
+                *expected_generation,
+                actor,
+                reason,
+                *proposed_at,
+            )?;
+            *control = next;
+            Ok(AuthorityResponse::MemberUpdated {
+                operation_id,
+                member,
+                sequence,
+                log_id,
+                replayed: false,
+            })
+        }
+        AuthorityCommand::ClaimOwnership {
+            agent_id,
+            owner_node_id,
+            ttl_seconds,
+            expected_fencing_token,
+            actor,
+            reason,
+            proposed_at,
+            ..
+        } => {
+            let control = control_plane_mut(state)?;
+            let mut next = control.clone();
+            let ownership = apply_claim_ownership(
+                &mut next,
+                agent_id,
+                owner_node_id,
+                *ttl_seconds,
+                *expected_fencing_token,
+                actor,
+                reason,
+                *proposed_at,
+            )?;
+            *control = next;
+            Ok(AuthorityResponse::OwnershipUpdated {
+                operation_id,
+                ownership,
+                sequence,
+                log_id,
+                replayed: false,
+            })
+        }
+        AuthorityCommand::RenewOwnership {
+            agent_id,
+            owner_node_id,
+            fencing_token,
+            ttl_seconds,
+            actor,
+            reason,
+            proposed_at,
+            ..
+        } => {
+            let control = control_plane_mut(state)?;
+            let mut next = control.clone();
+            let ownership = apply_renew_ownership(
+                &mut next,
+                agent_id,
+                owner_node_id,
+                *fencing_token,
+                *ttl_seconds,
+                actor,
+                reason,
+                *proposed_at,
+            )?;
+            *control = next;
+            Ok(AuthorityResponse::OwnershipUpdated {
+                operation_id,
+                ownership,
+                sequence,
+                log_id,
+                replayed: false,
+            })
+        }
+        AuthorityCommand::ReleaseOwnership {
+            agent_id,
+            owner_node_id,
+            fencing_token,
+            actor,
+            reason,
+            proposed_at,
+            ..
+        } => {
+            let control = control_plane_mut(state)?;
+            let mut next = control.clone();
+            let ownership = apply_release_ownership(
+                &mut next,
+                agent_id,
+                owner_node_id,
+                *fencing_token,
+                actor,
+                reason,
+                *proposed_at,
+            )?;
+            *control = next;
+            Ok(AuthorityResponse::OwnershipUpdated {
+                operation_id,
+                ownership,
+                sequence,
+                log_id,
+                replayed: false,
+            })
+        }
+    }
+}
+
+fn control_plane_mut(
+    state: &mut AuthorityState,
+) -> Result<&mut ReplicatedControlPlaneState, (AuthorityRejection, String)> {
+    state.control_plane.as_mut().ok_or_else(|| {
+        (
+            AuthorityRejection::NotInitialized,
+            "replicated authority is not initialized".into(),
+        )
+    })
+}
+
+fn advance_authority_time(
+    control: &mut ReplicatedControlPlaneState,
+    proposed_at: DateTime<Utc>,
+) -> Result<DateTime<Utc>, (AuthorityRejection, String)> {
+    let minimum = control
+        .logical_time
+        .checked_add_signed(TimeDelta::microseconds(1))
+        .ok_or_else(|| {
+            (
+                AuthorityRejection::InvalidCommand,
+                "replicated authority clock is exhausted".into(),
+            )
+        })?;
+    let effective = proposed_at.max(minimum);
+    control.logical_time = effective;
+    Ok(effective)
+}
+
+fn validate_and_build_genesis(
+    genesis: &AuthorityGenesis,
+    proposed_at: DateTime<Utc>,
+) -> Result<ReplicatedControlPlaneState, (AuthorityRejection, String)> {
+    let cluster_id = Uuid::parse_str(&genesis.cluster_id).map_err(|_| {
+        (
+            AuthorityRejection::InvalidCommand,
+            "authority genesis cluster_id must be a UUID".into(),
+        )
+    })?;
+    if cluster_id.to_string() != genesis.cluster_id {
+        return Err((
+            AuthorityRejection::InvalidCommand,
+            "authority genesis cluster_id must be canonical".into(),
+        ));
+    }
+    if genesis.members.is_empty() || genesis.members.len() > 31 {
+        return Err((
+            AuthorityRejection::InvalidCommand,
+            "authority genesis must contain 1 to 31 members".into(),
+        ));
+    }
+    let mut members = BTreeMap::new();
+    let mut fingerprints = BTreeSet::new();
+    let mut endpoints = BTreeSet::new();
+    let mut tls_fingerprints = BTreeSet::new();
+    for seed in &genesis.members {
+        let registration = ClusterMemberRegistration {
+            node_id: seed.node_id.clone(),
+            fingerprint: seed.fingerprint.clone(),
+            public_key: seed.public_key.clone(),
+            tls_server_certificate_fingerprint: seed.tls_server_certificate_fingerprint.clone(),
+            endpoint: seed.endpoint.clone(),
+            server_version: seed.server_version.clone(),
+            min_protocol_version: seed.min_protocol_version,
+            protocol_version: seed.protocol_version,
+        };
+        validate_member_registration(&registration).map_err(invalid_command)?;
+        if !fingerprints.insert(seed.fingerprint.clone())
+            || !endpoints.insert(seed.endpoint.clone())
+            || seed
+                .tls_server_certificate_fingerprint
+                .as_ref()
+                .is_some_and(|fingerprint| !tls_fingerprints.insert(fingerprint.clone()))
+        {
+            return Err((
+                AuthorityRejection::InvalidCommand,
+                "authority genesis contains a duplicate identity, endpoint, or TLS binding".into(),
+            ));
+        }
+        let member = ClusterMember {
+            node_id: seed.node_id.clone(),
+            fingerprint: seed.fingerprint.clone(),
+            public_key: seed.public_key.clone(),
+            tls_server_certificate_fingerprint: seed.tls_server_certificate_fingerprint.clone(),
+            endpoint: seed.endpoint.clone(),
+            server_version: seed.server_version.clone(),
+            min_protocol_version: seed.min_protocol_version,
+            protocol_version: seed.protocol_version,
+            state: ClusterMemberState::Active,
+            generation: 1,
+            joined_at: proposed_at,
+            updated_at: proposed_at,
+            reason: "replicated authority genesis".into(),
+        };
+        if members.insert(seed.node_id.clone(), member).is_some() {
+            return Err((
+                AuthorityRejection::InvalidCommand,
+                "authority genesis contains a duplicate application node id".into(),
+            ));
+        }
+    }
+    let membership_generation = members.len() as u64;
+    let membership_audit = members
+        .values()
+        .enumerate()
+        .map(|(index, member)| ClusterMembershipAudit {
+            membership_generation: index as u64 + 1,
+            node_id: member.node_id.clone(),
+            member_generation: 1,
+            previous: None,
+            current: ClusterMemberState::Active,
+            previous_tls_server_certificate_fingerprint: None,
+            current_tls_server_certificate_fingerprint: member
+                .tls_server_certificate_fingerprint
+                .clone(),
+            actor: "system:raft-genesis".into(),
+            reason: "replicated authority genesis".into(),
+            changed_at: proposed_at,
+        })
+        .collect();
+    Ok(ReplicatedControlPlaneState {
+        genesis: genesis.clone(),
+        cluster_id: genesis.cluster_id.clone(),
+        membership_generation,
+        members,
+        membership_audit,
+        join_challenges: BTreeMap::new(),
+        ownerships: BTreeMap::new(),
+        ownership_audit: Vec::new(),
+        logical_time: proposed_at,
+    })
+}
+
+fn invalid_command(error: impl fmt::Display) -> (AuthorityRejection, String) {
+    (AuthorityRejection::InvalidCommand, error.to_string())
+}
+
+fn conflict(error: impl Into<String>) -> (AuthorityRejection, String) {
+    (AuthorityRejection::Conflict, error.into())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_register_member(
+    control: &mut ReplicatedControlPlaneState,
+    registration: &ClusterMemberRegistration,
+    challenge_hex: &str,
+    signature_hex: &str,
+    expected_generation: Option<u64>,
+    authority_min_protocol_version: u32,
+    authority_protocol_version: u32,
+    actor: &str,
+    reason: &str,
+    proposed_at: DateTime<Utc>,
+) -> Result<ClusterMember, (AuthorityRejection, String)> {
+    validate_member_registration(registration).map_err(invalid_command)?;
+    validate_text(actor, "cluster-membership actor").map_err(invalid_command)?;
+    validate_reason(reason).map_err(invalid_command)?;
+    if authority_min_protocol_version == 0
+        || authority_min_protocol_version > authority_protocol_version
+    {
+        return Err(invalid_command("invalid authority protocol window"));
+    }
+    if registration.protocol_version < authority_min_protocol_version
+        || registration.min_protocol_version > authority_protocol_version
+    {
+        return Err(conflict(format!(
+            "incompatible wire-protocol cluster member window: authority v{authority_min_protocol_version}..=v{authority_protocol_version}, member v{}..=v{}",
+            registration.min_protocol_version, registration.protocol_version
+        )));
+    }
+    let challenge = hex_decode(challenge_hex)
+        .filter(|bytes| bytes.len() == 32)
+        .ok_or_else(|| invalid_command("invalid cluster join challenge"))?;
+    let signature = hex_decode(signature_hex)
+        .ok_or_else(|| invalid_command("invalid cluster join signature"))?;
+    let payload = membership_join_payload(&control.cluster_id, challenge_hex, registration)
+        .map_err(invalid_command)?;
+    if !ClusterControl::verify_challenge(&registration.public_key, &payload, &signature) {
+        return Err(conflict("cluster member challenged identity proof denied"));
+    }
+    let now = advance_authority_time(control, proposed_at)?;
+    let challenge_hash = sha256_hex(&challenge);
+    let challenge_record = control
+        .join_challenges
+        .get(&challenge_hash)
+        .ok_or_else(|| conflict("invalid cluster join challenge: unknown"))?;
+    if challenge_record.challenge_hex != challenge_hex {
+        return Err(conflict("invalid cluster join challenge: hash mismatch"));
+    }
+    if challenge_record.consumed_at.is_some() {
+        return Err(conflict("cluster join challenge was already consumed"));
+    }
+    if challenge_record.expires_at <= now {
+        return Err(conflict("invalid cluster join challenge: expired"));
+    }
+    if control.members.values().any(|member| {
+        member.node_id != registration.node_id
+            && (member.fingerprint == registration.fingerprint
+                || member.endpoint == registration.endpoint
+                || registration
+                    .tls_server_certificate_fingerprint
+                    .as_ref()
+                    .is_some_and(|fingerprint| {
+                        member.tls_server_certificate_fingerprint.as_ref() == Some(fingerprint)
+                    }))
+    }) {
+        return Err(conflict(
+            "cluster member identity, endpoint, or TLS binding already belongs to another node",
+        ));
+    }
+    if control.membership_audit.len() >= 100_000 {
+        return Err((
+            AuthorityRejection::CapacityReached,
+            "replicated membership audit capacity is exhausted".into(),
+        ));
+    }
+    let existing = control.members.get(&registration.node_id).cloned();
+    let (previous, previous_tls, generation, joined_at) = match existing {
+        Some(member) => {
+            let expected = expected_generation.ok_or_else(|| {
+                conflict(format!(
+                    "cluster member revision conflict: expected generation is required, current {}",
+                    member.generation
+                ))
+            })?;
+            if expected != member.generation {
+                return Err(conflict(format!(
+                    "cluster member revision conflict: expected {expected}, current {}",
+                    member.generation
+                )));
+            }
+            if member.state == ClusterMemberState::Revoked {
+                return Err(conflict("revoked cluster member conflict: cannot rejoin"));
+            }
+            if member.fingerprint != registration.fingerprint
+                || member.public_key != registration.public_key
+            {
+                return Err(conflict(
+                    "cluster member durable identity cannot change during rejoin",
+                ));
+            }
+            if member.tls_server_certificate_fingerprint.is_some()
+                && registration.tls_server_certificate_fingerprint.is_none()
+            {
+                return Err(conflict(
+                    "cluster member TLS certificate binding cannot be removed during rejoin",
+                ));
+            }
+            (
+                Some(member.state),
+                member.tls_server_certificate_fingerprint,
+                member
+                    .generation
+                    .checked_add(1)
+                    .ok_or_else(|| conflict("cluster member generation overflow"))?,
+                member.joined_at,
+            )
+        }
+        None => {
+            if expected_generation.is_some() {
+                return Err(conflict(
+                    "cluster member revision conflict: no current member exists",
+                ));
+            }
+            (None, None, 1, now)
+        }
+    };
+    let membership_generation = control
+        .membership_generation
+        .checked_add(1)
+        .ok_or_else(|| conflict("membership generation overflow"))?;
+    let member = ClusterMember {
+        node_id: registration.node_id.clone(),
+        fingerprint: registration.fingerprint.clone(),
+        public_key: registration.public_key.clone(),
+        tls_server_certificate_fingerprint: registration.tls_server_certificate_fingerprint.clone(),
+        endpoint: registration.endpoint.clone(),
+        server_version: registration.server_version.clone(),
+        min_protocol_version: registration.min_protocol_version,
+        protocol_version: registration.protocol_version,
+        state: ClusterMemberState::Active,
+        generation,
+        joined_at,
+        updated_at: now,
+        reason: reason.to_owned(),
+    };
+    control
+        .members
+        .insert(member.node_id.clone(), member.clone());
+    control.membership_generation = membership_generation;
+    control.membership_audit.push(ClusterMembershipAudit {
+        membership_generation,
+        node_id: member.node_id.clone(),
+        member_generation: generation,
+        previous,
+        current: ClusterMemberState::Active,
+        previous_tls_server_certificate_fingerprint: previous_tls,
+        current_tls_server_certificate_fingerprint: member
+            .tls_server_certificate_fingerprint
+            .clone(),
+        actor: actor.to_owned(),
+        reason: reason.to_owned(),
+        changed_at: now,
+    });
+    control
+        .join_challenges
+        .get_mut(&challenge_hash)
+        .expect("validated challenge remains present")
+        .consumed_at = Some(now);
+    Ok(member)
+}
+
+fn apply_set_member_state(
+    control: &mut ReplicatedControlPlaneState,
+    node_id: &str,
+    state: ClusterMemberState,
+    expected_generation: u64,
+    actor: &str,
+    reason: &str,
+    proposed_at: DateTime<Utc>,
+) -> Result<ClusterMember, (AuthorityRejection, String)> {
+    if state == ClusterMemberState::Active {
+        return Err(invalid_command(
+            "invalid active membership transition: a fresh challenged join is required",
+        ));
+    }
+    Uuid::parse_str(node_id).map_err(|_| invalid_command("invalid cluster member node id"))?;
+    validate_text(actor, "cluster-membership actor").map_err(invalid_command)?;
+    validate_reason(reason).map_err(invalid_command)?;
+    let member = control
+        .members
+        .get(node_id)
+        .cloned()
+        .ok_or_else(|| conflict("cluster member not found"))?;
+    if member.generation != expected_generation {
+        return Err(conflict(format!(
+            "cluster member revision conflict: expected {expected_generation}, current {}",
+            member.generation
+        )));
+    }
+    if member.state == ClusterMemberState::Revoked {
+        return Err(conflict(
+            "revoked cluster member state conflict: revocation is terminal",
+        ));
+    }
+    if member.state == state {
+        return Err(conflict("cluster member is already in the requested state"));
+    }
+    if control.membership_audit.len() >= 100_000 {
+        return Err((
+            AuthorityRejection::CapacityReached,
+            "replicated membership audit capacity is exhausted".into(),
+        ));
+    }
+    let now = advance_authority_time(control, proposed_at)?;
+    let active_owned = control
+        .ownerships
+        .values()
+        .filter(|ownership| {
+            ownership.owner_node_id == node_id
+                && ownership.state == ClusterOwnershipState::Active
+                && ownership.lease_expires_at > now
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    if state == ClusterMemberState::Left && !active_owned.is_empty() {
+        return Err(conflict(
+            "cluster member leave conflict: active ownership leases must be released first",
+        ));
+    }
+    if state == ClusterMemberState::Revoked {
+        if control
+            .ownership_audit
+            .len()
+            .saturating_add(active_owned.len())
+            > 100_000
+        {
+            return Err((
+                AuthorityRejection::CapacityReached,
+                "replicated ownership audit capacity is exhausted".into(),
+            ));
+        }
+        for previous in active_owned {
+            let generation = previous
+                .generation
+                .checked_add(1)
+                .ok_or_else(|| conflict("agent ownership generation overflow"))?;
+            let released = ClusterAgentOwnership {
+                agent_id: previous.agent_id.clone(),
+                owner_node_id: node_id.to_owned(),
+                fencing_token: previous.fencing_token,
+                generation,
+                state: ClusterOwnershipState::Released,
+                lease_expires_at: now,
+                updated_at: now,
+                reason: reason.to_owned(),
+            };
+            control
+                .ownerships
+                .insert(released.agent_id.clone(), released);
+            control.ownership_audit.push(ClusterAgentOwnershipAudit {
+                agent_id: previous.agent_id,
+                generation,
+                previous_owner_node_id: Some(node_id.to_owned()),
+                owner_node_id: node_id.to_owned(),
+                fencing_token: previous.fencing_token,
+                operation: "release".into(),
+                actor: actor.to_owned(),
+                reason: reason.to_owned(),
+                changed_at: now,
+            });
+        }
+    }
+    let generation = member
+        .generation
+        .checked_add(1)
+        .ok_or_else(|| conflict("cluster member generation overflow"))?;
+    let membership_generation = control
+        .membership_generation
+        .checked_add(1)
+        .ok_or_else(|| conflict("membership generation overflow"))?;
+    let updated = ClusterMember {
+        state,
+        generation,
+        updated_at: now,
+        reason: reason.to_owned(),
+        ..member.clone()
+    };
+    control.members.insert(node_id.to_owned(), updated.clone());
+    control.membership_generation = membership_generation;
+    control.membership_audit.push(ClusterMembershipAudit {
+        membership_generation,
+        node_id: node_id.to_owned(),
+        member_generation: generation,
+        previous: Some(member.state),
+        current: state,
+        previous_tls_server_certificate_fingerprint: member
+            .tls_server_certificate_fingerprint
+            .clone(),
+        current_tls_server_certificate_fingerprint: member.tls_server_certificate_fingerprint,
+        actor: actor.to_owned(),
+        reason: reason.to_owned(),
+        changed_at: now,
+    });
+    Ok(updated)
+}
+
+fn require_replicated_active_member(
+    control: &ReplicatedControlPlaneState,
+    node_id: &str,
+) -> Result<(), (AuthorityRejection, String)> {
+    match control.members.get(node_id).map(|member| member.state) {
+        Some(ClusterMemberState::Active) => Ok(()),
+        Some(_) => Err(conflict(
+            "agent ownership denied: owner node is not an active cluster member",
+        )),
+        None => Err(conflict(
+            "agent ownership denied: owner node is not a cluster member",
+        )),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_claim_ownership(
+    control: &mut ReplicatedControlPlaneState,
+    agent_id: &str,
+    owner_node_id: &str,
+    ttl_seconds: u64,
+    expected_fencing_token: Option<u64>,
+    actor: &str,
+    reason: &str,
+    proposed_at: DateTime<Utc>,
+) -> Result<ClusterAgentOwnership, (AuthorityRejection, String)> {
+    validate_ownership_request(agent_id, owner_node_id, ttl_seconds, actor, reason)
+        .map_err(invalid_command)?;
+    require_replicated_active_member(control, owner_node_id)?;
+    if control.ownerships.len() >= 1_000_000 && !control.ownerships.contains_key(agent_id) {
+        return Err((
+            AuthorityRejection::CapacityReached,
+            "replicated ownership directory capacity is exhausted".into(),
+        ));
+    }
+    if control.ownership_audit.len() >= 100_000 {
+        return Err((
+            AuthorityRejection::CapacityReached,
+            "replicated ownership audit capacity is exhausted".into(),
+        ));
+    }
+    let now = advance_authority_time(control, proposed_at)?;
+    let previous = control.ownerships.get(agent_id).cloned();
+    let (fencing_token, generation, operation, previous_owner_node_id) = match previous {
+        None => {
+            if expected_fencing_token.is_some() {
+                return Err(conflict(
+                    "agent ownership conflict: no previous fencing token exists",
+                ));
+            }
+            (1, 1, "claim", None)
+        }
+        Some(previous) => {
+            if expected_fencing_token != Some(previous.fencing_token) {
+                return Err(conflict(format!(
+                    "agent ownership fencing conflict: expected {:?}, current {}",
+                    expected_fencing_token, previous.fencing_token
+                )));
+            }
+            if previous.state == ClusterOwnershipState::Active && previous.lease_expires_at > now {
+                return Err(conflict(
+                    "agent ownership conflict: current lease has not expired",
+                ));
+            }
+            (
+                previous
+                    .fencing_token
+                    .checked_add(1)
+                    .ok_or_else(|| conflict("agent ownership fencing token overflow"))?,
+                previous
+                    .generation
+                    .checked_add(1)
+                    .ok_or_else(|| conflict("agent ownership generation overflow"))?,
+                "transfer",
+                Some(previous.owner_node_id),
+            )
+        }
+    };
+    let lease_expires_at = ownership_expiry(now, ttl_seconds).map_err(invalid_command)?;
+    let ownership = ClusterAgentOwnership {
+        agent_id: agent_id.to_owned(),
+        owner_node_id: owner_node_id.to_owned(),
+        fencing_token,
+        generation,
+        state: ClusterOwnershipState::Active,
+        lease_expires_at,
+        updated_at: now,
+        reason: reason.to_owned(),
+    };
+    control
+        .ownerships
+        .insert(agent_id.to_owned(), ownership.clone());
+    control.ownership_audit.push(ClusterAgentOwnershipAudit {
+        agent_id: agent_id.to_owned(),
+        generation,
+        previous_owner_node_id,
+        owner_node_id: owner_node_id.to_owned(),
+        fencing_token,
+        operation: operation.into(),
+        actor: actor.to_owned(),
+        reason: reason.to_owned(),
+        changed_at: now,
+    });
+    Ok(ownership)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_renew_ownership(
+    control: &mut ReplicatedControlPlaneState,
+    agent_id: &str,
+    owner_node_id: &str,
+    fencing_token: u64,
+    ttl_seconds: u64,
+    actor: &str,
+    reason: &str,
+    proposed_at: DateTime<Utc>,
+) -> Result<ClusterAgentOwnership, (AuthorityRejection, String)> {
+    validate_ownership_request(agent_id, owner_node_id, ttl_seconds, actor, reason)
+        .map_err(invalid_command)?;
+    require_replicated_active_member(control, owner_node_id)?;
+    if control.ownership_audit.len() >= 100_000 {
+        return Err((
+            AuthorityRejection::CapacityReached,
+            "replicated ownership audit capacity is exhausted".into(),
+        ));
+    }
+    let previous = control
+        .ownerships
+        .get(agent_id)
+        .cloned()
+        .ok_or_else(|| conflict("agent ownership not found"))?;
+    let now = advance_authority_time(control, proposed_at)?;
+    if previous.state != ClusterOwnershipState::Active
+        || previous.owner_node_id != owner_node_id
+        || previous.fencing_token != fencing_token
+    {
+        return Err(conflict("agent ownership fencing conflict"));
+    }
+    if previous.lease_expires_at <= now {
+        return Err(conflict("agent ownership lease expired before renewal"));
+    }
+    let generation = previous
+        .generation
+        .checked_add(1)
+        .ok_or_else(|| conflict("agent ownership generation overflow"))?;
+    let ownership = ClusterAgentOwnership {
+        generation,
+        lease_expires_at: ownership_expiry(now, ttl_seconds).map_err(invalid_command)?,
+        updated_at: now,
+        reason: reason.to_owned(),
+        ..previous
+    };
+    control
+        .ownerships
+        .insert(agent_id.to_owned(), ownership.clone());
+    control.ownership_audit.push(ClusterAgentOwnershipAudit {
+        agent_id: agent_id.to_owned(),
+        generation,
+        previous_owner_node_id: Some(owner_node_id.to_owned()),
+        owner_node_id: owner_node_id.to_owned(),
+        fencing_token,
+        operation: "renew".into(),
+        actor: actor.to_owned(),
+        reason: reason.to_owned(),
+        changed_at: now,
+    });
+    Ok(ownership)
+}
+
+fn apply_release_ownership(
+    control: &mut ReplicatedControlPlaneState,
+    agent_id: &str,
+    owner_node_id: &str,
+    fencing_token: u64,
+    actor: &str,
+    reason: &str,
+    proposed_at: DateTime<Utc>,
+) -> Result<ClusterAgentOwnership, (AuthorityRejection, String)> {
+    validate_ownership_identity(agent_id, owner_node_id).map_err(invalid_command)?;
+    validate_text(actor, "cluster-ownership actor").map_err(invalid_command)?;
+    validate_reason(reason).map_err(invalid_command)?;
+    if control.ownership_audit.len() >= 100_000 {
+        return Err((
+            AuthorityRejection::CapacityReached,
+            "replicated ownership audit capacity is exhausted".into(),
+        ));
+    }
+    let previous = control
+        .ownerships
+        .get(agent_id)
+        .cloned()
+        .ok_or_else(|| conflict("agent ownership not found"))?;
+    if previous.state != ClusterOwnershipState::Active
+        || previous.owner_node_id != owner_node_id
+        || previous.fencing_token != fencing_token
+    {
+        return Err(conflict("agent ownership fencing conflict"));
+    }
+    let now = advance_authority_time(control, proposed_at)?;
+    let generation = previous
+        .generation
+        .checked_add(1)
+        .ok_or_else(|| conflict("agent ownership generation overflow"))?;
+    let ownership = ClusterAgentOwnership {
+        generation,
+        state: ClusterOwnershipState::Released,
+        lease_expires_at: now,
+        updated_at: now,
+        reason: reason.to_owned(),
+        ..previous
+    };
+    control
+        .ownerships
+        .insert(agent_id.to_owned(), ownership.clone());
+    control.ownership_audit.push(ClusterAgentOwnershipAudit {
+        agent_id: agent_id.to_owned(),
+        generation,
+        previous_owner_node_id: Some(owner_node_id.to_owned()),
+        owner_node_id: owner_node_id.to_owned(),
+        fencing_token,
+        operation: "release".into(),
+        actor: actor.to_owned(),
+        reason: reason.to_owned(),
+        changed_at: now,
+    });
+    Ok(ownership)
 }
 
 impl RaftStateMachine<ClusterRaftTypeConfig> for ClusterRaftStateMachine {
@@ -1403,7 +3000,415 @@ mod tests {
                 sequence: 1,
                 log_id: log_id(1, 3),
                 reason: AuthorityRejection::OperationIdConflict,
+                message: "authority operation_id is already committed with a different command"
+                    .into(),
             }]
+        );
+    }
+
+    fn test_identity() -> (ring::signature::Ed25519KeyPair, String, String) {
+        use ring::signature::KeyPair as _;
+
+        let pkcs8 =
+            ring::signature::Ed25519KeyPair::generate_pkcs8(&ring::rand::SystemRandom::new())
+                .unwrap();
+        let pair = ring::signature::Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap();
+        let public_key = pair
+            .public_key()
+            .as_ref()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let fingerprint = sha256_hex(pair.public_key().as_ref());
+        (pair, public_key, fingerprint)
+    }
+
+    #[test]
+    fn authority_genesis_rejects_a_tls_leaf_shared_by_two_identities() {
+        let (_, first_public_key, first_fingerprint) = test_identity();
+        let (_, second_public_key, second_fingerprint) = test_identity();
+        let shared_tls = Some("a".repeat(64));
+        let member = |node_id: String, public_key: String, fingerprint: String, endpoint: &str| {
+            AuthorityGenesisMember {
+                node_id,
+                fingerprint,
+                public_key,
+                tls_server_certificate_fingerprint: shared_tls.clone(),
+                endpoint: endpoint.into(),
+                server_version: "0.3.0".into(),
+                min_protocol_version: 1,
+                protocol_version: 2,
+            }
+        };
+        let genesis = AuthorityGenesis {
+            cluster_id: Uuid::new_v4().to_string(),
+            members: vec![
+                member(
+                    Uuid::new_v4().to_string(),
+                    first_public_key,
+                    first_fingerprint,
+                    "127.0.0.1:7777",
+                ),
+                member(
+                    Uuid::new_v4().to_string(),
+                    second_public_key,
+                    second_fingerprint,
+                    "127.0.0.1:7778",
+                ),
+            ],
+        };
+        let error = validate_and_build_genesis(&genesis, Utc::now()).unwrap_err();
+        assert_eq!(error.0, AuthorityRejection::InvalidCommand);
+        assert!(error.1.contains("TLS binding"), "{}", error.1);
+    }
+
+    #[test]
+    fn expired_join_challenges_are_reclaimed_before_capacity_is_enforced() {
+        let (_, public_key, fingerprint) = test_identity();
+        let cluster_id = Uuid::new_v4().to_string();
+        let started_at = Utc::now();
+        let mut state = AuthorityState::default();
+        let initialized = apply_authority_command(
+            &mut state,
+            AuthorityCommand::Initialize {
+                operation_id: cluster_id.clone(),
+                genesis: AuthorityGenesis {
+                    cluster_id,
+                    members: vec![AuthorityGenesisMember {
+                        node_id: Uuid::new_v4().to_string(),
+                        fingerprint,
+                        public_key,
+                        tls_server_certificate_fingerprint: None,
+                        endpoint: "127.0.0.1:7777".into(),
+                        server_version: "0.3.0".into(),
+                        min_protocol_version: 1,
+                        protocol_version: 2,
+                    }],
+                },
+                proposed_at: started_at,
+            },
+            log_id(1, 1),
+        );
+        assert!(matches!(
+            initialized,
+            AuthorityResponse::ControlPlaneInitialized { .. }
+        ));
+        let control = state.control_plane.as_mut().expect("initialized authority");
+        for index in 0..4_096_u64 {
+            let challenge_hex = format!("{index:064x}");
+            let challenge = hex_decode(&challenge_hex).expect("fixed-width challenge");
+            control.join_challenges.insert(
+                sha256_hex(&challenge),
+                ReplicatedJoinChallenge {
+                    challenge_hex,
+                    expires_at: started_at + TimeDelta::seconds(1),
+                    consumed_at: None,
+                },
+            );
+        }
+
+        let replacement = apply_authority_command(
+            &mut state,
+            AuthorityCommand::IssueJoinChallenge {
+                operation_id: Uuid::new_v4().to_string(),
+                challenge_hex: "ff".repeat(32),
+                ttl_seconds: 60,
+                proposed_at: started_at + TimeDelta::seconds(2),
+            },
+            log_id(1, 2),
+        );
+        assert!(matches!(
+            replacement,
+            AuthorityResponse::JoinChallengeIssued { .. }
+        ));
+        assert_eq!(
+            state
+                .control_plane
+                .as_ref()
+                .expect("initialized authority")
+                .join_challenges
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn replicated_membership_and_ownership_are_deterministic_and_replay_safe() {
+        let context = Arc::new(SqliteContextManager::in_memory().unwrap());
+        let (_, mut state) = open_cluster_raft_storage(context.clone()).unwrap();
+        let (_, seed_public_key, seed_fingerprint) = test_identity();
+        let seed_node_id = Uuid::new_v4().to_string();
+        let cluster_id = Uuid::new_v4().to_string();
+        let started_at = Utc::now();
+        let genesis = AuthorityGenesis {
+            cluster_id: cluster_id.clone(),
+            members: vec![AuthorityGenesisMember {
+                node_id: seed_node_id.clone(),
+                fingerprint: seed_fingerprint,
+                public_key: seed_public_key,
+                tls_server_certificate_fingerprint: Some("a".repeat(64)),
+                endpoint: "127.0.0.1:7777".into(),
+                server_version: "0.3.0".into(),
+                min_protocol_version: 1,
+                protocol_version: 2,
+            }],
+        };
+        let initialized = state
+            .apply([normal_entry(
+                log_id(1, 1),
+                AuthorityCommand::Initialize {
+                    operation_id: cluster_id.clone(),
+                    genesis: genesis.clone(),
+                    proposed_at: started_at,
+                },
+            )])
+            .await
+            .unwrap();
+        assert!(matches!(
+            &initialized[0],
+            AuthorityResponse::ControlPlaneInitialized {
+                sequence: 1,
+                replayed: false,
+                ..
+            }
+        ));
+
+        let challenge_operation = Uuid::new_v4();
+        let challenge_hex = "bc".repeat(32);
+        let challenge_response = state
+            .apply([normal_entry(
+                log_id(1, 2),
+                AuthorityCommand::IssueJoinChallenge {
+                    operation_id: challenge_operation.to_string(),
+                    challenge_hex: challenge_hex.clone(),
+                    ttl_seconds: 60,
+                    proposed_at: started_at + TimeDelta::seconds(1),
+                },
+            )])
+            .await
+            .unwrap();
+        assert!(matches!(
+            &challenge_response[0],
+            AuthorityResponse::JoinChallengeIssued {
+                sequence: 2,
+                replayed: false,
+                ..
+            }
+        ));
+
+        let (joining_pair, joining_public_key, joining_fingerprint) = test_identity();
+        let registration = ClusterMemberRegistration {
+            node_id: Uuid::new_v4().to_string(),
+            fingerprint: joining_fingerprint,
+            public_key: joining_public_key,
+            tls_server_certificate_fingerprint: Some("b".repeat(64)),
+            endpoint: "127.0.0.1:7778".into(),
+            server_version: "0.3.0".into(),
+            min_protocol_version: 1,
+            protocol_version: 2,
+        };
+        let payload = membership_join_payload(&cluster_id, &challenge_hex, &registration).unwrap();
+        let signature_hex = joining_pair
+            .sign(&payload)
+            .as_ref()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let registered = state
+            .apply([normal_entry(
+                log_id(1, 3),
+                AuthorityCommand::RegisterMember {
+                    operation_id: Uuid::new_v4().to_string(),
+                    registration: registration.clone(),
+                    challenge_hex,
+                    signature_hex,
+                    expected_generation: None,
+                    authority_min_protocol_version: 1,
+                    authority_protocol_version: 2,
+                    actor: "operator".into(),
+                    reason: "admit workload node".into(),
+                    proposed_at: started_at + TimeDelta::seconds(2),
+                },
+            )])
+            .await
+            .unwrap();
+        assert!(matches!(
+            &registered[0],
+            AuthorityResponse::MemberUpdated {
+                member,
+                sequence: 3,
+                ..
+            } if member.node_id == registration.node_id
+        ));
+
+        let agent_id = Uuid::new_v4().to_string();
+        let claim_operation = Uuid::new_v4().to_string();
+        let claim = AuthorityCommand::ClaimOwnership {
+            operation_id: claim_operation,
+            agent_id: agent_id.clone(),
+            owner_node_id: seed_node_id.clone(),
+            ttl_seconds: 60,
+            expected_fencing_token: None,
+            actor: "operator".into(),
+            reason: "place agent".into(),
+            proposed_at: started_at + TimeDelta::seconds(3),
+        };
+        let claimed = state
+            .apply([normal_entry(log_id(1, 4), claim.clone())])
+            .await
+            .unwrap();
+        let AuthorityResponse::OwnershipUpdated {
+            ownership: claimed_ownership,
+            sequence: 4,
+            ..
+        } = &claimed[0]
+        else {
+            panic!("expected replicated ownership claim");
+        };
+        assert_eq!(claimed_ownership.fencing_token, 1);
+
+        let mut replay = claim;
+        if let AuthorityCommand::ClaimOwnership { proposed_at, .. } = &mut replay {
+            *proposed_at = started_at + TimeDelta::seconds(10);
+        }
+        let replayed = state
+            .apply([normal_entry(log_id(1, 5), replay)])
+            .await
+            .unwrap();
+        assert!(matches!(
+            &replayed[0],
+            AuthorityResponse::OwnershipUpdated {
+                sequence: 4,
+                log_id: committed_log_id,
+                replayed: true,
+                ..
+            } if *committed_log_id == log_id(1, 4)
+        ));
+
+        let renewed = state
+            .apply([normal_entry(
+                log_id(1, 6),
+                AuthorityCommand::RenewOwnership {
+                    operation_id: Uuid::new_v4().to_string(),
+                    agent_id: agent_id.clone(),
+                    owner_node_id: seed_node_id.clone(),
+                    fencing_token: 1,
+                    ttl_seconds: 60,
+                    actor: "operator".into(),
+                    reason: "renew agent".into(),
+                    proposed_at: started_at + TimeDelta::seconds(4),
+                },
+            )])
+            .await
+            .unwrap();
+        assert!(matches!(
+            &renewed[0],
+            AuthorityResponse::OwnershipUpdated {
+                ownership,
+                sequence: 5,
+                ..
+            } if ownership.generation == 2 && ownership.fencing_token == 1
+        ));
+
+        state
+            .apply([normal_entry(
+                log_id(1, 7),
+                AuthorityCommand::ReleaseOwnership {
+                    operation_id: Uuid::new_v4().to_string(),
+                    agent_id: agent_id.clone(),
+                    owner_node_id: seed_node_id,
+                    fencing_token: 1,
+                    actor: "operator".into(),
+                    reason: "release agent".into(),
+                    proposed_at: started_at + TimeDelta::seconds(5),
+                },
+            )])
+            .await
+            .unwrap();
+        let advanced_to = started_at + TimeDelta::seconds(600);
+        let advanced = state
+            .apply([normal_entry(
+                log_id(1, 8),
+                AuthorityCommand::AdvanceTime {
+                    operation_id: Uuid::new_v4().to_string(),
+                    proposed_at: advanced_to,
+                },
+            )])
+            .await
+            .unwrap();
+        assert!(matches!(
+            &advanced[0],
+            AuthorityResponse::AuthorityTimeAdvanced {
+                logical_time,
+                ..
+            } if *logical_time == advanced_to
+        ));
+        let view = read_replicated_authority_view(&context)
+            .unwrap()
+            .expect("initialized authority view");
+        assert_eq!(view.genesis, genesis);
+        assert_eq!(view.membership.generation, 2);
+        assert_eq!(view.membership.members.len(), 2);
+        assert_eq!(view.ownerships.len(), 1);
+        assert_eq!(view.ownerships[0].agent_id, agent_id);
+        assert_eq!(view.ownerships[0].state, ClusterOwnershipState::Released);
+        assert_eq!(view.ownership_audit.len(), 3);
+        assert_eq!(view.logical_time, advanced_to);
+        let connection = context.conn.lock().unwrap();
+        let persisted = load_persistent_state(&connection).unwrap();
+        assert_eq!(persisted.authority.sequence, 6);
+        assert_eq!(persisted.authority.receipts.len(), 6);
+    }
+
+    #[tokio::test]
+    async fn corrupted_replicated_audit_history_fails_closed_on_open() {
+        let context = Arc::new(SqliteContextManager::in_memory().unwrap());
+        let (_, mut state) = open_cluster_raft_storage(context.clone()).unwrap();
+        let (_, public_key, fingerprint) = test_identity();
+        let cluster_id = Uuid::new_v4().to_string();
+        state
+            .apply([normal_entry(
+                log_id(1, 1),
+                AuthorityCommand::Initialize {
+                    operation_id: cluster_id.clone(),
+                    genesis: AuthorityGenesis {
+                        cluster_id,
+                        members: vec![AuthorityGenesisMember {
+                            node_id: Uuid::new_v4().to_string(),
+                            fingerprint,
+                            public_key,
+                            tls_server_certificate_fingerprint: None,
+                            endpoint: "127.0.0.1:7777".into(),
+                            server_version: "0.3.0".into(),
+                            min_protocol_version: 1,
+                            protocol_version: 2,
+                        }],
+                    },
+                    proposed_at: Utc::now(),
+                },
+            )])
+            .await
+            .unwrap();
+        {
+            let connection = context.conn.lock().unwrap();
+            let mut persisted = load_persistent_state(&connection).unwrap();
+            persisted
+                .authority
+                .control_plane
+                .as_mut()
+                .unwrap()
+                .membership_audit[0]
+                .member_generation = 2;
+            connection
+                .execute(
+                    "UPDATE cluster_raft_state SET authority_state_json = ?1 WHERE singleton = 1",
+                    [serialize(&persisted.authority).unwrap()],
+                )
+                .unwrap();
+        }
+        assert!(
+            open_cluster_raft_storage(context).is_err(),
+            "corrupted replicated audit evidence must prevent participation"
         );
     }
 

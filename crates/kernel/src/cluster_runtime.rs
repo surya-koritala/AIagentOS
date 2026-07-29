@@ -6,11 +6,12 @@
 //! server and client leaf fingerprints must match the statically trusted
 //! membership supplied when the runtime starts.
 //!
-//! This module deliberately does not route public membership or ownership
-//! syscalls through Raft yet. It makes election, replication, restart, and
-//! failover executable so the next integration stage can switch those public
-//! authority commands without pretending that the existing single-writer
-//! paths are already quorum-backed.
+//! The daemon installs a cloneable authority handle after identical genesis is
+//! committed. Public membership and ownership syscalls use it for
+//! majority-backed writes and linearizable reads; followers forward both over
+//! the authenticated peer transport. The OpenRaft voter map remains static,
+//! so safe voter reconfiguration and coordinated certificate epochs are later
+//! stages.
 
 #![allow(clippy::result_large_err)]
 
@@ -46,8 +47,9 @@ use tokio_rustls::{TlsAcceptor, TlsConnector};
 use zeroize::Zeroizing;
 
 use crate::cluster_consensus::{
-    open_cluster_raft_storage, AuthorityCommand, ClusterRaftNode, ClusterRaftNodeId,
-    ClusterRaftTypeConfig,
+    open_cluster_raft_storage, read_replicated_authority_view, AuthorityCommand, AuthorityGenesis,
+    AuthorityGenesisMember, AuthorityResponse, ClusterRaftNode, ClusterRaftNodeId,
+    ClusterRaftTypeConfig, ReplicatedAuthorityView,
 };
 use crate::config::ClusterRaftConfig;
 use crate::context::SqliteContextManager;
@@ -62,6 +64,7 @@ const DEFAULT_INBOUND_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_CLUSTER_PEM_BYTES: u64 = 1024 * 1024;
 const INITIAL_METRICS_TIMEOUT: Duration = Duration::from_secs(5);
 const MEMBERSHIP_SETTLE_TIMEOUT: Duration = Duration::from_secs(10);
+const AUTHORITY_INITIALIZATION_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Server and client TLS identities used by one Raft peer.
 ///
@@ -257,6 +260,7 @@ pub struct ClusterRaftRuntimeConfig {
     pub node_id: ClusterRaftNodeId,
     pub listen_addr: SocketAddr,
     pub members: BTreeMap<ClusterRaftNodeId, ClusterRaftNode>,
+    pub authority_genesis: AuthorityGenesis,
     pub tls: ClusterRaftTls,
     pub raft: OpenRaftConfig,
     pub transport: ClusterRaftTransportLimits,
@@ -269,6 +273,7 @@ impl fmt::Debug for ClusterRaftRuntimeConfig {
             .field("node_id", &self.node_id)
             .field("listen_addr", &self.listen_addr)
             .field("members", &self.members)
+            .field("authority_genesis", &self.authority_genesis)
             .field("tls", &self.tls)
             .field("raft", &self.raft)
             .field("transport", &self.transport)
@@ -343,10 +348,36 @@ impl ClusterRaftRuntimeConfig {
                 )
             })
             .collect();
+        let mut authority_members = config
+            .members
+            .iter()
+            .map(|member| {
+                let public_key = crate::cluster_control::hex_decode(&member.identity_public_key)
+                    .expect("validated application identity public key");
+                AuthorityGenesisMember {
+                    node_id: member.application_node_id.clone(),
+                    fingerprint: crate::cluster_control::sha256_hex(&public_key),
+                    public_key: member.identity_public_key.clone(),
+                    tls_server_certificate_fingerprint: member
+                        .application_tls_server_certificate_sha256
+                        .clone(),
+                    endpoint: member.application_endpoint.clone(),
+                    server_version: env!("CARGO_PKG_VERSION").into(),
+                    min_protocol_version: crate::syscall_server::MIN_PROTOCOL_VERSION,
+                    protocol_version: crate::syscall_server::PROTOCOL_VERSION,
+                }
+            })
+            .collect::<Vec<_>>();
+        authority_members.sort_by(|left, right| left.node_id.cmp(&right.node_id));
+        let authority_genesis = AuthorityGenesis {
+            cluster_id: config.authority_cluster_id.clone(),
+            members: authority_members,
+        };
         let runtime = Self {
             node_id: config.node_id,
             listen_addr: config.listen_addr.parse().map_err(invalid_input)?,
             members,
+            authority_genesis,
             tls,
             raft: OpenRaftConfig {
                 cluster_name: config.cluster_name.clone(),
@@ -375,6 +406,7 @@ impl ClusterRaftRuntimeConfig {
         if self.members.is_empty() || self.members.len() > 31 {
             return Err(invalid_input("Raft membership must contain 1 to 31 nodes"));
         }
+        validate_authority_genesis(&self.authority_genesis)?;
         let local = self
             .members
             .get(&self.node_id)
@@ -426,9 +458,14 @@ impl ClusterRaftRuntimeConfig {
             ServerName::try_from(node.server_name.clone()).map_err(invalid_input)?;
             validate_sha256(&node.tls_certificate_sha256, "server certificate")?;
             validate_sha256(&node.tls_client_certificate_sha256, "client certificate")?;
-            if node.identity_public_key.is_empty() || node.identity_public_key.len() > 8_192 {
+            if node.identity_public_key.len() != 64
+                || !node
+                    .identity_public_key
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            {
                 return Err(invalid_input(
-                    "Raft member identity public key must contain 1 to 8192 bytes",
+                    "Raft member identity public key must be 64 lowercase hexadecimal characters",
                 ));
             }
             if !endpoints.insert(node.endpoint.clone()) {
@@ -463,6 +500,104 @@ impl ClusterRaftRuntimeConfig {
         }
         Ok(())
     }
+}
+
+fn validate_authority_genesis(genesis: &AuthorityGenesis) -> io::Result<()> {
+    let cluster_id = uuid::Uuid::parse_str(&genesis.cluster_id)
+        .map_err(|_| invalid_input("authority genesis cluster id must be a UUID"))?;
+    if cluster_id.to_string() != genesis.cluster_id {
+        return Err(invalid_input(
+            "authority genesis cluster id must use canonical lowercase UUID form",
+        ));
+    }
+    if genesis.members.is_empty() || genesis.members.len() > 31 {
+        return Err(invalid_input(
+            "authority genesis must contain 1 to 31 application members",
+        ));
+    }
+    let mut node_ids = BTreeSet::new();
+    let mut fingerprints = BTreeSet::new();
+    let mut endpoints = BTreeSet::new();
+    for member in &genesis.members {
+        let registration = crate::cluster_control::ClusterMemberRegistration {
+            node_id: member.node_id.clone(),
+            fingerprint: member.fingerprint.clone(),
+            public_key: member.public_key.clone(),
+            tls_server_certificate_fingerprint: member.tls_server_certificate_fingerprint.clone(),
+            endpoint: member.endpoint.clone(),
+            server_version: member.server_version.clone(),
+            min_protocol_version: member.min_protocol_version,
+            protocol_version: member.protocol_version,
+        };
+        crate::cluster_control::validate_member_registration(&registration)
+            .map_err(invalid_input)?;
+        if !node_ids.insert(member.node_id.clone())
+            || !fingerprints.insert(member.fingerprint.clone())
+            || !endpoints.insert(member.endpoint.clone())
+        {
+            return Err(invalid_input(
+                "authority genesis contains a duplicate application identity or endpoint",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_initialized_authority(
+    view: &ReplicatedAuthorityView,
+    genesis: &AuthorityGenesis,
+) -> io::Result<()> {
+    let immutable_members_match = view.genesis.members.len() == genesis.members.len()
+        && view
+            .genesis
+            .members
+            .iter()
+            .zip(&genesis.members)
+            .all(|(durable, configured)| {
+                durable.node_id == configured.node_id
+                    && durable.fingerprint == configured.fingerprint
+                    && durable.public_key == configured.public_key
+            });
+    if view.genesis.cluster_id != genesis.cluster_id
+        || view.membership.cluster_id != genesis.cluster_id
+        || !immutable_members_match
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "durable replicated application authority identity genesis does not match configuration",
+        ));
+    }
+    for configured in &genesis.members {
+        let durable = view
+            .membership
+            .members
+            .iter()
+            .find(|member| member.node_id == configured.node_id)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "configured application voter {} is absent from durable membership",
+                        configured.node_id
+                    ),
+                )
+            })?;
+        if durable.fingerprint != configured.fingerprint
+            || durable.public_key != configured.public_key
+            || durable.endpoint != configured.endpoint
+            || durable.tls_server_certificate_fingerprint
+                != configured.tls_server_certificate_fingerprint
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "configured application voter {} does not match its current durable membership identity, endpoint, or TLS binding",
+                    configured.node_id
+                ),
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn required_path<'a>(path: Option<&'a Path>, field: &str) -> io::Result<&'a Path> {
@@ -604,6 +739,14 @@ enum RpcRequest {
     AppendEntries(AppendEntriesRequest<ClusterRaftTypeConfig>),
     Vote(VoteRequest<ClusterRaftNodeId>),
     InstallSnapshot(InstallSnapshotRequest<ClusterRaftTypeConfig>),
+    AuthorityWrite(AuthorityCommand),
+    AuthorityRead,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AuthorityReadBarrier {
+    logical_time: chrono::DateTime<chrono::Utc>,
+    log_id: openraft::LogId<ClusterRaftNodeId>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -625,6 +768,13 @@ enum RpcResponse {
             RaftError<ClusterRaftNodeId, openraft::error::InstallSnapshotError>,
         >,
     ),
+    AuthorityWrite(
+        Result<
+            ClientWriteResponse<ClusterRaftTypeConfig>,
+            RaftError<ClusterRaftNodeId, ClientWriteError<ClusterRaftNodeId, ClusterRaftNode>>,
+        >,
+    ),
+    AuthorityRead(Result<AuthorityReadBarrier, String>),
 }
 
 impl RpcRequest {
@@ -633,6 +783,7 @@ impl RpcRequest {
             Self::AppendEntries(_) => RPCTypes::AppendEntries,
             Self::Vote(_) => RPCTypes::Vote,
             Self::InstallSnapshot(_) => RPCTypes::InstallSnapshot,
+            Self::AuthorityWrite(_) | Self::AuthorityRead => RPCTypes::AppendEntries,
         }
     }
 
@@ -641,7 +792,12 @@ impl RpcRequest {
             Self::AppendEntries(request) => request.vote.leader_id.voted_for(),
             Self::Vote(request) => request.vote.leader_id.voted_for(),
             Self::InstallSnapshot(request) => request.vote.leader_id.voted_for(),
+            Self::AuthorityWrite(_) | Self::AuthorityRead => None,
         }
+    }
+
+    fn is_authority_request(&self) -> bool {
+        matches!(self, Self::AuthorityWrite(_) | Self::AuthorityRead)
     }
 }
 
@@ -877,11 +1033,235 @@ impl RaftNetwork<ClusterRaftTypeConfig> for ClusterNetwork {
     }
 }
 
+/// Cloneable application-authority client tied to one live Raft runtime.
+///
+/// Writes are accepted only by the current leader. Reads first commit a
+/// logical-clock floor through the quorum, then inspect the locally applied
+/// SQLite state-machine projection so an idle lease cannot remain active just
+/// because no authority mutation occurred.
+#[derive(Clone)]
+pub struct ClusterAuthorityHandle {
+    raft: Raft<ClusterRaftTypeConfig>,
+    context: Arc<SqliteContextManager>,
+    network: ClusterNetworkFactory,
+    forward_timeout: Duration,
+}
+
+impl fmt::Debug for ClusterAuthorityHandle {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ClusterAuthorityHandle")
+            .finish_non_exhaustive()
+    }
+}
+
+impl ClusterAuthorityHandle {
+    pub async fn commit(&self, command: AuthorityCommand) -> io::Result<AuthorityResponse> {
+        match self.raft.client_write(command.clone()).await {
+            Ok(response) => Ok(response.data),
+            Err(error) => {
+                let (leader_id, leader_node) = leader_target(&error)?;
+                let response = self
+                    .forward(leader_id, &leader_node, RpcRequest::AuthorityWrite(command))
+                    .await?;
+                match response {
+                    RpcResponse::AuthorityWrite(Ok(response)) => Ok(response.data),
+                    RpcResponse::AuthorityWrite(Err(error)) => Err(io::Error::new(
+                        io::ErrorKind::ConnectionRefused,
+                        format!("replicated authority leader rejected forwarded write: {error}"),
+                    )),
+                    _ => Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "replicated authority forwarding returned the wrong response type",
+                    )),
+                }
+            }
+        }
+    }
+
+    pub async fn linearizable_view(&self) -> io::Result<ReplicatedAuthorityView> {
+        let time_advance = AuthorityCommand::AdvanceTime {
+            operation_id: uuid::Uuid::new_v4().to_string(),
+            proposed_at: chrono::Utc::now(),
+        };
+        match self.raft.client_write(time_advance).await {
+            Ok(response) => {
+                authority_read_barrier(response.data)?;
+                read_initialized_authority_view(&self.context)
+            }
+            Err(error) => {
+                let (leader_id, leader_node) = leader_target(&error)?;
+                match self
+                    .forward(leader_id, &leader_node, RpcRequest::AuthorityRead)
+                    .await?
+                {
+                    RpcResponse::AuthorityRead(Ok(barrier)) => {
+                        self.wait_for_local_apply(barrier.log_id).await?;
+                        let view = read_initialized_authority_view(&self.context)?;
+                        if view.logical_time < barrier.logical_time {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "local authority projection did not apply the forwarded logical-clock floor",
+                            ));
+                        }
+                        Ok(view)
+                    }
+                    RpcResponse::AuthorityRead(Err(message)) => {
+                        Err(io::Error::new(io::ErrorKind::ConnectionRefused, message))
+                    }
+                    _ => Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "replicated authority forwarding returned the wrong response type",
+                    )),
+                }
+            }
+        }
+    }
+
+    pub fn local_view(&self) -> io::Result<Option<ReplicatedAuthorityView>> {
+        read_replicated_authority_view(&self.context)
+    }
+
+    async fn wait_for_local_apply(
+        &self,
+        required: openraft::LogId<ClusterRaftNodeId>,
+    ) -> io::Result<()> {
+        let mut metrics = self.raft.metrics();
+        let wait = async {
+            loop {
+                if let Some(applied) = metrics.borrow().last_applied {
+                    if applied.index > required.index || applied == required {
+                        return Ok(());
+                    }
+                    if applied.index == required.index {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!(
+                                "local authority projection applied {applied} instead of forwarded barrier {required}"
+                            ),
+                        ));
+                    }
+                }
+                metrics.changed().await.map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::ConnectionAborted,
+                        "OpenRaft metrics closed while waiting for a forwarded authority read",
+                    )
+                })?;
+            }
+        };
+        tokio::time::timeout(self.forward_timeout, wait)
+            .await
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!(
+                        "local authority projection did not reach forwarded log index {}",
+                        required.index
+                    ),
+                )
+            })?
+    }
+
+    async fn forward(
+        &self,
+        leader_id: ClusterRaftNodeId,
+        leader_node: &ClusterRaftNode,
+        request: RpcRequest,
+    ) -> io::Result<RpcResponse> {
+        let mut factory = self.network.clone();
+        let client = factory.new_client(leader_id, leader_node).await;
+        client
+            .call(request, RPCOption::new(self.forward_timeout))
+            .await
+            .map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::ConnectionRefused,
+                    format!(
+                        "forward replicated authority request to Raft leader {leader_id}: {}",
+                        rpc_call_error_message(&error)
+                    ),
+                )
+            })
+    }
+}
+
+fn authority_read_barrier(response: AuthorityResponse) -> io::Result<AuthorityReadBarrier> {
+    match response {
+        AuthorityResponse::AuthorityTimeAdvanced {
+            logical_time,
+            log_id,
+            ..
+        } => Ok(AuthorityReadBarrier {
+            logical_time,
+            log_id,
+        }),
+        AuthorityResponse::Rejected { message, .. } => Err(io::Error::new(
+            io::ErrorKind::ConnectionRefused,
+            format!("replicated authority rejected logical-clock advancement: {message}"),
+        )),
+        other => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("replicated authority returned the wrong logical-clock response: {other:?}"),
+        )),
+    }
+}
+
+fn read_initialized_authority_view(
+    context: &SqliteContextManager,
+) -> io::Result<ReplicatedAuthorityView> {
+    read_replicated_authority_view(context)?.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotConnected,
+            "replicated authority is not initialized",
+        )
+    })
+}
+
+fn leader_target<E>(
+    error: &RaftError<ClusterRaftNodeId, E>,
+) -> io::Result<(ClusterRaftNodeId, ClusterRaftNode)>
+where
+    E: std::error::Error
+        + openraft::TryAsRef<openraft::error::ForwardToLeader<ClusterRaftNodeId, ClusterRaftNode>>,
+{
+    let forward = error.forward_to_leader().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::ConnectionRefused,
+            format!("replicated authority operation failed without a leader hint: {error}"),
+        )
+    })?;
+    let leader_id = forward.leader_id.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::ConnectionRefused,
+            "replicated authority has no elected leader",
+        )
+    })?;
+    let leader_node = forward.leader_node.clone().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::ConnectionRefused,
+            "replicated authority leader hint omitted its trusted node identity",
+        )
+    })?;
+    Ok((leader_id, leader_node))
+}
+
+fn rpc_call_error_message(error: &RpcCallError) -> &str {
+    match error {
+        RpcCallError::Timeout(_) => "request timed out",
+        RpcCallError::Unreachable(message) | RpcCallError::Network(message) => message,
+    }
+}
+
 /// Live OpenRaft node plus its authenticated peer listener.
 pub struct ClusterRaftRuntime {
     node_id: ClusterRaftNodeId,
     local_addr: SocketAddr,
     members: BTreeMap<ClusterRaftNodeId, ClusterRaftNode>,
+    authority_genesis: AuthorityGenesis,
+    context: Arc<SqliteContextManager>,
+    authority_network: ClusterNetworkFactory,
+    authority_forward_timeout: Duration,
     raft: Raft<ClusterRaftTypeConfig>,
     shutdown_tx: watch::Sender<bool>,
     listener_task: Option<JoinHandle<io::Result<()>>>,
@@ -894,6 +1274,7 @@ impl fmt::Debug for ClusterRaftRuntime {
             .field("node_id", &self.node_id)
             .field("local_addr", &self.local_addr)
             .field("members", &self.members)
+            .field("authority_genesis", &self.authority_genesis)
             .finish_non_exhaustive()
     }
 }
@@ -925,12 +1306,15 @@ impl ClusterRaftRuntime {
             handshake_timeout: config.transport.handshake_timeout,
             max_frame_bytes: config.transport.max_frame_bytes,
         };
-        let (log_store, state_machine) = open_cluster_raft_storage(context).map_err(|error| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("open durable Raft storage: {error}"),
-            )
-        })?;
+        let authority_network = network.clone();
+        let authority_forward_timeout = config.transport.inbound_request_timeout;
+        let (log_store, state_machine) =
+            open_cluster_raft_storage(context.clone()).map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("open durable Raft storage: {error}"),
+                )
+            })?;
         let raft_config = Arc::new(config.raft.clone().validate().map_err(invalid_input)?);
         let raft = Raft::new(
             config.node_id,
@@ -985,6 +1369,10 @@ impl ClusterRaftRuntime {
             node_id: config.node_id,
             local_addr,
             members: config.members,
+            authority_genesis: config.authority_genesis,
+            context,
+            authority_network,
+            authority_forward_timeout,
             raft,
             shutdown_tx,
             listener_task: Some(listener_task),
@@ -1001,6 +1389,15 @@ impl ClusterRaftRuntime {
 
     pub fn metrics(&self) -> watch::Receiver<RaftMetrics<ClusterRaftNodeId, ClusterRaftNode>> {
         self.raft.metrics()
+    }
+
+    pub fn authority_handle(&self) -> ClusterAuthorityHandle {
+        ClusterAuthorityHandle {
+            raft: self.raft.clone(),
+            context: self.context.clone(),
+            network: self.authority_network.clone(),
+            forward_timeout: self.authority_forward_timeout,
+        }
     }
 
     /// Explicitly initialize the cluster with the exact trusted node map.
@@ -1054,6 +1451,64 @@ impl ClusterRaftRuntime {
                     ))
                 }
                 Err(error) => return Err(error),
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    /// Seed the replicated application authority once, or verify its immutable
+    /// identities plus current endpoint/TLS bindings against configuration.
+    /// Version/protocol metadata may change across a binary restart and is
+    /// updated later through challenged membership re-admission.
+    ///
+    /// Every voter may call this concurrently. Only the elected leader submits
+    /// the deterministic initialization command; followers wait for that entry
+    /// to apply locally.
+    pub async fn ensure_authority_initialized(&self) -> io::Result<()> {
+        let deadline = Instant::now() + AUTHORITY_INITIALIZATION_TIMEOUT;
+        let mut submitted = false;
+        loop {
+            if let Some(view) = read_replicated_authority_view(&self.context)? {
+                validate_initialized_authority(&view, &self.authority_genesis)?;
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "replicated application authority did not initialize before the startup deadline",
+                ));
+            }
+            if !submitted && self.metrics().borrow().current_leader == Some(self.node_id) {
+                submitted = true;
+                let response = self
+                    .commit(AuthorityCommand::Initialize {
+                        operation_id: self.authority_genesis.cluster_id.clone(),
+                        genesis: self.authority_genesis.clone(),
+                        proposed_at: chrono::Utc::now(),
+                    })
+                    .await
+                    .map_err(|error| {
+                        io::Error::new(
+                            io::ErrorKind::ConnectionRefused,
+                            format!("initialize replicated application authority: {error}"),
+                        )
+                    })?;
+                match response.data {
+                    AuthorityResponse::ControlPlaneInitialized { .. } => {}
+                    AuthorityResponse::Rejected { message, .. } => {
+                        return Err(invalid_input(format!(
+                            "replicated application authority rejected genesis: {message}"
+                        )))
+                    }
+                    other => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!(
+                                "replicated application authority returned an unexpected genesis response: {other:?}"
+                            ),
+                        ))
+                    }
+                }
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
@@ -1149,6 +1604,18 @@ pub async fn start_configured_cluster_runtime(
                 error.kind(),
                 format!(
                     "{error}; Raft shutdown after startup failure also failed: {shutdown_error}"
+                ),
+            ),
+            None => error,
+        });
+    }
+    if let Err(error) = runtime.ensure_authority_initialized().await {
+        let shutdown_error = runtime.shutdown().await.err();
+        return Err(match shutdown_error {
+            Some(shutdown_error) => io::Error::new(
+                error.kind(),
+                format!(
+                    "{error}; Raft shutdown after authority initialization failure also failed: {shutdown_error}"
                 ),
             ),
             None => error,
@@ -1288,7 +1755,9 @@ async fn handle_connection(
             "Raft client leaf does not match trusted membership",
         ));
     }
-    if request.body.embedded_sender() != Some(request.source) {
+    if !request.body.is_authority_request()
+        && request.body.embedded_sender() != Some(request.source)
+    {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             "Raft embedded vote identity does not match authenticated source",
@@ -1302,6 +1771,27 @@ async fn handle_connection(
         RpcRequest::Vote(request) => RpcResponse::Vote(raft.vote(request).await),
         RpcRequest::InstallSnapshot(request) => {
             RpcResponse::InstallSnapshot(raft.install_snapshot(request).await)
+        }
+        RpcRequest::AuthorityWrite(mut command) => {
+            normalize_forwarded_authority_command(&mut command)?;
+            RpcResponse::AuthorityWrite(raft.client_write(command).await)
+        }
+        RpcRequest::AuthorityRead => {
+            let view = match raft
+                .client_write(AuthorityCommand::AdvanceTime {
+                    operation_id: uuid::Uuid::new_v4().to_string(),
+                    proposed_at: chrono::Utc::now(),
+                })
+                .await
+            {
+                Ok(response) => {
+                    authority_read_barrier(response.data).map_err(|error| error.to_string())
+                }
+                Err(error) => Err(format!(
+                    "replicated authority leader rejected forwarded read: {error}"
+                )),
+            };
+            RpcResponse::AuthorityRead(view)
         }
     };
     let response = RpcResponseEnvelope {
@@ -1318,6 +1808,27 @@ async fn handle_connection(
     .await
     .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "Raft response timed out"))??;
     tls.shutdown().await?;
+    Ok(())
+}
+
+fn normalize_forwarded_authority_command(command: &mut AuthorityCommand) -> io::Result<()> {
+    let proposed_at = match command {
+        AuthorityCommand::IssueJoinChallenge { proposed_at, .. }
+        | AuthorityCommand::RegisterMember { proposed_at, .. }
+        | AuthorityCommand::SetMemberState { proposed_at, .. }
+        | AuthorityCommand::ClaimOwnership { proposed_at, .. }
+        | AuthorityCommand::RenewOwnership { proposed_at, .. }
+        | AuthorityCommand::ReleaseOwnership { proposed_at, .. } => proposed_at,
+        AuthorityCommand::Initialize { .. }
+        | AuthorityCommand::Barrier { .. }
+        | AuthorityCommand::AdvanceTime { .. } => {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "internal authority command cannot be submitted through follower forwarding",
+            ))
+        }
+    };
+    *proposed_at = chrono::Utc::now();
     Ok(())
 }
 
@@ -1397,6 +1908,38 @@ mod tests {
         CertifiedIssuer::self_signed(params, key).expect("self-sign CA")
     }
 
+    #[test]
+    fn follower_forwarding_rejects_internal_commands_and_uses_leader_time() {
+        let mut command = AuthorityCommand::ClaimOwnership {
+            operation_id: Uuid::new_v4().to_string(),
+            agent_id: Uuid::new_v4().to_string(),
+            owner_node_id: Uuid::new_v4().to_string(),
+            ttl_seconds: 30,
+            expected_fencing_token: None,
+            actor: "system".into(),
+            reason: "forwarding clock regression".into(),
+            proposed_at: chrono::DateTime::<chrono::Utc>::MAX_UTC,
+        };
+        let before = chrono::Utc::now();
+        normalize_forwarded_authority_command(&mut command).unwrap();
+        let after = chrono::Utc::now();
+        let AuthorityCommand::ClaimOwnership { proposed_at, .. } = command else {
+            unreachable!()
+        };
+        assert!((before..=after).contains(&proposed_at));
+
+        let mut internal = AuthorityCommand::AdvanceTime {
+            operation_id: Uuid::new_v4().to_string(),
+            proposed_at: chrono::Utc::now(),
+        };
+        assert_eq!(
+            normalize_forwarded_authority_command(&mut internal)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::PermissionDenied
+        );
+    }
+
     fn test_peer(ca: &CertifiedIssuer<'_, KeyPair>, node_id: ClusterRaftNodeId) -> TestPeer {
         let server_name = format!("node-{node_id}.agentos.test");
         let server_key = KeyPair::generate().expect("generate server key");
@@ -1472,15 +2015,19 @@ mod tests {
             enabled: true,
             bootstrap,
             node_id: peer.node_id,
+            authority_cluster_id: "00000000-0000-0000-0000-000000000100".into(),
             listen_addr: listen_addr.to_string(),
             cluster_name: "operator-runtime-test".into(),
             members: vec![ClusterRaftMemberConfig {
                 node_id: peer.node_id,
+                application_node_id: format!("00000000-0000-0000-0000-{:012}", peer.node_id),
+                application_endpoint: format!("127.0.0.1:{}", 7_000 + peer.node_id),
+                application_tls_server_certificate_sha256: None,
                 endpoint: listen_addr.to_string(),
                 server_name: peer.server_name.clone(),
                 tls_certificate_sha256: peer.tls.server_certificate_sha256().into(),
                 tls_client_certificate_sha256: peer.tls.client_certificate_sha256().into(),
-                identity_public_key: format!("test-identity-key-{}", peer.node_id),
+                identity_public_key: format!("{:064x}", peer.node_id),
             }],
             server_certificate_path: Some(server_certificate_path),
             server_private_key_path: Some(server_private_key_path),
@@ -1524,7 +2071,7 @@ mod tests {
                             .tls
                             .client_certificate_sha256()
                             .to_string(),
-                        identity_public_key: format!("test-identity-key-{}", peer.node_id),
+                        identity_public_key: format!("{:064x}", peer.node_id),
                     },
                 )
             })
@@ -1537,10 +2084,32 @@ mod tests {
         members: &BTreeMap<ClusterRaftNodeId, ClusterRaftNode>,
         cluster_name: &str,
     ) -> ClusterRaftRuntimeConfig {
+        let authority_genesis = AuthorityGenesis {
+            cluster_id: "00000000-0000-0000-0000-000000000100".into(),
+            members: members
+                .iter()
+                .map(|(node_id, member)| {
+                    let public_key =
+                        crate::cluster_control::hex_decode(&member.identity_public_key)
+                            .expect("test identity key");
+                    AuthorityGenesisMember {
+                        node_id: format!("00000000-0000-0000-0000-{node_id:012}"),
+                        fingerprint: crate::cluster_control::sha256_hex(&public_key),
+                        public_key: member.identity_public_key.clone(),
+                        tls_server_certificate_fingerprint: None,
+                        endpoint: format!("127.0.0.1:{}", 7_000 + node_id),
+                        server_version: env!("CARGO_PKG_VERSION").into(),
+                        min_protocol_version: crate::syscall_server::MIN_PROTOCOL_VERSION,
+                        protocol_version: crate::syscall_server::PROTOCOL_VERSION,
+                    }
+                })
+                .collect(),
+        };
         ClusterRaftRuntimeConfig {
             node_id: peer.node_id,
             listen_addr: listener.local_addr().expect("listener address"),
             members: members.clone(),
+            authority_genesis,
             tls: peer.tls.clone(),
             raft: OpenRaftConfig {
                 cluster_name: cluster_name.to_string(),
@@ -1666,13 +2235,34 @@ mod tests {
 
         let first_leader = wait_for_leader(&runtimes, None).await;
         let first_leader_index = (first_leader - 1) as usize;
+        runtimes[first_leader_index]
+            .as_ref()
+            .expect("first leader runtime")
+            .ensure_authority_initialized()
+            .await
+            .expect("initialize replicated application authority");
+        let authority_deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            if runtimes
+                .iter()
+                .flatten()
+                .all(|runtime| runtime.authority_handle().local_view().unwrap().is_some())
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < authority_deadline,
+                "application authority did not reach every replica"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
         let operation_id = Uuid::new_v4().to_string();
         let first_write = runtimes[first_leader_index]
             .as_ref()
             .expect("first leader runtime")
             .commit(AuthorityCommand::Barrier {
                 operation_id: operation_id.clone(),
-                expected_sequence: Some(0),
+                expected_sequence: Some(1),
             })
             .await
             .expect("commit first barrier");
@@ -1680,7 +2270,7 @@ mod tests {
             first_write.data,
             AuthorityResponse::BarrierCommitted {
                 operation_id: ref committed,
-                sequence: 1,
+                sequence: 2,
                 replayed: false,
                 ..
             } if committed == &operation_id
@@ -1695,20 +2285,83 @@ mod tests {
             .expect("shutdown first leader");
         let second_leader = wait_for_leader(&runtimes, Some(first_leader)).await;
         assert_ne!(first_leader, second_leader);
-        let second_write = runtimes[(second_leader - 1) as usize]
+        let agent_id = Uuid::new_v4().to_string();
+        let owner_node_id = configs[(second_leader - 1) as usize]
+            .authority_genesis
+            .members[(second_leader - 1) as usize]
+            .node_id
+            .clone();
+        let forwarding_index = runtimes
+            .iter()
+            .enumerate()
+            .find_map(|(index, runtime)| {
+                runtime
+                    .as_ref()
+                    .filter(|runtime| runtime.node_id() != second_leader)
+                    .map(|_| index)
+            })
+            .expect("live follower for forwarding");
+        let second_write = runtimes[forwarding_index]
             .as_ref()
-            .expect("second leader runtime")
-            .commit(AuthorityCommand::Barrier {
+            .expect("forwarding follower runtime")
+            .authority_handle()
+            .commit(AuthorityCommand::ClaimOwnership {
                 operation_id: Uuid::new_v4().to_string(),
-                expected_sequence: Some(1),
+                agent_id: agent_id.clone(),
+                owner_node_id,
+                ttl_seconds: 60,
+                expected_fencing_token: None,
+                actor: "test-operator".into(),
+                reason: "prove failover ownership".into(),
+                proposed_at: chrono::Utc::now(),
             })
             .await
-            .expect("commit after leader failover");
+            .expect("forward ownership through follower after leader failover");
         assert!(matches!(
-            second_write.data,
-            AuthorityResponse::BarrierCommitted { sequence: 2, .. }
+            &second_write,
+            AuthorityResponse::OwnershipUpdated {
+                sequence: 3,
+                ownership,
+                ..
+            } if ownership.agent_id == agent_id
         ));
-        wait_for_applied(&runtimes, second_write.log_id.index, 2).await;
+        let AuthorityResponse::OwnershipUpdated { log_id, .. } = second_write else {
+            unreachable!("ownership response checked above")
+        };
+        wait_for_applied(&runtimes, log_id.index, 2).await;
+        let read_started_at = chrono::Utc::now();
+        let follower_read = runtimes[forwarding_index]
+            .as_ref()
+            .expect("forwarding follower runtime")
+            .authority_handle()
+            .linearizable_view()
+            .await
+            .expect("forward linearizable authority read through follower");
+        assert_eq!(
+            follower_read
+                .ownerships
+                .iter()
+                .find(|ownership| ownership.agent_id == agent_id)
+                .map(|ownership| ownership.fencing_token),
+            Some(1)
+        );
+        assert!(
+            follower_read.logical_time >= read_started_at,
+            "linearizable authority reads must commit a current logical-clock floor"
+        );
+        let mut upgraded_binary_genesis = configs[0].authority_genesis.clone();
+        for member in &mut upgraded_binary_genesis.members {
+            member.server_version = "0.4.0".into();
+            member.min_protocol_version = 2;
+            member.protocol_version = 3;
+        }
+        validate_initialized_authority(&follower_read, &upgraded_binary_genesis)
+            .expect("binary version metadata may change without rewriting identity genesis");
+        upgraded_binary_genesis.members[0].endpoint = "127.0.0.1:7999".into();
+        assert!(
+            validate_initialized_authority(&follower_read, &upgraded_binary_genesis).is_err(),
+            "configured live application endpoints must still match durable membership"
+        );
 
         let restarted_listener = TcpListener::bind(configs[first_leader_index].listen_addr)
             .await
@@ -1722,11 +2375,83 @@ mod tests {
             .await
             .expect("restart old leader"),
         );
-        wait_for_applied(&runtimes, second_write.log_id.index, 3).await;
+        wait_for_applied(&runtimes, log_id.index, 3).await;
         assert_eq!(
             wait_for_leader(&runtimes, None).await,
             second_leader,
             "restarted old leader must not revive its old term"
+        );
+        let recovered = runtimes[first_leader_index]
+            .as_ref()
+            .expect("restarted runtime")
+            .authority_handle()
+            .local_view()
+            .unwrap()
+            .expect("recovered authority view");
+        assert_eq!(
+            recovered
+                .ownerships
+                .iter()
+                .find(|ownership| ownership.agent_id == agent_id)
+                .map(|ownership| ownership.fencing_token),
+            Some(1)
+        );
+
+        let isolated_leader_index = runtimes
+            .iter()
+            .position(|runtime| {
+                runtime
+                    .as_ref()
+                    .is_some_and(|runtime| runtime.node_id() == second_leader)
+            })
+            .expect("current leader runtime");
+        for (index, runtime) in runtimes.iter_mut().enumerate() {
+            if index != isolated_leader_index {
+                runtime
+                    .take()
+                    .expect("live non-leader runtime")
+                    .shutdown()
+                    .await
+                    .expect("shutdown non-leader runtime");
+            }
+        }
+        let uncommitted_agent_id = Uuid::new_v4().to_string();
+        let isolated_handle = runtimes[isolated_leader_index]
+            .as_ref()
+            .expect("isolated leader runtime")
+            .authority_handle();
+        let no_quorum = tokio::time::timeout(
+            Duration::from_secs(5),
+            isolated_handle.commit(AuthorityCommand::ClaimOwnership {
+                operation_id: Uuid::new_v4().to_string(),
+                agent_id: uncommitted_agent_id.clone(),
+                owner_node_id: configs[(second_leader - 1) as usize]
+                    .authority_genesis
+                    .members[(second_leader - 1) as usize]
+                    .node_id
+                    .clone(),
+                ttl_seconds: 60,
+                expected_fencing_token: None,
+                actor: "test-operator".into(),
+                reason: "must not commit without quorum".into(),
+                proposed_at: chrono::Utc::now(),
+            }),
+        )
+        .await;
+        assert!(
+            !matches!(no_quorum, Ok(Ok(_))),
+            "isolated leader must not commit authority mutations"
+        );
+        let isolated_view = isolated_handle
+            .local_view()
+            .expect("read isolated local view")
+            .expect("initialized isolated authority view");
+        assert!(
+            isolated_view
+                .ownerships
+                .iter()
+                .all(|ownership| ownership.agent_id != uncommitted_agent_id),
+            "uncommitted ownership must not be applied locally"
         );
 
         for runtime in runtimes.into_iter().flatten() {
@@ -1924,13 +2649,13 @@ mod tests {
         let write = first
             .commit(AuthorityCommand::Barrier {
                 operation_id: Uuid::new_v4().to_string(),
-                expected_sequence: Some(0),
+                expected_sequence: Some(1),
             })
             .await
             .expect("commit through configured runtime");
         assert!(matches!(
             write.data,
-            AuthorityResponse::BarrierCommitted { sequence: 1, .. }
+            AuthorityResponse::BarrierCommitted { sequence: 2, .. }
         ));
         first.shutdown().await.expect("shutdown first runtime");
         drop(first_context);
@@ -1952,7 +2677,7 @@ mod tests {
         drop(restart_context);
 
         let mut drifted = restart_config;
-        drifted.members[0].identity_public_key = "different-identity-key".into();
+        drifted.members[0].identity_public_key = "00".repeat(32);
         let drift_context = Arc::new(
             SqliteContextManager::new_without_storage_lease(&database)
                 .expect("reopen drift database"),

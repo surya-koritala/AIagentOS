@@ -10,6 +10,23 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
 
 ## [Unreleased]
 
+- Routed public membership and ownership authority through the optional
+  production OpenRaft runtime. Identical voter genesis now seeds challenged
+  application membership, generation/audit history, ownership
+  leases/tombstones/audit, a monotonic replicated clock, and caller-stable
+  idempotency receipts. Writes and linearizable reads received by followers
+  forward to the elected leader over exact identity-pinned mTLS; an isolated
+  leader cannot apply authority state. The production daemon verifies its
+  configured application UUID/key against durable node identity, installs the
+  authority handle only after genesis commits, and serves the public syscall
+  endpoint through failover. SDK callers can supply stable operation UUIDs for
+  exact retry. Application-listener TLS identity is configured independently
+  from Raft transport TLS. State-machine, three-node failover/partition, and
+  real daemon TCP lifecycle regressions cover deterministic replay, restart
+  recovery, follower forwarding, no-quorum rejection, and clean shutdown.
+  Static voter changes, authority-term destination proofs, coordinated
+  certificate rollout, migration, cross-node IPC, global quotas/trust, rolling
+  upgrades, and disaster recovery remain #122.
 - Wired the authenticated OpenRaft runtime into the production `agent-server`
   lifecycle behind a default-off, strict `[cluster_raft]` configuration.
   Enabled nodes read bounded no-follow PEM files, require owner-only private
@@ -18,8 +35,7 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
   from the configured node, endpoint, certificate, or identity map. The daemon
   owns clean Raft shutdown on SIGINT/SIGTERM. Restart and negative regressions
   cover exact durable membership, configuration drift, unsafe key permissions,
-  and symlinked TLS material. Public membership and ownership syscalls are not
-  quorum-routed yet, so production authority failover remains pending #122.
+  and symlinked TLS material.
 - Added a durable OpenRaft storage-v2 implementation and an executable internal
   quorum runtime for the cluster authority foundation. Votes, log and commit
   pointers, deterministic barrier state, membership, receipts, and snapshots
@@ -29,8 +45,7 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
   three-node regression proves election, replication, leader failover, durable
   restart catch-up, and old-term fencing; negative regressions cover identity
   spoofing, wrong-but-CA-valid leaves, invalid configuration, and oversized
-  frames. Public membership/ownership commands are not routed through this
-  runtime yet, so product quorum authority remains pending #122.
+  frames.
 - Fixed service startup deadlines so a configured readiness delay that cannot
   finish inside the remaining startup budget fails closed deterministically,
   reclaims the created service agent, and records `startup_timeout`. This

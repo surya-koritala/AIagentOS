@@ -19,17 +19,17 @@ use crate::context::SqliteContextManager;
 use crate::ContextError;
 
 const SINGLETON: i64 = 1;
-const MAX_REASON_BYTES: usize = 1024;
+pub(crate) const MAX_REASON_BYTES: usize = 1024;
 const MAX_PROFILE_BYTES: usize = 64 * 1024;
 const MAX_PROFILE_VALUES: usize = 256;
 const MAX_PROFILE_LABELS: usize = 128;
 const MAX_PROFILE_TEXT_BYTES: usize = 256;
 const MAX_MEMBER_ENDPOINT_BYTES: usize = 2048;
 const MAX_MEMBER_VERSION_BYTES: usize = 256;
-const MIN_JOIN_CHALLENGE_TTL_SECONDS: u64 = 5;
-const MAX_JOIN_CHALLENGE_TTL_SECONDS: u64 = 300;
-const MIN_OWNERSHIP_LEASE_TTL_SECONDS: u64 = 5;
-const MAX_OWNERSHIP_LEASE_TTL_SECONDS: u64 = 300;
+pub(crate) const MIN_JOIN_CHALLENGE_TTL_SECONDS: u64 = 5;
+pub(crate) const MAX_JOIN_CHALLENGE_TTL_SECONDS: u64 = 300;
+pub(crate) const MIN_OWNERSHIP_LEASE_TTL_SECONDS: u64 = 5;
+pub(crate) const MAX_OWNERSHIP_LEASE_TTL_SECONDS: u64 = 300;
 
 #[cfg(test)]
 thread_local! {
@@ -2130,7 +2130,10 @@ fn load_member(
         .transpose()
 }
 
-fn validate_ownership_identity(agent_id: &str, owner_node_id: &str) -> Result<(), ContextError> {
+pub(crate) fn validate_ownership_identity(
+    agent_id: &str,
+    owner_node_id: &str,
+) -> Result<(), ContextError> {
     uuid::Uuid::parse_str(agent_id)
         .map_err(|_| storage_error("invalid cluster ownership agent id"))?;
     uuid::Uuid::parse_str(owner_node_id)
@@ -2138,7 +2141,7 @@ fn validate_ownership_identity(agent_id: &str, owner_node_id: &str) -> Result<()
     Ok(())
 }
 
-fn validate_ownership_request(
+pub(crate) fn validate_ownership_request(
     agent_id: &str,
     owner_node_id: &str,
     ttl_seconds: u64,
@@ -2155,7 +2158,10 @@ fn validate_ownership_request(
     validate_reason(reason)
 }
 
-fn ownership_expiry(now: DateTime<Utc>, ttl_seconds: u64) -> Result<DateTime<Utc>, ContextError> {
+pub(crate) fn ownership_expiry(
+    now: DateTime<Utc>,
+    ttl_seconds: u64,
+) -> Result<DateTime<Utc>, ContextError> {
     let seconds = i64::try_from(ttl_seconds)
         .map_err(|_| storage_error("agent ownership TTL exceeds clock range"))?;
     now.checked_add_signed(chrono::Duration::seconds(seconds))
@@ -2590,18 +2596,18 @@ fn load_identity(connection: &rusqlite::Connection) -> Result<Option<NodeIdentit
         .transpose()
 }
 
-fn validate_text(value: &str, field: &str) -> Result<(), ContextError> {
+pub(crate) fn validate_text(value: &str, field: &str) -> Result<(), ContextError> {
     if value.trim().is_empty() || value.len() > MAX_REASON_BYTES || value.contains('\0') {
         return Err(storage_error(format!("invalid {field}")));
     }
     Ok(())
 }
 
-fn validate_reason(reason: &str) -> Result<(), ContextError> {
+pub(crate) fn validate_reason(reason: &str) -> Result<(), ContextError> {
     validate_text(reason, "cluster-control reason")
 }
 
-fn validate_member_registration(
+pub(crate) fn validate_member_registration(
     registration: &ClusterMemberRegistration,
 ) -> Result<(), ContextError> {
     uuid::Uuid::parse_str(&registration.node_id)
@@ -2703,7 +2709,7 @@ fn parse_timestamp(value: &str) -> Result<DateTime<Utc>, ContextError> {
         .map_err(|error| storage_error(format!("invalid cluster timestamp: {error}")))
 }
 
-fn sha256_hex(bytes: &[u8]) -> String {
+pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
     hex_encode(ring::digest::digest(&ring::digest::SHA256, bytes).as_ref())
 }
 
@@ -2711,7 +2717,7 @@ fn hex_encode(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-fn hex_decode(value: &str) -> Option<Vec<u8>> {
+pub(crate) fn hex_decode(value: &str) -> Option<Vec<u8>> {
     if !value.len().is_multiple_of(2) {
         return None;
     }

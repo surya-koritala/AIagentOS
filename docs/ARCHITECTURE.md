@@ -13,12 +13,14 @@ separately in the
 [distributed control-plane consistency contract](DISTRIBUTED_CONTROL_PLANE.md).
 The durable OpenRaft storage-v2 implementation in
 `crates/kernel/src/cluster_consensus.rs` and the bounded mTLS peer/election
-runtime in `crates/kernel/src/cluster_runtime.rs` form an executable internal
-quorum foundation. The product still uses the designated single SQLite
-authority: `agent-server` can construct the Raft runtime from strict,
-default-off operator configuration, but membership is static inside a running
-Raft process and public membership/ownership syscalls are not routed through
-the replicated state machine.
+runtime in `crates/kernel/src/cluster_runtime.rs` form the optional quorum
+authority. Under strict, default-off `[cluster_raft]` configuration,
+`agent-server` routes public membership and ownership mutations through the
+replicated deterministic state machine and serves linearizable reads, including
+transparent follower forwarding. The disabled default retains the designated
+single SQLite authority. The voter map remains static, and authority-term
+destination proofs, coordinated certificate rollout, migration, global
+quotas/trust, rolling upgrades, and disaster recovery are not complete.
 
 ---
 

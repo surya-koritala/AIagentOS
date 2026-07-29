@@ -448,11 +448,13 @@ fn distributed_consistency_contract_is_published_and_fail_closed() {
     }
 
     for honest_boundary in [
-        "public membership and ownership operations are not routed through it yet",
-        "no quorum or automatic failover for product authority",
+        "isolated former leader cannot commit or locally apply",
+        "OpenRaft voter map is still static",
+        "Configured Raft voters are still fully trusted forwarders",
+        "do not yet contain an authority term",
         "not atomic across databases",
-        "not partition tolerant",
-        "advertised as a production distributed kernel",
+        "not fully partition tolerant",
+        "production distributed kernel",
         "every mutable agent operation must be rejected",
         "Lease expiry alone is insufficient",
     ] {

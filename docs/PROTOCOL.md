@@ -512,6 +512,17 @@ audit entry commit in one immediate SQLite transaction and survive authority
 restart. Clean leave is rejected while the node has an unexpired active lease;
 terminal identity revocation releases all of that member's records atomically.
 
+Every membership and ownership mutation accepts an optional canonical
+`operation_id` UUID. In quorum mode the state machine returns the original
+successful result for an exact retained retry and rejects reuse of that
+retained UUID for different command semantics. Rejected outcomes are not
+retained and are never evidence of success. The SDK's `*_with_operation_id`
+methods let callers persist that UUID before sending; convenience methods
+generate a fresh UUID for one attempt. Callers must reuse an ID only for the
+exact same logical operation. The durable receipt map is bounded and fails
+closed at capacity; receipt compaction and its long-term retry window remain
+part of #122.
+
 Destination nodes persist the highest accepted ownership token and require an
 exact cluster/owner/generation/token envelope for every mutable agent-targeted
 operation. The fenced envelope also supports ordered streams and exact
@@ -537,17 +548,24 @@ authenticated connector in memory, renew leases, republish exact destination
 fences, and expose bounded health through `maintenance_status`.
 
 This is not yet a partition-tolerant production membership and mutation-fencing
-protocol. A durable OpenRaft storage-v2 log/state machine and an executable
-bounded mTLS peer runtime exist inside the kernel. The internal runtime elects,
-replicates, fails over, and catches up a restarted node in a three-node
-regression. `agent-server` now starts and cleanly stops that runtime when strict
-`[cluster_raft]` configuration is enabled, but these public wire operations are
-not routed through it. The designated authority remains a single consistency
-point with no product quorum failover;
-creation/claim/fence publication is not one atomic cross-database transaction,
-and there is no automatic migration,
-partition-safe quorum authority, cluster-wide quota transaction, policy/package
-convergence, rolling-upgrade coordinator, or disaster-recovery controller.
+protocol. When strict `[cluster_raft]` configuration is enabled,
+`agent-server` routes public membership and ownership mutations through a
+durable OpenRaft majority and serves their reads after a linearizability
+barrier. Followers forward those authority requests to the current leader over
+the exact identity-pinned mTLS peer transport. The replicated state machine
+owns immutable genesis, challenged membership, generation/audit, ownership
+leases/tombstones/audit, a monotonic authority clock, and exact caller-stable
+operation receipts. A three-node regression covers state replication, follower
+read/write forwarding, majority failover, restart recovery, and no-quorum
+rejection. With `[cluster_raft]` disabled, the designated single-node
+authority remains available for compatibility.
+
+The OpenRaft voter map is static, destination proofs do not yet contain an
+independently verifiable authority term/expiry, and
+creation/claim/fence publication is not one atomic cross-database transaction.
+There is no automatic migration, cluster-wide quota transaction,
+policy/package convergence, rolling-upgrade coordinator, or
+disaster-recovery controller.
 Live TLS material can now rotate without restarting listeners, old trust
 generations are drained, and discovery rejects superseded node server leaves.
 Coordinating trust overlap, member re-admission, and rollout order across a
@@ -561,13 +579,15 @@ The normative object-by-object consistency and failure rules are published in
 The Raft transport is an internal kernel protocol, not part of the public
 SDK compatibility contract. Each connection carries one length-prefixed JSON
 request and one response over mutual TLS. Version 1 supports OpenRaft
-AppendEntries, Vote, and InstallSnapshot messages.
+AppendEntries, Vote, and InstallSnapshot messages plus authenticated authority
+write forwarding and linearizable authority reads.
 
 The request envelope binds the wire version, bounded cluster name, source node
 ID, target node ID, and RPC body. The response reverses the authenticated
 source and target. The listener rejects an unknown version, cluster or target;
 an unknown member; a client leaf fingerprint that does not exactly match that
-member; or a source ID that differs from the vote identity embedded in the RPC.
+member; or, for a Raft vote-bearing message, a source ID that differs from the
+vote identity embedded in the RPC.
 The caller validates the server name and CA chain and then independently
 requires the exact server leaf fingerprint recorded for the target member.
 
@@ -578,8 +598,9 @@ timed. The listener bounds concurrent connections (128 by default, hard maximum
 also rejects empty or duplicate endpoints, server/client fingerprints, and
 identity keys. The current trusted member map cannot change without restarting
 the runtime. Startup rejects any configured map that differs from durable
-membership; safe quorum-versioned membership changes are still required before
-public authority cutover.
+membership; safe quorum-versioned voter changes and coordinated trust rotation
+are still required before this mode can be called a complete distributed
+kernel.
 
 ## Conformance evidence
 

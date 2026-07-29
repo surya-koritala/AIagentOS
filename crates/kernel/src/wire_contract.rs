@@ -446,11 +446,15 @@ const REQUEST_VARIANTS: &[Variant] = &[
     },
     Variant {
         tag: "issue_cluster_join_challenge",
-        fields: &[Field::required("ttl_seconds", I)],
+        fields: &[
+            Field::optional("operation_id", S),
+            Field::required("ttl_seconds", I),
+        ],
     },
     Variant {
         tag: "register_cluster_member",
         fields: &[
+            Field::optional("operation_id", S),
             Field::required("registration", O),
             Field::required("challenge_hex", S),
             Field::required("signature_hex", S),
@@ -461,6 +465,7 @@ const REQUEST_VARIANTS: &[Variant] = &[
     Variant {
         tag: "set_cluster_member_state",
         fields: &[
+            Field::optional("operation_id", S),
             Field::required("node_id", S),
             Field::required("state", S),
             Field::required("expected_generation", I),
@@ -478,6 +483,7 @@ const REQUEST_VARIANTS: &[Variant] = &[
     Variant {
         tag: "claim_cluster_agent_ownership",
         fields: &[
+            Field::optional("operation_id", S),
             Field::required("agent_id", S),
             Field::required("owner_node_id", S),
             Field::required("ttl_seconds", I),
@@ -488,6 +494,7 @@ const REQUEST_VARIANTS: &[Variant] = &[
     Variant {
         tag: "renew_cluster_agent_ownership",
         fields: &[
+            Field::optional("operation_id", S),
             Field::required("agent_id", S),
             Field::required("owner_node_id", S),
             Field::required("fencing_token", I),
@@ -498,6 +505,7 @@ const REQUEST_VARIANTS: &[Variant] = &[
     Variant {
         tag: "release_cluster_agent_ownership",
         fields: &[
+            Field::optional("operation_id", S),
             Field::required("agent_id", S),
             Field::required("owner_node_id", S),
             Field::required("fencing_token", I),

@@ -210,6 +210,31 @@ async fn main() {
             std::process::exit(1);
         }
     };
+    if config.cluster_raft.enabled {
+        let identity = kernel.cluster_control.identity();
+        let local_member = config
+            .cluster_raft
+            .members
+            .iter()
+            .find(|member| member.node_id == config.cluster_raft.node_id);
+        let Some(local_member) = local_member else {
+            eprintln!("agent-server: local Raft member configuration disappeared after validation");
+            std::process::exit(1);
+        };
+        if local_member.application_node_id != identity.node_id
+            || local_member.identity_public_key != identity.public_key
+        {
+            eprintln!(
+                "agent-server: local cluster_raft application identity does not match the durable node identity"
+            );
+            eprintln!(
+                "  configured application_node_id: {}",
+                local_member.application_node_id
+            );
+            eprintln!("  durable application_node_id: {}", identity.node_id);
+            std::process::exit(1);
+        }
+    }
     let cluster_runtime = match start_configured_cluster_runtime(
         kernel.context_manager.clone(),
         &config.cluster_raft,
@@ -224,6 +249,10 @@ async fn main() {
         }
     };
     if let Some(runtime) = cluster_runtime.as_ref() {
+        if let Err(error) = kernel.install_cluster_authority(runtime.authority_handle()) {
+            eprintln!("agent-server: failed to install cluster authority: {error}");
+            std::process::exit(1);
+        }
         eprintln!(
             "agent-server: cluster Raft node {} listening on {}",
             runtime.node_id(),

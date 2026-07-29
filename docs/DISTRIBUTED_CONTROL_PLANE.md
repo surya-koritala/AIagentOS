@@ -7,20 +7,23 @@ It is not a production-readiness claim.
 
 ## Current maturity and authority model
 
-The current implementation has one designated membership authority backed by
-one kernel SQLite database. Membership changes are serialized by an immediate
-SQLite transaction and published as an atomic, monotonically generated
-snapshot. An opt-in OpenRaft peer process now runs inside `agent-server`, but
-public membership and ownership operations are not routed through it yet.
-Therefore there is still no quorum or automatic failover for product authority.
-If the designated authority is unavailable, clients must fail closed for joins,
-leaves, revocation, and fresh authenticated discovery.
+The default, single-node configuration retains the original designated
+SQLite authority for compatibility. When the strict, default-off
+`[cluster_raft]` mode is enabled, public membership and ownership mutations are
+instead committed through an OpenRaft majority, and their reads pass an
+OpenRaft linearizability barrier. A request received by a follower is forwarded
+to the elected leader over the same identity-pinned mTLS transport. A minority
+or isolated former leader cannot commit or locally apply an authority mutation.
+This provides product authority election and failover for the operations moved
+behind that mode; it does not make the whole distributed kernel production
+ready.
 
 The kernel now contains a durable OpenRaft storage-v2 substrate and an
 executable, statically configured peer runtime for the next stage. Votes,
-committed and purged pointers, consecutive log entries,
-deterministic authority barriers, applied state and membership, and current
-snapshots share the existing SQLCipher-capable SQLite database, WAL,
+committed and purged pointers, consecutive log entries, deterministic
+membership and ownership state, idempotency receipts, applied state and
+membership, and current snapshots share the existing SQLCipher-capable SQLite
+database, WAL,
 `synchronous=FULL`, backup/restore, and process-lease boundary. Open validates
 all serialized state and fails closed on corruption. The upstream OpenRaft
 storage conformance suite plus restart, idempotency, and malformed-record
@@ -31,11 +34,25 @@ RPCs over mutual TLS. CA validation is necessary but not sufficient: outbound
 connections verify the exact member server leaf, inbound connections bind the
 exact client leaf to the claimed stable node ID, and the authenticated source
 must match the vote identity inside each RPC. Configuration rejects duplicate
-endpoints, certificate fingerprints, and identity keys. A three-node regression
-proves election, replication, majority failover, durable restart catch-up, and
-that the old leader cannot revive its old term. Separate regressions reject
+endpoints, certificate fingerprints, and identity keys. The internal protocol
+also carries authenticated authority writes and linearizable reads for
+follower forwarding. The leader replaces a forwarded mutation's proposed
+timestamp with its own clock and rejects internal initialization/barrier/clock
+commands on that path, so a follower cannot force a future authority time. A
+three-node regression proves election, application
+state replication, majority failover, follower forwarding, durable restart
+catch-up, old-term fencing, and that authority writes fail closed without a
+quorum. Separate regressions reject
 certificate/node spoofing, embedded vote spoofing, wrong-but-CA-valid server
 leaves, oversized frames, and invalid bounds.
+
+Configured Raft voters are still fully trusted forwarders. The forwarded
+command records the authenticated actor selected by the receiving application
+node, but it does not yet carry an end-to-end operator credential or delegated
+principal proof that the leader can independently verify. A compromised voter
+must therefore be treated as a control-plane trust breach; proving that a
+compromised node cannot forge tenant/operator authority remains an unchecked
+#122 requirement.
 
 `agent-server` constructs and owns this runtime when `[cluster_raft].enabled`
 is true. Startup reads bounded no-follow PEM inputs, requires owner-only private
@@ -44,14 +61,25 @@ member record, and fails if an existing durable membership differs from the
 configured static map. A pristine store requires explicit `bootstrap = true`;
 the same setting is restart-safe because an already initialized node is
 verified instead of reinitialized. SIGINT/SIGTERM closes the peer listener and
-OpenRaft task cleanly.
+OpenRaft task cleanly. Startup also verifies that the local application UUID
+and Ed25519 public key match the durable node identity before the process can
+join the quorum.
 
-The member map is still fixed for the lifetime of the process, and the only
-application command is an internal idempotent barrier. Production membership
-and ownership syscalls continue to use the designated single SQLite authority
-and do not carry a quorum term. The runtime is therefore an executable,
-daemon-integrated quorum foundation, not evidence that the product has quorum
-authority or partition-safe availability.
+All voters supply one identical immutable application genesis document. The
+replicated state machine owns challenged join, membership generation and audit,
+leave/revocation, ownership claim/renew/release, a monotonic authority clock,
+and exact caller-stable operation receipts. The SDK exposes explicit
+operation-ID variants for safe replay after an ambiguous authority response.
+An application endpoint certificate fingerprint is independent from the Raft
+transport certificate and may be omitted only when that application listener
+does not use TLS.
+
+The OpenRaft voter map is still static and fixed for the lifetime of the
+process. Application membership can change through the replicated state
+machine, but adding/removing consensus voters, coordinating cluster-wide
+certificate epochs, and rotating the Raft trust map safely are not implemented.
+Destination mutation proofs also do not yet contain an authority term or a
+proof expiry that a partitioned destination can independently validate.
 
 Each workload node owns a separate SQLite database under the existing
 single-process storage lease. Agent state is not replicated between nodes.
@@ -67,9 +95,9 @@ it. Managed routes can be renewed explicitly or by an opt-in maintenance worker
 that uses fresh authenticated connections, republishes exact fences, and
 exposes bounded health.
 
-The designated authority remains a single database with no quorum term, and
-agent creation plus authority/fence publication is not atomic across databases.
-It is now durably reconcilable: the
+In enabled mode the authority directory is quorum-replicated, but agent
+creation plus authority/fence publication is not atomic across databases. It
+is durably reconcilable: the
 authority exposes a stable paginated ownership directory, reserved-ID creation
 cannot cross a retired fence, and discovery or `reconcile_routes` repairs an
 expired lease/fence for an exact local agent. An incomplete expired reservation
@@ -78,8 +106,10 @@ retired, and only then released. Unknown outcomes are reported with the exact
 agent id and never blindly replayed.
 
 Consequently, the current multi-node foundation is appropriate for controlled
-development and qualification. It is not partition tolerant and must not be
-advertised as a production distributed kernel.
+development and qualification. Authority writes are majority-safe, but
+destination execution, placement, migration, trust rollout, quotas, and
+workload state are not fully partition tolerant. This must not be advertised as
+a production distributed kernel.
 
 ## Starting the internal Raft runtime
 
@@ -94,6 +124,7 @@ owner-only files on Unix and no TLS input may be a symbolic link.
 enabled = true
 bootstrap = true
 node_id = 1
+authority_cluster_id = "2d1b98c1-6caf-4ed4-b87f-55acde52d1ee"
 listen_addr = "10.0.0.11:8788"
 cluster_name = "production-agentos"
 server_certificate_path = "/etc/agentos/raft/node-1-server.pem"
@@ -104,20 +135,27 @@ peer_ca_path = "/etc/agentos/raft/peer-ca.pem"
 
 [[cluster_raft.members]]
 node_id = 1
+application_node_id = "558b5ce5-10a9-4274-9984-f209f0945c89"
+application_endpoint = "10.0.0.11:7443"
+application_tls_server_certificate_sha256 = "<64 lowercase hex characters>"
 endpoint = "10.0.0.11:8788"
 server_name = "node-1.internal.example"
 tls_certificate_sha256 = "<64 lowercase hex characters>"
 tls_client_certificate_sha256 = "<64 lowercase hex characters>"
-identity_public_key = "<stable node identity public key>"
+identity_public_key = "<64 lowercase hex characters>"
 ```
 
 Add one `[[cluster_raft.members]]` table for every voter. Set `bootstrap =
 true` on the first start of every pristine node using the identical map. After
 the membership is durable, operators may set it to `false`; a pristine or
 mismatched store then fails startup rather than silently forming another
-cluster. This configuration starts the internal consensus substrate only. It
-does not change the public authority endpoint or make agent operations
-partition-safe.
+cluster. Every node must use the same `authority_cluster_id`, application
+identity records, and voter records. Omit
+`application_tls_server_certificate_sha256` only for a non-TLS application
+listener; never substitute the Raft transport leaf for a different application
+certificate. This configuration moves public membership and ownership
+authority into the quorum, but does not replicate agent state or make all agent
+operations partition-safe.
 
 `agent-server` reads the platform config path by default. A service manager may
 set `AGENT_SERVER_CONFIG` to an explicit absolute `config.toml` path; relative
@@ -127,11 +165,11 @@ paths are rejected.
 
 | Object | System of record now | Current consistency | Production requirement |
 |---|---|---|---|
-| Cluster identity and membership | Designated authority SQLite database | Linearized on that one authority; atomic generation-fenced snapshots and audit | Quorum-committed authority term, failover, and read rules that cannot revive an old authority |
+| Cluster identity and membership | Replicated authority state when `[cluster_raft]` is enabled; designated SQLite authority otherwise | Enabled mode commits mutations through a majority, forwards followers to the leader, and uses linearizable reads; the voter map remains static | Safe voter membership changes and coordinated certificate/trust epochs |
 | Node identity | Node-local Ed25519 key plus authority membership certificate fingerprint | Stable across restart; fresh challenge signs the verified TLS server leaf; listener trust generations reload atomically and drain old sessions | Quorum-coordinated certificate/trust epochs and rollout order across partitions |
 | Node availability and placement profile | Node-local SQLite database | Generation-fenced on one node; discovery reads a point-in-time value | Signed or quorum-observed liveness/capacity with staleness bounds |
 | Agent identity | Authority reservation plus owning-node SQLite database | Managed creation reserves one UUID before exact destination creation; duplicates cannot overwrite a local agent | Quorum-allocated immutable identity and migration-aware placement record |
-| Agent ownership and routing | Authority lease registry, destination fence tombstones, plus `ClusterClient` in-memory routes | Authority-discovered clients reserve, pre-fence, create, and publish exact routes; paginated reconciliation repairs or safely retires partial creation; every mutation revalidates authority/fence agreement; opt-in maintenance renews idle routes; a per-agent admission barrier prevents fence changes from crossing admitted work | Quorum-committed authority term, partition-safe renewal, and migration admission |
+| Agent ownership and routing | Quorum authority lease registry in enabled mode, destination fence tombstones, plus `ClusterClient` in-memory routes | Ownership mutations and reads are quorum-backed in enabled mode; authority-discovered clients reserve, pre-fence, create, and publish exact routes; paginated reconciliation repairs or safely retires partial creation; every mutation revalidates authority/fence agreement; opt-in maintenance renews idle routes; a per-agent admission barrier prevents fence changes from crossing admitted work | Authority term/expiry in destination-verifiable proofs, partition-safe execution, and migration admission |
 | Agent state and checkpoints | Owning node SQLite database | Transactional on one node; no cross-node replica or migration transaction | Checkpoint/handoff protocol with one committed owner, rollback point, and side-effect boundary |
 | Package metadata and trust roots | Node-local package registry and policy | Transactional per node; no cluster convergence guarantee | Versioned trust epoch distributed atomically or by a documented monotonic convergence protocol |
 | Authorization policy | Node-local kernel configuration and durable policy state | Enforced consistently across local entry points; not synchronized cluster-wide | Tenant policy epoch included in placement and mutation admission |
@@ -141,9 +179,9 @@ paths are rejected.
 
 ## Current operation semantics
 
-- A challenged join, clean leave, or identity revocation succeeds only after
-  the designated authority commits the member row, authority generation, and
-  audit row in one transaction.
+- In enabled mode, a challenged join, clean leave, or identity revocation
+  succeeds only after a majority commits the member row, authority generation,
+  and audit evidence. Disabled mode retains the single-node transaction path.
 - Authenticated discovery reads one atomic membership snapshot, connects to
   every active endpoint, proves the advertised identity and fingerprint, and
   re-reads membership. Any change during assembly returns a retryable conflict.
@@ -192,15 +230,15 @@ paths are rejected.
 
 | Event | Required current behavior | What remains before production |
 |---|---|---|
-| Membership authority loss | Existing node-local work can continue; membership mutation and fresh authoritative discovery fail closed | Elect a new term by quorum and fence every previous authority |
+| Membership authority loss | Enabled mode elects a replacement while a majority remains; a minority or isolated old leader rejects authority writes and linearizable reads | Safe voter changes, cluster-wide trust rollout, and externally qualified partition/latency behavior |
 | Workload node loss | Calls to that node fail; another node must not recreate or resume its agents automatically | Expiring ownership lease, durable replica/checkpoint, and explicit recovery policy |
-| Network partition | A node with an installed destination fence rejects older or missing tokens, but the single authority can still be duplicated or revived without quorum | Majority ownership authority and an authority term incorporated into every destination proof |
+| Network partition | Only the authority majority can mutate membership/ownership. A destination rejects older or missing installed tokens, but a previously installed proof has no independently verifiable authority term/expiry | Authority term and expiry incorporated into every destination proof, plus partition qualification |
 | Duplicate agent ownership | Reconciliation compares every node with the durable authority directory, returns a conflict, and publishes neither arbitrary copy | Quorum-backed repair procedure and replicated workload evidence |
-| Stale route | A managed client re-reads authority ownership before each mutation, rejects released/expired/different ownership, propagates same-owner renewal generations, and requires the destination fence before use; explicit reconciliation repairs exact same-owner evidence | Quorum-backed route reads, authority terms, and durable request identity |
-| Client retry before visible output | Safe only where the called local API already documents idempotency | Cluster request identity and durable deduplication at the authority and owner |
+| Stale route | In enabled mode a managed client receives a linearizable authority ownership read before each mutation, rejects released/expired/different ownership, propagates same-owner renewal generations, and requires the destination fence before use; explicit reconciliation repairs exact same-owner evidence | Authority terms in destination proofs and durable owner request identity |
+| Client retry before visible output | Authority mutations accept a caller-stable UUID and return the original retained successful quorum result for an exact retry; reusing that retained ID for a different command fails closed. Rejections are not retained and never count as success. Local workload APIs remain safe only where their contract documents idempotency | Durable request identity and deduplication at each workload owner |
 | Retry after a side effect or partial model/tool output | Must not happen automatically; the result is terminal unless the operation contract proves idempotency | Side-effect journal and explicit at-most-once or at-least-once contract per operation |
 | Clock skew | Join challenge and ownership expiry use authority time; workload nodes do not independently expire or enforce leases | Authority term plus bounded lease clock assumptions or logical-expiry protocol |
-| Authority restart | The same database restores cluster identity, membership generation, and audit | Quorum log recovery and disaster-recovery procedure |
+| Authority restart | Each voter restores its log, snapshots, immutable genesis, membership, ownership, receipts, and audit; a quorum elects a leader and catches up a restarted node | Cross-host disaster-recovery procedure and external qualification |
 | Workload restart | The same node database restores its agents and highest-token/retired destination tombstones; managed reconstruction recovers exact same-owner leases/fences and rejects ambiguous evidence | Checkpoint replication and quorum takeover publication |
 
 Unknown outcomes are not successes. A timeout, broken connection, or authority
@@ -231,10 +269,9 @@ non-migratable.
 
 ## Required implementation sequence
 
-1. Move membership and ownership commands plus their read rules into the
-   deterministic state machine; add safe quorum-versioned membership changes;
-   include the committed authority term in every destination proof; and
-   permanently fence old terms.
+1. Add safe quorum-versioned voter membership changes; coordinate certificate
+   and trust epochs; include the committed authority term/expiry in every
+   destination proof; and permanently fence old terms.
 2. Checkpointed drain/migration with rollback and side-effect classifications.
 3. Cross-node IPC/delegation with end-to-end authorization and audit.
 4. Cluster quota reservations and monotonic policy/package trust epochs.
@@ -251,8 +288,8 @@ passing single-node test is never accepted as substitute evidence.
 
 - Membership, identity, ownership leases, generations, and audit:
   `crates/kernel/src/cluster_control.rs`
-- Durable OpenRaft storage-v2 log, state machine, idempotent authority barrier,
-  and snapshots: `crates/kernel/src/cluster_consensus.rs`
+- Durable OpenRaft storage-v2 log, replicated membership/ownership authority,
+  operation receipts, and snapshots: `crates/kernel/src/cluster_consensus.rs`
 - Strict operator configuration: `crates/kernel/src/config.rs`
 - Bounded mTLS Raft peer RPCs, exact certificate/node binding, daemon
   lifecycle, and quorum regressions: `crates/kernel/src/cluster_runtime.rs` and

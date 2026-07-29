@@ -180,3 +180,71 @@ async fn profile_refresh_recovers_once_and_reports_the_reconnect_generation() {
     proxy_task.abort();
     server_task.abort();
 }
+
+#[tokio::test]
+async fn tunable_update_audit_and_rollback_use_the_public_tui_client() {
+    let kernel = Arc::new(AgentKernelImpl::new().expect("kernel new"));
+    let server = SyscallServer::bind(kernel, "127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = server.local_addr().expect("addr");
+    let server_task = tokio::spawn(server.serve());
+    let mut client = TuiClient::connect(&addr.to_string(), None)
+        .await
+        .expect("TUI public client");
+    let mut app = App::new(addr.to_string());
+
+    app.refresh(&mut client).await.expect("initial refresh");
+    let initial = app
+        .tunables
+        .iter()
+        .find(|tunable| tunable.name == kernel::operator_control::MAX_AGENTS)
+        .cloned()
+        .expect("max agents tunable");
+    let changed = client
+        .set_operator_tunable(&initial.name, 2, initial.revision)
+        .await
+        .expect("revision-checked TUI update");
+    assert_eq!(changed.value, 2);
+    assert_eq!(changed.revision, initial.revision + 1);
+
+    client
+        .set_operator_tunable(&initial.name, 3, initial.revision)
+        .await
+        .expect_err("stale TUI revision must fail closed");
+    app.refresh(&mut client)
+        .await
+        .expect("refresh changed tunable");
+    let projected = app
+        .tunables
+        .iter()
+        .find(|tunable| tunable.name == initial.name)
+        .expect("projected changed tunable");
+    assert_eq!(projected.value, 2);
+    assert_eq!(projected.revision, changed.revision);
+
+    let audit = client
+        .operator_tunable_audit(Some(initial.name.clone()), 20)
+        .await
+        .expect("TUI audit through public client");
+    assert!(audit.iter().any(|entry| entry.action == "set"));
+    assert!(audit.iter().any(|entry| entry.outcome == "denied"));
+    app.set_tunable_audit(initial.name.clone(), audit);
+    assert_eq!(
+        app.tunable_audit_name.as_deref(),
+        Some(initial.name.as_str())
+    );
+
+    let rolled_back = client
+        .rollback_operator_tunable(&initial.name, initial.revision, changed.revision)
+        .await
+        .expect("revision-checked TUI rollback");
+    assert_eq!(rolled_back.value, initial.value);
+    assert_eq!(rolled_back.revision, changed.revision + 1);
+    let audit = client
+        .operator_tunable_audit(Some(initial.name.clone()), 20)
+        .await
+        .expect("post-rollback audit");
+    assert!(audit.iter().any(|entry| entry.action == "rollback"));
+    server_task.abort();
+}

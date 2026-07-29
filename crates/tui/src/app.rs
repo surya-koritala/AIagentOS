@@ -6,7 +6,7 @@
 use agent_sdk::{
     AgentSummary, GateStats, KernelClient, NodeLoad, OperatorAgentSnapshot,
     OperatorPackageSnapshot, OperatorServiceSnapshot, OperatorSnapshot, OperatorTunable,
-    ProviderSummary, SdkError,
+    OperatorTunableAudit, ProviderSummary, SdkError,
 };
 
 /// Input modes — the UI is modal (vim-ish): Normal navigates, the others edit a
@@ -22,6 +22,10 @@ pub enum Mode {
     ConfirmKill,
     /// Typing the exact frozen service name before stop or restart.
     ConfirmServiceControl,
+    /// Typing a bounded value for one exact frozen tunable revision.
+    SetTunable,
+    /// Typing `target-revision|exact-name` for one frozen tunable rollback.
+    ConfirmTunableRollback,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -46,22 +50,64 @@ struct PendingServiceControl {
     agent_id: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingTunableControl {
+    name: String,
+    value: u64,
+    revision: u64,
+    minimum: u64,
+    maximum: u64,
+}
+
 /// An action the event loop should perform asynchronously (the pure key handler
 /// can't do I/O itself). `None` from [`App::on_key`] means "handled, no I/O".
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UiAction {
     Quit,
     Refresh,
-    CreateAgent { name: String, task: String },
-    SendMessage { agent_id: String, message: String },
-    PauseAgent { agent_id: String },
-    ResumeAgent { agent_id: String },
-    StopAgent { agent_id: String },
-    KillAgent { agent_id: String },
-    StartService { name: String },
-    StopService { name: String },
-    RestartService { name: String },
+    CreateAgent {
+        name: String,
+        task: String,
+    },
+    SendMessage {
+        agent_id: String,
+        message: String,
+    },
+    PauseAgent {
+        agent_id: String,
+    },
+    ResumeAgent {
+        agent_id: String,
+    },
+    StopAgent {
+        agent_id: String,
+    },
+    KillAgent {
+        agent_id: String,
+    },
+    StartService {
+        name: String,
+    },
+    StopService {
+        name: String,
+    },
+    RestartService {
+        name: String,
+    },
     ReloadServices,
+    SetOperatorTunable {
+        name: String,
+        value: u64,
+        expected_revision: u64,
+    },
+    LoadOperatorTunableAudit {
+        name: String,
+    },
+    RollbackOperatorTunable {
+        name: String,
+        target_revision: u64,
+        expected_revision: u64,
+    },
 }
 
 impl UiAction {
@@ -81,6 +127,9 @@ impl UiAction {
             Self::StopService { .. } => "stopping service",
             Self::RestartService { .. } => "restarting service",
             Self::ReloadServices => "reloading services",
+            Self::SetOperatorTunable { .. } => "updating operator tunable",
+            Self::LoadOperatorTunableAudit { .. } => "loading tunable audit",
+            Self::RollbackOperatorTunable { .. } => "rolling back operator tunable",
         }
     }
 }
@@ -155,6 +204,8 @@ pub struct App {
     pub packages: Vec<OperatorPackageSnapshot>,
     pub tunables: Vec<OperatorTunable>,
     pub services: Vec<OperatorServiceSnapshot>,
+    pub tunable_audit: Vec<OperatorTunableAudit>,
+    pub tunable_audit_name: Option<String>,
     pub snapshot_scope: String,
     pub kernel_version: String,
     pub protocol_version: u32,
@@ -162,11 +213,13 @@ pub struct App {
     pub agents_truncated: bool,
     pub selected: usize,
     pub selected_service: usize,
+    pub selected_tunable: usize,
     pub mode: Mode,
     pub input: String,
     pub status: String,
     pending_kill: Option<(String, String)>,
     pending_service_control: Option<PendingServiceControl>,
+    pending_tunable_control: Option<PendingTunableControl>,
     pub last_output: Option<String>,
     pub operator_state: OperatorUiState,
     pub should_quit: bool,
@@ -184,6 +237,8 @@ impl App {
             packages: Vec::new(),
             tunables: Vec::new(),
             services: Vec::new(),
+            tunable_audit: Vec::new(),
+            tunable_audit_name: None,
             snapshot_scope: "unknown".into(),
             kernel_version: "unknown".into(),
             protocol_version: 0,
@@ -191,11 +246,13 @@ impl App {
             agents_truncated: false,
             selected: 0,
             selected_service: 0,
+            selected_tunable: 0,
             mode: Mode::Normal,
             input: String::new(),
-            status: "r refresh · c/m/p/s/X agents · [/ ] service · u start · d stop · R restart · L reload · q quit".into(),
+            status: "r refresh · c/m/p/s/X agents · [/ ] service · u/d/R/L control · ,/. tunable · v set · a audit · B rollback · q quit".into(),
             pending_kill: None,
             pending_service_control: None,
+            pending_tunable_control: None,
             last_output: None,
             operator_state: OperatorUiState::default(),
             should_quit: false,
@@ -340,6 +397,9 @@ impl App {
         if self.selected_service >= self.services.len() {
             self.selected_service = self.services.len().saturating_sub(1);
         }
+        if self.selected_tunable >= self.tunables.len() {
+            self.selected_tunable = self.tunables.len().saturating_sub(1);
+        }
     }
 
     pub fn selected_agent(&self) -> Option<&AgentSummary> {
@@ -353,6 +413,24 @@ impl App {
 
     pub fn selected_service(&self) -> Option<&OperatorServiceSnapshot> {
         self.services.get(self.selected_service)
+    }
+
+    pub fn selected_tunable(&self) -> Option<&OperatorTunable> {
+        self.tunables.get(self.selected_tunable)
+    }
+
+    pub fn set_tunable_audit(
+        &mut self,
+        name: impl Into<String>,
+        entries: Vec<OperatorTunableAudit>,
+    ) {
+        self.tunable_audit_name = Some(name.into());
+        self.tunable_audit = entries;
+    }
+
+    pub fn clear_tunable_audit(&mut self) {
+        self.tunable_audit_name = None;
+        self.tunable_audit.clear();
     }
 
     fn move_selection(&mut self, delta: isize) {
@@ -373,6 +451,15 @@ impl App {
         self.selected_service = next as usize;
     }
 
+    fn move_tunable_selection(&mut self, delta: isize) {
+        if self.tunables.is_empty() {
+            return;
+        }
+        let len = self.tunables.len() as isize;
+        let next = (self.selected_tunable as isize + delta).clamp(0, len - 1);
+        self.selected_tunable = next as usize;
+    }
+
     /// Handle a key press. Returns an action for the event loop to run, or
     /// `None` when the key only mutated local state. `key` is the character/name
     /// of the key; `enter`/`esc`/`backspace` are signalled via [`Key`].
@@ -382,6 +469,8 @@ impl App {
             Mode::CreateAgent | Mode::SendMessage => self.on_key_editing(key),
             Mode::ConfirmKill => self.on_key_confirm_kill(key),
             Mode::ConfirmServiceControl => self.on_key_confirm_service_control(key),
+            Mode::SetTunable => self.on_key_set_tunable(key),
+            Mode::ConfirmTunableRollback => self.on_key_confirm_tunable_rollback(key),
         }
     }
 
@@ -465,6 +554,32 @@ impl App {
                 None
             }
             Key::Char('L') => Some(UiAction::ReloadServices),
+            Key::Char(',') => {
+                self.move_tunable_selection(-1);
+                None
+            }
+            Key::Char('.') => {
+                self.move_tunable_selection(1);
+                None
+            }
+            Key::Char('v') => {
+                self.begin_tunable_control(Mode::SetTunable);
+                None
+            }
+            Key::Char('a') => {
+                if let Some(tunable) = self.selected_tunable() {
+                    Some(UiAction::LoadOperatorTunableAudit {
+                        name: tunable.name.clone(),
+                    })
+                } else {
+                    self.status = "no operator tunable selected".into();
+                    None
+                }
+            }
+            Key::Char('B') => {
+                self.begin_tunable_control(Mode::ConfirmTunableRollback);
+                None
+            }
             _ => None,
         }
     }
@@ -604,6 +719,176 @@ impl App {
         })
     }
 
+    fn begin_tunable_control(&mut self, mode: Mode) {
+        let Some(tunable) = self.selected_tunable().cloned() else {
+            self.status = "no operator tunable selected".into();
+            return;
+        };
+        self.pending_tunable_control = Some(PendingTunableControl {
+            name: tunable.name.clone(),
+            value: tunable.value,
+            revision: tunable.revision,
+            minimum: tunable.minimum,
+            maximum: tunable.maximum,
+        });
+        self.mode = mode;
+        self.input.clear();
+        self.status = match mode {
+            Mode::SetTunable => format!(
+                "set tunable — {}={}@r{} · allowed {}..={} · type a value, Enter to submit, Esc to cancel",
+                tunable.name,
+                tunable.value,
+                tunable.revision,
+                tunable.minimum,
+                tunable.maximum
+            ),
+            Mode::ConfirmTunableRollback => format!(
+                "rollback tunable — {}={}@r{} · type target-revision|{} exactly, Enter to submit, Esc to cancel",
+                tunable.name, tunable.value, tunable.revision, tunable.name
+            ),
+            _ => unreachable!("tunable control uses a tunable input mode"),
+        };
+    }
+
+    fn on_key_set_tunable(&mut self, key: Key) -> Option<UiAction> {
+        match key {
+            Key::Esc => {
+                self.cancel_tunable_control("tunable update cancelled");
+                None
+            }
+            Key::Backspace => {
+                self.input.pop();
+                None
+            }
+            Key::Char(character) if character.is_ascii_digit() => {
+                self.input.push(character);
+                None
+            }
+            Key::Enter => {
+                let Some(target) = self.pending_tunable_control.as_ref() else {
+                    self.cancel_tunable_control("tunable update cancelled — target unavailable");
+                    return None;
+                };
+                let Ok(value) = self.input.parse::<u64>() else {
+                    self.status = "tunable update not submitted — enter a whole number".into();
+                    return None;
+                };
+                if !(target.minimum..=target.maximum).contains(&value) {
+                    self.status = format!(
+                        "tunable update not submitted — value must be within {}..={}",
+                        target.minimum, target.maximum
+                    );
+                    return None;
+                }
+                let target = self
+                    .pending_tunable_control
+                    .take()
+                    .expect("validated pending tunable target");
+                self.mode = Mode::Normal;
+                self.input.clear();
+                self.status = format!(
+                    "tunable update submitted — {} from {}@r{} to {}",
+                    target.name, target.value, target.revision, value
+                );
+                Some(UiAction::SetOperatorTunable {
+                    name: target.name,
+                    value,
+                    expected_revision: target.revision,
+                })
+            }
+            _ => {
+                self.status =
+                    "tunable update not submitted — value must contain digits only".into();
+                None
+            }
+        }
+    }
+
+    fn on_key_confirm_tunable_rollback(&mut self, key: Key) -> Option<UiAction> {
+        match key {
+            Key::Esc => {
+                self.cancel_tunable_control("tunable rollback cancelled");
+                None
+            }
+            Key::Backspace => {
+                self.input.pop();
+                None
+            }
+            Key::Char(character) => {
+                self.input.push(character);
+                None
+            }
+            Key::Enter => {
+                let Some(target) = self.pending_tunable_control.as_ref() else {
+                    self.cancel_tunable_control("tunable rollback cancelled — target unavailable");
+                    return None;
+                };
+                let Some((revision, confirmed_name)) = self.input.split_once('|') else {
+                    self.status = format!(
+                        "tunable rollback not submitted — type target-revision|{} exactly",
+                        target.name
+                    );
+                    return None;
+                };
+                let Ok(target_revision) = revision.parse::<u64>() else {
+                    self.status =
+                        "tunable rollback not submitted — target revision must be a whole number"
+                            .into();
+                    return None;
+                };
+                if confirmed_name != target.name {
+                    self.status = format!(
+                        "tunable rollback not submitted — confirmation must exactly match {}",
+                        target.name
+                    );
+                    return None;
+                }
+                if target_revision == 0 || target_revision >= target.revision {
+                    self.status = format!(
+                        "tunable rollback not submitted — target revision must be within 1..{}",
+                        target.revision
+                    );
+                    return None;
+                }
+                let target = self
+                    .pending_tunable_control
+                    .take()
+                    .expect("validated pending tunable rollback target");
+                self.mode = Mode::Normal;
+                self.input.clear();
+                self.status = format!(
+                    "tunable rollback submitted — {} from r{} to r{}",
+                    target.name, target.revision, target_revision
+                );
+                Some(UiAction::RollbackOperatorTunable {
+                    name: target.name,
+                    target_revision,
+                    expected_revision: target.revision,
+                })
+            }
+            _ => None,
+        }
+    }
+
+    fn cancel_tunable_control(&mut self, status: &str) {
+        self.pending_tunable_control = None;
+        self.mode = Mode::Normal;
+        self.input.clear();
+        self.status = status.into();
+    }
+
+    pub fn pending_tunable_control(&self) -> Option<(&str, u64, u64, u64, u64)> {
+        self.pending_tunable_control.as_ref().map(|target| {
+            (
+                target.name.as_str(),
+                target.value,
+                target.revision,
+                target.minimum,
+                target.maximum,
+            )
+        })
+    }
+
     fn submit(&mut self) -> Option<UiAction> {
         let action = match self.mode {
             Mode::CreateAgent => {
@@ -633,7 +918,11 @@ impl App {
                 }
                 UiAction::SendMessage { agent_id, message }
             }
-            Mode::Normal | Mode::ConfirmKill | Mode::ConfirmServiceControl => return None,
+            Mode::Normal
+            | Mode::ConfirmKill
+            | Mode::ConfirmServiceControl
+            | Mode::SetTunable
+            | Mode::ConfirmTunableRollback => return None,
         };
         self.mode = Mode::Normal;
         self.input.clear();
@@ -683,6 +972,20 @@ mod tests {
             last_failure: None,
             next_restart_at: None,
             last_transition_at: String::new(),
+        }
+    }
+
+    fn dummy_tunable(name: &str, value: u64, revision: u64) -> OperatorTunable {
+        OperatorTunable {
+            name: name.into(),
+            value,
+            revision,
+            minimum: 1,
+            maximum: 100,
+            persisted: true,
+            updated_at: "2026-07-29T00:00:00Z".into(),
+            updated_by: "operator".into(),
+            description: "test tunable".into(),
         }
     }
 
@@ -991,5 +1294,113 @@ mod tests {
         );
         assert_eq!(a.mode, Mode::Normal);
         assert_eq!(a.on_key(Key::Char('L')), Some(UiAction::ReloadServices));
+    }
+
+    #[test]
+    fn tunable_update_freezes_name_revision_and_enforces_bounds() {
+        let mut a = app();
+        a.tunables = vec![
+            dummy_tunable("kernel.max_agents", 10, 2),
+            dummy_tunable("kernel.max_turns", 20, 4),
+        ];
+
+        assert_eq!(a.on_key(Key::Char('v')), None);
+        assert_eq!(a.mode, Mode::SetTunable);
+        assert_eq!(
+            a.pending_tunable_control(),
+            Some(("kernel.max_agents", 10, 2, 1, 100))
+        );
+        a.selected_tunable = 1;
+        for character in "101".chars() {
+            assert_eq!(a.on_key(Key::Char(character)), None);
+        }
+        assert_eq!(a.on_key(Key::Enter), None);
+        assert_eq!(a.mode, Mode::SetTunable);
+        assert!(a.status.contains("within 1..=100"));
+        for _ in 0..3 {
+            a.on_key(Key::Backspace);
+        }
+        for character in "25".chars() {
+            a.on_key(Key::Char(character));
+        }
+        assert_eq!(
+            a.on_key(Key::Enter),
+            Some(UiAction::SetOperatorTunable {
+                name: "kernel.max_agents".into(),
+                value: 25,
+                expected_revision: 2,
+            })
+        );
+        assert_eq!(a.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn tunable_rollback_requires_exact_frozen_name_and_older_revision() {
+        let mut a = app();
+        a.tunables = vec![
+            dummy_tunable("kernel.max_agents", 10, 3),
+            dummy_tunable("kernel.max_turns", 20, 5),
+        ];
+
+        assert_eq!(a.on_key(Key::Char('B')), None);
+        assert_eq!(a.mode, Mode::ConfirmTunableRollback);
+        a.selected_tunable = 1;
+        for character in "2|kernel.max_turns".chars() {
+            a.on_key(Key::Char(character));
+        }
+        assert_eq!(a.on_key(Key::Enter), None);
+        assert_eq!(a.mode, Mode::ConfirmTunableRollback);
+        assert!(a.status.contains("exactly match kernel.max_agents"));
+        while !a.input.is_empty() {
+            a.on_key(Key::Backspace);
+        }
+        for character in "3|kernel.max_agents".chars() {
+            a.on_key(Key::Char(character));
+        }
+        assert_eq!(a.on_key(Key::Enter), None);
+        assert!(a.status.contains("within 1..3"));
+        while !a.input.is_empty() {
+            a.on_key(Key::Backspace);
+        }
+        for character in "1|kernel.max_agents".chars() {
+            a.on_key(Key::Char(character));
+        }
+        assert_eq!(
+            a.on_key(Key::Enter),
+            Some(UiAction::RollbackOperatorTunable {
+                name: "kernel.max_agents".into(),
+                target_revision: 1,
+                expected_revision: 3,
+            })
+        );
+        assert_eq!(a.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn tunable_selection_audit_and_cancellation_keep_exact_target() {
+        let mut a = app();
+        a.tunables = vec![
+            dummy_tunable("kernel.max_agents", 10, 2),
+            dummy_tunable("kernel.max_turns", 20, 4),
+        ];
+
+        assert_eq!(a.on_key(Key::Char('.')), None);
+        assert_eq!(a.selected_tunable, 1);
+        assert_eq!(
+            a.on_key(Key::Char('a')),
+            Some(UiAction::LoadOperatorTunableAudit {
+                name: "kernel.max_turns".into(),
+            })
+        );
+        assert_eq!(a.on_key(Key::Char('v')), None);
+        assert_eq!(
+            a.pending_tunable_control(),
+            Some(("kernel.max_turns", 20, 4, 1, 100))
+        );
+        a.selected_tunable = 0;
+        assert_eq!(a.on_key(Key::Esc), None);
+        assert_eq!(a.mode, Mode::Normal);
+        assert_eq!(a.pending_tunable_control(), None);
+        assert!(a.status.contains("cancelled"));
     }
 }

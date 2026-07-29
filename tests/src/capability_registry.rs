@@ -568,6 +568,49 @@ fn high_risk_client_actions_keep_target_bound_confirmation() {
 }
 
 #[test]
+fn tui_tunable_controls_stay_revision_bound_on_the_public_wire_boundary() {
+    let app = read_workspace_file("crates/tui/src/app.rs");
+    for contract in [
+        "Mode::SetTunable",
+        "Mode::ConfirmTunableRollback",
+        "expected_revision: target.revision",
+        "target-revision|exact-name",
+        "confirmation must exactly match",
+        "value must be within",
+    ] {
+        assert!(
+            app.contains(contract),
+            "TUI tunable state lost revision/target contract {contract:?}"
+        );
+    }
+
+    let binary = read_workspace_file("crates/tui/src/main.rs");
+    for contract in [
+        "client.set_operator_tunable(",
+        "client.operator_tunable_audit(",
+        "client.rollback_operator_tunable(",
+        "app.set_tunable_audit(",
+    ] {
+        assert!(
+            binary.contains(contract),
+            "TUI tunable I/O lost public KernelClient contract {contract:?}"
+        );
+    }
+
+    let integration = read_workspace_file("crates/tui/tests/refresh.rs");
+    for contract in [
+        "tunable_update_audit_and_rollback_use_the_public_tui_client",
+        "stale TUI revision must fail closed",
+        "revision-checked TUI rollback",
+    ] {
+        assert!(
+            integration.contains(contract),
+            "TUI tunable integration lost evidence {contract:?}"
+        );
+    }
+}
+
+#[test]
 fn reconnect_contract_is_bounded_and_fail_closed() {
     let protocol = read_workspace_file("docs/PROTOCOL.md");
     for contract in [

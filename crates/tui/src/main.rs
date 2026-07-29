@@ -13,7 +13,8 @@
 //! Keys: `j`/`k` (or arrows) move · `r` refresh · `c` create (`name|task`) ·
 //! `m` message · `p` pause/resume · `s` stop · `X` kill · `[`/`]` select
 //! service · `u` start · `d` stop with exact-name confirmation · `R` restart
-//! with exact-name confirmation · `L` reload · `q` quit.
+//! with exact-name confirmation · `L` reload · `,`/`.` select tunable · `v`
+//! set · `a` audit · `B` rollback with exact target confirmation · `q` quit.
 
 use std::io;
 use std::time::Duration;
@@ -193,6 +194,64 @@ fn perform(action: UiAction, app: &mut App, client: &mut TuiClient, rt: &tokio::
             app.status = match rt.block_on(client.reload_services()) {
                 Ok(order) => format!("services reloaded: {}", order.join(" → ")),
                 Err(error) => format!("service reload failed: {error}"),
+            };
+            refresh_after_action(app, client, rt);
+        }
+        UiAction::SetOperatorTunable {
+            name,
+            value,
+            expected_revision,
+        } => {
+            app.status = match rt.block_on(client.set_operator_tunable(
+                name.clone(),
+                value,
+                expected_revision,
+            )) {
+                Ok(tunable) => {
+                    app.clear_tunable_audit();
+                    format!(
+                        "tunable {}={} applied at revision {}; reload audit with `a`",
+                        tunable.name, tunable.value, tunable.revision
+                    )
+                }
+                Err(error) => {
+                    format!("tunable update failed for {name}@r{expected_revision}: {error}")
+                }
+            };
+            refresh_after_action(app, client, rt);
+        }
+        UiAction::LoadOperatorTunableAudit { name } => {
+            match rt.block_on(client.operator_tunable_audit(Some(name.clone()), 20)) {
+                Ok(entries) => {
+                    let count = entries.len();
+                    app.set_tunable_audit(name.clone(), entries);
+                    app.status = format!("loaded {count} audit entries for {name}");
+                }
+                Err(error) => {
+                    app.status = format!("tunable audit failed for {name}: {error}");
+                }
+            }
+        }
+        UiAction::RollbackOperatorTunable {
+            name,
+            target_revision,
+            expected_revision,
+        } => {
+            app.status = match rt.block_on(client.rollback_operator_tunable(
+                name.clone(),
+                target_revision,
+                expected_revision,
+            )) {
+                Ok(tunable) => {
+                    app.clear_tunable_audit();
+                    format!(
+                        "tunable {} rolled back to value {} at revision {}; reload audit with `a`",
+                        tunable.name, tunable.value, tunable.revision
+                    )
+                }
+                Err(error) => format!(
+                    "tunable rollback failed for {name} from r{expected_revision} to r{target_revision}: {error}"
+                ),
             };
             refresh_after_action(app, client, rt);
         }
@@ -535,6 +594,55 @@ fn append_operator_summary(lines: &mut Vec<Line<'static>>, app: &App) {
             tunables.as_str()
         }
     )));
+    if let Some(tunable) = app.selected_tunable() {
+        lines.push(Line::from(format!(
+            "selected tunable [{}/{}]: {}={}@r{} · allowed {}..={} · {}",
+            app.selected_tunable + 1,
+            app.tunables.len(),
+            tunable.name,
+            tunable.value,
+            tunable.revision,
+            tunable.minimum,
+            tunable.maximum,
+            if tunable.persisted {
+                "persisted"
+            } else {
+                "runtime only"
+            }
+        )));
+        lines.push(Line::from(format!(
+            "updated by {} at {} · {}",
+            tunable.updated_by, tunable.updated_at, tunable.description
+        )));
+    }
+    if let Some(name) = &app.tunable_audit_name {
+        lines.push(Line::from(format!(
+            "audit for {name}: {} entr{}",
+            app.tunable_audit.len(),
+            if app.tunable_audit.len() == 1 {
+                "y"
+            } else {
+                "ies"
+            }
+        )));
+        for entry in app.tunable_audit.iter().take(3) {
+            lines.push(Line::from(format!(
+                "  #{} {} {} r{} value={} actor={}",
+                entry.id,
+                entry.action,
+                entry.outcome,
+                entry
+                    .revision
+                    .map(|revision| revision.to_string())
+                    .unwrap_or_else(|| "-".into()),
+                entry
+                    .effective_value
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "-".into()),
+                entry.actor
+            )));
+        }
+    }
 }
 
 fn render_footer(f: &mut Frame, area: Rect, app: &App) {
@@ -572,6 +680,38 @@ fn render_footer(f: &mut Frame, area: Rect, app: &App) {
                 Span::raw(format!(
                     "{name} (owner {}) · exact name> {}▏ · Enter confirm · Esc cancel",
                     agent_id.unwrap_or("none"),
+                    app.input
+                )),
+            ])
+        }
+        Mode::SetTunable => {
+            let (name, value, revision, minimum, maximum) = app
+                .pending_tunable_control()
+                .unwrap_or(("missing target", 0, 0, 0, 0));
+            Line::from(vec![
+                Span::styled(
+                    "SET TUNABLE ",
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(format!(
+                    "{name}={value}@r{revision} · range {minimum}..={maximum} · value> {}▏ · Enter submit · Esc cancel",
+                    app.input
+                )),
+            ])
+        }
+        Mode::ConfirmTunableRollback => {
+            let (name, value, revision, _, _) =
+                app.pending_tunable_control()
+                    .unwrap_or(("missing target", 0, 0, 0, 0));
+            Line::from(vec![
+                Span::styled(
+                    "CONFIRM TUNABLE ROLLBACK ",
+                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(format!(
+                    "{name}={value}@r{revision} · target-revision|exact-name> {}▏ · Enter submit · Esc cancel",
                     app.input
                 )),
             ])

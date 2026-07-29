@@ -536,8 +536,10 @@ need idle routes to remain live can explicitly use the
 authenticated connector in memory, renew leases, republish exact destination
 fences, and expose bounded health through `maintenance_status`.
 
-This is not yet a consensus or partition-tolerant membership and
-mutation-fencing protocol.
+This is not yet a running consensus or partition-tolerant membership and
+mutation-fencing protocol. A durable OpenRaft storage-v2 log, state machine,
+and snapshot substrate exists inside the kernel database, but production does
+not yet construct a Raft node or route these wire operations through it.
 The designated authority is a single consistency point with no quorum failover;
 creation/claim/fence publication is not one atomic cross-database transaction,
 and there is no automatic migration,

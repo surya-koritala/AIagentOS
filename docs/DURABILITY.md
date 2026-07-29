@@ -2,7 +2,8 @@
 
 AI Agent OS currently stores kernel-owned state in one SQLite database. The
 database includes context, memory, usage and quota accounting, agent lifecycle,
-packages, operator settings, services, identity, and cluster control state.
+packages, operator settings, services, identity, cluster control state, and the
+durable log/state/snapshot substrate for future quorum authority.
 
 This document describes the guarantees implemented today. The kernel backup
 and offline restore primitives plus authenticated SDK/CLI entry points are
@@ -54,6 +55,36 @@ After migration, startup verifies the ownership metadata, exact schema version,
 physical integrity, foreign-key consistency, authenticated accounting root, and
 complete accounting event chain. Reopening the current version is idempotent
 and does not append a duplicate migration record.
+
+## Durable consensus substrate
+
+Schema version `6` adds `cluster_raft_meta`, `cluster_raft_log`,
+`cluster_raft_state`, and `cluster_raft_snapshot`. They deliberately use the
+same database rather than a plaintext side store, so SQLCipher encryption,
+`WAL`, `synchronous=FULL`, online backup, offline restore, and the exclusive
+storage lease cover consensus state together with the authority data it will
+eventually govern.
+
+Raft indices are fixed-width big-endian blobs, preserving the full `u64` range
+and numeric ordering. Vote, committed pointer, log append/truncate/purge,
+applied state, and snapshot replacement commit in SQLite transactions.
+OpenRaft's log-flush callback is signaled only after the append transaction
+commits. Durable votes, committed pointers, and purged pointers cannot regress;
+committed log entries cannot be truncated or recreated; conflicting log
+rewrites require truncation; appends cannot introduce a hole after the durable
+frontier; and an older or conflicting snapshot cannot roll back applied state.
+Consensus-store open rejects malformed JSON, index/entry disagreement, log
+holes, invalid idempotency receipts, and snapshot row/metadata/payload
+disagreement.
+
+The state machine currently exposes only an idempotent sequencing barrier with
+a bounded durable receipt map. Capacity exhaustion rejects new application
+commands rather than pruning independently on one replica. OpenRaft's complete
+storage-v2 conformance suite, file-backed vote/committed/log/state/snapshot
+restart persistence, barrier idempotency, snapshot transfer and rollback
+protection, durable-pointer monotonicity, and malformed-record rejection run in
+the kernel test suite. This is storage qualification, not a claim that peer
+transport, election, or quorum authority is active.
 
 ## Authenticated accounting integrity
 
@@ -626,8 +657,8 @@ The current policy classes are:
   archives, installations, history, rate limits, transparency, and audit;
 - user identity state: the user row, sessions, API-key hashes, and that user's
   package rate-limit state;
-- system state: schema/install metadata, cluster identity/control, global
-  operator settings, and shared quota/accounting records.
+- system state: schema/install metadata, cluster identity/control and durable
+  Raft state, global operator settings, and shared quota/accounting records.
 
 `erase_agent_data`, `erase_user_data`, and `erase_tenant_data` use
 `BEGIN IMMEDIATE` and either commit the complete classified mutation plus one

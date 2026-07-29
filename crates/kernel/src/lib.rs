@@ -14,6 +14,7 @@ pub mod auth;
 pub mod budget;
 pub mod cfs;
 pub mod cgroups;
+pub mod cluster_consensus;
 pub mod cluster_control;
 pub mod config;
 pub mod connector;

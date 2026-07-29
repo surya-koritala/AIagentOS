@@ -11,7 +11,8 @@ use agent_sdk::{
     AgentEnforcementInfo, ConnectionProfile, GenerationCheckpointSummary, KernelClient,
     LifecycleResult, MessageResult, MessageStreamEvent, OperatorAgentSnapshot,
     OperatorCgroupSnapshot, OperatorPackageSnapshot, OperatorServiceSnapshot, OperatorSnapshot,
-    OperatorTunable, ProviderSummary, SdkError, ServiceHistoryEntry, ServiceRuntimeInfo,
+    OperatorTunable, OperatorTunableAudit, ProviderSummary, SdkError, ServiceHistoryEntry,
+    ServiceRuntimeInfo,
 };
 use kernel::{syscall_gate::GateStats, syscall_server::SyscallServer, AgentKernelImpl};
 use serde::Serialize;
@@ -124,6 +125,21 @@ pub struct DesktopTunable {
     pub updated_at: String,
     pub updated_by: String,
     pub description: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DesktopTunableAudit {
+    pub id: u64,
+    pub name: String,
+    pub revision: Option<u64>,
+    pub previous_value: Option<u64>,
+    pub requested_value: Option<u64>,
+    pub effective_value: Option<u64>,
+    pub action: String,
+    pub outcome: String,
+    pub actor: String,
+    pub reason: Option<String>,
+    pub created_at: String,
 }
 
 /// Non-secret global metrics shown by the desktop dashboard.
@@ -378,6 +394,24 @@ impl From<OperatorTunable> for DesktopTunable {
     }
 }
 
+impl From<OperatorTunableAudit> for DesktopTunableAudit {
+    fn from(entry: OperatorTunableAudit) -> Self {
+        Self {
+            id: entry.id,
+            name: entry.name,
+            revision: entry.revision,
+            previous_value: entry.previous_value,
+            requested_value: entry.requested_value,
+            effective_value: entry.effective_value,
+            action: entry.action,
+            outcome: entry.outcome,
+            actor: entry.actor,
+            reason: entry.reason,
+            created_at: entry.created_at,
+        }
+    }
+}
+
 impl DesktopMetricsView {
     pub fn try_from_operator_snapshot(snapshot: &OperatorSnapshot) -> Result<Self, &'static str> {
         let metrics = snapshot
@@ -623,6 +657,50 @@ impl DesktopClient {
             .await?
             .into_iter()
             .map(DesktopServiceHistory::from)
+            .collect())
+    }
+
+    pub async fn set_operator_tunable(
+        &self,
+        name: impl Into<String>,
+        value: u64,
+        expected_revision: u64,
+    ) -> Result<DesktopTunable, SdkError> {
+        self.inner
+            .lock()
+            .await
+            .set_operator_tunable(name, value, expected_revision)
+            .await
+            .map(DesktopTunable::from)
+    }
+
+    pub async fn rollback_operator_tunable(
+        &self,
+        name: impl Into<String>,
+        target_revision: u64,
+        expected_revision: u64,
+    ) -> Result<DesktopTunable, SdkError> {
+        self.inner
+            .lock()
+            .await
+            .rollback_operator_tunable(name, target_revision, expected_revision)
+            .await
+            .map(DesktopTunable::from)
+    }
+
+    pub async fn operator_tunable_audit(
+        &self,
+        name: Option<String>,
+        limit: usize,
+    ) -> Result<Vec<DesktopTunableAudit>, SdkError> {
+        Ok(self
+            .inner
+            .lock()
+            .await
+            .operator_tunable_audit(name, limit)
+            .await?
+            .into_iter()
+            .map(DesktopTunableAudit::from)
             .collect())
     }
 
@@ -990,6 +1068,82 @@ mod tests {
             .await
             .expect_err("unknown service must fail through the public boundary");
         assert!(error.to_string().contains("missing-service"));
+    }
+
+    #[tokio::test]
+    async fn desktop_tunable_controls_and_audit_use_the_public_wire_client() {
+        let kernel = Arc::new(AgentKernelImpl::new().expect("kernel"));
+        let tenant_id = kernel
+            .create_tenant("desktop-tunable-tenant")
+            .await
+            .unwrap();
+        let tenant_admin = kernel
+            .register_user(
+                &tenant_id,
+                "desktop-tunable-admin",
+                "desktop-tunable-admin@example.invalid",
+                Role::Admin,
+            )
+            .await
+            .unwrap();
+        let tenant_token = kernel
+            .issue_api_key(&tenant_admin, "desktop-tunable-admin")
+            .await
+            .unwrap();
+        let server = SyscallServer::bind(Arc::clone(&kernel), "127.0.0.1:0")
+            .await
+            .expect("bind tunable server");
+        let address = server.local_addr().expect("tunable server address");
+        tokio::spawn(server.serve());
+        let client = DesktopClient::connect(&address.to_string(), None)
+            .await
+            .expect("system desktop");
+        let tenant_client = DesktopClient::connect(&address.to_string(), Some(&tenant_token))
+            .await
+            .expect("tenant desktop");
+
+        let initial = client
+            .operator_view()
+            .await
+            .expect("operator view")
+            .tunables
+            .expect("system tunables")
+            .into_iter()
+            .find(|tunable| tunable.name == kernel::operator_control::MAX_AGENTS)
+            .expect("max agents tunable");
+        let denied = tenant_client
+            .set_operator_tunable(&initial.name, 3, initial.revision)
+            .await
+            .expect_err("tenant admin cannot mutate system tunables");
+        assert_eq!(
+            denied.wire_code(),
+            Some(agent_sdk::WireErrorCode::AuthorizationDenied)
+        );
+
+        let changed = client
+            .set_operator_tunable(&initial.name, 2, initial.revision)
+            .await
+            .expect("desktop tunable update over wire");
+        assert_eq!(changed.value, 2);
+        assert_eq!(changed.revision, initial.revision + 1);
+        client
+            .set_operator_tunable(&initial.name, 4, initial.revision)
+            .await
+            .expect_err("stale desktop revision must fail closed");
+
+        let audit = client
+            .operator_tunable_audit(Some(initial.name.clone()), 20)
+            .await
+            .expect("desktop tunable audit over wire");
+        assert!(audit.iter().any(|entry| entry.action == "set"));
+        assert!(audit.iter().any(|entry| entry.outcome == "denied"));
+
+        let rolled_back = client
+            .rollback_operator_tunable(&initial.name, initial.revision, changed.revision)
+            .await
+            .expect("desktop tunable rollback over wire");
+        assert_eq!(rolled_back.value, initial.value);
+        assert_eq!(rolled_back.revision, changed.revision + 1);
     }
 
     #[test]

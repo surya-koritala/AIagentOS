@@ -100,3 +100,17 @@ test('service supervision retains public commands and frozen exact-target confir
   assert.match(status, /may block dependent services/);
   assert.match(status, /can interrupt in-flight work/);
 });
+
+test('operator tunables retain revision bounds, exact rollback target, and audit controls', () => {
+  const status = source('AgentStatus.svelte');
+
+  assert.match(status, /const frozenTarget = \{ \.\.\.pendingTunableControl \}/);
+  assert.match(status, /invoke\('set_operator_tunable'/);
+  assert.match(status, /invoke\('rollback_operator_tunable'/);
+  assert.match(status, /invoke\('operator_tunable_audit'/);
+  assert.match(status, /expectedRevision: frozenTarget\.revision/);
+  assert.match(status, /confirmTunableName: frozenTarget\.name/);
+  assert.match(status, /revision >= target\.revision/);
+  assert.match(status, /Target revision\|exact tunable name/);
+  assert.match(status, /another operator changes the revision first/);
+});

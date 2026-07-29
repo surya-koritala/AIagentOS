@@ -6,6 +6,7 @@ use crate::{
         CLOUD_DESKTOP_PROVIDERS, SUPPORTED_DESKTOP_PROVIDERS,
     },
     AppState, DesktopMetricsView, DesktopOperatorView, DesktopService, DesktopServiceHistory,
+    DesktopTunable, DesktopTunableAudit,
 };
 use kernel::config::Config;
 use serde::Serialize;
@@ -320,6 +321,97 @@ fn validate_service_control_confirmation(
     validate_service_name(service_name)?;
     if service_name != confirmation {
         return Err("service control confirmation must exactly match the service name".into());
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn set_operator_tunable(
+    state: State<'_, AppState>,
+    tunable_name: String,
+    value: u64,
+    expected_revision: u64,
+) -> Result<DesktopTunable, String> {
+    validate_tunable_target(&tunable_name, expected_revision)?;
+    state
+        .client
+        .set_operator_tunable(tunable_name, value, expected_revision)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn rollback_operator_tunable(
+    state: State<'_, AppState>,
+    tunable_name: String,
+    target_revision: u64,
+    expected_revision: u64,
+    confirm_tunable_name: String,
+) -> Result<DesktopTunable, String> {
+    validate_tunable_rollback_confirmation(
+        &tunable_name,
+        target_revision,
+        expected_revision,
+        &confirm_tunable_name,
+    )?;
+    state
+        .client
+        .rollback_operator_tunable(tunable_name, target_revision, expected_revision)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn operator_tunable_audit(
+    state: State<'_, AppState>,
+    tunable_name: Option<String>,
+    limit: usize,
+) -> Result<Vec<DesktopTunableAudit>, String> {
+    if let Some(name) = tunable_name.as_deref() {
+        validate_tunable_name(name)?;
+    }
+    if !(1..=200).contains(&limit) {
+        return Err("operator tunable audit limit must be between 1 and 200".into());
+    }
+    state
+        .client
+        .operator_tunable_audit(tunable_name, limit)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+fn validate_tunable_name(name: &str) -> Result<(), String> {
+    if name.is_empty() || name.trim() != name || name.len() > 128 {
+        return Err("operator tunable name must be a bounded non-empty exact target".into());
+    }
+    Ok(())
+}
+
+fn validate_tunable_target(name: &str, expected_revision: u64) -> Result<(), String> {
+    validate_tunable_name(name)?;
+    if expected_revision == 0 {
+        return Err("operator tunable expected revision must be positive".into());
+    }
+    Ok(())
+}
+
+fn validate_tunable_rollback_confirmation(
+    name: &str,
+    target_revision: u64,
+    expected_revision: u64,
+    confirmation: &str,
+) -> Result<(), String> {
+    validate_tunable_target(name, expected_revision)?;
+    if name != confirmation {
+        return Err(
+            "operator tunable rollback confirmation must exactly match the tunable name".into(),
+        );
+    }
+    if target_revision == 0 || target_revision >= expected_revision {
+        return Err(
+            "operator tunable rollback revision must be positive and older than the current revision"
+                .into(),
+        );
     }
     Ok(())
 }
@@ -650,6 +742,46 @@ mod tests {
         assert_eq!(
             validate_service_control_confirmation(" worker", " worker").unwrap_err(),
             "service name must be a non-empty exact target"
+        );
+    }
+
+    #[test]
+    fn tunable_mutations_require_frozen_positive_revisions_and_exact_rollback_target() {
+        assert!(validate_tunable_target("kernel.max_agents", 2).is_ok());
+        assert_eq!(
+            validate_tunable_target(" kernel.max_agents", 2).unwrap_err(),
+            "operator tunable name must be a bounded non-empty exact target"
+        );
+        assert_eq!(
+            validate_tunable_target("kernel.max_agents", 0).unwrap_err(),
+            "operator tunable expected revision must be positive"
+        );
+        assert!(validate_tunable_rollback_confirmation(
+            "kernel.max_agents",
+            1,
+            2,
+            "kernel.max_agents"
+        )
+        .is_ok());
+        assert_eq!(
+            validate_tunable_rollback_confirmation(
+                "kernel.max_agents",
+                1,
+                2,
+                "kernel.max_agents.other"
+            )
+            .unwrap_err(),
+            "operator tunable rollback confirmation must exactly match the tunable name"
+        );
+        assert_eq!(
+            validate_tunable_rollback_confirmation(
+                "kernel.max_agents",
+                2,
+                2,
+                "kernel.max_agents"
+            )
+            .unwrap_err(),
+            "operator tunable rollback revision must be positive and older than the current revision"
         );
     }
 }

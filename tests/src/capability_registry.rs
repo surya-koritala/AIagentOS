@@ -611,6 +611,73 @@ fn tui_tunable_controls_stay_revision_bound_on_the_public_wire_boundary() {
 }
 
 #[test]
+fn desktop_tunable_controls_stay_revision_bound_on_the_public_wire_boundary() {
+    let protocol = read_workspace_file("docs/PROTOCOL.md");
+    let normalized_protocol = protocol.split_whitespace().collect::<Vec<_>>().join(" ");
+    for contract in [
+        "freeze the displayed name and expected revision",
+        "compare-and-set revision check",
+        "requires the exact frozen tunable name",
+    ] {
+        assert!(
+            normalized_protocol.contains(contract),
+            "desktop tunable protocol lost {contract:?}"
+        );
+    }
+
+    let backend = read_workspace_file("crates/tauri-app/src/lib.rs");
+    for contract in [
+        ".set_operator_tunable(name, value, expected_revision)",
+        ".rollback_operator_tunable(name, target_revision, expected_revision)",
+        ".operator_tunable_audit(name, limit)",
+        "desktop_tunable_controls_and_audit_use_the_public_wire_client",
+    ] {
+        assert!(
+            backend.contains(contract),
+            "desktop tunable backend lost public client contract {contract:?}"
+        );
+    }
+
+    let commands = read_workspace_file("crates/tauri-app/src/commands.rs");
+    for contract in [
+        "pub async fn set_operator_tunable",
+        "pub async fn rollback_operator_tunable",
+        "pub async fn operator_tunable_audit",
+        "validate_tunable_rollback_confirmation(",
+    ] {
+        assert!(
+            commands.contains(contract),
+            "desktop tunable command surface lost {contract:?}"
+        );
+    }
+
+    let main = read_workspace_file("crates/tauri-app/src/main.rs");
+    for contract in [
+        "commands::set_operator_tunable",
+        "commands::rollback_operator_tunable",
+        "commands::operator_tunable_audit",
+    ] {
+        assert!(
+            main.contains(contract),
+            "desktop shell stopped registering tunable command {contract:?}"
+        );
+    }
+
+    let ui = read_workspace_file("crates/tauri-app/ui/src/lib/AgentStatus.svelte");
+    for contract in [
+        "expectedRevision: frozenTarget.revision",
+        "confirmTunableName: frozenTarget.name",
+        "Target revision|exact tunable name",
+        "another operator changes the revision first",
+    ] {
+        assert!(
+            ui.contains(contract),
+            "desktop tunable UI lost frozen target contract {contract:?}"
+        );
+    }
+}
+
+#[test]
 fn reconnect_contract_is_bounded_and_fail_closed() {
     let protocol = read_workspace_file("docs/PROTOCOL.md");
     for contract in [

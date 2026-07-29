@@ -75,6 +75,15 @@ dependency or in-flight-work impact, and require the exact service name before
 the mutation is sent. A changed selection or refreshed snapshot cannot retarget
 an open confirmation.
 
+TUI and desktop tunable controls are focused projections of the system-only
+operator-tunable wire operations. Both freeze the displayed name and expected
+revision before mutation, submit updates only within the server-advertised
+bounds, and use the server's compare-and-set revision check so stale screens
+cannot overwrite a newer operator change. Audit history is bounded and
+non-secret. Rollback identifies an older retained revision and requires the
+exact frozen tunable name before submission; the server remains authoritative
+for authorization, revision history, bounds, and atomic persistence.
+
 ## Version and feature negotiation
 
 The wire protocol is versioned independently from the crate. Protocol v2 serves

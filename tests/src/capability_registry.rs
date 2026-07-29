@@ -611,6 +611,69 @@ fn tui_tunable_controls_stay_revision_bound_on_the_public_wire_boundary() {
 }
 
 #[test]
+fn tui_package_controls_stay_exact_on_the_public_wire_boundary() {
+    let app = read_workspace_file("crates/tui/src/app.rs");
+    for contract in [
+        "Mode::InstallPackage",
+        "Mode::ConfirmPackageMutation",
+        "expected_version: target.version",
+        "expected_digest: target.digest",
+        "confirmation must exactly match",
+        "prevents new package runs",
+    ] {
+        assert!(
+            app.contains(contract),
+            "TUI package state lost exact-target contract {contract:?}"
+        );
+    }
+
+    let binary = read_workspace_file("crates/tui/src/main.rs");
+    for contract in [
+        "client.install_package(",
+        "client.run_installed_package(",
+        "client.rollback_package_exact(",
+        "client.remove_package_exact(",
+    ] {
+        assert!(
+            binary.contains(contract),
+            "TUI package I/O lost public KernelClient contract {contract:?}"
+        );
+    }
+
+    let sdk = read_workspace_file("crates/sdk/src/lib.rs");
+    let server = read_workspace_file("crates/kernel/src/syscall_server.rs");
+    let registry = read_workspace_file("crates/kernel/src/package.rs");
+    for contract in ["RollbackPackageExact", "RemovePackageExact"] {
+        assert!(
+            sdk.contains(contract) && server.contains(contract),
+            "exact package mutation lost wire/SDK operation {contract:?}"
+        );
+    }
+    for contract in [
+        "rollback_exact",
+        "remove_exact",
+        "PackageError::Stale",
+        "transaction_with_behavior(TransactionBehavior::Immediate)",
+    ] {
+        assert!(
+            registry.contains(contract),
+            "exact package mutation lost transactional contract {contract:?}"
+        );
+    }
+
+    let integration = read_workspace_file("crates/tui/tests/refresh.rs");
+    for contract in [
+        "package_lifecycle_and_stale_confirmation_use_the_public_tui_client",
+        "stale TUI confirmation must fail closed",
+    ] {
+        assert!(
+            integration.contains(contract),
+            "TUI package integration lost evidence {contract:?}"
+        );
+    }
+}
+
+#[test]
 fn desktop_tunable_controls_stay_revision_bound_on_the_public_wire_boundary() {
     let protocol = read_workspace_file("docs/PROTOCOL.md");
     let normalized_protocol = protocol.split_whitespace().collect::<Vec<_>>().join(" ");

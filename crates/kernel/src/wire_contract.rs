@@ -386,8 +386,24 @@ const REQUEST_VARIANTS: &[Variant] = &[
         fields: &[Field::required("name", S)],
     },
     Variant {
+        tag: "rollback_package_exact",
+        fields: &[
+            Field::required("name", S),
+            Field::required("expected_version", S),
+            Field::required("expected_digest", S),
+        ],
+    },
+    Variant {
         tag: "remove_package",
         fields: &[Field::required("name", S)],
+    },
+    Variant {
+        tag: "remove_package_exact",
+        fields: &[
+            Field::required("name", S),
+            Field::required("expected_version", S),
+            Field::required("expected_digest", S),
+        ],
     },
     Variant {
         tag: "list_installed_packages",
@@ -1288,8 +1304,8 @@ mod tests {
                     });
             }
         }
-        assert_eq!(conformance_request_fixtures(1).unwrap().len(), 59);
-        assert_eq!(conformance_request_fixtures(2).unwrap().len(), 75);
+        assert_eq!(conformance_request_fixtures(1).unwrap().len(), 61);
+        assert_eq!(conformance_request_fixtures(2).unwrap().len(), 77);
         assert!(conformance_request_fixtures(0).is_err());
         assert!(conformance_request_fixtures(PROTOCOL_VERSION + 1).is_err());
     }

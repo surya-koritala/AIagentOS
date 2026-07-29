@@ -4,7 +4,7 @@
 //! how keys mutate it*.
 
 use agent_sdk::{
-    AgentSummary, GateStats, KernelClient, NodeLoad, OperatorAgentSnapshot,
+    AgentSummary, GateStats, InstalledPackage, KernelClient, NodeLoad, OperatorAgentSnapshot,
     OperatorPackageSnapshot, OperatorServiceSnapshot, OperatorSnapshot, OperatorTunable,
     OperatorTunableAudit, ProviderSummary, SdkError,
 };
@@ -26,6 +26,10 @@ pub enum Mode {
     SetTunable,
     /// Typing `target-revision|exact-name` for one frozen tunable rollback.
     ConfirmTunableRollback,
+    /// Typing `name|semver-requirement` for a signed package install/upgrade.
+    InstallPackage,
+    /// Typing `version|exact-name` for one frozen rollback or removal.
+    ConfirmPackageMutation,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,6 +61,29 @@ struct PendingTunableControl {
     revision: u64,
     minimum: u64,
     maximum: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PackageMutationKind {
+    Rollback,
+    Remove,
+}
+
+impl PackageMutationKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Rollback => "rollback",
+            Self::Remove => "remove",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingPackageMutation {
+    kind: PackageMutationKind,
+    name: String,
+    version: String,
+    digest: String,
 }
 
 /// An action the event loop should perform asynchronously (the pure key handler
@@ -108,6 +135,23 @@ pub enum UiAction {
         target_revision: u64,
         expected_revision: u64,
     },
+    InstallPackage {
+        name: String,
+        requirement: String,
+    },
+    RunInstalledPackage {
+        name: String,
+    },
+    RollbackInstalledPackage {
+        name: String,
+        expected_version: String,
+        expected_digest: String,
+    },
+    RemoveInstalledPackage {
+        name: String,
+        expected_version: String,
+        expected_digest: String,
+    },
 }
 
 impl UiAction {
@@ -130,6 +174,10 @@ impl UiAction {
             Self::SetOperatorTunable { .. } => "updating operator tunable",
             Self::LoadOperatorTunableAudit { .. } => "loading tunable audit",
             Self::RollbackOperatorTunable { .. } => "rolling back operator tunable",
+            Self::InstallPackage { .. } => "installing signed package",
+            Self::RunInstalledPackage { .. } => "starting installed package",
+            Self::RollbackInstalledPackage { .. } => "rolling back installed package",
+            Self::RemoveInstalledPackage { .. } => "removing installed package",
         }
     }
 }
@@ -202,6 +250,7 @@ pub struct App {
     pub node: NodeLoad,
     pub providers: Vec<ProviderSummary>,
     pub packages: Vec<OperatorPackageSnapshot>,
+    pub installed_packages: Vec<InstalledPackage>,
     pub tunables: Vec<OperatorTunable>,
     pub services: Vec<OperatorServiceSnapshot>,
     pub tunable_audit: Vec<OperatorTunableAudit>,
@@ -214,12 +263,14 @@ pub struct App {
     pub selected: usize,
     pub selected_service: usize,
     pub selected_tunable: usize,
+    pub selected_package: usize,
     pub mode: Mode,
     pub input: String,
     pub status: String,
     pending_kill: Option<(String, String)>,
     pending_service_control: Option<PendingServiceControl>,
     pending_tunable_control: Option<PendingTunableControl>,
+    pending_package_mutation: Option<PendingPackageMutation>,
     pub last_output: Option<String>,
     pub operator_state: OperatorUiState,
     pub should_quit: bool,
@@ -235,6 +286,7 @@ impl App {
             node: NodeLoad::default(),
             providers: Vec::new(),
             packages: Vec::new(),
+            installed_packages: Vec::new(),
             tunables: Vec::new(),
             services: Vec::new(),
             tunable_audit: Vec::new(),
@@ -247,12 +299,14 @@ impl App {
             selected: 0,
             selected_service: 0,
             selected_tunable: 0,
+            selected_package: 0,
             mode: Mode::Normal,
             input: String::new(),
-            status: "r refresh · c/m/p/s/X agents · [/ ] service · u/d/R/L control · ,/. tunable · v set · a audit · B rollback · q quit".into(),
+            status: "r refresh · c/m/p/s/X agents · [/ ] service · u/d/R/L control · ,/. tunable · v/a/B · {/} package · i/P/b/D · q quit".into(),
             pending_kill: None,
             pending_service_control: None,
             pending_tunable_control: None,
+            pending_package_mutation: None,
             last_output: None,
             operator_state: OperatorUiState::default(),
             should_quit: false,
@@ -283,6 +337,15 @@ impl App {
                     ));
                 }
                 self.apply_operator_snapshot(snapshot);
+                match client.list_installed_packages().await {
+                    Ok(packages) => {
+                        self.installed_packages = packages;
+                        if self.selected_package >= self.installed_packages.len() {
+                            self.selected_package = self.installed_packages.len().saturating_sub(1);
+                        }
+                    }
+                    Err(_) => missing_sections.push("installed packages".to_string()),
+                }
                 let reconnect_generation = client.reconnect_generation();
                 self.operator_state = OperatorUiState {
                     freshness: if missing_sections.is_empty() {
@@ -419,6 +482,10 @@ impl App {
         self.tunables.get(self.selected_tunable)
     }
 
+    pub fn selected_package(&self) -> Option<&InstalledPackage> {
+        self.installed_packages.get(self.selected_package)
+    }
+
     pub fn set_tunable_audit(
         &mut self,
         name: impl Into<String>,
@@ -460,17 +527,29 @@ impl App {
         self.selected_tunable = next as usize;
     }
 
+    fn move_package_selection(&mut self, delta: isize) {
+        if self.installed_packages.is_empty() {
+            return;
+        }
+        let len = self.installed_packages.len() as isize;
+        let next = (self.selected_package as isize + delta).clamp(0, len - 1);
+        self.selected_package = next as usize;
+    }
+
     /// Handle a key press. Returns an action for the event loop to run, or
     /// `None` when the key only mutated local state. `key` is the character/name
     /// of the key; `enter`/`esc`/`backspace` are signalled via [`Key`].
     pub fn on_key(&mut self, key: Key) -> Option<UiAction> {
         match self.mode {
             Mode::Normal => self.on_key_normal(key),
-            Mode::CreateAgent | Mode::SendMessage => self.on_key_editing(key),
+            Mode::CreateAgent | Mode::SendMessage | Mode::InstallPackage => {
+                self.on_key_editing(key)
+            }
             Mode::ConfirmKill => self.on_key_confirm_kill(key),
             Mode::ConfirmServiceControl => self.on_key_confirm_service_control(key),
             Mode::SetTunable => self.on_key_set_tunable(key),
             Mode::ConfirmTunableRollback => self.on_key_confirm_tunable_rollback(key),
+            Mode::ConfirmPackageMutation => self.on_key_confirm_package_mutation(key),
         }
     }
 
@@ -578,6 +657,40 @@ impl App {
             }
             Key::Char('B') => {
                 self.begin_tunable_control(Mode::ConfirmTunableRollback);
+                None
+            }
+            Key::Char('{') => {
+                self.move_package_selection(-1);
+                None
+            }
+            Key::Char('}') => {
+                self.move_package_selection(1);
+                None
+            }
+            Key::Char('i') => {
+                self.mode = Mode::InstallPackage;
+                self.input.clear();
+                self.status =
+                    "install package — type `name|semver-requirement`, Enter to submit, Esc to cancel"
+                        .into();
+                None
+            }
+            Key::Char('P') => {
+                if let Some(package) = self.selected_package() {
+                    Some(UiAction::RunInstalledPackage {
+                        name: package.name.clone(),
+                    })
+                } else {
+                    self.status = "no installed package selected".into();
+                    None
+                }
+            }
+            Key::Char('b') => {
+                self.begin_package_mutation(PackageMutationKind::Rollback);
+                None
+            }
+            Key::Char('D') => {
+                self.begin_package_mutation(PackageMutationKind::Remove);
                 None
             }
             _ => None,
@@ -889,6 +1002,113 @@ impl App {
         })
     }
 
+    fn begin_package_mutation(&mut self, kind: PackageMutationKind) {
+        let Some(package) = self.selected_package().cloned() else {
+            self.status = "no installed package selected".into();
+            return;
+        };
+        let version = package.version.to_string();
+        self.pending_package_mutation = Some(PendingPackageMutation {
+            kind,
+            name: package.name.clone(),
+            version: version.clone(),
+            digest: package.digest.clone(),
+        });
+        self.mode = Mode::ConfirmPackageMutation;
+        self.input.clear();
+        let impact = match kind {
+            PackageMutationKind::Rollback => {
+                "replaces the current package and lock state with its previous committed version"
+            }
+            PackageMutationKind::Remove => {
+                "removes the installed package and prevents new package runs"
+            }
+        };
+        self.status = format!(
+            "confirm package {} — {}@{} ({}) · {}; type {}|{} exactly, Enter to submit, Esc to cancel",
+            kind.label(),
+            package.name,
+            version,
+            short_digest(&package.digest),
+            impact,
+            version,
+            package.name
+        );
+    }
+
+    fn on_key_confirm_package_mutation(&mut self, key: Key) -> Option<UiAction> {
+        match key {
+            Key::Esc => {
+                self.pending_package_mutation = None;
+                self.mode = Mode::Normal;
+                self.input.clear();
+                self.status = "package mutation cancelled".into();
+                None
+            }
+            Key::Backspace => {
+                self.input.pop();
+                None
+            }
+            Key::Char(character) => {
+                self.input.push(character);
+                None
+            }
+            Key::Enter => {
+                let Some(target) = self.pending_package_mutation.as_ref() else {
+                    self.mode = Mode::Normal;
+                    self.input.clear();
+                    self.status = "package mutation cancelled — target unavailable".into();
+                    return None;
+                };
+                let expected = format!("{}|{}", target.version, target.name);
+                if self.input != expected {
+                    self.status = format!(
+                        "package {} not submitted — confirmation must exactly match {expected}",
+                        target.kind.label()
+                    );
+                    return None;
+                }
+                let target = self
+                    .pending_package_mutation
+                    .take()
+                    .expect("validated pending package mutation");
+                self.mode = Mode::Normal;
+                self.input.clear();
+                self.status = format!(
+                    "package {} submitted — {}@{} ({})",
+                    target.kind.label(),
+                    target.name,
+                    target.version,
+                    short_digest(&target.digest)
+                );
+                Some(match target.kind {
+                    PackageMutationKind::Rollback => UiAction::RollbackInstalledPackage {
+                        name: target.name,
+                        expected_version: target.version,
+                        expected_digest: target.digest,
+                    },
+                    PackageMutationKind::Remove => UiAction::RemoveInstalledPackage {
+                        name: target.name,
+                        expected_version: target.version,
+                        expected_digest: target.digest,
+                    },
+                })
+            }
+            _ => None,
+        }
+    }
+
+    pub fn pending_package_mutation(&self) -> Option<(&str, &str, &str, &str)> {
+        self.pending_package_mutation.as_ref().map(|target| {
+            (
+                target.kind.label(),
+                target.name.as_str(),
+                target.version.as_str(),
+                target.digest.as_str(),
+            )
+        })
+    }
+
     fn submit(&mut self) -> Option<UiAction> {
         let action = match self.mode {
             Mode::CreateAgent => {
@@ -918,16 +1138,36 @@ impl App {
                 }
                 UiAction::SendMessage { agent_id, message }
             }
+            Mode::InstallPackage => {
+                let Some((name, requirement)) = self.input.split_once('|') else {
+                    self.status =
+                        "package install requires `name|semver-requirement` (for example reviewer|^1)"
+                            .into();
+                    return None;
+                };
+                let name = name.trim().to_string();
+                let requirement = requirement.trim().to_string();
+                if name.is_empty() || requirement.is_empty() {
+                    self.status = "package name and semver requirement are required".into();
+                    return None;
+                }
+                UiAction::InstallPackage { name, requirement }
+            }
             Mode::Normal
             | Mode::ConfirmKill
             | Mode::ConfirmServiceControl
             | Mode::SetTunable
-            | Mode::ConfirmTunableRollback => return None,
+            | Mode::ConfirmTunableRollback
+            | Mode::ConfirmPackageMutation => return None,
         };
         self.mode = Mode::Normal;
         self.input.clear();
         Some(action)
     }
+}
+
+fn short_digest(digest: &str) -> &str {
+    digest.get(..19).unwrap_or(digest)
 }
 
 /// A keypress abstracted away from any specific backend, so [`App::on_key`] is
@@ -987,6 +1227,35 @@ mod tests {
             updated_by: "operator".into(),
             description: "test tunable".into(),
         }
+    }
+
+    fn dummy_installed_package(name: &str, version: &str, digest: &str) -> InstalledPackage {
+        serde_json::from_value(serde_json::json!({
+            "tenant_id": "tenant-1",
+            "name": name,
+            "version": version,
+            "digest": digest,
+            "lock": {
+                "schema_version": 1,
+                "packages": [{
+                    "name": name,
+                    "version": version,
+                    "digest": digest
+                }]
+            },
+            "manifest": {
+                "name": name,
+                "version": version,
+                "description": "test package",
+                "publisher": "test-publisher",
+                "license": "AGPL-3.0-only",
+                "dependencies": [],
+                "capabilities_required": [],
+                "tools_required": []
+            },
+            "installed_at": "2026-07-29T00:00:00Z"
+        }))
+        .expect("valid installed package fixture")
     }
 
     #[test]
@@ -1402,5 +1671,86 @@ mod tests {
         assert_eq!(a.mode, Mode::Normal);
         assert_eq!(a.pending_tunable_control(), None);
         assert!(a.status.contains("cancelled"));
+    }
+
+    #[test]
+    fn package_install_and_run_actions_use_the_selected_public_package() {
+        let mut a = app();
+        assert_eq!(a.on_key(Key::Char('i')), None);
+        assert_eq!(a.mode, Mode::InstallPackage);
+        for character in "reviewer|^1.2".chars() {
+            a.on_key(Key::Char(character));
+        }
+        assert_eq!(
+            a.on_key(Key::Enter),
+            Some(UiAction::InstallPackage {
+                name: "reviewer".into(),
+                requirement: "^1.2".into(),
+            })
+        );
+
+        a.installed_packages = vec![
+            dummy_installed_package("reviewer", "1.2.3", "sha256:reviewer"),
+            dummy_installed_package("planner", "2.0.0", "sha256:planner"),
+        ];
+        assert_eq!(a.on_key(Key::Char('}')), None);
+        assert_eq!(a.selected_package, 1);
+        assert_eq!(
+            a.on_key(Key::Char('P')),
+            Some(UiAction::RunInstalledPackage {
+                name: "planner".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn package_mutations_freeze_version_digest_and_require_exact_target() {
+        let mut a = app();
+        a.installed_packages = vec![
+            dummy_installed_package("reviewer", "1.2.3", "sha256:reviewed-artifact"),
+            dummy_installed_package("planner", "2.0.0", "sha256:other-artifact"),
+        ];
+
+        assert_eq!(a.on_key(Key::Char('b')), None);
+        assert_eq!(a.mode, Mode::ConfirmPackageMutation);
+        assert_eq!(
+            a.pending_package_mutation(),
+            Some(("rollback", "reviewer", "1.2.3", "sha256:reviewed-artifact"))
+        );
+        a.selected_package = 1;
+        for character in "2.0.0|planner".chars() {
+            a.on_key(Key::Char(character));
+        }
+        assert_eq!(a.on_key(Key::Enter), None);
+        assert!(a.status.contains("must exactly match 1.2.3|reviewer"));
+        while !a.input.is_empty() {
+            a.on_key(Key::Backspace);
+        }
+        for character in "1.2.3|reviewer".chars() {
+            a.on_key(Key::Char(character));
+        }
+        assert_eq!(
+            a.on_key(Key::Enter),
+            Some(UiAction::RollbackInstalledPackage {
+                name: "reviewer".into(),
+                expected_version: "1.2.3".into(),
+                expected_digest: "sha256:reviewed-artifact".into(),
+            })
+        );
+
+        a.selected_package = 0;
+        assert_eq!(a.on_key(Key::Char('D')), None);
+        assert!(a.status.contains("prevents new package runs"));
+        for character in "1.2.3|reviewer".chars() {
+            a.on_key(Key::Char(character));
+        }
+        assert_eq!(
+            a.on_key(Key::Enter),
+            Some(UiAction::RemoveInstalledPackage {
+                name: "reviewer".into(),
+                expected_version: "1.2.3".into(),
+                expected_digest: "sha256:reviewed-artifact".into(),
+            })
+        );
     }
 }

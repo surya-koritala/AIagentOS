@@ -66,6 +66,12 @@ listing retain their read-only authorization. Fetch creates a new output file
 and refuses to overwrite an existing path. Revocation, yanking, rollback, and
 removal require `--confirm` followed by the exact key, `name@version`, or
 package name so scripts cannot accidentally confirm a different target.
+The focused TUI additionally exposes install/upgrade, run, rollback, and remove
+through `KernelClient`. Its rollback/removal confirmation freezes the displayed
+name, version, and digest. The `rollback_package_exact` and
+`remove_package_exact` operations compare that version and digest inside the
+same immediate SQLite transaction as the mutation; a concurrent upgrade fails
+as stale instead of retargeting the operator's approval.
 
 The desktop service controls are another focused projection of the same
 contract. Start, stop, restart, and bounded transition-history requests pass

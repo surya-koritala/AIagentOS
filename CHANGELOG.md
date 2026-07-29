@@ -10,6 +10,14 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
 
 ## [Unreleased]
 
+- Expanded the protected exact-commit provider-security workflow from a
+  browser-unavailable assertion to a real two-profile Chromium qualification.
+  The lockfile-pinned browser fixture proves cookies do not cross isolated
+  profiles, downloads cannot land, typed secrets do not enter errors, returned
+  URLs omit query secrets, screenshots stay bounded in memory, both browser
+  processes are reaped, and both private profiles are removed. The retained
+  Linux report separately proves the kernel browser provider remains
+  unavailable and does not promote the trusted helper into runtime discovery.
 - Hardened the feature-gated trusted-process HTML and Chromium helpers without
   advertising them as kernel providers. HTML fetches now use strict HTTPS,
   ignore ambient proxies, refuse redirects, cap strict-UTF-8 bodies and output,

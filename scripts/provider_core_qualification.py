@@ -107,15 +107,18 @@ def build_report(
         }
 
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "suite": "agentos-v1-provider-security-core",
         "generated_at": generated_at,
-        "qualification_class": "live_linux_kernel_provider_core",
+        "qualification_class": "live_linux_provider_security_core",
         "production_claim_allowed": False,
         "source": {"commit": commit, "dirty": False},
         "environment": {
             "operating_system": "linux",
-            "provider_path": "kernel-gate-broker-sandbox",
+            "provider_paths": [
+                "kernel-gate-broker-sandbox",
+                "feature-gated-trusted-browser-helper",
+            ],
         },
         "checks": checks,
         "evidence": logs,

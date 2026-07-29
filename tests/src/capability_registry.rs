@@ -449,7 +449,7 @@ fn distributed_consistency_contract_is_published_and_fail_closed() {
 
     for honest_boundary in [
         "There is no replicated log, election, quorum, or automatic authority",
-        "Workload nodes do not enforce that token",
+        "not atomic across databases",
         "not partition tolerant",
         "advertised as a production distributed kernel",
         "every mutable agent operation must be rejected",

@@ -497,21 +497,31 @@ audit entry commit in one immediate SQLite transaction and survive authority
 restart. Clean leave is rejected while the node has an unexpired active lease;
 terminal identity revocation releases all of that member's records atomically.
 
-These operations establish an authoritative monotonic token; they do not yet
-make the workload plane safe. Agent mutation requests do not carry or validate
-the token, and the authority itself is not replicated. Until destination-side
-enforcement and quorum terms exist, the lease registry is not a partition
-fence and must not be used to automate migration.
+Destination nodes persist the highest accepted ownership token and require an
+exact cluster/owner/generation/token envelope for every mutable agent-targeted
+operation. The fenced envelope also supports ordered streams and exact
+cancellation; the destination holds one per-agent admission guard through the
+complete operation. An authenticated authority-discovered `ClusterClient`
+retains its authority connection, claims and installs a fence before publishing
+a newly created route, revalidates authority state before every mutation,
+propagates same-owner renewal generations, and rebuilds only from exact
+authority/fence agreement. Explicit-address clients remain unmanaged for
+compatibility and cannot operate an agent after a fence is installed.
+The initial managed lease is 30 seconds. Long-lived control loops must call
+`ClusterClient::renew_agent_ownership` or
+`ClusterClient::renew_all_agent_ownerships` before expiry; no hidden background
+task masks renewal failures.
 
 This is not yet a consensus or partition-tolerant membership and
 mutation-fencing protocol.
 The designated authority is a single consistency point with no quorum failover;
-there is no ownership fencing token enforced by agent mutations,
-automatic migration, partition fencing, cluster-wide quota transaction,
-policy/package convergence, rolling-upgrade coordinator, or disaster-recovery
-controller. Identity revocation is enforced by discovery, but live TLS client
-certificate rotation/revocation still requires replacing trust configuration
-and restarting affected listeners. Those requirements remain tracked by #122.
+creation/claim/fence publication is not one atomic cross-database transaction,
+and there is no automatic idle lease-renewal task, automatic migration,
+partition-safe quorum authority, cluster-wide quota transaction, policy/package
+convergence, rolling-upgrade coordinator, or disaster-recovery controller.
+Identity revocation is enforced by discovery, but live TLS client certificate
+rotation/revocation still requires replacing trust configuration and restarting
+affected listeners. Those requirements remain tracked by #122.
 The normative object-by-object consistency and failure rules are published in
 [the distributed control-plane contract](DISTRIBUTED_CONTROL_PLANE.md).
 

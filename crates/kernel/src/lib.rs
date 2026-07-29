@@ -1170,7 +1170,7 @@ pub struct AgentKernelImpl {
     /// Request-scoped cancellation handles for public streaming turns. The
     /// agent id is part of the key so tenant authorization happens before a
     /// request can signal another turn.
-    active_requests: DashMap<(AgentId, String), tokio_util::sync::CancellationToken>,
+    active_requests: DashMap<(AgentId, String), ActiveRequestHandle>,
     pub(crate) lifecycle_counters: crate::metrics::LifecycleCounters,
     /// Stable, bounded-cardinality request outcomes and latency. Correlation
     /// identifiers remain in trace spans and never become metric labels.
@@ -1193,6 +1193,19 @@ struct ActiveTurnRegistration<'a> {
     kernel: &'a AgentKernelImpl,
     agent_id: AgentId,
     request_id: Option<String>,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct ActiveRequestFence {
+    pub cluster_id: String,
+    pub owner_node_id: String,
+    pub authority_generation: u64,
+    pub fencing_token: u64,
+}
+
+struct ActiveRequestHandle {
+    cancellation: tokio_util::sync::CancellationToken,
+    fence: Option<ActiveRequestFence>,
 }
 
 impl Drop for ActiveTurnRegistration<'_> {
@@ -4915,7 +4928,8 @@ impl AgentKernelImpl {
         agent_id: AgentId,
         message: &str,
     ) -> Result<AgentOutput, KernelError> {
-        self.send_message_inner(agent_id, message, None, None).await
+        self.send_message_inner(agent_id, message, None, None, None)
+            .await
     }
 
     /// Send a message while publishing bounded execution events and registering
@@ -4928,6 +4942,18 @@ impl AgentKernelImpl {
         request_id: &str,
         events: tokio::sync::mpsc::Sender<crate::execution::StreamEvent>,
     ) -> Result<AgentOutput, KernelError> {
+        self.send_message_stream_with_fence(agent_id, message, request_id, events, None)
+            .await
+    }
+
+    pub(crate) async fn send_message_stream_with_fence(
+        &self,
+        agent_id: AgentId,
+        message: &str,
+        request_id: &str,
+        events: tokio::sync::mpsc::Sender<crate::execution::StreamEvent>,
+        request_fence: Option<ActiveRequestFence>,
+    ) -> Result<AgentOutput, KernelError> {
         if request_id.is_empty() || request_id.len() > 128 {
             return Err(KernelError::Policy(
                 "request id must contain 1..=128 bytes".into(),
@@ -4938,6 +4964,7 @@ impl AgentKernelImpl {
             message,
             Some(request_id.to_string()),
             Some(events),
+            request_fence,
         )
         .await
     }
@@ -4947,10 +4974,30 @@ impl AgentKernelImpl {
     /// ambient cancellation capability.
     pub fn cancel_request(&self, agent_id: AgentId, request_id: &str) -> bool {
         let key = (agent_id, request_id.to_string());
-        let Some(token) = self.active_requests.get(&key) else {
+        let Some(handle) = self.active_requests.get(&key) else {
             return false;
         };
-        token.cancel();
+        if handle.fence.is_some() {
+            return false;
+        }
+        handle.cancellation.cancel();
+        true
+    }
+
+    pub(crate) fn cancel_request_fenced(
+        &self,
+        agent_id: AgentId,
+        request_id: &str,
+        fence: &ActiveRequestFence,
+    ) -> bool {
+        let key = (agent_id, request_id.to_string());
+        let Some(handle) = self.active_requests.get(&key) else {
+            return false;
+        };
+        if handle.fence.as_ref() != Some(fence) {
+            return false;
+        }
+        handle.cancellation.cancel();
         true
     }
 
@@ -4960,6 +5007,7 @@ impl AgentKernelImpl {
         message: &str,
         request_id: Option<String>,
         events: Option<tokio::sync::mpsc::Sender<crate::execution::StreamEvent>>,
+        request_fence: Option<ActiveRequestFence>,
     ) -> Result<AgentOutput, KernelError> {
         // Serialize executor creation against pause/stop/kill and reject work
         // unless the agent is currently runnable.
@@ -5002,8 +5050,13 @@ impl AgentKernelImpl {
                     self.active_cancellations
                         .insert(agent_id, cancellation.clone());
                     if let Some(request_id) = request_id.as_ref() {
-                        self.active_requests
-                            .insert((agent_id, request_id.clone()), cancellation);
+                        self.active_requests.insert(
+                            (agent_id, request_id.clone()),
+                            ActiveRequestHandle {
+                                cancellation,
+                                fence: request_fence.clone(),
+                            },
+                        );
                     }
                     drop(lifecycle_guard);
                     break executor_guard;

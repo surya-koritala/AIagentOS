@@ -4,7 +4,9 @@
 
 use std::sync::Arc;
 
-use agent_sdk::{Agent, KernelClient, MessageStreamEvent, SdkError, WireErrorCode};
+use agent_sdk::{
+    Agent, AgentMutationFenceProof, KernelClient, MessageStreamEvent, SdkError, WireErrorCode,
+};
 use kernel::agent::AgentKernel;
 use kernel::connector::{
     LlmProviderAdapter, LlmRequestOptions, LlmResponse, LlmSession, LlmUsage, ProviderCapabilities,
@@ -285,6 +287,79 @@ async fn message_stream_is_ordered_and_returns_the_terminal_result() {
 }
 
 #[tokio::test]
+async fn fenced_message_stream_is_ordered_and_rejects_the_ordinary_path() {
+    let (addr, _kernel) = spawn_stream_server("stream-fenced", false, 0).await;
+    let mut client = KernelClient::connect(addr).await.expect("connect");
+    let id = client
+        .create_agent(
+            "streaming-fenced",
+            "stream under exact ownership",
+            Some("stream-fenced".into()),
+            None,
+            None,
+        )
+        .await
+        .expect("create agent");
+    let owner_node_id = client
+        .node_info()
+        .await
+        .expect("node info")
+        .control
+        .expect("durable node control")
+        .identity
+        .node_id;
+    let proof = AgentMutationFenceProof {
+        cluster_id: uuid::Uuid::new_v4().to_string(),
+        owner_node_id,
+        authority_generation: 1,
+        fencing_token: 1,
+    };
+    client
+        .install_agent_mutation_fence(
+            &id,
+            &proof.cluster_id,
+            &proof.owner_node_id,
+            proof.authority_generation,
+            proof.fencing_token,
+            "fenced stream test",
+        )
+        .await
+        .expect("install fence");
+
+    assert_eq!(
+        client
+            .send_message_stream("ordinary-fenced", &id, "must reject", |_| {})
+            .await
+            .expect_err("ordinary stream rejected")
+            .wire_code(),
+        Some(WireErrorCode::Conflict)
+    );
+    let mut stale = proof.clone();
+    stale.fencing_token += 1;
+    assert_eq!(
+        client
+            .send_message_stream_fenced("stale-fenced", &id, stale, "must reject", |_| {})
+            .await
+            .expect_err("stale fenced stream rejected")
+            .wire_code(),
+        Some(WireErrorCode::Conflict)
+    );
+    let mut events = Vec::new();
+    let result = client
+        .send_message_stream_fenced("exact-fenced", &id, proof, "allowed", |event| {
+            events.push(event.clone())
+        })
+        .await
+        .expect("exact fenced stream");
+    assert_eq!(result.content, "streamed reply");
+    assert_eq!(events.first(), Some(&MessageStreamEvent::Started));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        MessageStreamEvent::Token { delta } if delta == "streamed reply"
+    )));
+}
+
+#[tokio::test]
 async fn sustained_stream_crosses_bounded_buffers_without_loss_or_reordering() {
     const EVENT_COUNT: usize = 10_000;
     let (addr, _kernel) = spawn_stream_server("stream-soak", false, EVENT_COUNT).await;
@@ -374,6 +449,97 @@ async fn second_authenticated_connection_cancels_one_exact_stream_request() {
         .cancel_request("request-cancel", &id)
         .await
         .expect("completed request is no longer active"));
+    assert_eq!(
+        kernel
+            .get_agent_status(id.parse().expect("agent id"))
+            .expect("agent state"),
+        kernel::AgentState::Running
+    );
+}
+
+#[tokio::test]
+async fn exact_fence_is_required_to_cancel_a_fenced_stream() {
+    let (addr, kernel) = spawn_stream_server("stream-fenced-cancel", true, 0).await;
+    let mut stream_client = KernelClient::connect(addr).await.expect("stream connect");
+    let mut control_client = KernelClient::connect(addr).await.expect("control connect");
+    let id = stream_client
+        .create_agent(
+            "cancel-fenced-stream",
+            "wait for fenced cancellation",
+            Some("stream-fenced-cancel".into()),
+            None,
+            None,
+        )
+        .await
+        .expect("create agent");
+    let owner_node_id = stream_client
+        .node_info()
+        .await
+        .expect("node info")
+        .control
+        .expect("durable node control")
+        .identity
+        .node_id;
+    let proof = AgentMutationFenceProof {
+        cluster_id: uuid::Uuid::new_v4().to_string(),
+        owner_node_id,
+        authority_generation: 1,
+        fencing_token: 1,
+    };
+    stream_client
+        .install_agent_mutation_fence(
+            &id,
+            &proof.cluster_id,
+            &proof.owner_node_id,
+            proof.authority_generation,
+            proof.fencing_token,
+            "fenced cancellation test",
+        )
+        .await
+        .expect("install fence");
+
+    let (started_tx, mut started_rx) = tokio::sync::mpsc::unbounded_channel();
+    let stream_agent = id.clone();
+    let stream_proof = proof.clone();
+    let stream = tokio::spawn(async move {
+        stream_client
+            .send_message_stream_fenced(
+                "request-fenced-cancel",
+                stream_agent,
+                stream_proof,
+                "block until cancelled",
+                |event| {
+                    if matches!(event, MessageStreamEvent::Started) {
+                        let _ = started_tx.send(());
+                    }
+                },
+            )
+            .await
+    });
+
+    tokio::time::timeout(std::time::Duration::from_secs(2), started_rx.recv())
+        .await
+        .expect("started event timeout")
+        .expect("started event channel");
+    assert_eq!(
+        control_client
+            .cancel_request("request-fenced-cancel", &id)
+            .await
+            .expect_err("ordinary cancellation is fenced")
+            .wire_code(),
+        Some(WireErrorCode::Conflict)
+    );
+    assert!(control_client
+        .cancel_request_fenced("request-fenced-cancel", &id, proof)
+        .await
+        .expect("exact fenced cancellation"));
+
+    let error = tokio::time::timeout(std::time::Duration::from_secs(2), stream)
+        .await
+        .expect("stream cancellation timeout")
+        .expect("stream task")
+        .expect_err("cancelled stream must fail");
+    assert_eq!(error.wire_code(), Some(WireErrorCode::Cancelled));
     assert_eq!(
         kernel
             .get_agent_status(id.parse().expect("agent id"))

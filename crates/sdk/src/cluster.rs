@@ -16,10 +16,16 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::{
-    AgentSummary, ClusterMember, ClusterMemberRegistration, ClusterMemberState,
-    ClusterMembershipSnapshot, KernelClient, MessageResult, MessageStreamEvent, NodeAvailability,
-    NodeLoad, SdkError, WireErrorCode,
+    AgentMutationFence, AgentMutationFenceProof, AgentMutationFenceState, AgentSummary,
+    ClusterAgentOwnership, ClusterMember, ClusterMemberRegistration, ClusterMemberState,
+    ClusterMembershipSnapshot, ClusterOwnershipState, KernelClient, MessageResult,
+    MessageStreamEvent, NodeAvailability, NodeLoad, SdkError, WireErrorCode,
 };
+
+/// Initial authority lease used when a discovered cluster places an agent.
+///
+/// Long-lived clients must renew before this authority-clock deadline.
+pub const DEFAULT_OWNERSHIP_LEASE_SECONDS: u64 = 30;
 
 /// One kernel node in the cluster: its stable id, transport address, and client.
 pub struct NodeHandle {
@@ -84,6 +90,16 @@ pub struct ClusterClient {
     rr: usize,
     /// agent id → index into `nodes` (the node that owns the agent).
     owners: HashMap<String, usize>,
+    /// Exact authority proof published for each managed route.
+    ownership_proofs: HashMap<String, AgentMutationFenceProof>,
+    /// Retained only by authority-discovered clients. Explicit-address clients
+    /// remain legacy unmanaged clients and never manufacture authority state.
+    authority: Option<ClusterAuthority>,
+}
+
+struct ClusterAuthority {
+    client: KernelClient,
+    cluster_id: String,
 }
 
 impl ClusterClient {
@@ -200,10 +216,15 @@ impl ClusterClient {
         authority.authenticate(&token).await?;
         let snapshot = authority.cluster_membership().await?;
         let addrs = active_member_endpoints(&snapshot)?;
-        let cluster = Self::connect_authenticated(&addrs, token).await?;
+        let mut cluster = Self::connect_authenticated(&addrs, token).await?;
         cluster.validate_membership(&snapshot)?;
         let confirmed = authority.cluster_membership().await?;
         ensure_unchanged_membership(&snapshot, &confirmed)?;
+        cluster.authority = Some(ClusterAuthority {
+            client: authority,
+            cluster_id: confirmed.cluster_id,
+        });
+        cluster.rebuild_owners().await?;
         Ok(cluster)
     }
 
@@ -222,10 +243,16 @@ impl ClusterClient {
         authority.authenticate(&token).await?;
         let snapshot = authority.cluster_membership().await?;
         let addrs = active_member_endpoints(&snapshot)?;
-        let cluster = Self::connect_tls_authenticated(&addrs, server_name, config, token).await?;
+        let mut cluster =
+            Self::connect_tls_authenticated(&addrs, server_name, config, token).await?;
         cluster.validate_membership(&snapshot)?;
         let confirmed = authority.cluster_membership().await?;
         ensure_unchanged_membership(&snapshot, &confirmed)?;
+        cluster.authority = Some(ClusterAuthority {
+            client: authority,
+            cluster_id: confirmed.cluster_id,
+        });
+        cluster.rebuild_owners().await?;
         Ok(cluster)
     }
 
@@ -316,6 +343,8 @@ impl ClusterClient {
             nodes,
             rr: 0,
             owners: HashMap::new(),
+            ownership_proofs: HashMap::new(),
+            authority: None,
         };
         cluster.rebuild_owners().await?;
         Ok(cluster)
@@ -324,6 +353,12 @@ impl ClusterClient {
     /// Number of nodes in the cluster.
     pub fn node_count(&self) -> usize {
         self.nodes.len()
+    }
+
+    /// Whether this client retains a designated authority and therefore
+    /// publishes and enforces exact ownership-fenced routes.
+    pub fn is_authority_managed(&self) -> bool {
+        self.authority.is_some()
     }
 
     /// The node ids (dialed addresses).
@@ -414,6 +449,40 @@ impl ClusterClient {
             .client
             .create_agent(name, task, provider, profile, priority)
             .await?;
+        if let Some(authority) = self.authority.as_mut() {
+            let ownership = authority
+                .client
+                .claim_cluster_agent_ownership(
+                    &agent_id,
+                    &node_id,
+                    DEFAULT_OWNERSHIP_LEASE_SECONDS,
+                    None,
+                    "cluster client placement",
+                )
+                .await
+                .map_err(|source| {
+                    route_publication_error(&agent_id, "authority ownership claim", source)
+                })?;
+            let proof = ownership_proof(&authority.cluster_id, &ownership);
+            let fence = self.nodes[idx]
+                .client
+                .install_agent_mutation_fence(
+                    &agent_id,
+                    &proof.cluster_id,
+                    &proof.owner_node_id,
+                    proof.authority_generation,
+                    proof.fencing_token,
+                    "cluster client route publication",
+                )
+                .await
+                .map_err(|source| {
+                    route_publication_error(&agent_id, "destination fence installation", source)
+                })?;
+            validate_destination_fence(&agent_id, &proof, &fence).map_err(|source| {
+                route_publication_error(&agent_id, "destination fence verification", source)
+            })?;
+            self.ownership_proofs.insert(agent_id.clone(), proof);
+        }
         self.owners.insert(agent_id.clone(), idx);
         Ok(PlacedAgent { agent_id, node_id })
     }
@@ -428,6 +497,11 @@ impl ClusterClient {
     /// Rebuild routing from durable node state. Duplicate agent ownership is a
     /// split-brain conflict and fails closed instead of selecting one owner.
     pub async fn rebuild_owners(&mut self) -> Result<(), SdkError> {
+        // Invalidate the published directory before any fallible read. A
+        // caller that observes an error cannot keep using a previously valid
+        // route after ownership or destination evidence changed.
+        self.owners.clear();
+        self.ownership_proofs.clear();
         let mut rebuilt: HashMap<String, usize> = HashMap::new();
         for index in 0..self.nodes.len() {
             let agents = self.nodes[index].client.list_agents().await?;
@@ -444,7 +518,31 @@ impl ClusterClient {
                 }
             }
         }
+        let mut rebuilt_proofs = HashMap::new();
+        if let Some(authority) = self.authority.as_mut() {
+            for (agent_id, index) in &rebuilt {
+                let ownership = authority
+                    .client
+                    .active_cluster_agent_ownership(agent_id)
+                    .await?;
+                validate_active_ownership(agent_id, &self.nodes[*index].id, &ownership)?;
+                let proof = ownership_proof(&authority.cluster_id, &ownership);
+                let fence = self.nodes[*index]
+                    .client
+                    .agent_mutation_fence(agent_id)
+                    .await?
+                    .ok_or_else(|| {
+                        route_conflict(format!(
+                            "destination {} has no mutation fence for agent {agent_id}",
+                            self.nodes[*index].id
+                        ))
+                    })?;
+                validate_destination_fence(agent_id, &proof, &fence)?;
+                rebuilt_proofs.insert(agent_id.clone(), proof);
+            }
+        }
         self.owners = rebuilt;
+        self.ownership_proofs = rebuilt_proofs;
         Ok(())
     }
 
@@ -457,6 +555,144 @@ impl ClusterClient {
         }
     }
 
+    async fn current_mutation_proof(
+        &mut self,
+        agent_id: &str,
+    ) -> Result<Option<AgentMutationFenceProof>, SdkError> {
+        let result = self.validated_mutation_proof(agent_id).await;
+        if result.is_err() {
+            self.owners.remove(agent_id);
+            self.ownership_proofs.remove(agent_id);
+        }
+        result
+    }
+
+    async fn validated_mutation_proof(
+        &mut self,
+        agent_id: &str,
+    ) -> Result<Option<AgentMutationFenceProof>, SdkError> {
+        let idx = self.owner_index(agent_id)?;
+        let Some(authority) = self.authority.as_mut() else {
+            return Ok(None);
+        };
+        let ownership = authority
+            .client
+            .active_cluster_agent_ownership(agent_id)
+            .await?;
+        validate_active_ownership(agent_id, &self.nodes[idx].id, &ownership)?;
+        let proof = ownership_proof(&authority.cluster_id, &ownership);
+        let current_fence = self.nodes[idx]
+            .client
+            .agent_mutation_fence(agent_id)
+            .await?;
+        match current_fence {
+            Some(fence) if destination_fence_matches(agent_id, &proof, &fence) => {}
+            Some(fence)
+                if fence.fencing_token > proof.fencing_token
+                    || (fence.fencing_token == proof.fencing_token
+                        && fence.authority_generation > proof.authority_generation) =>
+            {
+                return Err(route_conflict(format!(
+                    "destination {} has newer ownership evidence for agent {agent_id}",
+                    self.nodes[idx].id
+                )));
+            }
+            _ => {
+                let installed = self.nodes[idx]
+                    .client
+                    .install_agent_mutation_fence(
+                        agent_id,
+                        &proof.cluster_id,
+                        &proof.owner_node_id,
+                        proof.authority_generation,
+                        proof.fencing_token,
+                        "cluster client route refresh",
+                    )
+                    .await?;
+                validate_destination_fence(agent_id, &proof, &installed)?;
+            }
+        }
+        self.ownership_proofs
+            .insert(agent_id.to_string(), proof.clone());
+        Ok(Some(proof))
+    }
+
+    /// Renew one managed route's exact ownership lease and publish the renewed
+    /// authority generation to its destination before returning.
+    pub async fn renew_agent_ownership(
+        &mut self,
+        agent_id: &str,
+        ttl_seconds: u64,
+    ) -> Result<(), SdkError> {
+        let idx = self.owner_index(agent_id)?;
+        let existing = self
+            .current_mutation_proof(agent_id)
+            .await?
+            .ok_or_else(|| {
+                SdkError::Configuration(
+                    "ownership renewal requires an authority-discovered cluster".into(),
+                )
+            })?;
+        let authority = self
+            .authority
+            .as_mut()
+            .expect("managed proof requires retained authority");
+        let ownership = authority
+            .client
+            .renew_cluster_agent_ownership(
+                agent_id,
+                &self.nodes[idx].id,
+                existing.fencing_token,
+                ttl_seconds,
+                "cluster client lease renewal",
+            )
+            .await
+            .map_err(|source| {
+                route_publication_error(agent_id, "authority ownership renewal", source)
+            })?;
+        validate_active_ownership(agent_id, &self.nodes[idx].id, &ownership)?;
+        let proof = ownership_proof(&authority.cluster_id, &ownership);
+        let fence = self.nodes[idx]
+            .client
+            .install_agent_mutation_fence(
+                agent_id,
+                &proof.cluster_id,
+                &proof.owner_node_id,
+                proof.authority_generation,
+                proof.fencing_token,
+                "cluster client lease renewal",
+            )
+            .await
+            .map_err(|source| {
+                route_publication_error(agent_id, "renewed destination fence installation", source)
+            })?;
+        validate_destination_fence(agent_id, &proof, &fence).map_err(|source| {
+            route_publication_error(agent_id, "renewed destination fence verification", source)
+        })?;
+        self.ownership_proofs.insert(agent_id.to_string(), proof);
+        Ok(())
+    }
+
+    /// Renew and republish every currently routed managed agent.
+    ///
+    /// This is explicit rather than a hidden background task: callers choose
+    /// their scheduling and failure policy, and any first failure is surfaced.
+    pub async fn renew_all_agent_ownerships(
+        &mut self,
+        ttl_seconds: u64,
+    ) -> Result<usize, SdkError> {
+        if self.authority.is_none() {
+            return Err(SdkError::Configuration(
+                "ownership renewal requires an authority-discovered cluster".into(),
+            ));
+        }
+        let agent_ids: Vec<String> = self.owners.keys().cloned().collect();
+        for agent_id in &agent_ids {
+            self.renew_agent_ownership(agent_id, ttl_seconds).await?;
+        }
+        Ok(agent_ids.len())
+    }
+
     /// Drive one turn for an agent, routed to its owning node.
     pub async fn send_message(
         &mut self,
@@ -464,7 +700,15 @@ impl ClusterClient {
         message: impl Into<String>,
     ) -> Result<MessageResult, SdkError> {
         let idx = self.owner_index(agent_id)?;
-        self.nodes[idx].client.send_message(agent_id, message).await
+        match self.current_mutation_proof(agent_id).await? {
+            Some(proof) => {
+                self.nodes[idx]
+                    .client
+                    .send_message_fenced(agent_id, proof, message)
+                    .await
+            }
+            None => self.nodes[idx].client.send_message(agent_id, message).await,
+        }
     }
 
     /// Drive one streamed turn on the agent's owning node.
@@ -479,10 +723,20 @@ impl ClusterClient {
         F: FnMut(&MessageStreamEvent),
     {
         let idx = self.owner_index(agent_id)?;
-        self.nodes[idx]
-            .client
-            .send_message_stream(request_id, agent_id, message, on_event)
-            .await
+        match self.current_mutation_proof(agent_id).await? {
+            Some(proof) => {
+                self.nodes[idx]
+                    .client
+                    .send_message_stream_fenced(request_id, agent_id, proof, message, on_event)
+                    .await
+            }
+            None => {
+                self.nodes[idx]
+                    .client
+                    .send_message_stream(request_id, agent_id, message, on_event)
+                    .await
+            }
+        }
     }
 
     /// Cancel one exact active stream on the agent's owning node.
@@ -497,10 +751,20 @@ impl ClusterClient {
         agent_id: &str,
     ) -> Result<bool, SdkError> {
         let idx = self.owner_index(agent_id)?;
-        self.nodes[idx]
-            .client
-            .cancel_request(request_id, agent_id)
-            .await
+        match self.current_mutation_proof(agent_id).await? {
+            Some(proof) => {
+                self.nodes[idx]
+                    .client
+                    .cancel_request_fenced(request_id, agent_id, proof)
+                    .await
+            }
+            None => {
+                self.nodes[idx]
+                    .client
+                    .cancel_request(request_id, agent_id)
+                    .await
+            }
+        }
     }
 
     /// Invoke a tool as an agent, routed to its owning node (gate-enforced there).
@@ -511,7 +775,15 @@ impl ClusterClient {
         args: serde_json::Value,
     ) -> Result<serde_json::Value, SdkError> {
         let idx = self.owner_index(agent_id)?;
-        self.nodes[idx].client.call_tool(agent_id, tool, args).await
+        match self.current_mutation_proof(agent_id).await? {
+            Some(proof) => {
+                self.nodes[idx]
+                    .client
+                    .call_tool_fenced(agent_id, proof, tool, args)
+                    .await
+            }
+            None => self.nodes[idx].client.call_tool(agent_id, tool, args).await,
+        }
     }
 
     /// List agents across the whole cluster, each tagged with its node id.
@@ -612,6 +884,70 @@ fn membership_conflict(message: impl Into<String>, retryable: bool) -> SdkError 
         code: WireErrorCode::Conflict,
         message: message.into(),
         retryable,
+    }
+}
+
+fn route_conflict(message: impl Into<String>) -> SdkError {
+    membership_conflict(message, true)
+}
+
+fn route_publication_error(agent_id: &str, stage: &'static str, source: SdkError) -> SdkError {
+    SdkError::ClusterRoutePublication {
+        agent_id: agent_id.to_string(),
+        stage,
+        source: Box::new(source),
+    }
+}
+
+fn validate_active_ownership(
+    agent_id: &str,
+    expected_owner: &str,
+    ownership: &ClusterAgentOwnership,
+) -> Result<(), SdkError> {
+    if ownership.agent_id != agent_id
+        || ownership.owner_node_id != expected_owner
+        || ownership.state != ClusterOwnershipState::Active
+    {
+        return Err(route_conflict(format!(
+            "authority ownership for agent {agent_id} does not match routed node {expected_owner}"
+        )));
+    }
+    Ok(())
+}
+
+fn ownership_proof(cluster_id: &str, ownership: &ClusterAgentOwnership) -> AgentMutationFenceProof {
+    AgentMutationFenceProof {
+        cluster_id: cluster_id.to_string(),
+        owner_node_id: ownership.owner_node_id.clone(),
+        authority_generation: ownership.generation,
+        fencing_token: ownership.fencing_token,
+    }
+}
+
+fn destination_fence_matches(
+    agent_id: &str,
+    proof: &AgentMutationFenceProof,
+    fence: &AgentMutationFence,
+) -> bool {
+    fence.agent_id == agent_id
+        && fence.cluster_id == proof.cluster_id
+        && fence.owner_node_id == proof.owner_node_id
+        && fence.authority_generation == proof.authority_generation
+        && fence.fencing_token == proof.fencing_token
+        && fence.state == AgentMutationFenceState::Active
+}
+
+fn validate_destination_fence(
+    agent_id: &str,
+    proof: &AgentMutationFenceProof,
+    fence: &AgentMutationFence,
+) -> Result<(), SdkError> {
+    if destination_fence_matches(agent_id, proof, fence) {
+        Ok(())
+    } else {
+        Err(route_conflict(format!(
+            "destination mutation fence does not match authority ownership for agent {agent_id}"
+        )))
     }
 }
 

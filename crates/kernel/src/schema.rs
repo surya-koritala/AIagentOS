@@ -12,7 +12,7 @@ use crate::ContextError;
 /// ASCII `AIOS`, registered on every database owned by this kernel.
 pub(crate) const APPLICATION_ID: i64 = 0x4149_4f53;
 /// Latest schema this binary can read and write.
-pub(crate) const CURRENT_SCHEMA_VERSION: i64 = 4;
+pub(crate) const CURRENT_SCHEMA_VERSION: i64 = 5;
 const MIN_READABLE_SCHEMA_VERSION: i64 = 1;
 
 const MIGRATIONS: &[(i64, &str)] = &[
@@ -20,6 +20,7 @@ const MIGRATIONS: &[(i64, &str)] = &[
     (2, "add-privacy-safe-deletion-receipts"),
     (3, "authenticate-usage-and-quota-accounting"),
     (4, "add-cluster-agent-ownership-authority"),
+    (5, "add-destination-agent-mutation-fences"),
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -75,6 +76,8 @@ const REQUIRED_TABLES: &[&str] = &[
     "cluster_membership_audit",
     "cluster_agent_ownership",
     "cluster_agent_ownership_audit",
+    "cluster_agent_mutation_fences",
+    "cluster_agent_mutation_fence_audit",
     "deletion_receipts",
 ];
 

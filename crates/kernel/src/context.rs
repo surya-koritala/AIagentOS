@@ -1872,6 +1872,28 @@ impl SqliteContextManager {
                 reason TEXT NOT NULL,
                 changed_at TEXT NOT NULL,
                 PRIMARY KEY (agent_id, generation)
+            ) WITHOUT ROWID;
+            CREATE TABLE IF NOT EXISTS cluster_agent_mutation_fences (
+                agent_id TEXT PRIMARY KEY CHECK (length(agent_id) = 36),
+                cluster_id TEXT NOT NULL CHECK (length(cluster_id) = 36),
+                owner_node_id TEXT NOT NULL CHECK (length(owner_node_id) = 36),
+                authority_generation INTEGER NOT NULL CHECK (authority_generation >= 1),
+                fencing_token INTEGER NOT NULL CHECK (fencing_token >= 1),
+                state TEXT NOT NULL CHECK (state IN ('active', 'retired')),
+                installed_at TEXT NOT NULL,
+                reason TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS cluster_agent_mutation_fence_audit (
+                agent_id TEXT NOT NULL CHECK (length(agent_id) = 36),
+                fencing_token INTEGER NOT NULL CHECK (fencing_token >= 1),
+                cluster_id TEXT NOT NULL CHECK (length(cluster_id) = 36),
+                owner_node_id TEXT NOT NULL CHECK (length(owner_node_id) = 36),
+                authority_generation INTEGER NOT NULL CHECK (authority_generation >= 1),
+                state TEXT NOT NULL CHECK (state IN ('active', 'retired')),
+                actor TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                changed_at TEXT NOT NULL,
+                PRIMARY KEY (agent_id, fencing_token, state, authority_generation)
             ) WITHOUT ROWID;",
         ).map_err(|e| ContextError::StorageError(e.to_string()))?;
         // Legacy fact rows are deliberately marked stale and rebuilt on their
@@ -10642,7 +10664,7 @@ mod tests {
                 crate::schema::CURRENT_SCHEMA_VERSION,
                 "fresh stores record every released schema transition"
             );
-            assert_eq!(cluster_table_count, 9);
+            assert_eq!(cluster_table_count, 11);
         }
 
         let reopened = SqliteContextManager::new(&database.path).unwrap();

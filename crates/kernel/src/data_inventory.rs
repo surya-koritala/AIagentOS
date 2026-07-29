@@ -492,6 +492,24 @@ pub const SQLITE_DATA_INVENTORY: &[StaticDataInventoryEntry] = &[
         "retain"
     ),
     sqlite_entry!(
+        "cluster_agent_mutation_fences",
+        "system",
+        "agent UUID and durable node UUID",
+        "destination-enforced highest accepted ownership token and retirement tombstone",
+        "for cluster lifetime",
+        "not confidential; database integrity and file permissions",
+        "retain fencing tombstone until cluster retirement"
+    ),
+    sqlite_entry!(
+        "cluster_agent_mutation_fence_audit",
+        "system",
+        "agent UUID and durable node UUID",
+        "destination fence installation and retirement audit metadata",
+        "indefinite until an explicit audit-retention policy",
+        "not confidential; database integrity and file permissions",
+        "retain"
+    ),
+    sqlite_entry!(
         "storage_meta",
         "system",
         "none",

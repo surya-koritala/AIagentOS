@@ -10,6 +10,19 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
 
 ## [Unreleased]
 
+- Hardened the feature-gated trusted-process HTML and Chromium helpers without
+  advertising them as kernel providers. HTML fetches now use strict HTTPS,
+  ignore ambient proxies, refuse redirects, cap strict-UTF-8 bodies and output,
+  bound extracted fields, and redact returned source URLs. Each Chromium launch
+  uses a unique owner-only profile, denies downloads through CDP, applies fixed
+  launch and operation deadlines, returns bounded in-memory screenshots, strips
+  sensitive URL components, and explicitly reaps the process and profile.
+  Focused regressions cover bounds, redaction, redirects, invalid/oversized
+  responses, private unique profiles, and cleanup; an opt-in real Chromium
+  fixture also proves download denial and profile removal. These trusted helpers
+  remain Experimental: the unavailable kernel browser provider, agent egress and
+  authorization boundary, supported-platform live matrix, and independent
+  review remain open under #124/#127.
 - Added signed-package install/upgrade, run, rollback, removal, and honest
   installed-state projection to the desktop Operations view over `KernelClient`.
   Rollback and removal freeze the displayed package name, version, digest, and

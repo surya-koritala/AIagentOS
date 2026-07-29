@@ -405,6 +405,64 @@ fn provider_matrix_names_every_resource_provider_status_and_platform_contract() 
 }
 
 #[test]
+fn trusted_browser_helpers_remain_isolated_bounded_and_outside_runtime_discovery() {
+    let automation = read_workspace_file("crates/resources/src/playwright.rs");
+    for contract in [
+        ".respect_https_errors()",
+        ".user_data_dir(profile.path())",
+        "SetDownloadBehaviorBehavior::Deny",
+        "browser.wait()",
+        "profile.close()",
+        "MAX_SCREENSHOT_BYTES",
+        "MAX_INPUT_BYTES",
+        "browser URL is invalid or too large",
+        "live_browser_denies_downloads_and_removes_its_isolated_profile",
+    ] {
+        assert!(
+            automation.contains(contract),
+            "trusted Chromium helper lost security contract {contract:?}"
+        );
+    }
+
+    let html = read_workspace_file("crates/resources/src/browser.rs");
+    for contract in [
+        ".no_proxy()",
+        ".redirect(reqwest::redirect::Policy::none())",
+        "MAX_HTML_BYTES",
+        "MAX_CONTENT_CHARS",
+        "String::from_utf8(bytes)",
+        "project_document_link",
+        "trusted_web_fetch_is_bounded_strict_and_does_not_follow_redirects",
+    ] {
+        assert!(
+            html.contains(contract),
+            "trusted HTML helper lost security contract {contract:?}"
+        );
+    }
+
+    let matrix = read_workspace_file("docs/PROVIDER_MATRIX.md");
+    let helper_row = matrix
+        .lines()
+        .find(|line| line.contains("Feature-gated HTML/playwright helpers"))
+        .expect("provider matrix must retain the trusted helper row");
+    assert!(helper_row.contains("**Experimental**"));
+    assert!(helper_row.contains("Trusted operator process"));
+    assert!(helper_row.contains("not `ResourceProvider` implementations"));
+
+    let browser_row = matrix
+        .lines()
+        .find(|line| line.contains("Kernel browser provider"))
+        .expect("provider matrix must retain the kernel browser row");
+    assert!(browser_row.contains("Experimental — unavailable"));
+    assert!(browser_row.contains("None — unavailable"));
+    assert!(
+        !read_workspace_file("crates/kernel/src/lib.rs")
+            .contains("register_provider(ResourceType::Browser"),
+        "trusted helper work must not silently publish an unqualified kernel browser provider"
+    );
+}
+
+#[test]
 fn false_production_claim_is_rejected() {
     let root = workspace_root();
     let false_claim = Capability {

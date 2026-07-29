@@ -10,6 +10,12 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
 
 ## [Unreleased]
 
+- Added focused operator-tunable control to the TUI over the public
+  `KernelClient` boundary. Operators can select a live tunable, submit a value
+  only within its advertised bounds using the frozen expected revision, load
+  bounded audit history, and roll back only after entering the older revision
+  plus the exact frozen tunable name. Real loopback coverage proves successful
+  update/audit/rollback, stale-revision refusal, and snapshot projection.
 - Added frozen exact-name confirmation to TUI service stop and restart. The
   confirmation identifies the selected service and current owner, discloses
   dependent-service or in-flight-work impact, ignores later selection changes,

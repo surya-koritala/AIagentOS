@@ -554,6 +554,11 @@ fn high_risk_client_actions_keep_target_bound_confirmation() {
         "self.pending_kill = Some((agent.id.clone(), agent.name.clone()))",
         "will be force-stopped",
         "self.pending_kill.take()",
+        "Mode::ConfirmServiceControl",
+        "self.pending_service_control = Some(PendingServiceControl",
+        "confirmation must exactly match",
+        "may block dependent services",
+        "can interrupt in-flight work",
     ] {
         assert!(
             tui.contains(contract),

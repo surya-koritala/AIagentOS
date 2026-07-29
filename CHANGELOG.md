@@ -10,6 +10,10 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
 
 ## [Unreleased]
 
+- Added frozen exact-name confirmation to TUI service stop and restart. The
+  confirmation identifies the selected service and current owner, discloses
+  dependent-service or in-flight-work impact, ignores later selection changes,
+  and remains cancellable before the public SDK mutation is submitted.
 - Added desktop service supervision over the authenticated public SDK/wire
   boundary. Operators can start inactive services, inspect bounded transition
   history, and stop or restart a frozen service target only after typing its

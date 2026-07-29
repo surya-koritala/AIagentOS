@@ -12,7 +12,8 @@
 //!
 //! Keys: `j`/`k` (or arrows) move · `r` refresh · `c` create (`name|task`) ·
 //! `m` message · `p` pause/resume · `s` stop · `X` kill · `[`/`]` select
-//! service · `u` start · `d` stop · `R` restart · `L` reload · `q` quit.
+//! service · `u` start · `d` stop with exact-name confirmation · `R` restart
+//! with exact-name confirmation · `L` reload · `q` quit.
 
 use std::io;
 use std::time::Duration;
@@ -557,6 +558,22 @@ fn render_footer(f: &mut Frame, area: Rect, app: &App) {
                     Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
                 ),
                 Span::raw(format!("{name} ({agent_id}) · X confirm · Esc cancel")),
+            ])
+        }
+        Mode::ConfirmServiceControl => {
+            let (action, name, agent_id) =
+                app.pending_service_control()
+                    .unwrap_or(("control", "missing target", None));
+            Line::from(vec![
+                Span::styled(
+                    format!("CONFIRM SERVICE {} ", action.to_uppercase()),
+                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(format!(
+                    "{name} (owner {}) · exact name> {}▏ · Enter confirm · Esc cancel",
+                    agent_id.unwrap_or("none"),
+                    app.input
+                )),
             ])
         }
     };

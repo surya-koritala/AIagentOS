@@ -1955,8 +1955,10 @@ impl KernelClient {
         agent_id: impl Into<String>,
         cluster_id: impl Into<String>,
         owner_node_id: impl Into<String>,
+        authority_term: u64,
         authority_generation: u64,
         fencing_token: u64,
+        proof_expires_at: chrono::DateTime<chrono::Utc>,
         reason: impl Into<String>,
     ) -> Result<AgentMutationFence, SdkError> {
         match self
@@ -1964,8 +1966,10 @@ impl KernelClient {
                 agent_id: agent_id.into(),
                 cluster_id: cluster_id.into(),
                 owner_node_id: owner_node_id.into(),
+                authority_term,
                 authority_generation,
                 fencing_token,
+                proof_expires_at,
                 reason: reason.into(),
             })
             .await?
@@ -1981,8 +1985,10 @@ impl KernelClient {
         agent_id: impl Into<String>,
         cluster_id: impl Into<String>,
         owner_node_id: impl Into<String>,
+        authority_term: u64,
         authority_generation: u64,
         fencing_token: u64,
+        proof_expires_at: chrono::DateTime<chrono::Utc>,
         reason: impl Into<String>,
     ) -> Result<AgentMutationFence, SdkError> {
         match self
@@ -1990,8 +1996,10 @@ impl KernelClient {
                 agent_id: agent_id.into(),
                 cluster_id: cluster_id.into(),
                 owner_node_id: owner_node_id.into(),
+                authority_term,
                 authority_generation,
                 fencing_token,
+                proof_expires_at,
                 reason: reason.into(),
             })
             .await?
@@ -3475,8 +3483,10 @@ mod protocol_tests {
                 &agent_id,
                 &challenge.cluster_id,
                 &identity.node_id,
+                renewed.authority_term,
                 renewed.generation,
                 renewed.fencing_token,
+                renewed.lease_expires_at,
                 "destination admission",
             )
             .await
@@ -3489,8 +3499,10 @@ mod protocol_tests {
         let proof = AgentMutationFenceProof {
             cluster_id: challenge.cluster_id.clone(),
             owner_node_id: identity.node_id.clone(),
+            authority_term: renewed.authority_term,
             authority_generation: renewed.generation,
             fencing_token: renewed.fencing_token,
+            proof_expires_at: renewed.lease_expires_at,
         };
         assert_eq!(
             client.pause_agent(&agent_id).await.unwrap_err().wire_code(),
@@ -3529,8 +3541,10 @@ mod protocol_tests {
                 &agent_id,
                 &challenge.cluster_id,
                 &identity.node_id,
+                renewed.authority_term,
                 renewed.generation,
                 renewed.fencing_token,
+                renewed.lease_expires_at,
                 "destination drained",
             )
             .await

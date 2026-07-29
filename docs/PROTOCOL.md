@@ -560,11 +560,16 @@ exact same logical operation. The durable receipt map is bounded and fails
 closed at capacity; receipt compaction and its long-term retry window remain
 part of #122.
 
-Destination nodes persist the highest accepted ownership token and require an
-exact cluster/owner/generation/token envelope for every mutable agent-targeted
-operation. The fenced envelope also supports ordered streams and exact
-cancellation; the destination holds one per-agent admission guard through the
-complete operation. An authenticated authority-discovered `ClusterClient`
+Destination nodes persist the highest accepted ownership term/token and require
+an exact cluster/owner/term/generation/token/expiry envelope for every mutable
+agent-targeted operation. A proof must be unexpired, cannot extend beyond the
+five-minute authority lease plus 30 seconds of destination clock skew, and
+stops admitting new work at its exact expiry. A clock rollback behind fence
+installation fails closed. The fenced envelope also supports ordered streams
+and exact cancellation; the destination holds one per-agent admission guard
+through the complete operation. Work admitted before expiry may finish under
+that guard; expiry is not a side-effect rollback mechanism. An authenticated
+authority-discovered `ClusterClient`
 retains its authority connection, reserves an agent UUID, preinstalls its exact
 fence, creates that UUID only while the proof remains active, and then
 publishes the route. It revalidates authority state before every mutation,
@@ -597,9 +602,10 @@ read/write forwarding, majority failover, restart recovery, and no-quorum
 rejection. With `[cluster_raft]` disabled, the designated single-node
 authority remains available for compatibility.
 
-The OpenRaft voter map is static, destination proofs do not yet contain an
-independently verifiable authority term/expiry, and
-creation/claim/fence publication is not one atomic cross-database transaction.
+The OpenRaft voter map is static, destination proof installation is an
+authenticated system control operation rather than a self-contained authority
+signature, and creation/claim/fence publication is not one atomic
+cross-database transaction.
 There is no automatic migration, cluster-wide quota transaction,
 policy/package convergence, rolling-upgrade coordinator, or
 disaster-recovery controller.

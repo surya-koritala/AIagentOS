@@ -24,6 +24,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 #[cfg(test)]
 use tokio::io::AsyncBufReadExt;
@@ -232,8 +233,10 @@ pub enum DataErasureTarget {
 pub struct AgentMutationFenceProof {
     pub cluster_id: String,
     pub owner_node_id: String,
+    pub authority_term: u64,
     pub authority_generation: u64,
     pub fencing_token: u64,
+    pub proof_expires_at: DateTime<Utc>,
 }
 
 /// A syscall request from an agent / SDK to the kernel.
@@ -675,8 +678,10 @@ pub enum Syscall {
         agent_id: String,
         cluster_id: String,
         owner_node_id: String,
+        authority_term: u64,
         authority_generation: u64,
         fencing_token: u64,
+        proof_expires_at: DateTime<Utc>,
         reason: String,
     },
     /// Retire the exact active destination token while retaining its tombstone.
@@ -684,8 +689,10 @@ pub enum Syscall {
         agent_id: String,
         cluster_id: String,
         owner_node_id: String,
+        authority_term: u64,
         authority_generation: u64,
         fencing_token: u64,
+        proof_expires_at: DateTime<Utc>,
         reason: String,
     },
     /// Inspect one destination's highest accepted mutation fence.
@@ -2222,8 +2229,10 @@ async fn dispatch_scoped_inner_with_fence(
                 &canonical_agent_id,
                 &proof.cluster_id,
                 &proof.owner_node_id,
+                proof.authority_term,
                 proof.authority_generation,
                 proof.fencing_token,
+                proof.proof_expires_at,
             ) {
                 return SyscallReply::Error {
                     message: error.to_string(),
@@ -2232,8 +2241,10 @@ async fn dispatch_scoped_inner_with_fence(
             let request_fence = crate::ActiveRequestFence {
                 cluster_id: proof.cluster_id,
                 owner_node_id: proof.owner_node_id,
+                authority_term: proof.authority_term,
                 authority_generation: proof.authority_generation,
                 fencing_token: proof.fencing_token,
+                proof_expires_at: proof.proof_expires_at,
             };
             return SyscallReply::RequestCancellation {
                 request_id: request_id.clone(),
@@ -2247,8 +2258,10 @@ async fn dispatch_scoped_inner_with_fence(
             &canonical_agent_id,
             &proof.cluster_id,
             &proof.owner_node_id,
+            proof.authority_term,
             proof.authority_generation,
             proof.fencing_token,
+            proof.proof_expires_at,
         ) {
             return SyscallReply::Error {
                 message: error.to_string(),
@@ -2304,8 +2317,10 @@ async fn dispatch_scoped_inner_with_fence(
                         &parsed_agent.to_string(),
                         &proof.cluster_id,
                         &proof.owner_node_id,
+                        proof.authority_term,
                         proof.authority_generation,
                         proof.fencing_token,
+                        proof.proof_expires_at,
                     ) {
                         return SyscallReply::Error {
                             message: error.to_string(),
@@ -3997,8 +4012,10 @@ async fn dispatch_scoped_inner_with_fence(
             agent_id,
             cluster_id,
             owner_node_id,
+            authority_term,
             authority_generation,
             fencing_token,
+            proof_expires_at,
             reason,
         } => {
             let (parsed_agent, barrier) = match mutation_fence_barrier_for(kernel, &agent_id) {
@@ -4010,8 +4027,10 @@ async fn dispatch_scoped_inner_with_fence(
                 &parsed_agent.to_string(),
                 &cluster_id,
                 &owner_node_id,
+                authority_term,
                 authority_generation,
                 fencing_token,
+                proof_expires_at,
                 package_actor,
                 &reason,
             ) {
@@ -4025,8 +4044,10 @@ async fn dispatch_scoped_inner_with_fence(
             agent_id,
             cluster_id,
             owner_node_id,
+            authority_term,
             authority_generation,
             fencing_token,
+            proof_expires_at,
             reason,
         } => {
             let (parsed_agent, barrier) = match mutation_fence_barrier_for(kernel, &agent_id) {
@@ -4038,8 +4059,10 @@ async fn dispatch_scoped_inner_with_fence(
                 &parsed_agent.to_string(),
                 &cluster_id,
                 &owner_node_id,
+                authority_term,
                 authority_generation,
                 fencing_token,
+                proof_expires_at,
                 package_actor,
                 &reason,
             ) {
@@ -4837,8 +4860,10 @@ where
     let request_fence = fence.as_ref().map(|(_, proof)| crate::ActiveRequestFence {
         cluster_id: proof.cluster_id.clone(),
         owner_node_id: proof.owner_node_id.clone(),
+        authority_term: proof.authority_term,
         authority_generation: proof.authority_generation,
         fencing_token: proof.fencing_token,
+        proof_expires_at: proof.proof_expires_at,
     });
     let fence_result = match fence {
         Some((fenced_agent_id, proof)) => {
@@ -4851,8 +4876,10 @@ where
                         &parsed_agent.to_string(),
                         &proof.cluster_id,
                         &proof.owner_node_id,
+                        proof.authority_term,
                         proof.authority_generation,
                         proof.fencing_token,
+                        proof.proof_expires_at,
                     )
                     .map_err(|error| error.to_string()),
                 Ok(_) => {
@@ -7210,14 +7237,17 @@ mod tests {
         let agent_id = created.id.to_string();
         let cluster_id = uuid::Uuid::new_v4().to_string();
         let owner_node_id = kernel.cluster_control.identity().node_id.clone();
+        let proof_expires_at = Utc::now() + chrono::Duration::seconds(60);
         kernel
             .cluster_control
             .install_agent_mutation_fence(
                 &agent_id,
                 &cluster_id,
                 &owner_node_id,
+                2,
                 7,
                 3,
+                proof_expires_at,
                 "system",
                 "destination admission",
             )
@@ -7238,8 +7268,10 @@ mod tests {
             proof: AgentMutationFenceProof {
                 cluster_id: cluster_id.clone(),
                 owner_node_id: owner_node_id.clone(),
+                authority_term: 2,
                 authority_generation: 7,
                 fencing_token: token,
+                proof_expires_at,
             },
             mutation: Box::new(mutation),
         };
@@ -7272,8 +7304,10 @@ mod tests {
                     proof: AgentMutationFenceProof {
                         cluster_id: cluster_id.clone(),
                         owner_node_id: owner_node_id.clone(),
+                        authority_term: 2,
                         authority_generation: 7,
                         fencing_token: 3,
+                        proof_expires_at,
                     },
                     mutation: Box::new(Syscall::PauseAgent {
                         agent_id: agent_id.clone(),
@@ -7325,8 +7359,10 @@ mod tests {
                 &agent_id,
                 &cluster_id,
                 &owner_node_id,
+                2,
                 7,
                 3,
+                proof_expires_at,
                 "system",
                 "destination retired",
             )
@@ -7363,6 +7399,7 @@ mod tests {
         let agent_id = created.id.to_string();
         let cluster_id = uuid::Uuid::new_v4().to_string();
         let owner_node_id = kernel.cluster_control.identity().node_id.clone();
+        let proof_expires_at = Utc::now() + chrono::Duration::seconds(60);
         assert!(matches!(
             dispatch(
                 &kernel,
@@ -7370,8 +7407,10 @@ mod tests {
                     agent_id: agent_id.clone(),
                     cluster_id: cluster_id.clone(),
                     owner_node_id: owner_node_id.clone(),
+                    authority_term: 2,
                     authority_generation: 7,
                     fencing_token: 3,
+                    proof_expires_at,
                     reason: "destination handoff test".into(),
                 },
             )
@@ -7387,8 +7426,10 @@ mod tests {
             agent_id: agent_id.clone(),
             cluster_id: cluster_id.clone(),
             owner_node_id: owner_node_id.clone(),
+            authority_term: 3,
             authority_generation: 8,
             fencing_token: 4,
+            proof_expires_at,
             reason: "destination handoff test".into(),
         };
 
@@ -7408,8 +7449,10 @@ mod tests {
                     proof: AgentMutationFenceProof {
                         cluster_id: mutation_cluster_id,
                         owner_node_id: mutation_owner_node_id,
+                        authority_term: 2,
                         authority_generation: 7,
                         fencing_token: 3,
+                        proof_expires_at,
                     },
                     mutation: Box::new(Syscall::PauseAgent {
                         agent_id: mutation_agent_id,
@@ -7508,11 +7551,14 @@ mod tests {
         let agent_id = created.id.to_string();
         let cluster_id = uuid::Uuid::new_v4().to_string();
         let owner_node_id = kernel.cluster_control.identity().node_id.clone();
+        let proof_expires_at = Utc::now() + chrono::Duration::seconds(60);
         let old_proof = AgentMutationFenceProof {
             cluster_id: cluster_id.clone(),
             owner_node_id: owner_node_id.clone(),
+            authority_term: 2,
             authority_generation: 7,
             fencing_token: 3,
+            proof_expires_at,
         };
         assert!(matches!(
             dispatch(
@@ -7521,8 +7567,10 @@ mod tests {
                     agent_id: agent_id.clone(),
                     cluster_id: cluster_id.clone(),
                     owner_node_id: owner_node_id.clone(),
+                    authority_term: 2,
                     authority_generation: 7,
                     fencing_token: 3,
+                    proof_expires_at,
                     reason: "old stream owner".into(),
                 },
             )
@@ -7539,8 +7587,10 @@ mod tests {
                 fence: Some(crate::ActiveRequestFence {
                     cluster_id: cluster_id.clone(),
                     owner_node_id: owner_node_id.clone(),
+                    authority_term: 2,
                     authority_generation: 7,
                     fencing_token: 3,
+                    proof_expires_at,
                 }),
             },
         );
@@ -7558,8 +7608,10 @@ mod tests {
                     agent_id: handoff_agent_id,
                     cluster_id: handoff_cluster_id,
                     owner_node_id: handoff_owner_node_id,
+                    authority_term: 3,
                     authority_generation: 8,
                     fencing_token: 4,
+                    proof_expires_at,
                     reason: "queued stream handoff".into(),
                 },
             )
@@ -7623,8 +7675,10 @@ mod tests {
                 fence: Some(crate::ActiveRequestFence {
                     cluster_id,
                     owner_node_id,
+                    authority_term: 3,
                     authority_generation: 8,
                     fencing_token: 4,
+                    proof_expires_at,
                 }),
             },
         );
@@ -7666,12 +7720,15 @@ mod tests {
         let agent_id = created.id.to_string();
         let cluster_id = uuid::Uuid::new_v4().to_string();
         let owner_node_id = kernel.cluster_control.identity().node_id.clone();
+        let proof_expires_at = Utc::now() + chrono::Duration::seconds(60);
         let install_call = Syscall::InstallAgentMutationFence {
             agent_id: agent_id.clone(),
             cluster_id,
             owner_node_id,
+            authority_term: 1,
             authority_generation: 1,
             fencing_token: 1,
+            proof_expires_at,
             reason: "initial destination admission".into(),
         };
 
@@ -9156,8 +9213,10 @@ memory = ["remember this"]
                     agent_id: "00000000-0000-0000-0000-000000000001".into(),
                     cluster_id: "00000000-0000-0000-0000-000000000005".into(),
                     owner_node_id: "00000000-0000-0000-0000-000000000004".into(),
+                    authority_term: 1,
                     authority_generation: 1,
                     fencing_token: 1,
+                    proof_expires_at: Utc::now() + chrono::Duration::seconds(60),
                     reason: "test".into(),
                 },
                 AccessLevel::System,
@@ -9167,8 +9226,10 @@ memory = ["remember this"]
                     agent_id: "00000000-0000-0000-0000-000000000001".into(),
                     cluster_id: "00000000-0000-0000-0000-000000000005".into(),
                     owner_node_id: "00000000-0000-0000-0000-000000000004".into(),
+                    authority_term: 1,
                     authority_generation: 1,
                     fencing_token: 1,
+                    proof_expires_at: Utc::now() + chrono::Duration::seconds(60),
                     reason: "test".into(),
                 },
                 AccessLevel::System,
@@ -9192,8 +9253,10 @@ memory = ["remember this"]
                     proof: AgentMutationFenceProof {
                         cluster_id: "00000000-0000-0000-0000-000000000005".into(),
                         owner_node_id: "00000000-0000-0000-0000-000000000004".into(),
+                        authority_term: 1,
                         authority_generation: 1,
                         fencing_token: 1,
+                        proof_expires_at: Utc::now() + chrono::Duration::seconds(60),
                     },
                     mutation: Box::new(Syscall::PauseAgent {
                         agent_id: "00000000-0000-0000-0000-000000000001".into(),

@@ -504,7 +504,10 @@ const REQUEST_VARIANTS: &[Variant] = &[
     },
     Variant {
         tag: "get_cluster_agent_ownership",
-        fields: &[Field::required("agent_id", S)],
+        fields: &[
+            Field::required("agent_id", S),
+            Field::optional("require_active", B),
+        ],
     },
     Variant {
         tag: "list_cluster_agent_ownership_audit",

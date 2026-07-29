@@ -95,7 +95,10 @@ pub const CONFIRM_BACKUP_RETENTION: ConfirmBackupRetention = ConfirmBackupRetent
 pub mod cluster;
 pub mod patterns;
 
-pub use cluster::{ClusterClient, NodeHandle, PlacedAgent, Placement, PlacementConstraints};
+pub use cluster::{
+    ClusterClient, NodeHandle, PlacedAgent, Placement, PlacementConstraints,
+    DEFAULT_OWNERSHIP_LEASE_SECONDS,
+};
 pub use patterns::{
     Decision, DirectiveReasoner, FnPlanner, PlanRun, Planner, PlannerExecutor, ReActLoop,
     ReActOutcome, ReActStep, Reasoner, Step, StepResult, ToolInvocation,
@@ -147,6 +150,20 @@ pub enum SdkError {
         source: std::io::Error,
     },
 
+    /// A managed cluster could not prove that one authority/fence publication
+    /// stage completed. The agent id is returned so an operator can inspect all
+    /// durable stores and reconcile instead of blindly replaying creation or
+    /// renewal.
+    #[error(
+        "cluster route publication for agent {agent_id} stopped at {stage}; reconcile durable node, authority, and fence state before retrying: {source}"
+    )]
+    ClusterRoutePublication {
+        agent_id: String,
+        stage: &'static str,
+        #[source]
+        source: Box<SdkError>,
+    },
+
     /// The kernel replied with a variant that doesn't correspond to the
     /// syscall that was issued. Indicates a protocol mismatch.
     #[error("unexpected reply for {expected}: {got}")]
@@ -178,6 +195,7 @@ impl SdkError {
     pub fn wire_code(&self) -> Option<WireErrorCode> {
         match self {
             Self::Wire { code, .. } => Some(*code),
+            Self::ClusterRoutePublication { source, .. } => source.wire_code(),
             _ => None,
         }
     }
@@ -186,12 +204,15 @@ impl SdkError {
     pub fn kernel_message(&self) -> Option<&str> {
         match self {
             Self::Kernel(message) | Self::Wire { message, .. } => Some(message),
+            Self::ClusterRoutePublication { source, .. } => source.kernel_message(),
             _ => None,
         }
     }
 
     /// Whether the server explicitly classified the failure as retryable.
     pub fn is_retryable(&self) -> bool {
+        // A partial route publication always requires reconciliation even when
+        // its underlying transport or authority condition was retryable.
         matches!(
             self,
             Self::Wire {
@@ -918,22 +939,62 @@ impl KernelClient {
         request_id: impl Into<String>,
         agent_id: impl Into<String>,
         message: impl Into<String>,
-        mut on_event: F,
+        on_event: F,
     ) -> Result<MessageResult, SdkError>
     where
         F: FnMut(&MessageStreamEvent),
     {
         let request_id = request_id.into();
-        self.ensure_connected().await?;
-        if let Err(source) = self
-            .inner
-            .send(&Syscall::SendMessageStream {
-                request_id: request_id.clone(),
-                agent_id: agent_id.into(),
-                message: message.into(),
-            })
+        let call = Syscall::SendMessageStream {
+            request_id: request_id.clone(),
+            agent_id: agent_id.into(),
+            message: message.into(),
+        };
+        self.send_message_stream_call(request_id, call, on_event)
             .await
-        {
+    }
+
+    /// Drive one ordered stream under an exact destination ownership fence.
+    ///
+    /// The destination holds its per-agent mutation admission barrier for the
+    /// complete stream, so a fence handoff cannot cross an admitted turn.
+    pub async fn send_message_stream_fenced<F>(
+        &mut self,
+        request_id: impl Into<String>,
+        agent_id: impl Into<String>,
+        proof: AgentMutationFenceProof,
+        message: impl Into<String>,
+        on_event: F,
+    ) -> Result<MessageResult, SdkError>
+    where
+        F: FnMut(&MessageStreamEvent),
+    {
+        let request_id = request_id.into();
+        let agent_id = agent_id.into();
+        let call = Syscall::FencedAgentMutation {
+            agent_id: agent_id.clone(),
+            proof,
+            mutation: Box::new(Syscall::SendMessageStream {
+                request_id: request_id.clone(),
+                agent_id,
+                message: message.into(),
+            }),
+        };
+        self.send_message_stream_call(request_id, call, on_event)
+            .await
+    }
+
+    async fn send_message_stream_call<F>(
+        &mut self,
+        request_id: String,
+        call: Syscall,
+        mut on_event: F,
+    ) -> Result<MessageResult, SdkError>
+    where
+        F: FnMut(&MessageStreamEvent),
+    {
+        self.ensure_connected().await?;
+        if let Err(source) = self.inner.send(&call).await {
             if self.reconnect.is_some() {
                 self.needs_reconnect = true;
                 return Err(SdkError::IndeterminateMutation {
@@ -1020,6 +1081,34 @@ impl KernelClient {
                 request_id: request_id.clone(),
                 agent_id: agent_id.into(),
             })
+            .await?
+        {
+            SyscallReply::RequestCancellation {
+                request_id: reply_id,
+                accepted,
+            } if reply_id == request_id => Ok(accepted),
+            other => Err(unexpected("RequestCancellation", &other)),
+        }
+    }
+
+    /// Cancel one exact active stream under a destination ownership fence.
+    pub async fn cancel_request_fenced(
+        &mut self,
+        request_id: impl Into<String>,
+        agent_id: impl Into<String>,
+        proof: AgentMutationFenceProof,
+    ) -> Result<bool, SdkError> {
+        let request_id = request_id.into();
+        let agent_id = agent_id.into();
+        match self
+            .fenced_call(
+                agent_id.clone(),
+                proof,
+                Syscall::CancelRequest {
+                    request_id: request_id.clone(),
+                    agent_id,
+                },
+            )
             .await?
         {
             SyscallReply::RequestCancellation {
@@ -1467,11 +1556,32 @@ impl KernelClient {
         match self
             .call(Syscall::GetClusterAgentOwnership {
                 agent_id: agent_id.into(),
+                require_active: false,
             })
             .await?
         {
             SyscallReply::ClusterAgentOwnership { ownership } => Ok(ownership),
             other => Err(unexpected("ClusterAgentOwnership", &other)),
+        }
+    }
+
+    /// Read one ownership record only if the authority itself confirms that it
+    /// is active and unexpired using the authority clock.
+    pub async fn active_cluster_agent_ownership(
+        &mut self,
+        agent_id: impl Into<String>,
+    ) -> Result<ClusterAgentOwnership, SdkError> {
+        match self
+            .call(Syscall::GetClusterAgentOwnership {
+                agent_id: agent_id.into(),
+                require_active: true,
+            })
+            .await?
+        {
+            SyscallReply::ClusterAgentOwnership {
+                ownership: Some(ownership),
+            } => Ok(ownership),
+            other => Err(unexpected("active ClusterAgentOwnership", &other)),
         }
     }
 
@@ -2441,6 +2551,10 @@ fn safe_to_replay_after_reconnect(call: &Syscall) -> bool {
             | Syscall::ListNodeControlAudit { .. }
             | Syscall::GetClusterMembership
             | Syscall::ListClusterMembershipAudit { .. }
+            | Syscall::GetClusterAgentOwnership { .. }
+            | Syscall::ListClusterAgentOwnershipAudit { .. }
+            | Syscall::GetAgentMutationFence { .. }
+            | Syscall::ListAgentMutationFenceAudit { .. }
             | Syscall::Metrics
             | Syscall::OperatorSnapshot
             | Syscall::ListOperatorTunables
@@ -2466,6 +2580,7 @@ fn mutation_operation_name(call: &Syscall) -> &'static str {
         Syscall::KillAgent { .. } => "agent kill",
         Syscall::CallTool { .. } => "tool call",
         Syscall::SendMessage { .. } | Syscall::SendMessageStream { .. } => "agent turn",
+        Syscall::FencedAgentMutation { mutation, .. } => mutation_operation_name(mutation),
         _ => "side-effecting syscall",
     }
 }
@@ -2972,6 +3087,13 @@ mod protocol_tests {
             client.cluster_agent_ownership(&agent_id).await.unwrap(),
             Some(claimed.clone())
         );
+        assert_eq!(
+            client
+                .active_cluster_agent_ownership(&agent_id)
+                .await
+                .unwrap(),
+            claimed
+        );
         let stale = client
             .renew_cluster_agent_ownership(
                 &agent_id,
@@ -3077,6 +3199,14 @@ mod protocol_tests {
             .await
             .unwrap();
         assert_eq!(released.state, ClusterOwnershipState::Released);
+        assert_eq!(
+            client
+                .active_cluster_agent_ownership(&agent_id)
+                .await
+                .unwrap_err()
+                .wire_code(),
+            Some(WireErrorCode::Conflict)
+        );
         let audit = client
             .cluster_agent_ownership_audit(Some(agent_id), 10)
             .await

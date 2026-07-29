@@ -1509,6 +1509,29 @@ impl ClusterControl {
         load_ownership(&connection, agent_id)
     }
 
+    /// Read one ownership record and, when requested, have the authority
+    /// validate active state and expiry against its own clock.
+    pub fn agent_ownership_with_active_requirement(
+        &self,
+        agent_id: &str,
+        require_active: bool,
+    ) -> Result<Option<ClusterAgentOwnership>, ContextError> {
+        let ownership = self.agent_ownership(agent_id)?;
+        if require_active {
+            let Some(current) = ownership.as_ref() else {
+                return Err(storage_error("agent ownership conflict: record not found"));
+            };
+            if current.state != ClusterOwnershipState::Active
+                || current.lease_expires_at <= Utc::now()
+            {
+                return Err(storage_error(
+                    "agent ownership conflict: lease is released or expired",
+                ));
+            }
+        }
+        Ok(ownership)
+    }
+
     pub fn agent_ownership_audit(
         &self,
         agent_id: Option<&str>,
@@ -3877,6 +3900,12 @@ mod tests {
         assert_eq!(claimed.fencing_token, 1);
         assert_eq!(claimed.generation, 1);
         assert_eq!(claimed.state, ClusterOwnershipState::Active);
+        assert_eq!(
+            authority
+                .agent_ownership_with_active_requirement(&agent_id, true)
+                .unwrap(),
+            Some(claimed.clone())
+        );
         assert!(authority
             .claim_agent_ownership(
                 &agent_id,
@@ -3928,6 +3957,11 @@ mod tests {
         assert_eq!(released.fencing_token, 1);
         assert_eq!(released.generation, 3);
         assert!(authority
+            .agent_ownership_with_active_requirement(&agent_id, true)
+            .unwrap_err()
+            .to_string()
+            .contains("released or expired"));
+        assert!(authority
             .renew_agent_ownership(
                 &agent_id,
                 &first.identity().node_id,
@@ -3950,24 +3984,28 @@ mod tests {
                 "placement transfer",
             )
             .unwrap();
-        assert_eq!(transferred.fencing_token, 2);
-        assert_eq!(transferred.generation, 4);
         authority_store
             .conn
             .lock()
             .unwrap()
             .execute(
-                "UPDATE cluster_agent_ownership SET lease_expires_at = ?1
+                "UPDATE cluster_agent_ownership
+                 SET lease_expires_at = ?1
                  WHERE agent_id = ?2",
                 params![
-                    Utc::now()
-                        .checked_sub_signed(chrono::Duration::seconds(1))
-                        .unwrap()
-                        .to_rfc3339(),
+                    (Utc::now() - chrono::Duration::seconds(1)).to_rfc3339(),
                     agent_id
                 ],
             )
             .unwrap();
+        assert!(authority
+            .agent_ownership_with_active_requirement(&agent_id, true)
+            .unwrap_err()
+            .to_string()
+            .contains("released or expired"));
+        assert!(authority.agent_ownership(&agent_id).unwrap().is_some());
+        assert_eq!(transferred.fencing_token, 2);
+        assert_eq!(transferred.generation, 4);
         let reclaimed = authority
             .claim_agent_ownership(
                 &agent_id,

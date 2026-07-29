@@ -9,8 +9,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use agent_sdk::{
-    ClusterClient, ClusterMemberState, KernelClient, NodeAvailability, NodeProfile, Placement,
-    PlacementConstraints, SdkError, WireErrorCode,
+    AgentMutationFenceState, ClusterClient, ClusterMemberState, ClusterOwnershipState,
+    KernelClient, NodeAvailability, NodeProfile, Placement, PlacementConstraints, SdkError,
+    WireErrorCode,
 };
 use kernel::syscall_server::SyscallServer;
 use kernel::AgentKernelImpl;
@@ -160,6 +161,7 @@ async fn least_loaded_placement_spreads_agents() {
     let addrs = spawn_cluster(3).await;
     let mut cluster = ClusterClient::connect(&addrs).await.expect("connect");
     assert_eq!(cluster.node_count(), 3);
+    assert!(!cluster.is_authority_managed());
 
     // Three agents, least-loaded placement → one per node.
     let mut placed = Vec::new();
@@ -647,6 +649,308 @@ async fn authorized_membership_drives_discovery_leave_and_revocation() {
         task.abort();
         let _ = task.await;
     }
+}
+
+#[tokio::test]
+async fn discovered_cluster_publishes_renews_rebuilds_and_enforces_fenced_routes() {
+    let token = "managed-routing-system-secret";
+    let authority_kernel = Arc::new(AgentKernelImpl::new().expect("authority kernel"));
+    let authority_server = SyscallServer::bind(authority_kernel, "127.0.0.1:0")
+        .await
+        .expect("bind authority")
+        .with_auth_token(token);
+    let authority_address = authority_server.local_addr().unwrap().to_string();
+    let authority_task = tokio::spawn(authority_server.serve());
+
+    let member_kernel = Arc::new(AgentKernelImpl::new().expect("member kernel"));
+    let member_server = SyscallServer::bind(member_kernel, "127.0.0.1:0")
+        .await
+        .expect("bind member")
+        .with_auth_token(token);
+    let member_address = member_server.local_addr().unwrap().to_string();
+    let member_task = tokio::spawn(member_server.serve());
+
+    let mut authority = KernelClient::connect(&authority_address)
+        .await
+        .expect("connect authority");
+    authority.authenticate(token).await.expect("auth authority");
+    let mut member = KernelClient::connect(&member_address)
+        .await
+        .expect("connect member");
+    member.authenticate(token).await.expect("auth member");
+    let joined = ClusterClient::admit_node(
+        &mut authority,
+        &mut member,
+        &member_address,
+        None,
+        "managed routing member",
+    )
+    .await
+    .expect("admit member");
+    let cluster_id = authority
+        .cluster_membership()
+        .await
+        .expect("membership")
+        .cluster_id;
+
+    let mut cluster = ClusterClient::connect_discovered_authenticated(&authority_address, token)
+        .await
+        .expect("discover managed cluster");
+    assert!(cluster.is_authority_managed());
+    let placed = cluster
+        .create_agent(
+            "managed",
+            "authority fenced",
+            None,
+            None,
+            None,
+            Placement::LeastLoaded,
+        )
+        .await
+        .expect("create managed agent");
+    assert_eq!(placed.node_id, joined.node_id);
+
+    let claimed = authority
+        .cluster_agent_ownership(&placed.agent_id)
+        .await
+        .expect("read ownership")
+        .expect("ownership published");
+    assert_eq!(claimed.owner_node_id, joined.node_id);
+    assert_eq!(claimed.state, ClusterOwnershipState::Active);
+    let installed = member
+        .agent_mutation_fence(&placed.agent_id)
+        .await
+        .expect("read destination fence")
+        .expect("destination fence published");
+    assert_eq!(installed.cluster_id, cluster_id);
+    assert_eq!(installed.owner_node_id, joined.node_id);
+    assert_eq!(installed.authority_generation, claimed.generation);
+    assert_eq!(installed.fencing_token, claimed.fencing_token);
+    assert_eq!(installed.state, AgentMutationFenceState::Active);
+
+    assert_eq!(
+        member
+            .send_message(&placed.agent_id, "ordinary path must fail")
+            .await
+            .expect_err("managed agent rejects ordinary mutation")
+            .wire_code(),
+        Some(WireErrorCode::Conflict)
+    );
+    assert_eq!(
+        cluster
+            .send_message(&placed.agent_id, "managed fenced turn")
+            .await
+            .expect_err("stub provider remains unavailable after fence admission")
+            .wire_code(),
+        Some(WireErrorCode::Unavailable)
+    );
+    let mut streamed = Vec::new();
+    assert_eq!(
+        cluster
+            .send_message_stream(
+                "managed-stream",
+                &placed.agent_id,
+                "managed fenced stream",
+                |event| streamed.push(event.clone()),
+            )
+            .await
+            .expect_err("fenced stream reaches unavailable stub provider")
+            .wire_code(),
+        Some(WireErrorCode::Unavailable)
+    );
+    assert!(streamed.is_empty());
+
+    let externally_renewed = authority
+        .renew_cluster_agent_ownership(
+            &placed.agent_id,
+            &joined.node_id,
+            claimed.fencing_token,
+            60,
+            "external authority renewal",
+        )
+        .await
+        .expect("renew outside cluster client");
+    assert_eq!(
+        cluster
+            .send_message(&placed.agent_id, "refresh renewed authority route")
+            .await
+            .expect_err("refreshed route reaches unavailable stub provider")
+            .wire_code(),
+        Some(WireErrorCode::Unavailable)
+    );
+    assert_eq!(
+        member
+            .agent_mutation_fence(&placed.agent_id)
+            .await
+            .expect("read refreshed fence")
+            .expect("refreshed fence")
+            .authority_generation,
+        externally_renewed.generation
+    );
+
+    assert_eq!(
+        cluster
+            .renew_all_agent_ownerships(60)
+            .await
+            .expect("renew and publish every route"),
+        1
+    );
+    let renewed = authority
+        .cluster_agent_ownership(&placed.agent_id)
+        .await
+        .expect("read renewed ownership")
+        .expect("renewed ownership");
+    assert!(renewed.generation > externally_renewed.generation);
+    assert_eq!(renewed.fencing_token, claimed.fencing_token);
+    let renewed_fence = member
+        .agent_mutation_fence(&placed.agent_id)
+        .await
+        .expect("read renewed fence")
+        .expect("renewed fence");
+    assert_eq!(renewed_fence.authority_generation, renewed.generation);
+
+    drop(cluster);
+    let mut rebuilt = ClusterClient::connect_discovered_authenticated(&authority_address, token)
+        .await
+        .expect("rebuild exact managed route");
+    assert_eq!(
+        rebuilt.owner_of(&placed.agent_id),
+        Some(joined.node_id.as_str())
+    );
+    assert_eq!(
+        rebuilt
+            .send_message(&placed.agent_id, "rebuilt fenced route")
+            .await
+            .expect_err("rebuilt route reaches unavailable stub provider")
+            .wire_code(),
+        Some(WireErrorCode::Unavailable)
+    );
+
+    authority
+        .release_cluster_agent_ownership(
+            &placed.agent_id,
+            &joined.node_id,
+            renewed.fencing_token,
+            "invalidate stale cluster client",
+        )
+        .await
+        .expect("release ownership");
+    assert_eq!(
+        rebuilt
+            .send_message(&placed.agent_id, "stale route must fail closed")
+            .await
+            .expect_err("released route rejected")
+            .wire_code(),
+        Some(WireErrorCode::Conflict)
+    );
+    assert_eq!(rebuilt.owner_of(&placed.agent_id), None);
+    assert_eq!(
+        rebuilt
+            .rebuild_owners()
+            .await
+            .expect_err("released authority evidence cannot rebuild a route")
+            .wire_code(),
+        Some(WireErrorCode::Conflict)
+    );
+    assert_eq!(rebuilt.owner_of(&placed.agent_id), None);
+
+    authority_task.abort();
+    let _ = authority_task.await;
+    member_task.abort();
+    let _ = member_task.await;
+}
+
+#[tokio::test]
+async fn failed_managed_publication_returns_the_created_agent_id_for_reconciliation() {
+    let token = "managed-publication-failure-secret";
+    let authority_kernel = Arc::new(AgentKernelImpl::new().expect("authority kernel"));
+    let authority_server = SyscallServer::bind(authority_kernel, "127.0.0.1:0")
+        .await
+        .expect("bind authority")
+        .with_auth_token(token);
+    let authority_address = authority_server.local_addr().unwrap().to_string();
+    let authority_task = tokio::spawn(authority_server.serve());
+
+    let member_kernel = Arc::new(AgentKernelImpl::new().expect("member kernel"));
+    let member_server = SyscallServer::bind(member_kernel, "127.0.0.1:0")
+        .await
+        .expect("bind member")
+        .with_auth_token(token);
+    let member_address = member_server.local_addr().unwrap().to_string();
+    let member_task = tokio::spawn(member_server.serve());
+
+    let mut authority = KernelClient::connect(&authority_address)
+        .await
+        .expect("connect authority");
+    authority.authenticate(token).await.expect("auth authority");
+    let mut member = KernelClient::connect(&member_address)
+        .await
+        .expect("connect member");
+    member.authenticate(token).await.expect("auth member");
+    let joined = ClusterClient::admit_node(
+        &mut authority,
+        &mut member,
+        &member_address,
+        None,
+        "publication failure member",
+    )
+    .await
+    .expect("admit member");
+    let mut cluster = ClusterClient::connect_discovered_authenticated(&authority_address, token)
+        .await
+        .expect("discover before revocation");
+
+    authority
+        .set_cluster_member_state(
+            &joined.node_id,
+            ClusterMemberState::Revoked,
+            joined.generation,
+            "force claim failure after local creation",
+        )
+        .await
+        .expect("revoke authority member");
+    let error = cluster
+        .create_agent(
+            "publication-failure",
+            "return exact reconciliation identity",
+            None,
+            None,
+            None,
+            Placement::LeastLoaded,
+        )
+        .await
+        .expect_err("authority claim must fail after local creation");
+    assert!(
+        !error.is_retryable(),
+        "partial publication requires reconciliation, never blind replay"
+    );
+    let SdkError::ClusterRoutePublication {
+        agent_id,
+        stage,
+        source,
+    } = error
+    else {
+        panic!("expected route publication error, got {error:?}");
+    };
+    assert_eq!(stage, "authority ownership claim");
+    assert_eq!(source.wire_code(), Some(WireErrorCode::PermissionDenied));
+    assert_eq!(cluster.owner_of(&agent_id), None);
+    assert!(authority
+        .cluster_agent_ownership(&agent_id)
+        .await
+        .expect("inspect authority")
+        .is_none());
+    assert!(member
+        .list_agents()
+        .await
+        .expect("inspect destination")
+        .iter()
+        .any(|agent| agent.id == agent_id));
+
+    authority_task.abort();
+    let _ = authority_task.await;
+    member_task.abort();
+    let _ = member_task.await;
 }
 
 #[tokio::test]

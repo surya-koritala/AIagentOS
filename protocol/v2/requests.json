@@ -313,7 +313,8 @@
   },
   {
     "agent_id": "00000000-0000-0000-0000-000000000001",
-    "op": "get_cluster_agent_ownership"
+    "op": "get_cluster_agent_ownership",
+    "require_active": true
   },
   {
     "agent_id": null,

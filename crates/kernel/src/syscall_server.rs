@@ -208,6 +208,10 @@ fn default_tunable_audit_limit() -> usize {
     100
 }
 
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 fn default_package_requirement() -> String {
     "*".to_string()
 }
@@ -587,6 +591,10 @@ pub enum Syscall {
     /// Inspect the durable ownership record for one agent.
     GetClusterAgentOwnership {
         agent_id: String,
+        /// Ask the authority to reject a released or expired record using its
+        /// own clock. Omitted/false preserves the historical inspection API.
+        #[serde(default, skip_serializing_if = "is_false")]
+        require_active: bool,
     },
     /// Inspect bounded ownership claim/transfer/renew/release evidence.
     ListClusterAgentOwnershipAudit {
@@ -2046,6 +2054,35 @@ async fn dispatch_scoped_inner_with_fence(
             };
         }
         let canonical_agent_id = parsed_agent.to_string();
+        // A fenced cancellation is bound to the proof captured by the active
+        // stream registration. It deliberately does not queue for this
+        // writer-preferring barrier: a pending handoff writer must not prevent
+        // the old owner from cancelling the stream that writer is draining.
+        // Proof-matching on the active request prevents a verified old cancel
+        // from signalling a later stream that reused the request id.
+        if let Syscall::CancelRequest { request_id, .. } = mutation.as_ref() {
+            if let Err(error) = kernel.cluster_control.verify_agent_mutation_fence(
+                &canonical_agent_id,
+                &proof.cluster_id,
+                &proof.owner_node_id,
+                proof.authority_generation,
+                proof.fencing_token,
+            ) {
+                return SyscallReply::Error {
+                    message: error.to_string(),
+                };
+            }
+            let request_fence = crate::ActiveRequestFence {
+                cluster_id: proof.cluster_id,
+                owner_node_id: proof.owner_node_id,
+                authority_generation: proof.authority_generation,
+                fencing_token: proof.fencing_token,
+            };
+            return SyscallReply::RequestCancellation {
+                request_id: request_id.clone(),
+                accepted: kernel.cancel_request_fenced(parsed_agent, request_id, &request_fence),
+            };
+        }
         // Hold the shared guard through verification and the complete nested
         // operation. Install/retire takes the matching exclusive guard.
         let _mutation_fence_read = barrier.read().await;
@@ -3274,8 +3311,14 @@ async fn dispatch_scoped_inner_with_fence(
                 },
             }
         }
-        Syscall::GetClusterAgentOwnership { agent_id } => {
-            match kernel.cluster_control.agent_ownership(&agent_id) {
+        Syscall::GetClusterAgentOwnership {
+            agent_id,
+            require_active,
+        } => {
+            match kernel
+                .cluster_control
+                .agent_ownership_with_active_requirement(&agent_id, require_active)
+            {
                 Ok(ownership) => SyscallReply::ClusterAgentOwnership { ownership },
                 Err(error) => SyscallReply::Error {
                     message: error.to_string(),
@@ -3973,6 +4016,7 @@ where
             request_id,
             agent_id,
             message,
+            None,
             principal,
             write,
             negotiated_version,
@@ -4001,11 +4045,79 @@ where
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn dispatch_fenced_message_stream<W>(
+    kernel: &AgentKernelImpl,
+    request_id: String,
+    agent_id: String,
+    message: String,
+    fenced_agent_id: String,
+    proof: AgentMutationFenceProof,
+    principal: Option<&Principal>,
+    write: &mut W,
+    negotiated_version: u32,
+) -> std::io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    let correlation_id = uuid::Uuid::new_v4();
+    let subsystem = crate::telemetry::RequestSubsystem::Agent;
+    let mut observation = kernel.request_telemetry.start(subsystem);
+    let started = std::time::Instant::now();
+    let span = tracing::info_span!(
+        target: "agentos::request",
+        "agentos.request",
+        correlation_id = %correlation_id,
+        action = "agent.send_message_stream_fenced",
+        subsystem = subsystem.as_str(),
+        tenant_scoped = principal.is_some()
+    );
+    async {
+        let result = dispatch_message_stream_inner(
+            kernel,
+            request_id,
+            agent_id,
+            message,
+            Some((fenced_agent_id, proof)),
+            principal,
+            write,
+            negotiated_version,
+        )
+        .instrument(tracing::info_span!(
+            target: "agentos::request",
+            "kernel.component",
+            component = "provider"
+        ))
+        .instrument(tracing::info_span!(
+            target: "agentos::request",
+            "kernel.dispatch",
+            component = "kernel"
+        ))
+        .await;
+        let outcome = match &result {
+            Ok(outcome) => *outcome,
+            Err(_) => crate::telemetry::RequestOutcome::Cancelled,
+        };
+        observation.finish(outcome);
+        tracing::info!(
+            target: "agentos::request",
+            outcome = outcome.as_str(),
+            duration_ms = started.elapsed().as_secs_f64() * 1_000.0,
+            "fenced stream request completed"
+        );
+        result.map(|_| ())
+    }
+    .instrument(span)
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn dispatch_message_stream_inner<W>(
     kernel: &AgentKernelImpl,
     request_id: String,
     agent_id: String,
     message: String,
+    fence: Option<(String, AgentMutationFenceProof)>,
     principal: Option<&Principal>,
     write: &mut W,
     negotiated_version: u32,
@@ -4026,7 +4138,15 @@ where
         agent_id: agent_id.clone(),
         message: message.clone(),
     };
-    if let Err(reply) = authorize(kernel, principal, &call).await {
+    let authorization_call = match fence.as_ref() {
+        Some((fenced_agent_id, proof)) => Syscall::FencedAgentMutation {
+            agent_id: fenced_agent_id.clone(),
+            proof: proof.clone(),
+            mutation: Box::new(call.clone()),
+        },
+        None => call.clone(),
+    };
+    if let Err(reply) = authorize(kernel, principal, &authorization_call).await {
         let outcome = request_outcome(&reply);
         write_bounded_json(
             write,
@@ -4035,6 +4155,11 @@ where
         )
         .await?;
         return Ok(outcome);
+    }
+    if let Err(message) = enforce_node_admission(kernel, &authorization_call) {
+        let reply = SyscallReply::Error { message }.into_public_wire(negotiated_version);
+        write_bounded_json(write, &reply, MAX_WIRE_FRAME_BYTES).await?;
+        return Ok(crate::telemetry::RequestOutcome::Rejected);
     }
     let parsed_agent = match uuid::Uuid::parse_str(&agent_id) {
         Ok(agent) => agent,
@@ -4051,8 +4176,37 @@ where
     // Hold the same per-agent read barrier for the entire live stream so a
     // token handoff cannot cross an already-admitted provider operation.
     let mutation_fence_barrier = kernel.agent_mutation_fence_barrier(parsed_agent);
-    let _mutation_fence_read = mutation_fence_barrier.read().await;
-    if let Err(message) = enforce_unfenced_agent_mutation(kernel, &parsed_agent.to_string()) {
+    let _mutation_fence_read = mutation_fence_barrier.read_owned().await;
+    let request_fence = fence.as_ref().map(|(_, proof)| crate::ActiveRequestFence {
+        cluster_id: proof.cluster_id.clone(),
+        owner_node_id: proof.owner_node_id.clone(),
+        authority_generation: proof.authority_generation,
+        fencing_token: proof.fencing_token,
+    });
+    let fence_result = match fence {
+        Some((fenced_agent_id, proof)) => {
+            let fenced_agent = uuid::Uuid::parse_str(&fenced_agent_id)
+                .map_err(|_| format!("invalid destination fence agent id: {fenced_agent_id}"));
+            match fenced_agent {
+                Ok(fenced_agent) if fenced_agent == parsed_agent => kernel
+                    .cluster_control
+                    .verify_agent_mutation_fence(
+                        &parsed_agent.to_string(),
+                        &proof.cluster_id,
+                        &proof.owner_node_id,
+                        proof.authority_generation,
+                        proof.fencing_token,
+                    )
+                    .map_err(|error| error.to_string()),
+                Ok(_) => {
+                    Err("destination fence agent does not match the nested mutation target".into())
+                }
+                Err(message) => Err(message),
+            }
+        }
+        None => enforce_unfenced_agent_mutation(kernel, &parsed_agent.to_string()),
+    };
+    if let Err(message) = fence_result {
         let reply = SyscallReply::Error { message }.into_public_wire(negotiated_version);
         write_bounded_json(write, &reply, MAX_WIRE_FRAME_BYTES).await?;
         return Ok(crate::telemetry::RequestOutcome::Rejected);
@@ -4069,7 +4223,13 @@ where
     // A bounded channel makes the socket writer the backpressure boundary:
     // provider/executor production cannot outrun a slow client without bound.
     let (events_tx, mut events_rx) = tokio::sync::mpsc::channel(STREAM_EVENT_BUFFER_CAPACITY);
-    let run = kernel.send_message_stream(parsed_agent, &message, &request_id, events_tx);
+    let run = kernel.send_message_stream_with_fence(
+        parsed_agent,
+        &message,
+        &request_id,
+        events_tx,
+        request_fence,
+    );
     tokio::pin!(run);
     let mut sequence = 0_u64;
     let mut events_open = true;
@@ -4558,6 +4718,72 @@ impl SyscallServer {
             // A streaming turn owns this connection until its terminal frame.
             // Cancellation is intentionally sent from another authenticated
             // connection so event ordering on this socket remains unambiguous.
+            if authed
+                && matches!(
+                    &parsed,
+                    Ok(Syscall::FencedAgentMutation { mutation, .. })
+                        if matches!(mutation.as_ref(), Syscall::SendMessageStream { .. })
+                )
+            {
+                let Ok(Syscall::FencedAgentMutation {
+                    agent_id: fenced_agent_id,
+                    proof,
+                    mutation,
+                }) = parsed
+                else {
+                    unreachable!("fenced stream pattern checked above")
+                };
+                let Syscall::SendMessageStream {
+                    request_id,
+                    agent_id,
+                    message,
+                } = *mutation
+                else {
+                    unreachable!("nested stream pattern checked above")
+                };
+                if let Some(identity) = credential.as_ref() {
+                    match kernel.acquire_credential_principal(identity).await {
+                        Some((resolved, _credential_lease)) => {
+                            dispatch_fenced_message_stream(
+                                &kernel,
+                                request_id,
+                                agent_id,
+                                message,
+                                fenced_agent_id,
+                                proof,
+                                Some(&resolved),
+                                &mut write,
+                                negotiated_version,
+                            )
+                            .await?;
+                        }
+                        None => {
+                            authed = false;
+                            credential = None;
+                            let reply = SyscallReply::Error {
+                                message: "authentication required".into(),
+                            }
+                            .into_public_wire(negotiated_version);
+                            write_bounded_json(&mut write, &reply, MAX_WIRE_FRAME_BYTES).await?;
+                        }
+                    }
+                } else {
+                    dispatch_fenced_message_stream(
+                        &kernel,
+                        request_id,
+                        agent_id,
+                        message,
+                        fenced_agent_id,
+                        proof,
+                        None,
+                        &mut write,
+                        negotiated_version,
+                    )
+                    .await?;
+                }
+                continue;
+            }
+
             if authed
                 && matches!(
                     &parsed,
@@ -6314,6 +6540,164 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn queued_handoff_does_not_deadlock_exact_fenced_stream_cancellation() {
+        let kernel = Arc::new(AgentKernelImpl::new().expect("kernel new"));
+        let created = kernel
+            .create_agent_full(AgentConfig {
+                name: "destination-stream-handoff".into(),
+                task: "cancel old stream while a handoff waits".into(),
+                llm_provider: "stub".into(),
+                permission_profile: "standard".into(),
+                priority: Priority::default(),
+                sandbox_config: None,
+            })
+            .await
+            .unwrap();
+        let agent_id = created.id.to_string();
+        let cluster_id = uuid::Uuid::new_v4().to_string();
+        let owner_node_id = kernel.cluster_control.identity().node_id.clone();
+        let old_proof = AgentMutationFenceProof {
+            cluster_id: cluster_id.clone(),
+            owner_node_id: owner_node_id.clone(),
+            authority_generation: 7,
+            fencing_token: 3,
+        };
+        assert!(matches!(
+            dispatch(
+                &kernel,
+                Syscall::InstallAgentMutationFence {
+                    agent_id: agent_id.clone(),
+                    cluster_id: cluster_id.clone(),
+                    owner_node_id: owner_node_id.clone(),
+                    authority_generation: 7,
+                    fencing_token: 3,
+                    reason: "old stream owner".into(),
+                },
+            )
+            .await,
+            SyscallReply::AgentMutationFence { fence: Some(_) }
+        ));
+
+        let request_id = "handoff-cancel".to_string();
+        let old_cancellation = tokio_util::sync::CancellationToken::new();
+        kernel.active_requests.insert(
+            (created.id, request_id.clone()),
+            crate::ActiveRequestHandle {
+                cancellation: old_cancellation.clone(),
+                fence: Some(crate::ActiveRequestFence {
+                    cluster_id: cluster_id.clone(),
+                    owner_node_id: owner_node_id.clone(),
+                    authority_generation: 7,
+                    fencing_token: 3,
+                }),
+            },
+        );
+        let destination_barrier = kernel.agent_mutation_fence_barrier(created.id);
+        let stream_guard = destination_barrier.clone().read_owned().await;
+
+        let handoff_kernel = Arc::clone(&kernel);
+        let handoff_agent_id = agent_id.clone();
+        let handoff_cluster_id = cluster_id.clone();
+        let handoff_owner_node_id = owner_node_id.clone();
+        let handoff = tokio::spawn(async move {
+            dispatch(
+                &handoff_kernel,
+                Syscall::InstallAgentMutationFence {
+                    agent_id: handoff_agent_id,
+                    cluster_id: handoff_cluster_id,
+                    owner_node_id: handoff_owner_node_id,
+                    authority_generation: 8,
+                    fencing_token: 4,
+                    reason: "queued stream handoff".into(),
+                },
+            )
+            .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if destination_barrier.try_read().is_err() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("handoff writer must be queued behind the stream");
+
+        assert!(matches!(
+            tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                dispatch(
+                    &kernel,
+                    Syscall::FencedAgentMutation {
+                        agent_id: agent_id.clone(),
+                        proof: old_proof.clone(),
+                        mutation: Box::new(Syscall::CancelRequest {
+                            request_id: request_id.clone(),
+                            agent_id: agent_id.clone(),
+                        }),
+                    },
+                ),
+            )
+            .await
+            .expect("old owner cancellation must bypass the queued writer"),
+            SyscallReply::RequestCancellation { accepted: true, .. }
+        ));
+        assert!(old_cancellation.is_cancelled());
+
+        kernel
+            .active_requests
+            .remove(&(created.id, request_id.clone()));
+        drop(stream_guard);
+        assert!(matches!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), handoff)
+                .await
+                .expect("handoff completes after stream drain")
+                .expect("handoff task"),
+            SyscallReply::AgentMutationFence {
+                fence: Some(crate::cluster_control::AgentMutationFence {
+                    authority_generation: 8,
+                    fencing_token: 4,
+                    ..
+                })
+            }
+        ));
+
+        let new_cancellation = tokio_util::sync::CancellationToken::new();
+        kernel.active_requests.insert(
+            (created.id, request_id.clone()),
+            crate::ActiveRequestHandle {
+                cancellation: new_cancellation.clone(),
+                fence: Some(crate::ActiveRequestFence {
+                    cluster_id,
+                    owner_node_id,
+                    authority_generation: 8,
+                    fencing_token: 4,
+                }),
+            },
+        );
+        assert!(matches!(
+            dispatch(
+                &kernel,
+                Syscall::FencedAgentMutation {
+                    agent_id,
+                    proof: old_proof,
+                    mutation: Box::new(Syscall::CancelRequest {
+                        request_id,
+                        agent_id: created.id.to_string(),
+                    }),
+                },
+            )
+            .await,
+            SyscallReply::Error { .. }
+        ));
+        assert!(
+            !new_cancellation.is_cancelled(),
+            "a delayed old cancellation must not signal a later request-id reuse"
+        );
+    }
+
+    #[tokio::test]
     async fn destination_fence_install_waits_for_admitted_unfenced_mutation() {
         let kernel = Arc::new(AgentKernelImpl::new().expect("kernel new"));
         let created = kernel
@@ -7448,6 +7832,7 @@ memory = ["remember this"]
             (
                 Syscall::GetClusterAgentOwnership {
                     agent_id: "00000000-0000-0000-0000-000000000001".into(),
+                    require_active: false,
                 },
                 AccessLevel::System,
             ),

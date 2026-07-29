@@ -43,10 +43,10 @@ use tokio::net::ToSocketAddrs;
 // Re-export the kernel wire types that appear in this crate's public API, so
 // SDK consumers can name them without depending on the kernel directly.
 pub use kernel::cluster_control::{
-    ClusterAgentOwnership, ClusterAgentOwnershipAudit, ClusterJoinChallenge, ClusterMember,
-    ClusterMemberRegistration, ClusterMemberState, ClusterMembershipAudit,
-    ClusterMembershipSnapshot, ClusterOwnershipState, NodeAvailability, NodeControlAudit,
-    NodeControlStatus, NodeIdentity, NodeProfile,
+    AgentMutationFence, AgentMutationFenceAudit, AgentMutationFenceState, ClusterAgentOwnership,
+    ClusterAgentOwnershipAudit, ClusterJoinChallenge, ClusterMember, ClusterMemberRegistration,
+    ClusterMemberState, ClusterMembershipAudit, ClusterMembershipSnapshot, ClusterOwnershipState,
+    NodeAvailability, NodeControlAudit, NodeControlStatus, NodeIdentity, NodeProfile,
 };
 pub use kernel::context::{ContextPressureStats, DeletionReceipt};
 pub use kernel::data_inventory::{DataInventoryEntry, StorageDataInventory};
@@ -1347,6 +1347,87 @@ impl KernelClient {
         {
             SyscallReply::ClusterAgentOwnershipAudit { entries } => Ok(entries),
             other => Err(unexpected("ClusterAgentOwnershipAudit", &other)),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn install_agent_mutation_fence(
+        &mut self,
+        agent_id: impl Into<String>,
+        cluster_id: impl Into<String>,
+        owner_node_id: impl Into<String>,
+        authority_generation: u64,
+        fencing_token: u64,
+        reason: impl Into<String>,
+    ) -> Result<AgentMutationFence, SdkError> {
+        match self
+            .call(Syscall::InstallAgentMutationFence {
+                agent_id: agent_id.into(),
+                cluster_id: cluster_id.into(),
+                owner_node_id: owner_node_id.into(),
+                authority_generation,
+                fencing_token,
+                reason: reason.into(),
+            })
+            .await?
+        {
+            SyscallReply::AgentMutationFence { fence: Some(fence) } => Ok(fence),
+            other => Err(unexpected("AgentMutationFence", &other)),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn retire_agent_mutation_fence(
+        &mut self,
+        agent_id: impl Into<String>,
+        cluster_id: impl Into<String>,
+        owner_node_id: impl Into<String>,
+        authority_generation: u64,
+        fencing_token: u64,
+        reason: impl Into<String>,
+    ) -> Result<AgentMutationFence, SdkError> {
+        match self
+            .call(Syscall::RetireAgentMutationFence {
+                agent_id: agent_id.into(),
+                cluster_id: cluster_id.into(),
+                owner_node_id: owner_node_id.into(),
+                authority_generation,
+                fencing_token,
+                reason: reason.into(),
+            })
+            .await?
+        {
+            SyscallReply::AgentMutationFence { fence: Some(fence) } => Ok(fence),
+            other => Err(unexpected("AgentMutationFence", &other)),
+        }
+    }
+
+    pub async fn agent_mutation_fence(
+        &mut self,
+        agent_id: impl Into<String>,
+    ) -> Result<Option<AgentMutationFence>, SdkError> {
+        match self
+            .call(Syscall::GetAgentMutationFence {
+                agent_id: agent_id.into(),
+            })
+            .await?
+        {
+            SyscallReply::AgentMutationFence { fence } => Ok(fence),
+            other => Err(unexpected("AgentMutationFence", &other)),
+        }
+    }
+
+    pub async fn agent_mutation_fence_audit(
+        &mut self,
+        agent_id: Option<String>,
+        limit: usize,
+    ) -> Result<Vec<AgentMutationFenceAudit>, SdkError> {
+        match self
+            .call(Syscall::ListAgentMutationFenceAudit { agent_id, limit })
+            .await?
+        {
+            SyscallReply::AgentMutationFenceAudit { entries } => Ok(entries),
+            other => Err(unexpected("AgentMutationFenceAudit", &other)),
         }
     }
 
@@ -2725,7 +2806,16 @@ mod protocol_tests {
         let addr = server.local_addr().unwrap();
         tokio::spawn(server.serve());
         let mut client = KernelClient::connect(addr).await.expect("connect");
-        let agent_id = uuid::Uuid::new_v4().to_string();
+        let agent_id = client
+            .create_agent(
+                "fenced-sdk-agent",
+                "ownership and destination fence fixture",
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
 
         let claimed = client
             .claim_cluster_agent_ownership(
@@ -2765,6 +2855,40 @@ mod protocol_tests {
             .await
             .unwrap();
         assert_eq!(renewed.fencing_token, claimed.fencing_token);
+        let installed = client
+            .install_agent_mutation_fence(
+                &agent_id,
+                &challenge.cluster_id,
+                &identity.node_id,
+                renewed.generation,
+                renewed.fencing_token,
+                "destination admission",
+            )
+            .await
+            .unwrap();
+        assert_eq!(installed.state, AgentMutationFenceState::Active);
+        assert_eq!(
+            client.agent_mutation_fence(&agent_id).await.unwrap(),
+            Some(installed.clone())
+        );
+        let retired_fence = client
+            .retire_agent_mutation_fence(
+                &agent_id,
+                &challenge.cluster_id,
+                &identity.node_id,
+                renewed.generation,
+                renewed.fencing_token,
+                "destination drained",
+            )
+            .await
+            .unwrap();
+        assert_eq!(retired_fence.state, AgentMutationFenceState::Retired);
+        let fence_audit = client
+            .agent_mutation_fence_audit(Some(agent_id.clone()), 10)
+            .await
+            .unwrap();
+        assert_eq!(fence_audit.len(), 2);
+        assert_eq!(fence_audit[0].state, AgentMutationFenceState::Retired);
         let released = client
             .release_cluster_agent_ownership(
                 &agent_id,

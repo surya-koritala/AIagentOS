@@ -586,6 +586,36 @@ pub enum Syscall {
         #[serde(default = "default_tunable_audit_limit")]
         limit: usize,
     },
+    /// Install the highest authority-issued token accepted by this workload
+    /// node for one local agent.
+    InstallAgentMutationFence {
+        agent_id: String,
+        cluster_id: String,
+        owner_node_id: String,
+        authority_generation: u64,
+        fencing_token: u64,
+        reason: String,
+    },
+    /// Retire the exact active destination token while retaining its tombstone.
+    RetireAgentMutationFence {
+        agent_id: String,
+        cluster_id: String,
+        owner_node_id: String,
+        authority_generation: u64,
+        fencing_token: u64,
+        reason: String,
+    },
+    /// Inspect one destination's highest accepted mutation fence.
+    GetAgentMutationFence {
+        agent_id: String,
+    },
+    /// Inspect bounded destination fence installation/retirement evidence.
+    ListAgentMutationFenceAudit {
+        #[serde(default)]
+        agent_id: Option<String>,
+        #[serde(default = "default_tunable_audit_limit")]
+        limit: usize,
+    },
     /// Pull the kernel's operational metrics as a Prometheus text exposition
     /// (format version 0.0.4), rendered from the syscall-gate enforcement
     /// counters, agent counts, system token/api totals, and process uptime.
@@ -1200,6 +1230,15 @@ pub enum SyscallReply {
     ClusterAgentOwnershipAudit {
         entries: Vec<crate::cluster_control::ClusterAgentOwnershipAudit>,
     },
+    /// Destination-side highest accepted mutation token or retirement tombstone.
+    AgentMutationFence {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        fence: Option<crate::cluster_control::AgentMutationFence>,
+    },
+    /// Durable destination fence installation/retirement evidence.
+    AgentMutationFenceAudit {
+        entries: Vec<crate::cluster_control::AgentMutationFenceAudit>,
+    },
     /// The kernel's operational metrics (reply to [`Syscall::Metrics`]). Carries
     /// the rendered Prometheus text exposition plus a couple of the headline
     /// numbers as structured fields, so a client can use either form.
@@ -1492,6 +1531,22 @@ fn syscall_policy(call: &Syscall) -> (AccessLevel, &'static str, Option<&str>) {
         Syscall::ListClusterAgentOwnershipAudit { .. } => {
             (AccessLevel::System, "cluster.ownership.audit", None)
         }
+        Syscall::InstallAgentMutationFence { .. } => (
+            AccessLevel::System,
+            "cluster.destination_fence.install",
+            None,
+        ),
+        Syscall::RetireAgentMutationFence { .. } => (
+            AccessLevel::System,
+            "cluster.destination_fence.retire",
+            None,
+        ),
+        Syscall::GetAgentMutationFence { .. } => {
+            (AccessLevel::System, "cluster.destination_fence.get", None)
+        }
+        Syscall::ListAgentMutationFenceAudit { .. } => {
+            (AccessLevel::System, "cluster.destination_fence.audit", None)
+        }
         Syscall::Metrics => (AccessLevel::System, "system.metrics", None),
         Syscall::OperatorSnapshot => (AccessLevel::ReadOnly, "operator.snapshot", None),
         Syscall::ListOperatorTunables => (AccessLevel::System, "operator.tunable.list", None),
@@ -1732,6 +1787,10 @@ fn quarantine_recovery_call(call: &Syscall) -> bool {
             | Syscall::ReleaseClusterAgentOwnership { .. }
             | Syscall::GetClusterAgentOwnership { .. }
             | Syscall::ListClusterAgentOwnershipAudit { .. }
+            | Syscall::InstallAgentMutationFence { .. }
+            | Syscall::RetireAgentMutationFence { .. }
+            | Syscall::GetAgentMutationFence { .. }
+            | Syscall::ListAgentMutationFenceAudit { .. }
             | Syscall::Metrics
             | Syscall::OperatorSnapshot
             | Syscall::ListOperatorTunables
@@ -3077,6 +3136,67 @@ async fn dispatch_scoped_inner(
                 .agent_ownership_audit(agent_id.as_deref(), limit)
             {
                 Ok(entries) => SyscallReply::ClusterAgentOwnershipAudit { entries },
+                Err(error) => SyscallReply::Error {
+                    message: error.to_string(),
+                },
+            }
+        }
+        Syscall::InstallAgentMutationFence {
+            agent_id,
+            cluster_id,
+            owner_node_id,
+            authority_generation,
+            fencing_token,
+            reason,
+        } => match kernel.cluster_control.install_agent_mutation_fence(
+            &agent_id,
+            &cluster_id,
+            &owner_node_id,
+            authority_generation,
+            fencing_token,
+            package_actor,
+            &reason,
+        ) {
+            Ok(fence) => SyscallReply::AgentMutationFence { fence: Some(fence) },
+            Err(error) => SyscallReply::Error {
+                message: error.to_string(),
+            },
+        },
+        Syscall::RetireAgentMutationFence {
+            agent_id,
+            cluster_id,
+            owner_node_id,
+            authority_generation,
+            fencing_token,
+            reason,
+        } => match kernel.cluster_control.retire_agent_mutation_fence(
+            &agent_id,
+            &cluster_id,
+            &owner_node_id,
+            authority_generation,
+            fencing_token,
+            package_actor,
+            &reason,
+        ) {
+            Ok(fence) => SyscallReply::AgentMutationFence { fence: Some(fence) },
+            Err(error) => SyscallReply::Error {
+                message: error.to_string(),
+            },
+        },
+        Syscall::GetAgentMutationFence { agent_id } => {
+            match kernel.cluster_control.agent_mutation_fence(&agent_id) {
+                Ok(fence) => SyscallReply::AgentMutationFence { fence },
+                Err(error) => SyscallReply::Error {
+                    message: error.to_string(),
+                },
+            }
+        }
+        Syscall::ListAgentMutationFenceAudit { agent_id, limit } => {
+            match kernel
+                .cluster_control
+                .agent_mutation_fence_audit(agent_id.as_deref(), limit)
+            {
+                Ok(entries) => SyscallReply::AgentMutationFenceAudit { entries },
                 Err(error) => SyscallReply::Error {
                     message: error.to_string(),
                 },
@@ -6760,6 +6880,41 @@ memory = ["remember this"]
                 },
                 AccessLevel::System,
             ),
+            (
+                Syscall::InstallAgentMutationFence {
+                    agent_id: "00000000-0000-0000-0000-000000000001".into(),
+                    cluster_id: "00000000-0000-0000-0000-000000000005".into(),
+                    owner_node_id: "00000000-0000-0000-0000-000000000004".into(),
+                    authority_generation: 1,
+                    fencing_token: 1,
+                    reason: "test".into(),
+                },
+                AccessLevel::System,
+            ),
+            (
+                Syscall::RetireAgentMutationFence {
+                    agent_id: "00000000-0000-0000-0000-000000000001".into(),
+                    cluster_id: "00000000-0000-0000-0000-000000000005".into(),
+                    owner_node_id: "00000000-0000-0000-0000-000000000004".into(),
+                    authority_generation: 1,
+                    fencing_token: 1,
+                    reason: "test".into(),
+                },
+                AccessLevel::System,
+            ),
+            (
+                Syscall::GetAgentMutationFence {
+                    agent_id: "00000000-0000-0000-0000-000000000001".into(),
+                },
+                AccessLevel::System,
+            ),
+            (
+                Syscall::ListAgentMutationFenceAudit {
+                    agent_id: None,
+                    limit: 10,
+                },
+                AccessLevel::System,
+            ),
             (Syscall::Metrics, AccessLevel::System),
             (Syscall::OperatorSnapshot, AccessLevel::ReadOnly),
             (Syscall::ListOperatorTunables, AccessLevel::System),
@@ -6886,7 +7041,7 @@ memory = ["remember this"]
                     .to_string()
             })
             .collect::<std::collections::HashSet<_>>();
-        assert_eq!(calls.len(), 82);
+        assert_eq!(calls.len(), 86);
         assert_eq!(fixture_tags, schema_tags);
     }
 

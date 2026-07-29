@@ -463,6 +463,69 @@ fn trusted_browser_helpers_remain_isolated_bounded_and_outside_runtime_discovery
 }
 
 #[test]
+fn peripheral_access_stays_unavailable_and_requires_a_revocable_local_grant() {
+    let tools = read_workspace_file("crates/kernel/src/tools.rs");
+    for contract in [
+        "binding.resource_type == ResourceType::Peripheral",
+        "binding.security.approval_policy == ApprovalPolicy::None",
+        "binding.security.sandbox_requirement != SandboxRequirement::Required",
+        "placeholder_provider_operations_cannot_be_published_as_tools",
+    ] {
+        assert!(
+            tools.contains(contract),
+            "peripheral registration guard lost {contract:?}"
+        );
+    }
+
+    let kernel = read_workspace_file("crates/kernel/src/lib.rs");
+    for contract in [
+        "pub struct ToolApprovalState",
+        "pub fn approve_tool_call(",
+        "pub fn tool_call_approval_state(",
+        "pub fn revoke_tool_call_approval(",
+        "resource_identity",
+        "trusted_kernel_approval_api_grants_one_exact_registered_call",
+    ] {
+        assert!(
+            kernel.contains(contract),
+            "trusted local approval surface lost {contract:?}"
+        );
+    }
+
+    let gate = read_workspace_file("crates/kernel/src/syscall_gate.rs");
+    for contract in [
+        "tool_approval_granted_contract",
+        "revoke_tool_approval_contract",
+        "self.approvals.remove(&key)",
+        "self.approvals",
+        ".retain(|(agent, _, _, _, _), _| *agent != kid)",
+    ] {
+        assert!(
+            gate.contains(contract),
+            "single-use approval lifecycle lost {contract:?}"
+        );
+    }
+
+    let matrix = read_workspace_file("docs/PROVIDER_MATRIX.md");
+    let row = matrix
+        .lines()
+        .find(|line| line.contains("Kernel peripheral provider"))
+        .expect("provider matrix must retain the kernel peripheral row");
+    for contract in [
+        "Experimental — unavailable",
+        "None — unavailable",
+        "explicit local human approval",
+        "inspect a non-secret pending indicator",
+        "No remote, SDK, package, or MCP surface can create a grant",
+    ] {
+        assert!(
+            row.contains(contract),
+            "peripheral matrix row lost honest contract {contract:?}"
+        );
+    }
+}
+
+#[test]
 fn false_production_claim_is_rejected() {
     let root = workspace_root();
     let false_claim = Capability {

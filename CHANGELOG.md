@@ -10,6 +10,15 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
 
 ## [Unreleased]
 
+- Added a revocable, visible local approval contract for future peripheral
+  access without enabling any placeholder device operation. Peripheral tool
+  bindings are registration-rejected unless they require sandbox execution and
+  explicit human approval. The trusted in-process operator API can grant,
+  inspect, or revoke one exact agent/tool/opaque-target/contract approval;
+  grants are single-use, secrets never enter the status projection, and agent
+  teardown purges them. Capture, audio, print, and every kernel peripheral
+  provider remain unavailable until a platform backend supplies active-use
+  indicators and qualification.
 - Expanded the protected exact-commit provider-security workflow from a
   browser-unavailable assertion to a real two-profile Chromium qualification.
   The lockfile-pinned browser fixture proves cookies do not cross isolated

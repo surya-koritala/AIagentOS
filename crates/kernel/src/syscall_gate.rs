@@ -948,6 +948,61 @@ impl SyscallGate {
         true
     }
 
+    /// Return whether an exact local approval is pending. `None` means the
+    /// agent is not registered. The exact contract/resource identity prevents
+    /// a UI indicator from treating approval for a stale target as current.
+    pub(crate) fn tool_approval_granted_contract(
+        &self,
+        kid: uuid::Uuid,
+        tool_name: &str,
+        resource: &str,
+        contract: &str,
+        required: crate::tools::ApprovalPolicy,
+    ) -> Option<bool> {
+        let _mutation = self.mutation_lock.lock().unwrap();
+        let registration_revision = self
+            .records
+            .get(&kid)
+            .map(|record| record.registration_revision)?;
+        let key = (
+            kid,
+            registration_revision,
+            tool_name.to_string(),
+            crate::resources::opaque_identity(resource.as_bytes()),
+            contract.to_string(),
+        );
+        Some(
+            self.approvals
+                .get(&key)
+                .is_some_and(|approval| (*approval).satisfies(required)),
+        )
+    }
+
+    /// Revoke one exact, unconsumed local approval. Already-admitted calls own
+    /// their normal gate/cgroup lifecycle; revocation fences every call that
+    /// has not yet atomically consumed the grant.
+    pub(crate) fn revoke_tool_approval_contract(
+        &self,
+        kid: uuid::Uuid,
+        tool_name: &str,
+        resource: &str,
+        contract: &str,
+    ) -> Option<bool> {
+        let _mutation = self.mutation_lock.lock().unwrap();
+        let registration_revision = self
+            .records
+            .get(&kid)
+            .map(|record| record.registration_revision)?;
+        let key = (
+            kid,
+            registration_revision,
+            tool_name.to_string(),
+            crate::resources::opaque_identity(resource.as_bytes()),
+            contract.to_string(),
+        );
+        Some(self.approvals.remove(&key).is_some())
+    }
+
     /// Look up the OS PID for a kernel UUID (useful for MAC labelling).
     pub fn pid_of(&self, kid: uuid::Uuid) -> Option<Pid> {
         self.records.get(&kid).map(|r| r.pid)

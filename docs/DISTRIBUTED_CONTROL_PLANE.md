@@ -21,7 +21,10 @@ an in-memory owner map by listing every connected node and refuses duplicate
 agent identifiers. The designated authority can issue, renew, release, and
 audit a durable expiring ownership record with a monotonically increasing
 per-agent fencing token. Workload nodes do not enforce that token on agent
-mutations yet, so the record is not a partition fence.
+mutations until a system control-plane caller explicitly installs the matching
+destination fence. Once installed, the node durably rejects unfenced and stale
+operations, but the current client does not propagate authority records
+automatically and the single authority still has no quorum term.
 
 Consequently, the current multi-node foundation is appropriate for controlled
 development and qualification. It is not partition tolerant and must not be
@@ -35,7 +38,7 @@ advertised as a production distributed kernel.
 | Node identity | Node-local Ed25519 key in the node SQLite database | Stable across restart; proved by fresh challenge | Live certificate rotation/revocation bound to durable node identity |
 | Node availability and placement profile | Node-local SQLite database | Generation-fenced on one node; discovery reads a point-in-time value | Signed or quorum-observed liveness/capacity with staleness bounds |
 | Agent identity | Owning node SQLite database | Stable on one node; cluster-wide uniqueness is detected only while rebuilding connected nodes | Authority-allocated ownership record with an immutable agent identity |
-| Agent ownership and routing | Authority lease registry plus `ClusterClient` in-memory map rebuilt from node listings | Claims require an active member; renew/release require the exact owner/token; transfer requires release or expiry and increments the token; workload mutations do not check it | Quorum-committed authority term plus the fencing token checked by every mutable node path |
+| Agent ownership and routing | Authority lease registry, destination fence tombstones, plus `ClusterClient` in-memory routes | Claims require an active member; transfer increments the token; once a destination fence is installed, every mutable agent syscall is rejected unless a system envelope presents the exact active cluster/owner/generation/token; a per-agent admission barrier prevents install, retirement, or handoff from crossing a mutation already in flight | Quorum-committed authority term, automatic route/fence propagation, and migration admission |
 | Agent state and checkpoints | Owning node SQLite database | Transactional on one node; no cross-node replica or migration transaction | Checkpoint/handoff protocol with one committed owner, rollback point, and side-effect boundary |
 | Package metadata and trust roots | Node-local package registry and policy | Transactional per node; no cluster convergence guarantee | Versioned trust epoch distributed atomically or by a documented monotonic convergence protocol |
 | Authorization policy | Node-local kernel configuration and durable policy state | Enforced consistently across local entry points; not synchronized cluster-wide | Tenant policy epoch included in placement and mutation admission |
@@ -55,9 +58,18 @@ advertised as a production distributed kernel.
   active nodes. Capacity is advisory and has no signed freshness guarantee.
 - Agent creation commits on the selected node. The client records that node in
   memory only after creation succeeds.
-- Agent turns, tool calls, cancellation, memory operations, storage operations,
-  checkpoints, and lifecycle mutations are authorized and committed by the
-  owning node. They do not currently carry an authority ownership fence.
+- Agent turns, tool calls, cancellation, memory writes, storage writes,
+  checkpoint writes, and lifecycle mutations are authorized and committed by
+  the owning node. An operator/control-plane client can install a durable
+  highest-token destination fence; after installation, unfenced calls and
+  stale, retired, foreign-cluster, or cross-agent proofs fail closed. The
+  verification and complete protected operation share one per-agent read
+  barrier, while install and retirement take its exclusive side. A newer token
+  therefore waits for an admitted operation instead of crossing a
+  verify-to-execute gap. The typed SDK covers fenced lifecycle, turn, and tool
+  calls. Streaming is deliberately unavailable for fenced agents until a
+  fenced stream handshake is implemented; an ordinary stream holds the same
+  barrier for its lifetime and cannot race an initial fence installation.
 - Ownership claims are system-scoped authority operations. A new record starts
   at token 1; renewal preserves the token; release retains a tombstone; and
   transfer after release or expiry requires the exact old token and allocates a
@@ -74,14 +86,14 @@ advertised as a production distributed kernel.
 |---|---|---|
 | Membership authority loss | Existing node-local work can continue; membership mutation and fresh authoritative discovery fail closed | Elect a new term by quorum and fence every previous authority |
 | Workload node loss | Calls to that node fail; another node must not recreate or resume its agents automatically | Expiring ownership lease, durable replica/checkpoint, and explicit recovery policy |
-| Network partition | Each side may retain local state, so operators must prevent multi-side mutation; the system makes no availability promise | Majority ownership authority and node-side fencing of every mutation |
+| Network partition | A node with an installed destination fence rejects older or missing tokens, but the single authority can still be duplicated or revived without quorum | Majority ownership authority and an authority term incorporated into every destination proof |
 | Duplicate agent ownership | `rebuild_owners` returns a non-retryable conflict and routes neither copy | Durable ownership directory and repair procedure based on fencing evidence |
-| Stale route | The routed node may return not-found/unavailable; callers rebuild explicitly and do not guess | Route revision and ownership token verified by the destination |
+| Stale route | A fenced destination returns a retryable conflict for missing/stale evidence; the current `ClusterClient` does not yet fetch and propagate authority fences automatically | Authority-backed route refresh and atomic fence installation before publication |
 | Client retry before visible output | Safe only where the called local API already documents idempotency | Cluster request identity and durable deduplication at the authority and owner |
 | Retry after a side effect or partial model/tool output | Must not happen automatically; the result is terminal unless the operation contract proves idempotency | Side-effect journal and explicit at-most-once or at-least-once contract per operation |
 | Clock skew | Join challenge and ownership expiry use authority time; workload nodes do not independently expire or enforce leases | Authority term plus bounded lease clock assumptions or logical-expiry protocol |
 | Authority restart | The same database restores cluster identity, membership generation, and audit | Quorum log recovery and disaster-recovery procedure |
-| Workload restart | The same node database restores its agents and routing can be rebuilt | Ownership lease reacquisition that cannot overlap a previous owner |
+| Workload restart | The same node database restores its agents and highest-token/retired destination tombstones | Ownership lease reacquisition and automatic route publication that cannot overlap a previous owner |
 
 Unknown outcomes are not successes. A timeout, broken connection, or authority
 change must be surfaced as an explicit retryable or terminal error according to

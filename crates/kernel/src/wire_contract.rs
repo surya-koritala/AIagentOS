@@ -511,6 +511,44 @@ const REQUEST_VARIANTS: &[Variant] = &[
         fields: &[Field::optional("agent_id", N), Field::optional("limit", I)],
     },
     Variant {
+        tag: "install_agent_mutation_fence",
+        fields: &[
+            Field::required("agent_id", S),
+            Field::required("cluster_id", S),
+            Field::required("owner_node_id", S),
+            Field::required("authority_generation", I),
+            Field::required("fencing_token", I),
+            Field::required("reason", S),
+        ],
+    },
+    Variant {
+        tag: "retire_agent_mutation_fence",
+        fields: &[
+            Field::required("agent_id", S),
+            Field::required("cluster_id", S),
+            Field::required("owner_node_id", S),
+            Field::required("authority_generation", I),
+            Field::required("fencing_token", I),
+            Field::required("reason", S),
+        ],
+    },
+    Variant {
+        tag: "get_agent_mutation_fence",
+        fields: &[Field::required("agent_id", S)],
+    },
+    Variant {
+        tag: "list_agent_mutation_fence_audit",
+        fields: &[Field::optional("agent_id", N), Field::optional("limit", I)],
+    },
+    Variant {
+        tag: "fenced_agent_mutation",
+        fields: &[
+            Field::required("agent_id", S),
+            Field::required("proof", O),
+            Field::required("mutation", O),
+        ],
+    },
+    Variant {
         tag: "metrics",
         fields: &[],
     },
@@ -637,6 +675,11 @@ pub fn conformance_request_fixtures(protocol_version: u32) -> Result<Vec<Value>,
                         | "release_cluster_agent_ownership"
                         | "get_cluster_agent_ownership"
                         | "list_cluster_agent_ownership_audit"
+                        | "install_agent_mutation_fence"
+                        | "retire_agent_mutation_fence"
+                        | "get_agent_mutation_fence"
+                        | "list_agent_mutation_fence_audit"
+                        | "fenced_agent_mutation"
                 )
         })
         .map(|variant| {
@@ -676,6 +719,16 @@ pub fn conformance_request_fixtures(protocol_version: u32) -> Result<Vec<Value>,
                     }),
                     ("target", JsonKind::Object) => serde_json::json!({
                         "kind": "agent",
+                        "agent_id": "00000000-0000-0000-0000-000000000001"
+                    }),
+                    ("proof", JsonKind::Object) => serde_json::json!({
+                        "cluster_id": "00000000-0000-0000-0000-000000000005",
+                        "owner_node_id": "00000000-0000-0000-0000-000000000004",
+                        "authority_generation": 1,
+                        "fencing_token": 1
+                    }),
+                    ("mutation", JsonKind::Object) => serde_json::json!({
+                        "op": "pause_agent",
                         "agent_id": "00000000-0000-0000-0000-000000000001"
                     }),
                     ("valid_from", JsonKind::String) => {
@@ -962,6 +1015,14 @@ const REPLY_VARIANTS: &[Variant] = &[
     },
     Variant {
         tag: "cluster_agent_ownership_audit",
+        fields: &[Field::required("entries", A)],
+    },
+    Variant {
+        tag: "agent_mutation_fence",
+        fields: &[Field::optional("fence", JsonKind::ObjectOrNull)],
+    },
+    Variant {
+        tag: "agent_mutation_fence_audit",
         fields: &[Field::required("entries", A)],
     },
     Variant {
@@ -1359,7 +1420,7 @@ mod tests {
             }
         }
         assert_eq!(conformance_request_fixtures(1).unwrap().len(), 61);
-        assert_eq!(conformance_request_fixtures(2).unwrap().len(), 82);
+        assert_eq!(conformance_request_fixtures(2).unwrap().len(), 87);
         assert!(conformance_request_fixtures(0).is_err());
         assert!(conformance_request_fixtures(PROTOCOL_VERSION + 1).is_err());
     }

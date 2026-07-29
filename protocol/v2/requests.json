@@ -321,6 +321,47 @@
     "op": "list_cluster_agent_ownership_audit"
   },
   {
+    "agent_id": "00000000-0000-0000-0000-000000000001",
+    "authority_generation": 1,
+    "cluster_id": "fixture",
+    "fencing_token": 1,
+    "op": "install_agent_mutation_fence",
+    "owner_node_id": "00000000-0000-0000-0000-000000000004",
+    "reason": "fixture"
+  },
+  {
+    "agent_id": "00000000-0000-0000-0000-000000000001",
+    "authority_generation": 1,
+    "cluster_id": "fixture",
+    "fencing_token": 1,
+    "op": "retire_agent_mutation_fence",
+    "owner_node_id": "00000000-0000-0000-0000-000000000004",
+    "reason": "fixture"
+  },
+  {
+    "agent_id": "00000000-0000-0000-0000-000000000001",
+    "op": "get_agent_mutation_fence"
+  },
+  {
+    "agent_id": null,
+    "limit": 1,
+    "op": "list_agent_mutation_fence_audit"
+  },
+  {
+    "agent_id": "00000000-0000-0000-0000-000000000001",
+    "mutation": {
+      "agent_id": "00000000-0000-0000-0000-000000000001",
+      "op": "pause_agent"
+    },
+    "op": "fenced_agent_mutation",
+    "proof": {
+      "authority_generation": 1,
+      "cluster_id": "00000000-0000-0000-0000-000000000005",
+      "fencing_token": 1,
+      "owner_node_id": "00000000-0000-0000-0000-000000000004"
+    }
+  },
+  {
     "op": "metrics"
   },
   {

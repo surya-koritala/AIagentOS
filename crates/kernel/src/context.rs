@@ -1883,6 +1883,7 @@ impl SqliteContextManager {
             CREATE TABLE IF NOT EXISTS cluster_agent_ownership (
                 agent_id TEXT PRIMARY KEY CHECK (length(agent_id) = 36),
                 owner_node_id TEXT NOT NULL CHECK (length(owner_node_id) = 36),
+                authority_term INTEGER NOT NULL DEFAULT 1 CHECK (authority_term >= 1),
                 fencing_token INTEGER NOT NULL CHECK (fencing_token >= 1),
                 generation INTEGER NOT NULL CHECK (generation >= 1),
                 state TEXT NOT NULL CHECK (state IN ('active', 'released')),
@@ -1897,6 +1898,7 @@ impl SqliteContextManager {
                 generation INTEGER NOT NULL CHECK (generation >= 1),
                 previous_owner_node_id TEXT,
                 owner_node_id TEXT NOT NULL CHECK (length(owner_node_id) = 36),
+                authority_term INTEGER NOT NULL DEFAULT 1 CHECK (authority_term >= 1),
                 fencing_token INTEGER NOT NULL CHECK (fencing_token >= 1),
                 operation TEXT NOT NULL CHECK (
                     operation IN ('claim', 'transfer', 'renew', 'release')
@@ -1910,8 +1912,10 @@ impl SqliteContextManager {
                 agent_id TEXT PRIMARY KEY CHECK (length(agent_id) = 36),
                 cluster_id TEXT NOT NULL CHECK (length(cluster_id) = 36),
                 owner_node_id TEXT NOT NULL CHECK (length(owner_node_id) = 36),
+                authority_term INTEGER NOT NULL CHECK (authority_term >= 1),
                 authority_generation INTEGER NOT NULL CHECK (authority_generation >= 1),
                 fencing_token INTEGER NOT NULL CHECK (fencing_token >= 1),
+                proof_expires_at TEXT NOT NULL,
                 state TEXT NOT NULL CHECK (state IN ('active', 'retired')),
                 installed_at TEXT NOT NULL,
                 reason TEXT NOT NULL
@@ -1921,12 +1925,17 @@ impl SqliteContextManager {
                 fencing_token INTEGER NOT NULL CHECK (fencing_token >= 1),
                 cluster_id TEXT NOT NULL CHECK (length(cluster_id) = 36),
                 owner_node_id TEXT NOT NULL CHECK (length(owner_node_id) = 36),
+                authority_term INTEGER NOT NULL CHECK (authority_term >= 1),
                 authority_generation INTEGER NOT NULL CHECK (authority_generation >= 1),
+                proof_expires_at TEXT NOT NULL,
                 state TEXT NOT NULL CHECK (state IN ('active', 'retired')),
                 actor TEXT NOT NULL,
                 reason TEXT NOT NULL,
                 changed_at TEXT NOT NULL,
-                PRIMARY KEY (agent_id, fencing_token, state, authority_generation)
+                PRIMARY KEY (
+                    agent_id, fencing_token, state, authority_generation,
+                    authority_term, proof_expires_at
+                )
             ) WITHOUT ROWID;
             -- OpenRaft storage-v2 state shares the kernel's SQLCipher, WAL,
             -- synchronous=FULL, backup, restore, and process-lease boundary.
@@ -1965,6 +1974,98 @@ impl SqliteContextManager {
                 created_at TEXT NOT NULL
             );",
         ).map_err(|e| ContextError::StorageError(e.to_string()))?;
+        crate::schema::add_column_if_missing(
+            conn,
+            "cluster_agent_ownership",
+            "authority_term",
+            "INTEGER NOT NULL DEFAULT 1 CHECK (authority_term >= 1)",
+        )?;
+        crate::schema::add_column_if_missing(
+            conn,
+            "cluster_agent_ownership_audit",
+            "authority_term",
+            "INTEGER NOT NULL DEFAULT 1 CHECK (authority_term >= 1)",
+        )?;
+        let legacy_destination_fence =
+            !crate::schema::has_column(conn, "cluster_agent_mutation_fences", "authority_term")?
+                || !crate::schema::has_column(
+                    conn,
+                    "cluster_agent_mutation_fences",
+                    "proof_expires_at",
+                )?;
+        if legacy_destination_fence {
+            conn.execute_batch(
+                "CREATE TABLE cluster_agent_mutation_fences_v7 (
+                    agent_id TEXT PRIMARY KEY CHECK (length(agent_id) = 36),
+                    cluster_id TEXT NOT NULL CHECK (length(cluster_id) = 36),
+                    owner_node_id TEXT NOT NULL CHECK (length(owner_node_id) = 36),
+                    authority_term INTEGER NOT NULL CHECK (authority_term >= 1),
+                    authority_generation INTEGER NOT NULL CHECK (authority_generation >= 1),
+                    fencing_token INTEGER NOT NULL CHECK (fencing_token >= 1),
+                    proof_expires_at TEXT NOT NULL,
+                    state TEXT NOT NULL CHECK (state IN ('active', 'retired')),
+                    installed_at TEXT NOT NULL,
+                    reason TEXT NOT NULL
+                 );
+                 INSERT INTO cluster_agent_mutation_fences_v7
+                    (agent_id, cluster_id, owner_node_id, authority_term,
+                     authority_generation, fencing_token, proof_expires_at,
+                     state, installed_at, reason)
+                 SELECT agent_id, cluster_id, owner_node_id, 1,
+                        authority_generation, fencing_token, installed_at,
+                        state, installed_at, reason
+                 FROM cluster_agent_mutation_fences;
+                 DROP TABLE cluster_agent_mutation_fences;
+                 ALTER TABLE cluster_agent_mutation_fences_v7
+                    RENAME TO cluster_agent_mutation_fences;",
+            )
+            .map_err(|error| {
+                ContextError::StorageError(format!(
+                    "failed to expire legacy destination mutation proofs: {error}"
+                ))
+            })?;
+        }
+        if !crate::schema::has_column(
+            conn,
+            "cluster_agent_mutation_fence_audit",
+            "proof_expires_at",
+        )? {
+            conn.execute_batch(
+                "CREATE TABLE cluster_agent_mutation_fence_audit_v7 (
+                    agent_id TEXT NOT NULL CHECK (length(agent_id) = 36),
+                    fencing_token INTEGER NOT NULL CHECK (fencing_token >= 1),
+                    cluster_id TEXT NOT NULL CHECK (length(cluster_id) = 36),
+                    owner_node_id TEXT NOT NULL CHECK (length(owner_node_id) = 36),
+                    authority_term INTEGER NOT NULL CHECK (authority_term >= 1),
+                    authority_generation INTEGER NOT NULL CHECK (authority_generation >= 1),
+                    proof_expires_at TEXT NOT NULL,
+                    state TEXT NOT NULL CHECK (state IN ('active', 'retired')),
+                    actor TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    changed_at TEXT NOT NULL,
+                    PRIMARY KEY (
+                        agent_id, fencing_token, state, authority_generation,
+                        authority_term, proof_expires_at
+                    )
+                 ) WITHOUT ROWID;
+                 INSERT INTO cluster_agent_mutation_fence_audit_v7
+                    (agent_id, fencing_token, cluster_id, owner_node_id,
+                     authority_term, authority_generation, proof_expires_at,
+                     state, actor, reason, changed_at)
+                 SELECT agent_id, fencing_token, cluster_id, owner_node_id,
+                        1, authority_generation, changed_at,
+                        state, actor, reason, changed_at
+                 FROM cluster_agent_mutation_fence_audit;
+                 DROP TABLE cluster_agent_mutation_fence_audit;
+                 ALTER TABLE cluster_agent_mutation_fence_audit_v7
+                    RENAME TO cluster_agent_mutation_fence_audit;",
+            )
+            .map_err(|error| {
+                ContextError::StorageError(format!(
+                    "failed to migrate destination mutation proof audit: {error}"
+                ))
+            })?;
+        }
         crate::schema::add_column_if_missing(
             conn,
             "cluster_members",
@@ -10821,6 +10922,194 @@ mod tests {
         assert_eq!(receipt_table, 1);
         assert_eq!(integrity_tables, 2);
         crate::accounting_integrity::verify(&connection).unwrap();
+        crate::schema::verify(&connection).unwrap();
+    }
+
+    #[test]
+    fn schema_v6_authority_proofs_upgrade_with_term_one_and_expire_closed() {
+        let database = QuotaTestDatabase::new("schema-v6-authority-proofs");
+        let agent_id = uuid::Uuid::new_v4().to_string();
+        let cluster_id = uuid::Uuid::new_v4().to_string();
+        let owner_node_id = uuid::Uuid::new_v4().to_string();
+        let installed_at = "2026-01-01T00:00:00+00:00";
+        {
+            let manager = SqliteContextManager::new(&database.path).unwrap();
+            let connection = manager.conn.lock().unwrap();
+            connection
+                .execute_batch(
+                    "DROP TABLE cluster_agent_mutation_fence_audit;
+                     DROP TABLE cluster_agent_mutation_fences;
+                     DROP TABLE cluster_agent_ownership_audit;
+                     DROP TABLE cluster_agent_ownership;
+                     CREATE TABLE cluster_agent_ownership (
+                        agent_id TEXT PRIMARY KEY CHECK (length(agent_id) = 36),
+                        owner_node_id TEXT NOT NULL CHECK (length(owner_node_id) = 36),
+                        fencing_token INTEGER NOT NULL CHECK (fencing_token >= 1),
+                        generation INTEGER NOT NULL CHECK (generation >= 1),
+                        state TEXT NOT NULL CHECK (state IN ('active', 'released')),
+                        lease_expires_at TEXT NOT NULL,
+                        updated_at TEXT NOT NULL,
+                        reason TEXT NOT NULL
+                     );
+                     CREATE INDEX idx_cluster_agent_ownership_owner
+                        ON cluster_agent_ownership(
+                            owner_node_id, state, lease_expires_at
+                        );
+                     CREATE TABLE cluster_agent_ownership_audit (
+                        agent_id TEXT NOT NULL CHECK (length(agent_id) = 36),
+                        generation INTEGER NOT NULL CHECK (generation >= 1),
+                        previous_owner_node_id TEXT,
+                        owner_node_id TEXT NOT NULL CHECK (length(owner_node_id) = 36),
+                        fencing_token INTEGER NOT NULL CHECK (fencing_token >= 1),
+                        operation TEXT NOT NULL CHECK (
+                            operation IN ('claim', 'transfer', 'renew', 'release')
+                        ),
+                        actor TEXT NOT NULL,
+                        reason TEXT NOT NULL,
+                        changed_at TEXT NOT NULL,
+                        PRIMARY KEY (agent_id, generation)
+                     ) WITHOUT ROWID;
+                     CREATE TABLE cluster_agent_mutation_fences (
+                        agent_id TEXT PRIMARY KEY CHECK (length(agent_id) = 36),
+                        cluster_id TEXT NOT NULL CHECK (length(cluster_id) = 36),
+                        owner_node_id TEXT NOT NULL CHECK (length(owner_node_id) = 36),
+                        authority_generation INTEGER NOT NULL
+                            CHECK (authority_generation >= 1),
+                        fencing_token INTEGER NOT NULL CHECK (fencing_token >= 1),
+                        state TEXT NOT NULL CHECK (state IN ('active', 'retired')),
+                        installed_at TEXT NOT NULL,
+                        reason TEXT NOT NULL
+                     );
+                     CREATE TABLE cluster_agent_mutation_fence_audit (
+                        agent_id TEXT NOT NULL CHECK (length(agent_id) = 36),
+                        fencing_token INTEGER NOT NULL CHECK (fencing_token >= 1),
+                        cluster_id TEXT NOT NULL CHECK (length(cluster_id) = 36),
+                        owner_node_id TEXT NOT NULL CHECK (length(owner_node_id) = 36),
+                        authority_generation INTEGER NOT NULL
+                            CHECK (authority_generation >= 1),
+                        state TEXT NOT NULL CHECK (state IN ('active', 'retired')),
+                        actor TEXT NOT NULL,
+                        reason TEXT NOT NULL,
+                        changed_at TEXT NOT NULL,
+                        PRIMARY KEY (
+                            agent_id, fencing_token, state, authority_generation
+                        )
+                     ) WITHOUT ROWID;",
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO cluster_agent_ownership
+                        (agent_id, owner_node_id, fencing_token, generation, state,
+                         lease_expires_at, updated_at, reason)
+                     VALUES (?1, ?2, 5, 9, 'active', ?3, ?3, 'legacy owner')",
+                    params![&agent_id, &owner_node_id, installed_at],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO cluster_agent_ownership_audit
+                        (agent_id, generation, previous_owner_node_id,
+                         owner_node_id, fencing_token, operation, actor,
+                         reason, changed_at)
+                     VALUES (?1, 9, NULL, ?2, 5, 'claim', 'legacy',
+                             'legacy owner', ?3)",
+                    params![&agent_id, &owner_node_id, installed_at],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO cluster_agent_mutation_fences
+                        (agent_id, cluster_id, owner_node_id,
+                         authority_generation, fencing_token, state,
+                         installed_at, reason)
+                     VALUES (?1, ?2, ?3, 9, 5, 'active', ?4, 'legacy proof')",
+                    params![&agent_id, &cluster_id, &owner_node_id, installed_at],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO cluster_agent_mutation_fence_audit
+                        (agent_id, fencing_token, cluster_id, owner_node_id,
+                         authority_generation, state, actor, reason, changed_at)
+                     VALUES (?1, 5, ?2, ?3, 9, 'active', 'legacy',
+                             'legacy proof', ?4)",
+                    params![&agent_id, &cluster_id, &owner_node_id, installed_at],
+                )
+                .unwrap();
+            connection
+                .execute("DELETE FROM schema_migrations WHERE version = 7", [])
+                .unwrap();
+            connection
+                .execute("UPDATE storage_meta SET schema_version = 6", [])
+                .unwrap();
+            connection.pragma_update(None, "user_version", 6).unwrap();
+        }
+
+        let manager = SqliteContextManager::new(&database.path).unwrap();
+        let connection = manager.conn.lock().unwrap();
+        let ownership_term: i64 = connection
+            .query_row(
+                "SELECT authority_term FROM cluster_agent_ownership
+                 WHERE agent_id = ?1",
+                [&agent_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let ownership_audit_term: i64 = connection
+            .query_row(
+                "SELECT authority_term FROM cluster_agent_ownership_audit
+                 WHERE agent_id = ?1",
+                [&agent_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let (fence_term, proof_expires_at): (i64, String) = connection
+            .query_row(
+                "SELECT authority_term, proof_expires_at
+                 FROM cluster_agent_mutation_fences WHERE agent_id = ?1",
+                [&agent_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        let (audit_term, audit_expires_at): (i64, String) = connection
+            .query_row(
+                "SELECT authority_term, proof_expires_at
+                 FROM cluster_agent_mutation_fence_audit WHERE agent_id = ?1",
+                [&agent_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        let proof_expiry_not_null: i64 = connection
+            .query_row(
+                "SELECT \"notnull\" FROM pragma_table_info(
+                    'cluster_agent_mutation_fences'
+                 ) WHERE name = 'proof_expires_at'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let migration_name: String = connection
+            .query_row(
+                "SELECT name FROM schema_migrations WHERE version = 7",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(ownership_term, 1);
+        assert_eq!(ownership_audit_term, 1);
+        assert_eq!(fence_term, 1);
+        assert_eq!(audit_term, 1);
+        assert_eq!(proof_expires_at, installed_at);
+        assert_eq!(audit_expires_at, installed_at);
+        assert_eq!(
+            proof_expiry_not_null, 1,
+            "upgraded proofs must retain a database-level expiry invariant"
+        );
+        assert_eq!(
+            migration_name,
+            "bind-destination-fences-to-authority-terms-and-expiry"
+        );
         crate::schema::verify(&connection).unwrap();
     }
 

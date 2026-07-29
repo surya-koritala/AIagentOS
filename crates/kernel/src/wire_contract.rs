@@ -572,8 +572,10 @@ const REQUEST_VARIANTS: &[Variant] = &[
             Field::required("agent_id", S),
             Field::required("cluster_id", S),
             Field::required("owner_node_id", S),
+            Field::required("authority_term", I),
             Field::required("authority_generation", I),
             Field::required("fencing_token", I),
+            Field::required("proof_expires_at", S),
             Field::required("reason", S),
         ],
     },
@@ -583,8 +585,10 @@ const REQUEST_VARIANTS: &[Variant] = &[
             Field::required("agent_id", S),
             Field::required("cluster_id", S),
             Field::required("owner_node_id", S),
+            Field::required("authority_term", I),
             Field::required("authority_generation", I),
             Field::required("fencing_token", I),
+            Field::required("proof_expires_at", S),
             Field::required("reason", S),
         ],
     },
@@ -791,14 +795,19 @@ pub fn conformance_request_fixtures(protocol_version: u32) -> Result<Vec<Value>,
                     ("proof", JsonKind::Object) => serde_json::json!({
                         "cluster_id": "00000000-0000-0000-0000-000000000005",
                         "owner_node_id": "00000000-0000-0000-0000-000000000004",
+                        "authority_term": 1,
                         "authority_generation": 1,
-                        "fencing_token": 1
+                        "fencing_token": 1,
+                        "proof_expires_at": "2026-01-01T00:00:00Z"
                     }),
                     ("mutation", JsonKind::Object) => serde_json::json!({
                         "op": "pause_agent",
                         "agent_id": "00000000-0000-0000-0000-000000000001"
                     }),
                     ("valid_from", JsonKind::String) => {
+                        Value::String("2026-01-01T00:00:00Z".into())
+                    }
+                    ("proof_expires_at", JsonKind::String) => {
                         Value::String("2026-01-01T00:00:00Z".into())
                     }
                     ("manifest_toml", JsonKind::String) => {

@@ -88,6 +88,17 @@ must not treat an unavailable or rejected reply as success. The receipt map is
 bounded and capacity exhaustion rejects new application commands rather than
 letting one replica prune independently.
 
+Schema version `7` binds ownership and destination mutation fences to authority
+terms. Replicated ownership revisions store the term from the committing
+OpenRaft log ID; standalone authority records use term one. Destination records
+and their audit store term, generation, fencing token, and exact proof expiry as
+one identity. Migration backfills legacy ownership terms to one and expires
+every pre-v7 destination proof at its installation timestamp so it cannot admit
+new work until an authenticated client refreshes it. The destination-fence
+table is rebuilt transactionally so expiry remains `NOT NULL`; a regression
+reconstructs the exact v6 tables and verifies the full v7 backfill, fail-closed
+expiry, migration ledger, schema constraints, and idempotent verification.
+
 OpenRaft's complete storage-v2 conformance suite, file-backed
 vote/committed/log/state/snapshot restart persistence, command idempotency,
 snapshot transfer and rollback protection, durable-pointer monotonicity, and
@@ -98,11 +109,11 @@ follower write/read forwarding, leader failover, restart catch-up, old-term
 fencing, and no-quorum rejection. The production server constructs and owns
 that runtime and routes public membership and ownership authority through it
 when strict `[cluster_raft]` configuration is enabled. The disabled default
-retains the legacy single-node authority. Static voters, destination proof
-terms, Raft transport trust rotation, migration, global quota/trust
-convergence, and disaster recovery remain outside this slice. The replicated
-application authority does persist bounded application-listener certificate
-rollouts and their ordered trust audit.
+retains the legacy single-node authority. Static voters, Raft transport trust
+rotation, workload migration, global quota/trust convergence, and disaster
+recovery remain outside this slice. The replicated application authority also
+persists bounded application-listener certificate rollouts and their ordered
+trust audit.
 
 ## Authenticated accounting integrity
 

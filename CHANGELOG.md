@@ -10,6 +10,21 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
 
 ## [Unreleased]
 
+- Bound every destination mutation fence to the OpenRaft term that committed
+  its ownership revision and to the authority lease's exact expiry. Workload
+  nodes persist term/generation/token/expiry together, reject lower terms and
+  conflicting replays, permanently retain retirement tombstones, refuse proof
+  horizons beyond the five-minute authority lease plus 30 seconds of clock
+  skew, and stop admitting mutations at the exact expiry boundary. A detected
+  clock rollback behind fence installation also fails closed. Schema migration
+  v7 backfills standalone and legacy authority terms to one and expires legacy
+  destination proofs at their installation time, requiring an authenticated
+  refresh before reuse. Replicated ownership and audit now retain the committed
+  leader term across replay, snapshot, and restart. Typed v2/SDK operations,
+  managed cluster routing, streams, and exact cancellation carry the complete
+  proof. An operation admitted before expiry keeps the existing per-agent guard
+  through completion; expiry prevents new admission rather than rolling back an
+  already-started side effect.
 - Added quorum-coordinated, time-bounded application-listener certificate
   rollout for `[cluster_raft]` authorities. A fresh challenged identity proof
   prepares a never-before-authorized candidate for 5–3600 seconds; activation

@@ -831,8 +831,10 @@ impl ClusterClient {
                     &agent_id,
                     &proof.cluster_id,
                     &proof.owner_node_id,
+                    proof.authority_term,
                     proof.authority_generation,
                     proof.fencing_token,
+                    proof.proof_expires_at,
                     "cluster client pre-creation reservation",
                 )
                 .await
@@ -1029,8 +1031,10 @@ impl ClusterClient {
                                 &recovered.agent_id,
                                 &proof.cluster_id,
                                 &proof.owner_node_id,
+                                proof.authority_term,
                                 proof.authority_generation,
                                 proof.fencing_token,
+                                proof.proof_expires_at,
                                 "fence expired incomplete cluster creation",
                             )
                             .await?;
@@ -1053,8 +1057,10 @@ impl ClusterClient {
                                     &recovered.agent_id,
                                     &proof.cluster_id,
                                     &proof.owner_node_id,
+                                    proof.authority_term,
                                     proof.authority_generation,
                                     proof.fencing_token,
+                                    proof.proof_expires_at,
                                     "retire expired incomplete cluster creation",
                                 )
                                 .await?;
@@ -1121,8 +1127,10 @@ impl ClusterClient {
                             &listed.agent_id,
                             &proof.cluster_id,
                             &proof.owner_node_id,
+                            proof.authority_term,
                             proof.authority_generation,
                             proof.fencing_token,
+                            proof.proof_expires_at,
                             "cluster client durable reconciliation",
                         )
                         .await?;
@@ -1274,8 +1282,10 @@ impl ClusterClient {
                         agent_id,
                         &proof.cluster_id,
                         &proof.owner_node_id,
+                        proof.authority_term,
                         proof.authority_generation,
                         proof.fencing_token,
+                        proof.proof_expires_at,
                         "cluster client route refresh",
                     )
                     .await?;
@@ -1328,8 +1338,10 @@ impl ClusterClient {
                 agent_id,
                 &proof.cluster_id,
                 &proof.owner_node_id,
+                proof.authority_term,
                 proof.authority_generation,
                 proof.fencing_token,
+                proof.proof_expires_at,
                 "cluster client lease renewal",
             )
             .await
@@ -1712,9 +1724,11 @@ fn proof_is_at_least_as_new(
     candidate: &AgentMutationFenceProof,
     current: &AgentMutationFenceProof,
 ) -> bool {
-    candidate.fencing_token > current.fencing_token
-        || (candidate.fencing_token == current.fencing_token
-            && candidate.authority_generation >= current.authority_generation)
+    candidate.authority_term > current.authority_term
+        || (candidate.authority_term == current.authority_term
+            && (candidate.fencing_token > current.fencing_token
+                || (candidate.fencing_token == current.fencing_token
+                    && candidate.authority_generation >= current.authority_generation)))
 }
 
 async fn maintain_route(
@@ -1751,8 +1765,10 @@ async fn maintain_route(
             &route.agent_id,
             &proof.cluster_id,
             &proof.owner_node_id,
+            proof.authority_term,
             proof.authority_generation,
             proof.fencing_token,
+            proof.proof_expires_at,
             "cluster client automatic lease maintenance",
         )
         .await?;
@@ -1895,8 +1911,10 @@ fn ownership_proof(cluster_id: &str, ownership: &ClusterAgentOwnership) -> Agent
     AgentMutationFenceProof {
         cluster_id: cluster_id.to_string(),
         owner_node_id: ownership.owner_node_id.clone(),
+        authority_term: ownership.authority_term,
         authority_generation: ownership.generation,
         fencing_token: ownership.fencing_token,
+        proof_expires_at: ownership.lease_expires_at,
     }
 }
 
@@ -1922,8 +1940,10 @@ fn destination_fence_matches(
     fence.agent_id == agent_id
         && fence.cluster_id == proof.cluster_id
         && fence.owner_node_id == proof.owner_node_id
+        && fence.authority_term == proof.authority_term
         && fence.authority_generation == proof.authority_generation
         && fence.fencing_token == proof.fencing_token
+        && fence.proof_expires_at == proof.proof_expires_at
         && fence.state == AgentMutationFenceState::Active
 }
 

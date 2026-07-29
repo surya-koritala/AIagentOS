@@ -311,16 +311,20 @@ async fn fenced_message_stream_is_ordered_and_rejects_the_ordinary_path() {
     let proof = AgentMutationFenceProof {
         cluster_id: uuid::Uuid::new_v4().to_string(),
         owner_node_id,
+        authority_term: 1,
         authority_generation: 1,
         fencing_token: 1,
+        proof_expires_at: chrono::Utc::now() + chrono::Duration::seconds(60),
     };
     client
         .install_agent_mutation_fence(
             &id,
             &proof.cluster_id,
             &proof.owner_node_id,
+            proof.authority_term,
             proof.authority_generation,
             proof.fencing_token,
+            proof.proof_expires_at,
             "fenced stream test",
         )
         .await
@@ -483,16 +487,20 @@ async fn exact_fence_is_required_to_cancel_a_fenced_stream() {
     let proof = AgentMutationFenceProof {
         cluster_id: uuid::Uuid::new_v4().to_string(),
         owner_node_id,
+        authority_term: 1,
         authority_generation: 1,
         fencing_token: 1,
+        proof_expires_at: chrono::Utc::now() + chrono::Duration::seconds(60),
     };
     stream_client
         .install_agent_mutation_fence(
             &id,
             &proof.cluster_id,
             &proof.owner_node_id,
+            proof.authority_term,
             proof.authority_generation,
             proof.fencing_token,
+            proof.proof_expires_at,
             "fenced cancellation test",
         )
         .await

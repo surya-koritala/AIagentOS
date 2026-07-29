@@ -91,9 +91,21 @@ The OpenRaft voter map is still static and fixed for the lifetime of the
 process. Application membership can change through the replicated state
 machine, and application-listener leaves can rotate through the bounded
 protocol above. Adding/removing consensus voters and rotating the Raft
-transport certificates or trust map safely are not implemented. Destination
-mutation proofs also do not yet contain an authority term or a proof expiry
-that a partitioned destination can independently validate.
+transport certificates or trust map safely are not implemented.
+
+Every replicated ownership revision now records the OpenRaft leader term from
+its committed log ID. The managed client copies that term and the lease's exact
+expiry into the destination proof. A workload node durably binds
+cluster/owner/term/generation/token/expiry, rejects lower terms and stale or
+conflicting revisions, and stops admitting new mutations at the exact expiry
+boundary. Proof installation also rejects an expiry more than the maximum
+five-minute lease plus 30 seconds ahead of the destination clock, and mutation
+admission fails if the clock moves behind the fence's installation time. This
+gives a partitioned destination a bounded local stop condition and permanently
+fences a term after a newer term is installed. Proof installation remains a
+system-scoped authenticated control operation rather than a self-contained
+authority signature, so compromising a trusted workload/control client remains
+inside the current control-plane threat boundary.
 
 Each workload node owns a separate SQLite database under the existing
 single-process storage lease. Agent state is not replicated between nodes.
@@ -183,7 +195,7 @@ paths are rejected.
 | Node identity | Node-local Ed25519 key plus authority membership certificate fingerprint | Stable across restart; fresh challenges sign both prepare and activation; candidate and previous leaf acceptance expire against replicated time; listener reload drains old sessions | Raft transport certificate/trust rotation and external partition/clock qualification |
 | Node availability and placement profile | Node-local SQLite database | Generation-fenced on one node; discovery reads a point-in-time value | Signed or quorum-observed liveness/capacity with staleness bounds |
 | Agent identity | Authority reservation plus owning-node SQLite database | Managed creation reserves one UUID before exact destination creation; duplicates cannot overwrite a local agent | Quorum-allocated immutable identity and migration-aware placement record |
-| Agent ownership and routing | Quorum authority lease registry in enabled mode, destination fence tombstones, plus `ClusterClient` in-memory routes | Ownership mutations and reads are quorum-backed in enabled mode; authority-discovered clients reserve, pre-fence, create, and publish exact routes; paginated reconciliation repairs or safely retires partial creation; every mutation revalidates authority/fence agreement; opt-in maintenance renews idle routes; a per-agent admission barrier prevents fence changes from crossing admitted work | Authority term/expiry in destination-verifiable proofs, partition-safe execution, and migration admission |
+| Agent ownership and routing | Quorum authority lease registry in enabled mode, destination fence tombstones, plus `ClusterClient` in-memory routes | Ownership mutations and reads are quorum-backed in enabled mode; authority-discovered clients reserve, pre-fence, create, and publish exact routes; paginated reconciliation repairs or safely retires partial creation; every mutation revalidates exact term/generation/token/expiry agreement; expiry stops new destination admission; opt-in maintenance renews idle routes; a per-agent admission barrier prevents fence changes or expiry checks from crossing admitted work | Self-contained authority authentication at the destination, externally qualified partition/clock bounds, and migration admission |
 | Agent state and checkpoints | Owning node SQLite database | Transactional on one node; no cross-node replica or migration transaction | Checkpoint/handoff protocol with one committed owner, rollback point, and side-effect boundary |
 | Package metadata and trust roots | Node-local package registry and policy | Transactional per node; no cluster convergence guarantee | Versioned trust epoch distributed atomically or by a documented monotonic convergence protocol |
 | Authorization policy | Node-local kernel configuration and durable policy state | Enforced consistently across local entry points; not synchronized cluster-wide | Tenant policy epoch included in placement and mutation admission |
@@ -209,17 +221,20 @@ paths are rejected.
 - Agent turns, tool calls, cancellation, memory writes, storage writes,
   checkpoint writes, and lifecycle mutations are authorized and committed by
   the owning node. An operator/control-plane client can install a durable
-  highest-token destination fence; after installation, unfenced calls and
-  stale, retired, foreign-cluster, or cross-agent proofs fail closed. The
-  verification and complete protected operation share one per-agent read
-  barrier, while install and retirement take its exclusive side. A newer token
+  highest-term/token destination fence; after installation, unfenced calls and
+  stale, expired, retired, foreign-cluster, or cross-agent proofs fail closed.
+  Term, generation, token, and expiry must all match the durable record.
+  Verification and the complete protected operation share one per-agent read
+  barrier, while install and retirement take its exclusive side. A newer fence
   therefore waits for an admitted operation instead of crossing a
-  verify-to-execute gap. The typed SDK covers fenced lifecycle, turn, stream,
-  cancellation, and tool calls. A fenced stream holds the same barrier for its
-  complete lifetime; ordinary streams remain rejected after fence installation.
-  Its cancellation registration is bound to the exact proof, so an old owner
-  can drain its admitted stream even when a handoff writer is queued, but a
-  delayed cancel cannot signal a later request-id reuse under a new fence.
+  verify-to-execute gap. Expiry is checked at admission and does not cancel or
+  roll back a side effect admitted before the deadline. The typed SDK covers
+  fenced lifecycle, turn, stream, cancellation, and tool calls. A fenced stream
+  holds the same barrier for its complete lifetime; ordinary streams remain
+  rejected after fence installation. Its cancellation registration is bound to
+  the exact proof, so an old owner can drain its admitted stream even when a
+  handoff writer is queued, but a delayed cancel cannot signal a later
+  request-id reuse under a new fence.
 - Ownership claims are system-scoped authority operations. A new record starts
   at token 1; renewal preserves the token; release retains a tombstone; and
   transfer after release or expiry requires the exact old token and allocates a
@@ -245,13 +260,13 @@ paths are rejected.
 | Event | Required current behavior | What remains before production |
 |---|---|---|
 | Membership authority loss | Enabled mode elects a replacement while a majority remains; a minority or isolated old leader rejects authority writes and linearizable reads | Safe voter changes, Raft transport trust rotation, and externally qualified partition/latency behavior |
-| Workload node loss | Calls to that node fail; another node must not recreate or resume its agents automatically | Expiring ownership lease, durable replica/checkpoint, and explicit recovery policy |
-| Network partition | Only the authority majority can mutate membership/ownership. A destination rejects older or missing installed tokens, but a previously installed proof has no independently verifiable authority term/expiry | Authority term and expiry incorporated into every destination proof, plus partition qualification |
+| Workload node loss | Calls to that node fail; another node must not recreate or resume its agents automatically; authority leases expire but workload state stays on the failed node | Durable replica/checkpoint and explicit recovery policy |
+| Network partition | Only the authority majority can mutate membership/ownership. A destination admits only its exact installed term/generation/token/expiry and stops new admission at expiry; an already-admitted operation retains its guard through completion | Self-contained authority authentication at the destination plus external partition, delay, and clock qualification |
 | Duplicate agent ownership | Reconciliation compares every node with the durable authority directory, returns a conflict, and publishes neither arbitrary copy | Quorum-backed repair procedure and replicated workload evidence |
-| Stale route | In enabled mode a managed client receives a linearizable authority ownership read before each mutation, rejects released/expired/different ownership, propagates same-owner renewal generations, and requires the destination fence before use; explicit reconciliation repairs exact same-owner evidence | Authority terms in destination proofs and durable owner request identity |
+| Stale route | In enabled mode a managed client receives a linearizable authority ownership read before each mutation, rejects released/expired/different ownership, propagates the committed authority term and same-owner renewal generation/expiry, and requires exact destination agreement before use; explicit reconciliation repairs exact same-owner evidence | Durable owner request identity and external partition qualification |
 | Client retry before visible output | Authority mutations accept a caller-stable UUID and return the original retained successful quorum result for an exact retry; reusing that retained ID for a different command fails closed. Rejections are not retained and never count as success. Local workload APIs remain safe only where their contract documents idempotency | Durable request identity and deduplication at each workload owner |
 | Retry after a side effect or partial model/tool output | Must not happen automatically; the result is terminal unless the operation contract proves idempotency | Side-effect journal and explicit at-most-once or at-least-once contract per operation |
-| Clock skew | Join challenge and ownership expiry use authority time; workload nodes do not independently expire or enforce leases | Authority term plus bounded lease clock assumptions or logical-expiry protocol |
+| Clock skew | Join challenge and ownership expiry use authority time. Destination installation permits at most the five-minute lease horizon plus 30 seconds, rejects already-expired proofs, fails on rollback behind installation, and stops admission at the exact stored expiry | Supported-host clock discipline, alerting, and external skew/jump qualification |
 | Authority restart | Each voter restores its log, snapshots, immutable genesis, membership, ownership, receipts, and audit; a quorum elects a leader and catches up a restarted node | Cross-host disaster-recovery procedure and external qualification |
 | Workload restart | The same node database restores its agents and highest-token/retired destination tombstones; managed reconstruction recovers exact same-owner leases/fences and rejects ambiguous evidence | Checkpoint replication and quorum takeover publication |
 
@@ -261,7 +276,9 @@ whether replay can duplicate visible work.
 
 ## Production ownership invariant
 
-The next control-plane stage must enforce this invariant:
+The current destination-admission subset enforces the term/token/expiry portion
+of this invariant. Migration and every external side-effect boundary must still
+carry it before the complete invariant is production-qualified:
 
 > At most one non-expired authority term can grant the highest fencing token
 > for an agent, and every mutable agent operation must be rejected by the
@@ -284,8 +301,8 @@ non-migratable.
 ## Required implementation sequence
 
 1. Add safe quorum-versioned voter membership changes and Raft transport trust
-   epochs; include the committed authority term/expiry in every destination
-   proof; and permanently fence old terms.
+   epochs, then bind destination installation to self-contained authority
+   authentication instead of only the trusted system control path.
 2. Checkpointed drain/migration with rollback and side-effect classifications.
 3. Cross-node IPC/delegation with end-to-end authorization and audit.
 4. Cluster quota reservations and monotonic policy/package trust epochs.

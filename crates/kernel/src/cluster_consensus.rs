@@ -1140,10 +1140,13 @@ fn validate_control_plane_state(control: &ReplicatedControlPlaneState) -> Result
             "replicated certificate rollout audit references inconsistent live state",
         ));
     }
-    let mut latest_ownership_audit: BTreeMap<String, (u64, String, u64, ClusterOwnershipState)> =
-        BTreeMap::new();
+    let mut latest_ownership_audit: BTreeMap<
+        String,
+        (u64, String, u64, u64, ClusterOwnershipState),
+    > = BTreeMap::new();
     for audit in &control.ownership_audit {
         if audit.generation == 0
+            || audit.authority_term == 0
             || audit.fencing_token == 0
             || audit.changed_at > control.logical_time
             || validate_ownership_identity(&audit.agent_id, &audit.owner_node_id).is_err()
@@ -1169,9 +1172,10 @@ fn validate_control_plane_state(control: &ReplicatedControlPlaneState) -> Result
                     && audit.fencing_token == 1
                     && audit.previous_owner_node_id.is_none()
             }
-            Some((generation, owner, fencing_token, previous_state)) => {
+            Some((generation, owner, authority_term, fencing_token, previous_state)) => {
                 let common = generation.checked_add(1) == Some(audit.generation)
-                    && audit.previous_owner_node_id.as_ref() == Some(owner);
+                    && audit.previous_owner_node_id.as_ref() == Some(owner)
+                    && audit.authority_term >= *authority_term;
                 common
                     && match audit.operation.as_str() {
                         "renew" => {
@@ -1199,6 +1203,7 @@ fn validate_control_plane_state(control: &ReplicatedControlPlaneState) -> Result
             (
                 audit.generation,
                 audit.owner_node_id.clone(),
+                audit.authority_term,
                 audit.fencing_token,
                 state,
             ),
@@ -1207,6 +1212,7 @@ fn validate_control_plane_state(control: &ReplicatedControlPlaneState) -> Result
     for (agent_id, ownership) in &control.ownerships {
         if agent_id != &ownership.agent_id
             || ownership.generation == 0
+            || ownership.authority_term == 0
             || ownership.fencing_token == 0
             || ownership.updated_at > control.logical_time
         {
@@ -1229,6 +1235,7 @@ fn validate_control_plane_state(control: &ReplicatedControlPlaneState) -> Result
             != Some(&(
                 ownership.generation,
                 ownership.owner_node_id.clone(),
+                ownership.authority_term,
                 ownership.fencing_token,
                 ownership.state,
             ))
@@ -2054,6 +2061,7 @@ fn apply_new_authority_command(
     log_id: LogId<ClusterRaftNodeId>,
 ) -> Result<AuthorityResponse, (AuthorityRejection, String)> {
     let operation_id = command.operation_id().to_owned();
+    let authority_term = log_id.leader_id.term;
     match command {
         AuthorityCommand::Initialize {
             genesis,
@@ -2304,6 +2312,7 @@ fn apply_new_authority_command(
                 actor,
                 reason,
                 *proposed_at,
+                authority_term,
             )?;
             *control = next;
             Ok(AuthorityResponse::MemberUpdated {
@@ -2335,6 +2344,7 @@ fn apply_new_authority_command(
                 actor,
                 reason,
                 *proposed_at,
+                authority_term,
             )?;
             *control = next;
             Ok(AuthorityResponse::OwnershipUpdated {
@@ -2366,6 +2376,7 @@ fn apply_new_authority_command(
                 actor,
                 reason,
                 *proposed_at,
+                authority_term,
             )?;
             *control = next;
             Ok(AuthorityResponse::OwnershipUpdated {
@@ -2395,6 +2406,7 @@ fn apply_new_authority_command(
                 actor,
                 reason,
                 *proposed_at,
+                authority_term,
             )?;
             *control = next;
             Ok(AuthorityResponse::OwnershipUpdated {
@@ -3167,6 +3179,7 @@ fn apply_register_member(
     Ok(member)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn apply_set_member_state(
     control: &mut ReplicatedControlPlaneState,
     node_id: &str,
@@ -3175,6 +3188,7 @@ fn apply_set_member_state(
     actor: &str,
     reason: &str,
     proposed_at: DateTime<Utc>,
+    authority_term: u64,
 ) -> Result<ClusterMember, (AuthorityRejection, String)> {
     if state == ClusterMemberState::Active {
         return Err(invalid_command(
@@ -3249,6 +3263,7 @@ fn apply_set_member_state(
             let released = ClusterAgentOwnership {
                 agent_id: previous.agent_id.clone(),
                 owner_node_id: node_id.to_owned(),
+                authority_term,
                 fencing_token: previous.fencing_token,
                 generation,
                 state: ClusterOwnershipState::Released,
@@ -3264,6 +3279,7 @@ fn apply_set_member_state(
                 generation,
                 previous_owner_node_id: Some(node_id.to_owned()),
                 owner_node_id: node_id.to_owned(),
+                authority_term,
                 fencing_token: previous.fencing_token,
                 operation: "release".into(),
                 actor: actor.to_owned(),
@@ -3346,6 +3362,7 @@ fn apply_claim_ownership(
     actor: &str,
     reason: &str,
     proposed_at: DateTime<Utc>,
+    authority_term: u64,
 ) -> Result<ClusterAgentOwnership, (AuthorityRejection, String)> {
     validate_ownership_request(agent_id, owner_node_id, ttl_seconds, actor, reason)
         .map_err(invalid_command)?;
@@ -3403,6 +3420,7 @@ fn apply_claim_ownership(
     let ownership = ClusterAgentOwnership {
         agent_id: agent_id.to_owned(),
         owner_node_id: owner_node_id.to_owned(),
+        authority_term,
         fencing_token,
         generation,
         state: ClusterOwnershipState::Active,
@@ -3418,6 +3436,7 @@ fn apply_claim_ownership(
         generation,
         previous_owner_node_id,
         owner_node_id: owner_node_id.to_owned(),
+        authority_term,
         fencing_token,
         operation: operation.into(),
         actor: actor.to_owned(),
@@ -3437,6 +3456,7 @@ fn apply_renew_ownership(
     actor: &str,
     reason: &str,
     proposed_at: DateTime<Utc>,
+    authority_term: u64,
 ) -> Result<ClusterAgentOwnership, (AuthorityRejection, String)> {
     validate_ownership_request(agent_id, owner_node_id, ttl_seconds, actor, reason)
         .map_err(invalid_command)?;
@@ -3467,6 +3487,7 @@ fn apply_renew_ownership(
         .checked_add(1)
         .ok_or_else(|| conflict("agent ownership generation overflow"))?;
     let ownership = ClusterAgentOwnership {
+        authority_term,
         generation,
         lease_expires_at: ownership_expiry(now, ttl_seconds).map_err(invalid_command)?,
         updated_at: now,
@@ -3481,6 +3502,7 @@ fn apply_renew_ownership(
         generation,
         previous_owner_node_id: Some(owner_node_id.to_owned()),
         owner_node_id: owner_node_id.to_owned(),
+        authority_term,
         fencing_token,
         operation: "renew".into(),
         actor: actor.to_owned(),
@@ -3490,6 +3512,7 @@ fn apply_renew_ownership(
     Ok(ownership)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn apply_release_ownership(
     control: &mut ReplicatedControlPlaneState,
     agent_id: &str,
@@ -3498,6 +3521,7 @@ fn apply_release_ownership(
     actor: &str,
     reason: &str,
     proposed_at: DateTime<Utc>,
+    authority_term: u64,
 ) -> Result<ClusterAgentOwnership, (AuthorityRejection, String)> {
     validate_ownership_identity(agent_id, owner_node_id).map_err(invalid_command)?;
     validate_text(actor, "cluster-ownership actor").map_err(invalid_command)?;
@@ -3525,6 +3549,7 @@ fn apply_release_ownership(
         .checked_add(1)
         .ok_or_else(|| conflict("agent ownership generation overflow"))?;
     let ownership = ClusterAgentOwnership {
+        authority_term,
         generation,
         state: ClusterOwnershipState::Released,
         lease_expires_at: now,
@@ -3540,6 +3565,7 @@ fn apply_release_ownership(
         generation,
         previous_owner_node_id: Some(owner_node_id.to_owned()),
         owner_node_id: owner_node_id.to_owned(),
+        authority_term,
         fencing_token,
         operation: "release".into(),
         actor: actor.to_owned(),
@@ -4182,6 +4208,7 @@ mod tests {
             panic!("expected replicated ownership claim");
         };
         assert_eq!(claimed_ownership.fencing_token, 1);
+        assert_eq!(claimed_ownership.authority_term, 1);
 
         let mut replay = claim;
         if let AuthorityCommand::ClaimOwnership { proposed_at, .. } = &mut replay {
@@ -4203,7 +4230,7 @@ mod tests {
 
         let renewed = state
             .apply([normal_entry(
-                log_id(1, 6),
+                log_id(2, 6),
                 AuthorityCommand::RenewOwnership {
                     operation_id: Uuid::new_v4().to_string(),
                     agent_id: agent_id.clone(),
@@ -4223,12 +4250,14 @@ mod tests {
                 ownership,
                 sequence: 5,
                 ..
-            } if ownership.generation == 2 && ownership.fencing_token == 1
+            } if ownership.generation == 2
+                && ownership.authority_term == 2
+                && ownership.fencing_token == 1
         ));
 
         state
             .apply([normal_entry(
-                log_id(1, 7),
+                log_id(2, 7),
                 AuthorityCommand::ReleaseOwnership {
                     operation_id: Uuid::new_v4().to_string(),
                     agent_id: agent_id.clone(),
@@ -4244,7 +4273,7 @@ mod tests {
         let advanced_to = started_at + TimeDelta::seconds(600);
         let advanced = state
             .apply([normal_entry(
-                log_id(1, 8),
+                log_id(2, 8),
                 AuthorityCommand::AdvanceTime {
                     operation_id: Uuid::new_v4().to_string(),
                     proposed_at: advanced_to,
@@ -4268,12 +4297,29 @@ mod tests {
         assert_eq!(view.ownerships.len(), 1);
         assert_eq!(view.ownerships[0].agent_id, agent_id);
         assert_eq!(view.ownerships[0].state, ClusterOwnershipState::Released);
+        assert_eq!(view.ownerships[0].authority_term, 2);
         assert_eq!(view.ownership_audit.len(), 3);
+        assert_eq!(
+            view.ownership_audit
+                .iter()
+                .map(|entry| entry.authority_term)
+                .collect::<Vec<_>>(),
+            [1, 2, 2]
+        );
         assert_eq!(view.logical_time, advanced_to);
         let connection = context.conn.lock().unwrap();
         let persisted = load_persistent_state(&connection).unwrap();
         assert_eq!(persisted.authority.sequence, 6);
         assert_eq!(persisted.authority.receipts.len(), 6);
+        let mut corrupted = persisted
+            .authority
+            .control_plane
+            .expect("initialized authority");
+        corrupted.ownership_audit[1].authority_term = 0;
+        assert!(
+            validate_control_plane_state(&corrupted).is_err(),
+            "zero or corrupted authority terms must prevent participation"
+        );
     }
 
     #[tokio::test]

@@ -20,8 +20,10 @@ replicated deterministic state machine and serves linearizable reads, including
 transparent follower forwarding. The disabled default retains the designated
 single SQLite authority. Application-listener leaves have a bounded replicated
 prepare/activate/finalize rollout, but the voter map remains static. Raft
-transport trust rotation, authority-term destination proofs, migration, global
-quotas/trust, rolling upgrades, and disaster recovery are not complete.
+transport trust rotation, self-contained authority authentication at workload
+destinations, migration, global quotas/trust, rolling upgrades, and disaster
+recovery are not complete. Ownership revisions and destination fences do retain
+the committed authority term and exact bounded lease expiry.
 
 ---
 

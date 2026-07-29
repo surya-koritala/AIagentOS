@@ -1208,8 +1208,10 @@ struct ActiveTurnRegistration<'a> {
 pub(crate) struct ActiveRequestFence {
     pub cluster_id: String,
     pub owner_node_id: String,
+    pub authority_term: u64,
     pub authority_generation: u64,
     pub fencing_token: u64,
+    pub proof_expires_at: chrono::DateTime<chrono::Utc>,
 }
 
 struct ActiveRequestHandle {

@@ -1358,8 +1358,10 @@ async fn reconciliation_recovers_an_expired_lease_and_missing_destination_fence(
                 ownership_proof: AgentMutationFenceProof {
                     cluster_id: installed.cluster_id.clone(),
                     owner_node_id: installed.owner_node_id.clone(),
+                    authority_term: installed.authority_term,
                     authority_generation: installed.authority_generation,
                     fencing_token: installed.fencing_token,
+                    proof_expires_at: installed.proof_expires_at,
                 },
             },
             "duplicate",
@@ -1402,8 +1404,10 @@ async fn reconciliation_releases_an_expired_reservation_without_a_local_agent() 
     let stale_proof = AgentMutationFenceProof {
         cluster_id,
         owner_node_id: reserved.owner_node_id.clone(),
+        authority_term: reserved.authority_term,
         authority_generation: reserved.generation,
         fencing_token: reserved.fencing_token,
+        proof_expires_at: reserved.lease_expires_at,
     };
 
     let expiry_deadline = tokio::time::Instant::now() + Duration::from_secs(7);

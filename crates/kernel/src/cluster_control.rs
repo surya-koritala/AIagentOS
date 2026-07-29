@@ -32,6 +32,7 @@ pub(crate) const MIN_CERTIFICATE_ROLLOUT_SECONDS: u64 = 5;
 pub(crate) const MAX_CERTIFICATE_ROLLOUT_SECONDS: u64 = 3_600;
 pub(crate) const MIN_OWNERSHIP_LEASE_TTL_SECONDS: u64 = 5;
 pub(crate) const MAX_OWNERSHIP_LEASE_TTL_SECONDS: u64 = 300;
+const MAX_DESTINATION_PROOF_CLOCK_SKEW_SECONDS: u64 = 30;
 
 #[cfg(test)]
 thread_local! {
@@ -370,6 +371,10 @@ impl TryFrom<&str> for ClusterOwnershipState {
 pub struct ClusterAgentOwnership {
     pub agent_id: String,
     pub owner_node_id: String,
+    /// Consensus term that committed this ownership revision. Standalone
+    /// authorities use term one.
+    #[serde(default = "default_authority_term")]
+    pub authority_term: u64,
     pub fencing_token: u64,
     pub generation: u64,
     pub state: ClusterOwnershipState,
@@ -385,6 +390,8 @@ pub struct ClusterAgentOwnershipAudit {
     pub generation: u64,
     pub previous_owner_node_id: Option<String>,
     pub owner_node_id: String,
+    #[serde(default = "default_authority_term")]
+    pub authority_term: u64,
     pub fencing_token: u64,
     pub operation: String,
     pub actor: String,
@@ -431,8 +438,11 @@ pub struct AgentMutationFence {
     pub agent_id: String,
     pub cluster_id: String,
     pub owner_node_id: String,
+    pub authority_term: u64,
     pub authority_generation: u64,
     pub fencing_token: u64,
+    /// No new mutation may be admitted at or after this instant.
+    pub proof_expires_at: DateTime<Utc>,
     pub state: AgentMutationFenceState,
     pub installed_at: DateTime<Utc>,
     pub reason: String,
@@ -444,12 +454,18 @@ pub struct AgentMutationFenceAudit {
     pub agent_id: String,
     pub cluster_id: String,
     pub owner_node_id: String,
+    pub authority_term: u64,
     pub authority_generation: u64,
     pub fencing_token: u64,
+    pub proof_expires_at: DateTime<Utc>,
     pub state: AgentMutationFenceState,
     pub actor: String,
     pub reason: String,
     pub changed_at: DateTime<Utc>,
+}
+
+const fn default_authority_term() -> u64 {
+    1
 }
 
 /// Persistent local node-control state.
@@ -1187,6 +1203,7 @@ impl ClusterControl {
                     &transaction,
                     &agent_id,
                     node_id,
+                    default_authority_term(),
                     fencing_token,
                     generation,
                     ClusterOwnershipState::Released,
@@ -1200,6 +1217,7 @@ impl ClusterControl {
                     generation,
                     Some(node_id),
                     node_id,
+                    default_authority_term(),
                     fencing_token,
                     "release",
                     actor,
@@ -1454,6 +1472,7 @@ impl ClusterControl {
             &transaction,
             agent_id,
             owner_node_id,
+            default_authority_term(),
             fencing_token,
             generation,
             ClusterOwnershipState::Active,
@@ -1467,6 +1486,7 @@ impl ClusterControl {
             generation,
             previous_owner_node_id.as_deref(),
             owner_node_id,
+            default_authority_term(),
             fencing_token,
             operation,
             actor,
@@ -1525,6 +1545,7 @@ impl ClusterControl {
             &transaction,
             agent_id,
             owner_node_id,
+            default_authority_term(),
             fencing_token,
             generation,
             ClusterOwnershipState::Active,
@@ -1538,6 +1559,7 @@ impl ClusterControl {
             generation,
             Some(owner_node_id),
             owner_node_id,
+            default_authority_term(),
             fencing_token,
             "renew",
             actor,
@@ -1590,6 +1612,7 @@ impl ClusterControl {
             &transaction,
             agent_id,
             owner_node_id,
+            default_authority_term(),
             fencing_token,
             generation,
             ClusterOwnershipState::Released,
@@ -1603,6 +1626,7 @@ impl ClusterControl {
             generation,
             Some(owner_node_id),
             owner_node_id,
+            default_authority_term(),
             fencing_token,
             "release",
             actor,
@@ -1652,8 +1676,8 @@ impl ClusterControl {
             .map_err(|_| storage_error("SQLite connection mutex is poisoned"))?;
         let mut statement = connection
             .prepare(
-                "SELECT agent_id, owner_node_id, fencing_token, generation, state,
-                        lease_expires_at, updated_at, reason
+                "SELECT agent_id, owner_node_id, authority_term, fencing_token,
+                        generation, state, lease_expires_at, updated_at, reason
                  FROM cluster_agent_ownership
                  WHERE (?1 IS NULL OR agent_id > ?1)
                  ORDER BY agent_id ASC
@@ -1669,10 +1693,11 @@ impl ClusterControl {
                         row.get::<_, String>(1)?,
                         row.get::<_, i64>(2)?,
                         row.get::<_, i64>(3)?,
-                        row.get::<_, String>(4)?,
+                        row.get::<_, i64>(4)?,
                         row.get::<_, String>(5)?,
                         row.get::<_, String>(6)?,
                         row.get::<_, String>(7)?,
+                        row.get::<_, String>(8)?,
                     ))
                 },
             )
@@ -1682,6 +1707,7 @@ impl ClusterControl {
             let (
                 agent_id,
                 owner_node_id,
+                authority_term,
                 fencing_token,
                 generation,
                 state,
@@ -1692,6 +1718,8 @@ impl ClusterControl {
             ownerships.push(ClusterAgentOwnership {
                 agent_id,
                 owner_node_id,
+                authority_term: u64::try_from(authority_term)
+                    .map_err(|_| storage_error("negative ownership authority term"))?,
                 fencing_token: u64::try_from(fencing_token)
                     .map_err(|_| storage_error("negative ownership fencing token"))?,
                 generation: u64::try_from(generation)
@@ -1745,13 +1773,13 @@ impl ClusterControl {
             .map_err(|_| storage_error("SQLite connection mutex is poisoned"))?;
         let sql = if agent_id.is_some() {
             "SELECT agent_id, generation, previous_owner_node_id, owner_node_id,
-                    fencing_token, operation, actor, reason, changed_at
+                    authority_term, fencing_token, operation, actor, reason, changed_at
              FROM cluster_agent_ownership_audit
              WHERE agent_id = ?1
              ORDER BY generation DESC LIMIT ?2"
         } else {
             "SELECT agent_id, generation, previous_owner_node_id, owner_node_id,
-                    fencing_token, operation, actor, reason, changed_at
+                    authority_term, fencing_token, operation, actor, reason, changed_at
              FROM cluster_agent_ownership_audit
              ORDER BY changed_at DESC, agent_id, generation DESC LIMIT ?2"
         };
@@ -1781,22 +1809,27 @@ impl ClusterControl {
                 owner_node_id: row
                     .get(3)
                     .map_err(|error| storage_error(error.to_string()))?,
-                fencing_token: u64::try_from(
+                authority_term: u64::try_from(
                     row.get::<_, i64>(4)
+                        .map_err(|error| storage_error(error.to_string()))?,
+                )
+                .map_err(|_| storage_error("negative ownership audit authority term"))?,
+                fencing_token: u64::try_from(
+                    row.get::<_, i64>(5)
                         .map_err(|error| storage_error(error.to_string()))?,
                 )
                 .map_err(|_| storage_error("negative ownership audit fencing token"))?,
                 operation: row
-                    .get(5)
-                    .map_err(|error| storage_error(error.to_string()))?,
-                actor: row
                     .get(6)
                     .map_err(|error| storage_error(error.to_string()))?,
-                reason: row
+                actor: row
                     .get(7)
                     .map_err(|error| storage_error(error.to_string()))?,
+                reason: row
+                    .get(8)
+                    .map_err(|error| storage_error(error.to_string()))?,
                 changed_at: parse_timestamp(
-                    &row.get::<_, String>(8)
+                    &row.get::<_, String>(9)
                         .map_err(|error| storage_error(error.to_string()))?,
                 )?,
             });
@@ -1815,8 +1848,10 @@ impl ClusterControl {
         agent_id: &str,
         cluster_id: &str,
         owner_node_id: &str,
+        authority_term: u64,
         authority_generation: u64,
         fencing_token: u64,
+        proof_expires_at: DateTime<Utc>,
         actor: &str,
         reason: &str,
     ) -> Result<AgentMutationFence, ContextError> {
@@ -1824,6 +1859,7 @@ impl ClusterControl {
             agent_id,
             cluster_id,
             owner_node_id,
+            authority_term,
             authority_generation,
             fencing_token,
             actor,
@@ -1842,6 +1878,25 @@ impl ClusterControl {
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| storage_error(format!("agent mutation fence transaction: {error}")))?;
+        let now = Utc::now();
+        if proof_expires_at <= now {
+            return Err(storage_error(
+                "expired agent mutation fence proof rejected by destination",
+            ));
+        }
+        let maximum_proof_horizon = now
+            .checked_add_signed(chrono::Duration::seconds(
+                i64::try_from(
+                    MAX_OWNERSHIP_LEASE_TTL_SECONDS + MAX_DESTINATION_PROOF_CLOCK_SKEW_SECONDS,
+                )
+                .map_err(|_| storage_error("destination proof horizon exceeds clock range"))?,
+            ))
+            .ok_or_else(|| storage_error("destination proof horizon overflow"))?;
+        if proof_expires_at > maximum_proof_horizon {
+            return Err(storage_error(
+                "agent mutation fence proof exceeds the bounded destination horizon",
+            ));
+        }
         let previous = load_mutation_fence(&transaction, agent_id)?;
         if let Some(previous) = &previous {
             if previous.cluster_id != cluster_id || previous.owner_node_id != owner_node_id {
@@ -1849,7 +1904,8 @@ impl ClusterControl {
                     "agent mutation fence conflicts with the durable cluster or destination",
                 ));
             }
-            if fencing_token < previous.fencing_token
+            if authority_term < previous.authority_term
+                || fencing_token < previous.fencing_token
                 || authority_generation < previous.authority_generation
             {
                 return Err(storage_error(
@@ -1857,19 +1913,27 @@ impl ClusterControl {
                 ));
             }
             if previous.state == AgentMutationFenceState::Retired
-                && fencing_token == previous.fencing_token
+                && fencing_token <= previous.fencing_token
             {
                 return Err(storage_error(
                     "retired agent mutation fence cannot become active again",
                 ));
             }
-            if fencing_token == previous.fencing_token
+            if authority_term == previous.authority_term
+                && fencing_token == previous.fencing_token
                 && authority_generation == previous.authority_generation
                 && previous.state == AgentMutationFenceState::Active
             {
-                return Ok(previous.clone());
+                if proof_expires_at == previous.proof_expires_at {
+                    return Ok(previous.clone());
+                }
+                if previous.proof_expires_at != previous.installed_at {
+                    return Err(storage_error(
+                        "agent mutation fence proof expiry conflicts with the durable revision",
+                    ));
+                }
             }
-            if fencing_token > previous.fencing_token
+            if (authority_term > previous.authority_term || fencing_token > previous.fencing_token)
                 && authority_generation <= previous.authority_generation
             {
                 return Err(storage_error(
@@ -1877,14 +1941,15 @@ impl ClusterControl {
                 ));
             }
         }
-        let now = Utc::now();
         write_mutation_fence(
             &transaction,
             agent_id,
             cluster_id,
             owner_node_id,
+            authority_term,
             authority_generation,
             fencing_token,
+            proof_expires_at,
             AgentMutationFenceState::Active,
             actor,
             reason,
@@ -1906,8 +1971,10 @@ impl ClusterControl {
         agent_id: &str,
         cluster_id: &str,
         owner_node_id: &str,
+        authority_term: u64,
         authority_generation: u64,
         fencing_token: u64,
+        proof_expires_at: DateTime<Utc>,
         actor: &str,
         reason: &str,
     ) -> Result<AgentMutationFence, ContextError> {
@@ -1915,6 +1982,7 @@ impl ClusterControl {
             agent_id,
             cluster_id,
             owner_node_id,
+            authority_term,
             authority_generation,
             fencing_token,
             actor,
@@ -1939,8 +2007,10 @@ impl ClusterControl {
             .ok_or_else(|| storage_error("agent mutation fence not found"))?;
         if previous.cluster_id != cluster_id
             || previous.owner_node_id != owner_node_id
+            || previous.authority_term != authority_term
             || previous.authority_generation != authority_generation
             || previous.fencing_token != fencing_token
+            || previous.proof_expires_at != proof_expires_at
             || previous.state != AgentMutationFenceState::Active
         {
             return Err(storage_error(
@@ -1953,8 +2023,10 @@ impl ClusterControl {
             agent_id,
             cluster_id,
             owner_node_id,
+            authority_term,
             authority_generation,
             fencing_token,
+            proof_expires_at,
             AgentMutationFenceState::Retired,
             actor,
             reason,
@@ -1985,26 +2057,117 @@ impl ClusterControl {
     /// Validate the exact active destination record before any fenced mutation
     /// is admitted. Missing, retired, stale, foreign, or cross-cluster tokens
     /// are indistinguishable conflicts to remote callers.
+    #[allow(clippy::too_many_arguments)]
     pub fn verify_agent_mutation_fence(
         &self,
         agent_id: &str,
         cluster_id: &str,
         owner_node_id: &str,
+        authority_term: u64,
         authority_generation: u64,
         fencing_token: u64,
+        proof_expires_at: DateTime<Utc>,
+    ) -> Result<(), ContextError> {
+        self.verify_agent_mutation_fence_with_clock(
+            agent_id,
+            cluster_id,
+            owner_node_id,
+            authority_term,
+            authority_generation,
+            fencing_token,
+            proof_expires_at,
+            Utc::now,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn verify_agent_mutation_fence_with_clock(
+        &self,
+        agent_id: &str,
+        cluster_id: &str,
+        owner_node_id: &str,
+        authority_term: u64,
+        authority_generation: u64,
+        fencing_token: u64,
+        proof_expires_at: DateTime<Utc>,
+        now: impl FnOnce() -> DateTime<Utc>,
     ) -> Result<(), ContextError> {
         let record = self
             .agent_mutation_fence(agent_id)?
             .ok_or_else(|| storage_error("agent mutation fence is not installed"))?;
-        if record.state != AgentMutationFenceState::Active
+        self.verify_loaded_agent_mutation_fence(
+            &record,
+            agent_id,
+            cluster_id,
+            owner_node_id,
+            authority_term,
+            authority_generation,
+            fencing_token,
+            proof_expires_at,
+            now(),
+        )
+    }
+
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    fn verify_agent_mutation_fence_at(
+        &self,
+        agent_id: &str,
+        cluster_id: &str,
+        owner_node_id: &str,
+        authority_term: u64,
+        authority_generation: u64,
+        fencing_token: u64,
+        proof_expires_at: DateTime<Utc>,
+        now: DateTime<Utc>,
+    ) -> Result<(), ContextError> {
+        self.verify_agent_mutation_fence_with_clock(
+            agent_id,
+            cluster_id,
+            owner_node_id,
+            authority_term,
+            authority_generation,
+            fencing_token,
+            proof_expires_at,
+            || now,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn verify_loaded_agent_mutation_fence(
+        &self,
+        record: &AgentMutationFence,
+        agent_id: &str,
+        cluster_id: &str,
+        owner_node_id: &str,
+        authority_term: u64,
+        authority_generation: u64,
+        fencing_token: u64,
+        proof_expires_at: DateTime<Utc>,
+        now: DateTime<Utc>,
+    ) -> Result<(), ContextError> {
+        if record.agent_id != agent_id
+            || record.state != AgentMutationFenceState::Active
             || record.cluster_id != cluster_id
             || record.owner_node_id != owner_node_id
             || record.owner_node_id != self.identity.node_id
+            || record.authority_term != authority_term
             || record.authority_generation != authority_generation
             || record.fencing_token != fencing_token
+            || record.proof_expires_at != proof_expires_at
         {
             return Err(storage_error(
                 "agent mutation rejected by destination ownership fence",
+            ));
+        }
+        if now < record.installed_at {
+            return Err(storage_error(
+                "agent mutation rejected because the destination clock moved behind fence installation",
+            ));
+        }
+        if now >= record.proof_expires_at {
+            return Err(storage_error(
+                "agent mutation rejected because the ownership proof expired",
             ));
         }
         Ok(())
@@ -2026,16 +2189,22 @@ impl ClusterControl {
             .lock()
             .map_err(|_| storage_error("SQLite connection mutex is poisoned"))?;
         let sql = if agent_id.is_some() {
-            "SELECT agent_id, cluster_id, owner_node_id, authority_generation,
-                    fencing_token, state, actor, reason, changed_at
+            "SELECT agent_id, cluster_id, owner_node_id, authority_term,
+                    authority_generation, fencing_token, proof_expires_at,
+                    state, actor, reason, changed_at
              FROM cluster_agent_mutation_fence_audit
              WHERE agent_id = ?1
-             ORDER BY fencing_token DESC, authority_generation DESC LIMIT ?2"
+             ORDER BY changed_at DESC, authority_term DESC,
+                      fencing_token DESC, authority_generation DESC,
+                      proof_expires_at DESC, state DESC LIMIT ?2"
         } else {
-            "SELECT agent_id, cluster_id, owner_node_id, authority_generation,
-                    fencing_token, state, actor, reason, changed_at
+            "SELECT agent_id, cluster_id, owner_node_id, authority_term,
+                    authority_generation, fencing_token, proof_expires_at,
+                    state, actor, reason, changed_at
              FROM cluster_agent_mutation_fence_audit
-             ORDER BY changed_at DESC, agent_id, fencing_token DESC LIMIT ?2"
+             ORDER BY changed_at DESC, agent_id, authority_term DESC,
+                      fencing_token DESC, authority_generation DESC,
+                      proof_expires_at DESC, state DESC LIMIT ?2"
         };
         let mut statement = connection
             .prepare(sql)
@@ -2281,8 +2450,8 @@ fn load_ownership(
 ) -> Result<Option<ClusterAgentOwnership>, ContextError> {
     let stored = connection
         .query_row(
-            "SELECT agent_id, owner_node_id, fencing_token, generation, state,
-                    lease_expires_at, updated_at, reason
+            "SELECT agent_id, owner_node_id, authority_term, fencing_token,
+                    generation, state, lease_expires_at, updated_at, reason
              FROM cluster_agent_ownership WHERE agent_id = ?1",
             [agent_id],
             |row| {
@@ -2291,10 +2460,11 @@ fn load_ownership(
                     row.get::<_, String>(1)?,
                     row.get::<_, i64>(2)?,
                     row.get::<_, i64>(3)?,
-                    row.get::<_, String>(4)?,
+                    row.get::<_, i64>(4)?,
                     row.get::<_, String>(5)?,
                     row.get::<_, String>(6)?,
                     row.get::<_, String>(7)?,
+                    row.get::<_, String>(8)?,
                 ))
             },
         )
@@ -2305,6 +2475,7 @@ fn load_ownership(
             |(
                 agent_id,
                 owner_node_id,
+                authority_term,
                 fencing_token,
                 generation,
                 state,
@@ -2315,6 +2486,8 @@ fn load_ownership(
                 Ok(ClusterAgentOwnership {
                     agent_id,
                     owner_node_id,
+                    authority_term: u64::try_from(authority_term)
+                        .map_err(|_| storage_error("negative ownership authority term"))?,
                     fencing_token: u64::try_from(fencing_token)
                         .map_err(|_| storage_error("negative ownership fencing token"))?,
                     generation: u64::try_from(generation)
@@ -2334,6 +2507,7 @@ fn validate_mutation_fence_input(
     agent_id: &str,
     cluster_id: &str,
     owner_node_id: &str,
+    authority_term: u64,
     authority_generation: u64,
     fencing_token: u64,
     actor: &str,
@@ -2345,6 +2519,11 @@ fn validate_mutation_fence_input(
         .map_err(|_| storage_error("invalid agent mutation fence cluster id"))?;
     uuid::Uuid::parse_str(owner_node_id)
         .map_err(|_| storage_error("invalid agent mutation fence owner node id"))?;
+    if authority_term == 0 {
+        return Err(storage_error(
+            "agent mutation fence authority term must be positive",
+        ));
+    }
     if authority_generation == 0 {
         return Err(storage_error(
             "agent mutation fence authority generation must be positive",
@@ -2363,8 +2542,9 @@ fn load_mutation_fence(
 ) -> Result<Option<AgentMutationFence>, ContextError> {
     connection
         .query_row(
-            "SELECT agent_id, cluster_id, owner_node_id, authority_generation,
-                    fencing_token, state, installed_at, reason
+            "SELECT agent_id, cluster_id, owner_node_id, authority_term,
+                    authority_generation, fencing_token, proof_expires_at,
+                    state, installed_at, reason
              FROM cluster_agent_mutation_fences WHERE agent_id = ?1",
             [agent_id],
             |row| {
@@ -2374,9 +2554,11 @@ fn load_mutation_fence(
                     row.get::<_, String>(2)?,
                     row.get::<_, i64>(3)?,
                     row.get::<_, i64>(4)?,
-                    row.get::<_, String>(5)?,
+                    row.get::<_, i64>(5)?,
                     row.get::<_, String>(6)?,
                     row.get::<_, String>(7)?,
+                    row.get::<_, String>(8)?,
+                    row.get::<_, String>(9)?,
                 ))
             },
         )
@@ -2387,8 +2569,10 @@ fn load_mutation_fence(
                 agent_id,
                 cluster_id,
                 owner_node_id,
+                authority_term,
                 authority_generation,
                 fencing_token,
+                proof_expires_at,
                 state,
                 installed_at,
                 reason,
@@ -2397,10 +2581,13 @@ fn load_mutation_fence(
                     agent_id,
                     cluster_id,
                     owner_node_id,
+                    authority_term: u64::try_from(authority_term)
+                        .map_err(|_| storage_error("negative fence authority term"))?,
                     authority_generation: u64::try_from(authority_generation)
                         .map_err(|_| storage_error("negative fence authority generation"))?,
                     fencing_token: u64::try_from(fencing_token)
                         .map_err(|_| storage_error("negative agent mutation fencing token"))?,
+                    proof_expires_at: parse_timestamp(&proof_expires_at)?,
                     state: AgentMutationFenceState::try_from(state.as_str())?,
                     installed_at: parse_timestamp(&installed_at)?,
                     reason,
@@ -2416,27 +2603,33 @@ fn write_mutation_fence(
     agent_id: &str,
     cluster_id: &str,
     owner_node_id: &str,
+    authority_term: u64,
     authority_generation: u64,
     fencing_token: u64,
+    proof_expires_at: DateTime<Utc>,
     state: AgentMutationFenceState,
     actor: &str,
     reason: &str,
     changed_at: DateTime<Utc>,
 ) -> Result<(), ContextError> {
+    let authority_term = sqlite_generation(authority_term, "fence authority term")?;
     let authority_generation =
         sqlite_generation(authority_generation, "fence authority generation")?;
     let fencing_token = sqlite_generation(fencing_token, "agent mutation fencing token")?;
     connection
         .execute(
             "INSERT INTO cluster_agent_mutation_fences
-             (agent_id, cluster_id, owner_node_id, authority_generation,
-              fencing_token, state, installed_at, reason)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             (agent_id, cluster_id, owner_node_id, authority_term,
+              authority_generation, fencing_token, proof_expires_at,
+              state, installed_at, reason)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
              ON CONFLICT(agent_id) DO UPDATE SET
                cluster_id = excluded.cluster_id,
                owner_node_id = excluded.owner_node_id,
+               authority_term = excluded.authority_term,
                authority_generation = excluded.authority_generation,
                fencing_token = excluded.fencing_token,
+               proof_expires_at = excluded.proof_expires_at,
                state = excluded.state,
                installed_at = excluded.installed_at,
                reason = excluded.reason",
@@ -2444,8 +2637,10 @@ fn write_mutation_fence(
                 agent_id,
                 cluster_id,
                 owner_node_id,
+                authority_term,
                 authority_generation,
                 fencing_token,
+                proof_expires_at.to_rfc3339(),
                 state.as_str(),
                 changed_at.to_rfc3339(),
                 reason,
@@ -2457,14 +2652,17 @@ fn write_mutation_fence(
         .execute(
             "INSERT INTO cluster_agent_mutation_fence_audit
              (agent_id, fencing_token, cluster_id, owner_node_id,
-              authority_generation, state, actor, reason, changed_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+              authority_term, authority_generation, proof_expires_at,
+              state, actor, reason, changed_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 agent_id,
                 fencing_token,
                 cluster_id,
                 owner_node_id,
+                authority_term,
                 authority_generation,
+                proof_expires_at.to_rfc3339(),
                 state.as_str(),
                 actor,
                 reason,
@@ -2489,29 +2687,38 @@ fn mutation_fence_audit_from_row(
         owner_node_id: row
             .get(2)
             .map_err(|error| storage_error(error.to_string()))?,
-        authority_generation: u64::try_from(
+        authority_term: u64::try_from(
             row.get::<_, i64>(3)
+                .map_err(|error| storage_error(error.to_string()))?,
+        )
+        .map_err(|_| storage_error("negative fence audit authority term"))?,
+        authority_generation: u64::try_from(
+            row.get::<_, i64>(4)
                 .map_err(|error| storage_error(error.to_string()))?,
         )
         .map_err(|_| storage_error("negative fence audit authority generation"))?,
         fencing_token: u64::try_from(
-            row.get::<_, i64>(4)
+            row.get::<_, i64>(5)
                 .map_err(|error| storage_error(error.to_string()))?,
         )
         .map_err(|_| storage_error("negative fence audit token"))?,
+        proof_expires_at: parse_timestamp(
+            &row.get::<_, String>(6)
+                .map_err(|error| storage_error(error.to_string()))?,
+        )?,
         state: AgentMutationFenceState::try_from(
-            row.get::<_, String>(5)
+            row.get::<_, String>(7)
                 .map_err(|error| storage_error(error.to_string()))?
                 .as_str(),
         )?,
         actor: row
-            .get(6)
+            .get(8)
             .map_err(|error| storage_error(error.to_string()))?,
         reason: row
-            .get(7)
+            .get(9)
             .map_err(|error| storage_error(error.to_string()))?,
         changed_at: parse_timestamp(
-            &row.get::<_, String>(8)
+            &row.get::<_, String>(10)
                 .map_err(|error| storage_error(error.to_string()))?,
         )?,
     })
@@ -2522,6 +2729,7 @@ fn write_ownership(
     connection: &rusqlite::Connection,
     agent_id: &str,
     owner_node_id: &str,
+    authority_term: u64,
     fencing_token: u64,
     generation: u64,
     state: ClusterOwnershipState,
@@ -2532,11 +2740,12 @@ fn write_ownership(
     connection
         .execute(
             "INSERT INTO cluster_agent_ownership
-             (agent_id, owner_node_id, fencing_token, generation, state,
-              lease_expires_at, updated_at, reason)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             (agent_id, owner_node_id, authority_term, fencing_token, generation,
+              state, lease_expires_at, updated_at, reason)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
              ON CONFLICT(agent_id) DO UPDATE SET
                owner_node_id = excluded.owner_node_id,
+               authority_term = excluded.authority_term,
                fencing_token = excluded.fencing_token,
                generation = excluded.generation,
                state = excluded.state,
@@ -2546,6 +2755,7 @@ fn write_ownership(
             params![
                 agent_id,
                 owner_node_id,
+                sqlite_generation(authority_term, "ownership authority term")?,
                 sqlite_generation(fencing_token, "ownership fencing token")?,
                 sqlite_generation(generation, "ownership generation")?,
                 state.as_str(),
@@ -2566,6 +2776,7 @@ fn write_ownership_audit(
     generation: u64,
     previous_owner_node_id: Option<&str>,
     owner_node_id: &str,
+    authority_term: u64,
     fencing_token: u64,
     operation: &str,
     actor: &str,
@@ -2576,13 +2787,14 @@ fn write_ownership_audit(
         .execute(
             "INSERT INTO cluster_agent_ownership_audit
              (agent_id, generation, previous_owner_node_id, owner_node_id,
-              fencing_token, operation, actor, reason, changed_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+              authority_term, fencing_token, operation, actor, reason, changed_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 agent_id,
                 sqlite_generation(generation, "ownership audit generation")?,
                 previous_owner_node_id,
                 owner_node_id,
+                sqlite_generation(authority_term, "ownership audit authority term")?,
                 sqlite_generation(fencing_token, "ownership audit fencing token")?,
                 operation,
                 actor,
@@ -2887,6 +3099,7 @@ mod tests {
         agent_id: Option<String>,
         cluster_id: Option<String>,
         fencing_token: Option<u64>,
+        proof_expires_at: Option<DateTime<Utc>>,
     }
 
     fn remove_cluster_crash_database(path: &std::path::Path) {
@@ -3025,6 +3238,7 @@ mod tests {
                 let agent_id = uuid::Uuid::new_v4().to_string();
                 let node_id = authority.identity().node_id.clone();
                 let cluster_id = uuid::Uuid::new_v4().to_string();
+                let proof_expires_at = Utc::now() + chrono::Duration::seconds(300);
                 let now = Utc::now().to_rfc3339();
                 authority
                     .store
@@ -3047,8 +3261,10 @@ mod tests {
                             &agent_id,
                             &cluster_id,
                             &node_id,
+                            1,
                             10,
                             5,
+                            proof_expires_at,
                             "system",
                             "fence crash fixture",
                         )
@@ -3060,6 +3276,7 @@ mod tests {
                     agent_id: Some(agent_id),
                     cluster_id: Some(cluster_id),
                     fencing_token: Some(5),
+                    proof_expires_at: Some(proof_expires_at),
                     ..ClusterCrashInput::default()
                 }
             }
@@ -3194,12 +3411,16 @@ mod tests {
                             .as_deref()
                             .expect("cluster crash cluster id"),
                         input.node_id.as_deref().expect("cluster crash node id"),
+                        1,
                         input
                             .expected_generation
                             .expect("cluster crash authority generation"),
                         input
                             .fencing_token
                             .expect("cluster crash mutation fencing token"),
+                        input
+                            .proof_expires_at
+                            .expect("cluster crash mutation proof expiry"),
                         "system",
                         "crash-qualified mutation fence install",
                     )
@@ -3214,12 +3435,16 @@ mod tests {
                             .as_deref()
                             .expect("cluster crash cluster id"),
                         input.node_id.as_deref().expect("cluster crash node id"),
+                        1,
                         input
                             .expected_generation
                             .expect("cluster crash authority generation"),
                         input
                             .fencing_token
                             .expect("cluster crash mutation fencing token"),
+                        input
+                            .proof_expires_at
+                            .expect("cluster crash mutation proof expiry"),
                         "system",
                         "crash-qualified mutation fence retirement",
                     )
@@ -3592,10 +3817,11 @@ mod tests {
     #[test]
     fn destination_mutation_fences_are_monotonic_exact_and_durable() {
         let store = Arc::new(SqliteContextManager::in_memory().unwrap());
-        let control = ClusterControl::new(store.clone()).unwrap();
+        let control = Arc::new(ClusterControl::new(store.clone()).unwrap());
         let agent_id = uuid::Uuid::new_v4().to_string();
         let cluster_id = uuid::Uuid::new_v4().to_string();
         let node_id = control.identity().node_id.clone();
+        let proof_expires_at = Utc::now() + chrono::Duration::seconds(60);
         let now = Utc::now().to_rfc3339();
         store
             .conn
@@ -3617,38 +3843,118 @@ mod tests {
                 &agent_id,
                 &cluster_id,
                 &foreign_node,
+                2,
                 10,
                 5,
+                proof_expires_at,
                 "system",
                 "foreign destination",
             )
             .unwrap_err()
             .to_string()
             .contains("destination node"));
+        assert!(control
+            .install_agent_mutation_fence(
+                &agent_id,
+                &cluster_id,
+                &node_id,
+                2,
+                10,
+                5,
+                Utc::now() - chrono::Duration::seconds(1),
+                "system",
+                "expired destination proof",
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("expired"));
+        assert!(control
+            .install_agent_mutation_fence(
+                &agent_id,
+                &cluster_id,
+                &node_id,
+                2,
+                10,
+                5,
+                Utc::now() + chrono::Duration::seconds(400),
+                "system",
+                "unbounded destination proof",
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("bounded destination horizon"));
 
         let installed = control
             .install_agent_mutation_fence(
                 &agent_id,
                 &cluster_id,
                 &node_id,
+                2,
                 10,
                 5,
+                proof_expires_at,
                 "system",
                 "initial destination fence",
             )
             .unwrap();
         assert_eq!(installed.state, AgentMutationFenceState::Active);
         control
-            .verify_agent_mutation_fence(&agent_id, &cluster_id, &node_id, 10, 5)
+            .verify_agent_mutation_fence(
+                &agent_id,
+                &cluster_id,
+                &node_id,
+                2,
+                10,
+                5,
+                proof_expires_at,
+            )
             .unwrap();
+        let connection_guard = store.conn.lock().unwrap();
+        let (clock_sampled_tx, clock_sampled_rx) = std::sync::mpsc::channel();
+        let verifier = Arc::clone(&control);
+        let verify_agent_id = agent_id.clone();
+        let verify_cluster_id = cluster_id.clone();
+        let verify_node_id = node_id.clone();
+        let verifier_task = std::thread::spawn(move || {
+            verifier.verify_agent_mutation_fence_with_clock(
+                &verify_agent_id,
+                &verify_cluster_id,
+                &verify_node_id,
+                2,
+                10,
+                5,
+                proof_expires_at,
+                || {
+                    clock_sampled_tx.send(()).unwrap();
+                    Utc::now()
+                },
+            )
+        });
+        assert!(
+            matches!(
+                clock_sampled_rx.recv_timeout(std::time::Duration::from_millis(50)),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ),
+            "verification must not sample time before its durable fence read"
+        );
+        drop(connection_guard);
+        clock_sampled_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("verification samples time after the durable fence read");
+        verifier_task
+            .join()
+            .expect("fence verifier thread")
+            .expect("unexpired exact proof remains valid");
         assert_eq!(
             control
                 .install_agent_mutation_fence(
                     &agent_id,
                     &cluster_id,
                     &node_id,
+                    2,
                     10,
                     5,
+                    proof_expires_at,
                     "system",
                     "idempotent retry",
                 )
@@ -3660,8 +3966,10 @@ mod tests {
                 &agent_id,
                 &cluster_id,
                 &node_id,
+                2,
                 9,
                 4,
+                proof_expires_at,
                 "system",
                 "stale route",
             )
@@ -3673,8 +3981,10 @@ mod tests {
                 &agent_id,
                 &cluster_id,
                 &node_id,
+                2,
                 10,
                 6,
+                proof_expires_at,
                 "system",
                 "token without generation",
             )
@@ -3687,44 +3997,118 @@ mod tests {
                 &agent_id,
                 &cluster_id,
                 &node_id,
+                3,
                 11,
                 6,
+                proof_expires_at,
                 "system",
                 "ownership transfer",
             )
             .unwrap();
         assert_eq!(transferred.fencing_token, 6);
+        assert_eq!(transferred.authority_term, 3);
         assert!(control
-            .verify_agent_mutation_fence(&agent_id, &cluster_id, &node_id, 10, 5)
+            .install_agent_mutation_fence(
+                &agent_id,
+                &cluster_id,
+                &node_id,
+                2,
+                12,
+                7,
+                proof_expires_at,
+                "system",
+                "delayed old authority term",
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("stale"));
+        assert!(control
+            .verify_agent_mutation_fence(
+                &agent_id,
+                &cluster_id,
+                &node_id,
+                2,
+                10,
+                5,
+                proof_expires_at,
+            )
             .unwrap_err()
             .to_string()
             .contains("destination ownership fence"));
         control
-            .verify_agent_mutation_fence(&agent_id, &cluster_id, &node_id, 11, 6)
+            .verify_agent_mutation_fence(
+                &agent_id,
+                &cluster_id,
+                &node_id,
+                3,
+                11,
+                6,
+                proof_expires_at,
+            )
             .unwrap();
+        assert!(control
+            .verify_agent_mutation_fence_at(
+                &agent_id,
+                &cluster_id,
+                &node_id,
+                3,
+                11,
+                6,
+                proof_expires_at,
+                proof_expires_at,
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("proof expired"));
+        assert!(control
+            .verify_agent_mutation_fence_at(
+                &agent_id,
+                &cluster_id,
+                &node_id,
+                3,
+                11,
+                6,
+                proof_expires_at,
+                transferred.installed_at - chrono::Duration::milliseconds(1),
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("clock moved"));
 
         let retired = control
             .retire_agent_mutation_fence(
                 &agent_id,
                 &cluster_id,
                 &node_id,
+                3,
                 11,
                 6,
+                proof_expires_at,
                 "system",
                 "drained old owner",
             )
             .unwrap();
         assert_eq!(retired.state, AgentMutationFenceState::Retired);
         assert!(control
-            .verify_agent_mutation_fence(&agent_id, &cluster_id, &node_id, 11, 6)
+            .verify_agent_mutation_fence(
+                &agent_id,
+                &cluster_id,
+                &node_id,
+                3,
+                11,
+                6,
+                proof_expires_at,
+            )
             .is_err());
         assert!(control
             .install_agent_mutation_fence(
                 &agent_id,
                 &cluster_id,
                 &node_id,
+                3,
                 11,
                 6,
+                proof_expires_at,
                 "system",
                 "delayed replay",
             )

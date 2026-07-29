@@ -492,6 +492,8 @@ policy/package convergence, rolling-upgrade coordinator, or disaster-recovery
 controller. Identity revocation is enforced by discovery, but live TLS client
 certificate rotation/revocation still requires replacing trust configuration
 and restarting affected listeners. Those requirements remain tracked by #122.
+The normative object-by-object consistency and failure rules are published in
+[the distributed control-plane contract](DISTRIBUTED_CONTROL_PLANE.md).
 
 ## Conformance evidence
 

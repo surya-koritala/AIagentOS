@@ -405,6 +405,64 @@ fn provider_matrix_names_every_resource_provider_status_and_platform_contract() 
 }
 
 #[test]
+fn distributed_consistency_contract_is_published_and_fail_closed() {
+    let contract = read_workspace_file("docs/DISTRIBUTED_CONTROL_PLANE.md");
+    let summary = read_workspace_file("docs/src/SUMMARY.md");
+    let architecture = read_workspace_file("docs/ARCHITECTURE.md");
+    let protocol = read_workspace_file("docs/PROTOCOL.md");
+
+    assert!(summary.contains("./distributed-control-plane.md"));
+    assert!(architecture.contains("DISTRIBUTED_CONTROL_PLANE.md"));
+    assert!(protocol.contains("DISTRIBUTED_CONTROL_PLANE.md"));
+
+    for object in [
+        "Cluster identity and membership",
+        "Agent identity",
+        "Agent ownership and routing",
+        "Agent state and checkpoints",
+        "Package metadata and trust roots",
+        "Authorization policy",
+        "Quotas and accounting",
+        "Audit",
+        "IPC and delegation",
+    ] {
+        assert!(
+            contract.contains(object),
+            "distributed consistency contract must classify {object}"
+        );
+    }
+
+    for failure in [
+        "Membership authority loss",
+        "Workload node loss",
+        "Network partition",
+        "Duplicate agent ownership",
+        "Stale route",
+        "Clock skew",
+        "Unknown outcomes are not successes",
+    ] {
+        assert!(
+            contract.contains(failure),
+            "distributed consistency contract must define {failure}"
+        );
+    }
+
+    for honest_boundary in [
+        "There is no replicated log, election, quorum, or automatic authority",
+        "no ownership lease or fencing token is enforced",
+        "not partition tolerant",
+        "advertised as a production distributed kernel",
+        "every mutable agent operation must be rejected",
+        "Lease expiry alone is insufficient",
+    ] {
+        assert!(
+            contract.contains(honest_boundary),
+            "distributed consistency contract lost boundary: {honest_boundary}"
+        );
+    }
+}
+
+#[test]
 fn trusted_browser_helpers_remain_isolated_bounded_and_outside_runtime_discovery() {
     let automation = read_workspace_file("crates/resources/src/playwright.rs");
     for contract in [

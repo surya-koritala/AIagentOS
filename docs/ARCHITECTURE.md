@@ -8,6 +8,10 @@
 This document describes the system **as it is built today**. It is the canonical
 reference for the README and for new design work.
 
+The multi-node authority, ownership, partition, and retry rules are specified
+separately in the
+[distributed control-plane consistency contract](DISTRIBUTED_CONTROL_PLANE.md).
+
 ---
 
 ## 1. The one-paragraph version

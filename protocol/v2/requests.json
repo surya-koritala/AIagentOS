@@ -289,6 +289,38 @@
     "op": "list_cluster_membership_audit"
   },
   {
+    "agent_id": "00000000-0000-0000-0000-000000000001",
+    "expected_fencing_token": null,
+    "op": "claim_cluster_agent_ownership",
+    "owner_node_id": "00000000-0000-0000-0000-000000000004",
+    "reason": "fixture",
+    "ttl_seconds": 1
+  },
+  {
+    "agent_id": "00000000-0000-0000-0000-000000000001",
+    "fencing_token": 1,
+    "op": "renew_cluster_agent_ownership",
+    "owner_node_id": "00000000-0000-0000-0000-000000000004",
+    "reason": "fixture",
+    "ttl_seconds": 1
+  },
+  {
+    "agent_id": "00000000-0000-0000-0000-000000000001",
+    "fencing_token": 1,
+    "op": "release_cluster_agent_ownership",
+    "owner_node_id": "00000000-0000-0000-0000-000000000004",
+    "reason": "fixture"
+  },
+  {
+    "agent_id": "00000000-0000-0000-0000-000000000001",
+    "op": "get_cluster_agent_ownership"
+  },
+  {
+    "agent_id": null,
+    "limit": 1,
+    "op": "list_cluster_agent_ownership_audit"
+  },
+  {
     "op": "metrics"
   },
   {

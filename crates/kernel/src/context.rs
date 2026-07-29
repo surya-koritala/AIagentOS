@@ -356,6 +356,16 @@ pub const DURABLE_DATA_CATALOG: &[DurableDataClassification] = &[
         deletion: "retain",
     },
     DurableDataClassification {
+        table: "cluster_agent_ownership",
+        owner: "system",
+        deletion: "retain fencing tombstone until cluster retirement",
+    },
+    DurableDataClassification {
+        table: "cluster_agent_ownership_audit",
+        owner: "system",
+        deletion: "retain",
+    },
+    DurableDataClassification {
         table: "storage_meta",
         owner: "system",
         deletion: "retain",
@@ -1836,7 +1846,33 @@ impl SqliteContextManager {
                 actor TEXT NOT NULL,
                 reason TEXT NOT NULL,
                 changed_at TEXT NOT NULL
-            );",
+            );
+            CREATE TABLE IF NOT EXISTS cluster_agent_ownership (
+                agent_id TEXT PRIMARY KEY CHECK (length(agent_id) = 36),
+                owner_node_id TEXT NOT NULL CHECK (length(owner_node_id) = 36),
+                fencing_token INTEGER NOT NULL CHECK (fencing_token >= 1),
+                generation INTEGER NOT NULL CHECK (generation >= 1),
+                state TEXT NOT NULL CHECK (state IN ('active', 'released')),
+                lease_expires_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                reason TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_cluster_agent_ownership_owner
+                ON cluster_agent_ownership(owner_node_id, state, lease_expires_at);
+            CREATE TABLE IF NOT EXISTS cluster_agent_ownership_audit (
+                agent_id TEXT NOT NULL CHECK (length(agent_id) = 36),
+                generation INTEGER NOT NULL CHECK (generation >= 1),
+                previous_owner_node_id TEXT,
+                owner_node_id TEXT NOT NULL CHECK (length(owner_node_id) = 36),
+                fencing_token INTEGER NOT NULL CHECK (fencing_token >= 1),
+                operation TEXT NOT NULL CHECK (
+                    operation IN ('claim', 'transfer', 'renew', 'release')
+                ),
+                actor TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                changed_at TEXT NOT NULL,
+                PRIMARY KEY (agent_id, generation)
+            ) WITHOUT ROWID;",
         ).map_err(|e| ContextError::StorageError(e.to_string()))?;
         // Legacy fact rows are deliberately marked stale and rebuilt on their
         // next query or an explicit reindex.
@@ -10606,7 +10642,7 @@ mod tests {
                 crate::schema::CURRENT_SCHEMA_VERSION,
                 "fresh stores record every released schema transition"
             );
-            assert_eq!(cluster_table_count, 7);
+            assert_eq!(cluster_table_count, 9);
         }
 
         let reopened = SqliteContextManager::new(&database.path).unwrap();

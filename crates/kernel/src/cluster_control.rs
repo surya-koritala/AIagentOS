@@ -28,6 +28,8 @@ const MAX_MEMBER_ENDPOINT_BYTES: usize = 2048;
 const MAX_MEMBER_VERSION_BYTES: usize = 256;
 const MIN_JOIN_CHALLENGE_TTL_SECONDS: u64 = 5;
 const MAX_JOIN_CHALLENGE_TTL_SECONDS: u64 = 300;
+const MIN_OWNERSHIP_LEASE_TTL_SECONDS: u64 = 5;
+const MAX_OWNERSHIP_LEASE_TTL_SECONDS: u64 = 300;
 
 #[cfg(test)]
 thread_local! {
@@ -233,6 +235,67 @@ pub struct ClusterMembershipAudit {
     pub member_generation: u64,
     pub previous: Option<ClusterMemberState>,
     pub current: ClusterMemberState,
+    pub actor: String,
+    pub reason: String,
+    pub changed_at: DateTime<Utc>,
+}
+
+/// Durable state of one authority-issued agent ownership record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClusterOwnershipState {
+    /// The exact owner and fencing token may be renewed until expiry.
+    Active,
+    /// The token is a permanent tombstone and can never become active again.
+    Released,
+}
+
+impl ClusterOwnershipState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Released => "released",
+        }
+    }
+}
+
+impl TryFrom<&str> for ClusterOwnershipState {
+    type Error = ContextError;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value {
+            "active" => Ok(Self::Active),
+            "released" => Ok(Self::Released),
+            other => Err(storage_error(format!(
+                "invalid persisted cluster ownership state {other:?}"
+            ))),
+        }
+    }
+}
+
+/// Authority-issued ownership lease. The fencing token never decreases for an
+/// agent, including after release or expiry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClusterAgentOwnership {
+    pub agent_id: String,
+    pub owner_node_id: String,
+    pub fencing_token: u64,
+    pub generation: u64,
+    pub state: ClusterOwnershipState,
+    pub lease_expires_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    pub reason: String,
+}
+
+/// Durable evidence for an ownership claim, transfer, renewal, or release.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClusterAgentOwnershipAudit {
+    pub agent_id: String,
+    pub generation: u64,
+    pub previous_owner_node_id: Option<String>,
+    pub owner_node_id: String,
+    pub fencing_token: u64,
+    pub operation: String,
     pub actor: String,
     pub reason: String,
     pub changed_at: DateTime<Utc>,
@@ -905,6 +968,80 @@ impl ClusterControl {
         let membership_generation_i64 =
             sqlite_generation(membership_generation, "cluster membership")?;
         let now = Utc::now();
+        if state == ClusterMemberState::Left {
+            let active_leases: i64 = transaction
+                .query_row(
+                    "SELECT COUNT(*) FROM cluster_agent_ownership
+                     WHERE owner_node_id = ?1 AND state = 'active'
+                       AND lease_expires_at > ?2",
+                    params![node_id, now.to_rfc3339()],
+                    |row| row.get(0),
+                )
+                .map_err(|error| storage_error(format!("inspect member ownership: {error}")))?;
+            if active_leases != 0 {
+                return Err(storage_error(
+                    "cluster member leave conflict: active ownership leases must be released first",
+                ));
+            }
+        } else {
+            let owned = {
+                let mut statement = transaction
+                    .prepare(
+                        "SELECT agent_id, fencing_token, generation
+                         FROM cluster_agent_ownership
+                         WHERE owner_node_id = ?1 AND state = 'active'
+                         ORDER BY agent_id",
+                    )
+                    .map_err(|error| {
+                        storage_error(format!("prepare revoked member ownership: {error}"))
+                    })?;
+                let rows = statement
+                    .query_map([node_id], |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, i64>(2)?,
+                        ))
+                    })
+                    .map_err(|error| {
+                        storage_error(format!("query revoked member ownership: {error}"))
+                    })?;
+                rows.collect::<Result<Vec<_>, _>>().map_err(|error| {
+                    storage_error(format!("read revoked member ownership: {error}"))
+                })?
+            };
+            for (agent_id, fencing_token, generation) in owned {
+                let fencing_token = u64::try_from(fencing_token)
+                    .map_err(|_| storage_error("negative ownership fencing token"))?;
+                let generation = u64::try_from(generation)
+                    .map_err(|_| storage_error("negative ownership generation"))?
+                    .checked_add(1)
+                    .ok_or_else(|| storage_error("agent ownership generation overflow"))?;
+                write_ownership(
+                    &transaction,
+                    &agent_id,
+                    node_id,
+                    fencing_token,
+                    generation,
+                    ClusterOwnershipState::Released,
+                    now,
+                    now,
+                    reason,
+                )?;
+                write_ownership_audit(
+                    &transaction,
+                    &agent_id,
+                    generation,
+                    Some(node_id),
+                    node_id,
+                    fencing_token,
+                    "release",
+                    actor,
+                    reason,
+                    now,
+                )?;
+            }
+        }
         let changed = transaction
             .execute(
                 "UPDATE cluster_members SET state = ?1, generation = ?2,
@@ -1069,6 +1206,325 @@ impl ClusterControl {
         Ok(audit)
     }
 
+    /// Claim an unowned, released, or expired agent record for one active
+    /// member. Replacing any previous record requires its exact fencing token;
+    /// every successful replacement receives a strictly greater token.
+    pub fn claim_agent_ownership(
+        &self,
+        agent_id: &str,
+        owner_node_id: &str,
+        ttl_seconds: u64,
+        expected_fencing_token: Option<u64>,
+        actor: &str,
+        reason: &str,
+    ) -> Result<ClusterAgentOwnership, ContextError> {
+        validate_ownership_request(agent_id, owner_node_id, ttl_seconds, actor, reason)?;
+        let mut connection = self
+            .store
+            .conn
+            .lock()
+            .map_err(|_| storage_error("SQLite connection mutex is poisoned"))?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| storage_error(format!("agent ownership transaction: {error}")))?;
+        require_active_member(&transaction, owner_node_id)?;
+        let previous = load_ownership(&transaction, agent_id)?;
+        let now = Utc::now();
+        let (fencing_token, generation, operation, previous_owner_node_id) =
+            match previous.as_ref() {
+                None => {
+                    if expected_fencing_token.is_some() {
+                        return Err(storage_error(
+                            "agent ownership conflict: no previous fencing token exists",
+                        ));
+                    }
+                    (1, 1, "claim", None)
+                }
+                Some(previous) => {
+                    if expected_fencing_token != Some(previous.fencing_token) {
+                        return Err(storage_error(format!(
+                            "agent ownership fencing conflict: expected {:?}, current {}",
+                            expected_fencing_token, previous.fencing_token
+                        )));
+                    }
+                    if previous.state == ClusterOwnershipState::Active
+                        && previous.lease_expires_at > now
+                    {
+                        return Err(storage_error(
+                            "agent ownership conflict: current lease has not expired",
+                        ));
+                    }
+                    (
+                        previous.fencing_token.checked_add(1).ok_or_else(|| {
+                            storage_error("agent ownership fencing token overflow")
+                        })?,
+                        previous
+                            .generation
+                            .checked_add(1)
+                            .ok_or_else(|| storage_error("agent ownership generation overflow"))?,
+                        "transfer",
+                        Some(previous.owner_node_id.clone()),
+                    )
+                }
+            };
+        let lease_expires_at = ownership_expiry(now, ttl_seconds)?;
+        write_ownership(
+            &transaction,
+            agent_id,
+            owner_node_id,
+            fencing_token,
+            generation,
+            ClusterOwnershipState::Active,
+            lease_expires_at,
+            now,
+            reason,
+        )?;
+        write_ownership_audit(
+            &transaction,
+            agent_id,
+            generation,
+            previous_owner_node_id.as_deref(),
+            owner_node_id,
+            fencing_token,
+            operation,
+            actor,
+            reason,
+            now,
+        )?;
+        transaction
+            .commit()
+            .map_err(|error| storage_error(format!("commit agent ownership: {error}")))?;
+        drop(connection);
+        self.agent_ownership(agent_id)?
+            .ok_or_else(|| storage_error("claimed agent ownership disappeared"))
+    }
+
+    /// Renew only the exact active, unexpired owner/token pair. Renewal keeps
+    /// the fencing token stable and advances the audit generation.
+    pub fn renew_agent_ownership(
+        &self,
+        agent_id: &str,
+        owner_node_id: &str,
+        fencing_token: u64,
+        ttl_seconds: u64,
+        actor: &str,
+        reason: &str,
+    ) -> Result<ClusterAgentOwnership, ContextError> {
+        validate_ownership_request(agent_id, owner_node_id, ttl_seconds, actor, reason)?;
+        let mut connection = self
+            .store
+            .conn
+            .lock()
+            .map_err(|_| storage_error("SQLite connection mutex is poisoned"))?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| storage_error(format!("agent ownership renewal: {error}")))?;
+        require_active_member(&transaction, owner_node_id)?;
+        let previous = load_ownership(&transaction, agent_id)?
+            .ok_or_else(|| storage_error("agent ownership not found"))?;
+        let now = Utc::now();
+        if previous.state != ClusterOwnershipState::Active
+            || previous.owner_node_id != owner_node_id
+            || previous.fencing_token != fencing_token
+        {
+            return Err(storage_error("agent ownership fencing conflict"));
+        }
+        if previous.lease_expires_at <= now {
+            return Err(storage_error(
+                "agent ownership lease expired before renewal",
+            ));
+        }
+        let generation = previous
+            .generation
+            .checked_add(1)
+            .ok_or_else(|| storage_error("agent ownership generation overflow"))?;
+        let lease_expires_at = ownership_expiry(now, ttl_seconds)?;
+        write_ownership(
+            &transaction,
+            agent_id,
+            owner_node_id,
+            fencing_token,
+            generation,
+            ClusterOwnershipState::Active,
+            lease_expires_at,
+            now,
+            reason,
+        )?;
+        write_ownership_audit(
+            &transaction,
+            agent_id,
+            generation,
+            Some(owner_node_id),
+            owner_node_id,
+            fencing_token,
+            "renew",
+            actor,
+            reason,
+            now,
+        )?;
+        transaction
+            .commit()
+            .map_err(|error| storage_error(format!("commit ownership renewal: {error}")))?;
+        drop(connection);
+        self.agent_ownership(agent_id)?
+            .ok_or_else(|| storage_error("renewed agent ownership disappeared"))
+    }
+
+    /// Release only the exact active owner/token pair. The retained tombstone
+    /// prevents the fencing token from ever being reused.
+    pub fn release_agent_ownership(
+        &self,
+        agent_id: &str,
+        owner_node_id: &str,
+        fencing_token: u64,
+        actor: &str,
+        reason: &str,
+    ) -> Result<ClusterAgentOwnership, ContextError> {
+        validate_ownership_identity(agent_id, owner_node_id)?;
+        validate_text(actor, "cluster-ownership actor")?;
+        validate_reason(reason)?;
+        let mut connection = self
+            .store
+            .conn
+            .lock()
+            .map_err(|_| storage_error("SQLite connection mutex is poisoned"))?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| storage_error(format!("agent ownership release: {error}")))?;
+        let previous = load_ownership(&transaction, agent_id)?
+            .ok_or_else(|| storage_error("agent ownership not found"))?;
+        if previous.state != ClusterOwnershipState::Active
+            || previous.owner_node_id != owner_node_id
+            || previous.fencing_token != fencing_token
+        {
+            return Err(storage_error("agent ownership fencing conflict"));
+        }
+        let now = Utc::now();
+        let generation = previous
+            .generation
+            .checked_add(1)
+            .ok_or_else(|| storage_error("agent ownership generation overflow"))?;
+        write_ownership(
+            &transaction,
+            agent_id,
+            owner_node_id,
+            fencing_token,
+            generation,
+            ClusterOwnershipState::Released,
+            now,
+            now,
+            reason,
+        )?;
+        write_ownership_audit(
+            &transaction,
+            agent_id,
+            generation,
+            Some(owner_node_id),
+            owner_node_id,
+            fencing_token,
+            "release",
+            actor,
+            reason,
+            now,
+        )?;
+        transaction
+            .commit()
+            .map_err(|error| storage_error(format!("commit ownership release: {error}")))?;
+        drop(connection);
+        self.agent_ownership(agent_id)?
+            .ok_or_else(|| storage_error("released agent ownership disappeared"))
+    }
+
+    pub fn agent_ownership(
+        &self,
+        agent_id: &str,
+    ) -> Result<Option<ClusterAgentOwnership>, ContextError> {
+        uuid::Uuid::parse_str(agent_id)
+            .map_err(|_| storage_error("invalid cluster ownership agent id"))?;
+        let connection = self
+            .store
+            .conn
+            .lock()
+            .map_err(|_| storage_error("SQLite connection mutex is poisoned"))?;
+        load_ownership(&connection, agent_id)
+    }
+
+    pub fn agent_ownership_audit(
+        &self,
+        agent_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<ClusterAgentOwnershipAudit>, ContextError> {
+        if let Some(agent_id) = agent_id {
+            uuid::Uuid::parse_str(agent_id)
+                .map_err(|_| storage_error("invalid cluster ownership agent id"))?;
+        }
+        let limit = limit.clamp(1, 1_000);
+        let connection = self
+            .store
+            .conn
+            .lock()
+            .map_err(|_| storage_error("SQLite connection mutex is poisoned"))?;
+        let sql = if agent_id.is_some() {
+            "SELECT agent_id, generation, previous_owner_node_id, owner_node_id,
+                    fencing_token, operation, actor, reason, changed_at
+             FROM cluster_agent_ownership_audit
+             WHERE agent_id = ?1
+             ORDER BY generation DESC LIMIT ?2"
+        } else {
+            "SELECT agent_id, generation, previous_owner_node_id, owner_node_id,
+                    fencing_token, operation, actor, reason, changed_at
+             FROM cluster_agent_ownership_audit
+             ORDER BY changed_at DESC, agent_id, generation DESC LIMIT ?2"
+        };
+        let mut statement = connection
+            .prepare(sql)
+            .map_err(|error| storage_error(format!("prepare ownership audit: {error}")))?;
+        let mut rows = statement
+            .query(params![agent_id, limit as i64])
+            .map_err(|error| storage_error(format!("query ownership audit: {error}")))?;
+        let mut audit = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .map_err(|error| storage_error(format!("read ownership audit: {error}")))?
+        {
+            audit.push(ClusterAgentOwnershipAudit {
+                agent_id: row
+                    .get(0)
+                    .map_err(|error| storage_error(error.to_string()))?,
+                generation: u64::try_from(
+                    row.get::<_, i64>(1)
+                        .map_err(|error| storage_error(error.to_string()))?,
+                )
+                .map_err(|_| storage_error("negative ownership audit generation"))?,
+                previous_owner_node_id: row
+                    .get(2)
+                    .map_err(|error| storage_error(error.to_string()))?,
+                owner_node_id: row
+                    .get(3)
+                    .map_err(|error| storage_error(error.to_string()))?,
+                fencing_token: u64::try_from(
+                    row.get::<_, i64>(4)
+                        .map_err(|error| storage_error(error.to_string()))?,
+                )
+                .map_err(|_| storage_error("negative ownership audit fencing token"))?,
+                operation: row
+                    .get(5)
+                    .map_err(|error| storage_error(error.to_string()))?,
+                actor: row
+                    .get(6)
+                    .map_err(|error| storage_error(error.to_string()))?,
+                reason: row
+                    .get(7)
+                    .map_err(|error| storage_error(error.to_string()))?,
+                changed_at: parse_timestamp(
+                    &row.get::<_, String>(8)
+                        .map_err(|error| storage_error(error.to_string()))?,
+                )?,
+            });
+        }
+        Ok(audit)
+    }
+
     fn member(&self, node_id: &str) -> Result<Option<ClusterMember>, ContextError> {
         let connection = self
             .store
@@ -1222,6 +1678,193 @@ fn load_member(
         .map_err(|error| storage_error(format!("load cluster member: {error}")))?
         .map(ClusterMember::try_from)
         .transpose()
+}
+
+fn validate_ownership_identity(agent_id: &str, owner_node_id: &str) -> Result<(), ContextError> {
+    uuid::Uuid::parse_str(agent_id)
+        .map_err(|_| storage_error("invalid cluster ownership agent id"))?;
+    uuid::Uuid::parse_str(owner_node_id)
+        .map_err(|_| storage_error("invalid cluster ownership node id"))?;
+    Ok(())
+}
+
+fn validate_ownership_request(
+    agent_id: &str,
+    owner_node_id: &str,
+    ttl_seconds: u64,
+    actor: &str,
+    reason: &str,
+) -> Result<(), ContextError> {
+    validate_ownership_identity(agent_id, owner_node_id)?;
+    if !(MIN_OWNERSHIP_LEASE_TTL_SECONDS..=MAX_OWNERSHIP_LEASE_TTL_SECONDS).contains(&ttl_seconds) {
+        return Err(storage_error(format!(
+            "invalid agent ownership TTL: expected {MIN_OWNERSHIP_LEASE_TTL_SECONDS}..={MAX_OWNERSHIP_LEASE_TTL_SECONDS} seconds"
+        )));
+    }
+    validate_text(actor, "cluster-ownership actor")?;
+    validate_reason(reason)
+}
+
+fn ownership_expiry(now: DateTime<Utc>, ttl_seconds: u64) -> Result<DateTime<Utc>, ContextError> {
+    let seconds = i64::try_from(ttl_seconds)
+        .map_err(|_| storage_error("agent ownership TTL exceeds clock range"))?;
+    now.checked_add_signed(chrono::Duration::seconds(seconds))
+        .ok_or_else(|| storage_error("agent ownership expiry overflow"))
+}
+
+fn require_active_member(
+    connection: &rusqlite::Connection,
+    node_id: &str,
+) -> Result<(), ContextError> {
+    let state: Option<String> = connection
+        .query_row(
+            "SELECT state FROM cluster_members WHERE node_id = ?1",
+            [node_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| storage_error(format!("read ownership member: {error}")))?;
+    match state.as_deref() {
+        Some("active") => Ok(()),
+        Some(_) => Err(storage_error(
+            "agent ownership denied: owner node is not an active cluster member",
+        )),
+        None => Err(storage_error(
+            "agent ownership denied: owner node is not a cluster member",
+        )),
+    }
+}
+
+fn load_ownership(
+    connection: &rusqlite::Connection,
+    agent_id: &str,
+) -> Result<Option<ClusterAgentOwnership>, ContextError> {
+    let stored = connection
+        .query_row(
+            "SELECT agent_id, owner_node_id, fencing_token, generation, state,
+                    lease_expires_at, updated_at, reason
+             FROM cluster_agent_ownership WHERE agent_id = ?1",
+            [agent_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, String>(7)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|error| storage_error(format!("load agent ownership: {error}")))?;
+    stored
+        .map(
+            |(
+                agent_id,
+                owner_node_id,
+                fencing_token,
+                generation,
+                state,
+                lease_expires_at,
+                updated_at,
+                reason,
+            )| {
+                Ok(ClusterAgentOwnership {
+                    agent_id,
+                    owner_node_id,
+                    fencing_token: u64::try_from(fencing_token)
+                        .map_err(|_| storage_error("negative ownership fencing token"))?,
+                    generation: u64::try_from(generation)
+                        .map_err(|_| storage_error("negative ownership generation"))?,
+                    state: ClusterOwnershipState::try_from(state.as_str())?,
+                    lease_expires_at: parse_timestamp(&lease_expires_at)?,
+                    updated_at: parse_timestamp(&updated_at)?,
+                    reason,
+                })
+            },
+        )
+        .transpose()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_ownership(
+    connection: &rusqlite::Connection,
+    agent_id: &str,
+    owner_node_id: &str,
+    fencing_token: u64,
+    generation: u64,
+    state: ClusterOwnershipState,
+    lease_expires_at: DateTime<Utc>,
+    updated_at: DateTime<Utc>,
+    reason: &str,
+) -> Result<(), ContextError> {
+    connection
+        .execute(
+            "INSERT INTO cluster_agent_ownership
+             (agent_id, owner_node_id, fencing_token, generation, state,
+              lease_expires_at, updated_at, reason)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT(agent_id) DO UPDATE SET
+               owner_node_id = excluded.owner_node_id,
+               fencing_token = excluded.fencing_token,
+               generation = excluded.generation,
+               state = excluded.state,
+               lease_expires_at = excluded.lease_expires_at,
+               updated_at = excluded.updated_at,
+               reason = excluded.reason",
+            params![
+                agent_id,
+                owner_node_id,
+                sqlite_generation(fencing_token, "ownership fencing token")?,
+                sqlite_generation(generation, "ownership generation")?,
+                state.as_str(),
+                lease_expires_at.to_rfc3339(),
+                updated_at.to_rfc3339(),
+                reason,
+            ],
+        )
+        .map_err(|error| storage_error(format!("write agent ownership: {error}")))?;
+    crash_cluster_mutation_after_step_for_test("agent_ownership.record");
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_ownership_audit(
+    connection: &rusqlite::Connection,
+    agent_id: &str,
+    generation: u64,
+    previous_owner_node_id: Option<&str>,
+    owner_node_id: &str,
+    fencing_token: u64,
+    operation: &str,
+    actor: &str,
+    reason: &str,
+    changed_at: DateTime<Utc>,
+) -> Result<(), ContextError> {
+    connection
+        .execute(
+            "INSERT INTO cluster_agent_ownership_audit
+             (agent_id, generation, previous_owner_node_id, owner_node_id,
+              fencing_token, operation, actor, reason, changed_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                agent_id,
+                sqlite_generation(generation, "ownership audit generation")?,
+                previous_owner_node_id,
+                owner_node_id,
+                sqlite_generation(fencing_token, "ownership audit fencing token")?,
+                operation,
+                actor,
+                reason,
+                changed_at.to_rfc3339(),
+            ],
+        )
+        .map_err(|error| storage_error(format!("audit agent ownership: {error}")))?;
+    crash_cluster_mutation_after_step_for_test("agent_ownership.audit");
+    Ok(())
 }
 
 /// Build the canonical, domain-separated bytes that a joining node signs.
@@ -1440,6 +2083,10 @@ mod tests {
         ("rejoin", 4),
         ("leave", 3),
         ("revoke", 3),
+        ("ownership_claim", 2),
+        ("ownership_renew", 2),
+        ("ownership_release", 2),
+        ("revoke_owned", 5),
     ];
     const CLUSTER_MUTATION_TABLES: &[&str] = &[
         "cluster_node_identity",
@@ -1449,6 +2096,8 @@ mod tests {
         "cluster_join_challenges",
         "cluster_members",
         "cluster_membership_audit",
+        "cluster_agent_ownership",
+        "cluster_agent_ownership_audit",
     ];
 
     struct ClusterCrashDatabase {
@@ -1483,6 +2132,8 @@ mod tests {
         signature_hex: Option<String>,
         node_id: Option<String>,
         expected_generation: Option<u64>,
+        agent_id: Option<String>,
+        fencing_token: Option<u64>,
     }
 
     fn remove_cluster_crash_database(path: &std::path::Path) {
@@ -1515,6 +2166,7 @@ mod tests {
             signature_hex: Some(signature),
             node_id: Some(registration.node_id),
             expected_generation,
+            ..ClusterCrashInput::default()
         }
     }
 
@@ -1580,15 +2232,39 @@ mod tests {
                     .unwrap();
                 prepare_cluster_crash_join(&authority, &member, Some(left.generation))
             }
-            "leave" | "revoke" => {
+            "leave" | "revoke" | "ownership_claim" | "ownership_renew" | "ownership_release"
+            | "revoke_owned" => {
                 let member =
                     ClusterControl::new(Arc::new(open_cluster_crash_manager(member_path))).unwrap();
                 let first = prepare_cluster_crash_join(&authority, &member, None);
                 let joined =
                     register_cluster_crash_member(&authority, &member, &first, "initial admission");
+                let agent_id = uuid::Uuid::new_v4().to_string();
+                let fencing_token = if operation == "ownership_renew"
+                    || operation == "ownership_release"
+                    || operation == "revoke_owned"
+                {
+                    Some(
+                        authority
+                            .claim_agent_ownership(
+                                &agent_id,
+                                &joined.node_id,
+                                30,
+                                None,
+                                "system",
+                                "ownership crash fixture",
+                            )
+                            .unwrap()
+                            .fencing_token,
+                    )
+                } else {
+                    None
+                };
                 ClusterCrashInput {
                     node_id: Some(joined.node_id),
                     expected_generation: Some(joined.generation),
+                    agent_id: Some(agent_id),
+                    fencing_token,
                     ..ClusterCrashInput::default()
                 }
             }
@@ -1654,7 +2330,7 @@ mod tests {
                     },
                 );
             }
-            "leave" | "revoke" => {
+            "leave" | "revoke" | "revoke_owned" => {
                 authority
                     .set_member_state(
                         input.node_id.as_deref().expect("cluster crash node id"),
@@ -1672,6 +2348,45 @@ mod tests {
                         } else {
                             "crash-qualified revocation"
                         },
+                    )
+                    .unwrap();
+            }
+            "ownership_claim" => {
+                authority
+                    .claim_agent_ownership(
+                        input.agent_id.as_deref().expect("cluster crash agent id"),
+                        input.node_id.as_deref().expect("cluster crash node id"),
+                        30,
+                        None,
+                        "system",
+                        "crash-qualified ownership claim",
+                    )
+                    .unwrap();
+            }
+            "ownership_renew" => {
+                authority
+                    .renew_agent_ownership(
+                        input.agent_id.as_deref().expect("cluster crash agent id"),
+                        input.node_id.as_deref().expect("cluster crash node id"),
+                        input
+                            .fencing_token
+                            .expect("cluster crash ownership fencing token"),
+                        30,
+                        "system",
+                        "crash-qualified ownership renewal",
+                    )
+                    .unwrap();
+            }
+            "ownership_release" => {
+                authority
+                    .release_agent_ownership(
+                        input.agent_id.as_deref().expect("cluster crash agent id"),
+                        input.node_id.as_deref().expect("cluster crash node id"),
+                        input
+                            .fencing_token
+                            .expect("cluster crash ownership fencing token"),
+                        "system",
+                        "crash-qualified ownership release",
                     )
                     .unwrap();
             }
@@ -1821,7 +2536,7 @@ mod tests {
                         .expect("committed cluster challenge"),
                 );
             }
-            "leave" | "revoke" => {
+            "leave" | "revoke" | "revoke_owned" => {
                 let expected_state = if operation == "leave" {
                     ClusterMemberState::Left
                 } else {
@@ -1837,6 +2552,58 @@ mod tests {
                 assert_eq!(audit[0].membership_generation, 2);
                 assert_eq!(audit[0].member_generation, 2);
                 assert_eq!(audit[0].current, expected_state);
+                if operation == "revoke_owned" {
+                    let ownership = control
+                        .agent_ownership(input.agent_id.as_deref().expect("cluster crash agent id"))
+                        .unwrap()
+                        .expect("released ownership tombstone");
+                    assert_eq!(ownership.state, ClusterOwnershipState::Released);
+                    assert_eq!(
+                        ownership.fencing_token,
+                        input
+                            .fencing_token
+                            .expect("cluster crash ownership fencing token")
+                    );
+                    let ownership_audit = control
+                        .agent_ownership_audit(input.agent_id.as_deref(), 10)
+                        .unwrap();
+                    assert_eq!(ownership_audit.len(), 2);
+                    assert_eq!(ownership_audit[0].operation, "release");
+                }
+            }
+            "ownership_claim" | "ownership_renew" | "ownership_release" => {
+                let ownership = control
+                    .agent_ownership(input.agent_id.as_deref().expect("cluster crash agent id"))
+                    .unwrap()
+                    .expect("committed ownership");
+                assert_eq!(
+                    ownership.state,
+                    if operation == "ownership_release" {
+                        ClusterOwnershipState::Released
+                    } else {
+                        ClusterOwnershipState::Active
+                    }
+                );
+                assert_eq!(ownership.fencing_token, 1);
+                assert_eq!(
+                    ownership.generation,
+                    if operation == "ownership_claim" { 1 } else { 2 }
+                );
+                let audit = control
+                    .agent_ownership_audit(input.agent_id.as_deref(), 10)
+                    .unwrap();
+                assert_eq!(
+                    audit.len(),
+                    if operation == "ownership_claim" { 1 } else { 2 }
+                );
+                assert_eq!(
+                    audit[0].operation,
+                    match operation {
+                        "ownership_claim" => "claim",
+                        "ownership_renew" => "renew",
+                        _ => "release",
+                    }
+                );
             }
             unknown => panic!("unknown cluster crash operation {unknown}"),
         }
@@ -2274,5 +3041,226 @@ mod tests {
             .to_string()
             .contains("incompatible wire-protocol"));
         assert!(authority.membership_snapshot().unwrap().members.is_empty());
+    }
+
+    #[test]
+    fn agent_ownership_tokens_are_monotonic_exact_and_audited() {
+        let authority_store = Arc::new(SqliteContextManager::in_memory().unwrap());
+        let authority = ClusterControl::new(authority_store.clone()).unwrap();
+        let first = ClusterControl::new(Arc::new(SqliteContextManager::in_memory().unwrap()))
+            .expect("first member");
+        let second = ClusterControl::new(Arc::new(SqliteContextManager::in_memory().unwrap()))
+            .expect("second member");
+        for (member, endpoint) in [
+            (&first, "first.internal:7443"),
+            (&second, "second.internal:7443"),
+        ] {
+            let registration = member_registration(member, endpoint);
+            let challenge = authority.issue_join_challenge(30).unwrap();
+            let signature = sign_join(&authority, member, &challenge, &registration);
+            authority
+                .register_member(
+                    registration,
+                    &challenge.challenge_hex,
+                    &signature,
+                    None,
+                    1,
+                    2,
+                    "system",
+                    "ownership fixture member",
+                )
+                .unwrap();
+        }
+
+        let agent_id = uuid::Uuid::new_v4().to_string();
+        assert!(authority
+            .claim_agent_ownership(
+                &agent_id,
+                &first.identity().node_id,
+                MIN_OWNERSHIP_LEASE_TTL_SECONDS - 1,
+                None,
+                "scheduler",
+                "invalid TTL",
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("ownership TTL"));
+
+        let claimed = authority
+            .claim_agent_ownership(
+                &agent_id,
+                &first.identity().node_id,
+                30,
+                None,
+                "scheduler",
+                "initial placement",
+            )
+            .unwrap();
+        assert_eq!(claimed.fencing_token, 1);
+        assert_eq!(claimed.generation, 1);
+        assert_eq!(claimed.state, ClusterOwnershipState::Active);
+        assert!(authority
+            .claim_agent_ownership(
+                &agent_id,
+                &second.identity().node_id,
+                30,
+                Some(claimed.fencing_token),
+                "scheduler",
+                "premature transfer",
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("has not expired"));
+        assert!(authority
+            .renew_agent_ownership(
+                &agent_id,
+                &second.identity().node_id,
+                claimed.fencing_token,
+                30,
+                "scheduler",
+                "wrong owner",
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("fencing conflict"));
+
+        let renewed = authority
+            .renew_agent_ownership(
+                &agent_id,
+                &first.identity().node_id,
+                claimed.fencing_token,
+                30,
+                "scheduler",
+                "heartbeat",
+            )
+            .unwrap();
+        assert_eq!(renewed.fencing_token, claimed.fencing_token);
+        assert_eq!(renewed.generation, 2);
+
+        let released = authority
+            .release_agent_ownership(
+                &agent_id,
+                &first.identity().node_id,
+                renewed.fencing_token,
+                "scheduler",
+                "drained",
+            )
+            .unwrap();
+        assert_eq!(released.state, ClusterOwnershipState::Released);
+        assert_eq!(released.fencing_token, 1);
+        assert_eq!(released.generation, 3);
+        assert!(authority
+            .renew_agent_ownership(
+                &agent_id,
+                &first.identity().node_id,
+                released.fencing_token,
+                30,
+                "scheduler",
+                "stale renewal",
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("fencing conflict"));
+
+        let transferred = authority
+            .claim_agent_ownership(
+                &agent_id,
+                &second.identity().node_id,
+                30,
+                Some(released.fencing_token),
+                "scheduler",
+                "placement transfer",
+            )
+            .unwrap();
+        assert_eq!(transferred.fencing_token, 2);
+        assert_eq!(transferred.generation, 4);
+        authority_store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE cluster_agent_ownership SET lease_expires_at = ?1
+                 WHERE agent_id = ?2",
+                params![
+                    Utc::now()
+                        .checked_sub_signed(chrono::Duration::seconds(1))
+                        .unwrap()
+                        .to_rfc3339(),
+                    agent_id
+                ],
+            )
+            .unwrap();
+        let reclaimed = authority
+            .claim_agent_ownership(
+                &agent_id,
+                &first.identity().node_id,
+                30,
+                Some(transferred.fencing_token),
+                "recovery",
+                "expired owner recovery",
+            )
+            .unwrap();
+        assert_eq!(reclaimed.fencing_token, 3);
+        assert_eq!(reclaimed.generation, 5);
+        let first_member = authority
+            .membership_snapshot()
+            .unwrap()
+            .members
+            .into_iter()
+            .find(|member| member.node_id == first.identity().node_id)
+            .unwrap();
+        assert!(authority
+            .set_member_state(
+                &first_member.node_id,
+                ClusterMemberState::Left,
+                first_member.generation,
+                "scheduler",
+                "unsafe leave",
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("ownership leases must be released"));
+        authority
+            .set_member_state(
+                &first_member.node_id,
+                ClusterMemberState::Revoked,
+                first_member.generation,
+                "security",
+                "compromised owner",
+            )
+            .unwrap();
+        let revoked_ownership = authority.agent_ownership(&agent_id).unwrap().unwrap();
+        assert_eq!(revoked_ownership.state, ClusterOwnershipState::Released);
+        assert_eq!(revoked_ownership.fencing_token, reclaimed.fencing_token);
+        assert_eq!(revoked_ownership.generation, 6);
+
+        let audit = authority
+            .agent_ownership_audit(Some(&agent_id), 10)
+            .unwrap();
+        assert_eq!(audit.len(), 6);
+        assert_eq!(
+            authority
+                .agent_ownership_audit(None, 10)
+                .unwrap()
+                .iter()
+                .filter(|entry| entry.agent_id == agent_id)
+                .count(),
+            6
+        );
+        assert_eq!(
+            audit
+                .iter()
+                .map(|entry| entry.operation.as_str())
+                .collect::<Vec<_>>(),
+            vec!["release", "transfer", "transfer", "release", "renew", "claim"]
+        );
+        assert_eq!(audit[0].fencing_token, revoked_ownership.fencing_token);
+        assert_eq!(
+            ClusterControl::new(authority_store)
+                .unwrap()
+                .agent_ownership(&agent_id)
+                .unwrap(),
+            Some(revoked_ownership)
+        );
     }
 }

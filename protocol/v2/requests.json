@@ -209,8 +209,20 @@
     "op": "rollback_package"
   },
   {
+    "expected_digest": "fixture",
+    "expected_version": "fixture",
+    "name": "fixture",
+    "op": "rollback_package_exact"
+  },
+  {
     "name": "fixture",
     "op": "remove_package"
+  },
+  {
+    "expected_digest": "fixture",
+    "expected_version": "fixture",
+    "name": "fixture",
+    "op": "remove_package_exact"
   },
   {
     "op": "list_installed_packages"

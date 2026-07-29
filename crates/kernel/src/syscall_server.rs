@@ -475,9 +475,22 @@ pub enum Syscall {
     RollbackPackage {
         name: String,
     },
+    /// Restore the previous committed version only if the currently installed
+    /// artifact still matches the operator-reviewed version and digest.
+    RollbackPackageExact {
+        name: String,
+        expected_version: String,
+        expected_digest: String,
+    },
     /// Remove an installed package when no installed package depends on it.
     RemovePackage {
         name: String,
+    },
+    /// Remove only the exact installed artifact reviewed by the operator.
+    RemovePackageExact {
+        name: String,
+        expected_version: String,
+        expected_digest: String,
     },
     /// List the caller tenant's installed package lock state.
     ListInstalledPackages,
@@ -1390,8 +1403,12 @@ fn syscall_policy(call: &Syscall) -> (AccessLevel, &'static str, Option<&str>) {
         Syscall::FetchPackage { .. } => (AccessLevel::ReadOnly, "package.fetch", None),
         Syscall::SearchPackages { .. } => (AccessLevel::ReadOnly, "package.search", None),
         Syscall::InstallPackage { .. } => (AccessLevel::Admin, "package.install", None),
-        Syscall::RollbackPackage { .. } => (AccessLevel::Admin, "package.rollback", None),
-        Syscall::RemovePackage { .. } => (AccessLevel::Admin, "package.remove", None),
+        Syscall::RollbackPackage { .. } | Syscall::RollbackPackageExact { .. } => {
+            (AccessLevel::Admin, "package.rollback", None)
+        }
+        Syscall::RemovePackage { .. } | Syscall::RemovePackageExact { .. } => {
+            (AccessLevel::Admin, "package.remove", None)
+        }
         Syscall::ListInstalledPackages => (AccessLevel::ReadOnly, "package.installed.list", None),
         Syscall::RunInstalledPackage { .. } => (AccessLevel::Admin, "package.run", None),
         Syscall::NodeInfo => (AccessLevel::System, "system.node_info", None),
@@ -2654,11 +2671,63 @@ async fn dispatch_scoped_inner(
                 },
             }
         }
+        Syscall::RollbackPackageExact {
+            name,
+            expected_version,
+            expected_digest,
+        } => {
+            let expected_version = match semver::Version::parse(&expected_version) {
+                Ok(version) => version,
+                Err(error) => {
+                    return SyscallReply::Error {
+                        message: format!("invalid expected package version: {error}"),
+                    };
+                }
+            };
+            match kernel.package_registry.rollback_exact(
+                package_scope,
+                package_actor,
+                &name,
+                &expected_version,
+                &expected_digest,
+            ) {
+                Ok(package) => SyscallReply::PackageInstalled { package },
+                Err(error) => SyscallReply::Error {
+                    message: error.to_string(),
+                },
+            }
+        }
         Syscall::RemovePackage { name } => {
             match kernel
                 .package_registry
                 .remove(package_scope, package_actor, &name)
             {
+                Ok(()) => SyscallReply::PackageMutationComplete,
+                Err(error) => SyscallReply::Error {
+                    message: error.to_string(),
+                },
+            }
+        }
+        Syscall::RemovePackageExact {
+            name,
+            expected_version,
+            expected_digest,
+        } => {
+            let expected_version = match semver::Version::parse(&expected_version) {
+                Ok(version) => version,
+                Err(error) => {
+                    return SyscallReply::Error {
+                        message: format!("invalid expected package version: {error}"),
+                    };
+                }
+            };
+            match kernel.package_registry.remove_exact(
+                package_scope,
+                package_actor,
+                &name,
+                &expected_version,
+                &expected_digest,
+            ) {
                 Ok(()) => SyscallReply::PackageMutationComplete,
                 Err(error) => SyscallReply::Error {
                     message: error.to_string(),
@@ -6392,8 +6461,24 @@ memory = ["remember this"]
                 AccessLevel::Admin,
             ),
             (
+                Syscall::RollbackPackageExact {
+                    name: "package".into(),
+                    expected_version: "1.0.0".into(),
+                    expected_digest: "sha256:reviewed".into(),
+                },
+                AccessLevel::Admin,
+            ),
+            (
                 Syscall::RemovePackage {
                     name: "package".into(),
+                },
+                AccessLevel::Admin,
+            ),
+            (
+                Syscall::RemovePackageExact {
+                    name: "package".into(),
+                    expected_version: "1.0.0".into(),
+                    expected_digest: "sha256:reviewed".into(),
                 },
                 AccessLevel::Admin,
             ),
@@ -6593,7 +6678,7 @@ memory = ["remember this"]
                     .to_string()
             })
             .collect::<std::collections::HashSet<_>>();
-        assert_eq!(calls.len(), 75);
+        assert_eq!(calls.len(), 77);
         assert_eq!(fixture_tags, schema_tags);
     }
 

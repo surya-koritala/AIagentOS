@@ -10,6 +10,12 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
 
 ## [Unreleased]
 
+- Added signed-package install/upgrade, run, rollback, removal, and installed
+  state to the TUI over `KernelClient`. Rollback and removal freeze the
+  displayed name, version, and digest, require exact `version|name`
+  confirmation, and use new transaction-bound exact mutation operations so a
+  concurrent package change fails stale. State-machine, registry, and
+  authenticated loopback regressions cover the complete flow.
 - Added desktop operator-tunable update, rollback, and bounded audit history
   through the authenticated public `KernelClient`. The UI freezes the tunable
   name, value, revision, and advertised bounds; updates use compare-and-set

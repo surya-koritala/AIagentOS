@@ -5,13 +5,50 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use agent_sdk::{ConnectionProfile, KernelClient};
+use agent_sdk::{
+    ConnectionProfile, KernelClient, PackageArchive, PackagePayload, PackageSigningKey,
+};
 use agent_tui::app::{App, DataFreshness};
 use agent_tui::TuiClient;
+use kernel::auth::Role;
 use kernel::syscall_server::SyscallServer;
 use kernel::AgentKernelImpl;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
+
+fn signed_package_payload(name: &str, version: &str, publisher: &str) -> PackagePayload {
+    serde_json::from_value(serde_json::json!({
+        "schema_version": 1,
+        "package": {
+            "name": name,
+            "version": version,
+            "description": "TUI exact package mutation regression",
+            "publisher": publisher,
+            "license": "AGPL-3.0-only",
+            "dependencies": [],
+            "capabilities_required": ["CAP_FILE_READ"],
+            "tools_required": []
+        },
+        "agent": {
+            "name": name,
+            "description": "Runs through normal tenant admission",
+            "task": "prove TUI signed package lifecycle",
+            "entry": "start",
+            "provider": "stub",
+            "profile": "read-only",
+            "priority": 3,
+            "nice": null,
+            "tools": [],
+            "memory": []
+        },
+        "files": [],
+        "sbom": {
+            "format": "SPDX-2.3",
+            "components": []
+        }
+    }))
+    .expect("valid signed package fixture")
+}
 
 async fn proxy_connection(
     client: TcpStream,
@@ -246,5 +283,92 @@ async fn tunable_update_audit_and_rollback_use_the_public_tui_client() {
         .await
         .expect("post-rollback audit");
     assert!(audit.iter().any(|entry| entry.action == "rollback"));
+    server_task.abort();
+}
+
+#[tokio::test]
+async fn package_lifecycle_and_stale_confirmation_use_the_public_tui_client() {
+    let kernel = Arc::new(AgentKernelImpl::new().expect("kernel new"));
+    let tenant = kernel.create_tenant("tui-packages").await.unwrap();
+    let admin = kernel
+        .register_user(
+            &tenant,
+            "tui-package-admin",
+            "tui-packages@example.invalid",
+            Role::Admin,
+        )
+        .await
+        .unwrap();
+    let token = kernel
+        .issue_api_key(&admin, "tui-package-admin")
+        .await
+        .unwrap();
+    let server = SyscallServer::bind(Arc::clone(&kernel), "127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = server.local_addr().expect("addr");
+    let server_task = tokio::spawn(server.serve());
+    let mut client = TuiClient::connect(&addr.to_string(), Some(&token))
+        .await
+        .expect("authenticated TUI public client");
+    let mut app = App::new(addr.to_string());
+
+    let (signer, _) = PackageSigningKey::generate(&admin, "tui-release").unwrap();
+    client
+        .trust_package_key(
+            &admin,
+            signer.key_id(),
+            &signer.public_key(),
+            "2020-01-01T00:00:00Z",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let v1 = PackageArchive::sign(
+        signed_package_payload("tui-runner", "1.0.0", &admin),
+        &signer,
+    )
+    .unwrap();
+    let v2 = PackageArchive::sign(
+        signed_package_payload("tui-runner", "2.0.0", &admin),
+        &signer,
+    )
+    .unwrap();
+    client.publish_package(&v1).await.unwrap();
+    client.publish_package(&v2).await.unwrap();
+
+    let reviewed = client
+        .install_package("tui-runner", "=1.0.0")
+        .await
+        .unwrap();
+    app.refresh(&mut client).await.unwrap();
+    assert_eq!(app.installed_packages.len(), 1);
+    assert_eq!(app.selected_package().unwrap().version, reviewed.version);
+
+    let changed = client
+        .install_package("tui-runner", "=2.0.0")
+        .await
+        .unwrap();
+    client
+        .rollback_package_exact("tui-runner", reviewed.version.to_string(), reviewed.digest)
+        .await
+        .expect_err("stale TUI confirmation must fail closed");
+    app.refresh(&mut client).await.unwrap();
+    assert_eq!(app.selected_package().unwrap().version, changed.version);
+
+    let restored = client
+        .rollback_package_exact("tui-runner", changed.version.to_string(), changed.digest)
+        .await
+        .unwrap();
+    assert_eq!(restored.version.to_string(), "1.0.0");
+    let agent_id = client.run_installed_package("tui-runner").await.unwrap();
+    assert!(!agent_id.is_empty());
+    client
+        .remove_package_exact("tui-runner", restored.version.to_string(), restored.digest)
+        .await
+        .unwrap();
+    app.refresh(&mut client).await.unwrap();
+    assert!(app.installed_packages.is_empty());
     server_task.abort();
 }

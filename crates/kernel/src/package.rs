@@ -245,6 +245,8 @@ pub enum PackageError {
     NotFound,
     #[error("package version already exists")]
     Duplicate,
+    #[error("package state changed before the requested mutation: {0}")]
+    Stale(String),
     #[error("package dependency error: {0}")]
     Dependency(String),
     #[error("package policy denied: {0}")]
@@ -1377,6 +1379,36 @@ impl PackageRegistry {
         actor: &str,
         name: &str,
     ) -> Result<InstalledPackage, PackageError> {
+        self.rollback_internal(tenant_id, actor, name, None)
+    }
+
+    /// Roll back only when the installed package still matches the exact
+    /// version and digest an operator reviewed. The comparison and mutation
+    /// share one immediate transaction, so a concurrent upgrade cannot turn a
+    /// confirmation for one artifact into a rollback of another.
+    pub fn rollback_exact(
+        &self,
+        tenant_id: &str,
+        actor: &str,
+        name: &str,
+        expected_version: &Version,
+        expected_digest: &str,
+    ) -> Result<InstalledPackage, PackageError> {
+        self.rollback_internal(
+            tenant_id,
+            actor,
+            name,
+            Some((expected_version, expected_digest)),
+        )
+    }
+
+    fn rollback_internal(
+        &self,
+        tenant_id: &str,
+        actor: &str,
+        name: &str,
+        expected: Option<(&Version, &str)>,
+    ) -> Result<InstalledPackage, PackageError> {
         validate_scope(tenant_id, actor)?;
         self.admit_request(tenant_id, actor)?;
         let mut conn = self
@@ -1404,6 +1436,13 @@ impl PackageRegistry {
             .map_err(|error| PackageError::Persistence(error.to_string()))?;
         let current =
             read_installed(&transaction, tenant_id, name)?.ok_or(PackageError::NotFound)?;
+        if let Some((expected_version, expected_digest)) = expected {
+            if &current.version != expected_version || current.digest != expected_digest {
+                return Err(PackageError::Stale(format!(
+                    "expected {name}@{expected_version} with digest {expected_digest}"
+                )));
+            }
+        }
         let current_json = serde_json::to_string(&Some(current))
             .map_err(|error| PackageError::Persistence(error.to_string()))?;
         transaction
@@ -1460,6 +1499,33 @@ impl PackageRegistry {
     }
 
     pub fn remove(&self, tenant_id: &str, actor: &str, name: &str) -> Result<(), PackageError> {
+        self.remove_internal(tenant_id, actor, name, None)
+    }
+
+    /// Remove only the exact installed artifact an operator reviewed.
+    pub fn remove_exact(
+        &self,
+        tenant_id: &str,
+        actor: &str,
+        name: &str,
+        expected_version: &Version,
+        expected_digest: &str,
+    ) -> Result<(), PackageError> {
+        self.remove_internal(
+            tenant_id,
+            actor,
+            name,
+            Some((expected_version, expected_digest)),
+        )
+    }
+
+    fn remove_internal(
+        &self,
+        tenant_id: &str,
+        actor: &str,
+        name: &str,
+        expected: Option<(&Version, &str)>,
+    ) -> Result<(), PackageError> {
         validate_scope(tenant_id, actor)?;
         self.admit_request(tenant_id, actor)?;
         let mut conn = self
@@ -1472,6 +1538,13 @@ impl PackageRegistry {
             .map_err(persistence)?;
         let installed =
             read_installed(&transaction, tenant_id, name)?.ok_or(PackageError::NotFound)?;
+        if let Some((expected_version, expected_digest)) = expected {
+            if &installed.version != expected_version || installed.digest != expected_digest {
+                return Err(PackageError::Stale(format!(
+                    "expected {name}@{expected_version} with digest {expected_digest}"
+                )));
+            }
+        }
         let mut statement = transaction
             .prepare(
                 "SELECT name, manifest_json FROM package_installations
@@ -3201,6 +3274,63 @@ mod tests {
             .remove(DEFAULT_TENANT, "operator", "runner")
             .unwrap();
         assert!(registry.list_installed(DEFAULT_TENANT).unwrap().is_empty());
+    }
+
+    #[test]
+    fn exact_package_mutations_reject_a_concurrently_changed_artifact() {
+        let (registry, key) = registry_with_key(DEFAULT_TENANT, "alice");
+        for version in ["1.0.0", "2.0.0"] {
+            registry
+                .publish(
+                    DEFAULT_TENANT,
+                    "alice",
+                    &PackageArchive::sign(payload("runner", version, "alice"), &key).unwrap(),
+                )
+                .unwrap();
+        }
+        let reviewed = registry
+            .install(
+                DEFAULT_TENANT,
+                "operator",
+                "runner",
+                &VersionReq::parse("=1.0.0").unwrap(),
+                &InstallPolicy::tenant_default(),
+            )
+            .unwrap();
+        let changed = registry
+            .install(
+                DEFAULT_TENANT,
+                "operator",
+                "runner",
+                &VersionReq::parse("=2.0.0").unwrap(),
+                &InstallPolicy::tenant_default(),
+            )
+            .unwrap();
+
+        assert!(matches!(
+            registry.rollback_exact(
+                DEFAULT_TENANT,
+                "operator",
+                "runner",
+                &reviewed.version,
+                &reviewed.digest,
+            ),
+            Err(PackageError::Stale(_))
+        ));
+        assert!(matches!(
+            registry.remove_exact(
+                DEFAULT_TENANT,
+                "operator",
+                "runner",
+                &reviewed.version,
+                &reviewed.digest,
+            ),
+            Err(PackageError::Stale(_))
+        ));
+        let retained = registry.list_installed(DEFAULT_TENANT).unwrap();
+        assert_eq!(retained.len(), 1);
+        assert_eq!(retained[0].version, changed.version);
+        assert_eq!(retained[0].digest, changed.digest);
     }
 
     #[test]

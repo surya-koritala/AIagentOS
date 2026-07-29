@@ -102,6 +102,10 @@ documented in [docs/OPERATIONS_API.md](docs/OPERATIONS_API.md). The focused TUI
 and desktop Operations views expose scope-safe agent enforcement and context
 pressure, provider health, loaded packages, services, tunables, and gate
 counters; protected sections are shown as unavailable rather than fabricated.
+The TUI also lists tenant-installed signed packages and can install/upgrade,
+run, roll back, or remove them through the same public client. Rollback and
+removal freeze the displayed version and digest and fail if the package changes
+before confirmation.
 Declarative service boot ordering and the current supervision boundary are in
 [docs/SERVICES.md](docs/SERVICES.md).
 

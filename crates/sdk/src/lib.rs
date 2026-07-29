@@ -1945,10 +1945,52 @@ impl KernelClient {
         }
     }
 
+    /// Roll back only if the installed package still matches the exact
+    /// operator-reviewed version and digest.
+    pub async fn rollback_package_exact(
+        &mut self,
+        name: impl Into<String>,
+        expected_version: impl Into<String>,
+        expected_digest: impl Into<String>,
+    ) -> Result<InstalledPackage, SdkError> {
+        match self
+            .call(Syscall::RollbackPackageExact {
+                name: name.into(),
+                expected_version: expected_version.into(),
+                expected_digest: expected_digest.into(),
+            })
+            .await?
+        {
+            SyscallReply::PackageInstalled { package } => Ok(package),
+            other => Err(unexpected("PackageInstalled", &other)),
+        }
+    }
+
     /// Remove an installed package if it has no installed dependents.
     pub async fn remove_package(&mut self, name: impl Into<String>) -> Result<(), SdkError> {
         match self
             .call(Syscall::RemovePackage { name: name.into() })
+            .await?
+        {
+            SyscallReply::PackageMutationComplete => Ok(()),
+            other => Err(unexpected("PackageMutationComplete", &other)),
+        }
+    }
+
+    /// Remove only if the installed package still matches the exact
+    /// operator-reviewed version and digest.
+    pub async fn remove_package_exact(
+        &mut self,
+        name: impl Into<String>,
+        expected_version: impl Into<String>,
+        expected_digest: impl Into<String>,
+    ) -> Result<(), SdkError> {
+        match self
+            .call(Syscall::RemovePackageExact {
+                name: name.into(),
+                expected_version: expected_version.into(),
+                expected_digest: expected_digest.into(),
+            })
             .await?
         {
             SyscallReply::PackageMutationComplete => Ok(()),
@@ -2091,8 +2133,10 @@ fn safe_to_replay_after_reconnect(call: &Syscall) -> bool {
 fn mutation_operation_name(call: &Syscall) -> &'static str {
     match call {
         Syscall::InstallPackage { .. } => "package installation",
-        Syscall::RollbackPackage { .. } => "package rollback",
-        Syscall::RemovePackage { .. } => "package removal",
+        Syscall::RollbackPackage { .. } | Syscall::RollbackPackageExact { .. } => {
+            "package rollback"
+        }
+        Syscall::RemovePackage { .. } | Syscall::RemovePackageExact { .. } => "package removal",
         Syscall::PauseAgent { .. } => "agent pause",
         Syscall::ResumeAgent { .. } => "agent resume",
         Syscall::StopAgent { .. } => "agent stop",

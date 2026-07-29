@@ -15,6 +15,9 @@
 //! service · `u` start · `d` stop with exact-name confirmation · `R` restart
 //! with exact-name confirmation · `L` reload · `,`/`.` select tunable · `v`
 //! set · `a` audit · `B` rollback with exact target confirmation · `q` quit.
+//! `{`/`}` select installed package · `i` install/upgrade · `P` run · `b`
+//! rollback · `D` remove, with exact artifact confirmation for destructive
+//! mutations.
 
 use std::io;
 use std::time::Duration;
@@ -255,6 +258,67 @@ fn perform(action: UiAction, app: &mut App, client: &mut TuiClient, rt: &tokio::
             };
             refresh_after_action(app, client, rt);
         }
+        UiAction::InstallPackage { name, requirement } => {
+            app.status = match rt.block_on(client.install_package(&name, &requirement)) {
+                Ok(package) => format!(
+                    "installed {}@{} ({})",
+                    package.name,
+                    package.version,
+                    short_digest(&package.digest)
+                ),
+                Err(error) => {
+                    format!("package install failed for {name}|{requirement}: {error}")
+                }
+            };
+            refresh_after_action(app, client, rt);
+        }
+        UiAction::RunInstalledPackage { name } => {
+            app.status = match rt.block_on(client.run_installed_package(&name)) {
+                Ok(agent_id) => format!("started package {name} as agent {agent_id}"),
+                Err(error) => format!("package run failed for {name}: {error}"),
+            };
+            refresh_after_action(app, client, rt);
+        }
+        UiAction::RollbackInstalledPackage {
+            name,
+            expected_version,
+            expected_digest,
+        } => {
+            app.status = match rt.block_on(client.rollback_package_exact(
+                &name,
+                &expected_version,
+                &expected_digest,
+            )) {
+                Ok(package) => format!(
+                    "rolled back {} from {} to {} ({})",
+                    package.name,
+                    expected_version,
+                    package.version,
+                    short_digest(&package.digest)
+                ),
+                Err(error) => {
+                    format!("package rollback failed for {name}@{expected_version}: {error}")
+                }
+            };
+            refresh_after_action(app, client, rt);
+        }
+        UiAction::RemoveInstalledPackage {
+            name,
+            expected_version,
+            expected_digest,
+        } => {
+            app.status = match rt.block_on(client.remove_package_exact(
+                &name,
+                &expected_version,
+                &expected_digest,
+            )) {
+                Ok(()) => format!("removed {name}@{expected_version}"),
+                Err(error) => {
+                    format!("package removal failed for {name}@{expected_version}: {error}")
+                }
+            };
+            refresh_after_action(app, client, rt);
+        }
     }
 }
 
@@ -337,12 +401,13 @@ fn render_header(f: &mut Frame, area: Rect, app: &App) {
         Span::raw("   "),
         Span::styled(
             format!(
-                "providers:{} available:{} packages:{}",
+                "providers:{} available:{} packages:{}/{}",
                 app.providers.len(),
                 app.providers
                     .iter()
                     .filter(|provider| provider.available && !provider.circuit_open)
                     .count(),
+                app.installed_packages.len(),
                 app.packages.len()
             ),
             Style::default().fg(Color::Blue),
@@ -643,6 +708,24 @@ fn append_operator_summary(lines: &mut Vec<Line<'static>>, app: &App) {
             )));
         }
     }
+    if let Some(package) = app.selected_package() {
+        lines.push(Line::from(format!(
+            "installed package [{}/{}]: {}@{} · {}",
+            app.selected_package + 1,
+            app.installed_packages.len(),
+            package.name,
+            package.version,
+            short_digest(&package.digest)
+        )));
+        lines.push(Line::from(format!(
+            "publisher={} · lock entries={} · installed {}",
+            package.manifest.publisher,
+            package.lock.packages.len(),
+            package.installed_at
+        )));
+    } else {
+        lines.push(Line::from("installed packages: none"));
+    }
 }
 
 fn render_footer(f: &mut Frame, area: Rect, app: &App) {
@@ -716,6 +799,31 @@ fn render_footer(f: &mut Frame, area: Rect, app: &App) {
                 )),
             ])
         }
+        Mode::InstallPackage => Line::from(vec![
+            Span::styled("INSTALL PACKAGE ", Style::default().fg(Color::Magenta)),
+            Span::raw(app.input.clone()),
+            Span::styled("▏", Style::default().add_modifier(Modifier::SLOW_BLINK)),
+            Span::raw(" · name|semver-requirement · Enter submit · Esc cancel"),
+        ]),
+        Mode::ConfirmPackageMutation => {
+            let (action, name, version, digest) = app.pending_package_mutation().unwrap_or((
+                "mutate",
+                "missing target",
+                "unknown",
+                "unknown",
+            ));
+            Line::from(vec![
+                Span::styled(
+                    format!("CONFIRM PACKAGE {} ", action.to_uppercase()),
+                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(format!(
+                    "{name}@{version} ({}) · {version}|{name}> {}▏ · Enter confirm · Esc cancel",
+                    short_digest(digest),
+                    app.input
+                )),
+            ])
+        }
     };
     f.render_widget(
         Paragraph::new(content).block(Block::default().borders(Borders::ALL)),
@@ -733,4 +841,8 @@ fn trunc(s: &str, n: usize) -> String {
 
 fn short(id: &str) -> &str {
     id.get(..8).unwrap_or(id)
+}
+
+fn short_digest(digest: &str) -> &str {
+    digest.get(..19).unwrap_or(digest)
 }

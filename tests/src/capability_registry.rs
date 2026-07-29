@@ -741,6 +741,68 @@ fn desktop_tunable_controls_stay_revision_bound_on_the_public_wire_boundary() {
 }
 
 #[test]
+fn desktop_package_controls_stay_exact_on_the_public_wire_boundary() {
+    let backend = read_workspace_file("crates/tauri-app/src/lib.rs");
+    for contract in [
+        ".install_package(name, requirement)",
+        ".run_installed_package(name)",
+        ".rollback_package_exact(name, expected_version, expected_digest)",
+        ".remove_package_exact(name, expected_version, expected_digest)",
+        "desktop_package_controls_use_exact_public_wire_mutations",
+        "stale desktop package confirmation must fail closed",
+    ] {
+        assert!(
+            backend.contains(contract),
+            "desktop package backend lost public client contract {contract:?}"
+        );
+    }
+
+    let commands = read_workspace_file("crates/tauri-app/src/commands.rs");
+    let main = read_workspace_file("crates/tauri-app/src/main.rs");
+    for command in [
+        "list_installed_packages",
+        "install_package",
+        "run_installed_package",
+        "rollback_installed_package",
+        "remove_installed_package",
+    ] {
+        assert!(
+            commands.contains(&format!("pub async fn {command}")),
+            "desktop command surface lost {command:?}"
+        );
+        assert!(
+            main.contains(&format!("commands::{command}")),
+            "desktop shell stopped registering package command {command:?}"
+        );
+    }
+    for contract in [
+        "validate_exact_package_mutation(",
+        "package mutation confirmation must exactly match version|package-name",
+        "expected package digest must be a lowercase SHA-256 hex value",
+    ] {
+        assert!(
+            commands.contains(contract),
+            "desktop package IPC validation lost {contract:?}"
+        );
+    }
+
+    let ui = read_workspace_file("crates/tauri-app/ui/src/lib/AgentStatus.svelte");
+    for contract in [
+        "expectedVersion: frozenTarget.version",
+        "expectedDigest: frozenTarget.digest",
+        "confirmPackageTarget: packageConfirmation",
+        "Version|exact package name",
+        "rejects a concurrent change",
+        "prevents new runs from this package",
+    ] {
+        assert!(
+            ui.contains(contract),
+            "desktop package UI lost frozen target contract {contract:?}"
+        );
+    }
+}
+
+#[test]
 fn reconnect_contract_is_bounded_and_fail_closed() {
     let protocol = read_workspace_file("docs/PROTOCOL.md");
     for contract in [

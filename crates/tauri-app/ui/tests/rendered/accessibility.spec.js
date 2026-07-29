@@ -43,6 +43,17 @@ const operatorView = {
     },
   ],
   packages: [],
+  installed_packages: [
+    {
+      name: 'reviewer',
+      version: '2.0.0',
+      digest: 'a'.repeat(64),
+      publisher: 'fixture-publisher',
+      description: 'Signed review agent',
+      installed_at: '2026-07-28T19:45:00Z',
+      lock_package_count: 1,
+    },
+  ],
   services: [
     {
       name: 'research-worker',
@@ -135,8 +146,10 @@ async function installTauriFixture(page, { setupComplete = true } = {}) {
         data_dir: '/tmp/fixture',
       };
 
+      window.__TAURI_CALLS__ = [];
       window.__TAURI_INTERNALS__ = {
-        invoke(command) {
+        invoke(command, args = {}) {
+          window.__TAURI_CALLS__.push({ command, args });
           if (command === 'load_config') return Promise.resolve(config);
           if (command === 'get_operator_view') return Promise.resolve(snapshot);
           if (command === 'list_checkpoints') return Promise.resolve(checkpointFixtures);
@@ -164,6 +177,20 @@ async function installTauriFixture(page, { setupComplete = true } = {}) {
               revision: 4,
             });
           }
+          if (command === 'install_package') {
+            return Promise.resolve(snapshot.installed_packages[0]);
+          }
+          if (command === 'run_installed_package') {
+            return Promise.resolve('fixture-package-agent');
+          }
+          if (command === 'rollback_installed_package') {
+            return Promise.resolve({
+              ...snapshot.installed_packages[0],
+              version: '1.0.0',
+              digest: 'b'.repeat(64),
+            });
+          }
+          if (command === 'remove_installed_package') return Promise.resolve();
           if (command === 'start_service' || command === 'stop_service' || command === 'restart_service') {
             return Promise.resolve({
               ...snapshot.services[0],
@@ -377,4 +404,46 @@ test('tunable controls freeze revisions, bound updates, and require exact rollba
   ).toBeVisible();
   await expect(page.getByText('fixture-operator', { exact: true })).toBeVisible();
   await expectWcagAxeClean(page);
+});
+
+test('signed package controls are axe-clean and submit the frozen version and digest', async ({ page }) => {
+  await installTauriFixture(page);
+  await page.goto('/');
+  await page.getByRole('button', { name: 'Agent status' }).click();
+
+  await expect(
+    page.getByRole('heading', { name: 'Installed signed packages' }),
+  ).toBeVisible();
+  await expect(page.getByText('fixture-publisher', { exact: true })).toBeVisible();
+  await expectWcagAxeClean(page);
+
+  await page.getByRole('button', { name: 'Rollback reviewer 2.0.0' }).click();
+  const rollback = page.getByRole('group', {
+    name: 'Rollback reviewer 2.0.0',
+  });
+  await expect(rollback).toContainText('a'.repeat(64));
+  await expect(rollback).toContainText('rejects a concurrent change');
+  const confirm = page.getByRole('button', { name: 'Confirm rollback' });
+  await expect(confirm).toBeDisabled();
+  await page
+    .getByRole('textbox', { name: 'Version|exact package name' })
+    .fill('2.0.0|reviewer');
+  await expect(confirm).toBeEnabled();
+  await expectWcagAxeClean(page);
+  await confirm.click();
+
+  await expect(
+    page.getByText('Rolled back reviewer to 1.0.0.', { exact: true }),
+  ).toBeVisible();
+  const mutation = await page.evaluate(() =>
+    window.__TAURI_CALLS__.find(call =>
+      call.command === 'rollback_installed_package'
+    ),
+  );
+  expect(mutation.args).toEqual({
+    packageName: 'reviewer',
+    expectedVersion: '2.0.0',
+    expectedDigest: 'a'.repeat(64),
+    confirmPackageTarget: '2.0.0|reviewer',
+  });
 });

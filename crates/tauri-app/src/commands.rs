@@ -5,8 +5,8 @@ use crate::{
         validate_cloud_provider, NativeProviderCredentialStore, ProviderCredentialStore,
         CLOUD_DESKTOP_PROVIDERS, SUPPORTED_DESKTOP_PROVIDERS,
     },
-    AppState, DesktopMetricsView, DesktopOperatorView, DesktopService, DesktopServiceHistory,
-    DesktopTunable, DesktopTunableAudit,
+    AppState, DesktopInstalledPackage, DesktopMetricsView, DesktopOperatorView, DesktopService,
+    DesktopServiceHistory, DesktopTunable, DesktopTunableAudit,
 };
 use kernel::config::Config;
 use serde::Serialize;
@@ -417,6 +417,132 @@ fn validate_tunable_rollback_confirmation(
 }
 
 #[tauri::command]
+pub async fn list_installed_packages(
+    state: State<'_, AppState>,
+) -> Result<Vec<DesktopInstalledPackage>, String> {
+    state
+        .client
+        .list_installed_packages()
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn install_package(
+    state: State<'_, AppState>,
+    package_name: String,
+    requirement: String,
+) -> Result<DesktopInstalledPackage, String> {
+    validate_package_target(&package_name, &requirement)?;
+    state
+        .client
+        .install_package(package_name, requirement)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn run_installed_package(
+    state: State<'_, AppState>,
+    package_name: String,
+) -> Result<String, String> {
+    validate_package_name(&package_name)?;
+    state
+        .client
+        .run_installed_package(package_name)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn rollback_installed_package(
+    state: State<'_, AppState>,
+    package_name: String,
+    expected_version: String,
+    expected_digest: String,
+    confirm_package_target: String,
+) -> Result<DesktopInstalledPackage, String> {
+    validate_exact_package_mutation(
+        &package_name,
+        &expected_version,
+        &expected_digest,
+        &confirm_package_target,
+    )?;
+    state
+        .client
+        .rollback_installed_package_exact(package_name, expected_version, expected_digest)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn remove_installed_package(
+    state: State<'_, AppState>,
+    package_name: String,
+    expected_version: String,
+    expected_digest: String,
+    confirm_package_target: String,
+) -> Result<(), String> {
+    validate_exact_package_mutation(
+        &package_name,
+        &expected_version,
+        &expected_digest,
+        &confirm_package_target,
+    )?;
+    state
+        .client
+        .remove_installed_package_exact(package_name, expected_version, expected_digest)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+fn validate_package_name(name: &str) -> Result<(), String> {
+    if name.is_empty() || name.trim() != name || name.len() > 128 || name.contains('\0') {
+        return Err("package name must be a bounded non-empty exact target".into());
+    }
+    Ok(())
+}
+
+fn validate_package_target(name: &str, requirement: &str) -> Result<(), String> {
+    validate_package_name(name)?;
+    if requirement.is_empty()
+        || requirement.trim() != requirement
+        || requirement.len() > 128
+        || requirement.contains('\0')
+    {
+        return Err("package requirement must be a bounded non-empty exact value".into());
+    }
+    Ok(())
+}
+
+fn validate_exact_package_mutation(
+    name: &str,
+    expected_version: &str,
+    expected_digest: &str,
+    confirmation: &str,
+) -> Result<(), String> {
+    validate_package_name(name)?;
+    if expected_version.is_empty()
+        || expected_version.trim() != expected_version
+        || expected_version.len() > 128
+        || expected_version.contains('\0')
+    {
+        return Err("expected package version must be a bounded non-empty exact value".into());
+    }
+    if expected_digest.len() != 64
+        || !expected_digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err("expected package digest must be a lowercase SHA-256 hex value".into());
+    }
+    if confirmation != format!("{expected_version}|{name}") {
+        return Err("package mutation confirmation must exactly match version|package-name".into());
+    }
+    Ok(())
+}
+
+#[tauri::command]
 pub async fn list_agents(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
     let agents = state
         .client
@@ -782,6 +908,32 @@ mod tests {
             )
             .unwrap_err(),
             "operator tunable rollback revision must be positive and older than the current revision"
+        );
+    }
+
+    #[test]
+    fn package_mutations_require_frozen_version_digest_and_exact_target() {
+        let digest = "a".repeat(64);
+        assert!(
+            validate_exact_package_mutation("reviewer", "1.2.3", &digest, "1.2.3|reviewer").is_ok()
+        );
+        assert_eq!(
+            validate_exact_package_mutation("reviewer", "1.2.3", &digest, "1.2.3|planner")
+                .unwrap_err(),
+            "package mutation confirmation must exactly match version|package-name"
+        );
+        assert_eq!(
+            validate_exact_package_mutation("reviewer", "1.2.3", &"A".repeat(64), "1.2.3|reviewer")
+                .unwrap_err(),
+            "expected package digest must be a lowercase SHA-256 hex value"
+        );
+        assert_eq!(
+            validate_package_target(" reviewer", "^1").unwrap_err(),
+            "package name must be a bounded non-empty exact target"
+        );
+        assert_eq!(
+            validate_package_target("reviewer\0shadow", "^1").unwrap_err(),
+            "package name must be a bounded non-empty exact target"
         );
     }
 }

@@ -13,19 +13,25 @@
 //! syscall gate, so enforcement holds across the cluster exactly as it does for
 //! a single node.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::{
+    collections::{BTreeMap, HashMap, HashSet},
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use crate::{
     AgentMutationFence, AgentMutationFenceProof, AgentMutationFenceState, AgentSummary,
     ClusterAgentOwnership, ClusterMember, ClusterMemberRegistration, ClusterMemberState,
     ClusterMembershipSnapshot, ClusterOwnershipState, KernelClient, MessageResult,
-    MessageStreamEvent, NodeAvailability, NodeLoad, SdkError, WireErrorCode,
+    MessageStreamEvent, NodeAvailability, NodeLoad, ReservedAgentIdentity, SdkError, WireErrorCode,
 };
 
 /// Initial authority lease used when a discovered cluster places an agent.
 ///
-/// Long-lived clients must renew before this authority-clock deadline.
+/// Long-lived clients must renew before this authority-clock deadline, either
+/// explicitly or through an opt-in maintenance constructor.
 pub const DEFAULT_OWNERSHIP_LEASE_SECONDS: u64 = 30;
+pub const DEFAULT_OWNERSHIP_RENEW_INTERVAL: Duration = Duration::from_secs(10);
 
 /// One kernel node in the cluster: its stable id, transport address, and client.
 pub struct NodeHandle {
@@ -84,6 +90,45 @@ pub struct PlacedAgent {
     pub node_id: String,
 }
 
+/// Result of rebuilding managed routes from durable authority, destination,
+/// and local-agent evidence.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ClusterReconciliationReport {
+    pub published_routes: usize,
+    pub recovered_expired_leases: usize,
+    pub released_expired_reservations: usize,
+    pub pending_reservations: usize,
+}
+
+/// Automatic managed-route renewal policy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClusterMaintenanceConfig {
+    pub lease_ttl_seconds: u64,
+    pub renew_interval: Duration,
+}
+
+impl Default for ClusterMaintenanceConfig {
+    fn default() -> Self {
+        Self {
+            lease_ttl_seconds: DEFAULT_OWNERSHIP_LEASE_SECONDS,
+            renew_interval: DEFAULT_OWNERSHIP_RENEW_INTERVAL,
+        }
+    }
+}
+
+/// Bounded, non-secret health for the automatic managed-route worker.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ClusterMaintenanceStatus {
+    pub running: bool,
+    pub tracked_routes: usize,
+    pub successful_cycles: u64,
+    pub failed_cycles: u64,
+    pub successful_renewals: u64,
+    pub failed_renewals: u64,
+    pub consecutive_failed_cycles: u64,
+    pub last_error: Option<String>,
+}
+
 /// A client that fans out across multiple kernel nodes.
 pub struct ClusterClient {
     nodes: Vec<NodeHandle>,
@@ -100,6 +145,36 @@ pub struct ClusterClient {
 struct ClusterAuthority {
     client: KernelClient,
     cluster_id: String,
+    lease_ttl_seconds: u64,
+    maintenance: Option<AutomaticMaintenance>,
+}
+
+struct AutomaticMaintenance {
+    routes: Arc<Mutex<HashMap<String, MaintainedRoute>>>,
+    status: Arc<Mutex<ClusterMaintenanceStatus>>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+#[derive(Clone)]
+enum MaintenanceConnector {
+    Plaintext {
+        authority_address: String,
+        token: String,
+    },
+    Tls {
+        authority_address: String,
+        server_name: String,
+        config: Arc<rustls::ClientConfig>,
+        token: String,
+    },
+}
+
+#[derive(Clone)]
+struct MaintainedRoute {
+    agent_id: String,
+    node_id: String,
+    node_address: String,
+    proof: AgentMutationFenceProof,
 }
 
 impl ClusterClient {
@@ -223,8 +298,34 @@ impl ClusterClient {
         cluster.authority = Some(ClusterAuthority {
             client: authority,
             cluster_id: confirmed.cluster_id,
+            lease_ttl_seconds: DEFAULT_OWNERSHIP_LEASE_SECONDS,
+            maintenance: None,
         });
         cluster.rebuild_owners().await?;
+        Ok(cluster)
+    }
+
+    /// Discover an authenticated cluster and explicitly opt into automatic
+    /// idle lease renewal and destination-fence maintenance.
+    pub async fn connect_discovered_authenticated_with_maintenance(
+        authority_addr: impl AsRef<str>,
+        token: impl Into<String>,
+        maintenance: ClusterMaintenanceConfig,
+    ) -> Result<Self, SdkError> {
+        validate_maintenance_config(&maintenance)?;
+        let authority_address = authority_addr.as_ref().to_string();
+        let token = token.into();
+        let connector = MaintenanceConnector::Plaintext {
+            authority_address: authority_address.clone(),
+            token: token.clone(),
+        };
+        let mut cluster = Self::connect_discovered_authenticated(&authority_address, token).await?;
+        cluster
+            .authority
+            .as_mut()
+            .expect("discovered cluster retains authority")
+            .lease_ttl_seconds = maintenance.lease_ttl_seconds;
+        cluster.start_automatic_maintenance(connector, maintenance)?;
         Ok(cluster)
     }
 
@@ -251,8 +352,45 @@ impl ClusterClient {
         cluster.authority = Some(ClusterAuthority {
             client: authority,
             cluster_id: confirmed.cluster_id,
+            lease_ttl_seconds: DEFAULT_OWNERSHIP_LEASE_SECONDS,
+            maintenance: None,
         });
         cluster.rebuild_owners().await?;
+        Ok(cluster)
+    }
+
+    /// TLS/mTLS discovery with explicit automatic idle lease and destination
+    /// fence maintenance.
+    pub async fn connect_discovered_tls_authenticated_with_maintenance(
+        authority_addr: impl AsRef<str>,
+        server_name: impl Into<String>,
+        config: rustls::ClientConfig,
+        token: impl Into<String>,
+        maintenance: ClusterMaintenanceConfig,
+    ) -> Result<Self, SdkError> {
+        validate_maintenance_config(&maintenance)?;
+        let authority_address = authority_addr.as_ref().to_string();
+        let server_name = server_name.into();
+        let token = token.into();
+        let connector = MaintenanceConnector::Tls {
+            authority_address: authority_address.clone(),
+            server_name: server_name.clone(),
+            config: Arc::new(config.clone()),
+            token: token.clone(),
+        };
+        let mut cluster = Self::connect_discovered_tls_authenticated(
+            &authority_address,
+            server_name,
+            config,
+            token,
+        )
+        .await?;
+        cluster
+            .authority
+            .as_mut()
+            .expect("discovered cluster retains authority")
+            .lease_ttl_seconds = maintenance.lease_ttl_seconds;
+        cluster.start_automatic_maintenance(connector, maintenance)?;
         Ok(cluster)
     }
 
@@ -361,6 +499,154 @@ impl ClusterClient {
         self.authority.is_some()
     }
 
+    /// Snapshot automatic maintenance health, when the caller explicitly
+    /// enabled it at discovery time.
+    pub fn maintenance_status(&self) -> Option<ClusterMaintenanceStatus> {
+        let maintenance = self.authority.as_ref()?.maintenance.as_ref()?;
+        Some(
+            maintenance
+                .status
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone(),
+        )
+    }
+
+    fn start_automatic_maintenance(
+        &mut self,
+        connector: MaintenanceConnector,
+        config: ClusterMaintenanceConfig,
+    ) -> Result<(), SdkError> {
+        validate_maintenance_config(&config)?;
+        let routes: HashMap<String, MaintainedRoute> = self
+            .maintained_routes()
+            .into_iter()
+            .map(|route| (route.agent_id.clone(), route))
+            .collect();
+        let status = Arc::new(Mutex::new(ClusterMaintenanceStatus {
+            running: true,
+            tracked_routes: routes.len(),
+            ..ClusterMaintenanceStatus::default()
+        }));
+        let routes = Arc::new(Mutex::new(routes));
+        let worker_status = Arc::clone(&status);
+        let worker_routes = Arc::clone(&routes);
+        let cluster_id = self
+            .authority
+            .as_ref()
+            .expect("automatic maintenance requires authority")
+            .cluster_id
+            .clone();
+        let task = tokio::spawn(automatic_maintenance_loop(
+            connector,
+            cluster_id,
+            config,
+            worker_routes,
+            worker_status,
+        ));
+        self.authority
+            .as_mut()
+            .expect("automatic maintenance requires authority")
+            .maintenance = Some(AutomaticMaintenance {
+            routes,
+            status,
+            task,
+        });
+        Ok(())
+    }
+
+    fn maintained_routes(&self) -> Vec<MaintainedRoute> {
+        self.owners
+            .iter()
+            .filter_map(|(agent_id, index)| {
+                self.ownership_proofs
+                    .get(agent_id)
+                    .map(|proof| MaintainedRoute {
+                        agent_id: agent_id.clone(),
+                        node_id: self.nodes[*index].id.clone(),
+                        node_address: self.nodes[*index].address.clone(),
+                        proof: proof.clone(),
+                    })
+            })
+            .collect()
+    }
+
+    fn track_maintenance_route(&self, agent_id: &str) {
+        let Some(index) = self.owners.get(agent_id).copied() else {
+            return;
+        };
+        let Some(proof) = self.ownership_proofs.get(agent_id).cloned() else {
+            return;
+        };
+        if let Some(maintenance) = self
+            .authority
+            .as_ref()
+            .and_then(|authority| authority.maintenance.as_ref())
+        {
+            let mut routes = maintenance
+                .routes
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            routes.insert(
+                agent_id.to_string(),
+                MaintainedRoute {
+                    agent_id: agent_id.to_string(),
+                    node_id: self.nodes[index].id.clone(),
+                    node_address: self.nodes[index].address.clone(),
+                    proof,
+                },
+            );
+            maintenance
+                .status
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .tracked_routes = routes.len();
+        }
+    }
+
+    fn replace_maintenance_routes(&self) {
+        if let Some(maintenance) = self
+            .authority
+            .as_ref()
+            .and_then(|authority| authority.maintenance.as_ref())
+        {
+            let replacements = self
+                .maintained_routes()
+                .into_iter()
+                .map(|route| (route.agent_id.clone(), route))
+                .collect::<HashMap<_, _>>();
+            let route_count = replacements.len();
+            *maintenance
+                .routes
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = replacements;
+            maintenance
+                .status
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .tracked_routes = route_count;
+        }
+    }
+
+    fn untrack_maintenance_route(&self, agent_id: &str) {
+        if let Some(maintenance) = self
+            .authority
+            .as_ref()
+            .and_then(|authority| authority.maintenance.as_ref())
+        {
+            let mut routes = maintenance
+                .routes
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            routes.remove(agent_id);
+            maintenance
+                .status
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .tracked_routes = routes.len();
+        }
+    }
+
     /// The node ids (dialed addresses).
     pub fn node_ids(&self) -> Vec<String> {
         self.nodes.iter().map(|n| n.id.clone()).collect()
@@ -445,26 +731,23 @@ impl ClusterClient {
     ) -> Result<PlacedAgent, SdkError> {
         let idx = self.pick_node(placement).await?;
         let node_id = self.nodes[idx].id.clone();
-        let agent_id = self.nodes[idx]
-            .client
-            .create_agent(name, task, provider, profile, priority)
-            .await?;
-        if let Some(authority) = self.authority.as_mut() {
+        let agent_id = if let Some(authority) = self.authority.as_mut() {
+            let agent_id = uuid::Uuid::new_v4().to_string();
             let ownership = authority
                 .client
                 .claim_cluster_agent_ownership(
                     &agent_id,
                     &node_id,
-                    DEFAULT_OWNERSHIP_LEASE_SECONDS,
+                    authority.lease_ttl_seconds,
                     None,
-                    "cluster client placement",
+                    "cluster client pre-creation reservation",
                 )
                 .await
                 .map_err(|source| {
                     route_publication_error(&agent_id, "authority ownership claim", source)
                 })?;
             let proof = ownership_proof(&authority.cluster_id, &ownership);
-            let fence = self.nodes[idx]
+            let reservation_fence = self.nodes[idx]
                 .client
                 .install_agent_mutation_fence(
                     &agent_id,
@@ -472,18 +755,62 @@ impl ClusterClient {
                     &proof.owner_node_id,
                     proof.authority_generation,
                     proof.fencing_token,
-                    "cluster client route publication",
+                    "cluster client pre-creation reservation",
                 )
                 .await
                 .map_err(|source| {
-                    route_publication_error(&agent_id, "destination fence installation", source)
+                    route_publication_error(
+                        &agent_id,
+                        "destination reservation fence installation",
+                        source,
+                    )
                 })?;
-            validate_destination_fence(&agent_id, &proof, &fence).map_err(|source| {
-                route_publication_error(&agent_id, "destination fence verification", source)
-            })?;
+            validate_destination_fence(&agent_id, &proof, &reservation_fence).map_err(
+                |source| {
+                    route_publication_error(
+                        &agent_id,
+                        "destination reservation fence verification",
+                        source,
+                    )
+                },
+            )?;
+            let created_agent_id = self.nodes[idx]
+                .client
+                .create_agent_with_id(
+                    ReservedAgentIdentity {
+                        agent_id: agent_id.clone(),
+                        ownership_proof: proof.clone(),
+                    },
+                    name,
+                    task,
+                    provider,
+                    profile,
+                    priority,
+                )
+                .await
+                .map_err(|source| {
+                    route_publication_error(&agent_id, "destination agent creation", source)
+                })?;
+            if created_agent_id != agent_id {
+                return Err(route_publication_error(
+                    &agent_id,
+                    "destination agent identity verification",
+                    route_conflict(format!(
+                        "destination {} created unexpected agent {created_agent_id}",
+                        self.nodes[idx].id
+                    )),
+                ));
+            }
             self.ownership_proofs.insert(agent_id.clone(), proof);
-        }
+            agent_id
+        } else {
+            self.nodes[idx]
+                .client
+                .create_agent(name, task, provider, profile, priority)
+                .await?
+        };
         self.owners.insert(agent_id.clone(), idx);
+        self.track_maintenance_route(&agent_id);
         Ok(PlacedAgent { agent_id, node_id })
     }
 
@@ -494,9 +821,297 @@ impl ClusterClient {
             .map(|&i| self.nodes[i].id.as_str())
     }
 
+    /// Reconcile managed routes from the authority directory and exact local
+    /// node state.
+    ///
+    /// An unexpired pre-creation reservation is left pending so a concurrent
+    /// creator cannot be raced. Once that reservation expires, absence of the
+    /// exact agent on every node proves that it can be released. An expired
+    /// lease with the exact agent on its recorded owner is recovered with the
+    /// previous token, producing a strictly newer fence.
+    pub async fn reconcile_routes(&mut self) -> Result<ClusterReconciliationReport, SdkError> {
+        if self.authority.is_none() {
+            return Err(SdkError::Configuration(
+                "route reconciliation requires an authority-discovered cluster".into(),
+            ));
+        }
+        self.owners.clear();
+        self.ownership_proofs.clear();
+
+        let mut local_agents: HashMap<String, usize> = HashMap::new();
+        for index in 0..self.nodes.len() {
+            for agent in self.nodes[index].client.list_agents().await? {
+                if let Some(previous) = local_agents.insert(agent.id.clone(), index) {
+                    return Err(route_conflict(format!(
+                        "duplicate agent ownership for {} on nodes {} and {}",
+                        agent.id, self.nodes[previous].id, self.nodes[index].id
+                    )));
+                }
+            }
+        }
+
+        let ownerships = self.ownership_directory().await?;
+        let directory_ids: HashSet<String> = ownerships
+            .iter()
+            .map(|ownership| ownership.agent_id.clone())
+            .collect();
+        let mut rebuilt = HashMap::new();
+        let mut rebuilt_proofs = HashMap::new();
+        let mut report = ClusterReconciliationReport::default();
+
+        for listed in ownerships {
+            let local_index = local_agents.get(&listed.agent_id).copied();
+            if listed.state == ClusterOwnershipState::Released {
+                if local_index.is_some() {
+                    return Err(route_conflict(format!(
+                        "local agent {} has a released authority ownership tombstone",
+                        listed.agent_id
+                    )));
+                }
+                continue;
+            }
+
+            let Some(index) = local_index else {
+                if listed.reason != "cluster client pre-creation reservation" {
+                    return Err(route_conflict(format!(
+                        "authority owns agent {} but no cluster node contains it",
+                        listed.agent_id
+                    )));
+                }
+                let active_result = self
+                    .authority
+                    .as_mut()
+                    .expect("managed reconciliation retains authority")
+                    .client
+                    .active_cluster_agent_ownership(&listed.agent_id)
+                    .await;
+                match active_result {
+                    Ok(active) => {
+                        validate_active_ownership(
+                            &listed.agent_id,
+                            &listed.owner_node_id,
+                            &active,
+                        )?;
+                        report.pending_reservations += 1;
+                    }
+                    Err(error) if error.wire_code() == Some(WireErrorCode::Conflict) => {
+                        let destination_index = self
+                            .nodes
+                            .iter()
+                            .position(|node| node.id == listed.owner_node_id)
+                            .ok_or_else(|| {
+                                route_conflict(format!(
+                                    "reservation {} names an unavailable destination {}",
+                                    listed.agent_id, listed.owner_node_id
+                                ))
+                            })?;
+                        let (recovered, cluster_id) = {
+                            let authority = self
+                                .authority
+                                .as_mut()
+                                .expect("managed reconciliation retains authority");
+                            let current = authority
+                                .client
+                                .cluster_agent_ownership(&listed.agent_id)
+                                .await?
+                                .ok_or_else(|| {
+                                    route_conflict(format!(
+                                        "ownership {} disappeared during reconciliation",
+                                        listed.agent_id
+                                    ))
+                                })?;
+                            if current.state == ClusterOwnershipState::Released {
+                                continue;
+                            }
+                            if current.owner_node_id != listed.owner_node_id
+                                || current.fencing_token != listed.fencing_token
+                                || current.reason != "cluster client pre-creation reservation"
+                            {
+                                return Err(route_conflict(format!(
+                                    "ownership {} changed while reconciling a reservation",
+                                    listed.agent_id
+                                )));
+                            }
+                            let recovered = authority
+                                .client
+                                .claim_cluster_agent_ownership(
+                                    &current.agent_id,
+                                    &current.owner_node_id,
+                                    authority.lease_ttl_seconds,
+                                    Some(current.fencing_token),
+                                    "cluster client pre-creation reservation",
+                                )
+                                .await?;
+                            (recovered, authority.cluster_id.clone())
+                        };
+                        let proof = ownership_proof(&cluster_id, &recovered);
+                        let fence = self.nodes[destination_index]
+                            .client
+                            .install_agent_mutation_fence(
+                                &recovered.agent_id,
+                                &proof.cluster_id,
+                                &proof.owner_node_id,
+                                proof.authority_generation,
+                                proof.fencing_token,
+                                "fence expired incomplete cluster creation",
+                            )
+                            .await?;
+                        validate_destination_fence(&recovered.agent_id, &proof, &fence)?;
+                        let appeared = self.nodes[destination_index]
+                            .client
+                            .list_agents()
+                            .await?
+                            .iter()
+                            .any(|agent| agent.id == recovered.agent_id);
+                        if appeared {
+                            rebuilt.insert(recovered.agent_id.clone(), destination_index);
+                            rebuilt_proofs.insert(recovered.agent_id, proof);
+                            report.recovered_expired_leases += 1;
+                            report.published_routes += 1;
+                        } else {
+                            self.nodes[destination_index]
+                                .client
+                                .retire_agent_mutation_fence(
+                                    &recovered.agent_id,
+                                    &proof.cluster_id,
+                                    &proof.owner_node_id,
+                                    proof.authority_generation,
+                                    proof.fencing_token,
+                                    "retire expired incomplete cluster creation",
+                                )
+                                .await?;
+                            self.authority
+                                .as_mut()
+                                .expect("managed reconciliation retains authority")
+                                .client
+                                .release_cluster_agent_ownership(
+                                    &recovered.agent_id,
+                                    &recovered.owner_node_id,
+                                    recovered.fencing_token,
+                                    "release expired incomplete cluster creation",
+                                )
+                                .await?;
+                            report.released_expired_reservations += 1;
+                        }
+                    }
+                    Err(error) => return Err(error),
+                }
+                continue;
+            };
+
+            if self.nodes[index].id != listed.owner_node_id {
+                return Err(route_conflict(format!(
+                    "authority routes agent {} to {} but durable local state is on {}",
+                    listed.agent_id, listed.owner_node_id, self.nodes[index].id
+                )));
+            }
+            let authority = self
+                .authority
+                .as_mut()
+                .expect("managed reconciliation retains authority");
+            let (active, recovered) = active_or_recover_ownership(
+                &mut authority.client,
+                &listed,
+                &self.nodes[index].id,
+                authority.lease_ttl_seconds,
+            )
+            .await?;
+            if recovered {
+                report.recovered_expired_leases += 1;
+            }
+            let proof = ownership_proof(&authority.cluster_id, &active);
+            let current_fence = self.nodes[index]
+                .client
+                .agent_mutation_fence(&listed.agent_id)
+                .await?;
+            match current_fence {
+                Some(fence) if destination_fence_matches(&listed.agent_id, &proof, &fence) => {}
+                Some(fence)
+                    if fence.fencing_token > proof.fencing_token
+                        || (fence.fencing_token == proof.fencing_token
+                            && fence.authority_generation > proof.authority_generation) =>
+                {
+                    return Err(route_conflict(format!(
+                        "destination {} has newer ownership evidence for agent {}",
+                        self.nodes[index].id, listed.agent_id
+                    )));
+                }
+                _ => {
+                    let installed = self.nodes[index]
+                        .client
+                        .install_agent_mutation_fence(
+                            &listed.agent_id,
+                            &proof.cluster_id,
+                            &proof.owner_node_id,
+                            proof.authority_generation,
+                            proof.fencing_token,
+                            "cluster client durable reconciliation",
+                        )
+                        .await?;
+                    validate_destination_fence(&listed.agent_id, &proof, &installed)?;
+                }
+            }
+            rebuilt.insert(listed.agent_id.clone(), index);
+            rebuilt_proofs.insert(listed.agent_id, proof);
+            report.published_routes += 1;
+        }
+
+        if let Some(agent_id) = local_agents
+            .keys()
+            .find(|agent_id| !directory_ids.contains(*agent_id))
+        {
+            return Err(route_conflict(format!(
+                "local agent {agent_id} has no durable authority ownership record"
+            )));
+        }
+        self.owners = rebuilt;
+        self.ownership_proofs = rebuilt_proofs;
+        self.replace_maintenance_routes();
+        Ok(report)
+    }
+
+    async fn ownership_directory(&mut self) -> Result<Vec<ClusterAgentOwnership>, SdkError> {
+        let authority = self
+            .authority
+            .as_mut()
+            .expect("ownership directory requires managed authority");
+        let mut ownerships = Vec::new();
+        let mut after_agent_id = None;
+        loop {
+            let page = authority
+                .client
+                .cluster_agent_ownerships(after_agent_id.clone(), 1_000)
+                .await?;
+            if page.is_empty() {
+                break;
+            }
+            if let Some(previous) = after_agent_id.as_deref() {
+                if page
+                    .first()
+                    .is_some_and(|ownership| ownership.agent_id.as_str() <= previous)
+                {
+                    return Err(route_conflict(
+                        "authority ownership directory did not advance its page cursor",
+                    ));
+                }
+            }
+            after_agent_id = page.last().map(|ownership| ownership.agent_id.clone());
+            let full_page = page.len() == 1_000;
+            ownerships.extend(page);
+            if !full_page {
+                break;
+            }
+        }
+        Ok(ownerships)
+    }
+
     /// Rebuild routing from durable node state. Duplicate agent ownership is a
     /// split-brain conflict and fails closed instead of selecting one owner.
     pub async fn rebuild_owners(&mut self) -> Result<(), SdkError> {
+        if self.authority.is_some() {
+            self.reconcile_routes().await?;
+            return Ok(());
+        }
         // Invalidate the published directory before any fallible read. A
         // caller that observes an error cannot keep using a previously valid
         // route after ownership or destination evidence changed.
@@ -518,31 +1133,7 @@ impl ClusterClient {
                 }
             }
         }
-        let mut rebuilt_proofs = HashMap::new();
-        if let Some(authority) = self.authority.as_mut() {
-            for (agent_id, index) in &rebuilt {
-                let ownership = authority
-                    .client
-                    .active_cluster_agent_ownership(agent_id)
-                    .await?;
-                validate_active_ownership(agent_id, &self.nodes[*index].id, &ownership)?;
-                let proof = ownership_proof(&authority.cluster_id, &ownership);
-                let fence = self.nodes[*index]
-                    .client
-                    .agent_mutation_fence(agent_id)
-                    .await?
-                    .ok_or_else(|| {
-                        route_conflict(format!(
-                            "destination {} has no mutation fence for agent {agent_id}",
-                            self.nodes[*index].id
-                        ))
-                    })?;
-                validate_destination_fence(agent_id, &proof, &fence)?;
-                rebuilt_proofs.insert(agent_id.clone(), proof);
-            }
-        }
         self.owners = rebuilt;
-        self.ownership_proofs = rebuilt_proofs;
         Ok(())
     }
 
@@ -563,6 +1154,7 @@ impl ClusterClient {
         if result.is_err() {
             self.owners.remove(agent_id);
             self.ownership_proofs.remove(agent_id);
+            self.untrack_maintenance_route(agent_id);
         }
         result
     }
@@ -670,13 +1262,15 @@ impl ClusterClient {
             route_publication_error(agent_id, "renewed destination fence verification", source)
         })?;
         self.ownership_proofs.insert(agent_id.to_string(), proof);
+        self.track_maintenance_route(agent_id);
         Ok(())
     }
 
     /// Renew and republish every currently routed managed agent.
     ///
-    /// This is explicit rather than a hidden background task: callers choose
-    /// their scheduling and failure policy, and any first failure is surfaced.
+    /// This remains available to clients without automatic maintenance and to
+    /// callers that need an explicit renewal boundary. Any first failure is
+    /// surfaced.
     pub async fn renew_all_agent_ownerships(
         &mut self,
         ttl_seconds: u64,
@@ -846,6 +1440,229 @@ impl ClusterClient {
     }
 }
 
+impl Drop for ClusterClient {
+    fn drop(&mut self) {
+        if let Some(maintenance) = self
+            .authority
+            .as_mut()
+            .and_then(|authority| authority.maintenance.take())
+        {
+            maintenance.task.abort();
+            maintenance
+                .status
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .running = false;
+        }
+    }
+}
+
+impl MaintenanceConnector {
+    fn authority_address(&self) -> &str {
+        match self {
+            Self::Plaintext {
+                authority_address, ..
+            }
+            | Self::Tls {
+                authority_address, ..
+            } => authority_address,
+        }
+    }
+
+    async fn connect(&self, address: &str) -> Result<KernelClient, SdkError> {
+        match self {
+            Self::Plaintext { token, .. } => {
+                let mut client = KernelClient::connect(address).await?;
+                client.authenticate(token).await?;
+                Ok(client)
+            }
+            Self::Tls {
+                server_name,
+                config,
+                token,
+                ..
+            } => {
+                let mut client = KernelClient::connect_tls(
+                    address,
+                    server_name.clone(),
+                    config.as_ref().clone(),
+                )
+                .await?;
+                client.authenticate(token).await?;
+                Ok(client)
+            }
+        }
+    }
+}
+
+fn validate_maintenance_config(config: &ClusterMaintenanceConfig) -> Result<(), SdkError> {
+    if !(5..=300).contains(&config.lease_ttl_seconds) {
+        return Err(SdkError::Configuration(
+            "cluster maintenance lease TTL must be between 5 and 300 seconds".into(),
+        ));
+    }
+    if config.renew_interval.is_zero()
+        || config
+            .renew_interval
+            .checked_mul(2)
+            .is_none_or(|retry_window| retry_window > Duration::from_secs(config.lease_ttl_seconds))
+    {
+        return Err(SdkError::Configuration(
+            "cluster maintenance renewal interval must be positive and leave at least one retry before lease expiry"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+async fn automatic_maintenance_loop(
+    connector: MaintenanceConnector,
+    cluster_id: String,
+    config: ClusterMaintenanceConfig,
+    routes: Arc<Mutex<HashMap<String, MaintainedRoute>>>,
+    status: Arc<Mutex<ClusterMaintenanceStatus>>,
+) {
+    let mut interval = tokio::time::interval(config.renew_interval);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // Tokio intervals tick immediately once. Consume that tick so every newly
+    // created route gets its full initial lease before the first renewal.
+    interval.tick().await;
+
+    loop {
+        interval.tick().await;
+        let route_snapshot = routes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        if route_snapshot.is_empty() {
+            continue;
+        }
+        let mut successful_renewals = 0_u64;
+        let mut failed_renewals = 0_u64;
+        let mut last_error = None;
+        match connector.connect(connector.authority_address()).await {
+            Ok(mut authority) => {
+                for route in &route_snapshot {
+                    match maintain_route(
+                        &connector,
+                        &cluster_id,
+                        &mut authority,
+                        route,
+                        config.lease_ttl_seconds,
+                    )
+                    .await
+                    {
+                        Ok(proof) => {
+                            let mut current_routes = routes
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner());
+                            if let Some(current) = current_routes.get_mut(&route.agent_id) {
+                                if current.node_id == route.node_id
+                                    && current.node_address == route.node_address
+                                    && current.proof.cluster_id == proof.cluster_id
+                                    && current.proof.owner_node_id == proof.owner_node_id
+                                    && proof_is_at_least_as_new(&proof, &current.proof)
+                                {
+                                    current.proof = proof;
+                                }
+                            }
+                            successful_renewals = successful_renewals.saturating_add(1);
+                        }
+                        Err(error) => {
+                            failed_renewals = failed_renewals.saturating_add(1);
+                            last_error = Some(format!(
+                                "automatic maintenance failed for agent {} on node {}: {error}",
+                                route.agent_id, route.node_id
+                            ));
+                        }
+                    }
+                }
+            }
+            Err(error) => {
+                failed_renewals = u64::try_from(route_snapshot.len()).unwrap_or(u64::MAX);
+                last_error = Some(format!(
+                    "automatic maintenance could not connect to the authority: {error}"
+                ));
+            }
+        }
+        let tracked_routes = routes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .len();
+        let mut current = status
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        current.tracked_routes = tracked_routes;
+        current.successful_renewals = current
+            .successful_renewals
+            .saturating_add(successful_renewals);
+        current.failed_renewals = current.failed_renewals.saturating_add(failed_renewals);
+        if failed_renewals == 0 {
+            current.successful_cycles = current.successful_cycles.saturating_add(1);
+            current.consecutive_failed_cycles = 0;
+            current.last_error = None;
+        } else {
+            current.failed_cycles = current.failed_cycles.saturating_add(1);
+            current.consecutive_failed_cycles = current.consecutive_failed_cycles.saturating_add(1);
+            current.last_error = last_error;
+        }
+    }
+}
+
+fn proof_is_at_least_as_new(
+    candidate: &AgentMutationFenceProof,
+    current: &AgentMutationFenceProof,
+) -> bool {
+    candidate.fencing_token > current.fencing_token
+        || (candidate.fencing_token == current.fencing_token
+            && candidate.authority_generation >= current.authority_generation)
+}
+
+async fn maintain_route(
+    connector: &MaintenanceConnector,
+    cluster_id: &str,
+    authority: &mut KernelClient,
+    route: &MaintainedRoute,
+    ttl_seconds: u64,
+) -> Result<AgentMutationFenceProof, SdkError> {
+    if route.proof.cluster_id != cluster_id || route.proof.owner_node_id != route.node_id {
+        return Err(route_conflict(format!(
+            "tracked proof for agent {} does not match maintenance cluster/node",
+            route.agent_id
+        )));
+    }
+    let active = authority
+        .active_cluster_agent_ownership(&route.agent_id)
+        .await?;
+    validate_active_ownership(&route.agent_id, &route.node_id, &active)?;
+    let renewed = authority
+        .renew_cluster_agent_ownership(
+            &route.agent_id,
+            &route.node_id,
+            active.fencing_token,
+            ttl_seconds,
+            "cluster client automatic lease maintenance",
+        )
+        .await?;
+    validate_active_ownership(&route.agent_id, &route.node_id, &renewed)?;
+    let proof = ownership_proof(cluster_id, &renewed);
+    let mut destination = connector.connect(&route.node_address).await?;
+    let fence = destination
+        .install_agent_mutation_fence(
+            &route.agent_id,
+            &proof.cluster_id,
+            &proof.owner_node_id,
+            proof.authority_generation,
+            proof.fencing_token,
+            "cluster client automatic lease maintenance",
+        )
+        .await?;
+    validate_destination_fence(&route.agent_id, &proof, &fence)?;
+    Ok(proof)
+}
+
 fn active_member_endpoints(snapshot: &ClusterMembershipSnapshot) -> Result<Vec<String>, SdkError> {
     let endpoints: Vec<String> = snapshot
         .members
@@ -896,6 +1713,66 @@ fn route_publication_error(agent_id: &str, stage: &'static str, source: SdkError
         agent_id: agent_id.to_string(),
         stage,
         source: Box::new(source),
+    }
+}
+
+async fn active_or_recover_ownership(
+    authority: &mut KernelClient,
+    listed: &ClusterAgentOwnership,
+    expected_owner: &str,
+    ttl_seconds: u64,
+) -> Result<(ClusterAgentOwnership, bool), SdkError> {
+    match authority
+        .active_cluster_agent_ownership(&listed.agent_id)
+        .await
+    {
+        Ok(active) => {
+            validate_active_ownership(&listed.agent_id, expected_owner, &active)?;
+            Ok((active, false))
+        }
+        Err(error) if error.wire_code() == Some(WireErrorCode::Conflict) => {
+            let current = authority
+                .cluster_agent_ownership(&listed.agent_id)
+                .await?
+                .ok_or_else(|| {
+                    route_conflict(format!(
+                        "ownership {} disappeared during lease recovery",
+                        listed.agent_id
+                    ))
+                })?;
+            if current.state != ClusterOwnershipState::Active
+                || current.owner_node_id != expected_owner
+            {
+                return Err(route_conflict(format!(
+                    "ownership {} was released or transferred during lease recovery",
+                    listed.agent_id
+                )));
+            }
+            match authority
+                .claim_cluster_agent_ownership(
+                    &current.agent_id,
+                    expected_owner,
+                    ttl_seconds,
+                    Some(current.fencing_token),
+                    "cluster client expired lease recovery",
+                )
+                .await
+            {
+                Ok(recovered) => {
+                    validate_active_ownership(&listed.agent_id, expected_owner, &recovered)?;
+                    Ok((recovered, true))
+                }
+                Err(claim_error) if claim_error.wire_code() == Some(WireErrorCode::Conflict) => {
+                    let active = authority
+                        .active_cluster_agent_ownership(&listed.agent_id)
+                        .await?;
+                    validate_active_ownership(&listed.agent_id, expected_owner, &active)?;
+                    Ok((active, false))
+                }
+                Err(claim_error) => Err(claim_error),
+            }
+        }
+        Err(error) => Err(error),
     }
 }
 

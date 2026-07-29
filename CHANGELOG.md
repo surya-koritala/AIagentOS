@@ -10,6 +10,16 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
 
 ## [Unreleased]
 
+- Added durably reconcilable managed cluster creation. The authority now exposes
+  a stable paginated ownership directory; managed placement reserves a UUID,
+  preinstalls its exact destination fence, and creates only while that proof is
+  active. Startup/manual reconciliation recovers expired exact-owner leases,
+  repairs missing fences, leaves live reservations pending, and advances,
+  rechecks, retires, then releases expired incomplete reservations so a delayed
+  creator cannot cross cleanup. Duplicate exact IDs never overwrite state.
+  New explicit maintenance constructors renew idle leases, republish destination
+  fences through fresh authenticated connections, expose bounded health, and
+  stop on client drop. These controls remain single-authority, not quorum.
 - Added a system-scoped durable cluster ownership authority: active members can
   claim bounded leases, exact owner/token pairs can renew or release them, and
   transfer after release or expiry requires the old token and allocates a
@@ -27,9 +37,8 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
   operation, serialize initial installation and handoff with in-flight work,
   and cover the dedicated ordinary-stream path.
   Fenced lifecycle, turn, and tool SDK calls reuse the existing authorization
-  and resource gates. This is destination enforcement, not quorum: automatic
-  `ClusterClient` propagation, fenced streaming, authority terms/failover, and
-  migration remain open in #122.
+  and resource gates. This is destination enforcement, not quorum: authority
+  terms/failover and migration remain open in #122.
 - Published the normative distributed control-plane consistency contract. It
   distinguishes single-authority membership, node-local state, reconstructed
   routing, and missing ownership fencing; defines fail-closed partition, retry,

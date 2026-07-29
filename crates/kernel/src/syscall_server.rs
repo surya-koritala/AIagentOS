@@ -241,6 +241,15 @@ pub enum Syscall {
     /// Create an agent through the full kernel path (gate registration, cgroup,
     /// namespaces, scheduler admission, procfs).
     CreateAgent {
+        /// Optional authority-reserved identifier. Legacy callers omit it and
+        /// the destination generates a fresh UUID.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent_id: Option<String>,
+        /// Exact preinstalled ownership fence required for reserved-ID
+        /// creation. It prevents a delayed creator from crossing reservation
+        /// expiry and cleanup.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ownership_proof: Option<AgentMutationFenceProof>,
         name: String,
         task: String,
         #[serde(default = "default_provider")]
@@ -595,6 +604,13 @@ pub enum Syscall {
         /// own clock. Omitted/false preserves the historical inspection API.
         #[serde(default, skip_serializing_if = "is_false")]
         require_active: bool,
+    },
+    /// Page through the complete durable ownership directory.
+    ListClusterAgentOwnerships {
+        #[serde(default)]
+        after_agent_id: Option<String>,
+        #[serde(default = "default_tunable_audit_limit")]
+        limit: usize,
     },
     /// Inspect bounded ownership claim/transfer/renew/release evidence.
     ListClusterAgentOwnershipAudit {
@@ -1011,6 +1027,10 @@ impl WireErrorCode {
             || message.contains("stopped")
         {
             (Self::Lifecycle, false)
+        } else if message.contains("agent") && message.contains("already exists") {
+            // Retrying the same exact-id creation cannot succeed while the
+            // durable destination record exists.
+            (Self::Conflict, false)
         } else if message.contains("busy")
             || message.contains("conflict")
             || message.contains("already")
@@ -1257,6 +1277,10 @@ pub enum SyscallReply {
     ClusterAgentOwnership {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         ownership: Option<crate::cluster_control::ClusterAgentOwnership>,
+    },
+    /// Stable page from the durable authority ownership directory.
+    ClusterAgentOwnerships {
+        ownerships: Vec<crate::cluster_control::ClusterAgentOwnership>,
     },
     /// Durable ownership mutation audit entries.
     ClusterAgentOwnershipAudit {
@@ -1560,6 +1584,9 @@ fn syscall_policy(call: &Syscall) -> (AccessLevel, &'static str, Option<&str>) {
         }
         Syscall::GetClusterAgentOwnership { .. } => {
             (AccessLevel::System, "cluster.ownership.get", None)
+        }
+        Syscall::ListClusterAgentOwnerships { .. } => {
+            (AccessLevel::System, "cluster.ownership.list", None)
         }
         Syscall::ListClusterAgentOwnershipAudit { .. } => {
             (AccessLevel::System, "cluster.ownership.audit", None)
@@ -1874,6 +1901,7 @@ fn quarantine_recovery_call(call: &Syscall) -> bool {
             | Syscall::RenewClusterAgentOwnership { .. }
             | Syscall::ReleaseClusterAgentOwnership { .. }
             | Syscall::GetClusterAgentOwnership { .. }
+            | Syscall::ListClusterAgentOwnerships { .. }
             | Syscall::ListClusterAgentOwnershipAudit { .. }
             | Syscall::InstallAgentMutationFence { .. }
             | Syscall::RetireAgentMutationFence { .. }
@@ -2127,12 +2155,49 @@ async fn dispatch_scoped_inner_with_fence(
         .unwrap_or("system");
     match call {
         Syscall::CreateAgent {
+            agent_id,
+            ownership_proof,
             name,
             task,
             provider,
             profile,
             priority,
         } => {
+            let (requested_agent_id, _reservation_guard) = match (agent_id, ownership_proof) {
+                (Some(agent_id), Some(proof)) => {
+                    let (parsed_agent, barrier) =
+                        match mutation_fence_barrier_for(kernel, &agent_id) {
+                            Ok(result) => result,
+                            Err(message) => return SyscallReply::Error { message },
+                        };
+                    let guard = barrier.read_owned().await;
+                    if let Err(error) = kernel.cluster_control.verify_agent_mutation_fence(
+                        &parsed_agent.to_string(),
+                        &proof.cluster_id,
+                        &proof.owner_node_id,
+                        proof.authority_generation,
+                        proof.fencing_token,
+                    ) {
+                        return SyscallReply::Error {
+                            message: error.to_string(),
+                        };
+                    }
+                    (Some(parsed_agent), Some(guard))
+                }
+                (Some(_), None) => {
+                    return SyscallReply::Error {
+                        message:
+                            "reserved agent creation requires an exact destination ownership fence"
+                                .into(),
+                    };
+                }
+                (None, Some(_)) => {
+                    return SyscallReply::Error {
+                        message: "agent ownership proof requires a reserved agent id".into(),
+                    };
+                }
+                (None, None) => (None, None),
+            };
             let prio = Priority::new(priority).unwrap_or_else(|| Priority::new(3).unwrap());
             let config = AgentConfig {
                 name,
@@ -2144,9 +2209,15 @@ async fn dispatch_scoped_inner_with_fence(
             };
             // A tenant-bound connection creates agents inside its tenant (own
             // namespace + cgroup); otherwise the un-tenanted full path.
-            let created = match tenant {
-                Some(t) => kernel.create_agent_for_tenant(t, config).await,
-                None => kernel.create_agent_full(config).await,
+            let created = match (tenant, requested_agent_id) {
+                (Some(tenant), Some(agent_id)) => {
+                    kernel
+                        .create_agent_for_tenant_with_id(tenant, agent_id, config)
+                        .await
+                }
+                (Some(tenant), None) => kernel.create_agent_for_tenant(tenant, config).await,
+                (None, Some(agent_id)) => kernel.create_agent_full_with_id(agent_id, config).await,
+                (None, None) => kernel.create_agent_full(config).await,
             };
             match created {
                 Ok(handle) => SyscallReply::AgentCreated {
@@ -3320,6 +3391,20 @@ async fn dispatch_scoped_inner_with_fence(
                 .agent_ownership_with_active_requirement(&agent_id, require_active)
             {
                 Ok(ownership) => SyscallReply::ClusterAgentOwnership { ownership },
+                Err(error) => SyscallReply::Error {
+                    message: error.to_string(),
+                },
+            }
+        }
+        Syscall::ListClusterAgentOwnerships {
+            after_agent_id,
+            limit,
+        } => {
+            match kernel
+                .cluster_control
+                .agent_ownerships(after_agent_id.as_deref(), limit)
+            {
+                Ok(ownerships) => SyscallReply::ClusterAgentOwnerships { ownerships },
                 Err(error) => SyscallReply::Error {
                     message: error.to_string(),
                 },
@@ -4926,6 +5011,10 @@ impl SyscallServer {
                             &call,
                             Syscall::SendMessageStream { .. }
                                 | Syscall::CancelRequest { .. }
+                                | Syscall::CreateAgent {
+                                    agent_id: Some(_),
+                                    ..
+                                }
                                 | Syscall::ProveNodeIdentity { .. }
                                 | Syscall::SetNodeAvailability { .. }
                                 | Syscall::SetNodeProfile { .. }
@@ -4939,6 +5028,7 @@ impl SyscallServer {
                                 | Syscall::RenewClusterAgentOwnership { .. }
                                 | Syscall::ReleaseClusterAgentOwnership { .. }
                                 | Syscall::GetClusterAgentOwnership { .. }
+                                | Syscall::ListClusterAgentOwnerships { .. }
                                 | Syscall::ListClusterAgentOwnershipAudit { .. }
                         ) =>
                 {
@@ -5496,6 +5586,19 @@ mod tests {
                 request_id: "v1-stream".into(),
                 agent_id: "not-a-uuid".into(),
             },
+            Syscall::CreateAgent {
+                agent_id: Some(uuid::Uuid::new_v4().to_string()),
+                ownership_proof: None,
+                name: "v1-exact-id".into(),
+                task: "must not start".into(),
+                provider: "stub".into(),
+                profile: "standard".into(),
+                priority: 3,
+            },
+            Syscall::ListClusterAgentOwnerships {
+                after_agent_id: None,
+                limit: 10,
+            },
             Syscall::Ping,
         ] {
             match v1.call(call).await.unwrap() {
@@ -5546,6 +5649,8 @@ mod tests {
         // create_agent over the wire → real kernel create_agent_full.
         let reply = client
             .call(Syscall::CreateAgent {
+                agent_id: None,
+                ownership_proof: None,
                 name: "alpha".into(),
                 task: "demo".into(),
                 provider: "stub".into(),
@@ -5590,6 +5695,8 @@ mod tests {
         // A read-only agent lacks CAP_FILE_WRITE.
         let id = match client
             .call(Syscall::CreateAgent {
+                agent_id: None,
+                ownership_proof: None,
                 name: "ro".into(),
                 task: "t".into(),
                 provider: "stub".into(),
@@ -5645,6 +5752,8 @@ mod tests {
         // A read-only agent: no CAP_FILE_WRITE.
         let id = match client
             .call(Syscall::CreateAgent {
+                agent_id: None,
+                ownership_proof: None,
                 name: "introspect".into(),
                 task: "t".into(),
                 provider: "stub".into(),
@@ -5732,6 +5841,8 @@ mod tests {
 
         let id = match client
             .call(Syscall::CreateAgent {
+                agent_id: None,
+                ownership_proof: None,
                 name: "mem".into(),
                 task: "t".into(),
                 provider: "stub".into(),
@@ -5834,6 +5945,8 @@ mod tests {
 
         let id = match client
             .call(Syscall::CreateAgent {
+                agent_id: None,
+                ownership_proof: None,
                 name: "kv".into(),
                 task: "t".into(),
                 provider: "stub".into(),
@@ -5948,6 +6061,8 @@ mod tests {
         // snapshottable immediately.
         let id = match client
             .call(Syscall::CreateAgent {
+                agent_id: None,
+                ownership_proof: None,
                 name: "snap".into(),
                 task: "t".into(),
                 provider: "stub".into(),
@@ -6117,6 +6232,8 @@ mod tests {
         for n in ["a", "b"] {
             client
                 .call(Syscall::CreateAgent {
+                    agent_id: None,
+                    ownership_proof: None,
                     name: n.into(),
                     task: "t".into(),
                     provider: "stub".into(),
@@ -6156,6 +6273,8 @@ mod tests {
             dispatch(
                 &kernel,
                 Syscall::CreateAgent {
+                    agent_id: None,
+                    ownership_proof: None,
                     name: "rejected".into(),
                     task: "new work".into(),
                     provider: "stub".into(),
@@ -6229,6 +6348,8 @@ mod tests {
             dispatch(
                 &kernel,
                 Syscall::CreateAgent {
+                    agent_id: None,
+                    ownership_proof: None,
                     name: "accepted".into(),
                     task: "new work".into(),
                     provider: "stub".into(),
@@ -7097,6 +7218,8 @@ mod tests {
         // A read-only agent: it can read but lacks CAP_FILE_WRITE.
         let agent_id = match client
             .call(Syscall::CreateAgent {
+                agent_id: None,
+                ownership_proof: None,
                 name: "ro".into(),
                 task: "t".into(),
                 provider: "stub".into(),
@@ -7278,6 +7401,8 @@ memory = ["remember this"]
         let mut client = SyscallClient::connect_unix(&path).await.unwrap();
         let reply = client
             .call(Syscall::CreateAgent {
+                agent_id: None,
+                ownership_proof: None,
                 name: "over-unix".into(),
                 task: "t".into(),
                 provider: "stub".into(),
@@ -7380,6 +7505,8 @@ memory = ["remember this"]
         // CreateAgent over the encrypted transport → real kernel path.
         let id = match client
             .call(Syscall::CreateAgent {
+                agent_id: None,
+                ownership_proof: None,
                 name: "tls-alpha".into(),
                 task: "demo".into(),
                 provider: "stub".into(),
@@ -7623,6 +7750,8 @@ memory = ["remember this"]
         let unscoped_calls = vec![
             (
                 Syscall::CreateAgent {
+                    agent_id: None,
+                    ownership_proof: None,
                     name: "x".into(),
                     task: "x".into(),
                     provider: "stub".into(),
@@ -7837,6 +7966,13 @@ memory = ["remember this"]
                 AccessLevel::System,
             ),
             (
+                Syscall::ListClusterAgentOwnerships {
+                    after_agent_id: None,
+                    limit: 10,
+                },
+                AccessLevel::System,
+            ),
+            (
                 Syscall::ListClusterAgentOwnershipAudit {
                     agent_id: None,
                     limit: 10,
@@ -8019,7 +8155,7 @@ memory = ["remember this"]
                     .to_string()
             })
             .collect::<std::collections::HashSet<_>>();
-        assert_eq!(calls.len(), 87);
+        assert_eq!(calls.len(), 88);
         assert_eq!(fixture_tags, schema_tags);
     }
 

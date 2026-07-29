@@ -320,6 +320,9 @@ pub enum AgentError {
     #[error("Agent {0} not found")]
     NotFound(AgentId),
 
+    #[error("Agent {0} already exists")]
+    AlreadyExists(AgentId),
+
     #[error("Agent {0} is unresponsive")]
     Unresponsive(AgentId),
 
@@ -1653,7 +1656,17 @@ impl AgentKernelImpl {
 
     /// Create agent with full subsystem coordination.
     pub async fn create_agent_full(&self, config: AgentConfig) -> Result<AgentHandle, KernelError> {
-        self.create_agent_grouped(config, None, crate::context::DEFAULT_TENANT)
+        self.create_agent_grouped(config, None, crate::context::DEFAULT_TENANT, None)
+            .await
+    }
+
+    /// Create an agent with an authority-reserved identifier.
+    pub async fn create_agent_full_with_id(
+        &self,
+        agent_id: AgentId,
+        config: AgentConfig,
+    ) -> Result<AgentHandle, KernelError> {
+        self.create_agent_grouped(config, None, crate::context::DEFAULT_TENANT, Some(agent_id))
             .await
     }
 
@@ -1680,7 +1693,24 @@ impl AgentKernelImpl {
         } else {
             Some(tenant_id)
         };
-        self.create_agent_grouped(config, group, tenant_id).await
+        self.create_agent_grouped(config, group, tenant_id, None)
+            .await
+    }
+
+    /// Tenant-scoped variant of [`create_agent_full_with_id`](Self::create_agent_full_with_id).
+    pub async fn create_agent_for_tenant_with_id(
+        &self,
+        tenant_id: &str,
+        agent_id: AgentId,
+        config: AgentConfig,
+    ) -> Result<AgentHandle, KernelError> {
+        let group = if tenant_id == crate::context::DEFAULT_TENANT {
+            None
+        } else {
+            Some(tenant_id)
+        };
+        self.create_agent_grouped(config, group, tenant_id, Some(agent_id))
+            .await
     }
 
     /// Get or build the stable root→tenant→profile→agent hierarchy used for
@@ -1778,7 +1808,7 @@ impl AgentKernelImpl {
         config: AgentConfig,
         group: &str,
     ) -> Result<AgentHandle, KernelError> {
-        self.create_agent_grouped(config, Some(group), crate::context::DEFAULT_TENANT)
+        self.create_agent_grouped(config, Some(group), crate::context::DEFAULT_TENANT, None)
             .await
     }
 
@@ -1990,6 +2020,7 @@ impl AgentKernelImpl {
         mut config: AgentConfig,
         group: Option<&str>,
         tenant_id: &str,
+        requested_agent_id: Option<AgentId>,
     ) -> Result<AgentHandle, KernelError> {
         let _operator_mutation = self.operator_control.mutation_guard().await;
         let max_agents = self.operator_control.max_agents();
@@ -2009,7 +2040,14 @@ impl AgentKernelImpl {
             config.sandbox_config = Some(SandboxManagerImpl::default_config());
         }
         // 1. Create agent via agent manager
-        let handle = self.agent_manager.create_agent(config.clone()).await?;
+        let handle = match requested_agent_id {
+            Some(agent_id) => {
+                self.agent_manager
+                    .create_agent_with_id(agent_id, config.clone())
+                    .await?
+            }
+            None => self.agent_manager.create_agent(config.clone()).await?,
+        };
         let agent_id = handle.id;
 
         // 2. Assign permission profile
@@ -3715,6 +3753,7 @@ impl AgentKernelImpl {
             },
             group,
             &state.def.policy.tenant_id,
+            None,
         );
         let created = tokio::time::timeout(startup_timeout, create).await;
         match created {

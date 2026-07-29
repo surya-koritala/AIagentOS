@@ -1509,6 +1509,80 @@ impl ClusterControl {
         load_ownership(&connection, agent_id)
     }
 
+    /// Page through the complete durable ownership directory in stable agent-id
+    /// order. Released and expired records are intentionally included so
+    /// reconciliation can distinguish tombstones, live routes, and abandoned
+    /// pre-creation reservations without guessing from local node state.
+    pub fn agent_ownerships(
+        &self,
+        after_agent_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<ClusterAgentOwnership>, ContextError> {
+        if let Some(agent_id) = after_agent_id {
+            uuid::Uuid::parse_str(agent_id)
+                .map_err(|_| storage_error("invalid ownership page cursor"))?;
+        }
+        let limit = limit.clamp(1, 1_000);
+        let connection = self
+            .store
+            .conn
+            .lock()
+            .map_err(|_| storage_error("SQLite connection mutex is poisoned"))?;
+        let mut statement = connection
+            .prepare(
+                "SELECT agent_id, owner_node_id, fencing_token, generation, state,
+                        lease_expires_at, updated_at, reason
+                 FROM cluster_agent_ownership
+                 WHERE (?1 IS NULL OR agent_id > ?1)
+                 ORDER BY agent_id ASC
+                 LIMIT ?2",
+            )
+            .map_err(|error| storage_error(format!("prepare ownership directory: {error}")))?;
+        let rows = statement
+            .query_map(
+                rusqlite::params![after_agent_id, i64::try_from(limit).unwrap_or(i64::MAX)],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, String>(6)?,
+                        row.get::<_, String>(7)?,
+                    ))
+                },
+            )
+            .map_err(|error| storage_error(format!("query ownership directory: {error}")))?;
+        let mut ownerships = Vec::new();
+        for row in rows {
+            let (
+                agent_id,
+                owner_node_id,
+                fencing_token,
+                generation,
+                state,
+                lease_expires_at,
+                updated_at,
+                reason,
+            ) = row.map_err(|error| storage_error(format!("read ownership directory: {error}")))?;
+            ownerships.push(ClusterAgentOwnership {
+                agent_id,
+                owner_node_id,
+                fencing_token: u64::try_from(fencing_token)
+                    .map_err(|_| storage_error("negative ownership fencing token"))?,
+                generation: u64::try_from(generation)
+                    .map_err(|_| storage_error("negative ownership generation"))?,
+                state: ClusterOwnershipState::try_from(state.as_str())?,
+                lease_expires_at: parse_timestamp(&lease_expires_at)?,
+                updated_at: parse_timestamp(&updated_at)?,
+                reason,
+            });
+        }
+        Ok(ownerships)
+    }
+
     /// Read one ownership record and, when requested, have the authority
     /// validate active state and expiry against its own clock.
     pub fn agent_ownership_with_active_requirement(
@@ -1609,8 +1683,10 @@ impl ClusterControl {
     }
 
     /// Install the highest authority-issued token accepted by this workload
-    /// node for one local agent. Older tokens and foreign-node records fail
-    /// closed; a retired token can never be reactivated.
+    /// node for one local or authority-reserved agent identity. Preinstalling
+    /// the fence lets exact-ID creation prove that its reservation is still
+    /// current. Older tokens and foreign-node records fail closed; a retired
+    /// token can never be reactivated.
     #[allow(clippy::too_many_arguments)]
     pub fn install_agent_mutation_fence(
         &self,
@@ -1644,16 +1720,6 @@ impl ClusterControl {
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| storage_error(format!("agent mutation fence transaction: {error}")))?;
-        let local_agent_exists = transaction
-            .query_row("SELECT 1 FROM agents WHERE id = ?1", [agent_id], |_| Ok(()))
-            .optional()
-            .map_err(|error| storage_error(format!("inspect fenced local agent: {error}")))?
-            .is_some();
-        if !local_agent_exists {
-            return Err(storage_error(
-                "agent mutation fence denied: destination agent does not exist",
-            ));
-        }
         let previous = load_mutation_fence(&transaction, agent_id)?;
         if let Some(previous) = &previous {
             if previous.cluster_id != cluster_id || previous.owner_node_id != owner_node_id {
@@ -4018,6 +4084,45 @@ mod tests {
             .unwrap();
         assert_eq!(reclaimed.fencing_token, 3);
         assert_eq!(reclaimed.generation, 5);
+        let mut directory_ids = vec![agent_id.clone()];
+        for _ in 0..2 {
+            let extra_agent_id = uuid::Uuid::new_v4().to_string();
+            authority
+                .claim_agent_ownership(
+                    &extra_agent_id,
+                    &first.identity().node_id,
+                    30,
+                    None,
+                    "scheduler",
+                    "directory pagination fixture",
+                )
+                .unwrap();
+            directory_ids.push(extra_agent_id);
+        }
+        directory_ids.sort();
+        let first_page = authority.agent_ownerships(None, 2).unwrap();
+        assert_eq!(
+            first_page
+                .iter()
+                .map(|ownership| ownership.agent_id.as_str())
+                .collect::<Vec<_>>(),
+            directory_ids[..2]
+        );
+        let second_page = authority
+            .agent_ownerships(Some(&first_page[1].agent_id), 2)
+            .unwrap();
+        assert_eq!(
+            second_page
+                .iter()
+                .map(|ownership| ownership.agent_id.as_str())
+                .collect::<Vec<_>>(),
+            vec![directory_ids[2].as_str()]
+        );
+        assert!(authority
+            .agent_ownerships(Some("not-a-uuid"), 10)
+            .unwrap_err()
+            .to_string()
+            .contains("invalid ownership page cursor"));
         let first_member = authority
             .membership_snapshot()
             .unwrap()

@@ -130,9 +130,9 @@ compatibility behavior, and transport limits:
 
 The schemas use JSON Schema draft 2020-12 and cover every top-level request,
 reply, and stream-event tag. The authorization/schema regression constructs
-all 87 current syscalls and rejects either a missing schema operation or an
+all 88 current syscalls and rejects either a missing schema operation or an
 undocumented extra. Deterministic golden request arrays cover all 61 v1
-operations and all 87 v2 operations. Domain payload examples and
+operations and all 88 v2 operations. Domain payload examples and
 previous-version shapes are retained under `protocol/`.
 
 ## Compatibility policy
@@ -486,9 +486,11 @@ restart.
 
 ### Authority ownership lease registry
 
-Protocol-v2 trusted-system callers can claim, renew, release, inspect, and audit
-an agent ownership record on the designated authority. A claim names an active
-member and a 5–300 second TTL. The first claim receives fencing token 1.
+Protocol-v2 trusted-system callers can claim, renew, release, inspect, page, and
+audit agent ownership records on the designated authority. Directory pages are
+stable by agent id and include active, expired, and released records so clients
+do not infer ownership from absence. A claim names an active member and a
+5–300 second TTL. The first claim receives fencing token 1.
 Renewal requires the exact active owner/token pair and keeps the token stable.
 Release retains a tombstone. A later claim requires that exact old token, is
 allowed only after release or expiry, and allocates a strictly greater token.
@@ -502,21 +504,30 @@ exact cluster/owner/generation/token envelope for every mutable agent-targeted
 operation. The fenced envelope also supports ordered streams and exact
 cancellation; the destination holds one per-agent admission guard through the
 complete operation. An authenticated authority-discovered `ClusterClient`
-retains its authority connection, claims and installs a fence before publishing
-a newly created route, revalidates authority state before every mutation,
+retains its authority connection, reserves an agent UUID, preinstalls its exact
+fence, creates that UUID only while the proof remains active, and then
+publishes the route. It revalidates authority state before every mutation,
 propagates same-owner renewal generations, and rebuilds only from exact
 authority/fence agreement. Explicit-address clients remain unmanaged for
 compatibility and cannot operate an agent after a fence is installed.
+Discovery and `reconcile_routes` compare the complete authority directory with
+every local listing. They recover an expired exact-owner lease, repair its
+fence, leave live incomplete reservations pending, and safely advance, recheck,
+retire, and release expired reservations with no local agent. Ambiguous or
+duplicate evidence fails closed.
 The initial managed lease is 30 seconds. Long-lived control loops must call
 `ClusterClient::renew_agent_ownership` or
-`ClusterClient::renew_all_agent_ownerships` before expiry; no hidden background
-task masks renewal failures.
+`ClusterClient::renew_all_agent_ownerships` before expiry. Applications that
+need idle routes to remain live can explicitly use the
+`connect_discovered_*_with_maintenance` constructors; those retain the
+authenticated connector in memory, renew leases, republish exact destination
+fences, and expose bounded health through `maintenance_status`.
 
 This is not yet a consensus or partition-tolerant membership and
 mutation-fencing protocol.
 The designated authority is a single consistency point with no quorum failover;
 creation/claim/fence publication is not one atomic cross-database transaction,
-and there is no automatic idle lease-renewal task, automatic migration,
+and there is no automatic migration,
 partition-safe quorum authority, cluster-wide quota transaction, policy/package
 convergence, rolling-upgrade coordinator, or disaster-recovery controller.
 Identity revocation is enforced by discovery, but live TLS client certificate
@@ -534,7 +545,7 @@ Versioned fixtures:
 - `protocol/v2/hello.json`
 - `protocol/v2/typed-error.json`
 - `protocol/v2/describe-protocol-request.json`
-- `protocol/v2/requests.json` (all 87 v2 operations)
+- `protocol/v2/requests.json` (all 88 v2 operations)
 - `protocol/v2/send-message-stream.json`
 - `protocol/v2/stream-event.json`
 - `protocol/v2/stream-completed.json`

@@ -283,16 +283,21 @@ impl AgentManager {
         };
         self.agents.insert(id, agent);
     }
-}
 
-#[async_trait::async_trait]
-impl AgentKernel for AgentManager {
-    async fn create_agent(&self, config: AgentConfig) -> Result<AgentHandle, KernelError> {
-        let agent_id = uuid::Uuid::new_v4();
+    /// Create an agent with a caller-reserved durable identifier.
+    ///
+    /// Cluster placement reserves the identifier in its authority before
+    /// destination creation so every crash boundary has durable evidence.
+    /// The entry API prevents a retry or concurrent caller from overwriting an
+    /// existing runtime agent.
+    pub async fn create_agent_with_id(
+        &self,
+        agent_id: AgentId,
+        config: AgentConfig,
+    ) -> Result<AgentHandle, KernelError> {
         let session_id = uuid::Uuid::new_v4();
         let now = Utc::now();
 
-        // Create agent in Initializing state
         let agent = Agent {
             id: agent_id,
             session_id,
@@ -304,15 +309,16 @@ impl AgentKernel for AgentManager {
             last_activity_at: now,
             metrics: Metrics::default(),
         };
+        match self.agents.entry(agent_id) {
+            dashmap::mapref::entry::Entry::Occupied(_) => {
+                return Err(AgentError::AlreadyExists(agent_id).into());
+            }
+            dashmap::mapref::entry::Entry::Vacant(entry) => {
+                entry.insert(agent);
+            }
+        }
 
-        self.agents.insert(agent_id, agent);
-
-        // Broadcast creation event
         let _ = self.event_tx.send(KernelEvent::AgentCreated(agent_id));
-
-        // Perform initialization with a 5-second timeout.
-        // Context initialization and sandbox assignment are stubbed for now
-        // (will be implemented in later tasks).
         let init_result = tokio::time::timeout(
             tokio::time::Duration::from_secs(INIT_TIMEOUT_SECS),
             self.initialize_agent(agent_id, &config),
@@ -321,17 +327,14 @@ impl AgentKernel for AgentManager {
 
         match init_result {
             Ok(Ok(())) => {
-                // Transition to Running
                 self.transition_state(agent_id, AgentState::Running)?;
             }
-            Ok(Err(e)) => {
-                // Initialization failed — transition to Error
+            Ok(Err(error)) => {
                 let _ = self
-                    .transition_state(agent_id, AgentState::Error(format!("Init failed: {}", e)));
-                return Err(e);
+                    .transition_state(agent_id, AgentState::Error(format!("Init failed: {error}")));
+                return Err(error);
             }
-            Err(_elapsed) => {
-                // Timeout — transition to Error
+            Err(_) => {
                 let _ = self.transition_state(
                     agent_id,
                     AgentState::Error("Initialization timed out".to_string()),
@@ -340,16 +343,20 @@ impl AgentKernel for AgentManager {
             }
         }
 
-        // Create command channel for the agent handle
         let (cmd_tx, _cmd_rx) = tokio::sync::mpsc::channel(32);
-
-        let handle = AgentHandle {
+        Ok(AgentHandle {
             id: agent_id,
             state: AgentState::Running,
             cmd_tx,
-        };
+        })
+    }
+}
 
-        Ok(handle)
+#[async_trait::async_trait]
+impl AgentKernel for AgentManager {
+    async fn create_agent(&self, config: AgentConfig) -> Result<AgentHandle, KernelError> {
+        self.create_agent_with_id(uuid::Uuid::new_v4(), config)
+            .await
     }
 
     async fn pause_agent(&self, agent_id: AgentId) -> Result<(), KernelError> {
@@ -617,6 +624,28 @@ mod tests {
             manager.get_agent_state(handle.id),
             Some(AgentState::Running)
         );
+    }
+
+    #[tokio::test]
+    async fn reserved_agent_id_is_exact_and_cannot_be_overwritten() {
+        let manager = AgentManager::new(16);
+        let reserved = uuid::Uuid::new_v4();
+        let created = manager
+            .create_agent_with_id(reserved, test_config())
+            .await
+            .expect("create reserved id");
+        assert_eq!(created.id, reserved);
+
+        let duplicate = manager
+            .create_agent_with_id(reserved, test_config())
+            .await
+            .expect_err("duplicate reserved id must fail");
+        assert!(matches!(
+            duplicate,
+            KernelError::Agent(AgentError::AlreadyExists(id)) if id == reserved
+        ));
+        assert_eq!(manager.list_agents(None).len(), 1);
+        assert_eq!(manager.get_agent_state(reserved), Some(AgentState::Running));
     }
 
     #[tokio::test]

@@ -7,14 +7,15 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use agent_sdk::{
-    AgentMutationFenceState, ClusterClient, ClusterMemberState, ClusterOwnershipState,
-    KernelClient, NodeAvailability, NodeProfile, Placement, PlacementConstraints, SdkError,
-    WireErrorCode,
+    AgentMutationFenceProof, AgentMutationFenceState, ClusterClient, ClusterMaintenanceConfig,
+    ClusterMemberState, ClusterOwnershipState, KernelClient, NodeAvailability, NodeProfile,
+    Placement, PlacementConstraints, ReservedAgentIdentity, SdkError, WireErrorCode,
 };
 use kernel::syscall_server::SyscallServer;
-use kernel::AgentKernelImpl;
+use kernel::{AgentConfig, AgentKernelImpl, Priority};
 use tokio::task::JoinHandle;
 
 struct TempDb(PathBuf);
@@ -154,6 +155,69 @@ async fn spawn_authenticated_cluster(n: usize, token: &str) -> Vec<String> {
         addrs.push(addr.to_string());
     }
     addrs
+}
+
+struct ManagedCluster {
+    authority_address: String,
+    member_id: String,
+    member_kernel: Arc<AgentKernelImpl>,
+    authority: KernelClient,
+    member: KernelClient,
+    authority_task: JoinHandle<std::io::Result<()>>,
+    member_task: JoinHandle<std::io::Result<()>>,
+}
+
+impl Drop for ManagedCluster {
+    fn drop(&mut self) {
+        self.authority_task.abort();
+        self.member_task.abort();
+    }
+}
+
+async fn spawn_managed_cluster(token: &str) -> ManagedCluster {
+    let authority_kernel = Arc::new(AgentKernelImpl::new().expect("authority kernel"));
+    let authority_server = SyscallServer::bind(authority_kernel, "127.0.0.1:0")
+        .await
+        .expect("bind authority")
+        .with_auth_token(token);
+    let authority_address = authority_server.local_addr().unwrap().to_string();
+    let authority_task = tokio::spawn(authority_server.serve());
+
+    let member_kernel = Arc::new(AgentKernelImpl::new().expect("member kernel"));
+    let member_server = SyscallServer::bind(member_kernel.clone(), "127.0.0.1:0")
+        .await
+        .expect("bind member")
+        .with_auth_token(token);
+    let member_address = member_server.local_addr().unwrap().to_string();
+    let member_task = tokio::spawn(member_server.serve());
+
+    let mut authority = KernelClient::connect(&authority_address)
+        .await
+        .expect("connect authority");
+    authority.authenticate(token).await.expect("auth authority");
+    let mut member = KernelClient::connect(&member_address)
+        .await
+        .expect("connect member");
+    member.authenticate(token).await.expect("auth member");
+    let joined = ClusterClient::admit_node(
+        &mut authority,
+        &mut member,
+        &member_address,
+        None,
+        "managed test member",
+    )
+    .await
+    .expect("admit member");
+
+    ManagedCluster {
+        authority_address,
+        member_id: joined.node_id,
+        member_kernel,
+        authority,
+        member,
+        authority_task,
+        member_task,
+    }
 }
 
 #[tokio::test]
@@ -861,54 +925,38 @@ async fn discovered_cluster_publishes_renews_rebuilds_and_enforces_fenced_routes
 }
 
 #[tokio::test]
-async fn failed_managed_publication_returns_the_created_agent_id_for_reconciliation() {
+async fn failed_managed_destination_creation_retains_a_reconcilable_reservation() {
     let token = "managed-publication-failure-secret";
-    let authority_kernel = Arc::new(AgentKernelImpl::new().expect("authority kernel"));
-    let authority_server = SyscallServer::bind(authority_kernel, "127.0.0.1:0")
-        .await
-        .expect("bind authority")
-        .with_auth_token(token);
-    let authority_address = authority_server.local_addr().unwrap().to_string();
-    let authority_task = tokio::spawn(authority_server.serve());
-
-    let member_kernel = Arc::new(AgentKernelImpl::new().expect("member kernel"));
-    let member_server = SyscallServer::bind(member_kernel, "127.0.0.1:0")
-        .await
-        .expect("bind member")
-        .with_auth_token(token);
-    let member_address = member_server.local_addr().unwrap().to_string();
-    let member_task = tokio::spawn(member_server.serve());
-
-    let mut authority = KernelClient::connect(&authority_address)
-        .await
-        .expect("connect authority");
-    authority.authenticate(token).await.expect("auth authority");
-    let mut member = KernelClient::connect(&member_address)
-        .await
-        .expect("connect member");
-    member.authenticate(token).await.expect("auth member");
-    let joined = ClusterClient::admit_node(
-        &mut authority,
-        &mut member,
-        &member_address,
-        None,
-        "publication failure member",
-    )
-    .await
-    .expect("admit member");
-    let mut cluster = ClusterClient::connect_discovered_authenticated(&authority_address, token)
-        .await
-        .expect("discover before revocation");
-
-    authority
-        .set_cluster_member_state(
-            &joined.node_id,
-            ClusterMemberState::Revoked,
-            joined.generation,
-            "force claim failure after local creation",
+    let mut managed = spawn_managed_cluster(token).await;
+    let mut cluster =
+        ClusterClient::connect_discovered_authenticated(&managed.authority_address, token)
+            .await
+            .expect("discover managed cluster");
+    cluster
+        .create_agent(
+            "quota-fill",
+            "consume the single destination slot",
+            None,
+            None,
+            None,
+            Placement::LeastLoaded,
         )
         .await
-        .expect("revoke authority member");
+        .expect("create first managed agent");
+    let max_agents = managed
+        .member
+        .list_operator_tunables()
+        .await
+        .expect("list destination tunables")
+        .into_iter()
+        .find(|tunable| tunable.name == kernel::operator_control::MAX_AGENTS)
+        .expect("max-agents tunable");
+    managed
+        .member
+        .set_operator_tunable(&max_agents.name, 1, max_agents.revision)
+        .await
+        .expect("limit destination to its current agent");
+
     let error = cluster
         .create_agent(
             "publication-failure",
@@ -919,7 +967,7 @@ async fn failed_managed_publication_returns_the_created_agent_id_for_reconciliat
             Placement::LeastLoaded,
         )
         .await
-        .expect_err("authority claim must fail after local creation");
+        .expect_err("destination quota must fail after authority reservation");
     assert!(
         !error.is_retryable(),
         "partial publication requires reconciliation, never blind replay"
@@ -932,25 +980,337 @@ async fn failed_managed_publication_returns_the_created_agent_id_for_reconciliat
     else {
         panic!("expected route publication error, got {error:?}");
     };
-    assert_eq!(stage, "authority ownership claim");
-    assert_eq!(source.wire_code(), Some(WireErrorCode::PermissionDenied));
+    assert_eq!(stage, "destination agent creation");
+    assert!(source
+        .kernel_message()
+        .is_some_and(|message| message.contains("kernel.max_agents")));
     assert_eq!(cluster.owner_of(&agent_id), None);
-    assert!(authority
+    let reservation = managed
+        .authority
         .cluster_agent_ownership(&agent_id)
         .await
         .expect("inspect authority")
-        .is_none());
-    assert!(member
+        .expect("reservation remains durable");
+    assert_eq!(reservation.owner_node_id, managed.member_id);
+    assert_eq!(reservation.state, ClusterOwnershipState::Active);
+    assert_eq!(
+        reservation.reason,
+        "cluster client pre-creation reservation"
+    );
+    assert!(!managed
+        .member
         .list_agents()
         .await
         .expect("inspect destination")
         .iter()
         .any(|agent| agent.id == agent_id));
+    let report = cluster
+        .reconcile_routes()
+        .await
+        .expect("unexpired reservation remains pending");
+    assert_eq!(report.pending_reservations, 1);
+    assert_eq!(cluster.owner_of(&agent_id), None);
+}
 
-    authority_task.abort();
-    let _ = authority_task.await;
-    member_task.abort();
-    let _ = member_task.await;
+#[tokio::test]
+async fn reconciliation_recovers_an_expired_lease_and_missing_destination_fence() {
+    let token = "managed-reconciliation-secret";
+    let mut managed = spawn_managed_cluster(token).await;
+    let agent_id = uuid::Uuid::new_v4().to_string();
+    let reserved = managed
+        .authority
+        .claim_cluster_agent_ownership(
+            &agent_id,
+            &managed.member_id,
+            5,
+            None,
+            "cluster client pre-creation reservation",
+        )
+        .await
+        .expect("reserve exact agent identity");
+    assert_eq!(
+        managed
+            .member_kernel
+            .create_agent_full_with_id(
+                uuid::Uuid::parse_str(&agent_id).unwrap(),
+                AgentConfig {
+                    name: "crash-recovery".into(),
+                    task: "created before the publisher crashed".into(),
+                    llm_provider: "stub".into(),
+                    permission_profile: "standard".into(),
+                    priority: Priority::new(3).unwrap(),
+                    sandbox_config: None,
+                },
+            )
+            .await
+            .expect("create exact destination agent")
+            .id
+            .to_string(),
+        agent_id
+    );
+    assert!(managed
+        .member
+        .agent_mutation_fence(&agent_id)
+        .await
+        .expect("inspect pre-recovery fence")
+        .is_none());
+
+    let expiry_deadline = tokio::time::Instant::now() + Duration::from_secs(7);
+    loop {
+        match managed
+            .authority
+            .active_cluster_agent_ownership(&agent_id)
+            .await
+        {
+            Err(error) if error.wire_code() == Some(WireErrorCode::Conflict) => break,
+            Ok(_) if tokio::time::Instant::now() < expiry_deadline => {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            Ok(_) => panic!("ownership lease did not expire"),
+            Err(error) => panic!("unexpected ownership read failure: {error}"),
+        }
+    }
+
+    let cluster =
+        ClusterClient::connect_discovered_authenticated(&managed.authority_address, token)
+            .await
+            .expect("reconcile durable route after publisher crash");
+    assert_eq!(
+        cluster.owner_of(&agent_id),
+        Some(managed.member_id.as_str())
+    );
+    let recovered = managed
+        .authority
+        .active_cluster_agent_ownership(&agent_id)
+        .await
+        .expect("recovered ownership is active");
+    assert!(recovered.fencing_token > reserved.fencing_token);
+    assert!(recovered.generation > reserved.generation);
+    let installed = managed
+        .member
+        .agent_mutation_fence(&agent_id)
+        .await
+        .expect("inspect recovered fence")
+        .expect("reconciliation installs destination fence");
+    assert_eq!(installed.owner_node_id, managed.member_id);
+    assert_eq!(installed.fencing_token, recovered.fencing_token);
+    assert_eq!(installed.authority_generation, recovered.generation);
+
+    let duplicate = managed
+        .member
+        .create_agent_with_id(
+            ReservedAgentIdentity {
+                agent_id: agent_id.clone(),
+                ownership_proof: AgentMutationFenceProof {
+                    cluster_id: installed.cluster_id.clone(),
+                    owner_node_id: installed.owner_node_id.clone(),
+                    authority_generation: installed.authority_generation,
+                    fencing_token: installed.fencing_token,
+                },
+            },
+            "duplicate",
+            "must not overwrite recovered state",
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect_err("exact-id retry cannot overwrite an existing agent");
+    assert_eq!(duplicate.wire_code(), Some(WireErrorCode::Conflict));
+    assert!(!duplicate.is_retryable());
+    assert!(duplicate
+        .kernel_message()
+        .is_some_and(|message| message.contains("already exists")));
+}
+
+#[tokio::test]
+async fn reconciliation_releases_an_expired_reservation_without_a_local_agent() {
+    let token = "managed-reservation-cleanup-secret";
+    let mut managed = spawn_managed_cluster(token).await;
+    let agent_id = uuid::Uuid::new_v4().to_string();
+    let cluster_id = managed
+        .authority
+        .cluster_membership()
+        .await
+        .expect("read cluster identity")
+        .cluster_id;
+    let reserved = managed
+        .authority
+        .claim_cluster_agent_ownership(
+            &agent_id,
+            &managed.member_id,
+            5,
+            None,
+            "cluster client pre-creation reservation",
+        )
+        .await
+        .expect("reserve exact agent identity");
+    let stale_proof = AgentMutationFenceProof {
+        cluster_id,
+        owner_node_id: reserved.owner_node_id.clone(),
+        authority_generation: reserved.generation,
+        fencing_token: reserved.fencing_token,
+    };
+
+    let expiry_deadline = tokio::time::Instant::now() + Duration::from_secs(7);
+    loop {
+        match managed
+            .authority
+            .active_cluster_agent_ownership(&agent_id)
+            .await
+        {
+            Err(error) if error.wire_code() == Some(WireErrorCode::Conflict) => break,
+            Ok(_) if tokio::time::Instant::now() < expiry_deadline => {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            Ok(_) => panic!("ownership lease did not expire"),
+            Err(error) => panic!("unexpected ownership read failure: {error}"),
+        }
+    }
+
+    let mut cluster =
+        ClusterClient::connect_discovered_authenticated(&managed.authority_address, token)
+            .await
+            .expect("expired incomplete reservation is reconciled");
+    assert_eq!(cluster.owner_of(&agent_id), None);
+    let released = managed
+        .authority
+        .cluster_agent_ownership(&agent_id)
+        .await
+        .expect("read reconciled ownership")
+        .expect("released tombstone remains durable");
+    assert_eq!(released.state, ClusterOwnershipState::Released);
+    assert!(released.fencing_token > reserved.fencing_token);
+    assert_eq!(
+        released.reason,
+        "release expired incomplete cluster creation"
+    );
+    assert!(!managed
+        .member
+        .list_agents()
+        .await
+        .expect("inspect destination")
+        .iter()
+        .any(|agent| agent.id == agent_id));
+    let retired = managed
+        .member
+        .agent_mutation_fence(&agent_id)
+        .await
+        .expect("inspect reservation fence")
+        .expect("cleanup retains a destination tombstone");
+    assert_eq!(retired.state, AgentMutationFenceState::Retired);
+    assert_eq!(retired.fencing_token, released.fencing_token);
+    let delayed = managed
+        .member
+        .create_agent_with_id(
+            ReservedAgentIdentity {
+                agent_id: agent_id.clone(),
+                ownership_proof: stale_proof,
+            },
+            "delayed-creator",
+            "must not cross cleanup",
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect_err("stale creator must be fenced after cleanup");
+    assert_eq!(delayed.wire_code(), Some(WireErrorCode::Conflict));
+    assert!(!managed
+        .member
+        .list_agents()
+        .await
+        .expect("inspect destination after delayed create")
+        .iter()
+        .any(|agent| agent.id == agent_id));
+    let report = cluster
+        .reconcile_routes()
+        .await
+        .expect("released tombstone is stable on repeated reconciliation");
+    assert_eq!(report, Default::default());
+}
+
+#[tokio::test]
+async fn explicit_automatic_maintenance_renews_idle_routes_and_stops_on_drop() {
+    let token = "managed-automatic-maintenance-secret";
+    let mut managed = spawn_managed_cluster(token).await;
+    let mut cluster = ClusterClient::connect_discovered_authenticated_with_maintenance(
+        &managed.authority_address,
+        token,
+        ClusterMaintenanceConfig {
+            lease_ttl_seconds: 5,
+            renew_interval: Duration::from_secs(1),
+        },
+    )
+    .await
+    .expect("discover with explicit maintenance");
+    let placed = cluster
+        .create_agent(
+            "idle-maintained",
+            "remain fenced while the control plane is idle",
+            None,
+            None,
+            None,
+            Placement::LeastLoaded,
+        )
+        .await
+        .expect("create maintained route");
+    let initial = managed
+        .authority
+        .active_cluster_agent_ownership(&placed.agent_id)
+        .await
+        .expect("initial ownership");
+
+    let renewal_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let status = cluster
+            .maintenance_status()
+            .expect("maintenance status is exposed");
+        if status.successful_renewals > 0 {
+            assert!(status.running);
+            assert_eq!(status.tracked_routes, 1);
+            assert_eq!(status.failed_renewals, 0);
+            assert!(status.last_error.is_none());
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < renewal_deadline,
+            "automatic ownership renewal did not complete: {status:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    let renewed = managed
+        .authority
+        .active_cluster_agent_ownership(&placed.agent_id)
+        .await
+        .expect("idle ownership remains active");
+    assert!(renewed.generation > initial.generation);
+    let renewed_fence = managed
+        .member
+        .agent_mutation_fence(&placed.agent_id)
+        .await
+        .expect("inspect maintained fence")
+        .expect("maintained fence exists");
+    assert_eq!(renewed_fence.authority_generation, renewed.generation);
+    assert_eq!(renewed_fence.fencing_token, renewed.fencing_token);
+
+    drop(cluster);
+    let stop_deadline = tokio::time::Instant::now() + Duration::from_secs(7);
+    loop {
+        match managed
+            .authority
+            .active_cluster_agent_ownership(&placed.agent_id)
+            .await
+        {
+            Err(error) if error.wire_code() == Some(WireErrorCode::Conflict) => break,
+            Ok(_) if tokio::time::Instant::now() < stop_deadline => {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            Ok(_) => panic!("maintenance continued renewing after ClusterClient drop"),
+            Err(error) => panic!("unexpected ownership read failure: {error}"),
+        }
+    }
 }
 
 #[tokio::test]

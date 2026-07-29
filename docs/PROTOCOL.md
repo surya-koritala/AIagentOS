@@ -536,11 +536,13 @@ need idle routes to remain live can explicitly use the
 authenticated connector in memory, renew leases, republish exact destination
 fences, and expose bounded health through `maintenance_status`.
 
-This is not yet a running consensus or partition-tolerant membership and
-mutation-fencing protocol. A durable OpenRaft storage-v2 log, state machine,
-and snapshot substrate exists inside the kernel database, but production does
-not yet construct a Raft node or route these wire operations through it.
-The designated authority is a single consistency point with no quorum failover;
+This is not yet a partition-tolerant production membership and mutation-fencing
+protocol. A durable OpenRaft storage-v2 log/state machine and an executable
+bounded mTLS peer runtime exist inside the kernel. The internal runtime elects,
+replicates, fails over, and catches up a restarted node in a three-node
+regression, but production does not construct it or route these public wire
+operations through it. The designated authority remains a single consistency
+point with no product quorum failover;
 creation/claim/fence publication is not one atomic cross-database transaction,
 and there is no automatic migration,
 partition-safe quorum authority, cluster-wide quota transaction, policy/package
@@ -552,6 +554,30 @@ partitioned cluster is still an operator responsibility. Those remaining
 requirements are tracked by #122.
 The normative object-by-object consistency and failure rules are published in
 [the distributed control-plane contract](DISTRIBUTED_CONTROL_PLANE.md).
+
+## Internal Raft peer protocol
+
+The Raft transport is an internal kernel protocol, not part of the public
+SDK compatibility contract. Each connection carries one length-prefixed JSON
+request and one response over mutual TLS. Version 1 supports OpenRaft
+AppendEntries, Vote, and InstallSnapshot messages.
+
+The request envelope binds the wire version, bounded cluster name, source node
+ID, target node ID, and RPC body. The response reverses the authenticated
+source and target. The listener rejects an unknown version, cluster or target;
+an unknown member; a client leaf fingerprint that does not exactly match that
+member; or a source ID that differs from the vote identity embedded in the RPC.
+The caller validates the server name and CA chain and then independently
+requires the exact server leaf fingerprint recorded for the target member.
+
+The default frame ceiling is 8 MiB and configurable only from 64 KiB through
+64 MiB. Handshake, inbound request, OpenRaft RPC, and response operations are
+timed. The listener bounds concurrent connections (128 by default, hard maximum
+16,384) and drops excess connections without dispatch. Runtime configuration
+also rejects empty or duplicate endpoints, server/client fingerprints, and
+identity keys. The current trusted member map cannot change without restarting
+the runtime; safe quorum-versioned membership changes are still required before
+production wiring.
 
 ## Conformance evidence
 

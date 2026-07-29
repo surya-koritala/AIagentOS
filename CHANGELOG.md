@@ -10,6 +10,22 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
 
 ## [Unreleased]
 
+- Added a durable OpenRaft storage-v2 implementation and an executable internal
+  quorum runtime for the cluster authority foundation. Votes, log and commit
+  pointers, deterministic barrier state, membership, receipts, and snapshots
+  share the encrypted SQLite durability/backup boundary and fail closed on
+  corruption or safety-pointer regression. Bounded versioned Raft RPCs run over
+  mutual TLS with exact server/client leaf binding to stable node IDs. A
+  three-node regression proves election, replication, leader failover, durable
+  restart catch-up, and old-term fencing; negative regressions cover identity
+  spoofing, wrong-but-CA-valid leaves, invalid configuration, and oversized
+  frames. The production server does not start this runtime or route public
+  membership/ownership commands through it yet, so product quorum authority
+  remains pending #122.
+- Fixed service startup deadlines so a configured readiness delay that cannot
+  finish inside the remaining startup budget fails closed deterministically,
+  reclaims the created service agent, and records `startup_timeout`. This
+  removes a timer-boundary race observed on protected macOS CI.
 - Added restart-free TLS certificate and client-trust rotation for the syscall
   server. Operators atomically replace PEM material and then change a bounded
   trigger file; a fully validated configuration is published as one monotonic

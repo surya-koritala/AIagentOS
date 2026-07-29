@@ -10,6 +10,17 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
 
 ## [Unreleased]
 
+- Added real ordered message streaming, exact-request cancellation, and durable
+  checkpoint controls to the desktop client over the public SDK/wire boundary.
+  Streaming, ordinary operator reads, and cancellation use separate
+  authenticated connections so a live turn cannot freeze status refreshes or
+  prevent its own cancellation. The desktop lists checkpoint metadata, resumes
+  an exact checkpoint, and requires the full frozen checkpoint ID before
+  permanent deletion. A loopback regression proves refresh remains responsive
+  during a blocked stream and that cancellation terminates only the exact
+  request. Source and rendered axe tests cover the cancellation and checkpoint
+  controls. Dashboard selection now passes the real agent ID instead of a
+  double-wrapped event payload that left the detail panel empty.
 - Added rendered accessibility regression coverage for the production desktop
   frontend bundle. Lockfile-pinned Playwright Chromium and axe now scan the
   dashboard, operations, settings, and setup states against WCAG A/AA rules and

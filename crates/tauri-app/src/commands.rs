@@ -10,7 +10,7 @@ use crate::{
 use kernel::config::Config;
 use serde::Serialize;
 use std::path::PathBuf;
-use tauri::State;
+use tauri::{ipc::Channel, State};
 use zeroize::Zeroizing;
 
 /// Non-secret configuration that may cross the desktop IPC boundary.
@@ -133,6 +133,41 @@ pub async fn send_message(
 }
 
 #[tauri::command]
+pub async fn stream_message(
+    state: State<'_, AppState>,
+    request_id: String,
+    agent_id: String,
+    message: String,
+    on_event: Channel<agent_sdk::MessageStreamEvent>,
+) -> Result<serde_json::Value, String> {
+    let output = state
+        .client
+        .send_message_stream(request_id, agent_id, message, |event| {
+            let _ = on_event.send(event.clone());
+        })
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(serde_json::json!({
+        "content": output.content,
+        "tool_calls_made": output.tool_calls,
+        "tokens_used": output.tokens,
+    }))
+}
+
+#[tauri::command]
+pub async fn cancel_message(
+    state: State<'_, AppState>,
+    request_id: String,
+    agent_id: String,
+) -> Result<bool, String> {
+    state
+        .client
+        .cancel_request(request_id, agent_id)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
 pub async fn pause_agent(state: State<'_, AppState>, agent_id: String) -> Result<(), String> {
     state
         .client
@@ -157,6 +192,58 @@ pub async fn stop_agent(state: State<'_, AppState>, agent_id: String) -> Result<
         .stop_agent(agent_id)
         .await
         .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn list_checkpoints(
+    state: State<'_, AppState>,
+    agent_id: String,
+) -> Result<serde_json::Value, String> {
+    let checkpoints = state
+        .client
+        .list_generation_checkpoints(agent_id)
+        .await
+        .map_err(|error| error.to_string())?;
+    serde_json::to_value(checkpoints).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn resume_checkpoint(
+    state: State<'_, AppState>,
+    agent_id: String,
+    checkpoint_id: String,
+) -> Result<serde_json::Value, String> {
+    let result = state
+        .client
+        .resume_generation_checkpoint(agent_id, checkpoint_id)
+        .await
+        .map_err(|error| error.to_string())?;
+    serde_json::to_value(result).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn delete_checkpoint(
+    state: State<'_, AppState>,
+    agent_id: String,
+    checkpoint_id: String,
+    confirm_checkpoint_id: String,
+) -> Result<bool, String> {
+    validate_checkpoint_deletion_confirmation(&checkpoint_id, &confirm_checkpoint_id)?;
+    state
+        .client
+        .delete_generation_checkpoint(agent_id, checkpoint_id)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+fn validate_checkpoint_deletion_confirmation(
+    checkpoint_id: &str,
+    confirmation: &str,
+) -> Result<(), String> {
+    if checkpoint_id != confirmation {
+        return Err("checkpoint deletion confirmation must exactly match the checkpoint ID".into());
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -455,6 +542,23 @@ mod tests {
         assert!(
             !manifest.contains("\"devtools\""),
             "production desktop builds must not enable Tauri devtools"
+        );
+    }
+
+    #[test]
+    fn checkpoint_deletion_requires_the_exact_target_in_the_backend() {
+        assert!(validate_checkpoint_deletion_confirmation(
+            "11111111-2222-4333-8444-555555555555",
+            "11111111-2222-4333-8444-555555555555"
+        )
+        .is_ok());
+        assert_eq!(
+            validate_checkpoint_deletion_confirmation(
+                "11111111-2222-4333-8444-555555555555",
+                "11111111-2222-4333-8444-555555555556"
+            )
+            .unwrap_err(),
+            "checkpoint deletion confirmation must exactly match the checkpoint ID"
         );
     }
 }

@@ -1,5 +1,5 @@
 <script>
-  import { invoke } from '@tauri-apps/api/core';
+  import { Channel, invoke } from '@tauri-apps/api/core';
   import { createEventDispatcher } from 'svelte';
 
   export let agentId = null;
@@ -8,6 +8,9 @@
   let messages = [];
   let input = '';
   let loading = false;
+  let activeRequest = null;
+  let cancelPending = false;
+  let streamStatus = '';
   let messagesEl;
 
   $: if (messagesEl) {
@@ -17,26 +20,104 @@
   async function sendMessage() {
     if (!input.trim() || !agentId || loading) return;
     const userMsg = input.trim();
+    const requestAgentId = agentId;
+    const requestId = crypto.randomUUID();
     input = '';
-    messages = [...messages, { role: 'user', content: userMsg }];
+    messages = [
+      ...messages,
+      { role: 'user', content: userMsg },
+      {
+        role: 'assistant',
+        content: '',
+        toolCalls: 0,
+        requestId,
+        streaming: true,
+      },
+    ];
     loading = true;
+    activeRequest = { requestId, agentId: requestAgentId };
+    streamStatus = 'Starting streamed turn…';
     const operation = 'waiting for agent turn';
     dispatch('operation', { label: operation, active: true });
 
+    const onEvent = new Channel();
+    onEvent.onmessage = event => {
+      if (!activeRequest || activeRequest.requestId !== requestId) return;
+      if (event.event === 'started') {
+        streamStatus = 'Agent turn started';
+      } else if (event.event === 'token') {
+        updateStreamMessage(requestId, message => ({
+          ...message,
+          content: message.content + event.delta,
+        }));
+        streamStatus = 'Receiving response…';
+      } else if (event.event === 'tool_call_started') {
+        streamStatus = `Running tool: ${event.name}`;
+      } else if (event.event === 'tool_call_completed') {
+        updateStreamMessage(requestId, message => ({
+          ...message,
+          toolCalls: message.toolCalls + 1,
+        }));
+        streamStatus = `Tool completed: ${event.name}`;
+      } else if (event.event === 'context_pressure') {
+        streamStatus = `Context ${event.active_tokens}/${event.budget_tokens} tokens`;
+      }
+    };
+
     try {
-      const response = await invoke('send_message', { agentId, message: userMsg });
-      messages = [...messages, {
-        role: 'assistant',
+      const response = await invoke('stream_message', {
+        requestId,
+        agentId: requestAgentId,
+        message: userMsg,
+        onEvent,
+      });
+      updateStreamMessage(requestId, message => ({
+        ...message,
         content: response.content,
         toolCalls: response.tool_calls_made,
         tokens: response.tokens_used,
-      }];
+        streaming: false,
+      }));
       dispatch('messageSent');
     } catch (e) {
-      messages = [...messages, { role: 'error', content: String(e) }];
+      updateStreamMessage(requestId, message => ({
+        ...message,
+        role: 'error',
+        content: String(e),
+        streaming: false,
+      }));
     } finally {
       loading = false;
+      activeRequest = null;
+      cancelPending = false;
+      streamStatus = '';
       dispatch('operation', { label: operation, active: false });
+    }
+  }
+
+  function updateStreamMessage(requestId, update) {
+    messages = messages.map(message =>
+      message.requestId === requestId ? update(message) : message
+    );
+  }
+
+  async function cancelMessage() {
+    if (!activeRequest || cancelPending) return;
+    const target = activeRequest;
+    cancelPending = true;
+    streamStatus = 'Requesting cancellation…';
+    try {
+      const accepted = await invoke('cancel_message', {
+        requestId: target.requestId,
+        agentId: target.agentId,
+      });
+      streamStatus = accepted
+        ? 'Cancellation accepted; waiting for the terminal response…'
+        : 'The turn already completed or is no longer active.';
+    } catch (error) {
+      streamStatus = `Cancellation failed: ${String(error)}`;
+    } finally {
+      cancelPending = false;
     }
   }
 
@@ -79,7 +160,7 @@
           <div class="avatar" aria-hidden="true">🤖</div>
           <div class="bubble">
             <div class="thinking">
-              <span class="dot-pulse" aria-hidden="true"></span> Agent is thinking…
+              <span class="dot-pulse" aria-hidden="true"></span> {streamStatus || 'Agent is thinking…'}
             </div>
           </div>
         </div>
@@ -95,9 +176,15 @@
         rows="1"
         disabled={loading}
       ></textarea>
-      <button aria-label="Send message" on:click={sendMessage} disabled={loading || !input.trim()}>
-        <span aria-hidden="true">↑</span>
-      </button>
+      {#if loading}
+        <button class="cancel-button" on:click={cancelMessage} disabled={cancelPending}>
+          {cancelPending ? 'Cancelling…' : 'Cancel turn'}
+        </button>
+      {:else}
+        <button class="send-button" aria-label="Send message" on:click={sendMessage} disabled={!input.trim()}>
+          <span aria-hidden="true">↑</span>
+        </button>
+      {/if}
     </div>
   {/if}
 </div>
@@ -126,7 +213,10 @@
   textarea { flex: 1; min-height: 44px; resize: none; padding: 0.65rem 1rem; border-radius: 10px; border: 1px solid #66667a; background: #1a1a2e; color: #eee; font-size: 0.9rem; font-family: inherit; line-height: 1.4; }
   textarea:focus { border-color: #8bc5ff; }
   textarea:disabled { opacity: 0.5; }
-  button { min-width: 44px; min-height: 44px; border-radius: 10px; border: none; background: #3276bd; color: white; cursor: pointer; font-size: 1.1rem; display: flex; align-items: center; justify-content: center; align-self: flex-end; }
+  button { min-width: 44px; min-height: 44px; border-radius: 10px; border: none; color: white; cursor: pointer; display: flex; align-items: center; justify-content: center; align-self: flex-end; }
+  .send-button { background: #3276bd; font-size: 1.1rem; }
+  .cancel-button { background: #7f1d1d; border: 1px solid #dc2626; padding: 0.5rem 0.85rem; white-space: nowrap; }
   button:disabled { opacity: 0.3; cursor: not-allowed; }
-  button:hover:not(:disabled) { background: #5a9fe9; }
+  .send-button:hover:not(:disabled) { background: #5a9fe9; }
+  .cancel-button:hover:not(:disabled) { background: #991b1b; }
 </style>

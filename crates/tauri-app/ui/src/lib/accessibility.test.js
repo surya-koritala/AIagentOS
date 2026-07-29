@@ -48,11 +48,37 @@ test('setup and chat controls retain names and modal keyboard containment', () =
 
 test('primary navigation exposes current state and no fabricated activity', () => {
   const sidebar = source('Sidebar.svelte');
+  const dashboard = source('Dashboard.svelte');
   const status = source('AgentStatus.svelte');
 
   assert.match(sidebar, /<nav aria-label="Primary">/);
   assert.match(sidebar, /aria-current=/);
   assert.match(sidebar, /aria-label=\{showNewAgent/);
+  assert.match(dashboard, /dispatch\('select', agent\.id\)/);
+  assert.doesNotMatch(dashboard, /dispatch\('select', \{ detail:/);
   assert.match(status, /This view is not an event history\./);
   assert.doesNotMatch(status, /simulated|time:\s*['"]now['"]|Activity Feed/i);
+});
+
+test('stream cancellation and checkpoint deletion retain explicit target contracts', () => {
+  const chat = source('ChatPanel.svelte');
+  const detail = source('AgentDetail.svelte');
+
+  assert.match(chat, /new Channel\(\)/);
+  assert.match(chat, /invoke\('stream_message'/);
+  assert.match(chat, /invoke\('cancel_message'/);
+  assert.match(chat, /requestId: target\.requestId/);
+  assert.match(chat, /agentId: target\.agentId/);
+  assert.match(chat, /Cancel turn/);
+
+  assert.match(detail, /invoke\('list_checkpoints'/);
+  assert.match(detail, /invoke\('resume_checkpoint'/);
+  assert.match(detail, /invoke\('delete_checkpoint'/);
+  assert.match(detail, /confirmCheckpointId: checkpointDeleteConfirmation/);
+  assert.match(detail, /Type the exact checkpoint\s+ID to continue/);
+  assert.match(
+    detail,
+    /checkpointDeleteConfirmation !== pendingCheckpointDelete\.checkpointId/,
+  );
+  assert.match(detail, /const targetAgentId = pendingCheckpointDelete\.agentId/);
 });

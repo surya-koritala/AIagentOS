@@ -24,6 +24,12 @@ The Rust SDK exposes `pause_agent_durable`, `resume_agent_durable`,
 `delete_generation_checkpoint`. The simpler `pause_agent`/`resume_agent`
 helpers retain their state-only return type.
 
+The desktop exposes the same list, explicit resume, and explicit delete calls
+through its `KernelClient` backend. It renders only the non-sensitive metadata
+above. Deletion freezes both the agent and checkpoint identifiers selected by
+the operator and stays disabled until the full checkpoint ID is typed exactly;
+changing the visible selection cannot retarget the pending mutation.
+
 ## What “pause” means
 
 - Hosted request/response APIs pause at a request boundary. If cancellation wins

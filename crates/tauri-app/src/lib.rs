@@ -8,8 +8,8 @@
 use std::sync::Arc;
 
 use agent_sdk::{
-    AgentEnforcementInfo, ConnectionProfile, GenerationCheckpointSummary, KernelClient,
-    LifecycleResult, MessageResult, MessageStreamEvent, OperatorAgentSnapshot,
+    AgentEnforcementInfo, ConnectionProfile, GenerationCheckpointSummary, InstalledPackage,
+    KernelClient, LifecycleResult, MessageResult, MessageStreamEvent, OperatorAgentSnapshot,
     OperatorCgroupSnapshot, OperatorPackageSnapshot, OperatorServiceSnapshot, OperatorSnapshot,
     OperatorTunable, OperatorTunableAudit, ProviderSummary, SdkError, ServiceHistoryEntry,
     ServiceRuntimeInfo,
@@ -85,6 +85,17 @@ pub struct DesktopPackage {
     pub profile: String,
     pub loaded_at: String,
     pub agent_state: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DesktopInstalledPackage {
+    pub name: String,
+    pub version: String,
+    pub digest: String,
+    pub publisher: String,
+    pub description: String,
+    pub installed_at: String,
+    pub lock_package_count: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -169,6 +180,7 @@ pub struct DesktopOperatorView {
     pub agents_truncated: bool,
     pub providers: Vec<DesktopProvider>,
     pub packages: Vec<DesktopPackage>,
+    pub installed_packages: Option<Vec<DesktopInstalledPackage>>,
     pub services: Option<Vec<DesktopService>>,
     pub tunables: Option<Vec<DesktopTunable>>,
     pub scoped_gate: DesktopGateView,
@@ -178,7 +190,11 @@ pub struct DesktopOperatorView {
 }
 
 impl DesktopOperatorView {
-    fn from_operator_snapshot(snapshot: OperatorSnapshot, reconnect_generation: u64) -> Self {
+    fn from_operator_snapshot(
+        snapshot: OperatorSnapshot,
+        reconnect_generation: u64,
+        installed_packages: Option<Vec<InstalledPackage>>,
+    ) -> Self {
         let metrics = DesktopMetricsView::try_from_operator_snapshot(&snapshot).ok();
         let mut warnings = Vec::new();
         if metrics.is_none() {
@@ -206,6 +222,12 @@ impl DesktopOperatorView {
                 snapshot.total_visible_agents
             ));
         }
+        if installed_packages.is_none() {
+            warnings.push(
+                "Installed package state is unavailable for this refresh; no empty package list was invented."
+                    .to_string(),
+            );
+        }
         Self {
             captured_at: snapshot.captured_at,
             consistency: snapshot.consistency,
@@ -229,6 +251,12 @@ impl DesktopOperatorView {
                 .into_iter()
                 .map(DesktopPackage::from)
                 .collect(),
+            installed_packages: installed_packages.map(|packages| {
+                packages
+                    .into_iter()
+                    .map(DesktopInstalledPackage::from)
+                    .collect()
+            }),
             services: snapshot
                 .services
                 .map(|services| services.into_iter().map(DesktopService::from).collect()),
@@ -322,6 +350,20 @@ impl From<OperatorPackageSnapshot> for DesktopPackage {
             profile: package.profile,
             loaded_at: package.loaded_at,
             agent_state: package.agent_state,
+        }
+    }
+}
+
+impl From<InstalledPackage> for DesktopInstalledPackage {
+    fn from(package: InstalledPackage) -> Self {
+        Self {
+            name: package.name,
+            version: package.version.to_string(),
+            digest: package.digest,
+            publisher: package.manifest.publisher,
+            description: package.manifest.description,
+            installed_at: package.installed_at,
+            lock_package_count: package.lock.packages.len(),
         }
     }
 }
@@ -711,10 +753,73 @@ impl DesktopClient {
     pub async fn operator_view(&self) -> Result<DesktopOperatorView, SdkError> {
         let mut client = self.inner.lock().await;
         let snapshot = client.operator_snapshot().await?;
+        let snapshot_generation = client.reconnect_generation();
+        let installed_packages = client.list_installed_packages().await.ok();
+        let reconnect_generation = client.reconnect_generation();
+        let installed_packages = (snapshot_generation == reconnect_generation)
+            .then_some(installed_packages)
+            .flatten();
         Ok(DesktopOperatorView::from_operator_snapshot(
             snapshot,
-            client.reconnect_generation(),
+            reconnect_generation,
+            installed_packages,
         ))
+    }
+
+    pub async fn list_installed_packages(&self) -> Result<Vec<DesktopInstalledPackage>, SdkError> {
+        Ok(self
+            .inner
+            .lock()
+            .await
+            .list_installed_packages()
+            .await?
+            .into_iter()
+            .map(DesktopInstalledPackage::from)
+            .collect())
+    }
+
+    pub async fn install_package(
+        &self,
+        name: impl Into<String>,
+        requirement: impl Into<String>,
+    ) -> Result<DesktopInstalledPackage, SdkError> {
+        self.inner
+            .lock()
+            .await
+            .install_package(name, requirement)
+            .await
+            .map(DesktopInstalledPackage::from)
+    }
+
+    pub async fn run_installed_package(&self, name: impl Into<String>) -> Result<String, SdkError> {
+        self.inner.lock().await.run_installed_package(name).await
+    }
+
+    pub async fn rollback_installed_package_exact(
+        &self,
+        name: impl Into<String>,
+        expected_version: impl Into<String>,
+        expected_digest: impl Into<String>,
+    ) -> Result<DesktopInstalledPackage, SdkError> {
+        self.inner
+            .lock()
+            .await
+            .rollback_package_exact(name, expected_version, expected_digest)
+            .await
+            .map(DesktopInstalledPackage::from)
+    }
+
+    pub async fn remove_installed_package_exact(
+        &self,
+        name: impl Into<String>,
+        expected_version: impl Into<String>,
+        expected_digest: impl Into<String>,
+    ) -> Result<(), SdkError> {
+        self.inner
+            .lock()
+            .await
+            .remove_package_exact(name, expected_version, expected_digest)
+            .await
     }
 
     pub async fn list_agents(&self) -> Result<Vec<DesktopAgent>, SdkError> {
@@ -756,6 +861,7 @@ pub struct AppState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agent_sdk::{PackageArchive, PackagePayload, PackageSigningKey};
     use kernel::auth::Role;
     use kernel::connector::{
         LlmProviderAdapter, LlmRequestOptions, LlmResponse, LlmSession, ProviderCapabilities,
@@ -880,6 +986,40 @@ mod tests {
             policy: ServicePolicyConfig::default(),
             health: HealthConfig::default(),
         }
+    }
+
+    fn desktop_package_payload(name: &str, version: &str, publisher: &str) -> PackagePayload {
+        serde_json::from_value(serde_json::json!({
+            "schema_version": 1,
+            "package": {
+                "name": name,
+                "version": version,
+                "description": "Desktop exact package mutation regression",
+                "publisher": publisher,
+                "license": "AGPL-3.0-only",
+                "dependencies": [],
+                "capabilities_required": ["CAP_FILE_READ"],
+                "tools_required": []
+            },
+            "agent": {
+                "name": name,
+                "description": "Runs through normal tenant admission",
+                "task": "prove desktop signed package lifecycle",
+                "entry": "start",
+                "provider": "stub",
+                "profile": "read-only",
+                "priority": 3,
+                "nice": null,
+                "tools": [],
+                "memory": []
+            },
+            "files": [],
+            "sbom": {
+                "format": "SPDX-2.3",
+                "components": []
+            }
+        }))
+        .expect("valid desktop package fixture")
     }
 
     #[tokio::test]
@@ -1146,6 +1286,99 @@ mod tests {
         assert_eq!(rolled_back.revision, changed.revision + 1);
     }
 
+    #[tokio::test]
+    async fn desktop_package_controls_use_exact_public_wire_mutations() {
+        let kernel = Arc::new(AgentKernelImpl::new().expect("kernel"));
+        let tenant = kernel.create_tenant("desktop-packages").await.unwrap();
+        let admin = kernel
+            .register_user(
+                &tenant,
+                "desktop-package-admin",
+                "desktop-packages@example.invalid",
+                Role::Admin,
+            )
+            .await
+            .unwrap();
+        let token = kernel
+            .issue_api_key(&admin, "desktop-package-admin")
+            .await
+            .unwrap();
+        let server = SyscallServer::bind(Arc::clone(&kernel), "127.0.0.1:0")
+            .await
+            .expect("bind package server");
+        let address = server.local_addr().expect("package server address");
+        tokio::spawn(server.serve());
+        let client = DesktopClient::connect(&address.to_string(), Some(&token))
+            .await
+            .expect("tenant desktop");
+
+        let (signer, _) = PackageSigningKey::generate(&admin, "desktop-release").unwrap();
+        client
+            .inner
+            .lock()
+            .await
+            .trust_package_key(
+                &admin,
+                signer.key_id(),
+                &signer.public_key(),
+                "2020-01-01T00:00:00Z",
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        for version in ["1.0.0", "2.0.0"] {
+            let archive = PackageArchive::sign(
+                desktop_package_payload("desktop-runner", version, &admin),
+                &signer,
+            )
+            .unwrap();
+            client
+                .inner
+                .lock()
+                .await
+                .publish_package(&archive)
+                .await
+                .unwrap();
+        }
+
+        let reviewed = client
+            .install_package("desktop-runner", "=1.0.0")
+            .await
+            .unwrap();
+        let view = client.operator_view().await.unwrap();
+        assert_eq!(
+            view.installed_packages
+                .as_ref()
+                .expect("installed package view")[0]
+                .version,
+            "1.0.0"
+        );
+        let changed = client
+            .install_package("desktop-runner", "=2.0.0")
+            .await
+            .unwrap();
+        client
+            .rollback_installed_package_exact("desktop-runner", reviewed.version, reviewed.digest)
+            .await
+            .expect_err("stale desktop package confirmation must fail closed");
+        let restored = client
+            .rollback_installed_package_exact("desktop-runner", changed.version, changed.digest)
+            .await
+            .unwrap();
+        assert_eq!(restored.version, "1.0.0");
+        let agent_id = client
+            .run_installed_package("desktop-runner")
+            .await
+            .unwrap();
+        assert!(!agent_id.is_empty());
+        client
+            .remove_installed_package_exact("desktop-runner", restored.version, restored.digest)
+            .await
+            .unwrap();
+        assert!(client.list_installed_packages().await.unwrap().is_empty());
+    }
+
     #[test]
     fn scoped_operator_view_is_partial_instead_of_inventing_global_zeroes() {
         let snapshot = OperatorSnapshot {
@@ -1166,7 +1399,7 @@ mod tests {
             global_spend_usd: None,
         };
 
-        let view = DesktopOperatorView::from_operator_snapshot(snapshot, 3);
+        let view = DesktopOperatorView::from_operator_snapshot(snapshot, 3, Some(Vec::new()));
         assert_eq!(view.reconnect_generation, 3);
         assert!(view.metrics.is_none());
         assert!(view.services.is_none());
@@ -1237,7 +1470,7 @@ mod tests {
             global_spend_usd: None,
         };
 
-        let view = DesktopOperatorView::from_operator_snapshot(snapshot, 0);
+        let view = DesktopOperatorView::from_operator_snapshot(snapshot, 0, Some(Vec::new()));
         assert_eq!(view.scope, "global");
         assert_eq!(view.providers[0].id, "stub");
         assert_eq!(view.packages[0].name, "reviewer");

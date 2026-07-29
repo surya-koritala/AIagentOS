@@ -114,3 +114,23 @@ test('operator tunables retain revision bounds, exact rollback target, and audit
   assert.match(status, /Target revision\|exact tunable name/);
   assert.match(status, /another operator changes the revision first/);
 });
+
+test('signed package controls freeze version and digest on the public command boundary', () => {
+  const status = source('AgentStatus.svelte');
+
+  assert.match(status, /invoke\('install_package'/);
+  assert.match(status, /invoke\('run_installed_package'/);
+  assert.match(status, /invoke\('rollback_installed_package'/);
+  assert.match(status, /invoke\('remove_installed_package'/);
+  assert.match(status, /const frozenTarget = \{ \.\.\.pendingPackageControl \}/);
+  assert.match(status, /expectedVersion: frozenTarget\.version/);
+  assert.match(status, /expectedDigest: frozenTarget\.digest/);
+  assert.match(status, /confirmPackageTarget: packageConfirmation/);
+  assert.match(
+    status,
+    /packageConfirmation !== `\$\{pendingPackageControl\.version\}\|\$\{pendingPackageControl\.name\}`/,
+  );
+  assert.match(status, /Version\|exact package name/);
+  assert.match(status, /rejects a concurrent change/);
+  assert.match(status, /prevents new runs from this package/);
+});

@@ -10,6 +10,13 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
 
 ## [Unreleased]
 
+- Added signed-package install/upgrade, run, rollback, removal, and honest
+  installed-state projection to the desktop Operations view over `KernelClient`.
+  Rollback and removal freeze the displayed package name, version, digest, and
+  publisher; require exact `version|name` confirmation; and submit the frozen
+  version and digest to the transaction-bound wire operation. Backend loopback,
+  IPC validation, reducer, source-contract, rendered interaction, axe, and
+  capability-registry regressions retain the flow and stale-target refusal.
 - Added signed-package install/upgrade, run, rollback, removal, and installed
   state to the TUI over `KernelClient`. Rollback and removal freeze the
   displayed name, version, and digest, require exact `version|name`

@@ -73,6 +73,15 @@ name, version, and digest. The `rollback_package_exact` and
 same immediate SQLite transaction as the mutation; a concurrent upgrade fails
 as stale instead of retargeting the operator's approval.
 
+The desktop Operations view uses the same package operations and never invokes
+the registry in process. Installed package state is explicitly unavailable
+rather than replaced with an empty list when its public read fails or a
+reconnect occurs between the atomic operator snapshot and package read.
+Rollback/removal freeze the displayed name, version, digest, and publisher,
+require exact `version|name` confirmation, and send the frozen version and
+digest to the transaction-bound mutation. A refreshed row therefore cannot
+retarget an open confirmation, and a concurrent change fails stale.
+
 The desktop service controls are another focused projection of the same
 contract. Start, stop, restart, and bounded transition-history requests pass
 through `KernelClient` on the authenticated public-wire connection. Stop and

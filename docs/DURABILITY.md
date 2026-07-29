@@ -86,8 +86,10 @@ protection, durable-pointer monotonicity, and malformed-record rejection run in
 the kernel test suite. The separate `cluster_runtime` module executes this
 storage behind bounded mTLS peer RPCs; a three-node regression covers election,
 replication, leader failover, restart catch-up, and old-term fencing. The
-production server still does not construct that runtime or route public
-authority commands through it, so this is not a product quorum-authority claim.
+production server now constructs and owns that runtime when its strict
+`[cluster_raft]` configuration is enabled, but it still does not route public
+authority commands through the replicated state machine. This is therefore not
+a product quorum-authority claim.
 
 ## Authenticated accounting integrity
 

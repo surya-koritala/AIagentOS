@@ -19,6 +19,8 @@
 //!   AGENT_SERVER_TLS_RELOAD_TRIGGER=/run/agentos/tls.reload
 //!                                       # atomically trigger live TLS reload
 //!   AGENT_SERVER_ALLOW_INSECURE_REMOTE=1 # explicit development-only override
+//!   AGENT_SERVER_CONFIG=/etc/agentos/config.toml
+//!                                       # explicit absolute operator config
 
 #[path = "../logging.rs"]
 mod logging;
@@ -26,6 +28,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use agent_cli::providers::register_providers;
+use kernel::cluster_runtime::start_configured_cluster_runtime;
 use kernel::config::Config;
 use kernel::syscall_server::{SyscallServer, TlsReloadHandle};
 use kernel::AgentKernelImpl;
@@ -170,7 +173,21 @@ async fn main() {
         }
     }
 
-    let config = match Config::try_load() {
+    let explicit_config = std::env::var_os("AGENT_SERVER_CONFIG")
+        .filter(|path| !path.is_empty())
+        .map(std::path::PathBuf::from);
+    if explicit_config
+        .as_deref()
+        .is_some_and(|path| !path.is_absolute())
+    {
+        eprintln!("agent-server: AGENT_SERVER_CONFIG must be an absolute path");
+        std::process::exit(1);
+    }
+    let loaded_config = match explicit_config.as_deref() {
+        Some(path) => Config::try_load_from(path),
+        None => Config::try_load(),
+    };
+    let config = match loaded_config {
         Ok(config) => config,
         Err(error) => {
             tracing::error!(error = %error, "failed to load configuration");
@@ -193,6 +210,26 @@ async fn main() {
             std::process::exit(1);
         }
     };
+    let cluster_runtime = match start_configured_cluster_runtime(
+        kernel.context_manager.clone(),
+        &config.cluster_raft,
+    )
+    .await
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            tracing::error!(error = %error, "cluster Raft startup failed");
+            eprintln!("agent-server: cluster Raft startup failed: {error}");
+            std::process::exit(1);
+        }
+    };
+    if let Some(runtime) = cluster_runtime.as_ref() {
+        eprintln!(
+            "agent-server: cluster Raft node {} listening on {}",
+            runtime.node_id(),
+            runtime.local_addr()
+        );
+    }
     // Make SendMessage syscalls functional against the configured backend.
     register_providers(&kernel, &config);
     if config.service_dir.is_some() {
@@ -338,9 +375,36 @@ async fn main() {
         }
     }
 
-    if let Err(e) = server.serve().await {
+    let serve_result = tokio::select! {
+        result = server.serve() => result,
+        result = shutdown_signal() => result,
+    };
+    if let Some(runtime) = cluster_runtime {
+        if let Err(error) = runtime.shutdown().await {
+            tracing::error!(error = %error, "cluster Raft shutdown failed");
+            eprintln!("agent-server: cluster Raft shutdown failed: {error}");
+            std::process::exit(1);
+        }
+    }
+    if let Err(e) = serve_result {
         eprintln!("agent-server: serve error: {e}");
         std::process::exit(1);
+    }
+}
+
+async fn shutdown_signal() -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => result,
+            _ = terminate.recv() => Ok(()),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c().await
     }
 }
 

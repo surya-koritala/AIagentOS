@@ -15,9 +15,10 @@ The durable OpenRaft storage-v2 implementation in
 `crates/kernel/src/cluster_consensus.rs` and the bounded mTLS peer/election
 runtime in `crates/kernel/src/cluster_runtime.rs` form an executable internal
 quorum foundation. The product still uses the designated single SQLite
-authority: `agent-server` does not construct the Raft runtime, membership is
-static inside a running Raft process, and public membership/ownership syscalls
-are not routed through the replicated state machine.
+authority: `agent-server` can construct the Raft runtime from strict,
+default-off operator configuration, but membership is static inside a running
+Raft process and public membership/ownership syscalls are not routed through
+the replicated state machine.
 
 ---
 

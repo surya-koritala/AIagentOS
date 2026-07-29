@@ -540,8 +540,9 @@ This is not yet a partition-tolerant production membership and mutation-fencing
 protocol. A durable OpenRaft storage-v2 log/state machine and an executable
 bounded mTLS peer runtime exist inside the kernel. The internal runtime elects,
 replicates, fails over, and catches up a restarted node in a three-node
-regression, but production does not construct it or route these public wire
-operations through it. The designated authority remains a single consistency
+regression. `agent-server` now starts and cleanly stops that runtime when strict
+`[cluster_raft]` configuration is enabled, but these public wire operations are
+not routed through it. The designated authority remains a single consistency
 point with no product quorum failover;
 creation/claim/fence publication is not one atomic cross-database transaction,
 and there is no automatic migration,
@@ -576,8 +577,9 @@ timed. The listener bounds concurrent connections (128 by default, hard maximum
 16,384) and drops excess connections without dispatch. Runtime configuration
 also rejects empty or duplicate endpoints, server/client fingerprints, and
 identity keys. The current trusted member map cannot change without restarting
-the runtime; safe quorum-versioned membership changes are still required before
-production wiring.
+the runtime. Startup rejects any configured map that differs from durable
+membership; safe quorum-versioned membership changes are still required before
+public authority cutover.
 
 ## Conformance evidence
 

@@ -1,6 +1,7 @@
 //! Configuration management — TOML-based persistent config.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -71,6 +72,8 @@ pub enum ConfigLoadError {
     Backup { path: PathBuf, message: String },
     #[error("invalid storage-encryption configuration in {path}: {message}")]
     StorageEncryption { path: PathBuf, message: String },
+    #[error("invalid cluster-Raft configuration in {path}: {message}")]
+    ClusterRaft { path: PathBuf, message: String },
 }
 
 /// Whole-database encryption policy for the kernel-owned SQLite store.
@@ -224,6 +227,296 @@ impl BackupScheduleConfig {
     }
 }
 
+/// One statically trusted peer in the initial Raft membership.
+///
+/// These values are copied into the quorum-versioned OpenRaft membership.
+/// Exact server and client certificate fingerprints bind every transport role
+/// to one node id in addition to the normal CA-backed TLS validation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClusterRaftMemberConfig {
+    pub node_id: u64,
+    pub endpoint: String,
+    pub server_name: String,
+    pub tls_certificate_sha256: String,
+    pub tls_client_certificate_sha256: String,
+    pub identity_public_key: String,
+}
+
+/// Production daemon configuration for the authenticated OpenRaft runtime.
+///
+/// The runtime is disabled by default so existing single-node installations
+/// remain compatible. Enabling it requires an exact static membership and five
+/// absolute PEM paths. `bootstrap` may be used for a pristine cluster; on
+/// restart it verifies the durable membership instead of creating a second
+/// cluster.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ClusterRaftConfig {
+    pub enabled: bool,
+    pub bootstrap: bool,
+    pub node_id: u64,
+    pub listen_addr: String,
+    pub cluster_name: String,
+    pub members: Vec<ClusterRaftMemberConfig>,
+    pub server_certificate_path: Option<PathBuf>,
+    pub server_private_key_path: Option<PathBuf>,
+    pub client_certificate_path: Option<PathBuf>,
+    pub client_private_key_path: Option<PathBuf>,
+    pub peer_ca_path: Option<PathBuf>,
+    pub handshake_timeout_ms: u64,
+    pub inbound_request_timeout_ms: u64,
+    pub max_frame_bytes: usize,
+    pub max_in_flight_connections: usize,
+    pub heartbeat_interval_ms: u64,
+    pub election_timeout_min_ms: u64,
+    pub election_timeout_max_ms: u64,
+    pub install_snapshot_timeout_ms: u64,
+    pub max_payload_entries: u64,
+}
+
+impl Default for ClusterRaftConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            bootstrap: false,
+            node_id: 0,
+            listen_addr: "127.0.0.1:8788".into(),
+            cluster_name: "ai-agent-os".into(),
+            members: Vec::new(),
+            server_certificate_path: None,
+            server_private_key_path: None,
+            client_certificate_path: None,
+            client_private_key_path: None,
+            peer_ca_path: None,
+            handshake_timeout_ms: 5_000,
+            inbound_request_timeout_ms: 15_000,
+            max_frame_bytes: 8 * 1024 * 1024,
+            max_in_flight_connections: 128,
+            heartbeat_interval_ms: 100,
+            election_timeout_min_ms: 500,
+            election_timeout_max_ms: 1_000,
+            install_snapshot_timeout_ms: 10_000,
+            max_payload_entries: 300,
+        }
+    }
+}
+
+impl ClusterRaftConfig {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.bootstrap && !self.enabled {
+            return Err("cluster_raft.bootstrap requires cluster_raft.enabled = true".into());
+        }
+        if !self.enabled {
+            return Ok(());
+        }
+        if self.node_id == 0 {
+            return Err("cluster_raft.node_id 0 is reserved".into());
+        }
+        let listen_addr = self
+            .listen_addr
+            .parse::<SocketAddr>()
+            .map_err(|_| "cluster_raft.listen_addr must be a numeric IP:port value".to_string())?;
+        if listen_addr.port() == 0 {
+            return Err("cluster_raft.listen_addr port cannot be zero".into());
+        }
+        if self.cluster_name.trim().is_empty() || self.cluster_name.len() > 128 {
+            return Err("cluster_raft.cluster_name must contain 1 to 128 bytes".into());
+        }
+        if self.members.is_empty() || self.members.len() > 31 {
+            return Err("cluster_raft.members must contain 1 to 31 nodes".into());
+        }
+
+        for (name, value, maximum) in [
+            ("handshake_timeout_ms", self.handshake_timeout_ms, 300_000),
+            (
+                "inbound_request_timeout_ms",
+                self.inbound_request_timeout_ms,
+                300_000,
+            ),
+            ("heartbeat_interval_ms", self.heartbeat_interval_ms, 60_000),
+            (
+                "election_timeout_min_ms",
+                self.election_timeout_min_ms,
+                600_000,
+            ),
+            (
+                "election_timeout_max_ms",
+                self.election_timeout_max_ms,
+                600_000,
+            ),
+            (
+                "install_snapshot_timeout_ms",
+                self.install_snapshot_timeout_ms,
+                3_600_000,
+            ),
+        ] {
+            if value == 0 || value > maximum {
+                return Err(format!(
+                    "cluster_raft.{name} must be between 1 and {maximum}"
+                ));
+            }
+        }
+        if self.election_timeout_min_ms <= self.heartbeat_interval_ms {
+            return Err(
+                "cluster_raft.election_timeout_min_ms must exceed heartbeat_interval_ms".into(),
+            );
+        }
+        if self.election_timeout_max_ms <= self.election_timeout_min_ms {
+            return Err(
+                "cluster_raft.election_timeout_max_ms must exceed election_timeout_min_ms".into(),
+            );
+        }
+        if !(64 * 1024..=64 * 1024 * 1024).contains(&self.max_frame_bytes) {
+            return Err("cluster_raft.max_frame_bytes must be between 65536 and 67108864".into());
+        }
+        if !(1..=16_384).contains(&self.max_in_flight_connections) {
+            return Err(
+                "cluster_raft.max_in_flight_connections must be between 1 and 16384".into(),
+            );
+        }
+        if self.max_payload_entries == 0 || self.max_payload_entries > 1_000_000 {
+            return Err("cluster_raft.max_payload_entries must be between 1 and 1000000".into());
+        }
+
+        for (name, path) in [
+            (
+                "server_certificate_path",
+                self.server_certificate_path.as_deref(),
+            ),
+            (
+                "server_private_key_path",
+                self.server_private_key_path.as_deref(),
+            ),
+            (
+                "client_certificate_path",
+                self.client_certificate_path.as_deref(),
+            ),
+            (
+                "client_private_key_path",
+                self.client_private_key_path.as_deref(),
+            ),
+            ("peer_ca_path", self.peer_ca_path.as_deref()),
+        ] {
+            let path =
+                path.ok_or_else(|| format!("cluster_raft.{name} is required when enabled"))?;
+            if !path.is_absolute() {
+                return Err(format!(
+                    "cluster_raft.{name} must be an absolute path (got {})",
+                    path.display()
+                ));
+            }
+        }
+
+        let mut node_ids = BTreeSet::new();
+        let mut endpoints = BTreeSet::new();
+        let mut server_fingerprints = BTreeSet::new();
+        let mut client_fingerprints = BTreeSet::new();
+        let mut certificate_owners = HashMap::new();
+        let mut identity_keys = BTreeSet::new();
+        for member in &self.members {
+            if member.node_id == 0 {
+                return Err("cluster_raft member node_id 0 is reserved".into());
+            }
+            if !node_ids.insert(member.node_id) {
+                return Err("cluster_raft contains a duplicate member node_id".into());
+            }
+            validate_cluster_endpoint(&member.endpoint)?;
+            validate_cluster_server_name(&member.server_name)?;
+            validate_cluster_fingerprint(&member.tls_certificate_sha256, "tls_certificate_sha256")?;
+            validate_cluster_fingerprint(
+                &member.tls_client_certificate_sha256,
+                "tls_client_certificate_sha256",
+            )?;
+            if member.identity_public_key.is_empty() || member.identity_public_key.len() > 8_192 {
+                return Err(
+                    "cluster_raft member identity_public_key must contain 1 to 8192 bytes".into(),
+                );
+            }
+            if !endpoints.insert(member.endpoint.as_str()) {
+                return Err("cluster_raft contains a duplicate member endpoint".into());
+            }
+            if !server_fingerprints.insert(member.tls_certificate_sha256.as_str()) {
+                return Err(
+                    "cluster_raft contains a duplicate server certificate fingerprint".into(),
+                );
+            }
+            if !client_fingerprints.insert(member.tls_client_certificate_sha256.as_str()) {
+                return Err(
+                    "cluster_raft contains a duplicate client certificate fingerprint".into(),
+                );
+            }
+            for fingerprint in [
+                member.tls_certificate_sha256.as_str(),
+                member.tls_client_certificate_sha256.as_str(),
+            ] {
+                if certificate_owners
+                    .insert(fingerprint, member.node_id)
+                    .is_some_and(|owner| owner != member.node_id)
+                {
+                    return Err(
+                        "cluster_raft certificate fingerprint is assigned to multiple node ids"
+                            .into(),
+                    );
+                }
+            }
+            if !identity_keys.insert(member.identity_public_key.as_str()) {
+                return Err("cluster_raft contains a duplicate member identity key".into());
+            }
+        }
+        if !node_ids.contains(&self.node_id) {
+            return Err("cluster_raft local node_id is absent from members".into());
+        }
+        Ok(())
+    }
+}
+
+fn validate_cluster_endpoint(endpoint: &str) -> Result<(), String> {
+    if endpoint.is_empty()
+        || endpoint.len() > 512
+        || endpoint.chars().any(char::is_whitespace)
+        || endpoint.contains("://")
+        || endpoint.contains('/')
+    {
+        return Err(
+            "cluster_raft member endpoint must be a bounded host:port without a URL scheme".into(),
+        );
+    }
+    let (_, port) = endpoint
+        .rsplit_once(':')
+        .ok_or_else(|| "cluster_raft member endpoint must include a port".to_string())?;
+    if port.parse::<u16>().ok().is_none_or(|parsed| parsed == 0) {
+        return Err("cluster_raft member endpoint port must be between 1 and 65535".into());
+    }
+    Ok(())
+}
+
+fn validate_cluster_server_name(server_name: &str) -> Result<(), String> {
+    if server_name.is_empty()
+        || server_name.len() > 253
+        || server_name.chars().any(char::is_whitespace)
+        || server_name.contains("://")
+        || server_name.contains('/')
+    {
+        return Err("cluster_raft member server_name is invalid".into());
+    }
+    Ok(())
+}
+
+fn validate_cluster_fingerprint(value: &str, field: &str) -> Result<(), String> {
+    if value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        Ok(())
+    } else {
+        Err(format!(
+            "cluster_raft member {field} must be 64 lowercase hexadecimal characters"
+        ))
+    }
+}
+
 /// Application configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
@@ -293,6 +586,9 @@ pub struct Config {
     /// `required = true` so missing key custody fails startup closed.
     #[serde(default)]
     pub storage_encryption: StorageEncryptionConfig,
+    /// Disabled-by-default authenticated OpenRaft peer runtime.
+    #[serde(default)]
+    pub cluster_raft: ClusterRaftConfig,
 }
 
 /// Resource budgets applied at agent creation and to the shared rate limiter.
@@ -519,6 +815,7 @@ impl Default for Config {
             service_dir: None,
             backup: BackupScheduleConfig::default(),
             storage_encryption: StorageEncryptionConfig::default(),
+            cluster_raft: ClusterRaftConfig::default(),
         }
     }
 }
@@ -726,6 +1023,13 @@ impl Config {
                 message,
             }
         })?;
+        config
+            .cluster_raft
+            .validate()
+            .map_err(|message| ConfigLoadError::ClusterRaft {
+                path: path.to_path_buf(),
+                message,
+            })?;
         Ok(config)
     }
 
@@ -753,6 +1057,12 @@ impl Config {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 format!("invalid storage-encryption configuration: {error}"),
+            )
+        })?;
+        self.cluster_raft.validate().map_err(|error| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("invalid cluster-Raft configuration: {error}"),
             )
         })?;
         let content = toml::to_string_pretty(self).map_err(std::io::Error::other)?;
@@ -802,6 +1112,89 @@ mod tests {
         assert_eq!(cfg.llm_provider, "azure-openai");
         assert!(!cfg.setup_complete);
         assert!(cfg.api_keys.is_empty());
+        assert!(!cfg.cluster_raft.enabled);
+        assert!(!cfg.cluster_raft.bootstrap);
+    }
+
+    fn valid_cluster_raft_config() -> ClusterRaftConfig {
+        let root =
+            std::env::temp_dir().join(format!("agentos-raft-config-{}", uuid::Uuid::new_v4()));
+        ClusterRaftConfig {
+            enabled: true,
+            bootstrap: true,
+            node_id: 1,
+            members: vec![ClusterRaftMemberConfig {
+                node_id: 1,
+                endpoint: "127.0.0.1:8788".into(),
+                server_name: "node-1.agentos.test".into(),
+                tls_certificate_sha256: "a".repeat(64),
+                tls_client_certificate_sha256: "b".repeat(64),
+                identity_public_key: "test-node-1-identity".into(),
+            }],
+            server_certificate_path: Some(root.join("server.pem")),
+            server_private_key_path: Some(root.join("server-key.pem")),
+            client_certificate_path: Some(root.join("client.pem")),
+            client_private_key_path: Some(root.join("client-key.pem")),
+            peer_ca_path: Some(root.join("ca.pem")),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn cluster_raft_defaults_off_and_enabled_configuration_is_strict() {
+        let legacy =
+            "llm_provider = \"local\"\ndefault_model = \"m\"\ndata_dir = \"/tmp/x\"\n[api_keys]\n";
+        let config = Config::from_toml(legacy).unwrap();
+        assert!(!config.cluster_raft.enabled);
+
+        let configured = valid_cluster_raft_config();
+        configured.validate().expect("valid cluster config");
+        let config = Config {
+            cluster_raft: configured.clone(),
+            ..Default::default()
+        };
+        let serialized = toml::to_string_pretty(&config).expect("serialize config");
+        let parsed = Config::from_toml(&serialized).expect("parse config");
+        assert_eq!(parsed.cluster_raft, configured);
+
+        let unknown = serialized.replace(
+            "[cluster_raft]",
+            "[cluster_raft]\nunknown_cluster_option = true",
+        );
+        assert!(matches!(
+            Config::from_toml(&unknown),
+            Err(ConfigLoadError::Parse { .. })
+        ));
+    }
+
+    #[test]
+    fn cluster_raft_configuration_rejects_partial_and_ambiguous_identity() {
+        let mut config = valid_cluster_raft_config();
+        config.enabled = false;
+        assert!(config.validate().unwrap_err().contains("bootstrap"));
+
+        let mut config = valid_cluster_raft_config();
+        config.server_private_key_path = Some(PathBuf::from("relative-key.pem"));
+        assert!(config.validate().unwrap_err().contains("absolute"));
+
+        let mut config = valid_cluster_raft_config();
+        config.members[0].tls_certificate_sha256 = "uppercase".into();
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .contains("lowercase hexadecimal"));
+
+        let mut config = valid_cluster_raft_config();
+        let mut second = config.members[0].clone();
+        second.node_id = 2;
+        second.endpoint = "127.0.0.1:8789".into();
+        second.tls_client_certificate_sha256 = "c".repeat(64);
+        second.identity_public_key = "test-node-2-identity".into();
+        config.members.push(second);
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .contains("duplicate server certificate"));
     }
 
     #[test]

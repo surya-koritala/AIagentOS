@@ -10,6 +10,16 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
 
 ## [Unreleased]
 
+- Wired the authenticated OpenRaft runtime into the production `agent-server`
+  lifecycle behind a default-off, strict `[cluster_raft]` configuration.
+  Enabled nodes read bounded no-follow PEM files, require owner-only private
+  keys on Unix, bind the configured peer listener, bootstrap only when
+  explicitly requested, and reject restart if the durable membership differs
+  from the configured node, endpoint, certificate, or identity map. The daemon
+  owns clean Raft shutdown on SIGINT/SIGTERM. Restart and negative regressions
+  cover exact durable membership, configuration drift, unsafe key permissions,
+  and symlinked TLS material. Public membership and ownership syscalls are not
+  quorum-routed yet, so production authority failover remains pending #122.
 - Added a durable OpenRaft storage-v2 implementation and an executable internal
   quorum runtime for the cluster authority foundation. Votes, log and commit
   pointers, deterministic barrier state, membership, receipts, and snapshots
@@ -19,9 +29,8 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
   three-node regression proves election, replication, leader failover, durable
   restart catch-up, and old-term fencing; negative regressions cover identity
   spoofing, wrong-but-CA-valid leaves, invalid configuration, and oversized
-  frames. The production server does not start this runtime or route public
-  membership/ownership commands through it yet, so product quorum authority
-  remains pending #122.
+  frames. Public membership/ownership commands are not routed through this
+  runtime yet, so product quorum authority remains pending #122.
 - Fixed service startup deadlines so a configured readiness delay that cannot
   finish inside the remaining startup budget fails closed deterministically,
   reclaims the created service agent, and records `startup_timeout`. This

@@ -193,6 +193,28 @@ fn agent_server_owns_configured_raft_startup_and_sigterm_shutdown() {
         let _ = child.wait();
         panic!("agent-server did not become ready:\n{}", output.join("\n"));
     }
+    let voter_status = output
+        .iter()
+        .find(|line| line.contains("voter generation"))
+        .unwrap_or_else(|| {
+            panic!(
+                "agent-server did not publish converged voter status:\n{}",
+                output.join("\n")
+            )
+        });
+    assert!(voter_status.contains("voter generation 0"));
+    assert!(voter_status.contains("voters {1}"));
+    let catalog_digest = voter_status
+        .rsplit_once("transport catalog ")
+        .map(|(_, digest)| digest)
+        .expect("transport catalog digest in startup status");
+    assert_eq!(catalog_digest.len(), 64);
+    assert!(
+        catalog_digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+        "{catalog_digest}"
+    );
 
     let mut stream =
         std::net::TcpStream::connect(application_addr).expect("connect application listener");

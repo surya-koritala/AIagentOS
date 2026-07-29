@@ -65,6 +65,28 @@ pub struct ClusterRaftNode {
     pub tls_client_certificate_sha256: String,
     /// Base64 or PEM encoded Ed25519 membership identity public key.
     pub identity_public_key: String,
+    /// Lowercase SHA-256 digest of the complete, statically trusted Raft
+    /// transport catalog. This separates voter changes from peer trust
+    /// changes: every voter generation must retain the same catalog digest
+    /// until a dedicated transport-trust protocol replaces it.
+    ///
+    /// Older durable memberships deserialize this as empty. The runtime
+    /// accepts that legacy value only when the durable node map already
+    /// exactly matches the operator catalog.
+    #[serde(default)]
+    pub transport_catalog_sha256: String,
+    /// Monotonic voter-set generation carried by every node record while a
+    /// quorum change is prepared or active. Generation zero and an empty
+    /// digest preserve compatibility with memberships written before dynamic
+    /// voter reconfiguration existed.
+    #[serde(default)]
+    pub voter_set_generation: u64,
+    /// Lowercase SHA-256 digest of the exact target voter ids for
+    /// `voter_set_generation`. Persisting the intent in OpenRaft membership
+    /// lets a new leader resume a crash-interrupted joint-consensus change
+    /// without accepting a conflicting operator target.
+    #[serde(default)]
+    pub voter_set_sha256: String,
 }
 
 /// Canonical application-level member seeded into a new authority.

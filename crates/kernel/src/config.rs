@@ -227,7 +227,7 @@ impl BackupScheduleConfig {
     }
 }
 
-/// One statically trusted peer in the initial Raft membership.
+/// One statically trusted peer in the Raft transport catalog.
 ///
 /// These values are copied into the quorum-versioned OpenRaft membership.
 /// Exact server and client certificate fingerprints bind every transport role
@@ -259,10 +259,12 @@ pub struct ClusterRaftMemberConfig {
 /// Production daemon configuration for the authenticated OpenRaft runtime.
 ///
 /// The runtime is disabled by default so existing single-node installations
-/// remain compatible. Enabling it requires an exact static membership and five
-/// absolute PEM paths. `bootstrap` may be used for a pristine cluster; on
-/// restart it verifies the durable membership instead of creating a second
-/// cluster.
+/// remain compatible. Enabling it requires an exact static transport catalog
+/// and five absolute PEM paths. `voter_ids` selects a non-empty subset of that
+/// catalog; post-bootstrap changes advance `voter_set_generation` exactly once
+/// per target. `bootstrap` may be used for a pristine cluster; on restart it
+/// verifies or resumes the durable voter generation instead of creating a
+/// second cluster.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ClusterRaftConfig {
@@ -274,6 +276,15 @@ pub struct ClusterRaftConfig {
     pub authority_cluster_id: String,
     pub listen_addr: String,
     pub cluster_name: String,
+    /// Desired OpenRaft voter ids within the statically trusted `members`
+    /// catalog. An empty list preserves the legacy behavior in which every
+    /// trusted member is a voter.
+    pub voter_ids: Vec<u64>,
+    /// Monotonic operator generation for changes to `voter_ids`. Generation
+    /// zero is the bootstrap/legacy generation. A running cluster accepts only
+    /// the next generation and persists its target digest in OpenRaft
+    /// membership before changing quorum.
+    pub voter_set_generation: u64,
     pub members: Vec<ClusterRaftMemberConfig>,
     pub server_certificate_path: Option<PathBuf>,
     pub server_private_key_path: Option<PathBuf>,
@@ -300,6 +311,8 @@ impl Default for ClusterRaftConfig {
             authority_cluster_id: String::new(),
             listen_addr: "127.0.0.1:8788".into(),
             cluster_name: "ai-agent-os".into(),
+            voter_ids: Vec::new(),
+            voter_set_generation: 0,
             members: Vec::new(),
             server_certificate_path: None,
             server_private_key_path: None,
@@ -539,7 +552,32 @@ impl ClusterRaftConfig {
         if !node_ids.contains(&self.node_id) {
             return Err("cluster_raft local node_id is absent from members".into());
         }
+        let mut voter_ids = BTreeSet::new();
+        for voter_id in &self.voter_ids {
+            if *voter_id == 0 {
+                return Err("cluster_raft voter_ids cannot contain reserved node id 0".into());
+            }
+            if !node_ids.contains(voter_id) {
+                return Err(format!(
+                    "cluster_raft voter id {voter_id} is absent from members"
+                ));
+            }
+            if !voter_ids.insert(*voter_id) {
+                return Err("cluster_raft voter_ids contains a duplicate node id".into());
+            }
+        }
+        if self.desired_voter_ids().is_empty() {
+            return Err("cluster_raft voter set cannot be empty".into());
+        }
         Ok(())
+    }
+
+    pub(crate) fn desired_voter_ids(&self) -> BTreeSet<u64> {
+        if self.voter_ids.is_empty() {
+            self.members.iter().map(|member| member.node_id).collect()
+        } else {
+            self.voter_ids.iter().copied().collect()
+        }
     }
 }
 
@@ -1281,6 +1319,36 @@ mod tests {
             .validate()
             .unwrap_err()
             .contains("duplicate server certificate"));
+    }
+
+    #[test]
+    fn cluster_raft_voter_subset_is_bounded_by_the_trusted_catalog() {
+        let mut config = valid_cluster_raft_config();
+        let mut second = config.members[0].clone();
+        second.node_id = 2;
+        second.application_node_id = "00000000-0000-0000-0000-000000000002".into();
+        second.application_endpoint = "127.0.0.1:7778".into();
+        second.endpoint = "127.0.0.1:8789".into();
+        second.server_name = "node-2.agentos.test".into();
+        second.tls_certificate_sha256 = "d".repeat(64);
+        second.tls_client_certificate_sha256 = "e".repeat(64);
+        second.identity_public_key = "f".repeat(64);
+        config.members.push(second);
+
+        assert_eq!(config.desired_voter_ids(), BTreeSet::from([1, 2]));
+        config.voter_ids = vec![2];
+        config.voter_set_generation = 1;
+        config
+            .validate()
+            .expect("one trusted voter is a valid desired subset");
+        assert_eq!(config.desired_voter_ids(), BTreeSet::from([2]));
+
+        config.voter_ids = vec![2, 2];
+        assert!(config.validate().unwrap_err().contains("duplicate"));
+        config.voter_ids = vec![3];
+        assert!(config.validate().unwrap_err().contains("absent"));
+        config.voter_ids = vec![0];
+        assert!(config.validate().unwrap_err().contains("reserved"));
     }
 
     #[test]

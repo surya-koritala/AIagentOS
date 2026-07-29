@@ -254,9 +254,12 @@ async fn main() {
             std::process::exit(1);
         }
         eprintln!(
-            "agent-server: cluster Raft node {} listening on {}",
+            "agent-server: cluster Raft node {} listening on {}; voter generation {}; voters {:?}; transport catalog {}",
             runtime.node_id(),
-            runtime.local_addr()
+            runtime.local_addr(),
+            runtime.voter_set_generation(),
+            runtime.voter_ids(),
+            runtime.transport_catalog_sha256(),
         );
     }
     // Make SendMessage syscalls functional against the configured backend.

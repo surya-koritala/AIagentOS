@@ -449,7 +449,8 @@ fn distributed_consistency_contract_is_published_and_fail_closed() {
 
     for honest_boundary in [
         "isolated former leader cannot commit or locally apply",
-        "OpenRaft voter map is still static",
+        "digest-pinned static transport-trust catalog",
+        "peer removed from voting remains a replicated learner",
         "Configured Raft voters are still fully trusted forwarders",
         "records the OpenRaft leader term",
         "stops admitting new mutations at the exact expiry",

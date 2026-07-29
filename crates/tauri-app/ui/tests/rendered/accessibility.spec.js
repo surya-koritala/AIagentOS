@@ -49,9 +49,21 @@ const operatorView = {
   metrics: { tokens_consumed: 128, api_calls_made: 3 },
 };
 
+const checkpoints = [
+  {
+    id: '11111111-2222-4333-8444-555555555555',
+    agent_id: 'agent-1',
+    version: 1,
+    provider_id: 'provider-1',
+    model_id: 'fixture-model',
+    created_at: '2026-07-28T19:00:00Z',
+    expires_at: '2026-07-29T19:00:00Z',
+  },
+];
+
 async function installTauriFixture(page, { setupComplete = true } = {}) {
   await page.addInitScript(
-    ({ complete, snapshot }) => {
+    ({ complete, snapshot, checkpointFixtures }) => {
       const config = {
         setup_complete: complete,
         llm_provider: 'azure-openai',
@@ -67,11 +79,20 @@ async function installTauriFixture(page, { setupComplete = true } = {}) {
         invoke(command) {
           if (command === 'load_config') return Promise.resolve(config);
           if (command === 'get_operator_view') return Promise.resolve(snapshot);
+          if (command === 'list_checkpoints') return Promise.resolve(checkpointFixtures);
+          if (command === 'resume_checkpoint') {
+            return Promise.resolve({ state: 'Running', output: null });
+          }
+          if (command === 'delete_checkpoint') return Promise.resolve(true);
           return Promise.reject(new Error(`Unexpected rendered-test command: ${command}`));
         },
       };
     },
-    { complete: setupComplete, snapshot: operatorView },
+    {
+      complete: setupComplete,
+      snapshot: operatorView,
+      checkpointFixtures: checkpoints,
+    },
   );
 }
 
@@ -167,4 +188,33 @@ test('reduced-motion preference suppresses nonessential transitions', async ({ p
   const durationSeconds = value => Math.max(...value.split(',').map(Number.parseFloat));
   expect(durationSeconds(durations.animation)).toBeLessThanOrEqual(0.00001);
   expect(durationSeconds(durations.transition)).toBeLessThanOrEqual(0.00001);
+});
+
+test('checkpoint controls are axe-clean and require exact-target deletion confirmation', async ({ page }) => {
+  await installTauriFixture(page);
+  await page.goto('/');
+  await page.getByRole('button', { name: /Open Research agent/ }).click();
+
+  await expect(
+    page.getByRole('heading', { name: 'Generation checkpoints' }),
+  ).toBeVisible();
+  await expect(
+    page.getByText('11111111-2222-4333-8444-555555555555', { exact: true }),
+  ).toBeVisible();
+  await expectWcagAxeClean(page);
+
+  await page.getByRole('button', { name: 'Delete', exact: true }).click();
+  const confirmation = page.getByRole('group', {
+    name: 'Confirm permanent checkpoint deletion',
+  });
+  await expect(confirmation).toBeVisible();
+  const permanentDelete = page.getByRole('button', {
+    name: 'Permanently delete',
+  });
+  await expect(permanentDelete).toBeDisabled();
+  await page
+    .getByRole('textbox', { name: 'Exact checkpoint ID' })
+    .fill('11111111-2222-4333-8444-555555555555');
+  await expect(permanentDelete).toBeEnabled();
+  await expectWcagAxeClean(page);
 });

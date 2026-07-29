@@ -8,7 +8,8 @@
 use std::sync::Arc;
 
 use agent_sdk::{
-    AgentEnforcementInfo, ConnectionProfile, KernelClient, MessageResult, OperatorAgentSnapshot,
+    AgentEnforcementInfo, ConnectionProfile, GenerationCheckpointSummary, KernelClient,
+    LifecycleResult, MessageResult, MessageStreamEvent, OperatorAgentSnapshot,
     OperatorCgroupSnapshot, OperatorPackageSnapshot, OperatorServiceSnapshot, OperatorSnapshot,
     OperatorTunable, ProviderSummary, SdkError,
 };
@@ -355,6 +356,8 @@ impl DesktopMetricsView {
 /// request/reply. The mutex preserves that protocol invariant.
 pub struct DesktopClient {
     inner: Mutex<KernelClient>,
+    stream: Mutex<KernelClient>,
+    cancellation: Mutex<KernelClient>,
 }
 
 impl DesktopClient {
@@ -368,8 +371,12 @@ impl DesktopClient {
         token: Option<&str>,
     ) -> Result<Self, SdkError> {
         let inner = profile.connect(token).await?;
+        let stream = profile.connect(token).await?;
+        let cancellation = profile.connect(token).await?;
         Ok(Self {
             inner: Mutex::new(inner),
+            stream: Mutex::new(stream),
+            cancellation: Mutex::new(cancellation),
         })
     }
 
@@ -433,6 +440,40 @@ impl DesktopClient {
             .await
     }
 
+    /// Drive one streamed turn on a dedicated wire connection.
+    ///
+    /// Keeping the stream separate means operator refreshes remain responsive
+    /// and the cancellation connection can stop the exact in-flight request.
+    pub async fn send_message_stream<F>(
+        &self,
+        request_id: impl Into<String>,
+        agent_id: impl Into<String>,
+        message: impl Into<String>,
+        on_event: F,
+    ) -> Result<MessageResult, SdkError>
+    where
+        F: FnMut(&MessageStreamEvent),
+    {
+        self.stream
+            .lock()
+            .await
+            .send_message_stream(request_id, agent_id, message, on_event)
+            .await
+    }
+
+    /// Cooperatively cancel one exact streamed turn without replaying it.
+    pub async fn cancel_request(
+        &self,
+        request_id: impl Into<String>,
+        agent_id: impl Into<String>,
+    ) -> Result<bool, SdkError> {
+        self.cancellation
+            .lock()
+            .await
+            .cancel_request(request_id, agent_id)
+            .await
+    }
+
     pub async fn pause_agent(&self, agent_id: impl Into<String>) -> Result<(), SdkError> {
         self.inner
             .lock()
@@ -458,6 +499,41 @@ impl DesktopClient {
             .stop_agent(agent_id)
             .await
             .map(|_| ())
+    }
+
+    pub async fn list_generation_checkpoints(
+        &self,
+        agent_id: impl Into<String>,
+    ) -> Result<Vec<GenerationCheckpointSummary>, SdkError> {
+        self.inner
+            .lock()
+            .await
+            .list_generation_checkpoints(agent_id)
+            .await
+    }
+
+    pub async fn resume_generation_checkpoint(
+        &self,
+        agent_id: impl Into<String>,
+        checkpoint_id: impl Into<String>,
+    ) -> Result<LifecycleResult, SdkError> {
+        self.inner
+            .lock()
+            .await
+            .resume_generation_checkpoint(agent_id, checkpoint_id)
+            .await
+    }
+
+    pub async fn delete_generation_checkpoint(
+        &self,
+        agent_id: impl Into<String>,
+        checkpoint_id: impl Into<String>,
+    ) -> Result<bool, SdkError> {
+        self.inner
+            .lock()
+            .await
+            .delete_generation_checkpoint(agent_id, checkpoint_id)
+            .await
     }
 
     pub async fn operator_snapshot(&self) -> Result<OperatorSnapshot, SdkError> {
@@ -512,6 +588,104 @@ pub struct AppState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kernel::connector::{
+        LlmProviderAdapter, LlmRequestOptions, LlmResponse, LlmSession, ProviderCapabilities,
+        ProviderEventSink, ProviderStreamEvent, ProviderType, StandardMessage, ToolDefinition,
+    };
+    use kernel::{ConnectorError, ProviderId};
+
+    struct BlockingStreamAdapter {
+        id: ProviderId,
+    }
+
+    struct BlockingStreamSession {
+        id: ProviderId,
+    }
+
+    #[async_trait::async_trait]
+    impl LlmSession for BlockingStreamSession {
+        async fn send(
+            &self,
+            _messages: Vec<StandardMessage>,
+        ) -> Result<LlmResponse, ConnectorError> {
+            std::future::pending::<Result<LlmResponse, ConnectorError>>().await
+        }
+
+        async fn send_with_tools(
+            &self,
+            _messages: Vec<StandardMessage>,
+            _tools: &[ToolDefinition],
+        ) -> Result<LlmResponse, ConnectorError> {
+            std::future::pending::<Result<LlmResponse, ConnectorError>>().await
+        }
+
+        async fn send_streaming_events_controlled(
+            &self,
+            _messages: Vec<StandardMessage>,
+            _tools: &[ToolDefinition],
+            _options: LlmRequestOptions,
+            cancellation: &tokio_util::sync::CancellationToken,
+            events: ProviderEventSink,
+        ) -> Result<LlmResponse, ConnectorError> {
+            events
+                .emit(ProviderStreamEvent::TextDelta("before-cancel".into()))
+                .await;
+            cancellation.cancelled().await;
+            Err(ConnectorError::cancelled(self.id.clone(), None))
+        }
+
+        fn enforces_max_output_tokens(&self) -> bool {
+            true
+        }
+
+        fn provider_id(&self) -> &ProviderId {
+            &self.id
+        }
+
+        fn model_id(&self) -> &str {
+            "desktop-stream-test"
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl LlmProviderAdapter for BlockingStreamAdapter {
+        fn id(&self) -> &ProviderId {
+            &self.id
+        }
+
+        fn name(&self) -> &str {
+            "desktop stream test"
+        }
+
+        fn provider_type(&self) -> ProviderType {
+            ProviderType::Local
+        }
+
+        async fn is_available(&self) -> bool {
+            true
+        }
+
+        async fn create_session(&self) -> Result<Box<dyn LlmSession>, ConnectorError> {
+            Ok(Box::new(BlockingStreamSession {
+                id: self.id.clone(),
+            }))
+        }
+
+        fn capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities {
+                prompt_cancellation: true,
+                ..ProviderCapabilities::default()
+            }
+        }
+
+        fn translate_to_provider(&self, message: &StandardMessage) -> serde_json::Value {
+            serde_json::json!({"role": message.role, "content": message.content})
+        }
+
+        fn translate_from_provider(&self, value: &serde_json::Value) -> Option<StandardMessage> {
+            Some(StandardMessage::assistant(value.get("content")?.as_str()?))
+        }
+    }
 
     #[tokio::test]
     async fn embedded_desktop_reaches_the_kernel_only_through_its_wire_client() {
@@ -543,6 +717,79 @@ mod tests {
             .tunables
             .as_ref()
             .is_some_and(|items| !items.is_empty()));
+    }
+
+    #[tokio::test]
+    async fn desktop_stream_keeps_refresh_live_and_cancels_on_a_dedicated_connection() {
+        let kernel = Arc::new(AgentKernelImpl::new().expect("kernel"));
+        kernel
+            .register_provider(Arc::new(BlockingStreamAdapter {
+                id: "desktop-stream".into(),
+            }))
+            .expect("register stream provider");
+        let server = SyscallServer::bind(Arc::clone(&kernel), "127.0.0.1:0")
+            .await
+            .expect("bind");
+        let address = server.local_addr().expect("address");
+        tokio::spawn(server.serve());
+
+        let client = Arc::new(
+            DesktopClient::connect(&address.to_string(), None)
+                .await
+                .expect("desktop client"),
+        );
+        let agent_id = client
+            .create_agent(
+                "streaming",
+                "prove independent connections",
+                Some("desktop-stream".into()),
+            )
+            .await
+            .expect("create agent");
+        let (started_tx, mut started_rx) = tokio::sync::mpsc::unbounded_channel();
+        let stream_client = Arc::clone(&client);
+        let stream_agent = agent_id.clone();
+        let stream = tokio::spawn(async move {
+            stream_client
+                .send_message_stream(
+                    "desktop-request",
+                    stream_agent,
+                    "wait for cancellation",
+                    |event| {
+                        if matches!(event, MessageStreamEvent::Started) {
+                            let _ = started_tx.send(());
+                        }
+                    },
+                )
+                .await
+        });
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), started_rx.recv())
+            .await
+            .expect("stream start timeout")
+            .expect("stream start signal");
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            client.operator_snapshot(),
+        )
+        .await
+        .expect("operator refresh was blocked by stream")
+        .expect("operator refresh");
+        assert!(client
+            .cancel_request("desktop-request", &agent_id)
+            .await
+            .expect("cancel request"));
+
+        let error = tokio::time::timeout(std::time::Duration::from_secs(2), stream)
+            .await
+            .expect("stream cancellation timeout")
+            .expect("stream task")
+            .expect_err("cancelled stream must fail");
+        assert_eq!(error.wire_code(), Some(agent_sdk::WireErrorCode::Cancelled));
+        assert!(!client
+            .cancel_request("desktop-request", &agent_id)
+            .await
+            .expect("completed stream is not active"));
     }
 
     #[test]

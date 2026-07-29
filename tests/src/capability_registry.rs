@@ -654,6 +654,67 @@ fn operator_ui_state_contract_is_visible_and_regressed() {
 }
 
 #[test]
+fn desktop_stream_and_checkpoint_controls_stay_on_the_public_wire_boundary() {
+    let protocol = read_workspace_file("docs/PROTOCOL.md");
+    for contract in [
+        "separate authenticated public-wire connections",
+        "cannot hold the operator snapshot path",
+        "freezes the request and agent identifiers",
+        "requires the full checkpoint identifier",
+    ] {
+        assert!(
+            protocol.contains(contract),
+            "desktop stream/checkpoint protocol lost {contract:?}"
+        );
+    }
+
+    let backend = read_workspace_file("crates/tauri-app/src/lib.rs");
+    for contract in [
+        "stream: Mutex<KernelClient>",
+        "cancellation: Mutex<KernelClient>",
+        ".send_message_stream(request_id, agent_id, message, on_event)",
+        ".cancel_request(request_id, agent_id)",
+        ".list_generation_checkpoints(agent_id)",
+        ".resume_generation_checkpoint(agent_id, checkpoint_id)",
+        ".delete_generation_checkpoint(agent_id, checkpoint_id)",
+        "desktop_stream_keeps_refresh_live_and_cancels_on_a_dedicated_connection",
+    ] {
+        assert!(
+            backend.contains(contract),
+            "desktop public-wire backend lost {contract:?}"
+        );
+    }
+
+    let commands = read_workspace_file("crates/tauri-app/src/commands.rs");
+    for contract in [
+        "Channel<agent_sdk::MessageStreamEvent>",
+        "pub async fn cancel_message",
+        "pub async fn list_checkpoints",
+        "pub async fn resume_checkpoint",
+        "pub async fn delete_checkpoint",
+        "validate_checkpoint_deletion_confirmation(&checkpoint_id, &confirm_checkpoint_id)",
+    ] {
+        assert!(
+            commands.contains(contract),
+            "desktop command surface lost {contract:?}"
+        );
+    }
+
+    let chat = read_workspace_file("crates/tauri-app/ui/src/lib/ChatPanel.svelte");
+    assert!(chat.contains("invoke('stream_message'"));
+    assert!(chat.contains("invoke('cancel_message'"));
+    assert!(chat.contains("requestId: target.requestId"));
+    assert!(chat.contains("agentId: target.agentId"));
+
+    let detail = read_workspace_file("crates/tauri-app/ui/src/lib/AgentDetail.svelte");
+    assert!(detail.contains("pendingCheckpointDelete.agentId"));
+    assert!(detail.contains("pendingCheckpointDelete.checkpointId"));
+    assert!(
+        detail.contains("checkpointDeleteConfirmation !== pendingCheckpointDelete.checkpointId")
+    );
+}
+
+#[test]
 fn desktop_accessibility_baseline_is_explicit_and_honest() {
     let qualification = read_workspace_file("docs/ACCESSIBILITY.md");
     let normalized_qualification = qualification

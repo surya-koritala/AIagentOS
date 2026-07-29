@@ -45,7 +45,7 @@
     <h2 class="section-title">Agents</h2>
     <div class="agent-grid">
       {#each agents as agent}
-        <button class="agent-card" aria-label={`Open ${agent.name}, ${agent.state}`} on:click={() => dispatch('select', { detail: agent.id })}>
+        <button class="agent-card" aria-label={`Open ${agent.name}, ${agent.state}`} on:click={() => dispatch('select', agent.id)}>
           <div class="agent-header">
             <span class="agent-name">{agent.name}</span>
             <span class="agent-state" class:running={agent.state === 'Running'} class:paused={agent.state === 'Paused'} class:stopped={agent.state === 'Stopped'}>

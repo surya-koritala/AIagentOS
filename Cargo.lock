@@ -6502,6 +6502,7 @@ version = "0.3.0"
 dependencies = [
  "agent-cli",
  "agent-sdk",
+ "async-trait",
  "kernel",
  "keyring",
  "serde",
@@ -6509,6 +6510,7 @@ dependencies = [
  "tauri",
  "tauri-build",
  "tokio",
+ "tokio-util",
  "tracing",
  "uuid",
  "zeroize",

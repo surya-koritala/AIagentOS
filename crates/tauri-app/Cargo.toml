@@ -35,3 +35,7 @@ keyring = { version = "=4.1.5", optional = true }
 
 [build-dependencies]
 tauri-build = { workspace = true, optional = true }
+
+[dev-dependencies]
+async-trait = { workspace = true }
+tokio-util = { workspace = true }

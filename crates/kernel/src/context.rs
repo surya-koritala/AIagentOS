@@ -1837,6 +1837,7 @@ impl SqliteContextManager {
                 node_id TEXT PRIMARY KEY,
                 fingerprint TEXT NOT NULL UNIQUE,
                 public_key TEXT NOT NULL,
+                tls_server_certificate_fingerprint TEXT,
                 endpoint TEXT NOT NULL UNIQUE,
                 server_version TEXT NOT NULL,
                 min_protocol_version INTEGER NOT NULL CHECK (min_protocol_version >= 1),
@@ -1853,6 +1854,8 @@ impl SqliteContextManager {
                 member_generation INTEGER NOT NULL CHECK (member_generation >= 1),
                 previous_state TEXT,
                 current_state TEXT NOT NULL,
+                previous_tls_server_certificate_fingerprint TEXT,
+                current_tls_server_certificate_fingerprint TEXT,
                 actor TEXT NOT NULL,
                 reason TEXT NOT NULL,
                 changed_at TEXT NOT NULL
@@ -1906,6 +1909,24 @@ impl SqliteContextManager {
                 PRIMARY KEY (agent_id, fencing_token, state, authority_generation)
             ) WITHOUT ROWID;",
         ).map_err(|e| ContextError::StorageError(e.to_string()))?;
+        crate::schema::add_column_if_missing(
+            conn,
+            "cluster_members",
+            "tls_server_certificate_fingerprint",
+            "TEXT",
+        )?;
+        crate::schema::add_column_if_missing(
+            conn,
+            "cluster_membership_audit",
+            "previous_tls_server_certificate_fingerprint",
+            "TEXT",
+        )?;
+        crate::schema::add_column_if_missing(
+            conn,
+            "cluster_membership_audit",
+            "current_tls_server_certificate_fingerprint",
+            "TEXT",
+        )?;
         // Legacy fact rows are deliberately marked stale and rebuilt on their
         // next query or an explicit reindex.
         for (column, definition) in [

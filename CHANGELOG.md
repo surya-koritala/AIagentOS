@@ -10,6 +10,19 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
 
 ## [Unreleased]
 
+- Added restart-free TLS certificate and client-trust rotation for the syscall
+  server. Operators atomically replace PEM material and then change a bounded
+  trigger file; a fully validated configuration is published as one monotonic
+  generation, while unreadable, partial, or mismatched updates leave the
+  current generation active. Optional client CRLs provide fail-closed
+  individual certificate revocation with expiry enforcement. New handshakes
+  switch immediately and sessions admitted under the previous trust generation
+  finish their current request before being closed. TLS clients retain only the
+  verified server leaf's SHA-256 fingerprint. Cluster admission signs and persists that observed
+  fingerprint, permits authenticated certificate rotation, forbids TLS-to-
+  plaintext re-admission, records old/new leaf fingerprints in durable
+  membership audit, and rejects a superseded leaf during discovery.
+  Certificate rollout orchestration and quorum authority remain pending #122.
 - Added durably reconcilable managed cluster creation. The authority now exposes
   a stable paginated ownership directory; managed placement reserves a UUID,
   preinstalls its exact destination fence, and creates only while that proof is

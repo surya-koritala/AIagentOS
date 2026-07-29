@@ -328,6 +328,13 @@ cancelled, incompatible version, provider, lifecycle, and internal failures.
 - Setting `AGENT_SERVER_TLS_CLIENT_CA` makes the TLS handshake mutually
   authenticated. `ClusterClient::connect_tls` accepts a rustls client config
   carrying the client certificate and cluster trust roots.
+- `AGENT_SERVER_TLS_CLIENT_CRL` adds fail-closed individual client-certificate
+  revocation. The CRL must cover the presented chain and must not be expired.
+- A TLS listener can reload its certificate, key, optional client CA, and
+  optional CRL as one monotonic trust generation. New handshakes use the
+  replacement immediately; old-generation sessions finish the request already
+  admitted and close before another frame is read. Invalid candidates never
+  replace the active config.
 - Unix sockets rely on filesystem permissions and may additionally require a
   token.
 - Plaintext MCP binds only to loopback. Remote MCP is not advertised until it
@@ -467,8 +474,9 @@ system authentication token and mutual TLS.
 
 1. The authority issues a random 32-byte challenge valid for 5–300 seconds.
 2. The joining node signs a domain-separated payload covering the authority
-   cluster ID, challenge, durable identity, endpoint, software version, and
-   protocol support window.
+   cluster ID, challenge, durable identity, endpoint, software version,
+   protocol support window, and—when TLS is used—the SHA-256 fingerprint of the
+   server leaf certificate actually verified on the joining connection.
 3. The authority verifies and consumes the challenge exactly once, rejects
    incompatible versions and duplicate identities/endpoints, and commits the
    active member plus audit evidence in one SQLite transaction.
@@ -479,8 +487,13 @@ system authentication token and mutual TLS.
 `get_cluster_membership` returns one atomic cluster ID/generation/member
 snapshot. `ClusterClient::connect_discovered_authenticated` and its TLS variant
 dial only active endpoints, prove every identity, require exact endpoint and
-fingerprint matches, then re-read the authority. If membership changed while
-connections were assembled, construction fails with a retryable `conflict`.
+application-identity fingerprint matches, and require the observed TLS leaf to
+match the signed membership record, then re-read the authority. A fresh
+challenged re-admission by the same durable identity may rotate that leaf; once
+TLS-bound, the identity cannot re-admit without a TLS certificate binding. If
+membership changed while connections were assembled, construction fails with
+a retryable `conflict`. Membership audit records the previous and current TLS
+leaf fingerprints for every join, rotation, leave, or revocation.
 The authority identity, membership, generations, and audit survive authority
 restart.
 
@@ -530,9 +543,11 @@ creation/claim/fence publication is not one atomic cross-database transaction,
 and there is no automatic migration,
 partition-safe quorum authority, cluster-wide quota transaction, policy/package
 convergence, rolling-upgrade coordinator, or disaster-recovery controller.
-Identity revocation is enforced by discovery, but live TLS client certificate
-rotation/revocation still requires replacing trust configuration and restarting
-affected listeners. Those requirements remain tracked by #122.
+Live TLS material can now rotate without restarting listeners, old trust
+generations are drained, and discovery rejects superseded node server leaves.
+Coordinating trust overlap, member re-admission, and rollout order across a
+partitioned cluster is still an operator responsibility. Those remaining
+requirements are tracked by #122.
 The normative object-by-object consistency and failure rules are published in
 [the distributed control-plane contract](DISTRIBUTED_CONTROL_PLANE.md).
 

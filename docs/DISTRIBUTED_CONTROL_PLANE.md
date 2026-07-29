@@ -47,7 +47,7 @@ advertised as a production distributed kernel.
 | Object | System of record now | Current consistency | Production requirement |
 |---|---|---|---|
 | Cluster identity and membership | Designated authority SQLite database | Linearized on that one authority; atomic generation-fenced snapshots and audit | Quorum-committed authority term, failover, and read rules that cannot revive an old authority |
-| Node identity | Node-local Ed25519 key in the node SQLite database | Stable across restart; proved by fresh challenge | Live certificate rotation/revocation bound to durable node identity |
+| Node identity | Node-local Ed25519 key plus authority membership certificate fingerprint | Stable across restart; fresh challenge signs the verified TLS server leaf; listener trust generations reload atomically and drain old sessions | Quorum-coordinated certificate/trust epochs and rollout order across partitions |
 | Node availability and placement profile | Node-local SQLite database | Generation-fenced on one node; discovery reads a point-in-time value | Signed or quorum-observed liveness/capacity with staleness bounds |
 | Agent identity | Authority reservation plus owning-node SQLite database | Managed creation reserves one UUID before exact destination creation; duplicates cannot overwrite a local agent | Quorum-allocated immutable identity and migration-aware placement record |
 | Agent ownership and routing | Authority lease registry, destination fence tombstones, plus `ClusterClient` in-memory routes | Authority-discovered clients reserve, pre-fence, create, and publish exact routes; paginated reconciliation repairs or safely retires partial creation; every mutation revalidates authority/fence agreement; opt-in maintenance renews idle routes; a per-agent admission barrier prevents fence changes from crossing admitted work | Quorum-committed authority term, partition-safe renewal, and migration admission |
@@ -155,8 +155,10 @@ non-migratable.
 2. Checkpointed drain/migration with rollback and side-effect classifications.
 3. Cross-node IPC/delegation with end-to-end authorization and audit.
 4. Cluster quota reservations and monotonic policy/package trust epochs.
-5. Live certificate rotation/revocation, rolling upgrades, partition/clock-skew
-   chaos qualification, and disaster recovery.
+5. Quorum-coordinated certificate rollout, rolling upgrades,
+   partition/clock-skew chaos qualification, and disaster recovery. The
+   node-local live reload, session drain, and membership leaf binding primitives
+   exist; cluster-wide sequencing does not.
 
 The unchecked criteria in issue #122 remain unchecked until their implementation
 and exact-commit evidence exist. Documentation, a client-side route map, or a

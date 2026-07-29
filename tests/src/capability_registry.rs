@@ -460,6 +460,29 @@ fn trusted_browser_helpers_remain_isolated_bounded_and_outside_runtime_discovery
             .contains("register_provider(ResourceType::Browser"),
         "trusted helper work must not silently publish an unqualified kernel browser provider"
     );
+
+    let qualification = read_workspace_file(".github/workflows/extended-security.yml");
+    for contract in [
+        "flags=(unconfined)",
+        "userns,",
+        "apparmor_parser -r",
+        "browser_sandbox=userns_apparmor_profile",
+        "browser_userns_profile_sha256",
+    ] {
+        assert!(
+            qualification.contains(contract),
+            "live Chromium qualification lost sandbox contract {contract:?}"
+        );
+    }
+    assert!(
+        !qualification.contains("--no-sandbox")
+            && !qualification.contains("--disable-setuid-sandbox")
+            && !qualification.contains("apparmor_restrict_unprivileged_userns=0")
+            && !qualification.contains("chmod 4755")
+            && !qualification.contains("CHROME_DEVEL_SANDBOX"),
+        "live Chromium qualification must use a scoped userns profile, not disable \
+         Chromium's sandbox, weaken the runner globally, or elevate a downloaded helper"
+    );
 }
 
 #[test]

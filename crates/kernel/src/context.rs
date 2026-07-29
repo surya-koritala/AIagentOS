@@ -366,6 +366,16 @@ pub const DURABLE_DATA_CATALOG: &[DurableDataClassification] = &[
         deletion: "retain",
     },
     DurableDataClassification {
+        table: "cluster_agent_mutation_fences",
+        owner: "system",
+        deletion: "retain fencing tombstone until cluster retirement",
+    },
+    DurableDataClassification {
+        table: "cluster_agent_mutation_fence_audit",
+        owner: "system",
+        deletion: "retain",
+    },
+    DurableDataClassification {
         table: "storage_meta",
         owner: "system",
         deletion: "retain",

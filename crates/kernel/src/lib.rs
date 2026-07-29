@@ -1153,6 +1153,11 @@ pub struct AgentKernelImpl {
     /// then takes the write guard so no admitted request can recreate deleted
     /// state during the storage transaction.
     pub(crate) erasure_barrier: tokio::sync::RwLock<()>,
+    /// Per-agent admission barriers that make destination-fence verification
+    /// atomic with the full protected mutation. Mutations hold a shared guard;
+    /// installing or retiring a token holds the exclusive guard, so an
+    /// ownership handoff cannot cross a verified operation in flight.
+    agent_mutation_fence_barriers: DashMap<AgentId, Arc<tokio::sync::RwLock<()>>>,
     /// Per-credential in-flight request admission. Revocation closes and drains
     /// only the affected identity instead of holding the global auth lock across
     /// syscall, tool, or provider I/O.
@@ -1607,6 +1612,7 @@ impl AgentKernelImpl {
             auth: Arc::new(tokio::sync::RwLock::new(crate::auth::AuthSystem::new())),
             auth_mutation_lock: tokio::sync::Mutex::new(()),
             erasure_barrier: tokio::sync::RwLock::new(()),
+            agent_mutation_fence_barriers: DashMap::new(),
             credential_leases: Arc::new(crate::auth::CredentialLeaseManager::default()),
             cgroup_budgets: budgets.clone(),
             executors: DashMap::new(),
@@ -3059,6 +3065,16 @@ impl AgentKernelImpl {
         self.lifecycle_locks
             .entry(agent_id)
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    }
+
+    pub(crate) fn agent_mutation_fence_barrier(
+        &self,
+        agent_id: AgentId,
+    ) -> Arc<tokio::sync::RwLock<()>> {
+        self.agent_mutation_fence_barriers
+            .entry(agent_id)
+            .or_insert_with(|| Arc::new(tokio::sync::RwLock::new(())))
             .clone()
     }
 

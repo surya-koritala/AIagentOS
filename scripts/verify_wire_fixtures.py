@@ -26,6 +26,7 @@ V2_ONLY_OPERATIONS = {
     "claim_cluster_agent_ownership",
     "enforce_storage_backup_retention",
     "erase_data",
+    "fenced_agent_mutation",
     "get_cluster_agent_ownership",
     "get_cluster_membership",
     "get_agent_mutation_fence",

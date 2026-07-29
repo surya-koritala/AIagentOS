@@ -221,6 +221,15 @@ pub enum DataErasureTarget {
     Tenant { tenant_id: String },
 }
 
+/// Exact destination-side ownership evidence required for a fenced mutation.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct AgentMutationFenceProof {
+    pub cluster_id: String,
+    pub owner_node_id: String,
+    pub authority_generation: u64,
+    pub fencing_token: u64,
+}
+
 /// A syscall request from an agent / SDK to the kernel.
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
@@ -616,6 +625,14 @@ pub enum Syscall {
         #[serde(default = "default_tunable_audit_limit")]
         limit: usize,
     },
+    /// Execute one existing agent mutation only after the destination verifies
+    /// the exact active ownership fence. The nested operation must target the
+    /// same agent and must be part of the explicit mutable-agent allowlist.
+    FencedAgentMutation {
+        agent_id: String,
+        proof: AgentMutationFenceProof,
+        mutation: Box<Syscall>,
+    },
     /// Pull the kernel's operational metrics as a Prometheus text exposition
     /// (format version 0.0.4), rendered from the syscall-gate enforcement
     /// counters, agent counts, system token/api totals, and process uptime.
@@ -918,6 +935,13 @@ impl WireErrorCode {
             (Self::InvalidRequest, false)
         } else if message.contains("invalid agent id") || message.contains("invalid ") {
             (Self::InvalidArgument, false)
+        } else if message.contains("mutation fence")
+            || message.contains("destination fence")
+            || message.contains("ownership fence")
+        {
+            // Callers must refresh authority/destination ownership evidence;
+            // replaying an older route unchanged can never be admitted.
+            (Self::Conflict, true)
         } else if message.contains("sandbox") {
             (Self::SandboxDenied, false)
         } else if message.contains("unavailable") || message.contains("not registered") {
@@ -1333,6 +1357,7 @@ impl std::fmt::Debug for Syscall {
             Self::StoragePut { .. } => &["value"],
             Self::LoadPackage { .. } => &["manifest_toml"],
             Self::PublishPackage { .. } => &["archive_hex"],
+            Self::FencedAgentMutation { .. } => &["mutation"],
             _ => &[],
         };
         redact_debug_fields(&mut value, fields);
@@ -1547,6 +1572,11 @@ fn syscall_policy(call: &Syscall) -> (AccessLevel, &'static str, Option<&str>) {
         Syscall::ListAgentMutationFenceAudit { .. } => {
             (AccessLevel::System, "cluster.destination_fence.audit", None)
         }
+        Syscall::FencedAgentMutation { .. } => (
+            AccessLevel::System,
+            "cluster.destination_fence.mutate",
+            None,
+        ),
         Syscall::Metrics => (AccessLevel::System, "system.metrics", None),
         Syscall::OperatorSnapshot => (AccessLevel::ReadOnly, "operator.snapshot", None),
         Syscall::ListOperatorTunables => (AccessLevel::System, "operator.tunable.list", None),
@@ -1753,6 +1783,9 @@ fn enforce_node_admission(kernel: &AgentKernelImpl, call: &Syscall) -> Result<()
 }
 
 fn starts_new_work(call: &Syscall) -> bool {
+    if let Syscall::FencedAgentMutation { mutation, .. } = call {
+        return starts_new_work(mutation);
+    }
     matches!(
         call,
         Syscall::CreateAgent { .. }
@@ -1765,7 +1798,54 @@ fn starts_new_work(call: &Syscall) -> bool {
     )
 }
 
+fn mutable_agent_target(call: &Syscall) -> Option<&str> {
+    match call {
+        Syscall::PauseAgent { agent_id }
+        | Syscall::ResumeAgent { agent_id }
+        | Syscall::StopAgent { agent_id }
+        | Syscall::KillAgent { agent_id }
+        | Syscall::ResumeGenerationCheckpoint { agent_id, .. }
+        | Syscall::DeleteGenerationCheckpoint { agent_id, .. }
+        | Syscall::SendMessage { agent_id, .. }
+        | Syscall::SendMessageStream { agent_id, .. }
+        | Syscall::CancelRequest { agent_id, .. }
+        | Syscall::CallTool { agent_id, .. }
+        | Syscall::MemoryStore { agent_id, .. }
+        | Syscall::MemoryUpdate { agent_id, .. }
+        | Syscall::MemoryDelete { agent_id, .. }
+        | Syscall::MemoryReindex { agent_id }
+        | Syscall::StoragePut { agent_id, .. }
+        | Syscall::StorageDelete { agent_id, .. }
+        | Syscall::SnapshotContext { agent_id, .. }
+        | Syscall::RestoreSnapshot { agent_id, .. }
+        | Syscall::DeleteSnapshot { agent_id, .. } => Some(agent_id),
+        _ => None,
+    }
+}
+
+fn enforce_unfenced_agent_mutation(kernel: &AgentKernelImpl, agent_id: &str) -> Result<(), String> {
+    match kernel.cluster_control.agent_mutation_fence(agent_id) {
+        Ok(Some(_)) => Err("agent mutation requires an exact destination ownership fence".into()),
+        Ok(None) => Ok(()),
+        Err(error) => Err(format!(
+            "agent mutation fence verification unavailable: {error}"
+        )),
+    }
+}
+
+fn mutation_fence_barrier_for(
+    kernel: &AgentKernelImpl,
+    agent_id: &str,
+) -> Result<(crate::AgentId, std::sync::Arc<tokio::sync::RwLock<()>>), String> {
+    let parsed =
+        uuid::Uuid::parse_str(agent_id).map_err(|_| format!("invalid agent id: {agent_id}"))?;
+    Ok((parsed, kernel.agent_mutation_fence_barrier(parsed)))
+}
+
 fn quarantine_recovery_call(call: &Syscall) -> bool {
+    if let Syscall::FencedAgentMutation { mutation, .. } = call {
+        return quarantine_recovery_call(mutation);
+    }
     matches!(
         call,
         Syscall::Hello { .. }
@@ -1861,7 +1941,7 @@ pub async fn dispatch_scoped(
                 "kernel.component",
                 component
             );
-            dispatch_scoped_inner(kernel, call, principal)
+            dispatch_scoped_inner_with_fence(kernel, call, principal, false, false)
                 .instrument(component_span)
                 .await
         }
@@ -1915,12 +1995,18 @@ fn request_outcome(reply: &SyscallReply) -> crate::telemetry::RequestOutcome {
     }
 }
 
-async fn dispatch_scoped_inner(
+async fn dispatch_scoped_inner_with_fence(
     kernel: &AgentKernelImpl,
     call: Syscall,
     principal: Option<&Principal>,
+    fence_verified: bool,
+    erasure_read_inherited: bool,
 ) -> SyscallReply {
-    let _erasure_read = if matches!(&call, Syscall::EraseData { .. }) {
+    // A fenced envelope recursively dispatches while its outer erasure read
+    // guard remains alive. Do not reacquire this writer-preferring lock in the
+    // same task: a queued erasure writer would otherwise deadlock between the
+    // inherited and recursive read acquisitions.
+    let _erasure_read = if erasure_read_inherited || matches!(&call, Syscall::EraseData { .. }) {
         None
     } else {
         Some(kernel.erasure_barrier.read().await)
@@ -1931,6 +2017,72 @@ async fn dispatch_scoped_inner(
     if let Err(message) = enforce_node_admission(kernel, &call) {
         return SyscallReply::Error { message };
     }
+    if let Syscall::FencedAgentMutation {
+        agent_id,
+        proof,
+        mutation,
+    } = call
+    {
+        let Some(target) = mutable_agent_target(&mutation) else {
+            return SyscallReply::Error {
+                message: "destination fence rejected a non-agent or read-only operation".into(),
+            };
+        };
+        let (parsed_agent, barrier) = match mutation_fence_barrier_for(kernel, &agent_id) {
+            Ok(result) => result,
+            Err(message) => return SyscallReply::Error { message },
+        };
+        let parsed_target = match uuid::Uuid::parse_str(target) {
+            Ok(parsed) => parsed,
+            Err(_) => {
+                return SyscallReply::Error {
+                    message: format!("invalid agent id: {target}"),
+                }
+            }
+        };
+        if parsed_target != parsed_agent {
+            return SyscallReply::Error {
+                message: "destination fence agent does not match the nested mutation target".into(),
+            };
+        }
+        let canonical_agent_id = parsed_agent.to_string();
+        // Hold the shared guard through verification and the complete nested
+        // operation. Install/retire takes the matching exclusive guard.
+        let _mutation_fence_read = barrier.read().await;
+        if let Err(error) = kernel.cluster_control.verify_agent_mutation_fence(
+            &canonical_agent_id,
+            &proof.cluster_id,
+            &proof.owner_node_id,
+            proof.authority_generation,
+            proof.fencing_token,
+        ) {
+            return SyscallReply::Error {
+                message: error.to_string(),
+            };
+        }
+        return Box::pin(dispatch_scoped_inner_with_fence(
+            kernel, *mutation, None, true, true,
+        ))
+        .await;
+    }
+    let _mutation_fence_read = if !fence_verified {
+        if let Some(agent_id) = mutable_agent_target(&call) {
+            let (parsed_agent, barrier) = match mutation_fence_barrier_for(kernel, agent_id) {
+                Ok(result) => result,
+                Err(message) => return SyscallReply::Error { message },
+            };
+            let guard = barrier.read_owned().await;
+            if let Err(message) = enforce_unfenced_agent_mutation(kernel, &parsed_agent.to_string())
+            {
+                return SyscallReply::Error { message };
+            }
+            Some(guard)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
     let tenant = principal.map(|principal| principal.tenant_id.as_str());
     let package_scope = tenant.unwrap_or(crate::context::DEFAULT_TENANT);
     let package_actor = principal
@@ -3148,20 +3300,27 @@ async fn dispatch_scoped_inner(
             authority_generation,
             fencing_token,
             reason,
-        } => match kernel.cluster_control.install_agent_mutation_fence(
-            &agent_id,
-            &cluster_id,
-            &owner_node_id,
-            authority_generation,
-            fencing_token,
-            package_actor,
-            &reason,
-        ) {
-            Ok(fence) => SyscallReply::AgentMutationFence { fence: Some(fence) },
-            Err(error) => SyscallReply::Error {
-                message: error.to_string(),
-            },
-        },
+        } => {
+            let (parsed_agent, barrier) = match mutation_fence_barrier_for(kernel, &agent_id) {
+                Ok(result) => result,
+                Err(message) => return SyscallReply::Error { message },
+            };
+            let _mutation_fence_write = barrier.write().await;
+            match kernel.cluster_control.install_agent_mutation_fence(
+                &parsed_agent.to_string(),
+                &cluster_id,
+                &owner_node_id,
+                authority_generation,
+                fencing_token,
+                package_actor,
+                &reason,
+            ) {
+                Ok(fence) => SyscallReply::AgentMutationFence { fence: Some(fence) },
+                Err(error) => SyscallReply::Error {
+                    message: error.to_string(),
+                },
+            }
+        }
         Syscall::RetireAgentMutationFence {
             agent_id,
             cluster_id,
@@ -3169,20 +3328,27 @@ async fn dispatch_scoped_inner(
             authority_generation,
             fencing_token,
             reason,
-        } => match kernel.cluster_control.retire_agent_mutation_fence(
-            &agent_id,
-            &cluster_id,
-            &owner_node_id,
-            authority_generation,
-            fencing_token,
-            package_actor,
-            &reason,
-        ) {
-            Ok(fence) => SyscallReply::AgentMutationFence { fence: Some(fence) },
-            Err(error) => SyscallReply::Error {
-                message: error.to_string(),
-            },
-        },
+        } => {
+            let (parsed_agent, barrier) = match mutation_fence_barrier_for(kernel, &agent_id) {
+                Ok(result) => result,
+                Err(message) => return SyscallReply::Error { message },
+            };
+            let _mutation_fence_write = barrier.write().await;
+            match kernel.cluster_control.retire_agent_mutation_fence(
+                &parsed_agent.to_string(),
+                &cluster_id,
+                &owner_node_id,
+                authority_generation,
+                fencing_token,
+                package_actor,
+                &reason,
+            ) {
+                Ok(fence) => SyscallReply::AgentMutationFence { fence: Some(fence) },
+                Err(error) => SyscallReply::Error {
+                    message: error.to_string(),
+                },
+            }
+        }
         Syscall::GetAgentMutationFence { agent_id } => {
             match kernel.cluster_control.agent_mutation_fence(&agent_id) {
                 Ok(fence) => SyscallReply::AgentMutationFence { fence },
@@ -3202,6 +3368,7 @@ async fn dispatch_scoped_inner(
                 },
             }
         }
+        Syscall::FencedAgentMutation { .. } => unreachable!("fenced mutation is unwrapped above"),
         Syscall::Metrics => {
             let snap = crate::metrics::MetricsSnapshot::collect(kernel);
             SyscallReply::Metrics {
@@ -3880,6 +4047,16 @@ where
             return Ok(crate::telemetry::RequestOutcome::Rejected);
         }
     };
+    // The raw streaming path bypasses ordinary dispatch after authorization.
+    // Hold the same per-agent read barrier for the entire live stream so a
+    // token handoff cannot cross an already-admitted provider operation.
+    let mutation_fence_barrier = kernel.agent_mutation_fence_barrier(parsed_agent);
+    let _mutation_fence_read = mutation_fence_barrier.read().await;
+    if let Err(message) = enforce_unfenced_agent_mutation(kernel, &parsed_agent.to_string()) {
+        let reply = SyscallReply::Error { message }.into_public_wire(negotiated_version);
+        write_bounded_json(write, &reply, MAX_WIRE_FRAME_BYTES).await?;
+        return Ok(crate::telemetry::RequestOutcome::Rejected);
+    }
     if request_id.is_empty() || request_id.len() > 128 {
         let reply = SyscallReply::Error {
             message: "invalid request id: expected 1..=128 bytes".into(),
@@ -5839,6 +6016,400 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn destination_fence_rejects_unfenced_stale_and_mismatched_mutations() {
+        let kernel = AgentKernelImpl::new().expect("kernel new");
+        let created = kernel
+            .create_agent_full(AgentConfig {
+                name: "destination-fenced".into(),
+                task: "reject stale routes".into(),
+                llm_provider: "stub".into(),
+                permission_profile: "standard".into(),
+                priority: Priority::default(),
+                sandbox_config: None,
+            })
+            .await
+            .unwrap();
+        let agent_id = created.id.to_string();
+        let cluster_id = uuid::Uuid::new_v4().to_string();
+        let owner_node_id = kernel.cluster_control.identity().node_id.clone();
+        kernel
+            .cluster_control
+            .install_agent_mutation_fence(
+                &agent_id,
+                &cluster_id,
+                &owner_node_id,
+                7,
+                3,
+                "system",
+                "destination admission",
+            )
+            .unwrap();
+
+        assert!(matches!(
+            dispatch(
+                &kernel,
+                Syscall::PauseAgent {
+                    agent_id: agent_id.clone(),
+                },
+            )
+            .await,
+            SyscallReply::Error { message } if message.contains("requires an exact")
+        ));
+        let fenced = |token, mutation| Syscall::FencedAgentMutation {
+            agent_id: agent_id.clone(),
+            proof: AgentMutationFenceProof {
+                cluster_id: cluster_id.clone(),
+                owner_node_id: owner_node_id.clone(),
+                authority_generation: 7,
+                fencing_token: token,
+            },
+            mutation: Box::new(mutation),
+        };
+        assert!(matches!(
+            dispatch(
+                &kernel,
+                fenced(
+                    2,
+                    Syscall::PauseAgent {
+                        agent_id: agent_id.clone(),
+                    },
+                ),
+            )
+            .await,
+            SyscallReply::Error { message } if message.contains("destination ownership fence")
+        ));
+        assert!(matches!(
+            dispatch(
+                &kernel,
+                fenced(3, Syscall::ListAgents),
+            )
+            .await,
+            SyscallReply::Error { message } if message.contains("read-only")
+        ));
+        assert!(matches!(
+            dispatch(
+                &kernel,
+                Syscall::FencedAgentMutation {
+                    agent_id: uuid::Uuid::new_v4().to_string(),
+                    proof: AgentMutationFenceProof {
+                        cluster_id: cluster_id.clone(),
+                        owner_node_id: owner_node_id.clone(),
+                        authority_generation: 7,
+                        fencing_token: 3,
+                    },
+                    mutation: Box::new(Syscall::PauseAgent {
+                        agent_id: agent_id.clone(),
+                    }),
+                },
+            )
+            .await,
+            SyscallReply::Error { message } if message.contains("does not match")
+        ));
+        assert!(matches!(
+            dispatch(
+                &kernel,
+                fenced(
+                    3,
+                    Syscall::PauseAgent {
+                        agent_id: agent_id.clone(),
+                    },
+                ),
+            )
+            .await,
+            SyscallReply::AgentStatus { state, .. } if state == "Paused"
+        ));
+        assert!(matches!(
+            dispatch(
+                &kernel,
+                Syscall::ResumeAgent {
+                    agent_id: agent_id.clone(),
+                },
+            )
+            .await,
+            SyscallReply::Error { message } if message.contains("requires an exact")
+        ));
+        assert!(matches!(
+            dispatch(
+                &kernel,
+                fenced(
+                    3,
+                    Syscall::ResumeAgent {
+                        agent_id: agent_id.clone(),
+                    },
+                ),
+            )
+            .await,
+            SyscallReply::AgentStatus { state, .. } if state == "Running"
+        ));
+        kernel
+            .cluster_control
+            .retire_agent_mutation_fence(
+                &agent_id,
+                &cluster_id,
+                &owner_node_id,
+                7,
+                3,
+                "system",
+                "destination retired",
+            )
+            .unwrap();
+        assert!(matches!(
+            dispatch(
+                &kernel,
+                fenced(
+                    3,
+                    Syscall::PauseAgent {
+                        agent_id: agent_id.clone(),
+                    },
+                ),
+            )
+            .await,
+            SyscallReply::Error { message } if message.contains("destination ownership fence")
+        ));
+    }
+
+    #[tokio::test]
+    async fn destination_fence_handoff_waits_for_verified_mutation_to_finish() {
+        let kernel = Arc::new(AgentKernelImpl::new().expect("kernel new"));
+        let created = kernel
+            .create_agent_full(AgentConfig {
+                name: "destination-handoff".into(),
+                task: "serialize ownership transitions".into(),
+                llm_provider: "stub".into(),
+                permission_profile: "standard".into(),
+                priority: Priority::default(),
+                sandbox_config: None,
+            })
+            .await
+            .unwrap();
+        let agent_id = created.id.to_string();
+        let cluster_id = uuid::Uuid::new_v4().to_string();
+        let owner_node_id = kernel.cluster_control.identity().node_id.clone();
+        assert!(matches!(
+            dispatch(
+                &kernel,
+                Syscall::InstallAgentMutationFence {
+                    agent_id: agent_id.clone(),
+                    cluster_id: cluster_id.clone(),
+                    owner_node_id: owner_node_id.clone(),
+                    authority_generation: 7,
+                    fencing_token: 3,
+                    reason: "destination handoff test".into(),
+                },
+            )
+            .await,
+            SyscallReply::AgentMutationFence {
+                fence: Some(crate::cluster_control::AgentMutationFence {
+                    fencing_token: 3,
+                    ..
+                })
+            }
+        ));
+        let handoff_call = Syscall::InstallAgentMutationFence {
+            agent_id: agent_id.clone(),
+            cluster_id: cluster_id.clone(),
+            owner_node_id: owner_node_id.clone(),
+            authority_generation: 8,
+            fencing_token: 4,
+            reason: "destination handoff test".into(),
+        };
+
+        // Pause takes this guard after the destination fence is verified. Its
+        // deliberate hold lets the test observe that the fence's shared guard
+        // remains alive for the complete nested mutation.
+        let operator_guard = kernel.operator_control.mutation_guard().await;
+        let mutation_kernel = Arc::clone(&kernel);
+        let mutation_agent_id = agent_id.clone();
+        let mutation_cluster_id = cluster_id.clone();
+        let mutation_owner_node_id = owner_node_id.clone();
+        let mutation = tokio::spawn(async move {
+            dispatch(
+                &mutation_kernel,
+                Syscall::FencedAgentMutation {
+                    agent_id: mutation_agent_id.clone(),
+                    proof: AgentMutationFenceProof {
+                        cluster_id: mutation_cluster_id,
+                        owner_node_id: mutation_owner_node_id,
+                        authority_generation: 7,
+                        fencing_token: 3,
+                    },
+                    mutation: Box::new(Syscall::PauseAgent {
+                        agent_id: mutation_agent_id,
+                    }),
+                },
+            )
+            .await
+        });
+        let destination_barrier = kernel.agent_mutation_fence_barrier(created.id);
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if destination_barrier.try_write().is_err() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("verified mutation must acquire the destination read barrier");
+
+        let handoff_kernel = Arc::clone(&kernel);
+        let mut handoff =
+            tokio::spawn(async move { dispatch(&handoff_kernel, handoff_call).await });
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if destination_barrier.try_read().is_err() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("handoff writer must queue behind the verified mutation");
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut handoff)
+                .await
+                .is_err(),
+            "new ownership token must wait for the verified mutation"
+        );
+        let erasure_kernel = Arc::clone(&kernel);
+        let erasure_waiter = tokio::spawn(async move {
+            let _erasure_write = erasure_kernel.erasure_barrier.write().await;
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if kernel.erasure_barrier.try_read().is_err() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("erasure writer must queue behind the admitted mutation");
+
+        drop(operator_guard);
+        assert!(matches!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), mutation)
+                .await
+                .expect("fenced mutation must not deadlock behind a queued erasure")
+                .expect("mutation task"),
+            SyscallReply::AgentStatus { state, .. } if state == "Paused"
+        ));
+        assert!(matches!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), handoff)
+                .await
+                .expect("handoff must finish after the mutation")
+                .expect("handoff task"),
+            SyscallReply::AgentMutationFence {
+                fence: Some(crate::cluster_control::AgentMutationFence {
+                    authority_generation: 8,
+                    fencing_token: 4,
+                    ..
+                })
+            }
+        ));
+        tokio::time::timeout(std::time::Duration::from_secs(1), erasure_waiter)
+            .await
+            .expect("queued erasure barrier writer must finish")
+            .expect("erasure waiter task");
+    }
+
+    #[tokio::test]
+    async fn destination_fence_install_waits_for_admitted_unfenced_mutation() {
+        let kernel = Arc::new(AgentKernelImpl::new().expect("kernel new"));
+        let created = kernel
+            .create_agent_full(AgentConfig {
+                name: "destination-first-install".into(),
+                task: "serialize initial destination admission".into(),
+                llm_provider: "stub".into(),
+                permission_profile: "standard".into(),
+                priority: Priority::default(),
+                sandbox_config: None,
+            })
+            .await
+            .unwrap();
+        let agent_id = created.id.to_string();
+        let cluster_id = uuid::Uuid::new_v4().to_string();
+        let owner_node_id = kernel.cluster_control.identity().node_id.clone();
+        let install_call = Syscall::InstallAgentMutationFence {
+            agent_id: agent_id.clone(),
+            cluster_id,
+            owner_node_id,
+            authority_generation: 1,
+            fencing_token: 1,
+            reason: "initial destination admission".into(),
+        };
+
+        let operator_guard = kernel.operator_control.mutation_guard().await;
+        let mutation_kernel = Arc::clone(&kernel);
+        let mutation_agent_id = agent_id.clone();
+        let mutation = tokio::spawn(async move {
+            dispatch(
+                &mutation_kernel,
+                Syscall::PauseAgent {
+                    agent_id: mutation_agent_id,
+                },
+            )
+            .await
+        });
+        let destination_barrier = kernel.agent_mutation_fence_barrier(created.id);
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if destination_barrier.try_write().is_err() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("admitted mutation must acquire the destination read barrier");
+
+        let install_kernel = Arc::clone(&kernel);
+        let mut install =
+            tokio::spawn(async move { dispatch(&install_kernel, install_call).await });
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if destination_barrier.try_read().is_err() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("initial fence writer must queue behind the admitted mutation");
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut install)
+                .await
+                .is_err(),
+            "initial destination fence must wait for an admitted mutation"
+        );
+
+        drop(operator_guard);
+        assert!(matches!(
+            mutation.await.expect("mutation task"),
+            SyscallReply::AgentStatus { state, .. } if state == "Paused"
+        ));
+        assert!(matches!(
+            install.await.expect("install task"),
+            SyscallReply::AgentMutationFence {
+                fence: Some(crate::cluster_control::AgentMutationFence {
+                    fencing_token: 1,
+                    ..
+                })
+            }
+        ));
+        assert!(matches!(
+            dispatch(
+                &kernel,
+                Syscall::ResumeAgent {
+                    agent_id: agent_id.clone(),
+                },
+            )
+            .await,
+            SyscallReply::Error { message } if message.contains("requires an exact")
+        ));
+    }
+
+    #[tokio::test]
     async fn hello_negotiates_compatible_version() {
         let kernel = Arc::new(AgentKernelImpl::new().expect("kernel new"));
         let server = SyscallServer::bind(kernel, "127.0.0.1:0").await.unwrap();
@@ -6650,6 +7221,13 @@ memory = ["remember this"]
             let (required, action, target) = syscall_policy(call);
             assert_eq!(target, Some(id.as_str()), "unscoped operation: {action}");
             assert!(!action.is_empty());
+            if required != AccessLevel::ReadOnly {
+                assert_eq!(
+                    mutable_agent_target(call),
+                    target,
+                    "mutable agent operation {action} must be covered by destination fencing"
+                );
+            }
             assert!(authorize(&kernel, Some(&admin), call).await.is_ok());
             assert_eq!(
                 authorize(&kernel, Some(&reader), call).await.is_ok(),
@@ -6915,6 +7493,21 @@ memory = ["remember this"]
                 },
                 AccessLevel::System,
             ),
+            (
+                Syscall::FencedAgentMutation {
+                    agent_id: "00000000-0000-0000-0000-000000000001".into(),
+                    proof: AgentMutationFenceProof {
+                        cluster_id: "00000000-0000-0000-0000-000000000005".into(),
+                        owner_node_id: "00000000-0000-0000-0000-000000000004".into(),
+                        authority_generation: 1,
+                        fencing_token: 1,
+                    },
+                    mutation: Box::new(Syscall::PauseAgent {
+                        agent_id: "00000000-0000-0000-0000-000000000001".into(),
+                    }),
+                },
+                AccessLevel::System,
+            ),
             (Syscall::Metrics, AccessLevel::System),
             (Syscall::OperatorSnapshot, AccessLevel::ReadOnly),
             (Syscall::ListOperatorTunables, AccessLevel::System),
@@ -7041,7 +7634,7 @@ memory = ["remember this"]
                     .to_string()
             })
             .collect::<std::collections::HashSet<_>>();
-        assert_eq!(calls.len(), 86);
+        assert_eq!(calls.len(), 87);
         assert_eq!(fixture_tags, schema_tags);
     }
 

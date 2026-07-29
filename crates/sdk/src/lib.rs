@@ -62,6 +62,7 @@ pub use kernel::storage::{
     BackupRetentionEntry, BackupRetentionIssue, BackupRetentionPolicy, BackupRetentionReport,
     BackupTrustRoot, CorruptStorageRecoveryReport, RestoreReport,
 };
+pub use kernel::syscall_server::AgentMutationFenceProof;
 pub use kernel::syscall_server::{
     AgentSummary, FactSummary, GenerationCheckpointSummary, MessageStreamEvent,
     OperatorAgentSnapshot, OperatorCgroupSnapshot, OperatorNamespaceSnapshot,
@@ -646,6 +647,88 @@ impl KernelClient {
         }
     }
 
+    async fn fenced_call(
+        &mut self,
+        agent_id: String,
+        proof: AgentMutationFenceProof,
+        mutation: Syscall,
+    ) -> Result<SyscallReply, SdkError> {
+        self.call(Syscall::FencedAgentMutation {
+            agent_id,
+            proof,
+            mutation: Box::new(mutation),
+        })
+        .await
+    }
+
+    async fn fenced_lifecycle_call(
+        &mut self,
+        agent_id: String,
+        proof: AgentMutationFenceProof,
+        mutation: Syscall,
+    ) -> Result<LifecycleResult, SdkError> {
+        match self.fenced_call(agent_id, proof, mutation).await? {
+            SyscallReply::AgentStatus {
+                state,
+                checkpoint_id,
+                resumed_content,
+                resumed_tool_calls,
+                resumed_tokens,
+            } => Ok(LifecycleResult {
+                state,
+                checkpoint_id,
+                resumed_content,
+                resumed_tool_calls,
+                resumed_tokens,
+            }),
+            other => Err(unexpected("AgentStatus", &other)),
+        }
+    }
+
+    pub async fn pause_agent_fenced(
+        &mut self,
+        agent_id: impl Into<String>,
+        proof: AgentMutationFenceProof,
+    ) -> Result<LifecycleResult, SdkError> {
+        let agent_id = agent_id.into();
+        self.fenced_lifecycle_call(agent_id.clone(), proof, Syscall::PauseAgent { agent_id })
+            .await
+    }
+
+    pub async fn resume_agent_fenced(
+        &mut self,
+        agent_id: impl Into<String>,
+        proof: AgentMutationFenceProof,
+    ) -> Result<LifecycleResult, SdkError> {
+        let agent_id = agent_id.into();
+        self.fenced_lifecycle_call(agent_id.clone(), proof, Syscall::ResumeAgent { agent_id })
+            .await
+    }
+
+    pub async fn stop_agent_fenced(
+        &mut self,
+        agent_id: impl Into<String>,
+        proof: AgentMutationFenceProof,
+    ) -> Result<String, SdkError> {
+        let agent_id = agent_id.into();
+        Ok(self
+            .fenced_lifecycle_call(agent_id.clone(), proof, Syscall::StopAgent { agent_id })
+            .await?
+            .state)
+    }
+
+    pub async fn kill_agent_fenced(
+        &mut self,
+        agent_id: impl Into<String>,
+        proof: AgentMutationFenceProof,
+    ) -> Result<String, SdkError> {
+        let agent_id = agent_id.into();
+        Ok(self
+            .fenced_lifecycle_call(agent_id.clone(), proof, Syscall::KillAgent { agent_id })
+            .await?
+            .state)
+    }
+
     /// Durable pause result, including the checkpoint id when an active turn
     /// reached its cooperative boundary.
     pub async fn pause_agent_durable(
@@ -780,6 +863,37 @@ impl KernelClient {
             message: message.into(),
         };
         match self.call(call).await? {
+            SyscallReply::Message {
+                content,
+                tool_calls,
+                tokens,
+            } => Ok(MessageResult {
+                content,
+                tool_calls,
+                tokens,
+            }),
+            other => Err(unexpected("Message", &other)),
+        }
+    }
+
+    pub async fn send_message_fenced(
+        &mut self,
+        agent_id: impl Into<String>,
+        proof: AgentMutationFenceProof,
+        message: impl Into<String>,
+    ) -> Result<MessageResult, SdkError> {
+        let agent_id = agent_id.into();
+        match self
+            .fenced_call(
+                agent_id.clone(),
+                proof,
+                Syscall::SendMessage {
+                    agent_id,
+                    message: message.into(),
+                },
+            )
+            .await?
+        {
             SyscallReply::Message {
                 content,
                 tool_calls,
@@ -931,6 +1045,31 @@ impl KernelClient {
             args,
         };
         match self.call(call).await? {
+            SyscallReply::ToolResult { data } => Ok(data),
+            other => Err(unexpected("ToolResult", &other)),
+        }
+    }
+
+    pub async fn call_tool_fenced(
+        &mut self,
+        agent_id: impl Into<String>,
+        proof: AgentMutationFenceProof,
+        tool: impl Into<String>,
+        args: serde_json::Value,
+    ) -> Result<serde_json::Value, SdkError> {
+        let agent_id = agent_id.into();
+        match self
+            .fenced_call(
+                agent_id.clone(),
+                proof,
+                Syscall::CallTool {
+                    agent_id,
+                    tool: tool.into(),
+                    args,
+                },
+            )
+            .await?
+        {
             SyscallReply::ToolResult { data } => Ok(data),
             other => Err(unexpected("ToolResult", &other)),
         }
@@ -2806,6 +2945,7 @@ mod protocol_tests {
         let addr = server.local_addr().unwrap();
         tokio::spawn(server.serve());
         let mut client = KernelClient::connect(addr).await.expect("connect");
+        client.hello().await.unwrap();
         let agent_id = client
             .create_agent(
                 "fenced-sdk-agent",
@@ -2870,6 +3010,44 @@ mod protocol_tests {
         assert_eq!(
             client.agent_mutation_fence(&agent_id).await.unwrap(),
             Some(installed.clone())
+        );
+        let proof = AgentMutationFenceProof {
+            cluster_id: challenge.cluster_id.clone(),
+            owner_node_id: identity.node_id.clone(),
+            authority_generation: renewed.generation,
+            fencing_token: renewed.fencing_token,
+        };
+        assert_eq!(
+            client.pause_agent(&agent_id).await.unwrap_err().wire_code(),
+            Some(WireErrorCode::Conflict)
+        );
+        let stream_error = client
+            .send_message_stream(
+                "unfenced-stream",
+                &agent_id,
+                "must be rejected before provider execution",
+                |_| {},
+            )
+            .await
+            .unwrap_err();
+        assert!(stream_error
+            .kernel_message()
+            .is_some_and(|message| message.contains("requires an exact")));
+        assert_eq!(
+            client
+                .pause_agent_fenced(&agent_id, proof.clone())
+                .await
+                .unwrap()
+                .state,
+            "Paused"
+        );
+        assert_eq!(
+            client
+                .resume_agent_fenced(&agent_id, proof)
+                .await
+                .unwrap()
+                .state,
+            "Running"
         );
         let retired_fence = client
             .retire_agent_mutation_fence(

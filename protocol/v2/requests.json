@@ -348,6 +348,20 @@
     "op": "list_agent_mutation_fence_audit"
   },
   {
+    "agent_id": "00000000-0000-0000-0000-000000000001",
+    "mutation": {
+      "agent_id": "00000000-0000-0000-0000-000000000001",
+      "op": "pause_agent"
+    },
+    "op": "fenced_agent_mutation",
+    "proof": {
+      "authority_generation": 1,
+      "cluster_id": "00000000-0000-0000-0000-000000000005",
+      "fencing_token": 1,
+      "owner_node_id": "00000000-0000-0000-0000-000000000004"
+    }
+  },
+  {
     "op": "metrics"
   },
   {

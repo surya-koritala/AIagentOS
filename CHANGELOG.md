@@ -17,8 +17,19 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
   restart; clean leave cannot strand an active lease, and identity revocation
   releases every owned record atomically. The controls are exposed through the
   typed v2 wire/SDK boundary, and schema migration v4 upgrades existing stores
-  atomically. Workload mutations do not enforce these tokens yet, so this is
-  not a partition fence.
+  atomically. Authority records require explicit destination installation and
+  are not automatically propagated, so this alone is not a partition fence.
+- Added durable workload-node mutation fences and retirement tombstones.
+  System-only v2/SDK controls install the highest accepted cluster/owner/
+  generation/token record; every agent-targeted write path then rejects
+  unfenced, stale, retired, cross-agent, and foreign-destination calls.
+  Per-agent read/write admission barriers hold verification across the complete
+  operation, serialize initial installation and handoff with in-flight work,
+  and cover the dedicated ordinary-stream path.
+  Fenced lifecycle, turn, and tool SDK calls reuse the existing authorization
+  and resource gates. This is destination enforcement, not quorum: automatic
+  `ClusterClient` propagation, fenced streaming, authority terms/failover, and
+  migration remain open in #122.
 - Published the normative distributed control-plane consistency contract. It
   distinguishes single-authority membership, node-local state, reconstructed
   routing, and missing ownership fencing; defines fail-closed partition, retry,

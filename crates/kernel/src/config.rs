@@ -236,10 +236,23 @@ impl BackupScheduleConfig {
 #[serde(deny_unknown_fields)]
 pub struct ClusterRaftMemberConfig {
     pub node_id: u64,
+    /// Durable application-level node UUID exposed by cluster membership and
+    /// ownership APIs. This is distinct from OpenRaft's compact numeric id.
+    pub application_node_id: String,
+    /// Agent syscall endpoint published to SDK clients for this node.
+    pub application_endpoint: String,
+    /// Optional SHA-256 fingerprint of the certificate served by the agent
+    /// syscall endpoint. This is intentionally separate from the Raft
+    /// transport certificate because the two listeners may use different
+    /// credentials, or the application listener may be loopback plaintext.
+    #[serde(default)]
+    pub application_tls_server_certificate_sha256: Option<String>,
     pub endpoint: String,
     pub server_name: String,
     pub tls_certificate_sha256: String,
     pub tls_client_certificate_sha256: String,
+    /// Hex-encoded Ed25519 public key of the durable application node
+    /// identity. The local entry must match `ClusterControl::identity()`.
     pub identity_public_key: String,
 }
 
@@ -256,6 +269,9 @@ pub struct ClusterRaftConfig {
     pub enabled: bool,
     pub bootstrap: bool,
     pub node_id: u64,
+    /// Canonical UUID shared by every voter and returned by the replicated
+    /// membership API.
+    pub authority_cluster_id: String,
     pub listen_addr: String,
     pub cluster_name: String,
     pub members: Vec<ClusterRaftMemberConfig>,
@@ -281,6 +297,7 @@ impl Default for ClusterRaftConfig {
             enabled: false,
             bootstrap: false,
             node_id: 0,
+            authority_cluster_id: String::new(),
             listen_addr: "127.0.0.1:8788".into(),
             cluster_name: "ai-agent-os".into(),
             members: Vec::new(),
@@ -312,6 +329,13 @@ impl ClusterRaftConfig {
         }
         if self.node_id == 0 {
             return Err("cluster_raft.node_id 0 is reserved".into());
+        }
+        let authority_cluster_id = uuid::Uuid::parse_str(&self.authority_cluster_id)
+            .map_err(|_| "cluster_raft.authority_cluster_id must be a UUID".to_string())?;
+        if authority_cluster_id.to_string() != self.authority_cluster_id {
+            return Err(
+                "cluster_raft.authority_cluster_id must use canonical lowercase UUID form".into(),
+            );
         }
         let listen_addr = self
             .listen_addr
@@ -409,6 +433,9 @@ impl ClusterRaftConfig {
         }
 
         let mut node_ids = BTreeSet::new();
+        let mut application_node_ids = BTreeSet::new();
+        let mut application_endpoints = BTreeSet::new();
+        let mut application_tls_fingerprints = BTreeSet::new();
         let mut endpoints = BTreeSet::new();
         let mut server_fingerprints = BTreeSet::new();
         let mut client_fingerprints = BTreeSet::new();
@@ -421,6 +448,29 @@ impl ClusterRaftConfig {
             if !node_ids.insert(member.node_id) {
                 return Err("cluster_raft contains a duplicate member node_id".into());
             }
+            let application_node_id =
+                uuid::Uuid::parse_str(&member.application_node_id).map_err(|_| {
+                    "cluster_raft member application_node_id must be a UUID".to_string()
+                })?;
+            if application_node_id.to_string() != member.application_node_id {
+                return Err(
+                    "cluster_raft member application_node_id must use canonical lowercase UUID form"
+                        .into(),
+                );
+            }
+            validate_cluster_endpoint(&member.application_endpoint)?;
+            if let Some(fingerprint) = member.application_tls_server_certificate_sha256.as_deref() {
+                validate_cluster_fingerprint(
+                    fingerprint,
+                    "application_tls_server_certificate_sha256",
+                )?;
+                if !application_tls_fingerprints.insert(fingerprint) {
+                    return Err(
+                        "cluster_raft contains a duplicate application TLS server certificate fingerprint"
+                            .into(),
+                    );
+                }
+            }
             validate_cluster_endpoint(&member.endpoint)?;
             validate_cluster_server_name(&member.server_name)?;
             validate_cluster_fingerprint(&member.tls_certificate_sha256, "tls_certificate_sha256")?;
@@ -428,10 +478,21 @@ impl ClusterRaftConfig {
                 &member.tls_client_certificate_sha256,
                 "tls_client_certificate_sha256",
             )?;
-            if member.identity_public_key.is_empty() || member.identity_public_key.len() > 8_192 {
+            if member.identity_public_key.len() != 64
+                || !member
+                    .identity_public_key
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            {
                 return Err(
-                    "cluster_raft member identity_public_key must contain 1 to 8192 bytes".into(),
+                    "cluster_raft member identity_public_key must be a 32-byte Ed25519 key encoded as 64 lowercase hexadecimal characters".into(),
                 );
+            }
+            if !application_node_ids.insert(member.application_node_id.as_str()) {
+                return Err("cluster_raft contains a duplicate member application_node_id".into());
+            }
+            if !application_endpoints.insert(member.application_endpoint.as_str()) {
+                return Err("cluster_raft contains a duplicate member application_endpoint".into());
             }
             if !endpoints.insert(member.endpoint.as_str()) {
                 return Err("cluster_raft contains a duplicate member endpoint".into());
@@ -450,6 +511,17 @@ impl ClusterRaftConfig {
                 member.tls_certificate_sha256.as_str(),
                 member.tls_client_certificate_sha256.as_str(),
             ] {
+                if certificate_owners
+                    .insert(fingerprint, member.node_id)
+                    .is_some_and(|owner| owner != member.node_id)
+                {
+                    return Err(
+                        "cluster_raft certificate fingerprint is assigned to multiple node ids"
+                            .into(),
+                    );
+                }
+            }
+            if let Some(fingerprint) = member.application_tls_server_certificate_sha256.as_deref() {
                 if certificate_owners
                     .insert(fingerprint, member.node_id)
                     .is_some_and(|owner| owner != member.node_id)
@@ -1123,13 +1195,17 @@ mod tests {
             enabled: true,
             bootstrap: true,
             node_id: 1,
+            authority_cluster_id: "00000000-0000-0000-0000-000000000100".into(),
             members: vec![ClusterRaftMemberConfig {
                 node_id: 1,
+                application_node_id: "00000000-0000-0000-0000-000000000001".into(),
+                application_endpoint: "127.0.0.1:7777".into(),
+                application_tls_server_certificate_sha256: None,
                 endpoint: "127.0.0.1:8788".into(),
                 server_name: "node-1.agentos.test".into(),
                 tls_certificate_sha256: "a".repeat(64),
                 tls_client_certificate_sha256: "b".repeat(64),
-                identity_public_key: "test-node-1-identity".into(),
+                identity_public_key: "c".repeat(64),
             }],
             server_certificate_path: Some(root.join("server.pem")),
             server_private_key_path: Some(root.join("server-key.pem")),
@@ -1185,11 +1261,21 @@ mod tests {
             .contains("lowercase hexadecimal"));
 
         let mut config = valid_cluster_raft_config();
+        config.members[0].application_tls_server_certificate_sha256 =
+            Some("application-cert".into());
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .contains("application_tls_server_certificate_sha256"));
+
+        let mut config = valid_cluster_raft_config();
         let mut second = config.members[0].clone();
         second.node_id = 2;
+        second.application_node_id = "00000000-0000-0000-0000-000000000002".into();
+        second.application_endpoint = "127.0.0.1:7778".into();
         second.endpoint = "127.0.0.1:8789".into();
         second.tls_client_certificate_sha256 = "c".repeat(64);
-        second.identity_public_key = "test-node-2-identity".into();
+        second.identity_public_key = "d".repeat(64);
         config.members.push(second);
         assert!(config
             .validate()

@@ -34,6 +34,7 @@ use tracing::Instrument;
 
 use crate::agent::AgentKernel;
 use crate::auth::{Principal, Role};
+use crate::cluster_consensus::{AuthorityCommand, AuthorityRejection, AuthorityResponse};
 use crate::connector::AgentConnector;
 use crate::context::{ContextManager, ContextPressureStats, Fact, FactCategory};
 use crate::observability::{AgentAction, ObservabilityEngine};
@@ -548,10 +549,16 @@ pub enum Syscall {
     },
     /// Create a one-time authority challenge for admitting a durable node.
     IssueClusterJoinChallenge {
+        /// Stable UUID for safe replay after an ambiguous response. Omitted by
+        /// legacy clients; the server then creates one for this attempt.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        operation_id: Option<String>,
         ttl_seconds: u64,
     },
     /// Register or re-register a node after verifying its challenged identity.
     RegisterClusterMember {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        operation_id: Option<String>,
         registration: crate::cluster_control::ClusterMemberRegistration,
         challenge_hex: String,
         signature_hex: String,
@@ -561,6 +568,8 @@ pub enum Syscall {
     },
     /// Generation-fenced clean leave or terminal identity revocation.
     SetClusterMemberState {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        operation_id: Option<String>,
         node_id: String,
         state: crate::cluster_control::ClusterMemberState,
         expected_generation: u64,
@@ -576,6 +585,8 @@ pub enum Syscall {
     /// Claim an unowned, released, or expired agent ownership record. Replacing
     /// a tombstone or expired lease requires its exact fencing token.
     ClaimClusterAgentOwnership {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        operation_id: Option<String>,
         agent_id: String,
         owner_node_id: String,
         ttl_seconds: u64,
@@ -585,6 +596,8 @@ pub enum Syscall {
     },
     /// Renew the exact active owner/token pair without changing its fence.
     RenewClusterAgentOwnership {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        operation_id: Option<String>,
         agent_id: String,
         owner_node_id: String,
         fencing_token: u64,
@@ -593,6 +606,8 @@ pub enum Syscall {
     },
     /// Release the exact active owner/token pair and retain its tombstone.
     ReleaseClusterAgentOwnership {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        operation_id: Option<String>,
         agent_id: String,
         owner_node_id: String,
         fencing_token: u64,
@@ -960,6 +975,10 @@ impl WireErrorCode {
             (Self::InvalidRequest, false)
         } else if message.contains("invalid agent id") || message.contains("invalid ") {
             (Self::InvalidArgument, false)
+        } else if message
+            .contains("authority operation_id is already committed with a different command")
+        {
+            (Self::Conflict, false)
         } else if message.contains("mutation fence")
             || message.contains("destination fence")
             || message.contains("ownership fence")
@@ -2029,6 +2048,55 @@ fn request_outcome(reply: &SyscallReply) -> crate::telemetry::RequestOutcome {
             crate::telemetry::RequestOutcome::Failed
         }
         Some(_) => crate::telemetry::RequestOutcome::Rejected,
+    }
+}
+
+fn configured_cluster_authority(
+    kernel: &AgentKernelImpl,
+) -> std::io::Result<Option<crate::cluster_runtime::ClusterAuthorityHandle>> {
+    kernel.cluster_authority().map_err(std::io::Error::other)
+}
+
+fn authority_operation_id(operation_id: Option<String>) -> String {
+    operation_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string())
+}
+
+fn authority_command_error(response: AuthorityResponse) -> SyscallReply {
+    match response {
+        AuthorityResponse::Rejected {
+            reason, message, ..
+        } => {
+            let category = match reason {
+                AuthorityRejection::InvalidOperationId | AuthorityRejection::InvalidCommand => {
+                    "invalid replicated authority command"
+                }
+                AuthorityRejection::OperationIdConflict
+                | AuthorityRejection::SequenceMismatch
+                | AuthorityRejection::Conflict => "replicated authority conflict",
+                AuthorityRejection::ReceiptCapacityReached
+                | AuthorityRejection::SequenceExhausted
+                | AuthorityRejection::NotInitialized
+                | AuthorityRejection::CapacityReached => "replicated authority unavailable",
+            };
+            SyscallReply::Error {
+                message: format!("{category}: {message}"),
+            }
+        }
+        other => SyscallReply::Error {
+            message: format!("replicated authority returned an unexpected response: {other:?}"),
+        },
+    }
+}
+
+fn authority_io_error(error: std::io::Error) -> SyscallReply {
+    let category = match error.kind() {
+        std::io::ErrorKind::InvalidData
+        | std::io::ErrorKind::InvalidInput
+        | std::io::ErrorKind::Other => "replicated authority internal",
+        _ => "replicated authority unavailable",
+    };
+    SyscallReply::Error {
+        message: format!("{category}: {error}"),
     }
 }
 
@@ -3237,15 +3305,45 @@ async fn dispatch_scoped_inner_with_fence(
                 message: error.to_string(),
             },
         },
-        Syscall::IssueClusterJoinChallenge { ttl_seconds } => {
-            match kernel.cluster_control.issue_join_challenge(ttl_seconds) {
-                Ok(challenge) => SyscallReply::ClusterJoinChallenge { challenge },
-                Err(error) => SyscallReply::Error {
-                    message: error.to_string(),
-                },
+        Syscall::IssueClusterJoinChallenge {
+            operation_id,
+            ttl_seconds,
+        } => {
+            let authority = match configured_cluster_authority(kernel) {
+                Ok(authority) => authority,
+                Err(error) => return authority_io_error(error),
+            };
+            if let Some(authority) = authority {
+                let operation_id = authority_operation_id(operation_id);
+                let mut challenge_material = b"AIagentOS replicated join challenge v1".to_vec();
+                challenge_material.extend_from_slice(operation_id.as_bytes());
+                let challenge_hex = crate::cluster_control::sha256_hex(&challenge_material);
+                match authority
+                    .commit(AuthorityCommand::IssueJoinChallenge {
+                        operation_id,
+                        challenge_hex,
+                        ttl_seconds,
+                        proposed_at: chrono::Utc::now(),
+                    })
+                    .await
+                {
+                    Ok(AuthorityResponse::JoinChallengeIssued { challenge, .. }) => {
+                        SyscallReply::ClusterJoinChallenge { challenge }
+                    }
+                    Ok(response) => authority_command_error(response),
+                    Err(error) => authority_io_error(error),
+                }
+            } else {
+                match kernel.cluster_control.issue_join_challenge(ttl_seconds) {
+                    Ok(challenge) => SyscallReply::ClusterJoinChallenge { challenge },
+                    Err(error) => SyscallReply::Error {
+                        message: error.to_string(),
+                    },
+                }
             }
         }
         Syscall::RegisterClusterMember {
+            operation_id,
             registration,
             challenge_hex,
             signature_hex,
@@ -3255,23 +3353,52 @@ async fn dispatch_scoped_inner_with_fence(
             let actor = principal
                 .map(|principal| principal.user_id.as_str())
                 .unwrap_or("system");
-            match kernel.cluster_control.register_member(
-                registration,
-                &challenge_hex,
-                &signature_hex,
-                expected_generation,
-                MIN_PROTOCOL_VERSION,
-                PROTOCOL_VERSION,
-                actor,
-                &reason,
-            ) {
-                Ok(member) => SyscallReply::ClusterMemberUpdated { member },
-                Err(error) => SyscallReply::Error {
-                    message: error.to_string(),
-                },
+            let authority = match configured_cluster_authority(kernel) {
+                Ok(authority) => authority,
+                Err(error) => return authority_io_error(error),
+            };
+            if let Some(authority) = authority {
+                match authority
+                    .commit(AuthorityCommand::RegisterMember {
+                        operation_id: authority_operation_id(operation_id),
+                        registration,
+                        challenge_hex,
+                        signature_hex,
+                        expected_generation,
+                        authority_min_protocol_version: MIN_PROTOCOL_VERSION,
+                        authority_protocol_version: PROTOCOL_VERSION,
+                        actor: actor.to_owned(),
+                        reason,
+                        proposed_at: chrono::Utc::now(),
+                    })
+                    .await
+                {
+                    Ok(AuthorityResponse::MemberUpdated { member, .. }) => {
+                        SyscallReply::ClusterMemberUpdated { member }
+                    }
+                    Ok(response) => authority_command_error(response),
+                    Err(error) => authority_io_error(error),
+                }
+            } else {
+                match kernel.cluster_control.register_member(
+                    registration,
+                    &challenge_hex,
+                    &signature_hex,
+                    expected_generation,
+                    MIN_PROTOCOL_VERSION,
+                    PROTOCOL_VERSION,
+                    actor,
+                    &reason,
+                ) {
+                    Ok(member) => SyscallReply::ClusterMemberUpdated { member },
+                    Err(error) => SyscallReply::Error {
+                        message: error.to_string(),
+                    },
+                }
             }
         }
         Syscall::SetClusterMemberState {
+            operation_id,
             node_id,
             state,
             expected_generation,
@@ -3280,34 +3407,94 @@ async fn dispatch_scoped_inner_with_fence(
             let actor = principal
                 .map(|principal| principal.user_id.as_str())
                 .unwrap_or("system");
-            match kernel.cluster_control.set_member_state(
-                &node_id,
-                state,
-                expected_generation,
-                actor,
-                &reason,
-            ) {
-                Ok(member) => SyscallReply::ClusterMemberUpdated { member },
-                Err(error) => SyscallReply::Error {
-                    message: error.to_string(),
-                },
+            let authority = match configured_cluster_authority(kernel) {
+                Ok(authority) => authority,
+                Err(error) => return authority_io_error(error),
+            };
+            if let Some(authority) = authority {
+                match authority
+                    .commit(AuthorityCommand::SetMemberState {
+                        operation_id: authority_operation_id(operation_id),
+                        node_id,
+                        state,
+                        expected_generation,
+                        actor: actor.to_owned(),
+                        reason,
+                        proposed_at: chrono::Utc::now(),
+                    })
+                    .await
+                {
+                    Ok(AuthorityResponse::MemberUpdated { member, .. }) => {
+                        SyscallReply::ClusterMemberUpdated { member }
+                    }
+                    Ok(response) => authority_command_error(response),
+                    Err(error) => authority_io_error(error),
+                }
+            } else {
+                match kernel.cluster_control.set_member_state(
+                    &node_id,
+                    state,
+                    expected_generation,
+                    actor,
+                    &reason,
+                ) {
+                    Ok(member) => SyscallReply::ClusterMemberUpdated { member },
+                    Err(error) => SyscallReply::Error {
+                        message: error.to_string(),
+                    },
+                }
             }
         }
-        Syscall::GetClusterMembership => match kernel.cluster_control.membership_snapshot() {
-            Ok(membership) => SyscallReply::ClusterMembership { membership },
-            Err(error) => SyscallReply::Error {
-                message: error.to_string(),
-            },
-        },
+        Syscall::GetClusterMembership => {
+            let authority = match configured_cluster_authority(kernel) {
+                Ok(authority) => authority,
+                Err(error) => return authority_io_error(error),
+            };
+            if let Some(authority) = authority {
+                match authority.linearizable_view().await {
+                    Ok(view) => SyscallReply::ClusterMembership {
+                        membership: view.membership,
+                    },
+                    Err(error) => authority_io_error(error),
+                }
+            } else {
+                match kernel.cluster_control.membership_snapshot() {
+                    Ok(membership) => SyscallReply::ClusterMembership { membership },
+                    Err(error) => SyscallReply::Error {
+                        message: error.to_string(),
+                    },
+                }
+            }
+        }
         Syscall::ListClusterMembershipAudit { limit } => {
-            match kernel.cluster_control.membership_audit(limit) {
-                Ok(entries) => SyscallReply::ClusterMembershipAudit { entries },
-                Err(error) => SyscallReply::Error {
-                    message: error.to_string(),
-                },
+            let authority = match configured_cluster_authority(kernel) {
+                Ok(authority) => authority,
+                Err(error) => return authority_io_error(error),
+            };
+            if let Some(authority) = authority {
+                match authority.linearizable_view().await {
+                    Ok(view) => {
+                        let entries = view
+                            .membership_audit
+                            .into_iter()
+                            .rev()
+                            .take(limit.clamp(1, 1_000))
+                            .collect();
+                        SyscallReply::ClusterMembershipAudit { entries }
+                    }
+                    Err(error) => authority_io_error(error),
+                }
+            } else {
+                match kernel.cluster_control.membership_audit(limit) {
+                    Ok(entries) => SyscallReply::ClusterMembershipAudit { entries },
+                    Err(error) => SyscallReply::Error {
+                        message: error.to_string(),
+                    },
+                }
             }
         }
         Syscall::ClaimClusterAgentOwnership {
+            operation_id,
             agent_id,
             owner_node_id,
             ttl_seconds,
@@ -3317,23 +3504,52 @@ async fn dispatch_scoped_inner_with_fence(
             let actor = principal
                 .map(|principal| principal.user_id.as_str())
                 .unwrap_or("system");
-            match kernel.cluster_control.claim_agent_ownership(
-                &agent_id,
-                &owner_node_id,
-                ttl_seconds,
-                expected_fencing_token,
-                actor,
-                &reason,
-            ) {
-                Ok(ownership) => SyscallReply::ClusterAgentOwnership {
-                    ownership: Some(ownership),
-                },
-                Err(error) => SyscallReply::Error {
-                    message: error.to_string(),
-                },
+            let authority = match configured_cluster_authority(kernel) {
+                Ok(authority) => authority,
+                Err(error) => return authority_io_error(error),
+            };
+            if let Some(authority) = authority {
+                match authority
+                    .commit(AuthorityCommand::ClaimOwnership {
+                        operation_id: authority_operation_id(operation_id),
+                        agent_id,
+                        owner_node_id,
+                        ttl_seconds,
+                        expected_fencing_token,
+                        actor: actor.to_owned(),
+                        reason,
+                        proposed_at: chrono::Utc::now(),
+                    })
+                    .await
+                {
+                    Ok(AuthorityResponse::OwnershipUpdated { ownership, .. }) => {
+                        SyscallReply::ClusterAgentOwnership {
+                            ownership: Some(ownership),
+                        }
+                    }
+                    Ok(response) => authority_command_error(response),
+                    Err(error) => authority_io_error(error),
+                }
+            } else {
+                match kernel.cluster_control.claim_agent_ownership(
+                    &agent_id,
+                    &owner_node_id,
+                    ttl_seconds,
+                    expected_fencing_token,
+                    actor,
+                    &reason,
+                ) {
+                    Ok(ownership) => SyscallReply::ClusterAgentOwnership {
+                        ownership: Some(ownership),
+                    },
+                    Err(error) => SyscallReply::Error {
+                        message: error.to_string(),
+                    },
+                }
             }
         }
         Syscall::RenewClusterAgentOwnership {
+            operation_id,
             agent_id,
             owner_node_id,
             fencing_token,
@@ -3343,23 +3559,52 @@ async fn dispatch_scoped_inner_with_fence(
             let actor = principal
                 .map(|principal| principal.user_id.as_str())
                 .unwrap_or("system");
-            match kernel.cluster_control.renew_agent_ownership(
-                &agent_id,
-                &owner_node_id,
-                fencing_token,
-                ttl_seconds,
-                actor,
-                &reason,
-            ) {
-                Ok(ownership) => SyscallReply::ClusterAgentOwnership {
-                    ownership: Some(ownership),
-                },
-                Err(error) => SyscallReply::Error {
-                    message: error.to_string(),
-                },
+            let authority = match configured_cluster_authority(kernel) {
+                Ok(authority) => authority,
+                Err(error) => return authority_io_error(error),
+            };
+            if let Some(authority) = authority {
+                match authority
+                    .commit(AuthorityCommand::RenewOwnership {
+                        operation_id: authority_operation_id(operation_id),
+                        agent_id,
+                        owner_node_id,
+                        fencing_token,
+                        ttl_seconds,
+                        actor: actor.to_owned(),
+                        reason,
+                        proposed_at: chrono::Utc::now(),
+                    })
+                    .await
+                {
+                    Ok(AuthorityResponse::OwnershipUpdated { ownership, .. }) => {
+                        SyscallReply::ClusterAgentOwnership {
+                            ownership: Some(ownership),
+                        }
+                    }
+                    Ok(response) => authority_command_error(response),
+                    Err(error) => authority_io_error(error),
+                }
+            } else {
+                match kernel.cluster_control.renew_agent_ownership(
+                    &agent_id,
+                    &owner_node_id,
+                    fencing_token,
+                    ttl_seconds,
+                    actor,
+                    &reason,
+                ) {
+                    Ok(ownership) => SyscallReply::ClusterAgentOwnership {
+                        ownership: Some(ownership),
+                    },
+                    Err(error) => SyscallReply::Error {
+                        message: error.to_string(),
+                    },
+                }
             }
         }
         Syscall::ReleaseClusterAgentOwnership {
+            operation_id,
             agent_id,
             owner_node_id,
             fencing_token,
@@ -3368,58 +3613,180 @@ async fn dispatch_scoped_inner_with_fence(
             let actor = principal
                 .map(|principal| principal.user_id.as_str())
                 .unwrap_or("system");
-            match kernel.cluster_control.release_agent_ownership(
-                &agent_id,
-                &owner_node_id,
-                fencing_token,
-                actor,
-                &reason,
-            ) {
-                Ok(ownership) => SyscallReply::ClusterAgentOwnership {
-                    ownership: Some(ownership),
-                },
-                Err(error) => SyscallReply::Error {
-                    message: error.to_string(),
-                },
+            let authority = match configured_cluster_authority(kernel) {
+                Ok(authority) => authority,
+                Err(error) => return authority_io_error(error),
+            };
+            if let Some(authority) = authority {
+                match authority
+                    .commit(AuthorityCommand::ReleaseOwnership {
+                        operation_id: authority_operation_id(operation_id),
+                        agent_id,
+                        owner_node_id,
+                        fencing_token,
+                        actor: actor.to_owned(),
+                        reason,
+                        proposed_at: chrono::Utc::now(),
+                    })
+                    .await
+                {
+                    Ok(AuthorityResponse::OwnershipUpdated { ownership, .. }) => {
+                        SyscallReply::ClusterAgentOwnership {
+                            ownership: Some(ownership),
+                        }
+                    }
+                    Ok(response) => authority_command_error(response),
+                    Err(error) => authority_io_error(error),
+                }
+            } else {
+                match kernel.cluster_control.release_agent_ownership(
+                    &agent_id,
+                    &owner_node_id,
+                    fencing_token,
+                    actor,
+                    &reason,
+                ) {
+                    Ok(ownership) => SyscallReply::ClusterAgentOwnership {
+                        ownership: Some(ownership),
+                    },
+                    Err(error) => SyscallReply::Error {
+                        message: error.to_string(),
+                    },
+                }
             }
         }
         Syscall::GetClusterAgentOwnership {
             agent_id,
             require_active,
         } => {
-            match kernel
-                .cluster_control
-                .agent_ownership_with_active_requirement(&agent_id, require_active)
-            {
-                Ok(ownership) => SyscallReply::ClusterAgentOwnership { ownership },
-                Err(error) => SyscallReply::Error {
-                    message: error.to_string(),
-                },
+            let authority = match configured_cluster_authority(kernel) {
+                Ok(authority) => authority,
+                Err(error) => return authority_io_error(error),
+            };
+            if let Some(authority) = authority {
+                match authority.linearizable_view().await {
+                    Ok(view) => {
+                        let authority_time = view.logical_time;
+                        let ownership = view
+                            .ownerships
+                            .into_iter()
+                            .find(|ownership| ownership.agent_id == agent_id);
+                        if require_active
+                            && ownership.as_ref().is_none_or(|ownership| {
+                                ownership.state
+                                    != crate::cluster_control::ClusterOwnershipState::Active
+                                    || ownership.lease_expires_at <= authority_time
+                            })
+                        {
+                            SyscallReply::Error {
+                                message:
+                                    "agent ownership conflict: lease is absent, released, or expired"
+                                        .into(),
+                            }
+                        } else {
+                            SyscallReply::ClusterAgentOwnership { ownership }
+                        }
+                    }
+                    Err(error) => authority_io_error(error),
+                }
+            } else {
+                match kernel
+                    .cluster_control
+                    .agent_ownership_with_active_requirement(&agent_id, require_active)
+                {
+                    Ok(ownership) => SyscallReply::ClusterAgentOwnership { ownership },
+                    Err(error) => SyscallReply::Error {
+                        message: error.to_string(),
+                    },
+                }
             }
         }
         Syscall::ListClusterAgentOwnerships {
             after_agent_id,
             limit,
         } => {
-            match kernel
-                .cluster_control
-                .agent_ownerships(after_agent_id.as_deref(), limit)
-            {
-                Ok(ownerships) => SyscallReply::ClusterAgentOwnerships { ownerships },
-                Err(error) => SyscallReply::Error {
-                    message: error.to_string(),
-                },
+            let authority = match configured_cluster_authority(kernel) {
+                Ok(authority) => authority,
+                Err(error) => return authority_io_error(error),
+            };
+            if let Some(authority) = authority {
+                if after_agent_id
+                    .as_deref()
+                    .is_some_and(|agent_id| uuid::Uuid::parse_str(agent_id).is_err())
+                {
+                    return SyscallReply::Error {
+                        message: "invalid ownership page cursor".into(),
+                    };
+                }
+                match authority.linearizable_view().await {
+                    Ok(view) => {
+                        let ownerships = view
+                            .ownerships
+                            .into_iter()
+                            .filter(|ownership| {
+                                after_agent_id
+                                    .as_deref()
+                                    .is_none_or(|cursor| ownership.agent_id.as_str() > cursor)
+                            })
+                            .take(limit.clamp(1, 1_000))
+                            .collect();
+                        SyscallReply::ClusterAgentOwnerships { ownerships }
+                    }
+                    Err(error) => authority_io_error(error),
+                }
+            } else {
+                match kernel
+                    .cluster_control
+                    .agent_ownerships(after_agent_id.as_deref(), limit)
+                {
+                    Ok(ownerships) => SyscallReply::ClusterAgentOwnerships { ownerships },
+                    Err(error) => SyscallReply::Error {
+                        message: error.to_string(),
+                    },
+                }
             }
         }
         Syscall::ListClusterAgentOwnershipAudit { agent_id, limit } => {
-            match kernel
-                .cluster_control
-                .agent_ownership_audit(agent_id.as_deref(), limit)
-            {
-                Ok(entries) => SyscallReply::ClusterAgentOwnershipAudit { entries },
-                Err(error) => SyscallReply::Error {
-                    message: error.to_string(),
-                },
+            let authority = match configured_cluster_authority(kernel) {
+                Ok(authority) => authority,
+                Err(error) => return authority_io_error(error),
+            };
+            if let Some(authority) = authority {
+                if agent_id
+                    .as_deref()
+                    .is_some_and(|agent_id| uuid::Uuid::parse_str(agent_id).is_err())
+                {
+                    return SyscallReply::Error {
+                        message: "invalid cluster ownership agent id".into(),
+                    };
+                }
+                match authority.linearizable_view().await {
+                    Ok(view) => {
+                        let entries = view
+                            .ownership_audit
+                            .into_iter()
+                            .rev()
+                            .filter(|entry| {
+                                agent_id
+                                    .as_deref()
+                                    .is_none_or(|agent_id| entry.agent_id == agent_id)
+                            })
+                            .take(limit.clamp(1, 1_000))
+                            .collect();
+                        SyscallReply::ClusterAgentOwnershipAudit { entries }
+                    }
+                    Err(error) => authority_io_error(error),
+                }
+            } else {
+                match kernel
+                    .cluster_control
+                    .agent_ownership_audit(agent_id.as_deref(), limit)
+                {
+                    Ok(entries) => SyscallReply::ClusterAgentOwnershipAudit { entries },
+                    Err(error) => SyscallReply::Error {
+                        message: error.to_string(),
+                    },
+                }
             }
         }
         Syscall::InstallAgentMutationFence {
@@ -5542,6 +5909,42 @@ mod tests {
         assert_eq!(
             WireErrorCode::classify("cgroup token quota exceeded"),
             (WireErrorCode::QuotaExceeded, true)
+        );
+    }
+
+    #[test]
+    fn replicated_authority_errors_have_stable_retry_semantics() {
+        assert_eq!(
+            WireErrorCode::classify(
+                "replicated authority conflict: authority operation_id is already committed with a different command"
+            ),
+            (WireErrorCode::Conflict, false)
+        );
+        assert_eq!(
+            WireErrorCode::classify(
+                "replicated authority unavailable: authority idempotency receipt capacity is exhausted"
+            ),
+            (WireErrorCode::Unavailable, true)
+        );
+        let SyscallReply::Error { message } = authority_io_error(std::io::Error::new(
+            std::io::ErrorKind::ConnectionRefused,
+            "no elected leader",
+        )) else {
+            panic!("authority I/O failures must use the ordinary error boundary");
+        };
+        assert_eq!(
+            WireErrorCode::classify(&message),
+            (WireErrorCode::Unavailable, true)
+        );
+        let SyscallReply::Error { message } = authority_io_error(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "barrier mismatch",
+        )) else {
+            panic!("authority invariant failures must use the ordinary error boundary");
+        };
+        assert_eq!(
+            WireErrorCode::classify(&message),
+            (WireErrorCode::Internal, false)
         );
     }
 
@@ -8402,11 +8805,15 @@ memory = ["remember this"]
                 AccessLevel::System,
             ),
             (
-                Syscall::IssueClusterJoinChallenge { ttl_seconds: 30 },
+                Syscall::IssueClusterJoinChallenge {
+                    operation_id: None,
+                    ttl_seconds: 30,
+                },
                 AccessLevel::System,
             ),
             (
                 Syscall::RegisterClusterMember {
+                    operation_id: None,
                     registration: crate::cluster_control::ClusterMemberRegistration {
                         node_id: "00000000-0000-0000-0000-000000000004".into(),
                         fingerprint: "00".repeat(32),
@@ -8426,6 +8833,7 @@ memory = ["remember this"]
             ),
             (
                 Syscall::SetClusterMemberState {
+                    operation_id: None,
                     node_id: "00000000-0000-0000-0000-000000000004".into(),
                     state: crate::cluster_control::ClusterMemberState::Left,
                     expected_generation: 1,
@@ -8440,6 +8848,7 @@ memory = ["remember this"]
             ),
             (
                 Syscall::ClaimClusterAgentOwnership {
+                    operation_id: None,
                     agent_id: "00000000-0000-0000-0000-000000000001".into(),
                     owner_node_id: "00000000-0000-0000-0000-000000000004".into(),
                     ttl_seconds: 30,
@@ -8450,6 +8859,7 @@ memory = ["remember this"]
             ),
             (
                 Syscall::RenewClusterAgentOwnership {
+                    operation_id: None,
                     agent_id: "00000000-0000-0000-0000-000000000001".into(),
                     owner_node_id: "00000000-0000-0000-0000-000000000004".into(),
                     fencing_token: 1,
@@ -8460,6 +8870,7 @@ memory = ["remember this"]
             ),
             (
                 Syscall::ReleaseClusterAgentOwnership {
+                    operation_id: None,
                     agent_id: "00000000-0000-0000-0000-000000000001".into(),
                     owner_node_id: "00000000-0000-0000-0000-000000000004".into(),
                     fencing_token: 1,

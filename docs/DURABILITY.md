@@ -3,7 +3,7 @@
 AI Agent OS currently stores kernel-owned state in one SQLite database. The
 database includes context, memory, usage and quota accounting, agent lifecycle,
 packages, operator settings, services, identity, cluster control state, and the
-durable log/state/snapshot substrate for future quorum authority.
+durable log/state/snapshot substrate used by the optional quorum authority.
 
 This document describes the guarantees implemented today. The kernel backup
 and offline restore primitives plus authenticated SDK/CLI entry points are
@@ -77,19 +77,30 @@ Consensus-store open rejects malformed JSON, index/entry disagreement, log
 holes, invalid idempotency receipts, and snapshot row/metadata/payload
 disagreement.
 
-The state machine currently exposes only an idempotent sequencing barrier with
-a bounded durable receipt map. Capacity exhaustion rejects new application
-commands rather than pruning independently on one replica. OpenRaft's complete
-storage-v2 conformance suite, file-backed vote/committed/log/state/snapshot
-restart persistence, barrier idempotency, snapshot transfer and rollback
-protection, durable-pointer monotonicity, and malformed-record rejection run in
-the kernel test suite. The separate `cluster_runtime` module executes this
-storage behind bounded mTLS peer RPCs; a three-node regression covers election,
-replication, leader failover, restart catch-up, and old-term fencing. The
-production server now constructs and owns that runtime when its strict
-`[cluster_raft]` configuration is enabled, but it still does not route public
-authority commands through the replicated state machine. This is therefore not
-a product quorum-authority claim.
+The state machine owns an immutable authority genesis, challenged application
+membership, membership generation/audit, ownership leases/tombstones/audit, a
+monotonic replicated authority clock, and exact operation receipts. A rejected
+command does not mutate that state. An exact retry returns its original result
+and log identity after a successful result is retained, even if the retry
+proposes a later wall-clock value; reusing that retained UUID for different
+command semantics fails closed. Rejected outcomes are not retained and callers
+must not treat an unavailable or rejected reply as success. The receipt map is
+bounded and capacity exhaustion rejects new application commands rather than
+letting one replica prune independently.
+
+OpenRaft's complete storage-v2 conformance suite, file-backed
+vote/committed/log/state/snapshot restart persistence, command idempotency,
+snapshot transfer and rollback protection, durable-pointer monotonicity, and
+malformed-record rejection run in the kernel test suite. The separate
+`cluster_runtime` module executes this storage behind bounded mTLS peer RPCs.
+A three-node regression covers election, application-state replication,
+follower write/read forwarding, leader failover, restart catch-up, old-term
+fencing, and no-quorum rejection. The production server constructs and owns
+that runtime and routes public membership and ownership authority through it
+when strict `[cluster_raft]` configuration is enabled. The disabled default
+retains the legacy single-node authority. Static voters, destination proof
+terms, cluster-wide certificate coordination, migration, global quota/trust
+convergence, and disaster recovery remain outside this slice.
 
 ## Authenticated accounting integrity
 

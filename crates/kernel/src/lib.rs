@@ -1078,6 +1078,10 @@ pub struct AgentKernelImpl {
     /// Durable cryptographic node identity plus generation-fenced
     /// active/draining/quarantined admission state.
     pub cluster_control: Arc<crate::cluster_control::ClusterControl>,
+    /// Present only while the daemon owns an initialized authenticated Raft
+    /// runtime. Public membership and ownership dispatch uses this handle
+    /// instead of the legacy single-writer tables.
+    cluster_authority: std::sync::RwLock<Option<crate::cluster_runtime::ClusterAuthorityHandle>>,
     pub permission_manager: Arc<PermissionManager>,
     pub sandbox_manager: Arc<SandboxManagerImpl>,
     pub ipc: Arc<IpcManager>,
@@ -1584,6 +1588,7 @@ impl AgentKernelImpl {
             backup_maintenance: Arc::new(crate::storage::BackupMaintenance::default()),
             _storage_lease: storage_lease,
             cluster_control,
+            cluster_authority: std::sync::RwLock::new(None),
             permission_manager,
             sandbox_manager,
             ipc,
@@ -1644,6 +1649,34 @@ impl AgentKernelImpl {
             service_directory: std::sync::RwLock::new(None),
             event_tx,
         })
+    }
+
+    /// Attach the live replicated authority exactly once during daemon
+    /// startup. Unit/in-process kernels retain the legacy single-node path.
+    pub fn install_cluster_authority(
+        &self,
+        authority: crate::cluster_runtime::ClusterAuthorityHandle,
+    ) -> Result<(), KernelError> {
+        let mut slot = self
+            .cluster_authority
+            .write()
+            .map_err(|_| KernelError::Policy("cluster authority lock is poisoned".into()))?;
+        if slot.is_some() {
+            return Err(KernelError::Policy(
+                "cluster authority is already installed".into(),
+            ));
+        }
+        *slot = Some(authority);
+        Ok(())
+    }
+
+    pub fn cluster_authority(
+        &self,
+    ) -> Result<Option<crate::cluster_runtime::ClusterAuthorityHandle>, KernelError> {
+        self.cluster_authority
+            .read()
+            .map(|authority| authority.clone())
+            .map_err(|_| KernelError::Policy("cluster authority lock is poisoned".into()))
     }
 
     /// Register an LLM provider adapter.

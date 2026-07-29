@@ -1458,8 +1458,26 @@ impl KernelClient {
         &mut self,
         ttl_seconds: u64,
     ) -> Result<ClusterJoinChallenge, SdkError> {
+        self.issue_cluster_join_challenge_with_operation_id(
+            uuid::Uuid::new_v4().to_string(),
+            ttl_seconds,
+        )
+        .await
+    }
+
+    /// Issue a join challenge using a caller-stable UUID. Reuse the same UUID
+    /// only when retrying the exact request after an ambiguous transport
+    /// outcome.
+    pub async fn issue_cluster_join_challenge_with_operation_id(
+        &mut self,
+        operation_id: impl Into<String>,
+        ttl_seconds: u64,
+    ) -> Result<ClusterJoinChallenge, SdkError> {
         match self
-            .call(Syscall::IssueClusterJoinChallenge { ttl_seconds })
+            .call(Syscall::IssueClusterJoinChallenge {
+                operation_id: Some(operation_id.into()),
+                ttl_seconds,
+            })
             .await?
         {
             SyscallReply::ClusterJoinChallenge { challenge } => Ok(challenge),
@@ -1475,8 +1493,31 @@ impl KernelClient {
         expected_generation: Option<u64>,
         reason: impl Into<String>,
     ) -> Result<ClusterMember, SdkError> {
+        self.register_cluster_member_with_operation_id(
+            uuid::Uuid::new_v4().to_string(),
+            registration,
+            challenge_hex,
+            signature_hex,
+            expected_generation,
+            reason,
+        )
+        .await
+    }
+
+    /// Register a member using a caller-stable UUID for exact retry.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn register_cluster_member_with_operation_id(
+        &mut self,
+        operation_id: impl Into<String>,
+        registration: ClusterMemberRegistration,
+        challenge_hex: impl Into<String>,
+        signature_hex: impl Into<String>,
+        expected_generation: Option<u64>,
+        reason: impl Into<String>,
+    ) -> Result<ClusterMember, SdkError> {
         match self
             .call(Syscall::RegisterClusterMember {
+                operation_id: Some(operation_id.into()),
                 registration,
                 challenge_hex: challenge_hex.into(),
                 signature_hex: signature_hex.into(),
@@ -1497,8 +1538,28 @@ impl KernelClient {
         expected_generation: u64,
         reason: impl Into<String>,
     ) -> Result<ClusterMember, SdkError> {
+        self.set_cluster_member_state_with_operation_id(
+            uuid::Uuid::new_v4().to_string(),
+            node_id,
+            state,
+            expected_generation,
+            reason,
+        )
+        .await
+    }
+
+    /// Change member state using a caller-stable UUID for exact retry.
+    pub async fn set_cluster_member_state_with_operation_id(
+        &mut self,
+        operation_id: impl Into<String>,
+        node_id: impl Into<String>,
+        state: ClusterMemberState,
+        expected_generation: u64,
+        reason: impl Into<String>,
+    ) -> Result<ClusterMember, SdkError> {
         match self
             .call(Syscall::SetClusterMemberState {
+                operation_id: Some(operation_id.into()),
                 node_id: node_id.into(),
                 state,
                 expected_generation,
@@ -1539,8 +1600,31 @@ impl KernelClient {
         expected_fencing_token: Option<u64>,
         reason: impl Into<String>,
     ) -> Result<ClusterAgentOwnership, SdkError> {
+        self.claim_cluster_agent_ownership_with_operation_id(
+            uuid::Uuid::new_v4().to_string(),
+            agent_id,
+            owner_node_id,
+            ttl_seconds,
+            expected_fencing_token,
+            reason,
+        )
+        .await
+    }
+
+    /// Claim ownership using a caller-stable UUID for exact retry.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn claim_cluster_agent_ownership_with_operation_id(
+        &mut self,
+        operation_id: impl Into<String>,
+        agent_id: impl Into<String>,
+        owner_node_id: impl Into<String>,
+        ttl_seconds: u64,
+        expected_fencing_token: Option<u64>,
+        reason: impl Into<String>,
+    ) -> Result<ClusterAgentOwnership, SdkError> {
         match self
             .call(Syscall::ClaimClusterAgentOwnership {
+                operation_id: Some(operation_id.into()),
                 agent_id: agent_id.into(),
                 owner_node_id: owner_node_id.into(),
                 ttl_seconds,
@@ -1564,8 +1648,31 @@ impl KernelClient {
         ttl_seconds: u64,
         reason: impl Into<String>,
     ) -> Result<ClusterAgentOwnership, SdkError> {
+        self.renew_cluster_agent_ownership_with_operation_id(
+            uuid::Uuid::new_v4().to_string(),
+            agent_id,
+            owner_node_id,
+            fencing_token,
+            ttl_seconds,
+            reason,
+        )
+        .await
+    }
+
+    /// Renew ownership using a caller-stable UUID for exact retry.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn renew_cluster_agent_ownership_with_operation_id(
+        &mut self,
+        operation_id: impl Into<String>,
+        agent_id: impl Into<String>,
+        owner_node_id: impl Into<String>,
+        fencing_token: u64,
+        ttl_seconds: u64,
+        reason: impl Into<String>,
+    ) -> Result<ClusterAgentOwnership, SdkError> {
         match self
             .call(Syscall::RenewClusterAgentOwnership {
+                operation_id: Some(operation_id.into()),
                 agent_id: agent_id.into(),
                 owner_node_id: owner_node_id.into(),
                 fencing_token,
@@ -1588,8 +1695,28 @@ impl KernelClient {
         fencing_token: u64,
         reason: impl Into<String>,
     ) -> Result<ClusterAgentOwnership, SdkError> {
+        self.release_cluster_agent_ownership_with_operation_id(
+            uuid::Uuid::new_v4().to_string(),
+            agent_id,
+            owner_node_id,
+            fencing_token,
+            reason,
+        )
+        .await
+    }
+
+    /// Release ownership using a caller-stable UUID for exact retry.
+    pub async fn release_cluster_agent_ownership_with_operation_id(
+        &mut self,
+        operation_id: impl Into<String>,
+        agent_id: impl Into<String>,
+        owner_node_id: impl Into<String>,
+        fencing_token: u64,
+        reason: impl Into<String>,
+    ) -> Result<ClusterAgentOwnership, SdkError> {
         match self
             .call(Syscall::ReleaseClusterAgentOwnership {
+                operation_id: Some(operation_id.into()),
                 agent_id: agent_id.into(),
                 owner_node_id: owner_node_id.into(),
                 fencing_token,

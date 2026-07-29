@@ -11,6 +11,10 @@ reference for the README and for new design work.
 The multi-node authority, ownership, partition, and retry rules are specified
 separately in the
 [distributed control-plane consistency contract](DISTRIBUTED_CONTROL_PLANE.md).
+The durable OpenRaft storage-v2 implementation in
+`crates/kernel/src/cluster_consensus.rs` is a qualified substrate only; the
+runtime still uses the designated single SQLite authority until authenticated
+peer transport, election, and syscall integration are implemented.
 
 ---
 

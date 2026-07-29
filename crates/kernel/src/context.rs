@@ -376,6 +376,26 @@ pub const DURABLE_DATA_CATALOG: &[DurableDataClassification] = &[
         deletion: "retain",
     },
     DurableDataClassification {
+        table: "cluster_raft_meta",
+        owner: "system",
+        deletion: "retain consensus safety state",
+    },
+    DurableDataClassification {
+        table: "cluster_raft_log",
+        owner: "system",
+        deletion: "purge only after durable snapshot compaction",
+    },
+    DurableDataClassification {
+        table: "cluster_raft_state",
+        owner: "system",
+        deletion: "retain applied consensus state",
+    },
+    DurableDataClassification {
+        table: "cluster_raft_snapshot",
+        owner: "system",
+        deletion: "replace atomically after snapshot installation",
+    },
+    DurableDataClassification {
         table: "storage_meta",
         owner: "system",
         deletion: "retain",
@@ -1907,7 +1927,43 @@ impl SqliteContextManager {
                 reason TEXT NOT NULL,
                 changed_at TEXT NOT NULL,
                 PRIMARY KEY (agent_id, fencing_token, state, authority_generation)
-            ) WITHOUT ROWID;",
+            ) WITHOUT ROWID;
+            -- OpenRaft storage-v2 state shares the kernel's SQLCipher, WAL,
+            -- synchronous=FULL, backup, restore, and process-lease boundary.
+            -- Unsigned indices are fixed-width big-endian blobs so lexical
+            -- SQLite ordering is identical to u64 ordering.
+            CREATE TABLE IF NOT EXISTS cluster_raft_meta (
+                key TEXT PRIMARY KEY CHECK (
+                    key IN ('vote', 'committed', 'last_purged')
+                ),
+                value BLOB NOT NULL CHECK (typeof(value) = 'blob')
+            ) WITHOUT ROWID;
+            CREATE TABLE IF NOT EXISTS cluster_raft_log (
+                log_index BLOB PRIMARY KEY
+                    CHECK (typeof(log_index) = 'blob' AND length(log_index) = 8),
+                entry_json BLOB NOT NULL CHECK (typeof(entry_json) = 'blob')
+            ) WITHOUT ROWID;
+            CREATE TABLE IF NOT EXISTS cluster_raft_state (
+                singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                last_applied_json BLOB,
+                membership_json BLOB NOT NULL
+                    CHECK (typeof(membership_json) = 'blob'),
+                authority_state_json BLOB NOT NULL
+                    CHECK (typeof(authority_state_json) = 'blob'),
+                snapshot_sequence BLOB NOT NULL
+                    CHECK (
+                        typeof(snapshot_sequence) = 'blob'
+                        AND length(snapshot_sequence) = 8
+                    )
+            );
+            CREATE TABLE IF NOT EXISTS cluster_raft_snapshot (
+                singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                snapshot_id TEXT NOT NULL UNIQUE
+                    CHECK (length(snapshot_id) BETWEEN 1 AND 255),
+                meta_json BLOB NOT NULL CHECK (typeof(meta_json) = 'blob'),
+                data BLOB NOT NULL CHECK (typeof(data) = 'blob'),
+                created_at TEXT NOT NULL
+            );",
         ).map_err(|e| ContextError::StorageError(e.to_string()))?;
         crate::schema::add_column_if_missing(
             conn,
@@ -10695,7 +10751,7 @@ mod tests {
                 crate::schema::CURRENT_SCHEMA_VERSION,
                 "fresh stores record every released schema transition"
             );
-            assert_eq!(cluster_table_count, 11);
+            assert_eq!(cluster_table_count, 15);
         }
 
         let reopened = SqliteContextManager::new(&database.path).unwrap();

@@ -11,8 +11,21 @@ The current implementation has one designated membership authority backed by
 one kernel SQLite database. Membership changes are serialized by an immediate
 SQLite transaction and published as an atomic, monotonically generated
 snapshot. There is no replicated log, election, quorum, or automatic authority
-failover. If the designated authority is unavailable, clients must fail closed
-for joins, leaves, revocation, and fresh authenticated discovery.
+failover in the production runtime. If the designated authority is
+unavailable, clients must fail closed for joins, leaves, revocation, and fresh
+authenticated discovery.
+
+The kernel now contains a durable OpenRaft storage-v2 substrate for the next
+stage. Votes, committed and purged pointers, consecutive log entries,
+deterministic authority barriers, applied state and membership, and current
+snapshots share the existing SQLCipher-capable SQLite database, WAL,
+`synchronous=FULL`, backup/restore, and process-lease boundary. Open validates
+all serialized state and fails closed on corruption. The upstream OpenRaft
+storage conformance suite plus restart, idempotency, and malformed-record
+regressions qualify that storage contract. This substrate is not constructed
+by the production kernel yet, has no peer transport, and does not route any
+membership or ownership syscall through Raft; it is therefore not evidence of
+quorum availability.
 
 Each workload node owns a separate SQLite database under the existing
 single-process storage lease. Agent state is not replicated between nodes.
@@ -150,8 +163,10 @@ non-migratable.
 
 ## Required implementation sequence
 
-1. Replicated authority log, term election, quorum read/write rules, snapshot
-   installation, and permanent fencing of old terms.
+1. Wire the implemented durable Raft log/state/snapshot substrate to
+   authenticated peer transport, stable node IDs, term election, quorum
+   read/write rules, production membership changes, and permanent fencing of
+   old terms.
 2. Checkpointed drain/migration with rollback and side-effect classifications.
 3. Cross-node IPC/delegation with end-to-end authorization and audit.
 4. Cluster quota reservations and monotonic policy/package trust epochs.
@@ -168,6 +183,8 @@ passing single-node test is never accepted as substitute evidence.
 
 - Membership, identity, ownership leases, generations, and audit:
   `crates/kernel/src/cluster_control.rs`
+- Durable OpenRaft storage-v2 log, state machine, idempotent authority barrier,
+  and snapshots: `crates/kernel/src/cluster_consensus.rs`
 - Durable cluster tables and single-process storage lease:
   `crates/kernel/src/context.rs` and `crates/kernel/src/storage.rs`
 - Authenticated discovery, placement, and owner reconstruction:

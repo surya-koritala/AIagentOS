@@ -510,6 +510,42 @@ pub const SQLITE_DATA_INVENTORY: &[StaticDataInventoryEntry] = &[
         "retain"
     ),
     sqlite_entry!(
+        "cluster_raft_meta",
+        "system",
+        "none",
+        "consensus vote, committed pointer, and purged-log pointer",
+        "for cluster lifetime",
+        "not confidential; consensus integrity protected by database durability",
+        "retain consensus safety state"
+    ),
+    sqlite_entry!(
+        "cluster_raft_log",
+        "system",
+        "none",
+        "serialized consensus membership and authority commands",
+        "until quorum-safe snapshot compaction",
+        "may contain cluster identity and routing metadata; database confidentiality and integrity apply",
+        "purge only after durable snapshot compaction"
+    ),
+    sqlite_entry!(
+        "cluster_raft_state",
+        "system",
+        "none",
+        "last applied consensus identity, membership, sequencing state, and idempotency receipts",
+        "for cluster lifetime",
+        "may contain cluster identity and routing metadata; database confidentiality and integrity apply",
+        "retain applied consensus state"
+    ),
+    sqlite_entry!(
+        "cluster_raft_snapshot",
+        "system",
+        "none",
+        "complete serialized consensus state-machine snapshot",
+        "current snapshot until atomically superseded",
+        "may contain cluster identity and routing metadata; database confidentiality and integrity apply",
+        "replace atomically after snapshot installation"
+    ),
+    sqlite_entry!(
         "storage_meta",
         "system",
         "none",

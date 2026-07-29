@@ -221,7 +221,7 @@ jobs:
   provider-core:
     name: Provider core live-path security controls
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     env:
       RUSTUP_TOOLCHAIN: 1.97.1
     steps:
@@ -229,8 +229,18 @@ jobs:
       - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
         with:
           toolchain: 1.97.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22.12.0
+          cache: npm
+          cache-dependency-path: crates/tauri-app/ui/package-lock.json
+      - name: Install the lockfile-pinned Chromium qualification runtime
+        working-directory: crates/tauri-app/ui
+        run: |
+          npm ci
+          npx --no-install playwright install --with-deps chromium
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-      - name: Exercise exact live kernel provider paths
+      - name: Exercise exact live provider and trusted-browser paths
         run: |
           set -euo pipefail
           mkdir -p target/qualification/provider-core-logs
@@ -263,8 +273,25 @@ jobs:
           run_exact integration-tests \
             capability_registry::provider_matrix_names_every_resource_provider_status_and_platform_contract \
             provider-matrix
+          browser_test=playwright::tests::live_browser_denies_downloads_isolates_sessions_and_removes_profiles
+          browser_executable="$(
+            find "${HOME}/.cache/ms-playwright" -type f \
+              -name chrome-headless-shell -perm -u+x -print -quit
+          )"
+          test -n "${browser_executable}"
+          {
+            printf 'browser_sha256=%s\n' "$(sha256sum "${browser_executable}" | cut -d ' ' -f 1)"
+            "${browser_executable}" --version
+            env AGENTOS_TEST_CHROME="${browser_executable}" \
+              cargo test -p resources --features browser --locked "${browser_test}" \
+              -- --ignored --exact --nocapture
+          } 2>&1 | tee target/qualification/provider-core-logs/browser-profile.log
       - name: Derive exact-source core provider evidence from test events
         run: |
+          grep -Eq '^browser_sha256=[0-9a-f]{64}$' \
+            target/qualification/provider-core-logs/browser-profile.log
+          grep -Eq '^(Google Chrome for Testing|Chromium) [0-9]' \
+            target/qualification/provider-core-logs/browser-profile.log
           python3 scripts/provider_core_qualification.py \
             --commit "$GITHUB_SHA" \
             --output target/qualification/provider-core.json \
@@ -274,17 +301,19 @@ jobs:
             --evidence provider_panic_isolated,resources::tests::provider_panic_is_redacted_and_releases_admission_permit,target/qualification/provider-core-logs/provider-panic.log \
             --evidence resource_envelope_bounded,resources::tests::broker_rejects_unbounded_requests_responses_and_error_diagnostics,target/qualification/provider-core-logs/resource-envelope.log \
             --evidence cross_surface_sandbox_consistent,sandbox_surfaces::wire_sdk_package_custom_and_mcp_calls_share_the_fail_closed_sandbox,target/qualification/provider-core-logs/cross-surface.log \
-            --evidence browser_profile_surface_unavailable,capability_registry::provider_matrix_names_every_resource_provider_status_and_platform_contract,target/qualification/provider-core-logs/provider-matrix.log
+            --evidence kernel_browser_provider_unavailable,capability_registry::provider_matrix_names_every_resource_provider_status_and_platform_contract,target/qualification/provider-core-logs/provider-matrix.log \
+            --evidence browser_profiles_isolated_and_cleaned,playwright::tests::live_browser_denies_downloads_isolates_sessions_and_removes_profiles,target/qualification/provider-core-logs/browser-profile.log
       - name: Verify exact-source core provider evidence
         run: |
           report=target/qualification/provider-core.json
+          test "$(jq -r .schema_version "$report")" = "2"
           test "$(jq -r .passed "$report")" = "true"
           test "$(jq -r .production_claim_allowed "$report")" = "false"
-          test "$(jq -r .qualification_class "$report")" = "live_linux_kernel_provider_core"
+          test "$(jq -r .qualification_class "$report")" = "live_linux_provider_security_core"
           test "$(jq -r .source.commit "$report")" = "$GITHUB_SHA"
           test "$(jq -r .source.dirty "$report")" = "false"
-          test "$(jq '[.checks[] | select(. == true)] | length' "$report")" = "7"
-          test "$(jq '.evidence | length' "$report")" = "7"
+          test "$(jq '[.checks[] | select(. == true)] | length' "$report")" = "8"
+          test "$(jq '.evidence | length' "$report")" = "8"
           jq -e 'all(.evidence[]; .sha256 | test("^[0-9a-f]{64}$"))' "$report"
       - name: Retain core provider qualification evidence
         if: always()
@@ -378,7 +407,8 @@ jobs:
                 dns_rebinding_denied: $network[0].checks.dns_rebinding_denied,
                 large_output_bounded: $rootless[0].checks.stdout_limit_enforced,
                 hung_process_cleaned: $rootless[0].checks.hung_process_cleanup,
-                browser_profile_surface_unavailable: $core[0].checks.browser_profile_surface_unavailable,
+                browser_profiles_isolated_and_cleaned: $core[0].checks.browser_profiles_isolated_and_cleaned,
+                kernel_browser_provider_unavailable: $core[0].checks.kernel_browser_provider_unavailable,
                 cross_agent_access_denied: $core[0].checks.cross_agent_filesystem_denied,
                 provider_panic_isolated: $core[0].checks.provider_panic_isolated,
                 resource_envelope_bounded: $core[0].checks.resource_envelope_bounded,
@@ -398,7 +428,7 @@ jobs:
           test "$(jq -r .qualification_class "$report")" = "combined_live_linux_provider_security"
           test "$(jq -r .source.commit "$report")" = "$GITHUB_SHA"
           test "$(jq -r .source.dirty "$report")" = "false"
-          test "$(jq '[.checks[] | select(. == true)] | length' "$report")" = "12"
+          test "$(jq '[.checks[] | select(. == true)] | length' "$report")" = "13"
           test "$(jq '.components | length' "$report")" = "3"
           jq -e 'all(.components[]; .evidence_sha256 | test("^[0-9a-f]{64}$"))' "$report"
       - name: Retain combined provider security evidence

@@ -40,8 +40,19 @@ class ProviderCoreQualificationTests(unittest.TestCase):
             )
 
         self.assertTrue(report["passed"])
+        self.assertEqual(report["schema_version"], 2)
         self.assertFalse(report["production_claim_allowed"])
         self.assertEqual(report["source"], {"commit": COMMIT, "dirty": False})
+        self.assertEqual(
+            report["qualification_class"], "live_linux_provider_security_core"
+        )
+        self.assertEqual(
+            report["environment"]["provider_paths"],
+            [
+                "kernel-gate-broker-sandbox",
+                "feature-gated-trusted-browser-helper",
+            ],
+        )
         self.assertEqual(
             report["evidence"]["cross_agent_access_denied"]["sha256"],
             hashlib.sha256(raw).hexdigest(),

@@ -474,7 +474,7 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires AGENTOS_TEST_CHROME and permission to launch a disposable browser"]
-    async fn live_browser_denies_downloads_and_removes_its_isolated_profile() {
+    async fn live_browser_denies_downloads_isolates_sessions_and_removes_profiles() {
         let executable = std::env::var_os("AGENTOS_TEST_CHROME")
             .map(PathBuf::from)
             .expect("AGENTOS_TEST_CHROME must point to a disposable Chromium binary");
@@ -495,12 +495,36 @@ mod tests {
                     };
                     let request = String::from_utf8_lossy(&buffer[..length]);
                     let download = request.starts_with("GET /download ");
+                    let seed = request.starts_with("GET /seed ");
+                    let probe = request.starts_with("GET /probe ");
+                    let has_private_cookie = request
+                        .lines()
+                        .any(|line| line == "Cookie: agentos_profile=private-marker");
                     let (headers, body) = if download {
                         requests.fetch_add(1, Ordering::SeqCst);
                         (
                             "Content-Type: application/octet-stream\r\n\
                              Content-Disposition: attachment; filename=\"forbidden.bin\"\r\n",
                             "download-must-not-land",
+                        )
+                    } else if seed {
+                        (
+                            "Content-Type: text/html; charset=utf-8\r\n\
+                             Set-Cookie: agentos_profile=private-marker; Path=/; \
+                             HttpOnly; SameSite=Strict\r\n",
+                            "<!doctype html><title>Seeded</title><body>profile seeded</body>",
+                        )
+                    } else if probe && has_private_cookie {
+                        (
+                            "Content-Type: text/html; charset=utf-8\r\n",
+                            "<!doctype html><title>Private</title>\
+                             <body>private profile marker present</body>",
+                        )
+                    } else if probe {
+                        (
+                            "Content-Type: text/html; charset=utf-8\r\n",
+                            "<!doctype html><title>Clean</title>\
+                             <body>clean isolated profile</body>",
                         )
                     } else {
                         (
@@ -522,7 +546,7 @@ mod tests {
         });
 
         let mut browser = BrowserAutomation::launch_with_config(
-            BrowserAutomationConfig::default().with_chrome_executable(executable),
+            BrowserAutomationConfig::default().with_chrome_executable(executable.clone()),
         )
         .await
         .unwrap();
@@ -556,7 +580,39 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(500)).await;
         assert!(download_requests.load(Ordering::SeqCst) <= 1);
         assert!(!profile_contains_name(&profile_path, "forbidden.bin"));
+
+        browser
+            .navigate(&format!("http://{address}/seed"))
+            .await
+            .unwrap();
+        browser
+            .navigate(&format!("http://{address}/probe"))
+            .await
+            .unwrap();
+        assert!(browser
+            .get_text()
+            .await
+            .unwrap()
+            .contains("private profile marker present"));
+
+        let mut isolated_peer = BrowserAutomation::launch_with_config(
+            BrowserAutomationConfig::default().with_chrome_executable(executable),
+        )
+        .await
+        .unwrap();
+        let peer_profile_path = isolated_peer.profile.as_ref().unwrap().path().to_path_buf();
+        assert_ne!(profile_path, peer_profile_path);
+        isolated_peer
+            .navigate(&format!("http://{address}/probe"))
+            .await
+            .unwrap();
+        let peer_text = isolated_peer.get_text().await.unwrap();
+        assert!(peer_text.contains("clean isolated profile"));
+        assert!(!peer_text.contains("private profile marker"));
+
+        isolated_peer.shutdown().await.unwrap();
         browser.shutdown().await.unwrap();
+        assert!(!peer_profile_path.exists());
         assert!(!profile_path.exists());
         server.abort();
     }

@@ -416,7 +416,7 @@ fn trusted_browser_helpers_remain_isolated_bounded_and_outside_runtime_discovery
         "MAX_SCREENSHOT_BYTES",
         "MAX_INPUT_BYTES",
         "browser URL is invalid or too large",
-        "live_browser_denies_downloads_and_removes_its_isolated_profile",
+        "live_browser_denies_downloads_isolates_sessions_and_removes_profiles",
     ] {
         assert!(
             automation.contains(contract),
@@ -1271,6 +1271,13 @@ fn release_blocking_workflows_keep_their_security_contract() {
         "stdout_limit_enforced",
         "hung_process_cleanup",
         "Provider core live-path security controls",
+        "Install the lockfile-pinned Chromium qualification runtime",
+        "live_browser_denies_downloads_isolates_sessions_and_removes_profiles",
+        "browser_profiles_isolated_and_cleaned",
+        "browser_sha256=",
+        "Google Chrome for Testing|Chromium",
+        "kernel_browser_provider_unavailable",
+        "live_linux_provider_security_core",
         "scripts/provider_core_qualification.py",
         "provider-core-${{ github.sha }}",
         "Live network SSRF and DNS-rebinding controls",

@@ -7,6 +7,7 @@
 - [Getting Started](./getting-started.md)
 - [Concepts](./concepts.md)
   - [Architecture](./architecture.md)
+  - [Distributed Control Plane](./distributed-control-plane.md)
   - [Scheduler Contract](./scheduler.md)
   - [Durable Checkpoints](./checkpoints.md)
   - [Context Pressure](./context-pressure.md)

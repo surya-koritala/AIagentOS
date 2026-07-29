@@ -10,6 +10,12 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
 
 ## [Unreleased]
 
+- Published the normative distributed control-plane consistency contract. It
+  distinguishes single-authority membership, node-local state, reconstructed
+  routing, and missing ownership fencing; defines fail-closed partition, retry,
+  duplicate-owner, stale-route, and unknown-outcome behavior; and states the
+  invariants required before the multi-node foundation can be production
+  qualified.
 - Added a revocable, visible local approval contract for future peripheral
   access without enabling any placeholder device operation. Peripheral tool
   bindings are registration-rejected unless they require sandbox execution and

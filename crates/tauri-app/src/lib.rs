@@ -11,7 +11,7 @@ use agent_sdk::{
     AgentEnforcementInfo, ConnectionProfile, GenerationCheckpointSummary, KernelClient,
     LifecycleResult, MessageResult, MessageStreamEvent, OperatorAgentSnapshot,
     OperatorCgroupSnapshot, OperatorPackageSnapshot, OperatorServiceSnapshot, OperatorSnapshot,
-    OperatorTunable, ProviderSummary, SdkError,
+    OperatorTunable, ProviderSummary, SdkError, ServiceHistoryEntry, ServiceRuntimeInfo,
 };
 use kernel::{syscall_gate::GateStats, syscall_server::SyscallServer, AgentKernelImpl};
 use serde::Serialize;
@@ -100,6 +100,17 @@ pub struct DesktopService {
     pub last_failure: Option<String>,
     pub next_restart_at: Option<String>,
     pub last_transition_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DesktopServiceHistory {
+    pub id: u64,
+    pub name: String,
+    pub event: String,
+    pub state: String,
+    pub agent_id: Option<String>,
+    pub reason: Option<String>,
+    pub created_at: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -314,6 +325,39 @@ impl From<OperatorServiceSnapshot> for DesktopService {
             last_failure: service.last_failure,
             next_restart_at: service.next_restart_at,
             last_transition_at: service.last_transition_at,
+        }
+    }
+}
+
+impl From<ServiceRuntimeInfo> for DesktopService {
+    fn from(service: ServiceRuntimeInfo) -> Self {
+        Self {
+            name: service.name,
+            state: format!("{:?}", service.status),
+            agent_id: service.agent_id.map(|id| id.to_string()),
+            restart_count: service.restart_count,
+            last_exit_code: service.last_exit_code,
+            desired_running: service.desired_running,
+            ready: service.ready,
+            healthy: service.healthy,
+            restart_exhausted: service.restart_exhausted,
+            last_failure: service.last_failure,
+            next_restart_at: service.next_restart_at,
+            last_transition_at: service.last_transition_at,
+        }
+    }
+}
+
+impl From<ServiceHistoryEntry> for DesktopServiceHistory {
+    fn from(entry: ServiceHistoryEntry) -> Self {
+        Self {
+            id: entry.id,
+            name: entry.name,
+            event: entry.event,
+            state: format!("{:?}", entry.status),
+            agent_id: entry.agent_id.map(|id| id.to_string()),
+            reason: entry.reason,
+            created_at: entry.created_at,
         }
     }
 }
@@ -536,6 +580,52 @@ impl DesktopClient {
             .await
     }
 
+    pub async fn start_service(&self, name: impl Into<String>) -> Result<DesktopService, SdkError> {
+        self.inner
+            .lock()
+            .await
+            .start_service(name)
+            .await
+            .map(DesktopService::from)
+    }
+
+    pub async fn stop_service(&self, name: impl Into<String>) -> Result<DesktopService, SdkError> {
+        self.inner
+            .lock()
+            .await
+            .stop_service(name)
+            .await
+            .map(DesktopService::from)
+    }
+
+    pub async fn restart_service(
+        &self,
+        name: impl Into<String>,
+    ) -> Result<DesktopService, SdkError> {
+        self.inner
+            .lock()
+            .await
+            .restart_service(name)
+            .await
+            .map(DesktopService::from)
+    }
+
+    pub async fn service_history(
+        &self,
+        name: Option<String>,
+        limit: usize,
+    ) -> Result<Vec<DesktopServiceHistory>, SdkError> {
+        Ok(self
+            .inner
+            .lock()
+            .await
+            .service_history(name, limit)
+            .await?
+            .into_iter()
+            .map(DesktopServiceHistory::from)
+            .collect())
+    }
+
     pub async fn operator_snapshot(&self) -> Result<OperatorSnapshot, SdkError> {
         self.inner.lock().await.operator_snapshot().await
     }
@@ -588,9 +678,14 @@ pub struct AppState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kernel::auth::Role;
     use kernel::connector::{
         LlmProviderAdapter, LlmRequestOptions, LlmResponse, LlmSession, ProviderCapabilities,
         ProviderEventSink, ProviderStreamEvent, ProviderType, StandardMessage, ToolDefinition,
+    };
+    use kernel::init_system::{
+        DependencyConfig, ExecConfig, HealthConfig, ResourceConfig, RestartPolicy, ServiceConfig,
+        ServiceDef, ServicePolicyConfig, ServiceType,
     };
     use kernel::{ConnectorError, ProviderId};
 
@@ -684,6 +779,28 @@ mod tests {
 
         fn translate_from_provider(&self, value: &serde_json::Value) -> Option<StandardMessage> {
             Some(StandardMessage::assistant(value.get("content")?.as_str()?))
+        }
+    }
+
+    fn desktop_service(name: &str) -> ServiceDef {
+        ServiceDef {
+            name: name.into(),
+            description: Some("desktop public-wire service".into()),
+            exec: ExecConfig {
+                provider: "stub".into(),
+                system_prompt: "serve desktop regression".into(),
+                tools: Vec::new(),
+                model: None,
+            },
+            service: ServiceConfig {
+                restart: RestartPolicy::OnFailure,
+                service_type: ServiceType::Simple,
+                ..ServiceConfig::default()
+            },
+            dependencies: DependencyConfig::default(),
+            resources: ResourceConfig::default(),
+            policy: ServicePolicyConfig::default(),
+            health: HealthConfig::default(),
         }
     }
 
@@ -790,6 +907,89 @@ mod tests {
             .cancel_request("desktop-request", &agent_id)
             .await
             .expect("completed stream is not active"));
+    }
+
+    #[tokio::test]
+    async fn desktop_service_controls_and_history_use_the_public_wire_client() {
+        let kernel = Arc::new(AgentKernelImpl::new().expect("kernel"));
+        kernel
+            .os
+            .init
+            .lock()
+            .await
+            .replace_definitions(vec![desktop_service("desktop-worker")])
+            .expect("service definition");
+        let tenant_id = kernel
+            .create_tenant("desktop-service-tenant")
+            .await
+            .unwrap();
+        let tenant_admin = kernel
+            .register_user(
+                &tenant_id,
+                "desktop-service-admin",
+                "desktop-service-admin@example.invalid",
+                Role::Admin,
+            )
+            .await
+            .unwrap();
+        let tenant_token = kernel
+            .issue_api_key(&tenant_admin, "desktop-service-admin")
+            .await
+            .unwrap();
+        let server = SyscallServer::bind(Arc::clone(&kernel), "127.0.0.1:0")
+            .await
+            .expect("bind service server");
+        let address = server.local_addr().expect("service server address");
+        tokio::spawn(server.serve());
+        let client = DesktopClient::connect(&address.to_string(), None)
+            .await
+            .expect("system desktop");
+        let tenant_client = DesktopClient::connect(&address.to_string(), Some(&tenant_token))
+            .await
+            .expect("tenant desktop");
+
+        let denied = tenant_client
+            .start_service("desktop-worker")
+            .await
+            .expect_err("tenant admin cannot control system services");
+        assert_eq!(
+            denied.wire_code(),
+            Some(agent_sdk::WireErrorCode::AuthorizationDenied)
+        );
+
+        let started = client
+            .start_service("desktop-worker")
+            .await
+            .expect("start over wire");
+        assert_eq!(started.name, "desktop-worker");
+        assert_eq!(started.state, "Running");
+
+        let restarted = client
+            .restart_service("desktop-worker")
+            .await
+            .expect("restart over wire");
+        assert_eq!(restarted.state, "Running");
+        assert_eq!(restarted.restart_count, 1);
+
+        let history = client
+            .service_history(Some("desktop-worker".into()), 20)
+            .await
+            .expect("history over wire");
+        assert!(history
+            .iter()
+            .any(|entry| entry.name == "desktop-worker" && entry.event == "manual_restart"));
+
+        let stopped = client
+            .stop_service("desktop-worker")
+            .await
+            .expect("stop over wire");
+        assert_eq!(stopped.state, "Inactive");
+
+        let error = client
+            .start_service("missing-service")
+            .await
+            .expect_err("unknown service must fail through the public boundary");
+        assert!(error.to_string().contains("missing-service"));
     }
 
     #[test]

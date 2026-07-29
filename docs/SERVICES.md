@@ -126,8 +126,13 @@ cargo run --package agent-cli --bin agentctl -- service-history researcher 100
 The Rust SDK exposes the corresponding `list_services`, `start_service`,
 `stop_service`, `restart_service`, `reload_services`, and `service_history`
 methods. In the TUI, `[`/`]` select a service, `u` starts, `d` stops, `R`
-restarts, and `L` reloads. Tenant credentials cannot access global service state
-or lifecycle operations.
+restarts, and `L` reloads. The desktop Operations view starts inactive services,
+shows bounded transition history, and freezes the displayed service name before
+a stop or restart. Those disruptive actions require the exact name and disclose
+that stopping may block dependents and restarting may interrupt in-flight work.
+All desktop actions still traverse `KernelClient`; there is no in-process
+supervisor shortcut. Tenant credentials cannot access global service state or
+lifecycle operations.
 
 Prometheus output includes configured, desired, running, ready, healthy, failed,
 restart, and dependency-block counters. Operator snapshots and history contain

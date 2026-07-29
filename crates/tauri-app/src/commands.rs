@@ -5,7 +5,7 @@ use crate::{
         validate_cloud_provider, NativeProviderCredentialStore, ProviderCredentialStore,
         CLOUD_DESKTOP_PROVIDERS, SUPPORTED_DESKTOP_PROVIDERS,
     },
-    AppState, DesktopMetricsView, DesktopOperatorView,
+    AppState, DesktopMetricsView, DesktopOperatorView, DesktopService, DesktopServiceHistory,
 };
 use kernel::config::Config;
 use serde::Serialize;
@@ -242,6 +242,84 @@ fn validate_checkpoint_deletion_confirmation(
 ) -> Result<(), String> {
     if checkpoint_id != confirmation {
         return Err("checkpoint deletion confirmation must exactly match the checkpoint ID".into());
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn start_service(
+    state: State<'_, AppState>,
+    service_name: String,
+) -> Result<DesktopService, String> {
+    validate_service_name(&service_name)?;
+    state
+        .client
+        .start_service(service_name)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn stop_service(
+    state: State<'_, AppState>,
+    service_name: String,
+    confirm_service_name: String,
+) -> Result<DesktopService, String> {
+    validate_service_control_confirmation(&service_name, &confirm_service_name)?;
+    state
+        .client
+        .stop_service(service_name)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn restart_service(
+    state: State<'_, AppState>,
+    service_name: String,
+    confirm_service_name: String,
+) -> Result<DesktopService, String> {
+    validate_service_control_confirmation(&service_name, &confirm_service_name)?;
+    state
+        .client
+        .restart_service(service_name)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn service_history(
+    state: State<'_, AppState>,
+    service_name: Option<String>,
+    limit: usize,
+) -> Result<Vec<DesktopServiceHistory>, String> {
+    if let Some(name) = service_name.as_deref() {
+        validate_service_name(name)?;
+    }
+    if !(1..=200).contains(&limit) {
+        return Err("service history limit must be between 1 and 200".into());
+    }
+    state
+        .client
+        .service_history(service_name, limit)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+fn validate_service_name(service_name: &str) -> Result<(), String> {
+    if service_name.is_empty() || service_name.trim() != service_name {
+        return Err("service name must be a non-empty exact target".into());
+    }
+    Ok(())
+}
+
+fn validate_service_control_confirmation(
+    service_name: &str,
+    confirmation: &str,
+) -> Result<(), String> {
+    validate_service_name(service_name)?;
+    if service_name != confirmation {
+        return Err("service control confirmation must exactly match the service name".into());
     }
     Ok(())
 }
@@ -559,6 +637,19 @@ mod tests {
             )
             .unwrap_err(),
             "checkpoint deletion confirmation must exactly match the checkpoint ID"
+        );
+    }
+
+    #[test]
+    fn disruptive_service_controls_require_the_exact_target_in_the_backend() {
+        assert!(validate_service_control_confirmation("worker", "worker").is_ok());
+        assert_eq!(
+            validate_service_control_confirmation("worker", "worker-2").unwrap_err(),
+            "service control confirmation must exactly match the service name"
+        );
+        assert_eq!(
+            validate_service_control_confirmation(" worker", " worker").unwrap_err(),
+            "service name must be a non-empty exact target"
         );
     }
 }

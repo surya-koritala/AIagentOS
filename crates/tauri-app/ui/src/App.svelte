@@ -111,7 +111,11 @@
         {:else if view === 'settings'}
           <Settings />
         {:else if view === 'status'}
-          <AgentStatus state={operatorState} />
+          <AgentStatus
+            state={operatorState}
+            on:refresh={refreshOperator}
+            on:operation={onOperation}
+          />
         {/if}
       </main>
       {#if view === 'chat' && activeAgentId}

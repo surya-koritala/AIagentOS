@@ -67,6 +67,14 @@ and refuses to overwrite an existing path. Revocation, yanking, rollback, and
 removal require `--confirm` followed by the exact key, `name@version`, or
 package name so scripts cannot accidentally confirm a different target.
 
+The desktop service controls are another focused projection of the same
+contract. Start, stop, restart, and bounded transition-history requests pass
+through `KernelClient` on the authenticated public-wire connection. Stop and
+restart freeze the displayed service name, owner, and state, describe the
+dependency or in-flight-work impact, and require the exact service name before
+the mutation is sent. A changed selection or refreshed snapshot cannot retarget
+an open confirmation.
+
 ## Version and feature negotiation
 
 The wire protocol is versioned independently from the crate. Protocol v2 serves

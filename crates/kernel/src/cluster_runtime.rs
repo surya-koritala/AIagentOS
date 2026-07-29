@@ -2661,6 +2661,21 @@ mod tests {
         listeners
     }
 
+    async fn rebind_test_listener(addr: SocketAddr, purpose: &str) -> TcpListener {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match TcpListener::bind(addr).await {
+                Ok(listener) => return listener,
+                Err(error)
+                    if error.kind() == io::ErrorKind::AddrInUse && Instant::now() < deadline =>
+                {
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+                Err(error) => panic!("{purpose}: {error}"),
+            }
+        }
+    }
+
     fn member_map(
         peers: &[TestPeer],
         listeners: &[TcpListener],
@@ -2931,9 +2946,8 @@ mod tests {
             runtime.shutdown().await.expect("shutdown voter subset");
         }
 
-        let conflicting_listener = TcpListener::bind(configs[0].listen_addr)
-            .await
-            .expect("rebind generation-zero voter");
+        let conflicting_listener =
+            rebind_test_listener(configs[0].listen_addr, "rebind generation-zero voter").await;
         let mut conflicting = configs[0].clone();
         set_voter_plan(&mut conflicting, 0, BTreeSet::from([1, 2, 3]));
         let conflicting = ClusterRaftRuntime::start_on_listener(
@@ -3066,9 +3080,7 @@ mod tests {
         }
         let mut reconfigured = Vec::new();
         for (config, context) in generation_one.iter().cloned().zip(&contexts) {
-            let listener = TcpListener::bind(config.listen_addr)
-                .await
-                .expect("rebind voter listener");
+            let listener = rebind_test_listener(config.listen_addr, "rebind voter listener").await;
             reconfigured.push(Some(
                 ClusterRaftRuntime::start_on_listener(context.clone(), config, listener)
                     .await
@@ -3134,9 +3146,8 @@ mod tests {
             .cloned()
             .zip(retained_contexts)
         {
-            let listener = TcpListener::bind(config.listen_addr)
-                .await
-                .expect("rebind retained voter listener");
+            let listener =
+                rebind_test_listener(config.listen_addr, "rebind retained voter listener").await;
             restarted.push(Some(
                 ClusterRaftRuntime::start_on_listener(context.clone(), config, listener)
                     .await
@@ -3154,9 +3165,8 @@ mod tests {
             runtime.shutdown().await.expect("shutdown retained voter");
         }
 
-        let stale_listener = TcpListener::bind(configs[0].listen_addr)
-            .await
-            .expect("bind stale-generation listener");
+        let stale_listener =
+            rebind_test_listener(configs[0].listen_addr, "bind stale-generation listener").await;
         let stale = ClusterRaftRuntime::start_on_listener(
             contexts[0].clone(),
             configs[0].clone(),
@@ -3166,9 +3176,11 @@ mod tests {
         .expect_err("stale voter generation must fail closed");
         assert!(stale.to_string().contains("stale"));
 
-        let skipped_listener = TcpListener::bind(generation_one[0].listen_addr)
-            .await
-            .expect("bind skipped-generation listener");
+        let skipped_listener = rebind_test_listener(
+            generation_one[0].listen_addr,
+            "bind skipped-generation listener",
+        )
+        .await;
         let mut skipped = generation_one[0].clone();
         set_voter_plan(&mut skipped, 3, desired.clone());
         let skipped =
@@ -3177,9 +3189,11 @@ mod tests {
                 .expect_err("skipped voter generation must fail closed");
         assert!(skipped.to_string().contains("skips"), "{skipped}");
 
-        let conflicting_listener = TcpListener::bind(generation_one[0].listen_addr)
-            .await
-            .expect("bind conflicting-generation listener");
+        let conflicting_listener = rebind_test_listener(
+            generation_one[0].listen_addr,
+            "bind conflicting-generation listener",
+        )
+        .await;
         let mut conflicting = generation_one[0].clone();
         set_voter_plan(&mut conflicting, 1, BTreeSet::from([1, 3]));
         let conflicting = ClusterRaftRuntime::start_on_listener(
@@ -3194,9 +3208,11 @@ mod tests {
             "{conflicting}"
         );
 
-        let drift_listener = TcpListener::bind(generation_one[0].listen_addr)
-            .await
-            .expect("bind transport-drift listener");
+        let drift_listener = rebind_test_listener(
+            generation_one[0].listen_addr,
+            "bind transport-drift listener",
+        )
+        .await;
         let mut transport_drift = generation_one[0].clone();
         let mut unexpected = transport_drift
             .members
@@ -3512,9 +3528,11 @@ mod tests {
             "configured live application endpoints must still match durable membership"
         );
 
-        let restarted_listener = TcpListener::bind(configs[first_leader_index].listen_addr)
-            .await
-            .expect("rebind first leader address");
+        let restarted_listener = rebind_test_listener(
+            configs[first_leader_index].listen_addr,
+            "rebind first leader address",
+        )
+        .await;
         runtimes[first_leader_index] = Some(
             ClusterRaftRuntime::start_on_listener(
                 contexts[first_leader_index].clone(),

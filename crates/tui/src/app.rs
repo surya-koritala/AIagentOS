@@ -20,6 +20,30 @@ pub enum Mode {
     SendMessage,
     /// Waiting for a second uppercase `X` for one exact selected agent.
     ConfirmKill,
+    /// Typing the exact frozen service name before stop or restart.
+    ConfirmServiceControl,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ServiceControlKind {
+    Stop,
+    Restart,
+}
+
+impl ServiceControlKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Stop => "stop",
+            Self::Restart => "restart",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingServiceControl {
+    kind: ServiceControlKind,
+    name: String,
+    agent_id: Option<String>,
 }
 
 /// An action the event loop should perform asynchronously (the pure key handler
@@ -142,6 +166,7 @@ pub struct App {
     pub input: String,
     pub status: String,
     pending_kill: Option<(String, String)>,
+    pending_service_control: Option<PendingServiceControl>,
     pub last_output: Option<String>,
     pub operator_state: OperatorUiState,
     pub should_quit: bool,
@@ -170,6 +195,7 @@ impl App {
             input: String::new(),
             status: "r refresh · c/m/p/s/X agents · [/ ] service · u start · d stop · R restart · L reload · q quit".into(),
             pending_kill: None,
+            pending_service_control: None,
             last_output: None,
             operator_state: OperatorUiState::default(),
             should_quit: false,
@@ -355,6 +381,7 @@ impl App {
             Mode::Normal => self.on_key_normal(key),
             Mode::CreateAgent | Mode::SendMessage => self.on_key_editing(key),
             Mode::ConfirmKill => self.on_key_confirm_kill(key),
+            Mode::ConfirmServiceControl => self.on_key_confirm_service_control(key),
         }
     }
 
@@ -429,16 +456,14 @@ impl App {
                 .map(|service| UiAction::StartService {
                     name: service.name.clone(),
                 }),
-            Key::Char('d') => self
-                .selected_service()
-                .map(|service| UiAction::StopService {
-                    name: service.name.clone(),
-                }),
-            Key::Char('R') => self
-                .selected_service()
-                .map(|service| UiAction::RestartService {
-                    name: service.name.clone(),
-                }),
+            Key::Char('d') => {
+                self.begin_service_control(ServiceControlKind::Stop);
+                None
+            }
+            Key::Char('R') => {
+                self.begin_service_control(ServiceControlKind::Restart);
+                None
+            }
             Key::Char('L') => Some(UiAction::ReloadServices),
             _ => None,
         }
@@ -492,6 +517,93 @@ impl App {
             .map(|(agent_id, name)| (agent_id.as_str(), name.as_str()))
     }
 
+    fn begin_service_control(&mut self, kind: ServiceControlKind) {
+        let Some(service) = self.selected_service().cloned() else {
+            self.status = "no service selected".into();
+            return;
+        };
+        self.pending_service_control = Some(PendingServiceControl {
+            kind,
+            name: service.name.clone(),
+            agent_id: service.agent_id.clone(),
+        });
+        self.mode = Mode::ConfirmServiceControl;
+        self.input.clear();
+        let impact = match kind {
+            ServiceControlKind::Stop => {
+                "stopping ends its supervised agent and may block dependent services"
+            }
+            ServiceControlKind::Restart => {
+                "restarting replaces its supervised agent and can interrupt in-flight work"
+            }
+        };
+        self.status = format!(
+            "confirm service {} — {} (owner {}) · {}; type the exact service name, Enter to submit, Esc to cancel",
+            kind.label(),
+            service.name,
+            service.agent_id.as_deref().unwrap_or("none"),
+            impact
+        );
+    }
+
+    fn on_key_confirm_service_control(&mut self, key: Key) -> Option<UiAction> {
+        match key {
+            Key::Esc => {
+                self.pending_service_control = None;
+                self.mode = Mode::Normal;
+                self.input.clear();
+                self.status = "service control cancelled".into();
+                None
+            }
+            Key::Backspace => {
+                self.input.pop();
+                None
+            }
+            Key::Char(character) => {
+                self.input.push(character);
+                None
+            }
+            Key::Enter => {
+                let Some(target) = self.pending_service_control.as_ref() else {
+                    self.mode = Mode::Normal;
+                    self.input.clear();
+                    self.status = "service control cancelled — target unavailable".into();
+                    return None;
+                };
+                if self.input != target.name {
+                    self.status = format!(
+                        "service {} not submitted — confirmation must exactly match {}",
+                        target.kind.label(),
+                        target.name
+                    );
+                    return None;
+                }
+                let target = self
+                    .pending_service_control
+                    .take()
+                    .expect("validated pending service target");
+                self.mode = Mode::Normal;
+                self.input.clear();
+                self.status = format!("service {} submitted", target.kind.label());
+                Some(match target.kind {
+                    ServiceControlKind::Stop => UiAction::StopService { name: target.name },
+                    ServiceControlKind::Restart => UiAction::RestartService { name: target.name },
+                })
+            }
+            _ => None,
+        }
+    }
+
+    pub fn pending_service_control(&self) -> Option<(&str, &str, Option<&str>)> {
+        self.pending_service_control.as_ref().map(|target| {
+            (
+                target.kind.label(),
+                target.name.as_str(),
+                target.agent_id.as_deref(),
+            )
+        })
+    }
+
     fn submit(&mut self) -> Option<UiAction> {
         let action = match self.mode {
             Mode::CreateAgent => {
@@ -521,7 +633,7 @@ impl App {
                 }
                 UiAction::SendMessage { agent_id, message }
             }
-            Mode::Normal | Mode::ConfirmKill => return None,
+            Mode::Normal | Mode::ConfirmKill | Mode::ConfirmServiceControl => return None,
         };
         self.mode = Mode::Normal;
         self.input.clear();
@@ -561,7 +673,7 @@ mod tests {
         OperatorServiceSnapshot {
             name: name.into(),
             state: "Running".into(),
-            agent_id: None,
+            agent_id: Some("service-agent".into()),
             restart_count: 0,
             last_exit_code: None,
             desired_running: true,
@@ -834,7 +946,7 @@ mod tests {
     }
 
     #[test]
-    fn service_keys_target_the_selected_kernel_supervisor_service() {
+    fn service_controls_freeze_the_selected_target_and_require_its_exact_name() {
         let mut a = app();
         a.services = vec![dummy_service("database"), dummy_service("worker")];
         a.on_key(Key::Char(']'));
@@ -845,18 +957,39 @@ mod tests {
                 name: "worker".into()
             })
         );
+
+        assert_eq!(a.on_key(Key::Char('d')), None);
+        assert_eq!(a.mode, Mode::ConfirmServiceControl);
         assert_eq!(
-            a.on_key(Key::Char('d')),
-            Some(UiAction::StopService {
-                name: "worker".into()
-            })
+            a.pending_service_control(),
+            Some(("stop", "worker", Some("service-agent")))
         );
+        assert!(a.status.contains("may block dependent services"));
+        a.selected_service = 0;
+        for character in "database".chars() {
+            assert_eq!(a.on_key(Key::Char(character)), None);
+        }
+        assert_eq!(a.on_key(Key::Enter), None);
+        assert_eq!(a.mode, Mode::ConfirmServiceControl);
+        assert!(a.status.contains("must exactly match worker"));
+        assert_eq!(a.on_key(Key::Esc), None);
+        assert_eq!(a.mode, Mode::Normal);
+
+        a.selected_service = 1;
+        assert_eq!(a.on_key(Key::Char('R')), None);
+        assert_eq!(a.mode, Mode::ConfirmServiceControl);
+        assert!(a.status.contains("can interrupt in-flight work"));
+        a.selected_service = 0;
+        for character in "worker".chars() {
+            assert_eq!(a.on_key(Key::Char(character)), None);
+        }
         assert_eq!(
-            a.on_key(Key::Char('R')),
+            a.on_key(Key::Enter),
             Some(UiAction::RestartService {
                 name: "worker".into()
             })
         );
+        assert_eq!(a.mode, Mode::Normal);
         assert_eq!(a.on_key(Key::Char('L')), Some(UiAction::ReloadServices));
     }
 }

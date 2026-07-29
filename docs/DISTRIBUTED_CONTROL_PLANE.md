@@ -10,10 +10,11 @@ It is not a production-readiness claim.
 The current implementation has one designated membership authority backed by
 one kernel SQLite database. Membership changes are serialized by an immediate
 SQLite transaction and published as an atomic, monotonically generated
-snapshot. There is no replicated log, election, quorum, or automatic authority
-failover in the production runtime. If the designated authority is
-unavailable, clients must fail closed for joins, leaves, revocation, and fresh
-authenticated discovery.
+snapshot. An opt-in OpenRaft peer process now runs inside `agent-server`, but
+public membership and ownership operations are not routed through it yet.
+Therefore there is still no quorum or automatic failover for product authority.
+If the designated authority is unavailable, clients must fail closed for joins,
+leaves, revocation, and fresh authenticated discovery.
 
 The kernel now contains a durable OpenRaft storage-v2 substrate and an
 executable, statically configured peer runtime for the next stage. Votes,
@@ -36,13 +37,21 @@ that the old leader cannot revive its old term. Separate regressions reject
 certificate/node spoofing, embedded vote spoofing, wrong-but-CA-valid server
 leaves, oversized frames, and invalid bounds.
 
-This runtime is not constructed by `agent-server` or any public product entry
-point yet. Its member map is fixed for the lifetime of the process, and its
-only application command is an internal idempotent barrier. Production
-membership and ownership syscalls still use the designated single SQLite
-authority and do not carry a quorum term. The runtime is therefore executable
-quorum foundation, not evidence that the product has quorum authority or
-partition-safe availability.
+`agent-server` constructs and owns this runtime when `[cluster_raft].enabled`
+is true. Startup reads bounded no-follow PEM inputs, requires owner-only private
+keys on Unix, validates the local certificate fingerprints against the exact
+member record, and fails if an existing durable membership differs from the
+configured static map. A pristine store requires explicit `bootstrap = true`;
+the same setting is restart-safe because an already initialized node is
+verified instead of reinitialized. SIGINT/SIGTERM closes the peer listener and
+OpenRaft task cleanly.
+
+The member map is still fixed for the lifetime of the process, and the only
+application command is an internal idempotent barrier. Production membership
+and ownership syscalls continue to use the designated single SQLite authority
+and do not carry a quorum term. The runtime is therefore an executable,
+daemon-integrated quorum foundation, not evidence that the product has quorum
+authority or partition-safe availability.
 
 Each workload node owns a separate SQLite database under the existing
 single-process storage lease. Agent state is not replicated between nodes.
@@ -71,6 +80,48 @@ agent id and never blindly replayed.
 Consequently, the current multi-node foundation is appropriate for controlled
 development and qualification. It is not partition tolerant and must not be
 advertised as a production distributed kernel.
+
+## Starting the internal Raft runtime
+
+Each node uses the same exact member list and cluster name, while `node_id`,
+`listen_addr`, and private-key paths identify that local process. Certificate
+fingerprints are lowercase SHA-256 hex for the leaf certificate in the
+corresponding PEM. Paths must be absolute; private keys must be regular,
+owner-only files on Unix and no TLS input may be a symbolic link.
+
+```toml
+[cluster_raft]
+enabled = true
+bootstrap = true
+node_id = 1
+listen_addr = "10.0.0.11:8788"
+cluster_name = "production-agentos"
+server_certificate_path = "/etc/agentos/raft/node-1-server.pem"
+server_private_key_path = "/etc/agentos/raft/node-1-server-key.pem"
+client_certificate_path = "/etc/agentos/raft/node-1-client.pem"
+client_private_key_path = "/etc/agentos/raft/node-1-client-key.pem"
+peer_ca_path = "/etc/agentos/raft/peer-ca.pem"
+
+[[cluster_raft.members]]
+node_id = 1
+endpoint = "10.0.0.11:8788"
+server_name = "node-1.internal.example"
+tls_certificate_sha256 = "<64 lowercase hex characters>"
+tls_client_certificate_sha256 = "<64 lowercase hex characters>"
+identity_public_key = "<stable node identity public key>"
+```
+
+Add one `[[cluster_raft.members]]` table for every voter. Set `bootstrap =
+true` on the first start of every pristine node using the identical map. After
+the membership is durable, operators may set it to `false`; a pristine or
+mismatched store then fails startup rather than silently forming another
+cluster. This configuration starts the internal consensus substrate only. It
+does not change the public authority endpoint or make agent operations
+partition-safe.
+
+`agent-server` reads the platform config path by default. A service manager may
+set `AGENT_SERVER_CONFIG` to an explicit absolute `config.toml` path; relative
+paths are rejected.
 
 ## Consistency by object
 
@@ -180,11 +231,10 @@ non-migratable.
 
 ## Required implementation sequence
 
-1. Construct the implemented authenticated Raft runtime from production
-   configuration; move membership and ownership commands plus their read rules
-   into the deterministic state machine; add safe quorum-versioned membership
-   changes; include the committed authority term in every destination proof;
-   and permanently fence old terms.
+1. Move membership and ownership commands plus their read rules into the
+   deterministic state machine; add safe quorum-versioned membership changes;
+   include the committed authority term in every destination proof; and
+   permanently fence old terms.
 2. Checkpointed drain/migration with rollback and side-effect classifications.
 3. Cross-node IPC/delegation with end-to-end authorization and audit.
 4. Cluster quota reservations and monotonic policy/package trust epochs.
@@ -203,8 +253,10 @@ passing single-node test is never accepted as substitute evidence.
   `crates/kernel/src/cluster_control.rs`
 - Durable OpenRaft storage-v2 log, state machine, idempotent authority barrier,
   and snapshots: `crates/kernel/src/cluster_consensus.rs`
-- Bounded mTLS Raft peer RPCs, exact certificate/node binding, election
-  lifecycle, and quorum regressions: `crates/kernel/src/cluster_runtime.rs`
+- Strict operator configuration: `crates/kernel/src/config.rs`
+- Bounded mTLS Raft peer RPCs, exact certificate/node binding, daemon
+  lifecycle, and quorum regressions: `crates/kernel/src/cluster_runtime.rs` and
+  `crates/cli/src/bin/agent-server.rs`
 - Durable cluster tables and single-process storage lease:
   `crates/kernel/src/context.rs` and `crates/kernel/src/storage.rs`
 - Authenticated discovery, placement, and owner reconstruction:

@@ -16,10 +16,15 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::fs::File;
+#[cfg(unix)]
+use std::fs::OpenOptions;
 use std::io;
+use std::io::Read as _;
 use std::net::SocketAddr;
+use std::path::Path;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use openraft::error::{
     ClientWriteError, InitializeError, NetworkError, RPCError, RaftError, RemoteError, Timeout,
@@ -38,11 +43,13 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{watch, Semaphore};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio_rustls::{TlsAcceptor, TlsConnector};
+use zeroize::Zeroizing;
 
 use crate::cluster_consensus::{
     open_cluster_raft_storage, AuthorityCommand, ClusterRaftNode, ClusterRaftNodeId,
     ClusterRaftTypeConfig,
 };
+use crate::config::ClusterRaftConfig;
 use crate::context::SqliteContextManager;
 
 const CLUSTER_RAFT_WIRE_VERSION: u16 = 1;
@@ -52,6 +59,9 @@ const ABSOLUTE_MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
 const DEFAULT_MAX_IN_FLIGHT: usize = 128;
 const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_INBOUND_TIMEOUT: Duration = Duration::from_secs(15);
+const MAX_CLUSTER_PEM_BYTES: u64 = 1024 * 1024;
+const INITIAL_METRICS_TIMEOUT: Duration = Duration::from_secs(5);
+const MEMBERSHIP_SETTLE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Server and client TLS identities used by one Raft peer.
 ///
@@ -267,6 +277,97 @@ impl fmt::Debug for ClusterRaftRuntimeConfig {
 }
 
 impl ClusterRaftRuntimeConfig {
+    /// Load and validate one enabled operator configuration.
+    ///
+    /// Private keys must be regular owner-only files on Unix. All PEM inputs
+    /// are read through bounded, no-follow file descriptors, and private-key
+    /// buffers are zeroized after rustls consumes them.
+    pub fn from_operator_config(config: &ClusterRaftConfig) -> io::Result<Option<Self>> {
+        config.validate().map_err(invalid_input)?;
+        if !config.enabled {
+            return Ok(None);
+        }
+        let server_certificate_path = required_path(
+            config.server_certificate_path.as_deref(),
+            "server_certificate_path",
+        )?;
+        let server_private_key_path = required_path(
+            config.server_private_key_path.as_deref(),
+            "server_private_key_path",
+        )?;
+        let client_certificate_path = required_path(
+            config.client_certificate_path.as_deref(),
+            "client_certificate_path",
+        )?;
+        let client_private_key_path = required_path(
+            config.client_private_key_path.as_deref(),
+            "client_private_key_path",
+        )?;
+        let peer_ca_path = required_path(config.peer_ca_path.as_deref(), "peer_ca_path")?;
+
+        let server_certificate =
+            read_bounded_pem(server_certificate_path, "Raft server certificate", false)?;
+        let server_private_key = Zeroizing::new(read_bounded_pem(
+            server_private_key_path,
+            "Raft server private key",
+            true,
+        )?);
+        let client_certificate =
+            read_bounded_pem(client_certificate_path, "Raft client certificate", false)?;
+        let client_private_key = Zeroizing::new(read_bounded_pem(
+            client_private_key_path,
+            "Raft client private key",
+            true,
+        )?);
+        let peer_ca = read_bounded_pem(peer_ca_path, "Raft peer CA", false)?;
+        let tls = ClusterRaftTls::from_pem(
+            &server_certificate,
+            &server_private_key,
+            &client_certificate,
+            &client_private_key,
+            &peer_ca,
+        )?;
+        let members = config
+            .members
+            .iter()
+            .map(|member| {
+                (
+                    member.node_id,
+                    ClusterRaftNode {
+                        endpoint: member.endpoint.clone(),
+                        server_name: member.server_name.clone(),
+                        tls_certificate_sha256: member.tls_certificate_sha256.clone(),
+                        tls_client_certificate_sha256: member.tls_client_certificate_sha256.clone(),
+                        identity_public_key: member.identity_public_key.clone(),
+                    },
+                )
+            })
+            .collect();
+        let runtime = Self {
+            node_id: config.node_id,
+            listen_addr: config.listen_addr.parse().map_err(invalid_input)?,
+            members,
+            tls,
+            raft: OpenRaftConfig {
+                cluster_name: config.cluster_name.clone(),
+                heartbeat_interval: config.heartbeat_interval_ms,
+                election_timeout_min: config.election_timeout_min_ms,
+                election_timeout_max: config.election_timeout_max_ms,
+                install_snapshot_timeout: config.install_snapshot_timeout_ms,
+                max_payload_entries: config.max_payload_entries,
+                ..Default::default()
+            },
+            transport: ClusterRaftTransportLimits {
+                handshake_timeout: Duration::from_millis(config.handshake_timeout_ms),
+                inbound_request_timeout: Duration::from_millis(config.inbound_request_timeout_ms),
+                max_frame_bytes: config.max_frame_bytes,
+                max_in_flight_connections: config.max_in_flight_connections,
+            },
+        };
+        runtime.validate()?;
+        Ok(Some(runtime))
+    }
+
     pub fn validate(&self) -> io::Result<()> {
         if self.node_id == 0 {
             return Err(invalid_input("Raft node id 0 is reserved"));
@@ -362,6 +463,108 @@ impl ClusterRaftRuntimeConfig {
         }
         Ok(())
     }
+}
+
+fn required_path<'a>(path: Option<&'a Path>, field: &str) -> io::Result<&'a Path> {
+    path.ok_or_else(|| invalid_input(format!("cluster_raft.{field} is required when enabled")))
+}
+
+fn read_bounded_pem(path: &Path, label: &str, private: bool) -> io::Result<Vec<u8>> {
+    let mut file = open_pem_without_follow(path).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("open {label} {}: {error}", path.display()),
+        )
+    })?;
+    let metadata = file.metadata().map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("inspect {label} {}: {error}", path.display()),
+        )
+    })?;
+    if !metadata.is_file() {
+        return Err(invalid_input(format!(
+            "{label} {} must be a regular file",
+            path.display()
+        )));
+    }
+    if metadata.len() == 0 || metadata.len() > MAX_CLUSTER_PEM_BYTES {
+        return Err(invalid_input(format!(
+            "{label} {} must contain 1 to {MAX_CLUSTER_PEM_BYTES} bytes",
+            path.display()
+        )));
+    }
+    if private {
+        verify_private_key_permissions(path, &metadata)?;
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.by_ref()
+        .take(MAX_CLUSTER_PEM_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("read {label} {}: {error}", path.display()),
+            )
+        })?;
+    if bytes.is_empty() || bytes.len() as u64 > MAX_CLUSTER_PEM_BYTES {
+        return Err(invalid_input(format!(
+            "{label} {} changed size while it was read",
+            path.display()
+        )));
+    }
+    Ok(bytes)
+}
+
+#[cfg(unix)]
+fn open_pem_without_follow(path: &Path) -> io::Result<File> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(path)
+}
+
+#[cfg(not(unix))]
+fn open_pem_without_follow(path: &Path) -> io::Result<File> {
+    if std::fs::symlink_metadata(path)?.file_type().is_symlink() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "symbolic links are not accepted for Raft TLS material",
+        ));
+    }
+    File::open(path)
+}
+
+#[cfg(unix)]
+fn verify_private_key_permissions(path: &Path, metadata: &std::fs::Metadata) -> io::Result<()> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    if metadata.permissions().mode() & 0o077 != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "Raft private key {} must not grant group or other permissions",
+                path.display()
+            ),
+        ));
+    }
+    if metadata.uid() != unsafe { libc::geteuid() } {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "Raft private key {} is not owned by the current user",
+                path.display()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn verify_private_key_permissions(_path: &Path, _metadata: &std::fs::Metadata) -> io::Result<()> {
+    Ok(())
 }
 
 fn validate_endpoint(endpoint: &str) -> io::Result<()> {
@@ -743,6 +946,28 @@ impl ClusterRaftRuntime {
                 format!("start OpenRaft node: {error}"),
             )
         })?;
+        let mut metrics = raft.metrics();
+        match tokio::time::timeout(INITIAL_METRICS_TIMEOUT, metrics.changed()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => {
+                let _ = raft.shutdown().await;
+                return Err(io::Error::other(
+                    "OpenRaft metrics channel closed during startup",
+                ));
+            }
+            Err(_) => {
+                let _ = raft.shutdown().await;
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "OpenRaft did not publish initial durable metrics",
+                ));
+            }
+        }
+        let initial_metrics = metrics.borrow().clone();
+        if let Err(error) = validate_durable_membership(&initial_metrics, &config.members) {
+            let _ = raft.shutdown().await;
+            return Err(error);
+        }
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let listener_task = tokio::spawn(serve_listener(
             listener,
@@ -790,6 +1015,50 @@ impl ClusterRaftRuntime {
         self.raft.initialize(self.members.clone()).await
     }
 
+    /// Make the configured membership active, or verify an exact durable
+    /// membership on restart.
+    ///
+    /// With `bootstrap = false`, a pristine database fails closed. With
+    /// `bootstrap = true`, initialization is attempted only for a pristine
+    /// database. A concurrent identical bootstrap is accepted after the
+    /// resulting durable membership is observed; any different or joint
+    /// membership is rejected.
+    pub async fn ensure_configured_membership(&self, bootstrap: bool) -> io::Result<()> {
+        let metrics = self.metrics();
+        if validate_durable_membership(&metrics.borrow(), &self.members)? {
+            return Ok(());
+        }
+        if !bootstrap {
+            return Err(invalid_input(
+                "Raft storage is pristine; set cluster_raft.bootstrap = true for the initial start",
+            ));
+        }
+        let initialization =
+            tokio::time::timeout(MEMBERSHIP_SETTLE_TIMEOUT, self.initialize()).await;
+        let initialization_failure: String = match &initialization {
+            Ok(Ok(())) => "Raft bootstrap did not publish the configured membership".into(),
+            Ok(Err(error)) => {
+                format!("Raft bootstrap failed and no configured membership appeared: {error}")
+            }
+            Err(_) => "Raft bootstrap timed out".into(),
+        };
+        let deadline = Instant::now() + MEMBERSHIP_SETTLE_TIMEOUT;
+        loop {
+            match validate_durable_membership(&metrics.borrow(), &self.members) {
+                Ok(true) => return Ok(()),
+                Ok(false) if Instant::now() < deadline => {}
+                Ok(false) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        initialization_failure.clone(),
+                    ))
+                }
+                Err(error) => return Err(error),
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
     pub async fn commit(
         &self,
         command: AuthorityCommand,
@@ -818,6 +1087,74 @@ impl ClusterRaftRuntime {
             .await
             .map_err(|error| io::Error::other(format!("Raft shutdown failed: {error}")))
     }
+}
+
+fn validate_durable_membership(
+    metrics: &RaftMetrics<ClusterRaftNodeId, ClusterRaftNode>,
+    expected: &BTreeMap<ClusterRaftNodeId, ClusterRaftNode>,
+) -> io::Result<bool> {
+    metrics.running_state.as_ref().map_err(|error| {
+        io::Error::other(format!(
+            "OpenRaft is not running while membership is validated: {error}"
+        ))
+    })?;
+    let stored = metrics.membership_config.as_ref();
+    let nodes = stored
+        .nodes()
+        .map(|(node_id, node)| (*node_id, node.clone()))
+        .collect::<BTreeMap<_, _>>();
+    let voters = stored.voter_ids().collect::<BTreeSet<_>>();
+    if stored.log_id().is_none() {
+        if nodes.is_empty() && voters.is_empty() {
+            return Ok(false);
+        }
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "durable Raft membership has no log id but is not empty",
+        ));
+    }
+    if stored.membership().get_joint_config().len() != 1 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "durable Raft membership is joint and cannot be represented by the static operator configuration",
+        ));
+    }
+    let expected_voters = expected.keys().copied().collect::<BTreeSet<_>>();
+    if voters != expected_voters || nodes != *expected {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "durable Raft membership does not exactly match cluster_raft.members",
+        ));
+    }
+    Ok(true)
+}
+
+/// Start the operator-configured runtime and establish its exact membership.
+///
+/// Disabled configuration returns `Ok(None)`. Any certificate, bind,
+/// bootstrap, or durable-membership failure shuts down a partially started
+/// runtime before returning the error.
+pub async fn start_configured_cluster_runtime(
+    context: Arc<SqliteContextManager>,
+    config: &ClusterRaftConfig,
+) -> io::Result<Option<ClusterRaftRuntime>> {
+    let Some(runtime_config) = ClusterRaftRuntimeConfig::from_operator_config(config)? else {
+        return Ok(None);
+    };
+    let runtime = ClusterRaftRuntime::start(context, runtime_config).await?;
+    if let Err(error) = runtime.ensure_configured_membership(config.bootstrap).await {
+        let shutdown_error = runtime.shutdown().await.err();
+        return Err(match shutdown_error {
+            Some(shutdown_error) => io::Error::new(
+                error.kind(),
+                format!(
+                    "{error}; Raft shutdown after startup failure also failed: {shutdown_error}"
+                ),
+            ),
+            None => error,
+        });
+    }
+    Ok(Some(runtime))
 }
 
 impl Drop for ClusterRaftRuntime {
@@ -1036,11 +1373,16 @@ mod tests {
 
     use super::*;
     use crate::cluster_consensus::AuthorityResponse;
+    use crate::config::ClusterRaftMemberConfig;
 
     struct TestPeer {
         node_id: ClusterRaftNodeId,
         server_name: String,
         tls: ClusterRaftTls,
+        server_certificate_pem: String,
+        server_private_key_pem: String,
+        client_certificate_pem: String,
+        client_private_key_pem: String,
     }
 
     fn test_ca() -> CertifiedIssuer<'static, KeyPair> {
@@ -1073,11 +1415,15 @@ mod tests {
             .signed_by(&client_key, ca)
             .expect("sign client certificate");
 
+        let server_certificate_pem = server_certificate.pem();
+        let server_private_key_pem = server_key.serialize_pem();
+        let client_certificate_pem = client_certificate.pem();
+        let client_private_key_pem = client_key.serialize_pem();
         let tls = ClusterRaftTls::from_pem(
-            server_certificate.pem().as_bytes(),
-            server_key.serialize_pem().as_bytes(),
-            client_certificate.pem().as_bytes(),
-            client_key.serialize_pem().as_bytes(),
+            server_certificate_pem.as_bytes(),
+            server_private_key_pem.as_bytes(),
+            client_certificate_pem.as_bytes(),
+            client_private_key_pem.as_bytes(),
             ca.pem().as_bytes(),
         )
         .expect("peer TLS");
@@ -1085,6 +1431,66 @@ mod tests {
             node_id,
             server_name,
             tls,
+            server_certificate_pem,
+            server_private_key_pem,
+            client_certificate_pem,
+            client_private_key_pem,
+        }
+    }
+
+    fn write_private_test_file(path: &Path, contents: &str) {
+        std::fs::write(path, contents).expect("write private test file");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+                .expect("set owner-only test permissions");
+        }
+    }
+
+    fn operator_config(
+        root: &Path,
+        peer: &TestPeer,
+        ca: &CertifiedIssuer<'_, KeyPair>,
+        listen_addr: SocketAddr,
+        bootstrap: bool,
+    ) -> ClusterRaftConfig {
+        let server_certificate_path = root.join("server.pem");
+        let server_private_key_path = root.join("server-key.pem");
+        let client_certificate_path = root.join("client.pem");
+        let client_private_key_path = root.join("client-key.pem");
+        let peer_ca_path = root.join("ca.pem");
+        std::fs::write(&server_certificate_path, &peer.server_certificate_pem)
+            .expect("write server certificate");
+        write_private_test_file(&server_private_key_path, &peer.server_private_key_pem);
+        std::fs::write(&client_certificate_path, &peer.client_certificate_pem)
+            .expect("write client certificate");
+        write_private_test_file(&client_private_key_path, &peer.client_private_key_pem);
+        std::fs::write(&peer_ca_path, ca.pem()).expect("write CA");
+        ClusterRaftConfig {
+            enabled: true,
+            bootstrap,
+            node_id: peer.node_id,
+            listen_addr: listen_addr.to_string(),
+            cluster_name: "operator-runtime-test".into(),
+            members: vec![ClusterRaftMemberConfig {
+                node_id: peer.node_id,
+                endpoint: listen_addr.to_string(),
+                server_name: peer.server_name.clone(),
+                tls_certificate_sha256: peer.tls.server_certificate_sha256().into(),
+                tls_client_certificate_sha256: peer.tls.client_certificate_sha256().into(),
+                identity_public_key: format!("test-identity-key-{}", peer.node_id),
+            }],
+            server_certificate_path: Some(server_certificate_path),
+            server_private_key_path: Some(server_private_key_path),
+            client_certificate_path: Some(client_certificate_path),
+            client_private_key_path: Some(client_private_key_path),
+            peer_ca_path: Some(peer_ca_path),
+            heartbeat_interval_ms: 50,
+            election_timeout_min_ms: 200,
+            election_timeout_max_ms: 400,
+            ..Default::default()
         }
     }
 
@@ -1469,6 +1875,146 @@ mod tests {
             "CA trust must not bypass the exact member leaf binding"
         );
         target_runtime.shutdown().await.expect("shutdown target");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn operator_runtime_bootstraps_restarts_and_rejects_membership_drift() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let root = TempDir::new().expect("tempdir");
+        let ca = test_ca();
+        let peer = test_peer(&ca, 1);
+        let reserved = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("reserve listener");
+        let listen_addr = reserved.local_addr().expect("listener address");
+        drop(reserved);
+        let database = root.path().join("operator-runtime.db");
+        let config = operator_config(root.path(), &peer, &ca, listen_addr, true);
+
+        let mut no_bootstrap = config.clone();
+        no_bootstrap.bootstrap = false;
+        let pristine_context = Arc::new(
+            SqliteContextManager::new_without_storage_lease(
+                &root.path().join("pristine-runtime.db"),
+            )
+            .expect("open pristine database"),
+        );
+        let error = start_configured_cluster_runtime(pristine_context.clone(), &no_bootstrap)
+            .await
+            .expect_err("pristine storage without bootstrap must fail");
+        assert!(error.to_string().contains("storage is pristine"), "{error}");
+        drop(pristine_context);
+
+        let first_context = Arc::new(
+            SqliteContextManager::new_without_storage_lease(&database)
+                .expect("open first database"),
+        );
+        let first = start_configured_cluster_runtime(first_context.clone(), &config)
+            .await
+            .expect("bootstrap configured runtime")
+            .expect("enabled runtime");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while first.metrics().borrow().current_leader != Some(1) {
+            assert!(
+                Instant::now() < deadline,
+                "single node did not elect itself"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        let write = first
+            .commit(AuthorityCommand::Barrier {
+                operation_id: Uuid::new_v4().to_string(),
+                expected_sequence: Some(0),
+            })
+            .await
+            .expect("commit through configured runtime");
+        assert!(matches!(
+            write.data,
+            AuthorityResponse::BarrierCommitted { sequence: 1, .. }
+        ));
+        first.shutdown().await.expect("shutdown first runtime");
+        drop(first_context);
+
+        let mut restart_config = config.clone();
+        restart_config.bootstrap = false;
+        let restart_context = Arc::new(
+            SqliteContextManager::new_without_storage_lease(&database).expect("reopen database"),
+        );
+        let restarted = start_configured_cluster_runtime(restart_context.clone(), &restart_config)
+            .await
+            .expect("restart exact configured runtime")
+            .expect("enabled runtime");
+        assert!(
+            validate_durable_membership(&restarted.metrics().borrow(), &restarted.members)
+                .expect("validate restart membership")
+        );
+        restarted.shutdown().await.expect("shutdown restart");
+        drop(restart_context);
+
+        let mut drifted = restart_config;
+        drifted.members[0].identity_public_key = "different-identity-key".into();
+        let drift_context = Arc::new(
+            SqliteContextManager::new_without_storage_lease(&database)
+                .expect("reopen drift database"),
+        );
+        let error = start_configured_cluster_runtime(drift_context, &drifted)
+            .await
+            .expect_err("durable membership drift must fail startup");
+        assert!(
+            error
+                .to_string()
+                .contains("does not exactly match cluster_raft.members"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn disabled_operator_config_opens_no_tls_material() {
+        assert!(
+            ClusterRaftRuntimeConfig::from_operator_config(&ClusterRaftConfig::default())
+                .expect("disabled config")
+                .is_none()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn operator_config_rejects_readable_private_keys_and_symlinks() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let root = TempDir::new().expect("tempdir");
+        let ca = test_ca();
+        let peer = test_peer(&ca, 1);
+        let config = operator_config(
+            root.path(),
+            &peer,
+            &ca,
+            "127.0.0.1:18788".parse().expect("socket address"),
+            true,
+        );
+        let key_path = config.server_private_key_path.as_ref().expect("server key");
+        std::fs::set_permissions(key_path, std::fs::Permissions::from_mode(0o644))
+            .expect("make key unsafe");
+        let error = ClusterRaftRuntimeConfig::from_operator_config(&config)
+            .expect_err("group-readable private key must fail");
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+
+        std::fs::set_permissions(key_path, std::fs::Permissions::from_mode(0o600))
+            .expect("restore owner-only key");
+        let certificate_path = config
+            .server_certificate_path
+            .as_ref()
+            .expect("certificate");
+        let certificate_target = root.path().join("server-target.pem");
+        std::fs::rename(certificate_path, &certificate_target).expect("move certificate");
+        symlink(&certificate_target, certificate_path).expect("symlink certificate");
+        let error = ClusterRaftRuntimeConfig::from_operator_config(&config)
+            .expect_err("symlinked certificate must fail");
+        assert!(
+            matches!(error.raw_os_error(), Some(libc::ELOOP) | Some(libc::EMLINK))
+                || error.to_string().contains("Too many levels"),
+            "{error}"
+        );
     }
 
     #[tokio::test]

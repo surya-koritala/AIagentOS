@@ -1016,8 +1016,12 @@ impl ToolRegistry {
                 name,
                 &prepared.authorization.resource,
                 &prepared.authorization.security,
-                &prepared.approval_contract_digest,
-                &request_identity,
+                crate::syscall_gate::GateAdmissionContract {
+                    approval_contract: &prepared.approval_contract_digest,
+                    request_identity: &request_identity,
+                    track_peripheral_activity: prepared.request.resource_type
+                        == ResourceType::Peripheral,
+                },
             )
             .await
             .map_err(ToolAuthorizationError::Denied)?;
@@ -1716,6 +1720,22 @@ mod tests {
                 "read_credential",
                 SecurityAction::CredentialAccess,
             ),
+            (
+                ResourceType::Peripheral,
+                "capture_image",
+                SecurityAction::Read,
+            ),
+            (
+                ResourceType::Peripheral,
+                "record_audio",
+                SecurityAction::Read,
+            ),
+            (
+                ResourceType::Peripheral,
+                "play_audio",
+                SecurityAction::Write,
+            ),
+            (ResourceType::Peripheral, "print", SecurityAction::Write),
         ];
 
         for (resource_type, operation, action) in expected {
@@ -1763,22 +1783,6 @@ mod tests {
                 "read_output",
                 SecurityAction::Execute,
             ),
-            (
-                ResourceType::Peripheral,
-                "capture_image",
-                SecurityAction::Read,
-            ),
-            (
-                ResourceType::Peripheral,
-                "record_audio",
-                SecurityAction::Read,
-            ),
-            (
-                ResourceType::Peripheral,
-                "play_audio",
-                SecurityAction::Write,
-            ),
-            (ResourceType::Peripheral, "print", SecurityAction::Write),
         ] {
             assert!(matches!(
                 ToolRegistry::validate_binding(&operation_binding(

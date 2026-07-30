@@ -119,6 +119,12 @@ struct ToolCallContract<'a> {
     approval_contract: Option<&'a str>,
 }
 
+pub(crate) struct GateAdmissionContract<'a> {
+    pub(crate) approval_contract: &'a str,
+    pub(crate) request_identity: &'a str,
+    pub(crate) track_peripheral_activity: bool,
+}
+
 struct AuthorizedToolCall {
     pid: Pid,
     audited: bool,
@@ -397,6 +403,10 @@ pub struct SyscallGate {
     /// contract identity/digest).
     /// No wire/package/MCP deserialization path can populate this map.
     approvals: DashMap<ApprovalKey, crate::tools::ApprovalPolicy>,
+    /// Gate-admitted peripheral calls, registered atomically with consumption
+    /// of their exact single-use grant. Only opaque contract/request digests
+    /// and cooperative cancellation handles are retained.
+    peripheral_activity: std::sync::Arc<crate::resources::PeripheralActivityMap>,
     /// Monotonic PID allocator (starts at 1 so 0 stays reserved for "kernel").
     next_pid: AtomicU64,
     /// Global monotonic cgroup-membership revision allocator. Global ordering
@@ -563,6 +573,7 @@ impl SyscallGate {
             tool_namespaces: DashMap::new(),
             tool_namespace_revision: AtomicU64::new(1),
             approvals: DashMap::new(),
+            peripheral_activity: std::sync::Arc::new(DashMap::new()),
             next_pid: AtomicU64::new(1),
             next_cgroup_revision: AtomicU64::new(1),
             next_authorization_revision: AtomicU64::new(1),
@@ -824,6 +835,7 @@ impl SyscallGate {
         self.records.remove(&kid);
         self.approvals
             .retain(|(agent, _, _, _, _), _| *agent != kid);
+        self.cancel_peripheral_for_agent_locked(kid);
         Ok(())
     }
 
@@ -842,6 +854,7 @@ impl SyscallGate {
         self.records.remove(&kid);
         self.approvals
             .retain(|(agent, _, _, _, _), _| *agent != kid);
+        self.cancel_peripheral_for_agent_locked(kid);
         Ok(())
     }
 
@@ -1001,6 +1014,105 @@ impl SyscallGate {
             contract.to_string(),
         );
         Some(self.approvals.remove(&key).is_some())
+    }
+
+    /// Return one coherent local projection of an exact peripheral grant and
+    /// every gate-admitted use of that same tool contract.
+    pub(crate) fn peripheral_call_state_contract(
+        &self,
+        kid: uuid::Uuid,
+        tool_name: &str,
+        resource: &str,
+        contract: &str,
+        required: crate::tools::ApprovalPolicy,
+        activity_identity: &str,
+    ) -> Option<(bool, usize)> {
+        let _mutation = self.mutation_lock.lock().unwrap();
+        let registration_revision = self
+            .records
+            .get(&kid)
+            .map(|record| record.registration_revision)?;
+        let approval_key = (
+            kid,
+            registration_revision,
+            tool_name.to_string(),
+            crate::resources::opaque_identity(resource.as_bytes()),
+            contract.to_string(),
+        );
+        let pending = self
+            .approvals
+            .get(&approval_key)
+            .is_some_and(|approval| (*approval).satisfies(required));
+        let active = self
+            .peripheral_activity
+            .iter()
+            .filter(|entry| {
+                let (active_agent, active_identity, _) = entry.key();
+                *active_agent == kid && active_identity == activity_identity
+            })
+            .count();
+        Some((pending, active))
+    }
+
+    /// Atomically revoke an unconsumed peripheral grant or cancel every use
+    /// that already consumed it. Admission takes the same mutation fence, so
+    /// revocation cannot miss a call between those two states.
+    pub(crate) fn revoke_peripheral_call_contract(
+        &self,
+        kid: uuid::Uuid,
+        tool_name: &str,
+        resource: &str,
+        contract: &str,
+        activity_identity: &str,
+    ) -> Option<(bool, usize)> {
+        let _mutation = self.mutation_lock.lock().unwrap();
+        let registration_revision = self
+            .records
+            .get(&kid)
+            .map(|record| record.registration_revision)?;
+        let approval_key = (
+            kid,
+            registration_revision,
+            tool_name.to_string(),
+            crate::resources::opaque_identity(resource.as_bytes()),
+            contract.to_string(),
+        );
+        let pending_revoked = self.approvals.remove(&approval_key).is_some();
+        let tokens = self
+            .peripheral_activity
+            .iter()
+            .filter_map(|entry| {
+                let (active_agent, active_identity, _) = entry.key();
+                (*active_agent == kid && active_identity == activity_identity)
+                    .then(|| entry.value().clone())
+            })
+            .collect::<Vec<_>>();
+        for token in &tokens {
+            token.cancel();
+        }
+        Some((pending_revoked, tokens.len()))
+    }
+
+    /// Cancel all gate-admitted peripheral operations for one agent. Lifecycle
+    /// teardown calls this before draining its normal tool-call guards.
+    pub(crate) fn cancel_peripheral_for_agent(&self, kid: uuid::Uuid) -> usize {
+        let _mutation = self.mutation_lock.lock().unwrap();
+        self.cancel_peripheral_for_agent_locked(kid)
+    }
+
+    fn cancel_peripheral_for_agent_locked(&self, kid: uuid::Uuid) -> usize {
+        let tokens = self
+            .peripheral_activity
+            .iter()
+            .filter_map(|entry| {
+                let (active_agent, _, _) = entry.key();
+                (*active_agent == kid).then(|| entry.value().clone())
+            })
+            .collect::<Vec<_>>();
+        for token in &tokens {
+            token.cancel();
+        }
+        tokens.len()
     }
 
     /// Look up the OS PID for a kernel UUID (useful for MAC labelling).
@@ -1196,8 +1308,11 @@ impl SyscallGate {
                 tool_name,
                 resource,
                 security,
-                &approval_contract,
-                "legacy-test-request",
+                GateAdmissionContract {
+                    approval_contract: &approval_contract,
+                    request_identity: "legacy-test-request",
+                    track_peripheral_activity: false,
+                },
             )
             .await?;
         Ok((pid, guard))
@@ -1211,8 +1326,7 @@ impl SyscallGate {
         tool_name: &str,
         resource: &str,
         security: &crate::tools::ToolSecurity,
-        approval_contract: &str,
-        request_identity: &str,
+        admission: GateAdmissionContract<'_>,
     ) -> Result<
         (
             Pid,
@@ -1221,6 +1335,11 @@ impl SyscallGate {
         ),
         GateDenial,
     > {
+        let GateAdmissionContract {
+            approval_contract,
+            request_identity,
+            track_peripheral_activity,
+        } = admission;
         let authorized = self
             .check_tool_call_contract(
                 kid,
@@ -1250,44 +1369,71 @@ impl SyscallGate {
             )
             .inspect_err(|error| self.record_agent_denial(kid, error))?
         };
-        let approval_satisfied = if self.unconfined {
-            true
-        } else if let Some((key, required)) = authorized.pending_approval {
-            let consumed = match self.approvals.entry(key) {
-                dashmap::mapref::entry::Entry::Occupied(entry)
-                    if (*entry.get()).satisfies(required) =>
-                {
-                    entry.remove();
-                    true
+        let activity_identity = track_peripheral_activity.then(|| {
+            crate::resources::peripheral_activity_identity(
+                tool_name,
+                approval_contract,
+                request_identity,
+            )
+        });
+        let pending_required = authorized
+            .pending_approval
+            .as_ref()
+            .map(|(_, required)| *required);
+        let (approval_satisfied, peripheral_activity) = {
+            // Revocation uses the same mutation fence. A call can therefore be
+            // observed either as an unconsumed grant or as a cancellable
+            // admitted lease, never in an uncancellable gap between the two.
+            let _mutation = self.mutation_lock.lock().unwrap();
+            let approval_satisfied = if self.unconfined {
+                true
+            } else if let Some((key, required)) = authorized.pending_approval.as_ref() {
+                match self.approvals.entry(key.clone()) {
+                    dashmap::mapref::entry::Entry::Occupied(entry)
+                        if (*entry.get()).satisfies(*required) =>
+                    {
+                        entry.remove();
+                        true
+                    }
+                    _ => false,
                 }
-                _ => false,
+            } else {
+                false
             };
-            if !consumed {
-                self.denied_approval.fetch_add(1, Ordering::Relaxed);
-                self.record_agent_denial(
-                    kid,
-                    &GateDenial::ApprovalRequired {
-                        tool: tool_name.to_string(),
-                        policy: required,
-                    },
-                );
-                self.emit_audit(AuditEvent {
-                    agent: kid,
-                    pid: authorized.pid,
-                    tool: tool_name.to_string(),
-                    action: security.action.as_str(),
-                    resource: crate::resources::opaque_identity(resource.as_bytes()),
-                    decision: AuditDecision::Denied,
+            let peripheral_activity = approval_satisfied
+                .then_some(activity_identity)
+                .flatten()
+                .map(|identity| {
+                    crate::resources::PeripheralActivityLease::new(
+                        self.peripheral_activity.clone(),
+                        kid,
+                        identity,
+                    )
                 });
-                return Err(GateDenial::ApprovalRequired {
+            (approval_satisfied, peripheral_activity)
+        };
+        if let Some(required) = pending_required.filter(|_| !approval_satisfied) {
+            self.denied_approval.fetch_add(1, Ordering::Relaxed);
+            self.record_agent_denial(
+                kid,
+                &GateDenial::ApprovalRequired {
                     tool: tool_name.to_string(),
                     policy: required,
-                });
-            }
-            true
-        } else {
-            false
-        };
+                },
+            );
+            self.emit_audit(AuditEvent {
+                agent: kid,
+                pid: authorized.pid,
+                tool: tool_name.to_string(),
+                action: security.action.as_str(),
+                resource: crate::resources::opaque_identity(resource.as_bytes()),
+                decision: AuditDecision::Denied,
+            });
+            return Err(GateDenial::ApprovalRequired {
+                tool: tool_name.to_string(),
+                policy: required,
+            });
+        }
         self.allowed.fetch_add(1, Ordering::Relaxed);
         self.record_agent_allowed(kid, authorized.audited);
         if authorized.audited {
@@ -1305,6 +1451,7 @@ impl SyscallGate {
             kid,
             request_identity.to_string(),
             approval_satisfied,
+            peripheral_activity,
         );
         Ok((authorized.pid, guard, proof))
     }

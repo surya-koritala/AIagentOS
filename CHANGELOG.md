@@ -10,6 +10,17 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
 
 ## [Unreleased]
 
+- Added the grant-aware kernel boundary required by future peripheral
+  providers. Capture, recording, playback, and print bindings now have fixed
+  device/printer target schemas and still require sandbox execution plus an
+  exact, single-use local human approval. A trusted in-process UI can inspect
+  non-secret pending and active-use counts, revoke an unconsumed grant, cancel
+  every active exact-match use, and rely on agent stop/kill to cancel device
+  work. The sandbox accepts peripheral dispatch only after the syscall gate
+  consumes the exact grant; remote wire, SDK, package, and MCP paths receive no
+  grant authority. No hardware backend is registered or advertised yet, so
+  peripheral support remains unavailable rather than falsely promoted.
+  Relates #124.
 - Replaced hand-built Phase 1 campaign files and manual bounded-report copying
   with a GitHub-hosted exact-tag assembly workflow. It authenticates every
   selected evidence run and human actor, downloads deterministic artifacts,

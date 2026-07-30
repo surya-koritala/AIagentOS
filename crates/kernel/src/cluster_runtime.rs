@@ -66,7 +66,10 @@ const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_INBOUND_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_CLUSTER_PEM_BYTES: u64 = 1024 * 1024;
 const INITIAL_METRICS_TIMEOUT: Duration = Duration::from_secs(5);
-const MEMBERSHIP_SETTLE_TIMEOUT: Duration = Duration::from_secs(10);
+// Startup convergence includes leader election, learner catch-up, and up to
+// two joint-consensus commits. Keep it bounded while allowing slower hosts
+// enough time to complete the full protocol.
+const MEMBERSHIP_SETTLE_TIMEOUT: Duration = Duration::from_secs(20);
 const AUTHORITY_INITIALIZATION_TIMEOUT: Duration = Duration::from_secs(15);
 const AUTHORITY_DELEGATION_VERSION: u16 = 1;
 const AUTHORITY_DELEGATION_TTL_SECONDS: i64 = 30;

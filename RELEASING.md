@@ -57,17 +57,23 @@ All workspace crates share one version number; bump them together.
 An exact `vX.Y.Z-rc.N` tag is intentionally routed to
 [`linux-cli-rc.yml`](.github/workflows/linux-cli-rc.yml), not the stable
 all-platform workflow. The tag must still be signed and annotated, every
-workspace/UI version must equal `X.Y.Z-rc.N`, and the changelog must have one
-matching section.
+workspace/UI version must equal `X.Y.Z-rc.N`, the changelog must have one
+matching section, and `Unreleased` must be empty. The tag workflow resolves the
+exact annotated tag object through GitHub's API and rejects it unless GitHub
+reports a verified cryptographic signature bound to the exact source commit.
 
-That workflow publishes a GitHub prerelease only after reproducible Ubuntu
-22.04 x86_64 binaries are signed and attested, then exercised from the final
-archive through verified TLS/authentication, released-schema upgrade, encrypted
-storage, governed agent creation, clean restart, signed/anchored backup,
-tamper rejection, missing-key rejection, and fresh-host recovery with
-enforcement re-armed. The final bounded evidence report is itself checksummed,
-keyless-signed, and covered by GitHub provenance. See the
-[restricted Linux CLI RC operator guide](docs/LINUX_CLI_RC.md).
+That tag workflow retains a signed candidate bundle only after reproducible
+Ubuntu 22.04 x86_64 binaries are signed and attested, then exercised from the
+final archive through verified TLS/authentication, released-schema upgrade,
+encrypted storage, governed agent creation, clean restart, signed/anchored
+backup, tamper rejection, missing-key rejection, and fresh-host recovery with
+enforcement re-armed. It does **not** publish a GitHub prerelease. The separate
+protected Phase 1 promotion workflow publishes the prerelease only after the
+exact candidate also has eligible provider/model, remote-storage, destructive
+storage, external-deletion, 24-hour soak, release-SLO, human game-day, campaign
+provenance, and independent-review evidence. Missing or mixed evidence fails
+closed. See the [restricted Linux CLI RC operator
+guide](docs/LINUX_CLI_RC.md).
 
 This restricted prerelease is not a stable all-platform release and does not
 waive the external provider/model, remote-storage, 24-hour soak, game-day,

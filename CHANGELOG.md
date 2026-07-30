@@ -10,6 +10,17 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
 
 ## [Unreleased]
 
+## [0.4.0-rc.1] - 2026-07-30
+
+- Finalized the restricted candidate change ledger and made the exact-tag
+  verifier reject any release candidate while notes remain under
+  `Unreleased`. This prevents the signed archive version and published release
+  notes from silently describing different source scopes. The tag workflow now
+  also binds the exact annotated tag object through GitHub's API and requires
+  GitHub to report its cryptographic signature as verified. The preliminary
+  workflow still retains a signed candidate bundle only; protected Phase 1
+  evidence and independent review remain mandatory before prerelease
+  publication. Relates #120, #123, and #125.
 - Added durable checkpoint list, selection, explicit resume, and exact deletion
   to the TUI through the authenticated public `KernelClient`. The projection is
   bound to the selected agent, rejects cross-agent entries, and is cleared when
@@ -70,8 +81,6 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
   provenance result is hash-bound into the promotion decision, signed,
   attested, and shipped as the third qualification report. Missing, expired,
   ambiguous, rerun, forked, or tampered evidence fails closed. (#284)
-
-## [0.4.0-rc.1] - 2026-07-30
 
 - Prepared the first restricted Linux CLI candidate with every workspace,
   desktop, UI, and internal dependency version locked to `0.4.0-rc.1`. All four

@@ -43,6 +43,26 @@ jobs:
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
           git diff --quiet
           git diff --cached --quiet
+      - name: Require GitHub-verified cryptographic tag signature
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag_object="$(git rev-parse "refs/tags/${GITHUB_REF_NAME}^{tag}")"
+          mkdir -p target/qualification
+          gh api \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2026-03-10" \
+            "repos/${GITHUB_REPOSITORY}/git/tags/${tag_object}" \
+            > target/qualification/release-tag.json
+          jq -e \
+            --arg tag "$GITHUB_REF_NAME" \
+            --arg commit "$GITHUB_SHA" \
+            '.tag == $tag
+              and .object.type == "commit"
+              and .object.sha == $commit
+              and .verification.verified == true
+              and (.verification.verified_at | type == "string" and length > 0)' \
+            target/qualification/release-tag.json
 
   governance:
     name: Governed-execution acceptance

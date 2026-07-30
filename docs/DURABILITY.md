@@ -118,8 +118,11 @@ that runtime and routes public membership and ownership authority through it
 when strict `[cluster_raft]` configuration is enabled. The disabled default
 retains the legacy single-node authority. Voters and the exact Raft peer/CA
 trust catalog now change through separate durable generations. Workload
-migration, global quota/policy/package convergence, delegated-principal
-authentication, and disaster recovery remain outside this slice. The replicated application authority also
+migration, global quota/policy/package convergence, end-user credential
+delegation, and disaster recovery remain outside this slice. Replicated
+external authority writes now require short-lived application-node signatures,
+and quorum-enabled destinations linearly verify exact ownership before
+installing or retiring a fence. The replicated application authority also
 persists bounded application-listener certificate rollouts and their ordered
 trust audit.
 

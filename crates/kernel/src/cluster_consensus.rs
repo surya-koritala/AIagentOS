@@ -242,7 +242,7 @@ pub enum AuthorityCommand {
 }
 
 impl AuthorityCommand {
-    fn operation_id(&self) -> &str {
+    pub(crate) fn operation_id(&self) -> &str {
         match self {
             Self::Initialize { operation_id, .. }
             | Self::Barrier { operation_id, .. }

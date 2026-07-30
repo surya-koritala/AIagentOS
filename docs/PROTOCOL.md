@@ -616,8 +616,13 @@ every fresh RPC and a later generation removes the retired credentials.
 Immutable genesis, complete current challenged application membership, and the
 transport subset are configured and checked separately. Removing only a voter
 retains it as a log-replicating
-learner and does not revoke that peer's mTLS/control trust. Destination proof installation is an
-authenticated system control operation rather than a self-contained authority signature, and
+learner and does not revoke that peer's mTLS/control trust. Every external
+forwarded authority write carries a short-lived application-node Ed25519
+delegation; the leader binds it to the authenticated Raft source, active
+replicated membership, stable operation UUID, semantic command digest, and
+canonical system-node actor. A quorum-enabled destination independently
+performs a linearizable ownership read before installing or retiring a fence.
+That online verification is not an offline quorum certificate, and
 creation/claim/fence publication is not one atomic cross-database transaction.
 There is no automatic migration, cluster-wide quota transaction,
 policy/package convergence, rolling-upgrade coordinator, or
@@ -634,9 +639,11 @@ The normative object-by-object consistency and failure rules are published in
 
 The Raft transport is an internal kernel protocol, not part of the public
 SDK compatibility contract. Each connection carries one length-prefixed JSON
-request and one response over mutual TLS. Version 1 supports OpenRaft
-AppendEntries, Vote, and InstallSnapshot messages plus authenticated authority
-write forwarding and linearizable authority reads.
+request and one response over mutual TLS. Version 2 supports OpenRaft
+AppendEntries, Vote, and InstallSnapshot messages plus delegated authority
+write forwarding and linearizable authority reads. It is intentionally
+incompatible with the earlier unsigned authority-write envelope; mixed
+internal protocol versions fail closed during a rolling deployment.
 
 The request envelope binds the wire version, bounded cluster name, source node
 ID, target node ID, and RPC body. The response reverses the authenticated
@@ -652,17 +659,24 @@ The default frame ceiling is 8 MiB and configurable only from 64 KiB through
 timed. The listener bounds concurrent connections (128 by default, hard maximum
 16,384) and drops excess connections without dispatch. Runtime configuration
 also rejects empty or duplicate endpoints, server/client fingerprints, and
-identity keys. The current trusted member map cannot change merely by
+identity keys. External authority writes additionally carry a 30-second
+Ed25519 proof made by the source node's durable application identity. The
+leader verifies the signer against both the Raft transport catalog and active
+replicated application membership, then binds the proof to the operation UUID,
+semantic command digest, and canonical system-node actor before replacing only
+the proposed clock value. Captured proofs can replay only the same idempotent
+operation during their validity window. The current trusted member map cannot change merely by
 restarting the runtime: startup verifies its durable catalog digest and exact
 transport identities. Quorum-versioned voter changes are supported within that
 catalog. Separate quorum-versioned transport-trust changes replace the complete
 catalog, preserve every voter, add/remove learners, and rotate exact leaves/CA
 roots through an expiring overlap with retained-peer continuity. Startup also
 requires an exact immutable application seed and complete durable application
-catalog before accepting a different transport subset. Delegated-principal authentication,
-migration, global policy/quota convergence, and external chaos/recovery
-qualification are still required before this mode is a complete distributed
-kernel.
+catalog before accepting a different transport subset. End-user credential
+delegation beyond the current system-node principal, live administration,
+migration, global policy/quota convergence, rolling compatibility, and external
+chaos/recovery qualification are still required before this mode is a complete
+distributed kernel.
 
 ## Conformance evidence
 

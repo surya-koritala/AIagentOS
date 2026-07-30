@@ -1148,6 +1148,79 @@ fn operator_ui_state_contract_is_visible_and_regressed() {
 }
 
 #[test]
+fn tui_stream_controls_stay_bounded_exact_and_on_the_public_wire_boundary() {
+    let protocol = read_workspace_file("docs/PROTOCOL.md");
+    for contract in [
+        "The desktop and TUI use separate authenticated public-wire connections",
+        "256-entry UI queue",
+        "retains at most 64 KiB of UTF-8 turn text",
+        "queues cancellation until registration is acknowledged",
+        "frozen request/agent pair on the third connection",
+    ] {
+        assert!(
+            protocol.contains(contract),
+            "TUI stream protocol lost {contract:?}"
+        );
+    }
+
+    let client = read_workspace_file("crates/tui/src/lib.rs");
+    for contract in [
+        "pub struct TuiMessageClient",
+        "stream: Arc<Mutex<KernelClient>>",
+        "cancellation: Arc<Mutex<KernelClient>>",
+        ".send_message_stream(request_id, agent_id, message, on_event)",
+        ".cancel_request(request_id, agent_id)",
+    ] {
+        assert!(
+            client.contains(contract),
+            "TUI message client lost public-wire contract {contract:?}"
+        );
+    }
+
+    let app = read_workspace_file("crates/tui/src/app.rs");
+    for contract in [
+        "pub const MAX_MESSAGE_PREVIEW_BYTES: usize = 64 * 1024",
+        "CancelMessageStream",
+        "one agent turn is already active",
+        "cancellation queued until the exact stream starts",
+        "active_stream_matches",
+        "EventsOmitted",
+    ] {
+        assert!(
+            app.contains(contract),
+            "TUI stream state lost bounded/exact contract {contract:?}"
+        );
+    }
+
+    let binary = read_workspace_file("crates/tui/src/main.rs");
+    for contract in [
+        "const MAX_PENDING_MESSAGE_EVENTS: usize = 256",
+        "message_client.cancel_request",
+        "event_updates.try_send(update)",
+        "updates.send(terminal).await",
+        "Duration::from_millis(50)",
+    ] {
+        assert!(
+            binary.contains(contract),
+            "TUI stream event loop lost responsive/bounded contract {contract:?}"
+        );
+    }
+
+    let integration = read_workspace_file("crates/tui/tests/streaming.rs");
+    for contract in [
+        "tui_stream_keeps_refresh_live_and_cancels_on_an_exact_dedicated_connection",
+        "ordinary operator connection was blocked by stream",
+        "wrong cancellation must not stop the live stream",
+        "WireErrorCode::Cancelled",
+    ] {
+        assert!(
+            integration.contains(contract),
+            "TUI live stream regression lost evidence {contract:?}"
+        );
+    }
+}
+
+#[test]
 fn desktop_stream_and_checkpoint_controls_stay_on_the_public_wire_boundary() {
     let protocol = read_workspace_file("docs/PROTOCOL.md");
     for contract in [

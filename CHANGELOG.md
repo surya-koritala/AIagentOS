@@ -10,6 +10,17 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
 
 ## [Unreleased]
 
+- Made TUI agent turns responsive and exactly cancellable over the public wire
+  boundary. Ordinary operator calls, the one active ordered stream, and
+  cancellation now use three authenticated connections, so streaming cannot
+  freeze refreshes or hold the connection needed to cancel itself. `C` freezes
+  the request/agent pair, queues pre-start cancellation until server
+  registration, and suppresses duplicate cancellation. A 256-entry projection
+  queue and 64 KiB UTF-8 display limit bound terminal memory; omitted live
+  events are counted while the authoritative terminal result remains
+  deliverable. State-machine and authenticated loopback regressions cover
+  stale updates, target binding, bounded Unicode output, responsive refresh,
+  wrong-request refusal, and terminal cancellation. Relates #126.
 - Added the grant-aware kernel boundary required by future peripheral
   providers. Capture, recording, playback, and print bindings now have fixed
   device/printer target schemas and still require sandbox execution plus an

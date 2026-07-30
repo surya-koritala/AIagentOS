@@ -12,7 +12,7 @@
 //! version without connecting.
 //!
 //! Keys: `j`/`k` (or arrows) move · `r` refresh · `c` create (`name|task`) ·
-//! `m` message · `p` pause/resume · `s` stop · `X` kill · `[`/`]` select
+//! `m` message · `C` cancel active turn · `p` pause/resume · `s` stop · `X` kill · `[`/`]` select
 //! service · `u` start · `d` stop with exact-name confirmation · `R` restart
 //! with exact-name confirmation · `L` reload · `,`/`.` select tunable · `v`
 //! set · `a` audit · `B` rollback with exact target confirmation · `q` quit.
@@ -21,6 +21,8 @@
 //! mutations.
 
 use std::io;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use agent_sdk::ConnectionProfile;
@@ -32,9 +34,12 @@ use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wra
 use ratatui::Frame;
 
 use agent_tui::{
-    app::{App, Key, Mode, UiAction},
-    TuiClient,
+    app::{App, Key, MessageStreamUpdate, Mode, UiAction},
+    TuiClient, TuiMessageClient,
 };
+use tokio::sync::mpsc;
+
+const MAX_PENDING_MESSAGE_EVENTS: usize = 256;
 
 fn main() -> io::Result<()> {
     let argv: Vec<String> = std::env::args().collect();
@@ -60,9 +65,10 @@ fn main() -> io::Result<()> {
     if let Err(e) = rt.block_on(app.refresh(&mut client)) {
         app.status = format!("initial refresh failed: {e}");
     }
+    let message_client = client.message_client();
 
     let mut terminal = ratatui::init();
-    let result = run(&mut terminal, &mut app, &mut client, &rt);
+    let result = run(&mut terminal, &mut app, &mut client, &message_client, &rt);
     ratatui::restore();
     result
 }
@@ -98,12 +104,20 @@ fn run(
     terminal: &mut ratatui::DefaultTerminal,
     app: &mut App,
     client: &mut TuiClient,
+    message_client: &TuiMessageClient,
     rt: &tokio::runtime::Runtime,
 ) -> io::Result<()> {
+    let (stream_updates_tx, mut stream_updates_rx) = mpsc::channel(MAX_PENDING_MESSAGE_EVENTS);
     loop {
+        drain_stream_updates(app, client, message_client, rt, &mut stream_updates_rx);
         terminal.draw(|f| ui(f, app))?;
 
-        if event::poll(Duration::from_millis(500))? {
+        let poll_interval = if app.has_active_message_stream() {
+            Duration::from_millis(50)
+        } else {
+            Duration::from_millis(500)
+        };
+        if event::poll(poll_interval)? {
             if let Event::Key(key) = event::read()? {
                 if key.kind != KeyEventKind::Press {
                     continue;
@@ -114,7 +128,7 @@ fn run(
                             app.begin_operation(action.operation_label());
                             terminal.draw(|f| ui(f, app))?;
                         }
-                        perform(action, app, client, rt);
+                        perform(action, app, client, message_client, &stream_updates_tx, rt);
                         app.finish_operation();
                     }
                 }
@@ -127,9 +141,22 @@ fn run(
 }
 
 /// Run an action's async I/O against the kernel, folding results into status.
-fn perform(action: UiAction, app: &mut App, client: &mut TuiClient, rt: &tokio::runtime::Runtime) {
+fn perform(
+    action: UiAction,
+    app: &mut App,
+    client: &mut TuiClient,
+    message_client: &TuiMessageClient,
+    stream_updates: &mpsc::Sender<MessageStreamUpdate>,
+    rt: &tokio::runtime::Runtime,
+) {
     match action {
-        UiAction::Quit => app.should_quit = true,
+        UiAction::Quit => {
+            if let Some(stream) = app.active_message_stream() {
+                let _ = rt
+                    .block_on(message_client.cancel_request(&stream.request_id, &stream.agent_id));
+            }
+            app.should_quit = true;
+        }
         UiAction::Refresh => match rt.block_on(app.refresh(client)) {
             Ok(()) => app.status = "refreshed".into(),
             Err(e) => app.status = format!("refresh failed: {e}"),
@@ -142,14 +169,77 @@ fn perform(action: UiAction, app: &mut App, client: &mut TuiClient, rt: &tokio::
             refresh_after_action(app, client, rt);
         }
         UiAction::SendMessage { agent_id, message } => {
-            match rt.block_on(client.send_message(agent_id, message)) {
-                Ok(out) => {
-                    app.status = format!("turn ok ({} tool calls)", out.tool_calls);
-                    app.last_output = Some(out.content);
-                }
-                Err(e) => app.status = format!("send failed: {e}"),
+            let request_id = format!("tui-{}", uuid::Uuid::new_v4());
+            if app
+                .start_message_stream(request_id.clone(), agent_id.clone())
+                .is_err()
+            {
+                return;
             }
-            refresh_after_action(app, client, rt);
+            let messages = message_client.clone();
+            let updates = stream_updates.clone();
+            let event_updates = updates.clone();
+            let event_request_id = request_id.clone();
+            let event_agent_id = agent_id.clone();
+            let omitted = Arc::new(AtomicU64::new(0));
+            let omitted_events = Arc::clone(&omitted);
+            rt.spawn(async move {
+                let outcome = messages
+                    .send_message_stream(
+                        request_id.clone(),
+                        agent_id.clone(),
+                        message,
+                        move |event| {
+                            let update = MessageStreamUpdate::Event {
+                                request_id: event_request_id.clone(),
+                                agent_id: event_agent_id.clone(),
+                                event: event.clone(),
+                            };
+                            match event_updates.try_send(update) {
+                                Ok(()) => {}
+                                Err(mpsc::error::TrySendError::Full(_)) => {
+                                    omitted_events.fetch_add(1, Ordering::Relaxed);
+                                }
+                                Err(mpsc::error::TrySendError::Closed(_)) => {}
+                            }
+                        },
+                    )
+                    .await;
+                let omitted_count = omitted.load(Ordering::Relaxed);
+                if omitted_count > 0
+                    && updates
+                        .send(MessageStreamUpdate::EventsOmitted {
+                            request_id: request_id.clone(),
+                            agent_id: agent_id.clone(),
+                            count: omitted_count,
+                        })
+                        .await
+                        .is_err()
+                {
+                    return;
+                }
+                let terminal = match outcome {
+                    Ok(result) => MessageStreamUpdate::Completed {
+                        request_id,
+                        agent_id,
+                        content: result.content,
+                        tool_calls: result.tool_calls,
+                        tokens: result.tokens,
+                    },
+                    Err(error) => MessageStreamUpdate::Failed {
+                        request_id,
+                        agent_id,
+                        error: error.to_string(),
+                    },
+                };
+                let _ = updates.send(terminal).await;
+            });
+        }
+        UiAction::CancelMessageStream {
+            request_id,
+            agent_id,
+        } => {
+            perform_message_stream_cancellation(app, message_client, rt, &request_id, &agent_id);
         }
         UiAction::PauseAgent { agent_id } => {
             app.status = match rt.block_on(client.pause_agent(agent_id)) {
@@ -325,6 +415,49 @@ fn perform(action: UiAction, app: &mut App, client: &mut TuiClient, rt: &tokio::
                 }
             };
             refresh_after_action(app, client, rt);
+        }
+    }
+}
+
+fn drain_stream_updates(
+    app: &mut App,
+    client: &mut TuiClient,
+    message_client: &TuiMessageClient,
+    rt: &tokio::runtime::Runtime,
+    updates: &mut mpsc::Receiver<MessageStreamUpdate>,
+) {
+    while let Ok(update) = updates.try_recv() {
+        let terminal = matches!(
+            update,
+            MessageStreamUpdate::Completed { .. } | MessageStreamUpdate::Failed { .. }
+        );
+        if let Some(UiAction::CancelMessageStream {
+            request_id,
+            agent_id,
+        }) = app.apply_message_stream_update(update)
+        {
+            app.begin_operation("cancelling agent turn");
+            perform_message_stream_cancellation(app, message_client, rt, &request_id, &agent_id);
+            app.finish_operation();
+        }
+        if terminal {
+            refresh_after_action(app, client, rt);
+        }
+    }
+}
+
+fn perform_message_stream_cancellation(
+    app: &mut App,
+    message_client: &TuiMessageClient,
+    rt: &tokio::runtime::Runtime,
+    request_id: &str,
+    agent_id: &str,
+) {
+    match rt.block_on(message_client.cancel_request(request_id, agent_id)) {
+        Ok(true) => app.message_stream_cancellation_accepted(request_id, agent_id),
+        Ok(false) => app.message_stream_cancellation_not_active(request_id, agent_id),
+        Err(error) => {
+            app.message_stream_cancellation_failed(request_id, agent_id, &error.to_string())
         }
     }
 }
@@ -552,12 +685,59 @@ fn render_body(f: &mut Frame, area: Rect, app: &App) {
                 }
                 lines.push(Line::from(""));
             }
+            if let Some(stream) = app.active_message_stream() {
+                lines.push(Line::from(Span::styled(
+                    format!(
+                        "active turn: request={} agent={} · events={} omitted={} · tools={}/{}{}",
+                        short(&stream.request_id),
+                        short(&stream.agent_id),
+                        stream.events_seen,
+                        stream.omitted_events,
+                        stream.tool_calls_completed,
+                        stream.tool_calls_started,
+                        if stream.cancellation_requested {
+                            " · cancellation requested"
+                        } else {
+                            " · C cancel"
+                        }
+                    ),
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                )));
+                if let Some(pressure) = &stream.context_pressure {
+                    lines.push(Line::from(format!(
+                        "context pressure: {}/{} tokens · evicted={} · spill={}",
+                        pressure.active_tokens,
+                        pressure.budget_tokens,
+                        pressure.evicted_messages,
+                        pressure.has_spill
+                    )));
+                }
+            }
             if let Some(out) = &app.last_output {
                 lines.push(Line::from(Span::styled(
-                    "last turn output:",
+                    format!(
+                        "{}turn output{}:",
+                        if app.has_active_message_stream() {
+                            "active "
+                        } else {
+                            "last "
+                        },
+                        match &app.last_output_agent_id {
+                            Some(agent_id) => format!(" for {}", short(agent_id)),
+                            None => String::new(),
+                        }
+                    ),
                     Style::default().add_modifier(Modifier::BOLD),
                 )));
                 lines.push(Line::from(out.clone()));
+                if app.last_output_truncated {
+                    lines.push(Line::from(Span::styled(
+                        "output truncated to the TUI retention limit",
+                        Style::default().fg(Color::Yellow),
+                    )));
+                }
             }
             if let Some(service) = app.selected_service() {
                 lines.push(Line::from(""));

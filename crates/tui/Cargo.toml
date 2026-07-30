@@ -14,7 +14,10 @@ path = "src/main.rs"
 agent-sdk = { path = "../sdk", version = "=0.4.0-rc.1" }
 tokio = { workspace = true }
 serde_json = { workspace = true }
+uuid = { workspace = true }
 ratatui = "0.30.2"
 
 [dev-dependencies]
 kernel = { path = "../kernel", version = "=0.4.0-rc.1" }
+async-trait = { workspace = true }
+tokio-util = { workspace = true }

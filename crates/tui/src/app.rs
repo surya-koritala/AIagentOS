@@ -4,10 +4,17 @@
 //! how keys mutate it*.
 
 use agent_sdk::{
-    AgentSummary, GateStats, InstalledPackage, KernelClient, NodeLoad, OperatorAgentSnapshot,
-    OperatorPackageSnapshot, OperatorServiceSnapshot, OperatorSnapshot, OperatorTunable,
-    OperatorTunableAudit, ProviderSummary, SdkError,
+    AgentSummary, GateStats, InstalledPackage, KernelClient, MessageStreamEvent, NodeLoad,
+    OperatorAgentSnapshot, OperatorPackageSnapshot, OperatorServiceSnapshot, OperatorSnapshot,
+    OperatorTunable, OperatorTunableAudit, ProviderSummary, SdkError,
 };
+
+/// Maximum streamed/final turn text retained by the terminal UI.
+///
+/// The wire and provider paths have their own bounds; this smaller projection
+/// prevents a valid but large response from consuming the terminal process or
+/// making every redraw expensive.
+pub const MAX_MESSAGE_PREVIEW_BYTES: usize = 64 * 1024;
 
 /// Input modes — the UI is modal (vim-ish): Normal navigates, the others edit a
 /// single-line buffer until Enter (submit) or Esc (cancel).
@@ -100,6 +107,10 @@ pub enum UiAction {
         agent_id: String,
         message: String,
     },
+    CancelMessageStream {
+        request_id: String,
+        agent_id: String,
+    },
     PauseAgent {
         agent_id: String,
     },
@@ -163,6 +174,7 @@ impl UiAction {
             Self::Refresh => "refreshing operator data",
             Self::CreateAgent { .. } => "creating agent",
             Self::SendMessage { .. } => "waiting for agent turn",
+            Self::CancelMessageStream { .. } => "cancelling agent turn",
             Self::PauseAgent { .. } => "pausing agent",
             Self::ResumeAgent { .. } => "resuming agent",
             Self::StopAgent { .. } => "stopping agent",
@@ -180,6 +192,61 @@ impl UiAction {
             Self::RemoveInstalledPackage { .. } => "removing installed package",
         }
     }
+}
+
+/// Bounded context-pressure projection retained for one active TUI stream.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MessageStreamPressure {
+    pub active_tokens: u32,
+    pub budget_tokens: u32,
+    pub evicted_messages: usize,
+    pub has_spill: bool,
+}
+
+/// Exact target and bounded progress retained for the one active TUI stream.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActiveMessageStream {
+    pub request_id: String,
+    pub agent_id: String,
+    pub started: bool,
+    pub cancellation_requested: bool,
+    pub events_seen: u64,
+    pub omitted_events: u64,
+    pub tool_calls_started: u64,
+    pub tool_calls_completed: u64,
+    pub output_preview: String,
+    pub preview_truncated: bool,
+    pub context_pressure: Option<MessageStreamPressure>,
+}
+
+/// One background-stream update folded into the render-free TUI model.
+///
+/// Every variant carries the frozen request/agent pair so a delayed update from
+/// an older stream cannot overwrite a newer turn.
+#[derive(Debug, Clone, PartialEq)]
+pub enum MessageStreamUpdate {
+    Event {
+        request_id: String,
+        agent_id: String,
+        event: MessageStreamEvent,
+    },
+    EventsOmitted {
+        request_id: String,
+        agent_id: String,
+        count: u64,
+    },
+    Completed {
+        request_id: String,
+        agent_id: String,
+        content: String,
+        tool_calls: usize,
+        tokens: u32,
+    },
+    Failed {
+        request_id: String,
+        agent_id: String,
+        error: String,
+    },
 }
 
 /// Freshness of the last public operator snapshot retained by the TUI.
@@ -272,6 +339,9 @@ pub struct App {
     pending_tunable_control: Option<PendingTunableControl>,
     pending_package_mutation: Option<PendingPackageMutation>,
     pub last_output: Option<String>,
+    pub last_output_agent_id: Option<String>,
+    pub last_output_truncated: bool,
+    active_message_stream: Option<ActiveMessageStream>,
     pub operator_state: OperatorUiState,
     pub should_quit: bool,
 }
@@ -302,12 +372,15 @@ impl App {
             selected_package: 0,
             mode: Mode::Normal,
             input: String::new(),
-            status: "r refresh · c/m/p/s/X agents · [/ ] service · u/d/R/L control · ,/. tunable · v/a/B · {/} package · i/P/b/D · q quit".into(),
+            status: "r refresh · c/m/p/s/X agents · C cancel turn · [/ ] service · u/d/R/L control · ,/. tunable · v/a/B · {/} package · i/P/b/D · q quit".into(),
             pending_kill: None,
             pending_service_control: None,
             pending_tunable_control: None,
             pending_package_mutation: None,
             last_output: None,
+            last_output_agent_id: None,
+            last_output_truncated: false,
+            active_message_stream: None,
             operator_state: OperatorUiState::default(),
             should_quit: false,
         }
@@ -377,7 +450,311 @@ impl App {
     }
 
     pub fn finish_operation(&mut self) {
-        self.operator_state.operation = None;
+        self.operator_state.operation = self.active_message_stream.as_ref().map(|stream| {
+            if stream.cancellation_requested {
+                "cancelling agent turn".to_string()
+            } else {
+                "streaming agent turn".to_string()
+            }
+        });
+    }
+
+    /// Freeze one generated request id and selected agent before background I/O
+    /// starts. A second stream is refused rather than queued behind the first.
+    pub fn start_message_stream(
+        &mut self,
+        request_id: String,
+        agent_id: String,
+    ) -> Result<(), &'static str> {
+        if self.active_message_stream.is_some() {
+            self.status = "one agent turn is already active; press C to cancel it".into();
+            return Err("one agent turn is already active");
+        }
+        if request_id.is_empty() || agent_id.is_empty() {
+            self.status = "stream request and agent identifiers must be non-empty".into();
+            return Err("stream identifiers must be non-empty");
+        }
+        self.last_output_agent_id = Some(agent_id.clone());
+        self.active_message_stream = Some(ActiveMessageStream {
+            request_id,
+            agent_id,
+            started: false,
+            cancellation_requested: false,
+            events_seen: 0,
+            omitted_events: 0,
+            tool_calls_started: 0,
+            tool_calls_completed: 0,
+            output_preview: String::new(),
+            preview_truncated: false,
+            context_pressure: None,
+        });
+        self.last_output = None;
+        self.last_output_truncated = false;
+        self.operator_state.operation = Some("streaming agent turn".into());
+        self.status = "connecting message stream · C queues exact cancellation".into();
+        Ok(())
+    }
+
+    pub fn active_message_stream(&self) -> Option<&ActiveMessageStream> {
+        self.active_message_stream.as_ref()
+    }
+
+    pub fn has_active_message_stream(&self) -> bool {
+        self.active_message_stream.is_some()
+    }
+
+    fn active_stream_matches(&self, request_id: &str, agent_id: &str) -> bool {
+        self.active_message_stream
+            .as_ref()
+            .is_some_and(|stream| stream.request_id == request_id && stream.agent_id == agent_id)
+    }
+
+    fn request_message_stream_cancellation(&mut self) -> Option<UiAction> {
+        let Some(stream) = self.active_message_stream.as_mut() else {
+            self.status = "no active agent turn to cancel".into();
+            return None;
+        };
+        if stream.cancellation_requested {
+            self.status = if stream.started {
+                "exact stream cancellation already requested".into()
+            } else {
+                "exact stream cancellation is queued until the stream starts".into()
+            };
+            return None;
+        }
+        stream.cancellation_requested = true;
+        self.operator_state.operation = Some("cancelling agent turn".into());
+        if !stream.started {
+            self.status = "cancellation queued until the exact stream starts".into();
+            return None;
+        }
+        let action = UiAction::CancelMessageStream {
+            request_id: stream.request_id.clone(),
+            agent_id: stream.agent_id.clone(),
+        };
+        self.status = "submitting exact stream cancellation".into();
+        Some(action)
+    }
+
+    /// Fold one exact background update into the bounded TUI projection.
+    ///
+    /// A queued pre-start cancellation becomes a concrete action only after the
+    /// server acknowledges the stream, closing the registration race.
+    pub fn apply_message_stream_update(&mut self, update: MessageStreamUpdate) -> Option<UiAction> {
+        let (request_id, agent_id) = match &update {
+            MessageStreamUpdate::Event {
+                request_id,
+                agent_id,
+                ..
+            }
+            | MessageStreamUpdate::EventsOmitted {
+                request_id,
+                agent_id,
+                ..
+            }
+            | MessageStreamUpdate::Completed {
+                request_id,
+                agent_id,
+                ..
+            }
+            | MessageStreamUpdate::Failed {
+                request_id,
+                agent_id,
+                ..
+            } => (request_id.as_str(), agent_id.as_str()),
+        };
+        if !self.active_stream_matches(request_id, agent_id) {
+            return None;
+        }
+
+        match update {
+            MessageStreamUpdate::Event { event, .. } => match event {
+                MessageStreamEvent::Started => {
+                    let stream = self
+                        .active_message_stream
+                        .as_mut()
+                        .expect("matching stream exists");
+                    stream.started = true;
+                    stream.events_seen = stream.events_seen.saturating_add(1);
+                    if stream.cancellation_requested {
+                        let action = UiAction::CancelMessageStream {
+                            request_id: stream.request_id.clone(),
+                            agent_id: stream.agent_id.clone(),
+                        };
+                        self.status = "stream started; submitting queued exact cancellation".into();
+                        Some(action)
+                    } else {
+                        self.status = "streaming agent turn · C cancels this exact request".into();
+                        None
+                    }
+                }
+                MessageStreamEvent::Token { delta } => {
+                    let stream = self
+                        .active_message_stream
+                        .as_mut()
+                        .expect("matching stream exists");
+                    stream.events_seen = stream.events_seen.saturating_add(1);
+                    if append_bounded_utf8(
+                        &mut stream.output_preview,
+                        &delta,
+                        MAX_MESSAGE_PREVIEW_BYTES,
+                    ) {
+                        stream.preview_truncated = true;
+                    }
+                    self.last_output = Some(stream.output_preview.clone());
+                    self.last_output_truncated = stream.preview_truncated;
+                    self.status = if stream.preview_truncated {
+                        "streaming agent turn · preview truncated · C cancels".into()
+                    } else {
+                        "streaming agent turn · C cancels this exact request".into()
+                    };
+                    None
+                }
+                MessageStreamEvent::ToolCallStarted { .. } => {
+                    let stream = self
+                        .active_message_stream
+                        .as_mut()
+                        .expect("matching stream exists");
+                    stream.events_seen = stream.events_seen.saturating_add(1);
+                    stream.tool_calls_started = stream.tool_calls_started.saturating_add(1);
+                    self.status = format!(
+                        "streaming agent turn · {} tool call(s) started · C cancels",
+                        stream.tool_calls_started
+                    );
+                    None
+                }
+                MessageStreamEvent::ToolCallCompleted { .. } => {
+                    let stream = self
+                        .active_message_stream
+                        .as_mut()
+                        .expect("matching stream exists");
+                    stream.events_seen = stream.events_seen.saturating_add(1);
+                    stream.tool_calls_completed = stream.tool_calls_completed.saturating_add(1);
+                    self.status = format!(
+                        "streaming agent turn · {} tool call(s) completed · C cancels",
+                        stream.tool_calls_completed
+                    );
+                    None
+                }
+                MessageStreamEvent::ContextPressure {
+                    active_tokens,
+                    budget_tokens,
+                    evicted_messages,
+                    spill_key,
+                } => {
+                    let stream = self
+                        .active_message_stream
+                        .as_mut()
+                        .expect("matching stream exists");
+                    stream.events_seen = stream.events_seen.saturating_add(1);
+                    stream.context_pressure = Some(MessageStreamPressure {
+                        active_tokens,
+                        budget_tokens,
+                        evicted_messages,
+                        has_spill: !spill_key.is_empty(),
+                    });
+                    self.status = format!(
+                        "streaming agent turn · context {active_tokens}/{budget_tokens} tokens · C cancels"
+                    );
+                    None
+                }
+            },
+            MessageStreamUpdate::EventsOmitted { count, .. } => {
+                let stream = self
+                    .active_message_stream
+                    .as_mut()
+                    .expect("matching stream exists");
+                stream.omitted_events = stream.omitted_events.saturating_add(count);
+                self.status = format!(
+                    "streaming agent turn · {} live event(s) omitted from bounded UI queue",
+                    stream.omitted_events
+                );
+                None
+            }
+            MessageStreamUpdate::Completed {
+                content,
+                tool_calls,
+                tokens,
+                ..
+            } => {
+                let stream = self
+                    .active_message_stream
+                    .take()
+                    .expect("matching stream exists");
+                let (content, truncated) = bounded_utf8(&content, MAX_MESSAGE_PREVIEW_BYTES);
+                self.last_output = Some(content);
+                self.last_output_truncated = truncated;
+                self.status = format!(
+                    "turn complete ({} tool calls, {} tokens, {} live events{}{})",
+                    tool_calls,
+                    tokens,
+                    stream.events_seen,
+                    if stream.omitted_events > 0 { ", " } else { "" },
+                    if stream.omitted_events > 0 {
+                        format!("{} omitted", stream.omitted_events)
+                    } else {
+                        String::new()
+                    }
+                );
+                if truncated {
+                    self.status.push_str("; output truncated in TUI");
+                }
+                self.finish_operation();
+                None
+            }
+            MessageStreamUpdate::Failed { error, .. } => {
+                self.active_message_stream.take();
+                let (error, truncated) = bounded_utf8(&error, 512);
+                self.status = format!(
+                    "agent turn failed: {error}{}",
+                    if truncated { "…" } else { "" }
+                );
+                self.finish_operation();
+                None
+            }
+        }
+    }
+
+    pub fn message_stream_cancellation_accepted(&mut self, request_id: &str, agent_id: &str) {
+        if self.active_stream_matches(request_id, agent_id) {
+            self.status =
+                "exact stream cancellation accepted; waiting for terminal confirmation".into();
+        }
+    }
+
+    pub fn message_stream_cancellation_not_active(&mut self, request_id: &str, agent_id: &str) {
+        if let Some(stream) = self
+            .active_message_stream
+            .as_mut()
+            .filter(|stream| stream.request_id == request_id && stream.agent_id == agent_id)
+        {
+            stream.cancellation_requested = false;
+            self.status =
+                "stream was not active at cancellation time; waiting for result or press C to retry"
+                    .into();
+            self.finish_operation();
+        }
+    }
+
+    pub fn message_stream_cancellation_failed(
+        &mut self,
+        request_id: &str,
+        agent_id: &str,
+        error: &str,
+    ) {
+        if let Some(stream) = self
+            .active_message_stream
+            .as_mut()
+            .filter(|stream| stream.request_id == request_id && stream.agent_id == agent_id)
+        {
+            stream.cancellation_requested = false;
+            let (error, truncated) = bounded_utf8(error, 512);
+            self.status = format!(
+                "stream cancellation failed: {error}{}; press C to retry",
+                if truncated { "…" } else { "" }
+            );
+            self.finish_operation();
+        }
     }
 
     /// Apply one raw public operator snapshot to the render-free TUI model.
@@ -575,7 +952,11 @@ impl App {
                 None
             }
             Key::Char('m') => {
-                if self.selected_agent().is_some() {
+                if self.active_message_stream.is_some() {
+                    self.status =
+                        "one agent turn is already active; press C to cancel it before sending another"
+                            .into();
+                } else if self.selected_agent().is_some() {
                     self.mode = Mode::SendMessage;
                     self.input.clear();
                     self.status = "message — type text, Enter to send, Esc to cancel".into();
@@ -584,6 +965,7 @@ impl App {
                 }
                 None
             }
+            Key::Char('C') => self.request_message_stream_cancellation(),
             Key::Char('p') => self.selected_agent().map(|agent| {
                 if agent.state == "Paused" {
                     UiAction::ResumeAgent {
@@ -1170,6 +1552,31 @@ fn short_digest(digest: &str) -> &str {
     digest.get(..19).unwrap_or(digest)
 }
 
+fn utf8_prefix(value: &str, maximum_bytes: usize) -> &str {
+    if value.len() <= maximum_bytes {
+        return value;
+    }
+    let mut end = maximum_bytes;
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    &value[..end]
+}
+
+fn bounded_utf8(value: &str, maximum_bytes: usize) -> (String, bool) {
+    (
+        utf8_prefix(value, maximum_bytes).to_string(),
+        value.len() > maximum_bytes,
+    )
+}
+
+fn append_bounded_utf8(target: &mut String, addition: &str, maximum_bytes: usize) -> bool {
+    let remaining = maximum_bytes.saturating_sub(target.len());
+    let prefix = utf8_prefix(addition, remaining);
+    target.push_str(prefix);
+    prefix.len() < addition.len()
+}
+
 /// A keypress abstracted away from any specific backend, so [`App::on_key`] is
 /// testable without a terminal. `main.rs` maps crossterm events onto this.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1450,6 +1857,151 @@ mod tests {
         a.on_key(Key::Char('m'));
         assert_eq!(a.on_key(Key::Enter), None, "empty message is not sent");
         assert_eq!(a.mode, Mode::SendMessage, "stays in edit mode");
+    }
+
+    #[test]
+    fn stream_cancellation_freezes_target_and_closes_the_start_race() {
+        let mut a = app();
+        a.agents = vec![
+            dummy_agent("agent-exact", "first"),
+            dummy_agent("agent-other", "second"),
+        ];
+        a.start_message_stream("request-exact".into(), "agent-exact".into())
+            .unwrap();
+        a.selected = 1;
+
+        assert_eq!(
+            a.on_key(Key::Char('C')),
+            None,
+            "pre-start cancellation is queued, not raced against registration"
+        );
+        assert!(a
+            .active_message_stream()
+            .is_some_and(|stream| stream.cancellation_requested && !stream.started));
+        assert_eq!(
+            a.apply_message_stream_update(MessageStreamUpdate::Event {
+                request_id: "request-exact".into(),
+                agent_id: "agent-exact".into(),
+                event: MessageStreamEvent::Started,
+            }),
+            Some(UiAction::CancelMessageStream {
+                request_id: "request-exact".into(),
+                agent_id: "agent-exact".into(),
+            }),
+            "server start acknowledgement releases the exact queued cancellation"
+        );
+        assert_eq!(
+            a.on_key(Key::Char('C')),
+            None,
+            "duplicate cancellation is suppressed"
+        );
+
+        a.message_stream_cancellation_failed(
+            "request-exact",
+            "agent-exact",
+            "temporary transport loss",
+        );
+        assert_eq!(
+            a.on_key(Key::Char('C')),
+            Some(UiAction::CancelMessageStream {
+                request_id: "request-exact".into(),
+                agent_id: "agent-exact".into(),
+            }),
+            "failure re-enables cancellation without retargeting selection"
+        );
+    }
+
+    #[test]
+    fn second_stream_and_message_editor_are_refused_while_one_turn_is_active() {
+        let mut a = app();
+        a.agents = vec![dummy_agent("agent-1", "first")];
+        a.start_message_stream("request-1".into(), "agent-1".into())
+            .unwrap();
+
+        assert_eq!(a.on_key(Key::Char('m')), None);
+        assert_eq!(a.mode, Mode::Normal);
+        assert!(a.status.contains("already active"));
+        assert!(a
+            .start_message_stream("request-2".into(), "agent-1".into())
+            .is_err());
+        assert_eq!(
+            a.active_message_stream()
+                .map(|stream| stream.request_id.as_str()),
+            Some("request-1")
+        );
+
+        a.begin_operation("refreshing operator data");
+        a.finish_operation();
+        assert_eq!(a.operator_state.label(), "WORKING: streaming agent turn");
+    }
+
+    #[test]
+    fn stream_projection_is_bounded_and_stale_terminal_updates_are_ignored() {
+        let mut a = app();
+        a.start_message_stream("request-1".into(), "agent-1".into())
+            .unwrap();
+
+        a.apply_message_stream_update(MessageStreamUpdate::Event {
+            request_id: "stale-request".into(),
+            agent_id: "agent-1".into(),
+            event: MessageStreamEvent::Token {
+                delta: "must not appear".into(),
+            },
+        });
+        assert_eq!(a.last_output, None);
+        a.apply_message_stream_update(MessageStreamUpdate::Event {
+            request_id: "request-1".into(),
+            agent_id: "agent-1".into(),
+            event: MessageStreamEvent::Started,
+        });
+        a.apply_message_stream_update(MessageStreamUpdate::Event {
+            request_id: "request-1".into(),
+            agent_id: "agent-1".into(),
+            event: MessageStreamEvent::Token {
+                delta: "é".repeat(MAX_MESSAGE_PREVIEW_BYTES),
+            },
+        });
+        assert!(a.last_output_truncated);
+        assert_eq!(
+            a.last_output.as_ref().map(String::len),
+            Some(MAX_MESSAGE_PREVIEW_BYTES)
+        );
+        assert!(a
+            .last_output
+            .as_ref()
+            .is_some_and(|output| output.is_char_boundary(output.len())));
+        a.apply_message_stream_update(MessageStreamUpdate::EventsOmitted {
+            request_id: "request-1".into(),
+            agent_id: "agent-1".into(),
+            count: 7,
+        });
+
+        a.apply_message_stream_update(MessageStreamUpdate::Completed {
+            request_id: "request-older".into(),
+            agent_id: "agent-1".into(),
+            content: "stale".into(),
+            tool_calls: 0,
+            tokens: 1,
+        });
+        assert!(a.has_active_message_stream());
+        a.apply_message_stream_update(MessageStreamUpdate::Completed {
+            request_id: "request-1".into(),
+            agent_id: "agent-1".into(),
+            content: "界".repeat(MAX_MESSAGE_PREVIEW_BYTES),
+            tool_calls: 2,
+            tokens: 42,
+        });
+
+        assert!(!a.has_active_message_stream());
+        assert!(a.last_output_truncated);
+        assert!(a
+            .last_output
+            .as_ref()
+            .is_some_and(|output| output.len() <= MAX_MESSAGE_PREVIEW_BYTES
+                && output.is_char_boundary(output.len())));
+        assert!(a.status.contains("7 omitted"));
+        assert!(a.status.contains("output truncated"));
+        assert_eq!(a.operator_state.operation, None);
     }
 
     #[test]

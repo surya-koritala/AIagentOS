@@ -115,7 +115,10 @@ The TUI and desktop also list tenant-installed signed packages and can
 install/upgrade, run, roll back, or remove them through the same public client.
 Rollback and removal freeze the displayed version and digest, require exact
 `version|name` confirmation, and fail if the package changes before
-confirmation.
+confirmation. TUI message turns stream without blocking operator refreshes;
+press `C` to cancel the exact active request. Stream, cancellation, and ordinary
+operator work use separate authenticated public-wire connections, and the TUI
+bounds both its pending event projection and retained output.
 Declarative service boot ordering and the current supervision boundary are in
 [docs/SERVICES.md](docs/SERVICES.md).
 

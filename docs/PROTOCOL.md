@@ -254,14 +254,28 @@ Reducer tests cover fresh, partial, stale, reconnected, and working states;
 loopback regressions cover response loss and a stable endpoint switching to a
 replacement server.
 
-The desktop uses separate authenticated public-wire connections for ordinary
-operator calls, one active ordered message stream, and exact-request
+The desktop and TUI use separate authenticated public-wire connections for
+ordinary operator calls, one active ordered message stream, and exact-request
 cancellation. A live stream therefore cannot hold the operator snapshot path or
-the connection needed to cancel itself. The UI forwards bounded public stream
-events through a Tauri channel, freezes the request and agent identifiers for
-cancellation, and never retries a lost mutation. Checkpoint list, explicit
-resume, and explicit delete also use `KernelClient`; permanent deletion freezes
-the selected agent/checkpoint pair and requires the full checkpoint identifier.
+the connection needed to cancel itself. Both freeze the request and agent
+identifiers and never retry a lost mutation. More specifically, the desktop UI
+freezes the request and agent identifiers for cancellation, and the TUI retains
+the same pair in its render-free state model.
+
+The desktop forwards bounded public stream events through a Tauri channel. The
+TUI generates an opaque request id, admits only one active turn, and forwards
+events through a 256-entry UI queue. If that projection queue fills, it counts
+omitted live events instead of growing without bound; the terminal result still
+waits for queue capacity and supplies the authoritative final response. The TUI
+retains at most 64 KiB of UTF-8 turn text for rendering. Pressing `C` before the
+server's `started` event queues cancellation until registration is acknowledged,
+closing the cancel-before-register race; later cancellation always uses the
+frozen request/agent pair on the third connection. Ordinary refresh and
+lifecycle actions remain usable while the stream connection is occupied.
+
+Desktop checkpoint list, explicit resume, and explicit delete also use
+`KernelClient`; permanent deletion freezes the selected agent/checkpoint pair
+and requires the full checkpoint identifier.
 
 ### Message streaming and request cancellation
 

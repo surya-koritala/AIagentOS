@@ -22,6 +22,7 @@ REVIEW_SCHEMA_VERSION = 2
 CAMPAIGN_CLASS = "restricted_phase1_evidence_campaign"
 REVIEW_CLASS = "independent_restricted_phase1_promotion_review"
 REPORT_CLASS = "restricted_phase1_promotion_decision"
+CAMPAIGN_PROVENANCE_CLASS = "restricted_phase1_campaign_provenance"
 WORKFLOW_PROVENANCE_CLASS = "restricted_phase1_github_provenance"
 REVIEW_PROVENANCE_CLASS = "restricted_phase1_independent_review_provenance"
 PROFILE_ID = "single-node-linux-rootless-container-cli"
@@ -31,6 +32,7 @@ RC_RE = re.compile(r"^v[0-9]+\.[0-9]+\.[0-9]+-rc\.[1-9][0-9]*$")
 IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$")
 MAX_CAMPAIGN_BYTES = 256 * 1024
 MAX_REVIEW_BYTES = 256 * 1024
+MAX_CAMPAIGN_PROVENANCE_BYTES = 256 * 1024
 MAX_WORKFLOW_PROVENANCE_BYTES = 512 * 1024
 MAX_REVIEW_PROVENANCE_BYTES = 256 * 1024
 MAX_EVIDENCE_BYTES = 8 * 1024 * 1024
@@ -1007,6 +1009,140 @@ def _parse_review_provenance(
     return report, report_sha
 
 
+def _parse_campaign_provenance(
+    path: Path,
+    *,
+    campaign_sha: str,
+    release_candidate: str,
+    expected_commit: str,
+    expected_campaign_run_id: int,
+    completion_times: list[dt.datetime],
+) -> tuple[dict[str, Any], str]:
+    report, report_sha = _load_json(
+        path,
+        "Phase 1 campaign provenance",
+        MAX_CAMPAIGN_PROVENANCE_BYTES,
+    )
+    _exact_keys(
+        report,
+        {
+            "schema_version",
+            "qualification_class",
+            "generated_at",
+            "repository",
+            "release_candidate",
+            "source",
+            "campaign_sha256",
+            "campaign_workflow",
+            "campaign_signature_bundle_sha256",
+            "github_campaign_workflow_provenance_verified",
+            "github_campaign_artifact_bytes_verified",
+            "keyless_campaign_signature_verified",
+            "production_claim_allowed",
+        },
+        "campaign provenance",
+    )
+    if report["schema_version"] != SCHEMA_VERSION:
+        raise QualificationError(
+            "campaign provenance schema_version is unsupported"
+        )
+    if report["qualification_class"] != CAMPAIGN_PROVENANCE_CLASS:
+        raise QualificationError(
+            "campaign provenance qualification_class is invalid"
+        )
+    if report["release_candidate"] != release_candidate:
+        raise QualificationError(
+            "campaign provenance release candidate does not match"
+        )
+    _source(report["source"], expected_commit, "campaign provenance.source")
+    _identifier(report["repository"], "campaign provenance.repository")
+    if report["campaign_sha256"] != campaign_sha:
+        raise QualificationError(
+            "campaign provenance does not bind the exact campaign bytes"
+        )
+    _sha256(
+        report["campaign_signature_bundle_sha256"],
+        "campaign provenance.campaign_signature_bundle_sha256",
+    )
+    for field in (
+        "github_campaign_workflow_provenance_verified",
+        "github_campaign_artifact_bytes_verified",
+        "keyless_campaign_signature_verified",
+    ):
+        if report[field] is not True:
+            raise QualificationError(
+                f"campaign provenance does not prove {field}"
+            )
+    if report["production_claim_allowed"] is not False:
+        raise QualificationError(
+            "campaign provenance must keep production_claim_allowed false"
+        )
+    workflow = _object(
+        report["campaign_workflow"], "campaign provenance.campaign_workflow"
+    )
+    _exact_keys(
+        workflow,
+        {
+            "run_id",
+            "run_attempt",
+            "workflow_path",
+            "head_sha",
+            "event",
+            "workflow_updated_at",
+        },
+        "campaign provenance.campaign_workflow",
+    )
+    if (
+        _positive_integer(
+            workflow["run_id"],
+            "campaign provenance.campaign_workflow.run_id",
+        )
+        != _positive_integer(
+            expected_campaign_run_id, "expected campaign workflow run id"
+        )
+    ):
+        raise QualificationError(
+            "campaign provenance run does not match the promotion dispatch"
+        )
+    if (
+        _positive_integer(
+            workflow["run_attempt"],
+            "campaign provenance.campaign_workflow.run_attempt",
+        )
+        != 1
+    ):
+        raise QualificationError(
+            "campaign provenance must use a fresh workflow dispatch"
+        )
+    if (
+        workflow["workflow_path"]
+        != ".github/workflows/phase1-campaign-assembly.yml"
+        or workflow["event"] != "workflow_dispatch"
+        or workflow["head_sha"] != expected_commit
+    ):
+        raise QualificationError(
+            "campaign provenance workflow identity does not match"
+        )
+    workflow_updated_at = _timestamp(
+        workflow["workflow_updated_at"],
+        "campaign provenance.campaign_workflow.workflow_updated_at",
+    )
+    if workflow_updated_at < max(completion_times):
+        raise QualificationError(
+            "campaign workflow completed before one or more evidence workflows"
+        )
+    generated_at = _timestamp(
+        report["generated_at"], "campaign provenance.generated_at"
+    )
+    if generated_at > dt.datetime.now(dt.timezone.utc) + dt.timedelta(minutes=5):
+        raise QualificationError("campaign provenance timestamp is in the future")
+    if generated_at < workflow_updated_at:
+        raise QualificationError(
+            "campaign provenance predates the authenticated campaign workflow"
+        )
+    return report, report_sha
+
+
 def _parse_workflow_provenance(
     path: Path,
     *,
@@ -1241,6 +1377,7 @@ def _parse_workflow_provenance(
 
 def evaluate(
     campaign_path: Path,
+    campaign_provenance_path: Path,
     review_path: Path,
     review_provenance_path: Path,
     workflow_provenance_path: Path,
@@ -1249,6 +1386,7 @@ def evaluate(
     release_candidate: str,
     expected_commit: str,
     expected_environment: str,
+    expected_campaign_run_id: int,
 ) -> dict[str, Any]:
     if RC_RE.fullmatch(release_candidate) is None:
         raise QualificationError("release candidate must be an exact vX.Y.Z-rc.N tag")
@@ -1273,6 +1411,16 @@ def evaluate(
     promoted_providers = campaign["_validated_promoted_providers"]
     operator_ids = campaign["_validated_operator_ids"]
     on_device_environment = campaign["_validated_on_device_environment"]
+    campaign_provenance, campaign_provenance_sha = (
+        _parse_campaign_provenance(
+            campaign_provenance_path,
+            campaign_sha=campaign_sha,
+            release_candidate=release_candidate,
+            expected_commit=expected_commit,
+            expected_campaign_run_id=expected_campaign_run_id,
+            completion_times=completion_times,
+        )
+    )
     workflow_provenance, workflow_provenance_sha = _parse_workflow_provenance(
         workflow_provenance_path,
         campaign_sha=campaign_sha,
@@ -1338,6 +1486,14 @@ def evaluate(
         release_candidate=release_candidate,
         expected_commit=expected_commit,
     )
+    expected_repository = review["review_workflow"]["repository"]
+    if (
+        campaign_provenance["repository"] != expected_repository
+        or workflow_provenance["repository"] != expected_repository
+    ):
+        raise QualificationError(
+            "campaign, evidence, and review provenance repositories differ"
+        )
     blockers.extend(review_blockers)
     ready = not blockers
     return {
@@ -1358,6 +1514,7 @@ def evaluate(
         "promoted_providers": promoted_providers,
         "evidence": {
             "campaign_sha256": campaign_sha,
+            "campaign_provenance_sha256": campaign_provenance_sha,
             "independent_review_sha256": review_sha,
             "independent_review_provenance_sha256": review_provenance_sha,
             "workflow_provenance_sha256": workflow_provenance_sha,
@@ -1365,6 +1522,15 @@ def evaluate(
             "artifacts": retained_artifacts,
             "same_clean_source_commit": True,
             "same_release_candidate": True,
+            "github_campaign_workflow_provenance_verified": campaign_provenance[
+                "github_campaign_workflow_provenance_verified"
+            ],
+            "github_campaign_artifact_bytes_verified": campaign_provenance[
+                "github_campaign_artifact_bytes_verified"
+            ],
+            "keyless_campaign_signature_verified": campaign_provenance[
+                "keyless_campaign_signature_verified"
+            ],
             "github_workflow_provenance_verified": workflow_provenance[
                 "github_workflow_provenance_verified"
             ],
@@ -1398,7 +1564,7 @@ def evaluate(
         "eligibility_blockers": blockers,
         "caveats": [
             "This decision is limited to the restricted single-node Linux rootless-container CLI release candidate and promoted provider/model set named above.",
-            "The bounded report proves GitHub-authenticated evidence and independent-review workflow attempts, downloaded artifact bytes, and the keyless review signature in addition to cross-artifact schema, digest, exact-source, environment, and reviewer-separation contracts.",
+            "The bounded report proves GitHub-authenticated campaign, evidence, and independent-review workflow attempts, downloaded artifact bytes, and keyless campaign/review signatures in addition to cross-artifact schema, digest, exact-source, environment, and reviewer-separation contracts.",
             "Whole-product production approval remains false until provider/client, distributed-control-plane, independent-security, and final v1 release gates pass.",
         ],
     }
@@ -1441,6 +1607,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--validate", action="store_true")
     parser.add_argument("--campaign", type=Path)
+    parser.add_argument("--campaign-provenance", type=Path)
     parser.add_argument("--review", type=Path)
     parser.add_argument("--review-provenance", type=Path)
     parser.add_argument("--workflow-provenance", type=Path)
@@ -1448,6 +1615,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--release-candidate")
     parser.add_argument("--expected-commit")
     parser.add_argument("--expected-environment")
+    parser.add_argument("--expected-campaign-run-id", type=int)
     parser.add_argument("--output", type=Path)
     parser.add_argument("--require-eligible", action="store_true")
     args = parser.parse_args(argv)
@@ -1455,6 +1623,7 @@ def main(argv: list[str] | None = None) -> int:
         validate_contract()
         execution_values = (
             args.campaign,
+            args.campaign_provenance,
             args.review,
             args.review_provenance,
             args.workflow_provenance,
@@ -1462,6 +1631,7 @@ def main(argv: list[str] | None = None) -> int:
             args.release_candidate,
             args.expected_commit,
             args.expected_environment,
+            args.expected_campaign_run_id,
             args.output,
         )
         if args.validate:
@@ -1476,12 +1646,15 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if any(value is None for value in execution_values):
             raise QualificationError(
-                "--campaign, --review, --review-provenance, --evidence-dir, "
+                "--campaign, --campaign-provenance, --review, "
+                "--review-provenance, --evidence-dir, "
                 "--release-candidate, --workflow-provenance, --expected-commit, "
-                "--expected-environment, and --output are required"
+                "--expected-environment, --expected-campaign-run-id, and "
+                "--output are required"
             )
         report = evaluate(
             args.campaign,
+            args.campaign_provenance,
             args.review,
             args.review_provenance,
             args.workflow_provenance,
@@ -1489,6 +1662,7 @@ def main(argv: list[str] | None = None) -> int:
             release_candidate=args.release_candidate,
             expected_commit=args.expected_commit,
             expected_environment=args.expected_environment,
+            expected_campaign_run_id=args.expected_campaign_run_id,
         )
         _write_report(args.output, report)
         if args.require_eligible and not report["phase1_release_candidate_ready"]:

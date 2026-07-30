@@ -52,11 +52,12 @@ secret values, model paths, evidence-directory contents, or credentials.
 
 The `phase1-review` environment and `agentos-review` runner are a separate
 trust boundary. Set `AGENTOS_PHASE1_REVIEW_DIR` to a reviewer-controlled
-directory containing only `campaign.json` and
-`phase1-review-observation.json`. The authenticated GitHub actor who dispatches
-the review must be distinct from every `operator_id` in the campaign. A rerun
-is deliberately rejected; a failed review must use a fresh dispatch so the
-actor and attempt cannot become ambiguous.
+directory containing only `phase1-review-observation.json`. The separately
+authenticated campaign workflow supplies the signed `campaign.json` and its
+bounded reports. The authenticated GitHub actor who dispatches the review must
+be distinct from every `operator_id` derived from the campaign and underlying
+evidence workflows. A rerun is deliberately rejected; a failed review must use
+a fresh dispatch so the actor and attempt cannot become ambiguous.
 
 Do not set an enable flag merely to make a workflow advance. If the protected
 job then waits for a runner or approval, that is unverified external state, not

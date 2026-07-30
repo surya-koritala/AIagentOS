@@ -10,6 +10,18 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
 
 ## [Unreleased]
 
+- Replaced hand-built Phase 1 campaign files and manual bounded-report copying
+  with a GitHub-hosted exact-tag assembly workflow. It authenticates every
+  selected evidence run and human actor, downloads deterministic artifacts,
+  derives the operator inventory, copies only the expected JSON reports,
+  computes exact digests, and keyless-signs the canonical campaign. Review,
+  promotion, and the final hosted publisher independently re-download and
+  verify the campaign workflow attempt, repository, actors, complete artifact
+  inventory, report bytes, and Sigstore identity. The identity-private campaign
+  provenance is hash-bound into the decision and shipped as the fifth signed
+  qualification report. This automates evidence assembly; it does not claim
+  that the external provider, GGUF, storage, deletion, soak, SLO, game-day, or
+  review runs exist. Relates #120, #123, #125, and #127.
 - Replaced the self-declared Phase 1 reviewer identity with a protected,
   exact-tag review workflow. A fresh authenticated GitHub actor distinct from
   every campaign operator must create and keyless-sign the hash-bound review;

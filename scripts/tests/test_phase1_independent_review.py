@@ -60,10 +60,12 @@ class Phase1IndependentReviewTests(unittest.TestCase):
             "release_candidate": RELEASE_CANDIDATE,
             "expected_commit": COMMIT,
             "expected_environment": TARGET_ENVIRONMENT,
+            "expected_campaign_run_id": 650,
         }
         arguments.update(overrides)
         return build_review(
             workspace.campaign_path,
+            workspace.campaign_provenance_path,
             observation_path,
             **arguments,
         )
@@ -124,7 +126,7 @@ class Phase1IndependentReviewTests(unittest.TestCase):
             (
                 "predates",
                 lambda value: value.__setitem__(
-                    "reviewed_at", "2026-04-30T23:59:59Z"
+                    "reviewed_at", "2026-05-01T12:30:00Z"
                 ),
             ),
             (
@@ -160,6 +162,8 @@ class Phase1IndependentReviewTests(unittest.TestCase):
             [
                 "--campaign",
                 str(workspace.campaign_path),
+                "--campaign-provenance",
+                str(workspace.campaign_provenance_path),
                 "--observation",
                 str(observation_path),
                 "--actor",
@@ -176,6 +180,8 @@ class Phase1IndependentReviewTests(unittest.TestCase):
                 COMMIT,
                 "--expected-environment",
                 TARGET_ENVIRONMENT,
+                "--expected-campaign-run-id",
+                "650",
                 "--output",
                 str(output),
                 "--require-approved",

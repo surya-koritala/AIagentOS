@@ -11,18 +11,24 @@ on:
         description: Stable target environment identity from campaign.json
         required: true
         type: string
+      phase1_campaign_run_id:
+        description: Successful authenticated Phase 1 campaign workflow run ID
+        required: true
+        type: string
 
 concurrency:
   group: phase1-independent-review-${{ inputs.release_candidate }}
   cancel-in-progress: false
 
 permissions:
+  actions: read
   contents: read
 
 env:
   AGENTOS_RELEASE_CANDIDATE: ${{ inputs.release_candidate }}
   AGENTOS_QUALIFICATION_ENVIRONMENT: ${{ inputs.environment_id }}
   AGENTOS_PHASE1_REVIEW_DIR: ${{ vars.AGENTOS_PHASE1_REVIEW_DIR }}
+  PHASE1_CAMPAIGN_RUN_ID: ${{ inputs.phase1_campaign_run_id }}
 
 jobs:
   qualification-plan:
@@ -40,6 +46,7 @@ jobs:
     timeout-minutes: 20
     environment: phase1-review
     permissions:
+      actions: read
       attestations: write
       contents: read
       id-token: write
@@ -50,6 +57,7 @@ jobs:
           fetch-depth: 0
       - name: Validate the authenticated review contracts
         run: |
+          python3 scripts/phase1_campaign_provenance.py --validate
           python3 scripts/phase1_independent_review.py --validate
           python3 scripts/phase1_review_provenance.py --validate
       - name: Bind dispatch, annotated tag, checkout, actor, and fresh attempt
@@ -63,6 +71,59 @@ jobs:
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
           git diff --quiet
           git diff --cached --quiet
+      - name: Download the exact authenticated Phase 1 campaign
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          [[ "$PHASE1_CAMPAIGN_RUN_ID" =~ ^[1-9][0-9]*$ ]]
+          campaign_dir=target/phase1/campaign/artifact
+          mkdir -p "$campaign_dir" target/phase1/campaign/metadata
+          current="$(gh api \
+            -H 'X-GitHub-Api-Version: 2022-11-28' \
+            "repos/${GITHUB_REPOSITORY}/actions/runs/${PHASE1_CAMPAIGN_RUN_ID}")"
+          test "$(jq -r .run_attempt <<<"$current")" = "1"
+          test "$(jq -r '.path | split("@")[0]' <<<"$current")" = \
+            ".github/workflows/phase1-campaign-assembly.yml"
+          test "$(jq -r .event <<<"$current")" = "workflow_dispatch"
+          test "$(jq -r .head_sha <<<"$current")" = "$GITHUB_SHA"
+          test "$(jq -r .status <<<"$current")" = "completed"
+          test "$(jq -r .conclusion <<<"$current")" = "success"
+          artifact_name="phase1-campaign-${AGENTOS_RELEASE_CANDIDATE}-${GITHUB_SHA}"
+          gh run download "$PHASE1_CAMPAIGN_RUN_ID" \
+            --repo "$GITHUB_REPOSITORY" \
+            --name "$artifact_name" \
+            --dir "$campaign_dir"
+          python3 scripts/phase1_campaign_provenance.py \
+            --campaign "$campaign_dir/campaign.json" \
+            --release-candidate "$AGENTOS_RELEASE_CANDIDATE" \
+            --expected-commit "$GITHUB_SHA" \
+            --expected-environment "$AGENTOS_QUALIFICATION_ENVIRONMENT" \
+            --expected-campaign-run-id "$PHASE1_CAMPAIGN_RUN_ID" \
+            --plan-output target/phase1/campaign/plan.json
+          metadata_file="$(jq -r .run.metadata_file \
+            target/phase1/campaign/plan.json)"
+          [[ "$metadata_file" =~ ^[1-9][0-9]*-1\.json$ ]]
+          gh api \
+            -H 'X-GitHub-Api-Version: 2022-11-28' \
+            "repos/${GITHUB_REPOSITORY}/actions/runs/${PHASE1_CAMPAIGN_RUN_ID}/attempts/1" \
+            > "target/phase1/campaign/metadata/${metadata_file}"
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+      - name: Authenticate campaign workflow, bytes, and signature
+        run: |
+          plan=target/phase1/campaign/plan.json
+          metadata_file="$(jq -r .run.metadata_file "$plan")"
+          python3 scripts/phase1_campaign_provenance.py \
+            --campaign target/phase1/campaign/artifact/campaign.json \
+            --release-candidate "$AGENTOS_RELEASE_CANDIDATE" \
+            --expected-commit "$GITHUB_SHA" \
+            --expected-environment "$AGENTOS_QUALIFICATION_ENVIRONMENT" \
+            --expected-campaign-run-id "$PHASE1_CAMPAIGN_RUN_ID" \
+            --plan "$plan" \
+            --repository "$GITHUB_REPOSITORY" \
+            --run-metadata \
+              "target/phase1/campaign/metadata/${metadata_file}" \
+            --artifact-dir target/phase1/campaign/artifact \
+            --output target/qualification/phase1-campaign-provenance.json
       - name: Require the reviewer-controlled evidence drop
         run: |
           test -n "$AGENTOS_PHASE1_REVIEW_DIR"
@@ -76,7 +137,7 @@ jobs:
               exit 1
               ;;
           esac
-          for name in campaign.json phase1-review-observation.json; do
+          for name in phase1-review-observation.json; do
             path="${review_dir}/${name}"
             test -f "$path"
             test ! -L "$path"
@@ -85,7 +146,9 @@ jobs:
         run: |
           mkdir -p target/qualification
           python3 scripts/phase1_independent_review.py \
-            --campaign "${AGENTOS_PHASE1_REVIEW_DIR}/campaign.json" \
+            --campaign target/phase1/campaign/artifact/campaign.json \
+            --campaign-provenance \
+              target/qualification/phase1-campaign-provenance.json \
             --observation \
               "${AGENTOS_PHASE1_REVIEW_DIR}/phase1-review-observation.json" \
             --actor "$GITHUB_ACTOR" \
@@ -95,9 +158,9 @@ jobs:
             --release-candidate "$AGENTOS_RELEASE_CANDIDATE" \
             --expected-commit "$GITHUB_SHA" \
             --expected-environment "$AGENTOS_QUALIFICATION_ENVIRONMENT" \
+            --expected-campaign-run-id "$PHASE1_CAMPAIGN_RUN_ID" \
             --output target/qualification/phase1-review.json \
             --require-approved
-      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
       - name: Keyless-sign the authenticated review
         run: |
           cosign sign-blob --yes \

@@ -1,0 +1,181 @@
+name: Restricted Phase 1 campaign assembly
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_candidate:
+        description: Existing signed annotated vX.Y.Z-rc.N tag
+        required: true
+        type: string
+      target_environment_id:
+        description: Stable target Linux/rootless deployment identity
+        required: true
+        type: string
+      on_device_environment_id:
+        description: Distinct stable GGUF CPU runner identity
+        required: true
+        type: string
+      promoted_providers_json:
+        description: JSON array containing Ollama, vLLM, and promoted hosted providers
+        required: true
+        type: string
+      run_ids_json:
+        description: JSON object containing every required exact evidence workflow run ID
+        required: true
+        type: string
+
+concurrency:
+  group: phase1-campaign-${{ inputs.release_candidate }}
+  cancel-in-progress: false
+
+permissions:
+  actions: read
+  attestations: write
+  contents: read
+  id-token: write
+
+env:
+  AGENTOS_RELEASE_CANDIDATE: ${{ inputs.release_candidate }}
+  AGENTOS_TARGET_ENVIRONMENT: ${{ inputs.target_environment_id }}
+  AGENTOS_ON_DEVICE_ENVIRONMENT: ${{ inputs.on_device_environment_id }}
+  AGENTOS_PROMOTED_PROVIDERS_JSON: ${{ inputs.promoted_providers_json }}
+  AGENTOS_PHASE1_RUN_IDS_JSON: ${{ inputs.run_ids_json }}
+
+jobs:
+  authenticated-campaign:
+    name: Assemble authenticated exact-RC campaign
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.release_candidate }}
+          fetch-depth: 0
+      - name: Validate source, tag, actor, and campaign contracts
+        run: |
+          python3 scripts/phase1_campaign_assembly.py --validate
+          python3 scripts/phase1_campaign_provenance.py --validate
+          [[ "$AGENTOS_RELEASE_CANDIDATE" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-rc\.[1-9][0-9]*$ ]]
+          [[ "$GITHUB_ACTOR" =~ ^[A-Za-z0-9][A-Za-z0-9-]{0,38}$ ]]
+          [[ "$GITHUB_TRIGGERING_ACTOR" =~ ^[A-Za-z0-9][A-Za-z0-9-]{0,38}$ ]]
+          test "$GITHUB_RUN_ATTEMPT" = "1"
+          test "$GITHUB_REF" = "refs/tags/${AGENTOS_RELEASE_CANDIDATE}"
+          test "$(git cat-file -t "$AGENTOS_RELEASE_CANDIDATE")" = "tag"
+          test "$(git rev-list -n 1 "$AGENTOS_RELEASE_CANDIDATE")" = "$GITHUB_SHA"
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          git diff --quiet
+          git diff --cached --quiet
+      - name: Create the bounded campaign request and download plan
+        run: |
+          mkdir -p target/phase1/campaign
+          jq -n \
+            --arg release_candidate "$AGENTOS_RELEASE_CANDIDATE" \
+            --arg commit "$GITHUB_SHA" \
+            --arg target_environment "$AGENTOS_TARGET_ENVIRONMENT" \
+            --arg on_device_environment "$AGENTOS_ON_DEVICE_ENVIRONMENT" \
+            --argjson providers "$AGENTOS_PROMOTED_PROVIDERS_JSON" \
+            --argjson run_ids "$AGENTOS_PHASE1_RUN_IDS_JSON" \
+            '{
+              schema_version: 1,
+              qualification_class: "restricted_phase1_campaign_assembly_request",
+              release_candidate: $release_candidate,
+              source: {commit: $commit, dirty: false},
+              profile_id: "single-node-linux-rootless-container-cli",
+              target_environment_id: $target_environment,
+              on_device_environment_id: $on_device_environment,
+              promoted_providers: $providers,
+              run_ids: $run_ids
+            }' > target/phase1/campaign/request.json
+          python3 scripts/phase1_campaign_assembly.py \
+            --request target/phase1/campaign/request.json \
+            --plan-output target/phase1/campaign/plan.json
+      - name: Authenticate exact attempts and download exact artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          plan=target/phase1/campaign/plan.json
+          run_dir=target/phase1/campaign/runs
+          artifact_dir=target/phase1/campaign/artifacts
+          mkdir -p "$run_dir" "$artifact_dir"
+          jq -r '.runs[] | [
+            .run_id,
+            .metadata_file
+          ] | @tsv' "$plan" |
+            while IFS=$'\t' read -r run_id metadata_file; do
+              [[ "$run_id" =~ ^[1-9][0-9]*$ ]]
+              [[ "$metadata_file" =~ ^[1-9][0-9]*\.json$ ]]
+              current="$(gh api \
+                -H 'X-GitHub-Api-Version: 2022-11-28' \
+                "repos/${GITHUB_REPOSITORY}/actions/runs/${run_id}")"
+              run_attempt="$(jq -r .run_attempt <<<"$current")"
+              [[ "$run_attempt" =~ ^[1-9][0-9]*$ ]]
+              gh api \
+                -H 'X-GitHub-Api-Version: 2022-11-28' \
+                "repos/${GITHUB_REPOSITORY}/actions/runs/${run_id}/attempts/${run_attempt}" \
+                > "${run_dir}/${metadata_file}"
+            done
+          jq -r '.artifacts[] | [
+            .run_id,
+            .artifact_name,
+            .download_subdir
+          ] | @tsv' "$plan" |
+            while IFS=$'\t' read -r run_id artifact_name download_subdir; do
+              [[ "$run_id" =~ ^[1-9][0-9]*$ ]]
+              [[ "$artifact_name" =~ ^[A-Za-z0-9._-]+$ ]]
+              [[ "$download_subdir" =~ ^[A-Za-z0-9._-]+$ ]]
+              gh run download "$run_id" \
+                --repo "$GITHUB_REPOSITORY" \
+                --name "$artifact_name" \
+                --dir "${artifact_dir}/${download_subdir}"
+            done
+          jq -r '.runs[] | [
+            .run_id,
+            .metadata_file
+          ] | @tsv' "$plan" |
+            while IFS=$'\t' read -r run_id metadata_file; do
+              captured="$(jq -r .run_attempt "${run_dir}/${metadata_file}")"
+              current="$(gh api \
+                -H 'X-GitHub-Api-Version: 2022-11-28' \
+                "repos/${GITHUB_REPOSITORY}/actions/runs/${run_id}")"
+              test "$(jq -r .run_attempt <<<"$current")" = "$captured"
+            done
+      - name: Assemble the deterministic bounded campaign bundle
+        run: |
+          python3 scripts/phase1_campaign_assembly.py \
+            --request target/phase1/campaign/request.json \
+            --plan target/phase1/campaign/plan.json \
+            --repository "$GITHUB_REPOSITORY" \
+            --assembly-actor "$GITHUB_ACTOR" \
+            --assembly-triggering-actor "$GITHUB_TRIGGERING_ACTOR" \
+            --run-metadata-dir target/phase1/campaign/runs \
+            --artifact-download-dir target/phase1/campaign/artifacts \
+            --output-dir target/phase1/campaign/bundle
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+      - name: Keyless-sign the exact campaign bytes
+        run: |
+          cosign sign-blob --yes \
+            --bundle target/phase1/campaign/bundle/campaign.json.sigstore.json \
+            target/phase1/campaign/bundle/campaign.json
+      - uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+        with:
+          subject-path: target/phase1/campaign/bundle/campaign.json
+      - name: Publish bounded campaign summary
+        run: |
+          campaign=target/phase1/campaign/bundle/campaign.json
+          {
+            printf '### Restricted Phase 1 evidence campaign\n\n'
+            printf -- '- Commit: `%s`\n' "$GITHUB_SHA"
+            printf -- '- Release candidate: `%s`\n' \
+              "$AGENTOS_RELEASE_CANDIDATE"
+            printf -- '- Evidence reports: `%s`\n' \
+              "$(jq '.artifacts | length' "$campaign")"
+            printf -- '- Promoted providers: `%s`\n' \
+              "$(jq -r '.promoted_providers | join(",")' "$campaign")"
+            printf -- '- Whole-product production claim: `false`\n'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: phase1-campaign-${{ inputs.release_candidate }}-${{ github.sha }}
+          path: target/phase1/campaign/bundle
+          if-no-files-found: error
+          retention-days: 90

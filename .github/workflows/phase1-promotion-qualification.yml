@@ -15,6 +15,10 @@ on:
         description: Successful Linux CLI RC workflow run ID for the same tag and commit
         required: true
         type: string
+      phase1_campaign_run_id:
+        description: Successful authenticated Phase 1 campaign workflow run ID
+        required: true
+        type: string
       phase1_review_run_id:
         description: Successful authenticated independent-review workflow run ID
         required: true
@@ -35,8 +39,8 @@ concurrency:
 env:
   AGENTOS_RELEASE_CANDIDATE: ${{ inputs.release_candidate }}
   AGENTOS_QUALIFICATION_ENVIRONMENT: ${{ inputs.environment_id }}
-  AGENTOS_PHASE1_EVIDENCE_DIR: ${{ vars.AGENTOS_PHASE1_EVIDENCE_DIR }}
   LINUX_CLI_RC_RUN_ID: ${{ inputs.linux_cli_rc_run_id }}
+  PHASE1_CAMPAIGN_RUN_ID: ${{ inputs.phase1_campaign_run_id }}
   PHASE1_REVIEW_RUN_ID: ${{ inputs.phase1_review_run_id }}
 
 jobs:
@@ -61,6 +65,7 @@ jobs:
           fetch-depth: 0
       - name: Validate the checked-in promotion and runtime contracts
         run: |
+          python3 scripts/phase1_campaign_provenance.py --validate
           python3 scripts/phase1_promotion_qualification.py --validate
           python3 scripts/phase1_workflow_provenance.py --validate
           python3 scripts/phase1_review_provenance.py --validate
@@ -87,24 +92,59 @@ jobs:
           test "$(jq -r .head_sha <<<"$metadata")" = "$GITHUB_SHA"
           test "$(jq -r .status <<<"$metadata")" = "completed"
           test "$(jq -r .conclusion <<<"$metadata")" = "success"
-      - name: Require the protected Phase 1 evidence drop
+      - name: Download the exact authenticated Phase 1 campaign
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          test -n "$AGENTOS_PHASE1_EVIDENCE_DIR"
-          [[ "$AGENTOS_PHASE1_EVIDENCE_DIR" = /* ]]
-          test -d "$AGENTOS_PHASE1_EVIDENCE_DIR"
-          test ! -L "$AGENTOS_PHASE1_EVIDENCE_DIR"
-          evidence_dir="$(realpath "$AGENTOS_PHASE1_EVIDENCE_DIR")"
-          case "$evidence_dir" in
-            "$GITHUB_WORKSPACE"|"$GITHUB_WORKSPACE"/*)
-              echo "Evidence must remain outside the source checkout" >&2
-              exit 1
-              ;;
-          esac
-          for name in campaign.json linux-cli-rc-qualification.json; do
-            path="${evidence_dir}/${name}"
-            test -f "$path"
-            test ! -L "$path"
-          done
+          [[ "$PHASE1_CAMPAIGN_RUN_ID" =~ ^[1-9][0-9]*$ ]]
+          campaign_dir=target/phase1/campaign/artifact
+          mkdir -p "$campaign_dir" target/phase1/campaign/metadata
+          current="$(gh api \
+            -H 'X-GitHub-Api-Version: 2022-11-28' \
+            "repos/${GITHUB_REPOSITORY}/actions/runs/${PHASE1_CAMPAIGN_RUN_ID}")"
+          test "$(jq -r .run_attempt <<<"$current")" = "1"
+          test "$(jq -r '.path | split("@")[0]' <<<"$current")" = \
+            ".github/workflows/phase1-campaign-assembly.yml"
+          test "$(jq -r .event <<<"$current")" = "workflow_dispatch"
+          test "$(jq -r .head_sha <<<"$current")" = "$GITHUB_SHA"
+          test "$(jq -r .status <<<"$current")" = "completed"
+          test "$(jq -r .conclusion <<<"$current")" = "success"
+          artifact_name="phase1-campaign-${AGENTOS_RELEASE_CANDIDATE}-${GITHUB_SHA}"
+          gh run download "$PHASE1_CAMPAIGN_RUN_ID" \
+            --repo "$GITHUB_REPOSITORY" \
+            --name "$artifact_name" \
+            --dir "$campaign_dir"
+          python3 scripts/phase1_campaign_provenance.py \
+            --campaign "$campaign_dir/campaign.json" \
+            --release-candidate "$AGENTOS_RELEASE_CANDIDATE" \
+            --expected-commit "$GITHUB_SHA" \
+            --expected-environment "$AGENTOS_QUALIFICATION_ENVIRONMENT" \
+            --expected-campaign-run-id "$PHASE1_CAMPAIGN_RUN_ID" \
+            --plan-output target/phase1/campaign/plan.json
+          metadata_file="$(jq -r .run.metadata_file \
+            target/phase1/campaign/plan.json)"
+          [[ "$metadata_file" =~ ^[1-9][0-9]*-1\.json$ ]]
+          gh api \
+            -H 'X-GitHub-Api-Version: 2022-11-28' \
+            "repos/${GITHUB_REPOSITORY}/actions/runs/${PHASE1_CAMPAIGN_RUN_ID}/attempts/1" \
+            > "target/phase1/campaign/metadata/${metadata_file}"
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+      - name: Authenticate campaign workflow, bytes, and signature
+        run: |
+          plan=target/phase1/campaign/plan.json
+          metadata_file="$(jq -r .run.metadata_file "$plan")"
+          python3 scripts/phase1_campaign_provenance.py \
+            --campaign target/phase1/campaign/artifact/campaign.json \
+            --release-candidate "$AGENTOS_RELEASE_CANDIDATE" \
+            --expected-commit "$GITHUB_SHA" \
+            --expected-environment "$AGENTOS_QUALIFICATION_ENVIRONMENT" \
+            --expected-campaign-run-id "$PHASE1_CAMPAIGN_RUN_ID" \
+            --plan "$plan" \
+            --repository "$GITHUB_REPOSITORY" \
+            --run-metadata \
+              "target/phase1/campaign/metadata/${metadata_file}" \
+            --artifact-dir target/phase1/campaign/artifact \
+            --output target/qualification/phase1-campaign-provenance.json
       - name: Download the exact authenticated independent review
         env:
           GH_TOKEN: ${{ github.token }}
@@ -128,7 +168,7 @@ jobs:
             --name "$artifact_name" \
             --dir "$review_dir"
           python3 scripts/phase1_review_provenance.py \
-            --campaign "${AGENTOS_PHASE1_EVIDENCE_DIR}/campaign.json" \
+            --campaign target/phase1/campaign/artifact/campaign.json \
             --review "$review_dir/phase1-review.json" \
             --release-candidate "$AGENTOS_RELEASE_CANDIDATE" \
             --expected-commit "$GITHUB_SHA" \
@@ -142,13 +182,12 @@ jobs:
             -H 'X-GitHub-Api-Version: 2022-11-28' \
             "repos/${GITHUB_REPOSITORY}/actions/runs/${PHASE1_REVIEW_RUN_ID}/attempts/1" \
             > "target/phase1/review/metadata/${metadata_file}"
-      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
       - name: Authenticate reviewer identity, workflow, bytes, and signature
         run: |
           plan=target/phase1/review/plan.json
           metadata_file="$(jq -r .run.metadata_file "$plan")"
           python3 scripts/phase1_review_provenance.py \
-            --campaign "${AGENTOS_PHASE1_EVIDENCE_DIR}/campaign.json" \
+            --campaign target/phase1/campaign/artifact/campaign.json \
             --review target/phase1/review/artifact/phase1-review.json \
             --release-candidate "$AGENTOS_RELEASE_CANDIDATE" \
             --expected-commit "$GITHUB_SHA" \
@@ -163,7 +202,7 @@ jobs:
         run: |
           mkdir -p target/phase1/provenance
           python3 scripts/phase1_workflow_provenance.py \
-            --campaign "${AGENTOS_PHASE1_EVIDENCE_DIR}/campaign.json" \
+            --campaign target/phase1/campaign/artifact/campaign.json \
             --release-candidate "$AGENTOS_RELEASE_CANDIDATE" \
             --expected-commit "$GITHUB_SHA" \
             --expected-environment "$AGENTOS_QUALIFICATION_ENVIRONMENT" \
@@ -210,7 +249,7 @@ jobs:
                 --dir "${artifact_dir}/${download_subdir}"
             done
           python3 scripts/phase1_workflow_provenance.py \
-            --campaign "${AGENTOS_PHASE1_EVIDENCE_DIR}/campaign.json" \
+            --campaign target/phase1/campaign/artifact/campaign.json \
             --release-candidate "$AGENTOS_RELEASE_CANDIDATE" \
             --expected-commit "$GITHUB_SHA" \
             --expected-environment "$AGENTOS_QUALIFICATION_ENVIRONMENT" \
@@ -219,7 +258,7 @@ jobs:
             --repository "$GITHUB_REPOSITORY" \
             --run-metadata-dir "$run_dir" \
             --artifact-download-dir "$artifact_dir" \
-            --evidence-dir "$AGENTOS_PHASE1_EVIDENCE_DIR" \
+            --evidence-dir target/phase1/campaign/artifact \
             --output target/qualification/phase1-workflow-provenance.json
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
@@ -231,7 +270,7 @@ jobs:
       - name: Revalidate exact signed runtime report and protected copy
         run: |
           report=target/phase1/linux-cli/linux-cli-rc-qualification.json
-          evidence_report="${AGENTOS_PHASE1_EVIDENCE_DIR}/linux-cli-rc-qualification.json"
+          evidence_report=target/phase1/campaign/artifact/linux-cli-rc-qualification.json
           cmp "$report" "$evidence_report"
           archive="target/phase1/linux-cli/agentos-${AGENTOS_RELEASE_CANDIDATE}-x86_64-unknown-linux-gnu.zip"
           python3 scripts/linux_cli_rc_qualification.py validate-report \
@@ -245,16 +284,19 @@ jobs:
         run: |
           mkdir -p target/qualification
           python3 scripts/phase1_promotion_qualification.py \
-            --campaign "${AGENTOS_PHASE1_EVIDENCE_DIR}/campaign.json" \
+            --campaign target/phase1/campaign/artifact/campaign.json \
+            --campaign-provenance \
+              target/qualification/phase1-campaign-provenance.json \
             --review target/phase1/review/artifact/phase1-review.json \
             --review-provenance \
               target/qualification/phase1-review-provenance.json \
             --workflow-provenance \
               target/qualification/phase1-workflow-provenance.json \
-            --evidence-dir "$AGENTOS_PHASE1_EVIDENCE_DIR" \
+            --evidence-dir target/phase1/campaign/artifact \
             --release-candidate "$AGENTOS_RELEASE_CANDIDATE" \
             --expected-commit "$GITHUB_SHA" \
             --expected-environment "$AGENTOS_QUALIFICATION_ENVIRONMENT" \
+            --expected-campaign-run-id "$PHASE1_CAMPAIGN_RUN_ID" \
             --output target/qualification/phase1-promotion.json \
             --require-eligible
       - name: Publish bounded decision summary
@@ -285,6 +327,7 @@ jobs:
           name: phase1-promotion-${{ inputs.release_candidate }}-${{ github.sha }}
           path: |
             target/qualification/phase1-promotion.json
+            target/qualification/phase1-campaign-provenance.json
             target/qualification/phase1-workflow-provenance.json
             target/qualification/phase1-review-provenance.json
           if-no-files-found: warn
@@ -323,6 +366,13 @@ jobs:
           path: phase1-report
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
+          name: phase1-campaign-${{ inputs.release_candidate }}-${{ github.sha }}
+          path: phase1-campaign
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.phase1_campaign_run_id }}
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
           name: phase1-independent-review-${{ inputs.release_candidate }}-${{ github.sha }}
           path: phase1-independent-review
           github-token: ${{ github.token }}
@@ -345,6 +395,52 @@ jobs:
           test "$(jq -r .phase1_release_candidate_ready "$report")" = "true"
           test "$(jq -r .production_claim_allowed "$report")" = "false"
           test "$(jq '.eligibility_blockers | length' "$report")" = "0"
+          campaign_provenance=phase1-report/phase1-campaign-provenance.json
+          test "$(jq -r .github_campaign_workflow_provenance_verified \
+            "$campaign_provenance")" = "true"
+          test "$(jq -r .github_campaign_artifact_bytes_verified \
+            "$campaign_provenance")" = "true"
+          test "$(jq -r .keyless_campaign_signature_verified \
+            "$campaign_provenance")" = "true"
+          test "$(jq -r .production_claim_allowed \
+            "$campaign_provenance")" = "false"
+          test "$(jq -r .evidence.campaign_provenance_sha256 "$report")" = \
+            "$(sha256sum "$campaign_provenance" | cut -d ' ' -f 1)"
+          test "$(sha256sum phase1-campaign/campaign.json | cut -d ' ' -f 1)" = \
+            "$(jq -r .evidence.campaign_sha256 "$report")"
+          mkdir -p phase1-campaign-publisher
+          python3 scripts/phase1_campaign_provenance.py \
+            --campaign phase1-campaign/campaign.json \
+            --release-candidate "$AGENTOS_RELEASE_CANDIDATE" \
+            --expected-commit "$GITHUB_SHA" \
+            --expected-environment "$AGENTOS_QUALIFICATION_ENVIRONMENT" \
+            --expected-campaign-run-id "$PHASE1_CAMPAIGN_RUN_ID" \
+            --plan-output phase1-campaign-publisher/plan.json
+          gh api \
+            -H 'X-GitHub-Api-Version: 2022-11-28' \
+            "repos/${GITHUB_REPOSITORY}/actions/runs/${PHASE1_CAMPAIGN_RUN_ID}/attempts/1" \
+            > phase1-campaign-publisher/run.json
+          python3 scripts/phase1_campaign_provenance.py \
+            --campaign phase1-campaign/campaign.json \
+            --release-candidate "$AGENTOS_RELEASE_CANDIDATE" \
+            --expected-commit "$GITHUB_SHA" \
+            --expected-environment "$AGENTOS_QUALIFICATION_ENVIRONMENT" \
+            --expected-campaign-run-id "$PHASE1_CAMPAIGN_RUN_ID" \
+            --plan phase1-campaign-publisher/plan.json \
+            --repository "$GITHUB_REPOSITORY" \
+            --run-metadata phase1-campaign-publisher/run.json \
+            --artifact-dir phase1-campaign \
+            --output phase1-campaign-publisher/provenance.json
+          for field in repository release_candidate campaign_sha256 \
+            campaign_signature_bundle_sha256; do
+              test "$(jq -r --arg field "$field" '.[$field]' \
+                "$campaign_provenance")" = \
+                "$(jq -r --arg field "$field" '.[$field]' \
+                  phase1-campaign-publisher/provenance.json)"
+          done
+          test "$(jq -S .campaign_workflow "$campaign_provenance")" = \
+            "$(jq -S .campaign_workflow \
+              phase1-campaign-publisher/provenance.json)"
           provenance=phase1-report/phase1-workflow-provenance.json
           test "$(jq -r .github_workflow_provenance_verified "$provenance")" = "true"
           test "$(jq -r .github_artifact_bytes_verified "$provenance")" = "true"
@@ -429,7 +525,8 @@ jobs:
             --certificate-identity "$review_identity" \
             --certificate-oidc-issuer https://token.actions.githubusercontent.com \
             "$review"
-          cp "$report" "$provenance" "$review_provenance" dist/
+          cp "$report" "$campaign_provenance" "$provenance" \
+            "$review_provenance" dist/
       - name: Verify the originating workflow signatures
         run: |
           identity="https://github.com/${GITHUB_REPOSITORY}/.github/workflows/linux-cli-rc.yml@refs/tags/${AGENTOS_RELEASE_CANDIDATE}"
@@ -460,6 +557,7 @@ jobs:
             dist/*.cdx.json
             dist/linux-cli-rc-qualification.json
             dist/phase1-promotion.json
+            dist/phase1-campaign-provenance.json
             dist/phase1-workflow-provenance.json
             dist/phase1-review-provenance.json
             dist/SHA256SUMS

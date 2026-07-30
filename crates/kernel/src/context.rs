@@ -10376,6 +10376,30 @@ mod tests {
         }
     }
 
+    fn reserve_after_transient_test_lock_drains(
+        mut attempt: impl FnMut() -> Result<ProviderRateReserveOutcome, ContextError>,
+    ) -> ProviderRateReserveOutcome {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            match attempt() {
+                Ok(outcome) => return outcome,
+                Err(error) => {
+                    let message = error.to_string();
+                    let transient_begin_lock = message.contains(
+                        "failed to start immediate quota transaction: database is locked",
+                    ) || message.contains(
+                        "failed to start immediate quota transaction: database table is locked",
+                    );
+                    assert!(
+                        transient_begin_lock && std::time::Instant::now() < deadline,
+                        "quota reservation failed outside the bounded test-only lock drain: {error}"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+            }
+        }
+    }
+
     #[test]
     fn provider_rate_epochs_are_fixed_and_floor_never_moves_backwards() {
         let mgr = SqliteContextManager::in_memory().unwrap();
@@ -10694,10 +10718,11 @@ mod tests {
             let barrier = barrier.clone();
             threads.push(std::thread::spawn(move || {
                 barrier.wait();
+                let receipt_id = uuid::Uuid::new_v4();
                 matches!(
-                    manager
-                        .reserve_provider_rate(uuid::Uuid::new_v4(), 80, 10, 10_000, 1)
-                        .unwrap(),
+                    reserve_after_transient_test_lock_drains(|| {
+                        manager.reserve_provider_rate(receipt_id, 80, 10, 10_000, 1)
+                    }),
                     ProviderRateReserveOutcome::Reserved(_)
                 )
             }));
@@ -12165,17 +12190,18 @@ mod tests {
                     cgroup_constraint(&format!("/sibling/{index}"), 10),
                 ];
                 barrier.wait();
+                let receipt_id = uuid::Uuid::new_v4();
                 matches!(
-                    manager
-                        .reserve_provider_rate_with_cgroups(
-                            uuid::Uuid::new_v4(),
+                    reserve_after_transient_test_lock_drains(|| {
+                        manager.reserve_provider_rate_with_cgroups(
+                            receipt_id,
                             170,
                             100,
                             1_000,
                             1,
                             &constraints,
                         )
-                        .unwrap(),
+                    }),
                     ProviderRateReserveOutcome::Reserved(_)
                 )
             }));

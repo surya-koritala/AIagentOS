@@ -3,17 +3,18 @@
 //! Every Raft RPC uses a fresh bounded connection authenticated in both
 //! directions by rustls. The wire envelope binds the durable cluster name,
 //! source node, target node, and embedded OpenRaft vote identity. The exact
-//! server and client leaf fingerprints must match the statically trusted
-//! membership supplied when the runtime starts.
+//! server and client leaf fingerprints must match the generation-fenced
+//! transport catalog supplied when the runtime starts.
 //!
 //! The daemon installs a cloneable authority handle after identical genesis is
 //! committed. Public membership and ownership syscalls use it for
 //! majority-backed writes and linearizable reads; followers forward both over
 //! the authenticated peer transport. Application-listener certificate rollout
-//! is coordinated by the authority. OpenRaft voter changes are limited to the
-//! statically trusted transport catalog: an exact generation/digest intent is
-//! committed before learner catch-up and joint consensus, and restart resumes
-//! only that intent. Transport trust rotation remains a later stage.
+//! is coordinated by the authority. OpenRaft voter changes commit an exact
+//! generation/digest intent before learner catch-up and joint consensus.
+//! Separate transport-trust generations atomically replace the complete peer
+//! catalog, accepted CA set, and bounded overlap leaves; restart resumes only
+//! the exact durable prior or configured target catalog.
 
 #![allow(clippy::result_large_err)]
 
@@ -49,9 +50,9 @@ use tokio_rustls::{TlsAcceptor, TlsConnector};
 use zeroize::Zeroizing;
 
 use crate::cluster_consensus::{
-    open_cluster_raft_storage, read_replicated_authority_view, AuthorityCommand, AuthorityGenesis,
-    AuthorityGenesisMember, AuthorityResponse, ClusterRaftNode, ClusterRaftNodeId,
-    ClusterRaftTypeConfig, ReplicatedAuthorityView,
+    open_cluster_raft_storage, read_cluster_raft_membership, read_replicated_authority_view,
+    AuthorityCommand, AuthorityGenesis, AuthorityGenesisMember, AuthorityResponse, ClusterRaftNode,
+    ClusterRaftNodeId, ClusterRaftTypeConfig, ReplicatedAuthorityView,
 };
 use crate::config::ClusterRaftConfig;
 use crate::context::SqliteContextManager;
@@ -209,6 +210,24 @@ fn first_pem_certificate_fingerprint(cert_pem: &[u8]) -> io::Result<String> {
     Ok(certificate_fingerprint(certificate.as_ref()))
 }
 
+fn certificate_fingerprints_from_pem(cert_pem: &[u8]) -> io::Result<Vec<String>> {
+    let certificates = CertificateDer::pem_slice_iter(cert_pem)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(invalid_input)?;
+    if certificates.is_empty() || certificates.len() > 32 {
+        return Err(invalid_input(
+            "Raft peer CA bundle must contain between 1 and 32 certificates",
+        ));
+    }
+    let mut fingerprints = certificates
+        .iter()
+        .map(|certificate| certificate_fingerprint(certificate.as_ref()))
+        .collect::<Vec<_>>();
+    fingerprints.sort();
+    fingerprints.dedup();
+    Ok(fingerprints)
+}
+
 fn invalid_input(error: impl fmt::Display) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, error.to_string())
 }
@@ -261,13 +280,17 @@ impl Default for ClusterRaftTransportLimits {
 pub struct ClusterRaftRuntimeConfig {
     pub node_id: ClusterRaftNodeId,
     pub listen_addr: SocketAddr,
-    /// Statically trusted transport catalog. Voters are a non-empty subset.
+    /// Generation-fenced transport catalog. Voters are a non-empty subset.
     pub members: BTreeMap<ClusterRaftNodeId, ClusterRaftNode>,
     pub transport_catalog_sha256: String,
+    pub transport_trust_generation: u64,
+    pub transport_trust_overlap_not_after: Option<chrono::DateTime<chrono::Utc>>,
     pub voter_ids: BTreeSet<ClusterRaftNodeId>,
     pub voter_set_generation: u64,
     pub voter_set_sha256: String,
     pub authority_genesis: AuthorityGenesis,
+    pub configured_authority: AuthorityGenesis,
+    pub transport_authority: AuthorityGenesis,
     pub tls: ClusterRaftTls,
     pub raft: OpenRaftConfig,
     pub transport: ClusterRaftTransportLimits,
@@ -281,10 +304,20 @@ impl fmt::Debug for ClusterRaftRuntimeConfig {
             .field("listen_addr", &self.listen_addr)
             .field("members", &self.members)
             .field("transport_catalog_sha256", &self.transport_catalog_sha256)
+            .field(
+                "transport_trust_generation",
+                &self.transport_trust_generation,
+            )
+            .field(
+                "transport_trust_overlap_not_after",
+                &self.transport_trust_overlap_not_after,
+            )
             .field("voter_ids", &self.voter_ids)
             .field("voter_set_generation", &self.voter_set_generation)
             .field("voter_set_sha256", &self.voter_set_sha256)
             .field("authority_genesis", &self.authority_genesis)
+            .field("configured_authority", &self.configured_authority)
+            .field("transport_authority", &self.transport_authority)
             .field("tls", &self.tls)
             .field("raft", &self.raft)
             .field("transport", &self.transport)
@@ -345,10 +378,19 @@ impl ClusterRaftRuntimeConfig {
         )?;
         let voter_ids = config.desired_voter_ids();
         let voter_set_sha256 = configured_voter_set_sha256(config.voter_set_generation, &voter_ids);
+        let transport_peer_ca_sha256 = if config.transport_trust_generation == 0 {
+            Vec::new()
+        } else {
+            certificate_fingerprints_from_pem(&peer_ca)?
+        };
         let mut members = config
             .members
             .iter()
             .map(|member| {
+                let mut server_overlap = member.tls_certificate_sha256_overlap.clone();
+                server_overlap.sort();
+                let mut client_overlap = member.tls_client_certificate_sha256_overlap.clone();
+                client_overlap.sort();
                 (
                     member.node_id,
                     ClusterRaftNode {
@@ -356,8 +398,13 @@ impl ClusterRaftRuntimeConfig {
                         server_name: member.server_name.clone(),
                         tls_certificate_sha256: member.tls_certificate_sha256.clone(),
                         tls_client_certificate_sha256: member.tls_client_certificate_sha256.clone(),
+                        tls_certificate_sha256_overlap: server_overlap,
+                        tls_client_certificate_sha256_overlap: client_overlap,
                         identity_public_key: member.identity_public_key.clone(),
                         transport_catalog_sha256: String::new(),
+                        transport_trust_generation: config.transport_trust_generation,
+                        transport_peer_ca_sha256: transport_peer_ca_sha256.clone(),
+                        transport_trust_overlap_not_after: config.transport_trust_overlap_not_after,
                         voter_set_generation: config.voter_set_generation,
                         voter_set_sha256: voter_set_sha256.clone(),
                     },
@@ -370,7 +417,7 @@ impl ClusterRaftRuntimeConfig {
                 .transport_catalog_sha256
                 .clone_from(&transport_catalog_sha256);
         }
-        let mut authority_members = config
+        let mut transport_authority_members = config
             .members
             .iter()
             .map(|member| {
@@ -390,20 +437,68 @@ impl ClusterRaftRuntimeConfig {
                 }
             })
             .collect::<Vec<_>>();
+        transport_authority_members.sort_by(|left, right| left.node_id.cmp(&right.node_id));
+        let to_authority_member = |member: &crate::config::ClusterAuthorityGenesisMemberConfig| {
+            let public_key = crate::cluster_control::hex_decode(&member.identity_public_key)
+                .expect("validated authority identity public key");
+            AuthorityGenesisMember {
+                node_id: member.application_node_id.clone(),
+                fingerprint: crate::cluster_control::sha256_hex(&public_key),
+                public_key: member.identity_public_key.clone(),
+                tls_server_certificate_fingerprint: member
+                    .application_tls_server_certificate_sha256
+                    .clone(),
+                endpoint: member.application_endpoint.clone(),
+                server_version: env!("CARGO_PKG_VERSION").into(),
+                min_protocol_version: crate::syscall_server::MIN_PROTOCOL_VERSION,
+                protocol_version: crate::syscall_server::PROTOCOL_VERSION,
+            }
+        };
+        let mut configured_authority_members = if config.authority_members.is_empty() {
+            transport_authority_members.clone()
+        } else {
+            config
+                .authority_members
+                .iter()
+                .map(to_authority_member)
+                .collect::<Vec<_>>()
+        };
+        configured_authority_members.sort_by(|left, right| left.node_id.cmp(&right.node_id));
+        let mut authority_members = if config.authority_genesis_members.is_empty() {
+            transport_authority_members.clone()
+        } else {
+            config
+                .authority_genesis_members
+                .iter()
+                .map(to_authority_member)
+                .collect::<Vec<_>>()
+        };
         authority_members.sort_by(|left, right| left.node_id.cmp(&right.node_id));
         let authority_genesis = AuthorityGenesis {
             cluster_id: config.authority_cluster_id.clone(),
             members: authority_members,
+        };
+        let configured_authority = AuthorityGenesis {
+            cluster_id: config.authority_cluster_id.clone(),
+            members: configured_authority_members,
+        };
+        let transport_authority = AuthorityGenesis {
+            cluster_id: config.authority_cluster_id.clone(),
+            members: transport_authority_members,
         };
         let runtime = Self {
             node_id: config.node_id,
             listen_addr: config.listen_addr.parse().map_err(invalid_input)?,
             members,
             transport_catalog_sha256,
+            transport_trust_generation: config.transport_trust_generation,
+            transport_trust_overlap_not_after: config.transport_trust_overlap_not_after,
             voter_ids,
             voter_set_generation: config.voter_set_generation,
             voter_set_sha256,
             authority_genesis,
+            configured_authority,
+            transport_authority,
             tls,
             raft: OpenRaftConfig {
                 cluster_name: config.cluster_name.clone(),
@@ -458,16 +553,49 @@ impl ClusterRaftRuntimeConfig {
             ));
         }
         validate_authority_genesis(&self.authority_genesis)?;
+        validate_authority_genesis(&self.configured_authority)?;
+        validate_authority_genesis(&self.transport_authority)?;
+        if self.authority_genesis.cluster_id != self.configured_authority.cluster_id
+            || self.authority_genesis.cluster_id != self.transport_authority.cluster_id
+        {
+            return Err(invalid_input(
+                "authority genesis, complete membership, and transport membership use different cluster ids",
+            ));
+        }
+        for transport_member in &self.transport_authority.members {
+            if !self
+                .configured_authority
+                .members
+                .iter()
+                .any(|member| member == transport_member)
+            {
+                return Err(invalid_input(
+                    "transport application identity is absent from the complete authority membership",
+                ));
+            }
+        }
+        for genesis_member in &self.authority_genesis.members {
+            if !self.configured_authority.members.iter().any(|member| {
+                member.node_id == genesis_member.node_id
+                    && member.fingerprint == genesis_member.fingerprint
+                    && member.public_key == genesis_member.public_key
+            }) {
+                return Err(invalid_input(
+                    "immutable authority identity is absent from the complete authority membership",
+                ));
+            }
+        }
         let local = self
             .members
             .get(&self.node_id)
             .ok_or_else(|| invalid_input("local Raft node is absent from membership"))?;
-        if local.tls_certificate_sha256 != self.tls.server_certificate_sha256 {
+        let now = chrono::Utc::now();
+        if !accepts_server_certificate(local, &self.tls.server_certificate_sha256, now) {
             return Err(invalid_input(
                 "local server certificate fingerprint does not match membership",
             ));
         }
-        if local.tls_client_certificate_sha256 != self.tls.client_certificate_sha256 {
+        if !accepts_client_certificate(local, &self.tls.client_certificate_sha256, now) {
             return Err(invalid_input(
                 "local client certificate fingerprint does not match membership",
             ));
@@ -501,6 +629,12 @@ impl ClusterRaftRuntimeConfig {
         let mut client_fingerprints = BTreeSet::new();
         let mut certificate_owners = BTreeMap::new();
         let mut identity_keys = BTreeSet::new();
+        let expected_peer_ca_sha256 = self
+            .members
+            .values()
+            .next()
+            .map(|node| node.transport_peer_ca_sha256.as_slice())
+            .unwrap_or_default();
         for (node_id, node) in &self.members {
             if *node_id == 0 {
                 return Err(invalid_input("Raft node id 0 is reserved"));
@@ -509,6 +643,105 @@ impl ClusterRaftRuntimeConfig {
             ServerName::try_from(node.server_name.clone()).map_err(invalid_input)?;
             validate_sha256(&node.tls_certificate_sha256, "server certificate")?;
             validate_sha256(&node.tls_client_certificate_sha256, "client certificate")?;
+            if node.tls_certificate_sha256_overlap.len() > 7
+                || node.tls_client_certificate_sha256_overlap.len() > 7
+            {
+                return Err(invalid_input(
+                    "Raft transport certificate overlap cannot contain more than 7 additional leaves",
+                ));
+            }
+            if node.transport_trust_generation == 0
+                && (!node.tls_certificate_sha256_overlap.is_empty()
+                    || !node.tls_client_certificate_sha256_overlap.is_empty()
+                    || !node.transport_peer_ca_sha256.is_empty()
+                    || node.transport_trust_overlap_not_after.is_some())
+            {
+                return Err(invalid_input(
+                    "Raft generation-zero transport trust cannot contain overlap leaves, CA fingerprints, or an overlap expiration",
+                ));
+            }
+            if node.transport_trust_generation > 0
+                && (node.transport_peer_ca_sha256.is_empty()
+                    || node.transport_peer_ca_sha256.len() > 32)
+            {
+                return Err(invalid_input(
+                    "versioned Raft transport trust must contain 1 to 32 CA fingerprints",
+                ));
+            }
+            if node.transport_peer_ca_sha256.as_slice() != expected_peer_ca_sha256 {
+                return Err(invalid_input(
+                    "Raft trusted catalog contains inconsistent peer CA fingerprints",
+                ));
+            }
+            if !node
+                .transport_peer_ca_sha256
+                .windows(2)
+                .all(|pair| pair[0] < pair[1])
+                || !node
+                    .tls_certificate_sha256_overlap
+                    .windows(2)
+                    .all(|pair| pair[0] < pair[1])
+                || !node
+                    .tls_client_certificate_sha256_overlap
+                    .windows(2)
+                    .all(|pair| pair[0] < pair[1])
+            {
+                return Err(invalid_input(
+                    "Raft transport trust fingerprint lists must be sorted and unique",
+                ));
+            }
+            let has_overlap = !node.tls_certificate_sha256_overlap.is_empty()
+                || !node.tls_client_certificate_sha256_overlap.is_empty()
+                || node.transport_peer_ca_sha256.len() > 1;
+            match (has_overlap, node.transport_trust_overlap_not_after) {
+                (true, Some(not_after))
+                    if not_after > now && not_after <= now + chrono::Duration::days(30) => {}
+                (true, Some(_)) => {
+                    return Err(invalid_input(
+                        "Raft transport trust overlap expiration must be in the next 30 days",
+                    ))
+                }
+                (true, None) => {
+                    return Err(invalid_input(
+                        "Raft transport trust overlap requires an absolute expiration",
+                    ))
+                }
+                (false, Some(_)) => return Err(invalid_input(
+                    "Raft transport trust overlap expiration exists without overlap credentials",
+                )),
+                (false, None) => {}
+            }
+            let mut member_server_fingerprints = BTreeSet::new();
+            for fingerprint in std::iter::once(&node.tls_certificate_sha256)
+                .chain(node.tls_certificate_sha256_overlap.iter())
+            {
+                validate_sha256(fingerprint, "server certificate")?;
+                if !member_server_fingerprints.insert(fingerprint) {
+                    return Err(invalid_input(
+                        "duplicate Raft peer server certificate fingerprint",
+                    ));
+                }
+            }
+            let mut member_client_fingerprints = BTreeSet::new();
+            for fingerprint in std::iter::once(&node.tls_client_certificate_sha256)
+                .chain(node.tls_client_certificate_sha256_overlap.iter())
+            {
+                validate_sha256(fingerprint, "client certificate")?;
+                if !member_client_fingerprints.insert(fingerprint) {
+                    return Err(invalid_input(
+                        "duplicate Raft peer client certificate fingerprint",
+                    ));
+                }
+            }
+            let mut ca_fingerprints = BTreeSet::new();
+            for fingerprint in &node.transport_peer_ca_sha256 {
+                validate_sha256(fingerprint, "peer CA certificate")?;
+                if !ca_fingerprints.insert(fingerprint) {
+                    return Err(invalid_input(
+                        "duplicate Raft peer CA certificate fingerprint",
+                    ));
+                }
+            }
             if node.identity_public_key.len() != 64
                 || !node
                     .identity_public_key
@@ -522,20 +755,27 @@ impl ClusterRaftRuntimeConfig {
             if !endpoints.insert(node.endpoint.clone()) {
                 return Err(invalid_input("duplicate Raft peer endpoint"));
             }
-            if !server_fingerprints.insert(node.tls_certificate_sha256.clone()) {
-                return Err(invalid_input(
-                    "duplicate Raft peer server certificate fingerprint",
-                ));
+            for fingerprint in member_server_fingerprints {
+                if !server_fingerprints.insert(fingerprint.clone()) {
+                    return Err(invalid_input(
+                        "duplicate Raft peer server certificate fingerprint",
+                    ));
+                }
+                if certificate_owners
+                    .insert(fingerprint.clone(), *node_id)
+                    .is_some_and(|owner| owner != *node_id)
+                {
+                    return Err(invalid_input(
+                        "Raft certificate fingerprint is assigned to multiple node identities",
+                    ));
+                }
             }
-            if !client_fingerprints.insert(node.tls_client_certificate_sha256.clone()) {
-                return Err(invalid_input(
-                    "duplicate Raft peer client certificate fingerprint",
-                ));
-            }
-            for fingerprint in [
-                &node.tls_certificate_sha256,
-                &node.tls_client_certificate_sha256,
-            ] {
+            for fingerprint in member_client_fingerprints {
+                if !client_fingerprints.insert(fingerprint.clone()) {
+                    return Err(invalid_input(
+                        "duplicate Raft peer client certificate fingerprint",
+                    ));
+                }
                 if certificate_owners
                     .insert(fingerprint.clone(), *node_id)
                     .is_some_and(|owner| owner != *node_id)
@@ -560,9 +800,46 @@ impl ClusterRaftRuntimeConfig {
                     "Raft trusted catalog contains inconsistent transport-catalog metadata",
                 ));
             }
+            if node.transport_trust_generation != self.transport_trust_generation
+                || node.transport_trust_overlap_not_after != self.transport_trust_overlap_not_after
+            {
+                return Err(invalid_input(
+                    "Raft trusted catalog contains inconsistent transport-trust metadata",
+                ));
+            }
         }
         Ok(())
     }
+}
+
+fn accepts_server_certificate(
+    node: &ClusterRaftNode,
+    fingerprint: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    node.tls_certificate_sha256 == fingerprint
+        || (node
+            .transport_trust_overlap_not_after
+            .is_some_and(|not_after| now < not_after)
+            && node
+                .tls_certificate_sha256_overlap
+                .iter()
+                .any(|candidate| candidate == fingerprint))
+}
+
+fn accepts_client_certificate(
+    node: &ClusterRaftNode,
+    fingerprint: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    node.tls_client_certificate_sha256 == fingerprint
+        || (node
+            .transport_trust_overlap_not_after
+            .is_some_and(|not_after| now < not_after)
+            && node
+                .tls_client_certificate_sha256_overlap
+                .iter()
+                .any(|candidate| candidate == fingerprint))
 }
 
 fn append_digest_field(payload: &mut Vec<u8>, value: &str) {
@@ -573,7 +850,29 @@ fn append_digest_field(payload: &mut Vec<u8>, value: &str) {
 fn configured_transport_catalog_sha256(
     members: &BTreeMap<ClusterRaftNodeId, ClusterRaftNode>,
 ) -> String {
-    let mut payload = b"AIagentOS OpenRaft transport catalog v1".to_vec();
+    let trust_generation = members
+        .values()
+        .next()
+        .map_or(0, |node| node.transport_trust_generation);
+    let mut payload = if trust_generation == 0 {
+        b"AIagentOS OpenRaft transport catalog v1".to_vec()
+    } else {
+        let first = members.values().next().expect("non-empty trusted catalog");
+        let mut payload = b"AIagentOS OpenRaft transport trust epoch v2".to_vec();
+        payload.extend_from_slice(&trust_generation.to_be_bytes());
+        payload.extend_from_slice(&(first.transport_peer_ca_sha256.len() as u64).to_be_bytes());
+        for fingerprint in &first.transport_peer_ca_sha256 {
+            append_digest_field(&mut payload, fingerprint);
+        }
+        match first.transport_trust_overlap_not_after {
+            Some(not_after) => {
+                payload.push(1);
+                append_digest_field(&mut payload, &not_after.to_rfc3339());
+            }
+            None => payload.push(0),
+        }
+        payload
+    };
     payload.extend_from_slice(&(members.len() as u64).to_be_bytes());
     for (node_id, node) in members {
         payload.extend_from_slice(&node_id.to_be_bytes());
@@ -581,9 +880,106 @@ fn configured_transport_catalog_sha256(
         append_digest_field(&mut payload, &node.server_name);
         append_digest_field(&mut payload, &node.tls_certificate_sha256);
         append_digest_field(&mut payload, &node.tls_client_certificate_sha256);
+        if trust_generation > 0 {
+            payload.extend_from_slice(
+                &(node.tls_certificate_sha256_overlap.len() as u64).to_be_bytes(),
+            );
+            for fingerprint in &node.tls_certificate_sha256_overlap {
+                append_digest_field(&mut payload, fingerprint);
+            }
+            payload.extend_from_slice(
+                &(node.tls_client_certificate_sha256_overlap.len() as u64).to_be_bytes(),
+            );
+            for fingerprint in &node.tls_client_certificate_sha256_overlap {
+                append_digest_field(&mut payload, fingerprint);
+            }
+        }
         append_digest_field(&mut payload, &node.identity_public_key);
     }
     crate::cluster_control::sha256_hex(&payload)
+}
+
+fn validated_durable_transport_catalog(
+    context: &SqliteContextManager,
+    desired: &BTreeMap<ClusterRaftNodeId, ClusterRaftNode>,
+) -> io::Result<BTreeMap<ClusterRaftNodeId, ClusterRaftNode>> {
+    let stored = read_cluster_raft_membership(context)?;
+    let nodes = stored
+        .nodes()
+        .map(|(node_id, node)| (*node_id, node.clone()))
+        .collect::<BTreeMap<_, _>>();
+    if nodes.is_empty() {
+        return Ok(nodes);
+    }
+    let mut digests = nodes
+        .values()
+        .map(|node| node.transport_catalog_sha256.as_str())
+        .collect::<BTreeSet<_>>();
+    if digests.len() != 1 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "durable Raft transport catalog has inconsistent digests",
+        ));
+    }
+    let digest = digests.pop_first().expect("non-empty durable catalog");
+    if digest.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    validate_sha256(digest, "durable transport catalog")?;
+    let exact_generation_zero_desired_subset = nodes
+        .values()
+        .next()
+        .is_some_and(|node| node.transport_trust_generation == 0)
+        && desired.values().next().is_some_and(|node| {
+            node.transport_trust_generation == 0 && node.transport_catalog_sha256 == digest
+        })
+        && nodes.iter().all(|(node_id, node)| {
+            desired
+                .get(node_id)
+                .is_some_and(|configured| same_transport_trust_entry(configured, node))
+        });
+    if configured_transport_catalog_sha256(&nodes) != digest
+        && !exact_generation_zero_desired_subset
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "durable Raft transport catalog digest does not authenticate its complete node map",
+        ));
+    }
+    let first = nodes.values().next().expect("non-empty durable catalog");
+    for node in nodes.values() {
+        if node.transport_trust_generation != first.transport_trust_generation
+            || node.transport_peer_ca_sha256 != first.transport_peer_ca_sha256
+            || node.transport_trust_overlap_not_after != first.transport_trust_overlap_not_after
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "durable Raft transport catalog has inconsistent trust-epoch metadata",
+            ));
+        }
+        validate_endpoint(&node.endpoint)?;
+        ServerName::try_from(node.server_name.clone()).map_err(invalid_input)?;
+        for fingerprint in std::iter::once(&node.tls_certificate_sha256)
+            .chain(node.tls_certificate_sha256_overlap.iter())
+            .chain(std::iter::once(&node.tls_client_certificate_sha256))
+            .chain(node.tls_client_certificate_sha256_overlap.iter())
+            .chain(node.transport_peer_ca_sha256.iter())
+        {
+            validate_sha256(fingerprint, "durable Raft transport certificate")?;
+        }
+        if node.identity_public_key.len() != 64
+            || !node
+                .identity_public_key
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "durable Raft transport identity key is malformed",
+            ));
+        }
+    }
+    Ok(nodes)
 }
 
 fn configured_voter_set_sha256(generation: u64, voters: &BTreeSet<ClusterRaftNodeId>) -> String {
@@ -703,6 +1099,70 @@ fn validate_initialized_authority(
                 format!(
                     "configured application voter {} does not match its current durable membership identity, endpoint, or TLS binding",
                     configured.node_id
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_configured_authority_members(
+    view: &ReplicatedAuthorityView,
+    configured: &AuthorityGenesis,
+) -> io::Result<()> {
+    if view.genesis.cluster_id != configured.cluster_id
+        || view.membership.cluster_id != configured.cluster_id
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "configured application members use a different durable cluster identity",
+        ));
+    }
+    if view.membership.members.len() != configured.members.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "configured application membership does not contain every durable identity",
+        ));
+    }
+    for configured_member in &configured.members {
+        let durable = view
+            .membership
+            .members
+            .iter()
+            .find(|member| member.node_id == configured_member.node_id)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "configured application member {} is absent from durable membership",
+                        configured_member.node_id
+                    ),
+                )
+            })?;
+        let configured_tls_is_authorized = durable.tls_server_certificate_fingerprint
+            == configured_member.tls_server_certificate_fingerprint
+            || configured_member
+                .tls_server_certificate_fingerprint
+                .as_deref()
+                .zip(
+                    view.membership
+                        .certificate_rollouts
+                        .iter()
+                        .find(|rollout| rollout.node_id == configured_member.node_id),
+                )
+                .is_some_and(|(fingerprint, rollout)| {
+                    rollout.accepts_fingerprint(fingerprint, view.logical_time)
+                });
+        if durable.fingerprint != configured_member.fingerprint
+            || durable.public_key != configured_member.public_key
+            || durable.endpoint != configured_member.endpoint
+            || !configured_tls_is_authorized
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "configured application member {} does not match its challenged durable identity, endpoint, or TLS binding",
+                    configured_member.node_id
                 ),
             ));
         }
@@ -916,6 +1376,7 @@ struct ClusterNetworkFactory {
     source: ClusterRaftNodeId,
     cluster_name: Arc<str>,
     members: Arc<BTreeMap<ClusterRaftNodeId, ClusterRaftNode>>,
+    prior_members: Arc<BTreeMap<ClusterRaftNodeId, ClusterRaftNode>>,
     client_config: Arc<rustls::ClientConfig>,
     handshake_timeout: Duration,
     max_frame_bytes: usize,
@@ -940,15 +1401,22 @@ impl RaftNetworkFactory<ClusterRaftTypeConfig> for ClusterNetworkFactory {
         target: ClusterRaftNodeId,
         node: &ClusterRaftNode,
     ) -> Self::Network {
-        let invalid_target = match self.members.get(&target) {
-            Some(trusted) if same_transport_identity(trusted, node) => None,
+        let configured = self.members.get(&target);
+        let matches_configured =
+            configured.is_some_and(|trusted| same_transport_trust_entry(trusted, node));
+        let matches_exact_prior = self
+            .prior_members
+            .get(&target)
+            .is_some_and(|prior| same_transport_trust_entry(prior, node));
+        let invalid_target = match configured {
+            Some(_) if matches_configured || matches_exact_prior => None,
             Some(_) => Some("OpenRaft membership differs from trusted peer configuration".into()),
             None => Some("OpenRaft target is absent from trusted peer configuration".into()),
         };
         ClusterNetwork {
             source: self.source,
             target,
-            target_node: node.clone(),
+            target_node: configured.cloned().unwrap_or_else(|| node.clone()),
             cluster_name: self.cluster_name.clone(),
             client_config: self.client_config.clone(),
             handshake_timeout: self.handshake_timeout,
@@ -963,7 +1431,17 @@ fn same_transport_identity(left: &ClusterRaftNode, right: &ClusterRaftNode) -> b
         && left.server_name == right.server_name
         && left.tls_certificate_sha256 == right.tls_certificate_sha256
         && left.tls_client_certificate_sha256 == right.tls_client_certificate_sha256
+        && left.tls_certificate_sha256_overlap == right.tls_certificate_sha256_overlap
+        && left.tls_client_certificate_sha256_overlap == right.tls_client_certificate_sha256_overlap
         && left.identity_public_key == right.identity_public_key
+}
+
+fn same_transport_trust_entry(left: &ClusterRaftNode, right: &ClusterRaftNode) -> bool {
+    same_transport_identity(left, right)
+        && left.transport_catalog_sha256 == right.transport_catalog_sha256
+        && left.transport_trust_generation == right.transport_trust_generation
+        && left.transport_peer_ca_sha256 == right.transport_peer_ca_sha256
+        && left.transport_trust_overlap_not_after == right.transport_trust_overlap_not_after
 }
 
 impl ClusterNetwork {
@@ -1012,7 +1490,7 @@ impl ClusterNetwork {
                 RpcCallError::Unreachable("TLS peer did not present a certificate".into())
             })?;
         let actual_fingerprint = certificate_fingerprint(peer_certificate.as_ref());
-        if actual_fingerprint != self.target_node.tls_certificate_sha256 {
+        if !accepts_server_certificate(&self.target_node, &actual_fingerprint, chrono::Utc::now()) {
             return Err(RpcCallError::Unreachable(
                 "TLS server leaf does not match trusted Raft membership".into(),
             ));
@@ -1379,14 +1857,18 @@ fn rpc_call_error_message(error: &RpcCallError) -> &str {
 pub struct ClusterRaftRuntime {
     node_id: ClusterRaftNodeId,
     local_addr: SocketAddr,
-    /// Statically trusted transport catalog. It may include non-voter
+    /// Generation-fenced transport catalog. It may include non-voter
     /// learners, but every durable OpenRaft node must match one entry.
     members: BTreeMap<ClusterRaftNodeId, ClusterRaftNode>,
     transport_catalog_sha256: String,
+    transport_trust_generation: u64,
+    transport_trust_overlap_not_after: Option<chrono::DateTime<chrono::Utc>>,
     voter_ids: BTreeSet<ClusterRaftNodeId>,
     voter_set_generation: u64,
     voter_set_sha256: String,
     authority_genesis: AuthorityGenesis,
+    configured_authority: AuthorityGenesis,
+    transport_authority: AuthorityGenesis,
     context: Arc<SqliteContextManager>,
     authority_network: ClusterNetworkFactory,
     authority_forward_timeout: Duration,
@@ -1403,10 +1885,20 @@ impl fmt::Debug for ClusterRaftRuntime {
             .field("local_addr", &self.local_addr)
             .field("members", &self.members)
             .field("transport_catalog_sha256", &self.transport_catalog_sha256)
+            .field(
+                "transport_trust_generation",
+                &self.transport_trust_generation,
+            )
+            .field(
+                "transport_trust_overlap_not_after",
+                &self.transport_trust_overlap_not_after,
+            )
             .field("voter_ids", &self.voter_ids)
             .field("voter_set_generation", &self.voter_set_generation)
             .field("voter_set_sha256", &self.voter_set_sha256)
             .field("authority_genesis", &self.authority_genesis)
+            .field("configured_authority", &self.configured_authority)
+            .field("transport_authority", &self.transport_authority)
             .finish_non_exhaustive()
     }
 }
@@ -1430,10 +1922,15 @@ impl ClusterRaftRuntime {
         config.validate()?;
         let local_addr = listener.local_addr()?;
         let members = Arc::new(config.members.clone());
+        let prior_members = Arc::new(validated_durable_transport_catalog(
+            &context,
+            &config.members,
+        )?);
         let network = ClusterNetworkFactory {
             source: config.node_id,
             cluster_name: Arc::from(config.raft.cluster_name.as_str()),
             members: members.clone(),
+            prior_members,
             client_config: config.tls.client_config.clone(),
             handshake_timeout: config.transport.handshake_timeout,
             max_frame_bytes: config.transport.max_frame_bytes,
@@ -1484,6 +1981,7 @@ impl ClusterRaftRuntime {
             &initial_metrics,
             &config.members,
             &config.transport_catalog_sha256,
+            config.transport_trust_generation,
             &config.voter_ids,
             config.voter_set_generation,
             &config.voter_set_sha256,
@@ -1509,10 +2007,14 @@ impl ClusterRaftRuntime {
             local_addr,
             members: config.members,
             transport_catalog_sha256: config.transport_catalog_sha256,
+            transport_trust_generation: config.transport_trust_generation,
+            transport_trust_overlap_not_after: config.transport_trust_overlap_not_after,
             voter_ids: config.voter_ids,
             voter_set_generation: config.voter_set_generation,
             voter_set_sha256: config.voter_set_sha256,
             authority_genesis: config.authority_genesis,
+            configured_authority: config.configured_authority,
+            transport_authority: config.transport_authority,
             context,
             authority_network,
             authority_forward_timeout,
@@ -1540,9 +2042,19 @@ impl ClusterRaftRuntime {
         self.voter_set_generation
     }
 
-    /// Digest pinning the complete static Raft transport-trust catalog.
+    /// Digest pinning the complete generation-fenced transport-trust catalog.
     pub fn transport_catalog_sha256(&self) -> &str {
         &self.transport_catalog_sha256
+    }
+
+    /// Durable generation of the peer catalog and accepted transport trust.
+    pub fn transport_trust_generation(&self) -> u64 {
+        self.transport_trust_generation
+    }
+
+    /// Absolute expiration of any current overlap credentials.
+    pub fn transport_trust_overlap_not_after(&self) -> Option<chrono::DateTime<chrono::Utc>> {
+        self.transport_trust_overlap_not_after
     }
 
     pub fn metrics(&self) -> watch::Receiver<RaftMetrics<ClusterRaftNodeId, ClusterRaftNode>> {
@@ -1556,6 +2068,14 @@ impl ClusterRaftRuntime {
             network: self.authority_network.clone(),
             forward_timeout: self.authority_forward_timeout,
         }
+    }
+
+    fn preflight_local_authority_configuration(&self) -> io::Result<()> {
+        if let Some(view) = read_replicated_authority_view(&self.context)? {
+            validate_initialized_authority(&view, &self.authority_genesis)?;
+            validate_configured_authority_members(&view, &self.configured_authority)?;
+        }
+        Ok(())
     }
 
     /// Explicitly initialize the cluster with the configured voter subset.
@@ -1604,6 +2124,7 @@ impl ClusterRaftRuntime {
                 &metrics.borrow(),
                 &self.members,
                 &self.transport_catalog_sha256,
+                self.transport_trust_generation,
                 &self.voter_ids,
                 self.voter_set_generation,
                 &self.voter_set_sha256,
@@ -1612,30 +2133,37 @@ impl ClusterRaftRuntime {
                 DurableMembershipProgress::Settled => return Ok(()),
                 DurableMembershipProgress::Pristine => {
                     if !bootstrap {
-                        return Err(invalid_input(
-                            "Raft storage is pristine; set cluster_raft.bootstrap = true for the initial start",
-                        ));
-                    }
-                    if self.voter_set_generation != 0 {
-                        return Err(invalid_input(
-                            "a pristine Raft cluster must bootstrap voter_set_generation 0",
-                        ));
-                    }
-                    if !bootstrap_attempted {
-                        bootstrap_attempted = true;
-                        match tokio::time::timeout(
-                            deadline.saturating_duration_since(Instant::now()),
-                            self.initialize(),
-                        )
-                        .await
-                        {
-                            Ok(Ok(())) => {}
-                            Ok(Err(error)) => {
-                                last_failure = Some(format!(
-                                    "Raft bootstrap failed and no configured membership appeared: {error}"
-                                ));
+                        if self.voter_ids.contains(&self.node_id) {
+                            return Err(invalid_input(
+                                "Raft voter storage is pristine; set cluster_raft.bootstrap = true only for the initial generation-zero cluster start",
+                            ));
+                        }
+                        // A newly trusted non-voter waits for the existing
+                        // leader to commit the target catalog and replicate it
+                        // as a learner. It must never initialize a second
+                        // cluster from its empty local store.
+                    } else {
+                        if self.voter_set_generation != 0 || self.transport_trust_generation != 0 {
+                            return Err(invalid_input(
+                                "a pristine Raft cluster must bootstrap voter and transport-trust generation 0",
+                            ));
+                        }
+                        if !bootstrap_attempted {
+                            bootstrap_attempted = true;
+                            match tokio::time::timeout(
+                                deadline.saturating_duration_since(Instant::now()),
+                                self.initialize(),
+                            )
+                            .await
+                            {
+                                Ok(Ok(())) => {}
+                                Ok(Err(error)) => {
+                                    last_failure = Some(format!(
+                                        "Raft bootstrap failed and no configured membership appeared: {error}"
+                                    ));
+                                }
+                                Err(_) => last_failure = Some("Raft bootstrap timed out".into()),
                             }
-                            Err(_) => last_failure = Some("Raft bootstrap timed out".into()),
                         }
                     }
                 }
@@ -1657,6 +2185,29 @@ impl ClusterRaftRuntime {
                         Err(_) => {
                             last_failure =
                                 Some("commit trusted transport catalog timed out".into());
+                        }
+                    }
+                }
+                DurableMembershipProgress::NeedsTransportTrust
+                    if metrics.borrow().current_leader == Some(self.node_id) =>
+                {
+                    match tokio::time::timeout(
+                        deadline.saturating_duration_since(Instant::now()),
+                        self.raft.change_membership(
+                            ChangeMembers::ReplaceAllNodes(self.members.clone()),
+                            false,
+                        ),
+                    )
+                    .await
+                    {
+                        Ok(Ok(_)) => {}
+                        Ok(Err(error)) => {
+                            last_failure =
+                                Some(format!("commit Raft transport-trust epoch: {error}"));
+                        }
+                        Err(_) => {
+                            last_failure =
+                                Some("commit Raft transport-trust epoch timed out".into());
                         }
                     }
                 }
@@ -1752,6 +2303,7 @@ impl ClusterRaftRuntime {
                     }
                 }
                 DurableMembershipProgress::NeedsCatalog
+                | DurableMembershipProgress::NeedsTransportTrust
                 | DurableMembershipProgress::NeedsIntent
                 | DurableMembershipProgress::IntentCommitted
                 | DurableMembershipProgress::Joint => {}
@@ -1786,6 +2338,7 @@ impl ClusterRaftRuntime {
                 match self.authority_handle().linearizable_view().await {
                     Ok(view) => {
                         validate_initialized_authority(&view, &self.authority_genesis)?;
+                        validate_configured_authority_members(&view, &self.configured_authority)?;
                         return Ok(());
                     }
                     Err(_) if Instant::now() < deadline => {
@@ -1809,6 +2362,13 @@ impl ClusterRaftRuntime {
                 ));
             }
             if !submitted && self.metrics().borrow().current_leader == Some(self.node_id) {
+                if self.authority_genesis != self.configured_authority
+                    || self.authority_genesis != self.transport_authority
+                {
+                    return Err(invalid_input(
+                        "a pristine application authority requires transport, complete authority, and immutable genesis members to match exactly",
+                    ));
+                }
                 submitted = true;
                 let response = self
                     .commit(AuthorityCommand::Initialize {
@@ -1878,6 +2438,7 @@ impl ClusterRaftRuntime {
 enum DurableMembershipProgress {
     Pristine,
     NeedsCatalog,
+    NeedsTransportTrust,
     Settled,
     NeedsIntent,
     IntentCommitted,
@@ -1888,6 +2449,7 @@ fn inspect_durable_membership(
     metrics: &RaftMetrics<ClusterRaftNodeId, ClusterRaftNode>,
     trusted: &BTreeMap<ClusterRaftNodeId, ClusterRaftNode>,
     desired_transport_catalog_sha256: &str,
+    desired_transport_trust_generation: u64,
     desired_voters: &BTreeSet<ClusterRaftNodeId>,
     desired_generation: u64,
     desired_sha256: &str,
@@ -1918,26 +2480,12 @@ fn inspect_durable_membership(
             "durable Raft membership has a log id but no nodes or voters",
         ));
     }
-    for (node_id, node) in &nodes {
-        let expected = trusted.get(node_id).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("durable Raft node {node_id} is absent from the trusted catalog"),
-            )
-        })?;
-        if !same_transport_identity(expected, node) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("durable Raft node {node_id} differs from its trusted transport identity"),
-            ));
-        }
-    }
-    let nodes_match_trusted = nodes.len() == trusted.len()
-        && nodes.iter().all(|(node_id, node)| {
-            trusted
-                .get(node_id)
-                .is_some_and(|expected| same_transport_identity(expected, node))
-        });
+    let nodes_are_trusted_subset = nodes.iter().all(|(node_id, node)| {
+        trusted
+            .get(node_id)
+            .is_some_and(|expected| same_transport_trust_entry(expected, node))
+    });
+    let nodes_match_trusted = nodes.len() == trusted.len() && nodes_are_trusted_subset;
     let mut catalog_digests = nodes
         .values()
         .map(|node| node.transport_catalog_sha256.as_str())
@@ -1951,8 +2499,34 @@ fn inspect_durable_membership(
     let stored_transport_catalog_sha256 = catalog_digests
         .pop_first()
         .expect("non-empty durable node map");
+    let mut trust_metadata = nodes
+        .values()
+        .map(|node| {
+            (
+                node.transport_trust_generation,
+                node.transport_peer_ca_sha256.clone(),
+                node.transport_trust_overlap_not_after,
+            )
+        })
+        .collect::<BTreeSet<_>>();
+    if trust_metadata.len() != 1 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "durable Raft nodes disagree on transport-trust generation, CA roots, or overlap expiration",
+        ));
+    }
+    let (stored_transport_trust_generation, _, _) = trust_metadata
+        .pop_first()
+        .expect("non-empty durable node map");
     if stored_transport_catalog_sha256.is_empty() {
-        if !nodes_match_trusted {
+        let legacy_matches_trusted = desired_transport_trust_generation == 0
+            && nodes.len() == trusted.len()
+            && nodes.iter().all(|(node_id, node)| {
+                trusted
+                    .get(node_id)
+                    .is_some_and(|expected| same_transport_identity(expected, node))
+            });
+        if !legacy_matches_trusted {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "legacy durable Raft node map does not exactly match the trusted transport catalog",
@@ -1969,10 +2543,16 @@ fn inspect_durable_membership(
                 "durable transport-catalog digest is not lowercase SHA-256",
             ));
         }
-        if stored_transport_catalog_sha256 != desired_transport_catalog_sha256 {
+        let generation_zero_catalog_intent = stored_transport_trust_generation == 0
+            && desired_transport_trust_generation == 0
+            && stored_transport_catalog_sha256 == desired_transport_catalog_sha256
+            && nodes_are_trusted_subset;
+        if configured_transport_catalog_sha256(&nodes) != stored_transport_catalog_sha256
+            && !generation_zero_catalog_intent
+        {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "configured Raft transport catalog differs from its durable digest",
+                "durable Raft transport catalog digest does not authenticate its complete node map",
             ));
         }
     }
@@ -2014,7 +2594,9 @@ fn inspect_durable_membership(
         ));
     }
     if configs.len() == 2 {
-        if !nodes_match_trusted
+        if stored_transport_trust_generation != desired_transport_trust_generation
+            || stored_transport_catalog_sha256 != desired_transport_catalog_sha256
+            || !nodes_match_trusted
             || stored_generation != desired_generation
             || stored_sha256 != desired_sha256
             || configs.last() != Some(desired_voters)
@@ -2025,6 +2607,117 @@ fn inspect_durable_membership(
             ));
         }
         return Ok(DurableMembershipProgress::Joint);
+    }
+
+    if stored_transport_catalog_sha256.is_empty() {
+        if desired_transport_trust_generation != 0
+            || desired_generation != stored_generation
+            || desired_sha256 != stored_sha256
+            || desired_voters != &voters
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "legacy Raft transport catalog must persist its generation-zero digest before any voter or trust change",
+            ));
+        }
+        return Ok(DurableMembershipProgress::NeedsCatalog);
+    }
+
+    if stored_transport_trust_generation != desired_transport_trust_generation {
+        if desired_transport_trust_generation
+            != stored_transport_trust_generation
+                .checked_add(1)
+                .ok_or_else(|| invalid_input("durable transport-trust generation overflow"))?
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "configured transport-trust generation is stale or skips a durable generation",
+            ));
+        }
+        if desired_generation != stored_generation
+            || desired_sha256 != stored_sha256
+            || desired_voters != &voters
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "transport trust and voter membership cannot change in the same generation",
+            ));
+        }
+        if stored_sha256 != configured_voter_set_sha256(stored_generation, &voters) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "transport trust cannot change while the durable voter intent is unsettled",
+            ));
+        }
+        if voters
+            .iter()
+            .any(|voter_id| !trusted.contains_key(voter_id))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "transport trust cannot remove a current voter; remove it from voting first",
+            ));
+        }
+        for (node_id, prior) in &nodes {
+            let Some(target) = trusted.get(node_id) else {
+                continue;
+            };
+            if prior.identity_public_key != target.identity_public_key {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "transport trust cannot replace retained node {node_id} application identity"
+                    ),
+                ));
+            }
+            let server_leaf_continuity = std::iter::once(&prior.tls_certificate_sha256)
+                .chain(prior.tls_certificate_sha256_overlap.iter())
+                .any(|fingerprint| {
+                    fingerprint == &target.tls_certificate_sha256
+                        || target
+                            .tls_certificate_sha256_overlap
+                            .iter()
+                            .any(|candidate| candidate == fingerprint)
+                });
+            let client_leaf_continuity = std::iter::once(&prior.tls_client_certificate_sha256)
+                .chain(prior.tls_client_certificate_sha256_overlap.iter())
+                .any(|fingerprint| {
+                    fingerprint == &target.tls_client_certificate_sha256
+                        || target
+                            .tls_client_certificate_sha256_overlap
+                            .iter()
+                            .any(|candidate| candidate == fingerprint)
+                });
+            if !server_leaf_continuity || !client_leaf_continuity {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "transport trust must retain server and client leaf continuity for node {node_id}"
+                    ),
+                ));
+            }
+            if stored_transport_trust_generation > 0
+                && !prior.transport_peer_ca_sha256.iter().any(|fingerprint| {
+                    target
+                        .transport_peer_ca_sha256
+                        .iter()
+                        .any(|candidate| candidate == fingerprint)
+                })
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("transport trust must retain at least one CA root for node {node_id}"),
+                ));
+            }
+        }
+        return Ok(DurableMembershipProgress::NeedsTransportTrust);
+    }
+
+    if stored_transport_catalog_sha256 != desired_transport_catalog_sha256 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "configured Raft transport catalog reuses a durable trust generation with a different target",
+        ));
     }
 
     if stored_generation == desired_generation {
@@ -2038,9 +2731,7 @@ fn inspect_durable_membership(
             if nodes_match_trusted {
                 return Ok(DurableMembershipProgress::Settled);
             }
-            if stored_generation == 0
-                && stored_transport_catalog_sha256 == desired_transport_catalog_sha256
-            {
+            if stored_transport_trust_generation == 0 && nodes_are_trusted_subset {
                 return Ok(DurableMembershipProgress::NeedsCatalog);
             }
             return Err(io::Error::new(
@@ -2102,6 +2793,18 @@ pub async fn start_configured_cluster_runtime(
         return Ok(None);
     };
     let runtime = ClusterRaftRuntime::start(context, runtime_config).await?;
+    if let Err(error) = runtime.preflight_local_authority_configuration() {
+        let shutdown_error = runtime.shutdown().await.err();
+        return Err(match shutdown_error {
+            Some(shutdown_error) => io::Error::new(
+                error.kind(),
+                format!(
+                    "{error}; Raft shutdown after authority preflight failure also failed: {shutdown_error}"
+                ),
+            ),
+            None => error,
+        });
+    }
     if let Err(error) = runtime.ensure_configured_membership(config.bootstrap).await {
         let shutdown_error = runtime.shutdown().await.err();
         return Err(match shutdown_error {
@@ -2254,7 +2957,7 @@ async fn handle_connection(
             "Raft source is absent from trusted membership",
         )
     })?;
-    if source.tls_client_certificate_sha256 != peer_fingerprint {
+    if !accepts_client_certificate(source, &peer_fingerprint, chrono::Utc::now()) {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             "Raft client leaf does not match trusted membership",
@@ -2546,6 +3249,51 @@ mod tests {
         );
         validate_initialized_authority(&view, &candidate_config)
             .expect("activated replacement remains current after retirement");
+
+        let added_identity = AuthorityGenesisMember {
+            node_id: Uuid::new_v4().to_string(),
+            fingerprint: "e".repeat(64),
+            public_key: "f".repeat(64),
+            tls_server_certificate_fingerprint: None,
+            endpoint: "127.0.0.1:7778".into(),
+            server_version: "0.3.0".into(),
+            min_protocol_version: 1,
+            protocol_version: 2,
+        };
+        view.membership.members.push(ClusterMember {
+            node_id: added_identity.node_id.clone(),
+            fingerprint: added_identity.fingerprint.clone(),
+            public_key: added_identity.public_key.clone(),
+            tls_server_certificate_fingerprint: None,
+            endpoint: added_identity.endpoint.clone(),
+            server_version: added_identity.server_version.clone(),
+            min_protocol_version: added_identity.min_protocol_version,
+            protocol_version: added_identity.protocol_version,
+            state: ClusterMemberState::Active,
+            generation: 1,
+            joined_at: now,
+            updated_at: now,
+            reason: "challenged addition".into(),
+        });
+        let mut complete_authority = candidate_config.clone();
+        complete_authority.members.push(added_identity);
+        complete_authority
+            .members
+            .sort_by(|left, right| left.node_id.cmp(&right.node_id));
+        validate_initialized_authority(&view, &candidate_config)
+            .expect("immutable genesis remains exact after a challenged addition");
+        validate_configured_authority_members(&view, &complete_authority)
+            .expect("complete configured authority accepts every durable identity");
+        assert!(
+            validate_configured_authority_members(&view, &candidate_config).is_err(),
+            "a transport subset cannot masquerade as the complete authority membership"
+        );
+        let mut forged_authority = complete_authority;
+        forged_authority.members[0].public_key = "0".repeat(64);
+        assert!(
+            validate_configured_authority_members(&view, &forged_authority).is_err(),
+            "every configured identity must match its challenged durable public key"
+        );
     }
 
     fn test_peer(ca: &CertifiedIssuer<'_, KeyPair>, node_id: ClusterRaftNodeId) -> TestPeer {
@@ -2586,6 +3334,26 @@ mod tests {
             server_private_key_pem,
             client_certificate_pem,
             client_private_key_pem,
+        }
+    }
+
+    fn peer_with_ca_bundle(peer: &TestPeer, peer_ca_pem: &str) -> TestPeer {
+        let tls = ClusterRaftTls::from_pem(
+            peer.server_certificate_pem.as_bytes(),
+            peer.server_private_key_pem.as_bytes(),
+            peer.client_certificate_pem.as_bytes(),
+            peer.client_private_key_pem.as_bytes(),
+            peer_ca_pem.as_bytes(),
+        )
+        .expect("peer TLS with overlap CA bundle");
+        TestPeer {
+            node_id: peer.node_id,
+            server_name: peer.server_name.clone(),
+            tls,
+            server_certificate_pem: peer.server_certificate_pem.clone(),
+            server_private_key_pem: peer.server_private_key_pem.clone(),
+            client_certificate_pem: peer.client_certificate_pem.clone(),
+            client_private_key_pem: peer.client_private_key_pem.clone(),
         }
     }
 
@@ -2634,7 +3402,9 @@ mod tests {
                 endpoint: listen_addr.to_string(),
                 server_name: peer.server_name.clone(),
                 tls_certificate_sha256: peer.tls.server_certificate_sha256().into(),
+                tls_certificate_sha256_overlap: Vec::new(),
                 tls_client_certificate_sha256: peer.tls.client_certificate_sha256().into(),
+                tls_client_certificate_sha256_overlap: Vec::new(),
                 identity_public_key: format!("{:064x}", peer.node_id),
             }],
             server_certificate_path: Some(server_certificate_path),
@@ -2694,8 +3464,13 @@ mod tests {
                             .tls
                             .client_certificate_sha256()
                             .to_string(),
+                        tls_certificate_sha256_overlap: Vec::new(),
+                        tls_client_certificate_sha256_overlap: Vec::new(),
                         identity_public_key: format!("{:064x}", peer.node_id),
                         transport_catalog_sha256: String::new(),
+                        transport_trust_generation: 0,
+                        transport_peer_ca_sha256: Vec::new(),
+                        transport_trust_overlap_not_after: None,
                         voter_set_generation: 0,
                         voter_set_sha256: String::new(),
                     },
@@ -2743,9 +3518,13 @@ mod tests {
             listen_addr: listener.local_addr().expect("listener address"),
             members: members.clone(),
             transport_catalog_sha256: configured_transport_catalog_sha256(members),
+            transport_trust_generation: 0,
+            transport_trust_overlap_not_after: None,
             voter_ids: members.keys().copied().collect(),
             voter_set_generation: 0,
             voter_set_sha256: String::new(),
+            configured_authority: authority_genesis.clone(),
+            transport_authority: authority_genesis.clone(),
             authority_genesis,
             tls: peer.tls.clone(),
             raft: OpenRaftConfig {
@@ -2780,6 +3559,27 @@ mod tests {
         }
     }
 
+    fn set_transport_trust_plan(
+        config: &mut ClusterRaftRuntimeConfig,
+        generation: u64,
+        peer_ca_sha256: Vec<String>,
+        overlap_not_after: Option<chrono::DateTime<chrono::Utc>>,
+    ) {
+        config.transport_trust_generation = generation;
+        config.transport_trust_overlap_not_after = overlap_not_after;
+        for member in config.members.values_mut() {
+            member.transport_trust_generation = generation;
+            member.transport_peer_ca_sha256 = peer_ca_sha256.clone();
+            member.transport_trust_overlap_not_after = overlap_not_after;
+            member.transport_catalog_sha256.clear();
+        }
+        let digest = configured_transport_catalog_sha256(&config.members);
+        config.transport_catalog_sha256.clone_from(&digest);
+        for member in config.members.values_mut() {
+            member.transport_catalog_sha256.clone_from(&digest);
+        }
+    }
+
     fn synthetic_members(
         voter_set_generation: u64,
         voter_ids: &BTreeSet<ClusterRaftNodeId>,
@@ -2794,8 +3594,13 @@ mod tests {
                         server_name: format!("node-{node_id}.agentos.test"),
                         tls_certificate_sha256: format!("{:064x}", node_id),
                         tls_client_certificate_sha256: format!("{:064x}", node_id + 10),
+                        tls_certificate_sha256_overlap: Vec::new(),
+                        tls_client_certificate_sha256_overlap: Vec::new(),
                         identity_public_key: format!("{:064x}", node_id + 20),
                         transport_catalog_sha256: String::new(),
+                        transport_trust_generation: 0,
+                        transport_peer_ca_sha256: Vec::new(),
+                        transport_trust_overlap_not_after: None,
                         voter_set_generation,
                         voter_set_sha256: voter_set_sha256.clone(),
                     },
@@ -2838,6 +3643,7 @@ mod tests {
                 &joint,
                 &trusted,
                 &transport_catalog_sha256,
+                0,
                 &desired,
                 1,
                 &desired_sha256,
@@ -2851,6 +3657,7 @@ mod tests {
             &joint,
             &trusted,
             &transport_catalog_sha256,
+            0,
             &conflicting,
             1,
             &configured_voter_set_sha256(1, &conflicting),
@@ -2865,12 +3672,205 @@ mod tests {
             &uniform,
             &generation_zero,
             &generation_zero_catalog,
+            0,
             &desired,
             2,
             &configured_voter_set_sha256(2, &desired),
         )
         .expect_err("skipped generation must fail closed");
         assert!(skipped.to_string().contains("skips"), "{skipped}");
+    }
+
+    #[test]
+    fn transport_trust_epoch_is_exact_separate_and_voter_safe() {
+        let voters = BTreeSet::from([1, 2]);
+        let current = synthetic_members(0, &voters);
+        let current_catalog = configured_transport_catalog_sha256(&current);
+        let uniform = membership_metrics(vec![voters.clone()], current.clone());
+
+        let mut target = current.clone();
+        let overlap_not_after = chrono::Utc::now() + chrono::Duration::hours(1);
+        for member in target.values_mut() {
+            let old_server = member.tls_certificate_sha256.clone();
+            let old_client = member.tls_client_certificate_sha256.clone();
+            member.tls_certificate_sha256 = crate::cluster_control::sha256_hex(
+                format!("next-server-{}", member.endpoint).as_bytes(),
+            );
+            member.tls_client_certificate_sha256 = crate::cluster_control::sha256_hex(
+                format!("next-client-{}", member.endpoint).as_bytes(),
+            );
+            member.tls_certificate_sha256_overlap = vec![old_server];
+            member.tls_client_certificate_sha256_overlap = vec![old_client];
+            member.transport_trust_generation = 1;
+            member.transport_peer_ca_sha256 = vec!["f".repeat(64)];
+            member.transport_trust_overlap_not_after = Some(overlap_not_after);
+            member.transport_catalog_sha256.clear();
+        }
+        let target_catalog = configured_transport_catalog_sha256(&target);
+        for member in target.values_mut() {
+            member.transport_catalog_sha256.clone_from(&target_catalog);
+        }
+
+        assert_eq!(
+            inspect_durable_membership(&uniform, &target, &target_catalog, 1, &voters, 0, "",)
+                .expect("exact next transport trust generation"),
+            DurableMembershipProgress::NeedsTransportTrust
+        );
+
+        let mut disconnected_leaf = target.clone();
+        disconnected_leaf
+            .get_mut(&1)
+            .expect("node 1")
+            .tls_certificate_sha256_overlap
+            .clear();
+        let disconnected_leaf_catalog = configured_transport_catalog_sha256(&disconnected_leaf);
+        for member in disconnected_leaf.values_mut() {
+            member
+                .transport_catalog_sha256
+                .clone_from(&disconnected_leaf_catalog);
+        }
+        let disconnected = inspect_durable_membership(
+            &uniform,
+            &disconnected_leaf,
+            &disconnected_leaf_catalog,
+            1,
+            &voters,
+            0,
+            "",
+        )
+        .expect_err("retained peer leaf continuity is mandatory");
+        assert!(disconnected.to_string().contains("leaf continuity"));
+
+        let mut replaced_identity = target.clone();
+        replaced_identity
+            .get_mut(&1)
+            .expect("node 1")
+            .identity_public_key = "0".repeat(64);
+        let replaced_identity_catalog = configured_transport_catalog_sha256(&replaced_identity);
+        for member in replaced_identity.values_mut() {
+            member
+                .transport_catalog_sha256
+                .clone_from(&replaced_identity_catalog);
+        }
+        let replaced = inspect_durable_membership(
+            &uniform,
+            &replaced_identity,
+            &replaced_identity_catalog,
+            1,
+            &voters,
+            0,
+            "",
+        )
+        .expect_err("transport trust cannot replace an application identity");
+        assert!(replaced.to_string().contains("application identity"));
+
+        let settled = membership_metrics(vec![voters.clone()], target.clone());
+        assert_eq!(
+            inspect_durable_membership(&settled, &target, &target_catalog, 1, &voters, 0, "",)
+                .expect("settled transport trust generation"),
+            DurableMembershipProgress::Settled
+        );
+
+        let mut disconnected_ca = target.clone();
+        for member in disconnected_ca.values_mut() {
+            member.transport_trust_generation = 2;
+            member.transport_peer_ca_sha256 = vec!["e".repeat(64)];
+            member.tls_certificate_sha256_overlap.clear();
+            member.tls_client_certificate_sha256_overlap.clear();
+            member.transport_trust_overlap_not_after = None;
+            member.transport_catalog_sha256.clear();
+        }
+        let disconnected_ca_catalog = configured_transport_catalog_sha256(&disconnected_ca);
+        for member in disconnected_ca.values_mut() {
+            member
+                .transport_catalog_sha256
+                .clone_from(&disconnected_ca_catalog);
+        }
+        let disconnected = inspect_durable_membership(
+            &settled,
+            &disconnected_ca,
+            &disconnected_ca_catalog,
+            2,
+            &voters,
+            0,
+            "",
+        )
+        .expect_err("retained peers require a CA continuity bridge");
+        assert!(disconnected.to_string().contains("CA root"));
+
+        let skipped =
+            inspect_durable_membership(&uniform, &target, &target_catalog, 2, &voters, 0, "")
+                .expect_err("skipped trust generation must fail closed");
+        assert!(skipped.to_string().contains("skips"), "{skipped}");
+
+        let changed_voters = BTreeSet::from([1]);
+        let mixed = inspect_durable_membership(
+            &uniform,
+            &target,
+            &target_catalog,
+            1,
+            &changed_voters,
+            1,
+            &configured_voter_set_sha256(1, &changed_voters),
+        )
+        .expect_err("trust and voter changes must be separate");
+        assert!(mixed.to_string().contains("cannot change"), "{mixed}");
+
+        let mut removes_voter = target.clone();
+        removes_voter.remove(&2);
+        let removes_voter_catalog = configured_transport_catalog_sha256(&removes_voter);
+        for member in removes_voter.values_mut() {
+            member
+                .transport_catalog_sha256
+                .clone_from(&removes_voter_catalog);
+        }
+        let removal = inspect_durable_membership(
+            &uniform,
+            &removes_voter,
+            &removes_voter_catalog,
+            1,
+            &voters,
+            0,
+            "",
+        )
+        .expect_err("trust generation must not remove a voter");
+        assert!(removal.to_string().contains("current voter"), "{removal}");
+
+        let bounded = target.get(&1).expect("overlap member");
+        let old_server = bounded
+            .tls_certificate_sha256_overlap
+            .first()
+            .expect("old server leaf");
+        let old_client = bounded
+            .tls_client_certificate_sha256_overlap
+            .first()
+            .expect("old client leaf");
+        assert!(accepts_server_certificate(
+            bounded,
+            old_server,
+            overlap_not_after - chrono::Duration::milliseconds(1),
+        ));
+        assert!(accepts_client_certificate(
+            bounded,
+            old_client,
+            overlap_not_after - chrono::Duration::milliseconds(1),
+        ));
+        assert!(!accepts_server_certificate(
+            bounded,
+            old_server,
+            overlap_not_after,
+        ));
+        assert!(!accepts_client_certificate(
+            bounded,
+            old_client,
+            overlap_not_after,
+        ));
+        assert!(accepts_server_certificate(
+            bounded,
+            &bounded.tls_certificate_sha256,
+            overlap_not_after + chrono::Duration::days(1),
+        ));
+        assert_ne!(current_catalog, target_catalog);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2961,6 +3961,410 @@ mod tests {
             conflicting.to_string().contains("generation-zero"),
             "{conflicting}"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn transport_trust_epochs_rotate_ca_and_leaves_then_revoke_old_credentials() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let old_ca = test_ca();
+        let next_ca = test_ca();
+        let old_peers = (1..=3)
+            .map(|node_id| test_peer(&old_ca, node_id))
+            .collect::<Vec<_>>();
+        let next_peers = (1..=3)
+            .map(|node_id| test_peer(&next_ca, node_id))
+            .collect::<Vec<_>>();
+        let initial_listeners = listeners(3).await;
+        let initial_members = member_map(&old_peers, &initial_listeners);
+        let initial_configs = old_peers
+            .iter()
+            .zip(&initial_listeners)
+            .map(|(peer, listener)| {
+                runtime_config(
+                    peer,
+                    listener,
+                    &initial_members,
+                    "transport-trust-epoch-test",
+                )
+            })
+            .collect::<Vec<_>>();
+        let tempdir = TempDir::new().expect("tempdir");
+        let contexts = (1..=3)
+            .map(|node_id| context(&tempdir, node_id))
+            .collect::<Vec<_>>();
+
+        let mut initial = Vec::new();
+        for ((config, listener), context) in initial_configs
+            .iter()
+            .cloned()
+            .zip(initial_listeners)
+            .zip(&contexts)
+        {
+            initial.push(Some(
+                ClusterRaftRuntime::start_on_listener(context.clone(), config, listener)
+                    .await
+                    .expect("start initial transport generation"),
+            ));
+        }
+        let (first, second, third) = tokio::join!(
+            initial[0].as_ref().expect("node 1").initialize(),
+            initial[1].as_ref().expect("node 2").initialize(),
+            initial[2].as_ref().expect("node 3").initialize(),
+        );
+        first.expect("initialize node 1");
+        second.expect("initialize node 2");
+        third.expect("initialize node 3");
+        wait_for_leader(&initial, None).await;
+        for runtime in initial.into_iter().flatten() {
+            runtime
+                .shutdown()
+                .await
+                .expect("shutdown initial transport generation");
+        }
+
+        let overlap_ca_pem = format!("{}{}", old_ca.pem(), next_ca.pem());
+        let old_overlap_peers = old_peers
+            .iter()
+            .map(|peer| peer_with_ca_bundle(peer, &overlap_ca_pem))
+            .collect::<Vec<_>>();
+        let next_overlap_peers = next_peers
+            .iter()
+            .map(|peer| peer_with_ca_bundle(peer, &overlap_ca_pem))
+            .collect::<Vec<_>>();
+        let overlap_roots =
+            certificate_fingerprints_from_pem(overlap_ca_pem.as_bytes()).expect("overlap roots");
+        let overlap_not_after = chrono::Utc::now() + chrono::Duration::hours(1);
+        let mut overlap_configs = initial_configs.clone();
+        for (node_index, config) in overlap_configs.iter_mut().enumerate() {
+            config.tls = if node_index == 0 {
+                old_overlap_peers[node_index].tls.clone()
+            } else {
+                next_overlap_peers[node_index].tls.clone()
+            };
+            for (member_index, member) in config.members.values_mut().enumerate() {
+                member.tls_certificate_sha256 = next_overlap_peers[member_index]
+                    .tls
+                    .server_certificate_sha256()
+                    .into();
+                member.tls_client_certificate_sha256 = next_overlap_peers[member_index]
+                    .tls
+                    .client_certificate_sha256()
+                    .into();
+                member.tls_certificate_sha256_overlap = vec![old_overlap_peers[member_index]
+                    .tls
+                    .server_certificate_sha256()
+                    .into()];
+                member.tls_client_certificate_sha256_overlap = vec![old_overlap_peers
+                    [member_index]
+                    .tls
+                    .client_certificate_sha256()
+                    .into()];
+            }
+            set_transport_trust_plan(config, 1, overlap_roots.clone(), Some(overlap_not_after));
+        }
+
+        let mut overlap = Vec::new();
+        for (config, context) in overlap_configs.iter().cloned().zip(&contexts) {
+            let listener =
+                rebind_test_listener(config.listen_addr, "rebind trust-overlap listener").await;
+            overlap.push(Some(
+                ClusterRaftRuntime::start_on_listener(context.clone(), config, listener)
+                    .await
+                    .expect("start trust-overlap generation"),
+            ));
+        }
+        let (first, second, third) = tokio::join!(
+            overlap[0]
+                .as_ref()
+                .expect("node 1")
+                .ensure_configured_membership(false),
+            overlap[1]
+                .as_ref()
+                .expect("node 2")
+                .ensure_configured_membership(false),
+            overlap[2]
+                .as_ref()
+                .expect("node 3")
+                .ensure_configured_membership(false),
+        );
+        first.expect("settle overlap on node 1 using old credential");
+        second.expect("settle overlap on node 2 using next credential");
+        third.expect("settle overlap on node 3 using next credential");
+        wait_for_leader(&overlap, None).await;
+        for runtime in overlap.into_iter().flatten() {
+            runtime
+                .shutdown()
+                .await
+                .expect("shutdown overlap generation");
+        }
+
+        let final_root =
+            certificate_fingerprints_from_pem(next_ca.pem().as_bytes()).expect("next root");
+        let mut final_configs = overlap_configs.clone();
+        for (node_index, config) in final_configs.iter_mut().enumerate() {
+            config.tls = next_peers[node_index].tls.clone();
+            for member in config.members.values_mut() {
+                member.tls_certificate_sha256_overlap.clear();
+                member.tls_client_certificate_sha256_overlap.clear();
+            }
+            set_transport_trust_plan(config, 2, final_root.clone(), None);
+        }
+        let mut final_generation = Vec::new();
+        for (config, context) in final_configs.iter().cloned().zip(&contexts) {
+            let listener =
+                rebind_test_listener(config.listen_addr, "rebind final-trust listener").await;
+            final_generation.push(Some(
+                ClusterRaftRuntime::start_on_listener(context.clone(), config, listener)
+                    .await
+                    .expect("start final trust generation"),
+            ));
+        }
+        let (first, second, third) = tokio::join!(
+            final_generation[0]
+                .as_ref()
+                .expect("node 1")
+                .ensure_configured_membership(false),
+            final_generation[1]
+                .as_ref()
+                .expect("node 2")
+                .ensure_configured_membership(false),
+            final_generation[2]
+                .as_ref()
+                .expect("node 3")
+                .ensure_configured_membership(false),
+        );
+        first.expect("settle final trust on node 1");
+        second.expect("settle final trust on node 2");
+        third.expect("settle final trust on node 3");
+        wait_for_leader(&final_generation, None).await;
+        for runtime in final_generation.into_iter().flatten() {
+            runtime.shutdown().await.expect("shutdown final trust");
+        }
+
+        let mut revoked = final_configs[0].clone();
+        revoked.tls = old_peers[0].tls.clone();
+        let revoked_listener =
+            rebind_test_listener(revoked.listen_addr, "bind revoked-credential listener").await;
+        let revoked_error =
+            ClusterRaftRuntime::start_on_listener(contexts[0].clone(), revoked, revoked_listener)
+                .await
+                .expect_err("old leaf and CA must be rejected after final generation");
+        assert!(
+            revoked_error
+                .to_string()
+                .contains("local server certificate fingerprint"),
+            "{revoked_error}"
+        );
+
+        let stale_listener =
+            rebind_test_listener(overlap_configs[0].listen_addr, "bind stale-trust listener").await;
+        let stale_error = ClusterRaftRuntime::start_on_listener(
+            contexts[0].clone(),
+            overlap_configs[0].clone(),
+            stale_listener,
+        )
+        .await
+        .expect_err("stale transport trust generation must fail closed");
+        assert!(
+            stale_error.to_string().contains("stale") || stale_error.to_string().contains("skips"),
+            "{stale_error}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn transport_trust_epochs_add_and_remove_a_non_voter_learner() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let ca = test_ca();
+        let peers = (1..=4)
+            .map(|node_id| test_peer(&ca, node_id))
+            .collect::<Vec<_>>();
+        let initial_listeners = listeners(3).await;
+        let initial_members = member_map(&peers[..3], &initial_listeners);
+        let initial_configs = peers[..3]
+            .iter()
+            .zip(&initial_listeners)
+            .map(|(peer, listener)| {
+                runtime_config(
+                    peer,
+                    listener,
+                    &initial_members,
+                    "transport-catalog-change-test",
+                )
+            })
+            .collect::<Vec<_>>();
+        let tempdir = TempDir::new().expect("tempdir");
+        let contexts = (1..=4)
+            .map(|node_id| context(&tempdir, node_id))
+            .collect::<Vec<_>>();
+
+        let mut initial = Vec::new();
+        for ((config, listener), context) in initial_configs
+            .iter()
+            .cloned()
+            .zip(initial_listeners)
+            .zip(&contexts[..3])
+        {
+            initial.push(Some(
+                ClusterRaftRuntime::start_on_listener(context.clone(), config, listener)
+                    .await
+                    .expect("start initial catalog"),
+            ));
+        }
+        let (first, second, third) = tokio::join!(
+            initial[0].as_ref().expect("node 1").initialize(),
+            initial[1].as_ref().expect("node 2").initialize(),
+            initial[2].as_ref().expect("node 3").initialize(),
+        );
+        first.expect("initialize node 1");
+        second.expect("initialize node 2");
+        third.expect("initialize node 3");
+        wait_for_leader(&initial, None).await;
+        for runtime in initial.into_iter().flatten() {
+            runtime.shutdown().await.expect("shutdown initial catalog");
+        }
+
+        let mut addition_listeners = Vec::new();
+        for config in &initial_configs {
+            addition_listeners.push(
+                rebind_test_listener(config.listen_addr, "rebind catalog-add listener").await,
+            );
+        }
+        addition_listeners.push(
+            TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind new learner listener"),
+        );
+        let addition_members = member_map(&peers, &addition_listeners);
+        let voters = BTreeSet::from([1, 2, 3]);
+        let peer_ca_sha256 =
+            certificate_fingerprints_from_pem(ca.pem().as_bytes()).expect("peer CA root");
+        let mut addition_configs = peers
+            .iter()
+            .zip(&addition_listeners)
+            .map(|(peer, listener)| {
+                runtime_config(
+                    peer,
+                    listener,
+                    &addition_members,
+                    "transport-catalog-change-test",
+                )
+            })
+            .collect::<Vec<_>>();
+        for config in &mut addition_configs {
+            set_voter_plan(config, 0, voters.clone());
+            set_transport_trust_plan(config, 1, peer_ca_sha256.clone(), None);
+        }
+
+        let mut added = Vec::new();
+        for ((config, listener), context) in addition_configs
+            .iter()
+            .cloned()
+            .zip(addition_listeners)
+            .zip(&contexts)
+        {
+            added.push(Some(
+                ClusterRaftRuntime::start_on_listener(context.clone(), config, listener)
+                    .await
+                    .expect("start catalog-add generation"),
+            ));
+        }
+        let (first, second, third, learner) = tokio::join!(
+            added[0]
+                .as_ref()
+                .expect("node 1")
+                .ensure_configured_membership(false),
+            added[1]
+                .as_ref()
+                .expect("node 2")
+                .ensure_configured_membership(false),
+            added[2]
+                .as_ref()
+                .expect("node 3")
+                .ensure_configured_membership(false),
+            added[3]
+                .as_ref()
+                .expect("node 4")
+                .ensure_configured_membership(false),
+        );
+        first.expect("settle catalog addition on node 1");
+        second.expect("settle catalog addition on node 2");
+        third.expect("settle catalog addition on node 3");
+        learner.expect("new node catches up as a non-voter learner");
+        assert!(added[3]
+            .as_ref()
+            .expect("node 4")
+            .metrics()
+            .borrow()
+            .membership_config
+            .nodes()
+            .any(|(node_id, _)| *node_id == 4));
+        for runtime in added.into_iter().flatten() {
+            runtime.shutdown().await.expect("shutdown added catalog");
+        }
+
+        let mut removal_listeners = Vec::new();
+        for config in addition_configs.iter().take(3) {
+            removal_listeners.push(
+                rebind_test_listener(config.listen_addr, "rebind catalog-remove listener").await,
+            );
+        }
+        let removal_members = member_map(&peers[..3], &removal_listeners);
+        let mut removal_configs = peers[..3]
+            .iter()
+            .zip(&removal_listeners)
+            .map(|(peer, listener)| {
+                runtime_config(
+                    peer,
+                    listener,
+                    &removal_members,
+                    "transport-catalog-change-test",
+                )
+            })
+            .collect::<Vec<_>>();
+        for config in &mut removal_configs {
+            set_transport_trust_plan(config, 2, peer_ca_sha256.clone(), None);
+        }
+        let mut removed = Vec::new();
+        for ((config, listener), context) in removal_configs
+            .iter()
+            .cloned()
+            .zip(removal_listeners)
+            .zip(&contexts[..3])
+        {
+            removed.push(Some(
+                ClusterRaftRuntime::start_on_listener(context.clone(), config, listener)
+                    .await
+                    .expect("start catalog-remove generation"),
+            ));
+        }
+        let (first, second, third) = tokio::join!(
+            removed[0]
+                .as_ref()
+                .expect("node 1")
+                .ensure_configured_membership(false),
+            removed[1]
+                .as_ref()
+                .expect("node 2")
+                .ensure_configured_membership(false),
+            removed[2]
+                .as_ref()
+                .expect("node 3")
+                .ensure_configured_membership(false),
+        );
+        first.expect("settle catalog removal on node 1");
+        second.expect("settle catalog removal on node 2");
+        third.expect("settle catalog removal on node 3");
+        for runtime in removed.iter().flatten() {
+            assert!(!runtime
+                .metrics()
+                .borrow()
+                .membership_config
+                .nodes()
+                .any(|(node_id, _)| *node_id == 4));
+        }
+        for runtime in removed.into_iter().flatten() {
+            runtime.shutdown().await.expect("shutdown removed catalog");
+        }
     }
 
     fn context(tempdir: &TempDir, node_id: ClusterRaftNodeId) -> Arc<SqliteContextManager> {
@@ -3114,6 +4518,7 @@ mod tests {
                             &runtime.metrics().borrow(),
                             &runtime.members,
                             &runtime.transport_catalog_sha256,
+                            runtime.transport_trust_generation,
                             &runtime.voter_ids,
                             runtime.voter_set_generation,
                             &runtime.voter_set_sha256,
@@ -3238,11 +4643,11 @@ mod tests {
             drift_listener,
         )
         .await
-        .expect_err("transport-catalog additions require a separate trust protocol");
+        .expect_err("transport-catalog additions must advance the trust generation");
         assert!(
             transport_drift
                 .to_string()
-                .contains("transport catalog differs"),
+                .contains("reuses a durable trust generation"),
             "{transport_drift}"
         );
     }
@@ -3283,6 +4688,8 @@ mod tests {
             config.authority_genesis.members[0].fingerprint = application_fingerprint.clone();
             config.authority_genesis.members[0].tls_server_certificate_fingerprint =
                 Some(previous_application_tls.clone());
+            config.configured_authority = config.authority_genesis.clone();
+            config.transport_authority = config.authority_genesis.clone();
         }
         let tempdir = TempDir::new().expect("tempdir");
         let contexts = (1..=3)
@@ -3639,6 +5046,7 @@ mod tests {
             source: 2,
             cluster_name: Arc::from("spoof-test"),
             members: Arc::new(members.clone()),
+            prior_members: Arc::new(members.clone()),
             client_config: peers[0].tls.client_config.clone(),
             handshake_timeout: Duration::from_secs(3),
             max_frame_bytes: DEFAULT_MAX_FRAME_BYTES,
@@ -3687,6 +5095,7 @@ mod tests {
             source: 1,
             cluster_name: Arc::from("embedded-vote-test"),
             members: Arc::new(members.clone()),
+            prior_members: Arc::new(members.clone()),
             client_config: peers[0].tls.client_config.clone(),
             handshake_timeout: Duration::from_secs(3),
             max_frame_bytes: DEFAULT_MAX_FRAME_BYTES,
@@ -3737,6 +5146,7 @@ mod tests {
             source: 1,
             cluster_name: Arc::from("leaf-test"),
             members: Arc::new(tampered_members.clone()),
+            prior_members: Arc::new(tampered_members.clone()),
             client_config: peers[0].tls.client_config.clone(),
             handshake_timeout: Duration::from_secs(3),
             max_frame_bytes: DEFAULT_MAX_FRAME_BYTES,
@@ -3832,6 +5242,7 @@ mod tests {
                 &restarted.metrics().borrow(),
                 &restarted.members,
                 &restarted.transport_catalog_sha256,
+                restarted.transport_trust_generation,
                 &restarted.voter_ids,
                 restarted.voter_set_generation,
                 &restarted.voter_set_sha256,
@@ -3854,7 +5265,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("differs from its trusted transport identity"),
+                .contains("reuses a durable trust generation"),
             "{error}"
         );
     }

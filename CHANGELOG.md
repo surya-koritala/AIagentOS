@@ -10,7 +10,22 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
 
 ## [Unreleased]
 
-- Added generation-fenced OpenRaft voter changes within the existing static
+- Added generation-fenced OpenRaft transport trust epochs. A quorum can
+  atomically replace the complete peer catalog while preserving every current
+  voter, add a new peer as a learner, or remove a former non-voter. Peer server
+  and client leaves plus the accepted CA bundle are digest-pinned in durable
+  membership. Certificate/CA rotation uses an explicit overlap generation
+  whose old leaves and multiple roots expire within 30 days and are checked on
+  every fresh RPC connection, followed by a separate generation that removes
+  the retired leaves and roots. Startup accepts only the complete
+  digest-verified durable prior catalog or exact configured target, rejects
+  stale/skipped/mixed voter-and-trust changes, requires retained peers to keep
+  identity, leaf, and CA continuity, and preserves the legacy generation-zero
+  catalog digest byte-for-byte. Immutable application genesis, the complete
+  current challenged application membership, and the current transport subset
+  are configured separately once those catalogs diverge; startup validates
+  every durable identity before mutating Raft membership.
+- Added generation-fenced OpenRaft voter changes within the versioned
   transport-trust catalog. Operators select a non-empty `voter_ids` subset and
   advance `voter_set_generation` by one through a coordinated config-driven
   startup. Before quorum changes, the target-configured leader
@@ -19,10 +34,8 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
   as a learner, and then completes joint consensus. Removed voters remain
   trusted learners so the catalog stays durable. Restart resumes the matching
   prepared or joint change; legacy configurations keep generation zero and
-  default to every trusted member voting. This changes consensus participation,
-  not the static mTLS trust catalog: adding unknown peers, removing a former
-  peer's control-plane trust, and rotating Raft certificates still require
-  transport trust epochs.
+  default to every trusted member voting. Voter and transport-trust generations
+  are separate and cannot advance in the same transition.
 - Bound every destination mutation fence to the OpenRaft term that committed
   its ownership revision and to the authority lease's exact expiry. Workload
   nodes persist term/generation/token/expiry together, reject lower terms and
@@ -47,8 +60,8 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
   deadline, and retired leaves cannot be reused. Membership discovery and
   configured-authority startup evaluate both windows against replicated
   authority time. New typed v2/SDK prepare, abort, finalize, and audit controls
-  preserve caller-stable retry IDs. This rotates application listener leaves,
-  not the static Raft voter transport certificates or trust map.
+  preserve caller-stable retry IDs. Raft peer transport certificates and trust
+  roots use the separate generation-fenced transport-trust protocol.
 - Routed public membership and ownership authority through the optional
   production OpenRaft runtime. Identical voter genesis now seeds challenged
   application membership, generation/audit history, ownership
@@ -63,8 +76,8 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
   from Raft transport TLS. State-machine, three-node failover/partition, and
   real daemon TCP lifecycle regressions cover deterministic replay, restart
   recovery, follower forwarding, no-quorum rejection, and clean shutdown.
-  Raft transport catalog and credential changes, migration, cross-node IPC,
-  global quotas/trust, rolling upgrades, and disaster recovery remain #122.
+  Delegated-principal authentication, migration, cross-node IPC, global
+  quotas/trust, rolling upgrades, and disaster recovery remain #122.
 - Wired the authenticated OpenRaft runtime into the production `agent-server`
   lifecycle behind a default-off, strict `[cluster_raft]` configuration.
   Enabled nodes read bounded no-follow PEM files, require owner-only private
@@ -100,8 +113,8 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
   fingerprint, permits authenticated certificate rotation, forbids TLS-to-
   plaintext re-admission, records old/new leaf fingerprints in durable
   membership audit, and rejects a superseded leaf during discovery.
-  Quorum application-listener rollout is now implemented by the replicated
-  authority; Raft transport trust rotation remains pending #122.
+  Quorum application-listener rollout is implemented by the replicated
+  authority; Raft peer transport rotation uses separate bounded trust epochs.
 - Added durably reconcilable managed cluster creation. The authority now exposes
   a stable paginated ownership directory; managed placement reserves a UUID,
   preinstalls its exact destination fence, and creates only while that proof is

@@ -117,7 +117,9 @@ fn write_cluster_config(
                 endpoint: listen_addr.to_string(),
                 server_name: server_name.into(),
                 tls_certificate_sha256: tls.server_certificate_sha256().into(),
+                tls_certificate_sha256_overlap: Vec::new(),
                 tls_client_certificate_sha256: tls.client_certificate_sha256().into(),
+                tls_client_certificate_sha256_overlap: Vec::new(),
                 identity_public_key: identity.public_key,
             }],
             server_certificate_path: Some(server_certificate_path),
@@ -204,6 +206,8 @@ fn agent_server_owns_configured_raft_startup_and_sigterm_shutdown() {
         });
     assert!(voter_status.contains("voter generation 0"));
     assert!(voter_status.contains("voters {1}"));
+    assert!(voter_status.contains("transport trust generation 0"));
+    assert!(voter_status.contains("overlap expiration None"));
     let catalog_digest = voter_status
         .rsplit_once("transport catalog ")
         .map(|(_, digest)| digest)

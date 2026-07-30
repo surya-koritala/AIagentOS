@@ -63,18 +63,38 @@ pub struct ClusterRaftNode {
     /// empty fingerprint.
     #[serde(default)]
     pub tls_client_certificate_sha256: String,
+    /// Additional exact server leaves accepted during the current
+    /// transport-trust overlap generation.
+    #[serde(default)]
+    pub tls_certificate_sha256_overlap: Vec<String>,
+    /// Additional exact client leaves accepted during the current
+    /// transport-trust overlap generation.
+    #[serde(default)]
+    pub tls_client_certificate_sha256_overlap: Vec<String>,
     /// Base64 or PEM encoded Ed25519 membership identity public key.
     pub identity_public_key: String,
-    /// Lowercase SHA-256 digest of the complete, statically trusted Raft
+    /// Lowercase SHA-256 digest of the complete, generation-fenced Raft
     /// transport catalog. This separates voter changes from peer trust
-    /// changes: every voter generation must retain the same catalog digest
-    /// until a dedicated transport-trust protocol replaces it.
+    /// changes: every voter generation must retain the same catalog digest,
+    /// while a dedicated trust generation may replace it exactly once.
     ///
     /// Older durable memberships deserialize this as empty. The runtime
     /// accepts that legacy value only when the durable node map already
     /// exactly matches the operator catalog.
     #[serde(default)]
     pub transport_catalog_sha256: String,
+    /// Monotonic generation of the peer catalog, leaf allowlists, and accepted
+    /// CA roots. Generation zero is the legacy single-leaf catalog.
+    #[serde(default)]
+    pub transport_trust_generation: u64,
+    /// Sorted exact fingerprints of every certificate accepted as a Raft trust
+    /// anchor for this generation. Empty only for legacy generation zero.
+    #[serde(default)]
+    pub transport_peer_ca_sha256: Vec<String>,
+    /// Absolute expiration for overlap leaves/roots in this trust generation.
+    /// It is part of the catalog digest and is enforced on every connection.
+    #[serde(default)]
+    pub transport_trust_overlap_not_after: Option<chrono::DateTime<chrono::Utc>>,
     /// Monotonic voter-set generation carried by every node record while a
     /// quorum change is prepared or active. Generation zero and an empty
     /// digest preserve compatibility with memberships written before dynamic
@@ -103,7 +123,7 @@ pub struct AuthorityGenesisMember {
     pub protocol_version: u32,
 }
 
-/// Identical genesis document supplied by every statically configured voter.
+/// Identical immutable genesis document supplied at the first quorum bootstrap.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuthorityGenesis {
     pub cluster_id: String,
@@ -467,6 +487,21 @@ pub fn open_cluster_raft_storage(
         },
         ClusterRaftStateMachine { context },
     ))
+}
+
+/// Read the locally applied durable Raft membership before the network factory
+/// is constructed. Callers use this only to preserve exact prior-catalog
+/// identity checks during a generation-fenced transport-trust transition.
+pub(crate) fn read_cluster_raft_membership(
+    context: &SqliteContextManager,
+) -> io::Result<StoredMembership<ClusterRaftNodeId, ClusterRaftNode>> {
+    let connection = context
+        .conn
+        .lock()
+        .map_err(|error| io::Error::other(format!("lock durable Raft membership: {error}")))?;
+    let state = load_persistent_state(&connection)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
+    Ok(state.membership)
 }
 
 /// Read the locally applied replicated control-plane projection.

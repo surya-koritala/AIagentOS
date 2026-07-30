@@ -88,6 +88,13 @@ must not treat an unavailable or rejected reply as success. The receipt map is
 bounded and capacity exhaustion rejects new application commands rather than
 letting one replica prune independently.
 
+Once application membership and Raft transport membership diverge, startup
+requires three explicit views: the original immutable genesis, the complete
+current challenged application membership, and the current transport subset.
+The first two must exactly match durable authority state, and every transport
+identity must be present unchanged in the complete catalog before a
+transport-trust generation can mutate OpenRaft membership.
+
 Schema version `7` binds ownership and destination mutation fences to authority
 terms. Replicated ownership revisions store the term from the committing
 OpenRaft log ID; standalone authority records use term one. Destination records
@@ -109,9 +116,10 @@ follower write/read forwarding, leader failover, restart catch-up, old-term
 fencing, and no-quorum rejection. The production server constructs and owns
 that runtime and routes public membership and ownership authority through it
 when strict `[cluster_raft]` configuration is enabled. The disabled default
-retains the legacy single-node authority. Static voters, Raft transport trust
-rotation, workload migration, global quota/trust convergence, and disaster
-recovery remain outside this slice. The replicated application authority also
+retains the legacy single-node authority. Voters and the exact Raft peer/CA
+trust catalog now change through separate durable generations. Workload
+migration, global quota/policy/package convergence, delegated-principal
+authentication, and disaster recovery remain outside this slice. The replicated application authority also
 persists bounded application-listener certificate rollouts and their ordered
 trust audit.
 

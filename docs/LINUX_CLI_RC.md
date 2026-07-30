@@ -17,21 +17,23 @@ the release keep those limitations machine-readable.
 An exact `vX.Y.Z-rc.N` tag first produces a retained signed candidate only
 after:
 
-1. full release-blocking CI and the governed-execution acceptance test pass;
-2. `agent`, `agent-server`, `agentctl`, and `agent-tui` build twice with
+1. the tag is annotated, points at the exact checked-out commit, and GitHub
+   reports its cryptographic signature as verified;
+2. full release-blocking CI and the governed-execution acceptance test pass;
+3. `agent`, `agent-server`, `agentctl`, and `agent-tui` build twice with
    byte-for-byte identical output;
-3. the deterministic archive and exact-binary SBOM receive keyless Sigstore
+4. the deterministic archive and exact-binary SBOM receive keyless Sigstore
    signatures and GitHub build provenance;
-4. a fresh Ubuntu 22.04 runner verifies that supply-chain evidence before
+5. a fresh Ubuntu 22.04 runner verifies that supply-chain evidence before
    executing the archive;
-5. the released v0.3.0 database fixture upgrades and is encrypted in place;
-6. the server starts with verified TLS, shared-secret authentication, required
+6. the released v0.3.0 database fixture upgrades and is encrypted in place;
+7. the server starts with verified TLS, shared-secret authentication, required
    SQLCipher storage, and signed backups;
-7. unauthenticated and wrong-token clients are rejected;
-8. a governed agent survives a clean server restart;
-9. an encrypted signed backup is independently anchored and verified, while a
+8. unauthenticated and wrong-token clients are rejected;
+9. a governed agent survives a clean server restart;
+10. an encrypted signed backup is independently anchored and verified, while a
    tampered copy and a recovery attempt without the storage key fail closed;
-10. the backup restores onto a distinct empty host directory, the configured
+11. the backup restores onto a distinct empty host directory, the configured
     kernel re-arms enforcement, and both the upgraded and newly created agents
     remain visible after the recovered server starts.
 

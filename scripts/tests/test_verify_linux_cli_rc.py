@@ -94,6 +94,22 @@ class LinuxCliRcReleaseContractTests(unittest.TestCase):
         self.assertTrue(any("must exclude" in item for item in failures))
         self.assertTrue(any("'fresh-host:'" in item for item in failures))
 
+    def test_missing_cryptographic_tag_verification_is_rejected(self):
+        rc = self.root / ".github/workflows/linux-cli-rc.yml"
+        rc.write_text(
+            rc.read_text(encoding="utf-8").replace(
+                ".verification.verified == true",
+                ".verification.verified == false",
+            ),
+            encoding="utf-8",
+        )
+
+        failures = validate_contract(self.root)
+
+        self.assertTrue(
+            any("'.verification.verified == true'" in item for item in failures)
+        )
+
     def test_version_dependency_changelog_tag_and_commit_drift_fail_closed(self):
         manifest = self.root / "crates/a/Cargo.toml"
         manifest.write_text(
@@ -121,6 +137,35 @@ class LinuxCliRcReleaseContractTests(unittest.TestCase):
         )
         failures = validate_release(self.root, TAG, COMMIT)
         self.assertTrue(any("at least one release note" in item for item in failures))
+
+    def test_release_rejects_notes_left_under_unreleased(self):
+        changelog = self.root / "CHANGELOG.md"
+        changelog.write_text(
+            f"# Changelog\n\n## [Unreleased]\n\n- Not included in the RC.\n\n"
+            f"## [{VERSION}] - 2026-07-30\n\n- RC.\n",
+            encoding="utf-8",
+        )
+
+        failures = validate_release(self.root, TAG, COMMIT)
+
+        self.assertIn(
+            "CHANGELOG.md [Unreleased] section must be empty before an RC tag",
+            failures,
+        )
+
+    def test_release_requires_exactly_one_unreleased_section(self):
+        changelog = self.root / "CHANGELOG.md"
+        changelog.write_text(
+            f"# Changelog\n\n## [{VERSION}] - 2026-07-30\n\n- RC.\n",
+            encoding="utf-8",
+        )
+
+        failures = validate_release(self.root, TAG, COMMIT)
+
+        self.assertIn(
+            "CHANGELOG.md must contain exactly one [Unreleased] section",
+            failures,
+        )
 
 
 if __name__ == "__main__":

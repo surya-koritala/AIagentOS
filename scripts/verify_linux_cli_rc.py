@@ -75,6 +75,10 @@ def validate_contract(root: Path) -> list[str]:
         "cmp -s",
         "Prove shipped binaries report the exact release version",
         "scripts/build_cli_archive.py",
+        "Require GitHub-verified cryptographic tag signature",
+        "repos/${GITHUB_REPOSITORY}/git/tags/${tag_object}",
+        ".verification.verified == true",
+        ".verification.verified_at",
         "sign-runtime:",
         "cosign sign-blob",
         "actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373",
@@ -254,7 +258,21 @@ def validate_release(root: Path, tag: str, commit: str) -> list[str]:
         if declared != version:
             failures.append(f"{source} version {declared!r} does not match {version!r}")
     changelog = (root / "CHANGELOG.md").read_text(encoding="utf-8")
-    headings = re.findall(r"(?m)^## \[([^\]]+)\](?:\s+-\s+\d{4}-\d{2}-\d{2})?\s*$", changelog)
+    headings = re.findall(
+        r"(?m)^## \[([^\]]+)\](?:\s+-\s+\d{4}-\d{2}-\d{2})?\s*$",
+        changelog,
+    )
+    if headings.count("Unreleased") != 1:
+        failures.append("CHANGELOG.md must contain exactly one [Unreleased] section")
+    else:
+        unreleased = re.search(
+            r"(?ms)^## \[Unreleased\]\s*$(.*?)(?=^## \[|\Z)",
+            changelog,
+        )
+        if unreleased is None or unreleased.group(1).strip():
+            failures.append(
+                "CHANGELOG.md [Unreleased] section must be empty before an RC tag"
+            )
     if headings.count(version) != 1:
         failures.append(f"CHANGELOG.md must contain exactly one [{version}] release section")
     else:

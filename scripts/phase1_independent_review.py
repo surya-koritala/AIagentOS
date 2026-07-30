@@ -27,6 +27,7 @@ from phase1_promotion_qualification import (
     _load_json,
     _object,
     _parse_campaign,
+    _parse_campaign_provenance,
     _positive_integer,
     _sha256,
     _source,
@@ -171,6 +172,7 @@ def _parse_observation(
 
 def build_review(
     campaign_path: Path,
+    campaign_provenance_path: Path,
     observation_path: Path,
     *,
     actor: str,
@@ -180,6 +182,7 @@ def build_review(
     release_candidate: str,
     expected_commit: str,
     expected_environment: str,
+    expected_campaign_run_id: int,
 ) -> dict[str, Any]:
     """Normalize one protected reviewer record into a workflow-bound review."""
 
@@ -199,6 +202,22 @@ def build_review(
         release_candidate=release_candidate,
         expected_commit=expected_commit,
         expected_environment=expected_environment,
+    )
+    campaign_provenance, _ = _parse_campaign_provenance(
+        campaign_provenance_path,
+        campaign_sha=campaign_sha,
+        release_candidate=release_candidate,
+        expected_commit=expected_commit,
+        expected_campaign_run_id=expected_campaign_run_id,
+        completion_times=completion_times,
+    )
+    completion_times.append(
+        _timestamp(
+            campaign_provenance["campaign_workflow"][
+                "workflow_updated_at"
+            ],
+            "campaign provenance workflow_updated_at",
+        )
     )
     operator_ids = campaign["_validated_operator_ids"]
     on_device_environment = campaign["_validated_on_device_environment"]
@@ -268,6 +287,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--validate", action="store_true")
     parser.add_argument("--campaign", type=Path)
+    parser.add_argument("--campaign-provenance", type=Path)
     parser.add_argument("--observation", type=Path)
     parser.add_argument("--actor")
     parser.add_argument("--repository")
@@ -276,6 +296,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--release-candidate")
     parser.add_argument("--expected-commit")
     parser.add_argument("--expected-environment")
+    parser.add_argument("--expected-campaign-run-id", type=int)
     parser.add_argument("--output", type=Path)
     parser.add_argument("--require-approved", action="store_true")
     args = parser.parse_args(argv)
@@ -297,6 +318,7 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         required = (
             args.campaign,
+            args.campaign_provenance,
             args.observation,
             args.actor,
             args.repository,
@@ -305,15 +327,18 @@ def main(argv: list[str] | None = None) -> int:
             args.release_candidate,
             args.expected_commit,
             args.expected_environment,
+            args.expected_campaign_run_id,
             args.output,
         )
         if any(value is None for value in required):
             raise QualificationError(
-                "campaign, observation, actor, repository, run identity, "
-                "release identity, environment, and output are required"
+                "campaign, campaign provenance, observation, actor, repository, "
+                "run identities, release identity, environment, and output are "
+                "required"
             )
         review = build_review(
             args.campaign,
+            args.campaign_provenance,
             args.observation,
             actor=args.actor,
             repository=args.repository,
@@ -322,6 +347,7 @@ def main(argv: list[str] | None = None) -> int:
             release_candidate=args.release_candidate,
             expected_commit=args.expected_commit,
             expected_environment=args.expected_environment,
+            expected_campaign_run_id=args.expected_campaign_run_id,
         )
         if args.require_approved and (
             review["decision"] != "approved"

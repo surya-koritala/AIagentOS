@@ -12,6 +12,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 
 from phase1_promotion_qualification import (  # noqa: E402
     BASE_EVIDENCE,
+    CAMPAIGN_PROVENANCE_CLASS,
     CAMPAIGN_CLASS,
     MAX_CAMPAIGN_BYTES,
     PROFILE_ID,
@@ -240,6 +241,9 @@ class PromotionWorkspace:
         self.evidence_dir.mkdir()
         self.campaign_path = self.root / "campaign.json"
         self.review_path = self.root / "review.json"
+        self.campaign_provenance_path = (
+            self.root / "campaign-provenance.json"
+        )
         self.review_provenance_path = self.root / "review-provenance.json"
         self.provenance_path = self.root / "workflow-provenance.json"
         self.output_path = self.root / "decision.json"
@@ -348,6 +352,32 @@ class PromotionWorkspace:
             },
         }
 
+    def make_campaign_provenance(self, campaign_sha):
+        return {
+            "schema_version": 1,
+            "qualification_class": CAMPAIGN_PROVENANCE_CLASS,
+            "generated_at": "2026-05-02T00:00:00Z",
+            "repository": "surya-koritala/AIagentOS",
+            "release_candidate": RELEASE_CANDIDATE,
+            "source": {"commit": COMMIT, "dirty": False},
+            "campaign_sha256": campaign_sha,
+            "campaign_workflow": {
+                "run_id": 650,
+                "run_attempt": 1,
+                "workflow_path": (
+                    ".github/workflows/phase1-campaign-assembly.yml"
+                ),
+                "head_sha": COMMIT,
+                "event": "workflow_dispatch",
+                "workflow_updated_at": "2026-05-01T13:00:00Z",
+            },
+            "campaign_signature_bundle_sha256": "e" * 64,
+            "github_campaign_workflow_provenance_verified": True,
+            "github_campaign_artifact_bytes_verified": True,
+            "keyless_campaign_signature_verified": True,
+            "production_claim_allowed": False,
+        }
+
     def make_review_provenance(self, campaign_sha, review_sha, reviewed_at):
         return {
             "schema_version": 1,
@@ -433,6 +463,9 @@ class PromotionWorkspace:
     def write_campaign_and_review(self, mutate_review=None):
         self.campaign_path.write_bytes(encoded(self.campaign))
         campaign_sha = digest(self.campaign_path)
+        self.campaign_provenance_path.write_bytes(
+            encoded(self.make_campaign_provenance(campaign_sha))
+        )
         try:
             provenance = self.make_workflow_provenance(campaign_sha)
         except QualificationError:
@@ -464,6 +497,7 @@ class PromotionWorkspace:
     def evaluate(self):
         return evaluate(
             self.campaign_path,
+            self.campaign_provenance_path,
             self.review_path,
             self.review_provenance_path,
             self.provenance_path,
@@ -471,6 +505,7 @@ class PromotionWorkspace:
             release_candidate=RELEASE_CANDIDATE,
             expected_commit=COMMIT,
             expected_environment=TARGET_ENVIRONMENT,
+            expected_campaign_run_id=650,
         )
 
     def write_github_provenance_inputs(self):
@@ -547,6 +582,17 @@ class Phase1PromotionQualificationTests(unittest.TestCase):
         self.assertEqual(
             report["evidence"]["artifact_count"],
             len(BASE_EVIDENCE) + len(PROMOTED_PROVIDERS),
+        )
+        self.assertTrue(
+            report["evidence"][
+                "github_campaign_workflow_provenance_verified"
+            ]
+        )
+        self.assertTrue(
+            report["evidence"]["github_campaign_artifact_bytes_verified"]
+        )
+        self.assertTrue(
+            report["evidence"]["keyless_campaign_signature_verified"]
         )
         self.assertTrue(
             report["evidence"]["github_workflow_provenance_verified"]
@@ -866,6 +912,39 @@ class Phase1PromotionQualificationTests(unittest.TestCase):
         with self.assertRaisesRegex(QualificationError, "exact campaign"):
             workspace.evaluate()
 
+    def test_campaign_provenance_must_authenticate_run_bytes_and_signature(self):
+        mutations = [
+            lambda report: report.__setitem__("campaign_sha256", "d" * 64),
+            lambda report: report.__setitem__(
+                "repository", "attacker/fork"
+            ),
+            lambda report: report["campaign_workflow"].__setitem__(
+                "run_attempt", 2
+            ),
+            lambda report: report["campaign_workflow"].__setitem__(
+                "workflow_path", ".github/workflows/ci.yml"
+            ),
+            lambda report: report.__setitem__(
+                "github_campaign_workflow_provenance_verified", False
+            ),
+            lambda report: report.__setitem__(
+                "github_campaign_artifact_bytes_verified", False
+            ),
+            lambda report: report.__setitem__(
+                "keyless_campaign_signature_verified", False
+            ),
+        ]
+        for mutation in mutations:
+            with self.subTest(mutation=mutation):
+                workspace = self.workspace()
+                report = json.loads(
+                    workspace.campaign_provenance_path.read_text()
+                )
+                mutation(report)
+                workspace.campaign_provenance_path.write_bytes(encoded(report))
+                with self.assertRaises(QualificationError):
+                    workspace.evaluate()
+
     def test_review_provenance_must_authenticate_identity_run_bytes_and_signature(self):
         mutations = [
             lambda report: report.__setitem__("campaign_sha256", "d" * 64),
@@ -943,6 +1022,8 @@ class Phase1PromotionQualificationTests(unittest.TestCase):
             [
                 "--campaign",
                 str(workspace.campaign_path),
+                "--campaign-provenance",
+                str(workspace.campaign_provenance_path),
                 "--review",
                 str(workspace.review_path),
                 "--review-provenance",
@@ -957,6 +1038,8 @@ class Phase1PromotionQualificationTests(unittest.TestCase):
                 COMMIT,
                 "--expected-environment",
                 TARGET_ENVIRONMENT,
+                "--expected-campaign-run-id",
+                "650",
                 "--output",
                 str(workspace.output_path),
                 "--require-eligible",
@@ -981,6 +1064,10 @@ class Phase1PromotionQualificationTests(unittest.TestCase):
             "needs: exact-release-candidate-promotion", promotion_workflow
         )
         self.assertIn(
+            "python3 scripts/phase1_campaign_provenance.py",
+            promotion_workflow,
+        )
+        self.assertIn(
             "python3 scripts/phase1_promotion_qualification.py",
             promotion_workflow,
         )
@@ -998,7 +1085,11 @@ class Phase1PromotionQualificationTests(unittest.TestCase):
         )
         self.assertIn('gh run download "$run_id"', promotion_workflow)
         self.assertIn("--workflow-provenance", promotion_workflow)
+        self.assertIn("--campaign-provenance", promotion_workflow)
         self.assertIn("--review-provenance", promotion_workflow)
+        self.assertIn(
+            "phase1-campaign-provenance.json", promotion_workflow
+        )
         self.assertIn(
             "phase1-workflow-provenance.json", promotion_workflow
         )

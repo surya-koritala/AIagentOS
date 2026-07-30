@@ -67,6 +67,7 @@ archive="agentos-${AGENTOS_RC}-x86_64-unknown-linux-gnu.zip"
 for asset in \
   "$archive" \
   linux-cli-rc-qualification.json \
+  phase1-campaign-provenance.json \
   phase1-workflow-provenance.json \
   phase1-review-provenance.json \
   phase1-promotion.json \
@@ -85,7 +86,7 @@ for asset in \
 done
 ```
 
-Inspect all four reports before trusting the candidate:
+Inspect all five reports before trusting the candidate:
 
 ```bash
 jq '{
@@ -115,6 +116,16 @@ jq '{
   repository,
   release_candidate,
   source,
+  campaign_workflow,
+  github_campaign_workflow_provenance_verified,
+  github_campaign_artifact_bytes_verified,
+  keyless_campaign_signature_verified,
+  production_claim_allowed
+}' phase1-campaign-provenance.json
+jq '{
+  repository,
+  release_candidate,
+  source,
   run_count,
   artifact_count,
   github_workflow_provenance_verified,
@@ -135,6 +146,9 @@ jq '{
 ```
 
 The restricted decision must set `phase1_release_candidate_ready` to `true`.
+The campaign provenance report must set its workflow, artifact-byte, and
+keyless-signature verification booleans to `true`, and its SHA-256 must match
+`phase1-promotion.json.evidence.campaign_provenance_sha256`.
 The GitHub provenance report must set both verification booleans to `true`,
 and its SHA-256 must match
 `phase1-promotion.json.evidence.workflow_provenance_sha256`.

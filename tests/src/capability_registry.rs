@@ -1544,28 +1544,34 @@ fn phase1_promotion_contract_is_exact_reviewed_and_fail_closed() {
         "workflow_dispatch:",
         "release_candidate:",
         "linux_cli_rc_run_id:",
+        "phase1_campaign_run_id:",
         "phase1_review_run_id:",
         "environment_id:",
         "profile: phase1-promotion",
         "enabled: ${{ vars.AGENTOS_CAPACITY_QUALIFICATION_ENABLED }}",
         "runs-on: [self-hosted, linux, x64, agentos-capacity]",
         "environment: capacity-qualification",
-        "AGENTOS_PHASE1_EVIDENCE_DIR: ${{ vars.AGENTOS_PHASE1_EVIDENCE_DIR }}",
+        "PHASE1_CAMPAIGN_RUN_ID: ${{ inputs.phase1_campaign_run_id }}",
         "test \"$GITHUB_REF\" = \"refs/tags/${AGENTOS_RELEASE_CANDIDATE}\"",
         ".github/workflows/linux-cli-rc.yml",
         "test \"$(jq -r .conclusion <<<\"$metadata\")\" = \"success\"",
         "name: qualified-linux-cli-rc-bundle",
         "cmp \"$report\" \"$evidence_report\"",
         "scripts/linux_cli_rc_qualification.py validate-report",
+        "scripts/phase1_campaign_provenance.py",
         "scripts/phase1_promotion_qualification.py",
         "scripts/phase1_workflow_provenance.py",
         "scripts/phase1_review_provenance.py",
         "actions/runs/${run_id}/attempts/${run_attempt}",
         "gh run download \"$run_id\"",
+        "--campaign-provenance",
         "--workflow-provenance",
         "--review-provenance",
+        "phase1-campaign-provenance.json",
         "phase1-workflow-provenance.json",
         "phase1-review-provenance.json",
+        "github_campaign_workflow_provenance_verified",
+        "keyless_campaign_signature_verified",
         "github_workflow_provenance_verified",
         "github_artifact_bytes_verified",
         "reviewer_identity_authenticated",
@@ -1609,12 +1615,69 @@ fn phase1_promotion_contract_is_exact_reviewed_and_fail_closed() {
         "release SLO does not bind the retained resource soak",
         "review does not bind the exact campaign bytes",
         "review provenance does not bind the exact review bytes",
+        "campaign provenance does not bind the exact campaign bytes",
         "\"phase1_release_candidate_ready\": ready",
         "\"production_claim_allowed\": False",
     ] {
         assert!(
             qualifier.contains(contract),
             "Phase 1 promotion evaluator lost {contract:?}"
+        );
+    }
+
+    let campaign_workflow = read_workspace_file(".github/workflows/phase1-campaign-assembly.yml");
+    for contract in [
+        "run_ids_json:",
+        "promoted_providers_json:",
+        "test \"$GITHUB_RUN_ATTEMPT\" = \"1\"",
+        "scripts/phase1_campaign_assembly.py",
+        "scripts/phase1_campaign_provenance.py",
+        "actions/runs/${run_id}/attempts/${run_attempt}",
+        "gh run download \"$run_id\"",
+        "cosign sign-blob --yes",
+        "actions/attest-build-provenance@",
+        "phase1-campaign-${{ inputs.release_candidate }}-${{ github.sha }}",
+    ] {
+        assert!(
+            campaign_workflow.contains(contract),
+            "Phase 1 campaign workflow lost {contract:?}"
+        );
+    }
+    assert!(
+        !campaign_workflow.contains("self-hosted")
+            && !campaign_workflow.contains("contents: write"),
+        "campaign assembly must remain hosted and read-only"
+    );
+
+    let campaign_builder = read_workspace_file("scripts/phase1_campaign_assembly.py");
+    for contract in [
+        "restricted_phase1_campaign_assembly_request",
+        "campaign request run IDs must be unique",
+        "workflow did not complete successfully",
+        "does not match trusted repository",
+        "downloaded artifact inventory differs from assembly plan",
+        "\"operator_ids\": operators",
+    ] {
+        assert!(
+            campaign_builder.contains(contract),
+            "Phase 1 campaign builder lost {contract:?}"
+        );
+    }
+
+    let campaign_provenance = read_workspace_file("scripts/phase1_campaign_provenance.py");
+    for contract in [
+        "restricted_phase1_campaign_provenance",
+        "campaign assembly must use a fresh workflow dispatch",
+        "is absent from campaign operators",
+        "downloaded campaign artifact inventory differs from contract",
+        "keyless campaign signature verification failed",
+        "\"github_campaign_workflow_provenance_verified\": True",
+        "\"github_campaign_artifact_bytes_verified\": True",
+        "\"keyless_campaign_signature_verified\": True",
+    ] {
+        assert!(
+            campaign_provenance.contains(contract),
+            "Phase 1 campaign provenance verifier lost {contract:?}"
         );
     }
 
@@ -1644,6 +1707,8 @@ fn phase1_promotion_contract_is_exact_reviewed_and_fail_closed() {
         "profile: phase1-independent-review",
         "runs-on: [self-hosted, linux, x64, agentos-review]",
         "environment: phase1-review",
+        "phase1_campaign_run_id:",
+        "scripts/phase1_campaign_provenance.py",
         "test \"$GITHUB_RUN_ATTEMPT\" = \"1\"",
         "--actor \"$GITHUB_ACTOR\"",
         "scripts/phase1_independent_review.py",

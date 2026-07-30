@@ -22,7 +22,7 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
   with enforcement re-armed. A strict bounded report retains the restricted
   scope and remaining external qualification gaps, is revalidated, checksummed,
   signed, attested, and published only as a prerelease. Relates #120, #123, and
-  #125.
+  #125. (#280)
 - Bound every external replicated-authority write to a 30-second Ed25519
   delegation from the originating application node. The signed,
   domain-separated proof covers the caller-stable operation UUID, a semantic

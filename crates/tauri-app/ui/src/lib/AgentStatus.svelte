@@ -13,6 +13,21 @@
   let serviceHistory = [];
   let historyTarget = null;
   let historyLoading = false;
+  let tunableBusy = null;
+  let tunableError = '';
+  let tunableStatus = '';
+  let pendingTunableControl = null;
+  let tunableInput = '';
+  let tunableAudit = [];
+  let tunableAuditTarget = null;
+  let tunableAuditLoading = false;
+  let packageBusy = null;
+  let packageError = '';
+  let packageStatus = '';
+  let pendingPackageControl = null;
+  let packageConfirmation = '';
+  let installPackageName = '';
+  let installRequirement = '';
 
   const availability = provider => {
     if (provider.probe_timed_out) return 'Probe timed out';
@@ -110,6 +125,272 @@
       historyLoading = false;
     }
   }
+
+  function requestTunableControl(action, tunable) {
+    pendingTunableControl = {
+      action,
+      name: tunable.name,
+      value: tunable.value,
+      revision: tunable.revision,
+      minimum: tunable.minimum,
+      maximum: tunable.maximum,
+      persisted: tunable.persisted,
+    };
+    tunableInput = action === 'set' ? String(tunable.value) : '';
+    tunableError = '';
+    tunableStatus = '';
+  }
+
+  function cancelTunableControl() {
+    pendingTunableControl = null;
+    tunableInput = '';
+  }
+
+  function parseTunableValue(value) {
+    if (!/^(0|[1-9]\d*)$/.test(value)) return null;
+    const parsed = Number(value);
+    return Number.isSafeInteger(parsed) ? parsed : null;
+  }
+
+  function parsedRollbackTarget(target, input) {
+    if (!target || target.action !== 'rollback') return null;
+    const parts = input.split('|');
+    if (parts.length !== 2 || parts[1] !== target.name) return null;
+    const revision = parseTunableValue(parts[0]);
+    if (
+      revision === null ||
+      revision < 1 ||
+      revision >= target.revision
+    ) return null;
+    return revision;
+  }
+
+  function canSubmitTunableControl(target, input, busy) {
+    if (!target || busy) return false;
+    if (target.action === 'rollback') {
+      return parsedRollbackTarget(target, input) !== null;
+    }
+    const value = parseTunableValue(input);
+    return (
+      value !== null &&
+      value >= target.minimum &&
+      value <= target.maximum
+    );
+  }
+
+  async function executeTunableControl() {
+    if (!canSubmitTunableControl(pendingTunableControl, tunableInput, tunableBusy)) return;
+    const frozenTarget = { ...pendingTunableControl };
+    const value = frozenTarget.action === 'set'
+      ? parseTunableValue(tunableInput)
+      : null;
+    const targetRevision = frozenTarget.action === 'rollback'
+      ? parsedRollbackTarget(frozenTarget, tunableInput)
+      : null;
+    tunableBusy = frozenTarget.name;
+    tunableError = '';
+    tunableStatus = `${frozenTarget.action === 'set' ? 'Updating' : 'Rolling back'} ${frozenTarget.name}…`;
+    dispatch('operation', {
+      label: `${frozenTarget.action === 'set' ? 'updating' : 'rolling back'} tunable ${frozenTarget.name}`,
+      active: true,
+    });
+    try {
+      const updated = frozenTarget.action === 'set'
+        ? await invoke('set_operator_tunable', {
+            tunableName: frozenTarget.name,
+            value,
+            expectedRevision: frozenTarget.revision,
+          })
+        : await invoke('rollback_operator_tunable', {
+            tunableName: frozenTarget.name,
+            targetRevision,
+            expectedRevision: frozenTarget.revision,
+            confirmTunableName: frozenTarget.name,
+          });
+      tunableStatus = `${updated.name} is ${updated.value} at revision ${updated.revision}.`;
+      cancelTunableControl();
+      dispatch('refresh');
+      if (tunableAuditTarget === frozenTarget.name) {
+        await loadTunableAudit(frozenTarget.name);
+      }
+    } catch (error) {
+      tunableError = String(error);
+      tunableStatus = '';
+    } finally {
+      tunableBusy = null;
+      dispatch('operation', {
+        label: `${frozenTarget.action === 'set' ? 'updating' : 'rolling back'} tunable ${frozenTarget.name}`,
+        active: false,
+      });
+    }
+  }
+
+  async function loadTunableAudit(tunableName) {
+    if (!tunableName || tunableAuditLoading) return;
+    const frozenName = tunableName;
+    tunableAuditTarget = frozenName;
+    tunableAuditLoading = true;
+    tunableError = '';
+    try {
+      const entries = await invoke('operator_tunable_audit', {
+        tunableName: frozenName,
+        limit: 50,
+      });
+      if (tunableAuditTarget === frozenName) tunableAudit = entries;
+    } catch (error) {
+      if (tunableAuditTarget === frozenName) {
+        tunableAudit = [];
+        tunableError = String(error);
+      }
+    } finally {
+      tunableAuditLoading = false;
+    }
+  }
+
+  const packageOperationLabel = target =>
+    `${target.action === 'remove' ? 'removing' : target.action === 'rollback' ? 'rolling back' : target.action === 'run' ? 'running' : 'installing'} package ${target.name}`;
+
+  function validInstallTarget(name, requirement) {
+    return (
+      name.length > 0 &&
+      name.length <= 128 &&
+      name.trim() === name &&
+      requirement.length > 0 &&
+      requirement.length <= 128 &&
+      requirement.trim() === requirement
+    );
+  }
+
+  async function installPackage() {
+    if (
+      packageBusy ||
+      !validInstallTarget(installPackageName, installRequirement)
+    ) return;
+    const frozenTarget = {
+      action: 'install',
+      name: installPackageName,
+      requirement: installRequirement,
+    };
+    packageBusy = frozenTarget.name;
+    packageError = '';
+    packageStatus = `Installing ${frozenTarget.name} ${frozenTarget.requirement}…`;
+    dispatch('operation', {
+      label: packageOperationLabel(frozenTarget),
+      active: true,
+    });
+    try {
+      const installed = await invoke('install_package', {
+        packageName: frozenTarget.name,
+        requirement: frozenTarget.requirement,
+      });
+      packageStatus = `Installed ${installed.name} ${installed.version}.`;
+      installPackageName = '';
+      installRequirement = '';
+      dispatch('refresh');
+    } catch (error) {
+      packageError = String(error);
+      packageStatus = '';
+    } finally {
+      packageBusy = null;
+      dispatch('operation', {
+        label: packageOperationLabel(frozenTarget),
+        active: false,
+      });
+    }
+  }
+
+  async function runPackage(packageTarget) {
+    if (!packageTarget || packageBusy) return;
+    const frozenTarget = {
+      action: 'run',
+      name: packageTarget.name,
+      version: packageTarget.version,
+      digest: packageTarget.digest,
+    };
+    packageBusy = frozenTarget.name;
+    packageError = '';
+    packageStatus = `Running ${frozenTarget.name} ${frozenTarget.version}…`;
+    dispatch('operation', {
+      label: packageOperationLabel(frozenTarget),
+      active: true,
+    });
+    try {
+      const agentId = await invoke('run_installed_package', {
+        packageName: frozenTarget.name,
+      });
+      packageStatus = `Started ${frozenTarget.name} as agent ${agentId}.`;
+      dispatch('refresh');
+    } catch (error) {
+      packageError = String(error);
+      packageStatus = '';
+    } finally {
+      packageBusy = null;
+      dispatch('operation', {
+        label: packageOperationLabel(frozenTarget),
+        active: false,
+      });
+    }
+  }
+
+  function requestPackageControl(action, packageTarget) {
+    pendingPackageControl = {
+      action,
+      name: packageTarget.name,
+      version: packageTarget.version,
+      digest: packageTarget.digest,
+      publisher: packageTarget.publisher,
+    };
+    packageConfirmation = '';
+    packageError = '';
+    packageStatus = '';
+  }
+
+  function cancelPackageControl() {
+    pendingPackageControl = null;
+    packageConfirmation = '';
+  }
+
+  async function executePackageControl() {
+    if (
+      !pendingPackageControl ||
+      packageBusy ||
+      packageConfirmation !== `${pendingPackageControl.version}|${pendingPackageControl.name}`
+    ) return;
+    const frozenTarget = { ...pendingPackageControl };
+    packageBusy = frozenTarget.name;
+    packageError = '';
+    packageStatus = `${frozenTarget.action === 'remove' ? 'Removing' : 'Rolling back'} ${frozenTarget.name} ${frozenTarget.version}…`;
+    dispatch('operation', {
+      label: packageOperationLabel(frozenTarget),
+      active: true,
+    });
+    try {
+      const args = {
+        packageName: frozenTarget.name,
+        expectedVersion: frozenTarget.version,
+        expectedDigest: frozenTarget.digest,
+        confirmPackageTarget: packageConfirmation,
+      };
+      if (frozenTarget.action === 'remove') {
+        await invoke('remove_installed_package', args);
+        packageStatus = `Removed ${frozenTarget.name} ${frozenTarget.version}.`;
+      } else {
+        const restored = await invoke('rollback_installed_package', args);
+        packageStatus = `Rolled back ${restored.name} to ${restored.version}.`;
+      }
+      cancelPackageControl();
+      dispatch('refresh');
+    } catch (error) {
+      packageError = String(error);
+      packageStatus = '';
+    } finally {
+      packageBusy = null;
+      dispatch('operation', {
+        label: packageOperationLabel(frozenTarget),
+        active: false,
+      });
+    }
+  }
 </script>
 
 <section class="operations" aria-labelledby="operations-heading">
@@ -138,6 +419,10 @@
     <div>
       <dt>Loaded packages</dt>
       <dd>{state.packages.length}</dd>
+    </div>
+    <div>
+      <dt>Installed signed packages</dt>
+      <dd>{state.installedPackages === null ? 'Unavailable' : state.installedPackages.length}</dd>
     </div>
   </dl>
 
@@ -331,6 +616,143 @@
     {/if}
   </section>
 
+  <section aria-labelledby="installed-packages-heading">
+    <h2 id="installed-packages-heading">Installed signed packages</h2>
+    <form class="package-install" on:submit|preventDefault={installPackage}>
+      <div>
+        <label for="install-package-name">Package name</label>
+        <input
+          id="install-package-name"
+          bind:value={installPackageName}
+          maxlength="128"
+          autocomplete="off"
+          spellcheck="false"
+          placeholder="reviewer"
+        />
+      </div>
+      <div>
+        <label for="install-package-requirement">Version requirement</label>
+        <input
+          id="install-package-requirement"
+          bind:value={installRequirement}
+          maxlength="128"
+          autocomplete="off"
+          spellcheck="false"
+          placeholder="^1.2 or =1.2.3"
+        />
+      </div>
+      <button
+        type="submit"
+        disabled={Boolean(packageBusy) || !validInstallTarget(installPackageName, installRequirement)}
+      >Install or upgrade</button>
+    </form>
+
+    {#if state.installedPackages === null}
+      <p class="unavailable">
+        Installed package state is unavailable for this refresh. No empty package
+        list has been assumed.
+      </p>
+    {:else if state.installedPackages.length === 0}
+      <p class="empty">No signed packages are installed in this caller scope.</p>
+    {:else}
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Package</th>
+              <th>Version</th>
+              <th>Publisher</th>
+              <th>Digest</th>
+              <th>Lock</th>
+              <th>Controls</th>
+            </tr>
+          </thead>
+          <tbody>
+            {#each state.installedPackages as installedPackage}
+              <tr>
+                <th scope="row">
+                  {installedPackage.name}
+                  <small>{installedPackage.description || 'No description'}</small>
+                </th>
+                <td>{installedPackage.version}</td>
+                <td>{installedPackage.publisher}</td>
+                <td><code>{installedPackage.digest.slice(0, 12)}…</code></td>
+                <td>{installedPackage.lock_package_count} packages</td>
+                <td>
+                  <div class="package-actions">
+                    <button
+                      on:click={() => runPackage(installedPackage)}
+                      disabled={Boolean(packageBusy)}
+                      aria-label={`Run ${installedPackage.name} ${installedPackage.version}`}
+                    >Run</button>
+                    <button
+                      on:click={() => requestPackageControl('rollback', installedPackage)}
+                      disabled={Boolean(packageBusy)}
+                      aria-label={`Rollback ${installedPackage.name} ${installedPackage.version}`}
+                    >Rollback</button>
+                    <button
+                      class="danger"
+                      on:click={() => requestPackageControl('remove', installedPackage)}
+                      disabled={Boolean(packageBusy)}
+                      aria-label={`Remove ${installedPackage.name} ${installedPackage.version}`}
+                    >Remove</button>
+                  </div>
+                </td>
+              </tr>
+            {/each}
+          </tbody>
+        </table>
+      </div>
+    {/if}
+
+    {#if pendingPackageControl}
+      <div
+        class="package-confirmation"
+        role="group"
+        aria-labelledby="package-confirmation-heading"
+      >
+        <h3 id="package-confirmation-heading">
+          {pendingPackageControl.action === 'remove' ? 'Remove' : 'Rollback'}
+          {pendingPackageControl.name} {pendingPackageControl.version}
+        </h3>
+        <p>
+          Frozen target: <code>{pendingPackageControl.name}</code>
+          version <code>{pendingPackageControl.version}</code>, digest
+          <code>{pendingPackageControl.digest}</code>, published by
+          {pendingPackageControl.publisher}. The server compares both version and
+          digest inside the package transaction and rejects a concurrent change.
+          {#if pendingPackageControl.action === 'remove'}
+            Removal prevents new runs from this package; already-created agents
+            keep their own lifecycle.
+          {:else}
+            Rollback replaces this artifact with its retained prior version.
+          {/if}
+        </p>
+        <p>
+          Type the frozen version, a vertical bar, and the exact package name.
+        </p>
+        <label for="package-control-confirmation">Version|exact package name</label>
+        <input
+          id="package-control-confirmation"
+          bind:value={packageConfirmation}
+          autocomplete="off"
+          spellcheck="false"
+        />
+        <div class="package-actions">
+          <button
+            class="danger"
+            on:click={executePackageControl}
+            disabled={Boolean(packageBusy) || packageConfirmation !== `${pendingPackageControl.version}|${pendingPackageControl.name}`}
+          >Confirm {pendingPackageControl.action}</button>
+          <button on:click={cancelPackageControl}>Cancel package change</button>
+        </div>
+      </div>
+    {/if}
+
+    {#if packageStatus}<p class="operation-status" role="status">{packageStatus}</p>{/if}
+    {#if packageError}<p class="operation-error" role="alert">{packageError}</p>{/if}
+  </section>
+
   <section aria-labelledby="packages-heading">
     <h2 id="packages-heading">Loaded packages</h2>
     {#if state.packages.length === 0}
@@ -354,15 +776,113 @@
     {:else if state.tunables.length === 0}
       <p class="empty">No live operator tunables are registered.</p>
     {:else}
-      <dl class="tunable-list">
+      <ul class="tunable-list">
         {#each state.tunables as tunable}
-          <div>
-            <dt>{tunable.name}</dt>
-            <dd>{tunable.value} · revision {tunable.revision} · {tunable.persisted ? 'persisted' : 'runtime only'}</dd>
+          <li class="tunable-card">
+            <strong>{tunable.name}</strong>
+            <p class="tunable-value">{tunable.value} · revision {tunable.revision} · {tunable.persisted ? 'persisted' : 'runtime only'}</p>
             <p>{tunable.description}</p>
-          </div>
+            <p>Allowed range: {tunable.minimum} to {tunable.maximum}</p>
+            <div class="tunable-actions">
+              <button
+                on:click={() => requestTunableControl('set', tunable)}
+                disabled={Boolean(tunableBusy)}
+                aria-label={`Set ${tunable.name}`}
+              >Set value</button>
+              <button
+                class="danger"
+                on:click={() => requestTunableControl('rollback', tunable)}
+                disabled={Boolean(tunableBusy) || tunable.revision <= 1}
+                aria-label={`Rollback ${tunable.name}`}
+              >Rollback</button>
+              <button
+                on:click={() => loadTunableAudit(tunable.name)}
+                disabled={tunableAuditLoading}
+                aria-label={`View audit for ${tunable.name}`}
+              >Audit</button>
+            </div>
+          </li>
         {/each}
-      </dl>
+      </ul>
+
+      {#if pendingTunableControl}
+        <div class="tunable-confirmation" role="group" aria-labelledby="tunable-confirmation-heading">
+          <h3 id="tunable-confirmation-heading">
+            {pendingTunableControl.action === 'set' ? 'Set' : 'Rollback'} {pendingTunableControl.name}
+          </h3>
+          <p>
+            Frozen target: <code>{pendingTunableControl.name}</code>
+            at revision {pendingTunableControl.revision}, current value
+            {pendingTunableControl.value}. The server will reject this operation
+            if another operator changes the revision first.
+          </p>
+          {#if pendingTunableControl.action === 'set'}
+            <label for="tunable-control-input">
+              New value ({pendingTunableControl.minimum} to {pendingTunableControl.maximum})
+            </label>
+          {:else}
+            <p>
+              Rollback changes live enforcement. Type an older retained revision,
+              a vertical bar, and the exact tunable name.
+            </p>
+            <label for="tunable-control-input">Target revision|exact tunable name</label>
+          {/if}
+          <input
+            id="tunable-control-input"
+            bind:value={tunableInput}
+            inputmode={pendingTunableControl.action === 'set' ? 'numeric' : 'text'}
+            autocomplete="off"
+            spellcheck="false"
+          />
+          <div class="tunable-actions">
+            <button
+              class:danger={pendingTunableControl.action === 'rollback'}
+              on:click={executeTunableControl}
+              disabled={!canSubmitTunableControl(pendingTunableControl, tunableInput, tunableBusy)}
+            >Confirm {pendingTunableControl.action}</button>
+            <button on:click={cancelTunableControl}>Cancel tunable change</button>
+          </div>
+        </div>
+      {/if}
+
+      {#if tunableStatus}<p class="operation-status" role="status">{tunableStatus}</p>{/if}
+      {#if tunableError}<p class="operation-error" role="alert">{tunableError}</p>{/if}
+
+      {#if tunableAuditTarget}
+        <section class="tunable-audit" aria-labelledby="tunable-audit-heading">
+          <div class="history-heading">
+            <h3 id="tunable-audit-heading">Tunable audit: {tunableAuditTarget}</h3>
+            <button
+              on:click={() => loadTunableAudit(tunableAuditTarget)}
+              disabled={tunableAuditLoading}
+            >Refresh audit</button>
+          </div>
+          {#if tunableAuditLoading}
+            <p class="operation-status" role="status">Loading tunable audit…</p>
+          {:else if tunableAudit.length === 0}
+            <p class="empty">No retained audit entries for this tunable.</p>
+          {:else}
+            <div class="table-wrap">
+              <table>
+                <thead><tr><th>Time</th><th>Action</th><th>Outcome</th><th>Revision</th><th>Value</th><th>Actor</th><th>Reason</th></tr></thead>
+                <tbody>
+                  {#each tunableAudit as entry}
+                    <tr>
+                      <th scope="row">{entry.created_at}</th>
+                      <td>{entry.action}</td>
+                      <td>{entry.outcome}</td>
+                      <td>{entry.revision ?? 'None'}</td>
+                      <td>{entry.effective_value ?? 'None'}</td>
+                      <td>{entry.actor}</td>
+                      <td>{entry.reason || 'None'}</td>
+                    </tr>
+                  {/each}
+                </tbody>
+              </table>
+            </div>
+          {/if}
+        </section>
+      {/if}
     {/if}
   </section>
 </section>
@@ -373,7 +893,7 @@
   h1 { margin: 0 0 0.5rem; font-size: 1.3rem; }
   h2 { margin: 1.75rem 0 0.75rem; font-size: 1rem; color: #d8d8e3; }
   .summary { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 0.75rem; margin: 1.25rem 0; }
-  .summary div, .agent-grid > li, .compact-list li, .tunable-list > div { background: #1a1a2e; border: 1px solid #3f3f5a; border-radius: 8px; }
+  .summary div, .agent-grid > li, .compact-list li, .tunable-card { background: #1a1a2e; border: 1px solid #3f3f5a; border-radius: 8px; }
   .summary div { padding: 0.8rem; }
   .summary dt, .details dt { color: #b9b9c8; font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.04em; }
   .summary dd { margin: 0.3rem 0 0; font-weight: 650; }
@@ -399,10 +919,10 @@
   .compact-list { display: grid; gap: 0.5rem; }
   .compact-list li { display: flex; justify-content: space-between; gap: 1rem; padding: 0.7rem; }
   .compact-list span { color: #b9b9c8; }
-  .tunable-list { display: grid; gap: 0.5rem; margin: 0; }
-  .tunable-list > div { padding: 0.75rem; }
-  .tunable-list dd { margin: 0.3rem 0; color: #b9b9c8; }
+  .tunable-list { display: grid; gap: 0.5rem; margin: 0; padding: 0; list-style: none; }
+  .tunable-card { padding: 0.75rem; }
   .tunable-list p { margin: 0; color: #a7a7b8; font-size: 0.78rem; }
+  .tunable-list .tunable-value { margin: 0.3rem 0; color: #b9b9c8; }
   .empty { color: #b9b9c8; font-size: 0.85rem; }
   .unavailable { padding: 0.75rem; border: 1px solid #6b531c; border-radius: 8px; background: #352a12; color: #fde68a; }
   .service-actions { display: flex; flex-wrap: wrap; gap: 0.4rem; align-items: center; }
@@ -416,7 +936,7 @@
     cursor: pointer;
   }
   .service-actions button:disabled, .history-heading button:disabled { opacity: 0.5; cursor: wait; }
-  .service-actions .danger { background: #581717; border-color: #991b1b; color: #fecaca; }
+  .service-actions .danger, .tunable-actions .danger, .package-actions .danger { background: #581717; border-color: #991b1b; color: #fecaca; }
   .service-confirmation { margin-top: 0.9rem; padding: 0.9rem; border: 1px solid #b91c1c; border-radius: 8px; background: #2b1518; }
   .service-confirmation h3 { margin: 0 0 0.5rem; }
   .service-confirmation p { color: #fecaca; line-height: 1.45; overflow-wrap: anywhere; }
@@ -425,6 +945,78 @@
   .operation-status { color: #93c5fd; }
   .operation-error { color: #fca5a5; overflow-wrap: anywhere; }
   .service-history { margin-top: 1rem; }
+  .tunable-actions { display: flex; flex-wrap: wrap; gap: 0.4rem; margin-top: 0.7rem; }
+  .tunable-actions button {
+    min-height: 40px;
+    padding: 0.35rem 0.65rem;
+    border: 1px solid #5b5b76;
+    border-radius: 6px;
+    background: #29293f;
+    color: #e8e8f0;
+    cursor: pointer;
+  }
+  .tunable-actions button:disabled { opacity: 0.5; cursor: wait; }
+  .tunable-confirmation { margin-top: 0.9rem; padding: 0.9rem; border: 1px solid #b91c1c; border-radius: 8px; background: #2b1518; }
+  .tunable-confirmation h3 { margin: 0 0 0.5rem; }
+  .tunable-confirmation p { color: #fecaca; line-height: 1.45; overflow-wrap: anywhere; }
+  .tunable-confirmation label { display: block; margin-bottom: 0.35rem; font-weight: 700; }
+  .tunable-confirmation input { width: 100%; min-height: 44px; border: 1px solid #77778e; border-radius: 7px; background: #11111d; color: #f5f5fa; padding: 0.5rem 0.65rem; }
+  .tunable-audit { margin-top: 1rem; }
+  .package-install {
+    display: grid;
+    grid-template-columns: minmax(12rem, 1fr) minmax(12rem, 1fr) auto;
+    gap: 0.75rem;
+    align-items: end;
+    margin-bottom: 0.9rem;
+  }
+  .package-install div { min-width: 0; }
+  .package-install label, .package-confirmation label {
+    display: block;
+    margin-bottom: 0.35rem;
+    font-weight: 700;
+  }
+  .package-install input, .package-confirmation input {
+    width: 100%;
+    min-height: 44px;
+    border: 1px solid #77778e;
+    border-radius: 7px;
+    background: #11111d;
+    color: #f5f5fa;
+    padding: 0.5rem 0.65rem;
+  }
+  .package-install button, .package-actions button {
+    min-height: 40px;
+    padding: 0.35rem 0.65rem;
+    border: 1px solid #5b5b76;
+    border-radius: 6px;
+    background: #29293f;
+    color: #e8e8f0;
+    cursor: pointer;
+  }
+  .package-install button { min-height: 44px; }
+  .package-install button:disabled, .package-actions button:disabled {
+    opacity: 0.5;
+    cursor: wait;
+  }
+  .package-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.4rem;
+    align-items: center;
+  }
+  .package-confirmation {
+    margin-top: 0.9rem;
+    padding: 0.9rem;
+    border: 1px solid #b91c1c;
+    border-radius: 8px;
+    background: #2b1518;
+  }
+  .package-confirmation h3 { margin: 0 0 0.5rem; }
+  .package-confirmation p {
+    color: #fecaca;
+    line-height: 1.45;
+    overflow-wrap: anywhere;
+  }
   .history-heading { display: flex; align-items: center; justify-content: space-between; gap: 0.75rem; }
   .history-heading h3 { margin: 0; }
   code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
@@ -433,5 +1025,6 @@
     .agent-grid { grid-template-columns: 1fr; }
     .details { grid-template-columns: 1fr; }
     .compact-list li { flex-direction: column; }
+    .package-install { grid-template-columns: 1fr; }
   }
 </style>

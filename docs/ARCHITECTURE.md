@@ -8,6 +8,30 @@
 This document describes the system **as it is built today**. It is the canonical
 reference for the README and for new design work.
 
+The multi-node authority, ownership, partition, and retry rules are specified
+separately in the
+[distributed control-plane consistency contract](DISTRIBUTED_CONTROL_PLANE.md).
+The durable OpenRaft storage-v2 implementation in
+`crates/kernel/src/cluster_consensus.rs` and the bounded mTLS peer/election
+runtime in `crates/kernel/src/cluster_runtime.rs` form the optional quorum
+authority. Under strict, default-off `[cluster_raft]` configuration,
+`agent-server` routes public membership and ownership mutations through the
+replicated deterministic state machine and serves linearizable reads, including
+transparent follower forwarding. The disabled default retains the designated
+single SQLite authority. Application-listener leaves have a bounded replicated
+prepare/activate/finalize rollout. The voter subset can change by one durable
+generation through persisted target intent, learner catch-up, and OpenRaft
+joint consensus; non-voters remain replicated learners. Separate durable
+transport-trust generations atomically replace the complete digest-pinned peer
+map, add/remove learners, and rotate exact server/client leaves plus CA roots
+through an expiring overlap. The immutable application genesis, complete
+challenged application catalog, and current transport subset remain separate
+exact inputs; retained peers preserve identity, leaf, and CA continuity.
+Self-contained authority authentication at
+workload destinations, migration, global quotas/trust, rolling upgrades, and
+disaster recovery are not complete. Ownership revisions and destination fences
+do retain the committed authority term and exact bounded lease expiry.
+
 ---
 
 ## 1. The one-paragraph version

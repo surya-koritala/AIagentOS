@@ -14,7 +14,9 @@ pub mod auth;
 pub mod budget;
 pub mod cfs;
 pub mod cgroups;
+pub mod cluster_consensus;
 pub mod cluster_control;
+pub mod cluster_runtime;
 pub mod config;
 pub mod connector;
 pub mod context;
@@ -319,6 +321,9 @@ pub enum KernelError {
 pub enum AgentError {
     #[error("Agent {0} not found")]
     NotFound(AgentId),
+
+    #[error("Agent {0} already exists")]
+    AlreadyExists(AgentId),
 
     #[error("Agent {0} is unresponsive")]
     Unresponsive(AgentId),
@@ -1073,6 +1078,10 @@ pub struct AgentKernelImpl {
     /// Durable cryptographic node identity plus generation-fenced
     /// active/draining/quarantined admission state.
     pub cluster_control: Arc<crate::cluster_control::ClusterControl>,
+    /// Present only while the daemon owns an initialized authenticated Raft
+    /// runtime. Public membership and ownership dispatch uses this handle
+    /// instead of the legacy single-writer tables.
+    cluster_authority: std::sync::RwLock<Option<crate::cluster_runtime::ClusterAuthorityHandle>>,
     pub permission_manager: Arc<PermissionManager>,
     pub sandbox_manager: Arc<SandboxManagerImpl>,
     pub ipc: Arc<IpcManager>,
@@ -1153,6 +1162,11 @@ pub struct AgentKernelImpl {
     /// then takes the write guard so no admitted request can recreate deleted
     /// state during the storage transaction.
     pub(crate) erasure_barrier: tokio::sync::RwLock<()>,
+    /// Per-agent admission barriers that make destination-fence verification
+    /// atomic with the full protected mutation. Mutations hold a shared guard;
+    /// installing or retiring a token holds the exclusive guard, so an
+    /// ownership handoff cannot cross a verified operation in flight.
+    agent_mutation_fence_barriers: DashMap<AgentId, Arc<tokio::sync::RwLock<()>>>,
     /// Per-credential in-flight request admission. Revocation closes and drains
     /// only the affected identity instead of holding the global auth lock across
     /// syscall, tool, or provider I/O.
@@ -1165,7 +1179,7 @@ pub struct AgentKernelImpl {
     /// Request-scoped cancellation handles for public streaming turns. The
     /// agent id is part of the key so tenant authorization happens before a
     /// request can signal another turn.
-    active_requests: DashMap<(AgentId, String), tokio_util::sync::CancellationToken>,
+    active_requests: DashMap<(AgentId, String), ActiveRequestHandle>,
     pub(crate) lifecycle_counters: crate::metrics::LifecycleCounters,
     /// Stable, bounded-cardinality request outcomes and latency. Correlation
     /// identifiers remain in trace spans and never become metric labels.
@@ -1188,6 +1202,21 @@ struct ActiveTurnRegistration<'a> {
     kernel: &'a AgentKernelImpl,
     agent_id: AgentId,
     request_id: Option<String>,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct ActiveRequestFence {
+    pub cluster_id: String,
+    pub owner_node_id: String,
+    pub authority_term: u64,
+    pub authority_generation: u64,
+    pub fencing_token: u64,
+    pub proof_expires_at: chrono::DateTime<chrono::Utc>,
+}
+
+struct ActiveRequestHandle {
+    cancellation: tokio_util::sync::CancellationToken,
+    fence: Option<ActiveRequestFence>,
 }
 
 impl Drop for ActiveTurnRegistration<'_> {
@@ -1215,6 +1244,25 @@ fn crash_live_erasure_after_step_for_test(step: &str) {
 
 #[cfg(not(test))]
 fn crash_live_erasure_after_step_for_test(_step: &str) {}
+
+/// Non-secret local-operator projection of one exact, single-use tool grant.
+///
+/// This is intentionally absent from remote wire, SDK, package, and MCP
+/// surfaces. The resource is an opaque digest so a visible approval indicator
+/// does not retain or disclose device names, paths, URLs, or typed inputs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolApprovalState {
+    /// Exact agent that would consume the grant.
+    pub agent_id: AgentId,
+    /// Registered tool name.
+    pub tool_name: String,
+    /// Opaque SHA-256 identity of the exact target.
+    pub resource_identity: String,
+    /// Minimum local human authority required by the tool declaration.
+    pub required_policy: crate::tools::ApprovalPolicy,
+    /// Whether a matching unconsumed grant is currently pending.
+    pub granted: bool,
+}
 
 impl AgentKernelImpl {
     const WATCHDOG_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
@@ -1542,6 +1590,7 @@ impl AgentKernelImpl {
             backup_maintenance: Arc::new(crate::storage::BackupMaintenance::default()),
             _storage_lease: storage_lease,
             cluster_control,
+            cluster_authority: std::sync::RwLock::new(None),
             permission_manager,
             sandbox_manager,
             ipc,
@@ -1588,6 +1637,7 @@ impl AgentKernelImpl {
             auth: Arc::new(tokio::sync::RwLock::new(crate::auth::AuthSystem::new())),
             auth_mutation_lock: tokio::sync::Mutex::new(()),
             erasure_barrier: tokio::sync::RwLock::new(()),
+            agent_mutation_fence_barriers: DashMap::new(),
             credential_leases: Arc::new(crate::auth::CredentialLeaseManager::default()),
             cgroup_budgets: budgets.clone(),
             executors: DashMap::new(),
@@ -1603,6 +1653,34 @@ impl AgentKernelImpl {
         })
     }
 
+    /// Attach the live replicated authority exactly once during daemon
+    /// startup. Unit/in-process kernels retain the legacy single-node path.
+    pub fn install_cluster_authority(
+        &self,
+        authority: crate::cluster_runtime::ClusterAuthorityHandle,
+    ) -> Result<(), KernelError> {
+        let mut slot = self
+            .cluster_authority
+            .write()
+            .map_err(|_| KernelError::Policy("cluster authority lock is poisoned".into()))?;
+        if slot.is_some() {
+            return Err(KernelError::Policy(
+                "cluster authority is already installed".into(),
+            ));
+        }
+        *slot = Some(authority);
+        Ok(())
+    }
+
+    pub fn cluster_authority(
+        &self,
+    ) -> Result<Option<crate::cluster_runtime::ClusterAuthorityHandle>, KernelError> {
+        self.cluster_authority
+            .read()
+            .map(|authority| authority.clone())
+            .map_err(|_| KernelError::Policy("cluster authority lock is poisoned".into()))
+    }
+
     /// Register an LLM provider adapter.
     pub fn register_provider(
         &self,
@@ -1615,7 +1693,17 @@ impl AgentKernelImpl {
 
     /// Create agent with full subsystem coordination.
     pub async fn create_agent_full(&self, config: AgentConfig) -> Result<AgentHandle, KernelError> {
-        self.create_agent_grouped(config, None, crate::context::DEFAULT_TENANT)
+        self.create_agent_grouped(config, None, crate::context::DEFAULT_TENANT, None)
+            .await
+    }
+
+    /// Create an agent with an authority-reserved identifier.
+    pub async fn create_agent_full_with_id(
+        &self,
+        agent_id: AgentId,
+        config: AgentConfig,
+    ) -> Result<AgentHandle, KernelError> {
+        self.create_agent_grouped(config, None, crate::context::DEFAULT_TENANT, Some(agent_id))
             .await
     }
 
@@ -1642,7 +1730,24 @@ impl AgentKernelImpl {
         } else {
             Some(tenant_id)
         };
-        self.create_agent_grouped(config, group, tenant_id).await
+        self.create_agent_grouped(config, group, tenant_id, None)
+            .await
+    }
+
+    /// Tenant-scoped variant of [`create_agent_full_with_id`](Self::create_agent_full_with_id).
+    pub async fn create_agent_for_tenant_with_id(
+        &self,
+        tenant_id: &str,
+        agent_id: AgentId,
+        config: AgentConfig,
+    ) -> Result<AgentHandle, KernelError> {
+        let group = if tenant_id == crate::context::DEFAULT_TENANT {
+            None
+        } else {
+            Some(tenant_id)
+        };
+        self.create_agent_grouped(config, group, tenant_id, Some(agent_id))
+            .await
     }
 
     /// Get or build the stable root→tenant→profile→agent hierarchy used for
@@ -1740,7 +1845,7 @@ impl AgentKernelImpl {
         config: AgentConfig,
         group: &str,
     ) -> Result<AgentHandle, KernelError> {
-        self.create_agent_grouped(config, Some(group), crate::context::DEFAULT_TENANT)
+        self.create_agent_grouped(config, Some(group), crate::context::DEFAULT_TENANT, None)
             .await
     }
 
@@ -1847,6 +1952,78 @@ impl AgentKernelImpl {
         Ok(())
     }
 
+    /// Return the non-secret status of one exact local approval target.
+    pub fn tool_call_approval_state(
+        &self,
+        agent_id: AgentId,
+        tool_name: &str,
+        arguments: &serde_json::Value,
+    ) -> Result<ToolApprovalState, KernelError> {
+        let prepared = self
+            .tool_registry
+            .prepare_execution(agent_id, tool_name, arguments)
+            .map_err(KernelError::Policy)?;
+        let required = prepared.authorization.security.approval_policy;
+        if required == crate::tools::ApprovalPolicy::None {
+            return Err(KernelError::Policy(format!(
+                "tool '{tool_name}' does not require approval"
+            )));
+        }
+        let resource_identity =
+            crate::resources::opaque_identity(prepared.authorization.resource.as_bytes());
+        let granted = self
+            .syscall_gate
+            .tool_approval_granted_contract(
+                agent_id,
+                tool_name,
+                &prepared.authorization.resource,
+                &prepared.approval_contract_digest,
+                required,
+            )
+            .ok_or_else(|| {
+                KernelError::Policy(format!(
+                    "cannot inspect tool approval for unknown agent {agent_id}"
+                ))
+            })?;
+        Ok(ToolApprovalState {
+            agent_id,
+            tool_name: tool_name.to_string(),
+            resource_identity,
+            required_policy: required,
+            granted,
+        })
+    }
+
+    /// Revoke one exact, unconsumed approval from the trusted local UI.
+    pub fn revoke_tool_call_approval(
+        &self,
+        agent_id: AgentId,
+        tool_name: &str,
+        arguments: &serde_json::Value,
+    ) -> Result<bool, KernelError> {
+        let prepared = self
+            .tool_registry
+            .prepare_execution(agent_id, tool_name, arguments)
+            .map_err(KernelError::Policy)?;
+        if prepared.authorization.security.approval_policy == crate::tools::ApprovalPolicy::None {
+            return Err(KernelError::Policy(format!(
+                "tool '{tool_name}' does not require approval"
+            )));
+        }
+        self.syscall_gate
+            .revoke_tool_approval_contract(
+                agent_id,
+                tool_name,
+                &prepared.authorization.resource,
+                &prepared.approval_contract_digest,
+            )
+            .ok_or_else(|| {
+                KernelError::Policy(format!(
+                    "cannot revoke tool approval for unknown agent {agent_id}"
+                ))
+            })
+    }
+
     /// Resolve the (Agent, Tool) namespaces for a group, creating them lazily.
     /// `None` → the registry's shared defaults.
     fn namespaces_for_group(
@@ -1880,6 +2057,7 @@ impl AgentKernelImpl {
         mut config: AgentConfig,
         group: Option<&str>,
         tenant_id: &str,
+        requested_agent_id: Option<AgentId>,
     ) -> Result<AgentHandle, KernelError> {
         let _operator_mutation = self.operator_control.mutation_guard().await;
         let max_agents = self.operator_control.max_agents();
@@ -1899,7 +2077,14 @@ impl AgentKernelImpl {
             config.sandbox_config = Some(SandboxManagerImpl::default_config());
         }
         // 1. Create agent via agent manager
-        let handle = self.agent_manager.create_agent(config.clone()).await?;
+        let handle = match requested_agent_id {
+            Some(agent_id) => {
+                self.agent_manager
+                    .create_agent_with_id(agent_id, config.clone())
+                    .await?
+            }
+            None => self.agent_manager.create_agent(config.clone()).await?,
+        };
         let agent_id = handle.id;
 
         // 2. Assign permission profile
@@ -2971,6 +3156,16 @@ impl AgentKernelImpl {
             .clone()
     }
 
+    pub(crate) fn agent_mutation_fence_barrier(
+        &self,
+        agent_id: AgentId,
+    ) -> Arc<tokio::sync::RwLock<()>> {
+        self.agent_mutation_fence_barriers
+            .entry(agent_id)
+            .or_insert_with(|| Arc::new(tokio::sync::RwLock::new(())))
+            .clone()
+    }
+
     fn record_lifecycle(
         &self,
         agent_id: AgentId,
@@ -3595,6 +3790,7 @@ impl AgentKernelImpl {
             },
             group,
             &state.def.policy.tenant_id,
+            None,
         );
         let created = tokio::time::timeout(startup_timeout, create).await;
         match created {
@@ -3660,12 +3856,20 @@ impl AgentKernelImpl {
                 self.persist_service_transition(name, "started", None)
                     .await?;
                 let remaining = startup_timeout.saturating_sub(startup_started.elapsed());
+                let readiness_delay =
+                    std::time::Duration::from_millis(state.def.health.readiness_delay_ms);
+                if remaining.is_zero() || readiness_delay >= remaining {
+                    let reason =
+                        format!("startup exceeded {}ms", state.def.health.startup_timeout_ms);
+                    self.fail_service_start(name, handle.id, "startup_timeout", &reason)
+                        .await?;
+                    return Err(KernelError::LifecycleTimeout(format!(
+                        "service '{name}' {reason}"
+                    )));
+                }
                 let readiness = tokio::time::timeout(remaining, async {
-                    if state.def.health.readiness_delay_ms > 0 {
-                        tokio::time::sleep(std::time::Duration::from_millis(
-                            state.def.health.readiness_delay_ms,
-                        ))
-                        .await;
+                    if !readiness_delay.is_zero() {
+                        tokio::time::sleep(readiness_delay).await;
                     }
                     self.get_agent_status(handle.id)
                 })
@@ -4808,7 +5012,8 @@ impl AgentKernelImpl {
         agent_id: AgentId,
         message: &str,
     ) -> Result<AgentOutput, KernelError> {
-        self.send_message_inner(agent_id, message, None, None).await
+        self.send_message_inner(agent_id, message, None, None, None)
+            .await
     }
 
     /// Send a message while publishing bounded execution events and registering
@@ -4821,6 +5026,18 @@ impl AgentKernelImpl {
         request_id: &str,
         events: tokio::sync::mpsc::Sender<crate::execution::StreamEvent>,
     ) -> Result<AgentOutput, KernelError> {
+        self.send_message_stream_with_fence(agent_id, message, request_id, events, None)
+            .await
+    }
+
+    pub(crate) async fn send_message_stream_with_fence(
+        &self,
+        agent_id: AgentId,
+        message: &str,
+        request_id: &str,
+        events: tokio::sync::mpsc::Sender<crate::execution::StreamEvent>,
+        request_fence: Option<ActiveRequestFence>,
+    ) -> Result<AgentOutput, KernelError> {
         if request_id.is_empty() || request_id.len() > 128 {
             return Err(KernelError::Policy(
                 "request id must contain 1..=128 bytes".into(),
@@ -4831,6 +5048,7 @@ impl AgentKernelImpl {
             message,
             Some(request_id.to_string()),
             Some(events),
+            request_fence,
         )
         .await
     }
@@ -4840,10 +5058,30 @@ impl AgentKernelImpl {
     /// ambient cancellation capability.
     pub fn cancel_request(&self, agent_id: AgentId, request_id: &str) -> bool {
         let key = (agent_id, request_id.to_string());
-        let Some(token) = self.active_requests.get(&key) else {
+        let Some(handle) = self.active_requests.get(&key) else {
             return false;
         };
-        token.cancel();
+        if handle.fence.is_some() {
+            return false;
+        }
+        handle.cancellation.cancel();
+        true
+    }
+
+    pub(crate) fn cancel_request_fenced(
+        &self,
+        agent_id: AgentId,
+        request_id: &str,
+        fence: &ActiveRequestFence,
+    ) -> bool {
+        let key = (agent_id, request_id.to_string());
+        let Some(handle) = self.active_requests.get(&key) else {
+            return false;
+        };
+        if handle.fence.as_ref() != Some(fence) {
+            return false;
+        }
+        handle.cancellation.cancel();
         true
     }
 
@@ -4853,6 +5091,7 @@ impl AgentKernelImpl {
         message: &str,
         request_id: Option<String>,
         events: Option<tokio::sync::mpsc::Sender<crate::execution::StreamEvent>>,
+        request_fence: Option<ActiveRequestFence>,
     ) -> Result<AgentOutput, KernelError> {
         // Serialize executor creation against pause/stop/kill and reject work
         // unless the agent is currently runnable.
@@ -4895,8 +5134,13 @@ impl AgentKernelImpl {
                     self.active_cancellations
                         .insert(agent_id, cancellation.clone());
                     if let Some(request_id) = request_id.as_ref() {
-                        self.active_requests
-                            .insert((agent_id, request_id.clone()), cancellation);
+                        self.active_requests.insert(
+                            (agent_id, request_id.clone()),
+                            ActiveRequestHandle {
+                                cancellation,
+                                fence: request_fence.clone(),
+                            },
+                        );
                     }
                     drop(lifecycle_guard);
                     break executor_guard;
@@ -7501,6 +7745,63 @@ mod tests {
                 crate::syscall_gate::GateDenial::ApprovalRequired { .. }
             ))
         ));
+        let initial = kernel
+            .tool_call_approval_state(agent, "run_command", &arguments)
+            .unwrap();
+        assert!(!initial.granted);
+        assert_eq!(initial.required_policy, crate::tools::ApprovalPolicy::User);
+        assert!(!initial.resource_identity.contains("echo"));
+        kernel
+            .approve_tool_call(
+                agent,
+                "run_command",
+                &arguments,
+                crate::tools::ApprovalPolicy::User,
+            )
+            .unwrap();
+        assert!(
+            kernel
+                .tool_call_approval_state(agent, "run_command", &arguments)
+                .unwrap()
+                .granted
+        );
+        let different_arguments = serde_json::json!({"command": "echo", "args": ["different"]});
+        assert!(
+            !kernel
+                .tool_call_approval_state(agent, "run_command", &different_arguments)
+                .unwrap()
+                .granted
+        );
+        assert!(!kernel
+            .revoke_tool_call_approval(agent, "run_command", &different_arguments)
+            .unwrap());
+        assert!(
+            kernel
+                .tool_call_approval_state(agent, "run_command", &arguments)
+                .unwrap()
+                .granted
+        );
+        assert!(kernel
+            .revoke_tool_call_approval(agent, "run_command", &arguments)
+            .unwrap());
+        assert!(
+            !kernel
+                .tool_call_approval_state(agent, "run_command", &arguments)
+                .unwrap()
+                .granted
+        );
+        assert!(!kernel
+            .revoke_tool_call_approval(agent, "run_command", &arguments)
+            .unwrap());
+        assert!(matches!(
+            kernel
+                .tool_registry
+                .authorize_and_acquire_call(&kernel.syscall_gate, agent, "run_command", &arguments)
+                .await,
+            Err(crate::tools::ToolAuthorizationError::Denied(
+                crate::syscall_gate::GateDenial::ApprovalRequired { .. }
+            ))
+        ));
         kernel
             .approve_tool_call(
                 agent,
@@ -7515,6 +7816,12 @@ mod tests {
             .await
             .unwrap();
         drop(guard);
+        assert!(
+            !kernel
+                .tool_call_approval_state(agent, "run_command", &arguments)
+                .unwrap()
+                .granted
+        );
     }
 
     #[tokio::test]

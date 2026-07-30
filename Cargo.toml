@@ -54,3 +54,4 @@ zeroize = "1"
 cap-std = "4.0.2"
 cap-primitives = "4.0.2"
 semver = { version = "1", features = ["serde"] }
+openraft = { version = "=0.9.24", features = ["serde", "storage-v2"] }

@@ -90,6 +90,17 @@ AGENT_SERVER_TLS_CERT=/etc/agentos/server.crt \
 AGENT_SERVER_TLS_KEY=/etc/agentos/server.key \
 cargo run --package agent-cli --bin agent-server -- 0.0.0.0:7777
 
+# Optional live rotation: atomically replace the PEM files, then atomically
+# replace this pre-created trigger file with new content. Add
+# AGENT_SERVER_TLS_CLIENT_CA and AGENT_SERVER_TLS_CLIENT_CRL for fail-closed
+# mTLS client authentication and individual certificate revocation.
+AGENT_SERVER_TLS_RELOAD_TRIGGER=/run/agentos/tls.reload \
+AGENT_SERVER_TLS_RELOAD_INTERVAL_SECONDS=5 \
+AGENT_SERVER_TOKEN="replace-with-a-secret" \
+AGENT_SERVER_TLS_CERT=/etc/agentos/server.crt \
+AGENT_SERVER_TLS_KEY=/etc/agentos/server.key \
+cargo run --package agent-cli --bin agent-server -- 0.0.0.0:7777
+
 # Unix-domain socket instead of TCP
 AGENT_SERVER_UNIX=/tmp/agent.sock cargo run --package agent-cli --bin agent-server
 

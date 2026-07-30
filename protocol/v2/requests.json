@@ -1,7 +1,9 @@
 [
   {
+    "agent_id": null,
     "name": "fixture",
     "op": "create_agent",
+    "ownership_proof": null,
     "priority": 1,
     "profile": "fixture",
     "provider": "fixture",
@@ -209,8 +211,20 @@
     "op": "rollback_package"
   },
   {
+    "expected_digest": "fixture",
+    "expected_version": "fixture",
+    "name": "fixture",
+    "op": "rollback_package_exact"
+  },
+  {
     "name": "fixture",
     "op": "remove_package"
+  },
+  {
+    "expected_digest": "fixture",
+    "expected_version": "fixture",
+    "name": "fixture",
+    "op": "remove_package_exact"
   },
   {
     "op": "list_installed_packages"
@@ -244,12 +258,33 @@
   },
   {
     "op": "issue_cluster_join_challenge",
+    "operation_id": "fixture",
     "ttl_seconds": 1
   },
   {
     "challenge_hex": "00",
     "expected_generation": null,
     "op": "register_cluster_member",
+    "operation_id": "fixture",
+    "reason": "fixture",
+    "registration": {
+      "endpoint": "127.0.0.1:7443",
+      "fingerprint": "0000000000000000000000000000000000000000000000000000000000000000",
+      "min_protocol_version": 1,
+      "node_id": "00000000-0000-0000-0000-000000000004",
+      "protocol_version": 2,
+      "public_key": "0000000000000000000000000000000000000000000000000000000000000000",
+      "server_version": "0.3.0"
+    },
+    "signature_hex": "00"
+  },
+  {
+    "challenge_hex": "00",
+    "expected_generation": 1,
+    "minimum_overlap_seconds": 1,
+    "op": "prepare_cluster_member_certificate_rollout",
+    "operation_id": "fixture",
+    "prepare_ttl_seconds": 1,
     "reason": "fixture",
     "registration": {
       "endpoint": "127.0.0.1:7443",
@@ -265,7 +300,22 @@
   {
     "expected_generation": 1,
     "node_id": "fixture",
+    "op": "abort_cluster_member_certificate_rollout",
+    "operation_id": "fixture",
+    "reason": "fixture"
+  },
+  {
+    "expected_generation": 1,
+    "node_id": "fixture",
+    "op": "finalize_cluster_member_certificate_rollout",
+    "operation_id": "fixture",
+    "reason": "fixture"
+  },
+  {
+    "expected_generation": 1,
+    "node_id": "fixture",
     "op": "set_cluster_member_state",
+    "operation_id": "fixture",
     "reason": "fixture",
     "state": "left"
   },
@@ -275,6 +325,98 @@
   {
     "limit": 1,
     "op": "list_cluster_membership_audit"
+  },
+  {
+    "limit": 1,
+    "op": "list_cluster_certificate_rollout_audit"
+  },
+  {
+    "agent_id": "00000000-0000-0000-0000-000000000001",
+    "expected_fencing_token": null,
+    "op": "claim_cluster_agent_ownership",
+    "operation_id": "fixture",
+    "owner_node_id": "00000000-0000-0000-0000-000000000004",
+    "reason": "fixture",
+    "ttl_seconds": 1
+  },
+  {
+    "agent_id": "00000000-0000-0000-0000-000000000001",
+    "fencing_token": 1,
+    "op": "renew_cluster_agent_ownership",
+    "operation_id": "fixture",
+    "owner_node_id": "00000000-0000-0000-0000-000000000004",
+    "reason": "fixture",
+    "ttl_seconds": 1
+  },
+  {
+    "agent_id": "00000000-0000-0000-0000-000000000001",
+    "fencing_token": 1,
+    "op": "release_cluster_agent_ownership",
+    "operation_id": "fixture",
+    "owner_node_id": "00000000-0000-0000-0000-000000000004",
+    "reason": "fixture"
+  },
+  {
+    "agent_id": "00000000-0000-0000-0000-000000000001",
+    "op": "get_cluster_agent_ownership",
+    "require_active": true
+  },
+  {
+    "after_agent_id": null,
+    "limit": 1,
+    "op": "list_cluster_agent_ownerships"
+  },
+  {
+    "agent_id": null,
+    "limit": 1,
+    "op": "list_cluster_agent_ownership_audit"
+  },
+  {
+    "agent_id": "00000000-0000-0000-0000-000000000001",
+    "authority_generation": 1,
+    "authority_term": 1,
+    "cluster_id": "fixture",
+    "fencing_token": 1,
+    "op": "install_agent_mutation_fence",
+    "owner_node_id": "00000000-0000-0000-0000-000000000004",
+    "proof_expires_at": "2026-01-01T00:00:00Z",
+    "reason": "fixture"
+  },
+  {
+    "agent_id": "00000000-0000-0000-0000-000000000001",
+    "authority_generation": 1,
+    "authority_term": 1,
+    "cluster_id": "fixture",
+    "fencing_token": 1,
+    "op": "retire_agent_mutation_fence",
+    "owner_node_id": "00000000-0000-0000-0000-000000000004",
+    "proof_expires_at": "2026-01-01T00:00:00Z",
+    "reason": "fixture"
+  },
+  {
+    "agent_id": "00000000-0000-0000-0000-000000000001",
+    "op": "get_agent_mutation_fence"
+  },
+  {
+    "agent_id": null,
+    "limit": 1,
+    "op": "list_agent_mutation_fence_audit"
+  },
+  {
+    "agent_id": "00000000-0000-0000-0000-000000000001",
+    "mutation": {
+      "agent_id": "00000000-0000-0000-0000-000000000001",
+      "op": "pause_agent"
+    },
+    "op": "fenced_agent_mutation",
+    "proof": {
+      "authority_generation": 1,
+      "authority_term": 1,
+      "cluster_id": "00000000-0000-0000-0000-000000000005",
+      "fencing_token": 1,
+      "owner_node_id": "00000000-0000-0000-0000-000000000004",
+      "proof_expires_at": "2026-01-01T00:00:00Z"
+    }
   },
   {
     "op": "metrics"

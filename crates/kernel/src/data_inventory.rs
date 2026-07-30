@@ -474,6 +474,78 @@ pub const SQLITE_DATA_INVENTORY: &[StaticDataInventoryEntry] = &[
         "retain"
     ),
     sqlite_entry!(
+        "cluster_agent_ownership",
+        "system",
+        "agent UUID and durable node UUID",
+        "current ownership lease, monotonically increasing fencing token, and release tombstone",
+        "for cluster lifetime",
+        "not confidential; database integrity and file permissions",
+        "retain fencing tombstone until cluster retirement"
+    ),
+    sqlite_entry!(
+        "cluster_agent_ownership_audit",
+        "system",
+        "agent UUID and durable node UUID",
+        "ownership claim, transfer, renewal, and release audit metadata",
+        "indefinite until an explicit audit-retention policy",
+        "not confidential; database integrity and file permissions",
+        "retain"
+    ),
+    sqlite_entry!(
+        "cluster_agent_mutation_fences",
+        "system",
+        "agent UUID and durable node UUID",
+        "destination-enforced highest accepted ownership token and retirement tombstone",
+        "for cluster lifetime",
+        "not confidential; database integrity and file permissions",
+        "retain fencing tombstone until cluster retirement"
+    ),
+    sqlite_entry!(
+        "cluster_agent_mutation_fence_audit",
+        "system",
+        "agent UUID and durable node UUID",
+        "destination fence installation and retirement audit metadata",
+        "indefinite until an explicit audit-retention policy",
+        "not confidential; database integrity and file permissions",
+        "retain"
+    ),
+    sqlite_entry!(
+        "cluster_raft_meta",
+        "system",
+        "none",
+        "consensus vote, committed pointer, and purged-log pointer",
+        "for cluster lifetime",
+        "not confidential; consensus integrity protected by database durability",
+        "retain consensus safety state"
+    ),
+    sqlite_entry!(
+        "cluster_raft_log",
+        "system",
+        "none",
+        "serialized consensus membership and authority commands",
+        "until quorum-safe snapshot compaction",
+        "may contain cluster identity and routing metadata; database confidentiality and integrity apply",
+        "purge only after durable snapshot compaction"
+    ),
+    sqlite_entry!(
+        "cluster_raft_state",
+        "system",
+        "none",
+        "last applied consensus identity, membership, sequencing state, and idempotency receipts",
+        "for cluster lifetime",
+        "may contain cluster identity and routing metadata; database confidentiality and integrity apply",
+        "retain applied consensus state"
+    ),
+    sqlite_entry!(
+        "cluster_raft_snapshot",
+        "system",
+        "none",
+        "complete serialized consensus state-machine snapshot",
+        "current snapshot until atomically superseded",
+        "may contain cluster identity and routing metadata; database confidentiality and integrity apply",
+        "replace atomically after snapshot installation"
+    ),
+    sqlite_entry!(
         "storage_meta",
         "system",
         "none",

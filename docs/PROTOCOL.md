@@ -51,8 +51,9 @@ Policy authoring is available from the same canonical binary without a server:
 `policy-validate POLICY_FILE` and `policy-explain POLICY_FILE --subject ...
 --action ... --object ...` read a bounded UTF-8 TOML document, use the runtime
 `PolicyDocument`/MAC evaluator, and emit JSON. Live `gate-stats`,
-`node-control-audit [LIMIT]`, and `cluster-membership-audit [LIMIT]` map
-directly to `KernelClient`. Those audit reads remain trusted-system operations:
+`node-control-audit [LIMIT]`, `cluster-membership-audit [LIMIT]`, and
+`cluster-certificate-rollout-audit [LIMIT]` map directly to `KernelClient`.
+Those audit reads remain trusted-system operations:
 tenant credentials are denied even when their role is `Admin`, and denials
 emit no audit payload.
 
@@ -66,6 +67,21 @@ listing retain their read-only authorization. Fetch creates a new output file
 and refuses to overwrite an existing path. Revocation, yanking, rollback, and
 removal require `--confirm` followed by the exact key, `name@version`, or
 package name so scripts cannot accidentally confirm a different target.
+The focused TUI additionally exposes install/upgrade, run, rollback, and remove
+through `KernelClient`. Its rollback/removal confirmation freezes the displayed
+name, version, and digest. The `rollback_package_exact` and
+`remove_package_exact` operations compare that version and digest inside the
+same immediate SQLite transaction as the mutation; a concurrent upgrade fails
+as stale instead of retargeting the operator's approval.
+
+The desktop Operations view uses the same package operations and never invokes
+the registry in process. Installed package state is explicitly unavailable
+rather than replaced with an empty list when its public read fails or a
+reconnect occurs between the atomic operator snapshot and package read.
+Rollback/removal freeze the displayed name, version, digest, and publisher,
+require exact `version|name` confirmation, and send the frozen version and
+digest to the transaction-bound mutation. A refreshed row therefore cannot
+retarget an open confirmation, and a concurrent change fails stale.
 
 The desktop service controls are another focused projection of the same
 contract. Start, stop, restart, and bounded transition-history requests pass
@@ -74,6 +90,15 @@ restart freeze the displayed service name, owner, and state, describe the
 dependency or in-flight-work impact, and require the exact service name before
 the mutation is sent. A changed selection or refreshed snapshot cannot retarget
 an open confirmation.
+
+TUI and desktop tunable controls are focused projections of the system-only
+operator-tunable wire operations. Both freeze the displayed name and expected
+revision before mutation, submit updates only within the server-advertised
+bounds, and use the server's compare-and-set revision check so stale screens
+cannot overwrite a newer operator change. Audit history is bounded and
+non-secret. Rollback identifies an older retained revision and requires the
+exact frozen tunable name before submission; the server remains authoritative
+for authorization, revision history, bounds, and atomic persistence.
 
 ## Version and feature negotiation
 
@@ -106,9 +131,9 @@ compatibility behavior, and transport limits:
 
 The schemas use JSON Schema draft 2020-12 and cover every top-level request,
 reply, and stream-event tag. The authorization/schema regression constructs
-all 75 current syscalls and rejects either a missing schema operation or an
-undocumented extra. Deterministic golden request arrays cover all 59 v1
-operations and all 75 v2 operations. Domain payload examples and
+all 92 current syscalls and rejects either a missing schema operation or an
+undocumented extra. Deterministic golden request arrays cover all 61 v1
+operations and all 92 v2 operations. Domain payload examples and
 previous-version shapes are retained under `protocol/`.
 
 ## Compatibility policy
@@ -304,6 +329,13 @@ cancelled, incompatible version, provider, lifecycle, and internal failures.
 - Setting `AGENT_SERVER_TLS_CLIENT_CA` makes the TLS handshake mutually
   authenticated. `ClusterClient::connect_tls` accepts a rustls client config
   carrying the client certificate and cluster trust roots.
+- `AGENT_SERVER_TLS_CLIENT_CRL` adds fail-closed individual client-certificate
+  revocation. The CRL must cover the presented chain and must not be expired.
+- A TLS listener can reload its certificate, key, optional client CA, and
+  optional CRL as one monotonic trust generation. New handshakes use the
+  replacement immediately; old-generation sessions finish the request already
+  admitted and close before another frame is read. Invalid candidates never
+  replace the active config.
 - Unix sockets rely on filesystem permissions and may additionally require a
   token.
 - Plaintext MCP binds only to loopback. Remote MCP is not advertised until it
@@ -443,8 +475,9 @@ system authentication token and mutual TLS.
 
 1. The authority issues a random 32-byte challenge valid for 5–300 seconds.
 2. The joining node signs a domain-separated payload covering the authority
-   cluster ID, challenge, durable identity, endpoint, software version, and
-   protocol support window.
+   cluster ID, challenge, durable identity, endpoint, software version,
+   protocol support window, and—when TLS is used—the SHA-256 fingerprint of the
+   server leaf certificate actually verified on the joining connection.
 3. The authority verifies and consumes the challenge exactly once, rejects
    incompatible versions and duplicate identities/endpoints, and commits the
    active member plus audit evidence in one SQLite transaction.
@@ -453,32 +486,208 @@ system authentication token and mutual TLS.
    identity cannot rejoin.
 
 `get_cluster_membership` returns one atomic cluster ID/generation/member
-snapshot. `ClusterClient::connect_discovered_authenticated` and its TLS variant
+snapshot, including replicated authority time and any bounded certificate
+rollout. `ClusterClient::connect_discovered_authenticated` and its TLS variant
 dial only active endpoints, prove every identity, require exact endpoint and
-fingerprint matches, then re-read the authority. If membership changed while
-connections were assembled, construction fails with a retryable `conflict`.
+application-identity fingerprint matches, and require the observed TLS leaf to
+match the current record or its unexpired replicated rollout, then re-read the
+authority. If membership or TLS trust generation changed while connections
+were assembled, construction fails with a retryable `conflict`. Membership
+audit records the previous and current TLS leaf fingerprints for every join,
+rollout transition, leave, or revocation.
 The authority identity, membership, generations, and audit survive authority
 restart.
 
-This is not yet a consensus, lease, or partition-tolerant membership protocol.
-The designated authority is a single consistency point with no quorum failover;
-there is no ownership lease/fencing token enforced by agent mutations,
-automatic migration, partition fencing, cluster-wide quota transaction,
-policy/package convergence, rolling-upgrade coordinator, or disaster-recovery
-controller. Identity revocation is enforced by discovery, but live TLS client
-certificate rotation/revocation still requires replacing trust configuration
-and restarting affected listeners. Those requirements remain tracked by #122.
+When `[cluster_raft]` is enabled, an active TLS-bound member cannot replace its
+leaf through a direct re-registration. The staged workflow is:
+
+1. While connected through the current leaf, request a fresh join challenge
+   and have the durable node identity sign a registration containing the
+   candidate fingerprint. `ClusterClient::prepare_node_certificate_rollout`
+   performs this proof flow.
+2. Commit `prepare_cluster_member_certificate_rollout` with exact member
+   generation, a 5–3600 second candidate lifetime, and a 5–3600 second minimum
+   overlap. The current leaf remains valid. The candidate is valid only before
+   the replicated `prepare_expires_at`; expiry narrows trust without another
+   write.
+3. Deploy/reload the candidate listener, connect through it, obtain another
+   fresh challenge, and call the normal challenged registration with the
+   generation returned by prepare. This atomically makes the candidate current
+   and sets `retire_previous_after`.
+4. During the overlap, new startup/discovery validation accepts either current
+   or previous leaf. At the retirement instant it rejects the previous leaf.
+   Existing transport sessions must still be drained by the listener reload
+   mechanism. Finalization removes the completed rollout and is rejected before
+   that instant. Abort is available only while prepared.
+
+Every transition advances membership and TLS trust generations and appends
+durable audit evidence. Candidate fingerprints must be new, distinct,
+lowercase SHA-256 values and cannot be reused after abort, activation,
+retirement, or revocation. A rollout requires an existing TLS binding; it
+cannot silently upgrade a plaintext member. Startup and SDK discovery evaluate
+overlap using quorum-replicated time, never a workload node's local clock.
+`list_cluster_certificate_rollout_audit` exposes bounded recent evidence.
+
+With `[cluster_raft]` disabled, the compatibility authority retains its older
+single-node direct re-admission behavior and rejects the new rollout controls.
+This protocol coordinates application-listener leaves only. The OpenRaft voter
+subset changes by an exact durable generation inside the current
+generation-fenced peer catalog, with learner catch-up and joint consensus.
+Separate transport-trust generations can add or remove non-voters and rotate
+Raft peer leaves/CA roots through a bounded continuity-preserving overlap.
+Immutable application genesis, complete challenged application membership, and
+the current transport subset remain exact separate startup inputs.
+
+### Authority ownership lease registry
+
+Protocol-v2 trusted-system callers can claim, renew, release, inspect, page, and
+audit agent ownership records on the designated authority. Directory pages are
+stable by agent id and include active, expired, and released records so clients
+do not infer ownership from absence. A claim names an active member and a
+5–300 second TTL. The first claim receives fencing token 1.
+Renewal requires the exact active owner/token pair and keeps the token stable.
+Release retains a tombstone. A later claim requires that exact old token, is
+allowed only after release or expiry, and allocates a strictly greater token.
+Claims for unknown, left, or revoked members fail closed. The record and its
+audit entry commit in one immediate SQLite transaction and survive authority
+restart. Clean leave is rejected while the node has an unexpired active lease;
+terminal identity revocation releases all of that member's records atomically.
+
+Every membership and ownership mutation accepts an optional canonical
+`operation_id` UUID. In quorum mode the state machine returns the original
+successful result for an exact retained retry and rejects reuse of that
+retained UUID for different command semantics. Rejected outcomes are not
+retained and are never evidence of success. The SDK's `*_with_operation_id`
+methods let callers persist that UUID before sending; convenience methods
+generate a fresh UUID for one attempt. Callers must reuse an ID only for the
+exact same logical operation. The durable receipt map is bounded and fails
+closed at capacity; receipt compaction and its long-term retry window remain
+part of #122.
+
+Destination nodes persist the highest accepted ownership term/token and require
+an exact cluster/owner/term/generation/token/expiry envelope for every mutable
+agent-targeted operation. A proof must be unexpired, cannot extend beyond the
+five-minute authority lease plus 30 seconds of destination clock skew, and
+stops admitting new work at its exact expiry. A clock rollback behind fence
+installation fails closed. The fenced envelope also supports ordered streams
+and exact cancellation; the destination holds one per-agent admission guard
+through the complete operation. Work admitted before expiry may finish under
+that guard; expiry is not a side-effect rollback mechanism. An authenticated
+authority-discovered `ClusterClient`
+retains its authority connection, reserves an agent UUID, preinstalls its exact
+fence, creates that UUID only while the proof remains active, and then
+publishes the route. It revalidates authority state before every mutation,
+propagates same-owner renewal generations, and rebuilds only from exact
+authority/fence agreement. Explicit-address clients remain unmanaged for
+compatibility and cannot operate an agent after a fence is installed.
+Discovery and `reconcile_routes` compare the complete authority directory with
+every local listing. They recover an expired exact-owner lease, repair its
+fence, leave live incomplete reservations pending, and safely advance, recheck,
+retire, and release expired reservations with no local agent. Ambiguous or
+duplicate evidence fails closed.
+The initial managed lease is 30 seconds. Long-lived control loops must call
+`ClusterClient::renew_agent_ownership` or
+`ClusterClient::renew_all_agent_ownerships` before expiry. Applications that
+need idle routes to remain live can explicitly use the
+`connect_discovered_*_with_maintenance` constructors; those retain the
+authenticated connector in memory, renew leases, republish exact destination
+fences, and expose bounded health through `maintenance_status`.
+
+This is not yet a partition-tolerant production membership and mutation-fencing
+protocol. When strict `[cluster_raft]` configuration is enabled,
+`agent-server` routes public membership and ownership mutations through a
+durable OpenRaft majority and serves their reads after a linearizability
+barrier. Followers forward those authority requests to the current leader over
+the exact identity-pinned mTLS peer transport. The replicated state machine
+owns immutable genesis, challenged membership, generation/audit, ownership
+leases/tombstones/audit, a monotonic authority clock, and exact caller-stable
+operation receipts. A three-node regression covers state replication, follower
+read/write forwarding, majority failover, restart recovery, and no-quorum
+rejection. With `[cluster_raft]` disabled, the designated single-node
+authority remains available for compatibility.
+
+The OpenRaft voter subset and transport trust use separate generation fences.
+The complete peer map, exact server/client leaf sets, accepted CA
+fingerprints, overlap expiration, and target digest are persisted with every
+node record. A trust generation can add learners or remove only non-voters;
+retained peers must preserve identity plus server/client leaf continuity and,
+after legacy generation zero, at least one CA root. Leaf/CA overlap expires on
+every fresh RPC and a later generation removes the retired credentials.
+Immutable genesis, complete current challenged application membership, and the
+transport subset are configured and checked separately. Removing only a voter
+retains it as a log-replicating
+learner and does not revoke that peer's mTLS/control trust. Every external
+forwarded authority write carries a short-lived application-node Ed25519
+delegation; the leader binds it to the authenticated Raft source, active
+replicated membership, stable operation UUID, semantic command digest, and
+canonical system-node actor. A quorum-enabled destination independently
+performs a linearizable ownership read before installing or retiring a fence.
+That online verification is not an offline quorum certificate, and
+creation/claim/fence publication is not one atomic cross-database transaction.
+There is no automatic migration, cluster-wide quota transaction,
+policy/package convergence, rolling-upgrade coordinator, or
+disaster-recovery controller.
+Live TLS material can now rotate without restarting listeners, old trust
+generations are drained, and discovery rejects superseded node server leaves.
+Coordinating trust overlap, member re-admission, and rollout order across a
+partitioned cluster is still an operator responsibility. Those remaining
+requirements are tracked by #122.
+The normative object-by-object consistency and failure rules are published in
+[the distributed control-plane contract](DISTRIBUTED_CONTROL_PLANE.md).
+
+## Internal Raft peer protocol
+
+The Raft transport is an internal kernel protocol, not part of the public
+SDK compatibility contract. Each connection carries one length-prefixed JSON
+request and one response over mutual TLS. Version 2 supports OpenRaft
+AppendEntries, Vote, and InstallSnapshot messages plus delegated authority
+write forwarding and linearizable authority reads. It is intentionally
+incompatible with the earlier unsigned authority-write envelope; mixed
+internal protocol versions fail closed during a rolling deployment.
+
+The request envelope binds the wire version, bounded cluster name, source node
+ID, target node ID, and RPC body. The response reverses the authenticated
+source and target. The listener rejects an unknown version, cluster or target;
+an unknown member; a client leaf fingerprint that does not exactly match that
+member; or, for a Raft vote-bearing message, a source ID that differs from the
+vote identity embedded in the RPC.
+The caller validates the server name and CA chain and then independently
+requires the exact server leaf fingerprint recorded for the target member.
+
+The default frame ceiling is 8 MiB and configurable only from 64 KiB through
+64 MiB. Handshake, inbound request, OpenRaft RPC, and response operations are
+timed. The listener bounds concurrent connections (128 by default, hard maximum
+16,384) and drops excess connections without dispatch. Runtime configuration
+also rejects empty or duplicate endpoints, server/client fingerprints, and
+identity keys. External authority writes additionally carry a 30-second
+Ed25519 proof made by the source node's durable application identity. The
+leader verifies the signer against both the Raft transport catalog and active
+replicated application membership, then binds the proof to the operation UUID,
+semantic command digest, and canonical system-node actor before replacing only
+the proposed clock value. Captured proofs can replay only the same idempotent
+operation during their validity window. The current trusted member map cannot change merely by
+restarting the runtime: startup verifies its durable catalog digest and exact
+transport identities. Quorum-versioned voter changes are supported within that
+catalog. Separate quorum-versioned transport-trust changes replace the complete
+catalog, preserve every voter, add/remove learners, and rotate exact leaves/CA
+roots through an expiring overlap with retained-peer continuity. Startup also
+requires an exact immutable application seed and complete durable application
+catalog before accepting a different transport subset. End-user credential
+delegation beyond the current system-node principal, live administration,
+migration, global policy/quota convergence, rolling compatibility, and external
+chaos/recovery qualification are still required before this mode is a complete
+distributed kernel.
 
 ## Conformance evidence
 
 Versioned fixtures:
 
 - `protocol/v1/error.json`
-- `protocol/v1/requests.json` (all 59 v1 operations)
+- `protocol/v1/requests.json` (all 61 v1 operations)
 - `protocol/v2/hello.json`
 - `protocol/v2/typed-error.json`
 - `protocol/v2/describe-protocol-request.json`
-- `protocol/v2/requests.json` (all 75 v2 operations)
+- `protocol/v2/requests.json` (all 92 v2 operations)
 - `protocol/v2/send-message-stream.json`
 - `protocol/v2/stream-event.json`
 - `protocol/v2/stream-completed.json`

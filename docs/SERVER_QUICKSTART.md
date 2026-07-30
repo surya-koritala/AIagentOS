@@ -149,6 +149,19 @@ TRUST.json` and `backup-restore ... --storage-key STORAGE.json
 - `AGENT_SERVER_TLS_CLIENT_CA` — require a client certificate chaining to this
   PEM CA bundle. This requires the TLS cert/key variables and rejects peers
   before the syscall protocol handshake.
+- `AGENT_SERVER_TLS_CLIENT_CRL` — optional PEM CRL bundle for individual mTLS
+  client-certificate revocation. It requires `AGENT_SERVER_TLS_CLIENT_CA`;
+  unknown revocation status fails closed and CRL expiry is enforced.
+- `AGENT_SERVER_TLS_RELOAD_TRIGGER` — enable restart-free replacement of the
+  configured certificate, key, optional client CA, and optional CRL. The trigger
+  file must exist at startup. Install every new PEM with an atomic rename, then
+  atomically replace this small trigger file with different content. The server
+  validates the complete candidate before one atomic generation change; a bad
+  or partial update leaves the old generation active. Existing sessions finish
+  their current request and close before another request is accepted.
+- `AGENT_SERVER_TLS_RELOAD_INTERVAL_SECONDS` — trigger polling interval,
+  `1..=3600` seconds (default `5`). It is accepted only when
+  `AGENT_SERVER_TLS_RELOAD_TRIGGER` is set.
 - `AGENT_SERVER_UNIX` — bind a Unix-domain socket instead of TCP.
 
 ## Observability

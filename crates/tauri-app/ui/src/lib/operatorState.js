@@ -10,6 +10,7 @@ export function createOperatorState() {
     protocolVersion: 0,
     providers: [],
     packages: [],
+    installedPackages: null,
     services: null,
     tunables: null,
     scopedGate: { allowed: 0, denied: 0, audited: 0 },
@@ -48,6 +49,9 @@ export function applyOperatorView(state, view) {
     protocolVersion: Number(view.protocol_version || 0),
     providers: Array.isArray(view.providers) ? view.providers : [],
     packages: Array.isArray(view.packages) ? view.packages : [],
+    installedPackages: Array.isArray(view.installed_packages)
+      ? view.installed_packages
+      : null,
     services: Array.isArray(view.services) ? view.services : null,
     tunables: Array.isArray(view.tunables) ? view.tunables : null,
     scopedGate: view.scoped_gate ?? { allowed: 0, denied: 0, audited: 0 },

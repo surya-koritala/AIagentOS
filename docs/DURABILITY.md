@@ -2,7 +2,8 @@
 
 AI Agent OS currently stores kernel-owned state in one SQLite database. The
 database includes context, memory, usage and quota accounting, agent lifecycle,
-packages, operator settings, services, identity, and cluster control state.
+packages, operator settings, services, identity, cluster control state, and the
+durable log/state/snapshot substrate used by the optional quorum authority.
 
 This document describes the guarantees implemented today. The kernel backup
 and offline restore primitives plus authenticated SDK/CLI entry points are
@@ -54,6 +55,76 @@ After migration, startup verifies the ownership metadata, exact schema version,
 physical integrity, foreign-key consistency, authenticated accounting root, and
 complete accounting event chain. Reopening the current version is idempotent
 and does not append a duplicate migration record.
+
+## Durable consensus substrate
+
+Schema version `6` adds `cluster_raft_meta`, `cluster_raft_log`,
+`cluster_raft_state`, and `cluster_raft_snapshot`. They deliberately use the
+same database rather than a plaintext side store, so SQLCipher encryption,
+`WAL`, `synchronous=FULL`, online backup, offline restore, and the exclusive
+storage lease cover consensus state together with the authority data it will
+eventually govern.
+
+Raft indices are fixed-width big-endian blobs, preserving the full `u64` range
+and numeric ordering. Vote, committed pointer, log append/truncate/purge,
+applied state, and snapshot replacement commit in SQLite transactions.
+OpenRaft's log-flush callback is signaled only after the append transaction
+commits. Durable votes, committed pointers, and purged pointers cannot regress;
+committed log entries cannot be truncated or recreated; conflicting log
+rewrites require truncation; appends cannot introduce a hole after the durable
+frontier; and an older or conflicting snapshot cannot roll back applied state.
+Consensus-store open rejects malformed JSON, index/entry disagreement, log
+holes, invalid idempotency receipts, and snapshot row/metadata/payload
+disagreement.
+
+The state machine owns an immutable authority genesis, challenged application
+membership, membership generation/audit, ownership leases/tombstones/audit, a
+monotonic replicated authority clock, and exact operation receipts. A rejected
+command does not mutate that state. An exact retry returns its original result
+and log identity after a successful result is retained, even if the retry
+proposes a later wall-clock value; reusing that retained UUID for different
+command semantics fails closed. Rejected outcomes are not retained and callers
+must not treat an unavailable or rejected reply as success. The receipt map is
+bounded and capacity exhaustion rejects new application commands rather than
+letting one replica prune independently.
+
+Once application membership and Raft transport membership diverge, startup
+requires three explicit views: the original immutable genesis, the complete
+current challenged application membership, and the current transport subset.
+The first two must exactly match durable authority state, and every transport
+identity must be present unchanged in the complete catalog before a
+transport-trust generation can mutate OpenRaft membership.
+
+Schema version `7` binds ownership and destination mutation fences to authority
+terms. Replicated ownership revisions store the term from the committing
+OpenRaft log ID; standalone authority records use term one. Destination records
+and their audit store term, generation, fencing token, and exact proof expiry as
+one identity. Migration backfills legacy ownership terms to one and expires
+every pre-v7 destination proof at its installation timestamp so it cannot admit
+new work until an authenticated client refreshes it. The destination-fence
+table is rebuilt transactionally so expiry remains `NOT NULL`; a regression
+reconstructs the exact v6 tables and verifies the full v7 backfill, fail-closed
+expiry, migration ledger, schema constraints, and idempotent verification.
+
+OpenRaft's complete storage-v2 conformance suite, file-backed
+vote/committed/log/state/snapshot restart persistence, command idempotency,
+snapshot transfer and rollback protection, durable-pointer monotonicity, and
+malformed-record rejection run in the kernel test suite. The separate
+`cluster_runtime` module executes this storage behind bounded mTLS peer RPCs.
+A three-node regression covers election, application-state replication,
+follower write/read forwarding, leader failover, restart catch-up, old-term
+fencing, and no-quorum rejection. The production server constructs and owns
+that runtime and routes public membership and ownership authority through it
+when strict `[cluster_raft]` configuration is enabled. The disabled default
+retains the legacy single-node authority. Voters and the exact Raft peer/CA
+trust catalog now change through separate durable generations. Workload
+migration, global quota/policy/package convergence, end-user credential
+delegation, and disaster recovery remain outside this slice. Replicated
+external authority writes now require short-lived application-node signatures,
+and quorum-enabled destinations linearly verify exact ownership before
+installing or retiring a fence. The replicated application authority also
+persists bounded application-listener certificate rollouts and their ordered
+trust audit.
 
 ## Authenticated accounting integrity
 
@@ -626,8 +697,8 @@ The current policy classes are:
   archives, installations, history, rate limits, transparency, and audit;
 - user identity state: the user row, sessions, API-key hashes, and that user's
   package rate-limit state;
-- system state: schema/install metadata, cluster identity/control, global
-  operator settings, and shared quota/accounting records.
+- system state: schema/install metadata, cluster identity/control and durable
+  Raft state, global operator settings, and shared quota/accounting records.
 
 `erase_agent_data`, `erase_user_data`, and `erase_tenant_data` use
 `BEGIN IMMEDIATE` and either commit the complete classified mutation plus one

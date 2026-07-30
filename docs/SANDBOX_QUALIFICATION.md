@@ -145,7 +145,11 @@ Linux daemon.
 The same protected workflow executes exact kernel tests for atomic/private
 filesystem behavior, symlink-swap races, cross-agent denial, provider panic
 isolation, generic request/response bounds, cross-surface sandbox parity, and
-the explicitly unavailable browser-profile surface. A fail-closed collector
+the explicitly unavailable kernel browser surface. It also installs the
+lockfile-pinned Chromium revision and runs the trusted helper against a
+disposable local fixture, proving unique profiles, cross-profile cookie
+isolation, URL and typed-input secret redaction, download denial, bounded
+screenshot output, process reaping, and removal of both profiles. A fail-closed collector
 accepts each check only when its log contains the named Rust test's passing
 event and an exact one-test successful harness result. It hashes every retained
 log and refuses dirty source trees, missing tests, duplicate checks, malformed
@@ -155,7 +159,8 @@ The final job downloads the exact-commit rootless, network, and core artifacts,
 rejects a missing, failed, dirty, or mismatched component, hashes each component
 report, and derives a combined artifact. The combined checks cover literal-argv
 injection, traversal/symlink races, metadata SSRF, redirects, DNS rebinding,
-large output, hung-process cleanup, browser-profile de-scope, cross-agent
+large output, hung-process cleanup, live browser-profile isolation and cleanup,
+kernel-browser de-scope, cross-agent
 access, provider panic, generic envelopes, and cross-surface policy. The
 artifact remains `production_claim_allowed: false`; it is proof of the
 restricted live-provider suite, not a substitute for independent review.

@@ -12,13 +12,17 @@ use crate::ContextError;
 /// ASCII `AIOS`, registered on every database owned by this kernel.
 pub(crate) const APPLICATION_ID: i64 = 0x4149_4f53;
 /// Latest schema this binary can read and write.
-pub(crate) const CURRENT_SCHEMA_VERSION: i64 = 3;
+pub(crate) const CURRENT_SCHEMA_VERSION: i64 = 7;
 const MIN_READABLE_SCHEMA_VERSION: i64 = 1;
 
 const MIGRATIONS: &[(i64, &str)] = &[
     (1, "adopt-versioned-kernel-schema"),
     (2, "add-privacy-safe-deletion-receipts"),
     (3, "authenticate-usage-and-quota-accounting"),
+    (4, "add-cluster-agent-ownership-authority"),
+    (5, "add-destination-agent-mutation-fences"),
+    (6, "add-durable-cluster-raft-storage"),
+    (7, "bind-destination-fences-to-authority-terms-and-expiry"),
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -72,6 +76,14 @@ const REQUIRED_TABLES: &[&str] = &[
     "cluster_join_challenges",
     "cluster_members",
     "cluster_membership_audit",
+    "cluster_agent_ownership",
+    "cluster_agent_ownership_audit",
+    "cluster_agent_mutation_fences",
+    "cluster_agent_mutation_fence_audit",
+    "cluster_raft_meta",
+    "cluster_raft_log",
+    "cluster_raft_state",
+    "cluster_raft_snapshot",
     "deletion_receipts",
 ];
 
@@ -202,6 +214,28 @@ pub(crate) fn add_column_if_missing(
             ))
         })?;
     Ok(())
+}
+
+pub(crate) fn has_column(
+    connection: &Connection,
+    table: &str,
+    column: &str,
+) -> Result<bool, ContextError> {
+    let mut statement = connection
+        .prepare(&format!("PRAGMA table_info({table})"))
+        .map_err(|error| storage_error(format!("failed to inspect {table}: {error}")))?;
+    let columns = statement
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(|error| storage_error(format!("failed to enumerate {table} columns: {error}")))?;
+    for existing in columns {
+        if existing
+            .map_err(|error| storage_error(format!("failed to read {table} column: {error}")))?
+            == column
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Publish ownership metadata and the final version marker inside the caller's

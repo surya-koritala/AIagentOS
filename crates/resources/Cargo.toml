@@ -10,9 +10,9 @@ rust-version.workspace = true
 # Heavy web tooling is opt-in.
 default = []
 # Headless browser automation (chromiumoxide, ~50 MB compiled).
-browser = ["dep:chromiumoxide", "dep:futures"]
+browser = ["dep:chromiumoxide", "dep:futures", "dep:tempfile"]
 # HTML parsing (scraper, ~3 MB compiled).
-web = ["dep:scraper"]
+web = ["dep:scraper", "dep:futures"]
 
 [dependencies]
 kernel = { path = "../kernel", version = "=0.3.0" }
@@ -28,6 +28,7 @@ scraper = { workspace = true, optional = true }
 urlencoding = "2"
 chromiumoxide = { workspace = true, optional = true }
 futures = { version = "0.3", optional = true }
+tempfile = { version = "3", optional = true }
 tracing = { workspace = true }
 
 [dev-dependencies]

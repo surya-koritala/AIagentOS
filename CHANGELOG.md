@@ -10,6 +10,226 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
 
 ## [Unreleased]
 
+- Bound every external replicated-authority write to a 30-second Ed25519
+  delegation from the originating application node. The signed,
+  domain-separated proof covers the caller-stable operation UUID, a semantic
+  command digest, the canonical system-node actor, issuance, and expiration.
+  Both the originating node and current leader require the signer to match the
+  authenticated Raft source's separately pinned application identity and an
+  active replicated member; stale, future, changed-command, changed-actor,
+  foreign-source, and revoked-member proofs fail closed. Internal clock,
+  barrier, and initialization commands remain unavailable to follower
+  forwarding. Quorum-enabled destinations now also perform their own
+  linearizable ownership read before installing or retiring a mutation fence
+  and accept only the exact active cluster/owner/term/generation/token/expiry
+  revision. The disabled standalone authority keeps its compatibility path.
+  This establishes attributable system-node delegation and online destination
+  verification; end-user credential delegation, offline quorum certificates,
+  compromised-host isolation, migration, cross-node IPC, and broader
+  qualification remain #122.
+- Added generation-fenced OpenRaft transport trust epochs. A quorum can
+  atomically replace the complete peer catalog while preserving every current
+  voter, add a new peer as a learner, or remove a former non-voter. Peer server
+  and client leaves plus the accepted CA bundle are digest-pinned in durable
+  membership. Certificate/CA rotation uses an explicit overlap generation
+  whose old leaves and multiple roots expire within 30 days and are checked on
+  every fresh RPC connection, followed by a separate generation that removes
+  the retired leaves and roots. Startup accepts only the complete
+  digest-verified durable prior catalog or exact configured target, rejects
+  stale/skipped/mixed voter-and-trust changes, requires retained peers to keep
+  identity, leaf, and CA continuity, and preserves the legacy generation-zero
+  catalog digest byte-for-byte. Immutable application genesis, the complete
+  current challenged application membership, and the current transport subset
+  are configured separately once those catalogs diverge; startup validates
+  every durable identity before mutating Raft membership.
+- Added generation-fenced OpenRaft voter changes within the versioned
+  transport-trust catalog. Operators select a non-empty `voter_ids` subset and
+  advance `voter_set_generation` by one through a coordinated config-driven
+  startup. Before quorum changes, the target-configured leader
+  persists the exact generation, target-set digest, and immutable transport
+  catalog digest in every OpenRaft node record, catches up each incoming voter
+  as a learner, and then completes joint consensus. Removed voters remain
+  trusted learners so the catalog stays durable. Restart resumes the matching
+  prepared or joint change; legacy configurations keep generation zero and
+  default to every trusted member voting. Voter and transport-trust generations
+  are separate and cannot advance in the same transition.
+- Bound every destination mutation fence to the OpenRaft term that committed
+  its ownership revision and to the authority lease's exact expiry. Workload
+  nodes persist term/generation/token/expiry together, reject lower terms and
+  conflicting replays, permanently retain retirement tombstones, refuse proof
+  horizons beyond the five-minute authority lease plus 30 seconds of clock
+  skew, and stop admitting mutations at the exact expiry boundary. A detected
+  clock rollback behind fence installation also fails closed. Schema migration
+  v7 backfills standalone and legacy authority terms to one and expires legacy
+  destination proofs at their installation time, requiring an authenticated
+  refresh before reuse. Replicated ownership and audit now retain the committed
+  leader term across replay, snapshot, and restart. Typed v2/SDK operations,
+  managed cluster routing, streams, and exact cancellation carry the complete
+  proof. An operation admitted before expiry keeps the existing per-agent guard
+  through completion; expiry prevents new admission rather than rolling back an
+  already-started side effect.
+- Added quorum-coordinated, time-bounded application-listener certificate
+  rollout for `[cluster_raft]` authorities. A fresh challenged identity proof
+  prepares a never-before-authorized candidate for 5–3600 seconds; activation
+  requires another fresh challenged registration, then retains the previous
+  leaf only for a replicated 5–3600 second overlap. Prepared rollouts can be
+  aborted, activated rollouts can be finalized only after their retirement
+  deadline, and retired leaves cannot be reused. Membership discovery and
+  configured-authority startup evaluate both windows against replicated
+  authority time. New typed v2/SDK prepare, abort, finalize, and audit controls
+  preserve caller-stable retry IDs. Raft peer transport certificates and trust
+  roots use the separate generation-fenced transport-trust protocol.
+- Routed public membership and ownership authority through the optional
+  production OpenRaft runtime. Identical voter genesis now seeds challenged
+  application membership, generation/audit history, ownership
+  leases/tombstones/audit, a monotonic replicated clock, and caller-stable
+  idempotency receipts. Writes and linearizable reads received by followers
+  forward to the elected leader over exact identity-pinned mTLS; an isolated
+  leader cannot apply authority state. The production daemon verifies its
+  configured application UUID/key against durable node identity, installs the
+  authority handle only after genesis commits, and serves the public syscall
+  endpoint through failover. SDK callers can supply stable operation UUIDs for
+  exact retry. Application-listener TLS identity is configured independently
+  from Raft transport TLS. State-machine, three-node failover/partition, and
+  real daemon TCP lifecycle regressions cover deterministic replay, restart
+  recovery, follower forwarding, no-quorum rejection, and clean shutdown.
+  End-user credential delegation beyond the system-node principal, migration,
+  cross-node IPC, global quotas/trust, rolling upgrades, and disaster recovery
+  remain #122.
+- Wired the authenticated OpenRaft runtime into the production `agent-server`
+  lifecycle behind a default-off, strict `[cluster_raft]` configuration.
+  Enabled nodes read bounded no-follow PEM files, require owner-only private
+  keys on Unix, bind the configured peer listener, bootstrap only when
+  explicitly requested, and reject restart if the durable membership differs
+  from the configured node, endpoint, certificate, or identity map. The daemon
+  owns clean Raft shutdown on SIGINT/SIGTERM. Restart and negative regressions
+  cover exact durable membership, configuration drift, unsafe key permissions,
+  and symlinked TLS material.
+- Added a durable OpenRaft storage-v2 implementation and an executable internal
+  quorum runtime for the cluster authority foundation. Votes, log and commit
+  pointers, deterministic barrier state, membership, receipts, and snapshots
+  share the encrypted SQLite durability/backup boundary and fail closed on
+  corruption or safety-pointer regression. Bounded versioned Raft RPCs run over
+  mutual TLS with exact server/client leaf binding to stable node IDs. A
+  three-node regression proves election, replication, leader failover, durable
+  restart catch-up, and old-term fencing; negative regressions cover identity
+  spoofing, wrong-but-CA-valid leaves, invalid configuration, and oversized
+  frames.
+- Fixed service startup deadlines so a configured readiness delay that cannot
+  finish inside the remaining startup budget fails closed deterministically,
+  reclaims the created service agent, and records `startup_timeout`. This
+  removes a timer-boundary race observed on protected macOS CI.
+- Added restart-free TLS certificate and client-trust rotation for the syscall
+  server. Operators atomically replace PEM material and then change a bounded
+  trigger file; a fully validated configuration is published as one monotonic
+  generation, while unreadable, partial, or mismatched updates leave the
+  current generation active. Optional client CRLs provide fail-closed
+  individual certificate revocation with expiry enforcement. New handshakes
+  switch immediately and sessions admitted under the previous trust generation
+  finish their current request before being closed. TLS clients retain only the
+  verified server leaf's SHA-256 fingerprint. Cluster admission signs and persists that observed
+  fingerprint, permits authenticated certificate rotation, forbids TLS-to-
+  plaintext re-admission, records old/new leaf fingerprints in durable
+  membership audit, and rejects a superseded leaf during discovery.
+  Quorum application-listener rollout is implemented by the replicated
+  authority; Raft peer transport rotation uses separate bounded trust epochs.
+- Added durably reconcilable managed cluster creation. The authority now exposes
+  a stable paginated ownership directory; managed placement reserves a UUID,
+  preinstalls its exact destination fence, and creates only while that proof is
+  active. Startup/manual reconciliation recovers expired exact-owner leases,
+  repairs missing fences, leaves live reservations pending, and advances,
+  rechecks, retires, then releases expired incomplete reservations so a delayed
+  creator cannot cross cleanup. Duplicate exact IDs never overwrite state.
+  New explicit maintenance constructors renew idle leases, republish destination
+  fences through fresh authenticated connections, expose bounded health, and
+  stop on client drop. These controls remain single-authority, not quorum.
+- Added a system-scoped durable cluster ownership authority: active members can
+  claim bounded leases, exact owner/token pairs can renew or release them, and
+  transfer after release or expiry requires the old token and allocates a
+  strictly greater fencing token. Records, tombstones, and audit survive
+  restart; clean leave cannot strand an active lease, and identity revocation
+  releases every owned record atomically. The controls are exposed through the
+  typed v2 wire/SDK boundary, and schema migration v4 upgrades existing stores
+  atomically. Authority records require explicit destination installation and
+  are not automatically propagated, so this alone is not a partition fence.
+- Added durable workload-node mutation fences and retirement tombstones.
+  System-only v2/SDK controls install the highest accepted cluster/owner/
+  generation/token record; every agent-targeted write path then rejects
+  unfenced, stale, retired, cross-agent, and foreign-destination calls.
+  Per-agent read/write admission barriers hold verification across the complete
+  operation, serialize initial installation and handoff with in-flight work,
+  and cover the dedicated ordinary-stream path.
+  Fenced lifecycle, turn, and tool SDK calls reuse the existing authorization
+  and resource gates. This is destination enforcement, not quorum: authority
+  terms/failover and migration remain open in #122.
+- Published the normative distributed control-plane consistency contract. It
+  distinguishes single-authority membership, node-local state, reconstructed
+  routing, and missing ownership fencing; defines fail-closed partition, retry,
+  duplicate-owner, stale-route, and unknown-outcome behavior; and states the
+  invariants required before the multi-node foundation can be production
+  qualified.
+- Added a revocable, visible local approval contract for future peripheral
+  access without enabling any placeholder device operation. Peripheral tool
+  bindings are registration-rejected unless they require sandbox execution and
+  explicit human approval. The trusted in-process operator API can grant,
+  inspect, or revoke one exact agent/tool/opaque-target/contract approval;
+  grants are single-use, secrets never enter the status projection, and agent
+  teardown purges them. Capture, audio, print, and every kernel peripheral
+  provider remain unavailable until a platform backend supplies active-use
+  indicators and qualification.
+- The protected Linux browser qualification now installs an exact-path
+  AppArmor profile granting only the `userns` permission Chromium needs for its
+  native process sandbox. This fixes Ubuntu 24.04 hosted-runner launch failure
+  without adding `--no-sandbox`; retained evidence records the browser and
+  profile SHA-256 values.
+
+- Expanded the protected exact-commit provider-security workflow from a
+  browser-unavailable assertion to a real two-profile Chromium qualification.
+  The lockfile-pinned browser fixture proves cookies do not cross isolated
+  profiles, downloads cannot land, typed secrets do not enter errors, returned
+  URLs omit query secrets, screenshots stay bounded in memory, both browser
+  processes are reaped, and both private profiles are removed. The retained
+  Linux report separately proves the kernel browser provider remains
+  unavailable and does not promote the trusted helper into runtime discovery.
+- Hardened the feature-gated trusted-process HTML and Chromium helpers without
+  advertising them as kernel providers. HTML fetches now use strict HTTPS,
+  ignore ambient proxies, refuse redirects, cap strict-UTF-8 bodies and output,
+  bound extracted fields, and redact returned source URLs. Each Chromium launch
+  uses a unique owner-only profile, denies downloads through CDP, applies fixed
+  launch and operation deadlines, returns bounded in-memory screenshots, strips
+  sensitive URL components, and explicitly reaps the process and profile.
+  Focused regressions cover bounds, redaction, redirects, invalid/oversized
+  responses, private unique profiles, and cleanup; an opt-in real Chromium
+  fixture also proves download denial and profile removal. These trusted helpers
+  remain Experimental: the unavailable kernel browser provider, agent egress and
+  authorization boundary, supported-platform live matrix, and independent
+  review remain open under #124/#127.
+- Added signed-package install/upgrade, run, rollback, removal, and honest
+  installed-state projection to the desktop Operations view over `KernelClient`.
+  Rollback and removal freeze the displayed package name, version, digest, and
+  publisher; require exact `version|name` confirmation; and submit the frozen
+  version and digest to the transaction-bound wire operation. Backend loopback,
+  IPC validation, reducer, source-contract, rendered interaction, axe, and
+  capability-registry regressions retain the flow and stale-target refusal.
+- Added signed-package install/upgrade, run, rollback, removal, and installed
+  state to the TUI over `KernelClient`. Rollback and removal freeze the
+  displayed name, version, and digest, require exact `version|name`
+  confirmation, and use new transaction-bound exact mutation operations so a
+  concurrent package change fails stale. State-machine, registry, and
+  authenticated loopback regressions cover the complete flow.
+- Added desktop operator-tunable update, rollback, and bounded audit history
+  through the authenticated public `KernelClient`. The UI freezes the tunable
+  name, value, revision, and advertised bounds; updates use compare-and-set
+  revision enforcement, while rollback requires an older retained revision and
+  the exact tunable name. Backend validation, system/tenant authorization,
+  stale-revision refusal, production-bundle interaction, and axe regressions
+  retain the contract.
+- Added focused operator-tunable control to the TUI over the public
+  `KernelClient` boundary. Operators can select a live tunable, submit a value
+  only within its advertised bounds using the frozen expected revision, load
+  bounded audit history, and roll back only after entering the older revision
+  plus the exact frozen tunable name. Real loopback coverage proves successful
+  update/audit/rollback, stale-revision refusal, and snapshot projection.
 - Added frozen exact-name confirmation to TUI service stop and restart. The
   confirmation identifies the selected service and current owner, discloses
   dependent-service or in-flight-work impact, ignores later selection changes,

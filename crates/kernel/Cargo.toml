@@ -39,6 +39,7 @@ zeroize = { workspace = true }
 cap-std = { workspace = true }
 cap-primitives = { workspace = true }
 semver = { workspace = true }
+openraft = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [
@@ -50,3 +51,4 @@ windows-sys = { version = "0.61", features = [
 proptest = { workspace = true }
 rcgen = { workspace = true }
 wiremock = { workspace = true }
+tempfile = "3"

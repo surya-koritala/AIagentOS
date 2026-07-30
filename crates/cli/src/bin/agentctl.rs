@@ -9,7 +9,7 @@ use agent_sdk::ConnectionProfile;
 fn usage() -> ! {
     eprintln!(
         "usage: agentctl [--addr HOST:PORT] [--token TOKEN] \
-         <create|list|inspect|message|stream|cancel|checkpoints|checkpoint-resume|checkpoint-delete|capabilities|providers|metrics|protocol|policy-validate|policy-explain|gate-stats|node-control-audit|cluster-membership-audit|package-trust-key|package-revoke-key|package-publish|package-yank|package-fetch|package-search|package-install|package-rollback|package-remove|packages|package-run|pressure|tunables|tunable-set|tunable-rollback|tunable-history|status|pause|resume|stop|kill|wait|services|service-start|service-stop|service-restart|service-reload|service-history|backup-create|backup-retention|backup-status|data-inventory|backup-key-generate|backup-anchor-create|backup-verify|backup-restore|backup-disaster-recover|backup-corruption-recover|backup-remote-publish|backup-remote-fetch|storage-key-generate|storage-encrypt|storage-encrypt-recover|storage-key-rotate|storage-portable-export|storage-portable-verify|storage-portable-import|erase-agent|erase-user|erase-tenant> [ARGS...]\n\
+         <create|list|inspect|message|stream|cancel|checkpoints|checkpoint-resume|checkpoint-delete|capabilities|providers|metrics|protocol|policy-validate|policy-explain|gate-stats|node-control-audit|cluster-membership-audit|cluster-certificate-rollout-audit|package-trust-key|package-revoke-key|package-publish|package-yank|package-fetch|package-search|package-install|package-rollback|package-remove|packages|package-run|pressure|tunables|tunable-set|tunable-rollback|tunable-history|status|pause|resume|stop|kill|wait|services|service-start|service-stop|service-restart|service-reload|service-history|backup-create|backup-retention|backup-status|data-inventory|backup-key-generate|backup-anchor-create|backup-verify|backup-restore|backup-disaster-recover|backup-corruption-recover|backup-remote-publish|backup-remote-fetch|storage-key-generate|storage-encrypt|storage-encrypt-recover|storage-key-rotate|storage-portable-export|storage-portable-verify|storage-portable-import|erase-agent|erase-user|erase-tenant> [ARGS...]\n\
          \n\
          public runtime commands:\n\
            agentctl [SERVER OPTIONS] create NAME TASK [PROVIDER [PROFILE [PRIORITY]]]\n\
@@ -32,6 +32,7 @@ fn usage() -> ! {
            agentctl [SERVER OPTIONS] gate-stats\n\
            agentctl [SERVER OPTIONS] node-control-audit [LIMIT]\n\
            agentctl [SERVER OPTIONS] cluster-membership-audit [LIMIT]\n\
+           agentctl [SERVER OPTIONS] cluster-certificate-rollout-audit [LIMIT]\n\
          \n\
          signed package commands:\n\
            agentctl [SERVER OPTIONS] package-trust-key PUBLISHER KEY_ID PUBLIC_KEY_FILE VALID_FROM [--valid-until RFC3339] [--supersedes KEY_ID]\n\
@@ -993,6 +994,15 @@ async fn main() {
                 .await
                 .unwrap_or_else(|error| fail(error));
             print_json(&entries, "cluster membership audit");
+            return;
+        }
+        "cluster-certificate-rollout-audit" => {
+            let limit = parse_audit_limit(args.collect::<Vec<_>>());
+            let entries = client
+                .cluster_certificate_rollout_audit(limit)
+                .await
+                .unwrap_or_else(|error| fail(error));
+            print_json(&entries, "cluster certificate rollout audit");
             return;
         }
         "package-trust-key" => {

@@ -43,9 +43,11 @@ use tokio::net::ToSocketAddrs;
 // Re-export the kernel wire types that appear in this crate's public API, so
 // SDK consumers can name them without depending on the kernel directly.
 pub use kernel::cluster_control::{
-    ClusterJoinChallenge, ClusterMember, ClusterMemberRegistration, ClusterMemberState,
-    ClusterMembershipAudit, ClusterMembershipSnapshot, NodeAvailability, NodeControlAudit,
-    NodeControlStatus, NodeIdentity, NodeProfile,
+    AgentMutationFence, AgentMutationFenceAudit, AgentMutationFenceState, ClusterAgentOwnership,
+    ClusterAgentOwnershipAudit, ClusterCertificateRollout, ClusterCertificateRolloutAudit,
+    ClusterCertificateRolloutPhase, ClusterJoinChallenge, ClusterMember, ClusterMemberRegistration,
+    ClusterMemberState, ClusterMembershipAudit, ClusterMembershipSnapshot, ClusterOwnershipState,
+    NodeAvailability, NodeControlAudit, NodeControlStatus, NodeIdentity, NodeProfile,
 };
 pub use kernel::context::{ContextPressureStats, DeletionReceipt};
 pub use kernel::data_inventory::{DataInventoryEntry, StorageDataInventory};
@@ -61,6 +63,7 @@ pub use kernel::storage::{
     BackupRetentionEntry, BackupRetentionIssue, BackupRetentionPolicy, BackupRetentionReport,
     BackupTrustRoot, CorruptStorageRecoveryReport, RestoreReport,
 };
+pub use kernel::syscall_server::AgentMutationFenceProof;
 pub use kernel::syscall_server::{
     AgentSummary, FactSummary, GenerationCheckpointSummary, MessageStreamEvent,
     OperatorAgentSnapshot, OperatorCgroupSnapshot, OperatorNamespaceSnapshot,
@@ -90,10 +93,24 @@ pub struct ConfirmBackupRetention(());
 
 pub const CONFIRM_BACKUP_RETENTION: ConfirmBackupRetention = ConfirmBackupRetention(());
 
+/// Authority-reserved identity and exact destination proof used for one
+/// fail-closed managed creation.
+#[derive(Clone)]
+pub struct ReservedAgentIdentity {
+    /// Canonical UUID committed by the authority reservation.
+    pub agent_id: String,
+    /// Exact active fence already installed on the selected destination.
+    pub ownership_proof: AgentMutationFenceProof,
+}
+
 pub mod cluster;
 pub mod patterns;
 
-pub use cluster::{ClusterClient, NodeHandle, PlacedAgent, Placement, PlacementConstraints};
+pub use cluster::{
+    ClusterClient, ClusterMaintenanceConfig, ClusterMaintenanceStatus, ClusterReconciliationReport,
+    NodeHandle, PlacedAgent, Placement, PlacementConstraints, DEFAULT_OWNERSHIP_LEASE_SECONDS,
+    DEFAULT_OWNERSHIP_RENEW_INTERVAL,
+};
 pub use patterns::{
     Decision, DirectiveReasoner, FnPlanner, PlanRun, Planner, PlannerExecutor, ReActLoop,
     ReActOutcome, ReActStep, Reasoner, Step, StepResult, ToolInvocation,
@@ -145,6 +162,20 @@ pub enum SdkError {
         source: std::io::Error,
     },
 
+    /// A managed cluster could not prove that one authority/fence publication
+    /// stage completed. The agent id is returned so an operator can inspect all
+    /// durable stores and reconcile instead of blindly replaying creation or
+    /// renewal.
+    #[error(
+        "cluster route publication for agent {agent_id} stopped at {stage}; reconcile durable node, authority, and fence state before retrying: {source}"
+    )]
+    ClusterRoutePublication {
+        agent_id: String,
+        stage: &'static str,
+        #[source]
+        source: Box<SdkError>,
+    },
+
     /// The kernel replied with a variant that doesn't correspond to the
     /// syscall that was issued. Indicates a protocol mismatch.
     #[error("unexpected reply for {expected}: {got}")]
@@ -176,6 +207,7 @@ impl SdkError {
     pub fn wire_code(&self) -> Option<WireErrorCode> {
         match self {
             Self::Wire { code, .. } => Some(*code),
+            Self::ClusterRoutePublication { source, .. } => source.wire_code(),
             _ => None,
         }
     }
@@ -184,12 +216,15 @@ impl SdkError {
     pub fn kernel_message(&self) -> Option<&str> {
         match self {
             Self::Kernel(message) | Self::Wire { message, .. } => Some(message),
+            Self::ClusterRoutePublication { source, .. } => source.kernel_message(),
             _ => None,
         }
     }
 
     /// Whether the server explicitly classified the failure as retryable.
     pub fn is_retryable(&self) -> bool {
+        // A partial route publication always requires reconciliation even when
+        // its underlying transport or authority condition was retryable.
         matches!(
             self,
             Self::Wire {
@@ -544,6 +579,12 @@ impl KernelClient {
         self.reconnect_generation
     }
 
+    /// SHA-256 of the verified TLS server leaf certificate for the current
+    /// transport. Plaintext and Unix connections return `None`.
+    pub fn tls_peer_certificate_fingerprint(&self) -> Option<&str> {
+        self.inner.tls_peer_certificate_fingerprint()
+    }
+
     /// Re-establish a profile-backed connection, renegotiate the protocol, and
     /// restore the latest successfully authenticated credential.
     pub async fn reconnect(&mut self) -> Result<(), SdkError> {
@@ -605,7 +646,45 @@ impl KernelClient {
         profile: Option<String>,
         priority: Option<u8>,
     ) -> Result<String, SdkError> {
+        self.create_agent_request(None, name, task, provider, profile, priority)
+            .await
+    }
+
+    /// Create an agent using an authority-reserved UUID and its exact
+    /// preinstalled destination fence.
+    pub async fn create_agent_with_id(
+        &mut self,
+        reservation: ReservedAgentIdentity,
+        name: impl Into<String>,
+        task: impl Into<String>,
+        provider: Option<String>,
+        profile: Option<String>,
+        priority: Option<u8>,
+    ) -> Result<String, SdkError> {
+        self.create_agent_request(Some(reservation), name, task, provider, profile, priority)
+            .await
+    }
+
+    async fn create_agent_request(
+        &mut self,
+        reservation: Option<ReservedAgentIdentity>,
+        name: impl Into<String>,
+        task: impl Into<String>,
+        provider: Option<String>,
+        profile: Option<String>,
+        priority: Option<u8>,
+    ) -> Result<String, SdkError> {
+        let (agent_id, ownership_proof) = reservation
+            .map(|reservation| {
+                (
+                    Some(reservation.agent_id),
+                    Some(reservation.ownership_proof),
+                )
+            })
+            .unwrap_or((None, None));
         let call = Syscall::CreateAgent {
+            agent_id,
+            ownership_proof,
             name: name.into(),
             task: task.into(),
             provider: provider.unwrap_or_else(|| "stub".to_string()),
@@ -643,6 +722,88 @@ impl KernelClient {
             }),
             other => Err(unexpected("AgentStatus", &other)),
         }
+    }
+
+    async fn fenced_call(
+        &mut self,
+        agent_id: String,
+        proof: AgentMutationFenceProof,
+        mutation: Syscall,
+    ) -> Result<SyscallReply, SdkError> {
+        self.call(Syscall::FencedAgentMutation {
+            agent_id,
+            proof,
+            mutation: Box::new(mutation),
+        })
+        .await
+    }
+
+    async fn fenced_lifecycle_call(
+        &mut self,
+        agent_id: String,
+        proof: AgentMutationFenceProof,
+        mutation: Syscall,
+    ) -> Result<LifecycleResult, SdkError> {
+        match self.fenced_call(agent_id, proof, mutation).await? {
+            SyscallReply::AgentStatus {
+                state,
+                checkpoint_id,
+                resumed_content,
+                resumed_tool_calls,
+                resumed_tokens,
+            } => Ok(LifecycleResult {
+                state,
+                checkpoint_id,
+                resumed_content,
+                resumed_tool_calls,
+                resumed_tokens,
+            }),
+            other => Err(unexpected("AgentStatus", &other)),
+        }
+    }
+
+    pub async fn pause_agent_fenced(
+        &mut self,
+        agent_id: impl Into<String>,
+        proof: AgentMutationFenceProof,
+    ) -> Result<LifecycleResult, SdkError> {
+        let agent_id = agent_id.into();
+        self.fenced_lifecycle_call(agent_id.clone(), proof, Syscall::PauseAgent { agent_id })
+            .await
+    }
+
+    pub async fn resume_agent_fenced(
+        &mut self,
+        agent_id: impl Into<String>,
+        proof: AgentMutationFenceProof,
+    ) -> Result<LifecycleResult, SdkError> {
+        let agent_id = agent_id.into();
+        self.fenced_lifecycle_call(agent_id.clone(), proof, Syscall::ResumeAgent { agent_id })
+            .await
+    }
+
+    pub async fn stop_agent_fenced(
+        &mut self,
+        agent_id: impl Into<String>,
+        proof: AgentMutationFenceProof,
+    ) -> Result<String, SdkError> {
+        let agent_id = agent_id.into();
+        Ok(self
+            .fenced_lifecycle_call(agent_id.clone(), proof, Syscall::StopAgent { agent_id })
+            .await?
+            .state)
+    }
+
+    pub async fn kill_agent_fenced(
+        &mut self,
+        agent_id: impl Into<String>,
+        proof: AgentMutationFenceProof,
+    ) -> Result<String, SdkError> {
+        let agent_id = agent_id.into();
+        Ok(self
+            .fenced_lifecycle_call(agent_id.clone(), proof, Syscall::KillAgent { agent_id })
+            .await?
+            .state)
     }
 
     /// Durable pause result, including the checkpoint id when an active turn
@@ -792,6 +953,37 @@ impl KernelClient {
         }
     }
 
+    pub async fn send_message_fenced(
+        &mut self,
+        agent_id: impl Into<String>,
+        proof: AgentMutationFenceProof,
+        message: impl Into<String>,
+    ) -> Result<MessageResult, SdkError> {
+        let agent_id = agent_id.into();
+        match self
+            .fenced_call(
+                agent_id.clone(),
+                proof,
+                Syscall::SendMessage {
+                    agent_id,
+                    message: message.into(),
+                },
+            )
+            .await?
+        {
+            SyscallReply::Message {
+                content,
+                tool_calls,
+                tokens,
+            } => Ok(MessageResult {
+                content,
+                tool_calls,
+                tokens,
+            }),
+            other => Err(unexpected("Message", &other)),
+        }
+    }
+
     /// Drive one turn and deliver ordered stream events as they arrive.
     ///
     /// `request_id` must be unique among active streams for this agent and is
@@ -803,22 +995,62 @@ impl KernelClient {
         request_id: impl Into<String>,
         agent_id: impl Into<String>,
         message: impl Into<String>,
-        mut on_event: F,
+        on_event: F,
     ) -> Result<MessageResult, SdkError>
     where
         F: FnMut(&MessageStreamEvent),
     {
         let request_id = request_id.into();
-        self.ensure_connected().await?;
-        if let Err(source) = self
-            .inner
-            .send(&Syscall::SendMessageStream {
-                request_id: request_id.clone(),
-                agent_id: agent_id.into(),
-                message: message.into(),
-            })
+        let call = Syscall::SendMessageStream {
+            request_id: request_id.clone(),
+            agent_id: agent_id.into(),
+            message: message.into(),
+        };
+        self.send_message_stream_call(request_id, call, on_event)
             .await
-        {
+    }
+
+    /// Drive one ordered stream under an exact destination ownership fence.
+    ///
+    /// The destination holds its per-agent mutation admission barrier for the
+    /// complete stream, so a fence handoff cannot cross an admitted turn.
+    pub async fn send_message_stream_fenced<F>(
+        &mut self,
+        request_id: impl Into<String>,
+        agent_id: impl Into<String>,
+        proof: AgentMutationFenceProof,
+        message: impl Into<String>,
+        on_event: F,
+    ) -> Result<MessageResult, SdkError>
+    where
+        F: FnMut(&MessageStreamEvent),
+    {
+        let request_id = request_id.into();
+        let agent_id = agent_id.into();
+        let call = Syscall::FencedAgentMutation {
+            agent_id: agent_id.clone(),
+            proof,
+            mutation: Box::new(Syscall::SendMessageStream {
+                request_id: request_id.clone(),
+                agent_id,
+                message: message.into(),
+            }),
+        };
+        self.send_message_stream_call(request_id, call, on_event)
+            .await
+    }
+
+    async fn send_message_stream_call<F>(
+        &mut self,
+        request_id: String,
+        call: Syscall,
+        mut on_event: F,
+    ) -> Result<MessageResult, SdkError>
+    where
+        F: FnMut(&MessageStreamEvent),
+    {
+        self.ensure_connected().await?;
+        if let Err(source) = self.inner.send(&call).await {
             if self.reconnect.is_some() {
                 self.needs_reconnect = true;
                 return Err(SdkError::IndeterminateMutation {
@@ -915,6 +1147,34 @@ impl KernelClient {
         }
     }
 
+    /// Cancel one exact active stream under a destination ownership fence.
+    pub async fn cancel_request_fenced(
+        &mut self,
+        request_id: impl Into<String>,
+        agent_id: impl Into<String>,
+        proof: AgentMutationFenceProof,
+    ) -> Result<bool, SdkError> {
+        let request_id = request_id.into();
+        let agent_id = agent_id.into();
+        match self
+            .fenced_call(
+                agent_id.clone(),
+                proof,
+                Syscall::CancelRequest {
+                    request_id: request_id.clone(),
+                    agent_id,
+                },
+            )
+            .await?
+        {
+            SyscallReply::RequestCancellation {
+                request_id: reply_id,
+                accepted,
+            } if reply_id == request_id => Ok(accepted),
+            other => Err(unexpected("RequestCancellation", &other)),
+        }
+    }
+
     /// Invoke a single tool as an agent. The call goes through the syscall gate
     /// (capability / MAC / cgroup / namespace) on the kernel side, so a denial
     /// comes back as [`SdkError::Kernel`].
@@ -930,6 +1190,31 @@ impl KernelClient {
             args,
         };
         match self.call(call).await? {
+            SyscallReply::ToolResult { data } => Ok(data),
+            other => Err(unexpected("ToolResult", &other)),
+        }
+    }
+
+    pub async fn call_tool_fenced(
+        &mut self,
+        agent_id: impl Into<String>,
+        proof: AgentMutationFenceProof,
+        tool: impl Into<String>,
+        args: serde_json::Value,
+    ) -> Result<serde_json::Value, SdkError> {
+        let agent_id = agent_id.into();
+        match self
+            .fenced_call(
+                agent_id.clone(),
+                proof,
+                Syscall::CallTool {
+                    agent_id,
+                    tool: tool.into(),
+                    args,
+                },
+            )
+            .await?
+        {
             SyscallReply::ToolResult { data } => Ok(data),
             other => Err(unexpected("ToolResult", &other)),
         }
@@ -1174,8 +1459,26 @@ impl KernelClient {
         &mut self,
         ttl_seconds: u64,
     ) -> Result<ClusterJoinChallenge, SdkError> {
+        self.issue_cluster_join_challenge_with_operation_id(
+            uuid::Uuid::new_v4().to_string(),
+            ttl_seconds,
+        )
+        .await
+    }
+
+    /// Issue a join challenge using a caller-stable UUID. Reuse the same UUID
+    /// only when retrying the exact request after an ambiguous transport
+    /// outcome.
+    pub async fn issue_cluster_join_challenge_with_operation_id(
+        &mut self,
+        operation_id: impl Into<String>,
+        ttl_seconds: u64,
+    ) -> Result<ClusterJoinChallenge, SdkError> {
         match self
-            .call(Syscall::IssueClusterJoinChallenge { ttl_seconds })
+            .call(Syscall::IssueClusterJoinChallenge {
+                operation_id: Some(operation_id.into()),
+                ttl_seconds,
+            })
             .await?
         {
             SyscallReply::ClusterJoinChallenge { challenge } => Ok(challenge),
@@ -1191,8 +1494,31 @@ impl KernelClient {
         expected_generation: Option<u64>,
         reason: impl Into<String>,
     ) -> Result<ClusterMember, SdkError> {
+        self.register_cluster_member_with_operation_id(
+            uuid::Uuid::new_v4().to_string(),
+            registration,
+            challenge_hex,
+            signature_hex,
+            expected_generation,
+            reason,
+        )
+        .await
+    }
+
+    /// Register a member using a caller-stable UUID for exact retry.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn register_cluster_member_with_operation_id(
+        &mut self,
+        operation_id: impl Into<String>,
+        registration: ClusterMemberRegistration,
+        challenge_hex: impl Into<String>,
+        signature_hex: impl Into<String>,
+        expected_generation: Option<u64>,
+        reason: impl Into<String>,
+    ) -> Result<ClusterMember, SdkError> {
         match self
             .call(Syscall::RegisterClusterMember {
+                operation_id: Some(operation_id.into()),
                 registration,
                 challenge_hex: challenge_hex.into(),
                 signature_hex: signature_hex.into(),
@@ -1213,8 +1539,28 @@ impl KernelClient {
         expected_generation: u64,
         reason: impl Into<String>,
     ) -> Result<ClusterMember, SdkError> {
+        self.set_cluster_member_state_with_operation_id(
+            uuid::Uuid::new_v4().to_string(),
+            node_id,
+            state,
+            expected_generation,
+            reason,
+        )
+        .await
+    }
+
+    /// Change member state using a caller-stable UUID for exact retry.
+    pub async fn set_cluster_member_state_with_operation_id(
+        &mut self,
+        operation_id: impl Into<String>,
+        node_id: impl Into<String>,
+        state: ClusterMemberState,
+        expected_generation: u64,
+        reason: impl Into<String>,
+    ) -> Result<ClusterMember, SdkError> {
         match self
             .call(Syscall::SetClusterMemberState {
+                operation_id: Some(operation_id.into()),
                 node_id: node_id.into(),
                 state,
                 expected_generation,
@@ -1224,6 +1570,142 @@ impl KernelClient {
         {
             SyscallReply::ClusterMemberUpdated { member } => Ok(member),
             other => Err(unexpected("ClusterMemberUpdated", &other)),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn prepare_cluster_member_certificate_rollout(
+        &mut self,
+        registration: ClusterMemberRegistration,
+        challenge_hex: impl Into<String>,
+        signature_hex: impl Into<String>,
+        expected_generation: u64,
+        prepare_ttl_seconds: u64,
+        minimum_overlap_seconds: u64,
+        reason: impl Into<String>,
+    ) -> Result<(ClusterMember, ClusterCertificateRollout), SdkError> {
+        self.prepare_cluster_member_certificate_rollout_with_operation_id(
+            uuid::Uuid::new_v4().to_string(),
+            registration,
+            challenge_hex,
+            signature_hex,
+            expected_generation,
+            prepare_ttl_seconds,
+            minimum_overlap_seconds,
+            reason,
+        )
+        .await
+    }
+
+    /// Stage a candidate using a caller-stable UUID for exact retry.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn prepare_cluster_member_certificate_rollout_with_operation_id(
+        &mut self,
+        operation_id: impl Into<String>,
+        registration: ClusterMemberRegistration,
+        challenge_hex: impl Into<String>,
+        signature_hex: impl Into<String>,
+        expected_generation: u64,
+        prepare_ttl_seconds: u64,
+        minimum_overlap_seconds: u64,
+        reason: impl Into<String>,
+    ) -> Result<(ClusterMember, ClusterCertificateRollout), SdkError> {
+        match self
+            .call(Syscall::PrepareClusterMemberCertificateRollout {
+                operation_id: Some(operation_id.into()),
+                registration,
+                challenge_hex: challenge_hex.into(),
+                signature_hex: signature_hex.into(),
+                expected_generation,
+                prepare_ttl_seconds,
+                minimum_overlap_seconds,
+                reason: reason.into(),
+            })
+            .await?
+        {
+            SyscallReply::ClusterCertificateRolloutUpdated {
+                member,
+                rollout: Some(rollout),
+            } => Ok((member, rollout)),
+            other => Err(unexpected("ClusterCertificateRolloutUpdated", &other)),
+        }
+    }
+
+    pub async fn abort_cluster_member_certificate_rollout(
+        &mut self,
+        node_id: impl Into<String>,
+        expected_generation: u64,
+        reason: impl Into<String>,
+    ) -> Result<ClusterMember, SdkError> {
+        self.abort_cluster_member_certificate_rollout_with_operation_id(
+            uuid::Uuid::new_v4().to_string(),
+            node_id,
+            expected_generation,
+            reason,
+        )
+        .await
+    }
+
+    pub async fn abort_cluster_member_certificate_rollout_with_operation_id(
+        &mut self,
+        operation_id: impl Into<String>,
+        node_id: impl Into<String>,
+        expected_generation: u64,
+        reason: impl Into<String>,
+    ) -> Result<ClusterMember, SdkError> {
+        match self
+            .call(Syscall::AbortClusterMemberCertificateRollout {
+                operation_id: Some(operation_id.into()),
+                node_id: node_id.into(),
+                expected_generation,
+                reason: reason.into(),
+            })
+            .await?
+        {
+            SyscallReply::ClusterCertificateRolloutUpdated {
+                member,
+                rollout: None,
+            } => Ok(member),
+            other => Err(unexpected("ClusterCertificateRolloutUpdated", &other)),
+        }
+    }
+
+    pub async fn finalize_cluster_member_certificate_rollout(
+        &mut self,
+        node_id: impl Into<String>,
+        expected_generation: u64,
+        reason: impl Into<String>,
+    ) -> Result<ClusterMember, SdkError> {
+        self.finalize_cluster_member_certificate_rollout_with_operation_id(
+            uuid::Uuid::new_v4().to_string(),
+            node_id,
+            expected_generation,
+            reason,
+        )
+        .await
+    }
+
+    pub async fn finalize_cluster_member_certificate_rollout_with_operation_id(
+        &mut self,
+        operation_id: impl Into<String>,
+        node_id: impl Into<String>,
+        expected_generation: u64,
+        reason: impl Into<String>,
+    ) -> Result<ClusterMember, SdkError> {
+        match self
+            .call(Syscall::FinalizeClusterMemberCertificateRollout {
+                operation_id: Some(operation_id.into()),
+                node_id: node_id.into(),
+                expected_generation,
+                reason: reason.into(),
+            })
+            .await?
+        {
+            SyscallReply::ClusterCertificateRolloutUpdated {
+                member,
+                rollout: None,
+            } => Ok(member),
+            other => Err(unexpected("ClusterCertificateRolloutUpdated", &other)),
         }
     }
 
@@ -1244,6 +1726,315 @@ impl KernelClient {
         {
             SyscallReply::ClusterMembershipAudit { entries } => Ok(entries),
             other => Err(unexpected("ClusterMembershipAudit", &other)),
+        }
+    }
+
+    pub async fn cluster_certificate_rollout_audit(
+        &mut self,
+        limit: usize,
+    ) -> Result<Vec<ClusterCertificateRolloutAudit>, SdkError> {
+        match self
+            .call(Syscall::ListClusterCertificateRolloutAudit { limit })
+            .await?
+        {
+            SyscallReply::ClusterCertificateRolloutAudit { entries } => Ok(entries),
+            other => Err(unexpected("ClusterCertificateRolloutAudit", &other)),
+        }
+    }
+
+    pub async fn claim_cluster_agent_ownership(
+        &mut self,
+        agent_id: impl Into<String>,
+        owner_node_id: impl Into<String>,
+        ttl_seconds: u64,
+        expected_fencing_token: Option<u64>,
+        reason: impl Into<String>,
+    ) -> Result<ClusterAgentOwnership, SdkError> {
+        self.claim_cluster_agent_ownership_with_operation_id(
+            uuid::Uuid::new_v4().to_string(),
+            agent_id,
+            owner_node_id,
+            ttl_seconds,
+            expected_fencing_token,
+            reason,
+        )
+        .await
+    }
+
+    /// Claim ownership using a caller-stable UUID for exact retry.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn claim_cluster_agent_ownership_with_operation_id(
+        &mut self,
+        operation_id: impl Into<String>,
+        agent_id: impl Into<String>,
+        owner_node_id: impl Into<String>,
+        ttl_seconds: u64,
+        expected_fencing_token: Option<u64>,
+        reason: impl Into<String>,
+    ) -> Result<ClusterAgentOwnership, SdkError> {
+        match self
+            .call(Syscall::ClaimClusterAgentOwnership {
+                operation_id: Some(operation_id.into()),
+                agent_id: agent_id.into(),
+                owner_node_id: owner_node_id.into(),
+                ttl_seconds,
+                expected_fencing_token,
+                reason: reason.into(),
+            })
+            .await?
+        {
+            SyscallReply::ClusterAgentOwnership {
+                ownership: Some(ownership),
+            } => Ok(ownership),
+            other => Err(unexpected("ClusterAgentOwnership", &other)),
+        }
+    }
+
+    pub async fn renew_cluster_agent_ownership(
+        &mut self,
+        agent_id: impl Into<String>,
+        owner_node_id: impl Into<String>,
+        fencing_token: u64,
+        ttl_seconds: u64,
+        reason: impl Into<String>,
+    ) -> Result<ClusterAgentOwnership, SdkError> {
+        self.renew_cluster_agent_ownership_with_operation_id(
+            uuid::Uuid::new_v4().to_string(),
+            agent_id,
+            owner_node_id,
+            fencing_token,
+            ttl_seconds,
+            reason,
+        )
+        .await
+    }
+
+    /// Renew ownership using a caller-stable UUID for exact retry.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn renew_cluster_agent_ownership_with_operation_id(
+        &mut self,
+        operation_id: impl Into<String>,
+        agent_id: impl Into<String>,
+        owner_node_id: impl Into<String>,
+        fencing_token: u64,
+        ttl_seconds: u64,
+        reason: impl Into<String>,
+    ) -> Result<ClusterAgentOwnership, SdkError> {
+        match self
+            .call(Syscall::RenewClusterAgentOwnership {
+                operation_id: Some(operation_id.into()),
+                agent_id: agent_id.into(),
+                owner_node_id: owner_node_id.into(),
+                fencing_token,
+                ttl_seconds,
+                reason: reason.into(),
+            })
+            .await?
+        {
+            SyscallReply::ClusterAgentOwnership {
+                ownership: Some(ownership),
+            } => Ok(ownership),
+            other => Err(unexpected("ClusterAgentOwnership", &other)),
+        }
+    }
+
+    pub async fn release_cluster_agent_ownership(
+        &mut self,
+        agent_id: impl Into<String>,
+        owner_node_id: impl Into<String>,
+        fencing_token: u64,
+        reason: impl Into<String>,
+    ) -> Result<ClusterAgentOwnership, SdkError> {
+        self.release_cluster_agent_ownership_with_operation_id(
+            uuid::Uuid::new_v4().to_string(),
+            agent_id,
+            owner_node_id,
+            fencing_token,
+            reason,
+        )
+        .await
+    }
+
+    /// Release ownership using a caller-stable UUID for exact retry.
+    pub async fn release_cluster_agent_ownership_with_operation_id(
+        &mut self,
+        operation_id: impl Into<String>,
+        agent_id: impl Into<String>,
+        owner_node_id: impl Into<String>,
+        fencing_token: u64,
+        reason: impl Into<String>,
+    ) -> Result<ClusterAgentOwnership, SdkError> {
+        match self
+            .call(Syscall::ReleaseClusterAgentOwnership {
+                operation_id: Some(operation_id.into()),
+                agent_id: agent_id.into(),
+                owner_node_id: owner_node_id.into(),
+                fencing_token,
+                reason: reason.into(),
+            })
+            .await?
+        {
+            SyscallReply::ClusterAgentOwnership {
+                ownership: Some(ownership),
+            } => Ok(ownership),
+            other => Err(unexpected("ClusterAgentOwnership", &other)),
+        }
+    }
+
+    pub async fn cluster_agent_ownership(
+        &mut self,
+        agent_id: impl Into<String>,
+    ) -> Result<Option<ClusterAgentOwnership>, SdkError> {
+        match self
+            .call(Syscall::GetClusterAgentOwnership {
+                agent_id: agent_id.into(),
+                require_active: false,
+            })
+            .await?
+        {
+            SyscallReply::ClusterAgentOwnership { ownership } => Ok(ownership),
+            other => Err(unexpected("ClusterAgentOwnership", &other)),
+        }
+    }
+
+    /// Read one ownership record only if the authority itself confirms that it
+    /// is active and unexpired using the authority clock.
+    pub async fn active_cluster_agent_ownership(
+        &mut self,
+        agent_id: impl Into<String>,
+    ) -> Result<ClusterAgentOwnership, SdkError> {
+        match self
+            .call(Syscall::GetClusterAgentOwnership {
+                agent_id: agent_id.into(),
+                require_active: true,
+            })
+            .await?
+        {
+            SyscallReply::ClusterAgentOwnership {
+                ownership: Some(ownership),
+            } => Ok(ownership),
+            other => Err(unexpected("active ClusterAgentOwnership", &other)),
+        }
+    }
+
+    /// Page through the authority's complete durable ownership directory.
+    pub async fn cluster_agent_ownerships(
+        &mut self,
+        after_agent_id: Option<String>,
+        limit: usize,
+    ) -> Result<Vec<ClusterAgentOwnership>, SdkError> {
+        match self
+            .call(Syscall::ListClusterAgentOwnerships {
+                after_agent_id,
+                limit,
+            })
+            .await?
+        {
+            SyscallReply::ClusterAgentOwnerships { ownerships } => Ok(ownerships),
+            other => Err(unexpected("ClusterAgentOwnerships", &other)),
+        }
+    }
+
+    pub async fn cluster_agent_ownership_audit(
+        &mut self,
+        agent_id: Option<String>,
+        limit: usize,
+    ) -> Result<Vec<ClusterAgentOwnershipAudit>, SdkError> {
+        match self
+            .call(Syscall::ListClusterAgentOwnershipAudit { agent_id, limit })
+            .await?
+        {
+            SyscallReply::ClusterAgentOwnershipAudit { entries } => Ok(entries),
+            other => Err(unexpected("ClusterAgentOwnershipAudit", &other)),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn install_agent_mutation_fence(
+        &mut self,
+        agent_id: impl Into<String>,
+        cluster_id: impl Into<String>,
+        owner_node_id: impl Into<String>,
+        authority_term: u64,
+        authority_generation: u64,
+        fencing_token: u64,
+        proof_expires_at: chrono::DateTime<chrono::Utc>,
+        reason: impl Into<String>,
+    ) -> Result<AgentMutationFence, SdkError> {
+        match self
+            .call(Syscall::InstallAgentMutationFence {
+                agent_id: agent_id.into(),
+                cluster_id: cluster_id.into(),
+                owner_node_id: owner_node_id.into(),
+                authority_term,
+                authority_generation,
+                fencing_token,
+                proof_expires_at,
+                reason: reason.into(),
+            })
+            .await?
+        {
+            SyscallReply::AgentMutationFence { fence: Some(fence) } => Ok(fence),
+            other => Err(unexpected("AgentMutationFence", &other)),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn retire_agent_mutation_fence(
+        &mut self,
+        agent_id: impl Into<String>,
+        cluster_id: impl Into<String>,
+        owner_node_id: impl Into<String>,
+        authority_term: u64,
+        authority_generation: u64,
+        fencing_token: u64,
+        proof_expires_at: chrono::DateTime<chrono::Utc>,
+        reason: impl Into<String>,
+    ) -> Result<AgentMutationFence, SdkError> {
+        match self
+            .call(Syscall::RetireAgentMutationFence {
+                agent_id: agent_id.into(),
+                cluster_id: cluster_id.into(),
+                owner_node_id: owner_node_id.into(),
+                authority_term,
+                authority_generation,
+                fencing_token,
+                proof_expires_at,
+                reason: reason.into(),
+            })
+            .await?
+        {
+            SyscallReply::AgentMutationFence { fence: Some(fence) } => Ok(fence),
+            other => Err(unexpected("AgentMutationFence", &other)),
+        }
+    }
+
+    pub async fn agent_mutation_fence(
+        &mut self,
+        agent_id: impl Into<String>,
+    ) -> Result<Option<AgentMutationFence>, SdkError> {
+        match self
+            .call(Syscall::GetAgentMutationFence {
+                agent_id: agent_id.into(),
+            })
+            .await?
+        {
+            SyscallReply::AgentMutationFence { fence } => Ok(fence),
+            other => Err(unexpected("AgentMutationFence", &other)),
+        }
+    }
+
+    pub async fn agent_mutation_fence_audit(
+        &mut self,
+        agent_id: Option<String>,
+        limit: usize,
+    ) -> Result<Vec<AgentMutationFenceAudit>, SdkError> {
+        match self
+            .call(Syscall::ListAgentMutationFenceAudit { agent_id, limit })
+            .await?
+        {
+            SyscallReply::AgentMutationFenceAudit { entries } => Ok(entries),
+            other => Err(unexpected("AgentMutationFenceAudit", &other)),
         }
     }
 
@@ -1945,10 +2736,52 @@ impl KernelClient {
         }
     }
 
+    /// Roll back only if the installed package still matches the exact
+    /// operator-reviewed version and digest.
+    pub async fn rollback_package_exact(
+        &mut self,
+        name: impl Into<String>,
+        expected_version: impl Into<String>,
+        expected_digest: impl Into<String>,
+    ) -> Result<InstalledPackage, SdkError> {
+        match self
+            .call(Syscall::RollbackPackageExact {
+                name: name.into(),
+                expected_version: expected_version.into(),
+                expected_digest: expected_digest.into(),
+            })
+            .await?
+        {
+            SyscallReply::PackageInstalled { package } => Ok(package),
+            other => Err(unexpected("PackageInstalled", &other)),
+        }
+    }
+
     /// Remove an installed package if it has no installed dependents.
     pub async fn remove_package(&mut self, name: impl Into<String>) -> Result<(), SdkError> {
         match self
             .call(Syscall::RemovePackage { name: name.into() })
+            .await?
+        {
+            SyscallReply::PackageMutationComplete => Ok(()),
+            other => Err(unexpected("PackageMutationComplete", &other)),
+        }
+    }
+
+    /// Remove only if the installed package still matches the exact
+    /// operator-reviewed version and digest.
+    pub async fn remove_package_exact(
+        &mut self,
+        name: impl Into<String>,
+        expected_version: impl Into<String>,
+        expected_digest: impl Into<String>,
+    ) -> Result<(), SdkError> {
+        match self
+            .call(Syscall::RemovePackageExact {
+                name: name.into(),
+                expected_version: expected_version.into(),
+                expected_digest: expected_digest.into(),
+            })
             .await?
         {
             SyscallReply::PackageMutationComplete => Ok(()),
@@ -2076,6 +2909,12 @@ fn safe_to_replay_after_reconnect(call: &Syscall) -> bool {
             | Syscall::ListNodeControlAudit { .. }
             | Syscall::GetClusterMembership
             | Syscall::ListClusterMembershipAudit { .. }
+            | Syscall::ListClusterCertificateRolloutAudit { .. }
+            | Syscall::GetClusterAgentOwnership { .. }
+            | Syscall::ListClusterAgentOwnerships { .. }
+            | Syscall::ListClusterAgentOwnershipAudit { .. }
+            | Syscall::GetAgentMutationFence { .. }
+            | Syscall::ListAgentMutationFenceAudit { .. }
             | Syscall::Metrics
             | Syscall::OperatorSnapshot
             | Syscall::ListOperatorTunables
@@ -2091,14 +2930,17 @@ fn safe_to_replay_after_reconnect(call: &Syscall) -> bool {
 fn mutation_operation_name(call: &Syscall) -> &'static str {
     match call {
         Syscall::InstallPackage { .. } => "package installation",
-        Syscall::RollbackPackage { .. } => "package rollback",
-        Syscall::RemovePackage { .. } => "package removal",
+        Syscall::RollbackPackage { .. } | Syscall::RollbackPackageExact { .. } => {
+            "package rollback"
+        }
+        Syscall::RemovePackage { .. } | Syscall::RemovePackageExact { .. } => "package removal",
         Syscall::PauseAgent { .. } => "agent pause",
         Syscall::ResumeAgent { .. } => "agent resume",
         Syscall::StopAgent { .. } => "agent stop",
         Syscall::KillAgent { .. } => "agent kill",
         Syscall::CallTool { .. } => "tool call",
         Syscall::SendMessage { .. } | Syscall::SendMessageStream { .. } => "agent turn",
+        Syscall::FencedAgentMutation { mutation, .. } => mutation_operation_name(mutation),
         _ => "side-effecting syscall",
     }
 }
@@ -2534,6 +3376,215 @@ mod protocol_tests {
         assert_eq!(info.protocol_version, PROTOCOL_VERSION);
         assert!(info.min_protocol_version <= PROTOCOL_VERSION);
         assert!(!info.server_version.is_empty());
+    }
+
+    #[tokio::test]
+    async fn sdk_cluster_ownership_roundtrip_is_exact_and_system_scoped() {
+        let kernel = Arc::new(AgentKernelImpl::new().expect("kernel new"));
+        let control = &kernel.cluster_control;
+        let identity = control.identity().clone();
+        let challenge = control.issue_join_challenge(30).unwrap();
+        let registration = ClusterMemberRegistration {
+            node_id: identity.node_id.clone(),
+            fingerprint: identity.fingerprint,
+            public_key: identity.public_key,
+            tls_server_certificate_fingerprint: None,
+            endpoint: "127.0.0.1:7443".into(),
+            server_version: env!("CARGO_PKG_VERSION").into(),
+            min_protocol_version: 1,
+            protocol_version: PROTOCOL_VERSION,
+        };
+        let payload = kernel::cluster_control::membership_join_payload(
+            &challenge.cluster_id,
+            &challenge.challenge_hex,
+            &registration,
+        )
+        .unwrap();
+        let signature = control.sign_challenge(&payload).unwrap();
+        let signature_hex: String = signature.iter().map(|byte| format!("{byte:02x}")).collect();
+        control
+            .register_member(
+                registration,
+                &challenge.challenge_hex,
+                &signature_hex,
+                None,
+                1,
+                PROTOCOL_VERSION,
+                "system",
+                "SDK ownership fixture",
+            )
+            .unwrap();
+
+        let server = SyscallServer::bind(Arc::clone(&kernel), "127.0.0.1:0")
+            .await
+            .unwrap();
+        let addr = server.local_addr().unwrap();
+        tokio::spawn(server.serve());
+        let mut client = KernelClient::connect(addr).await.expect("connect");
+        client.hello().await.unwrap();
+        let agent_id = client
+            .create_agent(
+                "fenced-sdk-agent",
+                "ownership and destination fence fixture",
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let claimed = client
+            .claim_cluster_agent_ownership(
+                &agent_id,
+                &identity.node_id,
+                30,
+                None,
+                "initial placement",
+            )
+            .await
+            .unwrap();
+        assert_eq!(claimed.fencing_token, 1);
+        assert_eq!(
+            client.cluster_agent_ownership(&agent_id).await.unwrap(),
+            Some(claimed.clone())
+        );
+        assert_eq!(
+            client
+                .active_cluster_agent_ownership(&agent_id)
+                .await
+                .unwrap(),
+            claimed
+        );
+        let stale = client
+            .renew_cluster_agent_ownership(
+                &agent_id,
+                &identity.node_id,
+                claimed.fencing_token + 1,
+                30,
+                "stale token",
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(stale.wire_code(), Some(WireErrorCode::Conflict));
+
+        let renewed = client
+            .renew_cluster_agent_ownership(
+                &agent_id,
+                &identity.node_id,
+                claimed.fencing_token,
+                30,
+                "heartbeat",
+            )
+            .await
+            .unwrap();
+        assert_eq!(renewed.fencing_token, claimed.fencing_token);
+        let installed = client
+            .install_agent_mutation_fence(
+                &agent_id,
+                &challenge.cluster_id,
+                &identity.node_id,
+                renewed.authority_term,
+                renewed.generation,
+                renewed.fencing_token,
+                renewed.lease_expires_at,
+                "destination admission",
+            )
+            .await
+            .unwrap();
+        assert_eq!(installed.state, AgentMutationFenceState::Active);
+        assert_eq!(
+            client.agent_mutation_fence(&agent_id).await.unwrap(),
+            Some(installed.clone())
+        );
+        let proof = AgentMutationFenceProof {
+            cluster_id: challenge.cluster_id.clone(),
+            owner_node_id: identity.node_id.clone(),
+            authority_term: renewed.authority_term,
+            authority_generation: renewed.generation,
+            fencing_token: renewed.fencing_token,
+            proof_expires_at: renewed.lease_expires_at,
+        };
+        assert_eq!(
+            client.pause_agent(&agent_id).await.unwrap_err().wire_code(),
+            Some(WireErrorCode::Conflict)
+        );
+        let stream_error = client
+            .send_message_stream(
+                "unfenced-stream",
+                &agent_id,
+                "must be rejected before provider execution",
+                |_| {},
+            )
+            .await
+            .unwrap_err();
+        assert!(stream_error
+            .kernel_message()
+            .is_some_and(|message| message.contains("requires an exact")));
+        assert_eq!(
+            client
+                .pause_agent_fenced(&agent_id, proof.clone())
+                .await
+                .unwrap()
+                .state,
+            "Paused"
+        );
+        assert_eq!(
+            client
+                .resume_agent_fenced(&agent_id, proof)
+                .await
+                .unwrap()
+                .state,
+            "Running"
+        );
+        let retired_fence = client
+            .retire_agent_mutation_fence(
+                &agent_id,
+                &challenge.cluster_id,
+                &identity.node_id,
+                renewed.authority_term,
+                renewed.generation,
+                renewed.fencing_token,
+                renewed.lease_expires_at,
+                "destination drained",
+            )
+            .await
+            .unwrap();
+        assert_eq!(retired_fence.state, AgentMutationFenceState::Retired);
+        let fence_audit = client
+            .agent_mutation_fence_audit(Some(agent_id.clone()), 10)
+            .await
+            .unwrap();
+        assert_eq!(fence_audit.len(), 2);
+        assert_eq!(fence_audit[0].state, AgentMutationFenceState::Retired);
+        let released = client
+            .release_cluster_agent_ownership(
+                &agent_id,
+                &identity.node_id,
+                renewed.fencing_token,
+                "drained",
+            )
+            .await
+            .unwrap();
+        assert_eq!(released.state, ClusterOwnershipState::Released);
+        assert_eq!(
+            client
+                .active_cluster_agent_ownership(&agent_id)
+                .await
+                .unwrap_err()
+                .wire_code(),
+            Some(WireErrorCode::Conflict)
+        );
+        let audit = client
+            .cluster_agent_ownership_audit(Some(agent_id), 10)
+            .await
+            .unwrap();
+        assert_eq!(
+            audit
+                .iter()
+                .map(|entry| entry.operation.as_str())
+                .collect::<Vec<_>>(),
+            vec!["release", "renew", "claim"]
+        );
     }
 
     #[tokio::test]

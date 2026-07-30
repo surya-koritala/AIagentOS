@@ -13,7 +13,11 @@
 //! Keys: `j`/`k` (or arrows) move · `r` refresh · `c` create (`name|task`) ·
 //! `m` message · `p` pause/resume · `s` stop · `X` kill · `[`/`]` select
 //! service · `u` start · `d` stop with exact-name confirmation · `R` restart
-//! with exact-name confirmation · `L` reload · `q` quit.
+//! with exact-name confirmation · `L` reload · `,`/`.` select tunable · `v`
+//! set · `a` audit · `B` rollback with exact target confirmation · `q` quit.
+//! `{`/`}` select installed package · `i` install/upgrade · `P` run · `b`
+//! rollback · `D` remove, with exact artifact confirmation for destructive
+//! mutations.
 
 use std::io;
 use std::time::Duration;
@@ -196,6 +200,125 @@ fn perform(action: UiAction, app: &mut App, client: &mut TuiClient, rt: &tokio::
             };
             refresh_after_action(app, client, rt);
         }
+        UiAction::SetOperatorTunable {
+            name,
+            value,
+            expected_revision,
+        } => {
+            app.status = match rt.block_on(client.set_operator_tunable(
+                name.clone(),
+                value,
+                expected_revision,
+            )) {
+                Ok(tunable) => {
+                    app.clear_tunable_audit();
+                    format!(
+                        "tunable {}={} applied at revision {}; reload audit with `a`",
+                        tunable.name, tunable.value, tunable.revision
+                    )
+                }
+                Err(error) => {
+                    format!("tunable update failed for {name}@r{expected_revision}: {error}")
+                }
+            };
+            refresh_after_action(app, client, rt);
+        }
+        UiAction::LoadOperatorTunableAudit { name } => {
+            match rt.block_on(client.operator_tunable_audit(Some(name.clone()), 20)) {
+                Ok(entries) => {
+                    let count = entries.len();
+                    app.set_tunable_audit(name.clone(), entries);
+                    app.status = format!("loaded {count} audit entries for {name}");
+                }
+                Err(error) => {
+                    app.status = format!("tunable audit failed for {name}: {error}");
+                }
+            }
+        }
+        UiAction::RollbackOperatorTunable {
+            name,
+            target_revision,
+            expected_revision,
+        } => {
+            app.status = match rt.block_on(client.rollback_operator_tunable(
+                name.clone(),
+                target_revision,
+                expected_revision,
+            )) {
+                Ok(tunable) => {
+                    app.clear_tunable_audit();
+                    format!(
+                        "tunable {} rolled back to value {} at revision {}; reload audit with `a`",
+                        tunable.name, tunable.value, tunable.revision
+                    )
+                }
+                Err(error) => format!(
+                    "tunable rollback failed for {name} from r{expected_revision} to r{target_revision}: {error}"
+                ),
+            };
+            refresh_after_action(app, client, rt);
+        }
+        UiAction::InstallPackage { name, requirement } => {
+            app.status = match rt.block_on(client.install_package(&name, &requirement)) {
+                Ok(package) => format!(
+                    "installed {}@{} ({})",
+                    package.name,
+                    package.version,
+                    short_digest(&package.digest)
+                ),
+                Err(error) => {
+                    format!("package install failed for {name}|{requirement}: {error}")
+                }
+            };
+            refresh_after_action(app, client, rt);
+        }
+        UiAction::RunInstalledPackage { name } => {
+            app.status = match rt.block_on(client.run_installed_package(&name)) {
+                Ok(agent_id) => format!("started package {name} as agent {agent_id}"),
+                Err(error) => format!("package run failed for {name}: {error}"),
+            };
+            refresh_after_action(app, client, rt);
+        }
+        UiAction::RollbackInstalledPackage {
+            name,
+            expected_version,
+            expected_digest,
+        } => {
+            app.status = match rt.block_on(client.rollback_package_exact(
+                &name,
+                &expected_version,
+                &expected_digest,
+            )) {
+                Ok(package) => format!(
+                    "rolled back {} from {} to {} ({})",
+                    package.name,
+                    expected_version,
+                    package.version,
+                    short_digest(&package.digest)
+                ),
+                Err(error) => {
+                    format!("package rollback failed for {name}@{expected_version}: {error}")
+                }
+            };
+            refresh_after_action(app, client, rt);
+        }
+        UiAction::RemoveInstalledPackage {
+            name,
+            expected_version,
+            expected_digest,
+        } => {
+            app.status = match rt.block_on(client.remove_package_exact(
+                &name,
+                &expected_version,
+                &expected_digest,
+            )) {
+                Ok(()) => format!("removed {name}@{expected_version}"),
+                Err(error) => {
+                    format!("package removal failed for {name}@{expected_version}: {error}")
+                }
+            };
+            refresh_after_action(app, client, rt);
+        }
     }
 }
 
@@ -278,12 +401,13 @@ fn render_header(f: &mut Frame, area: Rect, app: &App) {
         Span::raw("   "),
         Span::styled(
             format!(
-                "providers:{} available:{} packages:{}",
+                "providers:{} available:{} packages:{}/{}",
                 app.providers.len(),
                 app.providers
                     .iter()
                     .filter(|provider| provider.available && !provider.circuit_open)
                     .count(),
+                app.installed_packages.len(),
                 app.packages.len()
             ),
             Style::default().fg(Color::Blue),
@@ -535,6 +659,73 @@ fn append_operator_summary(lines: &mut Vec<Line<'static>>, app: &App) {
             tunables.as_str()
         }
     )));
+    if let Some(tunable) = app.selected_tunable() {
+        lines.push(Line::from(format!(
+            "selected tunable [{}/{}]: {}={}@r{} · allowed {}..={} · {}",
+            app.selected_tunable + 1,
+            app.tunables.len(),
+            tunable.name,
+            tunable.value,
+            tunable.revision,
+            tunable.minimum,
+            tunable.maximum,
+            if tunable.persisted {
+                "persisted"
+            } else {
+                "runtime only"
+            }
+        )));
+        lines.push(Line::from(format!(
+            "updated by {} at {} · {}",
+            tunable.updated_by, tunable.updated_at, tunable.description
+        )));
+    }
+    if let Some(name) = &app.tunable_audit_name {
+        lines.push(Line::from(format!(
+            "audit for {name}: {} entr{}",
+            app.tunable_audit.len(),
+            if app.tunable_audit.len() == 1 {
+                "y"
+            } else {
+                "ies"
+            }
+        )));
+        for entry in app.tunable_audit.iter().take(3) {
+            lines.push(Line::from(format!(
+                "  #{} {} {} r{} value={} actor={}",
+                entry.id,
+                entry.action,
+                entry.outcome,
+                entry
+                    .revision
+                    .map(|revision| revision.to_string())
+                    .unwrap_or_else(|| "-".into()),
+                entry
+                    .effective_value
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "-".into()),
+                entry.actor
+            )));
+        }
+    }
+    if let Some(package) = app.selected_package() {
+        lines.push(Line::from(format!(
+            "installed package [{}/{}]: {}@{} · {}",
+            app.selected_package + 1,
+            app.installed_packages.len(),
+            package.name,
+            package.version,
+            short_digest(&package.digest)
+        )));
+        lines.push(Line::from(format!(
+            "publisher={} · lock entries={} · installed {}",
+            package.manifest.publisher,
+            package.lock.packages.len(),
+            package.installed_at
+        )));
+    } else {
+        lines.push(Line::from("installed packages: none"));
+    }
 }
 
 fn render_footer(f: &mut Frame, area: Rect, app: &App) {
@@ -576,6 +767,63 @@ fn render_footer(f: &mut Frame, area: Rect, app: &App) {
                 )),
             ])
         }
+        Mode::SetTunable => {
+            let (name, value, revision, minimum, maximum) = app
+                .pending_tunable_control()
+                .unwrap_or(("missing target", 0, 0, 0, 0));
+            Line::from(vec![
+                Span::styled(
+                    "SET TUNABLE ",
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(format!(
+                    "{name}={value}@r{revision} · range {minimum}..={maximum} · value> {}▏ · Enter submit · Esc cancel",
+                    app.input
+                )),
+            ])
+        }
+        Mode::ConfirmTunableRollback => {
+            let (name, value, revision, _, _) =
+                app.pending_tunable_control()
+                    .unwrap_or(("missing target", 0, 0, 0, 0));
+            Line::from(vec![
+                Span::styled(
+                    "CONFIRM TUNABLE ROLLBACK ",
+                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(format!(
+                    "{name}={value}@r{revision} · target-revision|exact-name> {}▏ · Enter submit · Esc cancel",
+                    app.input
+                )),
+            ])
+        }
+        Mode::InstallPackage => Line::from(vec![
+            Span::styled("INSTALL PACKAGE ", Style::default().fg(Color::Magenta)),
+            Span::raw(app.input.clone()),
+            Span::styled("▏", Style::default().add_modifier(Modifier::SLOW_BLINK)),
+            Span::raw(" · name|semver-requirement · Enter submit · Esc cancel"),
+        ]),
+        Mode::ConfirmPackageMutation => {
+            let (action, name, version, digest) = app.pending_package_mutation().unwrap_or((
+                "mutate",
+                "missing target",
+                "unknown",
+                "unknown",
+            ));
+            Line::from(vec![
+                Span::styled(
+                    format!("CONFIRM PACKAGE {} ", action.to_uppercase()),
+                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(format!(
+                    "{name}@{version} ({}) · {version}|{name}> {}▏ · Enter confirm · Esc cancel",
+                    short_digest(digest),
+                    app.input
+                )),
+            ])
+        }
     };
     f.render_widget(
         Paragraph::new(content).block(Block::default().borders(Borders::ALL)),
@@ -593,4 +841,8 @@ fn trunc(s: &str, n: usize) -> String {
 
 fn short(id: &str) -> &str {
     id.get(..8).unwrap_or(id)
+}
+
+fn short_digest(digest: &str) -> &str {
+    digest.get(..19).unwrap_or(digest)
 }

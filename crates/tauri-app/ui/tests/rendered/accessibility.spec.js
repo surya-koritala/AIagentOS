@@ -43,6 +43,17 @@ const operatorView = {
     },
   ],
   packages: [],
+  installed_packages: [
+    {
+      name: 'reviewer',
+      version: '2.0.0',
+      digest: 'a'.repeat(64),
+      publisher: 'fixture-publisher',
+      description: 'Signed review agent',
+      installed_at: '2026-07-28T19:45:00Z',
+      lock_package_count: 1,
+    },
+  ],
   services: [
     {
       name: 'research-worker',
@@ -58,7 +69,19 @@ const operatorView = {
       last_transition_at: '2026-07-28T19:55:00Z',
     },
   ],
-  tunables: [],
+  tunables: [
+    {
+      name: 'kernel.max_agents',
+      value: 10,
+      revision: 3,
+      minimum: 0,
+      maximum: 1000000,
+      persisted: true,
+      updated_at: '2026-07-28T19:50:00Z',
+      updated_by: 'fixture-operator',
+      description: 'Maximum durable agent identities admitted by this node.',
+    },
+  ],
   scoped_gate: { allowed: 4, denied: 1, audited: 5 },
   metrics: { tokens_consumed: 128, api_calls_made: 3 },
 };
@@ -87,9 +110,31 @@ const serviceHistory = [
   },
 ];
 
+const tunableAudit = [
+  {
+    id: 2,
+    name: 'kernel.max_agents',
+    revision: 3,
+    previous_value: 5,
+    requested_value: 10,
+    effective_value: 10,
+    action: 'set',
+    outcome: 'applied',
+    actor: 'fixture-operator',
+    reason: null,
+    created_at: '2026-07-28T19:50:00Z',
+  },
+];
+
 async function installTauriFixture(page, { setupComplete = true } = {}) {
   await page.addInitScript(
-    ({ complete, snapshot, checkpointFixtures, serviceHistoryFixtures }) => {
+    ({
+      complete,
+      snapshot,
+      checkpointFixtures,
+      serviceHistoryFixtures,
+      tunableAuditFixtures,
+    }) => {
       const config = {
         setup_complete: complete,
         llm_provider: 'azure-openai',
@@ -101,8 +146,10 @@ async function installTauriFixture(page, { setupComplete = true } = {}) {
         data_dir: '/tmp/fixture',
       };
 
+      window.__TAURI_CALLS__ = [];
       window.__TAURI_INTERNALS__ = {
         invoke(command, args = {}) {
+          window.__TAURI_CALLS__.push({ command, args });
           if (command === 'load_config') return Promise.resolve(config);
           if (command === 'get_operator_view') return Promise.resolve(snapshot);
           if (command === 'list_checkpoints') return Promise.resolve(checkpointFixtures);
@@ -113,6 +160,37 @@ async function installTauriFixture(page, { setupComplete = true } = {}) {
           if (command === 'service_history') {
             return Promise.resolve(serviceHistoryFixtures);
           }
+          if (command === 'operator_tunable_audit') {
+            return Promise.resolve(tunableAuditFixtures);
+          }
+          if (command === 'set_operator_tunable') {
+            return Promise.resolve({
+              ...snapshot.tunables[0],
+              value: 11,
+              revision: 4,
+            });
+          }
+          if (command === 'rollback_operator_tunable') {
+            return Promise.resolve({
+              ...snapshot.tunables[0],
+              value: 5,
+              revision: 4,
+            });
+          }
+          if (command === 'install_package') {
+            return Promise.resolve(snapshot.installed_packages[0]);
+          }
+          if (command === 'run_installed_package') {
+            return Promise.resolve('fixture-package-agent');
+          }
+          if (command === 'rollback_installed_package') {
+            return Promise.resolve({
+              ...snapshot.installed_packages[0],
+              version: '1.0.0',
+              digest: 'b'.repeat(64),
+            });
+          }
+          if (command === 'remove_installed_package') return Promise.resolve();
           if (command === 'start_service' || command === 'stop_service' || command === 'restart_service') {
             return Promise.resolve({
               ...snapshot.services[0],
@@ -142,6 +220,7 @@ async function installTauriFixture(page, { setupComplete = true } = {}) {
       snapshot: operatorView,
       checkpointFixtures: checkpoints,
       serviceHistoryFixtures: serviceHistory,
+      tunableAuditFixtures: tunableAudit,
     },
   );
 }
@@ -310,4 +389,86 @@ test('service controls freeze the target and require exact-name confirmation', a
   ).toBeVisible();
   await expect(page.getByText('started', { exact: true })).toBeVisible();
   await expectWcagAxeClean(page);
+});
+
+test('tunable controls freeze revisions, bound updates, and require exact rollback targets', async ({ page }) => {
+  await installTauriFixture(page);
+  await page.goto('/');
+  await page.getByRole('button', { name: 'Agent status' }).click();
+
+  await expect(page.getByRole('heading', { name: 'Operator tunables' })).toBeVisible();
+  await page.getByRole('button', { name: 'Set kernel.max_agents' }).click();
+  const setControl = page.getByRole('group', { name: 'Set kernel.max_agents' });
+  await expect(setControl).toContainText('revision 3');
+  await expect(setControl).toContainText('another operator changes the revision first');
+  const confirmSet = page.getByRole('button', { name: 'Confirm set' });
+  await page.getByRole('textbox', { name: /New value/ }).fill('1000001');
+  await expect(confirmSet).toBeDisabled();
+  await page.getByRole('textbox', { name: /New value/ }).fill('11');
+  await expect(confirmSet).toBeEnabled();
+  await expectWcagAxeClean(page);
+  await page.getByRole('button', { name: 'Cancel tunable change' }).click();
+
+  await page.getByRole('button', { name: 'Rollback kernel.max_agents' }).click();
+  const rollbackControl = page.getByRole('group', {
+    name: 'Rollback kernel.max_agents',
+  });
+  await expect(rollbackControl).toContainText('revision 3');
+  const confirmRollback = page.getByRole('button', { name: 'Confirm rollback' });
+  await expect(confirmRollback).toBeDisabled();
+  await page
+    .getByRole('textbox', { name: 'Target revision|exact tunable name' })
+    .fill('1|kernel.max_agents');
+  await expect(confirmRollback).toBeEnabled();
+  await expectWcagAxeClean(page);
+  await page.getByRole('button', { name: 'Cancel tunable change' }).click();
+
+  await page.getByRole('button', { name: 'View audit for kernel.max_agents' }).click();
+  await expect(
+    page.getByRole('heading', { name: 'Tunable audit: kernel.max_agents' }),
+  ).toBeVisible();
+  await expect(page.getByText('fixture-operator', { exact: true })).toBeVisible();
+  await expectWcagAxeClean(page);
+});
+
+test('signed package controls are axe-clean and submit the frozen version and digest', async ({ page }) => {
+  await installTauriFixture(page);
+  await page.goto('/');
+  await page.getByRole('button', { name: 'Agent status' }).click();
+
+  await expect(
+    page.getByRole('heading', { name: 'Installed signed packages' }),
+  ).toBeVisible();
+  await expect(page.getByText('fixture-publisher', { exact: true })).toBeVisible();
+  await expectWcagAxeClean(page);
+
+  await page.getByRole('button', { name: 'Rollback reviewer 2.0.0' }).click();
+  const rollback = page.getByRole('group', {
+    name: 'Rollback reviewer 2.0.0',
+  });
+  await expect(rollback).toContainText('a'.repeat(64));
+  await expect(rollback).toContainText('rejects a concurrent change');
+  const confirm = page.getByRole('button', { name: 'Confirm rollback' });
+  await expect(confirm).toBeDisabled();
+  await page
+    .getByRole('textbox', { name: 'Version|exact package name' })
+    .fill('2.0.0|reviewer');
+  await expect(confirm).toBeEnabled();
+  await expectWcagAxeClean(page);
+  await confirm.click();
+
+  await expect(
+    page.getByText('Rolled back reviewer to 1.0.0.', { exact: true }),
+  ).toBeVisible();
+  const mutation = await page.evaluate(() =>
+    window.__TAURI_CALLS__.find(call =>
+      call.command === 'rollback_installed_package'
+    ),
+  );
+  expect(mutation.args).toEqual({
+    packageName: 'reviewer',
+    expectedVersion: '2.0.0',
+    expectedDigest: 'a'.repeat(64),
+    confirmPackageTarget: '2.0.0|reviewer',
+  });
 });

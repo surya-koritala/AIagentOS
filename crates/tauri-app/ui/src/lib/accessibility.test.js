@@ -115,3 +115,37 @@ test('software update requires review and exact-version confirmation', () => {
     assert.ok(settings.includes(contract), `software updater lost ${contract}`);
   }
 });
+
+test('operator tunables retain revision bounds, exact rollback target, and audit controls', () => {
+  const status = source('AgentStatus.svelte');
+
+  assert.match(status, /const frozenTarget = \{ \.\.\.pendingTunableControl \}/);
+  assert.match(status, /invoke\('set_operator_tunable'/);
+  assert.match(status, /invoke\('rollback_operator_tunable'/);
+  assert.match(status, /invoke\('operator_tunable_audit'/);
+  assert.match(status, /expectedRevision: frozenTarget\.revision/);
+  assert.match(status, /confirmTunableName: frozenTarget\.name/);
+  assert.match(status, /revision >= target\.revision/);
+  assert.match(status, /Target revision\|exact tunable name/);
+  assert.match(status, /another operator changes the revision first/);
+});
+
+test('signed package controls freeze version and digest on the public command boundary', () => {
+  const status = source('AgentStatus.svelte');
+
+  assert.match(status, /invoke\('install_package'/);
+  assert.match(status, /invoke\('run_installed_package'/);
+  assert.match(status, /invoke\('rollback_installed_package'/);
+  assert.match(status, /invoke\('remove_installed_package'/);
+  assert.match(status, /const frozenTarget = \{ \.\.\.pendingPackageControl \}/);
+  assert.match(status, /expectedVersion: frozenTarget\.version/);
+  assert.match(status, /expectedDigest: frozenTarget\.digest/);
+  assert.match(status, /confirmPackageTarget: packageConfirmation/);
+  assert.match(
+    status,
+    /packageConfirmation !== `\$\{pendingPackageControl\.version\}\|\$\{pendingPackageControl\.name\}`/,
+  );
+  assert.match(status, /Version\|exact package name/);
+  assert.match(status, /rejects a concurrent change/);
+  assert.match(status, /prevents new runs from this package/);
+});

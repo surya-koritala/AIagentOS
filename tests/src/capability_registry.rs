@@ -405,6 +405,221 @@ fn provider_matrix_names_every_resource_provider_status_and_platform_contract() 
 }
 
 #[test]
+fn distributed_consistency_contract_is_published_and_fail_closed() {
+    let contract = read_workspace_file("docs/DISTRIBUTED_CONTROL_PLANE.md");
+    let summary = read_workspace_file("docs/src/SUMMARY.md");
+    let architecture = read_workspace_file("docs/ARCHITECTURE.md");
+    let protocol = read_workspace_file("docs/PROTOCOL.md");
+
+    assert!(summary.contains("./distributed-control-plane.md"));
+    assert!(architecture.contains("DISTRIBUTED_CONTROL_PLANE.md"));
+    assert!(protocol.contains("DISTRIBUTED_CONTROL_PLANE.md"));
+
+    for object in [
+        "Cluster identity and membership",
+        "Agent identity",
+        "Agent ownership and routing",
+        "Agent state and checkpoints",
+        "Package metadata and trust roots",
+        "Authorization policy",
+        "Quotas and accounting",
+        "Audit",
+        "IPC and delegation",
+    ] {
+        assert!(
+            contract.contains(object),
+            "distributed consistency contract must classify {object}"
+        );
+    }
+
+    for failure in [
+        "Membership authority loss",
+        "Workload node loss",
+        "Network partition",
+        "Duplicate agent ownership",
+        "Stale route",
+        "Clock skew",
+        "Unknown outcomes are not successes",
+    ] {
+        assert!(
+            contract.contains(failure),
+            "distributed consistency contract must define {failure}"
+        );
+    }
+
+    for honest_boundary in [
+        "isolated former leader cannot commit or locally apply",
+        "separate generation-fenced transport-trust",
+        "every fresh RPC checks that",
+        "peer removed only from voting remains a replicated learner",
+        "Startup compares the immutable seed and complete application catalog",
+        "retained peers must preserve an application identity",
+        "Configured Raft peers can no longer forward a bare external command",
+        "proof delegates a system-node principal rather than",
+        "host compromise that exposes both the",
+        "records the OpenRaft leader term",
+        "stops admitting new mutations at the exact expiry",
+        "not a self-contained offline quorum certificate",
+        "Expiry is checked at admission",
+        "does not cancel or",
+        "not atomic across databases",
+        "not fully partition tolerant",
+        "production distributed kernel",
+        "every mutable agent operation must be rejected",
+        "Lease expiry alone is insufficient",
+    ] {
+        assert!(
+            contract.contains(honest_boundary),
+            "distributed consistency contract lost boundary: {honest_boundary}"
+        );
+    }
+}
+
+#[test]
+fn trusted_browser_helpers_remain_isolated_bounded_and_outside_runtime_discovery() {
+    let automation = read_workspace_file("crates/resources/src/playwright.rs");
+    for contract in [
+        ".respect_https_errors()",
+        ".user_data_dir(profile.path())",
+        "SetDownloadBehaviorBehavior::Deny",
+        "browser.wait()",
+        "profile.close()",
+        "MAX_SCREENSHOT_BYTES",
+        "MAX_INPUT_BYTES",
+        "browser URL is invalid or too large",
+        "live_browser_denies_downloads_isolates_sessions_and_removes_profiles",
+    ] {
+        assert!(
+            automation.contains(contract),
+            "trusted Chromium helper lost security contract {contract:?}"
+        );
+    }
+
+    let html = read_workspace_file("crates/resources/src/browser.rs");
+    for contract in [
+        ".no_proxy()",
+        ".redirect(reqwest::redirect::Policy::none())",
+        "MAX_HTML_BYTES",
+        "MAX_CONTENT_CHARS",
+        "String::from_utf8(bytes)",
+        "project_document_link",
+        "trusted_web_fetch_is_bounded_strict_and_does_not_follow_redirects",
+    ] {
+        assert!(
+            html.contains(contract),
+            "trusted HTML helper lost security contract {contract:?}"
+        );
+    }
+
+    let matrix = read_workspace_file("docs/PROVIDER_MATRIX.md");
+    let helper_row = matrix
+        .lines()
+        .find(|line| line.contains("Feature-gated HTML/playwright helpers"))
+        .expect("provider matrix must retain the trusted helper row");
+    assert!(helper_row.contains("**Experimental**"));
+    assert!(helper_row.contains("Trusted operator process"));
+    assert!(helper_row.contains("not `ResourceProvider` implementations"));
+
+    let browser_row = matrix
+        .lines()
+        .find(|line| line.contains("Kernel browser provider"))
+        .expect("provider matrix must retain the kernel browser row");
+    assert!(browser_row.contains("Experimental — unavailable"));
+    assert!(browser_row.contains("None — unavailable"));
+    assert!(
+        !read_workspace_file("crates/kernel/src/lib.rs")
+            .contains("register_provider(ResourceType::Browser"),
+        "trusted helper work must not silently publish an unqualified kernel browser provider"
+    );
+
+    let qualification = read_workspace_file(".github/workflows/extended-security.yml");
+    for contract in [
+        "flags=(unconfined)",
+        "userns,",
+        "apparmor_parser -r",
+        "browser_sandbox=userns_apparmor_profile",
+        "browser_userns_profile_sha256",
+    ] {
+        assert!(
+            qualification.contains(contract),
+            "live Chromium qualification lost sandbox contract {contract:?}"
+        );
+    }
+    assert!(
+        !qualification.contains("--no-sandbox")
+            && !qualification.contains("--disable-setuid-sandbox")
+            && !qualification.contains("apparmor_restrict_unprivileged_userns=0")
+            && !qualification.contains("chmod 4755")
+            && !qualification.contains("CHROME_DEVEL_SANDBOX"),
+        "live Chromium qualification must use a scoped userns profile, not disable \
+         Chromium's sandbox, weaken the runner globally, or elevate a downloaded helper"
+    );
+}
+
+#[test]
+fn peripheral_access_stays_unavailable_and_requires_a_revocable_local_grant() {
+    let tools = read_workspace_file("crates/kernel/src/tools.rs");
+    for contract in [
+        "binding.resource_type == ResourceType::Peripheral",
+        "binding.security.approval_policy == ApprovalPolicy::None",
+        "binding.security.sandbox_requirement != SandboxRequirement::Required",
+        "placeholder_provider_operations_cannot_be_published_as_tools",
+    ] {
+        assert!(
+            tools.contains(contract),
+            "peripheral registration guard lost {contract:?}"
+        );
+    }
+
+    let kernel = read_workspace_file("crates/kernel/src/lib.rs");
+    for contract in [
+        "pub struct ToolApprovalState",
+        "pub fn approve_tool_call(",
+        "pub fn tool_call_approval_state(",
+        "pub fn revoke_tool_call_approval(",
+        "resource_identity",
+        "trusted_kernel_approval_api_grants_one_exact_registered_call",
+    ] {
+        assert!(
+            kernel.contains(contract),
+            "trusted local approval surface lost {contract:?}"
+        );
+    }
+
+    let gate = read_workspace_file("crates/kernel/src/syscall_gate.rs");
+    for contract in [
+        "tool_approval_granted_contract",
+        "revoke_tool_approval_contract",
+        "self.approvals.remove(&key)",
+        "self.approvals",
+        ".retain(|(agent, _, _, _, _), _| *agent != kid)",
+    ] {
+        assert!(
+            gate.contains(contract),
+            "single-use approval lifecycle lost {contract:?}"
+        );
+    }
+
+    let matrix = read_workspace_file("docs/PROVIDER_MATRIX.md");
+    let row = matrix
+        .lines()
+        .find(|line| line.contains("Kernel peripheral provider"))
+        .expect("provider matrix must retain the kernel peripheral row");
+    for contract in [
+        "Experimental — unavailable",
+        "None — unavailable",
+        "explicit local human approval",
+        "inspect a non-secret pending indicator",
+        "No remote, SDK, package, or MCP surface can create a grant",
+    ] {
+        assert!(
+            row.contains(contract),
+            "peripheral matrix row lost honest contract {contract:?}"
+        );
+    }
+}
+
+#[test]
 fn false_production_claim_is_rejected() {
     let root = workspace_root();
     let false_claim = Capability {
@@ -508,6 +723,7 @@ fn canonical_client_contract_is_explicit_and_honest() {
         "gate-stats",
         "node-control-audit [LIMIT]",
         "cluster-membership-audit [LIMIT]",
+        "cluster-certificate-rollout-audit [LIMIT]",
     ] {
         assert!(
             agentctl.contains(command),
@@ -518,7 +734,8 @@ fn canonical_client_contract_is_explicit_and_honest() {
         agentctl.contains("policy::explain_file")
             && agentctl.contains(".gate_stats()")
             && agentctl.contains(".node_control_audit(limit)")
-            && agentctl.contains(".cluster_membership_audit(limit)"),
+            && agentctl.contains(".cluster_membership_audit(limit)")
+            && agentctl.contains(".cluster_certificate_rollout_audit(limit)"),
         "canonical policy/audit commands must use the shared policy and SDK paths"
     );
     for surface in ["crates/tui/src/lib.rs", "crates/tauri-app/src/lib.rs"] {
@@ -563,6 +780,241 @@ fn high_risk_client_actions_keep_target_bound_confirmation() {
         assert!(
             tui.contains(contract),
             "TUI lost target-bound destructive contract {contract:?}"
+        );
+    }
+}
+
+#[test]
+fn tui_tunable_controls_stay_revision_bound_on_the_public_wire_boundary() {
+    let app = read_workspace_file("crates/tui/src/app.rs");
+    for contract in [
+        "Mode::SetTunable",
+        "Mode::ConfirmTunableRollback",
+        "expected_revision: target.revision",
+        "target-revision|exact-name",
+        "confirmation must exactly match",
+        "value must be within",
+    ] {
+        assert!(
+            app.contains(contract),
+            "TUI tunable state lost revision/target contract {contract:?}"
+        );
+    }
+
+    let binary = read_workspace_file("crates/tui/src/main.rs");
+    for contract in [
+        "client.set_operator_tunable(",
+        "client.operator_tunable_audit(",
+        "client.rollback_operator_tunable(",
+        "app.set_tunable_audit(",
+    ] {
+        assert!(
+            binary.contains(contract),
+            "TUI tunable I/O lost public KernelClient contract {contract:?}"
+        );
+    }
+
+    let integration = read_workspace_file("crates/tui/tests/refresh.rs");
+    for contract in [
+        "tunable_update_audit_and_rollback_use_the_public_tui_client",
+        "stale TUI revision must fail closed",
+        "revision-checked TUI rollback",
+    ] {
+        assert!(
+            integration.contains(contract),
+            "TUI tunable integration lost evidence {contract:?}"
+        );
+    }
+}
+
+#[test]
+fn tui_package_controls_stay_exact_on_the_public_wire_boundary() {
+    let app = read_workspace_file("crates/tui/src/app.rs");
+    for contract in [
+        "Mode::InstallPackage",
+        "Mode::ConfirmPackageMutation",
+        "expected_version: target.version",
+        "expected_digest: target.digest",
+        "confirmation must exactly match",
+        "prevents new package runs",
+    ] {
+        assert!(
+            app.contains(contract),
+            "TUI package state lost exact-target contract {contract:?}"
+        );
+    }
+
+    let binary = read_workspace_file("crates/tui/src/main.rs");
+    for contract in [
+        "client.install_package(",
+        "client.run_installed_package(",
+        "client.rollback_package_exact(",
+        "client.remove_package_exact(",
+    ] {
+        assert!(
+            binary.contains(contract),
+            "TUI package I/O lost public KernelClient contract {contract:?}"
+        );
+    }
+
+    let sdk = read_workspace_file("crates/sdk/src/lib.rs");
+    let server = read_workspace_file("crates/kernel/src/syscall_server.rs");
+    let registry = read_workspace_file("crates/kernel/src/package.rs");
+    for contract in ["RollbackPackageExact", "RemovePackageExact"] {
+        assert!(
+            sdk.contains(contract) && server.contains(contract),
+            "exact package mutation lost wire/SDK operation {contract:?}"
+        );
+    }
+    for contract in [
+        "rollback_exact",
+        "remove_exact",
+        "PackageError::Stale",
+        "transaction_with_behavior(TransactionBehavior::Immediate)",
+    ] {
+        assert!(
+            registry.contains(contract),
+            "exact package mutation lost transactional contract {contract:?}"
+        );
+    }
+
+    let integration = read_workspace_file("crates/tui/tests/refresh.rs");
+    for contract in [
+        "package_lifecycle_and_stale_confirmation_use_the_public_tui_client",
+        "stale TUI confirmation must fail closed",
+    ] {
+        assert!(
+            integration.contains(contract),
+            "TUI package integration lost evidence {contract:?}"
+        );
+    }
+}
+
+#[test]
+fn desktop_tunable_controls_stay_revision_bound_on_the_public_wire_boundary() {
+    let protocol = read_workspace_file("docs/PROTOCOL.md");
+    let normalized_protocol = protocol.split_whitespace().collect::<Vec<_>>().join(" ");
+    for contract in [
+        "freeze the displayed name and expected revision",
+        "compare-and-set revision check",
+        "requires the exact frozen tunable name",
+    ] {
+        assert!(
+            normalized_protocol.contains(contract),
+            "desktop tunable protocol lost {contract:?}"
+        );
+    }
+
+    let backend = read_workspace_file("crates/tauri-app/src/lib.rs");
+    for contract in [
+        ".set_operator_tunable(name, value, expected_revision)",
+        ".rollback_operator_tunable(name, target_revision, expected_revision)",
+        ".operator_tunable_audit(name, limit)",
+        "desktop_tunable_controls_and_audit_use_the_public_wire_client",
+    ] {
+        assert!(
+            backend.contains(contract),
+            "desktop tunable backend lost public client contract {contract:?}"
+        );
+    }
+
+    let commands = read_workspace_file("crates/tauri-app/src/commands.rs");
+    for contract in [
+        "pub async fn set_operator_tunable",
+        "pub async fn rollback_operator_tunable",
+        "pub async fn operator_tunable_audit",
+        "validate_tunable_rollback_confirmation(",
+    ] {
+        assert!(
+            commands.contains(contract),
+            "desktop tunable command surface lost {contract:?}"
+        );
+    }
+
+    let main = read_workspace_file("crates/tauri-app/src/main.rs");
+    for contract in [
+        "commands::set_operator_tunable",
+        "commands::rollback_operator_tunable",
+        "commands::operator_tunable_audit",
+    ] {
+        assert!(
+            main.contains(contract),
+            "desktop shell stopped registering tunable command {contract:?}"
+        );
+    }
+
+    let ui = read_workspace_file("crates/tauri-app/ui/src/lib/AgentStatus.svelte");
+    for contract in [
+        "expectedRevision: frozenTarget.revision",
+        "confirmTunableName: frozenTarget.name",
+        "Target revision|exact tunable name",
+        "another operator changes the revision first",
+    ] {
+        assert!(
+            ui.contains(contract),
+            "desktop tunable UI lost frozen target contract {contract:?}"
+        );
+    }
+}
+
+#[test]
+fn desktop_package_controls_stay_exact_on_the_public_wire_boundary() {
+    let backend = read_workspace_file("crates/tauri-app/src/lib.rs");
+    for contract in [
+        ".install_package(name, requirement)",
+        ".run_installed_package(name)",
+        ".rollback_package_exact(name, expected_version, expected_digest)",
+        ".remove_package_exact(name, expected_version, expected_digest)",
+        "desktop_package_controls_use_exact_public_wire_mutations",
+        "stale desktop package confirmation must fail closed",
+    ] {
+        assert!(
+            backend.contains(contract),
+            "desktop package backend lost public client contract {contract:?}"
+        );
+    }
+
+    let commands = read_workspace_file("crates/tauri-app/src/commands.rs");
+    let main = read_workspace_file("crates/tauri-app/src/main.rs");
+    for command in [
+        "list_installed_packages",
+        "install_package",
+        "run_installed_package",
+        "rollback_installed_package",
+        "remove_installed_package",
+    ] {
+        assert!(
+            commands.contains(&format!("pub async fn {command}")),
+            "desktop command surface lost {command:?}"
+        );
+        assert!(
+            main.contains(&format!("commands::{command}")),
+            "desktop shell stopped registering package command {command:?}"
+        );
+    }
+    for contract in [
+        "validate_exact_package_mutation(",
+        "package mutation confirmation must exactly match version|package-name",
+        "expected package digest must be a lowercase SHA-256 hex value",
+    ] {
+        assert!(
+            commands.contains(contract),
+            "desktop package IPC validation lost {contract:?}"
+        );
+    }
+
+    let ui = read_workspace_file("crates/tauri-app/ui/src/lib/AgentStatus.svelte");
+    for contract in [
+        "expectedVersion: frozenTarget.version",
+        "expectedDigest: frozenTarget.digest",
+        "confirmPackageTarget: packageConfirmation",
+        "Version|exact package name",
+        "rejects a concurrent change",
+        "prevents new runs from this package",
+    ] {
+        assert!(
+            ui.contains(contract),
+            "desktop package UI lost frozen target contract {contract:?}"
         );
     }
 }
@@ -1048,6 +1500,13 @@ fn release_blocking_workflows_keep_their_security_contract() {
         "stdout_limit_enforced",
         "hung_process_cleanup",
         "Provider core live-path security controls",
+        "Install the lockfile-pinned Chromium qualification runtime",
+        "live_browser_denies_downloads_isolates_sessions_and_removes_profiles",
+        "browser_profiles_isolated_and_cleaned",
+        "browser_sha256=",
+        "Google Chrome for Testing|Chromium",
+        "kernel_browser_provider_unavailable",
+        "live_linux_provider_security_core",
         "scripts/provider_core_qualification.py",
         "provider-core-${{ github.sha }}",
         "Live network SSRF and DNS-rebinding controls",

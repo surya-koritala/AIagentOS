@@ -19,15 +19,20 @@ use crate::context::SqliteContextManager;
 use crate::ContextError;
 
 const SINGLETON: i64 = 1;
-const MAX_REASON_BYTES: usize = 1024;
+pub(crate) const MAX_REASON_BYTES: usize = 1024;
 const MAX_PROFILE_BYTES: usize = 64 * 1024;
 const MAX_PROFILE_VALUES: usize = 256;
 const MAX_PROFILE_LABELS: usize = 128;
 const MAX_PROFILE_TEXT_BYTES: usize = 256;
 const MAX_MEMBER_ENDPOINT_BYTES: usize = 2048;
 const MAX_MEMBER_VERSION_BYTES: usize = 256;
-const MIN_JOIN_CHALLENGE_TTL_SECONDS: u64 = 5;
-const MAX_JOIN_CHALLENGE_TTL_SECONDS: u64 = 300;
+pub(crate) const MIN_JOIN_CHALLENGE_TTL_SECONDS: u64 = 5;
+pub(crate) const MAX_JOIN_CHALLENGE_TTL_SECONDS: u64 = 300;
+pub(crate) const MIN_CERTIFICATE_ROLLOUT_SECONDS: u64 = 5;
+pub(crate) const MAX_CERTIFICATE_ROLLOUT_SECONDS: u64 = 3_600;
+pub(crate) const MIN_OWNERSHIP_LEASE_TTL_SECONDS: u64 = 5;
+pub(crate) const MAX_OWNERSHIP_LEASE_TTL_SECONDS: u64 = 300;
+const MAX_DESTINATION_PROOF_CLOCK_SKEW_SECONDS: u64 = 30;
 
 #[cfg(test)]
 thread_local! {
@@ -194,6 +199,10 @@ pub struct ClusterMemberRegistration {
     pub node_id: String,
     pub fingerprint: String,
     pub public_key: String,
+    /// SHA-256 of the node listener's verified TLS leaf certificate. `None`
+    /// preserves explicitly plaintext legacy membership.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls_server_certificate_fingerprint: Option<String>,
     pub endpoint: String,
     pub server_version: String,
     pub min_protocol_version: u32,
@@ -206,6 +215,8 @@ pub struct ClusterMember {
     pub node_id: String,
     pub fingerprint: String,
     pub public_key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls_server_certificate_fingerprint: Option<String>,
     pub endpoint: String,
     pub server_version: String,
     pub min_protocol_version: u32,
@@ -217,11 +228,73 @@ pub struct ClusterMember {
     pub reason: String,
 }
 
+/// Quorum-coordinated application-listener certificate rollout phase.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClusterCertificateRolloutPhase {
+    /// The current leaf remains authoritative while a bounded candidate leaf
+    /// is staged for publication.
+    Prepared,
+    /// The replacement is current while the previous leaf drains for a
+    /// bounded overlap interval.
+    Activated,
+}
+
+/// Replicated, time-bounded application-listener certificate rollout.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClusterCertificateRollout {
+    pub node_id: String,
+    pub trust_generation: u64,
+    pub member_generation: u64,
+    pub phase: ClusterCertificateRolloutPhase,
+    pub previous_tls_server_certificate_fingerprint: String,
+    pub next_tls_server_certificate_fingerprint: String,
+    pub minimum_overlap_seconds: u64,
+    /// Candidate authorization expires if activation never completes.
+    pub prepare_expires_at: DateTime<Utc>,
+    /// Present only after activation. The previous leaf is unauthorized at or
+    /// after this replicated authority-clock instant.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retire_previous_after: Option<DateTime<Utc>>,
+    pub prepared_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    pub reason: String,
+}
+
+impl ClusterCertificateRollout {
+    /// Evaluate one verified leaf against this rollout using replicated
+    /// authority time. Expiry always narrows trust without requiring another
+    /// mutation to be available.
+    pub fn accepts_fingerprint(&self, fingerprint: &str, authority_time: DateTime<Utc>) -> bool {
+        match self.phase {
+            ClusterCertificateRolloutPhase::Prepared => {
+                fingerprint == self.previous_tls_server_certificate_fingerprint
+                    || (authority_time < self.prepare_expires_at
+                        && fingerprint == self.next_tls_server_certificate_fingerprint)
+            }
+            ClusterCertificateRolloutPhase::Activated => {
+                fingerprint == self.next_tls_server_certificate_fingerprint
+                    || (self
+                        .retire_previous_after
+                        .is_some_and(|deadline| authority_time < deadline)
+                        && fingerprint == self.previous_tls_server_certificate_fingerprint)
+            }
+        }
+    }
+}
+
 /// One transactionally consistent authority view used for discovery.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClusterMembershipSnapshot {
     pub cluster_id: String,
     pub generation: u64,
+    /// Replicated authority time used to evaluate certificate overlap.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authority_time: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub tls_trust_generation: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub certificate_rollouts: Vec<ClusterCertificateRollout>,
     pub members: Vec<ClusterMember>,
 }
 
@@ -233,9 +306,166 @@ pub struct ClusterMembershipAudit {
     pub member_generation: u64,
     pub previous: Option<ClusterMemberState>,
     pub current: ClusterMemberState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_tls_server_certificate_fingerprint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_tls_server_certificate_fingerprint: Option<String>,
     pub actor: String,
     pub reason: String,
     pub changed_at: DateTime<Utc>,
+}
+
+/// Durable evidence for one certificate-rollout transition.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClusterCertificateRolloutAudit {
+    pub trust_generation: u64,
+    pub node_id: String,
+    pub member_generation: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_phase: Option<ClusterCertificateRolloutPhase>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_phase: Option<ClusterCertificateRolloutPhase>,
+    pub previous_tls_server_certificate_fingerprint: String,
+    pub next_tls_server_certificate_fingerprint: String,
+    pub actor: String,
+    pub reason: String,
+    pub changed_at: DateTime<Utc>,
+}
+
+/// Durable state of one authority-issued agent ownership record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClusterOwnershipState {
+    /// The exact owner and fencing token may be renewed until expiry.
+    Active,
+    /// The token is a permanent tombstone and can never become active again.
+    Released,
+}
+
+impl ClusterOwnershipState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Released => "released",
+        }
+    }
+}
+
+impl TryFrom<&str> for ClusterOwnershipState {
+    type Error = ContextError;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value {
+            "active" => Ok(Self::Active),
+            "released" => Ok(Self::Released),
+            other => Err(storage_error(format!(
+                "invalid persisted cluster ownership state {other:?}"
+            ))),
+        }
+    }
+}
+
+/// Authority-issued ownership lease. The fencing token never decreases for an
+/// agent, including after release or expiry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClusterAgentOwnership {
+    pub agent_id: String,
+    pub owner_node_id: String,
+    /// Consensus term that committed this ownership revision. Standalone
+    /// authorities use term one.
+    #[serde(default = "default_authority_term")]
+    pub authority_term: u64,
+    pub fencing_token: u64,
+    pub generation: u64,
+    pub state: ClusterOwnershipState,
+    pub lease_expires_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    pub reason: String,
+}
+
+/// Durable evidence for an ownership claim, transfer, renewal, or release.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClusterAgentOwnershipAudit {
+    pub agent_id: String,
+    pub generation: u64,
+    pub previous_owner_node_id: Option<String>,
+    pub owner_node_id: String,
+    #[serde(default = "default_authority_term")]
+    pub authority_term: u64,
+    pub fencing_token: u64,
+    pub operation: String,
+    pub actor: String,
+    pub reason: String,
+    pub changed_at: DateTime<Utc>,
+}
+
+/// Destination-side state for the highest ownership token ever accepted for
+/// one local agent. Retired fences remain as tombstones so an old owner cannot
+/// become writable again after a restart or partition heals.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentMutationFenceState {
+    Active,
+    Retired,
+}
+
+impl AgentMutationFenceState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Retired => "retired",
+        }
+    }
+}
+
+impl TryFrom<&str> for AgentMutationFenceState {
+    type Error = ContextError;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value {
+            "active" => Ok(Self::Active),
+            "retired" => Ok(Self::Retired),
+            other => Err(storage_error(format!(
+                "invalid persisted agent mutation fence state {other:?}"
+            ))),
+        }
+    }
+}
+
+/// Durable destination admission record for fenced agent mutations.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentMutationFence {
+    pub agent_id: String,
+    pub cluster_id: String,
+    pub owner_node_id: String,
+    pub authority_term: u64,
+    pub authority_generation: u64,
+    pub fencing_token: u64,
+    /// No new mutation may be admitted at or after this instant.
+    pub proof_expires_at: DateTime<Utc>,
+    pub state: AgentMutationFenceState,
+    pub installed_at: DateTime<Utc>,
+    pub reason: String,
+}
+
+/// Durable evidence for installation or retirement of a destination fence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentMutationFenceAudit {
+    pub agent_id: String,
+    pub cluster_id: String,
+    pub owner_node_id: String,
+    pub authority_term: u64,
+    pub authority_generation: u64,
+    pub fencing_token: u64,
+    pub proof_expires_at: DateTime<Utc>,
+    pub state: AgentMutationFenceState,
+    pub actor: String,
+    pub reason: String,
+    pub changed_at: DateTime<Utc>,
+}
+
+const fn default_authority_term() -> u64 {
+    1
 }
 
 /// Persistent local node-control state.
@@ -706,7 +936,7 @@ impl ClusterControl {
         }
 
         let now = Utc::now();
-        let (previous, member_generation, joined_at) = match existing {
+        let (previous, previous_tls_fingerprint, member_generation, joined_at) = match existing {
             Some(member) => {
                 let Some(expected) = expected_generation else {
                     return Err(storage_error(format!(
@@ -732,8 +962,16 @@ impl ClusterControl {
                         "cluster member durable identity cannot change during rejoin",
                     ));
                 }
+                if member.tls_server_certificate_fingerprint.is_some()
+                    && registration.tls_server_certificate_fingerprint.is_none()
+                {
+                    return Err(storage_error(
+                        "cluster member TLS certificate binding cannot be removed during rejoin",
+                    ));
+                }
                 (
                     Some(member.state),
+                    member.tls_server_certificate_fingerprint,
                     member
                         .generation
                         .checked_add(1)
@@ -747,7 +985,7 @@ impl ClusterControl {
                         "cluster member revision conflict: node does not exist",
                     ));
                 }
-                (None, 1, now)
+                (None, None, 1, now)
             }
         };
         let membership_generation = u64::try_from(membership_generation)
@@ -761,11 +999,14 @@ impl ClusterControl {
         transaction
             .execute(
                 "INSERT INTO cluster_members
-                 (node_id, fingerprint, public_key, endpoint, server_version,
+                 (node_id, fingerprint, public_key, tls_server_certificate_fingerprint,
+                  endpoint, server_version,
                   min_protocol_version, protocol_version, state, generation,
                   joined_at, updated_at, reason)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'active', ?8, ?9, ?10, ?11)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'active', ?9, ?10, ?11, ?12)
                  ON CONFLICT(node_id) DO UPDATE SET
+                   tls_server_certificate_fingerprint =
+                       excluded.tls_server_certificate_fingerprint,
                    endpoint = excluded.endpoint,
                    server_version = excluded.server_version,
                    min_protocol_version = excluded.min_protocol_version,
@@ -778,6 +1019,7 @@ impl ClusterControl {
                     registration.node_id,
                     registration.fingerprint,
                     registration.public_key,
+                    registration.tls_server_certificate_fingerprint,
                     registration.endpoint,
                     registration.server_version,
                     i64::from(registration.min_protocol_version),
@@ -820,13 +1062,16 @@ impl ClusterControl {
             .execute(
                 "INSERT INTO cluster_membership_audit
                  (membership_generation, node_id, member_generation, previous_state,
-                  current_state, actor, reason, changed_at)
-                 VALUES (?1, ?2, ?3, ?4, 'active', ?5, ?6, ?7)",
+                  current_state, previous_tls_server_certificate_fingerprint,
+                  current_tls_server_certificate_fingerprint, actor, reason, changed_at)
+                 VALUES (?1, ?2, ?3, ?4, 'active', ?5, ?6, ?7, ?8, ?9)",
                 params![
                     membership_generation_i64,
                     registration.node_id,
                     member_generation_i64,
                     previous.map(ClusterMemberState::as_str),
+                    previous_tls_fingerprint,
+                    registration.tls_server_certificate_fingerprint,
                     actor,
                     reason,
                     now.to_rfc3339(),
@@ -905,6 +1150,82 @@ impl ClusterControl {
         let membership_generation_i64 =
             sqlite_generation(membership_generation, "cluster membership")?;
         let now = Utc::now();
+        if state == ClusterMemberState::Left {
+            let active_leases: i64 = transaction
+                .query_row(
+                    "SELECT COUNT(*) FROM cluster_agent_ownership
+                     WHERE owner_node_id = ?1 AND state = 'active'
+                       AND lease_expires_at > ?2",
+                    params![node_id, now.to_rfc3339()],
+                    |row| row.get(0),
+                )
+                .map_err(|error| storage_error(format!("inspect member ownership: {error}")))?;
+            if active_leases != 0 {
+                return Err(storage_error(
+                    "cluster member leave conflict: active ownership leases must be released first",
+                ));
+            }
+        } else {
+            let owned = {
+                let mut statement = transaction
+                    .prepare(
+                        "SELECT agent_id, fencing_token, generation
+                         FROM cluster_agent_ownership
+                         WHERE owner_node_id = ?1 AND state = 'active'
+                         ORDER BY agent_id",
+                    )
+                    .map_err(|error| {
+                        storage_error(format!("prepare revoked member ownership: {error}"))
+                    })?;
+                let rows = statement
+                    .query_map([node_id], |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, i64>(2)?,
+                        ))
+                    })
+                    .map_err(|error| {
+                        storage_error(format!("query revoked member ownership: {error}"))
+                    })?;
+                rows.collect::<Result<Vec<_>, _>>().map_err(|error| {
+                    storage_error(format!("read revoked member ownership: {error}"))
+                })?
+            };
+            for (agent_id, fencing_token, generation) in owned {
+                let fencing_token = u64::try_from(fencing_token)
+                    .map_err(|_| storage_error("negative ownership fencing token"))?;
+                let generation = u64::try_from(generation)
+                    .map_err(|_| storage_error("negative ownership generation"))?
+                    .checked_add(1)
+                    .ok_or_else(|| storage_error("agent ownership generation overflow"))?;
+                write_ownership(
+                    &transaction,
+                    &agent_id,
+                    node_id,
+                    default_authority_term(),
+                    fencing_token,
+                    generation,
+                    ClusterOwnershipState::Released,
+                    now,
+                    now,
+                    reason,
+                )?;
+                write_ownership_audit(
+                    &transaction,
+                    &agent_id,
+                    generation,
+                    Some(node_id),
+                    node_id,
+                    default_authority_term(),
+                    fencing_token,
+                    "release",
+                    actor,
+                    reason,
+                    now,
+                )?;
+            }
+        }
         let changed = transaction
             .execute(
                 "UPDATE cluster_members SET state = ?1, generation = ?2,
@@ -943,14 +1264,17 @@ impl ClusterControl {
             .execute(
                 "INSERT INTO cluster_membership_audit
                  (membership_generation, node_id, member_generation, previous_state,
-                  current_state, actor, reason, changed_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                  current_state, previous_tls_server_certificate_fingerprint,
+                  current_tls_server_certificate_fingerprint, actor, reason, changed_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                 params![
                     membership_generation_i64,
                     node_id,
                     member_generation_i64,
                     member.state.as_str(),
                     state.as_str(),
+                    member.tls_server_certificate_fingerprint,
+                    member.tls_server_certificate_fingerprint,
                     actor,
                     reason,
                     now.to_rfc3339(),
@@ -982,7 +1306,8 @@ impl ClusterControl {
             .map_err(|error| storage_error(format!("read cluster membership snapshot: {error}")))?;
         let mut statement = connection
             .prepare(
-                "SELECT node_id, fingerprint, public_key, endpoint, server_version,
+                "SELECT node_id, fingerprint, public_key,
+                        tls_server_certificate_fingerprint, endpoint, server_version,
                         min_protocol_version, protocol_version, state, generation,
                         joined_at, updated_at, reason
                  FROM cluster_members ORDER BY node_id",
@@ -1002,6 +1327,9 @@ impl ClusterControl {
             cluster_id,
             generation: u64::try_from(generation)
                 .map_err(|_| storage_error("negative membership generation"))?,
+            authority_time: None,
+            tls_trust_generation: 0,
+            certificate_rollouts: Vec::new(),
             members,
         })
     }
@@ -1019,7 +1347,10 @@ impl ClusterControl {
         let mut statement = connection
             .prepare(
                 "SELECT membership_generation, node_id, member_generation,
-                        previous_state, current_state, actor, reason, changed_at
+                        previous_state, current_state,
+                        previous_tls_server_certificate_fingerprint,
+                        current_tls_server_certificate_fingerprint,
+                        actor, reason, changed_at
                  FROM cluster_membership_audit
                  ORDER BY membership_generation DESC LIMIT ?1",
             )
@@ -1032,9 +1363,11 @@ impl ClusterControl {
                     row.get::<_, i64>(2)?,
                     row.get::<_, Option<String>>(3)?,
                     row.get::<_, String>(4)?,
-                    row.get::<_, String>(5)?,
-                    row.get::<_, String>(6)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
                     row.get::<_, String>(7)?,
+                    row.get::<_, String>(8)?,
+                    row.get::<_, String>(9)?,
                 ))
             })
             .map_err(|error| storage_error(format!("query membership audit: {error}")))?;
@@ -1046,6 +1379,8 @@ impl ClusterControl {
                 member_generation,
                 previous,
                 current,
+                previous_tls_server_certificate_fingerprint,
+                current_tls_server_certificate_fingerprint,
                 actor,
                 reason,
                 changed_at,
@@ -1061,10 +1396,828 @@ impl ClusterControl {
                     .map(ClusterMemberState::try_from)
                     .transpose()?,
                 current: ClusterMemberState::try_from(current.as_str())?,
+                previous_tls_server_certificate_fingerprint,
+                current_tls_server_certificate_fingerprint,
                 actor,
                 reason,
                 changed_at: parse_timestamp(&changed_at)?,
             });
+        }
+        Ok(audit)
+    }
+
+    /// Claim an unowned, released, or expired agent record for one active
+    /// member. Replacing any previous record requires its exact fencing token;
+    /// every successful replacement receives a strictly greater token.
+    pub fn claim_agent_ownership(
+        &self,
+        agent_id: &str,
+        owner_node_id: &str,
+        ttl_seconds: u64,
+        expected_fencing_token: Option<u64>,
+        actor: &str,
+        reason: &str,
+    ) -> Result<ClusterAgentOwnership, ContextError> {
+        validate_ownership_request(agent_id, owner_node_id, ttl_seconds, actor, reason)?;
+        let mut connection = self
+            .store
+            .conn
+            .lock()
+            .map_err(|_| storage_error("SQLite connection mutex is poisoned"))?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| storage_error(format!("agent ownership transaction: {error}")))?;
+        require_active_member(&transaction, owner_node_id)?;
+        let previous = load_ownership(&transaction, agent_id)?;
+        let now = Utc::now();
+        let (fencing_token, generation, operation, previous_owner_node_id) =
+            match previous.as_ref() {
+                None => {
+                    if expected_fencing_token.is_some() {
+                        return Err(storage_error(
+                            "agent ownership conflict: no previous fencing token exists",
+                        ));
+                    }
+                    (1, 1, "claim", None)
+                }
+                Some(previous) => {
+                    if expected_fencing_token != Some(previous.fencing_token) {
+                        return Err(storage_error(format!(
+                            "agent ownership fencing conflict: expected {:?}, current {}",
+                            expected_fencing_token, previous.fencing_token
+                        )));
+                    }
+                    if previous.state == ClusterOwnershipState::Active
+                        && previous.lease_expires_at > now
+                    {
+                        return Err(storage_error(
+                            "agent ownership conflict: current lease has not expired",
+                        ));
+                    }
+                    (
+                        previous.fencing_token.checked_add(1).ok_or_else(|| {
+                            storage_error("agent ownership fencing token overflow")
+                        })?,
+                        previous
+                            .generation
+                            .checked_add(1)
+                            .ok_or_else(|| storage_error("agent ownership generation overflow"))?,
+                        "transfer",
+                        Some(previous.owner_node_id.clone()),
+                    )
+                }
+            };
+        let lease_expires_at = ownership_expiry(now, ttl_seconds)?;
+        write_ownership(
+            &transaction,
+            agent_id,
+            owner_node_id,
+            default_authority_term(),
+            fencing_token,
+            generation,
+            ClusterOwnershipState::Active,
+            lease_expires_at,
+            now,
+            reason,
+        )?;
+        write_ownership_audit(
+            &transaction,
+            agent_id,
+            generation,
+            previous_owner_node_id.as_deref(),
+            owner_node_id,
+            default_authority_term(),
+            fencing_token,
+            operation,
+            actor,
+            reason,
+            now,
+        )?;
+        transaction
+            .commit()
+            .map_err(|error| storage_error(format!("commit agent ownership: {error}")))?;
+        drop(connection);
+        self.agent_ownership(agent_id)?
+            .ok_or_else(|| storage_error("claimed agent ownership disappeared"))
+    }
+
+    /// Renew only the exact active, unexpired owner/token pair. Renewal keeps
+    /// the fencing token stable and advances the audit generation.
+    pub fn renew_agent_ownership(
+        &self,
+        agent_id: &str,
+        owner_node_id: &str,
+        fencing_token: u64,
+        ttl_seconds: u64,
+        actor: &str,
+        reason: &str,
+    ) -> Result<ClusterAgentOwnership, ContextError> {
+        validate_ownership_request(agent_id, owner_node_id, ttl_seconds, actor, reason)?;
+        let mut connection = self
+            .store
+            .conn
+            .lock()
+            .map_err(|_| storage_error("SQLite connection mutex is poisoned"))?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| storage_error(format!("agent ownership renewal: {error}")))?;
+        require_active_member(&transaction, owner_node_id)?;
+        let previous = load_ownership(&transaction, agent_id)?
+            .ok_or_else(|| storage_error("agent ownership not found"))?;
+        let now = Utc::now();
+        if previous.state != ClusterOwnershipState::Active
+            || previous.owner_node_id != owner_node_id
+            || previous.fencing_token != fencing_token
+        {
+            return Err(storage_error("agent ownership fencing conflict"));
+        }
+        if previous.lease_expires_at <= now {
+            return Err(storage_error(
+                "agent ownership lease expired before renewal",
+            ));
+        }
+        let generation = previous
+            .generation
+            .checked_add(1)
+            .ok_or_else(|| storage_error("agent ownership generation overflow"))?;
+        let lease_expires_at = ownership_expiry(now, ttl_seconds)?;
+        write_ownership(
+            &transaction,
+            agent_id,
+            owner_node_id,
+            default_authority_term(),
+            fencing_token,
+            generation,
+            ClusterOwnershipState::Active,
+            lease_expires_at,
+            now,
+            reason,
+        )?;
+        write_ownership_audit(
+            &transaction,
+            agent_id,
+            generation,
+            Some(owner_node_id),
+            owner_node_id,
+            default_authority_term(),
+            fencing_token,
+            "renew",
+            actor,
+            reason,
+            now,
+        )?;
+        transaction
+            .commit()
+            .map_err(|error| storage_error(format!("commit ownership renewal: {error}")))?;
+        drop(connection);
+        self.agent_ownership(agent_id)?
+            .ok_or_else(|| storage_error("renewed agent ownership disappeared"))
+    }
+
+    /// Release only the exact active owner/token pair. The retained tombstone
+    /// prevents the fencing token from ever being reused.
+    pub fn release_agent_ownership(
+        &self,
+        agent_id: &str,
+        owner_node_id: &str,
+        fencing_token: u64,
+        actor: &str,
+        reason: &str,
+    ) -> Result<ClusterAgentOwnership, ContextError> {
+        validate_ownership_identity(agent_id, owner_node_id)?;
+        validate_text(actor, "cluster-ownership actor")?;
+        validate_reason(reason)?;
+        let mut connection = self
+            .store
+            .conn
+            .lock()
+            .map_err(|_| storage_error("SQLite connection mutex is poisoned"))?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| storage_error(format!("agent ownership release: {error}")))?;
+        let previous = load_ownership(&transaction, agent_id)?
+            .ok_or_else(|| storage_error("agent ownership not found"))?;
+        if previous.state != ClusterOwnershipState::Active
+            || previous.owner_node_id != owner_node_id
+            || previous.fencing_token != fencing_token
+        {
+            return Err(storage_error("agent ownership fencing conflict"));
+        }
+        let now = Utc::now();
+        let generation = previous
+            .generation
+            .checked_add(1)
+            .ok_or_else(|| storage_error("agent ownership generation overflow"))?;
+        write_ownership(
+            &transaction,
+            agent_id,
+            owner_node_id,
+            default_authority_term(),
+            fencing_token,
+            generation,
+            ClusterOwnershipState::Released,
+            now,
+            now,
+            reason,
+        )?;
+        write_ownership_audit(
+            &transaction,
+            agent_id,
+            generation,
+            Some(owner_node_id),
+            owner_node_id,
+            default_authority_term(),
+            fencing_token,
+            "release",
+            actor,
+            reason,
+            now,
+        )?;
+        transaction
+            .commit()
+            .map_err(|error| storage_error(format!("commit ownership release: {error}")))?;
+        drop(connection);
+        self.agent_ownership(agent_id)?
+            .ok_or_else(|| storage_error("released agent ownership disappeared"))
+    }
+
+    pub fn agent_ownership(
+        &self,
+        agent_id: &str,
+    ) -> Result<Option<ClusterAgentOwnership>, ContextError> {
+        uuid::Uuid::parse_str(agent_id)
+            .map_err(|_| storage_error("invalid cluster ownership agent id"))?;
+        let connection = self
+            .store
+            .conn
+            .lock()
+            .map_err(|_| storage_error("SQLite connection mutex is poisoned"))?;
+        load_ownership(&connection, agent_id)
+    }
+
+    /// Page through the complete durable ownership directory in stable agent-id
+    /// order. Released and expired records are intentionally included so
+    /// reconciliation can distinguish tombstones, live routes, and abandoned
+    /// pre-creation reservations without guessing from local node state.
+    pub fn agent_ownerships(
+        &self,
+        after_agent_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<ClusterAgentOwnership>, ContextError> {
+        if let Some(agent_id) = after_agent_id {
+            uuid::Uuid::parse_str(agent_id)
+                .map_err(|_| storage_error("invalid ownership page cursor"))?;
+        }
+        let limit = limit.clamp(1, 1_000);
+        let connection = self
+            .store
+            .conn
+            .lock()
+            .map_err(|_| storage_error("SQLite connection mutex is poisoned"))?;
+        let mut statement = connection
+            .prepare(
+                "SELECT agent_id, owner_node_id, authority_term, fencing_token,
+                        generation, state, lease_expires_at, updated_at, reason
+                 FROM cluster_agent_ownership
+                 WHERE (?1 IS NULL OR agent_id > ?1)
+                 ORDER BY agent_id ASC
+                 LIMIT ?2",
+            )
+            .map_err(|error| storage_error(format!("prepare ownership directory: {error}")))?;
+        let rows = statement
+            .query_map(
+                rusqlite::params![after_agent_id, i64::try_from(limit).unwrap_or(i64::MAX)],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, String>(6)?,
+                        row.get::<_, String>(7)?,
+                        row.get::<_, String>(8)?,
+                    ))
+                },
+            )
+            .map_err(|error| storage_error(format!("query ownership directory: {error}")))?;
+        let mut ownerships = Vec::new();
+        for row in rows {
+            let (
+                agent_id,
+                owner_node_id,
+                authority_term,
+                fencing_token,
+                generation,
+                state,
+                lease_expires_at,
+                updated_at,
+                reason,
+            ) = row.map_err(|error| storage_error(format!("read ownership directory: {error}")))?;
+            ownerships.push(ClusterAgentOwnership {
+                agent_id,
+                owner_node_id,
+                authority_term: u64::try_from(authority_term)
+                    .map_err(|_| storage_error("negative ownership authority term"))?,
+                fencing_token: u64::try_from(fencing_token)
+                    .map_err(|_| storage_error("negative ownership fencing token"))?,
+                generation: u64::try_from(generation)
+                    .map_err(|_| storage_error("negative ownership generation"))?,
+                state: ClusterOwnershipState::try_from(state.as_str())?,
+                lease_expires_at: parse_timestamp(&lease_expires_at)?,
+                updated_at: parse_timestamp(&updated_at)?,
+                reason,
+            });
+        }
+        Ok(ownerships)
+    }
+
+    /// Read one ownership record and, when requested, have the authority
+    /// validate active state and expiry against its own clock.
+    pub fn agent_ownership_with_active_requirement(
+        &self,
+        agent_id: &str,
+        require_active: bool,
+    ) -> Result<Option<ClusterAgentOwnership>, ContextError> {
+        let ownership = self.agent_ownership(agent_id)?;
+        if require_active {
+            let Some(current) = ownership.as_ref() else {
+                return Err(storage_error("agent ownership conflict: record not found"));
+            };
+            if current.state != ClusterOwnershipState::Active
+                || current.lease_expires_at <= Utc::now()
+            {
+                return Err(storage_error(
+                    "agent ownership conflict: lease is released or expired",
+                ));
+            }
+        }
+        Ok(ownership)
+    }
+
+    pub fn agent_ownership_audit(
+        &self,
+        agent_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<ClusterAgentOwnershipAudit>, ContextError> {
+        if let Some(agent_id) = agent_id {
+            uuid::Uuid::parse_str(agent_id)
+                .map_err(|_| storage_error("invalid cluster ownership agent id"))?;
+        }
+        let limit = limit.clamp(1, 1_000);
+        let connection = self
+            .store
+            .conn
+            .lock()
+            .map_err(|_| storage_error("SQLite connection mutex is poisoned"))?;
+        let sql = if agent_id.is_some() {
+            "SELECT agent_id, generation, previous_owner_node_id, owner_node_id,
+                    authority_term, fencing_token, operation, actor, reason, changed_at
+             FROM cluster_agent_ownership_audit
+             WHERE agent_id = ?1
+             ORDER BY generation DESC LIMIT ?2"
+        } else {
+            "SELECT agent_id, generation, previous_owner_node_id, owner_node_id,
+                    authority_term, fencing_token, operation, actor, reason, changed_at
+             FROM cluster_agent_ownership_audit
+             ORDER BY changed_at DESC, agent_id, generation DESC LIMIT ?2"
+        };
+        let mut statement = connection
+            .prepare(sql)
+            .map_err(|error| storage_error(format!("prepare ownership audit: {error}")))?;
+        let mut rows = statement
+            .query(params![agent_id, limit as i64])
+            .map_err(|error| storage_error(format!("query ownership audit: {error}")))?;
+        let mut audit = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .map_err(|error| storage_error(format!("read ownership audit: {error}")))?
+        {
+            audit.push(ClusterAgentOwnershipAudit {
+                agent_id: row
+                    .get(0)
+                    .map_err(|error| storage_error(error.to_string()))?,
+                generation: u64::try_from(
+                    row.get::<_, i64>(1)
+                        .map_err(|error| storage_error(error.to_string()))?,
+                )
+                .map_err(|_| storage_error("negative ownership audit generation"))?,
+                previous_owner_node_id: row
+                    .get(2)
+                    .map_err(|error| storage_error(error.to_string()))?,
+                owner_node_id: row
+                    .get(3)
+                    .map_err(|error| storage_error(error.to_string()))?,
+                authority_term: u64::try_from(
+                    row.get::<_, i64>(4)
+                        .map_err(|error| storage_error(error.to_string()))?,
+                )
+                .map_err(|_| storage_error("negative ownership audit authority term"))?,
+                fencing_token: u64::try_from(
+                    row.get::<_, i64>(5)
+                        .map_err(|error| storage_error(error.to_string()))?,
+                )
+                .map_err(|_| storage_error("negative ownership audit fencing token"))?,
+                operation: row
+                    .get(6)
+                    .map_err(|error| storage_error(error.to_string()))?,
+                actor: row
+                    .get(7)
+                    .map_err(|error| storage_error(error.to_string()))?,
+                reason: row
+                    .get(8)
+                    .map_err(|error| storage_error(error.to_string()))?,
+                changed_at: parse_timestamp(
+                    &row.get::<_, String>(9)
+                        .map_err(|error| storage_error(error.to_string()))?,
+                )?,
+            });
+        }
+        Ok(audit)
+    }
+
+    /// Install the highest authority-issued token accepted by this workload
+    /// node for one local or authority-reserved agent identity. Preinstalling
+    /// the fence lets exact-ID creation prove that its reservation is still
+    /// current. Older tokens and foreign-node records fail closed; a retired
+    /// token can never be reactivated.
+    #[allow(clippy::too_many_arguments)]
+    pub fn install_agent_mutation_fence(
+        &self,
+        agent_id: &str,
+        cluster_id: &str,
+        owner_node_id: &str,
+        authority_term: u64,
+        authority_generation: u64,
+        fencing_token: u64,
+        proof_expires_at: DateTime<Utc>,
+        actor: &str,
+        reason: &str,
+    ) -> Result<AgentMutationFence, ContextError> {
+        validate_mutation_fence_input(
+            agent_id,
+            cluster_id,
+            owner_node_id,
+            authority_term,
+            authority_generation,
+            fencing_token,
+            actor,
+            reason,
+        )?;
+        if owner_node_id != self.identity.node_id {
+            return Err(storage_error(
+                "agent mutation fence owner does not match this destination node",
+            ));
+        }
+        let mut connection = self
+            .store
+            .conn
+            .lock()
+            .map_err(|_| storage_error("SQLite connection mutex is poisoned"))?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| storage_error(format!("agent mutation fence transaction: {error}")))?;
+        let now = Utc::now();
+        if proof_expires_at <= now {
+            return Err(storage_error(
+                "expired agent mutation fence proof rejected by destination",
+            ));
+        }
+        let maximum_proof_horizon = now
+            .checked_add_signed(chrono::Duration::seconds(
+                i64::try_from(
+                    MAX_OWNERSHIP_LEASE_TTL_SECONDS + MAX_DESTINATION_PROOF_CLOCK_SKEW_SECONDS,
+                )
+                .map_err(|_| storage_error("destination proof horizon exceeds clock range"))?,
+            ))
+            .ok_or_else(|| storage_error("destination proof horizon overflow"))?;
+        if proof_expires_at > maximum_proof_horizon {
+            return Err(storage_error(
+                "agent mutation fence proof exceeds the bounded destination horizon",
+            ));
+        }
+        let previous = load_mutation_fence(&transaction, agent_id)?;
+        if let Some(previous) = &previous {
+            if previous.cluster_id != cluster_id || previous.owner_node_id != owner_node_id {
+                return Err(storage_error(
+                    "agent mutation fence conflicts with the durable cluster or destination",
+                ));
+            }
+            if authority_term < previous.authority_term
+                || fencing_token < previous.fencing_token
+                || authority_generation < previous.authority_generation
+            {
+                return Err(storage_error(
+                    "stale agent mutation fence rejected by destination",
+                ));
+            }
+            if previous.state == AgentMutationFenceState::Retired
+                && fencing_token <= previous.fencing_token
+            {
+                return Err(storage_error(
+                    "retired agent mutation fence cannot become active again",
+                ));
+            }
+            if authority_term == previous.authority_term
+                && fencing_token == previous.fencing_token
+                && authority_generation == previous.authority_generation
+                && previous.state == AgentMutationFenceState::Active
+            {
+                if proof_expires_at == previous.proof_expires_at {
+                    return Ok(previous.clone());
+                }
+                if previous.proof_expires_at != previous.installed_at {
+                    return Err(storage_error(
+                        "agent mutation fence proof expiry conflicts with the durable revision",
+                    ));
+                }
+            }
+            if (authority_term > previous.authority_term || fencing_token > previous.fencing_token)
+                && authority_generation <= previous.authority_generation
+            {
+                return Err(storage_error(
+                    "new agent mutation fence requires a newer authority generation",
+                ));
+            }
+        }
+        write_mutation_fence(
+            &transaction,
+            agent_id,
+            cluster_id,
+            owner_node_id,
+            authority_term,
+            authority_generation,
+            fencing_token,
+            proof_expires_at,
+            AgentMutationFenceState::Active,
+            actor,
+            reason,
+            now,
+        )?;
+        transaction
+            .commit()
+            .map_err(|error| storage_error(format!("commit agent mutation fence: {error}")))?;
+        drop(connection);
+        self.agent_mutation_fence(agent_id)?
+            .ok_or_else(|| storage_error("installed agent mutation fence disappeared"))
+    }
+
+    /// Retire the exact active destination token. The retained maximum-token
+    /// tombstone permanently rejects a delayed mutation from the old owner.
+    #[allow(clippy::too_many_arguments)]
+    pub fn retire_agent_mutation_fence(
+        &self,
+        agent_id: &str,
+        cluster_id: &str,
+        owner_node_id: &str,
+        authority_term: u64,
+        authority_generation: u64,
+        fencing_token: u64,
+        proof_expires_at: DateTime<Utc>,
+        actor: &str,
+        reason: &str,
+    ) -> Result<AgentMutationFence, ContextError> {
+        validate_mutation_fence_input(
+            agent_id,
+            cluster_id,
+            owner_node_id,
+            authority_term,
+            authority_generation,
+            fencing_token,
+            actor,
+            reason,
+        )?;
+        if owner_node_id != self.identity.node_id {
+            return Err(storage_error(
+                "agent mutation fence owner does not match this destination node",
+            ));
+        }
+        let mut connection = self
+            .store
+            .conn
+            .lock()
+            .map_err(|_| storage_error("SQLite connection mutex is poisoned"))?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| {
+                storage_error(format!("retire agent mutation fence transaction: {error}"))
+            })?;
+        let previous = load_mutation_fence(&transaction, agent_id)?
+            .ok_or_else(|| storage_error("agent mutation fence not found"))?;
+        if previous.cluster_id != cluster_id
+            || previous.owner_node_id != owner_node_id
+            || previous.authority_term != authority_term
+            || previous.authority_generation != authority_generation
+            || previous.fencing_token != fencing_token
+            || previous.proof_expires_at != proof_expires_at
+            || previous.state != AgentMutationFenceState::Active
+        {
+            return Err(storage_error(
+                "agent mutation fence retirement requires the exact active record",
+            ));
+        }
+        let now = Utc::now();
+        write_mutation_fence(
+            &transaction,
+            agent_id,
+            cluster_id,
+            owner_node_id,
+            authority_term,
+            authority_generation,
+            fencing_token,
+            proof_expires_at,
+            AgentMutationFenceState::Retired,
+            actor,
+            reason,
+            now,
+        )?;
+        transaction
+            .commit()
+            .map_err(|error| storage_error(format!("commit fence retirement: {error}")))?;
+        drop(connection);
+        self.agent_mutation_fence(agent_id)?
+            .ok_or_else(|| storage_error("retired agent mutation fence disappeared"))
+    }
+
+    pub fn agent_mutation_fence(
+        &self,
+        agent_id: &str,
+    ) -> Result<Option<AgentMutationFence>, ContextError> {
+        uuid::Uuid::parse_str(agent_id)
+            .map_err(|_| storage_error("invalid agent mutation fence agent id"))?;
+        let connection = self
+            .store
+            .conn
+            .lock()
+            .map_err(|_| storage_error("SQLite connection mutex is poisoned"))?;
+        load_mutation_fence(&connection, agent_id)
+    }
+
+    /// Validate the exact active destination record before any fenced mutation
+    /// is admitted. Missing, retired, stale, foreign, or cross-cluster tokens
+    /// are indistinguishable conflicts to remote callers.
+    #[allow(clippy::too_many_arguments)]
+    pub fn verify_agent_mutation_fence(
+        &self,
+        agent_id: &str,
+        cluster_id: &str,
+        owner_node_id: &str,
+        authority_term: u64,
+        authority_generation: u64,
+        fencing_token: u64,
+        proof_expires_at: DateTime<Utc>,
+    ) -> Result<(), ContextError> {
+        self.verify_agent_mutation_fence_with_clock(
+            agent_id,
+            cluster_id,
+            owner_node_id,
+            authority_term,
+            authority_generation,
+            fencing_token,
+            proof_expires_at,
+            Utc::now,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn verify_agent_mutation_fence_with_clock(
+        &self,
+        agent_id: &str,
+        cluster_id: &str,
+        owner_node_id: &str,
+        authority_term: u64,
+        authority_generation: u64,
+        fencing_token: u64,
+        proof_expires_at: DateTime<Utc>,
+        now: impl FnOnce() -> DateTime<Utc>,
+    ) -> Result<(), ContextError> {
+        let record = self
+            .agent_mutation_fence(agent_id)?
+            .ok_or_else(|| storage_error("agent mutation fence is not installed"))?;
+        self.verify_loaded_agent_mutation_fence(
+            &record,
+            agent_id,
+            cluster_id,
+            owner_node_id,
+            authority_term,
+            authority_generation,
+            fencing_token,
+            proof_expires_at,
+            now(),
+        )
+    }
+
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    fn verify_agent_mutation_fence_at(
+        &self,
+        agent_id: &str,
+        cluster_id: &str,
+        owner_node_id: &str,
+        authority_term: u64,
+        authority_generation: u64,
+        fencing_token: u64,
+        proof_expires_at: DateTime<Utc>,
+        now: DateTime<Utc>,
+    ) -> Result<(), ContextError> {
+        self.verify_agent_mutation_fence_with_clock(
+            agent_id,
+            cluster_id,
+            owner_node_id,
+            authority_term,
+            authority_generation,
+            fencing_token,
+            proof_expires_at,
+            || now,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn verify_loaded_agent_mutation_fence(
+        &self,
+        record: &AgentMutationFence,
+        agent_id: &str,
+        cluster_id: &str,
+        owner_node_id: &str,
+        authority_term: u64,
+        authority_generation: u64,
+        fencing_token: u64,
+        proof_expires_at: DateTime<Utc>,
+        now: DateTime<Utc>,
+    ) -> Result<(), ContextError> {
+        if record.agent_id != agent_id
+            || record.state != AgentMutationFenceState::Active
+            || record.cluster_id != cluster_id
+            || record.owner_node_id != owner_node_id
+            || record.owner_node_id != self.identity.node_id
+            || record.authority_term != authority_term
+            || record.authority_generation != authority_generation
+            || record.fencing_token != fencing_token
+            || record.proof_expires_at != proof_expires_at
+        {
+            return Err(storage_error(
+                "agent mutation rejected by destination ownership fence",
+            ));
+        }
+        if now < record.installed_at {
+            return Err(storage_error(
+                "agent mutation rejected because the destination clock moved behind fence installation",
+            ));
+        }
+        if now >= record.proof_expires_at {
+            return Err(storage_error(
+                "agent mutation rejected because the ownership proof expired",
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn agent_mutation_fence_audit(
+        &self,
+        agent_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<AgentMutationFenceAudit>, ContextError> {
+        if let Some(agent_id) = agent_id {
+            uuid::Uuid::parse_str(agent_id)
+                .map_err(|_| storage_error("invalid agent mutation fence agent id"))?;
+        }
+        let limit = limit.clamp(1, 1_000);
+        let connection = self
+            .store
+            .conn
+            .lock()
+            .map_err(|_| storage_error("SQLite connection mutex is poisoned"))?;
+        let sql = if agent_id.is_some() {
+            "SELECT agent_id, cluster_id, owner_node_id, authority_term,
+                    authority_generation, fencing_token, proof_expires_at,
+                    state, actor, reason, changed_at
+             FROM cluster_agent_mutation_fence_audit
+             WHERE agent_id = ?1
+             ORDER BY changed_at DESC, authority_term DESC,
+                      fencing_token DESC, authority_generation DESC,
+                      proof_expires_at DESC, state DESC LIMIT ?2"
+        } else {
+            "SELECT agent_id, cluster_id, owner_node_id, authority_term,
+                    authority_generation, fencing_token, proof_expires_at,
+                    state, actor, reason, changed_at
+             FROM cluster_agent_mutation_fence_audit
+             ORDER BY changed_at DESC, agent_id, authority_term DESC,
+                      fencing_token DESC, authority_generation DESC,
+                      proof_expires_at DESC, state DESC LIMIT ?2"
+        };
+        let mut statement = connection
+            .prepare(sql)
+            .map_err(|error| storage_error(format!("prepare mutation fence audit: {error}")))?;
+        let mut rows = statement
+            .query(params![agent_id, limit as i64])
+            .map_err(|error| storage_error(format!("query mutation fence audit: {error}")))?;
+        let mut audit = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .map_err(|error| storage_error(format!("read mutation fence audit: {error}")))?
+        {
+            audit.push(mutation_fence_audit_from_row(row)?);
         }
         Ok(audit)
     }
@@ -1129,6 +2282,7 @@ type StoredMember = (
     String,
     String,
     String,
+    Option<String>,
     String,
     String,
     i64,
@@ -1154,6 +2308,7 @@ fn member_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredMember> {
         row.get(9)?,
         row.get(10)?,
         row.get(11)?,
+        row.get(12)?,
     ))
 }
 
@@ -1165,6 +2320,7 @@ impl TryFrom<StoredMember> for ClusterMember {
             node_id,
             fingerprint,
             public_key,
+            tls_server_certificate_fingerprint,
             endpoint,
             server_version,
             min_protocol_version,
@@ -1179,6 +2335,7 @@ impl TryFrom<StoredMember> for ClusterMember {
             node_id,
             fingerprint,
             public_key,
+            tls_server_certificate_fingerprint,
             endpoint,
             server_version,
             min_protocol_version: u32::try_from(min_protocol_version)
@@ -1196,6 +2353,7 @@ impl TryFrom<StoredMember> for ClusterMember {
             node_id: member.node_id.clone(),
             fingerprint: member.fingerprint.clone(),
             public_key: member.public_key.clone(),
+            tls_server_certificate_fingerprint: member.tls_server_certificate_fingerprint.clone(),
             endpoint: member.endpoint.clone(),
             server_version: member.server_version.clone(),
             min_protocol_version: member.min_protocol_version,
@@ -1211,7 +2369,8 @@ fn load_member(
 ) -> Result<Option<ClusterMember>, ContextError> {
     connection
         .query_row(
-            "SELECT node_id, fingerprint, public_key, endpoint, server_version,
+            "SELECT node_id, fingerprint, public_key,
+                    tls_server_certificate_fingerprint, endpoint, server_version,
                     min_protocol_version, protocol_version, state, generation,
                     joined_at, updated_at, reason
              FROM cluster_members WHERE node_id = ?1",
@@ -1222,6 +2381,430 @@ fn load_member(
         .map_err(|error| storage_error(format!("load cluster member: {error}")))?
         .map(ClusterMember::try_from)
         .transpose()
+}
+
+pub(crate) fn validate_ownership_identity(
+    agent_id: &str,
+    owner_node_id: &str,
+) -> Result<(), ContextError> {
+    uuid::Uuid::parse_str(agent_id)
+        .map_err(|_| storage_error("invalid cluster ownership agent id"))?;
+    uuid::Uuid::parse_str(owner_node_id)
+        .map_err(|_| storage_error("invalid cluster ownership node id"))?;
+    Ok(())
+}
+
+pub(crate) fn validate_ownership_request(
+    agent_id: &str,
+    owner_node_id: &str,
+    ttl_seconds: u64,
+    actor: &str,
+    reason: &str,
+) -> Result<(), ContextError> {
+    validate_ownership_identity(agent_id, owner_node_id)?;
+    if !(MIN_OWNERSHIP_LEASE_TTL_SECONDS..=MAX_OWNERSHIP_LEASE_TTL_SECONDS).contains(&ttl_seconds) {
+        return Err(storage_error(format!(
+            "invalid agent ownership TTL: expected {MIN_OWNERSHIP_LEASE_TTL_SECONDS}..={MAX_OWNERSHIP_LEASE_TTL_SECONDS} seconds"
+        )));
+    }
+    validate_text(actor, "cluster-ownership actor")?;
+    validate_reason(reason)
+}
+
+pub(crate) fn ownership_expiry(
+    now: DateTime<Utc>,
+    ttl_seconds: u64,
+) -> Result<DateTime<Utc>, ContextError> {
+    let seconds = i64::try_from(ttl_seconds)
+        .map_err(|_| storage_error("agent ownership TTL exceeds clock range"))?;
+    now.checked_add_signed(chrono::Duration::seconds(seconds))
+        .ok_or_else(|| storage_error("agent ownership expiry overflow"))
+}
+
+fn require_active_member(
+    connection: &rusqlite::Connection,
+    node_id: &str,
+) -> Result<(), ContextError> {
+    let state: Option<String> = connection
+        .query_row(
+            "SELECT state FROM cluster_members WHERE node_id = ?1",
+            [node_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| storage_error(format!("read ownership member: {error}")))?;
+    match state.as_deref() {
+        Some("active") => Ok(()),
+        Some(_) => Err(storage_error(
+            "agent ownership denied: owner node is not an active cluster member",
+        )),
+        None => Err(storage_error(
+            "agent ownership denied: owner node is not a cluster member",
+        )),
+    }
+}
+
+fn load_ownership(
+    connection: &rusqlite::Connection,
+    agent_id: &str,
+) -> Result<Option<ClusterAgentOwnership>, ContextError> {
+    let stored = connection
+        .query_row(
+            "SELECT agent_id, owner_node_id, authority_term, fencing_token,
+                    generation, state, lease_expires_at, updated_at, reason
+             FROM cluster_agent_ownership WHERE agent_id = ?1",
+            [agent_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, String>(8)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|error| storage_error(format!("load agent ownership: {error}")))?;
+    stored
+        .map(
+            |(
+                agent_id,
+                owner_node_id,
+                authority_term,
+                fencing_token,
+                generation,
+                state,
+                lease_expires_at,
+                updated_at,
+                reason,
+            )| {
+                Ok(ClusterAgentOwnership {
+                    agent_id,
+                    owner_node_id,
+                    authority_term: u64::try_from(authority_term)
+                        .map_err(|_| storage_error("negative ownership authority term"))?,
+                    fencing_token: u64::try_from(fencing_token)
+                        .map_err(|_| storage_error("negative ownership fencing token"))?,
+                    generation: u64::try_from(generation)
+                        .map_err(|_| storage_error("negative ownership generation"))?,
+                    state: ClusterOwnershipState::try_from(state.as_str())?,
+                    lease_expires_at: parse_timestamp(&lease_expires_at)?,
+                    updated_at: parse_timestamp(&updated_at)?,
+                    reason,
+                })
+            },
+        )
+        .transpose()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_mutation_fence_input(
+    agent_id: &str,
+    cluster_id: &str,
+    owner_node_id: &str,
+    authority_term: u64,
+    authority_generation: u64,
+    fencing_token: u64,
+    actor: &str,
+    reason: &str,
+) -> Result<(), ContextError> {
+    uuid::Uuid::parse_str(agent_id)
+        .map_err(|_| storage_error("invalid agent mutation fence agent id"))?;
+    uuid::Uuid::parse_str(cluster_id)
+        .map_err(|_| storage_error("invalid agent mutation fence cluster id"))?;
+    uuid::Uuid::parse_str(owner_node_id)
+        .map_err(|_| storage_error("invalid agent mutation fence owner node id"))?;
+    if authority_term == 0 {
+        return Err(storage_error(
+            "agent mutation fence authority term must be positive",
+        ));
+    }
+    if authority_generation == 0 {
+        return Err(storage_error(
+            "agent mutation fence authority generation must be positive",
+        ));
+    }
+    if fencing_token == 0 {
+        return Err(storage_error("agent mutation fence token must be positive"));
+    }
+    validate_text(actor, "agent mutation fence actor")?;
+    validate_reason(reason)
+}
+
+fn load_mutation_fence(
+    connection: &rusqlite::Connection,
+    agent_id: &str,
+) -> Result<Option<AgentMutationFence>, ContextError> {
+    connection
+        .query_row(
+            "SELECT agent_id, cluster_id, owner_node_id, authority_term,
+                    authority_generation, fencing_token, proof_expires_at,
+                    state, installed_at, reason
+             FROM cluster_agent_mutation_fences WHERE agent_id = ?1",
+            [agent_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, String>(8)?,
+                    row.get::<_, String>(9)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|error| storage_error(format!("load agent mutation fence: {error}")))?
+        .map(
+            |(
+                agent_id,
+                cluster_id,
+                owner_node_id,
+                authority_term,
+                authority_generation,
+                fencing_token,
+                proof_expires_at,
+                state,
+                installed_at,
+                reason,
+            )| {
+                Ok(AgentMutationFence {
+                    agent_id,
+                    cluster_id,
+                    owner_node_id,
+                    authority_term: u64::try_from(authority_term)
+                        .map_err(|_| storage_error("negative fence authority term"))?,
+                    authority_generation: u64::try_from(authority_generation)
+                        .map_err(|_| storage_error("negative fence authority generation"))?,
+                    fencing_token: u64::try_from(fencing_token)
+                        .map_err(|_| storage_error("negative agent mutation fencing token"))?,
+                    proof_expires_at: parse_timestamp(&proof_expires_at)?,
+                    state: AgentMutationFenceState::try_from(state.as_str())?,
+                    installed_at: parse_timestamp(&installed_at)?,
+                    reason,
+                })
+            },
+        )
+        .transpose()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_mutation_fence(
+    connection: &rusqlite::Connection,
+    agent_id: &str,
+    cluster_id: &str,
+    owner_node_id: &str,
+    authority_term: u64,
+    authority_generation: u64,
+    fencing_token: u64,
+    proof_expires_at: DateTime<Utc>,
+    state: AgentMutationFenceState,
+    actor: &str,
+    reason: &str,
+    changed_at: DateTime<Utc>,
+) -> Result<(), ContextError> {
+    let authority_term = sqlite_generation(authority_term, "fence authority term")?;
+    let authority_generation =
+        sqlite_generation(authority_generation, "fence authority generation")?;
+    let fencing_token = sqlite_generation(fencing_token, "agent mutation fencing token")?;
+    connection
+        .execute(
+            "INSERT INTO cluster_agent_mutation_fences
+             (agent_id, cluster_id, owner_node_id, authority_term,
+              authority_generation, fencing_token, proof_expires_at,
+              state, installed_at, reason)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+             ON CONFLICT(agent_id) DO UPDATE SET
+               cluster_id = excluded.cluster_id,
+               owner_node_id = excluded.owner_node_id,
+               authority_term = excluded.authority_term,
+               authority_generation = excluded.authority_generation,
+               fencing_token = excluded.fencing_token,
+               proof_expires_at = excluded.proof_expires_at,
+               state = excluded.state,
+               installed_at = excluded.installed_at,
+               reason = excluded.reason",
+            params![
+                agent_id,
+                cluster_id,
+                owner_node_id,
+                authority_term,
+                authority_generation,
+                fencing_token,
+                proof_expires_at.to_rfc3339(),
+                state.as_str(),
+                changed_at.to_rfc3339(),
+                reason,
+            ],
+        )
+        .map_err(|error| storage_error(format!("write agent mutation fence: {error}")))?;
+    crash_cluster_mutation_after_step_for_test("agent_mutation_fence.record");
+    connection
+        .execute(
+            "INSERT INTO cluster_agent_mutation_fence_audit
+             (agent_id, fencing_token, cluster_id, owner_node_id,
+              authority_term, authority_generation, proof_expires_at,
+              state, actor, reason, changed_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            params![
+                agent_id,
+                fencing_token,
+                cluster_id,
+                owner_node_id,
+                authority_term,
+                authority_generation,
+                proof_expires_at.to_rfc3339(),
+                state.as_str(),
+                actor,
+                reason,
+                changed_at.to_rfc3339(),
+            ],
+        )
+        .map_err(|error| storage_error(format!("audit agent mutation fence: {error}")))?;
+    crash_cluster_mutation_after_step_for_test("agent_mutation_fence.audit");
+    Ok(())
+}
+
+fn mutation_fence_audit_from_row(
+    row: &rusqlite::Row<'_>,
+) -> Result<AgentMutationFenceAudit, ContextError> {
+    Ok(AgentMutationFenceAudit {
+        agent_id: row
+            .get(0)
+            .map_err(|error| storage_error(error.to_string()))?,
+        cluster_id: row
+            .get(1)
+            .map_err(|error| storage_error(error.to_string()))?,
+        owner_node_id: row
+            .get(2)
+            .map_err(|error| storage_error(error.to_string()))?,
+        authority_term: u64::try_from(
+            row.get::<_, i64>(3)
+                .map_err(|error| storage_error(error.to_string()))?,
+        )
+        .map_err(|_| storage_error("negative fence audit authority term"))?,
+        authority_generation: u64::try_from(
+            row.get::<_, i64>(4)
+                .map_err(|error| storage_error(error.to_string()))?,
+        )
+        .map_err(|_| storage_error("negative fence audit authority generation"))?,
+        fencing_token: u64::try_from(
+            row.get::<_, i64>(5)
+                .map_err(|error| storage_error(error.to_string()))?,
+        )
+        .map_err(|_| storage_error("negative fence audit token"))?,
+        proof_expires_at: parse_timestamp(
+            &row.get::<_, String>(6)
+                .map_err(|error| storage_error(error.to_string()))?,
+        )?,
+        state: AgentMutationFenceState::try_from(
+            row.get::<_, String>(7)
+                .map_err(|error| storage_error(error.to_string()))?
+                .as_str(),
+        )?,
+        actor: row
+            .get(8)
+            .map_err(|error| storage_error(error.to_string()))?,
+        reason: row
+            .get(9)
+            .map_err(|error| storage_error(error.to_string()))?,
+        changed_at: parse_timestamp(
+            &row.get::<_, String>(10)
+                .map_err(|error| storage_error(error.to_string()))?,
+        )?,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_ownership(
+    connection: &rusqlite::Connection,
+    agent_id: &str,
+    owner_node_id: &str,
+    authority_term: u64,
+    fencing_token: u64,
+    generation: u64,
+    state: ClusterOwnershipState,
+    lease_expires_at: DateTime<Utc>,
+    updated_at: DateTime<Utc>,
+    reason: &str,
+) -> Result<(), ContextError> {
+    connection
+        .execute(
+            "INSERT INTO cluster_agent_ownership
+             (agent_id, owner_node_id, authority_term, fencing_token, generation,
+              state, lease_expires_at, updated_at, reason)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+             ON CONFLICT(agent_id) DO UPDATE SET
+               owner_node_id = excluded.owner_node_id,
+               authority_term = excluded.authority_term,
+               fencing_token = excluded.fencing_token,
+               generation = excluded.generation,
+               state = excluded.state,
+               lease_expires_at = excluded.lease_expires_at,
+               updated_at = excluded.updated_at,
+               reason = excluded.reason",
+            params![
+                agent_id,
+                owner_node_id,
+                sqlite_generation(authority_term, "ownership authority term")?,
+                sqlite_generation(fencing_token, "ownership fencing token")?,
+                sqlite_generation(generation, "ownership generation")?,
+                state.as_str(),
+                lease_expires_at.to_rfc3339(),
+                updated_at.to_rfc3339(),
+                reason,
+            ],
+        )
+        .map_err(|error| storage_error(format!("write agent ownership: {error}")))?;
+    crash_cluster_mutation_after_step_for_test("agent_ownership.record");
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_ownership_audit(
+    connection: &rusqlite::Connection,
+    agent_id: &str,
+    generation: u64,
+    previous_owner_node_id: Option<&str>,
+    owner_node_id: &str,
+    authority_term: u64,
+    fencing_token: u64,
+    operation: &str,
+    actor: &str,
+    reason: &str,
+    changed_at: DateTime<Utc>,
+) -> Result<(), ContextError> {
+    connection
+        .execute(
+            "INSERT INTO cluster_agent_ownership_audit
+             (agent_id, generation, previous_owner_node_id, owner_node_id,
+              authority_term, fencing_token, operation, actor, reason, changed_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                agent_id,
+                sqlite_generation(generation, "ownership audit generation")?,
+                previous_owner_node_id,
+                owner_node_id,
+                sqlite_generation(authority_term, "ownership audit authority term")?,
+                sqlite_generation(fencing_token, "ownership audit fencing token")?,
+                operation,
+                actor,
+                reason,
+                changed_at.to_rfc3339(),
+            ],
+        )
+        .map_err(|error| storage_error(format!("audit agent ownership: {error}")))?;
+    crash_cluster_mutation_after_step_for_test("agent_ownership.audit");
+    Ok(())
 }
 
 /// Build the canonical, domain-separated bytes that a joining node signs.
@@ -1253,6 +2836,12 @@ pub fn membership_join_payload(
             .map_err(|_| storage_error("cluster join payload field is too large"))?;
         payload.extend_from_slice(&length.to_be_bytes());
         payload.extend_from_slice(field);
+    }
+    if let Some(fingerprint) = registration.tls_server_certificate_fingerprint.as_deref() {
+        let length = u32::try_from(fingerprint.len())
+            .map_err(|_| storage_error("cluster join payload field is too large"))?;
+        payload.extend_from_slice(&length.to_be_bytes());
+        payload.extend_from_slice(fingerprint.as_bytes());
     }
     Ok(payload)
 }
@@ -1303,18 +2892,18 @@ fn load_identity(connection: &rusqlite::Connection) -> Result<Option<NodeIdentit
         .transpose()
 }
 
-fn validate_text(value: &str, field: &str) -> Result<(), ContextError> {
+pub(crate) fn validate_text(value: &str, field: &str) -> Result<(), ContextError> {
     if value.trim().is_empty() || value.len() > MAX_REASON_BYTES || value.contains('\0') {
         return Err(storage_error(format!("invalid {field}")));
     }
     Ok(())
 }
 
-fn validate_reason(reason: &str) -> Result<(), ContextError> {
+pub(crate) fn validate_reason(reason: &str) -> Result<(), ContextError> {
     validate_text(reason, "cluster-control reason")
 }
 
-fn validate_member_registration(
+pub(crate) fn validate_member_registration(
     registration: &ClusterMemberRegistration,
 ) -> Result<(), ContextError> {
     uuid::Uuid::parse_str(&registration.node_id)
@@ -1325,6 +2914,20 @@ fn validate_member_registration(
     if registration.fingerprint.len() != 64 || sha256_hex(&public_key) != registration.fingerprint {
         return Err(storage_error(
             "cluster member fingerprint does not match its public key",
+        ));
+    }
+    if registration
+        .tls_server_certificate_fingerprint
+        .as_deref()
+        .is_some_and(|fingerprint| {
+            fingerprint.len() != 64
+                || !fingerprint
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        })
+    {
+        return Err(storage_error(
+            "invalid cluster member TLS server certificate fingerprint",
         ));
     }
     validate_member_text(
@@ -1402,15 +3005,15 @@ fn parse_timestamp(value: &str) -> Result<DateTime<Utc>, ContextError> {
         .map_err(|error| storage_error(format!("invalid cluster timestamp: {error}")))
 }
 
-fn sha256_hex(bytes: &[u8]) -> String {
+pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
     hex_encode(ring::digest::digest(&ring::digest::SHA256, bytes).as_ref())
 }
 
-fn hex_encode(bytes: &[u8]) -> String {
+pub(crate) fn hex_encode(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-fn hex_decode(value: &str) -> Option<Vec<u8>> {
+pub(crate) fn hex_decode(value: &str) -> Option<Vec<u8>> {
     if !value.len().is_multiple_of(2) {
         return None;
     }
@@ -1440,6 +3043,12 @@ mod tests {
         ("rejoin", 4),
         ("leave", 3),
         ("revoke", 3),
+        ("ownership_claim", 2),
+        ("ownership_renew", 2),
+        ("ownership_release", 2),
+        ("revoke_owned", 5),
+        ("fence_install", 2),
+        ("fence_retire", 2),
     ];
     const CLUSTER_MUTATION_TABLES: &[&str] = &[
         "cluster_node_identity",
@@ -1449,6 +3058,10 @@ mod tests {
         "cluster_join_challenges",
         "cluster_members",
         "cluster_membership_audit",
+        "cluster_agent_ownership",
+        "cluster_agent_ownership_audit",
+        "cluster_agent_mutation_fences",
+        "cluster_agent_mutation_fence_audit",
     ];
 
     struct ClusterCrashDatabase {
@@ -1483,6 +3096,10 @@ mod tests {
         signature_hex: Option<String>,
         node_id: Option<String>,
         expected_generation: Option<u64>,
+        agent_id: Option<String>,
+        cluster_id: Option<String>,
+        fencing_token: Option<u64>,
+        proof_expires_at: Option<DateTime<Utc>>,
     }
 
     fn remove_cluster_crash_database(path: &std::path::Path) {
@@ -1515,6 +3132,7 @@ mod tests {
             signature_hex: Some(signature),
             node_id: Some(registration.node_id),
             expected_generation,
+            ..ClusterCrashInput::default()
         }
     }
 
@@ -1580,15 +3198,85 @@ mod tests {
                     .unwrap();
                 prepare_cluster_crash_join(&authority, &member, Some(left.generation))
             }
-            "leave" | "revoke" => {
+            "leave" | "revoke" | "ownership_claim" | "ownership_renew" | "ownership_release"
+            | "revoke_owned" => {
                 let member =
                     ClusterControl::new(Arc::new(open_cluster_crash_manager(member_path))).unwrap();
                 let first = prepare_cluster_crash_join(&authority, &member, None);
                 let joined =
                     register_cluster_crash_member(&authority, &member, &first, "initial admission");
+                let agent_id = uuid::Uuid::new_v4().to_string();
+                let fencing_token = if operation == "ownership_renew"
+                    || operation == "ownership_release"
+                    || operation == "revoke_owned"
+                {
+                    Some(
+                        authority
+                            .claim_agent_ownership(
+                                &agent_id,
+                                &joined.node_id,
+                                30,
+                                None,
+                                "system",
+                                "ownership crash fixture",
+                            )
+                            .unwrap()
+                            .fencing_token,
+                    )
+                } else {
+                    None
+                };
                 ClusterCrashInput {
                     node_id: Some(joined.node_id),
                     expected_generation: Some(joined.generation),
+                    agent_id: Some(agent_id),
+                    fencing_token,
+                    ..ClusterCrashInput::default()
+                }
+            }
+            "fence_install" | "fence_retire" => {
+                let agent_id = uuid::Uuid::new_v4().to_string();
+                let node_id = authority.identity().node_id.clone();
+                let cluster_id = uuid::Uuid::new_v4().to_string();
+                let proof_expires_at = Utc::now() + chrono::Duration::seconds(300);
+                let now = Utc::now().to_rfc3339();
+                authority
+                    .store
+                    .conn
+                    .lock()
+                    .unwrap()
+                    .execute(
+                        "INSERT INTO agents
+                         (id, session_id, name, task, llm_provider,
+                          permission_profile, priority, status, created_at,
+                          last_activity_at)
+                         VALUES (?1, ?2, 'fence-crash', 'test', 'stub',
+                                 'standard', 3, 'Running', ?3, ?3)",
+                        params![&agent_id, uuid::Uuid::new_v4().to_string(), now],
+                    )
+                    .unwrap();
+                if operation == "fence_retire" {
+                    authority
+                        .install_agent_mutation_fence(
+                            &agent_id,
+                            &cluster_id,
+                            &node_id,
+                            1,
+                            10,
+                            5,
+                            proof_expires_at,
+                            "system",
+                            "fence crash fixture",
+                        )
+                        .unwrap();
+                }
+                ClusterCrashInput {
+                    node_id: Some(node_id),
+                    expected_generation: Some(10),
+                    agent_id: Some(agent_id),
+                    cluster_id: Some(cluster_id),
+                    fencing_token: Some(5),
+                    proof_expires_at: Some(proof_expires_at),
                     ..ClusterCrashInput::default()
                 }
             }
@@ -1654,7 +3342,7 @@ mod tests {
                     },
                 );
             }
-            "leave" | "revoke" => {
+            "leave" | "revoke" | "revoke_owned" => {
                 authority
                     .set_member_state(
                         input.node_id.as_deref().expect("cluster crash node id"),
@@ -1672,6 +3360,93 @@ mod tests {
                         } else {
                             "crash-qualified revocation"
                         },
+                    )
+                    .unwrap();
+            }
+            "ownership_claim" => {
+                authority
+                    .claim_agent_ownership(
+                        input.agent_id.as_deref().expect("cluster crash agent id"),
+                        input.node_id.as_deref().expect("cluster crash node id"),
+                        30,
+                        None,
+                        "system",
+                        "crash-qualified ownership claim",
+                    )
+                    .unwrap();
+            }
+            "ownership_renew" => {
+                authority
+                    .renew_agent_ownership(
+                        input.agent_id.as_deref().expect("cluster crash agent id"),
+                        input.node_id.as_deref().expect("cluster crash node id"),
+                        input
+                            .fencing_token
+                            .expect("cluster crash ownership fencing token"),
+                        30,
+                        "system",
+                        "crash-qualified ownership renewal",
+                    )
+                    .unwrap();
+            }
+            "ownership_release" => {
+                authority
+                    .release_agent_ownership(
+                        input.agent_id.as_deref().expect("cluster crash agent id"),
+                        input.node_id.as_deref().expect("cluster crash node id"),
+                        input
+                            .fencing_token
+                            .expect("cluster crash ownership fencing token"),
+                        "system",
+                        "crash-qualified ownership release",
+                    )
+                    .unwrap();
+            }
+            "fence_install" => {
+                authority
+                    .install_agent_mutation_fence(
+                        input.agent_id.as_deref().expect("cluster crash agent id"),
+                        input
+                            .cluster_id
+                            .as_deref()
+                            .expect("cluster crash cluster id"),
+                        input.node_id.as_deref().expect("cluster crash node id"),
+                        1,
+                        input
+                            .expected_generation
+                            .expect("cluster crash authority generation"),
+                        input
+                            .fencing_token
+                            .expect("cluster crash mutation fencing token"),
+                        input
+                            .proof_expires_at
+                            .expect("cluster crash mutation proof expiry"),
+                        "system",
+                        "crash-qualified mutation fence install",
+                    )
+                    .unwrap();
+            }
+            "fence_retire" => {
+                authority
+                    .retire_agent_mutation_fence(
+                        input.agent_id.as_deref().expect("cluster crash agent id"),
+                        input
+                            .cluster_id
+                            .as_deref()
+                            .expect("cluster crash cluster id"),
+                        input.node_id.as_deref().expect("cluster crash node id"),
+                        1,
+                        input
+                            .expected_generation
+                            .expect("cluster crash authority generation"),
+                        input
+                            .fencing_token
+                            .expect("cluster crash mutation fencing token"),
+                        input
+                            .proof_expires_at
+                            .expect("cluster crash mutation proof expiry"),
+                        "system",
+                        "crash-qualified mutation fence retirement",
                     )
                     .unwrap();
             }
@@ -1821,7 +3596,7 @@ mod tests {
                         .expect("committed cluster challenge"),
                 );
             }
-            "leave" | "revoke" => {
+            "leave" | "revoke" | "revoke_owned" => {
                 let expected_state = if operation == "leave" {
                     ClusterMemberState::Left
                 } else {
@@ -1837,6 +3612,88 @@ mod tests {
                 assert_eq!(audit[0].membership_generation, 2);
                 assert_eq!(audit[0].member_generation, 2);
                 assert_eq!(audit[0].current, expected_state);
+                if operation == "revoke_owned" {
+                    let ownership = control
+                        .agent_ownership(input.agent_id.as_deref().expect("cluster crash agent id"))
+                        .unwrap()
+                        .expect("released ownership tombstone");
+                    assert_eq!(ownership.state, ClusterOwnershipState::Released);
+                    assert_eq!(
+                        ownership.fencing_token,
+                        input
+                            .fencing_token
+                            .expect("cluster crash ownership fencing token")
+                    );
+                    let ownership_audit = control
+                        .agent_ownership_audit(input.agent_id.as_deref(), 10)
+                        .unwrap();
+                    assert_eq!(ownership_audit.len(), 2);
+                    assert_eq!(ownership_audit[0].operation, "release");
+                }
+            }
+            "ownership_claim" | "ownership_renew" | "ownership_release" => {
+                let ownership = control
+                    .agent_ownership(input.agent_id.as_deref().expect("cluster crash agent id"))
+                    .unwrap()
+                    .expect("committed ownership");
+                assert_eq!(
+                    ownership.state,
+                    if operation == "ownership_release" {
+                        ClusterOwnershipState::Released
+                    } else {
+                        ClusterOwnershipState::Active
+                    }
+                );
+                assert_eq!(ownership.fencing_token, 1);
+                assert_eq!(
+                    ownership.generation,
+                    if operation == "ownership_claim" { 1 } else { 2 }
+                );
+                let audit = control
+                    .agent_ownership_audit(input.agent_id.as_deref(), 10)
+                    .unwrap();
+                assert_eq!(
+                    audit.len(),
+                    if operation == "ownership_claim" { 1 } else { 2 }
+                );
+                assert_eq!(
+                    audit[0].operation,
+                    match operation {
+                        "ownership_claim" => "claim",
+                        "ownership_renew" => "renew",
+                        _ => "release",
+                    }
+                );
+            }
+            "fence_install" | "fence_retire" => {
+                let fence = control
+                    .agent_mutation_fence(
+                        input.agent_id.as_deref().expect("cluster crash agent id"),
+                    )
+                    .unwrap()
+                    .expect("committed destination fence");
+                assert_eq!(
+                    fence.state,
+                    if operation == "fence_install" {
+                        AgentMutationFenceState::Active
+                    } else {
+                        AgentMutationFenceState::Retired
+                    }
+                );
+                assert_eq!(
+                    fence.fencing_token,
+                    input
+                        .fencing_token
+                        .expect("cluster crash mutation fencing token")
+                );
+                let audit = control
+                    .agent_mutation_fence_audit(input.agent_id.as_deref(), 10)
+                    .unwrap();
+                assert_eq!(
+                    audit.len(),
+                    if operation == "fence_install" { 1 } else { 2 }
+                );
+                assert_eq!(audit[0].state, fence.state);
             }
             unknown => panic!("unknown cluster crash operation {unknown}"),
         }
@@ -1958,6 +3815,321 @@ mod tests {
     }
 
     #[test]
+    fn destination_mutation_fences_are_monotonic_exact_and_durable() {
+        let store = Arc::new(SqliteContextManager::in_memory().unwrap());
+        let control = Arc::new(ClusterControl::new(store.clone()).unwrap());
+        let agent_id = uuid::Uuid::new_v4().to_string();
+        let cluster_id = uuid::Uuid::new_v4().to_string();
+        let node_id = control.identity().node_id.clone();
+        let proof_expires_at = Utc::now() + chrono::Duration::seconds(60);
+        let now = Utc::now().to_rfc3339();
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO agents
+                 (id, session_id, name, task, llm_provider, permission_profile,
+                  priority, status, created_at, last_activity_at)
+                 VALUES (?1, ?2, 'fenced', 'test', 'stub', 'standard',
+                         3, 'Running', ?3, ?3)",
+                params![&agent_id, uuid::Uuid::new_v4().to_string(), now],
+            )
+            .unwrap();
+
+        let foreign_node = uuid::Uuid::new_v4().to_string();
+        assert!(control
+            .install_agent_mutation_fence(
+                &agent_id,
+                &cluster_id,
+                &foreign_node,
+                2,
+                10,
+                5,
+                proof_expires_at,
+                "system",
+                "foreign destination",
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("destination node"));
+        assert!(control
+            .install_agent_mutation_fence(
+                &agent_id,
+                &cluster_id,
+                &node_id,
+                2,
+                10,
+                5,
+                Utc::now() - chrono::Duration::seconds(1),
+                "system",
+                "expired destination proof",
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("expired"));
+        assert!(control
+            .install_agent_mutation_fence(
+                &agent_id,
+                &cluster_id,
+                &node_id,
+                2,
+                10,
+                5,
+                Utc::now() + chrono::Duration::seconds(400),
+                "system",
+                "unbounded destination proof",
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("bounded destination horizon"));
+
+        let installed = control
+            .install_agent_mutation_fence(
+                &agent_id,
+                &cluster_id,
+                &node_id,
+                2,
+                10,
+                5,
+                proof_expires_at,
+                "system",
+                "initial destination fence",
+            )
+            .unwrap();
+        assert_eq!(installed.state, AgentMutationFenceState::Active);
+        control
+            .verify_agent_mutation_fence(
+                &agent_id,
+                &cluster_id,
+                &node_id,
+                2,
+                10,
+                5,
+                proof_expires_at,
+            )
+            .unwrap();
+        let connection_guard = store.conn.lock().unwrap();
+        let (clock_sampled_tx, clock_sampled_rx) = std::sync::mpsc::channel();
+        let verifier = Arc::clone(&control);
+        let verify_agent_id = agent_id.clone();
+        let verify_cluster_id = cluster_id.clone();
+        let verify_node_id = node_id.clone();
+        let verifier_task = std::thread::spawn(move || {
+            verifier.verify_agent_mutation_fence_with_clock(
+                &verify_agent_id,
+                &verify_cluster_id,
+                &verify_node_id,
+                2,
+                10,
+                5,
+                proof_expires_at,
+                || {
+                    clock_sampled_tx.send(()).unwrap();
+                    Utc::now()
+                },
+            )
+        });
+        assert!(
+            matches!(
+                clock_sampled_rx.recv_timeout(std::time::Duration::from_millis(50)),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ),
+            "verification must not sample time before its durable fence read"
+        );
+        drop(connection_guard);
+        clock_sampled_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("verification samples time after the durable fence read");
+        verifier_task
+            .join()
+            .expect("fence verifier thread")
+            .expect("unexpired exact proof remains valid");
+        assert_eq!(
+            control
+                .install_agent_mutation_fence(
+                    &agent_id,
+                    &cluster_id,
+                    &node_id,
+                    2,
+                    10,
+                    5,
+                    proof_expires_at,
+                    "system",
+                    "idempotent retry",
+                )
+                .unwrap(),
+            installed
+        );
+        assert!(control
+            .install_agent_mutation_fence(
+                &agent_id,
+                &cluster_id,
+                &node_id,
+                2,
+                9,
+                4,
+                proof_expires_at,
+                "system",
+                "stale route",
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("stale"));
+        assert!(control
+            .install_agent_mutation_fence(
+                &agent_id,
+                &cluster_id,
+                &node_id,
+                2,
+                10,
+                6,
+                proof_expires_at,
+                "system",
+                "token without generation",
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("newer authority generation"));
+
+        let transferred = control
+            .install_agent_mutation_fence(
+                &agent_id,
+                &cluster_id,
+                &node_id,
+                3,
+                11,
+                6,
+                proof_expires_at,
+                "system",
+                "ownership transfer",
+            )
+            .unwrap();
+        assert_eq!(transferred.fencing_token, 6);
+        assert_eq!(transferred.authority_term, 3);
+        assert!(control
+            .install_agent_mutation_fence(
+                &agent_id,
+                &cluster_id,
+                &node_id,
+                2,
+                12,
+                7,
+                proof_expires_at,
+                "system",
+                "delayed old authority term",
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("stale"));
+        assert!(control
+            .verify_agent_mutation_fence(
+                &agent_id,
+                &cluster_id,
+                &node_id,
+                2,
+                10,
+                5,
+                proof_expires_at,
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("destination ownership fence"));
+        control
+            .verify_agent_mutation_fence(
+                &agent_id,
+                &cluster_id,
+                &node_id,
+                3,
+                11,
+                6,
+                proof_expires_at,
+            )
+            .unwrap();
+        assert!(control
+            .verify_agent_mutation_fence_at(
+                &agent_id,
+                &cluster_id,
+                &node_id,
+                3,
+                11,
+                6,
+                proof_expires_at,
+                proof_expires_at,
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("proof expired"));
+        assert!(control
+            .verify_agent_mutation_fence_at(
+                &agent_id,
+                &cluster_id,
+                &node_id,
+                3,
+                11,
+                6,
+                proof_expires_at,
+                transferred.installed_at - chrono::Duration::milliseconds(1),
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("clock moved"));
+
+        let retired = control
+            .retire_agent_mutation_fence(
+                &agent_id,
+                &cluster_id,
+                &node_id,
+                3,
+                11,
+                6,
+                proof_expires_at,
+                "system",
+                "drained old owner",
+            )
+            .unwrap();
+        assert_eq!(retired.state, AgentMutationFenceState::Retired);
+        assert!(control
+            .verify_agent_mutation_fence(
+                &agent_id,
+                &cluster_id,
+                &node_id,
+                3,
+                11,
+                6,
+                proof_expires_at,
+            )
+            .is_err());
+        assert!(control
+            .install_agent_mutation_fence(
+                &agent_id,
+                &cluster_id,
+                &node_id,
+                3,
+                11,
+                6,
+                proof_expires_at,
+                "system",
+                "delayed replay",
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("cannot become active"));
+
+        let restarted = ClusterControl::new(store).unwrap();
+        assert_eq!(
+            restarted.agent_mutation_fence(&agent_id).unwrap(),
+            Some(retired)
+        );
+        let audit = restarted
+            .agent_mutation_fence_audit(Some(&agent_id), 10)
+            .unwrap();
+        assert_eq!(audit.len(), 3);
+        assert_eq!(audit[0].state, AgentMutationFenceState::Retired);
+        assert_eq!(audit[0].fencing_token, 6);
+    }
+
+    #[test]
     fn transitions_are_generation_fenced_and_audited() {
         let store = Arc::new(SqliteContextManager::in_memory().unwrap());
         let control = ClusterControl::new(store).unwrap();
@@ -2031,6 +4203,7 @@ mod tests {
             node_id: control.identity().node_id.clone(),
             fingerprint: control.identity().fingerprint.clone(),
             public_key: control.identity().public_key.clone(),
+            tls_server_certificate_fingerprint: None,
             endpoint: endpoint.to_string(),
             server_version: "0.3.0-test".to_string(),
             min_protocol_version: 1,
@@ -2274,5 +4447,280 @@ mod tests {
             .to_string()
             .contains("incompatible wire-protocol"));
         assert!(authority.membership_snapshot().unwrap().members.is_empty());
+    }
+
+    #[test]
+    fn agent_ownership_tokens_are_monotonic_exact_and_audited() {
+        let authority_store = Arc::new(SqliteContextManager::in_memory().unwrap());
+        let authority = ClusterControl::new(authority_store.clone()).unwrap();
+        let first = ClusterControl::new(Arc::new(SqliteContextManager::in_memory().unwrap()))
+            .expect("first member");
+        let second = ClusterControl::new(Arc::new(SqliteContextManager::in_memory().unwrap()))
+            .expect("second member");
+        for (member, endpoint) in [
+            (&first, "first.internal:7443"),
+            (&second, "second.internal:7443"),
+        ] {
+            let registration = member_registration(member, endpoint);
+            let challenge = authority.issue_join_challenge(30).unwrap();
+            let signature = sign_join(&authority, member, &challenge, &registration);
+            authority
+                .register_member(
+                    registration,
+                    &challenge.challenge_hex,
+                    &signature,
+                    None,
+                    1,
+                    2,
+                    "system",
+                    "ownership fixture member",
+                )
+                .unwrap();
+        }
+
+        let agent_id = uuid::Uuid::new_v4().to_string();
+        assert!(authority
+            .claim_agent_ownership(
+                &agent_id,
+                &first.identity().node_id,
+                MIN_OWNERSHIP_LEASE_TTL_SECONDS - 1,
+                None,
+                "scheduler",
+                "invalid TTL",
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("ownership TTL"));
+
+        let claimed = authority
+            .claim_agent_ownership(
+                &agent_id,
+                &first.identity().node_id,
+                30,
+                None,
+                "scheduler",
+                "initial placement",
+            )
+            .unwrap();
+        assert_eq!(claimed.fencing_token, 1);
+        assert_eq!(claimed.generation, 1);
+        assert_eq!(claimed.state, ClusterOwnershipState::Active);
+        assert_eq!(
+            authority
+                .agent_ownership_with_active_requirement(&agent_id, true)
+                .unwrap(),
+            Some(claimed.clone())
+        );
+        assert!(authority
+            .claim_agent_ownership(
+                &agent_id,
+                &second.identity().node_id,
+                30,
+                Some(claimed.fencing_token),
+                "scheduler",
+                "premature transfer",
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("has not expired"));
+        assert!(authority
+            .renew_agent_ownership(
+                &agent_id,
+                &second.identity().node_id,
+                claimed.fencing_token,
+                30,
+                "scheduler",
+                "wrong owner",
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("fencing conflict"));
+
+        let renewed = authority
+            .renew_agent_ownership(
+                &agent_id,
+                &first.identity().node_id,
+                claimed.fencing_token,
+                30,
+                "scheduler",
+                "heartbeat",
+            )
+            .unwrap();
+        assert_eq!(renewed.fencing_token, claimed.fencing_token);
+        assert_eq!(renewed.generation, 2);
+
+        let released = authority
+            .release_agent_ownership(
+                &agent_id,
+                &first.identity().node_id,
+                renewed.fencing_token,
+                "scheduler",
+                "drained",
+            )
+            .unwrap();
+        assert_eq!(released.state, ClusterOwnershipState::Released);
+        assert_eq!(released.fencing_token, 1);
+        assert_eq!(released.generation, 3);
+        assert!(authority
+            .agent_ownership_with_active_requirement(&agent_id, true)
+            .unwrap_err()
+            .to_string()
+            .contains("released or expired"));
+        assert!(authority
+            .renew_agent_ownership(
+                &agent_id,
+                &first.identity().node_id,
+                released.fencing_token,
+                30,
+                "scheduler",
+                "stale renewal",
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("fencing conflict"));
+
+        let transferred = authority
+            .claim_agent_ownership(
+                &agent_id,
+                &second.identity().node_id,
+                30,
+                Some(released.fencing_token),
+                "scheduler",
+                "placement transfer",
+            )
+            .unwrap();
+        authority_store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE cluster_agent_ownership
+                 SET lease_expires_at = ?1
+                 WHERE agent_id = ?2",
+                params![
+                    (Utc::now() - chrono::Duration::seconds(1)).to_rfc3339(),
+                    agent_id
+                ],
+            )
+            .unwrap();
+        assert!(authority
+            .agent_ownership_with_active_requirement(&agent_id, true)
+            .unwrap_err()
+            .to_string()
+            .contains("released or expired"));
+        assert!(authority.agent_ownership(&agent_id).unwrap().is_some());
+        assert_eq!(transferred.fencing_token, 2);
+        assert_eq!(transferred.generation, 4);
+        let reclaimed = authority
+            .claim_agent_ownership(
+                &agent_id,
+                &first.identity().node_id,
+                30,
+                Some(transferred.fencing_token),
+                "recovery",
+                "expired owner recovery",
+            )
+            .unwrap();
+        assert_eq!(reclaimed.fencing_token, 3);
+        assert_eq!(reclaimed.generation, 5);
+        let mut directory_ids = vec![agent_id.clone()];
+        for _ in 0..2 {
+            let extra_agent_id = uuid::Uuid::new_v4().to_string();
+            authority
+                .claim_agent_ownership(
+                    &extra_agent_id,
+                    &first.identity().node_id,
+                    30,
+                    None,
+                    "scheduler",
+                    "directory pagination fixture",
+                )
+                .unwrap();
+            directory_ids.push(extra_agent_id);
+        }
+        directory_ids.sort();
+        let first_page = authority.agent_ownerships(None, 2).unwrap();
+        assert_eq!(
+            first_page
+                .iter()
+                .map(|ownership| ownership.agent_id.as_str())
+                .collect::<Vec<_>>(),
+            directory_ids[..2]
+        );
+        let second_page = authority
+            .agent_ownerships(Some(&first_page[1].agent_id), 2)
+            .unwrap();
+        assert_eq!(
+            second_page
+                .iter()
+                .map(|ownership| ownership.agent_id.as_str())
+                .collect::<Vec<_>>(),
+            vec![directory_ids[2].as_str()]
+        );
+        assert!(authority
+            .agent_ownerships(Some("not-a-uuid"), 10)
+            .unwrap_err()
+            .to_string()
+            .contains("invalid ownership page cursor"));
+        let first_member = authority
+            .membership_snapshot()
+            .unwrap()
+            .members
+            .into_iter()
+            .find(|member| member.node_id == first.identity().node_id)
+            .unwrap();
+        assert!(authority
+            .set_member_state(
+                &first_member.node_id,
+                ClusterMemberState::Left,
+                first_member.generation,
+                "scheduler",
+                "unsafe leave",
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("ownership leases must be released"));
+        authority
+            .set_member_state(
+                &first_member.node_id,
+                ClusterMemberState::Revoked,
+                first_member.generation,
+                "security",
+                "compromised owner",
+            )
+            .unwrap();
+        let revoked_ownership = authority.agent_ownership(&agent_id).unwrap().unwrap();
+        assert_eq!(revoked_ownership.state, ClusterOwnershipState::Released);
+        assert_eq!(revoked_ownership.fencing_token, reclaimed.fencing_token);
+        assert_eq!(revoked_ownership.generation, 6);
+
+        let audit = authority
+            .agent_ownership_audit(Some(&agent_id), 10)
+            .unwrap();
+        assert_eq!(audit.len(), 6);
+        assert_eq!(
+            authority
+                .agent_ownership_audit(None, 10)
+                .unwrap()
+                .iter()
+                .filter(|entry| entry.agent_id == agent_id)
+                .count(),
+            6
+        );
+        assert_eq!(
+            audit
+                .iter()
+                .map(|entry| entry.operation.as_str())
+                .collect::<Vec<_>>(),
+            vec!["release", "transfer", "transfer", "release", "renew", "claim"]
+        );
+        assert_eq!(audit[0].fencing_token, revoked_ownership.fencing_token);
+        assert_eq!(
+            ClusterControl::new(authority_store)
+                .unwrap()
+                .agent_ownership(&agent_id)
+                .unwrap(),
+            Some(revoked_ownership)
+        );
     }
 }

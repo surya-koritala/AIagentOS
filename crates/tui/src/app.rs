@@ -4,9 +4,9 @@
 //! how keys mutate it*.
 
 use agent_sdk::{
-    AgentSummary, GateStats, KernelClient, NodeLoad, OperatorAgentSnapshot,
+    AgentSummary, GateStats, InstalledPackage, KernelClient, NodeLoad, OperatorAgentSnapshot,
     OperatorPackageSnapshot, OperatorServiceSnapshot, OperatorSnapshot, OperatorTunable,
-    ProviderSummary, SdkError,
+    OperatorTunableAudit, ProviderSummary, SdkError,
 };
 
 /// Input modes — the UI is modal (vim-ish): Normal navigates, the others edit a
@@ -22,6 +22,14 @@ pub enum Mode {
     ConfirmKill,
     /// Typing the exact frozen service name before stop or restart.
     ConfirmServiceControl,
+    /// Typing a bounded value for one exact frozen tunable revision.
+    SetTunable,
+    /// Typing `target-revision|exact-name` for one frozen tunable rollback.
+    ConfirmTunableRollback,
+    /// Typing `name|semver-requirement` for a signed package install/upgrade.
+    InstallPackage,
+    /// Typing `version|exact-name` for one frozen rollback or removal.
+    ConfirmPackageMutation,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -46,22 +54,104 @@ struct PendingServiceControl {
     agent_id: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingTunableControl {
+    name: String,
+    value: u64,
+    revision: u64,
+    minimum: u64,
+    maximum: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PackageMutationKind {
+    Rollback,
+    Remove,
+}
+
+impl PackageMutationKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Rollback => "rollback",
+            Self::Remove => "remove",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingPackageMutation {
+    kind: PackageMutationKind,
+    name: String,
+    version: String,
+    digest: String,
+}
+
 /// An action the event loop should perform asynchronously (the pure key handler
 /// can't do I/O itself). `None` from [`App::on_key`] means "handled, no I/O".
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UiAction {
     Quit,
     Refresh,
-    CreateAgent { name: String, task: String },
-    SendMessage { agent_id: String, message: String },
-    PauseAgent { agent_id: String },
-    ResumeAgent { agent_id: String },
-    StopAgent { agent_id: String },
-    KillAgent { agent_id: String },
-    StartService { name: String },
-    StopService { name: String },
-    RestartService { name: String },
+    CreateAgent {
+        name: String,
+        task: String,
+    },
+    SendMessage {
+        agent_id: String,
+        message: String,
+    },
+    PauseAgent {
+        agent_id: String,
+    },
+    ResumeAgent {
+        agent_id: String,
+    },
+    StopAgent {
+        agent_id: String,
+    },
+    KillAgent {
+        agent_id: String,
+    },
+    StartService {
+        name: String,
+    },
+    StopService {
+        name: String,
+    },
+    RestartService {
+        name: String,
+    },
     ReloadServices,
+    SetOperatorTunable {
+        name: String,
+        value: u64,
+        expected_revision: u64,
+    },
+    LoadOperatorTunableAudit {
+        name: String,
+    },
+    RollbackOperatorTunable {
+        name: String,
+        target_revision: u64,
+        expected_revision: u64,
+    },
+    InstallPackage {
+        name: String,
+        requirement: String,
+    },
+    RunInstalledPackage {
+        name: String,
+    },
+    RollbackInstalledPackage {
+        name: String,
+        expected_version: String,
+        expected_digest: String,
+    },
+    RemoveInstalledPackage {
+        name: String,
+        expected_version: String,
+        expected_digest: String,
+    },
 }
 
 impl UiAction {
@@ -81,6 +171,13 @@ impl UiAction {
             Self::StopService { .. } => "stopping service",
             Self::RestartService { .. } => "restarting service",
             Self::ReloadServices => "reloading services",
+            Self::SetOperatorTunable { .. } => "updating operator tunable",
+            Self::LoadOperatorTunableAudit { .. } => "loading tunable audit",
+            Self::RollbackOperatorTunable { .. } => "rolling back operator tunable",
+            Self::InstallPackage { .. } => "installing signed package",
+            Self::RunInstalledPackage { .. } => "starting installed package",
+            Self::RollbackInstalledPackage { .. } => "rolling back installed package",
+            Self::RemoveInstalledPackage { .. } => "removing installed package",
         }
     }
 }
@@ -153,8 +250,11 @@ pub struct App {
     pub node: NodeLoad,
     pub providers: Vec<ProviderSummary>,
     pub packages: Vec<OperatorPackageSnapshot>,
+    pub installed_packages: Vec<InstalledPackage>,
     pub tunables: Vec<OperatorTunable>,
     pub services: Vec<OperatorServiceSnapshot>,
+    pub tunable_audit: Vec<OperatorTunableAudit>,
+    pub tunable_audit_name: Option<String>,
     pub snapshot_scope: String,
     pub kernel_version: String,
     pub protocol_version: u32,
@@ -162,11 +262,15 @@ pub struct App {
     pub agents_truncated: bool,
     pub selected: usize,
     pub selected_service: usize,
+    pub selected_tunable: usize,
+    pub selected_package: usize,
     pub mode: Mode,
     pub input: String,
     pub status: String,
     pending_kill: Option<(String, String)>,
     pending_service_control: Option<PendingServiceControl>,
+    pending_tunable_control: Option<PendingTunableControl>,
+    pending_package_mutation: Option<PendingPackageMutation>,
     pub last_output: Option<String>,
     pub operator_state: OperatorUiState,
     pub should_quit: bool,
@@ -182,8 +286,11 @@ impl App {
             node: NodeLoad::default(),
             providers: Vec::new(),
             packages: Vec::new(),
+            installed_packages: Vec::new(),
             tunables: Vec::new(),
             services: Vec::new(),
+            tunable_audit: Vec::new(),
+            tunable_audit_name: None,
             snapshot_scope: "unknown".into(),
             kernel_version: "unknown".into(),
             protocol_version: 0,
@@ -191,11 +298,15 @@ impl App {
             agents_truncated: false,
             selected: 0,
             selected_service: 0,
+            selected_tunable: 0,
+            selected_package: 0,
             mode: Mode::Normal,
             input: String::new(),
-            status: "r refresh · c/m/p/s/X agents · [/ ] service · u start · d stop · R restart · L reload · q quit".into(),
+            status: "r refresh · c/m/p/s/X agents · [/ ] service · u/d/R/L control · ,/. tunable · v/a/B · {/} package · i/P/b/D · q quit".into(),
             pending_kill: None,
             pending_service_control: None,
+            pending_tunable_control: None,
+            pending_package_mutation: None,
             last_output: None,
             operator_state: OperatorUiState::default(),
             should_quit: false,
@@ -226,6 +337,15 @@ impl App {
                     ));
                 }
                 self.apply_operator_snapshot(snapshot);
+                match client.list_installed_packages().await {
+                    Ok(packages) => {
+                        self.installed_packages = packages;
+                        if self.selected_package >= self.installed_packages.len() {
+                            self.selected_package = self.installed_packages.len().saturating_sub(1);
+                        }
+                    }
+                    Err(_) => missing_sections.push("installed packages".to_string()),
+                }
                 let reconnect_generation = client.reconnect_generation();
                 self.operator_state = OperatorUiState {
                     freshness: if missing_sections.is_empty() {
@@ -340,6 +460,9 @@ impl App {
         if self.selected_service >= self.services.len() {
             self.selected_service = self.services.len().saturating_sub(1);
         }
+        if self.selected_tunable >= self.tunables.len() {
+            self.selected_tunable = self.tunables.len().saturating_sub(1);
+        }
     }
 
     pub fn selected_agent(&self) -> Option<&AgentSummary> {
@@ -353,6 +476,28 @@ impl App {
 
     pub fn selected_service(&self) -> Option<&OperatorServiceSnapshot> {
         self.services.get(self.selected_service)
+    }
+
+    pub fn selected_tunable(&self) -> Option<&OperatorTunable> {
+        self.tunables.get(self.selected_tunable)
+    }
+
+    pub fn selected_package(&self) -> Option<&InstalledPackage> {
+        self.installed_packages.get(self.selected_package)
+    }
+
+    pub fn set_tunable_audit(
+        &mut self,
+        name: impl Into<String>,
+        entries: Vec<OperatorTunableAudit>,
+    ) {
+        self.tunable_audit_name = Some(name.into());
+        self.tunable_audit = entries;
+    }
+
+    pub fn clear_tunable_audit(&mut self) {
+        self.tunable_audit_name = None;
+        self.tunable_audit.clear();
     }
 
     fn move_selection(&mut self, delta: isize) {
@@ -373,15 +518,38 @@ impl App {
         self.selected_service = next as usize;
     }
 
+    fn move_tunable_selection(&mut self, delta: isize) {
+        if self.tunables.is_empty() {
+            return;
+        }
+        let len = self.tunables.len() as isize;
+        let next = (self.selected_tunable as isize + delta).clamp(0, len - 1);
+        self.selected_tunable = next as usize;
+    }
+
+    fn move_package_selection(&mut self, delta: isize) {
+        if self.installed_packages.is_empty() {
+            return;
+        }
+        let len = self.installed_packages.len() as isize;
+        let next = (self.selected_package as isize + delta).clamp(0, len - 1);
+        self.selected_package = next as usize;
+    }
+
     /// Handle a key press. Returns an action for the event loop to run, or
     /// `None` when the key only mutated local state. `key` is the character/name
     /// of the key; `enter`/`esc`/`backspace` are signalled via [`Key`].
     pub fn on_key(&mut self, key: Key) -> Option<UiAction> {
         match self.mode {
             Mode::Normal => self.on_key_normal(key),
-            Mode::CreateAgent | Mode::SendMessage => self.on_key_editing(key),
+            Mode::CreateAgent | Mode::SendMessage | Mode::InstallPackage => {
+                self.on_key_editing(key)
+            }
             Mode::ConfirmKill => self.on_key_confirm_kill(key),
             Mode::ConfirmServiceControl => self.on_key_confirm_service_control(key),
+            Mode::SetTunable => self.on_key_set_tunable(key),
+            Mode::ConfirmTunableRollback => self.on_key_confirm_tunable_rollback(key),
+            Mode::ConfirmPackageMutation => self.on_key_confirm_package_mutation(key),
         }
     }
 
@@ -465,6 +633,66 @@ impl App {
                 None
             }
             Key::Char('L') => Some(UiAction::ReloadServices),
+            Key::Char(',') => {
+                self.move_tunable_selection(-1);
+                None
+            }
+            Key::Char('.') => {
+                self.move_tunable_selection(1);
+                None
+            }
+            Key::Char('v') => {
+                self.begin_tunable_control(Mode::SetTunable);
+                None
+            }
+            Key::Char('a') => {
+                if let Some(tunable) = self.selected_tunable() {
+                    Some(UiAction::LoadOperatorTunableAudit {
+                        name: tunable.name.clone(),
+                    })
+                } else {
+                    self.status = "no operator tunable selected".into();
+                    None
+                }
+            }
+            Key::Char('B') => {
+                self.begin_tunable_control(Mode::ConfirmTunableRollback);
+                None
+            }
+            Key::Char('{') => {
+                self.move_package_selection(-1);
+                None
+            }
+            Key::Char('}') => {
+                self.move_package_selection(1);
+                None
+            }
+            Key::Char('i') => {
+                self.mode = Mode::InstallPackage;
+                self.input.clear();
+                self.status =
+                    "install package — type `name|semver-requirement`, Enter to submit, Esc to cancel"
+                        .into();
+                None
+            }
+            Key::Char('P') => {
+                if let Some(package) = self.selected_package() {
+                    Some(UiAction::RunInstalledPackage {
+                        name: package.name.clone(),
+                    })
+                } else {
+                    self.status = "no installed package selected".into();
+                    None
+                }
+            }
+            Key::Char('b') => {
+                self.begin_package_mutation(PackageMutationKind::Rollback);
+                None
+            }
+            Key::Char('D') => {
+                self.begin_package_mutation(PackageMutationKind::Remove);
+                None
+            }
             _ => None,
         }
     }
@@ -604,6 +832,283 @@ impl App {
         })
     }
 
+    fn begin_tunable_control(&mut self, mode: Mode) {
+        let Some(tunable) = self.selected_tunable().cloned() else {
+            self.status = "no operator tunable selected".into();
+            return;
+        };
+        self.pending_tunable_control = Some(PendingTunableControl {
+            name: tunable.name.clone(),
+            value: tunable.value,
+            revision: tunable.revision,
+            minimum: tunable.minimum,
+            maximum: tunable.maximum,
+        });
+        self.mode = mode;
+        self.input.clear();
+        self.status = match mode {
+            Mode::SetTunable => format!(
+                "set tunable — {}={}@r{} · allowed {}..={} · type a value, Enter to submit, Esc to cancel",
+                tunable.name,
+                tunable.value,
+                tunable.revision,
+                tunable.minimum,
+                tunable.maximum
+            ),
+            Mode::ConfirmTunableRollback => format!(
+                "rollback tunable — {}={}@r{} · type target-revision|{} exactly, Enter to submit, Esc to cancel",
+                tunable.name, tunable.value, tunable.revision, tunable.name
+            ),
+            _ => unreachable!("tunable control uses a tunable input mode"),
+        };
+    }
+
+    fn on_key_set_tunable(&mut self, key: Key) -> Option<UiAction> {
+        match key {
+            Key::Esc => {
+                self.cancel_tunable_control("tunable update cancelled");
+                None
+            }
+            Key::Backspace => {
+                self.input.pop();
+                None
+            }
+            Key::Char(character) if character.is_ascii_digit() => {
+                self.input.push(character);
+                None
+            }
+            Key::Enter => {
+                let Some(target) = self.pending_tunable_control.as_ref() else {
+                    self.cancel_tunable_control("tunable update cancelled — target unavailable");
+                    return None;
+                };
+                let Ok(value) = self.input.parse::<u64>() else {
+                    self.status = "tunable update not submitted — enter a whole number".into();
+                    return None;
+                };
+                if !(target.minimum..=target.maximum).contains(&value) {
+                    self.status = format!(
+                        "tunable update not submitted — value must be within {}..={}",
+                        target.minimum, target.maximum
+                    );
+                    return None;
+                }
+                let target = self
+                    .pending_tunable_control
+                    .take()
+                    .expect("validated pending tunable target");
+                self.mode = Mode::Normal;
+                self.input.clear();
+                self.status = format!(
+                    "tunable update submitted — {} from {}@r{} to {}",
+                    target.name, target.value, target.revision, value
+                );
+                Some(UiAction::SetOperatorTunable {
+                    name: target.name,
+                    value,
+                    expected_revision: target.revision,
+                })
+            }
+            _ => {
+                self.status =
+                    "tunable update not submitted — value must contain digits only".into();
+                None
+            }
+        }
+    }
+
+    fn on_key_confirm_tunable_rollback(&mut self, key: Key) -> Option<UiAction> {
+        match key {
+            Key::Esc => {
+                self.cancel_tunable_control("tunable rollback cancelled");
+                None
+            }
+            Key::Backspace => {
+                self.input.pop();
+                None
+            }
+            Key::Char(character) => {
+                self.input.push(character);
+                None
+            }
+            Key::Enter => {
+                let Some(target) = self.pending_tunable_control.as_ref() else {
+                    self.cancel_tunable_control("tunable rollback cancelled — target unavailable");
+                    return None;
+                };
+                let Some((revision, confirmed_name)) = self.input.split_once('|') else {
+                    self.status = format!(
+                        "tunable rollback not submitted — type target-revision|{} exactly",
+                        target.name
+                    );
+                    return None;
+                };
+                let Ok(target_revision) = revision.parse::<u64>() else {
+                    self.status =
+                        "tunable rollback not submitted — target revision must be a whole number"
+                            .into();
+                    return None;
+                };
+                if confirmed_name != target.name {
+                    self.status = format!(
+                        "tunable rollback not submitted — confirmation must exactly match {}",
+                        target.name
+                    );
+                    return None;
+                }
+                if target_revision == 0 || target_revision >= target.revision {
+                    self.status = format!(
+                        "tunable rollback not submitted — target revision must be within 1..{}",
+                        target.revision
+                    );
+                    return None;
+                }
+                let target = self
+                    .pending_tunable_control
+                    .take()
+                    .expect("validated pending tunable rollback target");
+                self.mode = Mode::Normal;
+                self.input.clear();
+                self.status = format!(
+                    "tunable rollback submitted — {} from r{} to r{}",
+                    target.name, target.revision, target_revision
+                );
+                Some(UiAction::RollbackOperatorTunable {
+                    name: target.name,
+                    target_revision,
+                    expected_revision: target.revision,
+                })
+            }
+            _ => None,
+        }
+    }
+
+    fn cancel_tunable_control(&mut self, status: &str) {
+        self.pending_tunable_control = None;
+        self.mode = Mode::Normal;
+        self.input.clear();
+        self.status = status.into();
+    }
+
+    pub fn pending_tunable_control(&self) -> Option<(&str, u64, u64, u64, u64)> {
+        self.pending_tunable_control.as_ref().map(|target| {
+            (
+                target.name.as_str(),
+                target.value,
+                target.revision,
+                target.minimum,
+                target.maximum,
+            )
+        })
+    }
+
+    fn begin_package_mutation(&mut self, kind: PackageMutationKind) {
+        let Some(package) = self.selected_package().cloned() else {
+            self.status = "no installed package selected".into();
+            return;
+        };
+        let version = package.version.to_string();
+        self.pending_package_mutation = Some(PendingPackageMutation {
+            kind,
+            name: package.name.clone(),
+            version: version.clone(),
+            digest: package.digest.clone(),
+        });
+        self.mode = Mode::ConfirmPackageMutation;
+        self.input.clear();
+        let impact = match kind {
+            PackageMutationKind::Rollback => {
+                "replaces the current package and lock state with its previous committed version"
+            }
+            PackageMutationKind::Remove => {
+                "removes the installed package and prevents new package runs"
+            }
+        };
+        self.status = format!(
+            "confirm package {} — {}@{} ({}) · {}; type {}|{} exactly, Enter to submit, Esc to cancel",
+            kind.label(),
+            package.name,
+            version,
+            short_digest(&package.digest),
+            impact,
+            version,
+            package.name
+        );
+    }
+
+    fn on_key_confirm_package_mutation(&mut self, key: Key) -> Option<UiAction> {
+        match key {
+            Key::Esc => {
+                self.pending_package_mutation = None;
+                self.mode = Mode::Normal;
+                self.input.clear();
+                self.status = "package mutation cancelled".into();
+                None
+            }
+            Key::Backspace => {
+                self.input.pop();
+                None
+            }
+            Key::Char(character) => {
+                self.input.push(character);
+                None
+            }
+            Key::Enter => {
+                let Some(target) = self.pending_package_mutation.as_ref() else {
+                    self.mode = Mode::Normal;
+                    self.input.clear();
+                    self.status = "package mutation cancelled — target unavailable".into();
+                    return None;
+                };
+                let expected = format!("{}|{}", target.version, target.name);
+                if self.input != expected {
+                    self.status = format!(
+                        "package {} not submitted — confirmation must exactly match {expected}",
+                        target.kind.label()
+                    );
+                    return None;
+                }
+                let target = self
+                    .pending_package_mutation
+                    .take()
+                    .expect("validated pending package mutation");
+                self.mode = Mode::Normal;
+                self.input.clear();
+                self.status = format!(
+                    "package {} submitted — {}@{} ({})",
+                    target.kind.label(),
+                    target.name,
+                    target.version,
+                    short_digest(&target.digest)
+                );
+                Some(match target.kind {
+                    PackageMutationKind::Rollback => UiAction::RollbackInstalledPackage {
+                        name: target.name,
+                        expected_version: target.version,
+                        expected_digest: target.digest,
+                    },
+                    PackageMutationKind::Remove => UiAction::RemoveInstalledPackage {
+                        name: target.name,
+                        expected_version: target.version,
+                        expected_digest: target.digest,
+                    },
+                })
+            }
+            _ => None,
+        }
+    }
+
+    pub fn pending_package_mutation(&self) -> Option<(&str, &str, &str, &str)> {
+        self.pending_package_mutation.as_ref().map(|target| {
+            (
+                target.kind.label(),
+                target.name.as_str(),
+                target.version.as_str(),
+                target.digest.as_str(),
+            )
+        })
+    }
+
     fn submit(&mut self) -> Option<UiAction> {
         let action = match self.mode {
             Mode::CreateAgent => {
@@ -633,12 +1138,36 @@ impl App {
                 }
                 UiAction::SendMessage { agent_id, message }
             }
-            Mode::Normal | Mode::ConfirmKill | Mode::ConfirmServiceControl => return None,
+            Mode::InstallPackage => {
+                let Some((name, requirement)) = self.input.split_once('|') else {
+                    self.status =
+                        "package install requires `name|semver-requirement` (for example reviewer|^1)"
+                            .into();
+                    return None;
+                };
+                let name = name.trim().to_string();
+                let requirement = requirement.trim().to_string();
+                if name.is_empty() || requirement.is_empty() {
+                    self.status = "package name and semver requirement are required".into();
+                    return None;
+                }
+                UiAction::InstallPackage { name, requirement }
+            }
+            Mode::Normal
+            | Mode::ConfirmKill
+            | Mode::ConfirmServiceControl
+            | Mode::SetTunable
+            | Mode::ConfirmTunableRollback
+            | Mode::ConfirmPackageMutation => return None,
         };
         self.mode = Mode::Normal;
         self.input.clear();
         Some(action)
     }
+}
+
+fn short_digest(digest: &str) -> &str {
+    digest.get(..19).unwrap_or(digest)
 }
 
 /// A keypress abstracted away from any specific backend, so [`App::on_key`] is
@@ -684,6 +1213,49 @@ mod tests {
             next_restart_at: None,
             last_transition_at: String::new(),
         }
+    }
+
+    fn dummy_tunable(name: &str, value: u64, revision: u64) -> OperatorTunable {
+        OperatorTunable {
+            name: name.into(),
+            value,
+            revision,
+            minimum: 1,
+            maximum: 100,
+            persisted: true,
+            updated_at: "2026-07-29T00:00:00Z".into(),
+            updated_by: "operator".into(),
+            description: "test tunable".into(),
+        }
+    }
+
+    fn dummy_installed_package(name: &str, version: &str, digest: &str) -> InstalledPackage {
+        serde_json::from_value(serde_json::json!({
+            "tenant_id": "tenant-1",
+            "name": name,
+            "version": version,
+            "digest": digest,
+            "lock": {
+                "schema_version": 1,
+                "packages": [{
+                    "name": name,
+                    "version": version,
+                    "digest": digest
+                }]
+            },
+            "manifest": {
+                "name": name,
+                "version": version,
+                "description": "test package",
+                "publisher": "test-publisher",
+                "license": "AGPL-3.0-only",
+                "dependencies": [],
+                "capabilities_required": [],
+                "tools_required": []
+            },
+            "installed_at": "2026-07-29T00:00:00Z"
+        }))
+        .expect("valid installed package fixture")
     }
 
     #[test]
@@ -991,5 +1563,194 @@ mod tests {
         );
         assert_eq!(a.mode, Mode::Normal);
         assert_eq!(a.on_key(Key::Char('L')), Some(UiAction::ReloadServices));
+    }
+
+    #[test]
+    fn tunable_update_freezes_name_revision_and_enforces_bounds() {
+        let mut a = app();
+        a.tunables = vec![
+            dummy_tunable("kernel.max_agents", 10, 2),
+            dummy_tunable("kernel.max_turns", 20, 4),
+        ];
+
+        assert_eq!(a.on_key(Key::Char('v')), None);
+        assert_eq!(a.mode, Mode::SetTunable);
+        assert_eq!(
+            a.pending_tunable_control(),
+            Some(("kernel.max_agents", 10, 2, 1, 100))
+        );
+        a.selected_tunable = 1;
+        for character in "101".chars() {
+            assert_eq!(a.on_key(Key::Char(character)), None);
+        }
+        assert_eq!(a.on_key(Key::Enter), None);
+        assert_eq!(a.mode, Mode::SetTunable);
+        assert!(a.status.contains("within 1..=100"));
+        for _ in 0..3 {
+            a.on_key(Key::Backspace);
+        }
+        for character in "25".chars() {
+            a.on_key(Key::Char(character));
+        }
+        assert_eq!(
+            a.on_key(Key::Enter),
+            Some(UiAction::SetOperatorTunable {
+                name: "kernel.max_agents".into(),
+                value: 25,
+                expected_revision: 2,
+            })
+        );
+        assert_eq!(a.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn tunable_rollback_requires_exact_frozen_name_and_older_revision() {
+        let mut a = app();
+        a.tunables = vec![
+            dummy_tunable("kernel.max_agents", 10, 3),
+            dummy_tunable("kernel.max_turns", 20, 5),
+        ];
+
+        assert_eq!(a.on_key(Key::Char('B')), None);
+        assert_eq!(a.mode, Mode::ConfirmTunableRollback);
+        a.selected_tunable = 1;
+        for character in "2|kernel.max_turns".chars() {
+            a.on_key(Key::Char(character));
+        }
+        assert_eq!(a.on_key(Key::Enter), None);
+        assert_eq!(a.mode, Mode::ConfirmTunableRollback);
+        assert!(a.status.contains("exactly match kernel.max_agents"));
+        while !a.input.is_empty() {
+            a.on_key(Key::Backspace);
+        }
+        for character in "3|kernel.max_agents".chars() {
+            a.on_key(Key::Char(character));
+        }
+        assert_eq!(a.on_key(Key::Enter), None);
+        assert!(a.status.contains("within 1..3"));
+        while !a.input.is_empty() {
+            a.on_key(Key::Backspace);
+        }
+        for character in "1|kernel.max_agents".chars() {
+            a.on_key(Key::Char(character));
+        }
+        assert_eq!(
+            a.on_key(Key::Enter),
+            Some(UiAction::RollbackOperatorTunable {
+                name: "kernel.max_agents".into(),
+                target_revision: 1,
+                expected_revision: 3,
+            })
+        );
+        assert_eq!(a.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn tunable_selection_audit_and_cancellation_keep_exact_target() {
+        let mut a = app();
+        a.tunables = vec![
+            dummy_tunable("kernel.max_agents", 10, 2),
+            dummy_tunable("kernel.max_turns", 20, 4),
+        ];
+
+        assert_eq!(a.on_key(Key::Char('.')), None);
+        assert_eq!(a.selected_tunable, 1);
+        assert_eq!(
+            a.on_key(Key::Char('a')),
+            Some(UiAction::LoadOperatorTunableAudit {
+                name: "kernel.max_turns".into(),
+            })
+        );
+        assert_eq!(a.on_key(Key::Char('v')), None);
+        assert_eq!(
+            a.pending_tunable_control(),
+            Some(("kernel.max_turns", 20, 4, 1, 100))
+        );
+        a.selected_tunable = 0;
+        assert_eq!(a.on_key(Key::Esc), None);
+        assert_eq!(a.mode, Mode::Normal);
+        assert_eq!(a.pending_tunable_control(), None);
+        assert!(a.status.contains("cancelled"));
+    }
+
+    #[test]
+    fn package_install_and_run_actions_use_the_selected_public_package() {
+        let mut a = app();
+        assert_eq!(a.on_key(Key::Char('i')), None);
+        assert_eq!(a.mode, Mode::InstallPackage);
+        for character in "reviewer|^1.2".chars() {
+            a.on_key(Key::Char(character));
+        }
+        assert_eq!(
+            a.on_key(Key::Enter),
+            Some(UiAction::InstallPackage {
+                name: "reviewer".into(),
+                requirement: "^1.2".into(),
+            })
+        );
+
+        a.installed_packages = vec![
+            dummy_installed_package("reviewer", "1.2.3", "sha256:reviewer"),
+            dummy_installed_package("planner", "2.0.0", "sha256:planner"),
+        ];
+        assert_eq!(a.on_key(Key::Char('}')), None);
+        assert_eq!(a.selected_package, 1);
+        assert_eq!(
+            a.on_key(Key::Char('P')),
+            Some(UiAction::RunInstalledPackage {
+                name: "planner".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn package_mutations_freeze_version_digest_and_require_exact_target() {
+        let mut a = app();
+        a.installed_packages = vec![
+            dummy_installed_package("reviewer", "1.2.3", "sha256:reviewed-artifact"),
+            dummy_installed_package("planner", "2.0.0", "sha256:other-artifact"),
+        ];
+
+        assert_eq!(a.on_key(Key::Char('b')), None);
+        assert_eq!(a.mode, Mode::ConfirmPackageMutation);
+        assert_eq!(
+            a.pending_package_mutation(),
+            Some(("rollback", "reviewer", "1.2.3", "sha256:reviewed-artifact"))
+        );
+        a.selected_package = 1;
+        for character in "2.0.0|planner".chars() {
+            a.on_key(Key::Char(character));
+        }
+        assert_eq!(a.on_key(Key::Enter), None);
+        assert!(a.status.contains("must exactly match 1.2.3|reviewer"));
+        while !a.input.is_empty() {
+            a.on_key(Key::Backspace);
+        }
+        for character in "1.2.3|reviewer".chars() {
+            a.on_key(Key::Char(character));
+        }
+        assert_eq!(
+            a.on_key(Key::Enter),
+            Some(UiAction::RollbackInstalledPackage {
+                name: "reviewer".into(),
+                expected_version: "1.2.3".into(),
+                expected_digest: "sha256:reviewed-artifact".into(),
+            })
+        );
+
+        a.selected_package = 0;
+        assert_eq!(a.on_key(Key::Char('D')), None);
+        assert!(a.status.contains("prevents new package runs"));
+        for character in "1.2.3|reviewer".chars() {
+            a.on_key(Key::Char(character));
+        }
+        assert_eq!(
+            a.on_key(Key::Enter),
+            Some(UiAction::RemoveInstalledPackage {
+                name: "reviewer".into(),
+                expected_version: "1.2.3".into(),
+                expected_digest: "sha256:reviewed-artifact".into(),
+            })
+        );
     }
 }

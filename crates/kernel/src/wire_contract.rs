@@ -20,6 +20,8 @@ use crate::wire_io::{
 pub const WIRE_FEATURES: &[&str] = &[
     "agent_enforcement_introspection",
     "authorized_cluster_membership",
+    "bounded_certificate_rollout",
+    "cluster_ownership_leases",
     "backup_retention",
     "bounded_json_frames",
     "connection_keepalive",
@@ -154,6 +156,8 @@ const REQUEST_VARIANTS: &[Variant] = &[
     Variant {
         tag: "create_agent",
         fields: &[
+            Field::optional("agent_id", N),
+            Field::optional("ownership_proof", ON),
             Field::required("name", S),
             Field::required("task", S),
             Field::optional("provider", S),
@@ -386,8 +390,24 @@ const REQUEST_VARIANTS: &[Variant] = &[
         fields: &[Field::required("name", S)],
     },
     Variant {
+        tag: "rollback_package_exact",
+        fields: &[
+            Field::required("name", S),
+            Field::required("expected_version", S),
+            Field::required("expected_digest", S),
+        ],
+    },
+    Variant {
         tag: "remove_package",
         fields: &[Field::required("name", S)],
+    },
+    Variant {
+        tag: "remove_package_exact",
+        fields: &[
+            Field::required("name", S),
+            Field::required("expected_version", S),
+            Field::required("expected_digest", S),
+        ],
     },
     Variant {
         tag: "list_installed_packages",
@@ -427,11 +447,15 @@ const REQUEST_VARIANTS: &[Variant] = &[
     },
     Variant {
         tag: "issue_cluster_join_challenge",
-        fields: &[Field::required("ttl_seconds", I)],
+        fields: &[
+            Field::optional("operation_id", S),
+            Field::required("ttl_seconds", I),
+        ],
     },
     Variant {
         tag: "register_cluster_member",
         fields: &[
+            Field::optional("operation_id", S),
             Field::required("registration", O),
             Field::required("challenge_hex", S),
             Field::required("signature_hex", S),
@@ -440,8 +464,40 @@ const REQUEST_VARIANTS: &[Variant] = &[
         ],
     },
     Variant {
+        tag: "prepare_cluster_member_certificate_rollout",
+        fields: &[
+            Field::optional("operation_id", S),
+            Field::required("registration", O),
+            Field::required("challenge_hex", S),
+            Field::required("signature_hex", S),
+            Field::required("expected_generation", I),
+            Field::required("prepare_ttl_seconds", I),
+            Field::required("minimum_overlap_seconds", I),
+            Field::required("reason", S),
+        ],
+    },
+    Variant {
+        tag: "abort_cluster_member_certificate_rollout",
+        fields: &[
+            Field::optional("operation_id", S),
+            Field::required("node_id", S),
+            Field::required("expected_generation", I),
+            Field::required("reason", S),
+        ],
+    },
+    Variant {
+        tag: "finalize_cluster_member_certificate_rollout",
+        fields: &[
+            Field::optional("operation_id", S),
+            Field::required("node_id", S),
+            Field::required("expected_generation", I),
+            Field::required("reason", S),
+        ],
+    },
+    Variant {
         tag: "set_cluster_member_state",
         fields: &[
+            Field::optional("operation_id", S),
             Field::required("node_id", S),
             Field::required("state", S),
             Field::required("expected_generation", I),
@@ -455,6 +511,102 @@ const REQUEST_VARIANTS: &[Variant] = &[
     Variant {
         tag: "list_cluster_membership_audit",
         fields: &[Field::optional("limit", I)],
+    },
+    Variant {
+        tag: "list_cluster_certificate_rollout_audit",
+        fields: &[Field::optional("limit", I)],
+    },
+    Variant {
+        tag: "claim_cluster_agent_ownership",
+        fields: &[
+            Field::optional("operation_id", S),
+            Field::required("agent_id", S),
+            Field::required("owner_node_id", S),
+            Field::required("ttl_seconds", I),
+            Field::optional("expected_fencing_token", JsonKind::IntegerOrNull),
+            Field::required("reason", S),
+        ],
+    },
+    Variant {
+        tag: "renew_cluster_agent_ownership",
+        fields: &[
+            Field::optional("operation_id", S),
+            Field::required("agent_id", S),
+            Field::required("owner_node_id", S),
+            Field::required("fencing_token", I),
+            Field::required("ttl_seconds", I),
+            Field::required("reason", S),
+        ],
+    },
+    Variant {
+        tag: "release_cluster_agent_ownership",
+        fields: &[
+            Field::optional("operation_id", S),
+            Field::required("agent_id", S),
+            Field::required("owner_node_id", S),
+            Field::required("fencing_token", I),
+            Field::required("reason", S),
+        ],
+    },
+    Variant {
+        tag: "get_cluster_agent_ownership",
+        fields: &[
+            Field::required("agent_id", S),
+            Field::optional("require_active", B),
+        ],
+    },
+    Variant {
+        tag: "list_cluster_agent_ownerships",
+        fields: &[
+            Field::optional("after_agent_id", N),
+            Field::optional("limit", I),
+        ],
+    },
+    Variant {
+        tag: "list_cluster_agent_ownership_audit",
+        fields: &[Field::optional("agent_id", N), Field::optional("limit", I)],
+    },
+    Variant {
+        tag: "install_agent_mutation_fence",
+        fields: &[
+            Field::required("agent_id", S),
+            Field::required("cluster_id", S),
+            Field::required("owner_node_id", S),
+            Field::required("authority_term", I),
+            Field::required("authority_generation", I),
+            Field::required("fencing_token", I),
+            Field::required("proof_expires_at", S),
+            Field::required("reason", S),
+        ],
+    },
+    Variant {
+        tag: "retire_agent_mutation_fence",
+        fields: &[
+            Field::required("agent_id", S),
+            Field::required("cluster_id", S),
+            Field::required("owner_node_id", S),
+            Field::required("authority_term", I),
+            Field::required("authority_generation", I),
+            Field::required("fencing_token", I),
+            Field::required("proof_expires_at", S),
+            Field::required("reason", S),
+        ],
+    },
+    Variant {
+        tag: "get_agent_mutation_fence",
+        fields: &[Field::required("agent_id", S)],
+    },
+    Variant {
+        tag: "list_agent_mutation_fence_audit",
+        fields: &[Field::optional("agent_id", N), Field::optional("limit", I)],
+    },
+    Variant {
+        tag: "fenced_agent_mutation",
+        fields: &[
+            Field::required("agent_id", S),
+            Field::required("proof", O),
+            Field::required("mutation", O),
+        ],
     },
     Variant {
         tag: "metrics",
@@ -575,21 +727,45 @@ pub fn conformance_request_fixtures(protocol_version: u32) -> Result<Vec<Value>,
                         | "list_node_control_audit"
                         | "issue_cluster_join_challenge"
                         | "register_cluster_member"
+                        | "prepare_cluster_member_certificate_rollout"
+                        | "abort_cluster_member_certificate_rollout"
+                        | "finalize_cluster_member_certificate_rollout"
                         | "set_cluster_member_state"
                         | "get_cluster_membership"
                         | "list_cluster_membership_audit"
+                        | "list_cluster_certificate_rollout_audit"
+                        | "claim_cluster_agent_ownership"
+                        | "renew_cluster_agent_ownership"
+                        | "release_cluster_agent_ownership"
+                        | "get_cluster_agent_ownership"
+                        | "list_cluster_agent_ownerships"
+                        | "list_cluster_agent_ownership_audit"
+                        | "install_agent_mutation_fence"
+                        | "retire_agent_mutation_fence"
+                        | "get_agent_mutation_fence"
+                        | "list_agent_mutation_fence_audit"
+                        | "fenced_agent_mutation"
                 )
         })
         .map(|variant| {
             let mut request = Map::new();
             request.insert("op".into(), Value::String(variant.tag.into()));
             for field in variant.fields {
+                if protocol_version == 1
+                    && variant.tag == "create_agent"
+                    && matches!(field.name, "agent_id" | "ownership_proof")
+                {
+                    continue;
+                }
                 let value = match (field.name, field.kind) {
                     ("protocol_version", JsonKind::Integer) => {
                         Value::Number(protocol_version.into())
                     }
                     ("agent_id", JsonKind::String) => {
                         Value::String("00000000-0000-0000-0000-000000000001".into())
+                    }
+                    ("owner_node_id", JsonKind::String) => {
+                        Value::String("00000000-0000-0000-0000-000000000004".into())
                     }
                     ("checkpoint_id", JsonKind::String) => {
                         Value::String("00000000-0000-0000-0000-000000000002".into())
@@ -616,7 +792,22 @@ pub fn conformance_request_fixtures(protocol_version: u32) -> Result<Vec<Value>,
                         "kind": "agent",
                         "agent_id": "00000000-0000-0000-0000-000000000001"
                     }),
+                    ("proof", JsonKind::Object) => serde_json::json!({
+                        "cluster_id": "00000000-0000-0000-0000-000000000005",
+                        "owner_node_id": "00000000-0000-0000-0000-000000000004",
+                        "authority_term": 1,
+                        "authority_generation": 1,
+                        "fencing_token": 1,
+                        "proof_expires_at": "2026-01-01T00:00:00Z"
+                    }),
+                    ("mutation", JsonKind::Object) => serde_json::json!({
+                        "op": "pause_agent",
+                        "agent_id": "00000000-0000-0000-0000-000000000001"
+                    }),
                     ("valid_from", JsonKind::String) => {
+                        Value::String("2026-01-01T00:00:00Z".into())
+                    }
+                    ("proof_expires_at", JsonKind::String) => {
                         Value::String("2026-01-01T00:00:00Z".into())
                     }
                     ("manifest_toml", JsonKind::String) => {
@@ -887,11 +1078,42 @@ const REPLY_VARIANTS: &[Variant] = &[
         fields: &[Field::required("member", O)],
     },
     Variant {
+        tag: "cluster_certificate_rollout_updated",
+        fields: &[
+            Field::required("member", O),
+            Field::optional("rollout", JsonKind::ObjectOrNull),
+        ],
+    },
+    Variant {
         tag: "cluster_membership",
         fields: &[Field::required("membership", O)],
     },
     Variant {
         tag: "cluster_membership_audit",
+        fields: &[Field::required("entries", A)],
+    },
+    Variant {
+        tag: "cluster_certificate_rollout_audit",
+        fields: &[Field::required("entries", A)],
+    },
+    Variant {
+        tag: "cluster_agent_ownership",
+        fields: &[Field::optional("ownership", JsonKind::ObjectOrNull)],
+    },
+    Variant {
+        tag: "cluster_agent_ownerships",
+        fields: &[Field::required("ownerships", A)],
+    },
+    Variant {
+        tag: "cluster_agent_ownership_audit",
+        fields: &[Field::required("entries", A)],
+    },
+    Variant {
+        tag: "agent_mutation_fence",
+        fields: &[Field::optional("fence", JsonKind::ObjectOrNull)],
+    },
+    Variant {
+        tag: "agent_mutation_fence_audit",
         fields: &[Field::required("entries", A)],
     },
     Variant {
@@ -1288,8 +1510,8 @@ mod tests {
                     });
             }
         }
-        assert_eq!(conformance_request_fixtures(1).unwrap().len(), 59);
-        assert_eq!(conformance_request_fixtures(2).unwrap().len(), 75);
+        assert_eq!(conformance_request_fixtures(1).unwrap().len(), 61);
+        assert_eq!(conformance_request_fixtures(2).unwrap().len(), 92);
         assert!(conformance_request_fixtures(0).is_err());
         assert!(conformance_request_fixtures(PROTOCOL_VERSION + 1).is_err());
     }

@@ -24,6 +24,10 @@ class LinuxCliRcReleaseContractTests(unittest.TestCase):
         workflows.mkdir(parents=True)
         shutil.copy2(ROOT / ".github/workflows/release.yml", workflows)
         shutil.copy2(ROOT / ".github/workflows/linux-cli-rc.yml", workflows)
+        shutil.copy2(
+            ROOT / ".github/workflows/phase1-promotion-qualification.yml",
+            workflows,
+        )
         (self.root / "Cargo.toml").write_text(
             '[workspace]\nmembers = ["crates/a", "crates/tauri-app"]\n',
             encoding="utf-8",

@@ -6,14 +6,16 @@ is qualified from its final downloadable binaries. It supports one
 It is a governed agent runtime on Linux, not a replacement for the Linux
 kernel.
 
-This profile is deliberately narrower than the eventual v1.0 promise. A
-prerelease does not promote cloud or local LLM backends, desktop clients,
-peripherals, or the distributed control plane. The signed qualification report
-included in the release keeps those limitations machine-readable.
+This profile is deliberately narrower than the eventual v1.0 promise. Its
+Phase 1 decision promotes only the exact provider/model set named in that
+report; desktop clients, peripherals, and the distributed control plane remain
+outside the restricted promise. The signed qualification reports included in
+the release keep those limitations machine-readable.
 
 ## What the release gate proves
 
-An exact `vX.Y.Z-rc.N` tag is published only after:
+An exact `vX.Y.Z-rc.N` tag first produces a retained signed candidate only
+after:
 
 1. full release-blocking CI and the governed-execution acceptance test pass;
 2. `agent`, `agent-server`, `agentctl`, and `agent-tui` build twice with
@@ -33,9 +35,15 @@ An exact `vX.Y.Z-rc.N` tag is published only after:
     kernel re-arms enforcement, and both the upgraded and newly created agents
     remain visible after the recovered server starts.
 
-The workflow then signs and attests the bounded JSON qualification report and
-publishes everything as a GitHub **prerelease**. Missing evidence prevents
-publication.
+The tag workflow signs and attests the bounded runtime report but does **not**
+publish a GitHub release. The separate protected Phase 1 gate then requires
+the exact same RC/commit to have eligible live-provider, real GGUF, target
+remote-backup, destructive-storage, external-deletion, 24-hour soak,
+release-SLO, and human game-day reports. One independent review must bind the
+exact campaign and workflow provenance. Only that gate re-signs and attests the
+complete bundle and publishes it as a GitHub **prerelease**. See
+[Restricted Phase 1 promotion qualification](PHASE1_PROMOTION_QUALIFICATION.md).
+Missing or mixed evidence prevents publication.
 
 ## Download and verify
 
@@ -50,11 +58,12 @@ gh release download "$AGENTOS_RC" \
 sha256sum --check SHA256SUMS
 ```
 
-Verify the archive against the exact release workflow identity:
+Verify the final archive against the exact Phase 1 publication workflow
+identity:
 
 ```bash
 archive="agentos-${AGENTOS_RC}-x86_64-unknown-linux-gnu.zip"
-identity="https://github.com/surya-koritala/AIagentOS/.github/workflows/linux-cli-rc.yml@refs/tags/${AGENTOS_RC}"
+identity="https://github.com/surya-koritala/AIagentOS/.github/workflows/phase1-promotion-qualification.yml@refs/tags/${AGENTOS_RC}"
 cosign verify-blob \
   --bundle "${archive}.sigstore.json" \
   --certificate-identity "$identity" \
@@ -62,13 +71,13 @@ cosign verify-blob \
   "$archive"
 gh attestation verify "$archive" \
   --repo surya-koritala/AIagentOS \
-  --signer-workflow surya-koritala/AIagentOS/.github/workflows/linux-cli-rc.yml \
+  --signer-workflow surya-koritala/AIagentOS/.github/workflows/phase1-promotion-qualification.yml \
   --source-ref "refs/tags/${AGENTOS_RC}" \
   --cert-identity "$identity" \
   --deny-self-hosted-runners
 ```
 
-Inspect the report before trusting the candidate:
+Inspect both reports before trusting the candidate:
 
 ```bash
 jq '{
@@ -83,11 +92,23 @@ jq '{
   production_claim_allowed,
   limitations
 }' linux-cli-rc-qualification.json
+jq '{
+  release_candidate,
+  source,
+  profile,
+  promoted_providers,
+  evidence,
+  review,
+  phase1_release_candidate_ready,
+  production_claim_allowed,
+  eligibility_blockers
+}' phase1-promotion.json
 ```
 
-`production_claim_allowed` remains `false` until the separate remote-storage,
-24-hour soak, game-day, provider, client, distributed, and independent-review
-gates are satisfied.
+The restricted decision must set `phase1_release_candidate_ready` to `true`.
+`production_claim_allowed` remains `false` until the client, peripheral,
+distributed-control-plane, independent-security, and final v1 governance gates
+are satisfied.
 
 ## Install
 

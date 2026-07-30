@@ -1470,9 +1470,8 @@ fn restricted_linux_cli_rc_release_contract_is_fail_closed() {
         "--released-schema-tag v0.3.0",
         "finalize:",
         "scripts/linux_cli_rc_qualification.py validate-report",
-        "gh release create",
-        "--prerelease",
-        "--verify-tag",
+        "Signed candidate bundle awaiting Phase 1 promotion",
+        "qualified-linux-cli-rc-bundle",
     ] {
         assert!(
             workflow.contains(contract),
@@ -1484,6 +1483,7 @@ fn restricted_linux_cli_rc_release_contract_is_fail_closed() {
         "self-hosted",
         "continue-on-error: true",
         "AGENT_SERVER_ALLOW_INSECURE_REMOTE",
+        "gh release create",
     ] {
         assert!(
             !workflow.contains(forbidden),
@@ -1527,6 +1527,79 @@ fn restricted_linux_cli_rc_release_contract_is_fail_closed() {
         assert!(
             guide.contains(contract),
             "restricted Linux CLI operator guide lost {contract:?}"
+        );
+    }
+}
+
+#[test]
+fn phase1_promotion_contract_is_exact_reviewed_and_fail_closed() {
+    let tag_workflow = read_workspace_file(".github/workflows/linux-cli-rc.yml");
+    assert!(
+        !tag_workflow.contains("gh release create"),
+        "tag workflow must retain the signed candidate without publishing it"
+    );
+
+    let workflow = read_workspace_file(".github/workflows/phase1-promotion-qualification.yml");
+    for contract in [
+        "workflow_dispatch:",
+        "release_candidate:",
+        "linux_cli_rc_run_id:",
+        "environment_id:",
+        "profile: phase1-promotion",
+        "enabled: ${{ vars.AGENTOS_CAPACITY_QUALIFICATION_ENABLED }}",
+        "runs-on: [self-hosted, linux, x64, agentos-capacity]",
+        "environment: capacity-qualification",
+        "AGENTOS_PHASE1_EVIDENCE_DIR: ${{ vars.AGENTOS_PHASE1_EVIDENCE_DIR }}",
+        "test \"$GITHUB_REF\" = \"refs/tags/${AGENTOS_RELEASE_CANDIDATE}\"",
+        ".github/workflows/linux-cli-rc.yml",
+        "test \"$(jq -r .conclusion <<<\"$metadata\")\" = \"success\"",
+        "name: qualified-linux-cli-rc-bundle",
+        "cmp \"$report\" \"$evidence_report\"",
+        "scripts/linux_cli_rc_qualification.py validate-report",
+        "scripts/phase1_promotion_qualification.py",
+        "--require-eligible",
+        "phase1_release_candidate_ready",
+        "production_claim_allowed",
+        "needs: exact-release-candidate-promotion",
+        "cosign verify-blob",
+        "cosign sign-blob",
+        "attest-build-provenance@",
+        "gh release create",
+        "--prerelease",
+        "--verify-tag",
+    ] {
+        assert!(
+            workflow.contains(contract),
+            "Phase 1 promotion workflow lost {contract:?}"
+        );
+    }
+    let publish = workflow
+        .split_once("  publish:")
+        .expect("Phase 1 workflow lost gated publish job")
+        .1;
+    assert!(
+        publish.contains("needs: exact-release-candidate-promotion")
+            && publish.contains("gh release create"),
+        "publication must remain downstream of the exact Phase 1 decision"
+    );
+
+    let qualifier = read_workspace_file("scripts/phase1_promotion_qualification.py");
+    for contract in [
+        "restricted_phase1_evidence_campaign",
+        "independent_restricted_phase1_promotion_review",
+        "restricted_phase1_promotion_decision",
+        "single-node-linux-rootless-container-cli",
+        "Phase 1 promotion requires both Ollama and vLLM",
+        "Phase 1 promotion requires at least one hosted provider",
+        "live provider plan and provider reports must come from one run",
+        "release SLO does not bind the retained resource soak",
+        "review does not bind the exact campaign bytes",
+        "\"phase1_release_candidate_ready\": ready",
+        "\"production_claim_allowed\": False",
+    ] {
+        assert!(
+            qualifier.contains(contract),
+            "Phase 1 promotion evaluator lost {contract:?}"
         );
     }
 }

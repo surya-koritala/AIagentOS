@@ -205,7 +205,7 @@ jobs:
           if-no-files-found: error
 
   finalize:
-    name: Final signed release bundle
+    name: Signed candidate bundle awaiting Phase 1 promotion
     needs: fresh-host
     runs-on: ubuntu-22.04
     timeout-minutes: 15
@@ -258,35 +258,3 @@ jobs:
           name: qualified-linux-cli-rc-bundle
           path: dist
           if-no-files-found: error
-
-  publish:
-    name: Publish qualified prerelease
-    needs: finalize
-    runs-on: ubuntu-22.04
-    timeout-minutes: 10
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          name: qualified-linux-cli-rc-bundle
-          path: dist
-      - name: Extract matching release-candidate notes
-        run: |
-          version="${GITHUB_REF_NAME#v}"
-          awk -v v="$version" '
-            $0 ~ "^## \\[" v "\\]" {grab=1; next}
-            grab && /^## \[/ {exit}
-            grab {print}
-          ' CHANGELOG.md > RELEASE_NOTES.md
-          test -s RELEASE_NOTES.md
-      - name: Create immutable GitHub prerelease from the existing tag
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          gh release create "$GITHUB_REF_NAME" dist/* \
-            --title "$GITHUB_REF_NAME — restricted Linux CLI RC" \
-            --notes-file RELEASE_NOTES.md \
-            --prerelease \
-            --verify-tag

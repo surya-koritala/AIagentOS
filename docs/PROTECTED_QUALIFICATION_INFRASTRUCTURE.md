@@ -26,7 +26,7 @@ eligible evidence.
 
 | Profiles | Repository enable variable | Protected environment | Required runner label |
 | --- | --- | --- | --- |
-| Capacity baseline, resource soak, target remote backup, release SLO, game day | `AGENTOS_CAPACITY_QUALIFICATION_ENABLED` | `capacity-qualification` | `agentos-capacity` |
+| Capacity baseline, resource soak, target remote backup, release SLO, game day, Phase 1 promotion | `AGENTOS_CAPACITY_QUALIFICATION_ENABLED` | `capacity-qualification` | `agentos-capacity` |
 | Real GGUF/on-device model | `AGENTOS_MODEL_QUALIFICATION_ENABLED` | `model-qualification` | `agentos-model` |
 | Destructive target-storage profile | `AGENTOS_DESTRUCTIVE_STORAGE_QUALIFICATION_ENABLED` | `destructive-storage-qualification` | `agentos-destructive-storage` |
 | External deletion and retention | `AGENTOS_EXTERNAL_DATA_QUALIFICATION_ENABLED` | `external-data-qualification` | `agentos-external-data` |

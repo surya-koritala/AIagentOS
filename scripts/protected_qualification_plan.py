@@ -74,6 +74,16 @@ PROFILE_CONFIGS = (
         "optional_secrets": [],
     },
     {
+        "profile": "phase1-promotion",
+        "enable_variable": "AGENTOS_CAPACITY_QUALIFICATION_ENABLED",
+        "environment": "capacity-qualification",
+        "runner_labels": ["self-hosted", "linux", "x64", "agentos-capacity"],
+        "required_variables": ["AGENTOS_PHASE1_EVIDENCE_DIR"],
+        "optional_variables": [],
+        "required_secrets": [],
+        "optional_secrets": [],
+    },
+    {
         "profile": "on-device",
         "enable_variable": "AGENTOS_MODEL_QUALIFICATION_ENABLED",
         "environment": "model-qualification",

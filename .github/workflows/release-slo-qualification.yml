@@ -28,8 +28,17 @@ env:
   AGENTOS_RELEASE_CANDIDATE: ${{ inputs.release_candidate }}
 
 jobs:
+  qualification-plan:
+    name: Fail-closed release-SLO dispatch preflight
+    uses: ./.github/workflows/protected-qualification-plan.yml
+    with:
+      profile: release-slo
+      enabled: ${{ vars.AGENTOS_CAPACITY_QUALIFICATION_ENABLED }}
+
   exact-release-candidate-slo:
     name: Exact-release-candidate SLO report
+    needs: qualification-plan
+    if: needs.qualification-plan.outputs.ready == 'true'
     runs-on: [self-hosted, linux, x64, agentos-capacity]
     timeout-minutes: 15
     environment: capacity-qualification

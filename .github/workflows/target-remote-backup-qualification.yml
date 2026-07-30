@@ -30,19 +30,29 @@ env:
   AGENTOS_RELEASE_CANDIDATE: ${{ inputs.release_candidate }}
   AGENTOS_QUALIFICATION_ENVIRONMENT: ${{ inputs.environment_id }}
   AGENTOS_REMOTE_SERVICE_ID: ${{ inputs.service_id }}
-  AGENTOS_TARGET_REMOTE_ENDPOINT: ${{ vars.AGENTOS_TARGET_REMOTE_ENDPOINT }}
-  AGENTOS_TARGET_REMOTE_BUCKET: ${{ vars.AGENTOS_TARGET_REMOTE_BUCKET }}
-  AWS_REGION: ${{ vars.AGENTOS_TARGET_REMOTE_REGION }}
-  AWS_ACCESS_KEY_ID: ${{ secrets.AGENTOS_TARGET_REMOTE_ACCESS_KEY_ID }}
-  AWS_SECRET_ACCESS_KEY: ${{ secrets.AGENTOS_TARGET_REMOTE_SECRET_ACCESS_KEY }}
-  AWS_SESSION_TOKEN: ${{ secrets.AGENTOS_TARGET_REMOTE_SESSION_TOKEN }}
 
 jobs:
+  qualification-plan:
+    name: Fail-closed target-backup dispatch preflight
+    uses: ./.github/workflows/protected-qualification-plan.yml
+    with:
+      profile: target-remote-backup
+      enabled: ${{ vars.AGENTOS_CAPACITY_QUALIFICATION_ENABLED }}
+
   exact-release-candidate-target-recovery:
     name: Exact-RC target object-store recovery
+    needs: qualification-plan
+    if: needs.qualification-plan.outputs.ready == 'true'
     runs-on: [self-hosted, linux, x64, agentos-capacity]
     timeout-minutes: 30
     environment: capacity-qualification
+    env:
+      AGENTOS_TARGET_REMOTE_ENDPOINT: ${{ vars.AGENTOS_TARGET_REMOTE_ENDPOINT }}
+      AGENTOS_TARGET_REMOTE_BUCKET: ${{ vars.AGENTOS_TARGET_REMOTE_BUCKET }}
+      AWS_REGION: ${{ vars.AGENTOS_TARGET_REMOTE_REGION }}
+      AWS_ACCESS_KEY_ID: ${{ secrets.AGENTOS_TARGET_REMOTE_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AGENTOS_TARGET_REMOTE_SECRET_ACCESS_KEY }}
+      AWS_SESSION_TOKEN: ${{ secrets.AGENTOS_TARGET_REMOTE_SESSION_TOKEN }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

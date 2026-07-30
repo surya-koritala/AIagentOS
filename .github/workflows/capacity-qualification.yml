@@ -1,8 +1,9 @@
 name: Capacity qualification
 
-# Full profiles run only on a repository-owned, stable target host. A missing
-# runner leaves the workflow queued/not_run; GitHub-hosted hardware is not
-# silently substituted and cannot create production-capacity evidence.
+# Full profiles run only on a repository-owned, stable target host. Disabled
+# infrastructure fails in the hosted preflight before a self-hosted job queues.
+# Once explicitly enabled, a missing runner remains queued/not_run;
+# GitHub-hosted hardware is never substituted as production-capacity evidence.
 on:
   workflow_dispatch:
     inputs:
@@ -24,8 +25,17 @@ env:
   AGENTOS_QUALIFICATION_ENVIRONMENT: ${{ inputs.environment_id }}
 
 jobs:
+  qualification-plan:
+    name: Fail-closed capacity dispatch preflight
+    uses: ./.github/workflows/protected-qualification-plan.yml
+    with:
+      profile: capacity-baseline
+      enabled: ${{ vars.AGENTOS_CAPACITY_QUALIFICATION_ENABLED }}
+
   deterministic-baseline:
     name: Exact-commit release workload baseline
+    needs: qualification-plan
+    if: needs.qualification-plan.outputs.ready == 'true'
     runs-on: [self-hosted, linux, x64, agentos-capacity]
     timeout-minutes: 120
     environment: capacity-qualification

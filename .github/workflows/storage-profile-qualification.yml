@@ -29,8 +29,17 @@ env:
   AGENTOS_STORAGE_PROFILE_ID: single-node-linux-rootless-container-cli
 
 jobs:
+  qualification-plan:
+    name: Fail-closed destructive-storage dispatch preflight
+    uses: ./.github/workflows/protected-qualification-plan.yml
+    with:
+      profile: storage-profile
+      enabled: ${{ vars.AGENTOS_DESTRUCTIVE_STORAGE_QUALIFICATION_ENABLED }}
+
   exact-release-candidate-destructive-storage:
     name: Exact-RC destructive target storage evidence
+    needs: qualification-plan
+    if: needs.qualification-plan.outputs.ready == 'true'
     runs-on: [self-hosted, linux, x64, agentos-destructive-storage]
     timeout-minutes: 15
     environment: destructive-storage-qualification

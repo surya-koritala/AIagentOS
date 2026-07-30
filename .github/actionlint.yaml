@@ -1,3 +1,10 @@
+self-hosted-runner:
+  labels:
+    - agentos-capacity
+    - agentos-destructive-storage
+    - agentos-external-data
+    - agentos-model
+
 paths:
   .github/workflows/release.yml:
     # GitHub added this standard Intel label after actionlint 1.7.7's runner

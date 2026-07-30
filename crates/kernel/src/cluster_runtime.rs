@@ -4513,13 +4513,22 @@ mod tests {
             ));
         }
         let (first, second, third) = tokio::join!(
-            initial[0].as_ref().expect("node 1").initialize(),
-            initial[1].as_ref().expect("node 2").initialize(),
-            initial[2].as_ref().expect("node 3").initialize(),
+            initial[0]
+                .as_ref()
+                .expect("node 1")
+                .ensure_configured_membership(true),
+            initial[1]
+                .as_ref()
+                .expect("node 2")
+                .ensure_configured_membership(true),
+            initial[2]
+                .as_ref()
+                .expect("node 3")
+                .ensure_configured_membership(true),
         );
-        first.expect("initialize node 1");
-        second.expect("initialize node 2");
-        third.expect("initialize node 3");
+        first.expect("settle node 1 membership");
+        second.expect("settle node 2 membership");
+        third.expect("settle node 3 membership");
         wait_for_leader(&initial, None).await;
         for runtime in initial.into_iter().flatten() {
             runtime
@@ -4717,13 +4726,22 @@ mod tests {
             ));
         }
         let (first, second, third) = tokio::join!(
-            initial[0].as_ref().expect("node 1").initialize(),
-            initial[1].as_ref().expect("node 2").initialize(),
-            initial[2].as_ref().expect("node 3").initialize(),
+            initial[0]
+                .as_ref()
+                .expect("node 1")
+                .ensure_configured_membership(true),
+            initial[1]
+                .as_ref()
+                .expect("node 2")
+                .ensure_configured_membership(true),
+            initial[2]
+                .as_ref()
+                .expect("node 3")
+                .ensure_configured_membership(true),
         );
-        first.expect("initialize node 1");
-        second.expect("initialize node 2");
-        third.expect("initialize node 3");
+        first.expect("settle node 1 membership");
+        second.expect("settle node 2 membership");
+        third.expect("settle node 3 membership");
         wait_for_leader(&initial, None).await;
         for runtime in initial.into_iter().flatten() {
             runtime.shutdown().await.expect("shutdown initial catalog");
@@ -4971,13 +4989,22 @@ mod tests {
             ));
         }
         let (first, second, third) = tokio::join!(
-            runtimes[0].as_ref().expect("node 1").initialize(),
-            runtimes[1].as_ref().expect("node 2").initialize(),
-            runtimes[2].as_ref().expect("node 3").initialize(),
+            runtimes[0]
+                .as_ref()
+                .expect("node 1")
+                .ensure_configured_membership(true),
+            runtimes[1]
+                .as_ref()
+                .expect("node 2")
+                .ensure_configured_membership(true),
+            runtimes[2]
+                .as_ref()
+                .expect("node 3")
+                .ensure_configured_membership(true),
         );
-        first.expect("initialize node 1");
-        second.expect("initialize node 2");
-        third.expect("initialize node 3");
+        first.expect("settle node 1 membership");
+        second.expect("settle node 2 membership");
+        third.expect("settle node 3 membership");
         wait_for_leader(&runtimes, None).await;
         for runtime in runtimes.into_iter().flatten() {
             runtime.shutdown().await.expect("shutdown initial voter");
@@ -5206,13 +5233,22 @@ mod tests {
             ));
         }
         let (first, second, third) = tokio::join!(
-            runtimes[0].as_ref().expect("node 1").initialize(),
-            runtimes[1].as_ref().expect("node 2").initialize(),
-            runtimes[2].as_ref().expect("node 3").initialize(),
+            runtimes[0]
+                .as_ref()
+                .expect("node 1")
+                .ensure_configured_membership(true),
+            runtimes[1]
+                .as_ref()
+                .expect("node 2")
+                .ensure_configured_membership(true),
+            runtimes[2]
+                .as_ref()
+                .expect("node 3")
+                .ensure_configured_membership(true),
         );
-        first.expect("initialize node 1");
-        second.expect("initialize node 2");
-        third.expect("initialize node 3");
+        first.expect("settle node 1 membership");
+        second.expect("settle node 2 membership");
+        third.expect("settle node 3 membership");
 
         let first_leader = wait_for_leader(&runtimes, None).await;
         let first_leader_index = (first_leader - 1) as usize;

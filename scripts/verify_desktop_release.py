@@ -4,12 +4,15 @@
 from __future__ import annotations
 
 import argparse
+import base64
+import binascii
 import json
 import os
 import re
 import struct
 import sys
 from pathlib import Path
+from urllib.parse import urlparse
 
 
 REQUIRED_PNGS = {
@@ -140,6 +143,52 @@ def validate(root: Path, tag: str | None = None) -> list[str]:
             "tauri.conf.json does not configure required desktop icons: "
             + ", ".join(missing_config)
         )
+
+    bundle = tauri_config.get("bundle", {})
+    if bundle.get("createUpdaterArtifacts") is not True:
+        failures.append("tauri.conf.json must create Tauri v2 updater artifacts")
+
+    updater = tauri_config.get("plugins", {}).get("updater", {})
+    public_key = updater.get("pubkey")
+    if not isinstance(public_key, str) or not public_key:
+        failures.append("tauri.conf.json must embed the updater public key")
+    else:
+        try:
+            decoded_key = base64.b64decode(public_key, validate=True).decode("utf-8")
+        except (binascii.Error, UnicodeDecodeError):
+            failures.append("tauri.conf.json updater public key is not valid Tauri base64")
+        else:
+            if not decoded_key.startswith("untrusted comment: minisign public key:"):
+                failures.append("tauri.conf.json updater public key is not a minisign key")
+            if len(decoded_key.splitlines()) != 2:
+                failures.append("tauri.conf.json updater public key has an invalid envelope")
+
+    expected_endpoint = (
+        "https://github.com/surya-koritala/AIagentOS/"
+        "releases/latest/download/latest.json"
+    )
+    endpoints = updater.get("endpoints")
+    if endpoints != [expected_endpoint]:
+        failures.append(
+            "tauri.conf.json updater endpoint must be the canonical HTTPS latest.json"
+        )
+    elif urlparse(endpoints[0]).scheme != "https":
+        failures.append("tauri.conf.json updater endpoint must use HTTPS")
+    for dangerous in [
+        "dangerousInsecureTransportProtocol",
+        "dangerousAcceptInvalidCerts",
+        "dangerousAcceptInvalidHostnames",
+    ]:
+        if updater.get(dangerous) is True:
+            failures.append(f"tauri.conf.json updater must not enable {dangerous}")
+    if updater.get("windows", {}).get("installMode") != "passive":
+        failures.append("tauri.conf.json updater must use passive Windows install mode")
+
+    desktop_manifest = (root / "crates/tauri-app/Cargo.toml").read_text(
+        encoding="utf-8"
+    )
+    if 'tauri-plugin-updater = { version = "=2.10.1", optional = true }' not in desktop_manifest:
+        failures.append("desktop updater plugin must remain exactly pinned to 2.10.1")
 
     return failures
 

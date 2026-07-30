@@ -1,0 +1,1 @@
+AI Agent OS updater signature regression fixture v0.3.0

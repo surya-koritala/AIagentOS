@@ -252,6 +252,17 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
   request. Source and rendered axe tests cover the cancellation and checkpoint
   controls. Dashboard selection now passes the real agent ID instead of a
   double-wrapped event payload that left the detail panel empty.
+- Added the fail-closed Tauri 2 signed-updater foundation. The desktop embeds a
+  real minisign public identity, checks only the canonical HTTPS GitHub Release
+  manifest, bounds update metadata at IPC, requires exact-version review and
+  confirmation, rechecks before install, rejects concurrent installs, and
+  delegates mandatory artifact verification to the official updater plugin.
+  Release qualification now requires protected updater key/password secrets,
+  collects every installer signature, and can build strict tag-bound static
+  metadata. Real-signature tamper tests, malformed/ambiguous manifest tests,
+  frontend confirmation tests, and rendered axe coverage are blocking CI.
+  Native signing/notarization and clean-host install, upgrade, failed-update,
+  and operator-led rollback qualification remain open under #126.
 - Added rendered accessibility regression coverage for the production desktop
   frontend bundle. Lockfile-pinned Playwright Chromium and axe now scan the
   dashboard, operations, settings, and setup states against WCAG A/AA rules and

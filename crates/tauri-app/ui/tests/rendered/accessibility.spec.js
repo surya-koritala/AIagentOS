@@ -197,6 +197,20 @@ async function installTauriFixture(page, { setupComplete = true } = {}) {
               state: command === 'stop_service' ? 'Inactive' : 'Running',
             });
           }
+          if (command === 'check_for_update') {
+            return Promise.resolve({
+              current_version: '0.3.0',
+              version: '0.4.0',
+              target: 'darwin-x86_64-app',
+              published_at: '2026-07-28T20:00:00Z',
+              notes: 'Signed updater fixture',
+            });
+          }
+          if (command === 'install_update') {
+            window.__AIAgentOSRenderedTestCalls ??= [];
+            window.__AIAgentOSRenderedTestCalls.push({ command, args });
+            return Promise.resolve();
+          }
           return Promise.reject(new Error(`Unexpected rendered-test command: ${command}`));
         },
       };
@@ -233,6 +247,17 @@ test('production dashboard, status, and settings views pass rendered WCAG checks
   await page.getByRole('button', { name: 'Settings' }).click();
   await expect(page.getByRole('heading', { name: 'Settings' })).toBeVisible();
   await expectWcagAxeClean(page);
+
+  await page.getByRole('button', { name: 'Check for updates' }).click();
+  await expect(page.getByText('Signed update 0.4.0 is available')).toBeVisible();
+  await page.getByRole('button', { name: 'Review install 0.4.0' }).click();
+  await expect(page.getByRole('heading', { name: 'Confirm update 0.4.0' })).toBeVisible();
+  await expectWcagAxeClean(page);
+  await page.getByRole('button', { name: 'Confirm install 0.4.0' }).click();
+  await expect(page.getByText('Signed update 0.4.0 installed')).toBeVisible();
+  expect(
+    await page.evaluate(() => window.__AIAgentOSRenderedTestCalls),
+  ).toEqual([{ command: 'install_update', args: { expectedVersion: '0.4.0' } }]);
 });
 
 test('skip link and primary navigation are keyboard operable with visible focus', async ({ page }) => {

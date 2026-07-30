@@ -11,6 +11,12 @@
   let localEndpoint = 'http://localhost:11434';
   let saving = false;
   let message = '';
+  let availableUpdate = null;
+  let checkingUpdate = false;
+  let confirmingUpdate = false;
+  let installingUpdate = false;
+  let updateMessage = '';
+  let updateError = false;
 
   async function loadSettings() {
     try {
@@ -60,6 +66,42 @@
       message = `✗ Error: ${e}`;
     }
     saving = false;
+  }
+
+  async function checkForUpdate() {
+    if (checkingUpdate || installingUpdate) return;
+    checkingUpdate = true;
+    confirmingUpdate = false;
+    updateMessage = '';
+    updateError = false;
+    try {
+      availableUpdate = await invoke('check_for_update');
+      updateMessage = availableUpdate
+        ? `Signed update ${availableUpdate.version} is available. Review it before installing.`
+        : 'This installation is up to date.';
+    } catch (e) {
+      availableUpdate = null;
+      updateError = true;
+      updateMessage = `Update check failed: ${e}`;
+    }
+    checkingUpdate = false;
+  }
+
+  async function installUpdate() {
+    if (!availableUpdate || installingUpdate) return;
+    const expectedVersion = availableUpdate.version;
+    installingUpdate = true;
+    confirmingUpdate = false;
+    updateError = false;
+    updateMessage = `Verifying and installing signed update ${expectedVersion}…`;
+    try {
+      await invoke('install_update', { expectedVersion });
+      updateMessage = `Signed update ${expectedVersion} installed. Restarting…`;
+    } catch (e) {
+      updateError = true;
+      updateMessage = `Update ${expectedVersion} was not installed: ${e}`;
+      installingUpdate = false;
+    }
   }
 
   loadSettings();
@@ -133,6 +175,60 @@
     <p class="hint">Database: {config.data_dir || '~/.local/share/ai-agent-os'}/agent_os.db</p>
     <p class="hint">Config: ~/.config/ai-agent-os/config.toml</p>
   </section>
+
+  <section aria-labelledby="software-update-heading">
+    <h3 id="software-update-heading">Software update</h3>
+    <p class="hint">
+      Updates are downloaded over HTTPS and must match the updater signature built into this app.
+    </p>
+    <button class="secondary neutral" on:click={checkForUpdate} disabled={checkingUpdate || installingUpdate}>
+      {checkingUpdate ? 'Checking for updates…' : 'Check for updates'}
+    </button>
+
+    {#if availableUpdate}
+      <div class="update-card">
+        <dl>
+          <div><dt>Installed</dt><dd>{availableUpdate.current_version}</dd></div>
+          <div><dt>Available</dt><dd>{availableUpdate.version}</dd></div>
+          <div><dt>Target</dt><dd>{availableUpdate.target}</dd></div>
+        </dl>
+        {#if availableUpdate.published_at}
+          <p class="hint">Published {availableUpdate.published_at}</p>
+        {/if}
+        {#if availableUpdate.notes}
+          <p class="update-notes">{availableUpdate.notes}</p>
+        {/if}
+        {#if !confirmingUpdate}
+          <button on:click={() => { confirmingUpdate = true; }}>
+            Review install {availableUpdate.version}
+          </button>
+        {:else}
+          <div class="update-confirmation" aria-labelledby="update-confirmation-heading">
+            <h4 id="update-confirmation-heading">Confirm update {availableUpdate.version}</h4>
+            <p>
+              This replaces the installed desktop application and restarts it.
+              Keep the current version available for operator-led rollback.
+              Automatic downgrade is not available.
+            </p>
+            <div class="confirmation-actions">
+              <button class="secondary neutral" on:click={() => { confirmingUpdate = false; }} disabled={installingUpdate}>
+                Cancel
+              </button>
+              <button on:click={installUpdate} disabled={installingUpdate}>
+                {installingUpdate ? 'Installing…' : `Confirm install ${availableUpdate.version}`}
+              </button>
+            </div>
+          </div>
+        {/if}
+      </div>
+    {/if}
+
+    {#if updateMessage}
+      <div class="message" class:success={!updateError} role={updateError ? 'alert' : 'status'}>
+        {updateMessage}
+      </div>
+    {/if}
+  </section>
 </div>
 
 <style>
@@ -145,8 +241,20 @@
   button { width: 100%; min-height: 44px; padding: 0.6rem; border-radius: 8px; border: none; background: #3276bd; color: white; font-weight: 600; cursor: pointer; margin-top: 0.5rem; }
   button:disabled { opacity: 0.5; }
   button.secondary { background: transparent; color: #fca5a5; border: 1px solid #7f1d1d; margin-bottom: 0.5rem; }
+  button.secondary.neutral { color: #d8d8e3; border-color: #66667a; }
   .message { margin-top: 0.5rem; font-size: 0.8rem; color: #f87171; }
   .message.success { color: #86efac; }
   .hint { font-size: 0.75rem; color: #b9b9c8; margin: 0.25rem 0; }
   .credential-status { font-size: 0.8rem; color: #c7c7d2; line-height: 1.5; }
+  .update-card { margin-top: 0.75rem; padding: 0.85rem; border: 1px solid #4a4a68; border-radius: 8px; background: #12121f; }
+  .update-card dl { display: grid; gap: 0.35rem; margin: 0 0 0.75rem; }
+  .update-card dl div { display: flex; justify-content: space-between; gap: 1rem; }
+  .update-card dt { color: #b9b9c8; }
+  .update-card dd { margin: 0; overflow-wrap: anywhere; }
+  .update-notes { max-height: 10rem; overflow-y: auto; white-space: pre-wrap; color: #c7c7d2; line-height: 1.5; }
+  .update-confirmation { margin-top: 0.75rem; padding: 0.75rem; border: 1px solid #7c5c18; border-radius: 8px; background: #352a12; }
+  .update-confirmation h4 { margin: 0 0 0.4rem; color: #fde68a; }
+  .update-confirmation p { margin: 0; color: #f5deb0; line-height: 1.45; }
+  .confirmation-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 0.5rem; margin-top: 0.5rem; }
+  .confirmation-actions button { margin: 0; }
 </style>

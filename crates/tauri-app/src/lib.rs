@@ -7,6 +7,9 @@
 
 use std::sync::Arc;
 
+#[cfg(feature = "desktop-shell")]
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use agent_sdk::{
     AgentEnforcementInfo, ConnectionProfile, GenerationCheckpointSummary, InstalledPackage,
     KernelClient, LifecycleResult, MessageResult, MessageStreamEvent, OperatorAgentSnapshot,
@@ -858,6 +861,35 @@ pub struct AppState {
     pub client: DesktopClient,
 }
 
+/// Process-local guard preventing concurrent native updater installations.
+#[cfg(feature = "desktop-shell")]
+#[derive(Default)]
+pub struct DesktopUpdateState {
+    installing: AtomicBool,
+}
+
+#[cfg(feature = "desktop-shell")]
+impl DesktopUpdateState {
+    pub(crate) fn begin_install(&self) -> Result<DesktopUpdateInstallGuard<'_>, &'static str> {
+        self.installing
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| "an update installation is already in progress")?;
+        Ok(DesktopUpdateInstallGuard { state: self })
+    }
+}
+
+#[cfg(feature = "desktop-shell")]
+pub(crate) struct DesktopUpdateInstallGuard<'a> {
+    state: &'a DesktopUpdateState,
+}
+
+#[cfg(feature = "desktop-shell")]
+impl Drop for DesktopUpdateInstallGuard<'_> {
+    fn drop(&mut self) {
+        self.state.installing.store(false, Ordering::Release);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1486,5 +1518,18 @@ mod tests {
                     .to_string()
             ]
         );
+    }
+
+    #[cfg(feature = "desktop-shell")]
+    #[test]
+    fn desktop_update_installation_guard_is_exclusive_and_recoverable() {
+        let state = DesktopUpdateState::default();
+        let first = state.begin_install().expect("first update installation");
+        assert_eq!(
+            state.begin_install().err(),
+            Some("an update installation is already in progress")
+        );
+        drop(first);
+        assert!(state.begin_install().is_ok());
     }
 }

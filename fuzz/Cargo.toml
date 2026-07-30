@@ -11,7 +11,7 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 serde_json = "1"
-kernel = { path = "../crates/kernel", version = "=0.3.0", features = ["fuzzing"] }
+kernel = { path = "../crates/kernel", version = "=0.4.0-rc.1", features = ["fuzzing"] }
 
 [[bin]]
 name = "wire_syscall"

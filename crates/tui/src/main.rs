@@ -8,7 +8,8 @@
 //! Usage: `agent-tui [--addr ADDR] [--token TOKEN]` (default
 //! `127.0.0.1:7777`). `AGENTOS_ADDR` and `AGENT_SERVER_TOKEN` provide the same
 //! settings without exposing a token in shell history. Start a server first
-//! with `agent-server`.
+//! with `agent-server`. Use `agent-tui --version` to print the exact build
+//! version without connecting.
 //!
 //! Keys: `j`/`k` (or arrows) move · `r` refresh · `c` create (`name|task`) ·
 //! `m` message · `p` pause/resume · `s` stop · `X` kill · `[`/`]` select
@@ -36,6 +37,12 @@ use agent_tui::{
 };
 
 fn main() -> io::Result<()> {
+    let argv: Vec<String> = std::env::args().collect();
+    if argv.len() == 2 && matches!(argv[1].as_str(), "--version" | "-V") {
+        println!("agent-tui {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+
     let (profile, token) = connection_options();
     let addr = profile.address.clone();
 

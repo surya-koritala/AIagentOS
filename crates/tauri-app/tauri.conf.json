@@ -1,6 +1,6 @@
 {
   "productName": "AI Agent OS",
-  "version": "0.3.0",
+  "version": "0.4.0-rc.1",
   "identifier": "com.agentos.desktop",
   "build": {
     "frontendDist": "./ui/dist",

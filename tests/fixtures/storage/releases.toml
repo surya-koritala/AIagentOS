@@ -42,3 +42,18 @@ usage_tokens = 31
 usage_cost_micros = 375000
 tenant_id = "tenant-v030"
 kv_marker = "v0.3-kv"
+
+[[release]]
+tag = "v0.4.0-rc.1"
+source_commit = "799578afc022c6e8fa9e24517725ba726f372cef"
+sql_file = "v0.4.0-rc.1.sql"
+sql_sha256 = "c33acf4436325c01b1d22e3238d00929b1cc05e1f02822799f3267e8223966d9"
+legacy_schema_version = 7
+agent_id = "00000000-0000-0000-0000-000000000401"
+context_marker = "v0.4-rc1-context"
+memory_marker = "v0.4-rc1-memory"
+conversation_marker = "v0.4-rc1-conversation"
+usage_tokens = 41
+usage_cost_micros = 500000
+tenant_id = "tenant-v040-rc1"
+kv_marker = "v0.4-rc1-kv"

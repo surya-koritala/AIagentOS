@@ -64,6 +64,7 @@ def validate_contract(root: Path) -> list[str]:
         "governance:",
         "reproducible-linux:",
         "cmp -s",
+        "Prove shipped binaries report the exact release version",
         "scripts/build_cli_archive.py",
         "sign-runtime:",
         "cosign sign-blob",

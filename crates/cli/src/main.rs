@@ -2,6 +2,7 @@
 //!
 //! Usage:
 //!   agent                        # Interactive session
+//!   agent --version              # Print the exact build version and exit
 //!   agent --conversation ID      # Resume conversation
 //!   agent -c "do something"      # One-shot command
 //!   echo "text" | agent "prompt" # Pipe mode
@@ -101,6 +102,10 @@ async fn main() {
     // initialization. `agent policy …` validates/dry-runs a declarative policy
     // document (the SELinux checkpolicy/sesearch analogue) — see docs/POLICY.md.
     let argv: Vec<String> = std::env::args().collect();
+    if argv.len() == 2 && matches!(argv[1].as_str(), "--version" | "-V") {
+        println!("agent {}", env!("CARGO_PKG_VERSION"));
+        return;
+    }
     if argv.get(1).map(String::as_str) == Some("policy") {
         std::process::exit(policy_cmd::run(&argv));
     }

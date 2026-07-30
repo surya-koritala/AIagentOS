@@ -1,6 +1,6 @@
 [package]
 name = "agent-sdk"
-version = "0.3.0"
+version = "0.4.0-rc.1"
 edition = "2021"
 description = "Embeddable Rust SDK for building agents against the AI Agent OS kernel over its syscall server."
 license.workspace = true
@@ -8,7 +8,7 @@ rust-version.workspace = true
 
 [dependencies]
 chrono = { workspace = true }
-kernel = { path = "../kernel", version = "=0.3.0" }
+kernel = { path = "../kernel", version = "=0.4.0-rc.1" }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -19,7 +19,7 @@ uuid = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
-adapters = { path = "../adapters", version = "=0.3.0" }
+adapters = { path = "../adapters", version = "=0.4.0-rc.1" }
 wiremock = { workspace = true }
 async-trait = { workspace = true }
 rcgen = { workspace = true }

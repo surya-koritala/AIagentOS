@@ -10,6 +10,15 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
 
 ## [Unreleased]
 
+## [0.4.0-rc.1] - 2026-07-30
+
+- Prepared the first restricted Linux CLI candidate with every workspace,
+  desktop, UI, and internal dependency version locked to `0.4.0-rc.1`. All four
+  shipped binaries now provide side-effect-free `--version` and `-V` probes,
+  and the exact-tag workflow rejects an archive whose binaries do not report
+  the tagged version. The candidate remains ineligible for a production claim
+  until its signed per-tag qualification report and the separate roadmap
+  evidence are complete.
 - Added a separately scoped `vX.Y.Z-rc.N` release path for the restricted
   Ubuntu 22.04 x86_64 CLI profile. It builds all four CLI/server/TUI binaries
   twice, rejects byte drift, creates a canonical traversal-safe archive and

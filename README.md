@@ -25,12 +25,16 @@
 </p>
 
 > [!IMPORTANT]
-> **v0.3.0 is the latest stable release. The development tree is not yet a
-> production-qualified v1.0 application.** Its remaining security, isolation,
-> recovery, provider, UX, and release-governance work is tracked in the
-> [production roadmap](https://github.com/surya-koritala/AIagentOS/issues/105).
-> Use [CHANGELOG.md](CHANGELOG.md) to distinguish released behavior from
-> unreleased work.
+> **v0.3.0 is the latest stable release. v0.4.0-rc.1 is the restricted
+> Ubuntu 22.04 x86_64 CLI candidate and is not a production-qualified v1.0
+> application.** Trust that candidate only when its
+> [GitHub prerelease](https://github.com/surya-koritala/AIagentOS/releases/tag/v0.4.0-rc.1)
+> contains the signed qualification report and every artifact described in the
+> [verification and install guide](docs/LINUX_CLI_RC.md). Remaining security,
+> isolation, recovery, provider, UX, and release-governance work is tracked in
+> the [production roadmap](https://github.com/surya-koritala/AIagentOS/issues/105).
+> Use [CHANGELOG.md](CHANGELOG.md) to distinguish stable, candidate, and
+> unreleased behavior.
 
 ## What is AI Agent OS?
 

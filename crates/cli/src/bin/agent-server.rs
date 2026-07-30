@@ -8,6 +8,7 @@
 //!
 //! Usage:
 //!   agent-server \[ADDR\]               # TCP, default 127.0.0.1:7777
+//!   agent-server --version              # Print the exact build version and exit
 //!   AGENT_SERVER_UNIX=/path.sock agent-server   # Unix-domain socket instead
 //!   AGENT_SERVER_TOKEN=secret agent-server      # require auth before any syscall
 //!   AGENT_SERVER_TLS_CERT=cert.pem AGENT_SERVER_TLS_KEY=key.pem agent-server
@@ -78,10 +79,17 @@ impl TlsMaterial {
 
 #[tokio::main]
 async fn main() {
+    let argv: Vec<String> = std::env::args().collect();
+    if argv.len() == 2 && matches!(argv[1].as_str(), "--version" | "-V") {
+        println!("agent-server {}", env!("CARGO_PKG_VERSION"));
+        return;
+    }
+
     // Structured logging first, so kernel init + every later log line emits.
     logging::init_logging();
-    let addr = std::env::args()
-        .nth(1)
+    let addr = argv
+        .get(1)
+        .cloned()
         .unwrap_or_else(|| "127.0.0.1:7777".to_string());
     let unix_path = std::env::var("AGENT_SERVER_UNIX").ok();
     let token = std::env::var("AGENT_SERVER_TOKEN")

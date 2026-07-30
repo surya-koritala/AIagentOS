@@ -28,8 +28,17 @@ env:
   AGENTOS_RELEASE_CANDIDATE: ${{ inputs.release_candidate }}
 
 jobs:
+  qualification-plan:
+    name: Fail-closed game-day dispatch preflight
+    uses: ./.github/workflows/protected-qualification-plan.yml
+    with:
+      profile: game-day
+      enabled: ${{ vars.AGENTOS_CAPACITY_QUALIFICATION_ENABLED }}
+
   exact-release-candidate-game-day:
     name: Exact-release-candidate human game day
+    needs: qualification-plan
+    if: needs.qualification-plan.outputs.ready == 'true'
     runs-on: [self-hosted, linux, x64, agentos-capacity]
     timeout-minutes: 15
     environment: capacity-qualification

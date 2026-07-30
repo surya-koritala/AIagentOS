@@ -14,6 +14,7 @@
   - [Context Pressure](./context-pressure.md)
   - [Operations API](./operations-api.md)
   - [Production Observability](./observability.md)
+  - [Protected Qualification Infrastructure](./protected-qualification-infrastructure.md)
   - [Capacity Qualification](./capacity-qualification.md)
   - [Resilience Qualification](./resilience-qualification.md)
   - [Host Storage Fault Qualification](./host-storage-fault-qualification.md)

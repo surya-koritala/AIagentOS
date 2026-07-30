@@ -1,8 +1,9 @@
 name: Resource soak qualification
 
 # This is intentionally manual and pinned to a repository-owned stable Linux
-# host. The checked-in profile runs for 24 hours; a missing runner is not a
-# pass, and smoke artifacts are never accepted as production proof.
+# host. Disabled infrastructure fails in the hosted preflight; after explicit
+# enablement, a missing runner remains queued/not_run. The checked-in profile
+# runs for 24 hours, and smoke artifacts are never production proof.
 on:
   workflow_dispatch:
     inputs:
@@ -24,8 +25,17 @@ env:
   AGENTOS_QUALIFICATION_ENVIRONMENT: ${{ inputs.environment_id }}
 
 jobs:
+  qualification-plan:
+    name: Fail-closed resource-soak dispatch preflight
+    uses: ./.github/workflows/protected-qualification-plan.yml
+    with:
+      profile: resource-soak
+      enabled: ${{ vars.AGENTOS_CAPACITY_QUALIFICATION_ENABLED }}
+
   target-resource-soak:
     name: Exact-commit 24-hour resource and leak soak
+    needs: qualification-plan
+    if: needs.qualification-plan.outputs.ready == 'true'
     runs-on: [self-hosted, linux, x64, agentos-capacity]
     timeout-minutes: 1500
     environment: capacity-qualification

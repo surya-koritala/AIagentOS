@@ -1,0 +1,79 @@
+name: Protected qualification dispatch preflight
+
+on:
+  workflow_call:
+    inputs:
+      profile:
+        description: Checked-in protected qualification profile ID
+        required: true
+        type: string
+      enabled:
+        description: Exact lowercase true or false repository enable flag
+        required: false
+        default: ""
+        type: string
+    outputs:
+      ready:
+        description: Whether protected dispatch was explicitly enabled
+        value: ${{ jobs.qualification-plan.outputs.ready }}
+
+permissions:
+  contents: read
+
+jobs:
+  qualification-plan:
+    name: Fail-closed protected qualification preflight
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      ready: ${{ steps.plan.outputs.ready }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Build the exact-source protected dispatch plan
+        id: plan
+        env:
+          QUALIFICATION_PROFILE: ${{ inputs.profile }}
+          QUALIFICATION_ENABLED: ${{ inputs.enabled }}
+        run: |
+          mkdir -p target/qualification
+          python3 scripts/protected_qualification_plan.py \
+            --profile "$QUALIFICATION_PROFILE" \
+            --enabled "$QUALIFICATION_ENABLED" \
+            --commit "$GITHUB_SHA" \
+            --output target/qualification/protected-qualification-plan.json \
+            --github-output "$GITHUB_OUTPUT"
+      - name: Publish bounded preflight summary
+        if: always()
+        run: |
+          report=target/qualification/protected-qualification-plan.json
+          if test -f "$report"; then
+            {
+              printf '### Protected qualification dispatch preflight\n\n'
+              printf -- '- Commit: `%s`\n' "$GITHUB_SHA"
+              printf -- '- Profile: `%s`\n' "$(jq -r .profile "$report")"
+              printf -- '- Status: `%s`\n' "$(jq -r .status "$report")"
+              printf -- '- Environment: `%s`\n' \
+                "$(jq -r .required_environment "$report")"
+              printf -- '- Runner labels: `%s`\n' \
+                "$(jq -r '.required_runner_labels | join(",")' "$report")"
+              printf -- '- Infrastructure verified: `%s`\n' \
+                "$(jq -r .infrastructure_verified "$report")"
+              printf -- '- Production claim allowed: `%s`\n' \
+                "$(jq -r .production_claim_allowed "$report")"
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            printf '### Protected qualification dispatch preflight\n\n- Status: `failed before report publication`\n' \
+              >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: protected-qualification-plan-${{ inputs.profile }}-${{ github.sha }}
+          path: target/qualification/protected-qualification-plan.json
+          if-no-files-found: warn
+          retention-days: 30
+      - name: Require explicit protected dispatch enablement
+        run: >-
+          test
+          "$(jq -r .status target/qualification/protected-qualification-plan.json)"
+          = "ready"

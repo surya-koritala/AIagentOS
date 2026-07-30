@@ -1651,8 +1651,112 @@ fn release_blocking_workflows_keep_their_security_contract() {
         );
     }
 
+    let protected_plan = read_workspace_file("scripts/protected_qualification_plan.py");
+    let protected_preflight =
+        read_workspace_file(".github/workflows/protected-qualification-plan.yml");
+    for proof in [
+        "protected_external_dispatch_plan",
+        "dispatch_configuration_only",
+        "\"infrastructure_verified\": False",
+        "\"production_claim_allowed\": False",
+        "AGENTOS_CAPACITY_QUALIFICATION_ENABLED",
+        "AGENTOS_MODEL_QUALIFICATION_ENABLED",
+        "AGENTOS_DESTRUCTIVE_STORAGE_QUALIFICATION_ENABLED",
+        "AGENTOS_EXTERNAL_DATA_QUALIFICATION_ENABLED",
+        "capacity-qualification",
+        "model-qualification",
+        "destructive-storage-qualification",
+        "external-data-qualification",
+        "agentos-capacity",
+        "agentos-model",
+        "agentos-destructive-storage",
+        "agentos-external-data",
+    ] {
+        assert!(
+            protected_plan.contains(proof),
+            "protected qualification plan lost {proof:?}"
+        );
+    }
+    for proof in [
+        "workflow_call:",
+        "runs-on: ubuntu-latest",
+        "protected_qualification_plan.py",
+        "protected-qualification-plan-${{ inputs.profile }}-${{ github.sha }}",
+        "retention-days: 30",
+        "Require explicit protected dispatch enablement",
+    ] {
+        assert!(
+            protected_preflight.contains(proof),
+            "protected qualification preflight lost {proof:?}"
+        );
+    }
+    assert!(
+        !protected_preflight.contains("secrets.") && !protected_preflight.contains("vars."),
+        "hosted preflight must receive only the caller's non-secret enable input"
+    );
+    for (workflow, profile, enable_variable) in [
+        (
+            ".github/workflows/capacity-qualification.yml",
+            "capacity-baseline",
+            "AGENTOS_CAPACITY_QUALIFICATION_ENABLED",
+        ),
+        (
+            ".github/workflows/resource-soak-qualification.yml",
+            "resource-soak",
+            "AGENTOS_CAPACITY_QUALIFICATION_ENABLED",
+        ),
+        (
+            ".github/workflows/target-remote-backup-qualification.yml",
+            "target-remote-backup",
+            "AGENTOS_CAPACITY_QUALIFICATION_ENABLED",
+        ),
+        (
+            ".github/workflows/release-slo-qualification.yml",
+            "release-slo",
+            "AGENTOS_CAPACITY_QUALIFICATION_ENABLED",
+        ),
+        (
+            ".github/workflows/game-day-qualification.yml",
+            "game-day",
+            "AGENTOS_CAPACITY_QUALIFICATION_ENABLED",
+        ),
+        (
+            ".github/workflows/on-device-qualification.yml",
+            "on-device",
+            "AGENTOS_MODEL_QUALIFICATION_ENABLED",
+        ),
+        (
+            ".github/workflows/storage-profile-qualification.yml",
+            "storage-profile",
+            "AGENTOS_DESTRUCTIVE_STORAGE_QUALIFICATION_ENABLED",
+        ),
+        (
+            ".github/workflows/external-deletion-qualification.yml",
+            "external-deletion",
+            "AGENTOS_EXTERNAL_DATA_QUALIFICATION_ENABLED",
+        ),
+    ] {
+        let contents = read_workspace_file(workflow);
+        for proof in [
+            "uses: ./.github/workflows/protected-qualification-plan.yml",
+            "needs: qualification-plan",
+            "if: needs.qualification-plan.outputs.ready == 'true'",
+            profile,
+            enable_variable,
+        ] {
+            assert!(
+                contents.contains(proof),
+                "{workflow} lost protected preflight contract {proof:?}"
+            );
+        }
+    }
+
     let target_remote =
         read_workspace_file(".github/workflows/target-remote-backup-qualification.yml");
+    let target_remote_protected_job = target_remote
+        .split_once("  exact-release-candidate-target-recovery:")
+        .expect("target remote workflow lost protected job")
+        .1;
     assert!(
         target_remote.contains("workflow_dispatch:")
             && !target_remote.contains("pull_request:")
@@ -1678,6 +1782,11 @@ fn release_blocking_workflows_keep_their_security_contract() {
             "target remote-backup workflow lost {proof:?}"
         );
     }
+    assert!(
+        target_remote_protected_job
+            .contains("AWS_ACCESS_KEY_ID: ${{ secrets.AGENTOS_TARGET_REMOTE_ACCESS_KEY_ID }}"),
+        "target remote credentials must remain scoped to the protected self-hosted job"
+    );
 
     let storage_profile =
         read_workspace_file(".github/workflows/storage-profile-qualification.yml");
@@ -1876,6 +1985,7 @@ fn release_blocking_workflows_keep_their_security_contract() {
         ".github/workflows/live-provider-qualification.yml",
         ".github/workflows/linux-cli-rc.yml",
         ".github/workflows/on-device-qualification.yml",
+        ".github/workflows/protected-qualification-plan.yml",
         ".github/workflows/release.yml",
     ] {
         for line in read_workspace_file(workflow).lines() {

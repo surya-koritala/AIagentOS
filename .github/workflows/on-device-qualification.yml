@@ -3,7 +3,8 @@ name: On-device GGUF qualification
 # This protected workflow qualifies one provisioned model/tokenizer pair against
 # one exact tagged release candidate. It retains only bounded metadata and
 # digests: paths, prompts, generated text, credentials, and weights are never
-# uploaded.
+# uploaded. Disabled model infrastructure fails in a hosted preflight before
+# the protected self-hosted job is queued.
 on:
   workflow_dispatch:
     inputs:
@@ -64,8 +65,17 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  qualification-plan:
+    name: Fail-closed real-model dispatch preflight
+    uses: ./.github/workflows/protected-qualification-plan.yml
+    with:
+      profile: on-device
+      enabled: ${{ vars.AGENTOS_MODEL_QUALIFICATION_ENABLED }}
+
   exact-release-candidate:
     name: Exact-RC real GGUF CPU evidence
+    needs: qualification-plan
+    if: needs.qualification-plan.outputs.ready == 'true'
     runs-on: [self-hosted, linux, x64, agentos-model]
     timeout-minutes: 45
     environment: model-qualification

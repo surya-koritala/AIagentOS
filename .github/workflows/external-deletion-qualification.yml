@@ -29,8 +29,17 @@ env:
   AGENTOS_STORAGE_PROFILE_ID: single-node-linux-rootless-container-cli
 
 jobs:
+  qualification-plan:
+    name: Fail-closed external-data dispatch preflight
+    uses: ./.github/workflows/protected-qualification-plan.yml
+    with:
+      profile: external-deletion
+      enabled: ${{ vars.AGENTOS_EXTERNAL_DATA_QUALIFICATION_ENABLED }}
+
   exact-release-candidate-external-deletion:
     name: Exact-RC external deletion and retention evidence
+    needs: qualification-plan
+    if: needs.qualification-plan.outputs.ready == 'true'
     runs-on: [self-hosted, linux, x64, agentos-external-data]
     timeout-minutes: 15
     environment: external-data-qualification

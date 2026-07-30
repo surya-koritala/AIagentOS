@@ -19,8 +19,16 @@ from phase1_promotion_qualification import (  # noqa: E402
     QualificationError,
     REVIEW_CHECK_IDS,
     REVIEW_CLASS,
+    WORKFLOW_PROVENANCE_CLASS,
     evaluate,
     main,
+)
+from phase1_workflow_provenance import (  # noqa: E402
+    PLAN_CLASS,
+    REPORT_CLASS as WORKFLOW_PROVENANCE_REPORT_CLASS,
+    _artifact_name,
+    build_plan,
+    verify_provenance,
 )
 
 
@@ -231,6 +239,7 @@ class PromotionWorkspace:
         self.evidence_dir.mkdir()
         self.campaign_path = self.root / "campaign.json"
         self.review_path = self.root / "review.json"
+        self.provenance_path = self.root / "workflow-provenance.json"
         self.output_path = self.root / "decision.json"
         self.reports = {
             "linux-cli-rc": linux_cli_report(),
@@ -327,9 +336,70 @@ class PromotionWorkspace:
             "review_attestation_sha256": "c" * 64,
         }
 
+    def make_workflow_provenance(self, campaign_sha):
+        runs = {}
+        artifacts = []
+        for artifact in self.campaign["artifacts"]:
+            evidence_id = artifact["evidence_id"]
+            key = (
+                artifact["workflow_run_id"],
+                artifact["workflow_run_attempt"],
+            )
+            run = runs.setdefault(
+                key,
+                {
+                    "run_id": key[0],
+                    "run_attempt": key[1],
+                    "workflow_path": artifact["workflow_path"],
+                    "head_sha": COMMIT,
+                    "workflow_updated_at": artifact["workflow_completed_at"],
+                    "evidence_ids": [],
+                },
+            )
+            run["evidence_ids"].append(evidence_id)
+            artifacts.append(
+                {
+                    "evidence_id": evidence_id,
+                    "run_id": key[0],
+                    "run_attempt": key[1],
+                    "artifact_name": _artifact_name(
+                        evidence_id,
+                        release_candidate=RELEASE_CANDIDATE,
+                        commit=COMMIT,
+                    ),
+                    "report_sha256": artifact["sha256"],
+                }
+            )
+        ordered_runs = [runs[key] for key in sorted(runs)]
+        for run in ordered_runs:
+            run["evidence_ids"].sort()
+        return {
+            "schema_version": 1,
+            "qualification_class": WORKFLOW_PROVENANCE_CLASS,
+            "generated_at": "2026-05-02T00:00:00Z",
+            "repository": "surya-koritala/AIagentOS",
+            "release_candidate": RELEASE_CANDIDATE,
+            "source": {"commit": COMMIT, "dirty": False},
+            "campaign_sha256": campaign_sha,
+            "run_count": len(ordered_runs),
+            "artifact_count": len(artifacts),
+            "runs": ordered_runs,
+            "artifacts": artifacts,
+            "github_workflow_provenance_verified": True,
+            "github_artifact_bytes_verified": True,
+            "production_claim_allowed": False,
+        }
+
     def write_campaign_and_review(self, mutate_review=None):
         self.campaign_path.write_bytes(encoded(self.campaign))
-        review = self.make_review(digest(self.campaign_path))
+        campaign_sha = digest(self.campaign_path)
+        try:
+            provenance = self.make_workflow_provenance(campaign_sha)
+        except QualificationError:
+            provenance = None
+        if provenance is not None:
+            self.provenance_path.write_bytes(encoded(provenance))
+        review = self.make_review(campaign_sha)
         if mutate_review is not None:
             mutate_review(review)
         self.review_path.write_bytes(encoded(review))
@@ -348,10 +418,68 @@ class PromotionWorkspace:
         return evaluate(
             self.campaign_path,
             self.review_path,
+            self.provenance_path,
             self.evidence_dir,
             release_candidate=RELEASE_CANDIDATE,
             expected_commit=COMMIT,
             expected_environment=TARGET_ENVIRONMENT,
+        )
+
+    def write_github_provenance_inputs(self):
+        plan = build_plan(
+            self.campaign_path,
+            release_candidate=RELEASE_CANDIDATE,
+            expected_commit=COMMIT,
+            expected_environment=TARGET_ENVIRONMENT,
+            expected_linux_cli_run_id=self.linux_cli_run_id(),
+        )
+        plan_path = self.root / "provenance-plan.json"
+        plan_path.write_bytes(encoded(plan))
+        run_dir = self.root / "github-runs"
+        artifact_dir = self.root / "github-artifacts"
+        run_dir.mkdir()
+        artifact_dir.mkdir()
+        for run in plan["runs"]:
+            metadata = {
+                "id": run["run_id"],
+                "run_attempt": run["run_attempt"],
+                "path": f"{run['workflow_path']}@refs/tags/{RELEASE_CANDIDATE}",
+                "head_sha": run["head_sha"],
+                "status": "completed",
+                "conclusion": "success",
+                "updated_at": run["workflow_updated_at"],
+                "repository": {"full_name": "surya-koritala/AIagentOS"},
+                "head_repository": {"full_name": "surya-koritala/AIagentOS"},
+            }
+            (run_dir / run["metadata_file"]).write_bytes(encoded(metadata))
+        for artifact in plan["artifacts"]:
+            destination = artifact_dir / artifact["download_subdir"]
+            destination.mkdir()
+            source = self.evidence_dir / artifact["report_file"]
+            (destination / artifact["report_file"]).write_bytes(source.read_bytes())
+        return plan, plan_path, run_dir, artifact_dir
+
+    def linux_cli_run_id(self):
+        return next(
+            artifact["workflow_run_id"]
+            for artifact in self.campaign["artifacts"]
+            if artifact["evidence_id"] == "linux-cli-rc"
+        )
+
+    def verify_github_provenance(
+        self, plan_path, run_dir, artifact_dir
+    ):
+        return verify_provenance(
+            self.campaign_path,
+            plan_path,
+            run_dir,
+            artifact_dir,
+            self.evidence_dir,
+            repository="surya-koritala/AIagentOS",
+            release_candidate=RELEASE_CANDIDATE,
+            expected_commit=COMMIT,
+            expected_environment=TARGET_ENVIRONMENT,
+            expected_linux_cli_run_id=self.linux_cli_run_id(),
         )
 
 
@@ -372,9 +500,100 @@ class Phase1PromotionQualificationTests(unittest.TestCase):
             report["evidence"]["artifact_count"],
             len(BASE_EVIDENCE) + len(PROMOTED_PROVIDERS),
         )
+        self.assertTrue(
+            report["evidence"]["github_workflow_provenance_verified"]
+        )
+        self.assertTrue(report["evidence"]["github_artifact_bytes_verified"])
         encoded_report = json.dumps(report)
         self.assertNotIn("operator-1", encoded_report)
         self.assertNotIn("independent-reviewer-1", encoded_report)
+
+    def test_github_provenance_plan_and_downloaded_reports_are_exact(self):
+        workspace = self.workspace()
+        plan, plan_path, run_dir, artifact_dir = (
+            workspace.write_github_provenance_inputs()
+        )
+        report = workspace.verify_github_provenance(
+            plan_path, run_dir, artifact_dir
+        )
+        self.assertEqual(plan["qualification_class"], PLAN_CLASS)
+        self.assertEqual(
+            report["qualification_class"],
+            WORKFLOW_PROVENANCE_REPORT_CLASS,
+        )
+        self.assertEqual(report["run_count"], len(plan["runs"]))
+        self.assertEqual(report["artifact_count"], len(plan["artifacts"]))
+        self.assertTrue(report["github_workflow_provenance_verified"])
+        self.assertTrue(report["github_artifact_bytes_verified"])
+        self.assertFalse(report["production_claim_allowed"])
+
+    def test_github_provenance_rejects_forged_run_metadata(self):
+        mutations = [
+            lambda metadata: metadata.__setitem__("run_attempt", 2),
+            lambda metadata: metadata.__setitem__(
+                "path", ".github/workflows/ci.yml@main"
+            ),
+            lambda metadata: metadata.__setitem__("head_sha", OTHER_COMMIT),
+            lambda metadata: metadata.__setitem__("status", "in_progress"),
+            lambda metadata: metadata.__setitem__("conclusion", "failure"),
+            lambda metadata: metadata.__setitem__(
+                "updated_at", "2026-05-01T12:00:01Z"
+            ),
+            lambda metadata: metadata["repository"].__setitem__(
+                "full_name", "attacker/fork"
+            ),
+        ]
+        for mutation in mutations:
+            with self.subTest(mutation=mutation):
+                workspace = self.workspace()
+                _, plan_path, run_dir, artifact_dir = (
+                    workspace.write_github_provenance_inputs()
+                )
+                metadata_path = sorted(run_dir.iterdir())[0]
+                metadata = json.loads(metadata_path.read_text())
+                mutation(metadata)
+                metadata_path.write_bytes(encoded(metadata))
+                with self.assertRaises(QualificationError):
+                    workspace.verify_github_provenance(
+                        plan_path, run_dir, artifact_dir
+                    )
+
+    def test_github_provenance_rejects_wrong_bundle_run_and_artifact_bytes(self):
+        workspace = self.workspace()
+        with self.assertRaisesRegex(QualificationError, "signed bundle run"):
+            build_plan(
+                workspace.campaign_path,
+                release_candidate=RELEASE_CANDIDATE,
+                expected_commit=COMMIT,
+                expected_environment=TARGET_ENVIRONMENT,
+                expected_linux_cli_run_id=workspace.linux_cli_run_id() + 1,
+            )
+
+        workspace = self.workspace()
+        plan, plan_path, run_dir, artifact_dir = (
+            workspace.write_github_provenance_inputs()
+        )
+        artifact = plan["artifacts"][0]
+        report_path = (
+            artifact_dir
+            / artifact["download_subdir"]
+            / artifact["report_file"]
+        )
+        report_path.write_bytes(report_path.read_bytes() + b" ")
+        with self.assertRaisesRegex(QualificationError, "bytes differ"):
+            workspace.verify_github_provenance(
+                plan_path, run_dir, artifact_dir
+            )
+
+        workspace = self.workspace()
+        _, plan_path, run_dir, artifact_dir = (
+            workspace.write_github_provenance_inputs()
+        )
+        (run_dir / "unexpected.json").write_text("{}", encoding="utf-8")
+        with self.assertRaisesRegex(QualificationError, "inventory differs"):
+            workspace.verify_github_provenance(
+                plan_path, run_dir, artifact_dir
+            )
 
     def test_missing_extra_reordered_and_duplicate_artifacts_fail_closed(self):
         mutations = []
@@ -559,6 +778,29 @@ class Phase1PromotionQualificationTests(unittest.TestCase):
         with self.assertRaisesRegex(QualificationError, "predates"):
             workspace.evaluate()
 
+    def test_workflow_provenance_must_bind_campaign_runs_and_artifact_bytes(self):
+        mutations = [
+            lambda report: report.__setitem__("campaign_sha256", "d" * 64),
+            lambda report: report["runs"][0].__setitem__("head_sha", OTHER_COMMIT),
+            lambda report: report["artifacts"][0].__setitem__(
+                "report_sha256", "d" * 64
+            ),
+            lambda report: report.__setitem__(
+                "github_workflow_provenance_verified", False
+            ),
+            lambda report: report.__setitem__(
+                "github_artifact_bytes_verified", False
+            ),
+        ]
+        for mutation in mutations:
+            with self.subTest(mutation=mutation):
+                workspace = self.workspace()
+                report = json.loads(workspace.provenance_path.read_text())
+                mutation(report)
+                workspace.provenance_path.write_bytes(encoded(report))
+                with self.assertRaises(QualificationError):
+                    workspace.evaluate()
+
         workspace = self.workspace()
         workspace.write_campaign_and_review(
             lambda review: review.__setitem__("campaign_sha256", "d" * 64)
@@ -594,6 +836,8 @@ class Phase1PromotionQualificationTests(unittest.TestCase):
                 str(workspace.campaign_path),
                 "--review",
                 str(workspace.review_path),
+                "--workflow-provenance",
+                str(workspace.provenance_path),
                 "--evidence-dir",
                 str(workspace.evidence_dir),
                 "--release-candidate",
@@ -628,6 +872,19 @@ class Phase1PromotionQualificationTests(unittest.TestCase):
         self.assertIn(
             "python3 scripts/phase1_promotion_qualification.py",
             promotion_workflow,
+        )
+        self.assertIn(
+            "python3 scripts/phase1_workflow_provenance.py",
+            promotion_workflow,
+        )
+        self.assertIn(
+            "actions/runs/${run_id}/attempts/${run_attempt}",
+            promotion_workflow,
+        )
+        self.assertIn('gh run download "$run_id"', promotion_workflow)
+        self.assertIn("--workflow-provenance", promotion_workflow)
+        self.assertIn(
+            "phase1-workflow-provenance.json", promotion_workflow
         )
         self.assertIn("--require-eligible", promotion_workflow)
         self.assertIn(

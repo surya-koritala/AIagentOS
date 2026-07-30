@@ -6336,6 +6336,21 @@ mod tests {
         )
         .expect("exact active quorum ownership revision");
 
+        assert_eq!(
+            verify_quorum_destination_authority_view(
+                &view,
+                &uuid::Uuid::new_v4().to_string(),
+                &cluster_id,
+                &owner_node_id,
+                7,
+                13,
+                11,
+                proof_expires_at,
+            )
+            .unwrap_err()
+            .kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
         assert!(verify_quorum_destination_authority_view(
             &view,
             &agent_id,
@@ -6438,6 +6453,44 @@ mod tests {
             WireErrorCode::classify(&message),
             (WireErrorCode::Internal, false)
         );
+
+        let log_id = openraft::LogId::new(openraft::CommittedLeaderId::new(1_u64, 1_u64), 1_u64);
+        for (reason, expected_category) in [
+            (
+                AuthorityRejection::InvalidCommand,
+                "invalid replicated authority command",
+            ),
+            (
+                AuthorityRejection::Conflict,
+                "replicated authority conflict",
+            ),
+            (
+                AuthorityRejection::CapacityReached,
+                "replicated authority unavailable",
+            ),
+        ] {
+            let SyscallReply::Error { message } =
+                authority_command_error(AuthorityResponse::Rejected {
+                    operation_id: uuid::Uuid::new_v4().to_string(),
+                    sequence: 2,
+                    log_id,
+                    reason,
+                    message: "regression".into(),
+                })
+            else {
+                panic!("authority rejection must use the ordinary error boundary");
+            };
+            assert_eq!(message, format!("{expected_category}: regression"));
+        }
+        let SyscallReply::Error { message } =
+            authority_command_error(AuthorityResponse::MetadataApplied {
+                sequence: 3,
+                log_id,
+            })
+        else {
+            panic!("unexpected authority responses must use the ordinary error boundary");
+        };
+        assert!(message.starts_with("replicated authority returned an unexpected response:"));
     }
 
     #[test]
@@ -10865,6 +10918,60 @@ profile = "standard"
         );
         assert!(!stream.contains("private prompt"));
 
+        let redacted_requests = [
+            format!(
+                "{:?}",
+                Syscall::MemoryStore {
+                    agent_id: "agent".into(),
+                    content: "private memory".into(),
+                    category: None,
+                }
+            ),
+            format!(
+                "{:?}",
+                Syscall::StoragePut {
+                    agent_id: "agent".into(),
+                    key: "key".into(),
+                    value: "private storage value".into(),
+                }
+            ),
+            format!(
+                "{:?}",
+                Syscall::LoadPackage {
+                    manifest_toml: "private manifest".into(),
+                }
+            ),
+            format!(
+                "{:?}",
+                Syscall::PublishPackage {
+                    archive_hex: "private archive".into(),
+                }
+            ),
+            format!(
+                "{:?}",
+                Syscall::FencedAgentMutation {
+                    agent_id: "agent".into(),
+                    proof: AgentMutationFenceProof {
+                        cluster_id: "cluster".into(),
+                        owner_node_id: "owner".into(),
+                        authority_term: 1,
+                        authority_generation: 1,
+                        fencing_token: 1,
+                        proof_expires_at: chrono::Utc::now(),
+                    },
+                    mutation: Box::new(Syscall::StoragePut {
+                        agent_id: "agent".into(),
+                        key: "key".into(),
+                        value: "private fenced mutation".into(),
+                    }),
+                }
+            ),
+        ];
+        for request in redacted_requests {
+            assert!(request.contains("[REDACTED]"));
+            assert!(!request.contains("private"));
+        }
+
         let stream_event = format!(
             "{:?}",
             SyscallReply::StreamEvent {
@@ -10876,6 +10983,34 @@ profile = "standard"
             }
         );
         assert!(!stream_event.contains("private completion"));
+
+        let redacted_replies = [
+            format!(
+                "{:?}",
+                SyscallReply::Message {
+                    content: "private message".into(),
+                    tool_calls: 0,
+                    tokens: 0,
+                }
+            ),
+            format!(
+                "{:?}",
+                SyscallReply::ToolResult {
+                    data: serde_json::json!({"secret": "private tool result"}),
+                }
+            ),
+            format!("{:?}", SyscallReply::Memory { facts: Vec::new() }),
+            format!(
+                "{:?}",
+                SyscallReply::PackageArchive {
+                    archive_hex: "private package archive".into(),
+                }
+            ),
+        ];
+        for reply in redacted_replies {
+            assert!(reply.contains("[REDACTED]"));
+            assert!(!reply.contains("private"));
+        }
 
         let reply = format!(
             "{:?}",

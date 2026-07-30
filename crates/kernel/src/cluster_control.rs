@@ -3009,7 +3009,7 @@ pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
     hex_encode(ring::digest::digest(&ring::digest::SHA256, bytes).as_ref())
 }
 
-fn hex_encode(bytes: &[u8]) -> String {
+pub(crate) fn hex_encode(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 

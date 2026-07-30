@@ -36,10 +36,16 @@ connections verify the exact member server leaf, inbound connections bind the
 exact client leaf to the claimed stable node ID, and the authenticated source
 must match the vote identity inside each RPC. Configuration rejects duplicate
 endpoints, certificate fingerprints, and identity keys. The internal protocol
-also carries authenticated authority writes and linearizable reads for
-follower forwarding. The leader replaces a forwarded mutation's proposed
-timestamp with its own clock and rejects internal initialization/barrier/clock
-commands on that path, so a follower cannot force a future authority time. A
+also carries delegated authority writes and linearizable reads for follower
+forwarding. Every external write includes a 30-second, domain-separated
+Ed25519 proof from the source node's durable application identity. The proof
+binds the caller-stable operation UUID, semantic command digest, canonical
+system-node actor, issuance, and expiration. Both the origin and leader require
+that identity to match the authenticated Raft source and an active replicated
+application member. The leader then replaces only the forwarded mutation's
+proposed timestamp with its own clock and rejects internal
+initialization/barrier/clock commands on that path, so a follower cannot force a
+future authority time. A
 three-node regression proves election, application
 state replication, majority failover, follower forwarding, durable restart
 catch-up, old-term fencing, and that authority writes fail closed without a
@@ -47,13 +53,15 @@ quorum. Separate regressions reject
 certificate/node spoofing, embedded vote spoofing, wrong-but-CA-valid server
 leaves, oversized frames, and invalid bounds.
 
-Configured Raft voters are still fully trusted forwarders. The forwarded
-command records the authenticated actor selected by the receiving application
-node, but it does not yet carry an end-to-end operator credential or delegated
-principal proof that the leader can independently verify. A compromised voter
-must therefore be treated as a control-plane trust breach; proving that a
-compromised node cannot forge tenant/operator authority remains an unchecked
-#122 requirement.
+Configured Raft peers can no longer forward a bare external command or claim
+another node's actor: the leader independently verifies the application-node
+delegation described above. The currently supported cluster-authority surface
+is system-scoped, so this proof delegates a system-node principal rather than
+an end-user API-key/session principal. A host compromise that exposes both the
+Raft and application private keys can still act as that system node, and there
+is not yet a tenant credential or external operator signature that the quorum
+can validate independently. Compromised-host isolation and end-user
+operator/tenant delegation therefore remain unchecked #122 requirements.
 
 `agent-server` constructs and owns this runtime when `[cluster_raft].enabled`
 is true. Startup reads bounded no-follow PEM inputs, requires owner-only private
@@ -128,10 +136,14 @@ boundary. Proof installation also rejects an expiry more than the maximum
 five-minute lease plus 30 seconds ahead of the destination clock, and mutation
 admission fails if the clock moves behind the fence's installation time. This
 gives a partitioned destination a bounded local stop condition and permanently
-fences a term after a newer term is installed. Proof installation remains a
-system-scoped authenticated control operation rather than a self-contained
-authority signature, so compromising a trusted workload/control client remains
-inside the current control-plane threat boundary.
+fences a term after a newer term is installed. Before a quorum-enabled
+destination installs or retires a fence, it performs its own linearizable
+authority read and requires the exact active
+cluster/owner/term/generation/token/expiry revision. The presenting client is
+therefore no longer the source of truth for installation. This is online
+quorum verification, not a self-contained offline quorum certificate:
+installation fails when no majority can serve the read, and a standalone
+authority retains the legacy trusted-system path.
 
 Each workload node owns a separate SQLite database under the existing
 single-process storage lease. Agent state is not replicated between nodes.
@@ -311,11 +323,11 @@ paths are rejected.
 
 | Object | System of record now | Current consistency | Production requirement |
 |---|---|---|---|
-| Cluster identity and membership | Replicated authority state when `[cluster_raft]` is enabled; designated SQLite authority otherwise | Enabled mode commits mutations through a majority, forwards followers to the leader, and uses linearizable reads; application leaves use bounded prepare/activate/finalize trust generations; voter changes use learner catch-up and joint consensus; separate digest-pinned transport-trust generations add/remove learners and rotate exact peer leaves/CA roots | End-to-end delegated operator/tenant proof, live administration, and external partition/clock qualification |
+| Cluster identity and membership | Replicated authority state when `[cluster_raft]` is enabled; designated SQLite authority otherwise | Enabled mode commits mutations through a majority, signs external forwarding with a short-lived application-node delegation, binds the signer to the authenticated Raft source and active membership, and uses linearizable reads; application leaves use bounded prepare/activate/finalize trust generations; voter changes use learner catch-up and joint consensus; separate digest-pinned transport-trust generations add/remove learners and rotate exact peer leaves/CA roots | End-user operator/tenant proof beyond the system-node principal, live administration, compromised-host isolation, and external partition/clock qualification |
 | Node identity | Node-local Ed25519 key plus authority membership certificate fingerprint | Stable across restart; fresh challenges sign application-listener prepare and activation; candidate and previous leaf acceptance expire against replicated time; Raft peer leaves and roots use separately bounded trust epochs | Independent compromised-node and multi-host partition/clock qualification |
 | Node availability and placement profile | Node-local SQLite database | Generation-fenced on one node; discovery reads a point-in-time value | Signed or quorum-observed liveness/capacity with staleness bounds |
 | Agent identity | Authority reservation plus owning-node SQLite database | Managed creation reserves one UUID before exact destination creation; duplicates cannot overwrite a local agent | Quorum-allocated immutable identity and migration-aware placement record |
-| Agent ownership and routing | Quorum authority lease registry in enabled mode, destination fence tombstones, plus `ClusterClient` in-memory routes | Ownership mutations and reads are quorum-backed in enabled mode; authority-discovered clients reserve, pre-fence, create, and publish exact routes; paginated reconciliation repairs or safely retires partial creation; every mutation revalidates exact term/generation/token/expiry agreement; expiry stops new destination admission; opt-in maintenance renews idle routes; a per-agent admission barrier prevents fence changes or expiry checks from crossing admitted work | Self-contained authority authentication at the destination, externally qualified partition/clock bounds, and migration admission |
+| Agent ownership and routing | Quorum authority lease registry in enabled mode, destination fence tombstones, plus `ClusterClient` in-memory routes | Ownership mutations and reads are quorum-backed in enabled mode; a destination linearly confirms the exact active revision before fence install/retire; authority-discovered clients reserve, pre-fence, create, and publish exact routes; paginated reconciliation repairs or safely retires partial creation; every mutation revalidates exact term/generation/token/expiry agreement; expiry stops new destination admission; opt-in maintenance renews idle routes; a per-agent admission barrier prevents fence changes or expiry checks from crossing admitted work | Offline quorum certificate or explicitly online-only production contract, externally qualified partition/clock bounds, and migration admission |
 | Agent state and checkpoints | Owning node SQLite database | Transactional on one node; no cross-node replica or migration transaction | Checkpoint/handoff protocol with one committed owner, rollback point, and side-effect boundary |
 | Package metadata and trust roots | Node-local package registry and policy | Transactional per node; no cluster convergence guarantee | Versioned trust epoch distributed atomically or by a documented monotonic convergence protocol |
 | Authorization policy | Node-local kernel configuration and durable policy state | Enforced consistently across local entry points; not synchronized cluster-wide | Tenant policy epoch included in placement and mutation admission |
@@ -381,7 +393,7 @@ paths are rejected.
 |---|---|---|
 | Membership authority loss | Enabled mode elects a replacement while a majority remains; a minority or isolated old leader rejects authority writes and linearizable reads; exact voter and transport-trust changes are restart-safe | Live administration plus externally qualified partition/latency behavior |
 | Workload node loss | Calls to that node fail; another node must not recreate or resume its agents automatically; authority leases expire but workload state stays on the failed node | Durable replica/checkpoint and explicit recovery policy |
-| Network partition | Only the authority majority can mutate membership/ownership. A destination admits only its exact installed term/generation/token/expiry and stops new admission at expiry; an already-admitted operation retains its guard through completion | Self-contained authority authentication at the destination plus external partition, delay, and clock qualification |
+| Network partition | Only the authority majority can mutate membership/ownership. Fence installation/retirement requires a linearizable quorum read; after installation a destination admits only its exact installed term/generation/token/expiry and stops new admission at expiry; an already-admitted operation retains its guard through completion | Decide and qualify the online-only versus offline-certificate contract plus external partition, delay, and clock qualification |
 | Duplicate agent ownership | Reconciliation compares every node with the durable authority directory, returns a conflict, and publishes neither arbitrary copy | Quorum-backed repair procedure and replicated workload evidence |
 | Stale route | In enabled mode a managed client receives a linearizable authority ownership read before each mutation, rejects released/expired/different ownership, propagates the committed authority term and same-owner renewal generation/expiry, and requires exact destination agreement before use; explicit reconciliation repairs exact same-owner evidence | Durable owner request identity and external partition qualification |
 | Client retry before visible output | Authority mutations accept a caller-stable UUID and return the original retained successful quorum result for an exact retry; reusing that retained ID for a different command fails closed. Rejections are not retained and never count as success. Local workload APIs remain safe only where their contract documents idempotency | Durable request identity and deduplication at each workload owner |
@@ -420,10 +432,11 @@ non-migratable.
 
 ## Required implementation sequence
 
-1. Bind forwarded commands to end-to-end delegated principals and destination
-   installation to self-contained authority authentication instead of only the
-   trusted system control path. Quorum-versioned voter and transport-trust
-   changes are implemented.
+1. Extend the implemented application-node/system-principal delegation to
+   independently verifiable end-user operator/tenant credentials, and decide
+   whether destination authority remains deliberately online or gains an
+   offline quorum certificate. Quorum-versioned voter/transport trust and
+   destination-owned linearizable verification are implemented.
 2. Checkpointed drain/migration with rollback and side-effect classifications.
 3. Cross-node IPC/delegation with end-to-end authorization and audit.
 4. Cluster quota reservations and monotonic policy/package trust epochs.

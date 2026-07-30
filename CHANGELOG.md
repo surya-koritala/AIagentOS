@@ -10,6 +10,23 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
 
 ## [Unreleased]
 
+- Bound every external replicated-authority write to a 30-second Ed25519
+  delegation from the originating application node. The signed,
+  domain-separated proof covers the caller-stable operation UUID, a semantic
+  command digest, the canonical system-node actor, issuance, and expiration.
+  Both the originating node and current leader require the signer to match the
+  authenticated Raft source's separately pinned application identity and an
+  active replicated member; stale, future, changed-command, changed-actor,
+  foreign-source, and revoked-member proofs fail closed. Internal clock,
+  barrier, and initialization commands remain unavailable to follower
+  forwarding. Quorum-enabled destinations now also perform their own
+  linearizable ownership read before installing or retiring a mutation fence
+  and accept only the exact active cluster/owner/term/generation/token/expiry
+  revision. The disabled standalone authority keeps its compatibility path.
+  This establishes attributable system-node delegation and online destination
+  verification; end-user credential delegation, offline quorum certificates,
+  compromised-host isolation, migration, cross-node IPC, and broader
+  qualification remain #122.
 - Added generation-fenced OpenRaft transport trust epochs. A quorum can
   atomically replace the complete peer catalog while preserving every current
   voter, add a new peer as a learner, or remove a former non-voter. Peer server
@@ -76,8 +93,9 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
   from Raft transport TLS. State-machine, three-node failover/partition, and
   real daemon TCP lifecycle regressions cover deterministic replay, restart
   recovery, follower forwarding, no-quorum rejection, and clean shutdown.
-  Delegated-principal authentication, migration, cross-node IPC, global
-  quotas/trust, rolling upgrades, and disaster recovery remain #122.
+  End-user credential delegation beyond the system-node principal, migration,
+  cross-node IPC, global quotas/trust, rolling upgrades, and disaster recovery
+  remain #122.
 - Wired the authenticated OpenRaft runtime into the production `agent-server`
   lifecycle behind a default-off, strict `[cluster_raft]` configuration.
   Enabled nodes read bounded no-follow PEM files, require owner-only private

@@ -36,6 +36,9 @@ use tracing::Instrument;
 use crate::agent::AgentKernel;
 use crate::auth::{Principal, Role};
 use crate::cluster_consensus::{AuthorityCommand, AuthorityRejection, AuthorityResponse};
+use crate::cluster_runtime::{
+    authority_system_actor, sign_authority_delegation, ClusterAuthorityHandle,
+};
 use crate::connector::AgentConnector;
 use crate::context::{ContextManager, ContextPressureStats, Fact, FactCategory};
 use crate::observability::{AgentAction, ObservabilityEngine};
@@ -2120,12 +2123,93 @@ fn request_outcome(reply: &SyscallReply) -> crate::telemetry::RequestOutcome {
 
 fn configured_cluster_authority(
     kernel: &AgentKernelImpl,
-) -> std::io::Result<Option<crate::cluster_runtime::ClusterAuthorityHandle>> {
+) -> std::io::Result<Option<ClusterAuthorityHandle>> {
     kernel.cluster_authority().map_err(std::io::Error::other)
 }
 
 fn authority_operation_id(operation_id: Option<String>) -> String {
     operation_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string())
+}
+
+fn local_authority_actor(kernel: &AgentKernelImpl) -> String {
+    authority_system_actor(&kernel.cluster_control.identity().node_id)
+}
+
+async fn commit_delegated_authority(
+    kernel: &AgentKernelImpl,
+    authority: &ClusterAuthorityHandle,
+    command: AuthorityCommand,
+) -> std::io::Result<AuthorityResponse> {
+    let identity = kernel.cluster_control.identity();
+    let delegation = sign_authority_delegation(&command, &identity.node_id, |payload| {
+        kernel
+            .cluster_control
+            .sign_challenge(payload)
+            .map_err(std::io::Error::other)
+    })?;
+    authority.commit(command, delegation).await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn verify_quorum_destination_authority(
+    authority: &ClusterAuthorityHandle,
+    agent_id: &str,
+    cluster_id: &str,
+    owner_node_id: &str,
+    authority_term: u64,
+    authority_generation: u64,
+    fencing_token: u64,
+    proof_expires_at: DateTime<Utc>,
+) -> std::io::Result<()> {
+    let view = authority.linearizable_view().await?;
+    verify_quorum_destination_authority_view(
+        &view,
+        agent_id,
+        cluster_id,
+        owner_node_id,
+        authority_term,
+        authority_generation,
+        fencing_token,
+        proof_expires_at,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn verify_quorum_destination_authority_view(
+    view: &crate::cluster_consensus::ReplicatedAuthorityView,
+    agent_id: &str,
+    cluster_id: &str,
+    owner_node_id: &str,
+    authority_term: u64,
+    authority_generation: u64,
+    fencing_token: u64,
+    proof_expires_at: DateTime<Utc>,
+) -> std::io::Result<()> {
+    let ownership = view
+        .ownerships
+        .iter()
+        .find(|ownership| ownership.agent_id == agent_id)
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "destination authority rejected an unknown ownership record",
+            )
+        })?;
+    if view.membership.cluster_id != cluster_id
+        || ownership.owner_node_id != owner_node_id
+        || ownership.authority_term != authority_term
+        || ownership.generation != authority_generation
+        || ownership.fencing_token != fencing_token
+        || ownership.lease_expires_at != proof_expires_at
+        || ownership.state != crate::cluster_control::ClusterOwnershipState::Active
+        || view.logical_time >= proof_expires_at
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "destination authority rejected ownership evidence that is not the exact active quorum revision",
+        ));
+    }
+    Ok(())
 }
 
 fn authority_command_error(response: AuthorityResponse) -> SyscallReply {
@@ -3393,14 +3477,17 @@ async fn dispatch_scoped_inner_with_fence(
                 let mut challenge_material = b"AIagentOS replicated join challenge v1".to_vec();
                 challenge_material.extend_from_slice(operation_id.as_bytes());
                 let challenge_hex = crate::cluster_control::sha256_hex(&challenge_material);
-                match authority
-                    .commit(AuthorityCommand::IssueJoinChallenge {
+                match commit_delegated_authority(
+                    kernel,
+                    &authority,
+                    AuthorityCommand::IssueJoinChallenge {
                         operation_id,
                         challenge_hex,
                         ttl_seconds,
                         proposed_at: chrono::Utc::now(),
-                    })
-                    .await
+                    },
+                )
+                .await
                 {
                     Ok(AuthorityResponse::JoinChallengeIssued { challenge, .. }) => {
                         SyscallReply::ClusterJoinChallenge { challenge }
@@ -3433,8 +3520,11 @@ async fn dispatch_scoped_inner_with_fence(
                 Err(error) => return authority_io_error(error),
             };
             if let Some(authority) = authority {
-                match authority
-                    .commit(AuthorityCommand::RegisterMember {
+                let actor = local_authority_actor(kernel);
+                match commit_delegated_authority(
+                    kernel,
+                    &authority,
+                    AuthorityCommand::RegisterMember {
                         operation_id: authority_operation_id(operation_id),
                         registration,
                         challenge_hex,
@@ -3442,11 +3532,12 @@ async fn dispatch_scoped_inner_with_fence(
                         expected_generation,
                         authority_min_protocol_version: MIN_PROTOCOL_VERSION,
                         authority_protocol_version: PROTOCOL_VERSION,
-                        actor: actor.to_owned(),
+                        actor,
                         reason,
                         proposed_at: chrono::Utc::now(),
-                    })
-                    .await
+                    },
+                )
+                .await
                 {
                     Ok(AuthorityResponse::MemberUpdated { member, .. }) => {
                         SyscallReply::ClusterMemberUpdated { member }
@@ -3482,9 +3573,6 @@ async fn dispatch_scoped_inner_with_fence(
             minimum_overlap_seconds,
             reason,
         } => {
-            let actor = principal
-                .map(|principal| principal.user_id.as_str())
-                .unwrap_or("system");
             let authority = match configured_cluster_authority(kernel) {
                 Ok(authority) => authority,
                 Err(error) => return authority_io_error(error),
@@ -3495,8 +3583,11 @@ async fn dispatch_scoped_inner_with_fence(
                         .into(),
                 };
             };
-            match authority
-                .commit(AuthorityCommand::PrepareMemberCertificateRollout {
+            let actor = local_authority_actor(kernel);
+            match commit_delegated_authority(
+                kernel,
+                &authority,
+                AuthorityCommand::PrepareMemberCertificateRollout {
                     operation_id: authority_operation_id(operation_id),
                     registration,
                     challenge_hex,
@@ -3504,11 +3595,12 @@ async fn dispatch_scoped_inner_with_fence(
                     expected_generation,
                     prepare_ttl_seconds,
                     minimum_overlap_seconds,
-                    actor: actor.to_owned(),
+                    actor,
                     reason,
                     proposed_at: chrono::Utc::now(),
-                })
-                .await
+                },
+            )
+            .await
             {
                 Ok(AuthorityResponse::CertificateRolloutUpdated {
                     member, rollout, ..
@@ -3523,9 +3615,6 @@ async fn dispatch_scoped_inner_with_fence(
             expected_generation,
             reason,
         } => {
-            let actor = principal
-                .map(|principal| principal.user_id.as_str())
-                .unwrap_or("system");
             let authority = match configured_cluster_authority(kernel) {
                 Ok(authority) => authority,
                 Err(error) => return authority_io_error(error),
@@ -3536,16 +3625,20 @@ async fn dispatch_scoped_inner_with_fence(
                         .into(),
                 };
             };
-            match authority
-                .commit(AuthorityCommand::AbortMemberCertificateRollout {
+            let actor = local_authority_actor(kernel);
+            match commit_delegated_authority(
+                kernel,
+                &authority,
+                AuthorityCommand::AbortMemberCertificateRollout {
                     operation_id: authority_operation_id(operation_id),
                     node_id,
                     expected_generation,
-                    actor: actor.to_owned(),
+                    actor,
                     reason,
                     proposed_at: chrono::Utc::now(),
-                })
-                .await
+                },
+            )
+            .await
             {
                 Ok(AuthorityResponse::CertificateRolloutUpdated {
                     member, rollout, ..
@@ -3560,9 +3653,6 @@ async fn dispatch_scoped_inner_with_fence(
             expected_generation,
             reason,
         } => {
-            let actor = principal
-                .map(|principal| principal.user_id.as_str())
-                .unwrap_or("system");
             let authority = match configured_cluster_authority(kernel) {
                 Ok(authority) => authority,
                 Err(error) => return authority_io_error(error),
@@ -3573,16 +3663,20 @@ async fn dispatch_scoped_inner_with_fence(
                         .into(),
                 };
             };
-            match authority
-                .commit(AuthorityCommand::FinalizeMemberCertificateRollout {
+            let actor = local_authority_actor(kernel);
+            match commit_delegated_authority(
+                kernel,
+                &authority,
+                AuthorityCommand::FinalizeMemberCertificateRollout {
                     operation_id: authority_operation_id(operation_id),
                     node_id,
                     expected_generation,
-                    actor: actor.to_owned(),
+                    actor,
                     reason,
                     proposed_at: chrono::Utc::now(),
-                })
-                .await
+                },
+            )
+            .await
             {
                 Ok(AuthorityResponse::CertificateRolloutUpdated {
                     member, rollout, ..
@@ -3606,17 +3700,21 @@ async fn dispatch_scoped_inner_with_fence(
                 Err(error) => return authority_io_error(error),
             };
             if let Some(authority) = authority {
-                match authority
-                    .commit(AuthorityCommand::SetMemberState {
+                let actor = local_authority_actor(kernel);
+                match commit_delegated_authority(
+                    kernel,
+                    &authority,
+                    AuthorityCommand::SetMemberState {
                         operation_id: authority_operation_id(operation_id),
                         node_id,
                         state,
                         expected_generation,
-                        actor: actor.to_owned(),
+                        actor,
                         reason,
                         proposed_at: chrono::Utc::now(),
-                    })
-                    .await
+                    },
+                )
+                .await
                 {
                     Ok(AuthorityResponse::MemberUpdated { member, .. }) => {
                         SyscallReply::ClusterMemberUpdated { member }
@@ -3728,18 +3826,22 @@ async fn dispatch_scoped_inner_with_fence(
                 Err(error) => return authority_io_error(error),
             };
             if let Some(authority) = authority {
-                match authority
-                    .commit(AuthorityCommand::ClaimOwnership {
+                let actor = local_authority_actor(kernel);
+                match commit_delegated_authority(
+                    kernel,
+                    &authority,
+                    AuthorityCommand::ClaimOwnership {
                         operation_id: authority_operation_id(operation_id),
                         agent_id,
                         owner_node_id,
                         ttl_seconds,
                         expected_fencing_token,
-                        actor: actor.to_owned(),
+                        actor,
                         reason,
                         proposed_at: chrono::Utc::now(),
-                    })
-                    .await
+                    },
+                )
+                .await
                 {
                     Ok(AuthorityResponse::OwnershipUpdated { ownership, .. }) => {
                         SyscallReply::ClusterAgentOwnership {
@@ -3783,18 +3885,22 @@ async fn dispatch_scoped_inner_with_fence(
                 Err(error) => return authority_io_error(error),
             };
             if let Some(authority) = authority {
-                match authority
-                    .commit(AuthorityCommand::RenewOwnership {
+                let actor = local_authority_actor(kernel);
+                match commit_delegated_authority(
+                    kernel,
+                    &authority,
+                    AuthorityCommand::RenewOwnership {
                         operation_id: authority_operation_id(operation_id),
                         agent_id,
                         owner_node_id,
                         fencing_token,
                         ttl_seconds,
-                        actor: actor.to_owned(),
+                        actor,
                         reason,
                         proposed_at: chrono::Utc::now(),
-                    })
-                    .await
+                    },
+                )
+                .await
                 {
                     Ok(AuthorityResponse::OwnershipUpdated { ownership, .. }) => {
                         SyscallReply::ClusterAgentOwnership {
@@ -3837,17 +3943,21 @@ async fn dispatch_scoped_inner_with_fence(
                 Err(error) => return authority_io_error(error),
             };
             if let Some(authority) = authority {
-                match authority
-                    .commit(AuthorityCommand::ReleaseOwnership {
+                let actor = local_authority_actor(kernel);
+                match commit_delegated_authority(
+                    kernel,
+                    &authority,
+                    AuthorityCommand::ReleaseOwnership {
                         operation_id: authority_operation_id(operation_id),
                         agent_id,
                         owner_node_id,
                         fencing_token,
-                        actor: actor.to_owned(),
+                        actor,
                         reason,
                         proposed_at: chrono::Utc::now(),
-                    })
-                    .await
+                    },
+                )
+                .await
                 {
                     Ok(AuthorityResponse::OwnershipUpdated { ownership, .. }) => {
                         SyscallReply::ClusterAgentOwnership {
@@ -4018,6 +4128,30 @@ async fn dispatch_scoped_inner_with_fence(
             proof_expires_at,
             reason,
         } => {
+            let authority = match configured_cluster_authority(kernel) {
+                Ok(authority) => authority,
+                Err(error) => return authority_io_error(error),
+            };
+            if let Some(authority) = authority {
+                if let Err(error) = verify_quorum_destination_authority(
+                    &authority,
+                    &agent_id,
+                    &cluster_id,
+                    &owner_node_id,
+                    authority_term,
+                    authority_generation,
+                    fencing_token,
+                    proof_expires_at,
+                )
+                .await
+                {
+                    return SyscallReply::Error {
+                        message: format!(
+                            "replicated authority conflict: destination ownership verification failed: {error}"
+                        ),
+                    };
+                }
+            }
             let (parsed_agent, barrier) = match mutation_fence_barrier_for(kernel, &agent_id) {
                 Ok(result) => result,
                 Err(message) => return SyscallReply::Error { message },
@@ -4050,6 +4184,30 @@ async fn dispatch_scoped_inner_with_fence(
             proof_expires_at,
             reason,
         } => {
+            let authority = match configured_cluster_authority(kernel) {
+                Ok(authority) => authority,
+                Err(error) => return authority_io_error(error),
+            };
+            if let Some(authority) = authority {
+                if let Err(error) = verify_quorum_destination_authority(
+                    &authority,
+                    &agent_id,
+                    &cluster_id,
+                    &owner_node_id,
+                    authority_term,
+                    authority_generation,
+                    fencing_token,
+                    proof_expires_at,
+                )
+                .await
+                {
+                    return SyscallReply::Error {
+                        message: format!(
+                            "replicated authority conflict: destination ownership verification failed: {error}"
+                        ),
+                    };
+                }
+            }
             let (parsed_agent, barrier) = match mutation_fence_barrier_for(kernel, &agent_id) {
                 Ok(result) => result,
                 Err(message) => return SyscallReply::Error { message },
@@ -6130,6 +6288,120 @@ mod tests {
     }
 
     #[test]
+    fn quorum_destination_verification_accepts_only_exact_active_revision() {
+        let now = chrono::Utc::now();
+        let cluster_id = uuid::Uuid::new_v4().to_string();
+        let agent_id = uuid::Uuid::new_v4().to_string();
+        let owner_node_id = uuid::Uuid::new_v4().to_string();
+        let proof_expires_at = now + chrono::Duration::seconds(60);
+        let ownership = crate::cluster_control::ClusterAgentOwnership {
+            agent_id: agent_id.clone(),
+            owner_node_id: owner_node_id.clone(),
+            authority_term: 7,
+            fencing_token: 11,
+            generation: 13,
+            state: crate::cluster_control::ClusterOwnershipState::Active,
+            lease_expires_at: proof_expires_at,
+            updated_at: now,
+            reason: "destination verification regression".into(),
+        };
+        let mut view = crate::cluster_consensus::ReplicatedAuthorityView {
+            genesis: crate::cluster_consensus::AuthorityGenesis {
+                cluster_id: cluster_id.clone(),
+                members: Vec::new(),
+            },
+            membership: crate::cluster_control::ClusterMembershipSnapshot {
+                cluster_id: cluster_id.clone(),
+                generation: 1,
+                authority_time: Some(now),
+                tls_trust_generation: 0,
+                certificate_rollouts: Vec::new(),
+                members: Vec::new(),
+            },
+            membership_audit: Vec::new(),
+            certificate_rollout_audit: Vec::new(),
+            ownerships: vec![ownership],
+            ownership_audit: Vec::new(),
+            logical_time: now,
+        };
+        verify_quorum_destination_authority_view(
+            &view,
+            &agent_id,
+            &cluster_id,
+            &owner_node_id,
+            7,
+            13,
+            11,
+            proof_expires_at,
+        )
+        .expect("exact active quorum ownership revision");
+
+        assert_eq!(
+            verify_quorum_destination_authority_view(
+                &view,
+                &uuid::Uuid::new_v4().to_string(),
+                &cluster_id,
+                &owner_node_id,
+                7,
+                13,
+                11,
+                proof_expires_at,
+            )
+            .unwrap_err()
+            .kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        assert!(verify_quorum_destination_authority_view(
+            &view,
+            &agent_id,
+            &cluster_id,
+            &owner_node_id,
+            7,
+            12,
+            11,
+            proof_expires_at,
+        )
+        .is_err());
+        assert!(verify_quorum_destination_authority_view(
+            &view,
+            &agent_id,
+            &uuid::Uuid::new_v4().to_string(),
+            &owner_node_id,
+            7,
+            13,
+            11,
+            proof_expires_at,
+        )
+        .is_err());
+
+        view.ownerships[0].state = crate::cluster_control::ClusterOwnershipState::Released;
+        assert!(verify_quorum_destination_authority_view(
+            &view,
+            &agent_id,
+            &cluster_id,
+            &owner_node_id,
+            7,
+            13,
+            11,
+            proof_expires_at,
+        )
+        .is_err());
+        view.ownerships[0].state = crate::cluster_control::ClusterOwnershipState::Active;
+        view.logical_time = proof_expires_at;
+        assert!(verify_quorum_destination_authority_view(
+            &view,
+            &agent_id,
+            &cluster_id,
+            &owner_node_id,
+            7,
+            13,
+            11,
+            proof_expires_at,
+        )
+        .is_err());
+    }
+
+    #[test]
     fn unavailable_quota_storage_is_not_misclassified_as_quota_exhaustion() {
         assert_eq!(
             WireErrorCode::classify(
@@ -6181,6 +6453,44 @@ mod tests {
             WireErrorCode::classify(&message),
             (WireErrorCode::Internal, false)
         );
+
+        let log_id = openraft::LogId::new(openraft::CommittedLeaderId::new(1_u64, 1_u64), 1_u64);
+        for (reason, expected_category) in [
+            (
+                AuthorityRejection::InvalidCommand,
+                "invalid replicated authority command",
+            ),
+            (
+                AuthorityRejection::Conflict,
+                "replicated authority conflict",
+            ),
+            (
+                AuthorityRejection::CapacityReached,
+                "replicated authority unavailable",
+            ),
+        ] {
+            let SyscallReply::Error { message } =
+                authority_command_error(AuthorityResponse::Rejected {
+                    operation_id: uuid::Uuid::new_v4().to_string(),
+                    sequence: 2,
+                    log_id,
+                    reason,
+                    message: "regression".into(),
+                })
+            else {
+                panic!("authority rejection must use the ordinary error boundary");
+            };
+            assert_eq!(message, format!("{expected_category}: regression"));
+        }
+        let SyscallReply::Error { message } =
+            authority_command_error(AuthorityResponse::MetadataApplied {
+                sequence: 3,
+                log_id,
+            })
+        else {
+            panic!("unexpected authority responses must use the ordinary error boundary");
+        };
+        assert!(message.starts_with("replicated authority returned an unexpected response:"));
     }
 
     #[test]
@@ -10608,6 +10918,60 @@ profile = "standard"
         );
         assert!(!stream.contains("private prompt"));
 
+        let redacted_requests = [
+            format!(
+                "{:?}",
+                Syscall::MemoryStore {
+                    agent_id: "agent".into(),
+                    content: "private memory".into(),
+                    category: None,
+                }
+            ),
+            format!(
+                "{:?}",
+                Syscall::StoragePut {
+                    agent_id: "agent".into(),
+                    key: "key".into(),
+                    value: "private storage value".into(),
+                }
+            ),
+            format!(
+                "{:?}",
+                Syscall::LoadPackage {
+                    manifest_toml: "private manifest".into(),
+                }
+            ),
+            format!(
+                "{:?}",
+                Syscall::PublishPackage {
+                    archive_hex: "private archive".into(),
+                }
+            ),
+            format!(
+                "{:?}",
+                Syscall::FencedAgentMutation {
+                    agent_id: "agent".into(),
+                    proof: AgentMutationFenceProof {
+                        cluster_id: "cluster".into(),
+                        owner_node_id: "owner".into(),
+                        authority_term: 1,
+                        authority_generation: 1,
+                        fencing_token: 1,
+                        proof_expires_at: chrono::Utc::now(),
+                    },
+                    mutation: Box::new(Syscall::StoragePut {
+                        agent_id: "agent".into(),
+                        key: "key".into(),
+                        value: "private fenced mutation".into(),
+                    }),
+                }
+            ),
+        ];
+        for request in redacted_requests {
+            assert!(request.contains("[REDACTED]"));
+            assert!(!request.contains("private"));
+        }
+
         let stream_event = format!(
             "{:?}",
             SyscallReply::StreamEvent {
@@ -10619,6 +10983,34 @@ profile = "standard"
             }
         );
         assert!(!stream_event.contains("private completion"));
+
+        let redacted_replies = [
+            format!(
+                "{:?}",
+                SyscallReply::Message {
+                    content: "private message".into(),
+                    tool_calls: 0,
+                    tokens: 0,
+                }
+            ),
+            format!(
+                "{:?}",
+                SyscallReply::ToolResult {
+                    data: serde_json::json!({"secret": "private tool result"}),
+                }
+            ),
+            format!("{:?}", SyscallReply::Memory { facts: Vec::new() }),
+            format!(
+                "{:?}",
+                SyscallReply::PackageArchive {
+                    archive_hex: "private package archive".into(),
+                }
+            ),
+        ];
+        for reply in redacted_replies {
+            assert!(reply.contains("[REDACTED]"));
+            assert!(!reply.contains("private"));
+        }
 
         let reply = format!(
             "{:?}",

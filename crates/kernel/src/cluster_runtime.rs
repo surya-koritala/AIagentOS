@@ -57,7 +57,7 @@ use crate::cluster_consensus::{
 use crate::config::ClusterRaftConfig;
 use crate::context::SqliteContextManager;
 
-const CLUSTER_RAFT_WIRE_VERSION: u16 = 1;
+const CLUSTER_RAFT_WIRE_VERSION: u16 = 2;
 const MIN_FRAME_BYTES: usize = 64 * 1024;
 const DEFAULT_MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 const ABSOLUTE_MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
@@ -66,8 +66,276 @@ const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_INBOUND_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_CLUSTER_PEM_BYTES: u64 = 1024 * 1024;
 const INITIAL_METRICS_TIMEOUT: Duration = Duration::from_secs(5);
-const MEMBERSHIP_SETTLE_TIMEOUT: Duration = Duration::from_secs(10);
+// Startup convergence includes leader election, learner catch-up, and up to
+// two joint-consensus commits. Keep it bounded while allowing slower hosts
+// enough time to complete the full protocol.
+const MEMBERSHIP_SETTLE_TIMEOUT: Duration = Duration::from_secs(20);
 const AUTHORITY_INITIALIZATION_TIMEOUT: Duration = Duration::from_secs(15);
+const AUTHORITY_DELEGATION_VERSION: u16 = 1;
+const AUTHORITY_DELEGATION_TTL_SECONDS: i64 = 30;
+const AUTHORITY_DELEGATION_CLOCK_SKEW_SECONDS: i64 = 5;
+
+/// Short-lived, replay-bounded proof that the application node authenticated
+/// the system caller before submitting one external authority command.
+///
+/// The proof is deliberately not replicated into the state machine: the
+/// command's stable operation UUID remains the durable replay fence, while the
+/// current leader independently verifies this signature before admission.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct DelegatedAuthorityProof {
+    version: u16,
+    issuer_node_id: String,
+    operation_id: String,
+    command_sha256: String,
+    issued_at: chrono::DateTime<chrono::Utc>,
+    expires_at: chrono::DateTime<chrono::Utc>,
+    signature_hex: String,
+}
+
+pub(crate) fn authority_system_actor(node_id: &str) -> String {
+    format!("system-node:{node_id}")
+}
+
+fn authority_command_actor(command: &AuthorityCommand) -> Option<&str> {
+    match command {
+        AuthorityCommand::RegisterMember { actor, .. }
+        | AuthorityCommand::PrepareMemberCertificateRollout { actor, .. }
+        | AuthorityCommand::AbortMemberCertificateRollout { actor, .. }
+        | AuthorityCommand::FinalizeMemberCertificateRollout { actor, .. }
+        | AuthorityCommand::SetMemberState { actor, .. }
+        | AuthorityCommand::ClaimOwnership { actor, .. }
+        | AuthorityCommand::RenewOwnership { actor, .. }
+        | AuthorityCommand::ReleaseOwnership { actor, .. } => Some(actor),
+        AuthorityCommand::Initialize { .. }
+        | AuthorityCommand::Barrier { .. }
+        | AuthorityCommand::AdvanceTime { .. }
+        | AuthorityCommand::IssueJoinChallenge { .. } => None,
+    }
+}
+
+fn authority_command_semantic_sha256(command: &AuthorityCommand) -> io::Result<String> {
+    let mut value = serde_json::to_value(command).map_err(invalid_data)?;
+    let fields = value
+        .as_object_mut()
+        .and_then(|outer| outer.values_mut().next())
+        .and_then(serde_json::Value::as_object_mut)
+        .ok_or_else(|| invalid_data("authority command has an invalid serialized shape"))?;
+    fields.remove("proposed_at");
+    let canonical = serde_json::to_vec(&value).map_err(invalid_data)?;
+    Ok(crate::cluster_control::sha256_hex(&canonical))
+}
+
+fn append_delegation_field(payload: &mut Vec<u8>, value: &str) -> io::Result<()> {
+    let length = u32::try_from(value.len())
+        .map_err(|_| invalid_data("authority delegation field is too large"))?;
+    payload.extend_from_slice(&length.to_be_bytes());
+    payload.extend_from_slice(value.as_bytes());
+    Ok(())
+}
+
+fn authority_delegation_payload(
+    issuer_node_id: &str,
+    operation_id: &str,
+    command_sha256: &str,
+    issued_at: chrono::DateTime<chrono::Utc>,
+    expires_at: chrono::DateTime<chrono::Utc>,
+) -> io::Result<Vec<u8>> {
+    let mut payload = b"AIagentOS delegated authority command v1".to_vec();
+    payload.extend_from_slice(&AUTHORITY_DELEGATION_VERSION.to_be_bytes());
+    append_delegation_field(&mut payload, issuer_node_id)?;
+    append_delegation_field(&mut payload, operation_id)?;
+    append_delegation_field(&mut payload, command_sha256)?;
+    append_delegation_field(&mut payload, &issued_at.to_rfc3339())?;
+    append_delegation_field(&mut payload, &expires_at.to_rfc3339())?;
+    Ok(payload)
+}
+
+pub(crate) fn sign_authority_delegation(
+    command: &AuthorityCommand,
+    issuer_node_id: &str,
+    sign: impl FnOnce(&[u8]) -> io::Result<Vec<u8>>,
+) -> io::Result<DelegatedAuthorityProof> {
+    let canonical_issuer = uuid::Uuid::parse_str(issuer_node_id)
+        .map_err(|_| invalid_data("authority delegation issuer node id must be a UUID"))?
+        .to_string();
+    if canonical_issuer != issuer_node_id {
+        return Err(invalid_data(
+            "authority delegation issuer node id must be a canonical lowercase UUID",
+        ));
+    }
+    let operation_id = uuid::Uuid::parse_str(command.operation_id())
+        .map_err(|_| invalid_data("authority delegation operation id must be a UUID"))?
+        .to_string();
+    if operation_id != command.operation_id() {
+        return Err(invalid_data(
+            "authority delegation operation id must be a canonical lowercase UUID",
+        ));
+    }
+    if let Some(actor) = authority_command_actor(command) {
+        if actor != authority_system_actor(issuer_node_id) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "authority command actor does not match its delegated system node",
+            ));
+        }
+    }
+    let command_sha256 = authority_command_semantic_sha256(command)?;
+    let issued_at = chrono::Utc::now();
+    let expires_at = issued_at
+        .checked_add_signed(chrono::Duration::seconds(AUTHORITY_DELEGATION_TTL_SECONDS))
+        .ok_or_else(|| invalid_data("authority delegation expiration overflow"))?;
+    let payload = authority_delegation_payload(
+        issuer_node_id,
+        &operation_id,
+        &command_sha256,
+        issued_at,
+        expires_at,
+    )?;
+    let signature = sign(&payload)?;
+    if signature.len() != 64 {
+        return Err(invalid_data(
+            "authority delegation signer returned an invalid Ed25519 signature",
+        ));
+    }
+    Ok(DelegatedAuthorityProof {
+        version: AUTHORITY_DELEGATION_VERSION,
+        issuer_node_id: issuer_node_id.to_owned(),
+        operation_id,
+        command_sha256,
+        issued_at,
+        expires_at,
+        signature_hex: crate::cluster_control::hex_encode(&signature),
+    })
+}
+
+fn verify_authority_delegation(
+    command: &AuthorityCommand,
+    proof: &DelegatedAuthorityProof,
+    source: ClusterRaftNodeId,
+    source_node: &ClusterRaftNode,
+    view: &ReplicatedAuthorityView,
+    now: chrono::DateTime<chrono::Utc>,
+) -> io::Result<()> {
+    if proof.version != AUTHORITY_DELEGATION_VERSION {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "authority delegation version is unsupported",
+        ));
+    }
+    let canonical_issuer = uuid::Uuid::parse_str(&proof.issuer_node_id)
+        .map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "authority delegation issuer node id is invalid",
+            )
+        })?
+        .to_string();
+    if canonical_issuer != proof.issuer_node_id
+        || proof.operation_id != command.operation_id()
+        || uuid::Uuid::parse_str(&proof.operation_id)
+            .map(|operation_id| operation_id.to_string())
+            .ok()
+            .as_deref()
+            != Some(proof.operation_id.as_str())
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "authority delegation identity or operation binding is invalid",
+        ));
+    }
+    if proof.expires_at <= now
+        || proof.expires_at <= proof.issued_at
+        || proof.issued_at
+            > now
+                .checked_add_signed(chrono::Duration::seconds(
+                    AUTHORITY_DELEGATION_CLOCK_SKEW_SECONDS,
+                ))
+                .ok_or_else(|| invalid_data("authority delegation clock overflow"))?
+        || proof.expires_at
+            > proof
+                .issued_at
+                .checked_add_signed(chrono::Duration::seconds(AUTHORITY_DELEGATION_TTL_SECONDS))
+                .ok_or_else(|| invalid_data("authority delegation expiration overflow"))?
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "authority delegation is expired or outside its bounded validity window",
+        ));
+    }
+    let expected_digest = authority_command_semantic_sha256(command)?;
+    if proof.command_sha256 != expected_digest {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "authority delegation command digest mismatch",
+        ));
+    }
+    if let Some(actor) = authority_command_actor(command) {
+        if actor != authority_system_actor(&proof.issuer_node_id) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "authority command actor does not match its delegated system node",
+            ));
+        }
+    }
+    let member = view
+        .membership
+        .members
+        .iter()
+        .find(|member| member.node_id == proof.issuer_node_id)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "authority delegation issuer is absent from application membership",
+            )
+        })?;
+    if member.state != crate::cluster_control::ClusterMemberState::Active
+        || member.public_key != source_node.identity_public_key
+        || member.fingerprint
+            != crate::cluster_control::sha256_hex(
+                &crate::cluster_control::hex_decode(&source_node.identity_public_key).ok_or_else(
+                    || {
+                        io::Error::new(
+                            io::ErrorKind::PermissionDenied,
+                            "Raft source has an invalid application identity key",
+                        )
+                    },
+                )?,
+            )
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "Raft source {source} is not bound to the active delegated application identity"
+            ),
+        ));
+    }
+    let signature = crate::cluster_control::hex_decode(&proof.signature_hex)
+        .filter(|signature| signature.len() == 64)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "authority delegation signature is invalid",
+            )
+        })?;
+    let payload = authority_delegation_payload(
+        &proof.issuer_node_id,
+        &proof.operation_id,
+        &proof.command_sha256,
+        proof.issued_at,
+        proof.expires_at,
+    )?;
+    if !crate::cluster_control::ClusterControl::verify_challenge(
+        &source_node.identity_public_key,
+        &payload,
+        &signature,
+    ) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "authority delegation signature verification failed",
+        ));
+    }
+    Ok(())
+}
 
 /// Server and client TLS identities used by one Raft peer.
 ///
@@ -230,6 +498,10 @@ fn certificate_fingerprints_from_pem(cert_pem: &[u8]) -> io::Result<Vec<String>>
 
 fn invalid_input(error: impl fmt::Display) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, error.to_string())
+}
+
+fn invalid_data(error: impl fmt::Display) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, error.to_string())
 }
 
 fn certificate_fingerprint(certificate: &[u8]) -> String {
@@ -1309,8 +1581,14 @@ enum RpcRequest {
     AppendEntries(AppendEntriesRequest<ClusterRaftTypeConfig>),
     Vote(VoteRequest<ClusterRaftNodeId>),
     InstallSnapshot(InstallSnapshotRequest<ClusterRaftTypeConfig>),
-    AuthorityWrite(AuthorityCommand),
+    AuthorityWrite(Box<DelegatedAuthorityWrite>),
     AuthorityRead,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DelegatedAuthorityWrite {
+    command: AuthorityCommand,
+    delegation: DelegatedAuthorityProof,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1652,13 +1930,43 @@ impl fmt::Debug for ClusterAuthorityHandle {
 }
 
 impl ClusterAuthorityHandle {
-    pub async fn commit(&self, command: AuthorityCommand) -> io::Result<AuthorityResponse> {
+    pub(crate) async fn commit(
+        &self,
+        command: AuthorityCommand,
+        delegation: DelegatedAuthorityProof,
+    ) -> io::Result<AuthorityResponse> {
+        let source = self
+            .network
+            .members
+            .get(&self.network.source)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "local Raft source is absent from trusted membership",
+                )
+            })?;
+        let view = read_initialized_authority_view(&self.context)?;
+        verify_authority_delegation(
+            &command,
+            &delegation,
+            self.network.source,
+            source,
+            &view,
+            chrono::Utc::now(),
+        )?;
         match self.raft.client_write(command.clone()).await {
             Ok(response) => Ok(response.data),
             Err(error) => {
                 let (leader_id, leader_node) = leader_target(&error)?;
                 let response = self
-                    .forward(leader_id, &leader_node, RpcRequest::AuthorityWrite(command))
+                    .forward(
+                        leader_id,
+                        &leader_node,
+                        RpcRequest::AuthorityWrite(Box::new(DelegatedAuthorityWrite {
+                            command,
+                            delegation,
+                        })),
+                    )
                     .await?;
                 match response {
                     RpcResponse::AuthorityWrite(response) => match *response {
@@ -1998,6 +2306,7 @@ impl ClusterRaftRuntime {
                 members,
                 server_config: config.tls.server_config.clone(),
                 raft: raft.clone(),
+                context: context.clone(),
                 limits: config.transport,
             },
             shutdown_rx,
@@ -2371,7 +2680,8 @@ impl ClusterRaftRuntime {
                 }
                 submitted = true;
                 let response = self
-                    .commit(AuthorityCommand::Initialize {
+                    .raft
+                    .client_write(AuthorityCommand::Initialize {
                         operation_id: self.authority_genesis.cluster_id.clone(),
                         genesis: self.authority_genesis.clone(),
                         proposed_at: chrono::Utc::now(),
@@ -2841,12 +3151,14 @@ impl Drop for ClusterRaftRuntime {
     }
 }
 
+#[derive(Clone)]
 struct ListenerContext {
     local_node_id: ClusterRaftNodeId,
     cluster_name: Arc<str>,
     members: Arc<BTreeMap<ClusterRaftNodeId, ClusterRaftNode>>,
     server_config: Arc<rustls::ServerConfig>,
     raft: Raft<ClusterRaftTypeConfig>,
+    context: Arc<SqliteContextManager>,
     limits: ClusterRaftTransportLimits,
 }
 
@@ -2873,23 +3185,12 @@ async fn serve_listener(
                     continue;
                 };
                 let acceptor = acceptor.clone();
-                let cluster_name = context.cluster_name.clone();
-                let members = context.members.clone();
-                let raft = context.raft.clone();
-                let limits = context.limits.clone();
+                let connection_context = context.clone();
                 let local_node_id = context.local_node_id;
                 connections.spawn(async move {
                     let _permit = permit;
-                    if let Err(error) = handle_connection(
-                        stream,
-                        local_node_id,
-                        cluster_name,
-                        members,
-                        acceptor,
-                        raft,
-                        limits,
-                    )
-                    .await
+                    if let Err(error) =
+                        handle_connection(stream, connection_context, acceptor).await
                     {
                         tracing::warn!(
                             node_id = local_node_id,
@@ -2913,13 +3214,18 @@ async fn serve_listener(
 
 async fn handle_connection(
     stream: TcpStream,
-    local_node_id: ClusterRaftNodeId,
-    cluster_name: Arc<str>,
-    members: Arc<BTreeMap<ClusterRaftNodeId, ClusterRaftNode>>,
+    context: ListenerContext,
     acceptor: TlsAcceptor,
-    raft: Raft<ClusterRaftTypeConfig>,
-    limits: ClusterRaftTransportLimits,
 ) -> io::Result<()> {
+    let ListenerContext {
+        local_node_id,
+        cluster_name,
+        members,
+        server_config: _,
+        raft,
+        context,
+        limits,
+    } = context;
     let mut tls = tokio::time::timeout(limits.handshake_timeout, acceptor.accept(stream))
         .await
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "Raft TLS handshake timed out"))?
@@ -2980,7 +3286,20 @@ async fn handle_connection(
         RpcRequest::InstallSnapshot(request) => {
             RpcResponse::InstallSnapshot(raft.install_snapshot(request).await)
         }
-        RpcRequest::AuthorityWrite(mut command) => {
+        RpcRequest::AuthorityWrite(write) => {
+            let DelegatedAuthorityWrite {
+                mut command,
+                delegation,
+            } = *write;
+            let view = read_initialized_authority_view(&context)?;
+            verify_authority_delegation(
+                &command,
+                &delegation,
+                request.source,
+                source,
+                &view,
+                chrono::Utc::now(),
+            )?;
             normalize_forwarded_authority_command(&mut command)?;
             RpcResponse::AuthorityWrite(Box::new(raft.client_write(command).await))
         }
@@ -3090,6 +3409,7 @@ mod tests {
         BasicConstraints, CertificateParams, CertifiedIssuer, ExtendedKeyUsagePurpose, IsCa,
         KeyPair, KeyUsagePurpose,
     };
+    use ring::signature::KeyPair as _;
     use tempfile::TempDir;
     use uuid::Uuid;
 
@@ -3099,6 +3419,9 @@ mod tests {
 
     struct TestPeer {
         node_id: ClusterRaftNodeId,
+        application_node_id: String,
+        application_identity_pkcs8: Vec<u8>,
+        application_identity_public_key: String,
         server_name: String,
         tls: ClusterRaftTls,
         server_certificate_pem: String,
@@ -3145,6 +3468,163 @@ mod tests {
         };
         assert_eq!(
             normalize_forwarded_authority_command(&mut internal)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::PermissionDenied
+        );
+    }
+
+    #[test]
+    fn delegated_authority_proof_binds_source_command_actor_and_time() {
+        let ca = test_ca();
+        let peer = test_peer(&ca, 1);
+        let other = test_peer(&ca, 2);
+        let now = chrono::Utc::now();
+        let command = AuthorityCommand::ClaimOwnership {
+            operation_id: Uuid::new_v4().to_string(),
+            agent_id: Uuid::new_v4().to_string(),
+            owner_node_id: peer.application_node_id.clone(),
+            ttl_seconds: 30,
+            expected_fencing_token: None,
+            actor: authority_system_actor(&peer.application_node_id),
+            reason: "delegated proof regression".into(),
+            proposed_at: now,
+        };
+        let proof = test_authority_delegation(&peer, &command);
+        let public_key = crate::cluster_control::hex_decode(&peer.application_identity_public_key)
+            .expect("decode application public key");
+        let member = crate::cluster_control::ClusterMember {
+            node_id: peer.application_node_id.clone(),
+            fingerprint: crate::cluster_control::sha256_hex(&public_key),
+            public_key: peer.application_identity_public_key.clone(),
+            tls_server_certificate_fingerprint: None,
+            endpoint: "127.0.0.1:7001".into(),
+            server_version: env!("CARGO_PKG_VERSION").into(),
+            min_protocol_version: crate::syscall_server::MIN_PROTOCOL_VERSION,
+            protocol_version: crate::syscall_server::PROTOCOL_VERSION,
+            state: crate::cluster_control::ClusterMemberState::Active,
+            generation: 1,
+            joined_at: now,
+            updated_at: now,
+            reason: "test genesis".into(),
+        };
+        let genesis_member = AuthorityGenesisMember {
+            node_id: member.node_id.clone(),
+            fingerprint: member.fingerprint.clone(),
+            public_key: member.public_key.clone(),
+            tls_server_certificate_fingerprint: None,
+            endpoint: member.endpoint.clone(),
+            server_version: member.server_version.clone(),
+            min_protocol_version: member.min_protocol_version,
+            protocol_version: member.protocol_version,
+        };
+        let cluster_id = Uuid::new_v4().to_string();
+        let mut view = ReplicatedAuthorityView {
+            genesis: AuthorityGenesis {
+                cluster_id: cluster_id.clone(),
+                members: vec![genesis_member],
+            },
+            membership: crate::cluster_control::ClusterMembershipSnapshot {
+                cluster_id,
+                generation: 1,
+                authority_time: Some(now),
+                tls_trust_generation: 0,
+                certificate_rollouts: Vec::new(),
+                members: vec![member],
+            },
+            membership_audit: Vec::new(),
+            certificate_rollout_audit: Vec::new(),
+            ownerships: Vec::new(),
+            ownership_audit: Vec::new(),
+            logical_time: now,
+        };
+        let source_node = ClusterRaftNode {
+            identity_public_key: peer.application_identity_public_key.clone(),
+            ..Default::default()
+        };
+        verify_authority_delegation(&command, &proof, 1, &source_node, &view, now)
+            .expect("valid delegated authority proof");
+
+        let mut normalized_retry = command.clone();
+        normalize_forwarded_authority_command(&mut normalized_retry)
+            .expect("normalize delegated command time");
+        verify_authority_delegation(&normalized_retry, &proof, 1, &source_node, &view, now)
+            .expect("leader-owned proposed_at is outside the semantic command digest");
+
+        let mut tampered_signature = proof.clone();
+        tampered_signature.signature_hex = "00".repeat(64);
+        assert_eq!(
+            verify_authority_delegation(&command, &tampered_signature, 1, &source_node, &view, now)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::PermissionDenied
+        );
+
+        let unsigned_wire_shape = serde_json::json!({"AuthorityWrite": command.clone()});
+        assert!(
+            serde_json::from_value::<RpcRequest>(unsigned_wire_shape).is_err(),
+            "wire v2 must reject the former unsigned authority-write body"
+        );
+
+        let mut changed = command.clone();
+        let AuthorityCommand::ClaimOwnership { reason, .. } = &mut changed else {
+            unreachable!()
+        };
+        *reason = "tampered reason".into();
+        assert_eq!(
+            verify_authority_delegation(&changed, &proof, 1, &source_node, &view, now)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::PermissionDenied
+        );
+
+        let mut forged_actor = command.clone();
+        let AuthorityCommand::ClaimOwnership { actor, .. } = &mut forged_actor else {
+            unreachable!()
+        };
+        *actor = authority_system_actor(&other.application_node_id);
+        assert!(
+            sign_authority_delegation(&forged_actor, &peer.application_node_id, |_| Ok(vec![
+                0;
+                64
+            ]))
+            .is_err()
+        );
+
+        let mut expired = proof.clone();
+        expired.expires_at = now - chrono::Duration::seconds(1);
+        assert_eq!(
+            verify_authority_delegation(&command, &expired, 1, &source_node, &view, now)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::PermissionDenied
+        );
+
+        let mut future = proof.clone();
+        future.issued_at = now + chrono::Duration::seconds(6);
+        future.expires_at = future.issued_at + chrono::Duration::seconds(30);
+        assert_eq!(
+            verify_authority_delegation(&command, &future, 1, &source_node, &view, now)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::PermissionDenied
+        );
+
+        view.membership.members[0].state = crate::cluster_control::ClusterMemberState::Revoked;
+        assert_eq!(
+            verify_authority_delegation(&command, &proof, 1, &source_node, &view, now)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        view.membership.members[0].state = crate::cluster_control::ClusterMemberState::Active;
+
+        let foreign_source = ClusterRaftNode {
+            identity_public_key: other.application_identity_public_key.clone(),
+            ..Default::default()
+        };
+        assert_eq!(
+            verify_authority_delegation(&command, &proof, 2, &foreign_source, &view, now)
                 .unwrap_err()
                 .kind(),
             io::ErrorKind::PermissionDenied
@@ -3297,6 +3777,14 @@ mod tests {
     }
 
     fn test_peer(ca: &CertifiedIssuer<'_, KeyPair>, node_id: ClusterRaftNodeId) -> TestPeer {
+        let application_identity_pkcs8 =
+            ring::signature::Ed25519KeyPair::generate_pkcs8(&ring::rand::SystemRandom::new())
+                .expect("generate application identity");
+        let application_identity =
+            ring::signature::Ed25519KeyPair::from_pkcs8(application_identity_pkcs8.as_ref())
+                .expect("parse application identity");
+        let application_identity_public_key =
+            crate::cluster_control::hex_encode(application_identity.public_key().as_ref());
         let server_name = format!("node-{node_id}.agentos.test");
         let server_key = KeyPair::generate().expect("generate server key");
         let mut server_params =
@@ -3328,6 +3816,9 @@ mod tests {
         .expect("peer TLS");
         TestPeer {
             node_id,
+            application_node_id: format!("00000000-0000-0000-0000-{node_id:012}"),
+            application_identity_pkcs8: application_identity_pkcs8.as_ref().to_vec(),
+            application_identity_public_key,
             server_name,
             tls,
             server_certificate_pem,
@@ -3348,6 +3839,9 @@ mod tests {
         .expect("peer TLS with overlap CA bundle");
         TestPeer {
             node_id: peer.node_id,
+            application_node_id: peer.application_node_id.clone(),
+            application_identity_pkcs8: peer.application_identity_pkcs8.clone(),
+            application_identity_public_key: peer.application_identity_public_key.clone(),
             server_name: peer.server_name.clone(),
             tls,
             server_certificate_pem: peer.server_certificate_pem.clone(),
@@ -3396,7 +3890,7 @@ mod tests {
             cluster_name: "operator-runtime-test".into(),
             members: vec![ClusterRaftMemberConfig {
                 node_id: peer.node_id,
-                application_node_id: format!("00000000-0000-0000-0000-{:012}", peer.node_id),
+                application_node_id: peer.application_node_id.clone(),
                 application_endpoint: format!("127.0.0.1:{}", 7_000 + peer.node_id),
                 application_tls_server_certificate_sha256: None,
                 endpoint: listen_addr.to_string(),
@@ -3405,7 +3899,7 @@ mod tests {
                 tls_certificate_sha256_overlap: Vec::new(),
                 tls_client_certificate_sha256: peer.tls.client_certificate_sha256().into(),
                 tls_client_certificate_sha256_overlap: Vec::new(),
-                identity_public_key: format!("{:064x}", peer.node_id),
+                identity_public_key: peer.application_identity_public_key.clone(),
             }],
             server_certificate_path: Some(server_certificate_path),
             server_private_key_path: Some(server_private_key_path),
@@ -3466,7 +3960,7 @@ mod tests {
                             .to_string(),
                         tls_certificate_sha256_overlap: Vec::new(),
                         tls_client_certificate_sha256_overlap: Vec::new(),
-                        identity_public_key: format!("{:064x}", peer.node_id),
+                        identity_public_key: peer.application_identity_public_key.clone(),
                         transport_catalog_sha256: String::new(),
                         transport_trust_generation: 0,
                         transport_peer_ca_sha256: Vec::new(),
@@ -3542,6 +4036,18 @@ mod tests {
                 ..Default::default()
             },
         }
+    }
+
+    fn test_authority_delegation(
+        peer: &TestPeer,
+        command: &AuthorityCommand,
+    ) -> DelegatedAuthorityProof {
+        let pair = ring::signature::Ed25519KeyPair::from_pkcs8(&peer.application_identity_pkcs8)
+            .expect("parse test application identity");
+        sign_authority_delegation(command, &peer.application_node_id, |payload| {
+            Ok(pair.sign(payload).as_ref().to_vec())
+        })
+        .expect("sign test authority delegation")
     }
 
     fn set_voter_plan(
@@ -4654,8 +5160,6 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn three_node_mtls_quorum_elects_replicates_fails_over_and_recovers() {
-        use ring::signature::KeyPair as _;
-
         let _ = rustls::crypto::ring::default_provider().install_default();
         let ca = test_ca();
         let peers = (1..=3)
@@ -4668,18 +5172,10 @@ mod tests {
             .zip(&initial_listeners)
             .map(|(peer, listener)| runtime_config(peer, listener, &members, "mtls-quorum-test"))
             .collect::<Vec<_>>();
-        let application_pkcs8 =
-            ring::signature::Ed25519KeyPair::generate_pkcs8(&ring::rand::SystemRandom::new())
-                .expect("generate application identity");
         let application_pair =
-            ring::signature::Ed25519KeyPair::from_pkcs8(application_pkcs8.as_ref())
+            ring::signature::Ed25519KeyPair::from_pkcs8(&peers[0].application_identity_pkcs8)
                 .expect("parse application identity");
-        let application_public_key: String = application_pair
-            .public_key()
-            .as_ref()
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect();
+        let application_public_key = peers[0].application_identity_public_key.clone();
         let application_fingerprint =
             crate::cluster_control::sha256_hex(application_pair.public_key().as_ref());
         let previous_application_tls = "a".repeat(64);
@@ -4786,20 +5282,23 @@ mod tests {
                     .map(|_| index)
             })
             .expect("live follower for forwarding");
+        let second_command = AuthorityCommand::ClaimOwnership {
+            operation_id: Uuid::new_v4().to_string(),
+            agent_id: agent_id.clone(),
+            owner_node_id,
+            ttl_seconds: 60,
+            expected_fencing_token: None,
+            actor: authority_system_actor(&peers[forwarding_index].application_node_id),
+            reason: "prove failover ownership".into(),
+            proposed_at: chrono::Utc::now(),
+        };
+        let second_delegation =
+            test_authority_delegation(&peers[forwarding_index], &second_command);
         let second_write = runtimes[forwarding_index]
             .as_ref()
             .expect("forwarding follower runtime")
             .authority_handle()
-            .commit(AuthorityCommand::ClaimOwnership {
-                operation_id: Uuid::new_v4().to_string(),
-                agent_id: agent_id.clone(),
-                owner_node_id,
-                ttl_seconds: 60,
-                expected_fencing_token: None,
-                actor: "test-operator".into(),
-                reason: "prove failover ownership".into(),
-                proposed_at: chrono::Utc::now(),
-            })
+            .commit(second_command, second_delegation)
             .await
             .expect("forward ownership through follower after leader failover");
         assert!(matches!(
@@ -4839,13 +5338,16 @@ mod tests {
             .as_ref()
             .expect("forwarding follower runtime")
             .authority_handle();
+        let challenge_command = AuthorityCommand::IssueJoinChallenge {
+            operation_id: Uuid::new_v4().to_string(),
+            challenge_hex: rollout_challenge_hex.clone(),
+            ttl_seconds: 60,
+            proposed_at: chrono::Utc::now(),
+        };
+        let challenge_delegation =
+            test_authority_delegation(&peers[forwarding_index], &challenge_command);
         let challenge_response = rollout_handle
-            .commit(AuthorityCommand::IssueJoinChallenge {
-                operation_id: Uuid::new_v4().to_string(),
-                challenge_hex: rollout_challenge_hex.clone(),
-                ttl_seconds: 60,
-                proposed_at: chrono::Utc::now(),
-            })
+            .commit(challenge_command, challenge_delegation)
             .await
             .expect("forward rollout challenge through follower");
         let AuthorityResponse::JoinChallengeIssued {
@@ -4880,19 +5382,22 @@ mod tests {
             .iter()
             .map(|byte| format!("{byte:02x}"))
             .collect();
+        let prepare_command = AuthorityCommand::PrepareMemberCertificateRollout {
+            operation_id: Uuid::new_v4().to_string(),
+            registration: candidate_registration,
+            challenge_hex: rollout_challenge_hex,
+            signature_hex: rollout_signature,
+            expected_generation: 1,
+            prepare_ttl_seconds: 60,
+            minimum_overlap_seconds: 5,
+            actor: authority_system_actor(&peers[forwarding_index].application_node_id),
+            reason: "prove rollout survives failover".into(),
+            proposed_at: chrono::Utc::now(),
+        };
+        let prepare_delegation =
+            test_authority_delegation(&peers[forwarding_index], &prepare_command);
         let prepared_response = rollout_handle
-            .commit(AuthorityCommand::PrepareMemberCertificateRollout {
-                operation_id: Uuid::new_v4().to_string(),
-                registration: candidate_registration,
-                challenge_hex: rollout_challenge_hex,
-                signature_hex: rollout_signature,
-                expected_generation: 1,
-                prepare_ttl_seconds: 60,
-                minimum_overlap_seconds: 5,
-                actor: "test-operator".into(),
-                reason: "prove rollout survives failover".into(),
-                proposed_at: chrono::Utc::now(),
-            })
+            .commit(prepare_command, prepare_delegation)
             .await
             .expect("forward certificate rollout through follower");
         let AuthorityResponse::CertificateRolloutUpdated {
@@ -4994,16 +5499,19 @@ mod tests {
             .as_ref()
             .expect("isolated leader runtime")
             .authority_handle();
+        let abort_command = AuthorityCommand::AbortMemberCertificateRollout {
+            operation_id: Uuid::new_v4().to_string(),
+            node_id: configs[0].authority_genesis.members[0].node_id.clone(),
+            expected_generation: 2,
+            actor: authority_system_actor(&peers[isolated_leader_index].application_node_id),
+            reason: "must not abort rollout without quorum".into(),
+            proposed_at: chrono::Utc::now(),
+        };
+        let abort_delegation =
+            test_authority_delegation(&peers[isolated_leader_index], &abort_command);
         let no_quorum = tokio::time::timeout(
             Duration::from_secs(5),
-            isolated_handle.commit(AuthorityCommand::AbortMemberCertificateRollout {
-                operation_id: Uuid::new_v4().to_string(),
-                node_id: configs[0].authority_genesis.members[0].node_id.clone(),
-                expected_generation: 2,
-                actor: "test-operator".into(),
-                reason: "must not abort rollout without quorum".into(),
-                proposed_at: chrono::Utc::now(),
-            }),
+            isolated_handle.commit(abort_command, abort_delegation),
         )
         .await;
         assert!(

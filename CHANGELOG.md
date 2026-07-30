@@ -10,6 +10,16 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
 
 ## [Unreleased]
 
+- Added bounded system-audit views to the TUI and desktop through the public
+  `KernelClient`. Both clients read node-control, cluster-membership, and
+  application-listener certificate-rollout ledgers sequentially, update only
+  the ledgers whose reads succeed, retain previous projections on failure,
+  expose cluster-only history as unavailable on the single-node profile, and
+  preserve trusted-system authorization. Live loopback and capability
+  regressions cover positive reads, standalone partial state, and tenant-admin
+  denial.
+  Relates #126.
+
 ## [0.4.0-rc.1] - 2026-07-30
 
 - Finalized the restricted candidate change ledger and made the exact-tag

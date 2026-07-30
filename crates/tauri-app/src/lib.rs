@@ -11,8 +11,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use agent_sdk::{
-    AgentEnforcementInfo, ConnectionProfile, GenerationCheckpointSummary, InstalledPackage,
-    KernelClient, LifecycleResult, MessageResult, MessageStreamEvent, OperatorAgentSnapshot,
+    AgentEnforcementInfo, ClusterCertificateRolloutAudit, ClusterMembershipAudit,
+    ConnectionProfile, GenerationCheckpointSummary, InstalledPackage, KernelClient,
+    LifecycleResult, MessageResult, MessageStreamEvent, NodeControlAudit, OperatorAgentSnapshot,
     OperatorCgroupSnapshot, OperatorPackageSnapshot, OperatorServiceSnapshot, OperatorSnapshot,
     OperatorTunable, OperatorTunableAudit, ProviderSummary, SdkError, ServiceHistoryEntry,
     ServiceRuntimeInfo,
@@ -190,6 +191,20 @@ pub struct DesktopOperatorView {
     pub metrics: Option<DesktopMetricsView>,
     pub warnings: Vec<String>,
     pub reconnect_generation: u64,
+}
+
+/// Bounded global audit histories read sequentially through the public SDK.
+///
+/// The server authorizes every ledger independently. The node-control ledger
+/// is required; cluster-only ledgers are `None` with an explicit warning when
+/// the single-node runtime does not own replicated cluster authority. The
+/// response is intentionally not described as an atomic cross-ledger snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DesktopSystemAuditView {
+    pub node_control: Vec<NodeControlAudit>,
+    pub cluster_membership: Option<Vec<ClusterMembershipAudit>>,
+    pub cluster_certificate_rollout: Option<Vec<ClusterCertificateRolloutAudit>>,
+    pub warnings: Vec<String>,
 }
 
 impl DesktopOperatorView {
@@ -769,6 +784,33 @@ impl DesktopClient {
         ))
     }
 
+    pub async fn system_audit(&self, limit: usize) -> Result<DesktopSystemAuditView, SdkError> {
+        let mut client = self.inner.lock().await;
+        let node_control = client.node_control_audit(limit).await?;
+        let mut warnings = Vec::new();
+        let cluster_membership = match client.cluster_membership_audit(limit).await {
+            Ok(entries) => Some(entries),
+            Err(error) => {
+                warnings.push(format!("Cluster-membership audit is unavailable: {error}"));
+                None
+            }
+        };
+        let cluster_certificate_rollout =
+            match client.cluster_certificate_rollout_audit(limit).await {
+                Ok(entries) => Some(entries),
+                Err(error) => {
+                    warnings.push(format!("Certificate-rollout audit is unavailable: {error}"));
+                    None
+                }
+            };
+        Ok(DesktopSystemAuditView {
+            node_control,
+            cluster_membership,
+            cluster_certificate_rollout,
+            warnings,
+        })
+    }
+
     pub async fn list_installed_packages(&self) -> Result<Vec<DesktopInstalledPackage>, SdkError> {
         Ok(self
             .inner
@@ -1084,6 +1126,88 @@ mod tests {
             .tunables
             .as_ref()
             .is_some_and(|items| !items.is_empty()));
+    }
+
+    #[tokio::test]
+    async fn desktop_system_audits_use_the_public_wire_client_and_preserve_authorization() {
+        let kernel = Arc::new(AgentKernelImpl::new().expect("kernel"));
+        let tenant_id = kernel.create_tenant("desktop-audit-tenant").await.unwrap();
+        let tenant_admin = kernel
+            .register_user(
+                &tenant_id,
+                "desktop-audit-admin",
+                "desktop-audit-admin@example.invalid",
+                Role::Admin,
+            )
+            .await
+            .unwrap();
+        let tenant_token = kernel
+            .issue_api_key(&tenant_admin, "desktop-audit-admin")
+            .await
+            .unwrap();
+        let server = SyscallServer::bind(Arc::clone(&kernel), "127.0.0.1:0")
+            .await
+            .expect("bind audit server");
+        let address = server.local_addr().expect("audit server address");
+        let server_task = tokio::spawn(server.serve());
+
+        let mut control = KernelClient::connect(address)
+            .await
+            .expect("public system client");
+        let generation = control
+            .node_info()
+            .await
+            .expect("node info")
+            .control
+            .expect("node control")
+            .generation;
+        control
+            .set_node_availability(
+                agent_sdk::NodeAvailability::Draining,
+                generation,
+                "desktop system-audit regression",
+            )
+            .await
+            .expect("public node-control mutation");
+
+        let client = DesktopClient::connect(&address.to_string(), None)
+            .await
+            .expect("system desktop");
+        let tenant_client = DesktopClient::connect(&address.to_string(), Some(&tenant_token))
+            .await
+            .expect("tenant desktop");
+
+        let view = client
+            .system_audit(20)
+            .await
+            .expect("bounded system audit over public wire");
+        assert!(view.node_control.iter().any(|entry| {
+            entry.current == agent_sdk::NodeAvailability::Draining
+                && entry.reason == "desktop system-audit regression"
+        }));
+        assert!(view.cluster_membership.is_some());
+        assert!(view.cluster_certificate_rollout.is_none());
+        assert!(view.warnings.iter().any(|warning| {
+            warning.contains("Certificate-rollout audit is unavailable")
+                && warning.contains("requires the replicated cluster_raft authority")
+        }));
+        assert!(
+            serde_json::to_value(&view)
+                .expect("serialize desktop audit")
+                .get("cluster_certificate_rollout")
+                .is_some_and(serde_json::Value::is_null),
+            "standalone desktop must serialize unavailable cluster history as null"
+        );
+
+        let denied = tenant_client
+            .system_audit(20)
+            .await
+            .expect_err("tenant admin cannot read global system audit");
+        assert_eq!(
+            denied.wire_code(),
+            Some(agent_sdk::WireErrorCode::AuthorizationDenied)
+        );
+        server_task.abort();
     }
 
     #[tokio::test]

@@ -126,6 +126,24 @@ const tunableAudit = [
   },
 ];
 
+const systemAudit = {
+  node_control: [
+    {
+      generation: 2,
+      previous: 'active',
+      current: 'draining',
+      actor: 'fixture-system-operator',
+      reason: 'drain for maintenance',
+      changed_at: '2026-07-28T19:40:00Z',
+    },
+  ],
+  cluster_membership: [],
+  cluster_certificate_rollout: null,
+  warnings: [
+    'Certificate-rollout audit is unavailable: requires the replicated cluster_raft authority',
+  ],
+};
+
 async function installTauriFixture(page, { setupComplete = true } = {}) {
   await page.addInitScript(
     ({
@@ -134,6 +152,7 @@ async function installTauriFixture(page, { setupComplete = true } = {}) {
       checkpointFixtures,
       serviceHistoryFixtures,
       tunableAuditFixtures,
+      systemAuditFixture,
     }) => {
       const config = {
         setup_complete: complete,
@@ -162,6 +181,9 @@ async function installTauriFixture(page, { setupComplete = true } = {}) {
           }
           if (command === 'operator_tunable_audit') {
             return Promise.resolve(tunableAuditFixtures);
+          }
+          if (command === 'get_system_audit') {
+            return Promise.resolve(systemAuditFixture);
           }
           if (command === 'set_operator_tunable') {
             return Promise.resolve({
@@ -221,6 +243,7 @@ async function installTauriFixture(page, { setupComplete = true } = {}) {
       checkpointFixtures: checkpoints,
       serviceHistoryFixtures: serviceHistory,
       tunableAuditFixtures: tunableAudit,
+      systemAuditFixture: systemAudit,
     },
   );
 }
@@ -429,6 +452,30 @@ test('tunable controls freeze revisions, bound updates, and require exact rollba
   ).toBeVisible();
   await expect(page.getByText('fixture-operator', { exact: true })).toBeVisible();
   await expectWcagAxeClean(page);
+});
+
+test('system audit is axe-clean and exposes standalone partial state without fake emptiness', async ({ page }) => {
+  await installTauriFixture(page);
+  await page.goto('/');
+  await page.getByRole('button', { name: 'Agent status' }).click();
+
+  await page.getByRole('button', { name: 'Load system audit' }).click();
+  await expect(
+    page.getByRole('heading', { name: 'Node-control history' }),
+  ).toBeVisible();
+  await expect(page.getByText('drain for maintenance', { exact: true })).toBeVisible();
+  await expect(
+    page.getByText('Certificate-rollout history requires replicated cluster authority. No empty history has been assumed.'),
+  ).toBeVisible();
+  await expect(
+    page.getByRole('status').filter({ hasText: 'Certificate-rollout audit is unavailable' }),
+  ).toBeVisible();
+  await expectWcagAxeClean(page);
+
+  const call = await page.evaluate(() =>
+    window.__TAURI_CALLS__.find(entry => entry.command === 'get_system_audit'),
+  );
+  expect(call.args).toEqual({ limit: 50 });
 });
 
 test('signed package controls are axe-clean and submit the frozen version and digest', async ({ page }) => {

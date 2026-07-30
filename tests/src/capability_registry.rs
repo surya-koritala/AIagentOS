@@ -1341,6 +1341,95 @@ fn desktop_stream_and_checkpoint_controls_stay_on_the_public_wire_boundary() {
 }
 
 #[test]
+fn tui_and_desktop_system_audits_stay_bounded_and_on_the_public_wire_boundary() {
+    let protocol = read_workspace_file("docs/PROTOCOL.md");
+    let normalized_protocol = protocol.split_whitespace().collect::<Vec<_>>().join(" ");
+    for contract in [
+        "System audit views",
+        "three bounded sequential public-API reads",
+        "not an atomic cross-ledger snapshot",
+        "retain the last successfully loaded projection",
+    ] {
+        assert!(
+            normalized_protocol.contains(contract),
+            "operator system-audit protocol lost {contract:?}"
+        );
+    }
+
+    let tui_app = read_workspace_file("crates/tui/src/app.rs");
+    for contract in [
+        "LoadSystemAudit",
+        "set_system_audits(",
+        "system_audit_loaded",
+        "cluster_certificate_rollout_audit_loaded",
+        "sequential, not atomic",
+    ] {
+        assert!(
+            tui_app.contains(contract),
+            "TUI system-audit state lost {contract:?}"
+        );
+    }
+    let tui_binary = read_workspace_file("crates/tui/src/main.rs");
+    for contract in [
+        ".node_control_audit(SYSTEM_AUDIT_LIMIT)",
+        ".cluster_membership_audit(SYSTEM_AUDIT_LIMIT)",
+        ".cluster_certificate_rollout_audit(SYSTEM_AUDIT_LIMIT)",
+        "app.set_system_audits(",
+        ".map_err(|error| error.to_string())",
+    ] {
+        assert!(
+            tui_binary.contains(contract),
+            "TUI system-audit I/O lost public-client contract {contract:?}"
+        );
+    }
+    let tui_integration = read_workspace_file("crates/tui/tests/system_audit.rs");
+    for contract in [
+        "tui_system_audits_use_the_authenticated_public_client",
+        "TUI system-audit regression",
+        "tenant admin cannot read global node audit",
+        "WireErrorCode::AuthorizationDenied",
+    ] {
+        assert!(
+            tui_integration.contains(contract),
+            "TUI live system-audit regression lost {contract:?}"
+        );
+    }
+
+    let desktop_backend = read_workspace_file("crates/tauri-app/src/lib.rs");
+    for contract in [
+        "pub struct DesktopSystemAuditView",
+        "pub async fn system_audit(&self, limit: usize)",
+        ".node_control_audit(limit)",
+        ".cluster_membership_audit(limit)",
+        ".cluster_certificate_rollout_audit(limit)",
+        "desktop_system_audits_use_the_public_wire_client_and_preserve_authorization",
+    ] {
+        assert!(
+            desktop_backend.contains(contract),
+            "desktop system-audit backend lost {contract:?}"
+        );
+    }
+    let commands = read_workspace_file("crates/tauri-app/src/commands.rs");
+    assert!(commands.contains("pub async fn get_system_audit"));
+    assert!(commands.contains("validate_system_audit_limit(limit)?"));
+    assert!(commands.contains("system audit limit must be between 1 and 200"));
+    let main = read_workspace_file("crates/tauri-app/src/main.rs");
+    assert!(main.contains("commands::get_system_audit"));
+    let ui = read_workspace_file("crates/tauri-app/ui/src/lib/AgentStatus.svelte");
+    for contract in [
+        "invoke('get_system_audit', { limit: 50 })",
+        "bounded sequential public-API reads, not an atomic cross-ledger",
+        "showing the last successfully loaded audit",
+        "Certificate-rollout history",
+    ] {
+        assert!(
+            ui.contains(contract),
+            "desktop system-audit UI lost {contract:?}"
+        );
+    }
+}
+
+#[test]
 fn desktop_service_controls_stay_target_bound_on_the_public_wire_boundary() {
     let protocol = read_workspace_file("docs/PROTOCOL.md");
     let normalized_protocol = protocol.split_whitespace().collect::<Vec<_>>().join(" ");

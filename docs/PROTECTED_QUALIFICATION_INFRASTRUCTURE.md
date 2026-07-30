@@ -27,6 +27,7 @@ eligible evidence.
 | Profiles | Repository enable variable | Protected environment | Required runner label |
 | --- | --- | --- | --- |
 | Capacity baseline, resource soak, target remote backup, release SLO, game day, Phase 1 promotion | `AGENTOS_CAPACITY_QUALIFICATION_ENABLED` | `capacity-qualification` | `agentos-capacity` |
+| Phase 1 independent review | `AGENTOS_PHASE1_REVIEW_ENABLED` | `phase1-review` | `agentos-review` |
 | Real GGUF/on-device model | `AGENTOS_MODEL_QUALIFICATION_ENABLED` | `model-qualification` | `agentos-model` |
 | Destructive target-storage profile | `AGENTOS_DESTRUCTIVE_STORAGE_QUALIFICATION_ENABLED` | `destructive-storage-qualification` | `agentos-destructive-storage` |
 | External deletion and retention | `AGENTOS_EXTERNAL_DATA_QUALIFICATION_ENABLED` | `external-data-qualification` | `agentos-external-data` |
@@ -48,6 +49,14 @@ secret values, model paths, evidence-directory contents, or credentials.
    release-candidate tag and review the resulting protected artifact.
 7. Set the enable variable back to `false` when the runner or protected inputs
    are intentionally unavailable.
+
+The `phase1-review` environment and `agentos-review` runner are a separate
+trust boundary. Set `AGENTOS_PHASE1_REVIEW_DIR` to a reviewer-controlled
+directory containing only `campaign.json` and
+`phase1-review-observation.json`. The authenticated GitHub actor who dispatches
+the review must be distinct from every `operator_id` in the campaign. A rerun
+is deliberately rejected; a failed review must use a fresh dispatch so the
+actor and attempt cannot become ambiguous.
 
 Do not set an enable flag merely to make a workflow advance. If the protected
 job then waits for a runner or approval, that is unverified external state, not

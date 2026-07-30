@@ -10,6 +10,15 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
 
 ## [Unreleased]
 
+- Replaced the self-declared Phase 1 reviewer identity with a protected,
+  exact-tag review workflow. A fresh authenticated GitHub actor distinct from
+  every campaign operator must create and keyless-sign the hash-bound review;
+  promotion now verifies the exact review run, attempt, repository, workflow,
+  event, actor, triggering actor, downloaded bytes, and Sigstore signature.
+  The bounded identity-private review provenance is hash-bound into the
+  promotion decision and shipped as the fourth qualification report. Reruns,
+  forked metadata, actor substitution, unsigned reviews, and tampered artifacts
+  fail closed. Relates #120, #123, and #125.
 - Hardened restricted Phase 1 publication so copied campaign metadata cannot
   impersonate successful qualification. The protected gate now queries
   GitHub's exact workflow-run-attempt API for every retained report, requires

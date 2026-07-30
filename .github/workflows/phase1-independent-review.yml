@@ -1,0 +1,131 @@
+name: Restricted Phase 1 independent review
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_candidate:
+        description: Existing signed annotated vX.Y.Z-rc.N tag
+        required: true
+        type: string
+      environment_id:
+        description: Stable target environment identity from campaign.json
+        required: true
+        type: string
+
+concurrency:
+  group: phase1-independent-review-${{ inputs.release_candidate }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  AGENTOS_RELEASE_CANDIDATE: ${{ inputs.release_candidate }}
+  AGENTOS_QUALIFICATION_ENVIRONMENT: ${{ inputs.environment_id }}
+  AGENTOS_PHASE1_REVIEW_DIR: ${{ vars.AGENTOS_PHASE1_REVIEW_DIR }}
+
+jobs:
+  qualification-plan:
+    name: Fail-closed independent-review preflight
+    uses: ./.github/workflows/protected-qualification-plan.yml
+    with:
+      profile: phase1-independent-review
+      enabled: ${{ vars.AGENTOS_PHASE1_REVIEW_ENABLED }}
+
+  authenticated-independent-review:
+    name: Authenticated exact-RC independent review
+    needs: qualification-plan
+    if: needs.qualification-plan.outputs.ready == 'true'
+    runs-on: [self-hosted, linux, x64, agentos-review]
+    timeout-minutes: 20
+    environment: phase1-review
+    permissions:
+      attestations: write
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.release_candidate }}
+          fetch-depth: 0
+      - name: Validate the authenticated review contracts
+        run: |
+          python3 scripts/phase1_independent_review.py --validate
+          python3 scripts/phase1_review_provenance.py --validate
+      - name: Bind dispatch, annotated tag, checkout, actor, and fresh attempt
+        run: |
+          [[ "$AGENTOS_RELEASE_CANDIDATE" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-rc\.[1-9][0-9]*$ ]]
+          [[ "$GITHUB_ACTOR" =~ ^[A-Za-z0-9][A-Za-z0-9-]{0,38}$ ]]
+          test "$GITHUB_RUN_ATTEMPT" = "1"
+          test "$GITHUB_REF" = "refs/tags/${AGENTOS_RELEASE_CANDIDATE}"
+          test "$(git cat-file -t "$AGENTOS_RELEASE_CANDIDATE")" = "tag"
+          test "$(git rev-list -n 1 "$AGENTOS_RELEASE_CANDIDATE")" = "$GITHUB_SHA"
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          git diff --quiet
+          git diff --cached --quiet
+      - name: Require the reviewer-controlled evidence drop
+        run: |
+          test -n "$AGENTOS_PHASE1_REVIEW_DIR"
+          [[ "$AGENTOS_PHASE1_REVIEW_DIR" = /* ]]
+          test -d "$AGENTOS_PHASE1_REVIEW_DIR"
+          test ! -L "$AGENTOS_PHASE1_REVIEW_DIR"
+          review_dir="$(realpath "$AGENTOS_PHASE1_REVIEW_DIR")"
+          case "$review_dir" in
+            "$GITHUB_WORKSPACE"|"$GITHUB_WORKSPACE"/*)
+              echo "Review evidence must remain outside the source checkout" >&2
+              exit 1
+              ;;
+          esac
+          for name in campaign.json phase1-review-observation.json; do
+            path="${review_dir}/${name}"
+            test -f "$path"
+            test ! -L "$path"
+          done
+      - name: Create the actor-bound independent review
+        run: |
+          mkdir -p target/qualification
+          python3 scripts/phase1_independent_review.py \
+            --campaign "${AGENTOS_PHASE1_REVIEW_DIR}/campaign.json" \
+            --observation \
+              "${AGENTOS_PHASE1_REVIEW_DIR}/phase1-review-observation.json" \
+            --actor "$GITHUB_ACTOR" \
+            --repository "$GITHUB_REPOSITORY" \
+            --run-id "$GITHUB_RUN_ID" \
+            --run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --release-candidate "$AGENTOS_RELEASE_CANDIDATE" \
+            --expected-commit "$GITHUB_SHA" \
+            --expected-environment "$AGENTOS_QUALIFICATION_ENVIRONMENT" \
+            --output target/qualification/phase1-review.json \
+            --require-approved
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+      - name: Keyless-sign the authenticated review
+        run: |
+          cosign sign-blob --yes \
+            --bundle target/qualification/phase1-review.json.sigstore.json \
+            target/qualification/phase1-review.json
+      - uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+        with:
+          subject-path: target/qualification/phase1-review.json
+      - name: Publish bounded review summary
+        run: |
+          report=target/qualification/phase1-review.json
+          {
+            printf '### Restricted Phase 1 independent review\n\n'
+            printf -- '- Commit: `%s`\n' "$GITHUB_SHA"
+            printf -- '- Release candidate: `%s`\n' \
+              "$AGENTOS_RELEASE_CANDIDATE"
+            printf -- '- Decision: `%s`\n' "$(jq -r .decision "$report")"
+            printf -- '- Review attempt: `%s`\n' \
+              "$(jq -r .review_workflow.run_attempt "$report")"
+            printf -- '- Open findings: `%s`\n' \
+              "$(jq '.open_findings | length' "$report")"
+            printf -- '- Whole-product production claim: `false`\n'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: phase1-independent-review-${{ inputs.release_candidate }}-${{ github.sha }}
+          path: |
+            target/qualification/phase1-review.json
+            target/qualification/phase1-review.json.sigstore.json
+          if-no-files-found: error
+          retention-days: 90

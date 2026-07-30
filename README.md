@@ -29,7 +29,7 @@
 > Ubuntu 22.04 x86_64 CLI candidate and is not a production-qualified v1.0
 > application.** Trust that candidate only when its
 > [GitHub prerelease](https://github.com/surya-koritala/AIagentOS/releases/tag/v0.4.0-rc.1)
-> contains all three signed qualification reports and every artifact described
+> contains all four signed qualification reports and every artifact described
 > in the [verification and install guide](docs/LINUX_CLI_RC.md). Publication is
 > blocked until the
 > [Phase 1 evidence campaign](docs/PHASE1_PROMOTION_QUALIFICATION.md) binds the

@@ -68,6 +68,7 @@ for asset in \
   "$archive" \
   linux-cli-rc-qualification.json \
   phase1-workflow-provenance.json \
+  phase1-review-provenance.json \
   phase1-promotion.json \
   SHA256SUMS; do
   cosign verify-blob \
@@ -84,7 +85,7 @@ for asset in \
 done
 ```
 
-Inspect all three reports before trusting the candidate:
+Inspect all four reports before trusting the candidate:
 
 ```bash
 jq '{
@@ -120,12 +121,27 @@ jq '{
   github_artifact_bytes_verified,
   production_claim_allowed
 }' phase1-workflow-provenance.json
+jq '{
+  repository,
+  release_candidate,
+  source,
+  review_workflow,
+  reviewer_identity_authenticated,
+  github_review_workflow_provenance_verified,
+  github_review_artifact_bytes_verified,
+  keyless_review_signature_verified,
+  production_claim_allowed
+}' phase1-review-provenance.json
 ```
 
 The restricted decision must set `phase1_release_candidate_ready` to `true`.
 The GitHub provenance report must set both verification booleans to `true`,
 and its SHA-256 must match
 `phase1-promotion.json.evidence.workflow_provenance_sha256`.
+The independent-review provenance report must set its identity, workflow,
+artifact-byte, and keyless-signature verification booleans to `true`, and its
+SHA-256 must match
+`phase1-promotion.json.evidence.independent_review_provenance_sha256`.
 `production_claim_allowed` remains `false` until the client, peripheral,
 distributed-control-plane, independent-security, and final v1 governance gates
 are satisfied.

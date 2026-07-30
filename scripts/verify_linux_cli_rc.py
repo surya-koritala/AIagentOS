@@ -59,6 +59,9 @@ def validate_contract(root: Path) -> list[str]:
     promotion = (
         root / ".github/workflows/phase1-promotion-qualification.yml"
     ).read_text(encoding="utf-8")
+    independent_review = (
+        root / ".github/workflows/phase1-independent-review.yml"
+    ).read_text(encoding="utf-8")
     if '- "!v*-rc.*"' not in stable:
         failures.append("stable release workflow must exclude release-candidate tags")
     required = [
@@ -99,6 +102,7 @@ def validate_contract(root: Path) -> list[str]:
         "workflow_dispatch:",
         "release_candidate:",
         "linux_cli_rc_run_id:",
+        "phase1_review_run_id:",
         "environment_id:",
         "profile: phase1-promotion",
         "runs-on: [self-hosted, linux, x64, agentos-capacity]",
@@ -106,12 +110,18 @@ def validate_contract(root: Path) -> list[str]:
         "AGENTOS_PHASE1_EVIDENCE_DIR",
         "scripts/phase1_promotion_qualification.py",
         "scripts/phase1_workflow_provenance.py",
+        "scripts/phase1_review_provenance.py",
         "actions/runs/${run_id}/attempts/${run_attempt}",
         'gh run download "$run_id"',
         "--workflow-provenance",
+        "--review-provenance",
         "phase1-workflow-provenance.json",
+        "phase1-review-provenance.json",
         "github_workflow_provenance_verified",
         "github_artifact_bytes_verified",
+        "reviewer_identity_authenticated",
+        "keyless_review_signature_verified",
+        "phase1-independent-review/phase1-review.json",
         "--require-eligible",
         "phase1_release_candidate_ready",
         "production_claim_allowed",
@@ -130,6 +140,24 @@ def validate_contract(root: Path) -> list[str]:
             )
     if promotion.count("permissions:\n      actions: read\n      contents: write") != 1:
         failures.append("only the gated Phase 1 publication job may write contents")
+    review_required = [
+        "workflow_dispatch:",
+        "profile: phase1-independent-review",
+        "runs-on: [self-hosted, linux, x64, agentos-review]",
+        "environment: phase1-review",
+        "AGENTOS_PHASE1_REVIEW_DIR",
+        'test "$GITHUB_RUN_ATTEMPT" = "1"',
+        "scripts/phase1_independent_review.py",
+        "--actor \"$GITHUB_ACTOR\"",
+        "cosign sign-blob --yes",
+        "actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373",
+        "phase1-independent-review-${{ inputs.release_candidate }}-${{ github.sha }}",
+    ]
+    for value in review_required:
+        if value not in independent_review:
+            failures.append(
+                f"Phase 1 independent-review workflow lost contract {value!r}"
+            )
     return failures
 
 

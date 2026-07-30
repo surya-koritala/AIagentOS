@@ -4078,6 +4078,32 @@ mod tests {
         }
     }
 
+    fn apply_backup_retention_after_inherited_test_lock_drains(
+        manager: &SqliteContextManager,
+        root: &Path,
+        policy: BackupRetentionPolicy,
+        dry_run: bool,
+    ) -> BackupRetentionReport {
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            match manager.apply_backup_retention(root, policy.clone(), dry_run) {
+                Ok(report) => return report,
+                Err(error)
+                    if error.to_string().contains("another backup publication")
+                        && std::time::Instant::now() < deadline =>
+                {
+                    // Process-exit regressions run in parallel in this test
+                    // binary. A child forked while another test held the
+                    // advisory lock can retain the inherited descriptor until
+                    // exec. Production remains fail-fast; only successful test
+                    // setup retries this bounded inherited-lock window.
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("backup retention test setup never became idle: {error}"),
+            }
+        }
+    }
+
     #[test]
     fn online_backup_includes_wal_state_and_verifies() {
         let directory = TestDirectory::new("online");
@@ -4188,16 +4214,15 @@ mod tests {
             .is_err());
 
         manager.create_backup(&backup_root, "backup_002").unwrap();
-        let retention = manager
-            .apply_backup_retention(
-                &backup_root,
-                BackupRetentionPolicy {
-                    keep_latest: 1,
-                    max_age_seconds: 60,
-                },
-                true,
-            )
-            .unwrap();
+        let retention = apply_backup_retention_after_inherited_test_lock_drains(
+            &manager,
+            &backup_root,
+            BackupRetentionPolicy {
+                keep_latest: 1,
+                max_age_seconds: 60,
+            },
+            true,
+        );
         assert!(retention.skipped.is_empty(), "{:?}", retention.skipped);
         assert_eq!(retention.retained.len(), 2);
 
@@ -4253,16 +4278,15 @@ mod tests {
         )
         .unwrap();
         manager.create_backup(&backup_root, "current_key").unwrap();
-        let report = manager
-            .apply_backup_retention(
-                &backup_root,
-                BackupRetentionPolicy {
-                    keep_latest: 1,
-                    max_age_seconds: 1,
-                },
-                false,
-            )
-            .unwrap();
+        let report = apply_backup_retention_after_inherited_test_lock_drains(
+            &manager,
+            &backup_root,
+            BackupRetentionPolicy {
+                keep_latest: 1,
+                max_age_seconds: 1,
+            },
+            false,
+        );
         assert!(report.skipped.is_empty(), "{:?}", report.skipped);
         assert_eq!(
             report
@@ -4589,9 +4613,12 @@ mod tests {
             max_age_seconds: 60 * 60,
         };
 
-        let preview = manager
-            .apply_backup_retention(&root, policy.clone(), true)
-            .unwrap();
+        let preview = apply_backup_retention_after_inherited_test_lock_drains(
+            &manager,
+            &root,
+            policy.clone(),
+            true,
+        );
         assert!(preview.dry_run);
         assert_eq!(
             preview
@@ -4615,9 +4642,8 @@ mod tests {
             assert!(root.join(name).exists());
         }
 
-        let applied = manager
-            .apply_backup_retention(&root, policy, false)
-            .unwrap();
+        let applied =
+            apply_backup_retention_after_inherited_test_lock_drains(&manager, &root, policy, false);
         assert_eq!(applied.deleted, applied.eligible);
         assert!(!root.join("oldest").exists());
         assert!(!root.join("old").exists());
@@ -4646,16 +4672,15 @@ mod tests {
         fs::create_dir(root.join("corrupt")).unwrap();
         fs::write(root.join("corrupt/manifest.json"), b"not json").unwrap();
 
-        let report = manager
-            .apply_backup_retention(
-                &root,
-                BackupRetentionPolicy {
-                    keep_latest: 1,
-                    max_age_seconds: 1,
-                },
-                false,
-            )
-            .unwrap();
+        let report = apply_backup_retention_after_inherited_test_lock_drains(
+            &manager,
+            &root,
+            BackupRetentionPolicy {
+                keep_latest: 1,
+                max_age_seconds: 1,
+            },
+            false,
+        );
         assert!(report.deleted.is_empty());
         assert_eq!(report.retained.len(), 1, "{report:#?}");
         assert_eq!(report.skipped.len(), 3);
@@ -4734,16 +4759,15 @@ mod tests {
         fs::write(outside.join("must-survive"), b"proof").unwrap();
         symlink(&outside, root.join("linked")).unwrap();
 
-        let report = manager
-            .apply_backup_retention(
-                &root,
-                BackupRetentionPolicy {
-                    keep_latest: 1,
-                    max_age_seconds: 1,
-                },
-                false,
-            )
-            .unwrap();
+        let report = apply_backup_retention_after_inherited_test_lock_drains(
+            &manager,
+            &root,
+            BackupRetentionPolicy {
+                keep_latest: 1,
+                max_age_seconds: 1,
+            },
+            false,
+        );
         assert!(report
             .skipped
             .iter()

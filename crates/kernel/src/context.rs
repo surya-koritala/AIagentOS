@@ -11187,8 +11187,8 @@ mod tests {
                 .iter()
                 .map(|fixture| fixture.tag.as_str())
                 .collect::<Vec<_>>(),
-            ["v0.1.0", "v0.2.0", "v0.3.0"],
-            "the fixture manifest must enumerate every immutable published tag"
+            ["v0.1.0", "v0.2.0", "v0.3.0", "v0.4.0-rc.1"],
+            "the fixture manifest must enumerate every immutable release fixture"
         );
         assert_eq!(
             manifest.release.last().map(|fixture| fixture.tag.as_str()),
@@ -11335,6 +11335,22 @@ mod tests {
                 "{} idempotent reopen duplicated migration history",
                 fixture.tag
             );
+            drop(connection);
+            drop(reopened);
+
+            if fixture.legacy_schema_version == crate::schema::CURRENT_SCHEMA_VERSION {
+                let agent_id = uuid::Uuid::parse_str(&fixture.agent_id).unwrap();
+                let kernel =
+                    crate::AgentKernelImpl::with_db_path(&database.path).unwrap_or_else(|error| {
+                        panic!("{} full kernel boot failed: {error}", fixture.tag)
+                    });
+                assert_eq!(
+                    kernel.get_agent_status(agent_id).unwrap(),
+                    crate::AgentState::Running,
+                    "{} did not rehydrate its retained agent through the primary kernel path",
+                    fixture.tag
+                );
+            }
         }
     }
 

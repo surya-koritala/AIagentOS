@@ -12,6 +12,9 @@ from verify_desktop_release import validate
 
 
 ROOT = Path(__file__).resolve().parents[2]
+VERSION = json.loads(
+    (ROOT / "crates/tauri-app/tauri.conf.json").read_text(encoding="utf-8")
+)["version"]
 
 
 class DesktopReleaseValidationTests(unittest.TestCase):
@@ -46,7 +49,7 @@ class DesktopReleaseValidationTests(unittest.TestCase):
         self.directory.cleanup()
 
     def test_accepts_consistent_desktop_release(self):
-        self.assertEqual(validate(self.root, "v0.3.0"), [])
+        self.assertEqual(validate(self.root, f"v{VERSION}"), [])
 
     def test_rejects_version_and_tag_drift(self):
         package_path = self.root / "crates/tauri-app/ui/package.json"

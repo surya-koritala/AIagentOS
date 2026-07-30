@@ -162,8 +162,9 @@ older schema requires an offline restore of a compatible, verified pre-upgrade
 backup.
 
 Reviewable SQL fixtures under `tests/fixtures/storage/` reproduce representative
-stores from every immutable published tag (`v0.1.0`, `v0.2.0`, and `v0.3.0`).
-The fixture manifest pins each source tag commit and SQL SHA-256 digest. The
+stores from every immutable published tag (`v0.1.0`, `v0.2.0`, and `v0.3.0`)
+and the exact restricted release candidate (`v0.4.0-rc.1`).
+The fixture manifest pins each fixture's source commit and SQL SHA-256 digest. The
 regression suite builds a real SQLite database from every fixture, upgrades it,
 verifies current ownership/integrity/migration metadata, exercises context
 restore, and checks memory, FTS, usage-cost backfill, tenant, and KV retention

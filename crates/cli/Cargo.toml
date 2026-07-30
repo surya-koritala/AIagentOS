@@ -1,6 +1,6 @@
 [package]
 name = "agent-cli"
-version = "0.3.0"
+version = "0.4.0-rc.1"
 edition = "2021"
 license.workspace = true
 rust-version.workspace = true
@@ -20,9 +20,9 @@ default = []
 candle = ["adapters/candle"]
 
 [dependencies]
-kernel = { path = "../kernel", version = "=0.3.0" }
-agent-sdk = { path = "../sdk", version = "=0.3.0" }
-adapters = { path = "../adapters", version = "=0.3.0" }
+kernel = { path = "../kernel", version = "=0.4.0-rc.1" }
+agent-sdk = { path = "../sdk", version = "=0.4.0-rc.1" }
+adapters = { path = "../adapters", version = "=0.4.0-rc.1" }
 tokio = { version = "1", features = ["full"] }
 serde = { workspace = true }
 serde_json = { workspace = true }

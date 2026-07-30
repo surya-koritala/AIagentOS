@@ -1,6 +1,6 @@
 [package]
 name = "resources"
-version = "0.3.0"
+version = "0.4.0-rc.1"
 edition = "2021"
 license.workspace = true
 rust-version.workspace = true
@@ -15,7 +15,7 @@ browser = ["dep:chromiumoxide", "dep:futures", "dep:tempfile"]
 web = ["dep:scraper", "dep:futures"]
 
 [dependencies]
-kernel = { path = "../kernel", version = "=0.3.0" }
+kernel = { path = "../kernel", version = "=0.4.0-rc.1" }
 tokio = { workspace = true }
 async-trait = { workspace = true }
 serde = { workspace = true }

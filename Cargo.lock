@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "adapters"
-version = "0.3.0"
+version = "0.4.0-rc.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -56,7 +56,7 @@ dependencies = [
 
 [[package]]
 name = "agent-cli"
-version = "0.3.0"
+version = "0.4.0-rc.1"
 dependencies = [
  "adapters",
  "agent-sdk",
@@ -78,7 +78,7 @@ dependencies = [
 
 [[package]]
 name = "agent-sdk"
-version = "0.3.0"
+version = "0.4.0-rc.1"
 dependencies = [
  "adapters",
  "async-trait",
@@ -99,7 +99,7 @@ dependencies = [
 
 [[package]]
 name = "agent-tui"
-version = "0.3.0"
+version = "0.4.0-rc.1"
 dependencies = [
  "agent-sdk",
  "kernel",
@@ -1132,7 +1132,7 @@ checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 
 [[package]]
 name = "cli-test"
-version = "0.3.0"
+version = "0.4.0-rc.1"
 dependencies = [
  "adapters",
  "dirs",
@@ -3502,7 +3502,7 @@ dependencies = [
 
 [[package]]
 name = "integration-tests"
-version = "0.3.0"
+version = "0.4.0-rc.1"
 dependencies = [
  "adapters",
  "agent-cli",
@@ -3759,7 +3759,7 @@ dependencies = [
 
 [[package]]
 name = "kernel"
-version = "0.3.0"
+version = "0.4.0-rc.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4785,7 +4785,7 @@ dependencies = [
 
 [[package]]
 name = "os-benchmark"
-version = "0.3.0"
+version = "0.4.0-rc.1"
 dependencies = [
  "adapters",
  "agent-sdk",
@@ -5888,7 +5888,7 @@ dependencies = [
 
 [[package]]
 name = "resources"
-version = "0.3.0"
+version = "0.4.0-rc.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -6971,6 +6971,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "tap"
+version = "1.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "55937e1799185b12863d447f42597ed69d9928686b8d88a1df17376a097d8369"
+
+[[package]]
 name = "tar"
 version = "0.4.46"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6980,12 +6986,6 @@ dependencies = [
  "libc",
  "xattr",
 ]
-
-[[package]]
-name = "tap"
-version = "1.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "55937e1799185b12863d447f42597ed69d9928686b8d88a1df17376a097d8369"
 
 [[package]]
 name = "target-lexicon"
@@ -7052,7 +7052,7 @@ dependencies = [
 
 [[package]]
 name = "tauri-app"
-version = "0.3.0"
+version = "0.4.0-rc.1"
 dependencies = [
  "agent-cli",
  "agent-sdk",

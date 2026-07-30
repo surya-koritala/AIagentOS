@@ -92,6 +92,13 @@ jobs:
               exit 1
             fi
           done
+      - name: Prove shipped binaries report the exact release version
+        run: |
+          expected="${GITHUB_REF_NAME#v}"
+          for binary in agent agent-server agent-tui agentctl; do
+            actual="$(target-a/${TARGET}/release/${binary} --version)"
+            test "$actual" = "${binary} ${expected}"
+          done
       - name: Build canonical deterministic archive
         run: |
           mkdir -p dist/stage

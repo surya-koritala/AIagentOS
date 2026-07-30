@@ -257,7 +257,13 @@ fn parse_portable_file_options(
 
 #[tokio::main]
 async fn main() {
-    let mut args = std::env::args().skip(1).peekable();
+    let argv: Vec<String> = std::env::args().collect();
+    if argv.len() == 2 && matches!(argv[1].as_str(), "--version" | "-V") {
+        println!("agentctl {}", env!("CARGO_PKG_VERSION"));
+        return;
+    }
+
+    let mut args = argv.into_iter().skip(1).peekable();
     let mut address_override = None;
     let mut token = std::env::var("AGENT_SERVER_TOKEN").ok();
 

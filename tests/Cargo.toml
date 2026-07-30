@@ -1,6 +1,6 @@
 [package]
 name = "integration-tests"
-version = "0.3.0"
+version = "0.4.0-rc.1"
 edition = "2021"
 license.workspace = true
 rust-version.workspace = true
@@ -10,10 +10,10 @@ name = "integration_tests"
 path = "src/lib.rs"
 
 [dependencies]
-kernel = { path = "../crates/kernel", version = "=0.3.0" }
-agent-sdk = { path = "../crates/sdk", version = "=0.3.0" }
-adapters = { path = "../crates/adapters", version = "=0.3.0" }
-resources = { path = "../crates/resources", version = "=0.3.0" }
+kernel = { path = "../crates/kernel", version = "=0.4.0-rc.1" }
+agent-sdk = { path = "../crates/sdk", version = "=0.4.0-rc.1" }
+adapters = { path = "../crates/adapters", version = "=0.4.0-rc.1" }
+resources = { path = "../crates/resources", version = "=0.4.0-rc.1" }
 tokio = { workspace = true }
 async-trait = { workspace = true }
 serde = { workspace = true }
@@ -25,9 +25,9 @@ uuid = { workspace = true }
 semver = { workspace = true }
 
 [dev-dependencies]
-agent-cli = { path = "../crates/cli", version = "=0.3.0" }
-agent-tui = { path = "../crates/tui", version = "=0.3.0" }
-tauri-app = { path = "../crates/tauri-app", version = "=0.3.0", default-features = false }
+agent-cli = { path = "../crates/cli", version = "=0.4.0-rc.1" }
+agent-tui = { path = "../crates/tui", version = "=0.4.0-rc.1" }
+tauri-app = { path = "../crates/tauri-app", version = "=0.4.0-rc.1", default-features = false }
 proptest = { workspace = true }
 wiremock = { workspace = true }
 futures = "0.3"

@@ -62,22 +62,29 @@ Verify the final archive against the exact Phase 1 publication workflow
 identity:
 
 ```bash
-archive="agentos-${AGENTOS_RC}-x86_64-unknown-linux-gnu.zip"
 identity="https://github.com/surya-koritala/AIagentOS/.github/workflows/phase1-promotion-qualification.yml@refs/tags/${AGENTOS_RC}"
-cosign verify-blob \
-  --bundle "${archive}.sigstore.json" \
-  --certificate-identity "$identity" \
-  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
-  "$archive"
-gh attestation verify "$archive" \
-  --repo surya-koritala/AIagentOS \
-  --signer-workflow surya-koritala/AIagentOS/.github/workflows/phase1-promotion-qualification.yml \
-  --source-ref "refs/tags/${AGENTOS_RC}" \
-  --cert-identity "$identity" \
-  --deny-self-hosted-runners
+archive="agentos-${AGENTOS_RC}-x86_64-unknown-linux-gnu.zip"
+for asset in \
+  "$archive" \
+  linux-cli-rc-qualification.json \
+  phase1-workflow-provenance.json \
+  phase1-promotion.json \
+  SHA256SUMS; do
+  cosign verify-blob \
+    --bundle "${asset}.sigstore.json" \
+    --certificate-identity "$identity" \
+    --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+    "$asset"
+  gh attestation verify "$asset" \
+    --repo surya-koritala/AIagentOS \
+    --signer-workflow surya-koritala/AIagentOS/.github/workflows/phase1-promotion-qualification.yml \
+    --source-ref "refs/tags/${AGENTOS_RC}" \
+    --cert-identity "$identity" \
+    --deny-self-hosted-runners
+done
 ```
 
-Inspect both reports before trusting the candidate:
+Inspect all three reports before trusting the candidate:
 
 ```bash
 jq '{
@@ -103,9 +110,22 @@ jq '{
   production_claim_allowed,
   eligibility_blockers
 }' phase1-promotion.json
+jq '{
+  repository,
+  release_candidate,
+  source,
+  run_count,
+  artifact_count,
+  github_workflow_provenance_verified,
+  github_artifact_bytes_verified,
+  production_claim_allowed
+}' phase1-workflow-provenance.json
 ```
 
 The restricted decision must set `phase1_release_candidate_ready` to `true`.
+The GitHub provenance report must set both verification booleans to `true`,
+and its SHA-256 must match
+`phase1-promotion.json.evidence.workflow_provenance_sha256`.
 `production_claim_allowed` remains `false` until the client, peripheral,
 distributed-control-plane, independent-security, and final v1 governance gates
 are satisfied.

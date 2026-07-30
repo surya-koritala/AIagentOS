@@ -10,6 +10,16 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
 
 ## [Unreleased]
 
+- Hardened restricted Phase 1 publication so copied campaign metadata cannot
+  impersonate successful qualification. The protected gate now queries
+  GitHub's exact workflow-run-attempt API for every retained report, requires
+  the latest attempt to match the campaign's repository, workflow, commit,
+  conclusion, and update time, downloads every exact named artifact, and
+  compares its report bytes with the protected evidence digest. The bounded
+  provenance result is hash-bound into the promotion decision, signed,
+  attested, and shipped as the third qualification report. Missing, expired,
+  ambiguous, rerun, forked, or tampered evidence fails closed. (#284)
+
 ## [0.4.0-rc.1] - 2026-07-30
 
 - Prepared the first restricted Linux CLI candidate with every workspace,

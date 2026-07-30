@@ -21,6 +21,7 @@ SCHEMA_VERSION = 1
 CAMPAIGN_CLASS = "restricted_phase1_evidence_campaign"
 REVIEW_CLASS = "independent_restricted_phase1_promotion_review"
 REPORT_CLASS = "restricted_phase1_promotion_decision"
+WORKFLOW_PROVENANCE_CLASS = "restricted_phase1_github_provenance"
 PROFILE_ID = "single-node-linux-rootless-container-cli"
 COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -28,6 +29,7 @@ RC_RE = re.compile(r"^v[0-9]+\.[0-9]+\.[0-9]+-rc\.[1-9][0-9]*$")
 IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$")
 MAX_CAMPAIGN_BYTES = 256 * 1024
 MAX_REVIEW_BYTES = 256 * 1024
+MAX_WORKFLOW_PROVENANCE_BYTES = 512 * 1024
 MAX_EVIDENCE_BYTES = 8 * 1024 * 1024
 MAX_ARTIFACTS = 32
 MAX_REVIEW_DELAY = dt.timedelta(days=30)
@@ -825,9 +827,242 @@ def _parse_review(
     return review, review_sha, blockers
 
 
+def _parse_workflow_provenance(
+    path: Path,
+    *,
+    campaign_sha: str,
+    release_candidate: str,
+    expected_commit: str,
+    artifact_records: dict[str, dict[str, Any]],
+    completion_times: list[dt.datetime],
+) -> tuple[dict[str, Any], str]:
+    report, report_sha = _load_json(
+        path,
+        "Phase 1 GitHub workflow provenance",
+        MAX_WORKFLOW_PROVENANCE_BYTES,
+    )
+    _exact_keys(
+        report,
+        {
+            "schema_version",
+            "qualification_class",
+            "generated_at",
+            "repository",
+            "release_candidate",
+            "source",
+            "campaign_sha256",
+            "run_count",
+            "artifact_count",
+            "runs",
+            "artifacts",
+            "github_workflow_provenance_verified",
+            "github_artifact_bytes_verified",
+            "production_claim_allowed",
+        },
+        "workflow provenance",
+    )
+    if report["schema_version"] != SCHEMA_VERSION:
+        raise QualificationError(
+            "workflow provenance schema_version is unsupported"
+        )
+    if report["qualification_class"] != WORKFLOW_PROVENANCE_CLASS:
+        raise QualificationError(
+            "workflow provenance qualification_class is invalid"
+        )
+    if report["release_candidate"] != release_candidate:
+        raise QualificationError(
+            "workflow provenance release candidate does not match"
+        )
+    _source(report["source"], expected_commit, "workflow provenance.source")
+    _identifier(report["repository"], "workflow provenance.repository")
+    if report["campaign_sha256"] != campaign_sha:
+        raise QualificationError(
+            "workflow provenance does not bind the exact campaign bytes"
+        )
+    if (
+        report["github_workflow_provenance_verified"] is not True
+        or report["github_artifact_bytes_verified"] is not True
+        or report["production_claim_allowed"] is not False
+    ):
+        raise QualificationError(
+            "workflow provenance does not contain both required verified results"
+        )
+    generated_at = _timestamp(
+        report["generated_at"], "workflow provenance.generated_at"
+    )
+    if generated_at > dt.datetime.now(dt.timezone.utc) + dt.timedelta(minutes=5):
+        raise QualificationError("workflow provenance timestamp is in the future")
+    if generated_at < max(completion_times):
+        raise QualificationError(
+            "workflow provenance predates one or more workflow artifacts"
+        )
+
+    expected_runs: dict[tuple[int, int], dict[str, Any]] = {}
+    expected_artifacts: list[dict[str, Any]] = []
+    for evidence_id in sorted(artifact_records):
+        record = artifact_records[evidence_id]
+        key = (record["workflow_run_id"], record["workflow_run_attempt"])
+        run = expected_runs.setdefault(
+            key,
+            {
+                "run_id": key[0],
+                "run_attempt": key[1],
+                "workflow_path": record["workflow_path"],
+                "head_sha": expected_commit,
+                "workflow_updated_at": record["workflow_completed_at"],
+                "evidence_ids": [],
+            },
+        )
+        if (
+            run["workflow_path"] != record["workflow_path"]
+            or run["workflow_updated_at"] != record["workflow_completed_at"]
+        ):
+            raise QualificationError(
+                "campaign reuses one workflow attempt for mixed provenance"
+            )
+        run["evidence_ids"].append(evidence_id)
+        expected_artifacts.append(
+            {
+                "evidence_id": evidence_id,
+                "run_id": key[0],
+                "run_attempt": key[1],
+                "report_sha256": record["sha256"],
+            }
+        )
+
+    runs = _array(
+        report["runs"],
+        "workflow provenance.runs",
+        minimum=len(expected_runs),
+        maximum=len(expected_runs),
+    )
+    parsed_runs: list[dict[str, Any]] = []
+    for index, raw_run in enumerate(runs):
+        run = _object(raw_run, f"workflow provenance.runs[{index}]")
+        _exact_keys(
+            run,
+            {
+                "run_id",
+                "run_attempt",
+                "workflow_path",
+                "head_sha",
+                "workflow_updated_at",
+                "evidence_ids",
+            },
+            f"workflow provenance.runs[{index}]",
+        )
+        key = (
+            _positive_integer(
+                run["run_id"], f"workflow provenance.runs[{index}].run_id"
+            ),
+            _positive_integer(
+                run["run_attempt"],
+                f"workflow provenance.runs[{index}].run_attempt",
+            ),
+        )
+        expected = expected_runs.get(key)
+        if expected is None:
+            raise QualificationError(
+                "workflow provenance contains an unexpected workflow attempt"
+            )
+        evidence_ids = [
+            _identifier(
+                evidence_id,
+                f"workflow provenance.runs[{index}].evidence_ids[]",
+            )
+            for evidence_id in _array(
+                run["evidence_ids"],
+                f"workflow provenance.runs[{index}].evidence_ids",
+                minimum=1,
+                maximum=MAX_ARTIFACTS,
+            )
+        ]
+        parsed = {
+            "run_id": key[0],
+            "run_attempt": key[1],
+            "workflow_path": run["workflow_path"],
+            "head_sha": run["head_sha"],
+            "workflow_updated_at": _timestamp(
+                run["workflow_updated_at"],
+                f"workflow provenance.runs[{index}].workflow_updated_at",
+            ),
+            "evidence_ids": evidence_ids,
+        }
+        if parsed != expected:
+            raise QualificationError(
+                "workflow provenance run does not match the campaign"
+            )
+        parsed_runs.append(parsed)
+    if [
+        (run["run_id"], run["run_attempt"]) for run in parsed_runs
+    ] != sorted(expected_runs):
+        raise QualificationError(
+            "workflow provenance runs must be uniquely and canonically ordered"
+        )
+    if report["run_count"] != len(expected_runs):
+        raise QualificationError("workflow provenance run_count is incorrect")
+
+    artifacts = _array(
+        report["artifacts"],
+        "workflow provenance.artifacts",
+        minimum=len(expected_artifacts),
+        maximum=len(expected_artifacts),
+    )
+    parsed_artifacts: list[dict[str, Any]] = []
+    for index, raw_artifact in enumerate(artifacts):
+        artifact = _object(
+            raw_artifact, f"workflow provenance.artifacts[{index}]"
+        )
+        _exact_keys(
+            artifact,
+            {
+                "evidence_id",
+                "run_id",
+                "run_attempt",
+                "artifact_name",
+                "report_sha256",
+            },
+            f"workflow provenance.artifacts[{index}]",
+        )
+        _identifier(
+            artifact["artifact_name"],
+            f"workflow provenance.artifacts[{index}].artifact_name",
+        )
+        parsed_artifacts.append(
+            {
+                "evidence_id": _identifier(
+                    artifact["evidence_id"],
+                    f"workflow provenance.artifacts[{index}].evidence_id",
+                ),
+                "run_id": _positive_integer(
+                    artifact["run_id"],
+                    f"workflow provenance.artifacts[{index}].run_id",
+                ),
+                "run_attempt": _positive_integer(
+                    artifact["run_attempt"],
+                    f"workflow provenance.artifacts[{index}].run_attempt",
+                ),
+                "report_sha256": _sha256(
+                    artifact["report_sha256"],
+                    f"workflow provenance.artifacts[{index}].report_sha256",
+                ),
+            }
+        )
+    if parsed_artifacts != expected_artifacts:
+        raise QualificationError(
+            "workflow provenance artifact bytes do not match the campaign"
+        )
+    if report["artifact_count"] != len(expected_artifacts):
+        raise QualificationError(
+            "workflow provenance artifact_count is incorrect"
+        )
+    return report, report_sha
+
+
 def evaluate(
     campaign_path: Path,
     review_path: Path,
+    workflow_provenance_path: Path,
     evidence_dir: Path,
     *,
     release_candidate: str,
@@ -857,6 +1092,14 @@ def evaluate(
     promoted_providers = campaign["_validated_promoted_providers"]
     operator_ids = campaign["_validated_operator_ids"]
     on_device_environment = campaign["_validated_on_device_environment"]
+    workflow_provenance, workflow_provenance_sha = _parse_workflow_provenance(
+        workflow_provenance_path,
+        campaign_sha=campaign_sha,
+        release_candidate=release_candidate,
+        expected_commit=expected_commit,
+        artifact_records=artifact_records,
+        completion_times=completion_times,
+    )
     blockers: list[str] = []
     reports: dict[str, dict[str, Any]] = {}
     retained_artifacts: list[dict[str, Any]] = []
@@ -927,10 +1170,17 @@ def evaluate(
         "evidence": {
             "campaign_sha256": campaign_sha,
             "independent_review_sha256": review_sha,
+            "workflow_provenance_sha256": workflow_provenance_sha,
             "artifact_count": len(retained_artifacts),
             "artifacts": retained_artifacts,
             "same_clean_source_commit": True,
             "same_release_candidate": True,
+            "github_workflow_provenance_verified": workflow_provenance[
+                "github_workflow_provenance_verified"
+            ],
+            "github_artifact_bytes_verified": workflow_provenance[
+                "github_artifact_bytes_verified"
+            ],
         },
         "review": {
             "reviewed_at": review["reviewed_at"],
@@ -946,7 +1196,7 @@ def evaluate(
         "eligibility_blockers": blockers,
         "caveats": [
             "This decision is limited to the restricted single-node Linux rootless-container CLI release candidate and promoted provider/model set named above.",
-            "The bounded report proves cross-artifact schema, digest, workflow, exact-source, environment, and reviewer-separation contracts; protected operators must authenticate GitHub run provenance and reviewer identities.",
+            "The bounded report proves GitHub-authenticated workflow attempts and downloaded artifact bytes in addition to cross-artifact schema, digest, exact-source, environment, and reviewer-separation contracts.",
             "Whole-product production approval remains false until provider/client, distributed-control-plane, independent-security, and final v1 release gates pass.",
         ],
     }
@@ -990,6 +1240,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--validate", action="store_true")
     parser.add_argument("--campaign", type=Path)
     parser.add_argument("--review", type=Path)
+    parser.add_argument("--workflow-provenance", type=Path)
     parser.add_argument("--evidence-dir", type=Path)
     parser.add_argument("--release-candidate")
     parser.add_argument("--expected-commit")
@@ -1002,6 +1253,7 @@ def main(argv: list[str] | None = None) -> int:
         execution_values = (
             args.campaign,
             args.review,
+            args.workflow_provenance,
             args.evidence_dir,
             args.release_candidate,
             args.expected_commit,
@@ -1021,11 +1273,13 @@ def main(argv: list[str] | None = None) -> int:
         if any(value is None for value in execution_values):
             raise QualificationError(
                 "--campaign, --review, --evidence-dir, --release-candidate, "
-                "--expected-commit, --expected-environment, and --output are required"
+                "--workflow-provenance, --expected-commit, "
+                "--expected-environment, and --output are required"
             )
         report = evaluate(
             args.campaign,
             args.review,
+            args.workflow_provenance,
             args.evidence_dir,
             release_candidate=args.release_candidate,
             expected_commit=args.expected_commit,

@@ -37,6 +37,27 @@ The release SLO report must contain the SHA-256 digests of the exact retained
 resource-soak and game-day reports. A report from another release, commit,
 environment, workflow run, or run attempt is rejected.
 
+## GitHub workflow and artifact authentication
+
+The protected promotion job does not trust copied workflow fields in
+`campaign.json`. It deterministically derives a request plan, queries GitHub's
+specific workflow-run-attempt endpoint for every unique run/attempt pair, and
+requires the API response to match the exact repository, workflow path, head
+commit, successful conclusion, attempt number, and update time in the
+campaign. The campaign's Linux CLI run must also equal the run ID used to
+download the signed candidate bundle.
+
+The job then downloads every report from its exact expected GitHub artifact
+name. The downloaded JSON bytes and the protected evidence-store copy must
+both match the campaign SHA-256. Missing, expired, ambiguous, renamed, or
+tampered artifacts fail closed.
+
+`scripts/phase1_workflow_provenance.py` retains a bounded
+`phase1-workflow-provenance.json` containing only the authenticated run IDs,
+attempts, workflow paths, artifact names, and report digests. The final Phase 1
+decision hash-binds that report, and the publisher signs and attests all three
+qualification reports.
+
 ## Campaign manifest
 
 `campaign.json` is a bounded inventory, not an approval. It contains exactly:
@@ -75,10 +96,11 @@ environment, workflow run, or run attempt is rejected.
 }
 ```
 
-The protected operator obtains run metadata from the GitHub Actions API, not
-from job summaries or copied text. The live-provider plan and every promoted
-provider result must have the same run ID, attempt, commit, and completion
-time.
+The live-provider plan and every promoted provider result must have the same
+run ID, attempt, commit, and completion time. The protected promotion job
+authenticates those values against GitHub before trusting the campaign.
+`workflow_completed_at` records the specific completed attempt's GitHub API
+`updated_at` value; the gate parses and compares those instants exactly.
 
 ## Independent review
 
@@ -112,18 +134,20 @@ the bounded decision and its digests are uploaded.
 3. Run every protected qualification against that exact tag/commit and target
    profile.
 4. Copy only their bounded JSON reports into the protected evidence directory.
-5. Construct `campaign.json` from authenticated GitHub run metadata and exact
-   file digests.
+5. Construct `campaign.json` from GitHub run metadata and exact file digests.
 6. Have an independent reviewer verify the raw evidence and write the
    hash-bound `phase1-review.json`.
 7. Configure `AGENTOS_PHASE1_EVIDENCE_DIR` in the
    `capacity-qualification` environment and dispatch
    `phase1-promotion-qualification.yml` **using the RC tag as the workflow
    ref**, the originating Linux CLI run ID, and the target environment ID.
-8. The workflow revalidates the signed CLI bundle, campaign, review, every
-   report, cross-report hashes, and tag. Only then does it replace preliminary
-   checksums/signatures, attest the complete bundle, and create the immutable
-   GitHub prerelease.
+8. The workflow queries GitHub for every exact workflow attempt, downloads
+   every expected report artifact, and requires those bytes to match the
+   protected evidence and campaign digests.
+9. The workflow revalidates the signed CLI bundle, campaign, review, every
+   report, authenticated provenance report, cross-report hashes, and tag. Only
+   then does it replace preliminary checksums/signatures, attest the complete
+   bundle, and create the immutable GitHub prerelease.
 
 Missing files, a disabled runner, an unapproved environment, mixed commits,
 failed runs, stale review, unknown fields, duplicate JSON keys, symlinks,
@@ -134,6 +158,7 @@ candidate unpublished.
 
 ```bash
 python3 scripts/phase1_promotion_qualification.py --validate
+python3 scripts/phase1_workflow_provenance.py --validate
 ```
 
 A passing Phase 1 decision sets `phase1_release_candidate_ready: true`, but

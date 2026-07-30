@@ -1557,6 +1557,13 @@ fn phase1_promotion_contract_is_exact_reviewed_and_fail_closed() {
         "cmp \"$report\" \"$evidence_report\"",
         "scripts/linux_cli_rc_qualification.py validate-report",
         "scripts/phase1_promotion_qualification.py",
+        "scripts/phase1_workflow_provenance.py",
+        "actions/runs/${run_id}/attempts/${run_attempt}",
+        "gh run download \"$run_id\"",
+        "--workflow-provenance",
+        "phase1-workflow-provenance.json",
+        "github_workflow_provenance_verified",
+        "github_artifact_bytes_verified",
         "--require-eligible",
         "phase1_release_candidate_ready",
         "production_claim_allowed",
@@ -1600,6 +1607,27 @@ fn phase1_promotion_contract_is_exact_reviewed_and_fail_closed() {
         assert!(
             qualifier.contains(contract),
             "Phase 1 promotion evaluator lost {contract:?}"
+        );
+    }
+
+    let provenance = read_workspace_file("scripts/phase1_workflow_provenance.py");
+    for contract in [
+        "restricted_phase1_github_provenance_plan",
+        "restricted_phase1_github_provenance",
+        "campaign Linux CLI run does not match the downloaded signed bundle run",
+        "GitHub run attempt does not match the campaign",
+        "GitHub workflow path does not match the campaign",
+        "GitHub workflow head SHA does not match the campaign",
+        "GitHub workflow updated_at does not match the campaign",
+        "does not match the trusted repository",
+        "downloaded and protected bytes differ",
+        "\"github_workflow_provenance_verified\": True",
+        "\"github_artifact_bytes_verified\": True",
+        "\"production_claim_allowed\": False",
+    ] {
+        assert!(
+            provenance.contains(contract),
+            "Phase 1 provenance verifier lost {contract:?}"
         );
     }
 }

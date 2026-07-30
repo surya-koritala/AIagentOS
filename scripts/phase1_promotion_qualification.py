@@ -18,10 +18,12 @@ from live_provider_qualification_plan import PROVIDERS
 
 
 SCHEMA_VERSION = 1
+REVIEW_SCHEMA_VERSION = 2
 CAMPAIGN_CLASS = "restricted_phase1_evidence_campaign"
 REVIEW_CLASS = "independent_restricted_phase1_promotion_review"
 REPORT_CLASS = "restricted_phase1_promotion_decision"
 WORKFLOW_PROVENANCE_CLASS = "restricted_phase1_github_provenance"
+REVIEW_PROVENANCE_CLASS = "restricted_phase1_independent_review_provenance"
 PROFILE_ID = "single-node-linux-rootless-container-cli"
 COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -30,6 +32,7 @@ IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$")
 MAX_CAMPAIGN_BYTES = 256 * 1024
 MAX_REVIEW_BYTES = 256 * 1024
 MAX_WORKFLOW_PROVENANCE_BYTES = 512 * 1024
+MAX_REVIEW_PROVENANCE_BYTES = 256 * 1024
 MAX_EVIDENCE_BYTES = 8 * 1024 * 1024
 MAX_ARTIFACTS = 32
 MAX_REVIEW_DELAY = dt.timedelta(days=30)
@@ -759,10 +762,11 @@ def _parse_review(
             "checks",
             "open_findings",
             "review_attestation_sha256",
+            "review_workflow",
         },
         "review",
     )
-    if review["schema_version"] != SCHEMA_VERSION:
+    if review["schema_version"] != REVIEW_SCHEMA_VERSION:
         raise QualificationError("review schema_version is unsupported")
     if review["qualification_class"] != REVIEW_CLASS:
         raise QualificationError("review qualification_class is invalid")
@@ -806,6 +810,44 @@ def _parse_review(
         )
     ]
     _sha256(review["review_attestation_sha256"], "review.review_attestation_sha256")
+    review_workflow = _object(review["review_workflow"], "review.review_workflow")
+    _exact_keys(
+        review_workflow,
+        {
+            "repository",
+            "workflow_path",
+            "event",
+            "run_id",
+            "run_attempt",
+            "head_sha",
+        },
+        "review.review_workflow",
+    )
+    _identifier(
+        review_workflow["repository"], "review.review_workflow.repository"
+    )
+    if (
+        review_workflow["workflow_path"]
+        != ".github/workflows/phase1-independent-review.yml"
+    ):
+        raise QualificationError("review names the wrong authentication workflow")
+    if review_workflow["event"] != "workflow_dispatch":
+        raise QualificationError("review authentication must use workflow_dispatch")
+    _positive_integer(
+        review_workflow["run_id"], "review.review_workflow.run_id"
+    )
+    if (
+        _positive_integer(
+            review_workflow["run_attempt"],
+            "review.review_workflow.run_attempt",
+        )
+        != 1
+    ):
+        raise QualificationError(
+            "review authentication must use a fresh workflow dispatch"
+        )
+    if review_workflow["head_sha"] != expected_commit:
+        raise QualificationError("review workflow used a different commit")
     blockers: list[str] = []
     if not reviewer_independent:
         blockers.append("review.reviewer_independent")
@@ -825,6 +867,144 @@ def _parse_review(
     review["_all_checks_passed"] = all(review_checks.values())
     review["_open_findings_count"] = len(findings)
     return review, review_sha, blockers
+
+
+def _parse_review_provenance(
+    path: Path,
+    *,
+    campaign_sha: str,
+    review: dict[str, Any],
+    review_sha: str,
+    release_candidate: str,
+    expected_commit: str,
+) -> tuple[dict[str, Any], str]:
+    report, report_sha = _load_json(
+        path,
+        "Phase 1 independent review provenance",
+        MAX_REVIEW_PROVENANCE_BYTES,
+    )
+    _exact_keys(
+        report,
+        {
+            "schema_version",
+            "qualification_class",
+            "generated_at",
+            "repository",
+            "release_candidate",
+            "source",
+            "campaign_sha256",
+            "independent_review_sha256",
+            "review_workflow",
+            "review_signature_bundle_sha256",
+            "reviewer_identity_authenticated",
+            "github_review_workflow_provenance_verified",
+            "github_review_artifact_bytes_verified",
+            "keyless_review_signature_verified",
+            "production_claim_allowed",
+        },
+        "review provenance",
+    )
+    if report["schema_version"] != SCHEMA_VERSION:
+        raise QualificationError("review provenance schema_version is unsupported")
+    if report["qualification_class"] != REVIEW_PROVENANCE_CLASS:
+        raise QualificationError(
+            "review provenance qualification_class is invalid"
+        )
+    if report["release_candidate"] != release_candidate:
+        raise QualificationError(
+            "review provenance release candidate does not match"
+        )
+    _source(report["source"], expected_commit, "review provenance.source")
+    repository = _identifier(
+        report["repository"], "review provenance.repository"
+    )
+    if repository != review["review_workflow"]["repository"]:
+        raise QualificationError(
+            "review provenance repository does not match signed review"
+        )
+    if report["campaign_sha256"] != campaign_sha:
+        raise QualificationError(
+            "review provenance does not bind the exact campaign bytes"
+        )
+    if report["independent_review_sha256"] != review_sha:
+        raise QualificationError(
+            "review provenance does not bind the exact review bytes"
+        )
+    _sha256(
+        report["review_signature_bundle_sha256"],
+        "review provenance.review_signature_bundle_sha256",
+    )
+    for field in (
+        "reviewer_identity_authenticated",
+        "github_review_workflow_provenance_verified",
+        "github_review_artifact_bytes_verified",
+        "keyless_review_signature_verified",
+    ):
+        if report[field] is not True:
+            raise QualificationError(
+                f"review provenance does not prove {field}"
+            )
+    if report["production_claim_allowed"] is not False:
+        raise QualificationError(
+            "review provenance must keep production_claim_allowed false"
+        )
+    generated_at = _timestamp(
+        report["generated_at"], "review provenance.generated_at"
+    )
+    if generated_at > dt.datetime.now(dt.timezone.utc) + dt.timedelta(minutes=5):
+        raise QualificationError("review provenance timestamp is in the future")
+    if generated_at < _timestamp(review["reviewed_at"], "review.reviewed_at"):
+        raise QualificationError(
+            "review provenance predates the independent review"
+        )
+    workflow = _object(
+        report["review_workflow"], "review provenance.review_workflow"
+    )
+    _exact_keys(
+        workflow,
+        {
+            "run_id",
+            "run_attempt",
+            "workflow_path",
+            "head_sha",
+            "event",
+            "workflow_updated_at",
+        },
+        "review provenance.review_workflow",
+    )
+    expected_workflow = review["review_workflow"]
+    if (
+        _positive_integer(
+            workflow["run_id"], "review provenance.review_workflow.run_id"
+        )
+        != expected_workflow["run_id"]
+        or _positive_integer(
+            workflow["run_attempt"],
+            "review provenance.review_workflow.run_attempt",
+        )
+        != expected_workflow["run_attempt"]
+        or workflow["workflow_path"] != expected_workflow["workflow_path"]
+        or workflow["head_sha"] != expected_workflow["head_sha"]
+        or workflow["event"] != expected_workflow["event"]
+    ):
+        raise QualificationError(
+            "review provenance workflow identity does not match signed review"
+        )
+    workflow_updated_at = _timestamp(
+        workflow["workflow_updated_at"],
+        "review provenance.review_workflow.workflow_updated_at",
+    )
+    if workflow_updated_at < _timestamp(
+        review["reviewed_at"], "review.reviewed_at"
+    ):
+        raise QualificationError(
+            "authenticated review workflow completed before the review"
+        )
+    if generated_at < workflow_updated_at:
+        raise QualificationError(
+            "review provenance predates the authenticated workflow completion"
+        )
+    return report, report_sha
 
 
 def _parse_workflow_provenance(
@@ -1062,6 +1242,7 @@ def _parse_workflow_provenance(
 def evaluate(
     campaign_path: Path,
     review_path: Path,
+    review_provenance_path: Path,
     workflow_provenance_path: Path,
     evidence_dir: Path,
     *,
@@ -1149,6 +1330,14 @@ def evaluate(
         operator_ids=operator_ids,
         completion_times=completion_times,
     )
+    review_provenance, review_provenance_sha = _parse_review_provenance(
+        review_provenance_path,
+        campaign_sha=campaign_sha,
+        review=review,
+        review_sha=review_sha,
+        release_candidate=release_candidate,
+        expected_commit=expected_commit,
+    )
     blockers.extend(review_blockers)
     ready = not blockers
     return {
@@ -1170,6 +1359,7 @@ def evaluate(
         "evidence": {
             "campaign_sha256": campaign_sha,
             "independent_review_sha256": review_sha,
+            "independent_review_provenance_sha256": review_provenance_sha,
             "workflow_provenance_sha256": workflow_provenance_sha,
             "artifact_count": len(retained_artifacts),
             "artifacts": retained_artifacts,
@@ -1181,10 +1371,22 @@ def evaluate(
             "github_artifact_bytes_verified": workflow_provenance[
                 "github_artifact_bytes_verified"
             ],
+            "github_review_workflow_provenance_verified": review_provenance[
+                "github_review_workflow_provenance_verified"
+            ],
+            "github_review_artifact_bytes_verified": review_provenance[
+                "github_review_artifact_bytes_verified"
+            ],
+            "keyless_review_signature_verified": review_provenance[
+                "keyless_review_signature_verified"
+            ],
         },
         "review": {
             "reviewed_at": review["reviewed_at"],
             "reviewer_independent": review["_reviewer_independent"],
+            "reviewer_identity_authenticated": review_provenance[
+                "reviewer_identity_authenticated"
+            ],
             "decision": review["decision"],
             "all_checks_passed": review["_all_checks_passed"],
             "open_findings_count": review["_open_findings_count"],
@@ -1196,7 +1398,7 @@ def evaluate(
         "eligibility_blockers": blockers,
         "caveats": [
             "This decision is limited to the restricted single-node Linux rootless-container CLI release candidate and promoted provider/model set named above.",
-            "The bounded report proves GitHub-authenticated workflow attempts and downloaded artifact bytes in addition to cross-artifact schema, digest, exact-source, environment, and reviewer-separation contracts.",
+            "The bounded report proves GitHub-authenticated evidence and independent-review workflow attempts, downloaded artifact bytes, and the keyless review signature in addition to cross-artifact schema, digest, exact-source, environment, and reviewer-separation contracts.",
             "Whole-product production approval remains false until provider/client, distributed-control-plane, independent-security, and final v1 release gates pass.",
         ],
     }
@@ -1240,6 +1442,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--validate", action="store_true")
     parser.add_argument("--campaign", type=Path)
     parser.add_argument("--review", type=Path)
+    parser.add_argument("--review-provenance", type=Path)
     parser.add_argument("--workflow-provenance", type=Path)
     parser.add_argument("--evidence-dir", type=Path)
     parser.add_argument("--release-candidate")
@@ -1253,6 +1456,7 @@ def main(argv: list[str] | None = None) -> int:
         execution_values = (
             args.campaign,
             args.review,
+            args.review_provenance,
             args.workflow_provenance,
             args.evidence_dir,
             args.release_candidate,
@@ -1272,13 +1476,14 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if any(value is None for value in execution_values):
             raise QualificationError(
-                "--campaign, --review, --evidence-dir, --release-candidate, "
-                "--workflow-provenance, --expected-commit, "
+                "--campaign, --review, --review-provenance, --evidence-dir, "
+                "--release-candidate, --workflow-provenance, --expected-commit, "
                 "--expected-environment, and --output are required"
             )
         report = evaluate(
             args.campaign,
             args.review,
+            args.review_provenance,
             args.workflow_provenance,
             args.evidence_dir,
             release_candidate=args.release_candidate,

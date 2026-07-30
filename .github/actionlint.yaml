@@ -4,6 +4,7 @@ self-hosted-runner:
     - agentos-destructive-storage
     - agentos-external-data
     - agentos-model
+    - agentos-review
 
 paths:
   .github/workflows/release.yml:

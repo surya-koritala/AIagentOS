@@ -37,7 +37,7 @@ The release SLO report must contain the SHA-256 digests of the exact retained
 resource-soak and game-day reports. A report from another release, commit,
 environment, workflow run, or run attempt is rejected.
 
-## GitHub workflow and artifact authentication
+## GitHub workflow, reviewer, and artifact authentication
 
 The protected promotion job does not trust copied workflow fields in
 `campaign.json`. It deterministically derives a request plan, queries GitHub's
@@ -55,8 +55,30 @@ tampered artifacts fail closed.
 `scripts/phase1_workflow_provenance.py` retains a bounded
 `phase1-workflow-provenance.json` containing only the authenticated run IDs,
 attempts, workflow paths, artifact names, and report digests. The final Phase 1
-decision hash-binds that report, and the publisher signs and attests all three
-qualification reports.
+decision hash-binds that report.
+
+The independent review is authenticated separately. A reviewer-controlled
+`phase1-review` environment and `agentos-review` runner execute
+`phase1-independent-review.yml` from the exact annotated RC tag. The workflow:
+
+- rejects reruns and accepts only attempt 1 from a fresh `workflow_dispatch`;
+- requires the authenticated GitHub actor to match the reviewer record and to
+  differ from every campaign operator;
+- hash-binds the reviewer-controlled observation and exact campaign;
+- creates and keyless-signs `phase1-review.json`; and
+- retains the review and Sigstore bundle in one deterministic artifact.
+
+Promotion receives that review workflow run ID, queries GitHub's specific
+attempt API, and requires the trusted repository, workflow path, tag commit,
+event, successful conclusion, actor, and triggering actor to match the signed
+review. It downloads the exact named artifact and verifies its bytes and
+keyless signature. `scripts/phase1_review_provenance.py` emits a bounded
+`phase1-review-provenance.json` without the reviewer identity. The promotion
+decision hash-binds both provenance reports, and the publisher signs and
+attests the runtime report, both provenance reports, and the promotion report.
+Before signing, the hosted publisher independently downloads the exact review
+artifact again, rechecks the specific GitHub attempt and both actor identities,
+recomputes its digest, and re-verifies the review workflow's keyless signature.
 
 ## Campaign manifest
 
@@ -104,13 +126,14 @@ authenticates those values against GitHub before trusting the campaign.
 
 ## Independent review
 
-`phase1-review.json` is created only after every listed workflow completed. It
-repeats the exact release candidate, source, profile, environments, and
-operator inventory; binds the byte-for-byte SHA-256 of `campaign.json`; and
-contains:
+The independent reviewer first writes
+`phase1-review-observation.json` in the reviewer-controlled evidence store,
+only after every listed workflow completed. It repeats the exact release
+candidate, source, profile, environments, and operator inventory; binds the
+byte-for-byte SHA-256 of `campaign.json`; and contains:
 
-- an authenticated reviewer identity distinct from every operator and
-  qualification harness identity;
+- the reviewer's GitHub login, which must equal the authenticated workflow
+  actor and differ from every operator and reserved harness identity;
 - an `approved` decision no later than 30 days after the last workflow result;
 - an empty `open_findings` list;
 - a detached review-attestation SHA-256; and
@@ -122,9 +145,51 @@ workflow provenance, artifact digests, CLI signatures and fresh-host behavior,
 provider/model evidence, target recovery, destructive storage, external
 deletion, the 24-hour soak, SLOs, game day, and unresolved findings.
 
-Raw observations, credentials, model weights, participant identities, and
-reviewer identity proof stay in the operator-controlled evidence store. Only
-the bounded decision and its digests are uploaded.
+The protected observation has exactly this shape. Replace the example values,
+set `campaign_sha256` from the exact file bytes, and set a check to `true` only
+after the reviewer has inspected its raw evidence:
+
+```json
+{
+  "schema_version": 1,
+  "qualification_class": "independent_restricted_phase1_review_observation",
+  "release_candidate": "v0.4.0-rc.1",
+  "source": {
+    "commit": "0000000000000000000000000000000000000000",
+    "dirty": false
+  },
+  "profile_id": "single-node-linux-rootless-container-cli",
+  "target_environment_id": "target-linux-rootless-1",
+  "on_device_environment_id": "gguf-cpu-runner-1",
+  "campaign_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+  "operator_ids": ["operator-1"],
+  "reviewer_id": "independent-reviewer",
+  "reviewed_at": "2026-01-01T00:00:00Z",
+  "decision": "approved",
+  "checks": {
+    "exact_release_candidate_and_commit": true,
+    "workflow_run_provenance_verified": true,
+    "artifact_digests_verified": true,
+    "linux_cli_signatures_and_fresh_host_reviewed": true,
+    "promoted_provider_contracts_reviewed": true,
+    "on_device_model_and_resource_limits_reviewed": true,
+    "remote_backup_retention_and_recovery_reviewed": true,
+    "destructive_storage_rpo_rto_reviewed": true,
+    "external_deletion_and_retention_reviewed": true,
+    "resource_soak_and_slo_reviewed": true,
+    "human_game_day_reviewed": true,
+    "no_open_findings": true
+  },
+  "open_findings": []
+}
+```
+
+`scripts/phase1_independent_review.py` validates that observation and creates
+schema-v2 `phase1-review.json` with the exact GitHub run identity. The review's
+`review_attestation_sha256` is the digest of the protected observation. Raw
+observations, credentials, model weights, participant identities, and reviewer
+identity proof stay in the reviewer/operator-controlled stores. Only bounded
+decisions and digests enter the final release bundle.
 
 ## Promotion sequence
 
@@ -135,19 +200,26 @@ the bounded decision and its digests are uploaded.
    profile.
 4. Copy only their bounded JSON reports into the protected evidence directory.
 5. Construct `campaign.json` from GitHub run metadata and exact file digests.
-6. Have an independent reviewer verify the raw evidence and write the
-   hash-bound `phase1-review.json`.
-7. Configure `AGENTOS_PHASE1_EVIDENCE_DIR` in the
+6. Copy `campaign.json` into the separately controlled Phase 1 review store.
+   Have an independent reviewer verify the raw evidence and write the
+   hash-bound `phase1-review-observation.json`.
+7. Configure the `phase1-review` environment and
+   `AGENTOS_PHASE1_REVIEW_DIR`, then have that reviewer dispatch
+   `phase1-independent-review.yml` using the RC tag as the workflow ref.
+   Retain the successful fresh run ID; do not rerun it.
+8. Configure `AGENTOS_PHASE1_EVIDENCE_DIR` in the
    `capacity-qualification` environment and dispatch
    `phase1-promotion-qualification.yml` **using the RC tag as the workflow
-   ref**, the originating Linux CLI run ID, and the target environment ID.
-8. The workflow queries GitHub for every exact workflow attempt, downloads
-   every expected report artifact, and requires those bytes to match the
-   protected evidence and campaign digests.
-9. The workflow revalidates the signed CLI bundle, campaign, review, every
-   report, authenticated provenance report, cross-report hashes, and tag. Only
-   then does it replace preliminary checksums/signatures, attest the complete
-   bundle, and create the immutable GitHub prerelease.
+   ref**, the originating Linux CLI run ID, authenticated review run ID, and
+   target environment ID.
+9. The workflow authenticates and signature-verifies the exact independent
+   review, then queries GitHub for every exact evidence workflow attempt,
+   downloads every expected report artifact, and requires those bytes to match
+   the protected evidence and campaign digests.
+10. The workflow revalidates the signed CLI bundle, campaign, review, every
+    report, both authenticated provenance reports, cross-report hashes, and
+    tag. Only then does it replace preliminary checksums/signatures, attest the
+    complete bundle, and create the immutable GitHub prerelease.
 
 Missing files, a disabled runner, an unapproved environment, mixed commits,
 failed runs, stale review, unknown fields, duplicate JSON keys, symlinks,
@@ -159,6 +231,8 @@ candidate unpublished.
 ```bash
 python3 scripts/phase1_promotion_qualification.py --validate
 python3 scripts/phase1_workflow_provenance.py --validate
+python3 scripts/phase1_independent_review.py --validate
+python3 scripts/phase1_review_provenance.py --validate
 ```
 
 A passing Phase 1 decision sets `phase1_release_candidate_ready: true`, but

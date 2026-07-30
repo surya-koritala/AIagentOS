@@ -51,6 +51,11 @@ WORKFLOW_PROFILES = {
         "AGENTOS_CAPACITY_QUALIFICATION_ENABLED",
         "exact-release-candidate-promotion",
     ),
+    "phase1-independent-review.yml": (
+        "phase1-independent-review",
+        "AGENTOS_PHASE1_REVIEW_ENABLED",
+        "authenticated-independent-review",
+    ),
     "on-device-qualification.yml": (
         "on-device",
         "AGENTOS_MODEL_QUALIFICATION_ENABLED",

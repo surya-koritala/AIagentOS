@@ -1544,6 +1544,7 @@ fn phase1_promotion_contract_is_exact_reviewed_and_fail_closed() {
         "workflow_dispatch:",
         "release_candidate:",
         "linux_cli_rc_run_id:",
+        "phase1_review_run_id:",
         "environment_id:",
         "profile: phase1-promotion",
         "enabled: ${{ vars.AGENTOS_CAPACITY_QUALIFICATION_ENABLED }}",
@@ -1558,12 +1559,18 @@ fn phase1_promotion_contract_is_exact_reviewed_and_fail_closed() {
         "scripts/linux_cli_rc_qualification.py validate-report",
         "scripts/phase1_promotion_qualification.py",
         "scripts/phase1_workflow_provenance.py",
+        "scripts/phase1_review_provenance.py",
         "actions/runs/${run_id}/attempts/${run_attempt}",
         "gh run download \"$run_id\"",
         "--workflow-provenance",
+        "--review-provenance",
         "phase1-workflow-provenance.json",
+        "phase1-review-provenance.json",
         "github_workflow_provenance_verified",
         "github_artifact_bytes_verified",
+        "reviewer_identity_authenticated",
+        "keyless_review_signature_verified",
+        "phase1-independent-review/phase1-review.json",
         "--require-eligible",
         "phase1_release_candidate_ready",
         "production_claim_allowed",
@@ -1601,6 +1608,7 @@ fn phase1_promotion_contract_is_exact_reviewed_and_fail_closed() {
         "live provider plan and provider reports must come from one run",
         "release SLO does not bind the retained resource soak",
         "review does not bind the exact campaign bytes",
+        "review provenance does not bind the exact review bytes",
         "\"phase1_release_candidate_ready\": ready",
         "\"production_claim_allowed\": False",
     ] {
@@ -1628,6 +1636,56 @@ fn phase1_promotion_contract_is_exact_reviewed_and_fail_closed() {
         assert!(
             provenance.contains(contract),
             "Phase 1 provenance verifier lost {contract:?}"
+        );
+    }
+
+    let review_workflow = read_workspace_file(".github/workflows/phase1-independent-review.yml");
+    for contract in [
+        "profile: phase1-independent-review",
+        "runs-on: [self-hosted, linux, x64, agentos-review]",
+        "environment: phase1-review",
+        "test \"$GITHUB_RUN_ATTEMPT\" = \"1\"",
+        "--actor \"$GITHUB_ACTOR\"",
+        "scripts/phase1_independent_review.py",
+        "cosign sign-blob --yes",
+        "actions/attest-build-provenance@",
+        "phase1-independent-review-${{ inputs.release_candidate }}-${{ github.sha }}",
+    ] {
+        assert!(
+            review_workflow.contains(contract),
+            "Phase 1 independent-review workflow lost {contract:?}"
+        );
+    }
+
+    let review_builder = read_workspace_file("scripts/phase1_independent_review.py");
+    for contract in [
+        "independent_restricted_phase1_review_observation",
+        "review observation reviewer does not match authenticated GitHub actor",
+        "authenticated GitHub reviewer is not independent",
+        "independent review must use a fresh workflow dispatch",
+        "\"review_attestation_sha256\": observation_sha",
+    ] {
+        assert!(
+            review_builder.contains(contract),
+            "Phase 1 independent-review builder lost {contract:?}"
+        );
+    }
+
+    let review_provenance = read_workspace_file("scripts/phase1_review_provenance.py");
+    for contract in [
+        "restricted_phase1_independent_review_provenance",
+        "for field in (\"actor\", \"triggering_actor\")",
+        "does not match signed reviewer",
+        "downloaded independent review bytes differ",
+        "cosign",
+        "\"reviewer_identity_authenticated\": True",
+        "\"github_review_workflow_provenance_verified\": True",
+        "\"github_review_artifact_bytes_verified\": True",
+        "\"keyless_review_signature_verified\": True",
+    ] {
+        assert!(
+            review_provenance.contains(contract),
+            "Phase 1 independent-review provenance verifier lost {contract:?}"
         );
     }
 }
@@ -1764,14 +1822,17 @@ fn release_blocking_workflows_keep_their_security_contract() {
         "AGENTOS_MODEL_QUALIFICATION_ENABLED",
         "AGENTOS_DESTRUCTIVE_STORAGE_QUALIFICATION_ENABLED",
         "AGENTOS_EXTERNAL_DATA_QUALIFICATION_ENABLED",
+        "AGENTOS_PHASE1_REVIEW_ENABLED",
         "capacity-qualification",
         "model-qualification",
         "destructive-storage-qualification",
         "external-data-qualification",
+        "phase1-review",
         "agentos-capacity",
         "agentos-model",
         "agentos-destructive-storage",
         "agentos-external-data",
+        "agentos-review",
     ] {
         assert!(
             protected_plan.contains(proof),
@@ -1825,6 +1886,11 @@ fn release_blocking_workflows_keep_their_security_contract() {
             ".github/workflows/on-device-qualification.yml",
             "on-device",
             "AGENTOS_MODEL_QUALIFICATION_ENABLED",
+        ),
+        (
+            ".github/workflows/phase1-independent-review.yml",
+            "phase1-independent-review",
+            "AGENTOS_PHASE1_REVIEW_ENABLED",
         ),
         (
             ".github/workflows/storage-profile-qualification.yml",

@@ -28,6 +28,10 @@ class LinuxCliRcReleaseContractTests(unittest.TestCase):
             ROOT / ".github/workflows/phase1-promotion-qualification.yml",
             workflows,
         )
+        shutil.copy2(
+            ROOT / ".github/workflows/phase1-independent-review.yml",
+            workflows,
+        )
         (self.root / "Cargo.toml").write_text(
             '[workspace]\nmembers = ["crates/a", "crates/tauri-app"]\n',
             encoding="utf-8",

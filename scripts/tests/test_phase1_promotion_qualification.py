@@ -19,6 +19,7 @@ from phase1_promotion_qualification import (  # noqa: E402
     QualificationError,
     REVIEW_CHECK_IDS,
     REVIEW_CLASS,
+    REVIEW_PROVENANCE_CLASS,
     WORKFLOW_PROVENANCE_CLASS,
     evaluate,
     main,
@@ -239,6 +240,7 @@ class PromotionWorkspace:
         self.evidence_dir.mkdir()
         self.campaign_path = self.root / "campaign.json"
         self.review_path = self.root / "review.json"
+        self.review_provenance_path = self.root / "review-provenance.json"
         self.provenance_path = self.root / "workflow-provenance.json"
         self.output_path = self.root / "decision.json"
         self.reports = {
@@ -319,7 +321,7 @@ class PromotionWorkspace:
 
     def make_review(self, campaign_sha):
         return {
-            "schema_version": 1,
+            "schema_version": 2,
             "qualification_class": REVIEW_CLASS,
             "release_candidate": RELEASE_CANDIDATE,
             "source": {"commit": COMMIT, "dirty": False},
@@ -334,6 +336,44 @@ class PromotionWorkspace:
             "checks": {check_id: True for check_id in REVIEW_CHECK_IDS},
             "open_findings": [],
             "review_attestation_sha256": "c" * 64,
+            "review_workflow": {
+                "repository": "surya-koritala/AIagentOS",
+                "workflow_path": (
+                    ".github/workflows/phase1-independent-review.yml"
+                ),
+                "event": "workflow_dispatch",
+                "run_id": 700,
+                "run_attempt": 1,
+                "head_sha": COMMIT,
+            },
+        }
+
+    def make_review_provenance(self, campaign_sha, review_sha, reviewed_at):
+        return {
+            "schema_version": 1,
+            "qualification_class": REVIEW_PROVENANCE_CLASS,
+            "generated_at": reviewed_at,
+            "repository": "surya-koritala/AIagentOS",
+            "release_candidate": RELEASE_CANDIDATE,
+            "source": {"commit": COMMIT, "dirty": False},
+            "campaign_sha256": campaign_sha,
+            "independent_review_sha256": review_sha,
+            "review_workflow": {
+                "run_id": 700,
+                "run_attempt": 1,
+                "workflow_path": (
+                    ".github/workflows/phase1-independent-review.yml"
+                ),
+                "head_sha": COMMIT,
+                "event": "workflow_dispatch",
+                "workflow_updated_at": reviewed_at,
+            },
+            "review_signature_bundle_sha256": "d" * 64,
+            "reviewer_identity_authenticated": True,
+            "github_review_workflow_provenance_verified": True,
+            "github_review_artifact_bytes_verified": True,
+            "keyless_review_signature_verified": True,
+            "production_claim_allowed": False,
         }
 
     def make_workflow_provenance(self, campaign_sha):
@@ -403,6 +443,13 @@ class PromotionWorkspace:
         if mutate_review is not None:
             mutate_review(review)
         self.review_path.write_bytes(encoded(review))
+        self.review_provenance_path.write_bytes(
+            encoded(
+                self.make_review_provenance(
+                    campaign_sha, digest(self.review_path), review["reviewed_at"]
+                )
+            )
+        )
 
     def refresh(self, mutate_review=None):
         self.write_reports()
@@ -418,6 +465,7 @@ class PromotionWorkspace:
         return evaluate(
             self.campaign_path,
             self.review_path,
+            self.review_provenance_path,
             self.provenance_path,
             self.evidence_dir,
             release_candidate=RELEASE_CANDIDATE,
@@ -504,6 +552,16 @@ class Phase1PromotionQualificationTests(unittest.TestCase):
             report["evidence"]["github_workflow_provenance_verified"]
         )
         self.assertTrue(report["evidence"]["github_artifact_bytes_verified"])
+        self.assertTrue(
+            report["evidence"]["github_review_workflow_provenance_verified"]
+        )
+        self.assertTrue(
+            report["evidence"]["github_review_artifact_bytes_verified"]
+        )
+        self.assertTrue(
+            report["evidence"]["keyless_review_signature_verified"]
+        )
+        self.assertTrue(report["review"]["reviewer_identity_authenticated"])
         encoded_report = json.dumps(report)
         self.assertNotIn("operator-1", encoded_report)
         self.assertNotIn("independent-reviewer-1", encoded_report)
@@ -808,6 +866,57 @@ class Phase1PromotionQualificationTests(unittest.TestCase):
         with self.assertRaisesRegex(QualificationError, "exact campaign"):
             workspace.evaluate()
 
+    def test_review_provenance_must_authenticate_identity_run_bytes_and_signature(self):
+        mutations = [
+            lambda report: report.__setitem__("campaign_sha256", "d" * 64),
+            lambda report: report.__setitem__(
+                "independent_review_sha256", "d" * 64
+            ),
+            lambda report: report.__setitem__(
+                "repository", "attacker/fork"
+            ),
+            lambda report: report["review_workflow"].__setitem__(
+                "run_id", 701
+            ),
+            lambda report: report.__setitem__(
+                "reviewer_identity_authenticated", False
+            ),
+            lambda report: report.__setitem__(
+                "github_review_workflow_provenance_verified", False
+            ),
+            lambda report: report.__setitem__(
+                "github_review_artifact_bytes_verified", False
+            ),
+            lambda report: report.__setitem__(
+                "keyless_review_signature_verified", False
+            ),
+        ]
+        for mutation in mutations:
+            with self.subTest(mutation=mutation):
+                workspace = self.workspace()
+                report = json.loads(
+                    workspace.review_provenance_path.read_text()
+                )
+                mutation(report)
+                workspace.review_provenance_path.write_bytes(encoded(report))
+                with self.assertRaises(QualificationError):
+                    workspace.evaluate()
+
+        for mutation in (
+            lambda review: review.__setitem__("schema_version", 1),
+            lambda review: review["review_workflow"].__setitem__(
+                "workflow_path", ".github/workflows/ci.yml"
+            ),
+            lambda review: review["review_workflow"].__setitem__(
+                "run_attempt", 2
+            ),
+        ):
+            with self.subTest(review_mutation=mutation):
+                workspace = self.workspace()
+                workspace.write_campaign_and_review(mutation)
+                with self.assertRaises(QualificationError):
+                    workspace.evaluate()
+
     def test_future_workflow_and_review_timestamps_are_rejected(self):
         workspace = self.workspace()
         workspace.campaign["artifacts"][0]["workflow_completed_at"] = (
@@ -836,6 +945,8 @@ class Phase1PromotionQualificationTests(unittest.TestCase):
                 str(workspace.campaign_path),
                 "--review",
                 str(workspace.review_path),
+                "--review-provenance",
+                str(workspace.review_provenance_path),
                 "--workflow-provenance",
                 str(workspace.provenance_path),
                 "--evidence-dir",
@@ -878,13 +989,21 @@ class Phase1PromotionQualificationTests(unittest.TestCase):
             promotion_workflow,
         )
         self.assertIn(
+            "python3 scripts/phase1_review_provenance.py",
+            promotion_workflow,
+        )
+        self.assertIn(
             "actions/runs/${run_id}/attempts/${run_attempt}",
             promotion_workflow,
         )
         self.assertIn('gh run download "$run_id"', promotion_workflow)
         self.assertIn("--workflow-provenance", promotion_workflow)
+        self.assertIn("--review-provenance", promotion_workflow)
         self.assertIn(
             "phase1-workflow-provenance.json", promotion_workflow
+        )
+        self.assertIn(
+            "phase1-review-provenance.json", promotion_workflow
         )
         self.assertIn("--require-eligible", promotion_workflow)
         self.assertIn(

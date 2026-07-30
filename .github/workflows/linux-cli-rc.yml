@@ -1,0 +1,285 @@
+name: Restricted Linux CLI release candidate
+
+on:
+  push:
+    tags:
+      - "v*-rc.*"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  CARGO_PROFILE_RELEASE_CODEGEN_UNITS: 1
+  ARTIFACT_VERSION: ${{ github.ref_name }}
+
+jobs:
+  required-ci:
+    name: Full release-blocking CI
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+      checks: write
+
+  release-contract:
+    name: Exact RC source contract
+    needs: required-ci
+    runs-on: ubuntu-22.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - name: Verify exact tag, versions, changelog, and workflow
+        run: >-
+          python3 scripts/verify_linux_cli_rc.py
+          --tag "$GITHUB_REF_NAME"
+          --commit "$GITHUB_SHA"
+      - name: Require one annotated immutable tag at the exact source
+        run: |
+          test "$(git cat-file -t "$GITHUB_REF_NAME")" = "tag"
+          test "$(git rev-list -n 1 "$GITHUB_REF_NAME")" = "$GITHUB_SHA"
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          git diff --quiet
+          git diff --cached --quiet
+
+  governance:
+    name: Governed-execution acceptance
+    needs: required-ci
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
+        with:
+          toolchain: 1.97.1
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - name: Reject any unexpected governance result
+        run: cargo run --release --locked --package os-benchmark --bin governance-demo
+
+  reproducible-linux:
+    name: Reproducible Ubuntu 22.04 x86_64 CLI
+    needs: [required-ci, release-contract]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    env:
+      TARGET: x86_64-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
+        with:
+          toolchain: 1.97.1
+          targets: x86_64-unknown-linux-gnu
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - name: Set deterministic build inputs
+        run: |
+          echo "SOURCE_DATE_EPOCH=$(git show -s --format=%ct HEAD)" >> "$GITHUB_ENV"
+          echo "RUSTFLAGS=--remap-path-prefix=${GITHUB_WORKSPACE}=." >> "$GITHUB_ENV"
+      - name: Build twice from clean target directories at one stable path
+        run: |
+          CARGO_TARGET_DIR=target-repro cargo build --release --locked --target "$TARGET" -p agent-cli --bins -p agent-tui
+          mv target-repro target-a
+          CARGO_TARGET_DIR=target-repro cargo build --release --locked --target "$TARGET" -p agent-cli --bins -p agent-tui
+      - name: Prove every binary is byte-for-byte reproducible
+        run: |
+          for binary in agent agent-server agent-tui agentctl; do
+            first="target-a/${TARGET}/release/${binary}"
+            second="target-repro/${TARGET}/release/${binary}"
+            if ! cmp -s "$first" "$second"; then
+              echo "::error title=Non-reproducible Linux CLI binary::${binary} differs between isolated builds"
+              sha256sum "$first" "$second"
+              exit 1
+            fi
+          done
+      - name: Build canonical deterministic archive
+        run: |
+          mkdir -p dist/stage
+          for binary in agent agent-server agent-tui agentctl; do
+            cp "target-a/${TARGET}/release/${binary}" dist/stage/
+          done
+          python3 scripts/build_cli_archive.py \
+            --source dist/stage \
+            --output "dist/agentos-${ARTIFACT_VERSION}-${TARGET}.zip"
+      - uses: anchore/sbom-action/download-syft@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+      - name: Generate exact-binary CycloneDX SBOM
+        run: >-
+          syft dir:dist/stage
+          -o "cyclonedx-json=dist/agentos-${ARTIFACT_VERSION}-${TARGET}.cdx.json"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: unsigned-linux-cli-rc
+          path: |
+            dist/*.zip
+            dist/*.cdx.json
+          if-no-files-found: error
+
+  sign-runtime:
+    name: Preliminary signatures and provenance
+    needs: [governance, reproducible-linux]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: unsigned-linux-cli-rc
+          path: dist
+      - name: Generate SHA-256 manifest
+        working-directory: dist
+        run: >-
+          find . -maxdepth 1 -type f ! -name SHA256SUMS -print0
+          | sort -z | xargs -0 sha256sum > SHA256SUMS
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+      - name: Keyless-sign runtime inputs
+        run: |
+          find dist -maxdepth 1 -type f ! -name '*.sigstore.json' -print0 |
+            while IFS= read -r -d '' asset; do
+              cosign sign-blob --yes --bundle "${asset}.sigstore.json" "$asset"
+            done
+      - uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+        with:
+          subject-path: |
+            dist/*.zip
+            dist/*.cdx.json
+            dist/SHA256SUMS
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: prequalified-linux-cli-rc
+          path: dist
+          if-no-files-found: error
+
+  fresh-host:
+    name: Fresh-host secure operation and recovery
+    needs: sign-runtime
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      attestations: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: prequalified-linux-cli-rc
+          path: dist
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+      - name: Verify checksums, signatures, provenance, runtime, and recovery
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          (cd dist && sha256sum --check SHA256SUMS)
+          identity="https://github.com/${GITHUB_REPOSITORY}/.github/workflows/linux-cli-rc.yml@${GITHUB_REF}"
+          for asset in dist/*.zip dist/*.cdx.json dist/SHA256SUMS; do
+            cosign verify-blob \
+              --bundle "${asset}.sigstore.json" \
+              --certificate-identity "$identity" \
+              --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+              "$asset"
+          done
+          archive="dist/agentos-${ARTIFACT_VERSION}-x86_64-unknown-linux-gnu.zip"
+          test -f "$archive"
+          python3 scripts/linux_cli_rc_qualification.py qualify \
+            --archive "$archive" \
+            --sigstore-bundle "${archive}.sigstore.json" \
+            --release-candidate "$GITHUB_REF_NAME" \
+            --commit "$GITHUB_SHA" \
+            --repository "$GITHUB_REPOSITORY" \
+            --release-registry tests/fixtures/storage/releases.toml \
+            --released-schema-tag v0.3.0 \
+            --output linux-cli-rc-qualification.json
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: linux-cli-rc-qualification-report
+          path: linux-cli-rc-qualification.json
+          if-no-files-found: error
+
+  finalize:
+    name: Final signed release bundle
+    needs: fresh-host
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: prequalified-linux-cli-rc
+          path: dist
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: linux-cli-rc-qualification-report
+          path: dist
+      - name: Revalidate exact runtime evidence before signing it
+        run: |
+          archive="dist/agentos-${ARTIFACT_VERSION}-x86_64-unknown-linux-gnu.zip"
+          python3 scripts/linux_cli_rc_qualification.py validate-report \
+            --report dist/linux-cli-rc-qualification.json \
+            --archive "$archive" \
+            --release-candidate "$GITHUB_REF_NAME" \
+            --commit "$GITHUB_SHA" \
+            --release-registry tests/fixtures/storage/releases.toml \
+            --released-schema-tag v0.3.0
+      - name: Replace preliminary manifests with one complete checksum set
+        run: |
+          find dist -maxdepth 1 -type f -name '*.sigstore.json' -delete
+          rm dist/SHA256SUMS
+          (cd dist && find . -maxdepth 1 -type f ! -name SHA256SUMS -print0 \
+            | sort -z | xargs -0 sha256sum > SHA256SUMS)
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+      - name: Keyless-sign every final artifact and checksum manifest
+        run: |
+          find dist -maxdepth 1 -type f ! -name '*.sigstore.json' -print0 |
+            while IFS= read -r -d '' asset; do
+              cosign sign-blob --yes --bundle "${asset}.sigstore.json" "$asset"
+            done
+      - uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+        with:
+          subject-path: |
+            dist/*.zip
+            dist/*.cdx.json
+            dist/linux-cli-rc-qualification.json
+            dist/SHA256SUMS
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: qualified-linux-cli-rc-bundle
+          path: dist
+          if-no-files-found: error
+
+  publish:
+    name: Publish qualified prerelease
+    needs: finalize
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: qualified-linux-cli-rc-bundle
+          path: dist
+      - name: Extract matching release-candidate notes
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          awk -v v="$version" '
+            $0 ~ "^## \\[" v "\\]" {grab=1; next}
+            grab && /^## \[/ {exit}
+            grab {print}
+          ' CHANGELOG.md > RELEASE_NOTES.md
+          test -s RELEASE_NOTES.md
+      - name: Create immutable GitHub prerelease from the existing tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --title "$GITHUB_REF_NAME — restricted Linux CLI RC" \
+            --notes-file RELEASE_NOTES.md \
+            --prerelease \
+            --verify-tag

@@ -10,6 +10,19 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
 
 ## [Unreleased]
 
+- Added a separately scoped `vX.Y.Z-rc.N` release path for the restricted
+  Ubuntu 22.04 x86_64 CLI profile. It builds all four CLI/server/TUI binaries
+  twice, rejects byte drift, creates a canonical traversal-safe archive and
+  exact-binary SBOM, keyless-signs and attests the artifacts, and then verifies
+  the final archive on a fresh hosted runner. The runtime gate requires the
+  released v0.3.0 schema to upgrade under required SQLCipher encryption, verified
+  TLS and shared-secret authentication, wrong/absent-auth rejection, governed
+  agent creation, clean restart persistence, signed and independently anchored
+  encrypted backup, tamper and missing-key rejection, and fresh-host recovery
+  with enforcement re-armed. A strict bounded report retains the restricted
+  scope and remaining external qualification gaps, is revalidated, checksummed,
+  signed, attested, and published only as a prerelease. Relates #120, #123, and
+  #125. (#280)
 - Bound every external replicated-authority write to a 30-second Ed25519
   delegation from the originating application node. The signed,
   domain-separated proof covers the caller-stable operation UUID, a semantic

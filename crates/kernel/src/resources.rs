@@ -88,6 +88,10 @@ pub(crate) fn provider_target_spec(
         }
         (ResourceType::Ipc, "receive") => Some(ProviderTargetSpec::Constant("ipc:self")),
         (ResourceType::Ipc, "discover") => Some(ProviderTargetSpec::Constant("ipc:namespace")),
+        (ResourceType::Peripheral, "capture_image" | "record_audio" | "play_audio") => {
+            Some(ProviderTargetSpec::Argument("device"))
+        }
+        (ResourceType::Peripheral, "print") => Some(ProviderTargetSpec::Argument("printer")),
         (ResourceType::Peripheral, "credential" | "credential_access" | "read_credential") => {
             Some(ProviderTargetSpec::Argument("credential"))
         }
@@ -205,6 +209,21 @@ pub(crate) fn request_identity(
     Ok(opaque_identity(&serialized))
 }
 
+pub(crate) fn peripheral_activity_identity(
+    tool_name: &str,
+    approval_contract_digest: &str,
+    request_identity: &str,
+) -> String {
+    let serialized = serde_json::to_vec(&serde_json::json!({
+        "version": 1,
+        "tool_name": tool_name,
+        "approval_contract_digest": approval_contract_digest,
+        "request_identity": request_identity,
+    }))
+    .expect("peripheral activity identity contains only serializable strings");
+    opaque_identity(&serialized)
+}
+
 fn validate_resource_request(
     operation: &str,
     parameters: &serde_json::Value,
@@ -283,6 +302,12 @@ pub struct GateAdmissionProof {
     agent_id: AgentId,
     request_identity: String,
     approval_satisfied: bool,
+    peripheral_activity: Option<PeripheralActivityLease>,
+}
+
+struct VerifiedGateAdmission {
+    approval_satisfied: bool,
+    peripheral_activity: Option<PeripheralActivityLease>,
 }
 
 impl GateAdmissionProof {
@@ -290,15 +315,17 @@ impl GateAdmissionProof {
         agent_id: AgentId,
         request_identity: String,
         approval_satisfied: bool,
+        peripheral_activity: Option<PeripheralActivityLease>,
     ) -> Self {
         Self {
             agent_id,
             request_identity,
             approval_satisfied,
+            peripheral_activity,
         }
     }
 
-    fn verify(self, request: &ResourceRequest) -> Result<bool, ResourceError> {
+    fn verify(self, request: &ResourceRequest) -> Result<VerifiedGateAdmission, ResourceError> {
         let actual = request_identity(
             request.agent_id,
             &request.resource_type,
@@ -311,7 +338,46 @@ impl GateAdmissionProof {
                 "gate admission proof does not match immutable agent request".into(),
             ));
         }
-        Ok(self.approval_satisfied)
+        Ok(VerifiedGateAdmission {
+            approval_satisfied: self.approval_satisfied,
+            peripheral_activity: self.peripheral_activity,
+        })
+    }
+}
+
+pub(crate) type PeripheralActivityMap = DashMap<(AgentId, String, uuid::Uuid), CancellationToken>;
+
+#[derive(Debug)]
+pub(crate) struct PeripheralActivityLease {
+    activity: Arc<PeripheralActivityMap>,
+    key: (AgentId, String, uuid::Uuid),
+    cancellation: CancellationToken,
+}
+
+impl PeripheralActivityLease {
+    pub(crate) fn new(
+        activity: Arc<PeripheralActivityMap>,
+        agent_id: AgentId,
+        activity_identity: String,
+    ) -> Self {
+        let cancellation = CancellationToken::new();
+        let key = (agent_id, activity_identity, uuid::Uuid::new_v4());
+        activity.insert(key.clone(), cancellation.clone());
+        Self {
+            activity,
+            key,
+            cancellation,
+        }
+    }
+
+    fn cancellation(&self) -> CancellationToken {
+        self.cancellation.clone()
+    }
+}
+
+impl Drop for PeripheralActivityLease {
+    fn drop(&mut self) {
+        self.activity.remove(&self.key);
     }
 }
 
@@ -407,8 +473,8 @@ impl ProviderTaskGuard {
         operation: String,
         parameters: serde_json::Value,
         permit: OwnedSemaphorePermit,
+        cancellation: CancellationToken,
     ) -> Self {
-        let cancellation = CancellationToken::new();
         let provider_cancellation = cancellation.clone();
         let handle = tokio::spawn(async move {
             let _permit = permit;
@@ -628,6 +694,7 @@ impl ResourceBrokerImpl {
     fn enforce_sandbox(
         &self,
         request: &mut ResourceRequest,
+        approval_satisfied: bool,
     ) -> Result<Option<(SandboxId, IsolationLevel)>, ResourceError> {
         let Some(manager) = &self.sandbox_manager else {
             return Ok(None);
@@ -670,9 +737,15 @@ impl ResourceBrokerImpl {
             Ok(Some((actual, isolation)))
         } else {
             let action = Self::sandbox_action(request)?;
-            manager
-                .intercept_action(actual, &action)
-                .map_err(|_| ResourceError::OperationFailed("Sandbox denied".into()))?;
+            if request.resource_type == ResourceType::Peripheral {
+                manager
+                    .intercept_action_with_operator_grant(actual, &action, approval_satisfied)
+                    .map_err(|_| ResourceError::OperationFailed("Sandbox denied".into()))?;
+            } else {
+                manager
+                    .intercept_action(actual, &action)
+                    .map_err(|_| ResourceError::OperationFailed("Sandbox denied".into()))?;
+            }
             let isolation = manager
                 .isolation_level(actual)
                 .map_err(|_| ResourceError::OperationFailed("Sandbox denied".into()))?;
@@ -688,7 +761,7 @@ impl ResourceBroker for ResourceBrokerImpl {
         mut request: ResourceRequest,
     ) -> Result<ResourceResponse, ResourceError> {
         validate_resource_request(&request.operation, &request.parameters)?;
-        let admission_approved = match request.gate_admission.take() {
+        let gate_admission = match request.gate_admission.take() {
             Some(proof) => Some(proof.verify(&request)?),
             None if !self.require_gate_admission => None,
             None => {
@@ -697,6 +770,9 @@ impl ResourceBroker for ResourceBrokerImpl {
                 ));
             }
         };
+        let admission_approved = gate_admission
+            .as_ref()
+            .is_some_and(|admission| admission.approval_satisfied);
         let target = provider_target(
             &request.resource_type,
             &request.operation,
@@ -725,7 +801,7 @@ impl ResourceBroker for ResourceBrokerImpl {
                 ));
             }
             AccessDecision::RequiresApproval => {
-                if admission_approved != Some(true) {
+                if !admission_approved {
                     self.permission_system.log_action(
                         request.agent_id,
                         &request.operation,
@@ -741,7 +817,7 @@ impl ResourceBroker for ResourceBrokerImpl {
             AccessDecision::Allowed => {}
         }
 
-        let sandbox = match self.enforce_sandbox(&mut request) {
+        let sandbox = match self.enforce_sandbox(&mut request, admission_approved) {
             Ok(sandbox) => sandbox,
             Err(error) => {
                 self.permission_system.log_action(
@@ -912,6 +988,19 @@ impl ResourceBroker for ResourceBrokerImpl {
             )))
             .map_err(|error| ResourceError::OperationFailed(error.to_string()))
         } else {
+            let provider_cancellation = if request.resource_type == ResourceType::Peripheral {
+                gate_admission
+                    .as_ref()
+                    .and_then(|admission| admission.peripheral_activity.as_ref())
+                    .map(PeripheralActivityLease::cancellation)
+                    .ok_or_else(|| {
+                        ResourceError::OperationFailed(
+                            "peripheral gate admission lease required".into(),
+                        )
+                    })?
+            } else {
+                CancellationToken::new()
+            };
             let mut task = ProviderTaskGuard::new(
                 provider,
                 request.operation.clone(),
@@ -919,6 +1008,7 @@ impl ResourceBroker for ResourceBrokerImpl {
                 permit
                     .take()
                     .expect("generic provider execution owns its admission permit"),
+                provider_cancellation,
             );
             match tokio::time::timeout(PROVIDER_EXECUTION_TIMEOUT, task.join()).await {
                 Ok(result) => {
@@ -1018,6 +1108,47 @@ struct ResourceWaitGuard<'a>(&'a AtomicUsize);
 impl Drop for ResourceWaitGuard<'_> {
     fn drop(&mut self) {
         self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+#[cfg(test)]
+pub(crate) struct RevocablePeripheralProvider {
+    pub(crate) started: Arc<tokio::sync::Notify>,
+}
+
+#[cfg(test)]
+#[async_trait::async_trait]
+impl ResourceProvider for RevocablePeripheralProvider {
+    fn resource_type(&self) -> ResourceType {
+        ResourceType::Peripheral
+    }
+
+    fn supported_operations(&self) -> Vec<String> {
+        vec!["capture_image".into()]
+    }
+
+    async fn execute(
+        &self,
+        _operation: &str,
+        _params: &serde_json::Value,
+    ) -> Result<serde_json::Value, ResourceError> {
+        Err(ResourceError::OperationFailed(
+            "peripheral provider requires controlled execution".into(),
+        ))
+    }
+
+    async fn execute_controlled(
+        &self,
+        operation: &str,
+        _params: &serde_json::Value,
+        cancellation: &CancellationToken,
+    ) -> Result<serde_json::Value, ResourceError> {
+        assert_eq!(operation, "capture_image");
+        self.started.notify_one();
+        cancellation.cancelled().await;
+        Err(ResourceError::OperationFailed(
+            "peripheral use revoked".into(),
+        ))
     }
 }
 
@@ -1265,6 +1396,7 @@ mod tests {
             request.agent_id,
             identity,
             approval_satisfied,
+            None,
         ));
         request
     }
@@ -1756,7 +1888,7 @@ mod tests {
                 agent_id: agent,
                 resource_type: ResourceType::Peripheral,
                 operation: "capture_image".into(),
-                parameters: serde_json::json!({}),
+                parameters: serde_json::json!({"device": "camera-1"}),
                 sandbox_context: None,
                 gate_admission: None,
             })

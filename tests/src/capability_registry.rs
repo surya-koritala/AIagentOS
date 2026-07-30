@@ -563,7 +563,10 @@ fn peripheral_access_stays_unavailable_and_requires_a_revocable_local_grant() {
         "binding.resource_type == ResourceType::Peripheral",
         "binding.security.approval_policy == ApprovalPolicy::None",
         "binding.security.sandbox_requirement != SandboxRequirement::Required",
-        "placeholder_provider_operations_cannot_be_published_as_tools",
+        "ResourceType::Peripheral,\n                \"capture_image\"",
+        "ResourceType::Peripheral,\n                \"record_audio\"",
+        "ResourceType::Peripheral,\n                \"play_audio\"",
+        "(ResourceType::Peripheral, \"print\", SecurityAction::Write)",
     ] {
         assert!(
             tools.contains(contract),
@@ -573,16 +576,45 @@ fn peripheral_access_stays_unavailable_and_requires_a_revocable_local_grant() {
 
     let kernel = read_workspace_file("crates/kernel/src/lib.rs");
     for contract in [
-        "pub struct ToolApprovalState",
-        "pub fn approve_tool_call(",
-        "pub fn tool_call_approval_state(",
-        "pub fn revoke_tool_call_approval(",
+        "pub struct PeripheralCallState",
+        "pub struct PeripheralRevocation",
+        "pub fn approve_peripheral_call(",
+        "pub fn peripheral_call_state(",
+        "pub fn revoke_peripheral_call(",
+        "grant_pending",
+        "active_uses",
         "resource_identity",
-        "trusted_kernel_approval_api_grants_one_exact_registered_call",
+        "peripheral_grant_has_visible_active_state_and_revokes_exact_use",
+        "admitted_peripheral_use_is_revocable_before_provider_dispatch",
+        "agent_kill_revokes_active_peripheral_use",
     ] {
         assert!(
             kernel.contains(contract),
             "trusted local approval surface lost {contract:?}"
+        );
+    }
+
+    let resources = read_workspace_file("crates/kernel/src/resources.rs");
+    for contract in [
+        "pub(crate) struct PeripheralActivityLease",
+        "peripheral_activity: Option<PeripheralActivityLease>",
+        "peripheral gate admission lease required",
+    ] {
+        assert!(
+            resources.contains(contract),
+            "peripheral active-use contract lost {contract:?}"
+        );
+    }
+
+    let sandbox = read_workspace_file("crates/kernel/src/sandbox.rs");
+    for contract in [
+        "fn intercept_action_with_operator_grant(",
+        "peripheral access requires an exact trusted operator grant",
+        "peripheral_access_requires_the_gate_bound_operator_grant",
+    ] {
+        assert!(
+            sandbox.contains(contract),
+            "peripheral sandbox contract lost {contract:?}"
         );
     }
 
@@ -593,6 +625,10 @@ fn peripheral_access_stays_unavailable_and_requires_a_revocable_local_grant() {
         "self.approvals.remove(&key)",
         "self.approvals",
         ".retain(|(agent, _, _, _, _), _| *agent != kid)",
+        "peripheral_call_state_contract",
+        "revoke_peripheral_call_contract",
+        "cancel_peripheral_for_agent",
+        "never in an uncancellable gap",
     ] {
         assert!(
             gate.contains(contract),
@@ -609,8 +645,9 @@ fn peripheral_access_stays_unavailable_and_requires_a_revocable_local_grant() {
         "Experimental — unavailable",
         "None — unavailable",
         "explicit local human approval",
-        "inspect a non-secret pending indicator",
-        "No remote, SDK, package, or MCP surface can create a grant",
+        "pending-grant and active-use counts",
+        "cooperatively cancels every active exact-match use",
+        "No remote, SDK, package, or MCP surface can create, inspect, or revoke grants",
     ] {
         assert!(
             row.contains(contract),

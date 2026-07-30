@@ -1264,6 +1264,30 @@ pub struct ToolApprovalState {
     pub granted: bool,
 }
 
+/// Non-secret local indicator for one exact peripheral call.
+///
+/// This projection is deliberately unavailable through the remote wire, SDK,
+/// package, and MCP surfaces. Device names and call parameters are represented
+/// only by an opaque digest.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeripheralCallState {
+    pub agent_id: AgentId,
+    pub tool_name: String,
+    pub resource_identity: String,
+    pub required_policy: crate::tools::ApprovalPolicy,
+    /// Whether an exact, unconsumed local approval is waiting.
+    pub grant_pending: bool,
+    /// Number of exact matching calls currently using the peripheral.
+    pub active_uses: usize,
+}
+
+/// Result of revoking one exact peripheral target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PeripheralRevocation {
+    pub pending_grant_revoked: bool,
+    pub active_uses_cancelled: usize,
+}
+
 impl AgentKernelImpl {
     const WATCHDOG_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
     #[cfg(not(test))]
@@ -2022,6 +2046,177 @@ impl AgentKernelImpl {
                     "cannot revoke tool approval for unknown agent {agent_id}"
                 ))
             })
+    }
+
+    /// Grant one exact, single-use peripheral call from a trusted local UI and
+    /// return its non-secret indicator state. The binding must be a registered
+    /// peripheral operation with an explicit approval policy and sandbox
+    /// requirement.
+    pub fn approve_peripheral_call(
+        &self,
+        agent_id: AgentId,
+        tool_name: &str,
+        arguments: &serde_json::Value,
+        approval: crate::tools::ApprovalPolicy,
+    ) -> Result<PeripheralCallState, KernelError> {
+        let prepared = self
+            .tool_registry
+            .prepare_execution(agent_id, tool_name, arguments)
+            .map_err(KernelError::Policy)?;
+        if prepared.request.resource_type != crate::resources::ResourceType::Peripheral {
+            return Err(KernelError::Policy(format!(
+                "tool '{tool_name}' is not a peripheral operation"
+            )));
+        }
+        let required = prepared.authorization.security.approval_policy;
+        if required == crate::tools::ApprovalPolicy::None {
+            return Err(KernelError::Policy(format!(
+                "peripheral tool '{tool_name}' does not require approval"
+            )));
+        }
+        if !approval.satisfies(required) {
+            return Err(KernelError::Policy(format!(
+                "{approval:?} approval is insufficient for tool '{tool_name}'"
+            )));
+        }
+        if !self.syscall_gate.grant_tool_approval_contract(
+            agent_id,
+            tool_name,
+            &prepared.authorization.resource,
+            &prepared.approval_contract_digest,
+            approval,
+        ) {
+            return Err(KernelError::Policy(format!(
+                "cannot approve tool '{tool_name}' for an unknown agent"
+            )));
+        }
+        self.peripheral_call_state_for_prepared(agent_id, tool_name, &prepared)
+    }
+
+    /// Inspect pending grant and active-use state for one exact peripheral
+    /// call without retaining or returning its raw target.
+    pub fn peripheral_call_state(
+        &self,
+        agent_id: AgentId,
+        tool_name: &str,
+        arguments: &serde_json::Value,
+    ) -> Result<PeripheralCallState, KernelError> {
+        let prepared = self
+            .tool_registry
+            .prepare_execution(agent_id, tool_name, arguments)
+            .map_err(KernelError::Policy)?;
+        self.peripheral_call_state_for_prepared(agent_id, tool_name, &prepared)
+    }
+
+    fn peripheral_call_state_for_prepared(
+        &self,
+        agent_id: AgentId,
+        tool_name: &str,
+        prepared: &crate::tools::PreparedToolExecution,
+    ) -> Result<PeripheralCallState, KernelError> {
+        if prepared.request.resource_type != crate::resources::ResourceType::Peripheral {
+            return Err(KernelError::Policy(format!(
+                "tool '{tool_name}' is not a peripheral operation"
+            )));
+        }
+        let required = prepared.authorization.security.approval_policy;
+        if required == crate::tools::ApprovalPolicy::None {
+            return Err(KernelError::Policy(format!(
+                "peripheral tool '{tool_name}' does not require approval"
+            )));
+        }
+        let resource_identity =
+            crate::resources::opaque_identity(prepared.authorization.resource.as_bytes());
+        let request_identity = crate::resources::request_identity(
+            prepared.request.agent_id,
+            &prepared.request.resource_type,
+            &prepared.request.operation,
+            &prepared.request.parameters,
+        )
+        .map_err(KernelError::Policy)?;
+        let activity_identity = crate::resources::peripheral_activity_identity(
+            tool_name,
+            &prepared.approval_contract_digest,
+            &request_identity,
+        );
+        let (grant_pending, active_uses) = self
+            .syscall_gate
+            .peripheral_call_state_contract(
+                agent_id,
+                tool_name,
+                &prepared.authorization.resource,
+                &prepared.approval_contract_digest,
+                required,
+                &activity_identity,
+            )
+            .ok_or_else(|| {
+                KernelError::Policy(format!(
+                    "cannot inspect peripheral approval for unknown agent {agent_id}"
+                ))
+            })?;
+        Ok(PeripheralCallState {
+            agent_id,
+            tool_name: tool_name.to_string(),
+            resource_identity,
+            required_policy: required,
+            grant_pending,
+            active_uses,
+        })
+    }
+
+    /// Revoke an unconsumed grant and cooperatively cancel every active use of
+    /// the same exact peripheral call. Provider cancellation remains bounded
+    /// by the broker's existing drain/abort contract.
+    pub fn revoke_peripheral_call(
+        &self,
+        agent_id: AgentId,
+        tool_name: &str,
+        arguments: &serde_json::Value,
+    ) -> Result<PeripheralRevocation, KernelError> {
+        let prepared = self
+            .tool_registry
+            .prepare_execution(agent_id, tool_name, arguments)
+            .map_err(KernelError::Policy)?;
+        if prepared.request.resource_type != crate::resources::ResourceType::Peripheral {
+            return Err(KernelError::Policy(format!(
+                "tool '{tool_name}' is not a peripheral operation"
+            )));
+        }
+        if prepared.authorization.security.approval_policy == crate::tools::ApprovalPolicy::None {
+            return Err(KernelError::Policy(format!(
+                "peripheral tool '{tool_name}' does not require approval"
+            )));
+        }
+        let request_identity = crate::resources::request_identity(
+            prepared.request.agent_id,
+            &prepared.request.resource_type,
+            &prepared.request.operation,
+            &prepared.request.parameters,
+        )
+        .map_err(KernelError::Policy)?;
+        let activity_identity = crate::resources::peripheral_activity_identity(
+            tool_name,
+            &prepared.approval_contract_digest,
+            &request_identity,
+        );
+        let (pending_grant_revoked, active_uses_cancelled) = self
+            .syscall_gate
+            .revoke_peripheral_call_contract(
+                agent_id,
+                tool_name,
+                &prepared.authorization.resource,
+                &prepared.approval_contract_digest,
+                &activity_identity,
+            )
+            .ok_or_else(|| {
+                KernelError::Policy(format!(
+                    "cannot revoke peripheral approval for unknown agent {agent_id}"
+                ))
+            })?;
+        Ok(PeripheralRevocation {
+            pending_grant_revoked,
+            active_uses_cancelled,
+        })
     }
 
     /// Resolve the (Agent, Tool) namespaces for a group, creating them lazily.
@@ -3313,6 +3508,10 @@ impl AgentKernelImpl {
         forced: bool,
     ) -> Result<(), KernelError> {
         let mut failures = Vec::new();
+        // Peripheral calls carry a local, visible active-use contract. Agent
+        // teardown is also revocation: signal every active device operation
+        // before waiting on or forcibly invalidating its tool-call guard.
+        self.syscall_gate.cancel_peripheral_for_agent(agent_id);
         let gate_info = self.syscall_gate.agent_info(agent_id);
         let gate_registered = gate_info.is_some();
         let mut cgroup_membership_released = !gate_registered;
@@ -4365,6 +4564,7 @@ impl AgentKernelImpl {
         if self.syscall_gate.agent_info(agent_id).is_none() {
             return Ok(());
         }
+        self.syscall_gate.cancel_peripheral_for_agent(agent_id);
         let drain = tokio::time::timeout(
             Self::TOOL_DRAIN_TIMEOUT,
             self.syscall_gate.close_tool_admission_and_wait(agent_id),
@@ -7822,6 +8022,304 @@ mod tests {
                 .unwrap()
                 .granted
         );
+    }
+
+    fn register_revocable_camera(kernel: &AgentKernelImpl, started: Arc<tokio::sync::Notify>) {
+        kernel
+            .resource_broker
+            .register_provider(Box::new(crate::resources::RevocablePeripheralProvider {
+                started,
+            }))
+            .unwrap();
+        for name in ["capture_camera", "capture_camera_alternate"] {
+            kernel
+                .tool_registry
+                .register(crate::tools::ToolBinding {
+                    name: name.into(),
+                    description: "Capture one frame from an operator-approved camera".into(),
+                    parameters_schema: serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "device": {"type": "string"}
+                        },
+                        "required": ["device"]
+                    }),
+                    resource_type: crate::resources::ResourceType::Peripheral,
+                    operation: "capture_image".into(),
+                    security: crate::tools::ToolSecurity::argument(
+                        crate::tools::SecurityAction::Read,
+                        "device",
+                    )
+                    .with_approval(crate::tools::ApprovalPolicy::User)
+                    .sandboxed(),
+                })
+                .unwrap();
+        }
+    }
+
+    fn peripheral_test_config(name: &str) -> AgentConfig {
+        AgentConfig {
+            permission_profile: "full-access".into(),
+            ..lifecycle_test_config(name)
+        }
+    }
+
+    #[tokio::test]
+    async fn peripheral_grant_has_visible_active_state_and_revokes_exact_use() {
+        let kernel = Arc::new(AgentKernelImpl::new().unwrap());
+        let started = Arc::new(tokio::sync::Notify::new());
+        register_revocable_camera(&kernel, started.clone());
+        let agent = kernel
+            .create_agent_full(peripheral_test_config("revocable-camera"))
+            .await
+            .unwrap();
+        let arguments = serde_json::json!({"device": "private-camera-name"});
+
+        assert!(matches!(
+            kernel
+                .tool_registry
+                .authorize_and_acquire_call(
+                    &kernel.syscall_gate,
+                    agent.id,
+                    "capture_camera",
+                    &arguments,
+                )
+                .await,
+            Err(crate::tools::ToolAuthorizationError::Denied(
+                crate::syscall_gate::GateDenial::ApprovalRequired { .. }
+            ))
+        ));
+        let initial = kernel
+            .peripheral_call_state(agent.id, "capture_camera", &arguments)
+            .unwrap();
+        assert!(!initial.grant_pending);
+        assert_eq!(initial.active_uses, 0);
+        assert!(!initial.resource_identity.contains("private-camera-name"));
+
+        let granted = kernel
+            .approve_peripheral_call(
+                agent.id,
+                "capture_camera",
+                &arguments,
+                crate::tools::ApprovalPolicy::User,
+            )
+            .unwrap();
+        assert!(granted.grant_pending);
+        assert_eq!(granted.active_uses, 0);
+
+        let execution_kernel = kernel.clone();
+        let execution_arguments = arguments.clone();
+        let execution = tokio::spawn(async move {
+            let (prepared, tool_guard) = execution_kernel
+                .tool_registry
+                .authorize_and_acquire_call(
+                    &execution_kernel.syscall_gate,
+                    agent.id,
+                    "capture_camera",
+                    &execution_arguments,
+                )
+                .await
+                .unwrap();
+            let response = execution_kernel
+                .resource_broker
+                .execute(prepared.request)
+                .await
+                .unwrap();
+            drop(tool_guard);
+            response
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), started.notified())
+            .await
+            .expect("peripheral provider did not start");
+
+        let active = kernel
+            .peripheral_call_state(agent.id, "capture_camera", &arguments)
+            .unwrap();
+        assert!(!active.grant_pending, "grant must be consumed before use");
+        assert_eq!(active.active_uses, 1);
+        assert_eq!(
+            kernel
+                .peripheral_call_state(agent.id, "capture_camera_alternate", &arguments)
+                .unwrap()
+                .active_uses,
+            0,
+            "another tool with the same provider request must not share activity identity"
+        );
+        assert_eq!(
+            kernel
+                .revoke_peripheral_call(agent.id, "capture_camera_alternate", &arguments)
+                .unwrap()
+                .active_uses_cancelled,
+            0
+        );
+        let pending_while_active = kernel
+            .approve_peripheral_call(
+                agent.id,
+                "capture_camera",
+                &arguments,
+                crate::tools::ApprovalPolicy::User,
+            )
+            .unwrap();
+        assert!(pending_while_active.grant_pending);
+        assert_eq!(pending_while_active.active_uses, 1);
+        let revoked = kernel
+            .revoke_peripheral_call(agent.id, "capture_camera", &arguments)
+            .unwrap();
+        assert!(revoked.pending_grant_revoked);
+        assert_eq!(revoked.active_uses_cancelled, 1);
+        let response = tokio::time::timeout(std::time::Duration::from_secs(1), execution)
+            .await
+            .expect("revoked peripheral use did not drain")
+            .unwrap();
+        assert!(!response.success);
+        assert!(response
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("revoked")));
+        assert_eq!(
+            kernel
+                .peripheral_call_state(agent.id, "capture_camera", &arguments)
+                .unwrap()
+                .active_uses,
+            0
+        );
+        assert_eq!(
+            kernel
+                .revoke_peripheral_call(agent.id, "capture_camera", &arguments)
+                .unwrap(),
+            PeripheralRevocation {
+                pending_grant_revoked: false,
+                active_uses_cancelled: 0,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn admitted_peripheral_use_is_revocable_before_provider_dispatch() {
+        let kernel = AgentKernelImpl::new().unwrap();
+        register_revocable_camera(&kernel, Arc::new(tokio::sync::Notify::new()));
+        let agent = kernel
+            .create_agent_full(peripheral_test_config("admitted-camera"))
+            .await
+            .unwrap();
+        let arguments = serde_json::json!({"device": "camera-1"});
+        kernel
+            .approve_peripheral_call(
+                agent.id,
+                "capture_camera",
+                &arguments,
+                crate::tools::ApprovalPolicy::User,
+            )
+            .unwrap();
+
+        // Hold the immutable admitted request without dispatching it. The
+        // consumed grant must already have become a visible cancellable lease.
+        let (prepared, tool_guard) = kernel
+            .tool_registry
+            .authorize_and_acquire_call(
+                &kernel.syscall_gate,
+                agent.id,
+                "capture_camera",
+                &arguments,
+            )
+            .await
+            .unwrap();
+        let admitted = kernel
+            .peripheral_call_state(agent.id, "capture_camera", &arguments)
+            .unwrap();
+        assert!(!admitted.grant_pending);
+        assert_eq!(admitted.active_uses, 1);
+        assert_eq!(
+            kernel
+                .revoke_peripheral_call(agent.id, "capture_camera", &arguments)
+                .unwrap(),
+            PeripheralRevocation {
+                pending_grant_revoked: false,
+                active_uses_cancelled: 1,
+            }
+        );
+
+        let response = kernel
+            .resource_broker
+            .execute(prepared.request)
+            .await
+            .unwrap();
+        drop(tool_guard);
+        assert!(!response.success);
+        assert!(response
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("revoked")));
+        assert_eq!(
+            kernel
+                .peripheral_call_state(agent.id, "capture_camera", &arguments)
+                .unwrap()
+                .active_uses,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_kill_revokes_active_peripheral_use() {
+        let kernel = Arc::new(AgentKernelImpl::new().unwrap());
+        let started = Arc::new(tokio::sync::Notify::new());
+        register_revocable_camera(&kernel, started.clone());
+        let agent = kernel
+            .create_agent_full(peripheral_test_config("killed-camera"))
+            .await
+            .unwrap();
+        let arguments = serde_json::json!({"device": "camera-1"});
+        kernel
+            .approve_peripheral_call(
+                agent.id,
+                "capture_camera",
+                &arguments,
+                crate::tools::ApprovalPolicy::User,
+            )
+            .unwrap();
+
+        let execution_kernel = kernel.clone();
+        let execution = tokio::spawn(async move {
+            let (prepared, tool_guard) = execution_kernel
+                .tool_registry
+                .authorize_and_acquire_call(
+                    &execution_kernel.syscall_gate,
+                    agent.id,
+                    "capture_camera",
+                    &arguments,
+                )
+                .await
+                .unwrap();
+            let response = execution_kernel
+                .resource_broker
+                .execute(prepared.request)
+                .await
+                .unwrap();
+            drop(tool_guard);
+            response
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), started.notified())
+            .await
+            .expect("peripheral provider did not start");
+        assert_eq!(
+            tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                kernel.kill_agent(agent.id)
+            )
+            .await
+            .expect("agent kill did not revoke peripheral use")
+            .unwrap(),
+            AgentState::Stopped
+        );
+        let response = tokio::time::timeout(std::time::Duration::from_secs(1), execution)
+            .await
+            .expect("killed peripheral use did not drain")
+            .unwrap();
+        assert!(!response.success);
+        assert!(response
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("revoked")));
     }
 
     #[tokio::test]

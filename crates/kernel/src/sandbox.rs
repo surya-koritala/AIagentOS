@@ -47,6 +47,24 @@ pub trait SandboxManager: Send + Sync {
         sandbox_id: SandboxId,
         action: &SandboxAction,
     ) -> Result<(), SandboxError>;
+    /// Intercept one action with exact syscall-gate evidence that a trusted
+    /// local operator approved this single call. The default never converts an
+    /// approval into ambient peripheral authority: custom managers must still
+    /// opt in by overriding this method.
+    fn intercept_action_with_operator_grant(
+        &self,
+        sandbox_id: SandboxId,
+        action: &SandboxAction,
+        operator_granted: bool,
+    ) -> Result<(), SandboxError> {
+        if matches!(action, SandboxAction::PeripheralAccess(_)) {
+            let _ = operator_granted;
+            return Err(SandboxError::BoundaryViolation(
+                "peripheral access requires a supported grant-aware sandbox".into(),
+            ));
+        }
+        self.intercept_action(sandbox_id, action)
+    }
     /// Resolve the exact filesystem target that a provider may use. Relative
     /// paths are rooted in the sandbox workspace and the returned target has
     /// passed the same traversal/symlink boundary check as `intercept_action`.
@@ -1592,16 +1610,33 @@ impl SandboxManager for SandboxManagerImpl {
                 }
             }
             SandboxAction::PeripheralAccess(_) => {
-                if state.isolation_level == IsolationLevel::Trusted {
-                    return Ok(());
-                }
                 return Err(SandboxError::BoundaryViolation(
-                    "peripheral access requires an explicit trusted operator grant".into(),
+                    "peripheral access requires an exact trusted operator grant".into(),
                 ));
             }
             SandboxAction::Ipc => {}
         }
 
+        Ok(())
+    }
+
+    fn intercept_action_with_operator_grant(
+        &self,
+        sandbox_id: SandboxId,
+        action: &SandboxAction,
+        operator_granted: bool,
+    ) -> Result<(), SandboxError> {
+        if !matches!(action, SandboxAction::PeripheralAccess(_)) {
+            return self.intercept_action(sandbox_id, action);
+        }
+        if !operator_granted {
+            return Err(SandboxError::BoundaryViolation(
+                "peripheral access requires an exact trusted operator grant".into(),
+            ));
+        }
+        self.sandboxes
+            .get(&sandbox_id)
+            .ok_or_else(|| SandboxError::BoundaryViolation("Sandbox not found".to_string()))?;
         Ok(())
     }
 
@@ -1836,6 +1871,25 @@ mod tests {
         let sid = mgr.create_sandbox(agent_id, &test_config()).unwrap();
         let result = mgr.intercept_action(sid, &SandboxAction::ProcessExec("rm -rf /".to_string()));
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn peripheral_access_requires_the_gate_bound_operator_grant() {
+        let mgr = SandboxManagerImpl::new();
+        let agent_id = uuid::Uuid::new_v4();
+        let sid = mgr.create_sandbox(agent_id, &test_config()).unwrap();
+        let action = SandboxAction::PeripheralAccess("camera-1".into());
+
+        assert!(mgr.intercept_action(sid, &action).is_err());
+        assert!(mgr
+            .intercept_action_with_operator_grant(sid, &action, false)
+            .is_err());
+        assert!(mgr
+            .intercept_action_with_operator_grant(sid, &action, true)
+            .is_ok());
+        assert!(mgr
+            .intercept_action_with_operator_grant(uuid::Uuid::new_v4(), &action, true)
+            .is_err());
     }
 
     #[test]

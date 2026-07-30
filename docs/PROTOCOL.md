@@ -100,6 +100,20 @@ non-secret. Rollback identifies an older retained revision and requires the
 exact frozen tunable name before submission; the server remains authoritative
 for authorization, revision history, bounds, and atomic persistence.
 
+### System audit views
+
+The TUI and desktop can explicitly load node-control, cluster-membership, and
+application-listener certificate-rollout history through `KernelClient`. Each
+surface performs three bounded sequential public-API reads and updates each
+ledger only after that ledger succeeds. This is not an atomic cross-ledger
+snapshot: generations and timestamps remain the authority for ordering.
+Failures retain the last successfully loaded projection for that ledger and are
+rendered as unavailable instead of replacing history with empty arrays. This
+matters for the supported single-node profile, where cluster-only certificate
+history requires replicated cluster authority and is therefore explicitly
+unavailable. A tenant credential, including a tenant `Admin`, receives the
+server's typed authorization denial; the clients have no in-process fallback.
+
 ## Version and feature negotiation
 
 The wire protocol is versioned independently from the crate. Protocol v2 serves

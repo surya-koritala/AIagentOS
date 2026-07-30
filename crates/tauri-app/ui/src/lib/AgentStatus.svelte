@@ -28,12 +28,49 @@
   let packageConfirmation = '';
   let installPackageName = '';
   let installRequirement = '';
+  let systemAudit = null;
+  let systemAuditLoading = false;
+  let systemAuditError = '';
+  let systemAuditStatus = '';
 
   const availability = provider => {
     if (provider.probe_timed_out) return 'Probe timed out';
     if (provider.circuit_open) return 'Circuit open';
     return provider.available ? 'Available' : 'Unavailable';
   };
+
+  const shortFingerprint = fingerprint =>
+    fingerprint.length > 16 ? `${fingerprint.slice(0, 16)}…` : fingerprint;
+
+  async function loadSystemAudit() {
+    if (systemAuditLoading) return;
+    systemAuditLoading = true;
+    systemAuditError = '';
+    systemAuditStatus = systemAudit === null
+      ? 'Loading bounded system audit…'
+      : 'Refreshing bounded system audit…';
+    try {
+      const response = await invoke('get_system_audit', { limit: 50 });
+      systemAudit = response;
+      const membershipCount = response.cluster_membership === null
+        ? 'unavailable'
+        : response.cluster_membership.length;
+      const certificateCount = response.cluster_certificate_rollout === null
+        ? 'unavailable'
+        : response.cluster_certificate_rollout.length;
+      systemAuditStatus =
+        `Node-control entries: ${response.node_control.length}; ` +
+        `membership entries: ${membershipCount}; ` +
+        `certificate-rollout entries: ${certificateCount}.`;
+    } catch (error) {
+      systemAuditError = String(error);
+      systemAuditStatus = systemAudit === null
+        ? ''
+        : 'Refresh failed; showing the last successfully loaded audit.';
+    } finally {
+      systemAuditLoading = false;
+    }
+  }
 
   const serviceOperationLabel = target => {
     const verb = target.action === 'start'
@@ -488,6 +525,126 @@
           </tbody>
         </table>
       </div>
+    {/if}
+  </section>
+
+  <section aria-labelledby="system-audit-heading">
+    <div class="history-heading">
+      <h2 id="system-audit-heading">System audit</h2>
+      <button
+        class="audit-load"
+        on:click={loadSystemAudit}
+        disabled={systemAuditLoading}
+        aria-label={systemAudit === null ? 'Load system audit' : 'Refresh system audit'}
+      >{systemAudit === null ? 'Load audit' : 'Refresh audit'}</button>
+    </div>
+    <p class="audit-scope">
+      Global node-control, cluster-membership, and certificate-rollout history.
+      These are bounded sequential public-API reads, not an atomic cross-ledger
+      snapshot.
+    </p>
+    {#if systemAuditStatus}
+      <p class="operation-status" role="status">{systemAuditStatus}</p>
+    {/if}
+    {#if systemAuditError}
+      <p class="operation-error" role="alert">{systemAuditError}</p>
+    {/if}
+    {#if systemAudit !== null}
+      {#each systemAudit.warnings as warning}
+        <p class="unavailable" role="status">{warning}</p>
+      {/each}
+      <section class="system-audit-ledger" aria-labelledby="node-control-audit-heading">
+        <h3 id="node-control-audit-heading">Node-control history</h3>
+        {#if systemAudit.node_control.length === 0}
+          <p class="empty">No retained node-control changes.</p>
+        {:else}
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>Time</th><th>Generation</th><th>Transition</th><th>Actor</th><th>Reason</th></tr></thead>
+              <tbody>
+                {#each systemAudit.node_control as entry}
+                  <tr>
+                    <th scope="row">{entry.changed_at}</th>
+                    <td>{entry.generation}</td>
+                    <td>{entry.previous} → {entry.current}</td>
+                    <td>{entry.actor}</td>
+                    <td>{entry.reason}</td>
+                  </tr>
+                {/each}
+              </tbody>
+            </table>
+          </div>
+        {/if}
+      </section>
+
+      <section class="system-audit-ledger" aria-labelledby="cluster-membership-audit-heading">
+        <h3 id="cluster-membership-audit-heading">Cluster-membership history</h3>
+        {#if systemAudit.cluster_membership === null}
+          <p class="unavailable">
+            Cluster-membership history is unavailable for this runtime. No
+            empty history has been assumed.
+          </p>
+        {:else if systemAudit.cluster_membership.length === 0}
+          <p class="empty">No retained cluster-membership changes.</p>
+        {:else}
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>Time</th><th>Generation</th><th>Node</th><th>Transition</th><th>Actor</th><th>Reason</th></tr></thead>
+              <tbody>
+                {#each systemAudit.cluster_membership as entry}
+                  <tr>
+                    <th scope="row">{entry.changed_at}</th>
+                    <td>{entry.membership_generation} / member {entry.member_generation}</td>
+                    <td><code>{entry.node_id}</code></td>
+                    <td>{entry.previous ?? 'none'} → {entry.current}</td>
+                    <td>{entry.actor}</td>
+                    <td>{entry.reason}</td>
+                  </tr>
+                {/each}
+              </tbody>
+            </table>
+          </div>
+        {/if}
+      </section>
+
+      <section class="system-audit-ledger" aria-labelledby="certificate-rollout-audit-heading">
+        <h3 id="certificate-rollout-audit-heading">Certificate-rollout history</h3>
+        {#if systemAudit.cluster_certificate_rollout === null}
+          <p class="unavailable">
+            Certificate-rollout history requires replicated cluster authority.
+            No empty history has been assumed.
+          </p>
+        {:else if systemAudit.cluster_certificate_rollout.length === 0}
+          <p class="empty">No retained certificate-rollout changes.</p>
+        {:else}
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>Time</th><th>Generation</th><th>Node</th><th>Transition</th><th>Fingerprints</th><th>Actor</th><th>Reason</th></tr></thead>
+              <tbody>
+                {#each systemAudit.cluster_certificate_rollout as entry}
+                  <tr>
+                    <th scope="row">{entry.changed_at}</th>
+                    <td>{entry.trust_generation} / member {entry.member_generation}</td>
+                    <td><code>{entry.node_id}</code></td>
+                    <td>{entry.previous_phase ?? 'none'} → {entry.current_phase ?? 'complete'}</td>
+                    <td>
+                      <code title={entry.previous_tls_server_certificate_fingerprint}>
+                        {shortFingerprint(entry.previous_tls_server_certificate_fingerprint)}
+                      </code>
+                      →
+                      <code title={entry.next_tls_server_certificate_fingerprint}>
+                        {shortFingerprint(entry.next_tls_server_certificate_fingerprint)}
+                      </code>
+                    </td>
+                    <td>{entry.actor}</td>
+                    <td>{entry.reason}</td>
+                  </tr>
+                {/each}
+              </tbody>
+            </table>
+          </div>
+        {/if}
+      </section>
     {/if}
   </section>
 
@@ -1019,6 +1176,20 @@
   }
   .history-heading { display: flex; align-items: center; justify-content: space-between; gap: 0.75rem; }
   .history-heading h3 { margin: 0; }
+  .history-heading h2 { margin: 1.75rem 0 0.75rem; }
+  .audit-load {
+    min-height: 40px;
+    padding: 0.35rem 0.65rem;
+    border: 1px solid #5b5b76;
+    border-radius: 6px;
+    background: #29293f;
+    color: #e8e8f0;
+    cursor: pointer;
+  }
+  .audit-load:disabled { opacity: 0.5; cursor: wait; }
+  .audit-scope { max-width: 54rem; color: #b9b9c8; line-height: 1.5; }
+  .system-audit-ledger { margin-top: 1rem; }
+  .system-audit-ledger h3 { margin: 0 0 0.6rem; font-size: 0.9rem; }
   code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
   @media (max-width: 700px) {
     .operations { padding: 1rem; }

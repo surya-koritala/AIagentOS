@@ -123,6 +123,12 @@ Press `g` to load durable checkpoints for the selected agent, `(`/`)` to select
 one, `e` to resume it explicitly, or `K` to delete it only after typing the full
 frozen checkpoint ID. These operations use the same authenticated public
 `KernelClient` path as `agentctl` and the desktop client.
+Press `A` in the TUI, or use **Load audit** in the desktop Operations view, to
+load bounded node-control, cluster-membership, and certificate-rollout history.
+These are sequential system-only public API reads, not an atomic snapshot;
+failed refreshes retain the last successfully loaded projection, and
+cluster-only history is explicitly unavailable when the single-node runtime
+does not own replicated cluster authority.
 Declarative service boot ordering and the current supervision boundary are in
 [docs/SERVICES.md](docs/SERVICES.md).
 

@@ -130,6 +130,23 @@ test('operator tunables retain revision bounds, exact rollback target, and audit
   assert.match(status, /another operator changes the revision first/);
 });
 
+test('system audit remains explicit, bounded, non-atomic, and accessible', () => {
+  const status = source('AgentStatus.svelte');
+
+  assert.match(status, /invoke\('get_system_audit', \{ limit: 50 \}\)/);
+  assert.match(status, /aria-labelledby="system-audit-heading"/);
+  assert.match(status, /aria-label=\{systemAudit === null \? 'Load system audit' : 'Refresh system audit'\}/);
+  assert.match(status, /bounded sequential public-API reads, not an atomic cross-ledger/);
+  assert.match(status, /Node-control history/);
+  assert.match(status, /Cluster-membership history/);
+  assert.match(status, /Certificate-rollout history/);
+  assert.match(status, /systemAudit\.cluster_certificate_rollout === null/);
+  assert.match(status, /No empty history has been assumed/);
+  assert.match(status, /role="status"/);
+  assert.match(status, /role="alert"/);
+  assert.match(status, /showing the last successfully loaded audit/);
+});
+
 test('signed package controls freeze version and digest on the public command boundary', () => {
   const status = source('AgentStatus.svelte');
 

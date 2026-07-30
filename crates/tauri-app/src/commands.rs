@@ -6,7 +6,8 @@ use crate::{
         CLOUD_DESKTOP_PROVIDERS, SUPPORTED_DESKTOP_PROVIDERS,
     },
     AppState, DesktopInstalledPackage, DesktopMetricsView, DesktopOperatorView, DesktopService,
-    DesktopServiceHistory, DesktopTunable, DesktopTunableAudit, DesktopUpdateState,
+    DesktopServiceHistory, DesktopSystemAuditView, DesktopTunable, DesktopTunableAudit,
+    DesktopUpdateState,
 };
 use kernel::config::Config;
 use serde::Serialize;
@@ -624,6 +625,26 @@ pub async fn get_operator_view(state: State<'_, AppState>) -> Result<DesktopOper
 }
 
 #[tauri::command]
+pub async fn get_system_audit(
+    state: State<'_, AppState>,
+    limit: usize,
+) -> Result<DesktopSystemAuditView, String> {
+    validate_system_audit_limit(limit)?;
+    state
+        .client
+        .system_audit(limit)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+fn validate_system_audit_limit(limit: usize) -> Result<(), String> {
+    if !(1..=200).contains(&limit) {
+        return Err("system audit limit must be between 1 and 200".into());
+    }
+    Ok(())
+}
+
+#[tauri::command]
 pub async fn check_for_update(app: AppHandle) -> Result<Option<DesktopUpdateView>, String> {
     let update = app
         .updater()
@@ -976,6 +997,20 @@ mod tests {
         assert!(validate_update_field("version", "", 128).is_err());
         assert!(validate_update_field("version", "1.2.3\nforged", 128).is_err());
         assert!(validate_update_field("version", &"a".repeat(129), 128).is_err());
+    }
+
+    #[test]
+    fn system_audit_ipc_limit_is_positive_and_bounded() {
+        assert!(validate_system_audit_limit(1).is_ok());
+        assert!(validate_system_audit_limit(200).is_ok());
+        assert_eq!(
+            validate_system_audit_limit(0).unwrap_err(),
+            "system audit limit must be between 1 and 200"
+        );
+        assert_eq!(
+            validate_system_audit_limit(201).unwrap_err(),
+            "system audit limit must be between 1 and 200"
+        );
     }
 
     #[test]

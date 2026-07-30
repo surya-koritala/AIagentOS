@@ -64,6 +64,7 @@ fn main() {
             commands::list_agents,
             commands::get_metrics,
             commands::get_operator_view,
+            commands::get_system_audit,
             commands::check_for_update,
             commands::install_update,
             commands::load_config,

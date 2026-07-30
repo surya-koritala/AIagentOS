@@ -17,7 +17,8 @@
 //! exact-ID confirmation · `[`/`]` select service · `u` start · `d` stop · `R`
 //! restart
 //! with exact-name confirmation · `L` reload · `,`/`.` select tunable · `v`
-//! set · `a` audit · `B` rollback with exact target confirmation · `q` quit.
+//! set · `a` audit · `B` rollback with exact target confirmation · `A` load
+//! bounded system audit · `q` quit.
 //! `{`/`}` select installed package · `i` install/upgrade · `P` run · `b`
 //! rollback · `D` remove, with exact artifact confirmation for destructive
 //! mutations.
@@ -27,7 +28,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use agent_sdk::ConnectionProfile;
+use agent_sdk::{ClusterCertificateRolloutPhase, ConnectionProfile};
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -42,6 +43,7 @@ use agent_tui::{
 use tokio::sync::mpsc;
 
 const MAX_PENDING_MESSAGE_EVENTS: usize = 256;
+const SYSTEM_AUDIT_LIMIT: usize = 50;
 
 fn main() -> io::Result<()> {
     let argv: Vec<String> = std::env::args().collect();
@@ -373,6 +375,33 @@ fn perform(
                     app.status = format!("tunable audit failed for {name}: {error}");
                 }
             }
+        }
+        UiAction::LoadSystemAudit => {
+            let (node_control, cluster_membership, cluster_certificate_rollout) =
+                rt.block_on(async {
+                    let node_control = client
+                        .node_control_audit(SYSTEM_AUDIT_LIMIT)
+                        .await
+                        .map_err(|error| error.to_string());
+                    let cluster_membership = client
+                        .cluster_membership_audit(SYSTEM_AUDIT_LIMIT)
+                        .await
+                        .map_err(|error| error.to_string());
+                    let cluster_certificate_rollout = client
+                        .cluster_certificate_rollout_audit(SYSTEM_AUDIT_LIMIT)
+                        .await
+                        .map_err(|error| error.to_string());
+                    (
+                        node_control,
+                        cluster_membership,
+                        cluster_certificate_rollout,
+                    )
+                });
+            app.set_system_audits(
+                node_control,
+                cluster_membership,
+                cluster_certificate_rollout,
+            );
         }
         UiAction::RollbackOperatorTunable {
             name,
@@ -975,6 +1004,79 @@ fn append_operator_summary(lines: &mut Vec<Line<'static>>, app: &App) {
         )));
     } else {
         lines.push(Line::from("installed packages: none"));
+    }
+    for error in &app.system_audit_errors {
+        lines.push(Line::from(format!("system audit warning: {error}")));
+    }
+    if app.system_audit_loaded {
+        let node_count = if app.node_control_audit_loaded {
+            app.node_control_audit.len().to_string()
+        } else {
+            "unavailable".into()
+        };
+        let membership_count = if app.cluster_membership_audit_loaded {
+            app.cluster_membership_audit.len().to_string()
+        } else {
+            "unavailable".into()
+        };
+        let certificate_count = if app.cluster_certificate_rollout_audit_loaded {
+            app.cluster_certificate_rollout_audit.len().to_string()
+        } else {
+            "unavailable".into()
+        };
+        lines.push(Line::from(format!(
+            "system audit (bounded sequential reads, not atomic): node={} · membership={} · certificate-rollout={}",
+            node_count, membership_count, certificate_count
+        )));
+        for entry in app.node_control_audit.iter().take(2) {
+            lines.push(Line::from(format!(
+                "  node r{} {}→{} actor={} at {} · {}",
+                entry.generation,
+                entry.previous.as_str(),
+                entry.current.as_str(),
+                entry.actor,
+                entry.changed_at,
+                entry.reason
+            )));
+        }
+        for entry in app.cluster_membership_audit.iter().take(2) {
+            lines.push(Line::from(format!(
+                "  member g{} {} r{} {}→{} actor={} at {} · {}",
+                entry.membership_generation,
+                entry.node_id,
+                entry.member_generation,
+                entry.previous.map_or("none", |state| state.as_str()),
+                entry.current.as_str(),
+                entry.actor,
+                entry.changed_at,
+                entry.reason
+            )));
+        }
+        for entry in app.cluster_certificate_rollout_audit.iter().take(2) {
+            lines.push(Line::from(format!(
+                "  certificate g{} {} r{} {}→{} actor={} at {} · {}",
+                entry.trust_generation,
+                entry.node_id,
+                entry.member_generation,
+                certificate_phase_label(entry.previous_phase),
+                certificate_phase_label(entry.current_phase),
+                entry.actor,
+                entry.changed_at,
+                entry.reason
+            )));
+        }
+    } else {
+        lines.push(Line::from(
+            "system audit: not loaded · press A for bounded public-API history",
+        ));
+    }
+}
+
+fn certificate_phase_label(phase: Option<ClusterCertificateRolloutPhase>) -> &'static str {
+    match phase {
+        Some(ClusterCertificateRolloutPhase::Prepared) => "prepared",
+        Some(ClusterCertificateRolloutPhase::Activated) => "activated",
+        None => "none",
     }
 }
 

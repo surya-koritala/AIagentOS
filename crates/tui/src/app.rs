@@ -4,8 +4,9 @@
 //! how keys mutate it*.
 
 use agent_sdk::{
-    AgentSummary, GateStats, GenerationCheckpointSummary, InstalledPackage, KernelClient,
-    LifecycleResult, MessageStreamEvent, NodeLoad, OperatorAgentSnapshot, OperatorPackageSnapshot,
+    AgentSummary, ClusterCertificateRolloutAudit, ClusterMembershipAudit, GateStats,
+    GenerationCheckpointSummary, InstalledPackage, KernelClient, LifecycleResult,
+    MessageStreamEvent, NodeControlAudit, NodeLoad, OperatorAgentSnapshot, OperatorPackageSnapshot,
     OperatorServiceSnapshot, OperatorSnapshot, OperatorTunable, OperatorTunableAudit,
     ProviderSummary, SdkError,
 };
@@ -161,6 +162,7 @@ pub enum UiAction {
     LoadOperatorTunableAudit {
         name: String,
     },
+    LoadSystemAudit,
     RollbackOperatorTunable {
         name: String,
         target_revision: u64,
@@ -208,6 +210,7 @@ impl UiAction {
             Self::ReloadServices => "reloading services",
             Self::SetOperatorTunable { .. } => "updating operator tunable",
             Self::LoadOperatorTunableAudit { .. } => "loading tunable audit",
+            Self::LoadSystemAudit => "loading system audit",
             Self::RollbackOperatorTunable { .. } => "rolling back operator tunable",
             Self::InstallPackage { .. } => "installing signed package",
             Self::RunInstalledPackage { .. } => "starting installed package",
@@ -345,6 +348,14 @@ pub struct App {
     pub services: Vec<OperatorServiceSnapshot>,
     pub tunable_audit: Vec<OperatorTunableAudit>,
     pub tunable_audit_name: Option<String>,
+    pub node_control_audit: Vec<NodeControlAudit>,
+    pub cluster_membership_audit: Vec<ClusterMembershipAudit>,
+    pub cluster_certificate_rollout_audit: Vec<ClusterCertificateRolloutAudit>,
+    pub system_audit_loaded: bool,
+    pub node_control_audit_loaded: bool,
+    pub cluster_membership_audit_loaded: bool,
+    pub cluster_certificate_rollout_audit_loaded: bool,
+    pub system_audit_errors: Vec<String>,
     pub snapshot_scope: String,
     pub kernel_version: String,
     pub protocol_version: u32,
@@ -388,6 +399,14 @@ impl App {
             services: Vec::new(),
             tunable_audit: Vec::new(),
             tunable_audit_name: None,
+            node_control_audit: Vec::new(),
+            cluster_membership_audit: Vec::new(),
+            cluster_certificate_rollout_audit: Vec::new(),
+            system_audit_loaded: false,
+            node_control_audit_loaded: false,
+            cluster_membership_audit_loaded: false,
+            cluster_certificate_rollout_audit_loaded: false,
+            system_audit_errors: Vec::new(),
             snapshot_scope: "unknown".into(),
             kernel_version: "unknown".into(),
             protocol_version: 0,
@@ -402,7 +421,7 @@ impl App {
             selected_checkpoint: 0,
             mode: Mode::Normal,
             input: String::new(),
-            status: "r refresh · c/m/p/s/X agents · C cancel turn · g checkpoints · (/) select · e resume · K delete · [/ ] service · u/d/R/L control · ,/. tunable · v/a/B · {/} package · i/P/b/D · q quit".into(),
+            status: "r refresh · A system audit · c/m/p/s/X agents · C cancel turn · g checkpoints · (/) select · e resume · K delete · [/ ] service · u/d/R/L control · ,/. tunable · v/a/B · {/} package · i/P/b/D · q quit".into(),
             pending_kill: None,
             pending_service_control: None,
             pending_tunable_control: None,
@@ -1020,6 +1039,66 @@ impl App {
         self.tunable_audit.clear();
     }
 
+    /// Apply three bounded system-audit reads without inventing empty ledgers.
+    ///
+    /// The public API performs sequential reads rather than promising an atomic
+    /// cross-ledger snapshot. Each successful ledger replaces only its own
+    /// projection. A failed or unavailable ledger retains its last successful
+    /// projection and receives an explicit error.
+    pub fn set_system_audits(
+        &mut self,
+        node_control: Result<Vec<NodeControlAudit>, String>,
+        cluster_membership: Result<Vec<ClusterMembershipAudit>, String>,
+        cluster_certificate_rollout: Result<Vec<ClusterCertificateRolloutAudit>, String>,
+    ) {
+        let mut loaded = 0usize;
+        self.system_audit_errors.clear();
+        match node_control {
+            Ok(entries) => {
+                self.node_control_audit = entries;
+                self.node_control_audit_loaded = true;
+                loaded += 1;
+            }
+            Err(error) => self
+                .system_audit_errors
+                .push(format!("node-control audit unavailable: {error}")),
+        }
+        match cluster_membership {
+            Ok(entries) => {
+                self.cluster_membership_audit = entries;
+                self.cluster_membership_audit_loaded = true;
+                loaded += 1;
+            }
+            Err(error) => self
+                .system_audit_errors
+                .push(format!("cluster-membership audit unavailable: {error}")),
+        }
+        match cluster_certificate_rollout {
+            Ok(entries) => {
+                self.cluster_certificate_rollout_audit = entries;
+                self.cluster_certificate_rollout_audit_loaded = true;
+                loaded += 1;
+            }
+            Err(error) => self
+                .system_audit_errors
+                .push(format!("certificate-rollout audit unavailable: {error}")),
+        }
+        self.system_audit_loaded |= loaded > 0;
+        self.status = if self.system_audit_errors.is_empty() {
+            format!(
+                "loaded bounded system audit · node={} · membership={} · certificate-rollout={} · sequential, not atomic",
+                self.node_control_audit.len(),
+                self.cluster_membership_audit.len(),
+                self.cluster_certificate_rollout_audit.len()
+            )
+        } else {
+            format!(
+                "system audit partial · refreshed {loaded}/3 ledgers · retained prior data for {} unavailable ledger(s)",
+                self.system_audit_errors.len()
+            )
+        };
+    }
+
     fn move_selection(&mut self, delta: isize) {
         if self.agents.is_empty() {
             return;
@@ -1102,6 +1181,7 @@ impl App {
                 Some(UiAction::Quit)
             }
             Key::Char('r') => Some(UiAction::Refresh),
+            Key::Char('A') => Some(UiAction::LoadSystemAudit),
             Key::Char('j') | Key::Down => {
                 self.move_selection(1);
                 None
@@ -1971,6 +2051,33 @@ mod tests {
     fn refresh_key_requests_refresh() {
         let mut a = app();
         assert_eq!(a.on_key(Key::Char('r')), Some(UiAction::Refresh));
+    }
+
+    #[test]
+    fn system_audit_key_and_projection_are_explicit_and_retain_failed_ledgers() {
+        let mut a = app();
+        assert_eq!(a.on_key(Key::Char('A')), Some(UiAction::LoadSystemAudit));
+        assert!(!a.system_audit_loaded);
+
+        a.set_system_audits(Ok(Vec::new()), Ok(Vec::new()), Ok(Vec::new()));
+
+        assert!(a.system_audit_loaded);
+        assert!(a.node_control_audit.is_empty());
+        assert!(a.cluster_membership_audit.is_empty());
+        assert!(a.cluster_certificate_rollout_audit.is_empty());
+        assert!(a.node_control_audit_loaded);
+        assert!(a.cluster_membership_audit_loaded);
+        assert!(a.cluster_certificate_rollout_audit_loaded);
+        assert!(a.status.contains("sequential, not atomic"));
+
+        a.set_system_audits(
+            Err("node unavailable".into()),
+            Err("membership unavailable".into()),
+            Err("certificate unavailable".into()),
+        );
+        assert!(a.system_audit_loaded);
+        assert_eq!(a.system_audit_errors.len(), 3);
+        assert!(a.status.contains("retained prior data"));
     }
 
     #[test]

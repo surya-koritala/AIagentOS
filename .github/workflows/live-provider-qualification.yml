@@ -7,19 +7,75 @@ on:
   schedule:
     - cron: "17 4 * * *"
   workflow_dispatch:
+    inputs:
+      providers:
+        description: Comma-separated provider IDs, or all; defaults to AGENTOS_LIVE_PROVIDER_SET
+        required: false
+        default: ""
+        type: string
 
 permissions:
   contents: read
 
 concurrency:
   group: live-provider-qualification
-  cancel-in-progress: false
+  # A protected-environment approval for stale source must never block the next
+  # nightly run. The newest main commit is the only useful qualification target.
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  AGENTOS_LIVE_PROVIDER_SET: ${{ inputs.providers || vars.AGENTOS_LIVE_PROVIDER_SET }}
 
 jobs:
+  qualification-plan:
+    name: Fail-closed live-provider dispatch plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      providers: ${{ steps.plan.outputs.providers }}
+      matrix: ${{ steps.plan.outputs.matrix }}
+      has_providers: ${{ steps.plan.outputs.has_providers }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Build the exact-source provider plan
+        id: plan
+        run: |
+          mkdir -p target/qualification
+          python3 scripts/live_provider_qualification_plan.py \
+            --providers "$AGENTOS_LIVE_PROVIDER_SET" \
+            --commit "$GITHUB_SHA" \
+            --output target/qualification/live-provider-plan.json \
+            --github-output "$GITHUB_OUTPUT"
+      - name: Publish readiness in the job summary
+        if: always()
+        run: |
+          report=target/qualification/live-provider-plan.json
+          if test -f "$report"; then
+            {
+              printf '### Live-provider qualification plan\n\n'
+              printf -- '- Commit: `%s`\n' "$GITHUB_SHA"
+              printf -- '- Status: `%s`\n' "$(jq -r .status "$report")"
+              printf -- '- Selected providers: `%s`\n' \
+                "$(jq -r '.selected_providers | join(",")' "$report")"
+              printf -- '- Production claim allowed: `%s`\n' \
+                "$(jq -r .production_claim_allowed "$report")"
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            printf '### Live-provider qualification plan\n\n- Status: `failed before report publication`\n' \
+              >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: live-provider-plan-${{ github.sha }}
+          path: target/qualification/live-provider-plan.json
+          if-no-files-found: warn
+          retention-days: 30
+      - name: Require at least one explicitly enabled provider
+        run: test "$(jq -r .status target/qualification/live-provider-plan.json)" = "ready"
+
   fixture-contracts:
     name: Provider fixture contracts
     runs-on: ubuntu-latest
@@ -35,50 +91,14 @@ jobs:
 
   live-contract:
     name: Live contract (${{ matrix.provider }})
-    needs: fixture-contracts
+    needs: [qualification-plan, fixture-contracts]
+    if: needs.qualification-plan.outputs.has_providers == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     environment: provider-qualification
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - provider: openai
-            model_variable: OPENAI_QUALIFICATION_MODEL
-            credential_secret: OPENAI_API_KEY
-            endpoint_secret: UNUSED_PROVIDER_ENDPOINT
-          - provider: anthropic
-            model_variable: ANTHROPIC_QUALIFICATION_MODEL
-            credential_secret: ANTHROPIC_API_KEY
-            endpoint_secret: UNUSED_PROVIDER_ENDPOINT
-          - provider: azure-openai
-            model_variable: AZURE_OPENAI_QUALIFICATION_MODEL
-            credential_secret: AZURE_OPENAI_API_KEY
-            endpoint_secret: AZURE_OPENAI_ENDPOINT
-          - provider: groq
-            model_variable: GROQ_QUALIFICATION_MODEL
-            credential_secret: GROQ_API_KEY
-            endpoint_secret: UNUSED_PROVIDER_ENDPOINT
-          - provider: deepseek
-            model_variable: DEEPSEEK_QUALIFICATION_MODEL
-            credential_secret: DEEPSEEK_API_KEY
-            endpoint_secret: UNUSED_PROVIDER_ENDPOINT
-          - provider: gemini
-            model_variable: GEMINI_QUALIFICATION_MODEL
-            credential_secret: GEMINI_API_KEY
-            endpoint_secret: UNUSED_PROVIDER_ENDPOINT
-          - provider: huggingface
-            model_variable: HUGGINGFACE_QUALIFICATION_MODEL
-            credential_secret: HUGGINGFACE_API_KEY
-            endpoint_secret: UNUSED_PROVIDER_ENDPOINT
-          - provider: ollama
-            model_variable: OLLAMA_QUALIFICATION_MODEL
-            credential_secret: UNUSED_PROVIDER_CREDENTIAL
-            endpoint_secret: OLLAMA_BASE_URL
-          - provider: vllm
-            model_variable: VLLM_QUALIFICATION_MODEL
-            credential_secret: VLLM_API_KEY
-            endpoint_secret: VLLM_BASE_URL
+      matrix: ${{ fromJSON(needs.qualification-plan.outputs.matrix) }}
     env:
       QUALIFICATION_PROVIDER: ${{ matrix.provider }}
       QUALIFICATION_MODEL: ${{ vars[matrix.model_variable] }}
@@ -105,7 +125,7 @@ jobs:
             printf -- '- Status: `%s`\n' "$status"
             printf -- '- Evidence artifact: `provider-%s`\n' "$QUALIFICATION_PROVIDER"
           } >> "$GITHUB_STEP_SUMMARY"
-          test "$status" = "passed" || test "$status" = "not_run"
+          test "$status" = "passed"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()
         with:

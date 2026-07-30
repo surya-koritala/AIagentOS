@@ -12,8 +12,10 @@
 //! version without connecting.
 //!
 //! Keys: `j`/`k` (or arrows) move · `r` refresh · `c` create (`name|task`) ·
-//! `m` message · `C` cancel active turn · `p` pause/resume · `s` stop · `X` kill · `[`/`]` select
-//! service · `u` start · `d` stop with exact-name confirmation · `R` restart
+//! `m` message · `C` cancel active turn · `p` pause/resume · `s` stop · `X`
+//! kill · `g` load checkpoints · `(`/`)` select · `e` resume · `K` delete with
+//! exact-ID confirmation · `[`/`]` select service · `u` start · `d` stop · `R`
+//! restart
 //! with exact-name confirmation · `L` reload · `,`/`.` select tunable · `v`
 //! set · `a` audit · `B` rollback with exact target confirmation · `q` quit.
 //! `{`/`}` select installed package · `i` install/upgrade · `P` run · `b`
@@ -267,6 +269,46 @@ fn perform(
                 Ok(state) => format!("agent state: {state}"),
                 Err(error) => format!("kill failed: {error}"),
             };
+            refresh_after_action(app, client, rt);
+        }
+        UiAction::LoadGenerationCheckpoints { agent_id } => {
+            match rt.block_on(client.list_generation_checkpoints(agent_id.clone())) {
+                Ok(checkpoints) => app.set_generation_checkpoints(agent_id, checkpoints),
+                Err(error) => {
+                    app.status = format!("checkpoint list failed for {agent_id}: {error}");
+                }
+            }
+        }
+        UiAction::ResumeGenerationCheckpoint {
+            agent_id,
+            checkpoint_id,
+        } => {
+            match rt.block_on(
+                client.resume_generation_checkpoint(agent_id.clone(), checkpoint_id.clone()),
+            ) {
+                Ok(result) => app.checkpoint_resumed(&agent_id, &checkpoint_id, result),
+                Err(error) => {
+                    app.status = format!(
+                        "checkpoint resume failed for agent {agent_id}, checkpoint {checkpoint_id}: {error}"
+                    );
+                }
+            }
+            refresh_after_action(app, client, rt);
+        }
+        UiAction::DeleteGenerationCheckpoint {
+            agent_id,
+            checkpoint_id,
+        } => {
+            match rt.block_on(
+                client.delete_generation_checkpoint(agent_id.clone(), checkpoint_id.clone()),
+            ) {
+                Ok(existed) => app.checkpoint_deleted(&agent_id, &checkpoint_id, existed),
+                Err(error) => {
+                    app.status = format!(
+                        "checkpoint deletion failed for agent {agent_id}, checkpoint {checkpoint_id}: {error}"
+                    );
+                }
+            }
             refresh_after_action(app, client, rt);
         }
         UiAction::StartService { name } => {
@@ -683,6 +725,27 @@ fn render_body(f: &mut Frame, area: Rect, app: &App) {
                         package.name, package.provider, package.profile
                     )));
                 }
+                if app.checkpoint_agent_id.as_deref() == Some(agent.id.as_str()) {
+                    if let Some(checkpoint) = app.selected_checkpoint() {
+                        lines.push(Line::from(format!(
+                            "checkpoint [{}/{}]: {} · schema={} · {}/{}",
+                            app.selected_checkpoint + 1,
+                            app.checkpoints.len(),
+                            checkpoint.id,
+                            checkpoint.version,
+                            checkpoint.provider_id,
+                            checkpoint.model_id
+                        )));
+                        lines.push(Line::from(format!(
+                            "created={} · expires={} · e resume · K exact delete",
+                            checkpoint.created_at, checkpoint.expires_at
+                        )));
+                    } else {
+                        lines.push(Line::from(
+                            "loaded checkpoints: none · g reload for this agent",
+                        ));
+                    }
+                }
                 lines.push(Line::from(""));
             }
             if let Some(stream) = app.active_message_stream() {
@@ -1007,6 +1070,21 @@ fn render_footer(f: &mut Frame, area: Rect, app: &App) {
                 Span::raw(format!(
                     "{name}@{version} ({}) · {version}|{name}> {}▏ · Enter confirm · Esc cancel",
                     short_digest(digest),
+                    app.input
+                )),
+            ])
+        }
+        Mode::ConfirmCheckpointDelete => {
+            let (agent_id, checkpoint_id) = app
+                .pending_checkpoint_delete()
+                .unwrap_or(("missing agent", "missing checkpoint"));
+            Line::from(vec![
+                Span::styled(
+                    "CONFIRM CHECKPOINT DELETE ",
+                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(format!(
+                    "agent {agent_id} · checkpoint {checkpoint_id} · full checkpoint ID> {}▏ · Enter confirm · Esc cancel",
                     app.input
                 )),
             ])

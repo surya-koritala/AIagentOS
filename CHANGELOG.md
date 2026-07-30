@@ -10,6 +10,14 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
 
 ## [Unreleased]
 
+- Added durable checkpoint list, selection, explicit resume, and exact deletion
+  to the TUI through the authenticated public `KernelClient`. The projection is
+  bound to the selected agent, rejects cross-agent entries, and is cleared when
+  selection changes. Permanent deletion freezes the agent/checkpoint pair and
+  requires the complete checkpoint ID; resumed output is UTF-8 bounded like
+  streamed output. State-model tests and a live authenticated loopback
+  regression create real checkpoints and exercise resume and delete. Relates
+  #126.
 - Made TUI agent turns responsive and exactly cancellable over the public wire
   boundary. Ordinary operator calls, the one active ordered stream, and
   cancellation now use three authenticated connections, so streaming cannot

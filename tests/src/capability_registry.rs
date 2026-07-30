@@ -1221,6 +1221,65 @@ fn tui_stream_controls_stay_bounded_exact_and_on_the_public_wire_boundary() {
 }
 
 #[test]
+fn tui_checkpoint_controls_stay_agent_bound_and_on_the_public_wire_boundary() {
+    let protocol = read_workspace_file("docs/PROTOCOL.md");
+    for contract in [
+        "Desktop and TUI checkpoint list, explicit resume, and explicit delete",
+        "rejects any cross-agent entry before rendering it",
+        "clears the projection when agent selection changes",
+        "requires the full checkpoint identifier",
+    ] {
+        assert!(
+            protocol.contains(contract),
+            "TUI checkpoint protocol lost {contract:?}"
+        );
+    }
+
+    let app = read_workspace_file("crates/tui/src/app.rs");
+    for contract in [
+        "LoadGenerationCheckpoints",
+        "ResumeGenerationCheckpoint",
+        "DeleteGenerationCheckpoint",
+        "checkpoint.agent_id == agent_id",
+        "clear_checkpoint_projection_if_selection_changed",
+        "confirmation must exactly match",
+        "MAX_MESSAGE_PREVIEW_BYTES",
+    ] {
+        assert!(
+            app.contains(contract),
+            "TUI checkpoint state lost agent-bound/exact contract {contract:?}"
+        );
+    }
+
+    let binary = read_workspace_file("crates/tui/src/main.rs");
+    for contract in [
+        "client.list_generation_checkpoints",
+        "client.resume_generation_checkpoint",
+        "client.delete_generation_checkpoint",
+        "app.checkpoint_resumed",
+        "app.checkpoint_deleted",
+    ] {
+        assert!(
+            binary.contains(contract),
+            "TUI checkpoint event loop lost public-client contract {contract:?}"
+        );
+    }
+
+    let integration = read_workspace_file("crates/tui/tests/checkpoints.rs");
+    for contract in [
+        "tui_checkpoint_list_resume_and_exact_delete_use_the_authenticated_public_client",
+        "pause through public TUI client",
+        "explicit public checkpoint resume",
+        "exact public checkpoint delete",
+    ] {
+        assert!(
+            integration.contains(contract),
+            "TUI live checkpoint regression lost evidence {contract:?}"
+        );
+    }
+}
+
+#[test]
 fn desktop_stream_and_checkpoint_controls_stay_on_the_public_wire_boundary() {
     let protocol = read_workspace_file("docs/PROTOCOL.md");
     for contract in [

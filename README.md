@@ -119,6 +119,10 @@ confirmation. TUI message turns stream without blocking operator refreshes;
 press `C` to cancel the exact active request. Stream, cancellation, and ordinary
 operator work use separate authenticated public-wire connections, and the TUI
 bounds both its pending event projection and retained output.
+Press `g` to load durable checkpoints for the selected agent, `(`/`)` to select
+one, `e` to resume it explicitly, or `K` to delete it only after typing the full
+frozen checkpoint ID. These operations use the same authenticated public
+`KernelClient` path as `agentctl` and the desktop client.
 Declarative service boot ordering and the current supervision boundary are in
 [docs/SERVICES.md](docs/SERVICES.md).
 

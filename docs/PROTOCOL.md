@@ -273,9 +273,13 @@ closing the cancel-before-register race; later cancellation always uses the
 frozen request/agent pair on the third connection. Ordinary refresh and
 lifecycle actions remain usable while the stream connection is occupied.
 
-Desktop checkpoint list, explicit resume, and explicit delete also use
+Desktop and TUI checkpoint list, explicit resume, and explicit delete also use
 `KernelClient`; permanent deletion freezes the selected agent/checkpoint pair
-and requires the full checkpoint identifier.
+and requires the full checkpoint identifier. The TUI loads checkpoints only
+for its selected agent, rejects any cross-agent entry before rendering it,
+clears the projection when agent selection changes, and never retargets an open
+delete confirmation. Press `g` to load, `(`/`)` to select, `e` to resume, and
+`K` to begin exact-ID deletion.
 
 ### Message streaming and request cancellation
 

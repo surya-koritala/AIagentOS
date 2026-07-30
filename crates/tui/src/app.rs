@@ -4,9 +4,10 @@
 //! how keys mutate it*.
 
 use agent_sdk::{
-    AgentSummary, GateStats, InstalledPackage, KernelClient, MessageStreamEvent, NodeLoad,
-    OperatorAgentSnapshot, OperatorPackageSnapshot, OperatorServiceSnapshot, OperatorSnapshot,
-    OperatorTunable, OperatorTunableAudit, ProviderSummary, SdkError,
+    AgentSummary, GateStats, GenerationCheckpointSummary, InstalledPackage, KernelClient,
+    LifecycleResult, MessageStreamEvent, NodeLoad, OperatorAgentSnapshot, OperatorPackageSnapshot,
+    OperatorServiceSnapshot, OperatorSnapshot, OperatorTunable, OperatorTunableAudit,
+    ProviderSummary, SdkError,
 };
 
 /// Maximum streamed/final turn text retained by the terminal UI.
@@ -37,6 +38,8 @@ pub enum Mode {
     InstallPackage,
     /// Typing `version|exact-name` for one frozen rollback or removal.
     ConfirmPackageMutation,
+    /// Typing the full frozen checkpoint id before permanent deletion.
+    ConfirmCheckpointDelete,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -93,6 +96,12 @@ struct PendingPackageMutation {
     digest: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingCheckpointDelete {
+    agent_id: String,
+    checkpoint_id: String,
+}
+
 /// An action the event loop should perform asynchronously (the pure key handler
 /// can't do I/O itself). `None` from [`App::on_key`] means "handled, no I/O".
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -122,6 +131,17 @@ pub enum UiAction {
     },
     KillAgent {
         agent_id: String,
+    },
+    LoadGenerationCheckpoints {
+        agent_id: String,
+    },
+    ResumeGenerationCheckpoint {
+        agent_id: String,
+        checkpoint_id: String,
+    },
+    DeleteGenerationCheckpoint {
+        agent_id: String,
+        checkpoint_id: String,
     },
     StartService {
         name: String,
@@ -179,6 +199,9 @@ impl UiAction {
             Self::ResumeAgent { .. } => "resuming agent",
             Self::StopAgent { .. } => "stopping agent",
             Self::KillAgent { .. } => "force-stopping agent",
+            Self::LoadGenerationCheckpoints { .. } => "loading durable checkpoints",
+            Self::ResumeGenerationCheckpoint { .. } => "resuming durable checkpoint",
+            Self::DeleteGenerationCheckpoint { .. } => "deleting durable checkpoint",
             Self::StartService { .. } => "starting service",
             Self::StopService { .. } => "stopping service",
             Self::RestartService { .. } => "restarting service",
@@ -331,6 +354,9 @@ pub struct App {
     pub selected_service: usize,
     pub selected_tunable: usize,
     pub selected_package: usize,
+    pub checkpoints: Vec<GenerationCheckpointSummary>,
+    pub checkpoint_agent_id: Option<String>,
+    pub selected_checkpoint: usize,
     pub mode: Mode,
     pub input: String,
     pub status: String,
@@ -338,6 +364,7 @@ pub struct App {
     pending_service_control: Option<PendingServiceControl>,
     pending_tunable_control: Option<PendingTunableControl>,
     pending_package_mutation: Option<PendingPackageMutation>,
+    pending_checkpoint_delete: Option<PendingCheckpointDelete>,
     pub last_output: Option<String>,
     pub last_output_agent_id: Option<String>,
     pub last_output_truncated: bool,
@@ -370,13 +397,17 @@ impl App {
             selected_service: 0,
             selected_tunable: 0,
             selected_package: 0,
+            checkpoints: Vec::new(),
+            checkpoint_agent_id: None,
+            selected_checkpoint: 0,
             mode: Mode::Normal,
             input: String::new(),
-            status: "r refresh · c/m/p/s/X agents · C cancel turn · [/ ] service · u/d/R/L control · ,/. tunable · v/a/B · {/} package · i/P/b/D · q quit".into(),
+            status: "r refresh · c/m/p/s/X agents · C cancel turn · g checkpoints · (/) select · e resume · K delete · [/ ] service · u/d/R/L control · ,/. tunable · v/a/B · {/} package · i/P/b/D · q quit".into(),
             pending_kill: None,
             pending_service_control: None,
             pending_tunable_control: None,
             pending_package_mutation: None,
+            pending_checkpoint_delete: None,
             last_output: None,
             last_output_agent_id: None,
             last_output_truncated: false,
@@ -840,6 +871,7 @@ impl App {
         if self.selected_tunable >= self.tunables.len() {
             self.selected_tunable = self.tunables.len().saturating_sub(1);
         }
+        self.clear_checkpoint_projection_if_selection_changed();
     }
 
     pub fn selected_agent(&self) -> Option<&AgentSummary> {
@@ -863,6 +895,117 @@ impl App {
         self.installed_packages.get(self.selected_package)
     }
 
+    pub fn selected_checkpoint(&self) -> Option<&GenerationCheckpointSummary> {
+        let selected_agent = self.selected_agent()?;
+        if self.checkpoint_agent_id.as_deref() != Some(selected_agent.id.as_str()) {
+            return None;
+        }
+        self.checkpoints.get(self.selected_checkpoint)
+    }
+
+    /// Replace the checkpoint projection only when the response still belongs
+    /// to the selected agent. A malformed cross-agent entry is never rendered
+    /// or made actionable.
+    pub fn set_generation_checkpoints(
+        &mut self,
+        agent_id: String,
+        checkpoints: Vec<GenerationCheckpointSummary>,
+    ) {
+        if self.selected_agent().map(|agent| agent.id.as_str()) != Some(agent_id.as_str()) {
+            self.status = "discarded checkpoint response because the selected agent changed".into();
+            return;
+        }
+        let received = checkpoints.len();
+        self.checkpoints = checkpoints
+            .into_iter()
+            .filter(|checkpoint| checkpoint.agent_id == agent_id)
+            .collect();
+        let rejected = received.saturating_sub(self.checkpoints.len());
+        self.checkpoint_agent_id = Some(agent_id);
+        self.selected_checkpoint = self
+            .selected_checkpoint
+            .min(self.checkpoints.len().saturating_sub(1));
+        self.status = if rejected > 0 {
+            format!(
+                "loaded {} durable checkpoint(s); rejected {rejected} cross-agent entr{}",
+                self.checkpoints.len(),
+                if rejected == 1 { "y" } else { "ies" }
+            )
+        } else {
+            format!("loaded {} durable checkpoint(s)", self.checkpoints.len())
+        };
+    }
+
+    pub fn checkpoint_resumed(
+        &mut self,
+        agent_id: &str,
+        checkpoint_id: &str,
+        result: LifecycleResult,
+    ) {
+        if self.checkpoint_agent_id.as_deref() == Some(agent_id) {
+            self.checkpoints
+                .retain(|checkpoint| checkpoint.id != checkpoint_id);
+            self.selected_checkpoint = self
+                .selected_checkpoint
+                .min(self.checkpoints.len().saturating_sub(1));
+        }
+        let output_truncated = match result.resumed_content {
+            Some(content) => {
+                let (content, truncated) = bounded_utf8(&content, MAX_MESSAGE_PREVIEW_BYTES);
+                self.last_output = Some(content);
+                self.last_output_agent_id = Some(agent_id.to_string());
+                self.last_output_truncated = truncated;
+                truncated
+            }
+            None => {
+                self.last_output = None;
+                self.last_output_agent_id = Some(agent_id.to_string());
+                self.last_output_truncated = false;
+                false
+            }
+        };
+        let next_checkpoint = result
+            .checkpoint_id
+            .as_deref()
+            .map(|next| format!(" · paused again at {} · press g to reload", short_id(next)))
+            .unwrap_or_default();
+        self.status = format!(
+            "checkpoint {} resumed · state={} · tools={} · tokens={}{}",
+            short_id(checkpoint_id),
+            result.state,
+            result
+                .resumed_tool_calls
+                .map(|count| count.to_string())
+                .unwrap_or_else(|| "-".into()),
+            result
+                .resumed_tokens
+                .map(|tokens| tokens.to_string())
+                .unwrap_or_else(|| "-".into()),
+            next_checkpoint
+        );
+        if output_truncated {
+            self.status.push_str(" · output truncated in TUI");
+        }
+    }
+
+    pub fn checkpoint_deleted(&mut self, agent_id: &str, checkpoint_id: &str, existed: bool) {
+        if self.checkpoint_agent_id.as_deref() == Some(agent_id) {
+            self.checkpoints
+                .retain(|checkpoint| checkpoint.id != checkpoint_id);
+            self.selected_checkpoint = self
+                .selected_checkpoint
+                .min(self.checkpoints.len().saturating_sub(1));
+        }
+        self.status = if existed {
+            format!("deleted durable checkpoint {}", short_id(checkpoint_id))
+        } else {
+            format!(
+                "durable checkpoint {} was already absent",
+                short_id(checkpoint_id)
+            )
+        };
+    }
+
     pub fn set_tunable_audit(
         &mut self,
         name: impl Into<String>,
@@ -884,6 +1027,27 @@ impl App {
         let len = self.agents.len() as isize;
         let next = (self.selected as isize + delta).clamp(0, len - 1);
         self.selected = next as usize;
+        self.clear_checkpoint_projection_if_selection_changed();
+    }
+
+    fn clear_checkpoint_projection_if_selection_changed(&mut self) {
+        if self.checkpoint_agent_id.as_deref()
+            != self.selected_agent().map(|agent| agent.id.as_str())
+        {
+            self.checkpoints.clear();
+            self.checkpoint_agent_id = None;
+            self.selected_checkpoint = 0;
+        }
+    }
+
+    fn move_checkpoint_selection(&mut self, delta: isize) {
+        if self.checkpoints.is_empty() {
+            self.status = "no loaded checkpoints; press g for the selected agent".into();
+            return;
+        }
+        let len = self.checkpoints.len() as isize;
+        let next = (self.selected_checkpoint as isize + delta).clamp(0, len - 1);
+        self.selected_checkpoint = next as usize;
     }
 
     fn move_service_selection(&mut self, delta: isize) {
@@ -927,6 +1091,7 @@ impl App {
             Mode::SetTunable => self.on_key_set_tunable(key),
             Mode::ConfirmTunableRollback => self.on_key_confirm_tunable_rollback(key),
             Mode::ConfirmPackageMutation => self.on_key_confirm_package_mutation(key),
+            Mode::ConfirmCheckpointDelete => self.on_key_confirm_checkpoint_delete(key),
         }
     }
 
@@ -991,6 +1156,41 @@ impl App {
                 } else {
                     self.status = "no agent selected".into();
                 }
+                None
+            }
+            Key::Char('g') => {
+                if let Some(agent) = self.selected_agent() {
+                    Some(UiAction::LoadGenerationCheckpoints {
+                        agent_id: agent.id.clone(),
+                    })
+                } else {
+                    self.status = "no agent selected".into();
+                    None
+                }
+            }
+            Key::Char('(') => {
+                self.move_checkpoint_selection(-1);
+                None
+            }
+            Key::Char(')') => {
+                self.move_checkpoint_selection(1);
+                None
+            }
+            Key::Char('e') => {
+                if let Some(checkpoint) = self.selected_checkpoint() {
+                    Some(UiAction::ResumeGenerationCheckpoint {
+                        agent_id: checkpoint.agent_id.clone(),
+                        checkpoint_id: checkpoint.id.clone(),
+                    })
+                } else {
+                    self.status =
+                        "no checkpoint selected; press g to load the selected agent's checkpoints"
+                            .into();
+                    None
+                }
+            }
+            Key::Char('K') => {
+                self.begin_checkpoint_delete();
                 None
             }
             Key::Char('[') => {
@@ -1491,6 +1691,80 @@ impl App {
         })
     }
 
+    fn begin_checkpoint_delete(&mut self) {
+        let Some(checkpoint) = self.selected_checkpoint().cloned() else {
+            self.status =
+                "no checkpoint selected; press g to load the selected agent's checkpoints".into();
+            return;
+        };
+        self.pending_checkpoint_delete = Some(PendingCheckpointDelete {
+            agent_id: checkpoint.agent_id.clone(),
+            checkpoint_id: checkpoint.id.clone(),
+        });
+        self.mode = Mode::ConfirmCheckpointDelete;
+        self.input.clear();
+        self.status = format!(
+            "confirm permanent checkpoint deletion — agent {} checkpoint {}; type the full checkpoint ID exactly, Enter to submit, Esc to cancel",
+            checkpoint.agent_id, checkpoint.id
+        );
+    }
+
+    fn on_key_confirm_checkpoint_delete(&mut self, key: Key) -> Option<UiAction> {
+        match key {
+            Key::Esc => {
+                self.pending_checkpoint_delete = None;
+                self.mode = Mode::Normal;
+                self.input.clear();
+                self.status = "checkpoint deletion cancelled".into();
+                None
+            }
+            Key::Backspace => {
+                self.input.pop();
+                None
+            }
+            Key::Char(character) => {
+                self.input.push(character);
+                None
+            }
+            Key::Enter => {
+                let Some(target) = self.pending_checkpoint_delete.as_ref() else {
+                    self.mode = Mode::Normal;
+                    self.input.clear();
+                    self.status = "checkpoint deletion cancelled — target unavailable".into();
+                    return None;
+                };
+                if self.input != target.checkpoint_id {
+                    self.status = format!(
+                        "checkpoint deletion not submitted — confirmation must exactly match {}",
+                        target.checkpoint_id
+                    );
+                    return None;
+                }
+                let target = self
+                    .pending_checkpoint_delete
+                    .take()
+                    .expect("validated pending checkpoint deletion");
+                self.mode = Mode::Normal;
+                self.input.clear();
+                self.status = format!(
+                    "checkpoint deletion submitted — agent {} checkpoint {}",
+                    target.agent_id, target.checkpoint_id
+                );
+                Some(UiAction::DeleteGenerationCheckpoint {
+                    agent_id: target.agent_id,
+                    checkpoint_id: target.checkpoint_id,
+                })
+            }
+            _ => None,
+        }
+    }
+
+    pub fn pending_checkpoint_delete(&self) -> Option<(&str, &str)> {
+        self.pending_checkpoint_delete
+            .as_ref()
+            .map(|target| (target.agent_id.as_str(), target.checkpoint_id.as_str()))
+    }
+
     fn submit(&mut self) -> Option<UiAction> {
         let action = match self.mode {
             Mode::CreateAgent => {
@@ -1540,7 +1814,8 @@ impl App {
             | Mode::ConfirmServiceControl
             | Mode::SetTunable
             | Mode::ConfirmTunableRollback
-            | Mode::ConfirmPackageMutation => return None,
+            | Mode::ConfirmPackageMutation
+            | Mode::ConfirmCheckpointDelete => return None,
         };
         self.mode = Mode::Normal;
         self.input.clear();
@@ -1550,6 +1825,10 @@ impl App {
 
 fn short_digest(digest: &str) -> &str {
     digest.get(..19).unwrap_or(digest)
+}
+
+fn short_id(id: &str) -> &str {
+    id.get(..8).unwrap_or(id)
 }
 
 fn utf8_prefix(value: &str, maximum_bytes: usize) -> &str {
@@ -1663,6 +1942,22 @@ mod tests {
             "installed_at": "2026-07-29T00:00:00Z"
         }))
         .expect("valid installed package fixture")
+    }
+
+    fn dummy_checkpoint(
+        id: &str,
+        agent_id: &str,
+        provider_id: &str,
+    ) -> GenerationCheckpointSummary {
+        GenerationCheckpointSummary {
+            id: id.into(),
+            agent_id: agent_id.into(),
+            version: 1,
+            provider_id: provider_id.into(),
+            model_id: "checkpoint-test".into(),
+            created_at: "2026-07-30T00:00:00Z".into(),
+            expires_at: "2026-07-31T00:00:00Z".into(),
+        }
     }
 
     #[test]
@@ -2039,6 +2334,139 @@ mod tests {
             })
         );
         assert_eq!(a.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn checkpoint_projection_is_agent_bound_and_filters_cross_agent_entries() {
+        let mut a = app();
+        a.agents = vec![
+            dummy_agent("agent-exact", "first"),
+            dummy_agent("agent-other", "second"),
+        ];
+        a.set_generation_checkpoints(
+            "agent-exact".into(),
+            vec![
+                dummy_checkpoint("checkpoint-exact", "agent-exact", "provider-a"),
+                dummy_checkpoint("checkpoint-foreign", "agent-other", "provider-b"),
+            ],
+        );
+
+        assert_eq!(a.checkpoints.len(), 1);
+        assert_eq!(
+            a.selected_checkpoint()
+                .map(|checkpoint| checkpoint.id.as_str()),
+            Some("checkpoint-exact")
+        );
+        assert!(a.status.contains("rejected 1 cross-agent entry"));
+        assert_eq!(
+            a.on_key(Key::Char('e')),
+            Some(UiAction::ResumeGenerationCheckpoint {
+                agent_id: "agent-exact".into(),
+                checkpoint_id: "checkpoint-exact".into(),
+            })
+        );
+
+        a.on_key(Key::Char('j'));
+        assert_eq!(a.selected, 1);
+        assert!(a.checkpoints.is_empty());
+        assert_eq!(a.checkpoint_agent_id, None);
+        a.set_generation_checkpoints(
+            "agent-exact".into(),
+            vec![dummy_checkpoint(
+                "stale-checkpoint",
+                "agent-exact",
+                "provider-a",
+            )],
+        );
+        assert!(a.checkpoints.is_empty());
+        assert!(a.status.contains("selected agent changed"));
+    }
+
+    #[test]
+    fn checkpoint_delete_freezes_agent_and_full_id_before_confirmation() {
+        let mut a = app();
+        a.agents = vec![
+            dummy_agent("agent-exact", "first"),
+            dummy_agent("agent-other", "second"),
+        ];
+        a.set_generation_checkpoints(
+            "agent-exact".into(),
+            vec![
+                dummy_checkpoint("checkpoint-first", "agent-exact", "provider"),
+                dummy_checkpoint("checkpoint-second-full-id", "agent-exact", "provider"),
+            ],
+        );
+        a.on_key(Key::Char(')'));
+        assert_eq!(a.selected_checkpoint, 1);
+        assert_eq!(a.on_key(Key::Char('K')), None);
+        assert_eq!(a.mode, Mode::ConfirmCheckpointDelete);
+        assert_eq!(
+            a.pending_checkpoint_delete(),
+            Some(("agent-exact", "checkpoint-second-full-id"))
+        );
+
+        a.selected = 1;
+        for character in "checkpoint-first".chars() {
+            a.on_key(Key::Char(character));
+        }
+        assert_eq!(a.on_key(Key::Enter), None);
+        assert_eq!(a.mode, Mode::ConfirmCheckpointDelete);
+        assert!(a.status.contains("checkpoint-second-full-id"));
+        while !a.input.is_empty() {
+            a.on_key(Key::Backspace);
+        }
+        for character in "checkpoint-second-full-id".chars() {
+            a.on_key(Key::Char(character));
+        }
+        assert_eq!(
+            a.on_key(Key::Enter),
+            Some(UiAction::DeleteGenerationCheckpoint {
+                agent_id: "agent-exact".into(),
+                checkpoint_id: "checkpoint-second-full-id".into(),
+            })
+        );
+        assert_eq!(a.mode, Mode::Normal);
+
+        a.checkpoint_deleted("agent-exact", "checkpoint-second-full-id", true);
+        assert_eq!(a.checkpoints.len(), 1);
+        assert_eq!(a.checkpoints[0].id, "checkpoint-first");
+    }
+
+    #[test]
+    fn checkpoint_resume_bounds_output_and_removes_the_consumed_projection() {
+        let mut a = app();
+        a.agents = vec![dummy_agent("agent-exact", "first")];
+        a.set_generation_checkpoints(
+            "agent-exact".into(),
+            vec![dummy_checkpoint(
+                "checkpoint-exact",
+                "agent-exact",
+                "provider",
+            )],
+        );
+
+        a.checkpoint_resumed(
+            "agent-exact",
+            "checkpoint-exact",
+            LifecycleResult {
+                state: "Running".into(),
+                checkpoint_id: None,
+                resumed_content: Some("界".repeat(MAX_MESSAGE_PREVIEW_BYTES)),
+                resumed_tool_calls: Some(2),
+                resumed_tokens: Some(42),
+            },
+        );
+
+        assert!(a.checkpoints.is_empty());
+        assert!(a.last_output_truncated);
+        assert!(a
+            .last_output
+            .as_ref()
+            .is_some_and(|output| output.len() <= MAX_MESSAGE_PREVIEW_BYTES
+                && output.is_char_boundary(output.len())));
+        assert_eq!(a.last_output_agent_id.as_deref(), Some("agent-exact"));
+        assert!(a.status.contains("tools=2"));
+        assert!(a.status.contains("tokens=42"));
     }
 
     #[test]

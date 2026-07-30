@@ -56,6 +56,9 @@ def validate_contract(root: Path) -> list[str]:
     failures: list[str] = []
     stable = (root / ".github/workflows/release.yml").read_text(encoding="utf-8")
     rc = (root / ".github/workflows/linux-cli-rc.yml").read_text(encoding="utf-8")
+    promotion = (
+        root / ".github/workflows/phase1-promotion-qualification.yml"
+    ).read_text(encoding="utf-8")
     if '- "!v*-rc.*"' not in stable:
         failures.append("stable release workflow must exclude release-candidate tags")
     required = [
@@ -74,10 +77,8 @@ def validate_contract(root: Path) -> list[str]:
         "--released-schema-tag v0.3.0",
         "finalize:",
         "scripts/linux_cli_rc_qualification.py validate-report",
-        "publish:",
-        "gh release create",
-        "--prerelease",
-        "--verify-tag",
+        "Signed candidate bundle awaiting Phase 1 promotion",
+        "qualified-linux-cli-rc-bundle",
     ]
     for value in required:
         if value not in rc:
@@ -87,12 +88,41 @@ def validate_contract(root: Path) -> list[str]:
         "self-hosted",
         "continue-on-error: true",
         "AGENT_SERVER_ALLOW_INSECURE_REMOTE",
+        "gh release create",
     ]
     for value in forbidden:
         if value in rc:
             failures.append(f"Linux CLI RC workflow contains forbidden contract {value!r}")
-    if rc.count("permissions:\n      contents: write") != 1:
-        failures.append("only the publication job may receive contents: write")
+    if "contents: write" in rc:
+        failures.append("the tag workflow must not receive publication permission")
+    promotion_required = [
+        "workflow_dispatch:",
+        "release_candidate:",
+        "linux_cli_rc_run_id:",
+        "environment_id:",
+        "profile: phase1-promotion",
+        "runs-on: [self-hosted, linux, x64, agentos-capacity]",
+        "environment: capacity-qualification",
+        "AGENTOS_PHASE1_EVIDENCE_DIR",
+        "scripts/phase1_promotion_qualification.py",
+        "--require-eligible",
+        "phase1_release_candidate_ready",
+        "production_claim_allowed",
+        "needs: exact-release-candidate-promotion",
+        "cosign verify-blob",
+        "cosign sign-blob",
+        "attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373",
+        "gh release create",
+        "--prerelease",
+        "--verify-tag",
+    ]
+    for value in promotion_required:
+        if value not in promotion:
+            failures.append(
+                f"Phase 1 promotion workflow lost required contract {value!r}"
+            )
+    if promotion.count("permissions:\n      actions: read\n      contents: write") != 1:
+        failures.append("only the gated Phase 1 publication job may write contents")
     return failures
 
 

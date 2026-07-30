@@ -46,6 +46,11 @@ WORKFLOW_PROFILES = {
         "AGENTOS_CAPACITY_QUALIFICATION_ENABLED",
         "exact-release-candidate-game-day",
     ),
+    "phase1-promotion-qualification.yml": (
+        "phase1-promotion",
+        "AGENTOS_CAPACITY_QUALIFICATION_ENABLED",
+        "exact-release-candidate-promotion",
+    ),
     "on-device-qualification.yml": (
         "on-device",
         "AGENTOS_MODEL_QUALIFICATION_ENABLED",

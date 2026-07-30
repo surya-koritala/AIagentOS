@@ -15,6 +15,7 @@
   - [Operations API](./operations-api.md)
   - [Production Observability](./observability.md)
   - [Protected Qualification Infrastructure](./protected-qualification-infrastructure.md)
+  - [Restricted Phase 1 Promotion](./phase1-promotion-qualification.md)
   - [Capacity Qualification](./capacity-qualification.md)
   - [Resilience Qualification](./resilience-qualification.md)
   - [Host Storage Fault Qualification](./host-storage-fault-qualification.md)

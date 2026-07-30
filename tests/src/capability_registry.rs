@@ -1741,6 +1741,7 @@ fn release_blocking_workflows_keep_their_security_contract() {
     }
 
     let live = read_workspace_file(".github/workflows/live-provider-qualification.yml");
+    let live_plan = read_workspace_file("scripts/live_provider_qualification_plan.py");
     assert!(
         live.contains("workflow_dispatch:") && !live.contains("pull_request:"),
         "secret-backed qualification must be explicit and separate from deterministic PR CI"
@@ -1750,6 +1751,11 @@ fn release_blocking_workflows_keep_their_security_contract() {
         "QUALIFICATION_MODEL: ${{ vars[matrix.model_variable] }}",
         "QUALIFICATION_API_KEY: ${{ secrets[matrix.credential_secret] }}",
         "QUALIFICATION_ENDPOINT: ${{ secrets[matrix.endpoint_secret] }}",
+        "AGENTOS_LIVE_PROVIDER_SET",
+        "live_provider_qualification_plan.py",
+        "fromJSON(needs.qualification-plan.outputs.matrix)",
+        "cancel-in-progress: true",
+        "test \"$status\" = \"passed\"",
         "Execute one governed live turn",
     ] {
         assert!(
@@ -1768,8 +1774,8 @@ fn release_blocking_workflows_keep_their_security_contract() {
         "VLLM_API_KEY",
     ] {
         assert!(
-            live.contains(&format!("credential_secret: {secret}")),
-            "live-provider qualification lost matrix credential {secret:?}"
+            live_plan.contains(&format!("\"credential_secret\": \"{secret}\"")),
+            "live-provider plan lost matrix credential {secret:?}"
         );
         assert!(
             !live.contains(&format!("${{{{ secrets.{secret} }}}}")),
@@ -1780,6 +1786,10 @@ fn release_blocking_workflows_keep_their_security_contract() {
         live.matches("secrets[").count(),
         2,
         "live-provider jobs must select only their credential and endpoint secrets"
+    );
+    assert!(
+        !live.contains("test \"$status\" = \"passed\" || test \"$status\" = \"not_run\""),
+        "an explicitly enabled live provider must never report not_run as a passing job"
     );
 
     let on_device = read_workspace_file(".github/workflows/on-device-qualification.yml");

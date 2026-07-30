@@ -169,9 +169,22 @@ construction and sustained 100k+ latency/soak goals remain part of
 
 ## Protected evidence workflows
 
-- `live-provider-qualification.yml` runs fixtures and then one bounded contract
-  for each cloud/local service every night or on manual dispatch. Missing
-  credentials/endpoints emit a `not_run` artifact.
+- `live-provider-qualification.yml` runs fixtures every night and executes
+  bounded live contracts only for the comma-separated provider IDs in the
+  repository variable `AGENTOS_LIVE_PROVIDER_SET` (or the explicit manual
+  dispatch input). Use `all` only when every backend is deliberately
+  provisioned. The checked-in planner rejects unknown/duplicate IDs, cancels a
+  stale approval-bound run when newer source is scheduled, and retains an
+  exact-commit readiness artifact.
+- An empty provider set fails with explicit `not_run` evidence before entering
+  the protected environment. Once a provider is selected, its job must report
+  `passed`; a missing credential, endpoint, deployment, or model is retained as
+  `not_run` but fails the workflow. Consequently neither an empty setup nor an
+  approved-but-incomplete setup can create a green live-evidence claim.
+- Keep credentials/endpoints in the `provider-qualification` environment and
+  model/API selections in that environment's variables. The dynamic matrix
+  contains only selected providers, so unselected jobs never request
+  environment approval and never receive a credential expression.
 - `on-device-qualification.yml` binds a provisioned real GGUF model and
   tokenizer to one exact tagged release candidate, verifies bounded load,
   generation, cancellation drain, and peak RSS on a repository-owned CPU

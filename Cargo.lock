@@ -102,10 +102,13 @@ name = "agent-tui"
 version = "0.4.0-rc.1"
 dependencies = [
  "agent-sdk",
+ "async-trait",
  "kernel",
  "ratatui",
  "serde_json",
  "tokio",
+ "tokio-util",
+ "uuid",
 ]
 
 [[package]]

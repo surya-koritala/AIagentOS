@@ -5,8 +5,10 @@
 //! a terminal and the kernel syscall server.
 
 use std::ops::{Deref, DerefMut};
+use std::sync::Arc;
 
-use agent_sdk::{ConnectionProfile, KernelClient, SdkError};
+use agent_sdk::{ConnectionProfile, KernelClient, MessageResult, MessageStreamEvent, SdkError};
+use tokio::sync::Mutex;
 
 pub mod app;
 
@@ -17,6 +19,18 @@ pub mod app;
 /// path as the binary.
 pub struct TuiClient {
     inner: KernelClient,
+    messages: TuiMessageClient,
+}
+
+/// Cloneable message-stream handle backed by two dedicated public-wire
+/// connections: one for the ordered stream and one for exact cancellation.
+///
+/// The ordinary [`TuiClient`] connection therefore remains available for
+/// refreshes and lifecycle/operator actions while one turn is active.
+#[derive(Clone)]
+pub struct TuiMessageClient {
+    stream: Arc<Mutex<KernelClient>>,
+    cancellation: Arc<Mutex<KernelClient>>,
 }
 
 impl TuiClient {
@@ -29,12 +43,72 @@ impl TuiClient {
         profile: &ConnectionProfile,
         token: Option<&str>,
     ) -> Result<Self, SdkError> {
-        let inner = profile.connect(token).await?;
-        Ok(Self { inner })
+        let (inner, stream, cancellation) = tokio::try_join!(
+            profile.connect(token),
+            profile.connect(token),
+            profile.connect(token)
+        )?;
+        Ok(Self {
+            inner,
+            messages: TuiMessageClient {
+                stream: Arc::new(Mutex::new(stream)),
+                cancellation: Arc::new(Mutex::new(cancellation)),
+            },
+        })
     }
 
     pub async fn rotate_auth(&mut self, token: impl Into<String>) -> Result<(), SdkError> {
-        self.inner.authenticate(token).await
+        let token = token.into();
+        self.inner.authenticate(token.clone()).await?;
+        self.messages
+            .stream
+            .lock()
+            .await
+            .authenticate(token.clone())
+            .await?;
+        self.messages
+            .cancellation
+            .lock()
+            .await
+            .authenticate(token)
+            .await
+    }
+
+    pub fn message_client(&self) -> TuiMessageClient {
+        self.messages.clone()
+    }
+}
+
+impl TuiMessageClient {
+    /// Drive one ordered turn on the dedicated stream connection.
+    pub async fn send_message_stream<F>(
+        &self,
+        request_id: impl Into<String>,
+        agent_id: impl Into<String>,
+        message: impl Into<String>,
+        on_event: F,
+    ) -> Result<MessageResult, SdkError>
+    where
+        F: FnMut(&MessageStreamEvent),
+    {
+        self.stream
+            .lock()
+            .await
+            .send_message_stream(request_id, agent_id, message, on_event)
+            .await
+    }
+
+    /// Cooperatively cancel one exact stream without taking the stream lock.
+    pub async fn cancel_request(
+        &self,
+        request_id: impl Into<String>,
+        agent_id: impl Into<String>,
+    ) -> Result<bool, SdkError> {
+        self.cancellation
+            .lock()
+            .await
+            .cancel_request(request_id, agent_id)
+            .await
     }
 }
 

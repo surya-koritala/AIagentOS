@@ -392,9 +392,13 @@ public_entry_points = ["crates/cli/src/main.rs", "crates/tui/src/main.rs", "crat
 runtime_call_paths = ["crates/sdk/src/lib.rs::KernelClient"]
 test_evidence = [
   "crates/tui/tests/refresh.rs",
+  "crates/tui/tests/streaming.rs::tui_stream_keeps_refresh_live_and_cancels_on_an_exact_dedicated_connection",
   "crates/tui/tests/refresh.rs::tunable_update_audit_and_rollback_use_the_public_tui_client",
   "crates/tui/tests/refresh.rs::package_lifecycle_and_stale_confirmation_use_the_public_tui_client",
   "crates/tui/src/app.rs::tests::long_running_operation_is_explicit_until_finished",
+  "crates/tui/src/app.rs::tests::stream_cancellation_freezes_target_and_closes_the_start_race",
+  "crates/tui/src/app.rs::tests::second_stream_and_message_editor_are_refused_while_one_turn_is_active",
+  "crates/tui/src/app.rs::tests::stream_projection_is_bounded_and_stale_terminal_updates_are_ignored",
   "crates/tui/src/app.rs::tests::kill_confirmation_is_target_bound_and_cancellable",
   "crates/tui/src/app.rs::tests::tunable_update_freezes_name_revision_and_enforces_bounds",
   "crates/tui/src/app.rs::tests::tunable_rollback_requires_exact_frozen_name_and_older_revision",
@@ -441,13 +445,14 @@ test_evidence = [
   "tests/src/capability_registry.rs::desktop_package_controls_stay_exact_on_the_public_wire_boundary",
   "tests/src/capability_registry.rs::reconnect_contract_is_bounded_and_fail_closed",
   "tests/src/capability_registry.rs::operator_ui_state_contract_is_visible_and_regressed",
+  "tests/src/capability_registry.rs::tui_stream_controls_stay_bounded_exact_and_on_the_public_wire_boundary",
   "tests/src/capability_registry.rs::desktop_accessibility_baseline_is_explicit_and_honest",
   "tests/src/capability_registry.rs::desktop_release_foundation_is_versioned_and_fail_closed",
 ]
 platforms = ["linux", "macos", "windows"]
 limitations = [
   "Every client crosses the typed authorization boundary and passes the shared tenant/role behavior suite. `agentctl` is the canonical headless operator client, `KernelClient` is the canonical typed programmatic client, TUI/desktop are focused parity-checked subsets, and the embedded `agent` developer shell is not an operator parity target.",
-  "TUI and desktop metric projections use the same raw public operator-snapshot fixture; scoped omission is not converted into fake global zeroes. They retain last-known-good state on refresh failure, distinguish partial scope from stale transport, expose reconnect generations, and make long-running operations visible.",
+  "TUI and desktop metric projections use the same raw public operator-snapshot fixture; scoped omission is not converted into fake global zeroes. They retain last-known-good state on refresh failure, distinguish partial scope from stale transport, expose reconnect generations, and make long-running operations visible. TUI message turns use separate authenticated ordinary, stream, and cancellation connections, freeze one exact request/agent pair, queue pre-start cancellation until registration, bound pending UI events to 256 and retained UTF-8 output to 64 KiB, count omitted projection events, and never replay a lost turn.",
   "Only an explicit read-only allowlist is replayed once after reconnect. Package, lifecycle, tool, turn, service, and other mutations are never automatically replayed after an indeterminate response loss.",
   "CLI forced termination and erasure, TUI forced termination and service stop/restart, TUI/desktop signed-package rollback/removal, TUI/desktop tunable rollback, desktop checkpoint deletion, and desktop service stop/restart retain frozen exact-target confirmation. TUI and desktop package rollback/removal additionally compare the reviewed version and digest inside the package transaction, so concurrent upgrades fail stale. TUI and desktop tunable updates use advertised bounds plus compare-and-set revisions; audit, update, and rollback use only `KernelClient`. TUI/desktop service and package controls also use only `KernelClient`; cross-scope authorization is enforced by the server.",
   "Desktop configuration IPC exposes only a non-secret projection. Cloud credentials use macOS Keychain, Windows Credential Manager, or Linux Secret Service and are hydrated only into in-memory provider registration. Existing plaintext config values remain a compatibility fallback when migration is unavailable.",

@@ -3241,7 +3241,7 @@ mod tests {
                     max_concurrent: 4,
                 },
                 context.clone(),
-                Arc::new(crate::quota_clock::SystemQuotaClock::new()),
+                Arc::new(crate::quota_clock::ManualQuotaClock::new(0)),
             )
             .unwrap(),
         );

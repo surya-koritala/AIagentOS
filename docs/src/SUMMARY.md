@@ -5,6 +5,7 @@
 # Guide
 
 - [Getting Started](./getting-started.md)
+- [Restricted Linux CLI Release Candidate](./linux-cli-rc.md)
 - [Concepts](./concepts.md)
   - [Architecture](./architecture.md)
   - [Distributed Control Plane](./distributed-control-plane.md)

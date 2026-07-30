@@ -1447,6 +1447,91 @@ fn desktop_release_foundation_is_versioned_and_fail_closed() {
 }
 
 #[test]
+fn restricted_linux_cli_rc_release_contract_is_fail_closed() {
+    let stable = read_workspace_file(".github/workflows/release.yml");
+    assert!(
+        stable.contains("- \"!v*-rc.*\""),
+        "stable all-platform publication must not consume restricted RC tags"
+    );
+
+    let workflow = read_workspace_file(".github/workflows/linux-cli-rc.yml");
+    for contract in [
+        "- \"v*-rc.*\"",
+        "uses: ./.github/workflows/ci.yml",
+        "governance:",
+        "reproducible-linux:",
+        "cmp -s",
+        "python3 scripts/build_cli_archive.py",
+        "sign-runtime:",
+        "cosign sign-blob",
+        "attest-build-provenance@",
+        "fresh-host:",
+        "scripts/linux_cli_rc_qualification.py qualify",
+        "--released-schema-tag v0.3.0",
+        "finalize:",
+        "scripts/linux_cli_rc_qualification.py validate-report",
+        "gh release create",
+        "--prerelease",
+        "--verify-tag",
+    ] {
+        assert!(
+            workflow.contains(contract),
+            "restricted Linux CLI RC workflow lost {contract:?}"
+        );
+    }
+    for forbidden in [
+        "pull_request_target",
+        "self-hosted",
+        "continue-on-error: true",
+        "AGENT_SERVER_ALLOW_INSECURE_REMOTE",
+    ] {
+        assert!(
+            !workflow.contains(forbidden),
+            "restricted Linux CLI RC workflow contains unsafe {forbidden:?}"
+        );
+    }
+
+    let qualifier = read_workspace_file("scripts/linux_cli_rc_qualification.py");
+    for contract in [
+        "vX.Y.Z-rc.N",
+        "EXPECTED_ARCHIVE_NAMES",
+        "archive contains duplicate entries",
+        "storage-encrypt",
+        "AGENT_SERVER_TLS_CERT",
+        "AGENTOS_TLS_CA",
+        "wrong-token",
+        "backup-anchor-create",
+        "tampered-backup",
+        "missing-storage-key.json",
+        "backup-disaster-recover",
+        "\"enforcement_rearmed\": True",
+        "\"production_claim_allowed\": False",
+        "deny-self-hosted-runners",
+    ] {
+        assert!(
+            qualifier.contains(contract),
+            "restricted Linux CLI qualifier lost {contract:?}"
+        );
+    }
+
+    let guide = read_workspace_file("docs/LINUX_CLI_RC.md");
+    for contract in [
+        "Ubuntu 22.04 x86_64",
+        "sha256sum --check SHA256SUMS",
+        "--certificate-identity \"$identity\"",
+        "production_claim_allowed",
+        "backup-disaster-recover",
+        "\"enforcement_rearmed\": true",
+        "remote immutable-backup or measured RPO/RTO",
+    ] {
+        assert!(
+            guide.contains(contract),
+            "restricted Linux CLI operator guide lost {contract:?}"
+        );
+    }
+}
+
+#[test]
 fn release_blocking_workflows_keep_their_security_contract() {
     let ci = read_workspace_file(".github/workflows/ci.yml");
     for os in ["ubuntu-latest", "macos-latest", "windows-latest"] {
@@ -1779,6 +1864,7 @@ fn release_blocking_workflows_keep_their_security_contract() {
         ".github/workflows/extended-security.yml",
         ".github/workflows/external-deletion-qualification.yml",
         ".github/workflows/live-provider-qualification.yml",
+        ".github/workflows/linux-cli-rc.yml",
         ".github/workflows/on-device-qualification.yml",
         ".github/workflows/release.yml",
     ] {

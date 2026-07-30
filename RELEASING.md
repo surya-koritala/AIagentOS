@@ -52,6 +52,27 @@ All workspace crates share one version number; bump them together.
    ```
 6. The [`release` workflow](.github/workflows/release.yml) takes over — see below.
 
+### Restricted Linux CLI release candidates
+
+An exact `vX.Y.Z-rc.N` tag is intentionally routed to
+[`linux-cli-rc.yml`](.github/workflows/linux-cli-rc.yml), not the stable
+all-platform workflow. The tag must still be signed and annotated, every
+workspace/UI version must equal `X.Y.Z-rc.N`, and the changelog must have one
+matching section.
+
+That workflow publishes a GitHub prerelease only after reproducible Ubuntu
+22.04 x86_64 binaries are signed and attested, then exercised from the final
+archive through verified TLS/authentication, released-schema upgrade, encrypted
+storage, governed agent creation, clean restart, signed/anchored backup,
+tamper rejection, missing-key rejection, and fresh-host recovery with
+enforcement re-armed. The final bounded evidence report is itself checksummed,
+keyless-signed, and covered by GitHub provenance. See the
+[restricted Linux CLI RC operator guide](docs/LINUX_CLI_RC.md).
+
+This restricted prerelease is not a stable all-platform release and does not
+waive the external provider/model, remote-storage, 24-hour soak, game-day,
+desktop, distributed-control-plane, or independent-review gates.
+
 ## What a release must prove (the gate)
 
 Before tagging, manually dispatch `.github/workflows/release.yml` on the release
@@ -97,10 +118,12 @@ gh attestation verify agentos-vX.Y.Z-x86_64-unknown-linux-gnu.zip \
 This is how "are we building the right product?" gets enforced mechanically: a
 release that can't contain a rogue agent or boot a server doesn't ship.
 
-Public tags are currently blocked by the desktop release contract. Native
+Stable public tags are currently blocked by the desktop release contract. Native
 platform signing, macOS notarization, signed updater metadata, clean-host
 upgrade/rollback evidence, and the supported-platform matrix must land before
-that block can be removed. See [desktop distribution](docs/DESKTOP_DISTRIBUTION.md).
+that block can be removed. Restricted `vX.Y.Z-rc.N` tags use the separately
+scoped Linux CLI prerelease gate above. See
+[desktop distribution](docs/DESKTOP_DISTRIBUTION.md).
 
 ## Repository merge policy
 

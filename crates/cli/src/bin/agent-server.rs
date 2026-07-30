@@ -254,11 +254,13 @@ async fn main() {
             std::process::exit(1);
         }
         eprintln!(
-            "agent-server: cluster Raft node {} listening on {}; voter generation {}; voters {:?}; transport catalog {}",
+            "agent-server: cluster Raft node {} listening on {}; voter generation {}; voters {:?}; transport trust generation {}; overlap expiration {:?}; transport catalog {}",
             runtime.node_id(),
             runtime.local_addr(),
             runtime.voter_set_generation(),
             runtime.voter_ids(),
+            runtime.transport_trust_generation(),
+            runtime.transport_trust_overlap_not_after(),
             runtime.transport_catalog_sha256(),
         );
     }

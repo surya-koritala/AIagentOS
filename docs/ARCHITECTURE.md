@@ -21,13 +21,16 @@ transparent follower forwarding. The disabled default retains the designated
 single SQLite authority. Application-listener leaves have a bounded replicated
 prepare/activate/finalize rollout. The voter subset can change by one durable
 generation through persisted target intent, learner catch-up, and OpenRaft
-joint consensus, but only inside the digest-pinned static mTLS trust catalog;
-non-voters remain replicated learners. Catalog
-addition/removal, Raft certificate/CA rotation, self-contained authority
-authentication at workload destinations, migration, global quotas/trust,
-rolling upgrades, and disaster recovery are not complete. Ownership revisions
-and destination fences do retain the committed authority term and exact
-bounded lease expiry.
+joint consensus; non-voters remain replicated learners. Separate durable
+transport-trust generations atomically replace the complete digest-pinned peer
+map, add/remove learners, and rotate exact server/client leaves plus CA roots
+through an expiring overlap. The immutable application genesis, complete
+challenged application catalog, and current transport subset remain separate
+exact inputs; retained peers preserve identity, leaf, and CA continuity.
+Self-contained authority authentication at
+workload destinations, migration, global quotas/trust, rolling upgrades, and
+disaster recovery are not complete. Ownership revisions and destination fences
+do retain the committed authority term and exact bounded lease expiry.
 
 ---
 

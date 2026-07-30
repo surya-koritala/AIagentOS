@@ -227,7 +227,7 @@ impl BackupScheduleConfig {
     }
 }
 
-/// One statically trusted peer in the Raft transport catalog.
+/// One peer in the generation-fenced Raft transport catalog.
 ///
 /// These values are copied into the quorum-versioned OpenRaft membership.
 /// Exact server and client certificate fingerprints bind every transport role
@@ -250,21 +250,43 @@ pub struct ClusterRaftMemberConfig {
     pub endpoint: String,
     pub server_name: String,
     pub tls_certificate_sha256: String,
+    /// Additional server leaves accepted only during a bounded transport-trust
+    /// overlap generation. The primary fingerprint above remains accepted.
+    #[serde(default)]
+    pub tls_certificate_sha256_overlap: Vec<String>,
     pub tls_client_certificate_sha256: String,
+    /// Additional client leaves accepted only during a bounded transport-trust
+    /// overlap generation. The primary fingerprint above remains accepted.
+    #[serde(default)]
+    pub tls_client_certificate_sha256_overlap: Vec<String>,
     /// Hex-encoded Ed25519 public key of the durable application node
     /// identity. The local entry must match `ClusterControl::identity()`.
+    pub identity_public_key: String,
+}
+
+/// One application identity seeded when a Raft authority is first initialized.
+/// The node id/public key stay immutable; endpoint and TLS fields name the
+/// current challenged binding. Operators retain the identity list after
+/// transport members are added or removed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClusterAuthorityGenesisMemberConfig {
+    pub application_node_id: String,
+    pub application_endpoint: String,
+    #[serde(default)]
+    pub application_tls_server_certificate_sha256: Option<String>,
     pub identity_public_key: String,
 }
 
 /// Production daemon configuration for the authenticated OpenRaft runtime.
 ///
 /// The runtime is disabled by default so existing single-node installations
-/// remain compatible. Enabling it requires an exact static transport catalog
-/// and five absolute PEM paths. `voter_ids` selects a non-empty subset of that
-/// catalog; post-bootstrap changes advance `voter_set_generation` exactly once
-/// per target. `bootstrap` may be used for a pristine cluster; on restart it
-/// verifies or resumes the durable voter generation instead of creating a
-/// second cluster.
+/// remain compatible. Enabling it requires an exact generation-fenced
+/// transport catalog and five absolute PEM paths. `voter_ids` selects a
+/// non-empty subset; post-bootstrap voter and transport-trust changes advance
+/// their separate generations exactly once and never together. `bootstrap`
+/// may be used for a pristine cluster; on restart it verifies or resumes the
+/// exact durable generation instead of creating a second cluster.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ClusterRaftConfig {
@@ -274,9 +296,19 @@ pub struct ClusterRaftConfig {
     /// Canonical UUID shared by every voter and returned by the replicated
     /// membership API.
     pub authority_cluster_id: String,
+    /// Application identity seed from the first successful authority
+    /// initialization. Empty derives the seed from `members` for bootstrap and
+    /// backward compatibility. Once transport membership diverges, every node
+    /// must retain the original node-id/public-key list here while publishing
+    /// each identity's current challenged endpoint/TLS binding.
+    pub authority_genesis_members: Vec<ClusterAuthorityGenesisMemberConfig>,
+    /// Complete current challenged application membership, including members
+    /// no longer present in the Raft transport catalog. Empty derives this
+    /// list from `members` while the two catalogs are still identical.
+    pub authority_members: Vec<ClusterAuthorityGenesisMemberConfig>,
     pub listen_addr: String,
     pub cluster_name: String,
-    /// Desired OpenRaft voter ids within the statically trusted `members`
+    /// Desired OpenRaft voter ids within the generation-fenced `members`
     /// catalog. An empty list preserves the legacy behavior in which every
     /// trusted member is a voter.
     pub voter_ids: Vec<u64>,
@@ -285,6 +317,15 @@ pub struct ClusterRaftConfig {
     /// the next generation and persists its target digest in OpenRaft
     /// membership before changing quorum.
     pub voter_set_generation: u64,
+    /// Monotonic generation for changes to the Raft transport catalog, peer
+    /// leaf allowlists, or accepted CA bundle. Generation zero preserves the
+    /// legacy single-leaf catalog. Trust and voter generations cannot advance
+    /// in the same transition.
+    pub transport_trust_generation: u64,
+    /// Mandatory absolute expiration for any additional peer leaf or CA root
+    /// accepted during a trust-overlap generation. Primary peer leaves remain
+    /// valid after this instant; overlap leaves fail closed.
+    pub transport_trust_overlap_not_after: Option<chrono::DateTime<chrono::Utc>>,
     pub members: Vec<ClusterRaftMemberConfig>,
     pub server_certificate_path: Option<PathBuf>,
     pub server_private_key_path: Option<PathBuf>,
@@ -309,10 +350,14 @@ impl Default for ClusterRaftConfig {
             bootstrap: false,
             node_id: 0,
             authority_cluster_id: String::new(),
+            authority_genesis_members: Vec::new(),
+            authority_members: Vec::new(),
             listen_addr: "127.0.0.1:8788".into(),
             cluster_name: "ai-agent-os".into(),
             voter_ids: Vec::new(),
             voter_set_generation: 0,
+            transport_trust_generation: 0,
+            transport_trust_overlap_not_after: None,
             members: Vec::new(),
             server_certificate_path: None,
             server_private_key_path: None,
@@ -491,6 +536,53 @@ impl ClusterRaftConfig {
                 &member.tls_client_certificate_sha256,
                 "tls_client_certificate_sha256",
             )?;
+            if member.tls_certificate_sha256_overlap.len() > 7
+                || member.tls_client_certificate_sha256_overlap.len() > 7
+            {
+                return Err(
+                    "cluster_raft member transport certificate overlap cannot contain more than 7 additional leaves"
+                        .into(),
+                );
+            }
+            if self.transport_trust_generation == 0
+                && (!member.tls_certificate_sha256_overlap.is_empty()
+                    || !member.tls_client_certificate_sha256_overlap.is_empty())
+            {
+                return Err(
+                    "cluster_raft generation-zero transport trust cannot contain overlap leaves"
+                        .into(),
+                );
+            }
+            let mut member_server_fingerprints = BTreeSet::new();
+            for fingerprint in std::iter::once(member.tls_certificate_sha256.as_str()).chain(
+                member
+                    .tls_certificate_sha256_overlap
+                    .iter()
+                    .map(String::as_str),
+            ) {
+                validate_cluster_fingerprint(fingerprint, "tls_certificate_sha256")?;
+                if !member_server_fingerprints.insert(fingerprint) {
+                    return Err(
+                        "cluster_raft member contains a duplicate server certificate fingerprint"
+                            .into(),
+                    );
+                }
+            }
+            let mut member_client_fingerprints = BTreeSet::new();
+            for fingerprint in std::iter::once(member.tls_client_certificate_sha256.as_str()).chain(
+                member
+                    .tls_client_certificate_sha256_overlap
+                    .iter()
+                    .map(String::as_str),
+            ) {
+                validate_cluster_fingerprint(fingerprint, "tls_client_certificate_sha256")?;
+                if !member_client_fingerprints.insert(fingerprint) {
+                    return Err(
+                        "cluster_raft member contains a duplicate client certificate fingerprint"
+                            .into(),
+                    );
+                }
+            }
             if member.identity_public_key.len() != 64
                 || !member
                     .identity_public_key
@@ -510,22 +602,26 @@ impl ClusterRaftConfig {
             if !endpoints.insert(member.endpoint.as_str()) {
                 return Err("cluster_raft contains a duplicate member endpoint".into());
             }
-            if !server_fingerprints.insert(member.tls_certificate_sha256.as_str()) {
-                return Err(
-                    "cluster_raft contains a duplicate server certificate fingerprint".into(),
-                );
+            for fingerprint in &member_server_fingerprints {
+                if !server_fingerprints.insert(*fingerprint) {
+                    return Err(
+                        "cluster_raft contains a duplicate server certificate fingerprint".into(),
+                    );
+                }
             }
-            if !client_fingerprints.insert(member.tls_client_certificate_sha256.as_str()) {
-                return Err(
-                    "cluster_raft contains a duplicate client certificate fingerprint".into(),
-                );
+            for fingerprint in &member_client_fingerprints {
+                if !client_fingerprints.insert(*fingerprint) {
+                    return Err(
+                        "cluster_raft contains a duplicate client certificate fingerprint".into(),
+                    );
+                }
             }
-            for fingerprint in [
-                member.tls_certificate_sha256.as_str(),
-                member.tls_client_certificate_sha256.as_str(),
-            ] {
+            for fingerprint in member_server_fingerprints
+                .iter()
+                .chain(member_client_fingerprints.iter())
+            {
                 if certificate_owners
-                    .insert(fingerprint, member.node_id)
+                    .insert(*fingerprint, member.node_id)
                     .is_some_and(|owner| owner != member.node_id)
                 {
                     return Err(
@@ -549,6 +645,196 @@ impl ClusterRaftConfig {
                 return Err("cluster_raft contains a duplicate member identity key".into());
             }
         }
+        if self.authority_genesis_members.len() > 31 {
+            return Err(
+                "cluster_raft.authority_genesis_members cannot contain more than 31 members".into(),
+            );
+        }
+        let mut genesis_node_ids = BTreeSet::new();
+        let mut genesis_endpoints = BTreeSet::new();
+        let mut genesis_tls_fingerprints = BTreeSet::new();
+        let mut genesis_identity_keys = BTreeSet::new();
+        for member in &self.authority_genesis_members {
+            let application_node_id =
+                uuid::Uuid::parse_str(&member.application_node_id).map_err(|_| {
+                    "cluster_raft authority genesis application_node_id must be a UUID".to_string()
+                })?;
+            if application_node_id.to_string() != member.application_node_id {
+                return Err(
+                    "cluster_raft authority genesis application_node_id must use canonical lowercase UUID form"
+                        .into(),
+                );
+            }
+            validate_cluster_endpoint(&member.application_endpoint)?;
+            if let Some(fingerprint) = member.application_tls_server_certificate_sha256.as_deref() {
+                validate_cluster_fingerprint(
+                    fingerprint,
+                    "authority genesis application_tls_server_certificate_sha256",
+                )?;
+                if !genesis_tls_fingerprints.insert(fingerprint) {
+                    return Err(
+                        "cluster_raft authority genesis contains a duplicate application TLS fingerprint"
+                            .into(),
+                    );
+                }
+            }
+            if member.identity_public_key.len() != 64
+                || !member
+                    .identity_public_key
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            {
+                return Err(
+                    "cluster_raft authority genesis identity_public_key must be a 32-byte Ed25519 key encoded as 64 lowercase hexadecimal characters"
+                        .into(),
+                );
+            }
+            if !genesis_node_ids.insert(member.application_node_id.as_str())
+                || !genesis_endpoints.insert(member.application_endpoint.as_str())
+                || !genesis_identity_keys.insert(member.identity_public_key.as_str())
+            {
+                return Err(
+                    "cluster_raft authority genesis contains a duplicate application identity or endpoint"
+                        .into(),
+                );
+            }
+        }
+        if self.authority_members.len() > 31 {
+            return Err(
+                "cluster_raft.authority_members cannot contain more than 31 members".into(),
+            );
+        }
+        let mut authority_node_ids = BTreeSet::new();
+        let mut authority_endpoints = BTreeSet::new();
+        let mut authority_tls_fingerprints = BTreeSet::new();
+        let mut authority_identity_keys = BTreeSet::new();
+        for member in &self.authority_members {
+            let application_node_id =
+                uuid::Uuid::parse_str(&member.application_node_id).map_err(|_| {
+                    "cluster_raft authority member application_node_id must be a UUID".to_string()
+                })?;
+            if application_node_id.to_string() != member.application_node_id {
+                return Err(
+                    "cluster_raft authority member application_node_id must use canonical lowercase UUID form"
+                        .into(),
+                );
+            }
+            validate_cluster_endpoint(&member.application_endpoint)?;
+            if let Some(fingerprint) = member.application_tls_server_certificate_sha256.as_deref() {
+                validate_cluster_fingerprint(
+                    fingerprint,
+                    "authority member application_tls_server_certificate_sha256",
+                )?;
+                if !authority_tls_fingerprints.insert(fingerprint) {
+                    return Err(
+                        "cluster_raft authority members contain a duplicate application TLS fingerprint"
+                            .into(),
+                    );
+                }
+            }
+            if member.identity_public_key.len() != 64
+                || !member
+                    .identity_public_key
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            {
+                return Err(
+                    "cluster_raft authority member identity_public_key must be a 32-byte Ed25519 key encoded as 64 lowercase hexadecimal characters"
+                        .into(),
+                );
+            }
+            if !authority_node_ids.insert(member.application_node_id.as_str())
+                || !authority_endpoints.insert(member.application_endpoint.as_str())
+                || !authority_identity_keys.insert(member.identity_public_key.as_str())
+            {
+                return Err(
+                    "cluster_raft authority members contain a duplicate application identity or endpoint"
+                        .into(),
+                );
+            }
+        }
+        if !self.authority_members.is_empty() {
+            for member in &self.members {
+                let Some(authority_member) = self
+                    .authority_members
+                    .iter()
+                    .find(|candidate| candidate.application_node_id == member.application_node_id)
+                else {
+                    return Err(
+                        "cluster_raft transport member is absent from authority_members".into(),
+                    );
+                };
+                if authority_member.application_endpoint != member.application_endpoint
+                    || authority_member.application_tls_server_certificate_sha256
+                        != member.application_tls_server_certificate_sha256
+                    || authority_member.identity_public_key != member.identity_public_key
+                {
+                    return Err(
+                        "cluster_raft transport member does not exactly match authority_members"
+                            .into(),
+                    );
+                }
+            }
+        }
+        if !self.authority_genesis_members.is_empty() {
+            for genesis_member in &self.authority_genesis_members {
+                let authority_identity = if self.authority_members.is_empty() {
+                    self.members
+                        .iter()
+                        .find(|candidate| {
+                            candidate.application_node_id == genesis_member.application_node_id
+                        })
+                        .map(|candidate| candidate.identity_public_key.as_str())
+                } else {
+                    self.authority_members
+                        .iter()
+                        .find(|candidate| {
+                            candidate.application_node_id == genesis_member.application_node_id
+                        })
+                        .map(|candidate| candidate.identity_public_key.as_str())
+                };
+                if authority_identity != Some(genesis_member.identity_public_key.as_str()) {
+                    return Err(
+                        "cluster_raft authority genesis identity is absent from or conflicts with the complete authority membership"
+                            .into(),
+                    );
+                }
+            }
+        }
+        if self.bootstrap
+            && (!self.authority_genesis_members.is_empty() || !self.authority_members.is_empty())
+        {
+            let exact_bootstrap_catalog = self.members.len()
+                == self
+                    .authority_genesis_members
+                    .len()
+                    .max(self.authority_members.len())
+                && self.members.iter().all(|member| {
+                    let genesis_matches = self.authority_genesis_members.is_empty()
+                        || self.authority_genesis_members.iter().any(|candidate| {
+                            candidate.application_node_id == member.application_node_id
+                                && candidate.application_endpoint == member.application_endpoint
+                                && candidate.application_tls_server_certificate_sha256
+                                    == member.application_tls_server_certificate_sha256
+                                && candidate.identity_public_key == member.identity_public_key
+                        });
+                    let authority_matches = self.authority_members.is_empty()
+                        || self.authority_members.iter().any(|candidate| {
+                            candidate.application_node_id == member.application_node_id
+                                && candidate.application_endpoint == member.application_endpoint
+                                && candidate.application_tls_server_certificate_sha256
+                                    == member.application_tls_server_certificate_sha256
+                                && candidate.identity_public_key == member.identity_public_key
+                        });
+                    genesis_matches && authority_matches
+                });
+            if !exact_bootstrap_catalog {
+                return Err(
+                    "cluster_raft bootstrap requires transport, authority, and immutable genesis members to match exactly"
+                        .into(),
+                );
+            }
+        }
         if !node_ids.contains(&self.node_id) {
             return Err("cluster_raft local node_id is absent from members".into());
         }
@@ -568,6 +854,53 @@ impl ClusterRaftConfig {
         }
         if self.desired_voter_ids().is_empty() {
             return Err("cluster_raft voter set cannot be empty".into());
+        }
+        let has_leaf_overlap = self.members.iter().any(|member| {
+            !member.tls_certificate_sha256_overlap.is_empty()
+                || !member.tls_client_certificate_sha256_overlap.is_empty()
+        });
+        match (has_leaf_overlap, self.transport_trust_overlap_not_after) {
+            (true, None) => {
+                return Err(
+                    "cluster_raft transport certificate overlap requires transport_trust_overlap_not_after"
+                        .into(),
+                )
+            }
+            (false, Some(_)) if self.transport_trust_generation == 0 => {
+                return Err(
+                    "cluster_raft generation-zero transport trust cannot have an overlap expiration"
+                        .into(),
+                )
+            }
+            (true, Some(not_after)) => {
+                let now = chrono::Utc::now();
+                if not_after <= now {
+                    return Err(
+                        "cluster_raft transport trust overlap expiration must be in the future"
+                            .into(),
+                    );
+                }
+                if not_after > now + chrono::Duration::days(30) {
+                    return Err(
+                        "cluster_raft transport trust overlap cannot exceed 30 days".into(),
+                    );
+                }
+            }
+            (false, Some(not_after)) => {
+                let now = chrono::Utc::now();
+                if not_after <= now {
+                    return Err(
+                        "cluster_raft transport trust overlap expiration must be in the future"
+                            .into(),
+                    );
+                }
+                if not_after > now + chrono::Duration::days(30) {
+                    return Err(
+                        "cluster_raft transport trust overlap cannot exceed 30 days".into(),
+                    );
+                }
+            }
+            (false, None) => {}
         }
         Ok(())
     }
@@ -1242,7 +1575,9 @@ mod tests {
                 endpoint: "127.0.0.1:8788".into(),
                 server_name: "node-1.agentos.test".into(),
                 tls_certificate_sha256: "a".repeat(64),
+                tls_certificate_sha256_overlap: Vec::new(),
                 tls_client_certificate_sha256: "b".repeat(64),
+                tls_client_certificate_sha256_overlap: Vec::new(),
                 identity_public_key: "c".repeat(64),
             }],
             server_certificate_path: Some(root.join("server.pem")),
@@ -1349,6 +1684,119 @@ mod tests {
         assert!(config.validate().unwrap_err().contains("absent"));
         config.voter_ids = vec![0];
         assert!(config.validate().unwrap_err().contains("reserved"));
+    }
+
+    #[test]
+    fn cluster_raft_transport_overlap_is_versioned_bounded_and_expiring() {
+        let mut config = valid_cluster_raft_config();
+        config.members[0].tls_certificate_sha256_overlap = vec!["d".repeat(64)];
+        assert!(config.validate().unwrap_err().contains("generation-zero"));
+
+        config.transport_trust_generation = 1;
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .contains("requires transport_trust_overlap_not_after"));
+
+        config.transport_trust_overlap_not_after =
+            Some(chrono::Utc::now() + chrono::Duration::hours(1));
+        config.validate().expect("bounded next-generation overlap");
+        let encoded = toml::to_string(&config).expect("serialize overlap configuration");
+        let decoded: ClusterRaftConfig =
+            toml::from_str(&encoded).expect("deserialize overlap configuration");
+        assert_eq!(decoded, config);
+
+        config.transport_trust_overlap_not_after =
+            Some(chrono::Utc::now() + chrono::Duration::days(31));
+        assert!(config.validate().unwrap_err().contains("30 days"));
+
+        config.transport_trust_overlap_not_after =
+            Some(chrono::Utc::now() - chrono::Duration::seconds(1));
+        assert!(config.validate().unwrap_err().contains("future"));
+
+        config.transport_trust_overlap_not_after =
+            Some(chrono::Utc::now() + chrono::Duration::hours(1));
+        config.members[0]
+            .tls_certificate_sha256_overlap
+            .push("d".repeat(64));
+        assert!(config.validate().unwrap_err().contains("duplicate"));
+    }
+
+    #[test]
+    fn cluster_raft_separates_immutable_complete_and_transport_authority_catalogs() {
+        let mut config = valid_cluster_raft_config();
+        let seed = ClusterAuthorityGenesisMemberConfig {
+            application_node_id: config.members[0].application_node_id.clone(),
+            application_endpoint: config.members[0].application_endpoint.clone(),
+            application_tls_server_certificate_sha256: config.members[0]
+                .application_tls_server_certificate_sha256
+                .clone(),
+            identity_public_key: config.members[0].identity_public_key.clone(),
+        };
+        config.authority_genesis_members = vec![seed.clone()];
+        config.authority_members = vec![seed.clone()];
+        config
+            .validate()
+            .expect("explicit bootstrap catalogs match transport exactly");
+        let encoded = toml::to_string(&config).expect("serialize authority catalogs");
+        let decoded: ClusterRaftConfig =
+            toml::from_str(&encoded).expect("deserialize authority catalogs");
+        assert_eq!(decoded, config);
+
+        let mut second = config.members[0].clone();
+        second.node_id = 2;
+        second.application_node_id = "00000000-0000-0000-0000-000000000002".into();
+        second.application_endpoint = "127.0.0.1:7778".into();
+        second.endpoint = "127.0.0.1:8789".into();
+        second.server_name = "node-2.agentos.test".into();
+        second.tls_certificate_sha256 = "d".repeat(64);
+        second.tls_client_certificate_sha256 = "e".repeat(64);
+        second.identity_public_key = "f".repeat(64);
+        let second_authority = ClusterAuthorityGenesisMemberConfig {
+            application_node_id: second.application_node_id.clone(),
+            application_endpoint: second.application_endpoint.clone(),
+            application_tls_server_certificate_sha256: second
+                .application_tls_server_certificate_sha256
+                .clone(),
+            identity_public_key: second.identity_public_key.clone(),
+        };
+        config.bootstrap = false;
+        config.transport_trust_generation = 1;
+        config.voter_ids = vec![1];
+        config.members.push(second);
+        config.authority_members.push(second_authority);
+        config
+            .validate()
+            .expect("challenged application member may join transport after genesis");
+
+        config.members.pop();
+        config.transport_trust_generation = 2;
+        config
+            .validate()
+            .expect("complete authority retains an identity removed from transport");
+
+        let mut missing_current = config.clone();
+        missing_current.authority_members.clear();
+        missing_current.authority_genesis_members.clear();
+        missing_current
+            .authority_members
+            .push(ClusterAuthorityGenesisMemberConfig {
+                application_node_id: "00000000-0000-0000-0000-000000000002".into(),
+                application_endpoint: "127.0.0.1:7778".into(),
+                application_tls_server_certificate_sha256: None,
+                identity_public_key: "f".repeat(64),
+            });
+        assert!(missing_current
+            .validate()
+            .unwrap_err()
+            .contains("transport member is absent"));
+
+        let mut forged_genesis = config;
+        forged_genesis.authority_genesis_members[0].identity_public_key = "0".repeat(64);
+        assert!(forged_genesis
+            .validate()
+            .unwrap_err()
+            .contains("genesis identity"));
     }
 
     #[test]

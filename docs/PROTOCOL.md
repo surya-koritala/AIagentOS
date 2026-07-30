@@ -531,10 +531,12 @@ overlap using quorum-replicated time, never a workload node's local clock.
 With `[cluster_raft]` disabled, the compatibility authority retains its older
 single-node direct re-admission behavior and rejects the new rollout controls.
 This protocol coordinates application-listener leaves only. The OpenRaft voter
-subset can change by an exact durable generation inside the statically
-configured peer catalog, with learner catch-up and joint consensus. Adding or
-revoking catalog trust and rotating Raft peer certificates/CA roots remain
-separate pending work in #122.
+subset changes by an exact durable generation inside the current
+generation-fenced peer catalog, with learner catch-up and joint consensus.
+Separate transport-trust generations can add or remove non-voters and rotate
+Raft peer leaves/CA roots through a bounded continuity-preserving overlap.
+Immutable application genesis, complete challenged application membership, and
+the current transport subset remain exact separate startup inputs.
 
 ### Authority ownership lease registry
 
@@ -604,10 +606,17 @@ read/write forwarding, majority failover, restart recovery, and no-quorum
 rejection. With `[cluster_raft]` disabled, the designated single-node
 authority remains available for compatibility.
 
-The OpenRaft voter subset is generation-fenced inside a static transport trust
-catalog whose digest is persisted with every node record. Removing a voter
-retains it as a log-replicating learner and does not revoke that peer's
-configured mTLS/control trust. Destination proof installation is an
+The OpenRaft voter subset and transport trust use separate generation fences.
+The complete peer map, exact server/client leaf sets, accepted CA
+fingerprints, overlap expiration, and target digest are persisted with every
+node record. A trust generation can add learners or remove only non-voters;
+retained peers must preserve identity plus server/client leaf continuity and,
+after legacy generation zero, at least one CA root. Leaf/CA overlap expires on
+every fresh RPC and a later generation removes the retired credentials.
+Immutable genesis, complete current challenged application membership, and the
+transport subset are configured and checked separately. Removing only a voter
+retains it as a log-replicating
+learner and does not revoke that peer's mTLS/control trust. Destination proof installation is an
 authenticated system control operation rather than a self-contained authority signature, and
 creation/claim/fence publication is not one atomic cross-database transaction.
 There is no automatic migration, cluster-wide quota transaction,
@@ -646,8 +655,14 @@ also rejects empty or duplicate endpoints, server/client fingerprints, and
 identity keys. The current trusted member map cannot change merely by
 restarting the runtime: startup verifies its durable catalog digest and exact
 transport identities. Quorum-versioned voter changes are supported within that
-catalog; coordinated catalog/credential trust epochs are still required before
-this mode can be called a complete distributed kernel.
+catalog. Separate quorum-versioned transport-trust changes replace the complete
+catalog, preserve every voter, add/remove learners, and rotate exact leaves/CA
+roots through an expiring overlap with retained-peer continuity. Startup also
+requires an exact immutable application seed and complete durable application
+catalog before accepting a different transport subset. Delegated-principal authentication,
+migration, global policy/quota convergence, and external chaos/recovery
+qualification are still required before this mode is a complete distributed
+kernel.
 
 ## Conformance evidence
 

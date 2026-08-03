@@ -5714,6 +5714,35 @@ mod tests {
         target_runtime.shutdown().await.expect("shutdown target");
     }
 
+    /// Start a configured runtime, waiting out a listener left behind by an
+    /// earlier start in the same test.
+    ///
+    /// These tests deliberately reuse one address across bootstrap, restart,
+    /// and drift so the durable transport catalog stays byte-identical — the
+    /// address is part of what they assert on, so varying it would change what
+    /// the test proves. On Unix `SO_REUSEADDR` lets a closed listener's port be
+    /// rebound immediately. Windows does not: a rebind inside the previous
+    /// socket's `TIME_WAIT` window fails with `AddrInUse` (WSAEADDRINUSE),
+    /// which made this suite fail intermittently on the windows-latest runner.
+    /// Waiting for the OS to release the port keeps the address stable and the
+    /// assertions intact.
+    async fn start_runtime_awaiting_port_release(
+        context: Arc<SqliteContextManager>,
+        config: &ClusterRaftConfig,
+    ) -> io::Result<Option<ClusterRaftRuntime>> {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            match start_configured_cluster_runtime(Arc::clone(&context), config).await {
+                Err(error)
+                    if error.kind() == io::ErrorKind::AddrInUse && Instant::now() < deadline =>
+                {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                result => return result,
+            }
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn operator_runtime_bootstraps_restarts_and_rejects_membership_drift() {
         let _ = rustls::crypto::ring::default_provider().install_default();
@@ -5736,7 +5765,7 @@ mod tests {
             )
             .expect("open pristine database"),
         );
-        let error = start_configured_cluster_runtime(pristine_context.clone(), &no_bootstrap)
+        let error = start_runtime_awaiting_port_release(pristine_context.clone(), &no_bootstrap)
             .await
             .expect_err("pristine storage without bootstrap must fail");
         assert!(error.to_string().contains("storage is pristine"), "{error}");
@@ -5746,7 +5775,7 @@ mod tests {
             SqliteContextManager::new_without_storage_lease(&database)
                 .expect("open first database"),
         );
-        let first = start_configured_cluster_runtime(first_context.clone(), &config)
+        let first = start_runtime_awaiting_port_release(first_context.clone(), &config)
             .await
             .expect("bootstrap configured runtime")
             .expect("enabled runtime");
@@ -5777,10 +5806,11 @@ mod tests {
         let restart_context = Arc::new(
             SqliteContextManager::new_without_storage_lease(&database).expect("reopen database"),
         );
-        let restarted = start_configured_cluster_runtime(restart_context.clone(), &restart_config)
-            .await
-            .expect("restart exact configured runtime")
-            .expect("enabled runtime");
+        let restarted =
+            start_runtime_awaiting_port_release(restart_context.clone(), &restart_config)
+                .await
+                .expect("restart exact configured runtime")
+                .expect("enabled runtime");
         assert_eq!(
             inspect_durable_membership(
                 &restarted.metrics().borrow(),
@@ -5803,7 +5833,7 @@ mod tests {
             SqliteContextManager::new_without_storage_lease(&database)
                 .expect("reopen drift database"),
         );
-        let error = start_configured_cluster_runtime(drift_context, &drifted)
+        let error = start_runtime_awaiting_port_release(drift_context, &drifted)
             .await
             .expect_err("durable membership drift must fail startup");
         assert!(

@@ -10,6 +10,19 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
 
 ## [Unreleased]
 
+- Fixed an intermittent Windows failure in
+  `cluster_runtime::tests::operator_runtime_bootstraps_restarts_and_rejects_membership_drift`.
+  The test reuses one listen address across bootstrap, restart, and drift so the
+  durable transport catalog stays byte-identical, and rebinds it four times.
+  Unix `SO_REUSEADDR` permits rebinding a port whose previous socket is in
+  `TIME_WAIT`; Windows does not, so a restart following real Raft election
+  traffic could fail with `AddrInUse` (WSAEADDRINUSE) depending on timing — it
+  passed on one run and failed on the next against an identical tree. Restarts
+  now wait for the OS to release the port instead of varying the address, which
+  would have changed what the test asserts. The first bind was never affected: a
+  listener that has not accepted a connection closes without entering
+  `TIME_WAIT`, which is why only the restarts failed.
+
 - Cut the build footprint, which had no bound at all. The workspace defined no
   `[profile.*]` anywhere, so every build used Cargo's default `debug = true` —
   full DWARF for this crate *and* all ~200 dependencies, inherited by

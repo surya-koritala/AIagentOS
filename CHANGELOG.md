@@ -10,6 +10,91 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
 
 ## [Unreleased]
 
+- Cut the build footprint, which had no bound at all. The workspace defined no
+  `[profile.*]` anywhere, so every build used Cargo's default `debug = true` —
+  full DWARF for this crate *and* all ~200 dependencies, inherited by
+  `[profile.test]` — across ~47 separately linked units each statically
+  embedding SQLCipher and a vendored OpenSSL. A development session reached a
+  **533 GB** `target/` directory and filled a 926 GB disk. Dependencies now build
+  with no debug info and workspace crates with line tables only, measured at
+  **38.7% smaller** (1.93 GiB to 1.18 GiB for one lib build; larger for the
+  linked test binaries that dominate). Panics and `RUST_BACKTRACE` still give
+  exact file:line for workspace code. `split-debuginfo` and `strip` are
+  deliberately not set — on macOS `packed` would build a `.dSYM` per executable,
+  and `strip` destroys backtraces. `cargo llvm-cov` is unaffected, so the
+  coverage floor and per-subsystem floors are unchanged.
+- Stopped the GitHub Actions cache thrashing. The repository was holding 19
+  caches totalling 13 GiB against GitHub's 10 GiB per-repository ceiling, so
+  entries were evicted continuously and most jobs restored nothing. Every pull
+  request also minted a fresh ~1 GB key per job and evicted `main`'s warm set.
+  `ci.yml` now restores on every run but saves only on `main`, and the sixteen
+  `rust-cache` steps in scheduled, manual, and tag-triggered workflows are
+  restore-only. `ci.yml` also sets `CARGO_INCREMENTAL: 0`, matching `release.yml`
+  and `linux-cli-rc.yml` — incremental artifacts are never reused on an
+  ephemeral runner and only inflate the cache entry.
+- Removed `tokio-tungstenite`, which had zero references in any source file.
+- Added `target-a/` and `target-repro/` to `.gitignore` and `.dockerignore`. The
+  reproducible-build check in `release.yml` and `linux-cli-rc.yml` creates both,
+  and neither was ignored, so a contributor who ran it locally saw two
+  multi-gigabyte untracked trees in `git status`.
+- Documented the footprint and a prune cadence in CONTRIBUTING.md. Cargo never
+  garbage-collects superseded artifact generations, and `cargo clean` does not
+  reach `fuzz/target` — that retention, not per-set size, is what turns a large
+  `target/` into a full disk.
+- Gated the Wasm module system behind an off-by-default `wasm` feature on
+  `kernel`, so no shipped binary links wasmtime or Cranelift. `WasmModuleSystem`
+  has no production caller and the module is already deferred from v1, yet
+  wasmtime was an unconditional dependency: the default `kernel` dependency
+  graph drops from 274 crates to 195 — 79 removed, including all of Cranelift.
+  It also removes a dead-code dependency from the advisory surface;
+  RUSTSEC-2026-0222 and -0223 were both against wasmtime.
+  **Breaking for library consumers:** `kernel::modules::ResourceRequirements`
+  moved to `kernel::models::ResourceRequirements` (it was the only thing forcing
+  an ungated module to depend on the gated one), and `kernel::modules` is
+  unavailable without `--features wasm`. The crate is not published, so no
+  released artifact is affected. `ROADMAP.md` framed this as a follow-up
+  requiring structural work; it was one four-field struct. CI now exercises the
+  module system explicitly under the feature, since the default
+  `cargo test --workspace` no longer compiles it.
+  Relates #128.
+- Made the capability registry honest about Windows. Owner-only permission
+  enforcement, open-time symlink rejection, and directory-entry durability are
+  implemented on Unix only — the helpers in `storage.rs`,
+  `storage_encryption.rs`, and `remote_backup.rs` return `Ok(())` on Windows —
+  and every regression proving them is `#[cfg(unix)]`, so the passing
+  `windows-latest` leg was compiled-out behavior rather than Windows evidence.
+  `durable-state`, `resource-providers`, and `distributed-control-plane` still
+  declared Windows with no such caveat. Each now carries an explicit
+  platform-scope limitation, `sandbox-isolation`'s one-sentence Unix aside is
+  expanded to cover managed-workspace hardening, and the registry header now
+  defines `platforms` as where a capability is built and run rather than a claim
+  that every guarantee holds on each one. `docs/DURABILITY.md` gains a matching
+  Platform scope section, and its claim that the storage key loader rejects a
+  symlinked key file is corrected — that comes from `O_NOFOLLOW`, which Windows
+  does not have. No behavior changed; the claims now match the code.
+  Relates #122, #123, #124, and #127.
+- Stopped a panic under the shared SQLite connection guard from permanently
+  bricking the kernel. Every durable subsystem shares one `Mutex<Connection>`,
+  and the panic is reachable on the live path because `query_memory` calls the
+  pluggable `Arc<dyn Embedder>` while holding the guard. Sixty `lock().unwrap()`
+  sites in `context.rs` panicked on a poisoned mutex and the remaining sites
+  returned "mutex is poisoned" for the rest of the process lifetime. All of them
+  now go through `SqliteContextManager::locked_conn`, which takes the inner
+  guard and *clears* the poison flag, so the error-returning sites recover too;
+  the eleven quota-path sites that fed `RateLimiter::poison` are included, which
+  removes a permanent `healthy = false` latch. Recovery is sound because every
+  write path uses an RAII transaction that rolls back while unwinding. A
+  regression panics with an open transaction under the guard and proves the
+  store stays queryable, the aborted write rolled back, and the flag cleared.
+  Relates #123.
+- Stopped the online backup pacing itself while holding the writer mutex.
+  `run_to_completion` sleeps between steps, so a 64-page step size spent roughly
+  eight seconds asleep on a 1 GiB database — with the single connection mutex
+  held, which every Tokio worker blocks on synchronously. The pacing existed to
+  yield to concurrent writers who were locked out by that same mutex, so it
+  bought nothing. The copy now runs in one step; the pause remains only as
+  backoff on the `Busy`/`Locked` retry path.
+  Relates #123 and #125.
 - Restored blocking CI and separated capability governance from build evidence.
   `operator-clients` is still below production-qualified but its tracking issue
   #126 was auto-closed by PR #292, so the ownership gate failed and, because it

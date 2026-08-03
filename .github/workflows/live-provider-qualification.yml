@@ -86,6 +86,9 @@ jobs:
         with:
           toolchain: 1.97.1
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          # Off the PR critical path; restore only, never consume cache budget.
+          save-if: false
       - name: Run every adapter fixture and typed-error contract
         run: cargo test -p adapters --all-features --locked
 
@@ -112,6 +115,9 @@ jobs:
         with:
           toolchain: 1.97.1
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          # Off the PR critical path; restore only, never consume cache budget.
+          save-if: false
       - name: Execute one governed live turn
         run: >-
           timeout 5m cargo run --locked -p adapters

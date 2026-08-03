@@ -2478,8 +2478,17 @@ impl SqliteContextManager {
                 let backup = rusqlite::backup::Backup::new(&connection, &mut destination).map_err(
                     |error| storage_error(format!("failed to initialize SQLite backup: {error}")),
                 )?;
+                // Copy every page in one step. `run_to_completion` sleeps
+                // `pause_between_pages` after each non-`Done` step, so the
+                // previous 64-page step size spent ~2ms sleeping per 64 pages —
+                // about 8 seconds of pure sleep for a 1 GiB database — while
+                // holding the single writer mutex that every Tokio worker
+                // blocks on. The pacing existed to yield to concurrent writers,
+                // but they are locked out by that same mutex, so it bought
+                // nothing. `Done` never sleeps; the pause now only backs off the
+                // `Busy`/`Locked` retry path.
                 backup
-                    .run_to_completion(64, Duration::from_millis(2), None)
+                    .run_to_completion(i32::MAX, Duration::from_millis(2), None)
                     .map_err(|error| {
                         storage_error(format!("SQLite online backup failed: {error}"))
                     })?;

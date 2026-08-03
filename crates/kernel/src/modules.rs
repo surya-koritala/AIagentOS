@@ -11,6 +11,7 @@ use std::sync::Mutex;
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 
+use crate::models::ResourceRequirements;
 use crate::permissions::PermissionRule;
 use crate::{ModuleError, ModuleId};
 
@@ -22,15 +23,6 @@ pub enum ModuleStatus {
     Active,
     Error(String),
     Disabled,
-}
-
-/// Resource requirements declared by a module.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ResourceRequirements {
-    pub max_memory_bytes: Option<u64>,
-    pub max_cpu_time_ms: Option<u64>,
-    pub network_access: bool,
-    pub filesystem_access: Vec<String>,
 }
 
 /// Module manifest parsed from TOML.

@@ -35,6 +35,9 @@ jobs:
         with:
           toolchain: 1.97.1
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          # Off the PR critical path; restore only, never consume cache budget.
+          save-if: false
       - name: Reject any unexpected governance result
         run: cargo run --release --locked --package os-benchmark --bin governance-demo
 
@@ -92,6 +95,9 @@ jobs:
         with:
           toolchain: 1.97.1
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          # Off the PR critical path; restore only, never consume cache budget.
+          save-if: false
       - name: Install Linux desktop bundling prerequisites
         if: runner.os == 'Linux'
         run: >-
@@ -180,6 +186,9 @@ jobs:
           toolchain: 1.97.1
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          # Off the PR critical path; restore only, never consume cache budget.
+          save-if: false
       - name: Set deterministic build inputs
         run: |
           echo "SOURCE_DATE_EPOCH=$(git show -s --format=%ct HEAD)" >> "$GITHUB_ENV"

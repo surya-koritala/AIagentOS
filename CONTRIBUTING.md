@@ -31,6 +31,30 @@ cargo test --package kernel    # Test specific crate
 ./scripts/ci-local.sh          # Reproduce host-compatible release gates
 ```
 
+### Build footprint
+
+`target/` grows fast here and **Cargo never garbage-collects it**. Every distinct
+flag combination writes its own complete artifact set — `cargo test`,
+`cargo clippy --all-targets`, `--all-features`, and each feature selection are
+all separate — and bumping a large dependency strands the entire previous set
+rather than replacing it. About 200 crates are statically linked into each of
+~47 separately linked units, so one set is multiple GB and they accumulate
+silently. A long session that never prunes can reach hundreds of GB.
+
+The root `Cargo.toml` already drops debug info for dependencies, which cuts each
+set by roughly 40%. Retention is the other half, and it is on you:
+
+```bash
+cargo clean                    # after switching feature sets or bumping a big dep
+rm -rf fuzz/target             # a separate tree; `cargo clean` never reaches it
+rm -rf target/llvm-cov-target  # only exists if you ran coverage locally
+cargo install cargo-sweep && cargo sweep -t 7   # prune generations older than 7 days
+```
+
+Prefer `cargo test -p <crate>` over `cargo test --workspace` while iterating, and
+avoid `--all-features` locally — it resolves a much larger graph (candle,
+chromiumoxide) that no default build needs.
+
 ### Project Structure
 
 ```

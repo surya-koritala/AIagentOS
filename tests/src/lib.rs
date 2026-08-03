@@ -39,7 +39,7 @@ mod sandbox_surfaces;
 #[cfg(test)]
 mod connector_props;
 
-#[cfg(test)]
+#[cfg(all(test, feature = "wasm"))]
 mod module_props;
 
 #[cfg(test)]

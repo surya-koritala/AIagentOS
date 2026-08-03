@@ -9,6 +9,9 @@ rust-version.workspace = true
 name = "integration_tests"
 path = "src/lib.rs"
 
+[features]
+wasm = ["kernel/wasm"]
+
 [dependencies]
 kernel = { path = "../crates/kernel", version = "=0.4.0-rc.1" }
 agent-sdk = { path = "../crates/sdk", version = "=0.4.0-rc.1" }

@@ -1,6 +1,8 @@
 # Build artifacts
 /target/
 **/target/
+/target-a/
+/target-repro/
 __pycache__/
 *.py[cod]
 

@@ -45,3 +45,5 @@ Thumbs.db
 # (they are part of the source tree and cheap to send). The CLI's
 # project_context() does an optional read of README.md / Cargo.toml from its
 # CWD; this just degrades gracefully if absent, so it is not load-bearing.
+target-a/
+target-repro/

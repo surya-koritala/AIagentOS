@@ -10,6 +10,37 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
 
 ## [Unreleased]
 
+- Cut the build footprint, which had no bound at all. The workspace defined no
+  `[profile.*]` anywhere, so every build used Cargo's default `debug = true` —
+  full DWARF for this crate *and* all ~200 dependencies, inherited by
+  `[profile.test]` — across ~47 separately linked units each statically
+  embedding SQLCipher and a vendored OpenSSL. A development session reached a
+  **533 GB** `target/` directory and filled a 926 GB disk. Dependencies now build
+  with no debug info and workspace crates with line tables only, measured at
+  **38.7% smaller** (1.93 GiB to 1.18 GiB for one lib build; larger for the
+  linked test binaries that dominate). Panics and `RUST_BACKTRACE` still give
+  exact file:line for workspace code. `split-debuginfo` and `strip` are
+  deliberately not set — on macOS `packed` would build a `.dSYM` per executable,
+  and `strip` destroys backtraces. `cargo llvm-cov` is unaffected, so the
+  coverage floor and per-subsystem floors are unchanged.
+- Stopped the GitHub Actions cache thrashing. The repository was holding 19
+  caches totalling 13 GiB against GitHub's 10 GiB per-repository ceiling, so
+  entries were evicted continuously and most jobs restored nothing. Every pull
+  request also minted a fresh ~1 GB key per job and evicted `main`'s warm set.
+  `ci.yml` now restores on every run but saves only on `main`, and the sixteen
+  `rust-cache` steps in scheduled, manual, and tag-triggered workflows are
+  restore-only. `ci.yml` also sets `CARGO_INCREMENTAL: 0`, matching `release.yml`
+  and `linux-cli-rc.yml` — incremental artifacts are never reused on an
+  ephemeral runner and only inflate the cache entry.
+- Removed `tokio-tungstenite`, which had zero references in any source file.
+- Added `target-a/` and `target-repro/` to `.gitignore` and `.dockerignore`. The
+  reproducible-build check in `release.yml` and `linux-cli-rc.yml` creates both,
+  and neither was ignored, so a contributor who ran it locally saw two
+  multi-gigabyte untracked trees in `git status`.
+- Documented the footprint and a prune cadence in CONTRIBUTING.md. Cargo never
+  garbage-collects superseded artifact generations, and `cargo clean` does not
+  reach `fuzz/target` — that retention, not per-set size, is what turns a large
+  `target/` into a full disk.
 - Gated the Wasm module system behind an off-by-default `wasm` feature on
   `kernel`, so no shipped binary links wasmtime or Cranelift. `WasmModuleSystem`
   has no production caller and the module is already deferred from v1, yet

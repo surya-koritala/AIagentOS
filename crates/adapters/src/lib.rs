@@ -185,7 +185,11 @@ pub(crate) fn transport_error(provider: &str, error: reqwest::Error) -> kernel::
     if error.is_timeout() {
         kernel::ConnectorError::timeout(provider.into(), "provider transport timed out", None)
     } else {
-        kernel::ConnectorError::ConnectionFailed(error.to_string())
+        // `reqwest::Error` renders the request URL into its `Display`. Adapters
+        // must keep credentials out of URLs, but this strips the URL regardless
+        // so a future query-string credential cannot leak through an error that
+        // reaches logs, the CLI, or a wire client.
+        kernel::ConnectorError::ConnectionFailed(error.without_url().to_string())
     }
 }
 

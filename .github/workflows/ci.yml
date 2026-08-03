@@ -40,35 +40,6 @@ jobs:
         run: python -m unittest discover -s scripts/tests -p "test_*.py"
       - name: Prometheus alert syntax, firing, hold, and recovery regressions
         run: scripts/run_promtool_tests.sh
-      - name: Below-production retained capabilities have open qualification work
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          awk -F ' = ' '
-            function clean(value) { gsub(/"/, "", value); return value }
-            function emit() {
-              if (seen && maturity != "production-qualified" && disposition != "excluded-from-v1") {
-                if (qualification != "") print qualification
-                else print tracking
-              }
-            }
-            /^\[\[capability\]\]/ {
-              emit()
-              seen=1
-              maturity=""
-              tracking=""
-              qualification=""
-              disposition="retained"
-              next
-            }
-            /^maturity = / { maturity=clean($2) }
-            /^tracking_issue = / { tracking=$2 }
-            /^qualification_issue = / { qualification=$2 }
-            /^v1_disposition = / { disposition=clean($2) }
-            END { emit() }
-          ' docs/capabilities.toml | while read -r issue; do
-            test "$(gh issue view "$issue" --json state --jq .state)" = "OPEN"
-          done
       - name: Documentation tests
         run: cargo test --workspace --exclude tauri-app --doc --locked
       - name: Rustdoc warnings are errors
@@ -83,9 +54,61 @@ jobs:
       - name: All-feature compilation
         run: cargo build --workspace --exclude tauri-app --all-features --locked
 
+  capability-governance:
+    name: Capability qualification ownership
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Below-production retained capabilities have open qualification work
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          awk -F ' = ' '
+            function clean(value) { gsub(/"/, "", value); return value }
+            function emit() {
+              if (seen && maturity != "production-qualified" && disposition != "excluded-from-v1") {
+                if (qualification != "") print id "\t" qualification
+                else print id "\t" tracking
+              }
+            }
+            /^\[\[capability\]\]/ {
+              emit()
+              seen=1
+              id=""
+              maturity=""
+              tracking=""
+              qualification=""
+              disposition="retained"
+              next
+            }
+            /^id = / { id=clean($2) }
+            /^maturity = / { maturity=clean($2) }
+            /^tracking_issue = / { tracking=$2 }
+            /^qualification_issue = / { qualification=$2 }
+            /^v1_disposition = / { disposition=clean($2) }
+            END { emit() }
+          ' docs/capabilities.toml > capability-owners.tsv
+          test -s capability-owners.tsv
+          failures=0
+          while IFS="$(printf '\t')" read -r id issue; do
+            state="$(gh issue view "$issue" --json state --jq .state 2>/dev/null || true)"
+            case "$state" in
+              OPEN) ;;
+              CLOSED)
+                echo "::error title=Capability has no open qualification owner::'$id' is below production-qualified but its owning issue #$issue is CLOSED. Add 'qualification_issue = <open issue>', promote the capability, or set v1_disposition = \"excluded-from-v1\"."
+                failures=1
+                ;;
+              *)
+                echo "::error title=Capability ownership could not be resolved::'$id' references issue #$issue but the GitHub API returned no state. This is an infrastructure failure, not a governance verdict."
+                failures=1
+                ;;
+            esac
+          done < capability-owners.tsv
+          exit "$failures"
+
   rust-platforms:
     name: Rust tests (${{ matrix.os }})
-    needs: quality
     strategy:
       fail-fast: false
       matrix:
@@ -102,7 +125,7 @@ jobs:
 
   desktop-platforms:
     name: Desktop Rust warnings (${{ matrix.os }})
-    needs: [quality, frontend]
+    needs: frontend
     strategy:
       fail-fast: false
       matrix:
@@ -316,6 +339,7 @@ jobs:
     if: always()
     needs:
       - quality
+      - capability-governance
       - rust-platforms
       - desktop-platforms
       - frontend

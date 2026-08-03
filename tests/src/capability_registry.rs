@@ -2021,6 +2021,7 @@ fn release_blocking_workflows_keep_their_security_contract() {
     }
     for required_job in [
         "- quality",
+        "- capability-governance",
         "- rust-platforms",
         "- desktop-platforms",
         "- frontend",
@@ -2033,6 +2034,27 @@ fn release_blocking_workflows_keep_their_security_contract() {
             "required release gate lost {required_job}"
         );
     }
+
+    // Capability-ownership governance queries the live GitHub issue API, so it
+    // must never gate the jobs that produce compile and cross-platform test
+    // evidence: a closed tracking issue (or a transient API failure) previously
+    // skipped the whole macOS/Windows matrix and left a release candidate with
+    // no platform evidence at all.
+    assert!(
+        ci.contains("  capability-governance:\n"),
+        "capability-ownership governance must stay an independent job"
+    );
+    let platform_matrix = ci
+        .split_once("  rust-platforms:\n")
+        .expect("blocking CI must retain the rust-platforms matrix")
+        .1
+        .split_once("  desktop-platforms:")
+        .expect("blocking CI must retain the desktop-platforms matrix")
+        .0;
+    assert!(
+        !platform_matrix.contains("needs:"),
+        "the cross-platform test matrix must not depend on any other job"
+    );
     for command in [
         "cargo fmt --all -- --check",
         "cargo clippy --workspace --exclude tauri-app --all-targets -- -D warnings",

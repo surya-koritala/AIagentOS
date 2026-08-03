@@ -1511,8 +1511,12 @@ impl Config {
         let content = toml::to_string_pretty(self).map_err(std::io::Error::other)?;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
+            // Best effort: an operator-owned directory we cannot chmod must not
+            // turn a successful save into a failure. The file mode below is the
+            // load-bearing control.
+            let _ = set_owner_only_directory(parent);
         }
-        std::fs::write(path, content)
+        write_owner_only(path, content.as_bytes())
     }
 
     /// Get API key for a provider.
@@ -1524,6 +1528,47 @@ impl Config {
     pub fn set_api_key(&mut self, provider: &str, key: String) {
         self.api_keys.insert(provider.to_string(), key);
     }
+}
+
+/// Write `contents` to `path` so only the owner can read it.
+///
+/// The configuration file carries cleartext provider API keys, so it gets the
+/// same owner-only treatment as every other secret file in the tree. The mode
+/// is applied at create time so a new key is never briefly world-readable, and
+/// reapplied afterwards so a file left at the default umask by an older build
+/// is repaired on the next save.
+///
+/// Windows has no mode bits; the durable-state Windows permission gap is
+/// tracked separately and is not narrowed here.
+#[cfg(unix)]
+fn write_owner_only(path: &Path, contents: &[u8]) -> Result<(), std::io::Error> {
+    use std::io::Write;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)?;
+    file.write_all(contents)?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+}
+
+#[cfg(not(unix))]
+fn write_owner_only(path: &Path, contents: &[u8]) -> Result<(), std::io::Error> {
+    std::fs::write(path, contents)
+}
+
+#[cfg(unix)]
+fn set_owner_only_directory(path: &Path) -> Result<(), std::io::Error> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+}
+
+#[cfg(not(unix))]
+fn set_owner_only_directory(_path: &Path) -> Result<(), std::io::Error> {
+    Ok(())
 }
 
 /// Get the platform-appropriate config directory.
@@ -1829,6 +1874,46 @@ mod tests {
         let loaded = Config::load_from(&path);
         assert_eq!(loaded.get_api_key("openai"), Some("sk-test-123"));
         assert!(loaded.setup_complete);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The saved configuration holds cleartext provider API keys, so it must
+    /// never be readable by other local users. A pre-existing file left at the
+    /// default umask by an older build is repaired rather than preserved.
+    #[cfg(unix)]
+    #[test]
+    fn saved_config_is_owner_only_and_repairs_permissive_existing_files() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("cfg_perm_{}", uuid::Uuid::new_v4()));
+        let path = dir.join("config.toml");
+
+        let mut cfg = Config::default();
+        cfg.set_api_key("openai", "sk-secret".to_string());
+        cfg.save_to(&path).unwrap();
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "new config must be owner-only, got {mode:o}");
+        let dir_mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            dir_mode, 0o700,
+            "config directory must be owner-only, got {dir_mode:o}"
+        );
+
+        // A world-readable file from an earlier release is tightened on save.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        cfg.save_to(&path).unwrap();
+        let repaired = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            repaired, 0o600,
+            "existing permissive config must be repaired, got {repaired:o}"
+        );
+        assert_eq!(
+            Config::load_from(&path).get_api_key("openai"),
+            Some("sk-secret"),
+            "tightening permissions must not corrupt the contents"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }

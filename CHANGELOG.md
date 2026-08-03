@@ -10,6 +10,53 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
 
 ## [Unreleased]
 
+- Implemented native tool calling in the Ollama adapter, which previously bound
+  `_tools` and hardcoded an empty `tool_calls`. Because `connector.rs`
+  deliberately exempts the *primary* provider from the tool-compatibility guard
+  that protects failover targets, selecting `llm_provider = "local"` silently
+  degraded the whole think-act-observe loop: tool definitions were discarded and
+  the executor could only recover whatever tool intent the model happened to
+  emit as text. Requests now carry `tools`, `message.tool_calls` is parsed
+  (object arguments natively, JSON-string arguments for OpenAI-shaped
+  gateways), assistant tool-call turns survive the round trip, and the adapter
+  advertises `tool_calls`/`parallel_tool_calls` honestly so failover eligibility
+  is correct.
+  A model whose template lacks tool support is **not** broken by this. The
+  executor sends the agent's entire tool set on every turn, so naively attaching
+  `tools` would have made every turn fail with Ollama's
+  `does not support tools` 400 — for gemma2, phi3, and older mistral that means
+  total loss of function, not just loss of tool use. Such a rejection is now
+  retried once without tool definitions and logged. An unrelated 400 still
+  surfaces unchanged.
+  Registration also warns at boot when the selected primary provider declares no
+  tool support, so the remaining degraded configurations are visible instead of
+  inferred from bad answers.
+  Relates #120.
+- Removed 14 kernel modules with zero references anywhere in the workspace:
+  `agent_hub`, `agent_syscalls`, `agentpkg`, `agentps`, `delegation`,
+  `event_loop`, `github`, `linux_compat`, `marketplace`, `mount_table`, `shell`,
+  `syscall_interface`, `tool_descriptors`, and `voice` — 3,661 lines that
+  compiled into every binary and were reachable from nothing. Several were
+  listed as `kernel_modules` of production-qualified capabilities, so the
+  registry claimed they implemented shipped behavior; those entries now name
+  only the modules that are actually live. `mcp` was left in place because the
+  registry cites it as evidence for the `tool-governance` capability, which is a
+  separate decision. Workspace line coverage is 83.10% against a 60% floor, so
+  removing well-tested dead code stays far clear of the gate.
+  Relates #116, #117, #118, #119, and #128.
+- Made a panicking kernel background loop observable. `KernelRuntime` spawns the
+  scheduler observer, turn watchdog, service supervisor, and backup maintenance
+  and then drops their `JoinHandle`s, so a panic ended the task with nobody
+  watching: `running`/`generation` stay set, a later `start()` is a no-op, and
+  restart policy or turn-timeout enforcement was silently dead for the rest of
+  the process. Each loop now runs under a supervisor that counts the panic,
+  names the subsystem in a log line, and exports
+  `agentos_background_task_panics_total` so an alert can fire. The loop is not
+  restarted — resuming a half-completed sweep is not obviously safe for all four
+  — the point is that the failure stops being invisible. A source-level
+  regression keeps every future loop supervised.
+  Relates #125.
+
 - Fixed an intermittent Windows failure in
   `cluster_runtime::tests::operator_runtime_bootstraps_restarts_and_rejects_membership_drift`.
   The test reuses one listen address across bootstrap, restart, and drift so the

@@ -286,6 +286,8 @@ mod vllm_tests;
 
 #[cfg(test)]
 mod huggingface_tests;
+#[cfg(test)]
+mod local_tests;
 
 #[cfg(test)]
 mod output_bound_tests;

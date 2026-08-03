@@ -262,6 +262,8 @@ pub struct MetricsSnapshot {
     pub service_failed: u64,
     pub service_restarts_total: u64,
     pub service_dependency_blocks_total: u64,
+    /// Kernel background loops ended by a panic in this process.
+    pub background_task_panics_total: u64,
     /// System-wide tokens consumed (sum across agents).
     pub tokens_consumed: u64,
     /// System-wide LLM api calls made (sum across agents).
@@ -384,6 +386,9 @@ impl MetricsSnapshot {
             service_failed: services.failed,
             service_restarts_total: services.restarts_total,
             service_dependency_blocks_total: services.dependency_blocks_total,
+            background_task_panics_total: kernel
+                .background_task_panics
+                .load(std::sync::atomic::Ordering::Relaxed),
             tokens_consumed: sys.tokens_consumed,
             api_calls_made: sys.api_calls_made,
             uptime_seconds: process_start().elapsed().as_secs(),
@@ -550,6 +555,14 @@ impl MetricsSnapshot {
         out.push_str(&format!(
             "agentos_service_dependency_blocks_total {}\n",
             self.service_dependency_blocks_total
+        ));
+        out.push_str(
+            "# HELP agentos_background_task_panics_total Kernel background loops ended by a panic in this process.\n",
+        );
+        out.push_str("# TYPE agentos_background_task_panics_total counter\n");
+        out.push_str(&format!(
+            "agentos_background_task_panics_total {}\n",
+            self.background_task_panics_total
         ));
 
         out.push_str("# HELP agentos_turn_admission Turn admission slots by state.\n");
@@ -1028,6 +1041,7 @@ mod tests {
             service_failed: 1,
             service_restarts_total: 5,
             service_dependency_blocks_total: 2,
+            background_task_panics_total: 0,
             tokens_consumed: 1234,
             api_calls_made: 12,
             uptime_seconds: 99,

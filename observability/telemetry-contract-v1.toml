@@ -328,3 +328,9 @@ name = "agentos_process_uptime_seconds"
 type = "gauge"
 unit = "seconds"
 labels = []
+
+[[metric]]
+name = "agentos_background_task_panics_total"
+type = "counter"
+unit = "panics"
+labels = []

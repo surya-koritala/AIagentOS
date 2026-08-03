@@ -4,7 +4,7 @@
 mod tests {
     use crate::gemini::GeminiAdapter;
     use kernel::connector::*;
-    use wiremock::matchers::{body_partial_json, method, path};
+    use wiremock::matchers::{body_partial_json, header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     #[tokio::test]
@@ -118,5 +118,72 @@ mod tests {
             error,
             kernel::ConnectorError::ServiceUnavailable(_)
         ));
+    }
+
+    /// The credential must travel in a header. Gemini also accepts `?key=`, but
+    /// `reqwest::Error` renders the request URL into its `Display`, so a key in
+    /// the query string reaches error text, logs, and wire clients verbatim.
+    #[tokio::test]
+    async fn gemini_sends_the_key_as_a_header_and_never_in_the_url() {
+        let mock_server = MockServer::start().await;
+        let response_body = serde_json::json!({
+            "candidates": [{
+                "content": {"role": "model", "parts": [{"text": "ok"}]},
+                "finishReason": "STOP"
+            }],
+            "usageMetadata": {"totalTokenCount": 1}
+        });
+
+        Mock::given(method("POST"))
+            .and(path("/v1beta/models/gemini-1.5-flash:generateContent"))
+            .and(header("x-goog-api-key", "super-secret-key"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&response_body))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let adapter =
+            GeminiAdapter::new("super-secret-key".to_string()).with_base_url(mock_server.uri());
+        let session = adapter.create_session().await.unwrap();
+        session
+            .send(vec![StandardMessage::user("Hi")])
+            .await
+            .unwrap();
+
+        let requests = mock_server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1, "expected exactly one provider request");
+        let url = requests[0].url.to_string();
+        assert!(
+            !url.contains("super-secret-key") && !url.contains("key="),
+            "the API key must never appear in the request URL: {url}"
+        );
+    }
+
+    /// A transport failure must not carry the destination URL, which is the one
+    /// field the adapter error path does not redact.
+    #[tokio::test]
+    async fn gemini_transport_failure_reveals_no_url_or_credential() {
+        let mock_server = MockServer::start().await;
+        let base_url = mock_server.uri();
+        // Stopping the server turns the next request into a connection failure.
+        drop(mock_server);
+
+        let adapter =
+            GeminiAdapter::new("super-secret-key".to_string()).with_base_url(base_url.clone());
+        let session = adapter.create_session().await.unwrap();
+        let error = session
+            .send(vec![StandardMessage::user("Hi")])
+            .await
+            .unwrap_err();
+
+        let rendered = error.to_string();
+        assert!(
+            !rendered.contains("super-secret-key"),
+            "transport error leaked the credential: {rendered}"
+        );
+        assert!(
+            !rendered.contains(&base_url) && !rendered.contains("http"),
+            "transport error leaked the destination URL: {rendered}"
+        );
     }
 }

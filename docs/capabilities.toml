@@ -386,6 +386,7 @@ owner = "ux"
 maturity = "integrated"
 release = "v0.9"
 tracking_issue = 126
+qualification_issue = 127
 kernel_modules = []
 source_paths = ["crates/cli", "crates/sdk/src/lib.rs", "crates/tui", "crates/tauri-app", "docs/ACCESSIBILITY.md", "docs/DESKTOP_DISTRIBUTION.md", "docs/LINUX_CLI_RC.md", "scripts/verify_desktop_release.py", "scripts/build_desktop_update_manifest.py", "scripts/linux_cli_rc_qualification.py", ".github/workflows/release.yml", ".github/workflows/linux-cli-rc.yml"]
 public_entry_points = ["crates/cli/src/main.rs", "crates/tui/src/main.rs", "crates/tauri-app/src/main.rs"]
@@ -410,6 +411,8 @@ test_evidence = [
   "crates/tui/src/app.rs::tests::package_mutations_freeze_version_digest_and_require_exact_target",
   "crates/kernel/src/package.rs::tests::exact_package_mutations_reject_a_concurrently_changed_artifact",
   "crates/cli/tests/storage_commands.rs::erasure_commands_require_confirmation_and_use_live_operator_api",
+  "crates/cli/tests/help_commands.rs::shipped_operator_binaries_print_help_without_side_effects",
+  "crates/cli/tests/help_commands.rs::shipped_operator_binaries_reject_unknown_options_before_doing_work",
   "crates/sdk/tests/kernel_client.rs",
   "crates/sdk/tests/reconnect.rs::reconnect_replays_reads_but_never_package_lifecycle_or_tool_mutations",
   "crates/sdk/src/lib.rs::tls_tests::secure_profile_verifies_tls_and_supports_auth_refresh",

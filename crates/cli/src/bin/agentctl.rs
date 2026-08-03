@@ -6,9 +6,9 @@ use std::time::Duration;
 use agent_cli::{policy, OperatorClient};
 use agent_sdk::ConnectionProfile;
 
-fn usage() -> ! {
-    eprintln!(
-        "usage: agentctl [--addr HOST:PORT] [--token TOKEN] \
+/// Canonical `agentctl` usage text, shared by the usage-error and
+/// explicit-help paths so the two can never drift apart.
+const USAGE: &str = "usage: agentctl [--addr HOST:PORT] [--token TOKEN] \
          <create|list|inspect|message|stream|cancel|checkpoints|checkpoint-resume|checkpoint-delete|capabilities|providers|metrics|protocol|policy-validate|policy-explain|gate-stats|node-control-audit|cluster-membership-audit|cluster-certificate-rollout-audit|package-trust-key|package-revoke-key|package-publish|package-yank|package-fetch|package-search|package-install|package-rollback|package-remove|packages|package-run|pressure|tunables|tunable-set|tunable-rollback|tunable-history|status|pause|resume|stop|kill|wait|services|service-start|service-stop|service-restart|service-reload|service-history|backup-create|backup-retention|backup-status|data-inventory|backup-key-generate|backup-anchor-create|backup-verify|backup-restore|backup-disaster-recover|backup-corruption-recover|backup-remote-publish|backup-remote-fetch|storage-key-generate|storage-encrypt|storage-encrypt-recover|storage-key-rotate|storage-portable-export|storage-portable-verify|storage-portable-import|erase-agent|erase-user|erase-tenant> [ARGS...]\n\
          \n\
          public runtime commands:\n\
@@ -70,9 +70,20 @@ fn usage() -> ! {
            agentctl [SERVER OPTIONS] kill AGENT_ID --confirm AGENT_ID\n\
            agentctl [SERVER OPTIONS] erase-agent AGENT_ID --confirm AGENT_ID\n\
            agentctl [SERVER OPTIONS] erase-user USER_ID --confirm USER_ID\n\
-           agentctl [SERVER OPTIONS] erase-tenant TENANT_ID --confirm TENANT_ID"
-    );
+           agentctl [SERVER OPTIONS] erase-tenant TENANT_ID --confirm TENANT_ID";
+
+/// Usage error. Diagnostics go to stderr with a non-zero exit so a mistyped
+/// command can never be mistaken for success by a script.
+fn usage() -> ! {
+    eprintln!("{USAGE}");
     std::process::exit(2);
+}
+
+/// Explicit `--help`. The same text on stdout with a zero exit, so it pipes
+/// cleanly and does not read as a failure.
+fn help() -> ! {
+    println!("{USAGE}");
+    std::process::exit(0);
 }
 
 #[derive(Default)]
@@ -262,6 +273,15 @@ async fn main() {
         println!("agentctl {}", env!("CARGO_PKG_VERSION"));
         return;
     }
+    // Help must be answered before the connection profile is resolved. Reaching
+    // `OperatorClient::connect_profile` first made `agentctl --help` fail with a
+    // transport error against a server the caller never asked to reach.
+    if argv[1..]
+        .iter()
+        .any(|argument| matches!(argument.as_str(), "--help" | "-h" | "help"))
+    {
+        help();
+    }
 
     let mut args = argv.into_iter().skip(1).peekable();
     let mut address_override = None;
@@ -276,6 +296,15 @@ async fn main() {
     }
 
     let command = args.next().unwrap_or_else(|| usage());
+
+    // No command begins with `-`, so an option in command position is always a
+    // usage error. Rejecting it here keeps unknown flags from being carried all
+    // the way to `connect_profile`, which would report a transport failure for
+    // what is really a typo.
+    if command.starts_with('-') {
+        eprintln!("agentctl: unrecognized option '{command}'\n");
+        usage();
+    }
 
     // Policy authoring, verification, and restore operate directly on local
     // files and must not depend on a live connection profile. Restore remains

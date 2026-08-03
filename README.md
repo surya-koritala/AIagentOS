@@ -183,7 +183,7 @@ cargo run -p agent-cli --bin agentctl --locked -- \
 Search, fetch, list, upgrade, rollback, yank, remove, and key revocation are
 also exposed. Fetch refuses to overwrite an existing output file. Revocation,
 yanking, rollback, and removal require `--confirm` plus the exact target; run
-`agentctl` without a command for the full usage contract.
+`agentctl --help` for the full usage contract.
 
 ### Validate policy and inspect system audits
 

@@ -4075,6 +4075,26 @@ mod tests {
             .to_string()
             .contains("clock moved"));
 
+        // Retirement carries the same destination-owner guard as installation.
+        // Without it a fence installed here could be retired while naming a
+        // foreign owner, and the local-only path (no replicated authority
+        // configured) has no quorum check to fall back on.
+        assert!(control
+            .retire_agent_mutation_fence(
+                &agent_id,
+                &cluster_id,
+                &foreign_node,
+                3,
+                11,
+                6,
+                proof_expires_at,
+                "system",
+                "foreign destination retire",
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("destination node"));
+
         let retired = control
             .retire_agent_mutation_fence(
                 &agent_id,

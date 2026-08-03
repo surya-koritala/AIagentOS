@@ -654,8 +654,26 @@ fn validate_tcp_security(
 /// anything else, then closes the connection (no keep-alive). This is enough
 /// for a scraper, avoids pulling in an HTTP framework, and shares the same
 /// kernel `Arc` so the numbers are always current.
+/// Concurrent metrics connections held in flight. Scrapes are short-lived and
+/// serial per scraper, so this is generous; the point is that the bound exists.
+const METRICS_MAX_CONNECTIONS: usize = 16;
+
+/// How long one metrics connection may occupy a task. Without this a client
+/// that connects and never sends pins the task forever, and N such clients pin
+/// N tasks. The wire server bounds its connections the same way; the metrics
+/// listener must not be the soft spot, especially since
+/// `AGENT_SERVER_ALLOW_INSECURE_REMOTE=1` can expose it unauthenticated.
+const METRICS_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+
 async fn serve_metrics_http(listener: TcpListener, kernel: Arc<AgentKernelImpl>) {
+    let connection_limit = Arc::new(tokio::sync::Semaphore::new(METRICS_MAX_CONNECTIONS));
     loop {
+        // Taking the permit before accepting bounds in-flight handlers: excess
+        // connections wait in the OS backlog instead of becoming unbounded
+        // tasks. A legitimate scraper is never rejected, only briefly delayed.
+        let Ok(permit) = Arc::clone(&connection_limit).acquire_owned().await else {
+            return;
+        };
         let (mut stream, _peer) = match listener.accept().await {
             Ok(pair) => pair,
             // A transient accept error shouldn't take the endpoint down.
@@ -666,8 +684,16 @@ async fn serve_metrics_http(listener: TcpListener, kernel: Arc<AgentKernelImpl>)
         };
         let kernel = kernel.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_metrics_conn(&mut stream, &kernel).await {
-                tracing::debug!(error = %e, "metrics connection error");
+            let _permit = permit;
+            match tokio::time::timeout(
+                METRICS_REQUEST_TIMEOUT,
+                handle_metrics_conn(&mut stream, &kernel),
+            )
+            .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => tracing::debug!(error = %e, "metrics connection error"),
+                Err(_) => tracing::debug!("metrics connection exceeded the read timeout"),
             }
         });
     }
@@ -845,5 +871,38 @@ mod tests {
         // Any other path → 404.
         let (status, _) = http_get(addr, "/nope").await;
         assert!(status.contains("404"), "status: {status}");
+    }
+
+    /// A client that connects and never sends must be reaped, not held forever.
+    ///
+    /// The endpoint previously did a single un-timed `read`, so a silent client
+    /// pinned its task indefinitely and N of them pinned N tasks — unbounded,
+    /// unauthenticated, and reachable off-loopback under
+    /// `AGENT_SERVER_ALLOW_INSECURE_REMOTE=1`. Without the read timeout the
+    /// first assertion below never completes.
+    #[tokio::test]
+    async fn metrics_endpoint_reaps_silent_clients_and_keeps_serving() {
+        let kernel = Arc::new(AgentKernelImpl::new().expect("kernel new"));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(serve_metrics_http(listener, kernel));
+
+        // Connect and send nothing. The server must close the connection on its
+        // own; a read returning 0 bytes is that close.
+        let mut silent = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut discard = [0u8; 64];
+        // A fixed bound, deliberately not derived from METRICS_REQUEST_TIMEOUT:
+        // the test must fail promptly if that constant is ever raised out of a
+        // useful range, instead of scaling along with it.
+        let closed = tokio::time::timeout(Duration::from_secs(30), silent.read(&mut discard))
+            .await
+            .expect("a silent metrics client must be reaped, not held indefinitely")
+            .expect("read after server close");
+        assert_eq!(closed, 0, "server should close a silent connection");
+
+        // Reaping a stuck client must not disturb ordinary scraping.
+        let (status, body) = http_get(addr, "/metrics").await;
+        assert!(status.contains("200 OK"), "status: {status}");
+        assert!(body.contains("agentos_agents"), "body:\n{body}");
     }
 }

@@ -37,6 +37,54 @@ fn project_context() -> String {
     ctx
 }
 
+/// Canonical `agent` usage text, mirroring the module documentation above.
+const USAGE: &str = "\
+AI Agent OS — headless terminal agent.
+
+USAGE:
+  agent                          Interactive session
+  agent \"prompt\"                 One-shot prompt (also reads piped stdin)
+  agent -c \"do something\"        One-shot command
+  agent --conversation ID        Resume a stored conversation
+  agent policy <ARGS...>         Validate or dry-run a policy document (offline)
+
+OPTIONS:
+  -c <COMMAND>                   Run one command and exit
+  --conversation <ID>            Resume conversation <ID>
+  -h, --help                     Print this help and exit
+  -V, --version                  Print the exact build version and exit
+
+Provider, data directory, and permission profile come from the environment and
+configuration file; see .env.example and docs/PROVIDERS.md. `agentctl` is the
+canonical operator client for an already-running kernel.";
+
+/// Options `agent` understands. Anything else beginning with `-` is a usage
+/// error: without this the argument fell through and was treated as a prompt,
+/// so a typo booted the kernel and persisted an agent row.
+const KNOWN_FLAGS: [&str; 6] = ["-c", "--conversation", "-h", "--help", "-V", "--version"];
+
+/// First unrecognized option in `argv`, if any. `-c` and `--conversation`
+/// consume the following value, which may itself begin with `-`.
+fn unrecognized_flag(argv: &[String]) -> Option<&str> {
+    let mut index = 1;
+    while index < argv.len() {
+        let argument = argv[index].as_str();
+        if argument == "--" {
+            return None;
+        }
+        if argument.starts_with('-') && argument != "-" {
+            if !KNOWN_FLAGS.contains(&argument) {
+                return Some(argument);
+            }
+            if matches!(argument, "-c" | "--conversation") {
+                index += 1;
+            }
+        }
+        index += 1;
+    }
+    None
+}
+
 /// Handle slash commands. Returns true if handled.
 fn handle_slash(cmd: &str, executor: &AgentExecutor, kernel: &AgentKernelImpl) -> bool {
     match cmd.split_whitespace().next().unwrap_or("") {
@@ -106,8 +154,25 @@ async fn main() {
         println!("agent {}", env!("CARGO_PKG_VERSION"));
         return;
     }
+    // `policy` claims its own arguments first, so `agent policy --help` reaches
+    // the policy usage rather than this one.
     if argv.get(1).map(String::as_str) == Some("policy") {
         std::process::exit(policy_cmd::run(&argv));
+    }
+    // Help and argument errors are answered before any initialization. Falling
+    // through to `AgentKernelImpl::from_config` created the data directory,
+    // opened the database, and persisted a `cli-agent` row before failing on an
+    // unreachable provider — durable side effects for a documentation request.
+    if argv[1..]
+        .iter()
+        .any(|argument| matches!(argument.as_str(), "--help" | "-h"))
+    {
+        println!("{USAGE}");
+        return;
+    }
+    if let Some(unknown) = unrecognized_flag(&argv) {
+        eprintln!("agent: unrecognized option '{unknown}'\n\n{USAGE}");
+        std::process::exit(2);
     }
 
     // Install structured logging first so kernel init (persistence/auth) logs emit.

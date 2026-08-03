@@ -95,12 +95,21 @@ impl LlmSession for GeminiSession {
             });
         }
 
+        // The key travels in `x-goog-api-key`, never the query string: reqwest
+        // renders the request URL into its `Display`, so a key in the URL would
+        // reach transport error text, logs, and wire clients verbatim.
         let url = format!(
-            "{}/v1beta/models/{}:generateContent?key={}",
-            self.base_url, self.model, self.api_key
+            "{}/v1beta/models/{}:generateContent",
+            self.base_url, self.model
         );
 
-        let result = self.client.post(&url).json(&body).send().await;
+        let result = self
+            .client
+            .post(&url)
+            .header("x-goog-api-key", &self.api_key)
+            .json(&body)
+            .send()
+            .await;
 
         match result {
             Ok(resp) if resp.status().is_success() => {
@@ -172,9 +181,10 @@ impl LlmProviderAdapter for GeminiAdapter {
     }
 
     async fn is_available(&self) -> bool {
-        let url = format!("{}/v1beta/models?key={}", self.base_url, self.api_key);
+        let url = format!("{}/v1beta/models", self.base_url);
         self.client
             .get(url)
+            .header("x-goog-api-key", &self.api_key)
             .send()
             .await
             .map(|r| r.status().is_success())

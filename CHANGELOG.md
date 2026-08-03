@@ -10,6 +10,56 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
 
 ## [Unreleased]
 
+- Restored blocking CI and separated capability governance from build evidence.
+  `operator-clients` is still below production-qualified but its tracking issue
+  #126 was auto-closed by PR #292, so the ownership gate failed and, because it
+  ran inside the `quality` job that `rust-platforms` and `desktop-platforms`
+  depend on, silently skipped the entire macOS/Windows matrix. The capability
+  now declares `qualification_issue = 127`, the gate moved to its own
+  `capability-governance` job, the cross-platform matrix no longer depends on
+  any other job, and the gate distinguishes a closed issue from an unresolved
+  GitHub API call instead of treating both as a governance verdict. A
+  capability-registry regression pins the independence.
+  Relates #126 and #127.
+- Cleared the `cargo deny` advisories gate by taking wasmtime 47.0.3, which
+  carries the fixes for RUSTSEC-2026-0222 and RUSTSEC-2026-0223. The dependency
+  is not reachable from any shipped binary — the Wasm module system has no
+  production caller and is deferred from v1 — but the advisory gate is required
+  and blocks every subsequent push.
+- Made `agent` and `agentctl` answer `--help` before doing any work. `agent`
+  previously initialized the kernel, created its data directory, and persisted a
+  `cli-agent` row before failing on an unreachable provider, and `agentctl`
+  opened a TCP connection and reported a transport error; both now print usage
+  on stdout and exit zero, and reject an unrecognized option with a named
+  diagnostic on stderr and exit 2. `agentctl` usage text is shared between the
+  help and usage-error paths so they cannot drift. New regressions assert both
+  binaries leave an isolated home completely empty.
+  Relates #126.
+- Stopped the Gemini adapter putting its API key in the request URL: the key now
+  travels in `x-goog-api-key`. `reqwest::Error` renders the request URL into its
+  `Display`, so a query-string credential reached transport error text, logs,
+  and wire clients verbatim, bypassing the response-body redaction. The shared
+  adapter `transport_error` now also strips the URL so no future adapter can
+  reintroduce the leak. Gemini was the only adapter affected; the other eight
+  already use `Authorization: Bearer`.
+  Relates #120 and #124.
+- Made the saved configuration file owner-only. It carries cleartext provider
+  API keys and was written with the default umask while every other secret file
+  in the tree is forced to 0600. The mode is applied at create time so a new key
+  is never briefly world-readable, and reapplied on save so a permissive file
+  from an earlier release is repaired.
+  Relates #124 and #127.
+- Bounded the `/metrics` listener with a five-second read timeout and a
+  sixteen-connection limit. A client that connected and never sent pinned a task
+  indefinitely, with no cap on how many could do so, on a listener that
+  `AGENT_SERVER_ALLOW_INSECURE_REMOTE=1` can expose unauthenticated. The wire
+  server already had both protections.
+  Relates #125.
+- Added the missing regression for destination-fence retirement rejecting a
+  foreign owner node. Installation was already covered; retirement carries the
+  same guard and now has the same proof, which is what keeps a locally asserted
+  fence retirable when no replicated authority is configured.
+  Relates #122.
 - Added bounded system-audit views to the TUI and desktop through the public
   `KernelClient`. Both clients read node-control, cluster-membership, and
   application-listener certificate-rollout ledgers sequentially, update only

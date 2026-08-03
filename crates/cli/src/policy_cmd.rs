@@ -20,7 +20,7 @@ pub fn run(args: &[String]) -> i32 {
     match args.get(2).map(String::as_str) {
         Some("validate") => validate(args.get(3)),
         Some("explain") | Some("check") => explain(args),
-        Some("help") | None => {
+        Some("help") | Some("--help") | Some("-h") | None => {
             usage();
             0
         }

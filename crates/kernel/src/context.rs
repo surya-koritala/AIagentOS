@@ -7,7 +7,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 #[cfg(test)]
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 
 use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
@@ -963,6 +963,30 @@ pub struct SqliteContextManager {
 }
 
 impl SqliteContextManager {
+    /// Lock the shared SQLite connection, recovering from a poisoned mutex.
+    ///
+    /// A panic while the guard is held poisons the mutex. Without recovery the
+    /// process is permanently bricked: every later persistence call either
+    /// panics or returns "mutex is poisoned", and that covers every durable
+    /// subsystem, since they all share this one connection. The panic is
+    /// reachable today — `query_memory` calls the pluggable `Arc<dyn Embedder>`
+    /// while holding this guard.
+    ///
+    /// Recovery is sound because SQLite state is transactional: every write
+    /// path uses an RAII `Transaction`, rusqlite defaults to
+    /// `DropBehavior::Rollback`, and that rollback runs while unwinding, so a
+    /// panicked write leaves no partial row behind.
+    ///
+    /// The poison flag is *cleared*, not merely bypassed. Taking the inner
+    /// guard alone would leave the sites that map poisoning to an error
+    /// returning that error forever.
+    pub(crate) fn locked_conn(&self) -> MutexGuard<'_, Connection> {
+        self.conn.lock().unwrap_or_else(|poisoned| {
+            self.conn.clear_poison();
+            poisoned.into_inner()
+        })
+    }
+
     /// Create a new SqliteContextManager with the given database path.
     pub fn new(db_path: &Path) -> Result<Self, ContextError> {
         Self::open_file(db_path, true, None, Vec::new())
@@ -1226,10 +1250,7 @@ impl SqliteContextManager {
     }
 
     fn init_schema(&self, schema_version: i64) -> Result<(), ContextError> {
-        let mut connection = self
-            .conn
-            .lock()
-            .map_err(|_| quota_error("SQLite connection mutex is poisoned"))?;
+        let mut connection = self.locked_conn();
         connection
             .pragma_update(None, "foreign_keys", "ON")
             .map_err(|error| {
@@ -3166,10 +3187,7 @@ impl SqliteContextManager {
             return Err(quota_error("too many cgroup quota scopes"));
         }
 
-        let mut conn = self
-            .conn
-            .lock()
-            .map_err(|_| quota_error("SQLite connection mutex is poisoned"))?;
+        let mut conn = self.locked_conn();
         let tx = Self::begin_quota_transaction(&mut conn)?;
         let effective_epoch = Self::effective_quota_epoch(&tx, requested_epoch)?;
 
@@ -3394,10 +3412,7 @@ impl SqliteContextManager {
         &self,
         receipt_id: uuid::Uuid,
     ) -> Result<(), ContextError> {
-        let mut conn = self
-            .conn
-            .lock()
-            .map_err(|_| quota_error("SQLite connection mutex is poisoned"))?;
+        let mut conn = self.locked_conn();
         let tx = Self::begin_quota_transaction(&mut conn)?;
         let receipt = Self::load_quota_receipt(&tx, receipt_id)?
             .ok_or_else(|| quota_error(format!("unknown quota receipt {receipt_id}")))?;
@@ -3425,10 +3440,7 @@ impl SqliteContextManager {
         &self,
         receipt_id: uuid::Uuid,
     ) -> Result<(), ContextError> {
-        let mut conn = self
-            .conn
-            .lock()
-            .map_err(|_| quota_error("SQLite connection mutex is poisoned"))?;
+        let mut conn = self.locked_conn();
         let tx = Self::begin_quota_transaction(&mut conn)?;
         let Some(receipt) = Self::load_quota_receipt(&tx, receipt_id)? else {
             if Self::quota_receipt_was_refunded(&tx, receipt_id)? {
@@ -3477,10 +3489,7 @@ impl SqliteContextManager {
         &self,
         receipt_id: uuid::Uuid,
     ) -> Result<(), ContextError> {
-        let mut conn = self
-            .conn
-            .lock()
-            .map_err(|_| quota_error("SQLite connection mutex is poisoned"))?;
+        let mut conn = self.locked_conn();
         let tx = Self::begin_quota_transaction(&mut conn)?;
         let receipt = Self::load_quota_receipt(&tx, receipt_id)?
             .ok_or_else(|| quota_error(format!("unknown quota receipt {receipt_id}")))?;
@@ -3535,10 +3544,7 @@ impl SqliteContextManager {
         actual_requests: Option<u64>,
         actual_tokens: u64,
     ) -> Result<(), ContextError> {
-        let mut conn = self
-            .conn
-            .lock()
-            .map_err(|_| quota_error("SQLite connection mutex is poisoned"))?;
+        let mut conn = self.locked_conn();
         let tx = Self::begin_quota_transaction(&mut conn)?;
         let receipt = Self::load_quota_receipt(&tx, receipt_id)?
             .ok_or_else(|| quota_error(format!("unknown quota receipt {receipt_id}")))?;
@@ -3636,10 +3642,7 @@ impl SqliteContextManager {
         requested_epoch: u64,
         tokens: u64,
     ) -> Result<(), ContextError> {
-        let mut conn = self
-            .conn
-            .lock()
-            .map_err(|_| quota_error("SQLite connection mutex is poisoned"))?;
+        let mut conn = self.locked_conn();
         let tx = Self::begin_quota_transaction(&mut conn)?;
         let effective_epoch = Self::effective_quota_epoch(&tx, requested_epoch)?;
         if let Some(receipt) = Self::load_quota_receipt(&tx, receipt_id)? {
@@ -3719,10 +3722,7 @@ impl SqliteContextManager {
         &self,
         requested_epoch: u64,
     ) -> Result<ProviderRateUsage, ContextError> {
-        let mut conn = self
-            .conn
-            .lock()
-            .map_err(|_| quota_error("SQLite connection mutex is poisoned"))?;
+        let mut conn = self.locked_conn();
         let tx = Self::begin_quota_transaction(&mut conn)?;
         let effective_epoch = Self::effective_quota_epoch(&tx, requested_epoch)?;
         let usage = Self::validate_provider_epoch(&tx, effective_epoch)?;
@@ -3739,10 +3739,7 @@ impl SqliteContextManager {
         scope: &QuotaScopeKey,
     ) -> Result<QuotaScopeUsage, ContextError> {
         validate_quota_scope_key(scope)?;
-        let mut conn = self
-            .conn
-            .lock()
-            .map_err(|_| quota_error("SQLite connection mutex is poisoned"))?;
+        let mut conn = self.locked_conn();
         let tx = Self::begin_quota_transaction(&mut conn)?;
         let effective_epoch = Self::effective_quota_epoch(&tx, requested_epoch)?;
         let usage = Self::validate_scope_epoch(&tx, scope, effective_epoch)?;
@@ -3759,10 +3756,7 @@ impl SqliteContextManager {
         &self,
         requested_epoch: u64,
     ) -> Result<ProviderRateRecovery, ContextError> {
-        let mut conn = self
-            .conn
-            .lock()
-            .map_err(|_| quota_error("SQLite connection mutex is poisoned"))?;
+        let mut conn = self.locked_conn();
         let tx = Self::begin_quota_transaction(&mut conn)?;
         let effective_epoch = Self::effective_quota_epoch(&tx, requested_epoch)?;
         Self::validate_all_provider_epochs(&tx)?;
@@ -3863,10 +3857,7 @@ impl SqliteContextManager {
         &self,
         before_epoch: u64,
     ) -> Result<usize, ContextError> {
-        let mut conn = self
-            .conn
-            .lock()
-            .map_err(|_| quota_error("SQLite connection mutex is poisoned"))?;
+        let mut conn = self.locked_conn();
         let tx = Self::begin_quota_transaction(&mut conn)?;
         Self::validate_all_provider_epochs(&tx)?;
         let before_blob = u64_blob(before_epoch);
@@ -3959,7 +3950,7 @@ impl SqliteContextManager {
         let id_str = agent_id.to_string();
 
         for attempt in 0..MAX_RETRIES {
-            let mut conn = self.conn.lock().unwrap();
+            let mut conn = self.locked_conn();
             let transaction = conn
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
@@ -4022,7 +4013,7 @@ impl ContextManager for SqliteContextManager {
     }
 
     async fn get_context(&self, agent_id: AgentId) -> Result<AgentContext, ContextError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.locked_conn();
         let id_str = agent_id.to_string();
         let result = conn.query_row(
             "SELECT context_json FROM contexts WHERE agent_id = ?1",
@@ -4097,7 +4088,7 @@ impl ContextManager for SqliteContextManager {
     }
 
     async fn store_fact(&self, agent_id: AgentId, fact: Fact) -> Result<(), ContextError> {
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.locked_conn();
         let transaction = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| ContextError::StorageError(error.to_string()))?;
@@ -4187,7 +4178,7 @@ impl ContextManager for SqliteContextManager {
         agent_id: AgentId,
         query: &str,
     ) -> Result<Vec<Fact>, ContextError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.locked_conn();
         let id_str = agent_id.to_string();
 
         // Fetch the agent's candidate facts. We pull all of the agent's facts
@@ -4368,7 +4359,7 @@ impl SqliteContextManager {
         let json = serde_json::to_string(messages)
             .map_err(|e| ContextError::PersistenceFailed(e.to_string()))?;
         let now = chrono::Utc::now().to_rfc3339();
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.locked_conn();
         let transaction = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
@@ -4432,7 +4423,7 @@ impl SqliteContextManager {
         &self,
         id: &str,
     ) -> Result<Vec<crate::connector::StandardMessage>, ContextError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.locked_conn();
         let json: String = conn
             .query_row(
                 "SELECT messages_json FROM conversations WHERE id = ?1",
@@ -4445,7 +4436,7 @@ impl SqliteContextManager {
 
     /// List all conversations, sorted by most recently updated.
     pub fn list_conversations(&self) -> Vec<(String, String, String)> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.locked_conn();
         let mut stmt = conn
             .prepare("SELECT id, agent_id, updated_at FROM conversations ORDER BY updated_at DESC")
             .unwrap_or_else(|_| conn.prepare("SELECT 1, 2, 3 WHERE 0").unwrap());
@@ -4463,7 +4454,7 @@ impl SqliteContextManager {
 
     /// Delete a conversation.
     pub fn delete_conversation(&self, id: &str) -> Result<(), ContextError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.locked_conn();
         conn.execute(
             "DELETE FROM conversations WHERE id = ?1",
             rusqlite::params![id],
@@ -4505,7 +4496,7 @@ impl SqliteContextManager {
                 record.cost_micros
             ))
         })?;
-        let conn = self.conn.lock().unwrap();
+        let conn = self.locked_conn();
         conn.execute(
             "INSERT INTO usage_log (id, agent_id, timestamp, tokens_used, input_tokens, output_tokens, cached_tokens, llm_requests, retries, provider_latency_ms, provider_reported_requests, estimated_requests, provider, model, tool_calls, estimated_cost_usd, cost_micros) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
             rusqlite::params![uuid::Uuid::new_v4().to_string(), agent_id.to_string(), chrono::Utc::now().to_rfc3339(), record.tokens_used, record.input_tokens, record.output_tokens, record.cached_tokens, record.llm_requests, record.retries, record.provider_latency_ms, record.provider_reported_requests, record.estimated_requests, record.provider, record.model, record.tool_calls as i64, record.estimated_cost_usd.max(0.0), cost_micros],
@@ -4519,7 +4510,7 @@ impl SqliteContextManager {
     /// SQLite's `SUM(INTEGER)` can overflow before Rust sees the result, so
     /// every row is accumulated in Rust with `u64::saturating_add`.
     pub fn load_budget_usage_snapshot(&self) -> Result<BudgetUsageSnapshot, ContextError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.locked_conn();
         let mut snapshot = BudgetUsageSnapshot::default();
 
         {
@@ -4571,7 +4562,7 @@ impl SqliteContextManager {
     }
 
     pub fn get_total_usage(&self) -> (u64, f64) {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.locked_conn();
         conn.query_row(
             "SELECT COALESCE(SUM(tokens_used), 0), COALESCE(SUM(estimated_cost_usd), 0.0) FROM usage_log",
             [], |row| Ok((row.get::<_, i64>(0)? as u64, row.get::<_, f64>(1)?)),
@@ -4579,7 +4570,7 @@ impl SqliteContextManager {
     }
 
     pub fn latest_usage(&self, agent_id: AgentId) -> Option<UsageRecord> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.locked_conn();
         conn.query_row(
             "SELECT tokens_used, input_tokens, output_tokens, cached_tokens, llm_requests, retries, provider_latency_ms, provider_reported_requests, estimated_requests, COALESCE(provider, ''), COALESCE(model, ''), tool_calls, COALESCE(estimated_cost_usd, 0.0), cost_micros FROM usage_log WHERE agent_id = ?1 ORDER BY rowid DESC LIMIT 1",
             [agent_id.to_string()],
@@ -4636,7 +4627,7 @@ impl SqliteContextManager {
         }
         let status = serde_json::to_string(status)
             .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
-        let conn = self.conn.lock().unwrap();
+        let conn = self.locked_conn();
         let changed = conn
             .execute(
                 "UPDATE agents SET status = ?1, last_activity_at = ?2 WHERE id = ?3",
@@ -4656,7 +4647,7 @@ impl SqliteContextManager {
     }
 
     pub fn search_conversations(&self, query: &str) -> Vec<(String, String)> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.locked_conn();
         let mut stmt = conn.prepare(
             "SELECT conversation_id, snippet(conversations_fts, 1, '**', '**', '...', 32) FROM conversations_fts WHERE content MATCH ?1 LIMIT 20"
         ).unwrap_or_else(|_| conn.prepare("SELECT 1, 2 WHERE 0").unwrap());
@@ -4685,7 +4676,7 @@ impl SqliteContextManager {
                 "context spill retention must be greater than zero".into(),
             ));
         }
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.locked_conn();
         let spills = {
             let mut statement = conn
                 .prepare("SELECT agent_id, key, created_at, expires_at FROM context_spills")
@@ -4860,7 +4851,7 @@ impl SqliteContextManager {
                 "context spill key must start with context_spill:".into(),
             ));
         }
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.locked_conn();
         Self::purge_expired_spills_locked(&mut conn)?;
         let transaction = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -4943,7 +4934,7 @@ impl SqliteContextManager {
             ));
         }
         let now = Utc::now().to_rfc3339();
-        let conn = self.conn.lock().unwrap();
+        let conn = self.locked_conn();
         conn.execute(
             "INSERT OR REPLACE INTO agent_kv (agent_id, key, value, updated_at) VALUES (?1, ?2, ?3, ?4)",
             params![agent_id.to_string(), key, value, now],
@@ -4954,7 +4945,7 @@ impl SqliteContextManager {
 
     /// Get the value for `key` under `agent_id`, or `None` if absent.
     pub fn kv_get(&self, agent_id: AgentId, key: &str) -> Result<Option<String>, ContextError> {
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.locked_conn();
         Self::purge_expired_spills_locked(&mut conn)?;
         let result = conn.query_row(
             "SELECT value FROM agent_kv WHERE agent_id = ?1 AND key = ?2",
@@ -4997,7 +4988,7 @@ impl SqliteContextManager {
 
     /// List the keys stored under `agent_id` (sorted ascending).
     pub fn kv_list(&self, agent_id: AgentId) -> Result<Vec<String>, ContextError> {
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.locked_conn();
         Self::purge_expired_spills_locked(&mut conn)?;
         let mut stmt = conn
             .prepare("SELECT key FROM agent_kv WHERE agent_id = ?1 ORDER BY key ASC")
@@ -5015,7 +5006,7 @@ impl SqliteContextManager {
     /// Delete the value for `key` under `agent_id`. Returns `true` if a row was
     /// removed, `false` if no such key existed.
     pub fn kv_delete(&self, agent_id: AgentId, key: &str) -> Result<bool, ContextError> {
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.locked_conn();
         let transaction = conn
             .transaction()
             .map_err(|e| ContextError::PersistenceFailed(e.to_string()))?;
@@ -5052,7 +5043,7 @@ impl SqliteContextManager {
     ) -> Result<(), ContextError> {
         let spill_increment = u64::from(error.is_none() && evicted_messages > 0);
         let error_increment = u64::from(error.is_some());
-        let conn = self.conn.lock().unwrap();
+        let conn = self.locked_conn();
         conn.execute(
             "INSERT INTO context_pressure
                 (agent_id, active_tokens, budget_tokens, spill_count,
@@ -5088,7 +5079,7 @@ impl SqliteContextManager {
         &self,
         agent_id: AgentId,
     ) -> Result<ContextPressureStats, ContextError> {
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.locked_conn();
         Self::purge_expired_spills_locked(&mut conn)?;
         let tenant_id = conn
             .query_row(
@@ -5194,7 +5185,7 @@ impl SqliteContextManager {
     /// `(agent_id, label)`. Errors with [`ContextError::RestoreFailed`] if the
     /// agent has no current context to snapshot.
     pub fn snapshot_context(&self, agent_id: AgentId, label: &str) -> Result<(), ContextError> {
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.locked_conn();
         let transaction = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
@@ -5265,7 +5256,7 @@ impl SqliteContextManager {
         label: &str,
     ) -> Result<AgentContext, ContextError> {
         let json = {
-            let conn = self.conn.lock().unwrap();
+            let conn = self.locked_conn();
             match conn.query_row(
                 "SELECT context_json FROM context_snapshots WHERE agent_id = ?1 AND label = ?2",
                 params![agent_id.to_string(), label],
@@ -5290,7 +5281,7 @@ impl SqliteContextManager {
 
     /// List the snapshot labels stored for `agent_id`, newest first.
     pub fn list_snapshots(&self, agent_id: AgentId) -> Result<Vec<String>, ContextError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.locked_conn();
         let mut stmt = conn
             .prepare(
                 "SELECT label FROM context_snapshots WHERE agent_id = ?1 ORDER BY created_at DESC, label DESC",
@@ -5309,7 +5300,7 @@ impl SqliteContextManager {
     /// Delete the snapshot stored under `(agent_id, label)`. Returns `true` if a
     /// row was removed, `false` if no such snapshot existed.
     pub fn delete_snapshot(&self, agent_id: AgentId, label: &str) -> Result<bool, ContextError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.locked_conn();
         let affected = conn
             .execute(
                 "DELETE FROM context_snapshots WHERE agent_id = ?1 AND label = ?2",
@@ -5356,7 +5347,7 @@ impl SqliteContextManager {
                 "injected agent-registry save failure".into(),
             ));
         }
-        let conn = self.conn.lock().unwrap();
+        let conn = self.locked_conn();
         conn.execute(
             "INSERT OR REPLACE INTO agents
                 (id, session_id, tenant_id, name, task, llm_provider, permission_profile, priority, status, sandbox_config_json, created_at, last_activity_at)
@@ -5382,7 +5373,7 @@ impl SqliteContextManager {
 
     /// Load every persisted agent (registry rehydration on boot).
     pub fn load_all_agents(&self) -> Result<Vec<PersistedAgent>, ContextError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.locked_conn();
         let mut stmt = conn
             .prepare(
                 "SELECT id, session_id, tenant_id, name, task, llm_provider, permission_profile, priority, status, sandbox_config_json, created_at, last_activity_at
@@ -5455,7 +5446,7 @@ impl SqliteContextManager {
     /// The tenant that owns `agent_id`, if the agent is in the registry. Used to
     /// enforce that a caller may only read data for agents in its own tenant.
     pub fn agent_tenant(&self, agent_id: AgentId) -> Result<Option<String>, ContextError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.locked_conn();
         let result = conn.query_row(
             "SELECT tenant_id FROM agents WHERE id = ?1",
             params![agent_id.to_string()],
@@ -5490,7 +5481,7 @@ impl SqliteContextManager {
         let expires_at = now + ttl;
         let json = serde_json::to_string(checkpoint)
             .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.locked_conn();
         let transaction = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
@@ -5563,7 +5554,7 @@ impl SqliteContextManager {
         tenant_id: &str,
         agent_id: Option<AgentId>,
     ) -> Result<Vec<GenerationCheckpointMetadata>, ContextError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.locked_conn();
         let now = Utc::now().to_rfc3339();
         let sql = if agent_id.is_some() {
             "SELECT id, agent_id, version, provider_id, model_id, created_at, expires_at
@@ -5632,7 +5623,7 @@ impl SqliteContextManager {
         agent_id: AgentId,
         tenant_id: &str,
     ) -> Result<StoredGenerationCheckpoint, ContextError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.locked_conn();
         let changed = conn
             .execute(
                 "UPDATE generation_checkpoints SET status = 'resuming'
@@ -5713,9 +5704,7 @@ impl SqliteContextManager {
         &self,
         checkpoint_id: uuid::Uuid,
     ) -> Result<(), ContextError> {
-        self.conn
-            .lock()
-            .unwrap()
+        self.locked_conn()
             .execute(
                 "UPDATE generation_checkpoints SET status = 'active' WHERE id = ?1 AND status = 'resuming'",
                 params![checkpoint_id.to_string()],
@@ -5728,9 +5717,7 @@ impl SqliteContextManager {
         &self,
         checkpoint_id: uuid::Uuid,
     ) -> Result<(), ContextError> {
-        self.conn
-            .lock()
-            .unwrap()
+        self.locked_conn()
             .execute(
                 "UPDATE generation_checkpoints SET status = 'consumed', checkpoint_json = '{}' WHERE id = ?1 AND status = 'resuming'",
                 params![checkpoint_id.to_string()],
@@ -5745,9 +5732,7 @@ impl SqliteContextManager {
         tenant_id: &str,
     ) -> Result<bool, ContextError> {
         let changed = self
-            .conn
-            .lock()
-            .unwrap()
+            .locked_conn()
             .execute(
                 "DELETE FROM generation_checkpoints WHERE id = ?1 AND tenant_id = ?2 AND status != 'resuming'",
                 params![checkpoint_id.to_string(), tenant_id],
@@ -5759,7 +5744,7 @@ impl SqliteContextManager {
     /// List the ids of agents that belong to `tenant_id` (tenant-scoped registry
     /// view — a tenant-A caller never sees tenant-B agents).
     pub fn list_agents_for_tenant(&self, tenant_id: &str) -> Result<Vec<AgentId>, ContextError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.locked_conn();
         let mut stmt = conn
             .prepare("SELECT id FROM agents WHERE tenant_id = ?1 ORDER BY created_at ASC")
             .map_err(|e| ContextError::StorageError(e.to_string()))?;
@@ -5821,7 +5806,7 @@ impl SqliteContextManager {
                 "the reserved nil agent id cannot be erased".into(),
             ));
         }
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.locked_conn();
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
@@ -5957,7 +5942,7 @@ impl SqliteContextManager {
     /// subsequent open recovers a fully-consolidated, consistent DB. Called on
     /// graceful shutdown; best-effort (a busy DB simply checkpoints later).
     pub fn checkpoint(&self) -> Result<(), ContextError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.locked_conn();
         let (busy, _log_pages, _checkpointed_pages): (i64, i64, i64) = conn
             .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
                 Ok((row.get(0)?, row.get(1)?, row.get(2)?))
@@ -5987,7 +5972,7 @@ impl SqliteContextManager {
                 "operator tunable {name:?} exceeds SQLite integer range"
             ))
         })?;
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.locked_conn();
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
@@ -6019,7 +6004,7 @@ impl SqliteContextManager {
     pub fn list_operator_tunables(
         &self,
     ) -> Result<Vec<crate::operator_control::StoredOperatorTunable>, ContextError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.locked_conn();
         let mut statement = conn
             .prepare(
                 "SELECT name, value, revision, updated_at, updated_by
@@ -6059,7 +6044,7 @@ impl SqliteContextManager {
         let expected_revision = i64::try_from(expected_revision).map_err(|_| {
             ContextError::PersistenceFailed("operator tunable revision is too large".into())
         })?;
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.locked_conn();
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
@@ -6128,7 +6113,7 @@ impl SqliteContextManager {
         let expected_revision = i64::try_from(expected_revision).map_err(|_| {
             ContextError::PersistenceFailed("operator tunable revision is too large".into())
         })?;
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.locked_conn();
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
@@ -6219,7 +6204,7 @@ impl SqliteContextManager {
             .map(i64::try_from)
             .transpose()
             .map_err(|_| ContextError::PersistenceFailed("requested value is too large".into()))?;
-        let conn = self.conn.lock().unwrap();
+        let conn = self.locked_conn();
         conn.execute(
             "INSERT INTO operator_tunable_audit
              (name, revision, previous_value, requested_value, effective_value,
@@ -6243,7 +6228,7 @@ impl SqliteContextManager {
         limit: usize,
     ) -> Result<Vec<crate::operator_control::OperatorTunableAudit>, ContextError> {
         let limit = i64::try_from(limit.clamp(1, 1_000)).unwrap_or(1_000);
-        let conn = self.conn.lock().unwrap();
+        let conn = self.locked_conn();
         let sql = if name.is_some() {
             "SELECT id, name, revision, previous_value, requested_value,
                     effective_value, action, outcome, actor, reason, created_at
@@ -6304,7 +6289,7 @@ impl SqliteContextManager {
         &self,
         instance: &crate::operator_control::LoadedPackageInstance,
     ) -> Result<(), ContextError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.locked_conn();
         conn.execute(
             "INSERT INTO loaded_package_instances
              (agent_id, tenant_id, name, provider, profile, loaded_at)
@@ -6326,7 +6311,7 @@ impl SqliteContextManager {
         &self,
         tenant_id: Option<&str>,
     ) -> Result<Vec<crate::operator_control::LoadedPackageInstance>, ContextError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.locked_conn();
         let sql = if tenant_id.is_some() {
             "SELECT agent_id, tenant_id, name, provider, profile, loaded_at
              FROM loaded_package_instances WHERE tenant_id = ?1
@@ -6386,7 +6371,7 @@ impl SqliteContextManager {
         let dependency_blocks = i64::try_from(runtime.dependency_blocks).map_err(|_| {
             ContextError::PersistenceFailed("service dependency block counter overflow".into())
         })?;
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.locked_conn();
         let transaction = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
@@ -6471,7 +6456,7 @@ impl SqliteContextManager {
     pub fn load_service_runtime(
         &self,
     ) -> Result<Vec<crate::init_system::ServiceRuntimeInfo>, ContextError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.locked_conn();
         let mut statement = conn
             .prepare(
                 "SELECT name, definition_revision, status, agent_id,
@@ -6533,7 +6518,7 @@ impl SqliteContextManager {
     }
 
     pub fn remove_service_runtime(&self, name: &str, reason: &str) -> Result<(), ContextError> {
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.locked_conn();
         let transaction = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
@@ -6567,7 +6552,7 @@ impl SqliteContextManager {
         limit: usize,
     ) -> Result<Vec<crate::init_system::ServiceHistoryEntry>, ContextError> {
         let limit = i64::try_from(limit.clamp(1, 1_000)).unwrap_or(1_000);
-        let conn = self.conn.lock().unwrap();
+        let conn = self.locked_conn();
         let sql = if name.is_some() {
             "SELECT id, name, event, status, agent_id, reason, created_at
              FROM service_history WHERE name = ?1 ORDER BY id DESC LIMIT ?2"
@@ -6640,7 +6625,7 @@ impl SqliteContextManager {
 impl SqliteContextManager {
     /// Persist a tenant (insert-or-replace).
     pub fn save_tenant(&self, t: &crate::auth::Tenant) -> Result<(), ContextError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.locked_conn();
         conn.execute(
             "INSERT OR REPLACE INTO tenants (id, name, created_at) VALUES (?1, ?2, ?3)",
             params![t.id, t.name, t.created_at.to_rfc3339()],
@@ -6651,7 +6636,7 @@ impl SqliteContextManager {
 
     /// Persist a user (insert-or-replace).
     pub fn save_user(&self, u: &crate::auth::User) -> Result<(), ContextError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.locked_conn();
         conn.execute(
             "INSERT OR REPLACE INTO users (id, tenant_id, username, email, role, created_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
@@ -6670,7 +6655,7 @@ impl SqliteContextManager {
 
     /// Persist an api-key record (hash only — never the plaintext).
     pub fn save_api_key(&self, k: &crate::auth::ApiKey) -> Result<(), ContextError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.locked_conn();
         conn.execute(
             "INSERT OR REPLACE INTO api_keys (key_hash, name, user_id, tenant_id, created_at)
              VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -6688,7 +6673,7 @@ impl SqliteContextManager {
 
     /// Persist a session record (hash only — never the plaintext token).
     pub fn save_session(&self, s: &crate::auth::Session) -> Result<(), ContextError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.locked_conn();
         conn.execute(
             "INSERT OR REPLACE INTO sessions (token_hash, user_id, tenant_id, expires_at)
              VALUES (?1, ?2, ?3, ?4)",
@@ -6705,7 +6690,7 @@ impl SqliteContextManager {
 
     /// Permanently revoke a session by its stored hash.
     pub fn revoke_session_hash(&self, token_hash: &str) -> Result<bool, ContextError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.locked_conn();
         let changed = conn
             .execute(
                 "DELETE FROM sessions WHERE token_hash = ?1",
@@ -6717,7 +6702,7 @@ impl SqliteContextManager {
 
     /// Permanently revoke an API key by its stored hash.
     pub fn revoke_api_key_hash(&self, key_hash: &str) -> Result<bool, ContextError> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.locked_conn();
         let changed = conn
             .execute(
                 "DELETE FROM api_keys WHERE key_hash = ?1",
@@ -6731,7 +6716,7 @@ impl SqliteContextManager {
     /// transaction. Agent/data ownership is tenant-scoped and is intentionally
     /// not deleted by identity revocation.
     pub fn revoke_user_identity(&self, user_id: &str) -> Result<bool, ContextError> {
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.locked_conn();
         let tx = conn
             .transaction()
             .map_err(|e| ContextError::PersistenceFailed(e.to_string()))?;
@@ -6765,7 +6750,7 @@ impl SqliteContextManager {
         user_id: &str,
         managed_backups_deleted: usize,
     ) -> Result<Option<DeletionReceipt>, ContextError> {
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.locked_conn();
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
@@ -6826,7 +6811,7 @@ impl SqliteContextManager {
     /// Durable agent data remains present for explicit administrative recovery,
     /// but no tenant principal can authenticate after this commits.
     pub fn revoke_tenant_identity(&self, tenant_id: &str) -> Result<bool, ContextError> {
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.locked_conn();
         let tx = conn
             .transaction()
             .map_err(|e| ContextError::PersistenceFailed(e.to_string()))?;
@@ -6872,7 +6857,7 @@ impl SqliteContextManager {
         ),
         ContextError,
     > {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.locked_conn();
         let parse_ts = |s: &str| {
             DateTime::parse_from_rfc3339(s)
                 .map(|d| d.with_timezone(&Utc))
@@ -7389,6 +7374,58 @@ impl SqliteContextManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A panic under the shared connection guard must not brick the process.
+    ///
+    /// Every durable subsystem shares one `Mutex<Connection>`, and the panic is
+    /// reachable on the live path — `query_memory` calls the pluggable embedder
+    /// while holding this guard. Without recovery the mutex stays poisoned for
+    /// the process lifetime: `lock().unwrap()` sites panic and `map_err` sites
+    /// return "mutex is poisoned" forever.
+    #[test]
+    fn panic_under_the_connection_guard_leaves_the_store_usable_and_rolls_back() {
+        let manager = Arc::new(SqliteContextManager::in_memory().unwrap());
+
+        // Panic with an open transaction so the rollback path is exercised too.
+        let poisoner = Arc::clone(&manager);
+        let panicked = std::thread::spawn(move || {
+            let mut connection = poisoner.locked_conn();
+            let transaction = connection.transaction().unwrap();
+            transaction
+                .execute(
+                    "INSERT INTO agents
+                     (id, session_id, name, task, llm_provider, permission_profile,
+                      priority, status, created_at, last_activity_at)
+                     VALUES ('poison-agent', 'poison-session', 'doomed', 'test',
+                             'stub', 'standard', 3, 'Running', '2026-01-01', '2026-01-01')",
+                    [],
+                )
+                .unwrap();
+            panic!("embedder panicked while the connection guard was held");
+        })
+        .join();
+        assert!(panicked.is_err(), "the worker thread must have panicked");
+        assert!(
+            manager.conn.is_poisoned(),
+            "a panic under the guard must poison the mutex"
+        );
+
+        // The connection is usable again, and the flag is cleared so the sites
+        // that map poisoning to an error recover as well.
+        let count: i64 = manager
+            .locked_conn()
+            .query_row(
+                "SELECT count(*) FROM agents WHERE id = 'poison-agent'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("the store must remain queryable after a poisoned guard");
+        assert_eq!(count, 0, "the panicked transaction must have rolled back");
+        assert!(
+            !manager.conn.is_poisoned(),
+            "recovery must clear the poison flag, not just bypass it"
+        );
+    }
 
     #[test]
     fn every_logical_durable_table_has_an_ownership_and_deletion_classification() {

@@ -20,6 +20,30 @@ storage-key rotation remain explicit offline operator actions. Remote
 retention, measured recovery objectives, and independent release qualification
 are not yet complete.
 
+## Platform scope
+
+Every owner-only permission guarantee and every directory-entry sync described
+below is implemented on Unix only. On Windows the corresponding helpers in
+`crates/kernel/src/storage.rs`, `crates/kernel/src/storage_encryption.rs`, and
+`crates/kernel/src/remote_backup.rs` return `Ok(())` unchanged: files and
+directories inherit the parent ACL instead of receiving an owner-only DACL, a
+group- or world-readable storage key is accepted rather than rejected,
+`O_NOFOLLOW` is unavailable so a symlink to a regular key or manifest file
+satisfies the regular-file check, and the atomic same-directory renames used for
+publication are not followed by a directory sync — so a crash after a rename can
+lose it. `write_owner_only` in `crates/kernel/src/config.rs` and
+`create_owner_only_new_file_for` still create and write their file on Windows;
+only the mode is lost.
+
+The regressions proving these controls are `#[cfg(unix)]`, so the passing
+`windows-latest` CI leg is compiled-out behavior rather than Windows evidence.
+Explicit `symlink_metadata` checks on backup roots, published directories,
+restore destinations, and sidecars, create-without-overwrite on key material,
+and every SQLite transactional, integrity, WAL, and `synchronous=FULL` guarantee
+in this document are platform-independent and do apply. Windows permission and
+durable-rename enforcement is tracked by
+[#123](https://github.com/surya-koritala/AIagentOS/issues/123).
+
 ## Database identity and version
 
 Every database created or successfully adopted by the kernel carries:
@@ -197,8 +221,9 @@ When `[storage_encryption].key_path` is configured, SQLCipher encrypts the
 complete SQLite database, including WAL pages. The kernel supplies 256-bit key
 bytes through SQLCipher's C API rather than interpolating secrets into SQL.
 Startup authenticates the database before schema inspection and fails closed
-for a missing, malformed, wrong, or symlinked key file. On Unix it also rejects
-group/other-accessible files and files not owned by the current user.
+for a missing, malformed, or wrong key file. On Unix it also rejects a symlinked
+key path, group/other-accessible files, and files not owned by the current user;
+see [Platform scope](#platform-scope).
 
 Generate a key outside both the data and backup directories:
 

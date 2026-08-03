@@ -10,6 +10,44 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
 
 ## [Unreleased]
 
+- Made the capability registry honest about Windows. Owner-only permission
+  enforcement, open-time symlink rejection, and directory-entry durability are
+  implemented on Unix only — the helpers in `storage.rs`,
+  `storage_encryption.rs`, and `remote_backup.rs` return `Ok(())` on Windows —
+  and every regression proving them is `#[cfg(unix)]`, so the passing
+  `windows-latest` leg was compiled-out behavior rather than Windows evidence.
+  `durable-state`, `resource-providers`, and `distributed-control-plane` still
+  declared Windows with no such caveat. Each now carries an explicit
+  platform-scope limitation, `sandbox-isolation`'s one-sentence Unix aside is
+  expanded to cover managed-workspace hardening, and the registry header now
+  defines `platforms` as where a capability is built and run rather than a claim
+  that every guarantee holds on each one. `docs/DURABILITY.md` gains a matching
+  Platform scope section, and its claim that the storage key loader rejects a
+  symlinked key file is corrected — that comes from `O_NOFOLLOW`, which Windows
+  does not have. No behavior changed; the claims now match the code.
+  Relates #122, #123, #124, and #127.
+- Stopped a panic under the shared SQLite connection guard from permanently
+  bricking the kernel. Every durable subsystem shares one `Mutex<Connection>`,
+  and the panic is reachable on the live path because `query_memory` calls the
+  pluggable `Arc<dyn Embedder>` while holding the guard. Sixty `lock().unwrap()`
+  sites in `context.rs` panicked on a poisoned mutex and the remaining sites
+  returned "mutex is poisoned" for the rest of the process lifetime. All of them
+  now go through `SqliteContextManager::locked_conn`, which takes the inner
+  guard and *clears* the poison flag, so the error-returning sites recover too;
+  the eleven quota-path sites that fed `RateLimiter::poison` are included, which
+  removes a permanent `healthy = false` latch. Recovery is sound because every
+  write path uses an RAII transaction that rolls back while unwinding. A
+  regression panics with an open transaction under the guard and proves the
+  store stays queryable, the aborted write rolled back, and the flag cleared.
+  Relates #123.
+- Stopped the online backup pacing itself while holding the writer mutex.
+  `run_to_completion` sleeps between steps, so a 64-page step size spent roughly
+  eight seconds asleep on a 1 GiB database — with the single connection mutex
+  held, which every Tokio worker blocks on synchronously. The pacing existed to
+  yield to concurrent writers who were locked out by that same mutex, so it
+  bought nothing. The copy now runs in one step; the pause remains only as
+  backoff on the `Busy`/`Locked` retry path.
+  Relates #123 and #125.
 - Restored blocking CI and separated capability governance from build evidence.
   `operator-clients` is still below production-qualified but its tracking issue
   #126 was auto-closed by PR #292, so the ownership gate failed and, because it

@@ -31,7 +31,7 @@ plaintext tool shim is separate.
 | Gemini | Yes | No; bounded non-streaming fallback | No / no | Prompt, candidate, cached | Yes / yes | Not in the standard message contract | Configured model; GenerateContent v1beta family | **Not run** |
 | Hugging Face inference | Yes | No; bounded non-streaming fallback | No / no | Provider usage unavailable; runtime estimate | Yes / yes | Unsupported | Configured model endpoint | **Not run** |
 | vLLM | Yes | No; bounded non-streaming fallback | Yes / yes | Prompt, completion, cached when present | Yes / yes | Unsupported | Configured model; OpenAI-compatible v1 | **Not run** |
-| Ollama | Yes | No; bounded non-streaming fallback | No / no | Prompt/eval counts when present | Yes / yes | Unsupported | Configured endpoint and model | **Not run** |
+| Ollama | Yes | No; bounded non-streaming fallback | Yes / yes | Prompt/eval counts when present | Yes / yes | Unsupported | Configured endpoint and model | **Not run** |
 | Candle/GGUF | Failure/template fixtures; gated real-model test | No | No / no | Generated-token count; no input usage | Cooperative decode cancellation / wall timeout | Unsupported | CPU, quantized Llama-family GGUF; Simple, ChatML, or Llama 3 template | **Not run** |
 
 No adapter currently advertises vision, audio, or a supported model-discovery

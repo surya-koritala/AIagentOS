@@ -46,7 +46,7 @@ pub fn register_providers(kernel: &AgentKernelImpl, config: &Config) {
             if !key.is_empty() {
                 let adapter =
                     AzureOpenAiAdapter::new(endpoint, deployment, key).with_api_version(version);
-                let _ = kernel.register_provider(Arc::new(adapter));
+                register_and_report(kernel, adapter);
             }
         }
         "openai" => {
@@ -56,7 +56,7 @@ pub fn register_providers(kernel: &AgentKernelImpl, config: &Config) {
                 .or_else(|| std::env::var("OPENAI_API_KEY").ok())
             {
                 let adapter = OpenAiAdapter::new(key).with_model(config.default_model.clone());
-                let _ = kernel.register_provider(Arc::new(adapter));
+                register_and_report(kernel, adapter);
             }
         }
         "anthropic" => {
@@ -66,7 +66,7 @@ pub fn register_providers(kernel: &AgentKernelImpl, config: &Config) {
                 .or_else(|| std::env::var("ANTHROPIC_API_KEY").ok())
             {
                 let adapter = AnthropicAdapter::new(key).with_model(config.default_model.clone());
-                let _ = kernel.register_provider(Arc::new(adapter));
+                register_and_report(kernel, adapter);
             }
         }
         "groq" => {
@@ -76,7 +76,7 @@ pub fn register_providers(kernel: &AgentKernelImpl, config: &Config) {
                 .or_else(|| std::env::var("GROQ_API_KEY").ok())
             {
                 let adapter = GroqAdapter::new(key).with_model(config.default_model.clone());
-                let _ = kernel.register_provider(Arc::new(adapter));
+                register_and_report(kernel, adapter);
             }
         }
         "deepseek" => {
@@ -86,7 +86,7 @@ pub fn register_providers(kernel: &AgentKernelImpl, config: &Config) {
                 .or_else(|| std::env::var("DEEPSEEK_API_KEY").ok())
             {
                 let adapter = DeepseekAdapter::new(key).with_model(config.default_model.clone());
-                let _ = kernel.register_provider(Arc::new(adapter));
+                register_and_report(kernel, adapter);
             }
         }
         "local" => {
@@ -94,10 +94,10 @@ pub fn register_providers(kernel: &AgentKernelImpl, config: &Config) {
                 .get_api_key("local")
                 .unwrap_or("http://localhost:11434")
                 .to_string();
-            let _ = kernel.register_provider(Arc::new(LocalLlmAdapter::new(
-                url,
-                config.default_model.clone(),
-            )));
+            register_and_report(
+                kernel,
+                LocalLlmAdapter::new(url, config.default_model.clone()),
+            );
         }
         "gemini" => {
             if let Some(key) = config
@@ -106,7 +106,7 @@ pub fn register_providers(kernel: &AgentKernelImpl, config: &Config) {
                 .or_else(|| std::env::var("GEMINI_API_KEY").ok())
             {
                 let adapter = GeminiAdapter::new(key).with_model(config.default_model.clone());
-                let _ = kernel.register_provider(Arc::new(adapter));
+                register_and_report(kernel, adapter);
             }
         }
         "vllm" => {
@@ -121,7 +121,7 @@ pub fn register_providers(kernel: &AgentKernelImpl, config: &Config) {
             if let Ok(url) = std::env::var("VLLM_BASE_URL") {
                 adapter = adapter.with_base_url(url);
             }
-            let _ = kernel.register_provider(Arc::new(adapter));
+            register_and_report(kernel, adapter);
         }
         "huggingface" => {
             if let Some(key) = config
@@ -131,7 +131,7 @@ pub fn register_providers(kernel: &AgentKernelImpl, config: &Config) {
                 .or_else(|| std::env::var("HF_API_KEY").ok())
             {
                 let adapter = HuggingFaceAdapter::new(key).with_model(config.default_model.clone());
-                let _ = kernel.register_provider(Arc::new(adapter));
+                register_and_report(kernel, adapter);
             }
         }
         // In-process GGUF inference — no network, no sidecar. Only compiled with
@@ -142,7 +142,7 @@ pub fn register_providers(kernel: &AgentKernelImpl, config: &Config) {
         "on-device" => match adapters::on_device::OnDeviceConfig::from_env() {
             Some(cfg) => match adapters::on_device::OnDeviceLlmAdapter::load(cfg) {
                 Ok(adapter) => {
-                    let _ = kernel.register_provider(Arc::new(adapter));
+                    register_and_report(kernel, adapter);
                 }
                 Err(e) => tracing::error!("on-device model load failed: {e}"),
             },
@@ -152,4 +152,25 @@ pub fn register_providers(kernel: &AgentKernelImpl, config: &Config) {
         },
         _ => {}
     }
+}
+
+/// Register `adapter` and warn if it cannot call tools.
+///
+/// `connector.rs` deliberately exempts the primary provider from the
+/// tool-compatibility guard that protects failover targets, so a primary that
+/// drops tool definitions silently degrades the think-act-observe loop to
+/// whatever tool intent the model happens to emit as plain text. An operator
+/// should be told that at boot rather than inferring it from bad answers.
+fn register_and_report<A>(kernel: &AgentKernelImpl, adapter: A)
+where
+    A: kernel::connector::LlmProviderAdapter + 'static,
+{
+    if !adapter.capabilities().tool_calls {
+        tracing::warn!(
+            provider = %adapter.id(),
+            "provider does not support tool calling; agent tool use will depend on \
+             the model emitting tool intent as plain text"
+        );
+    }
+    let _ = kernel.register_provider(Arc::new(adapter));
 }

@@ -4,12 +4,8 @@
 
 mod accounting_integrity;
 pub mod agent;
-pub mod agent_hub;
 pub mod agent_package;
 pub mod agent_struct;
-pub mod agent_syscalls;
-pub mod agentpkg;
-pub mod agentps;
 pub mod auth;
 pub mod budget;
 pub mod cfs;
@@ -24,21 +20,16 @@ pub mod context_paging;
 pub mod custom_tools;
 pub mod data_inventory;
 pub mod database;
-pub mod delegation;
 pub mod docker_sandbox;
 pub mod editing;
-pub mod event_loop;
 pub mod execution;
 pub mod function_calling;
-pub mod github;
 pub mod indexer;
 pub mod init_system;
 pub mod ipc;
 pub mod learning;
-pub mod linux_compat;
 pub mod llm_sched;
 pub mod mac;
-pub mod marketplace;
 pub mod mcp;
 pub mod mcp_server;
 pub mod memory_manager;
@@ -46,7 +37,6 @@ pub mod metrics;
 pub mod models;
 #[cfg(feature = "wasm")]
 pub mod modules;
-pub mod mount_table;
 pub mod namespaces;
 pub mod observability;
 pub mod operator_control;
@@ -65,19 +55,15 @@ pub mod runtime;
 pub mod sandbox;
 pub mod scheduler;
 mod schema;
-pub mod shell;
 pub mod storage;
 pub mod storage_encryption;
 pub mod syscall_gate;
-pub mod syscall_interface;
 pub mod syscall_server;
 pub mod sysctl;
 pub mod telemetry;
-pub mod tool_descriptors;
 pub mod tool_registry_share;
 pub mod tools;
 pub mod vision;
-pub mod voice;
 pub mod wire_contract;
 #[cfg(feature = "fuzzing")]
 #[doc(hidden)]
@@ -1185,6 +1171,10 @@ pub struct AgentKernelImpl {
     /// Stable, bounded-cardinality request outcomes and latency. Correlation
     /// identifiers remain in trace spans and never become metric labels.
     pub(crate) request_telemetry: crate::telemetry::RequestTelemetry,
+    /// Kernel background loops ended by a panic in this process. Non-zero means
+    /// restart policy, the turn watchdog, procfs publication, or scheduled
+    /// backup has stopped running and will not resume without a restart.
+    pub(crate) background_task_panics: std::sync::atomic::AtomicU64,
     /// Serializes public service lifecycle, rolling reload, and supervisor
     /// recovery so two control paths cannot create duplicate live instances.
     service_operation_lock: tokio::sync::Mutex<()>,
@@ -1671,6 +1661,7 @@ impl AgentKernelImpl {
             active_requests: DashMap::new(),
             lifecycle_counters: crate::metrics::LifecycleCounters::default(),
             request_telemetry: crate::telemetry::RequestTelemetry::default(),
+            background_task_panics: std::sync::atomic::AtomicU64::new(0),
             service_operation_lock: tokio::sync::Mutex::new(()),
             service_health_checks: DashMap::new(),
             service_directory: std::sync::RwLock::new(None),

@@ -9,9 +9,9 @@
 //! Transport is deliberately dependency-light (tokio + serde_json, both already
 //! in the workspace): one JSON [`Syscall`] per line, one JSON [`SyscallReply`]
 //! per line. The wire format is plain JSON, so the boundary is language-neutral,
-//! but the SDK and clients we ship are Rust. The numbered, in-process
-//! [`crate::syscall_interface`] ABI remains a separate concern; this module is
-//! the live remoting boundary.
+//! but the SDK and clients we ship are Rust. This is now the only ABI: the
+//! numbered in-process prototype was excluded from v1 (see ADR-0001) and its
+//! unreachable module has been removed.
 //!
 //! The syscall surface spans agent lifecycle (create / list / send / agent
 //! info), the LLM core (the [`Syscall::SendMessage`] turn + [`Syscall::ListProviders`]),

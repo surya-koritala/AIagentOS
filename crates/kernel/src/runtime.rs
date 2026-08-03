@@ -65,6 +65,40 @@ impl KernelRuntime {
         self.running.load(std::sync::atomic::Ordering::SeqCst)
     }
 
+    /// Spawn a background loop and make its death observable.
+    ///
+    /// These loops own restart policy, turn-timeout enforcement, procfs
+    /// publication, and scheduled backup. Their `JoinHandle`s are dropped by
+    /// `AgentKernelImpl::start_runtime`, so a panic previously ended the task
+    /// with nobody watching: `running`/`generation` stay set, a later `start()`
+    /// is a no-op, and the subsystem is silently dead for the process lifetime.
+    /// The panic itself still reaches stderr via the default hook, but nothing
+    /// scrapeable recorded which subsystem stopped.
+    ///
+    /// This does not restart the loop — restarting a half-completed sweep is
+    /// not obviously safe for every one of them. It makes the failure loud and
+    /// countable so an operator alert can fire.
+    fn spawn_supervised(
+        kernel: Arc<AgentKernelImpl>,
+        task: &'static str,
+        body: impl std::future::Future<Output = ()> + Send + 'static,
+    ) -> tokio::task::JoinHandle<()> {
+        let loop_handle = tokio::spawn(body);
+        tokio::spawn(async move {
+            if let Err(error) = loop_handle.await {
+                if error.is_panic() {
+                    kernel
+                        .background_task_panics
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    tracing::error!(
+                        background_task = task,
+                        "kernel background loop panicked and will not run again"
+                    );
+                }
+            }
+        })
+    }
+
     /// Scheduler observer: every tick, ask CFS who would run next and
     /// publish that into procfs as `current_agent`. The actual turn execution
     /// is still driven by `send_message`; this loop just keeps procfs honest.
@@ -74,7 +108,7 @@ impl KernelRuntime {
         let active_generation = self.generation.clone();
         let interval_ms = self.scheduler_interval_ms;
 
-        tokio::spawn(async move {
+        Self::spawn_supervised(self.kernel.clone(), "scheduler_observer", async move {
             let mut tick = interval(Duration::from_millis(interval_ms));
             while running.load(std::sync::atomic::Ordering::SeqCst)
                 && active_generation.load(std::sync::atomic::Ordering::SeqCst) == generation
@@ -100,7 +134,7 @@ impl KernelRuntime {
         let running = self.running.clone();
         let active_generation = self.generation.clone();
 
-        tokio::spawn(async move {
+        Self::spawn_supervised(self.kernel.clone(), "agent_watchdog", async move {
             let mut tick = interval(Duration::from_secs(1));
             while running.load(std::sync::atomic::Ordering::SeqCst)
                 && active_generation.load(std::sync::atomic::Ordering::SeqCst) == generation
@@ -119,7 +153,7 @@ impl KernelRuntime {
         let running = self.running.clone();
         let active_generation = self.generation.clone();
 
-        tokio::spawn(async move {
+        Self::spawn_supervised(self.kernel.clone(), "service_supervisor", async move {
             let mut tick = interval(Duration::from_millis(100));
             while running.load(std::sync::atomic::Ordering::SeqCst)
                 && active_generation.load(std::sync::atomic::Ordering::SeqCst) == generation
@@ -149,7 +183,7 @@ impl KernelRuntime {
             Instant::now() + cadence
         };
 
-        tokio::spawn(async move {
+        Self::spawn_supervised(self.kernel.clone(), "backup_maintenance", async move {
             let mut tick = interval_at(first, cadence);
             while running.load(std::sync::atomic::Ordering::SeqCst)
                 && active_generation.load(std::sync::atomic::Ordering::SeqCst) == generation
@@ -411,6 +445,61 @@ mod tests {
         assert!(!clone.is_shared());
         assert_eq!(clone.read().len(), 3);
         assert_eq!(original.read().len(), 2); // original unchanged
+    }
+
+    /// A panicking background loop must be counted and named, not silent.
+    #[tokio::test]
+    async fn panicking_background_loop_is_counted_and_exported() {
+        let kernel = Arc::new(crate::AgentKernelImpl::new().unwrap());
+        assert_eq!(
+            kernel
+                .background_task_panics
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+
+        let watcher =
+            KernelRuntime::spawn_supervised(Arc::clone(&kernel), "unit_test_loop", async {
+                panic!("background loop died");
+            });
+        watcher.await.expect("supervisor must not itself panic");
+
+        assert_eq!(
+            kernel
+                .background_task_panics
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "a panicked loop must be counted"
+        );
+        assert!(
+            crate::metrics::MetricsSnapshot::collect(&kernel)
+                .render_prometheus()
+                .contains("agentos_background_task_panics_total 1"),
+            "the panic count must reach the Prometheus exposition"
+        );
+    }
+
+    /// Every long-lived loop must go through `spawn_supervised`.
+    ///
+    /// Without this, a new loop added later would silently reintroduce the
+    /// original defect. The literals are split with `concat!` so this test's
+    /// own source does not count toward the totals it asserts on.
+    #[test]
+    fn every_background_loop_is_supervised() {
+        let source = include_str!("runtime.rs");
+        assert_eq!(
+            source
+                .matches(concat!("Self::spawn_", "supervised("))
+                .count(),
+            4,
+            "expected exactly the four kernel background loops to be supervised"
+        );
+        assert_eq!(
+            source.matches(concat!("tokio::", "spawn(")).count(),
+            2,
+            "raw spawns belong only inside spawn_supervised; a new one here is \
+             an unsupervised loop"
+        );
     }
 
     #[tokio::test]

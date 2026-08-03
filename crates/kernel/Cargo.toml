@@ -10,6 +10,10 @@ unexpected_cfgs = { level = "warn", check-cfg = ["cfg(coverage)"] }
 
 [features]
 fuzzing = []
+# Experimental WASM module system (src/modules.rs). Off by default: it has no
+# production caller and pulls in 78 crates, including all of Cranelift.
+# See docs/SECONDARY_CAPABILITIES.md.
+wasm = ["dep:wasmtime"]
 qualification = []
 
 [dependencies]
@@ -23,7 +27,7 @@ dashmap = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
 tracing = { workspace = true }
-wasmtime = { workspace = true }
+wasmtime = { workspace = true, optional = true }
 tokio-util = { workspace = true, features = ["io"] }
 rusqlite = { workspace = true }
 toml = { workspace = true }

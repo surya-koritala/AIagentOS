@@ -44,6 +44,7 @@ pub mod mcp_server;
 pub mod memory_manager;
 pub mod metrics;
 pub mod models;
+#[cfg(feature = "wasm")]
 pub mod modules;
 pub mod mount_table;
 pub mod namespaces;

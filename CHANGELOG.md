@@ -10,6 +10,22 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
 
 ## [Unreleased]
 
+- Gated the Wasm module system behind an off-by-default `wasm` feature on
+  `kernel`, so no shipped binary links wasmtime or Cranelift. `WasmModuleSystem`
+  has no production caller and the module is already deferred from v1, yet
+  wasmtime was an unconditional dependency: the default `kernel` dependency
+  graph drops from 274 crates to 195 — 79 removed, including all of Cranelift.
+  It also removes a dead-code dependency from the advisory surface;
+  RUSTSEC-2026-0222 and -0223 were both against wasmtime.
+  **Breaking for library consumers:** `kernel::modules::ResourceRequirements`
+  moved to `kernel::models::ResourceRequirements` (it was the only thing forcing
+  an ungated module to depend on the gated one), and `kernel::modules` is
+  unavailable without `--features wasm`. The crate is not published, so no
+  released artifact is affected. `ROADMAP.md` framed this as a follow-up
+  requiring structural work; it was one four-field struct. CI now exercises the
+  module system explicitly under the feature, since the default
+  `cargo test --workspace` no longer compiles it.
+  Relates #128.
 - Made the capability registry honest about Windows. Owner-only permission
   enforcement, open-time symlink rejection, and directory-entry durability are
   implemented on Unix only — the helpers in `storage.rs`,

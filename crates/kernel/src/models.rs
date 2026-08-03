@@ -8,7 +8,6 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::context::{FactCategory, Message, Task, TaskResult};
-use crate::modules::ResourceRequirements;
 use crate::observability::Metrics;
 use crate::permissions::{AccessDecision, ActionOutcome, PermissionRule};
 use crate::{AgentConfig, AgentId, AgentState, ModuleId, SandboxId, SessionId};
@@ -135,6 +134,23 @@ pub struct MemoryEntry {
 }
 
 // ─── Module Manifest ─────────────────────────────────────────────────────────
+
+/// Resource requirements declared by a module manifest.
+///
+/// Lives here rather than in `modules` so that the ungated manifest types do
+/// not pull in the optional `wasm` feature and, with it, the whole Cranelift
+/// dependency tree.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResourceRequirements {
+    /// Peak linear-memory ceiling, if the manifest declares one.
+    pub max_memory_bytes: Option<u64>,
+    /// Wall-clock execution ceiling per call, if the manifest declares one.
+    pub max_cpu_time_ms: Option<u64>,
+    /// Whether the module declares a need for network egress.
+    pub network_access: bool,
+    /// Paths the module declares it needs to read or write.
+    pub filesystem_access: Vec<String>,
+}
 
 /// A dependency declared by a module.
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -493,7 +493,7 @@ public_entry_points = []
 runtime_call_paths = []
 test_evidence = ["tests/src/edge_cases.rs", "tests/src/module_props.rs"]
 platforms = ["linux", "macos", "windows"]
-limitations = ["The per-module disposition explicitly retains editing/function-calling on the governed live path and defers the in-memory agent hub/marketplace, planning, learning, indexer, shell, direct GitHub/database/MCP-client, vision/voice, Wasm modules, and linux_compat from the v1 public runtime until their stated security contracts are met. Marketplace ratings/download counters are never consulted by the signed package registry."]
+limitations = ["The per-module disposition explicitly retains editing/function-calling on the governed live path and defers the in-memory agent hub/marketplace, planning, learning, indexer, shell, direct GitHub/database/MCP-client, vision/voice, Wasm modules, and linux_compat from the v1 public runtime until their stated security contracts are met. Marketplace ratings/download counters are never consulted by the signed package registry. The Wasm module system sits behind the off-by-default kernel/wasm feature: it is absent from every default build and is compiled and exercised only by the all-features CI job, so no shipped binary links wasmtime or Cranelift."]
 
 [[capability]]
 id = "release-governance"

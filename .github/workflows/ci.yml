@@ -28,7 +28,7 @@ jobs:
         with:
           toolchain: 1.97.1
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: Swatinem/rust-cache@a45951ff880207c249adf57334cf2e9bd81d6e1e # v2
         with:
           # Restore always; only main writes. Otherwise every PR job mints a
           # new ~1 GB key and evicts main's warm cache from the 10 GiB budget.
@@ -130,7 +130,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
         with:
           toolchain: 1.97.1
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: Swatinem/rust-cache@a45951ff880207c249adf57334cf2e9bd81d6e1e # v2
         with:
           # Restore always; only main writes. Otherwise every PR job mints a
           # new ~1 GB key and evicts main's warm cache from the 10 GiB budget.
@@ -168,7 +168,7 @@ jobs:
         with:
           name: tauri-ui-dist
           path: crates/tauri-app/ui/dist
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: Swatinem/rust-cache@a45951ff880207c249adf57334cf2e9bd81d6e1e # v2
         with:
           # Restore always; only main writes. Otherwise every PR job mints a
           # new ~1 GB key and evicts main's warm cache from the 10 GiB budget.
@@ -236,7 +236,7 @@ jobs:
       - uses: taiki-e/install-action@41049aa56687c35e0afa74eed4f09cec4f9afabf
         with:
           tool: cargo-llvm-cov@0.8.7
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: Swatinem/rust-cache@a45951ff880207c249adf57334cf2e9bd81d6e1e # v2
         with:
           # Restore always; only main writes. Otherwise every PR job mints a
           # new ~1 GB key and evicts main's warm cache from the 10 GiB budget.
@@ -260,7 +260,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
         with:
           toolchain: 1.97.1
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: Swatinem/rust-cache@a45951ff880207c249adf57334cf2e9bd81d6e1e # v2
         with:
           # Restore always; only main writes. Otherwise every PR job mints a
           # new ~1 GB key and evicts main's warm cache from the 10 GiB budget.

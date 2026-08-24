@@ -27,7 +27,7 @@
 ############################
 # rust:1.97.1 matches the pinned toolchain used by CI and satisfies Wasmtime
 # 47's Rust 1.94 MSRV. bookworm => OpenSSL 3, matching the runtime image.
-FROM rust:1.97.1-slim-bookworm@sha256:99e09cb2284e2ddbb73a995deee3e91783fd04d177602ccf6eab326d778ee777 AS builder
+FROM rust:1.98.0-slim-bookworm@sha256:94e9efa4033213dbb70d4f665527e7ece3944ddb7ba1dd2e43f6fd6e2490af58 AS builder
 
 # Build-time system deps:
 #   build-essential -> C toolchain (cc) for openssl-sys / wasmtime / ring etc.

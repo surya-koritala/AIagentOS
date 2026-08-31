@@ -55,7 +55,7 @@ RUN cargo build --release --locked \
 ############################
 # Stage 2 — runtime
 ############################
-FROM debian:bookworm-20260713-slim@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818 AS runtime
+FROM debian:bookworm-20260824-slim@sha256:88200866dfff7ea7f5cbcb6ec7c8a701889efe6fe859fe64d6990e4b07ea4171 AS runtime
 
 # Runtime system deps:
 #   libssl3         -> libssl.so.3 / libcrypto.so.3 (reqwest native-tls)

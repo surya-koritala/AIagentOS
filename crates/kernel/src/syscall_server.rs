@@ -1520,6 +1520,7 @@ impl std::fmt::Debug for SyscallReply {
 impl SyscallReply {
     fn into_public_wire(self, negotiated_version: u32) -> Self {
         match self {
+            Self::TypedError { message, .. } if negotiated_version < 2 => Self::Error { message },
             Self::Error { message } if negotiated_version >= 2 => {
                 let (code, retryable) = WireErrorCode::classify(&message);
                 Self::TypedError {

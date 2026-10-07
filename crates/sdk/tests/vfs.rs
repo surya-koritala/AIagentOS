@@ -69,6 +69,42 @@ impl Drop for Fixture {
 }
 
 #[tokio::test]
+async fn vfs_errors_retain_legacy_v1_and_typed_v2_envelopes() {
+    let f = Fixture::new().await;
+    let agent = f.agent("versions").await.to_string();
+    let mut client = kernel::syscall_server::SyscallClient::connect(f.addr)
+        .await
+        .unwrap();
+    client
+        .call(Syscall::Hello {
+            protocol_version: 1,
+        })
+        .await
+        .unwrap();
+    let request = Syscall::VfsOpen {
+        agent_id: agent,
+        path: "/tools/../read_file".into(),
+    };
+    assert!(matches!(
+        client.call(request.clone()).await.unwrap(),
+        kernel::syscall_server::SyscallReply::Error { .. }
+    ));
+    client
+        .call(Syscall::Hello {
+            protocol_version: 2,
+        })
+        .await
+        .unwrap();
+    assert!(matches!(
+        client.call(request).await.unwrap(),
+        kernel::syscall_server::SyscallReply::TypedError {
+            code: WireErrorCode::InvalidArgument,
+            ..
+        }
+    ));
+}
+
+#[tokio::test]
 async fn vfs_restart_never_restores_an_old_handle() {
     let f = Fixture::new().await;
     let database = f.root.join("restart.db");

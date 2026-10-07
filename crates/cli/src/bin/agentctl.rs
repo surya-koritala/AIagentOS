@@ -9,9 +9,13 @@ use agent_sdk::ConnectionProfile;
 /// Canonical `agentctl` usage text, shared by the usage-error and
 /// explicit-help paths so the two can never drift apart.
 const USAGE: &str = "usage: agentctl [--addr HOST:PORT] [--token TOKEN] \
-         <create|list|inspect|message|stream|cancel|checkpoints|checkpoint-resume|checkpoint-delete|capabilities|providers|metrics|protocol|policy-validate|policy-explain|gate-stats|node-control-audit|cluster-membership-audit|cluster-certificate-rollout-audit|package-trust-key|package-revoke-key|package-publish|package-yank|package-fetch|package-search|package-install|package-rollback|package-remove|packages|package-run|pressure|tunables|tunable-set|tunable-rollback|tunable-history|status|pause|resume|stop|kill|wait|services|service-start|service-stop|service-restart|service-reload|service-history|backup-create|backup-retention|backup-status|data-inventory|backup-key-generate|backup-anchor-create|backup-verify|backup-restore|backup-disaster-recover|backup-corruption-recover|backup-remote-publish|backup-remote-fetch|storage-key-generate|storage-encrypt|storage-encrypt-recover|storage-key-rotate|storage-portable-export|storage-portable-verify|storage-portable-import|erase-agent|erase-user|erase-tenant> [ARGS...]\n\
+         <create|list|inspect|message|stream|cancel|checkpoints|checkpoint-resume|checkpoint-delete|capabilities|vfs-mounts|vfs-open|vfs-invoke|vfs-close|providers|metrics|protocol|policy-validate|policy-explain|gate-stats|node-control-audit|cluster-membership-audit|cluster-certificate-rollout-audit|package-trust-key|package-revoke-key|package-publish|package-yank|package-fetch|package-search|package-install|package-rollback|package-remove|packages|package-run|pressure|tunables|tunable-set|tunable-rollback|tunable-history|status|pause|resume|stop|kill|wait|services|service-start|service-stop|service-restart|service-reload|service-history|backup-create|backup-retention|backup-status|data-inventory|backup-key-generate|backup-anchor-create|backup-verify|backup-restore|backup-disaster-recover|backup-corruption-recover|backup-remote-publish|backup-remote-fetch|storage-key-generate|storage-encrypt|storage-encrypt-recover|storage-key-rotate|storage-portable-export|storage-portable-verify|storage-portable-import|erase-agent|erase-user|erase-tenant> [ARGS...]\n\
          \n\
          public runtime commands:\n\
+           agentctl [SERVER OPTIONS] vfs-mounts AGENT_ID\n\
+           agentctl [SERVER OPTIONS] vfs-open AGENT_ID /tools/NAME\n\
+           agentctl [SERVER OPTIONS] vfs-invoke AGENT_ID HANDLE ARGUMENTS_JSON\n\
+           agentctl [SERVER OPTIONS] vfs-close AGENT_ID HANDLE\n\
            agentctl [SERVER OPTIONS] create NAME TASK [PROVIDER [PROFILE [PRIORITY]]]\n\
            agentctl [SERVER OPTIONS] message AGENT_ID MESSAGE\n\
            agentctl [SERVER OPTIONS] stream REQUEST_ID AGENT_ID MESSAGE\n\
@@ -973,6 +977,59 @@ async fn main() {
                 .await
                 .unwrap_or_else(|error| fail(error));
             print_json(&info, "agent capabilities");
+            return;
+        }
+        "vfs-mounts" => {
+            let agent = args.next().unwrap_or_else(|| usage());
+            if args.next().is_some() {
+                usage();
+            }
+            let view = client
+                .vfs_mounts(agent)
+                .await
+                .unwrap_or_else(|error| fail(error));
+            print_json(&view, "VFS mounts");
+            return;
+        }
+        "vfs-open" => {
+            let agent = args.next().unwrap_or_else(|| usage());
+            let path = args.next().unwrap_or_else(|| usage());
+            if args.next().is_some() {
+                usage();
+            }
+            let handle = client
+                .vfs_open(agent, path)
+                .await
+                .unwrap_or_else(|error| fail(error));
+            print_json(&handle, "VFS handle");
+            return;
+        }
+        "vfs-invoke" => {
+            let agent = args.next().unwrap_or_else(|| usage());
+            let handle = args.next().unwrap_or_else(|| usage());
+            let arguments = args.next().unwrap_or_else(|| usage());
+            if args.next().is_some() {
+                usage();
+            }
+            let arguments = serde_json::from_str(&arguments).unwrap_or_else(|_| usage());
+            let result = client
+                .vfs_invoke(agent, handle, arguments)
+                .await
+                .unwrap_or_else(|error| fail(error));
+            print_json(&result, "VFS tool result");
+            return;
+        }
+        "vfs-close" => {
+            let agent = args.next().unwrap_or_else(|| usage());
+            let handle = args.next().unwrap_or_else(|| usage());
+            if args.next().is_some() {
+                usage();
+            }
+            client
+                .vfs_close(agent, handle)
+                .await
+                .unwrap_or_else(|error| fail(error));
+            print_json(&serde_json::json!({"closed": true}), "VFS close");
             return;
         }
         "providers" => {

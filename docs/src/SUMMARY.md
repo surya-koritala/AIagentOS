@@ -47,3 +47,5 @@
 - [ADR 0001: Public ABI](./public-abi.md)
 - [Full Roadmap](./full-roadmap.md)
 - [Operations Runbook](./runbook.md)
+
+- [Tool VFS](./vfs.md)

@@ -63,6 +63,7 @@ pub mod sysctl;
 pub mod telemetry;
 pub mod tool_registry_share;
 pub mod tools;
+pub mod vfs;
 pub mod vision;
 pub mod wire_contract;
 #[cfg(feature = "fuzzing")]
@@ -1076,6 +1077,7 @@ pub struct AgentKernelImpl {
     pub connector: Arc<AgentConnectorImpl>,
     pub resource_broker: Arc<ResourceBrokerImpl>,
     pub tool_registry: Arc<ToolRegistry>,
+    pub tool_vfs: crate::vfs::ToolVfs,
     /// Signed, tenant-scoped package supply chain backed by the same durable
     /// SQLite boundary as agents, auth, quotas, and operator state.
     pub package_registry: Arc<crate::package::PackageRegistry>,
@@ -1613,6 +1615,7 @@ impl AgentKernelImpl {
             connector: Arc::new(AgentConnectorImpl::new()),
             resource_broker,
             tool_registry,
+            tool_vfs: crate::vfs::ToolVfs::default(),
             package_registry,
             quota_clock,
             rate_limiter,
@@ -3500,6 +3503,7 @@ impl AgentKernelImpl {
         forced: bool,
     ) -> Result<(), KernelError> {
         let mut failures = Vec::new();
+        self.tool_vfs.revoke_agent(agent_id);
         // Peripheral calls carry a local, visible active-use contract. Agent
         // teardown is also revocation: signal every active device operation
         // before waiting on or forcibly invalidating its tool-call guard.

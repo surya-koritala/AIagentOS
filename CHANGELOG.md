@@ -10,6 +10,11 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
 
 ## [Unreleased]
 
+- Added an initial tool VFS at `/tools/<name>` through the public wire, Rust SDK,
+  and `agentctl`. Bounded agent-owned handles identify exact registrations;
+  invocation retains current tool governance, and close/teardown revoke them.
+  Workspace and other mounts plus durable cloning remain tracked in #392/#393.
+
 - Integrated the pending Rust, frontend, workflow-action, and container dependency
   updates, and refreshed vulnerable HTTP/TLS, Wasm, and frontend dependencies.
   Release contracts retain exact pins for the updated provenance action.

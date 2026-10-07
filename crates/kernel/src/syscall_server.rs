@@ -9277,6 +9277,22 @@ memory = ["remember this"]
                 tool: "read_file".into(),
                 args: serde_json::json!({"path": "/tmp/x"}),
             },
+            Syscall::VfsMounts {
+                agent_id: id.clone(),
+            },
+            Syscall::VfsOpen {
+                agent_id: id.clone(),
+                path: "/tools/read_file".into(),
+            },
+            Syscall::VfsInvoke {
+                agent_id: id.clone(),
+                handle: uuid::Uuid::new_v4().to_string(),
+                args: serde_json::json!({"path": "proof.txt"}),
+            },
+            Syscall::VfsClose {
+                agent_id: id.clone(),
+                handle: uuid::Uuid::new_v4().to_string(),
+            },
             Syscall::AgentInfo {
                 agent_id: id.clone(),
             },
@@ -9822,7 +9838,7 @@ memory = ["remember this"]
                     .to_string()
             })
             .collect::<std::collections::HashSet<_>>();
-        assert_eq!(calls.len(), 92);
+        assert_eq!(calls.len(), 96);
         assert_eq!(fixture_tags, schema_tags);
     }
 

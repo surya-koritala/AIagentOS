@@ -1,4 +1,6 @@
 import json
+import contextlib
+import io
 import sys
 import tempfile
 import unittest
@@ -90,6 +92,39 @@ class LiveProviderQualificationPlanTests(unittest.TestCase):
                 ["openai", "ollama"],
             )
 
+    def test_empty_cli_plan_succeeds_and_skips_live_matrix(self):
+        with tempfile.TemporaryDirectory() as directory:
+            report_path = Path(directory) / "plan.json"
+            github_output = Path(directory) / "github-output.txt"
+            result = main([
+                "--providers", "", "--commit", COMMIT,
+                "--output", str(report_path),
+                "--github-output", str(github_output),
+            ])
+
+            self.assertEqual(result, 0)
+            report = json.loads(report_path.read_text())
+            self.assertEqual(report["status"], "not_run")
+            self.assertFalse(report["production_claim_allowed"])
+            self.assertEqual(report["matrix"], {"include": []})
+            self.assertIn("has_providers=false\n", github_output.read_text())
+
+    def test_invalid_cli_provider_sets_fail_without_publishing_a_plan(self):
+        for providers in ("nope", "openai,openai"):
+            with self.subTest(providers=providers), tempfile.TemporaryDirectory() as directory:
+                report_path = Path(directory) / "plan.json"
+                github_output = Path(directory) / "github-output.txt"
+                with contextlib.redirect_stderr(io.StringIO()):
+                    result = main([
+                        "--providers", providers, "--commit", COMMIT,
+                        "--output", str(report_path),
+                        "--github-output", str(github_output),
+                    ])
+
+                self.assertEqual(result, 2)
+                self.assertFalse(report_path.exists())
+                self.assertFalse(github_output.exists())
+
     def test_workflow_skips_unselected_environments_and_requires_passed_evidence(self):
         workflow = (
             ROOT / ".github/workflows/live-provider-qualification.yml"
@@ -103,6 +138,7 @@ class LiveProviderQualificationPlanTests(unittest.TestCase):
             "environment: provider-qualification",
             'test "$status" = "passed"',
             "if: always()",
+            "jq -e '.status == \"ready\" or .status == \"not_run\"'",
         ]:
             self.assertIn(contract, workflow)
         self.assertNotIn(

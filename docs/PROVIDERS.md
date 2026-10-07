@@ -38,6 +38,11 @@ No adapter currently advertises vision, audio, or a supported model-discovery
 API. Those fields default to false, so callers cannot infer support from a
 provider name.
 
+A green nightly run with an empty provider set retains a dated `not_run` plan
+and skips live contracts. It verifies fixture contracts only; it is not live
+provider evidence and never permits a production claim. Invalid provider sets
+fail, and every explicitly selected live provider must still report `passed`.
+
 ## Shared runtime contract
 
 ### Errors and diagnostics

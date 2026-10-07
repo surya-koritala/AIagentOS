@@ -81,7 +81,7 @@ def validate_contract(root: Path) -> list[str]:
         ".verification.verified_at",
         "sign-runtime:",
         "cosign sign-blob",
-        "actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373",
+        "actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8",
         "fresh-host:",
         "scripts/linux_cli_rc_qualification.py qualify",
         "--released-schema-tag v0.3.0",
@@ -141,7 +141,7 @@ def validate_contract(root: Path) -> list[str]:
         "needs: exact-release-candidate-promotion",
         "cosign verify-blob",
         "cosign sign-blob",
-        "attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373",
+        "attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8",
         "gh release create",
         "--prerelease",
         "--verify-tag",
@@ -166,7 +166,7 @@ def validate_contract(root: Path) -> list[str]:
         "scripts/phase1_independent_review.py",
         "--actor \"$GITHUB_ACTOR\"",
         "cosign sign-blob --yes",
-        "actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373",
+        "actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8",
         "phase1-independent-review-${{ inputs.release_candidate }}-${{ github.sha }}",
     ]
     for value in review_required:
@@ -184,7 +184,7 @@ def validate_contract(root: Path) -> list[str]:
         "actions/runs/${run_id}/attempts/${run_attempt}",
         'gh run download "$run_id"',
         "cosign sign-blob --yes",
-        "actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373",
+        "actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8",
         "phase1-campaign-${{ inputs.release_candidate }}-${{ github.sha }}",
     ]
     for value in campaign_required:

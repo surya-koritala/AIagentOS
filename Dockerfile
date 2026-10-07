@@ -25,9 +25,9 @@
 ############################
 # Stage 1 — builder
 ############################
-# rust:1.97.1 matches the pinned toolchain used by CI and satisfies Wasmtime
-# 47's Rust 1.94 MSRV. bookworm => OpenSSL 3, matching the runtime image.
-FROM rust:1.97.1-slim-bookworm@sha256:99e09cb2284e2ddbb73a995deee3e91783fd04d177602ccf6eab326d778ee777 AS builder
+# The builder supplies Rust; rust-toolchain.toml selects the workspace's pinned
+# compiler. Bookworm supplies OpenSSL 3, matching the runtime image.
+FROM rust:1.99.0-slim-bookworm@sha256:452176c0cefca88c0b3184ce85a4eb03e3d4fa05d2afb5366abcba853221019e AS builder
 
 # Build-time system deps:
 #   build-essential -> C toolchain (cc) for openssl-sys / wasmtime / ring etc.
@@ -55,7 +55,7 @@ RUN cargo build --release --locked \
 ############################
 # Stage 2 — runtime
 ############################
-FROM debian:bookworm-20260713-slim@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818 AS runtime
+FROM debian:bookworm-20260918-slim@sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251 AS runtime
 
 # Runtime system deps:
 #   libssl3         -> libssl.so.3 / libcrypto.so.3 (reqwest native-tls)

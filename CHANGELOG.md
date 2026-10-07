@@ -10,6 +10,16 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
 
 ## [Unreleased]
 
+- Integrated the pending Rust, frontend, workflow-action, and container dependency
+  updates, and refreshed vulnerable HTTP/TLS, Wasm, and frontend dependencies.
+  Release contracts retain exact pins for the updated provenance action.
+- Disposable S3 backup qualification builds MinIO and its client from pinned
+  official source commits and retains the source commits and actual image
+  digests alongside recovery evidence.
+- Unconfigured live-provider nightlies retain `not_run` evidence and run fixture
+  contracts without failing the dispatch plan. Invalid provider sets and failed
+  selected live contracts still fail. Fixes #350.
+
 - Implemented native tool calling in the Ollama adapter, which previously bound
   `_tools` and hardcoded an empty `tool_calls`. Because `connector.rs`
   deliberately exempts the *primary* provider from the tool-compatibility guard

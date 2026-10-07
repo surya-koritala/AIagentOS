@@ -148,7 +148,10 @@ failed/not-run rather than passed.
 ## Checked-in qualification boundary
 
 `.github/workflows/remote-backup-qualification.yml` runs the release-mode path
-against fixed-digest MinIO server and client images. It creates an Object Lock
+against MinIO server and client images built from exact official source commits
+with digest-pinned build and runtime bases. It retains `minio-fixture-build.json`
+with those source commits and the actual image digests, and runs the containers
+by those digests. It creates an Object Lock
 bucket, publishes both objects in compliance mode, creates current-key delete
 markers, recovers the exact retained versions, restores the database, and
 checks an application value. The retained JSON is exact-commit regression

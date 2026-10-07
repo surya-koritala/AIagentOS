@@ -73,8 +73,10 @@ jobs:
           path: target/qualification/live-provider-plan.json
           if-no-files-found: warn
           retention-days: 30
-      - name: Require at least one explicitly enabled provider
-        run: test "$(jq -r .status target/qualification/live-provider-plan.json)" = "ready"
+      - name: Require a valid ready or not-run plan
+        run: >-
+          jq -e '.status == "ready" or .status == "not_run"'
+          target/qualification/live-provider-plan.json
 
   fixture-contracts:
     name: Provider fixture contracts

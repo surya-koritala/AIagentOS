@@ -228,7 +228,7 @@ class Phase1CampaignAssemblyTests(unittest.TestCase):
         self.assertIn('gh run download "$run_id"', workflow)
         self.assertIn("cosign sign-blob --yes", workflow)
         self.assertIn(
-            "actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373",
+            "actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8",
             workflow,
         )
         self.assertIn(

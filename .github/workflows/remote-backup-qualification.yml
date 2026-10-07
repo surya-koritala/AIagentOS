@@ -14,8 +14,8 @@ permissions:
 
 env:
   QUALIFICATION_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
-  MINIO_SERVER_IMAGE: minio/minio@sha256:a1a8bd4ac40ad7881a245bab97323e18f971e4d4cba2c2007ec1bedd21cbaba2
-  MINIO_CLIENT_IMAGE: minio/mc@sha256:eb4ea9884b77704230e2423e9004d2fa738dc272876b9cc41a297d29443b8780
+  MINIO_SOURCE_COMMIT: 7aac2a2c5b7c882e68c1ce017d8256be2feea27f
+  MC_SOURCE_COMMIT: 77f82e18b5401a65958f1619df6ebb994634bd88
   AWS_ACCESS_KEY_ID: agentosqualifier
   AWS_SECRET_ACCESS_KEY: agentosqualificationsecret
   AWS_REGION: us-east-1
@@ -44,10 +44,35 @@ jobs:
         run: >-
           cargo run --release --locked --package os-benchmark
           --bin remote-backup-qualification -- --validate
-      - name: Start an immutable disposable S3-compatible store
+      - name: Build immutable disposable fixtures from pinned upstream sources
+        id: minio-images
         run: |
-          docker pull "$MINIO_SERVER_IMAGE"
-          docker pull "$MINIO_CLIENT_IMAGE"
+          mkdir -p target/qualification
+          for component in server client; do
+            docker build \
+              --file docker/qualification-minio.Dockerfile \
+              --target "minio-${component}" \
+              --build-arg "MINIO_SOURCE_COMMIT=$MINIO_SOURCE_COMMIT" \
+              --build-arg "MC_SOURCE_COMMIT=$MC_SOURCE_COMMIT" \
+              --tag "agentos-minio-${component}:qualification" .
+            digest="$(docker image inspect --format '{{.Id}}' \
+              "agentos-minio-${component}:qualification")"
+            [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+            printf '%s=%s\n' "$component" "$digest" >> "$GITHUB_OUTPUT"
+          done
+          jq -n \
+            --arg server_commit "$MINIO_SOURCE_COMMIT" \
+            --arg client_commit "$MC_SOURCE_COMMIT" \
+            --arg server_image "$(docker image inspect --format '{{.Id}}' agentos-minio-server:qualification)" \
+            --arg client_image "$(docker image inspect --format '{{.Id}}' agentos-minio-client:qualification)" \
+            '{server_source_commit: $server_commit, client_source_commit: $client_commit,
+              server_image_digest: $server_image, client_image_digest: $client_image}' \
+            > target/qualification/minio-fixture-build.json
+      - name: Start an immutable disposable S3-compatible store
+        env:
+          MINIO_SERVER_IMAGE: ${{ steps.minio-images.outputs.server }}
+          MINIO_CLIENT_IMAGE: ${{ steps.minio-images.outputs.client }}
+        run: |
           docker volume create agentos-remote-backup-data
           docker run -d --name agentos-remote-backup \
             -p 127.0.0.1:9000:9000 \
@@ -68,6 +93,9 @@ jobs:
             -e "MC_HOST_target=http://${AWS_ACCESS_KEY_ID}:${AWS_SECRET_ACCESS_KEY}@127.0.0.1:9000" \
             "$MINIO_CLIENT_IMAGE" mb --with-lock target/agentos-qualified-backups
       - name: Publish, hide current keys, and recover exact locked versions
+        env:
+          MINIO_SERVER_IMAGE: ${{ steps.minio-images.outputs.server }}
+          MINIO_CLIENT_IMAGE: ${{ steps.minio-images.outputs.client }}
         run: |
           mkdir -p target/qualification
           cargo run --release --locked --package os-benchmark \
@@ -79,9 +107,12 @@ jobs:
             --region "$AWS_REGION" \
             --state-dir target/qualification/remote-backup-state \
             --output target/qualification/remote-backup.json \
-            --server-image-digest "${MINIO_SERVER_IMAGE#*@}" \
-            --client-image-digest "${MINIO_CLIENT_IMAGE#*@}"
+            --server-image-digest "$MINIO_SERVER_IMAGE" \
+            --client-image-digest "$MINIO_CLIENT_IMAGE"
       - name: Verify exact-source retained evidence
+        env:
+          MINIO_SERVER_IMAGE: ${{ steps.minio-images.outputs.server }}
+          MINIO_CLIENT_IMAGE: ${{ steps.minio-images.outputs.client }}
         run: |
           report=target/qualification/remote-backup.json
           test "$(jq -r .schema_version "$report")" = "1"
@@ -97,8 +128,8 @@ jobs:
           test "$(jq -r .source.dirty "$report")" = "false"
           test "$(jq -r .environment.os "$report")" = "linux"
           test "$(jq -r .environment.architecture "$report")" = "x86_64"
-          test "$(jq -r .environment.server_image_digest "$report")" = "${MINIO_SERVER_IMAGE#*@}"
-          test "$(jq -r .environment.client_image_digest "$report")" = "${MINIO_CLIENT_IMAGE#*@}"
+          test "$(jq -r .environment.server_image_digest "$report")" = "$MINIO_SERVER_IMAGE"
+          test "$(jq -r .environment.client_image_digest "$report")" = "$MINIO_CLIENT_IMAGE"
           test "$(jq '.publication.objects | length' "$report")" = "2"
           test "$(jq '.recovery.objects | length' "$report")" = "2"
           test "$(jq '.delete_marker_version_ids | length' "$report")" = "2"
@@ -118,7 +149,9 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: remote-backup-${{ env.QUALIFICATION_SHA }}
-          path: target/qualification/remote-backup.json
+          path: |
+            target/qualification/remote-backup.json
+            target/qualification/minio-fixture-build.json
           if-no-files-found: error
           retention-days: 90
       - name: Diagnostics and cleanup

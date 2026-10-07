@@ -25,8 +25,8 @@
 ############################
 # Stage 1 — builder
 ############################
-# rust:1.97.1 matches the pinned toolchain used by CI and satisfies Wasmtime
-# 47's Rust 1.94 MSRV. bookworm => OpenSSL 3, matching the runtime image.
+# The builder supplies Rust; rust-toolchain.toml selects the workspace's pinned
+# compiler. Bookworm supplies OpenSSL 3, matching the runtime image.
 FROM rust:1.99.0-slim-bookworm@sha256:452176c0cefca88c0b3184ce85a4eb03e3d4fa05d2afb5366abcba853221019e AS builder
 
 # Build-time system deps:

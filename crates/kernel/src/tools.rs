@@ -396,6 +396,7 @@ pub struct ToolRegistry {
     /// so they cannot observe half of a command-backed registration.
     publication: std::sync::RwLock<()>,
     tools: DashMap<String, ToolBinding>,
+    binding_ids: DashMap<String, uuid::Uuid>,
     /// Command templates for custom tools: name -> (command, args_template)
     command_templates: DashMap<String, (String, Vec<String>)>,
 }
@@ -411,6 +412,7 @@ impl ToolRegistry {
         let registry = Self {
             publication: std::sync::RwLock::new(()),
             tools: DashMap::new(),
+            binding_ids: DashMap::new(),
             command_templates: DashMap::new(),
         };
         registry.register_builtins();
@@ -438,6 +440,7 @@ impl ToolRegistry {
         match self.tools.entry(name.clone()) {
             dashmap::mapref::entry::Entry::Vacant(entry) => {
                 entry.insert(binding);
+                self.binding_ids.insert(name, uuid::Uuid::new_v4());
                 Ok(())
             }
             dashmap::mapref::entry::Entry::Occupied(_) => {
@@ -654,6 +657,7 @@ impl ToolRegistry {
 
     fn unregister_locked(&self, name: &str) {
         self.tools.remove(name);
+        self.binding_ids.remove(name);
         self.command_templates.remove(name);
     }
 
@@ -712,6 +716,8 @@ impl ToolRegistry {
         match self.command_templates.entry(name.to_string()) {
             dashmap::mapref::entry::Entry::Vacant(entry) => {
                 entry.insert((command.to_string(), args_template.to_vec()));
+                self.binding_ids
+                    .insert(name.to_string(), uuid::Uuid::new_v4());
                 Ok(())
             }
             dashmap::mapref::entry::Entry::Occupied(_) => Err(
@@ -744,6 +750,7 @@ impl ToolRegistry {
             // only our new binding is rolled back. Preserve any unexpected
             // template entry for fail-closed diagnostics.
             self.tools.remove(&name);
+            self.binding_ids.remove(&name);
             return Err(error);
         }
         Ok(())
@@ -877,10 +884,27 @@ impl ToolRegistry {
         name: &str,
         arguments: &serde_json::Value,
     ) -> Result<PreparedToolExecution, String> {
+        self.prepare_bound_execution(agent_id, name, arguments, None)
+    }
+
+    fn prepare_bound_execution(
+        &self,
+        agent_id: AgentId,
+        name: &str,
+        arguments: &serde_json::Value,
+        binding_id: Option<uuid::Uuid>,
+    ) -> Result<PreparedToolExecution, String> {
         let _publication = self
             .publication
             .read()
             .expect("tool registry publication lock poisoned");
+        if binding_id.is_some_and(|expected| {
+            self.binding_ids
+                .get(name)
+                .is_none_or(|current| *current != expected)
+        }) {
+            return Err("VFS tool binding revoked".into());
+        }
         let authorization = self.prepare_call_locked(name, arguments)?;
         let call = ToolCall {
             id: "prepared".into(),
@@ -985,6 +1009,19 @@ impl ToolRegistry {
         arguments: &serde_json::Value,
     ) -> Result<(PreparedToolExecution, crate::cgroups::ToolCallGuard), ToolAuthorizationError>
     {
+        self.authorize_and_acquire_bound_call(gate, agent_id, name, arguments, None)
+            .await
+    }
+
+    pub(crate) async fn authorize_and_acquire_bound_call(
+        &self,
+        gate: &crate::syscall_gate::SyscallGate,
+        agent_id: AgentId,
+        name: &str,
+        arguments: &serde_json::Value,
+        binding_id: Option<uuid::Uuid>,
+    ) -> Result<(PreparedToolExecution, crate::cgroups::ToolCallGuard), ToolAuthorizationError>
+    {
         // Visibility is sensitive declaration metadata. For a registered
         // caller, reject a namespace-hidden name before consulting the global
         // registry so an exact guess is indistinguishable from a missing name.
@@ -995,7 +1032,7 @@ impl ToolRegistry {
             ));
         }
         let mut prepared = self
-            .prepare_execution(agent_id, name, arguments)
+            .prepare_bound_execution(agent_id, name, arguments, binding_id)
             .map_err(|error| {
                 if error.starts_with("unknown tool '") {
                     ToolAuthorizationError::InvalidDeclaration(TOOL_NOT_FOUND_ERROR.to_string())
@@ -1027,6 +1064,19 @@ impl ToolRegistry {
             .map_err(ToolAuthorizationError::Denied)?;
         prepared.request.gate_admission = Some(proof);
         Ok((prepared, guard))
+    }
+
+    pub(crate) fn binding_id_for_agent(
+        &self,
+        gate: &crate::syscall_gate::SyscallGate,
+        agent_id: AgentId,
+        name: &str,
+    ) -> Option<uuid::Uuid> {
+        let _publication = self.publication.read().ok()?;
+        if gate.pid_of(agent_id).is_none() || !gate.tool_visible_to_agent(agent_id, name) {
+            return None;
+        }
+        self.binding_ids.get(name).map(|id| *id)
     }
 
     /// Build the validated security catalog shipped by the kernel. This is

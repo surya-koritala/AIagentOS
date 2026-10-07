@@ -340,6 +340,27 @@ pub enum Syscall {
         #[serde(default)]
         args: serde_json::Value,
     },
+    /// Discover the namespace-visible tool mount without granting tool access.
+    VfsMounts {
+        agent_id: String,
+    },
+    /// Open one canonical tool path as an ephemeral, agent-owned handle.
+    VfsOpen {
+        agent_id: String,
+        path: String,
+    },
+    /// Invoke the exact opened registration through the normal tool gate.
+    VfsInvoke {
+        agent_id: String,
+        handle: String,
+        #[serde(default)]
+        args: serde_json::Value,
+    },
+    /// Revoke a handle and reclaim its slot. Already admitted calls may finish.
+    VfsClose {
+        agent_id: String,
+        handle: String,
+    },
     /// Snapshot of the syscall gate's enforcement counters.
     GateStats,
     /// Read-only introspection of one agent's enforcement state: the
@@ -1168,6 +1189,13 @@ pub enum SyscallReply {
     ToolResult {
         data: serde_json::Value,
     },
+    VfsMounts {
+        view: crate::vfs::VfsMountView,
+    },
+    VfsOpened {
+        handle: crate::vfs::VfsHandle,
+    },
+    VfsClosed,
     GateStats {
         allowed: u64,
         denied_capability: u64,
@@ -1458,7 +1486,7 @@ impl std::fmt::Debug for Syscall {
         let fields: &[&str] = match self {
             Self::Authenticate { .. } => &["token"],
             Self::SendMessage { .. } | Self::SendMessageStream { .. } => &["message"],
-            Self::CallTool { .. } => &["args"],
+            Self::CallTool { .. } | Self::VfsInvoke { .. } => &["args"],
             Self::MemoryStore { .. } | Self::MemoryUpdate { .. } => &["content"],
             Self::StoragePut { .. } => &["value"],
             Self::LoadPackage { .. } => &["manifest_toml"],
@@ -1492,6 +1520,7 @@ impl std::fmt::Debug for SyscallReply {
 impl SyscallReply {
     fn into_public_wire(self, negotiated_version: u32) -> Self {
         match self {
+            Self::TypedError { message, .. } if negotiated_version < 2 => Self::Error { message },
             Self::Error { message } if negotiated_version >= 2 => {
                 let (code, retryable) = WireErrorCode::classify(&message);
                 Self::TypedError {
@@ -1564,6 +1593,12 @@ fn syscall_policy(call: &Syscall) -> (AccessLevel, &'static str, Option<&str>) {
         Syscall::CallTool { agent_id, .. } => {
             (AccessLevel::User, "agent.call_tool", Some(agent_id))
         }
+        Syscall::VfsMounts { agent_id } => (AccessLevel::ReadOnly, "vfs.mounts", Some(agent_id)),
+        Syscall::VfsOpen { agent_id, .. } => (AccessLevel::User, "vfs.open", Some(agent_id)),
+        Syscall::VfsInvoke { agent_id, .. } => {
+            (AccessLevel::User, "agent.call_tool", Some(agent_id))
+        }
+        Syscall::VfsClose { agent_id, .. } => (AccessLevel::User, "vfs.close", Some(agent_id)),
         Syscall::GateStats => (AccessLevel::System, "system.gate_stats", None),
         Syscall::AgentInfo { agent_id } => (AccessLevel::ReadOnly, "agent.info", Some(agent_id)),
         Syscall::ListProviders => (AccessLevel::ReadOnly, "provider.list", None),
@@ -1915,6 +1950,8 @@ fn starts_new_work(call: &Syscall) -> bool {
             | Syscall::SendMessage { .. }
             | Syscall::SendMessageStream { .. }
             | Syscall::CallTool { .. }
+            | Syscall::VfsOpen { .. }
+            | Syscall::VfsInvoke { .. }
             | Syscall::RunInstalledPackage { .. }
     )
 }
@@ -1931,6 +1968,9 @@ fn mutable_agent_target(call: &Syscall) -> Option<&str> {
         | Syscall::SendMessageStream { agent_id, .. }
         | Syscall::CancelRequest { agent_id, .. }
         | Syscall::CallTool { agent_id, .. }
+        | Syscall::VfsOpen { agent_id, .. }
+        | Syscall::VfsInvoke { agent_id, .. }
+        | Syscall::VfsClose { agent_id, .. }
         | Syscall::MemoryStore { agent_id, .. }
         | Syscall::MemoryUpdate { agent_id, .. }
         | Syscall::MemoryDelete { agent_id, .. }
@@ -2018,6 +2058,90 @@ fn quarantine_recovery_call(call: &Syscall) -> bool {
             | Syscall::KillAgent { .. }
             | Syscall::CancelRequest { .. }
     )
+}
+
+fn vfs_error(error: crate::vfs::VfsError) -> SyscallReply {
+    let code = match error {
+        crate::vfs::VfsError::InvalidPath => WireErrorCode::InvalidArgument,
+        crate::vfs::VfsError::NotFound => WireErrorCode::NotFound,
+        crate::vfs::VfsError::Capacity => WireErrorCode::QuotaExceeded,
+        crate::vfs::VfsError::Unavailable => WireErrorCode::Unavailable,
+    };
+    SyscallReply::TypedError {
+        code,
+        message: error.to_string(),
+        retryable: false,
+    }
+}
+
+async fn dispatch_tool_call(
+    kernel: &AgentKernelImpl,
+    agent_id: &str,
+    tool: &str,
+    args: &serde_json::Value,
+    lease: Option<std::sync::Arc<crate::vfs::ToolHandleLease>>,
+) -> SyscallReply {
+    let id = match uuid::Uuid::parse_str(agent_id) {
+        Ok(id) => id,
+        Err(_) => {
+            return SyscallReply::Error {
+                message: format!("invalid agent id: {agent_id}"),
+            }
+        }
+    };
+    if lease.as_ref().is_some_and(|lease| lease.is_closed()) {
+        return vfs_error(crate::vfs::VfsError::NotFound);
+    }
+    // Security preparation is shared with executor/MCP/SDK so action,
+    // resource extraction, and accounting cannot drift by entry point.
+    let (prepared_tool, _tool_slot) = match kernel
+        .tool_registry
+        .authorize_and_acquire_bound_call(
+            &kernel.syscall_gate,
+            id,
+            tool,
+            args,
+            lease.as_ref().map(|lease| lease.binding_id),
+        )
+        .await
+    {
+        Ok((prepared, slot)) => (prepared, slot),
+        Err(crate::tools::ToolAuthorizationError::InvalidDeclaration(error))
+            if error == "VFS tool binding revoked" =>
+        {
+            return vfs_error(crate::vfs::VfsError::NotFound);
+        }
+        Err(crate::tools::ToolAuthorizationError::InvalidDeclaration(error))
+            if error == crate::tools::TOOL_NOT_FOUND_ERROR =>
+        {
+            return SyscallReply::Error { message: error }
+        }
+        Err(error) => {
+            return SyscallReply::Error {
+                message: format!("tool '{tool}' denied by kernel: {error}"),
+            }
+        }
+    };
+
+    if lease.as_ref().is_some_and(|lease| {
+        lease.is_closed()
+            || kernel
+                .tool_registry
+                .binding_id_for_agent(&kernel.syscall_gate, id, tool)
+                != Some(lease.binding_id)
+    }) {
+        return vfs_error(crate::vfs::VfsError::NotFound);
+    }
+    let reply = match kernel.resource_broker.execute(prepared_tool.request).await {
+        Ok(resp) if resp.success => SyscallReply::ToolResult { data: resp.data },
+        Ok(resp) => SyscallReply::Error {
+            message: format!("tool '{tool}' failed: {}", resp.error.unwrap_or_default()),
+        },
+        Err(e) => SyscallReply::Error {
+            message: format!("tool '{tool}' error: {e}"),
+        },
+    };
+    reply
 }
 
 /// Dispatch a single syscall against the kernel. Pure routing — every call goes
@@ -2697,46 +2821,45 @@ async fn dispatch_scoped_inner_with_fence(
             agent_id,
             tool,
             args,
+        } => dispatch_tool_call(kernel, &agent_id, &tool, &args, None).await,
+        Syscall::VfsMounts { agent_id } => match uuid::Uuid::parse_str(&agent_id) {
+            Ok(id) => match kernel.vfs_mounts(id) {
+                Ok(view) => SyscallReply::VfsMounts { view },
+                Err(error) => vfs_error(error),
+            },
+            Err(_) => vfs_error(crate::vfs::VfsError::NotFound),
+        },
+        Syscall::VfsOpen { agent_id, path } => match uuid::Uuid::parse_str(&agent_id) {
+            Ok(id) => match kernel.vfs_open(id, &path).await {
+                Ok(handle) => SyscallReply::VfsOpened { handle },
+                Err(error) => vfs_error(error),
+            },
+            Err(_) => vfs_error(crate::vfs::VfsError::NotFound),
+        },
+        Syscall::VfsInvoke {
+            agent_id,
+            handle,
+            args,
         } => {
-            let id = match uuid::Uuid::parse_str(&agent_id) {
-                Ok(id) => id,
-                Err(_) => {
-                    return SyscallReply::Error {
-                        message: format!("invalid agent id: {agent_id}"),
-                    }
-                }
+            let lease = match uuid::Uuid::parse_str(&agent_id) {
+                Ok(id) => kernel.tool_vfs.acquire(id, &handle),
+                Err(_) => Err(crate::vfs::VfsError::NotFound),
             };
-            // Security preparation is shared with executor/MCP/SDK so action,
-            // resource extraction, and accounting cannot drift by entry point.
-            let (prepared_tool, _tool_slot) = match kernel
-                .tool_registry
-                .authorize_and_acquire_call(&kernel.syscall_gate, id, &tool, &args)
-                .await
-            {
-                Ok((prepared, slot)) => (prepared, slot),
-                Err(crate::tools::ToolAuthorizationError::InvalidDeclaration(error))
-                    if error == crate::tools::TOOL_NOT_FOUND_ERROR =>
-                {
-                    return SyscallReply::Error { message: error }
+            match lease {
+                Ok(lease) => {
+                    dispatch_tool_call(kernel, &agent_id, &lease.name.clone(), &args, Some(lease))
+                        .await
                 }
-                Err(error) => {
-                    return SyscallReply::Error {
-                        message: format!("tool '{tool}' denied by kernel: {error}"),
-                    }
-                }
-            };
-
-            let reply = match kernel.resource_broker.execute(prepared_tool.request).await {
-                Ok(resp) if resp.success => SyscallReply::ToolResult { data: resp.data },
-                Ok(resp) => SyscallReply::Error {
-                    message: format!("tool '{tool}' failed: {}", resp.error.unwrap_or_default()),
-                },
-                Err(e) => SyscallReply::Error {
-                    message: format!("tool '{tool}' error: {e}"),
-                },
-            };
-            reply
+                Err(error) => vfs_error(error),
+            }
         }
+        Syscall::VfsClose { agent_id, handle } => match uuid::Uuid::parse_str(&agent_id) {
+            Ok(id) => match kernel.tool_vfs.close(id, &handle) {
+                Ok(()) => SyscallReply::VfsClosed,
+                Err(error) => vfs_error(error),
+            },
+            Err(_) => vfs_error(crate::vfs::VfsError::NotFound),
+        },
         Syscall::GateStats => {
             let s = kernel.syscall_gate.stats();
             SyscallReply::GateStats {
@@ -9155,6 +9278,22 @@ memory = ["remember this"]
                 tool: "read_file".into(),
                 args: serde_json::json!({"path": "/tmp/x"}),
             },
+            Syscall::VfsMounts {
+                agent_id: id.clone(),
+            },
+            Syscall::VfsOpen {
+                agent_id: id.clone(),
+                path: "/tools/read_file".into(),
+            },
+            Syscall::VfsInvoke {
+                agent_id: id.clone(),
+                handle: uuid::Uuid::new_v4().to_string(),
+                args: serde_json::json!({"path": "proof.txt"}),
+            },
+            Syscall::VfsClose {
+                agent_id: id.clone(),
+                handle: uuid::Uuid::new_v4().to_string(),
+            },
             Syscall::AgentInfo {
                 agent_id: id.clone(),
             },
@@ -9700,7 +9839,7 @@ memory = ["remember this"]
                     .to_string()
             })
             .collect::<std::collections::HashSet<_>>();
-        assert_eq!(calls.len(), 92);
+        assert_eq!(calls.len(), 96);
         assert_eq!(fixture_tags, schema_tags);
     }
 

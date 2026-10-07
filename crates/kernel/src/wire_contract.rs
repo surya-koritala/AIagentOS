@@ -45,6 +45,7 @@ pub const WIRE_FEATURES: &[&str] = &[
     "tls",
     "token_streaming",
     "typed_errors",
+    "tool_vfs",
 ];
 
 /// A complete top-level protocol contract returned by `describe_protocol`.
@@ -247,6 +248,26 @@ const REQUEST_VARIANTS: &[Variant] = &[
     Variant {
         tag: "gate_stats",
         fields: &[],
+    },
+    Variant {
+        tag: "vfs_mounts",
+        fields: &[Field::required("agent_id", S)],
+    },
+    Variant {
+        tag: "vfs_open",
+        fields: &[Field::required("agent_id", S), Field::required("path", S)],
+    },
+    Variant {
+        tag: "vfs_invoke",
+        fields: &[
+            Field::required("agent_id", S),
+            Field::required("handle", S),
+            Field::optional("args", X),
+        ],
+    },
+    Variant {
+        tag: "vfs_close",
+        fields: &[Field::required("agent_id", S), Field::required("handle", S)],
     },
     Variant {
         tag: "agent_info",
@@ -905,6 +926,18 @@ const REPLY_VARIANTS: &[Variant] = &[
         fields: &[Field::required("data", X)],
     },
     Variant {
+        tag: "vfs_mounts",
+        fields: &[Field::required("view", O)],
+    },
+    Variant {
+        tag: "vfs_opened",
+        fields: &[Field::required("handle", O)],
+    },
+    Variant {
+        tag: "vfs_closed",
+        fields: &[],
+    },
+    Variant {
         tag: "gate_stats",
         fields: &[
             Field::required("allowed", I),
@@ -1510,8 +1543,8 @@ mod tests {
                     });
             }
         }
-        assert_eq!(conformance_request_fixtures(1).unwrap().len(), 61);
-        assert_eq!(conformance_request_fixtures(2).unwrap().len(), 92);
+        assert_eq!(conformance_request_fixtures(1).unwrap().len(), 65);
+        assert_eq!(conformance_request_fixtures(2).unwrap().len(), 96);
         assert!(conformance_request_fixtures(0).is_err());
         assert!(conformance_request_fixtures(PROTOCOL_VERSION + 1).is_err());
     }

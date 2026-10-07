@@ -70,6 +70,7 @@ pub use kernel::syscall_server::{
     OperatorPackageSnapshot, OperatorServiceSnapshot, OperatorSnapshot, ProviderSummary,
     WireErrorCode,
 };
+pub use kernel::vfs::{VfsHandle, VfsMountView};
 pub use kernel::wire_contract::{ProtocolDescription, TransportDescription};
 
 /// The wire-protocol version this SDK build was compiled against. A client
@@ -1192,6 +1193,78 @@ impl KernelClient {
         match self.call(call).await? {
             SyscallReply::ToolResult { data } => Ok(data),
             other => Err(unexpected("ToolResult", &other)),
+        }
+    }
+
+    /// Discover the visible tool mount and this agent's handle capacity.
+    pub async fn vfs_mounts(
+        &mut self,
+        agent_id: impl Into<String>,
+    ) -> Result<VfsMountView, SdkError> {
+        match self
+            .call(Syscall::VfsMounts {
+                agent_id: agent_id.into(),
+            })
+            .await?
+        {
+            SyscallReply::VfsMounts { view } => Ok(view),
+            other => Err(unexpected("VfsMounts", &other)),
+        }
+    }
+
+    /// Open an ephemeral tool handle. Opening does not grant tool permissions.
+    pub async fn vfs_open(
+        &mut self,
+        agent_id: impl Into<String>,
+        path: impl Into<String>,
+    ) -> Result<VfsHandle, SdkError> {
+        match self
+            .call(Syscall::VfsOpen {
+                agent_id: agent_id.into(),
+                path: path.into(),
+            })
+            .await?
+        {
+            SyscallReply::VfsOpened { handle } => Ok(handle),
+            other => Err(unexpected("VfsOpened", &other)),
+        }
+    }
+
+    /// Invoke an exact opened binding, with current gate checks and arguments.
+    pub async fn vfs_invoke(
+        &mut self,
+        agent_id: impl Into<String>,
+        handle: impl Into<String>,
+        args: serde_json::Value,
+    ) -> Result<serde_json::Value, SdkError> {
+        match self
+            .call(Syscall::VfsInvoke {
+                agent_id: agent_id.into(),
+                handle: handle.into(),
+                args,
+            })
+            .await?
+        {
+            SyscallReply::ToolResult { data } => Ok(data),
+            other => Err(unexpected("ToolResult", &other)),
+        }
+    }
+
+    /// Close a handle and reclaim its slot; repeated close returns NotFound.
+    pub async fn vfs_close(
+        &mut self,
+        agent_id: impl Into<String>,
+        handle: impl Into<String>,
+    ) -> Result<(), SdkError> {
+        match self
+            .call(Syscall::VfsClose {
+                agent_id: agent_id.into(),
+                handle: handle.into(),
+            })
+            .await?
+        {
+            SyscallReply::VfsClosed => Ok(()),
+            other => Err(unexpected("VfsClosed", &other)),
         }
     }
 
@@ -2895,6 +2968,7 @@ fn safe_to_replay_after_reconnect(call: &Syscall) -> bool {
             | Syscall::MemoryQuery { .. }
             | Syscall::StorageGet { .. }
             | Syscall::StorageList { .. }
+            | Syscall::VfsMounts { .. }
             | Syscall::ContextPressure { .. }
             | Syscall::ListSnapshots { .. }
             | Syscall::Hello { .. }
@@ -2938,7 +3012,9 @@ fn mutation_operation_name(call: &Syscall) -> &'static str {
         Syscall::ResumeAgent { .. } => "agent resume",
         Syscall::StopAgent { .. } => "agent stop",
         Syscall::KillAgent { .. } => "agent kill",
-        Syscall::CallTool { .. } => "tool call",
+        Syscall::CallTool { .. } | Syscall::VfsInvoke { .. } => "tool call",
+        Syscall::VfsOpen { .. } => "VFS open",
+        Syscall::VfsClose { .. } => "VFS close",
         Syscall::SendMessage { .. } | Syscall::SendMessageStream { .. } => "agent turn",
         Syscall::FencedAgentMutation { mutation, .. } => mutation_operation_name(mutation),
         _ => "side-effecting syscall",

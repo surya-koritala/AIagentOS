@@ -14,7 +14,7 @@
 # one platform, must be named explicitly in `limitations`.
 
 schema_version = 1
-updated = "2026-08-03"
+updated = "2026-10-07"
 model = [
   "scaffolded",
   "unit-tested",
@@ -509,3 +509,18 @@ runtime_call_paths = []
 test_evidence = []
 platforms = ["linux", "macos", "windows"]
 limitations = ["Independent security assessment, multi-maintainer review, reproducible release evidence, and external operator qualification are pending."]
+
+[[capability]]
+id = "tool-vfs"
+title = "Agent-owned tool VFS handles"
+owner = "core runtime"
+maturity = "integrated"
+release = "v1.0"
+tracking_issue = 392
+kernel_modules = ["vfs"]
+source_paths = ["crates/kernel/src/vfs.rs", "crates/kernel/src/tools.rs", "docs/VFS.md"]
+public_entry_points = ["crates/kernel/src/syscall_server.rs::Syscall::VfsOpen", "crates/sdk/src/lib.rs::KernelClient::vfs_invoke", "crates/cli/src/bin/agentctl.rs"]
+runtime_call_paths = ["crates/kernel/src/vfs.rs::AgentKernelImpl::vfs_open", "crates/kernel/src/syscall_server.rs::dispatch_tool_call"]
+test_evidence = ["crates/sdk/tests/vfs.rs", "crates/kernel/src/vfs.rs::tests"]
+platforms = ["linux", "macos", "windows"]
+limitations = ["Only the built-in tool mount is implemented; workspace and other mounts, namespace mount administration, and duplication semantics remain incomplete.", "Handles are ephemeral, lost on restart, and not inherited by clones.", "Independent security review and full VFS production qualification remain pending in #392."]

@@ -134,7 +134,7 @@ jobs:
           python3 scripts/build_cli_archive.py \
             --source dist/stage \
             --output "dist/agentos-${ARTIFACT_VERSION}-${TARGET}.zip"
-      - uses: anchore/sbom-action/download-syft@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+      - uses: anchore/sbom-action/download-syft@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
       - name: Generate exact-binary CycloneDX SBOM
         run: >-
           syft dir:dist/stage

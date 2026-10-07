@@ -524,7 +524,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
         with:
           toolchain: nightly-2026-07-20
-      - uses: taiki-e/install-action@41049aa56687c35e0afa74eed4f09cec4f9afabf
+      - uses: taiki-e/install-action@37f7c5781271959fb65b6b35224e28652ff2b63d
         with:
           tool: cargo-fuzz@0.13.2
       - name: Build every fuzz target

@@ -32,7 +32,11 @@ TARGETS = (
         85.0,
         ("crates/kernel/src/sandbox.rs", "crates/kernel/src/resources.rs"),
     ),
-    CoverageTarget("persistence", 80.0, ("crates/kernel/src/context.rs",)),
+    CoverageTarget(
+        "persistence",
+        80.0,
+        ("crates/kernel/src/context.rs", "crates/kernel/src/context/fact_index.rs"),
+    ),
     CoverageTarget("wire API", 85.0, ("crates/kernel/src/syscall_server.rs",)),
 )
 

@@ -42,6 +42,7 @@ use tokio::net::ToSocketAddrs;
 
 // Re-export the kernel wire types that appear in this crate's public API, so
 // SDK consumers can name them without depending on the kernel directly.
+pub use kernel::cloning::CloneResult;
 pub use kernel::cluster_control::{
     AgentMutationFence, AgentMutationFenceAudit, AgentMutationFenceState, ClusterAgentOwnership,
     ClusterAgentOwnershipAudit, ClusterCertificateRollout, ClusterCertificateRolloutAudit,
@@ -708,6 +709,55 @@ impl KernelClient {
         match self.call(call).await? {
             SyscallReply::AgentCreated { id } => Ok(id),
             other => Err(unexpected("AgentCreated", &other)),
+        }
+    }
+
+    /// Clone an idle agent using a caller-known child UUID. On an indeterminate
+    /// transport outcome, reconcile that UUID explicitly; this is never replayed
+    /// automatically. Capabilities may only be removed from the parent's set.
+    pub async fn clone_agent(
+        &mut self,
+        parent: impl Into<String>,
+        child: uuid::Uuid,
+        name: impl Into<String>,
+        drop_capabilities: Vec<String>,
+    ) -> Result<CloneResult, SdkError> {
+        match self
+            .call(Syscall::CloneAgent {
+                agent_id: parent.into(),
+                child_agent_id: child.to_string(),
+                child_ownership_proof: None,
+                name: name.into(),
+                drop_capabilities,
+            })
+            .await?
+        {
+            SyscallReply::AgentCloned { result } => Ok(result),
+            other => Err(unexpected("AgentCloned", &other)),
+        }
+    }
+
+    /// Clone with an exact parent ownership fence and an authority-reserved
+    /// child identity. Both ownership proofs are checked by the destination.
+    pub async fn clone_agent_fenced(
+        &mut self,
+        parent: impl Into<String>,
+        parent_proof: AgentMutationFenceProof,
+        child: ReservedAgentIdentity,
+        name: impl Into<String>,
+        drop_capabilities: Vec<String>,
+    ) -> Result<CloneResult, SdkError> {
+        let parent = parent.into();
+        let mutation = Syscall::CloneAgent {
+            agent_id: parent.clone(),
+            child_agent_id: child.agent_id,
+            child_ownership_proof: Some(child.ownership_proof),
+            name: name.into(),
+            drop_capabilities,
+        };
+        match self.fenced_call(parent, parent_proof, mutation).await? {
+            SyscallReply::AgentCloned { result } => Ok(result),
+            other => Err(unexpected("AgentCloned", &other)),
         }
     }
 
@@ -3655,6 +3705,7 @@ mod protocol_tests {
                 std::future::pending::<()>().await;
             }
             Ok(LlmResponse {
+                provider_metadata: None,
                 content: "wire resume complete".into(),
                 finish_reason: Some("stop".into()),
                 tokens_used: 5,

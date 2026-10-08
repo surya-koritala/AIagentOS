@@ -115,6 +115,7 @@ impl LlmSession for HuggingFaceSession {
                     .unwrap_or("")
                     .to_string();
                 Ok(LlmResponse {
+                    provider_metadata: None,
                     content,
                     finish_reason: Some("stop".to_string()),
                     tokens_used: 0,
@@ -187,6 +188,7 @@ impl LlmProviderAdapter for HuggingFaceAdapter {
 
     fn translate_from_provider(&self, value: &serde_json::Value) -> Option<StandardMessage> {
         Some(StandardMessage {
+            provider_metadata: None,
             role: value
                 .get("role")
                 .and_then(|r| r.as_str())

@@ -180,6 +180,7 @@ impl LlmSession for AzureSession {
                         ),
                     ),
                     tool_calls,
+                    provider_metadata: None,
                 })
             }
             Ok(resp) => Err(crate::provider_http_error(&self.provider_id, resp).await),
@@ -306,6 +307,7 @@ impl LlmProviderAdapter for AzureOpenAiAdapter {
                 .to_string(),
             tool_call_id: None,
             tool_calls: None,
+            provider_metadata: None,
         })
     }
 }

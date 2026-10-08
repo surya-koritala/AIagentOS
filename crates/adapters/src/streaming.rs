@@ -330,6 +330,7 @@ impl StreamState {
             tokens_used: self.tokens_used,
             usage: self.usage,
             tool_calls,
+            provider_metadata: None,
         })
     }
 }

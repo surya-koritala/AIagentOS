@@ -28,7 +28,7 @@ plaintext tool shim is separate.
 | Anthropic | Yes | No; bounded non-streaming fallback | Yes / yes | Input, output, cache-read | Yes / yes | Not in the standard message contract | Configured model; Messages API family | **Not run** |
 | Groq | Yes | Yes, SSE | Yes / yes | Prompt, completion, cached when present | Yes / yes | Unsupported | Configured model; OpenAI-compatible v1 | **Not run** |
 | DeepSeek | Yes | Yes, SSE | Yes / yes | Prompt, completion, cache-hit when present | Yes / yes | Unsupported | Configured model; OpenAI-compatible v1 | **Not run** |
-| Gemini | Yes | No; bounded non-streaming fallback | No / no | Prompt, candidate, cached | Yes / yes | Not in the standard message contract | Configured model; GenerateContent v1beta family | **Not run** |
+| Gemini | Yes | No; bounded non-streaming fallback | Yes / yes | Prompt, candidate + thought, cached | Yes / yes | Not in the standard message contract | Configured model; GenerateContent v1beta family | **Not run** |
 | Hugging Face inference | Yes | No; bounded non-streaming fallback | No / no | Provider usage unavailable; runtime estimate | Yes / yes | Unsupported | Configured model endpoint | **Not run** |
 | vLLM | Yes | Yes, SSE | Yes / yes | Prompt, completion, cached when present | Yes / yes | Unsupported | Configured model; OpenAI-compatible v1 | **Not run** |
 | Ollama | Yes | No; bounded non-streaming fallback | Yes / yes | Prompt/eval counts when present | Yes / yes | Unsupported | Configured endpoint and model | **Not run** |
@@ -115,6 +115,37 @@ cached usage stays distinct from conservative admission estimates. Missing
 provider usage is explicitly marked as estimated; the runtime does not invent a
 vendor invoice.
 
+## Gemini native history
+
+The GenerateContent adapter sends JSON-schema function declarations and parses
+all native function calls in response order. Tool results are paired by call ID
+and returned as functionResponse parts in original call order in one user turn
+for parallel calls, even when results arrive in reverse order.
+Upstream IDs are retained when present; missing IDs receive a durable unique
+synthetic ID. Synthetic IDs are never inserted into signed native response parts.
+System instructions use the separate systemInstruction field.
+
+Bounded provider/model-specific assistant metadata preserves native parts and
+thought signatures exactly through saved conversations, checkpoints and cloning.
+Thought-marked text is excluded from visible answer content. Native text is
+returned as text even when a code example resembles the plaintext tool shim. Malformed parts,
+non-object arguments, duplicate IDs, changed signed content, orphan results and
+incompatible provider/model history fail closed. Native history cannot fail over
+to a provider or model that cannot replay it. Signed history and its following
+messages stay pinned under context pressure; insufficient context rejects the
+request before provider I/O. Usage includes thought tokens in output accounting.
+
+Responses are limited to 1 MiB, native messages to 64 parts, and opaque replay
+payloads to 256 KiB. Replay state is not a tool permission. Tool calls still pass
+through the declaration, namespace, capability, MAC, approval and cgroup gate.
+The wiremock and kernel restart tests are fixtures; live Gemini evidence remains
+**not run**. Schema 11 prevents an older reader from discarding replay state.
+Custom Rust adapters constructing StandardMessage or LlmResponse literals must
+initialize the new optional provider_metadata field, normally to None.
+
+The contracts follow Google's [GenerateContent API reference](https://ai.google.dev/api/generate-content)
+and [thinking state documentation](https://ai.google.dev/gemini-api/docs/thinking).
+
 ## On-device boundary
 
 The feature-gated Candle adapter is a CPU-only, in-process GGUF path. It:
@@ -161,14 +192,20 @@ legacy, malformed, wrong-dimension, or content-mismatched vector is
 deterministically rebuilt and persisted before ranking.
 
 The public wire protocol and Rust SDK support store, semantic query, update,
-delete, and full-agent reindex. Mutations are agent-owned; tests cover
+delete, and full-agent reindex. The context manager retains per-agent fact rows
+and search indexes instead of rebuilding them for every query. Deterministic
+planes are shared; vectors and buckets remain private. Mutations are agent-owned;
+tests cover
 cross-agent denial, 160 concurrent writes without loss, large top-k queries,
 corrupt/stale rebuilds, and tenant purge that removes runtime/memory artifacts
 without damaging another tenant or deleting durable agent identity history.
 
 The default offline embedding is `blended-feature-hash` version 2 at 256
 dimensions. It is deterministic and dependency-free; it is not a neural
-embedding model and should not be described as equivalent to one.
+embedding model and should not be described as equivalent to one. An
+[opt-in HTTP embedding backend](HTTP_EMBEDDINGS.md) supports configured
+OpenAI-compatible/Ollama services with typed failures, model/dimension repair and
+same-corpus comparison. Actual neural-model quality remains not run.
 
 ### Exact-vs-ANN gate
 
@@ -176,7 +213,8 @@ embedding model and should not be described as equivalent to one.
 LSH indexes, runs planted queries, emits JSON evidence, and fails when:
 
 - mean recall@10 is below `0.80`; or
-- exact/ANN top-1 agreement is below `0.99`.
+- exact/ANN top-1 agreement is below `0.99`; or
+- ANN query p95 is not below exact p95 at 10,000 or more items.
 
 Run it with:
 
@@ -188,8 +226,18 @@ The default corpus is 10,000 items and 100 queries. A local development-profile
 run on 2026-07-25 produced recall@10 `1.0` and top-1 agreement `1.0`. Its ANN
 p95 (`44.260 ms`) was slower than exact search (`25.052 ms`) on that host, so
 this is quality evidence—not a performance SLO. The CI artifact records each
-runner's build/query timing and Linux resident memory. Cached/persistent ANN
-construction and sustained 100k+ latency/soak goals remain part of
+runner's build/query timing and Linux resident memory. The retained cache,
+binary-embedding migration, deterministic ordering and revised performance gate
+are described in [memory retrieval](MEMORY_RETRIEVAL.md). The
+[2026-10-08 Linux fixture](../benchmarks/retrieval/2026-10-08-linux-10k/README.md)
+passed with recall/top-one agreement 1.0 and ANN p95 15.228 ms versus exact
+17.851 ms; it measures index searches and excludes database warming.
+The [2026-10-08 100k context fixture](../benchmarks/retrieval/2026-10-08-linux-100k/README.md)
+passes the actual API under 60 seconds of concurrent updates and queries: cold
+16.035 seconds, warm p95 135.619 ms, concurrent-read p95 839.088 ms and process
+peak RSS 398,667,776 bytes. Recall/top-one are 1.0 before and after mutation;
+189 reads/189 writes preserve all facts and the foreign sentinel. These are
+synthetic runner-specific results. Target deployment and 24-hour soak goals remain
 [issue #125](https://github.com/surya-koritala/AIagentOS/issues/125).
 
 ## Protected evidence workflows

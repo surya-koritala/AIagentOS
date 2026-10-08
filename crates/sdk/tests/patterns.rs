@@ -58,6 +58,7 @@ impl OneToolSession {
     fn next_response(&self) -> LlmResponse {
         if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
             LlmResponse {
+                provider_metadata: None,
                 content: String::new(),
                 finish_reason: Some("tool_calls".into()),
                 tokens_used: 1,
@@ -70,6 +71,7 @@ impl OneToolSession {
             }
         } else {
             LlmResponse {
+                provider_metadata: None,
                 content: "done".into(),
                 finish_reason: Some("stop".into()),
                 tokens_used: 1,

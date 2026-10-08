@@ -1,0 +1,348 @@
+{
+  "architecture": "aarch64",
+  "evidence_class": "deterministic_fixture",
+  "latency_scope": "public child admission plus history publication, excludes store checkpoint and RSS sampling",
+  "platform": "macos",
+  "provider_calls": 0,
+  "results": [
+    {
+      "branches": 8,
+      "history_bytes": 241793,
+      "messages": 256,
+      "samples": [
+        {
+          "branch": 1,
+          "latency_us": 6749,
+          "resident_growth_bytes": 2572288,
+          "retained_database_growth_bytes": 475136
+        },
+        {
+          "branch": 2,
+          "latency_us": 1794,
+          "resident_growth_bytes": 2588672,
+          "retained_database_growth_bytes": 475136
+        },
+        {
+          "branch": 3,
+          "latency_us": 1673,
+          "resident_growth_bytes": 2588672,
+          "retained_database_growth_bytes": 475136
+        },
+        {
+          "branch": 4,
+          "latency_us": 1658,
+          "resident_growth_bytes": 2637824,
+          "retained_database_growth_bytes": 475136
+        },
+        {
+          "branch": 5,
+          "latency_us": 1650,
+          "resident_growth_bytes": 2637824,
+          "retained_database_growth_bytes": 475136
+        },
+        {
+          "branch": 6,
+          "latency_us": 1682,
+          "resident_growth_bytes": 2670592,
+          "retained_database_growth_bytes": 475136
+        },
+        {
+          "branch": 7,
+          "latency_us": 1661,
+          "resident_growth_bytes": 2703360,
+          "retained_database_growth_bytes": 475136
+        },
+        {
+          "branch": 8,
+          "latency_us": 1629,
+          "resident_growth_bytes": 2703360,
+          "retained_database_growth_bytes": 475136
+        }
+      ],
+      "strategy": "cow"
+    },
+    {
+      "branches": 8,
+      "history_bytes": 241793,
+      "messages": 256,
+      "samples": [
+        {
+          "branch": 1,
+          "latency_us": 3893,
+          "resident_growth_bytes": 1851392,
+          "retained_database_growth_bytes": 512000
+        },
+        {
+          "branch": 2,
+          "latency_us": 3701,
+          "resident_growth_bytes": 2260992,
+          "retained_database_growth_bytes": 1024000
+        },
+        {
+          "branch": 3,
+          "latency_us": 3692,
+          "resident_growth_bytes": 2277376,
+          "retained_database_growth_bytes": 1536000
+        },
+        {
+          "branch": 4,
+          "latency_us": 3739,
+          "resident_growth_bytes": 2342912,
+          "retained_database_growth_bytes": 2048000
+        },
+        {
+          "branch": 5,
+          "latency_us": 3919,
+          "resident_growth_bytes": 2359296,
+          "retained_database_growth_bytes": 2568192
+        },
+        {
+          "branch": 6,
+          "latency_us": 4031,
+          "resident_growth_bytes": 2392064,
+          "retained_database_growth_bytes": 3088384
+        },
+        {
+          "branch": 7,
+          "latency_us": 5176,
+          "resident_growth_bytes": 2506752,
+          "retained_database_growth_bytes": 3870720
+        },
+        {
+          "branch": 8,
+          "latency_us": 4333,
+          "resident_growth_bytes": 2523136,
+          "retained_database_growth_bytes": 4112384
+        }
+      ],
+      "strategy": "eager"
+    },
+    {
+      "branches": 8,
+      "history_bytes": 3868673,
+      "messages": 4096,
+      "samples": [
+        {
+          "branch": 1,
+          "latency_us": 79927,
+          "resident_growth_bytes": 14270464,
+          "retained_database_growth_bytes": 7614464
+        },
+        {
+          "branch": 2,
+          "latency_us": 5362,
+          "resident_growth_bytes": 14286848,
+          "retained_database_growth_bytes": 7614464
+        },
+        {
+          "branch": 3,
+          "latency_us": 5203,
+          "resident_growth_bytes": 14336000,
+          "retained_database_growth_bytes": 7614464
+        },
+        {
+          "branch": 4,
+          "latency_us": 5209,
+          "resident_growth_bytes": 14385152,
+          "retained_database_growth_bytes": 7614464
+        },
+        {
+          "branch": 5,
+          "latency_us": 5322,
+          "resident_growth_bytes": 14385152,
+          "retained_database_growth_bytes": 7614464
+        },
+        {
+          "branch": 6,
+          "latency_us": 5093,
+          "resident_growth_bytes": 14417920,
+          "retained_database_growth_bytes": 7614464
+        },
+        {
+          "branch": 7,
+          "latency_us": 5114,
+          "resident_growth_bytes": 14450688,
+          "retained_database_growth_bytes": 7614464
+        },
+        {
+          "branch": 8,
+          "latency_us": 5437,
+          "resident_growth_bytes": 14467072,
+          "retained_database_growth_bytes": 7614464
+        }
+      ],
+      "strategy": "cow"
+    },
+    {
+      "branches": 8,
+      "history_bytes": 3868673,
+      "messages": 4096,
+      "samples": [
+        {
+          "branch": 1,
+          "latency_us": 54120,
+          "resident_growth_bytes": 9535488,
+          "retained_database_growth_bytes": 8200192
+        },
+        {
+          "branch": 2,
+          "latency_us": 54723,
+          "resident_growth_bytes": 13434880,
+          "retained_database_growth_bytes": 16412672
+        },
+        {
+          "branch": 3,
+          "latency_us": 59398,
+          "resident_growth_bytes": 17383424,
+          "retained_database_growth_bytes": 25145344
+        },
+        {
+          "branch": 4,
+          "latency_us": 67396,
+          "resident_growth_bytes": 21315584,
+          "retained_database_growth_bytes": 34369536
+        },
+        {
+          "branch": 5,
+          "latency_us": 59413,
+          "resident_growth_bytes": 25247744,
+          "retained_database_growth_bytes": 41103360
+        },
+        {
+          "branch": 6,
+          "latency_us": 60147,
+          "resident_growth_bytes": 29196288,
+          "retained_database_growth_bytes": 49160192
+        },
+        {
+          "branch": 7,
+          "latency_us": 67718,
+          "resident_growth_bytes": 33128448,
+          "retained_database_growth_bytes": 58499072
+        },
+        {
+          "branch": 8,
+          "latency_us": 67072,
+          "resident_growth_bytes": 37027840,
+          "retained_database_growth_bytes": 66654208
+        }
+      ],
+      "strategy": "eager"
+    },
+    {
+      "branches": 8,
+      "history_bytes": 15474689,
+      "messages": 16384,
+      "samples": [
+        {
+          "branch": 1,
+          "latency_us": 313507,
+          "resident_growth_bytes": 112590848,
+          "retained_database_growth_bytes": 30474240
+        },
+        {
+          "branch": 2,
+          "latency_us": 16459,
+          "resident_growth_bytes": 112623616,
+          "retained_database_growth_bytes": 30474240
+        },
+        {
+          "branch": 3,
+          "latency_us": 16125,
+          "resident_growth_bytes": 112640000,
+          "retained_database_growth_bytes": 30474240
+        },
+        {
+          "branch": 4,
+          "latency_us": 16084,
+          "resident_growth_bytes": 112705536,
+          "retained_database_growth_bytes": 30474240
+        },
+        {
+          "branch": 5,
+          "latency_us": 16065,
+          "resident_growth_bytes": 112705536,
+          "retained_database_growth_bytes": 30474240
+        },
+        {
+          "branch": 6,
+          "latency_us": 16308,
+          "resident_growth_bytes": 112721920,
+          "retained_database_growth_bytes": 30474240
+        },
+        {
+          "branch": 7,
+          "latency_us": 16121,
+          "resident_growth_bytes": 112738304,
+          "retained_database_growth_bytes": 30474240
+        },
+        {
+          "branch": 8,
+          "latency_us": 16284,
+          "resident_growth_bytes": 112787456,
+          "retained_database_growth_bytes": 30474240
+        }
+      ],
+      "strategy": "cow"
+    },
+    {
+      "branches": 8,
+      "history_bytes": 15474689,
+      "messages": 16384,
+      "samples": [
+        {
+          "branch": 1,
+          "latency_us": 220545,
+          "resident_growth_bytes": 19447808,
+          "retained_database_growth_bytes": 32808960
+        },
+        {
+          "branch": 2,
+          "latency_us": 214559,
+          "resident_growth_bytes": 80412672,
+          "retained_database_growth_bytes": 65609728
+        },
+        {
+          "branch": 3,
+          "latency_us": 238077,
+          "resident_growth_bytes": 96026624,
+          "retained_database_growth_bytes": 100954112
+        },
+        {
+          "branch": 4,
+          "latency_us": 219320,
+          "resident_growth_bytes": 111607808,
+          "retained_database_growth_bytes": 135827456
+        },
+        {
+          "branch": 5,
+          "latency_us": 205953,
+          "resident_growth_bytes": 127107072,
+          "retained_database_growth_bytes": 165552128
+        },
+        {
+          "branch": 6,
+          "latency_us": 200098,
+          "resident_growth_bytes": 142655488,
+          "retained_database_growth_bytes": 196612096
+        },
+        {
+          "branch": 7,
+          "latency_us": 232173,
+          "resident_growth_bytes": 158171136,
+          "retained_database_growth_bytes": 234348544
+        },
+        {
+          "branch": 8,
+          "latency_us": 228793,
+          "resident_growth_bytes": 173703168,
+          "retained_database_growth_bytes": 266162176
+        }
+      ],
+      "strategy": "eager"
+    }
+  ],
+  "rss_scope": "current process resident bytes after each branch minus before first branch; each strategy and history uses a fresh process",
+  "schema_version": 1,
+  "storage_scope": "checkpointed allocated SQLite database bytes; includes indexes, metadata and freelist"
+}

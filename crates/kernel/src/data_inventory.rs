@@ -114,6 +114,15 @@ pub const SQLITE_DATA_INVENTORY: &[StaticDataInventoryEntry] = &[
         "erase with fact, agent, or tenant and rebuild index"
     ),
     sqlite_entry!(
+        "fact_index_generations",
+        "agent",
+        "agents.tenant_id via agent_id",
+        "retrieval cache revision; no fact content",
+        "until agent or tenant erasure",
+        "same whole-database protection as facts",
+        "erase after facts with agent or tenant"
+    ),
+    sqlite_entry!(
         "conversations",
         "agent",
         "agents.tenant_id via agent_id",
@@ -139,6 +148,60 @@ pub const SQLITE_DATA_INVENTORY: &[StaticDataInventoryEntry] = &[
         "until agent or tenant erasure",
         "HMAC-authenticated; plaintext mode exposes the integrity secret",
         "erase subject rows; shared quota ledger remains"
+    ),
+    sqlite_entry!(
+        "execution_context_snapshots",
+        "tenant and referencing conversation branches",
+        "tenant_id",
+        "confidential shared execution history",
+        "while reachable from at least one conversation branch",
+        "not encrypted; owner-only database file permissions",
+        "collect after the last reachable branch is erased; erase with tenant"
+    ),
+    sqlite_entry!(
+        "conversation_snapshot_refs",
+        "agent and tenant",
+        "tenant_id and conversations.agent_id",
+        "confidential execution-history ownership references",
+        "until conversation, agent or tenant erasure",
+        "not encrypted; owner-only database file permissions",
+        "erase with conversation, agent or tenant"
+    ),
+    sqlite_entry!(
+        "execution_snapshot_fts",
+        "tenant and referencing conversation branches",
+        "execution_context_snapshots.tenant_id via snapshot_id",
+        "confidential searchable shared execution history",
+        "while its immutable snapshot is reachable",
+        "not encrypted; owner-only database file permissions",
+        "erase with unreachable execution snapshot or tenant"
+    ),
+    sqlite_entry!(
+        "execution_spill_blobs",
+        "tenant and reachable snapshot branches",
+        "tenant_id",
+        "confidential immutable spilled context",
+        "while a conversation snapshot or spill dependency remains reachable",
+        "not encrypted; owner-only database file permissions",
+        "collect after the last reachable branch is erased; erase with tenant"
+    ),
+    sqlite_entry!(
+        "execution_spill_edges",
+        "referencing immutable spill",
+        "execution_spill_blobs.tenant_id via blob_id",
+        "confidential spilled-context ownership references",
+        "while its source immutable spill is reachable",
+        "not encrypted; owner-only database file permissions",
+        "erase with source spill or tenant"
+    ),
+    sqlite_entry!(
+        "execution_snapshot_spills",
+        "referencing execution snapshot",
+        "execution_context_snapshots.tenant_id via snapshot_id",
+        "confidential snapshot spill references",
+        "while its execution snapshot is reachable",
+        "not encrypted; owner-only database file permissions",
+        "erase with execution snapshot or tenant"
     ),
     sqlite_entry!(
         "agent_kv",
@@ -189,7 +252,7 @@ pub const SQLITE_DATA_INVENTORY: &[StaticDataInventoryEntry] = &[
         "agents",
         "agent and tenant",
         "tenant_id",
-        "agent identity, task, provider, and policy metadata",
+        "agent identity, task, provider, clone lineage, and captured policy metadata",
         "until agent or tenant erasure",
         "not encrypted; owner-only database file permissions",
         "erase last after owned child rows"
@@ -755,6 +818,17 @@ pub const NON_SQLITE_DATA_INVENTORY: &[StaticDataInventoryEntry] = &[
         "process memory only; no application memory encryption",
         "not backed up directly; committed state is in SQLite",
         "coordinated lifecycle cleanup or process exit"
+    ),
+    boundary_entry!(
+        "ephemeral/fact-index-cache",
+        "ephemeral-memory",
+        "agent and tenant",
+        "durable agent fact revision",
+        "confidential fact content, embeddings and last-access metadata",
+        "bounded 16-agent/512 MiB cache; eviction, fact deletion, subject erasure or exit",
+        "process memory only; no application memory encryption",
+        "not backed up; authoritative rows remain in SQLite",
+        "drop on fact deletion and successful subject erasure; warm after revision change"
     ),
     boundary_entry!(
         "ephemeral/scheduler-and-admission",

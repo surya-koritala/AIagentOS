@@ -10,6 +10,7 @@ pub mod auth;
 pub mod budget;
 pub mod cfs;
 pub mod cgroups;
+pub mod cloning;
 pub mod cluster_consensus;
 pub mod cluster_control;
 pub mod cluster_runtime;
@@ -351,6 +352,9 @@ pub enum SchedulerError {
 /// Errors related to context and memory management.
 #[derive(Debug, thiserror::Error, Clone, PartialEq, Eq)]
 pub enum ContextError {
+    #[error("Embedding failed: {0}")]
+    Embedding(#[from] crate::memory_manager::EmbeddingError),
+
     #[error("Context persistence failed: {0}")]
     PersistenceFailed(String),
 
@@ -1382,7 +1386,13 @@ impl AgentKernelImpl {
     ) -> Result<Self, KernelError> {
         set_max_browse_chars(config.max_browse_chars);
         let db_path = config.data_dir.join("agent_os.db");
-        let context_manager = Arc::new(match config.storage_encryption.key_path.as_deref() {
+        let embedding = config
+            .embeddings
+            .clone()
+            .map(crate::memory_manager::HttpEmbedder::new)
+            .transpose()
+            .map_err(|error| KernelError::Context(ContextError::Embedding(error)))?;
+        let mut context_store = match config.storage_encryption.key_path.as_deref() {
             Some(key_path) => {
                 let key = crate::storage_encryption::load_storage_encryption_key(key_path)
                     .map_err(KernelError::Context)?;
@@ -1411,7 +1421,11 @@ impl AgentKernelImpl {
             }
             None => SqliteContextManager::new_without_storage_lease(&db_path)
                 .map_err(KernelError::Context)?,
-        });
+        };
+        if let Some(embedding) = embedding {
+            context_store = context_store.with_embedder(Arc::new(embedding));
+        }
+        let context_manager = Arc::new(context_store);
         tracing::info!(
             target: "agentos::storage",
             storage_encryption_enabled = context_manager.storage_encryption_key_id().is_some(),
@@ -2352,7 +2366,7 @@ impl AgentKernelImpl {
         // 9. Persist the agent's durable identity (incl. tenant) so it survives a
         //    restart, then broadcast the creation event. Persistence commits
         //    immediately, so even an abrupt stop recovers this agent + its tenant.
-        if let Err(error) = self.persist_agent_registry(agent_id, &config, tenant_id) {
+        if let Err(error) = self.persist_agent_registry(agent_id, &config, tenant_id, group) {
             self.rollback_created_agent(agent_id).await;
             return Err(error);
         }
@@ -2439,6 +2453,7 @@ impl AgentKernelImpl {
         agent_id: AgentId,
         config: &AgentConfig,
         tenant_id: &str,
+        group: Option<&str>,
     ) -> Result<(), KernelError> {
         let state = self
             .agent_manager
@@ -2480,7 +2495,7 @@ impl AgentKernelImpl {
             created_at: now,
             last_activity_at: now,
         };
-        self.context_manager.save_agent(&record)?;
+        self.context_manager.save_agent_with_group(&record, group)?;
         Ok(())
     }
 
@@ -2493,6 +2508,8 @@ impl AgentKernelImpl {
     /// and best-effort per agent: a malformed row is skipped, not fatal. Returns
     /// the ids that were brought back. A fresh / empty DB rehydrates nothing.
     pub async fn rehydrate_agents(&self) -> Result<Vec<AgentId>, KernelError> {
+        let _operator = self.operator_control.mutation_guard().await;
+        self.context_manager.reconcile_pending_clones()?;
         // Rehydrate tenancy first so an agent's tenant is known to the AuthSystem
         // by the time the agent is re-placed into its tenant's namespace/cgroup.
         self.rehydrate_tenancy().await;
@@ -2586,6 +2603,18 @@ impl AgentKernelImpl {
                 restored.push(p.id);
                 continue;
             }
+            let clone_security = match self.context_manager.clone_security(p.id) {
+                Ok(Some(security))
+                    if security.version == 1 && security.profile == config.permission_profile =>
+                {
+                    Some(security)
+                }
+                Ok(None) => None,
+                _ => {
+                    tracing::warn!("Skipping agent {}: invalid clone security metadata", p.id);
+                    continue;
+                }
+            };
             let sandbox_result = if SandboxManagerImpl::is_managed_config(&sandbox_config) {
                 self.sandbox_manager
                     .create_managed_sandbox(p.id, &sandbox_config)
@@ -2603,24 +2632,35 @@ impl AgentKernelImpl {
                 p.id,
                 p.session_id,
                 config.clone(),
-                state.clone(),
+                if clone_security.is_some() {
+                    AgentState::Initializing
+                } else {
+                    state.clone()
+                },
                 p.created_at,
                 p.last_activity_at,
+            );
+            PermissionSystem::assign_profile(
+                &*self.permission_manager,
+                p.id,
+                &config.permission_profile,
             );
             // Re-admit to the priority scheduler and re-place into OS subsystems,
             // re-arming the agent's tenant isolation: a tenanted agent rejoins its
             // tenant's namespace group + cgroup exactly as at creation, so
             // cross-tenant isolation survives the restart.
-            self.scheduler.admit_id(p.id);
-            let group = if p.tenant_id == crate::context::DEFAULT_TENANT {
-                None
+            let persisted_group = self.context_manager.agent_namespace_group(p.id)?;
+            let group = persisted_group.as_deref().or_else(|| {
+                (p.tenant_id != crate::context::DEFAULT_TENANT).then_some(p.tenant_id.as_str())
+            });
+            let placed = if let Some(security) = clone_security.as_ref() {
+                self.place_cloned_agent(p.id, &config, group, &p.tenant_id, security)
+                    .await
             } else {
-                Some(p.tenant_id.as_str())
+                self.place_agent_in_subsystems(p.id, &config, group, &p.tenant_id)
+                    .await
             };
-            if let Err(error) = self
-                .place_agent_in_subsystems(p.id, &config, group, &p.tenant_id)
-                .await
-            {
+            if let Err(error) = placed {
                 tracing::warn!(
                     "Skipping persisted agent {} because enforcement could not be restored: {}",
                     p.id,
@@ -2630,6 +2670,30 @@ impl AgentKernelImpl {
                 self.agent_manager.purge_agent(p.id);
                 continue;
             }
+            if clone_security.is_some() {
+                if let Some(pid) = self.syscall_gate.pid_of(p.id) {
+                    self.os.procfs.lock().await.set_agent_info(
+                        pid,
+                        "state".into(),
+                        if state == AgentState::Paused {
+                            "paused".into()
+                        } else {
+                            "running".into()
+                        },
+                    );
+                }
+                self.ipc.register_agent(p.id);
+                self.agent_manager
+                    .transition_state(p.id, AgentState::Running)?;
+                if state == AgentState::Paused {
+                    self.agent_manager
+                        .transition_state(p.id, AgentState::Paused)?;
+                }
+                self.syscall_gate
+                    .reopen_tool_admission(p.id)
+                    .map_err(|error| KernelError::Policy(error.to_string()))?;
+            }
+            self.scheduler.admit_id(p.id);
             if state == AgentState::Paused {
                 self.scheduler.set_paused(p.id);
             }
@@ -5102,6 +5166,7 @@ impl AgentKernelImpl {
             .agent_manager
             .get_agent_provider(agent_id)
             .ok_or(AgentError::NotFound(agent_id))?;
+        let restored_history = self.context_manager.latest_execution_history(agent_id)?;
         let session = self
             .connector
             .connect_resilient(agent_id, &provider_id)
@@ -5116,6 +5181,9 @@ impl AgentKernelImpl {
             self.syscall_gate.clone(),
             "You are a helpful AI assistant. Use the available tools to help the user.".into(),
         );
+        if let Some((conversation_id, messages)) = restored_history {
+            executor = executor.with_restored_history(conversation_id, messages);
+        }
         executor.set_budget_enforcer(self.budget_enforcer.clone());
         executor.set_rate_limiter(self.rate_limiter.clone());
         executor.set_context_budget(self.context_budget_tokens);
@@ -7652,6 +7720,7 @@ mod tests {
                 self.entered.notify_one();
                 self.release.notified().await;
                 Ok(crate::connector::LlmResponse {
+                    provider_metadata: None,
                     content: "must be cancelled".into(),
                     finish_reason: Some("stop".into()),
                     tokens_used: 1,

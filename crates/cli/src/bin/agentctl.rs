@@ -83,6 +83,8 @@ const USAGE: &str = "usage: agentctl [--addr HOST:PORT] [--token TOKEN] [--tenan
            agentctl [SERVER OPTIONS] package-run NAME\n\
          \n\
          storage commands:\n\
+           agentctl workspace-ownership CONFIG_FILE list\n\
+           agentctl workspace-ownership CONFIG_FILE retain AGENT_UUID --confirm-offline\n\
            agentctl [SERVER OPTIONS] backup-create BACKUP_ROOT NAME\n\
            agentctl [SERVER OPTIONS] backup-retention BACKUP_ROOT KEEP_LATEST MAX_AGE_SECONDS <--dry-run|--confirm>\n\
            agentctl [SERVER OPTIONS] backup-status\n\
@@ -432,6 +434,36 @@ type CommandArgs = std::iter::Peekable<std::iter::Skip<std::vec::IntoIter<String
 
 async fn run_offline(command: &str, args: &mut CommandArgs) -> bool {
     match command {
+        "workspace-ownership" => {
+            let config_file = args.next().unwrap_or_else(|| usage());
+            let action = args.next().unwrap_or_else(|| usage());
+            let target = match action.as_str() {
+                "list" if args.next().is_none() => None,
+                "retain" => {
+                    let id = args.next().unwrap_or_else(|| usage());
+                    let id = id.parse::<kernel::AgentId>().unwrap_or_else(|_| fail_operator("workspace ownership requires a recorded agent UUID"));
+                    if args.next().as_deref() != Some("--confirm-offline") || args.next().is_some() { usage(); }
+                    Some(id)
+                }
+                _ => usage(),
+            };
+            let path = std::path::Path::new(&config_file);
+            if !std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_file()) {
+                fail_operator("workspace ownership requires an existing configuration file");
+            }
+            let config = kernel::config::Config::try_load_from(path).unwrap_or_else(|error| fail_operator(format!("invalid local configuration: {error}")));
+            // Startup acquires the existing exclusive database lease; a live
+            // runtime cannot race this purely local maintenance command.
+            let kernel = kernel::AgentKernelImpl::from_config(&config).unwrap_or_else(|error| fail_operator(format!("local workspace ownership maintenance failed: {error}")));
+            if let Some(id) = target {
+                kernel.retain_legacy_workspace_as_operator(id).await.unwrap_or_else(|error| fail_operator(error.to_string()));
+                print_json(&serde_json::json!({"agent_id":id,"resolution":"retain_as_operator_workspace","automatic_deletion":false}), "workspace ownership resolution");
+            } else {
+                let status = kernel.workspace_ownership_status().unwrap_or_else(|error| fail_operator(error.to_string()));
+                print_json(&status, "workspace ownership status");
+            }
+            true
+        }
         "policy-validate" => {
             let path = args.next().unwrap_or_else(|| usage());
             if args.next().is_some() {

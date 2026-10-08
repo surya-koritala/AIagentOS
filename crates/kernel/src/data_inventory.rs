@@ -168,6 +168,33 @@ pub const SQLITE_DATA_INVENTORY: &[StaticDataInventoryEntry] = &[
         "erase with unreachable execution snapshot or tenant"
     ),
     sqlite_entry!(
+        "execution_spill_blobs",
+        "tenant and reachable snapshot branches",
+        "tenant_id",
+        "confidential immutable spilled context",
+        "while a conversation snapshot or spill dependency remains reachable",
+        "not encrypted; owner-only database file permissions",
+        "collect after the last reachable branch is erased; erase with tenant"
+    ),
+    sqlite_entry!(
+        "execution_spill_edges",
+        "referencing immutable spill",
+        "execution_spill_blobs.tenant_id via blob_id",
+        "confidential spilled-context ownership references",
+        "while its source immutable spill is reachable",
+        "not encrypted; owner-only database file permissions",
+        "erase with source spill or tenant"
+    ),
+    sqlite_entry!(
+        "execution_snapshot_spills",
+        "referencing execution snapshot",
+        "execution_context_snapshots.tenant_id via snapshot_id",
+        "confidential snapshot spill references",
+        "while its execution snapshot is reachable",
+        "not encrypted; owner-only database file permissions",
+        "erase with execution snapshot or tenant"
+    ),
+    sqlite_entry!(
         "agent_kv",
         "agent",
         "agents.tenant_id via agent_id",

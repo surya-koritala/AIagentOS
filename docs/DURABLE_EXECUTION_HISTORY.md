@@ -19,6 +19,20 @@ are canonicalized once during promotion. Provider execution materializes its
 resolved conversation when needed; this storage contract does not promise
 shared provider memory or zero-copy inference.
 
+Referenced context spills are promoted into immutable, snapshot-owned payloads
+inside the same transaction. Spill dependencies preserve page-in through later
+compaction; an unrelated parent spill is not inherited. Payloads and dependency
+links are checked for integrity, and inherited keys cannot be overwritten.
+Dependency depth is bounded to 64 and the graph to 1,024 nodes. Missing, expired,
+corrupt or conflicting references fail cloning rather than losing detail.
+
+`StorageGet` resolves a spill only through the calling agent's reachable
+snapshot references. Shared spills remain available while a branch depends on
+them, including after parent erasure. Garbage collection removes their payloads
+and links when the last snapshot dependency disappears. Context-pressure views
+include these retained spills, and context quotas charge their logical bytes
+to each referencing conversation branch.
+
 Agent, tenant and global context quotas charge each branch's entire logical
 history, including shared prefixes. Sharing reduces retained payload copies;
 it does not provide free logical context allowance. Quota admission, reference
@@ -43,4 +57,5 @@ This is the storage and execution foundation for
 execution and teardown. It does not create an agent or transfer a sandbox,
 permissions, handles, approvals, credentials or live work. The public
 `CloneAgent` lifecycle transaction, SDK/CLI, idempotent recovery, eligibility
-rules, spill ownership and performance measurements remain part of #393.
+rules and performance measurements remain part of #393. Named namespace groups
+are now stored with agent identity and restored with their original isolation.

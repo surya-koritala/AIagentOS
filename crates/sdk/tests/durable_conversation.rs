@@ -273,3 +273,112 @@ async fn parent_and_child_restore_their_private_history_after_a_kernel_restart()
     }
     std::fs::remove_dir_all(root).unwrap();
 }
+
+#[tokio::test]
+async fn wire_page_in_and_named_namespace_isolation_survive_restart_and_parent_erasure() {
+    let root = std::env::temp_dir().join(format!("agentos-spill-wire-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&root).unwrap();
+    let path = root.join("store.db");
+    let (parent, child, foreign);
+    let value =
+        serde_json::to_string(&vec![StandardMessage::user("durable omitted detail")]).unwrap();
+    let digest = ring::digest::digest(&ring::digest::SHA256, value.as_bytes())
+        .as_ref()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    {
+        let kernel = Arc::new(AgentKernelImpl::with_db_path(&path).unwrap());
+        parent = kernel
+            .create_agent_in_namespace(config("parent"), "private-work")
+            .await
+            .unwrap()
+            .id;
+        child = kernel
+            .create_agent_in_namespace(config("child"), "private-work")
+            .await
+            .unwrap()
+            .id;
+        foreign = kernel
+            .create_agent_in_namespace(config("foreign"), "unrelated-work")
+            .await
+            .unwrap()
+            .id;
+        kernel
+            .context_manager
+            .store_context_spill(parent, "context_spill:wire", &value, &digest)
+            .unwrap();
+        let reference = StandardMessage::system(format!(
+            "[Context spill: key=context_spill:wire; sha256-prefix={}; n=1]",
+            &digest[..16]
+        ));
+        kernel
+            .context_manager
+            .save_conversation(
+                "parent-history",
+                parent,
+                &[StandardMessage::system("base"), reference],
+            )
+            .unwrap();
+        kernel
+            .context_manager
+            .fork_conversation(parent, "parent-history", child, "child-history")
+            .unwrap();
+        kernel.context_manager.checkpoint().unwrap();
+    }
+    {
+        let kernel = Arc::new(AgentKernelImpl::with_db_path(&path).unwrap());
+        kernel.rehydrate_agents().await.unwrap();
+        let server = SyscallServer::bind(kernel.clone(), "127.0.0.1:0")
+            .await
+            .unwrap();
+        let address = server.local_addr().unwrap();
+        let task = tokio::spawn(server.serve());
+        let mut client = KernelClient::connect(address).await.unwrap();
+        let parent_mounts = client
+            .vfs_namespace_mounts(parent.to_string())
+            .await
+            .unwrap();
+        let child_mounts = client
+            .vfs_namespace_mounts(child.to_string())
+            .await
+            .unwrap();
+        let foreign_mounts = client
+            .vfs_namespace_mounts(foreign.to_string())
+            .await
+            .unwrap();
+        assert_eq!(parent_mounts.namespace, child_mounts.namespace);
+        assert_ne!(parent_mounts.namespace, foreign_mounts.namespace);
+        assert_eq!(
+            client
+                .storage_get(child.to_string(), "context_spill:wire")
+                .await
+                .unwrap(),
+            Some(value.clone())
+        );
+        assert_eq!(
+            client
+                .storage_get(foreign.to_string(), "context_spill:wire")
+                .await
+                .unwrap(),
+            None
+        );
+        client
+            .erase_agent_data(parent, agent_sdk::CONFIRM_DATA_ERASURE)
+            .await
+            .unwrap();
+        assert_eq!(
+            client
+                .storage_get(child.to_string(), "context_spill:wire")
+                .await
+                .unwrap(),
+            Some(value)
+        );
+        client.close().await.unwrap();
+        task.abort();
+        let _ = task.await;
+        kernel.stop_agent(child).await.unwrap();
+        kernel.stop_agent(foreign).await.unwrap();
+    }
+    std::fs::remove_dir_all(root).unwrap();
+}

@@ -18,6 +18,8 @@ use crate::{AgentId, ContextError};
 
 #[path = "context/branching.rs"]
 mod branching;
+#[path = "context/shared_spills.rs"]
+mod shared_spills;
 pub use branching::{
     ExecutionSnapshotMetadata, EXECUTION_SNAPSHOT_VERSION, MAX_EXECUTION_SNAPSHOT_BYTES,
     MAX_EXECUTION_SNAPSHOT_DEPTH,
@@ -186,6 +188,21 @@ pub const DURABLE_DATA_CATALOG: &[DurableDataClassification] = &[
         table: "execution_snapshot_fts",
         owner: "tenant and referencing conversation branches",
         deletion: "erase with unreachable execution snapshot",
+    },
+    DurableDataClassification {
+        table: "execution_spill_blobs",
+        owner: "tenant and reachable snapshot branches",
+        deletion: "erase after the last reachable snapshot or spill dependency",
+    },
+    DurableDataClassification {
+        table: "execution_spill_edges",
+        owner: "referencing immutable spill",
+        deletion: "erase with source spill",
+    },
+    DurableDataClassification {
+        table: "execution_snapshot_spills",
+        owner: "referencing execution snapshot",
+        deletion: "erase with execution snapshot",
     },
     DurableDataClassification {
         table: "usage_log",
@@ -2339,6 +2356,7 @@ impl SqliteContextManager {
             Self::install_current_quota_migration_fence(conn)?;
         }
         crate::accounting_integrity::install(conn)?;
+        crate::schema::add_column_if_missing(conn, "agents", "namespace_group", "TEXT")?;
         branching::init_schema(conn)?;
         crate::schema::complete_migration(conn, schema_version)?;
         transaction.commit().map_err(|error| {
@@ -4381,8 +4399,6 @@ impl SqliteContextManager {
         agent_id: AgentId,
         messages: &[crate::connector::StandardMessage],
     ) -> Result<(), ContextError> {
-        let json = serde_json::to_string(messages)
-            .map_err(|e| ContextError::PersistenceFailed(e.to_string()))?;
         let now = chrono::Utc::now().to_rfc3339();
         let mut conn = self.locked_conn();
         let transaction = conn
@@ -4413,14 +4429,6 @@ impl SqliteContextManager {
                 "conversation id is already owned by another agent".into(),
             ));
         }
-        let replaced_bytes = branching::logical_bytes(&transaction, id)?;
-        self.enforce_context_storage_locked(
-            &transaction,
-            agent_id,
-            &tenant_id,
-            json.len() as u64,
-            replaced_bytes,
-        )?;
         let tail = branching::prepare_tail(&transaction, id, agent_id, &tenant_id, messages)?;
         let digest = branching::payload_hash(&tail);
         transaction.execute(
@@ -4444,6 +4452,7 @@ impl SqliteContextManager {
         )
         .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
         crash_multi_table_mutation_after_step_for_test("conversation.conversations_fts");
+        self.enforce_context_storage_locked(&transaction, agent_id, &tenant_id, 0, 0)?;
         transaction
             .commit()
             .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
@@ -4791,7 +4800,7 @@ impl SqliteContextManager {
     ) -> Result<ContextStorageUsage, ContextError> {
         let (agent, tenant, global) = conn
             .query_row(
-                "WITH context_bytes(agent_id, byte_count) AS (
+                &format!("WITH shared_spill_bytes AS ({}), context_bytes(agent_id, byte_count) AS (
                     SELECT agent_id, LENGTH(CAST(context_json AS BLOB)) FROM contexts
                     UNION ALL
                     SELECT agent_id, LENGTH(CAST(content AS BLOB)) + COALESCE(LENGTH(CAST(embedding_json AS BLOB)), 0) FROM facts
@@ -4808,6 +4817,8 @@ impl SqliteContextManager {
                     UNION ALL
                     SELECT agent_id, LENGTH(CAST(checkpoint_json AS BLOB)) FROM generation_checkpoints
                         WHERE status IN ('active', 'resuming')
+                    UNION ALL
+                    SELECT agent_id,byte_count FROM shared_spill_bytes
                 )
                 SELECT
                     COALESCE(SUM(CASE WHEN agent_id = ?1 THEN byte_count ELSE 0 END), 0),
@@ -4816,7 +4827,7 @@ impl SqliteContextManager {
                         'default'
                     ) = ?2 THEN byte_count ELSE 0 END), 0),
                     COALESCE(SUM(byte_count), 0)
-                FROM context_bytes",
+                FROM context_bytes",shared_spills::LOGICAL_SPILL_BYTES),
                 params![agent_id.to_string(), tenant_id],
                 |row| {
                     Ok((
@@ -4922,6 +4933,14 @@ impl SqliteContextManager {
                 "context spill key must start with context_spill:".into(),
             ));
         }
+        if key.len() > MAX_KV_KEY_BYTES
+            || value.len() as u64 > MAX_EXECUTION_SNAPSHOT_BYTES
+            || memory_content_hash(value) != sha256
+        {
+            return Err(ContextError::PersistenceFailed(
+                "invalid context spill digest or byte bound".into(),
+            ));
+        }
         let mut conn = self.locked_conn();
         Self::purge_expired_spills_locked(&mut conn)?;
         let transaction = conn
@@ -4936,6 +4955,16 @@ impl SqliteContextManager {
             .optional()
             .map_err(|error| ContextError::StorageError(error.to_string()))?
             .unwrap_or_else(|| DEFAULT_TENANT.to_string());
+        if let Some((_, digest)) =
+            shared_spills::owned_blob(&transaction, agent_id, key, &tenant_id)?
+        {
+            if digest == sha256 {
+                return Ok(());
+            }
+            return Err(ContextError::PersistenceFailed(
+                "an immutable shared spill key cannot be overwritten".into(),
+            ));
+        }
         let replaced_bytes = transaction
             .query_row(
                 "SELECT LENGTH(CAST(key AS BLOB)) + LENGTH(CAST(value AS BLOB)) FROM agent_kv WHERE agent_id = ?1 AND key = ?2",
@@ -5145,6 +5174,15 @@ impl SqliteContextManager {
                 Ok(Some(value))
             }
             Ok(value) => Ok(Some(value)),
+            Err(rusqlite::Error::QueryReturnedNoRows) if key.starts_with("context_spill:") => {
+                let tx = conn
+                    .transaction()
+                    .map_err(|error| ContextError::RestoreFailed(error.to_string()))?;
+                let value = shared_spills::read(&tx, agent_id, key)?;
+                tx.commit()
+                    .map_err(|error| ContextError::RestoreFailed(error.to_string()))?;
+                Ok(value)
+            }
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(e) => Err(ContextError::StorageError(e.to_string())),
         }
@@ -5304,6 +5342,9 @@ impl SqliteContextManager {
             .read()
             .map(|limits| *limits)
             .unwrap_or_default();
+        let (shared_count, shared_bytes) = shared_spills::agent_stats(&conn, agent_id)?;
+        let stored_spills = stored_spills.saturating_add(shared_count);
+        let stored_spill_bytes = stored_spill_bytes.saturating_add(shared_bytes);
         Ok(ContextPressureStats {
             agent_id,
             tenant_id,
@@ -5502,6 +5543,22 @@ impl SqliteContextManager {
 
     /// Insert-or-update an agent's durable identity + config.
     pub fn save_agent(&self, agent: &PersistedAgent) -> Result<(), ContextError> {
+        self.save_agent_grouped(agent, None)
+    }
+
+    pub(crate) fn save_agent_with_group(
+        &self,
+        agent: &PersistedAgent,
+        group: Option<&str>,
+    ) -> Result<(), ContextError> {
+        self.save_agent_grouped(agent, Some(group))
+    }
+
+    fn save_agent_grouped(
+        &self,
+        agent: &PersistedAgent,
+        group: Option<Option<&str>>,
+    ) -> Result<(), ContextError> {
         #[cfg(test)]
         if self
             .fail_next_agent_save
@@ -5513,9 +5570,14 @@ impl SqliteContextManager {
         }
         let conn = self.locked_conn();
         conn.execute(
-            "INSERT OR REPLACE INTO agents
-                (id, session_id, tenant_id, name, task, llm_provider, permission_profile, priority, status, sandbox_config_json, created_at, last_activity_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            "INSERT INTO agents
+                (id, session_id, tenant_id, name, task, llm_provider, permission_profile, priority, status, sandbox_config_json, created_at, last_activity_at, namespace_group)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+             ON CONFLICT(id) DO UPDATE SET session_id=excluded.session_id,tenant_id=excluded.tenant_id,name=excluded.name,
+                 task=excluded.task,llm_provider=excluded.llm_provider,permission_profile=excluded.permission_profile,
+                 priority=excluded.priority,status=excluded.status,sandbox_config_json=excluded.sandbox_config_json,
+                 created_at=excluded.created_at,last_activity_at=excluded.last_activity_at,
+                 namespace_group=CASE WHEN ?14 THEN excluded.namespace_group ELSE agents.namespace_group END",
             params![
                 agent.id.to_string(),
                 agent.session_id.to_string(),
@@ -5529,10 +5591,26 @@ impl SqliteContextManager {
                 agent.sandbox_config_json,
                 agent.created_at.to_rfc3339(),
                 agent.last_activity_at.to_rfc3339(),
+                group.flatten(),
+                group.is_some(),
             ],
         )
         .map_err(|e| ContextError::PersistenceFailed(e.to_string()))?;
         Ok(())
+    }
+
+    /// Logical namespace group retained across restart; legacy rows use the tenant default.
+    pub(crate) fn agent_namespace_group(
+        &self,
+        agent: AgentId,
+    ) -> Result<Option<String>, ContextError> {
+        self.locked_conn()
+            .query_row(
+                "SELECT namespace_group FROM agents WHERE id = ?1",
+                [agent.to_string()],
+                |row| row.get(0),
+            )
+            .map_err(|error| ContextError::RestoreFailed(error.to_string()))
     }
 
     /// Load every persisted agent (registry rehydration on boot).
@@ -5976,6 +6054,7 @@ impl SqliteContextManager {
             .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
         let id = agent_id.to_string();
         let mut deleted_rows = BTreeMap::new();
+        let shared_rows_before = shared_spills::row_counts(&tx)?;
 
         let deleted = tx
             .execute(
@@ -6033,6 +6112,21 @@ impl SqliteContextManager {
         let (snapshots, search_rows) = branching::gc(&tx)?;
         record_deleted_rows(&mut deleted_rows, "execution_context_snapshots", snapshots);
         record_deleted_rows(&mut deleted_rows, "execution_snapshot_fts", search_rows);
+        let shared_rows_after = shared_spills::row_counts(&tx)?;
+        for (index, table) in [
+            "execution_spill_blobs",
+            "execution_spill_edges",
+            "execution_snapshot_spills",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            record_deleted_rows(
+                &mut deleted_rows,
+                table,
+                shared_rows_before[index].saturating_sub(shared_rows_after[index]),
+            );
+        }
 
         let cleared = tx
             .execute(
@@ -7309,6 +7403,7 @@ impl SqliteContextManager {
             .map_err(|error| ContextError::StorageError(error.to_string()))?;
         let agent_selector = "SELECT id FROM agents WHERE tenant_id = ?1";
         let mut deleted_rows = BTreeMap::new();
+        let shared_rows_before = shared_spills::row_counts(&transaction)?;
         let deleted = transaction
             .execute(
                 &format!(
@@ -7381,6 +7476,21 @@ impl SqliteContextManager {
         let (snapshots, search_rows) = branching::gc(&transaction)?;
         record_deleted_rows(&mut deleted_rows, "execution_context_snapshots", snapshots);
         record_deleted_rows(&mut deleted_rows, "execution_snapshot_fts", search_rows);
+        let shared_rows_after = shared_spills::row_counts(&transaction)?;
+        for (index, table) in [
+            "execution_spill_blobs",
+            "execution_spill_edges",
+            "execution_snapshot_spills",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            record_deleted_rows(
+                &mut deleted_rows,
+                table,
+                shared_rows_before[index].saturating_sub(shared_rows_after[index]),
+            );
+        }
         for table in ["context_spills", "generation_checkpoints"] {
             let deleted = transaction
                 .execute(

@@ -2352,7 +2352,7 @@ impl AgentKernelImpl {
         // 9. Persist the agent's durable identity (incl. tenant) so it survives a
         //    restart, then broadcast the creation event. Persistence commits
         //    immediately, so even an abrupt stop recovers this agent + its tenant.
-        if let Err(error) = self.persist_agent_registry(agent_id, &config, tenant_id) {
+        if let Err(error) = self.persist_agent_registry(agent_id, &config, tenant_id, group) {
             self.rollback_created_agent(agent_id).await;
             return Err(error);
         }
@@ -2439,6 +2439,7 @@ impl AgentKernelImpl {
         agent_id: AgentId,
         config: &AgentConfig,
         tenant_id: &str,
+        group: Option<&str>,
     ) -> Result<(), KernelError> {
         let state = self
             .agent_manager
@@ -2480,7 +2481,7 @@ impl AgentKernelImpl {
             created_at: now,
             last_activity_at: now,
         };
-        self.context_manager.save_agent(&record)?;
+        self.context_manager.save_agent_with_group(&record, group)?;
         Ok(())
     }
 
@@ -2612,11 +2613,10 @@ impl AgentKernelImpl {
             // tenant's namespace group + cgroup exactly as at creation, so
             // cross-tenant isolation survives the restart.
             self.scheduler.admit_id(p.id);
-            let group = if p.tenant_id == crate::context::DEFAULT_TENANT {
-                None
-            } else {
-                Some(p.tenant_id.as_str())
-            };
+            let persisted_group = self.context_manager.agent_namespace_group(p.id)?;
+            let group = persisted_group.as_deref().or_else(|| {
+                (p.tenant_id != crate::context::DEFAULT_TENANT).then_some(p.tenant_id.as_str())
+            });
             if let Err(error) = self
                 .place_agent_in_subsystems(p.id, &config, group, &p.tenant_id)
                 .await

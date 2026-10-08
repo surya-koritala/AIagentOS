@@ -4,7 +4,7 @@ use super::*;
 use crate::connector::StandardMessage;
 use uuid::Uuid;
 
-pub const EXECUTION_SNAPSHOT_VERSION: u32 = 1;
+pub const EXECUTION_SNAPSHOT_VERSION: u32 = 2;
 pub const MAX_EXECUTION_SNAPSHOT_DEPTH: usize = 64;
 pub const MAX_EXECUTION_SNAPSHOT_BYTES: u64 = 64 * 1024 * 1024;
 
@@ -28,29 +28,38 @@ pub(super) fn payload_hash(payload: &str) -> String {
     memory_content_hash(payload)
 }
 fn node_hash(
-    id: &str,
+    metadata: &ExecutionSnapshotMetadata,
     tenant: &str,
     parent: &Option<String>,
     payload_digest: &str,
-    count: usize,
-    bytes: u64,
-    depth: usize,
+    spill_manifest: &str,
 ) -> Result<String, ContextError> {
     let encoded = serde_json::to_string(&(
-        EXECUTION_SNAPSHOT_VERSION,
-        id,
+        metadata.version,
+        metadata.id.to_string(),
         tenant,
         parent,
         payload_digest,
-        count,
-        bytes,
-        depth,
+        metadata.message_count,
+        metadata.logical_bytes,
+        metadata.depth,
+        spill_manifest,
     ))
     .map_err(|error| failed(error.to_string()))?;
     Ok(payload_hash(&encoded))
 }
 
 pub(super) fn init_schema(conn: &Connection) -> Result<(), ContextError> {
+    let old_shape = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_schema WHERE name = 'execution_context_snapshots'",
+            [],
+            |_| Ok(()),
+        )
+        .optional()
+        .map_err(sql_error)?
+        .is_some()
+        && !crate::schema::has_column(conn, "execution_context_snapshots", "spill_manifest_hash")?;
     crate::schema::add_column_if_missing(conn, "conversations", "messages_hash", "TEXT")?;
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS execution_context_snapshots (
@@ -61,6 +70,7 @@ pub(super) fn init_schema(conn: &Connection) -> Result<(), ContextError> {
              payload_json TEXT NOT NULL,
              payload_hash TEXT NOT NULL,
              node_hash TEXT NOT NULL,
+             spill_manifest_hash TEXT NOT NULL,
              message_count INTEGER NOT NULL CHECK(message_count >= 0),
              logical_bytes INTEGER NOT NULL CHECK(logical_bytes >= 2),
              depth INTEGER NOT NULL CHECK(depth BETWEEN 1 AND 64)
@@ -77,7 +87,62 @@ pub(super) fn init_schema(conn: &Connection) -> Result<(), ContextError> {
          CREATE VIRTUAL TABLE IF NOT EXISTS execution_snapshot_fts
              USING fts5(snapshot_id, content);",
     )
-    .map_err(sql_error)
+    .map_err(sql_error)?;
+    let empty_manifest = payload_hash("[]");
+    crate::schema::add_column_if_missing(
+        conn,
+        "execution_context_snapshots",
+        "spill_manifest_hash",
+        &format!("TEXT NOT NULL DEFAULT '{empty_manifest}'"),
+    )?;
+    shared_spills::init_schema(conn)?;
+    if old_shape {
+        let mut statement = conn.prepare("SELECT id, tenant_id, parent_id, version, payload_hash, node_hash, message_count, logical_bytes, depth FROM execution_context_snapshots").map_err(sql_error)?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, u32>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, usize>(6)?,
+                    row.get::<_, u64>(7)?,
+                    row.get::<_, usize>(8)?,
+                ))
+            })
+            .map_err(sql_error)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(sql_error)?;
+        drop(statement);
+        for (id, tenant, parent, version, digest, old_hash, count, bytes, depth) in rows {
+            let old_metadata = serde_json::to_string(&(
+                version, &id, &tenant, &parent, &digest, count, bytes, depth,
+            ))
+            .map_err(|error| failed(error.to_string()))?;
+            if version != 1 || payload_hash(&old_metadata) != old_hash {
+                return Err(failed("legacy execution snapshot integrity mismatch"));
+            }
+            let metadata = ExecutionSnapshotMetadata {
+                id: Uuid::parse_str(&id).map_err(|error| failed(error.to_string()))?,
+                version: EXECUTION_SNAPSHOT_VERSION,
+                message_count: count,
+                logical_bytes: bytes,
+                depth,
+            };
+            conn.execute(
+                "UPDATE execution_context_snapshots SET version = ?1, node_hash = ?2 WHERE id = ?3",
+                params![
+                    EXECUTION_SNAPSHOT_VERSION,
+                    node_hash(&metadata, &tenant, &parent, &digest, &empty_manifest)?,
+                    id
+                ],
+            )
+            .map_err(sql_error)?;
+        }
+    }
+    Ok(())
 }
 
 struct Node {
@@ -86,7 +151,7 @@ struct Node {
     payload_digest: String,
 }
 fn node(conn: &Connection, id: &str, tenant: &str) -> Result<Node, ContextError> {
-    let (stored_tenant, parent, version, digest, hash, count, bytes, depth): (
+    let (stored_tenant, parent, version, digest, hash, count, bytes, depth, manifest): (
         String,
         Option<String>,
         u32,
@@ -95,10 +160,11 @@ fn node(conn: &Connection, id: &str, tenant: &str) -> Result<Node, ContextError>
         usize,
         u64,
         usize,
+        String,
     ) = conn
         .query_row(
             "SELECT tenant_id, parent_id, version, payload_hash, node_hash,
-                    message_count, logical_bytes, depth
+                    message_count, logical_bytes, depth, spill_manifest_hash
              FROM execution_context_snapshots WHERE id = ?1",
             [id],
             |row| {
@@ -111,29 +177,32 @@ fn node(conn: &Connection, id: &str, tenant: &str) -> Result<Node, ContextError>
                     row.get(5)?,
                     row.get(6)?,
                     row.get(7)?,
+                    row.get(8)?,
                 ))
             },
         )
         .map_err(sql_error)?;
+    let metadata = ExecutionSnapshotMetadata {
+        id: Uuid::parse_str(id).map_err(|error| failed(error.to_string()))?,
+        version,
+        message_count: count,
+        logical_bytes: bytes,
+        depth,
+    };
     if stored_tenant != tenant
         || version != EXECUTION_SNAPSHOT_VERSION
         || depth == 0
         || depth > MAX_EXECUTION_SNAPSHOT_DEPTH
         || bytes > MAX_EXECUTION_SNAPSHOT_BYTES
-        || hash != node_hash(id, tenant, &parent, &digest, count, bytes, depth)?
+        || hash != node_hash(&metadata, tenant, &parent, &digest, &manifest)?
+        || manifest != shared_spills::manifest_digest(conn, id)?
     {
         return Err(failed(
             "execution snapshot ownership, version or integrity mismatch",
         ));
     }
     Ok(Node {
-        metadata: ExecutionSnapshotMetadata {
-            id: Uuid::parse_str(id).map_err(|error| failed(error.to_string()))?,
-            version,
-            message_count: count,
-            logical_bytes: bytes,
-            depth,
-        },
+        metadata,
         parent,
         payload_digest: digest,
     })
@@ -200,6 +269,85 @@ fn load_snapshot(
     Ok(messages)
 }
 
+pub(super) fn validate_owned_roots(
+    conn: &Connection,
+    agent: AgentId,
+    tenant: &str,
+) -> Result<(), ContextError> {
+    let mut statement = conn.prepare("SELECT r.snapshot_id,r.tenant_id FROM conversation_snapshot_refs r JOIN conversations c ON c.id = r.conversation_id WHERE c.agent_id = ?1").map_err(sql_error)?;
+    let roots = statement
+        .query_map([agent.to_string()], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(sql_error)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(sql_error)?;
+    drop(statement);
+    for (root, owner) in roots {
+        if owner != tenant {
+            return Err(failed("snapshot spill tenant mismatch"));
+        }
+        let mut seen = BTreeSet::new();
+        let mut cursor = Some(root);
+        while let Some(id) = cursor {
+            if seen.len() >= MAX_EXECUTION_SNAPSHOT_DEPTH || !seen.insert(id.clone()) {
+                return Err(failed("snapshot spill ancestry cycle or limit"));
+            }
+            cursor = node(conn, &id, tenant)?.parent;
+        }
+    }
+    Ok(())
+}
+
+fn seal_tail(
+    conn: &Connection,
+    conversation: &str,
+    agent: AgentId,
+    tenant: &str,
+    base: Option<&Node>,
+) -> Result<ExecutionSnapshotMetadata, ContextError> {
+    let (count,digest,tail_bytes): (usize,String,u64) = conn.query_row(
+        "SELECT json_array_length(messages_json),messages_hash,LENGTH(CAST(messages_json AS BLOB)) FROM conversations WHERE id = ?1",
+        [conversation],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?))
+    ).map_err(sql_error)?;
+    let metadata = ExecutionSnapshotMetadata {
+        id: Uuid::new_v4(),
+        version: EXECUTION_SNAPSHOT_VERSION,
+        message_count: count + base.map_or(0, |base| base.metadata.message_count),
+        logical_bytes: tail_bytes
+            + base.map_or(0, |base| base.metadata.logical_bytes - 2)
+            + u64::from(count > 0 && base.is_some_and(|base| base.metadata.message_count > 0)),
+        depth: base.map_or(1, |base| base.metadata.depth + 1),
+    };
+    if metadata.depth > MAX_EXECUTION_SNAPSHOT_DEPTH
+        || metadata.logical_bytes > MAX_EXECUTION_SNAPSHOT_BYTES
+    {
+        return Err(failed("execution snapshot depth or byte bound exceeded"));
+    }
+    let parent = base.map(|base| base.metadata.id.to_string());
+    let empty_manifest = payload_hash("[]");
+    let inserted = conn.execute(
+        "INSERT INTO execution_context_snapshots(id,tenant_id,parent_id,version,payload_json,payload_hash,node_hash,message_count,logical_bytes,depth,spill_manifest_hash)
+         SELECT ?1,?2,?3,?4,messages_json,?5,?6,?7,?8,?9,?10 FROM conversations WHERE id = ?11
+           AND messages_hash = agentos_digest(messages_json)",
+        params![metadata.id.to_string(),tenant,&parent,metadata.version,&digest,node_hash(&metadata,tenant,&parent,&digest,&empty_manifest)?,metadata.message_count,metadata.logical_bytes,metadata.depth,&empty_manifest,conversation]
+    ).map_err(sql_error)?;
+    if inserted != 1 {
+        return Err(failed("execution history digest mismatch"));
+    }
+    let manifest =
+        shared_spills::attach_tail(conn, &metadata.id.to_string(), agent, tenant, conversation)?;
+    conn.execute("UPDATE execution_context_snapshots SET spill_manifest_hash = ?1,node_hash = ?2 WHERE id = ?3",
+        params![&manifest,node_hash(&metadata,tenant,&parent,&digest,&manifest)?,metadata.id.to_string()]).map_err(sql_error)?;
+    conn.execute(
+        "INSERT INTO execution_snapshot_fts(snapshot_id,content)
+         SELECT id,COALESCE((SELECT group_concat(json_extract(value,'$.content'),' ') FROM json_each(payload_json)),'')
+         FROM execution_context_snapshots WHERE id = ?1",[metadata.id.to_string()]
+    ).map_err(sql_error)?;
+    crash_multi_table_mutation_after_step_for_test("fork.snapshot");
+    Ok(metadata)
+}
+
 pub(super) fn prepare_tail(
     conn: &Connection,
     conversation: &str,
@@ -218,12 +366,20 @@ pub(super) fn prepare_tail(
         }
         // A summarized or otherwise rewritten history starts a private root.
         // Shared prefixes referenced by other branches remain immutable.
+        let json = serde_json::to_string(messages).map_err(|error| failed(error.to_string()))?;
         conn.execute(
-            "DELETE FROM conversation_snapshot_refs WHERE conversation_id = ?1",
-            [conversation],
+            "UPDATE conversations SET messages_json = ?1,messages_hash = ?2 WHERE id = ?3",
+            params![&json, payload_hash(&json), conversation],
+        )
+        .map_err(sql_error)?;
+        let snapshot = seal_tail(conn, conversation, agent, tenant, None)?;
+        conn.execute(
+            "UPDATE conversation_snapshot_refs SET snapshot_id = ?1 WHERE conversation_id = ?2",
+            params![snapshot.id.to_string(), conversation],
         )
         .map_err(sql_error)?;
         gc(conn)?;
+        return Ok("[]".into());
     }
     serde_json::to_string(messages).map_err(|error| failed(error.to_string()))
 }
@@ -294,6 +450,7 @@ pub(super) fn gc(conn: &Connection) -> Result<(usize, usize), ContextError> {
         [],
     )
     .map_err(sql_error)?;
+    shared_spills::gc(conn)?;
     Ok((snapshots, search_rows))
 }
 
@@ -404,60 +561,17 @@ impl SqliteContextManager {
             Some(_) => return Err(failed("conversation snapshot tenant mismatch")),
             None => None,
         };
-        let (count, digest): (usize, Option<String>) = tx.query_row(
-            "SELECT json_array_length(messages_json), messages_hash FROM conversations WHERE id = ?1",
-            [source], |row| Ok((row.get(0)?, row.get(1)?))
-        ).map_err(sql_error)?;
+        let count: usize = tx
+            .query_row(
+                "SELECT json_array_length(messages_json) FROM conversations WHERE id = ?1",
+                [source],
+                |row| row.get(0),
+            )
+            .map_err(sql_error)?;
         let snapshot = if let (0, Some(base)) = (count, &baseline) {
             base.metadata.clone()
         } else {
-            let depth = baseline.as_ref().map_or(1, |base| base.metadata.depth + 1);
-            if depth > MAX_EXECUTION_SNAPSHOT_DEPTH {
-                return Err(failed(
-                    "execution snapshot depth bound exceeded; compact history before cloning",
-                ));
-            }
-            // Promotion copies only the private tail inside SQLite. The
-            // prefix and all later children remain shared by reference.
-            let digest = digest.ok_or_else(|| failed("conversation digest is missing"))?;
-            let id = Uuid::new_v4();
-            let parent_id = baseline.as_ref().map(|base| base.metadata.id.to_string());
-            let total_count = count
-                + baseline
-                    .as_ref()
-                    .map_or(0, |base| base.metadata.message_count);
-            let hash = node_hash(
-                &id.to_string(),
-                &tenant,
-                &parent_id,
-                &digest,
-                total_count,
-                bytes,
-                depth,
-            )?;
-            tx.execute(
-                "INSERT INTO execution_context_snapshots
-                 (id, tenant_id, parent_id, version, payload_json, payload_hash, node_hash, message_count, logical_bytes, depth)
-                 SELECT ?1, ?2, ?3, ?4, messages_json, ?5, ?6, ?7, ?8, ?9
-                 FROM conversations WHERE id = ?10",
-                params![id.to_string(), &tenant, parent_id, EXECUTION_SNAPSHOT_VERSION, digest, hash, total_count, bytes, depth, source]
-            ).map_err(sql_error)?;
-            crash_multi_table_mutation_after_step_for_test("fork.snapshot");
-            tx.execute(
-                "INSERT INTO execution_snapshot_fts(snapshot_id, content)
-                 SELECT id, COALESCE((SELECT group_concat(json_extract(value, '$.content'), ' ')
-                                      FROM json_each(payload_json)), '')
-                 FROM execution_context_snapshots WHERE id = ?1",
-                [id.to_string()],
-            )
-            .map_err(sql_error)?;
-            ExecutionSnapshotMetadata {
-                id,
-                version: EXECUTION_SNAPSHOT_VERSION,
-                message_count: total_count,
-                logical_bytes: bytes,
-                depth,
-            }
+            seal_tail(&tx, source, parent, &tenant, baseline.as_ref())?
         };
         tx.execute(
             "UPDATE conversations SET messages_json = '[]', messages_hash = ?1 WHERE id = ?2",
@@ -474,6 +588,14 @@ impl SqliteContextManager {
              ON CONFLICT(conversation_id) DO UPDATE SET snapshot_id = excluded.snapshot_id",
             params![source, &tenant, snapshot.id.to_string()]
         ).map_err(sql_error)?;
+        shared_spills::validate_ownership(&tx, parent, &tenant)?;
+        let spill_bytes = shared_spills::conversation_bytes(&tx, source)?;
+        if bytes.saturating_add(spill_bytes) > MAX_EXECUTION_SNAPSHOT_BYTES {
+            return Err(failed(
+                "execution snapshot including spills exceeds byte bound",
+            ));
+        }
+        self.enforce_context_storage_locked(&tx, child, &tenant, bytes + spill_bytes, 0)?;
         crash_multi_table_mutation_after_step_for_test("fork.source_reference");
         let now = Utc::now().to_rfc3339();
         tx.execute(
@@ -651,8 +773,11 @@ mod tests {
             .unwrap();
         assert_eq!(manager.load_conversation("parent").unwrap(), compact);
         assert_eq!(manager.load_conversation("child").unwrap(), history());
-        assert_eq!(count(&manager, "conversation_snapshot_refs"), 1);
+        assert_eq!(count(&manager, "conversation_snapshot_refs"), 2);
         manager.delete_conversation("child").unwrap();
+        assert_eq!(manager.load_conversation("parent").unwrap(), compact);
+        assert_eq!(count(&manager, "execution_context_snapshots"), 1);
+        manager.delete_conversation("parent").unwrap();
         assert_eq!(count(&manager, "execution_context_snapshots"), 0);
         assert_eq!(count(&manager, "execution_snapshot_fts"), 0);
     }
@@ -762,7 +887,7 @@ mod tests {
             )
             .unwrap();
         assert!(manager.load_conversation("child").is_err());
-        manager.locked_conn().execute("UPDATE execution_context_snapshots SET version = 1, payload_json = '[]' WHERE id = ?1", [metadata.id.to_string()]).unwrap();
+        manager.locked_conn().execute("UPDATE execution_context_snapshots SET version = 2, payload_json = '[]' WHERE id = ?1", [metadata.id.to_string()]).unwrap();
         assert!(manager.load_conversation("child").is_err());
     }
 

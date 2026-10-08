@@ -42,8 +42,8 @@ use tokio::net::ToSocketAddrs;
 
 // Re-export the kernel wire types that appear in this crate's public API, so
 // SDK consumers can name them without depending on the kernel directly.
-pub use kernel::cloning::CloneResult;
 pub use kernel::auth::{ApiKeyDescriptor, IssuedApiKey, Role, Tenant, User};
+pub use kernel::cloning::CloneResult;
 pub use kernel::cluster_control::{
     AgentMutationFence, AgentMutationFenceAudit, AgentMutationFenceState, ClusterAgentOwnership,
     ClusterAgentOwnershipAudit, ClusterCertificateRollout, ClusterCertificateRolloutAudit,

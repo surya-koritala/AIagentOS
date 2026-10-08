@@ -39,6 +39,14 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
   usage, cancellation, deadlines, wire ceilings and partial-output replay
   suppression. Real-service qualification remains pending. Closes #351.
 
+- Add protected current-user Windows DACLs at private file/directory creation,
+  handle-based ownership and reparse rejection, write-through storage publication,
+  and native permission/durability CI regressions. Physical power-loss and final
+  production qualification remain open (#337).
+- Share atomic owner-only local operator persistence with configuration, including
+  Unix permission tightening before replacement bytes and stable local owner
+  identity, without adding wire or tool authority (#337, #338).
+
 - Added Gemini native JSON-schema function declarations, ordered parallel calls
   and paired results, with bounded durable assistant replay state and preserved
   thought signatures. Checkpoints, cloning, restart, context admission and
@@ -1543,7 +1551,6 @@ end-to-end. (64 commits since 0.1.0.)
 - **First-class multi-tenancy** — a tenant model atop namespaces/cgroups/auth;
   cross-tenant tool/IPC/state access is denied at the gate (#93).
 
-### Persistence
 
 - **Durable agent registry** — agents (and conversations/memory/KV/snapshots)
   survive a process restart; enforcement is re-armed on rehydrate (#92).

@@ -20,6 +20,17 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
   Operators can reject before request/failover I/O or retain the default governed
   plaintext shim with one per-session degradation audit and per-turn counters.
   Prompt overhead is included in context and token admission. Relates #356.
+- Added bounded native Anthropic Messages and Gemini SSE streams with shared
+  byte framing, cancellation, usage and tool assembly. Signed thinking and
+  Gemini streamed Content boundaries survive durable history; schema 12 refuses
+  readers that would flatten signatures. Keyless conformance and restart
+  fixtures run on CI; real-service qualification remains pending. Relates #352.
+
+- Added native bounded SSE streaming for OpenAI, Groq, DeepSeek and vLLM,
+  using Azure's shared byte-safe reader. Keyless nine-provider conformance
+  fixtures cover capability declarations, parallel tool argument assembly,
+  usage, cancellation, deadlines, wire ceilings and partial-output replay
+  suppression. Real-service qualification remains pending. Closes #351.
 
 - Added Gemini native JSON-schema function declarations, ordered parallel calls
   and paired results, with bounded durable assistant replay state and preserved
@@ -45,12 +56,6 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
   durable mutation revisions, bounded cache eviction and erasure cleanup. LSH
   candidate compression and partial selection preserve search results; the 10k
   qualification also requires ANN p95 below exact search. Relates #357.
-- Added native bounded SSE streaming for OpenAI, Groq, DeepSeek and vLLM,
-  using Azure's shared byte-safe reader. Keyless nine-provider conformance
-  fixtures cover capability declarations, parallel tool argument assembly,
-  usage, cancellation, deadlines, wire ceilings and partial-output replay
-  suppression. Real-service qualification remains pending. Closes #351.
-### Distribution
 - Add native Linux and macOS arm64 release targets, architecture-bound desktop
   updater assets, fail-closed platform documentation checks, and fresh-runner ARM
   CLI installation evidence. Native desktop signing and public installer

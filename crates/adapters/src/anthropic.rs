@@ -3,6 +3,9 @@
 use kernel::connector::*;
 use kernel::{ConnectorError, ProviderId};
 
+#[path = "anthropic_protocol.rs"]
+mod protocol;
+
 pub struct AnthropicAdapter {
     id: ProviderId,
     client: reqwest::Client,
@@ -41,6 +44,42 @@ struct AnthropicSession {
     model: String,
 }
 
+impl AnthropicSession {
+    async fn stream(
+        &self,
+        messages: Vec<StandardMessage>,
+        tools: &[ToolDefinition],
+        options: LlmRequestOptions,
+        cancellation: &tokio_util::sync::CancellationToken,
+        events: Option<ProviderEventSink>,
+    ) -> Result<LlmResponse, ConnectorError> {
+        let body = protocol::request(
+            &messages,
+            tools,
+            &self.provider_id,
+            &self.model,
+            options,
+            true,
+        )?;
+        let request = self
+            .client
+            .post(format!("{}/messages", self.base_url.trim_end_matches('/')))
+            .header("x-api-key", &self.api_key)
+            .header("anthropic-version", "2023-06-01")
+            .json(&body);
+        let state = protocol::AnthropicStream::new(self.provider_id.clone(), self.model.clone());
+        crate::streaming::send_native_sse_controlled(
+            &self.provider_id,
+            request,
+            state,
+            options,
+            cancellation,
+            events,
+        )
+        .await
+    }
+}
+
 #[async_trait::async_trait]
 impl LlmSession for AnthropicSession {
     async fn send(&self, messages: Vec<StandardMessage>) -> Result<LlmResponse, ConnectorError> {
@@ -62,24 +101,14 @@ impl LlmSession for AnthropicSession {
         tools: &[ToolDefinition],
         options: LlmRequestOptions,
     ) -> Result<LlmResponse, ConnectorError> {
-        let max_output_tokens = options.max_output_tokens.unwrap_or(4096).min(4096);
-        let mut body = serde_json::json!({
-            "model": self.model,
-            "max_tokens": max_output_tokens,
-            "messages": messages.iter().map(|m| serde_json::json!({"role": m.role, "content": m.content})).collect::<Vec<_>>(),
-        });
-
-        if !tools.is_empty() {
-            let tool_defs: Vec<serde_json::Value> = tools
-                .iter()
-                .map(|t| {
-                    serde_json::json!({
-                        "name": t.name, "description": t.description, "input_schema": t.parameters
-                    })
-                })
-                .collect();
-            body["tools"] = serde_json::json!(tool_defs);
-        }
+        let body = protocol::request(
+            &messages,
+            tools,
+            &self.provider_id,
+            &self.model,
+            options,
+            false,
+        )?;
 
         let result = self
             .client
@@ -143,6 +172,54 @@ impl LlmSession for AnthropicSession {
         }
     }
 
+    async fn send_streaming(
+        &self,
+        messages: Vec<StandardMessage>,
+        tools: &[ToolDefinition],
+    ) -> Result<LlmResponse, ConnectorError> {
+        self.send_streaming_with_options(messages, tools, LlmRequestOptions::default())
+            .await
+    }
+
+    async fn send_streaming_with_options(
+        &self,
+        messages: Vec<StandardMessage>,
+        tools: &[ToolDefinition],
+        options: LlmRequestOptions,
+    ) -> Result<LlmResponse, ConnectorError> {
+        self.stream(
+            messages,
+            tools,
+            options,
+            &tokio_util::sync::CancellationToken::new(),
+            None,
+        )
+        .await
+    }
+
+    async fn send_streaming_controlled(
+        &self,
+        messages: Vec<StandardMessage>,
+        tools: &[ToolDefinition],
+        options: LlmRequestOptions,
+        cancellation: &tokio_util::sync::CancellationToken,
+    ) -> Result<LlmResponse, ConnectorError> {
+        self.stream(messages, tools, options, cancellation, None)
+            .await
+    }
+
+    async fn send_streaming_events_controlled(
+        &self,
+        messages: Vec<StandardMessage>,
+        tools: &[ToolDefinition],
+        options: LlmRequestOptions,
+        cancellation: &tokio_util::sync::CancellationToken,
+        events: ProviderEventSink,
+    ) -> Result<LlmResponse, ConnectorError> {
+        self.stream(messages, tools, options, cancellation, Some(events))
+            .await
+    }
+
     fn enforces_max_output_tokens(&self) -> bool {
         true
     }
@@ -169,6 +246,7 @@ impl LlmProviderAdapter for AnthropicAdapter {
     }
     fn capabilities(&self) -> kernel::connector::ProviderCapabilities {
         kernel::connector::ProviderCapabilities {
+            native_streaming: true,
             tool_calls: true,
             parallel_tool_calls: true,
             prompt_cancellation: true,

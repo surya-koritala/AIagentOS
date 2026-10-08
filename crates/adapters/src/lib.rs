@@ -296,3 +296,6 @@ mod output_bound_tests;
 
 #[cfg(test)]
 mod streaming_conformance_tests;
+
+#[cfg(test)]
+mod native_messages_streaming_tests;

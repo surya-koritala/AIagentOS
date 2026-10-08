@@ -1276,7 +1276,11 @@ impl AgentConnectorImpl {
                             .await;
                         if result.is_err()
                             && sink.has_emitted()
-                            && !matches!(result, Err(ConnectorError::Cancelled(_)))
+                            && !matches!(
+                                result,
+                                Err(ConnectorError::Cancelled(_)
+                                    | ConnectorError::ContentFiltered(_))
+                            )
                         {
                             return Err(ConnectorError::PartialStream(
                                 "provider failed after publishing output; retry and failover were suppressed"

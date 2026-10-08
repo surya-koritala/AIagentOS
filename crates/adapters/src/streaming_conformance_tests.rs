@@ -72,7 +72,7 @@ fn text_fixture() -> String {
     .concat()
 }
 
-async fn collect(
+pub(super) async fn collect(
     adapter: &dyn LlmProviderAdapter,
     tools: &[ToolDefinition],
 ) -> Result<(LlmResponse, Vec<String>), ConnectorError> {
@@ -122,15 +122,26 @@ async fn network_adapters_and_huggingface_modes_conform_to_declared_streaming() 
             .mount(&server)
             .await;
     }
+    Mock::given(method("POST"))
+        .and(path("/messages"))
+        .and(body_partial_json(json!({"stream": true, "max_tokens": 41})))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(crate::native_messages_streaming_tests::anthropic_text_fixture()),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1beta/models/fixture:streamGenerateContent"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(crate::native_messages_streaming_tests::gemini_text_fixture()),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
     let fallback_fixtures = [
-        (
-            "/messages",
-            json!({"content": [{"type": "text", "text": "Hello 🌐"}], "stop_reason": "end_turn", "usage": {"input_tokens": 11, "output_tokens": 3, "cache_read_input_tokens": 4}}),
-        ),
-        (
-            "/v1beta/models/fixture:generateContent",
-            json!({"candidates": [{"content": {"role": "model", "parts": [{"text": "Hello 🌐"}]}, "finishReason": "STOP"}], "usageMetadata": {"totalTokenCount": 14, "promptTokenCount": 11, "candidatesTokenCount": 3, "cachedContentTokenCount": 4}}),
-        ),
         ("/models/fixture", json!([{"generated_text": "Hello 🌐"}])),
         (
             "/api/chat",
@@ -295,7 +306,7 @@ async fn native_adapters_reject_oversized_streams_and_malformed_tool_calls() {
 
 // A raw chunked HTTP fixture proves that deltas arrive before the response
 // completes, and can split an individual UTF-8 code point across wire chunks.
-async fn paused_stream(
+pub(super) async fn paused_stream(
     chunks: Vec<Vec<u8>>,
 ) -> (
     String,

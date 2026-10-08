@@ -74,6 +74,7 @@ impl SecurityAction {
                 Self::Execute | Self::CredentialAccess | Self::PackageInstall
             ),
             ResourceType::Ipc => self == Self::Ipc,
+            ResourceType::Memory => matches!(self, Self::Read | Self::Write),
             // Peripheral tools can read device state, write device state, or
             // access a protected credential/device. Their provider still
             // supplies the concrete operation and sandbox classification.
@@ -95,6 +96,11 @@ impl SecurityAction {
                 "write" | "write_bytes" | "create" | "create_dir" | "edit",
             ) => Some(Self::Write),
             (ResourceType::Filesystem, "delete") => Some(Self::Delete),
+            (
+                ResourceType::Memory,
+                "query" | "stat" | "kv_get" | "kv_list" | "kv_dir_stat" | "kv_stat",
+            ) => Some(Self::Read),
+            (ResourceType::Memory, "store" | "kv_put") => Some(Self::Write),
             (ResourceType::Network, "get" | "post" | "put" | "delete" | "browse") => {
                 Some(Self::Network)
             }
@@ -112,6 +118,7 @@ impl SecurityAction {
                 ResourceType::Ipc,
                 "send"
                 | "receive"
+                | "stat"
                 | "delegate"
                 | "delegation_status"
                 | "complete_delegation"
@@ -1101,6 +1108,36 @@ impl ToolRegistry {
         self.binding_ids.get(name).map(|id| *id)
     }
 
+    pub(crate) fn data_binding_id(
+        &self,
+        gate: &crate::syscall_gate::SyscallGate,
+        agent: AgentId,
+        name: &str,
+        resource: &ResourceType,
+        operation: &str,
+    ) -> Option<uuid::Uuid> {
+        let _publication = self.publication.read().ok()?;
+        if gate.pid_of(agent).is_none() || !gate.tool_visible_to_agent(agent, name) {
+            return None;
+        }
+        let binding = self.tools.get(name)?;
+        if &binding.resource_type != resource || binding.operation != operation {
+            return None;
+        }
+        let expected = match crate::resources::provider_target_spec(resource, operation)? {
+            crate::resources::ProviderTargetSpec::Argument(argument) => {
+                ResourceExtractor::Argument(argument.into())
+            }
+            crate::resources::ProviderTargetSpec::Constant(target) => {
+                ResourceExtractor::Constant(target.into())
+            }
+        };
+        if binding.security.resource_extractor != expected {
+            return None;
+        }
+        self.binding_ids.get(name).map(|id| *id)
+    }
+
     /// Build the validated security catalog shipped by the kernel. This is
     /// also consumed by the legacy direct-gate compatibility API, ensuring its
     /// built-in classifications are generated from the same bindings.
@@ -1109,6 +1146,7 @@ impl ToolRegistry {
         registry.register_advanced_tools();
         registry.register_git_tools();
         registry.register_ipc_tools();
+        registry.register_memory_tools();
         crate::editing::register_edit_tools(&registry);
         registry.security_catalog()
     }
@@ -1212,6 +1250,14 @@ impl ToolRegistry {
         // cannot select another agent as sender, inbox owner, or namespace
         // viewer while authorizing a harmless constant.
         let parameters = match (&binding_rt, binding_op.as_str()) {
+            (ResourceType::Memory, _) => {
+                let mut parameters = tool_call.arguments.as_object()?.clone();
+                parameters.insert(
+                    "agent".into(),
+                    serde_json::Value::String(agent_id.to_string()),
+                );
+                serde_json::Value::Object(parameters)
+            }
             (ResourceType::Ipc, "send") => serde_json::json!({
                 "from": agent_id.to_string(),
                 "to": tool_call.arguments.get("to").and_then(|v| v.as_str()).unwrap_or(""),
@@ -1222,7 +1268,7 @@ impl ToolRegistry {
                     .cloned()
                     .unwrap_or(serde_json::Value::Null),
             }),
-            (ResourceType::Ipc, "receive") => {
+            (ResourceType::Ipc, "receive" | "stat") => {
                 serde_json::json!({"agent": agent_id.to_string()})
             }
             (ResourceType::Ipc, "discover") => {
@@ -2519,6 +2565,15 @@ impl ToolRegistry {
 impl ToolRegistry {
     pub fn register_ipc_tools(&self) {
         self.register(ToolBinding {
+            name: "ipc_stat".into(),
+            description: "Inspect your local mailbox depth and capacity.".into(),
+            parameters_schema: serde_json::json!({"type":"object","properties":{}}),
+            resource_type: ResourceType::Ipc,
+            operation: "stat".into(),
+            security: ToolSecurity::constant(SecurityAction::Ipc, "ipc:self").caller_namespace(),
+        })
+        .expect("builtin mailbox stat declaration must be valid");
+        self.register(ToolBinding {
             name: "send_agent_message".into(),
             description:
                 "Send a JSON message to another agent by its agent id. Delivery requires sharing \
@@ -2605,5 +2660,80 @@ impl ToolRegistry {
                 .caller_namespace(),
         })
         .expect("built-in discover_agents security declaration must be valid");
+    }
+}
+
+impl ToolRegistry {
+    pub fn register_memory_tools(&self) {
+        for (name, operation, action, target, fields, required) in [
+            (
+                "kv_directory_stat",
+                "kv_dir_stat",
+                SecurityAction::Read,
+                ResourceExtractor::Constant("kv:self".into()),
+                serde_json::json!({}),
+                vec![],
+            ),
+            (
+                "memory_store",
+                "store",
+                SecurityAction::Write,
+                ResourceExtractor::Constant("memory:self".into()),
+                serde_json::json!({"content":{"type":"string"},"category":{"type":"string","enum":["Fact","Preference","LearnedPattern","TaskOutcome"]}}),
+                vec!["content"],
+            ),
+            (
+                "memory_query",
+                "query",
+                SecurityAction::Read,
+                ResourceExtractor::Constant("memory:self".into()),
+                serde_json::json!({"query":{"type":"string"}}),
+                vec!["query"],
+            ),
+            (
+                "memory_stat",
+                "stat",
+                SecurityAction::Read,
+                ResourceExtractor::Constant("memory:self".into()),
+                serde_json::json!({}),
+                vec![],
+            ),
+            (
+                "kv_get",
+                "kv_get",
+                SecurityAction::Read,
+                ResourceExtractor::Argument("key".into()),
+                serde_json::json!({"key":{"type":"string"}}),
+                vec!["key"],
+            ),
+            (
+                "kv_put",
+                "kv_put",
+                SecurityAction::Write,
+                ResourceExtractor::Argument("key".into()),
+                serde_json::json!({"key":{"type":"string"},"value":{"type":"string"}}),
+                vec!["key", "value"],
+            ),
+            (
+                "kv_list",
+                "kv_list",
+                SecurityAction::Read,
+                ResourceExtractor::Constant("kv:self".into()),
+                serde_json::json!({}),
+                vec![],
+            ),
+            (
+                "kv_stat",
+                "kv_stat",
+                SecurityAction::Read,
+                ResourceExtractor::Argument("key".into()),
+                serde_json::json!({"key":{"type":"string"}}),
+                vec!["key"],
+            ),
+        ] {
+            let mut security = ToolSecurity::constant(action, "");
+            security.resource_extractor = target;
+            self.register(ToolBinding { name: name.into(), description: format!("Access your agent-owned persistent data using {operation}."), resource_type: ResourceType::Memory, operation: operation.into(), security, parameters_schema: serde_json::json!({"type":"object","properties":fields,"required":required,"additionalProperties":false}) }).expect("built-in memory declaration must be valid");
+        }
     }
 }

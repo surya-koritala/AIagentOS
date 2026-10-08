@@ -53,3 +53,5 @@
 - [Workspace VFS](./workspace-vfs.md)
 
 - [Namespace mounts](./namespace-mounts.md)
+
+- [Data VFS](./data-vfs.md)

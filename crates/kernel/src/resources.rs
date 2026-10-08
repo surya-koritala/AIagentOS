@@ -34,6 +34,8 @@ pub enum ResourceType {
     Network,
     /// Inter-agent communication (mailboxes) routed to `IpcManager`.
     Ipc,
+    /// Agent-owned persistent facts and key/value data.
+    Memory,
 }
 
 /// A request from an agent to access a resource.
@@ -90,8 +92,17 @@ pub(crate) fn provider_target_spec(
         (ResourceType::Ipc, "delegation_status" | "complete_delegation") => {
             Some(ProviderTargetSpec::Argument("task_id"))
         }
-        (ResourceType::Ipc, "receive") => Some(ProviderTargetSpec::Constant("ipc:self")),
+        (ResourceType::Ipc, "receive" | "stat") => Some(ProviderTargetSpec::Constant("ipc:self")),
         (ResourceType::Ipc, "discover") => Some(ProviderTargetSpec::Constant("ipc:namespace")),
+        (ResourceType::Memory, "store" | "query" | "stat") => {
+            Some(ProviderTargetSpec::Constant("memory:self"))
+        }
+        (ResourceType::Memory, "kv_get" | "kv_put" | "kv_stat") => {
+            Some(ProviderTargetSpec::Argument("key"))
+        }
+        (ResourceType::Memory, "kv_list" | "kv_dir_stat") => {
+            Some(ProviderTargetSpec::Constant("kv:self"))
+        }
         (ResourceType::Peripheral, "capture_image" | "record_audio" | "play_audio") => {
             Some(ProviderTargetSpec::Argument("device"))
         }
@@ -666,6 +677,7 @@ impl ResourceBrokerImpl {
             (ResourceType::Peripheral, 8),
             (ResourceType::Network, 64),
             (ResourceType::Ipc, 256),
+            (ResourceType::Memory, 32),
         ] {
             admission.insert(resource, Arc::new(tokio::sync::Semaphore::new(permits)));
         }
@@ -698,6 +710,7 @@ impl ResourceBrokerImpl {
             ResourceType::Application => Ok(SandboxAction::ProcessExec(target)),
             ResourceType::Peripheral => Ok(SandboxAction::PeripheralAccess(target)),
             ResourceType::Ipc => Ok(SandboxAction::Ipc),
+            ResourceType::Memory => Ok(SandboxAction::AgentData),
         }
     }
 

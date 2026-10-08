@@ -1,6 +1,40 @@
 [
   {
     "agent_id": "00000000-0000-0000-0000-000000000001",
+    "op": "vfs_open_data",
+    "path": "fixture",
+    "rights": []
+  },
+  {
+    "agent_id": "00000000-0000-0000-0000-000000000001",
+    "handle": "fixture",
+    "op": "vfs_dup_data",
+    "rights": []
+  },
+  {
+    "agent_id": "00000000-0000-0000-0000-000000000001",
+    "args": {},
+    "handle": "fixture",
+    "op": "vfs_read_data"
+  },
+  {
+    "agent_id": "00000000-0000-0000-0000-000000000001",
+    "args": {},
+    "handle": "fixture",
+    "op": "vfs_write_data"
+  },
+  {
+    "agent_id": "00000000-0000-0000-0000-000000000001",
+    "handle": "fixture",
+    "op": "vfs_list_data"
+  },
+  {
+    "agent_id": "00000000-0000-0000-0000-000000000001",
+    "handle": "fixture",
+    "op": "vfs_stat_data"
+  },
+  {
+    "agent_id": "00000000-0000-0000-0000-000000000001",
     "op": "vfs_namespace_mounts"
   },
   {

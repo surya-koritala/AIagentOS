@@ -157,6 +157,8 @@ pub enum SandboxAction {
     PeripheralAccess(String),
     /// Namespace-governed inter-agent communication.
     Ipc,
+    /// Access to the caller's kernel-owned persistent data, with no host path.
+    AgentData,
 }
 
 /// Internal sandbox state.
@@ -2107,7 +2109,7 @@ impl SandboxManager for SandboxManagerImpl {
                     "peripheral access requires an exact trusted operator grant".into(),
                 ));
             }
-            SandboxAction::Ipc => {}
+            SandboxAction::Ipc | SandboxAction::AgentData => {}
         }
 
         Ok(())

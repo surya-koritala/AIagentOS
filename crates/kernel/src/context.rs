@@ -824,6 +824,8 @@ pub trait ContextManager: Send + Sync {
 
 /// Maximum retry attempts for persistence operations.
 const MAX_RETRIES: u32 = 3;
+pub const MAX_KV_KEY_BYTES: usize = 1024;
+pub const MAX_KV_VALUE_BYTES: usize = 1024 * 1024;
 
 /// The implicit tenant assigned to agents that predate tenancy (or are created
 /// through the un-tenanted `create_agent_full` path). Cross-tenant isolation is
@@ -3965,7 +3967,7 @@ impl SqliteContextManager {
                 .unwrap_or_else(|| DEFAULT_TENANT.to_string());
             let replaced_bytes = transaction
                 .query_row(
-                    "SELECT LENGTH(context_json) FROM contexts WHERE agent_id = ?1",
+                    "SELECT LENGTH(CAST(context_json AS BLOB)) FROM contexts WHERE agent_id = ?1",
                     params![id_str],
                     |row| row.get::<_, i64>(0),
                 )
@@ -4114,7 +4116,7 @@ impl ContextManager for SqliteContextManager {
         let existing = transaction
             .query_row(
                 "SELECT agent_id,
-                        LENGTH(content) + COALESCE(LENGTH(embedding_json), 0)
+                        LENGTH(CAST(content AS BLOB)) + COALESCE(LENGTH(CAST(embedding_json AS BLOB)), 0)
                         + LENGTH(embedding_model) + LENGTH(content_hash)
                  FROM facts WHERE id = ?1",
                 params![fact.id.to_string()],
@@ -4374,7 +4376,7 @@ impl SqliteContextManager {
             .unwrap_or_else(|| DEFAULT_TENANT.to_string());
         let existing = transaction
             .query_row(
-                "SELECT agent_id, LENGTH(messages_json) FROM conversations WHERE id = ?1",
+                "SELECT agent_id, LENGTH(CAST(messages_json AS BLOB)) FROM conversations WHERE id = ?1",
                 params![id],
                 |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
             )
@@ -4737,18 +4739,17 @@ impl SqliteContextManager {
         let (agent, tenant, global) = conn
             .query_row(
                 "WITH context_bytes(agent_id, byte_count) AS (
-                    SELECT agent_id, LENGTH(context_json) FROM contexts
+                    SELECT agent_id, LENGTH(CAST(context_json AS BLOB)) FROM contexts
                     UNION ALL
-                    SELECT agent_id, LENGTH(content) + COALESCE(LENGTH(embedding_json), 0) FROM facts
+                    SELECT agent_id, LENGTH(CAST(content AS BLOB)) + COALESCE(LENGTH(CAST(embedding_json AS BLOB)), 0) FROM facts
                     UNION ALL
-                    SELECT agent_id, LENGTH(messages_json) FROM conversations
+                    SELECT agent_id, LENGTH(CAST(messages_json AS BLOB)) FROM conversations
                     UNION ALL
-                    SELECT agent_id, LENGTH(value) FROM agent_kv
-                        WHERE key LIKE 'context_spill:%'
+                    SELECT agent_id, LENGTH(CAST(value AS BLOB)) + LENGTH(CAST(key AS BLOB)) FROM agent_kv
                     UNION ALL
-                    SELECT agent_id, LENGTH(context_json) FROM context_snapshots
+                    SELECT agent_id, LENGTH(CAST(context_json AS BLOB)) FROM context_snapshots
                     UNION ALL
-                    SELECT agent_id, LENGTH(checkpoint_json) FROM generation_checkpoints
+                    SELECT agent_id, LENGTH(CAST(checkpoint_json AS BLOB)) FROM generation_checkpoints
                         WHERE status IN ('active', 'resuming')
                 )
                 SELECT
@@ -4790,20 +4791,33 @@ impl SqliteContextManager {
             .map(|limits| *limits)
             .unwrap_or_default();
         let usage = Self::context_storage_usage_locked(conn, agent_id, tenant_id)?;
-        let delta = incoming_bytes.saturating_sub(replaced_bytes);
         for (scope, used, limit) in [
             ("agent", usage.agent_bytes, limits.per_agent_bytes),
             ("tenant", usage.tenant_bytes, limits.per_tenant_bytes),
             ("global", usage.global_bytes, limits.global_bytes),
         ] {
-            if limit > 0 && used.saturating_add(delta) > limit {
+            let projected = used
+                .saturating_sub(replaced_bytes)
+                .saturating_add(incoming_bytes);
+            if limit > 0 && projected > limit {
                 return Err(ContextError::PersistenceFailed(format!(
                     "context storage pressure: {scope} would use {} bytes above limit {limit}; delete retained context or retry after retention cleanup",
-                    used.saturating_add(delta)
+                    projected
                 )));
             }
         }
         Ok(())
+    }
+
+    fn agent_tenant_locked(conn: &Connection, agent_id: AgentId) -> Result<String, ContextError> {
+        conn.query_row(
+            "SELECT tenant_id FROM agents WHERE id = ?1",
+            params![agent_id.to_string()],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| ContextError::StorageError(error.to_string()))
+        .map(|tenant| tenant.unwrap_or_else(|| DEFAULT_TENANT.to_string()))
     }
 
     fn purge_expired_spills_locked(conn: &mut Connection) -> Result<u64, ContextError> {
@@ -4867,7 +4881,7 @@ impl SqliteContextManager {
             .unwrap_or_else(|| DEFAULT_TENANT.to_string());
         let replaced_bytes = transaction
             .query_row(
-                "SELECT LENGTH(value) FROM agent_kv WHERE agent_id = ?1 AND key = ?2",
+                "SELECT LENGTH(CAST(key AS BLOB)) + LENGTH(CAST(value AS BLOB)) FROM agent_kv WHERE agent_id = ?1 AND key = ?2",
                 params![agent_id.to_string(), key],
                 |row| row.get::<_, i64>(0),
             )
@@ -4879,7 +4893,7 @@ impl SqliteContextManager {
             &transaction,
             agent_id,
             &tenant_id,
-            value.len() as u64,
+            (key.len() + value.len()) as u64,
             replaced_bytes,
         )?;
         let retention_seconds = self
@@ -4928,19 +4942,112 @@ impl SqliteContextManager {
 
     /// Put (insert-or-overwrite) a value for `key` under `agent_id`.
     pub fn kv_put(&self, agent_id: AgentId, key: &str, value: &str) -> Result<(), ContextError> {
+        if key.is_empty() || key.len() > MAX_KV_KEY_BYTES || value.len() > MAX_KV_VALUE_BYTES {
+            return Err(ContextError::PersistenceFailed(
+                "invalid or oversized KV key/value".into(),
+            ));
+        }
         if key.starts_with("context_spill:") {
             return Err(ContextError::PersistenceFailed(
                 "context spills require verified store_context_spill admission".into(),
             ));
         }
         let now = Utc::now().to_rfc3339();
-        let conn = self.locked_conn();
-        conn.execute(
+        let mut conn = self.locked_conn();
+        let transaction = conn
+            .transaction()
+            .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
+        let tenant = Self::agent_tenant_locked(&transaction, agent_id)?;
+        let replaced = transaction.query_row(
+            "SELECT LENGTH(CAST(key AS BLOB)) + LENGTH(CAST(value AS BLOB)) FROM agent_kv WHERE agent_id = ?1 AND key = ?2",
+            params![agent_id.to_string(), key], |row| row.get::<_, u64>(0),
+        ).optional().map_err(|error| ContextError::StorageError(error.to_string()))?.unwrap_or(0);
+        self.enforce_context_storage_locked(
+            &transaction,
+            agent_id,
+            &tenant,
+            (key.len() + value.len()) as u64,
+            replaced,
+        )?;
+        transaction.execute(
             "INSERT OR REPLACE INTO agent_kv (agent_id, key, value, updated_at) VALUES (?1, ?2, ?3, ?4)",
             params![agent_id.to_string(), key, value, now],
         )
         .map_err(|e| ContextError::PersistenceFailed(e.to_string()))?;
-        Ok(())
+        transaction
+            .commit()
+            .map_err(|error| ContextError::PersistenceFailed(error.to_string()))
+    }
+
+    /// Bounded public KV projection; internal spill references remain private.
+    pub fn kv_list_bounded(
+        &self,
+        agent_id: AgentId,
+        limit: usize,
+    ) -> Result<Vec<String>, ContextError> {
+        if limit == 0 || limit > 4097 {
+            return Err(ContextError::StorageError(
+                "invalid KV listing limit".into(),
+            ));
+        }
+        let conn = self.locked_conn();
+        let mut statement = conn.prepare(
+            "SELECT key FROM agent_kv WHERE agent_id = ?1 AND key NOT LIKE 'context_spill:%' ORDER BY key ASC LIMIT ?2"
+        ).map_err(|error| ContextError::StorageError(error.to_string()))?;
+        let keys = statement
+            .query_map(params![agent_id.to_string(), limit as i64], |row| {
+                row.get::<_, String>(0)
+            })
+            .map_err(|error| ContextError::StorageError(error.to_string()))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| ContextError::StorageError(error.to_string()))?;
+        Ok(keys)
+    }
+
+    pub fn kv_stat(
+        &self,
+        agent_id: AgentId,
+        key: &str,
+    ) -> Result<Option<(u64, String)>, ContextError> {
+        let conn = self.locked_conn();
+        conn.query_row("SELECT LENGTH(CAST(value AS BLOB)), updated_at FROM agent_kv WHERE agent_id = ?1 AND key = ?2",
+            params![agent_id.to_string(), key], |row| Ok((row.get(0)?, row.get(1)?)))
+            .optional().map_err(|error| ContextError::StorageError(error.to_string()))
+    }
+
+    pub fn kv_get_bounded(
+        &self,
+        agent_id: AgentId,
+        key: &str,
+        limit: usize,
+    ) -> Result<Option<String>, ContextError> {
+        let conn = self.locked_conn();
+        let row: Option<(u64, Option<String>)> = conn.query_row(
+            "SELECT LENGTH(CAST(value AS BLOB)), CASE WHEN LENGTH(CAST(value AS BLOB)) <= ?3 THEN value ELSE NULL END FROM agent_kv WHERE agent_id = ?1 AND key = ?2",
+            params![agent_id.to_string(), key, limit as i64], |row| Ok((row.get(0)?, row.get(1)?))
+        ).optional().map_err(|error| ContextError::StorageError(error.to_string()))?;
+        match row {
+            Some((bytes, _)) if bytes > limit as u64 => Err(ContextError::StorageError(
+                "KV value exceeds read limit".into(),
+            )),
+            Some((_, value)) => Ok(value),
+            None => Ok(None),
+        }
+    }
+
+    pub fn fact_count(&self, agent_id: AgentId) -> Result<u64, ContextError> {
+        self.locked_conn()
+            .query_row(
+                "SELECT COUNT(*) FROM facts WHERE agent_id = ?1",
+                [agent_id.to_string()],
+                |row| row.get(0),
+            )
+            .map_err(|error| ContextError::StorageError(error.to_string()))
+    }
+
+    pub fn kv_count(&self, agent_id: AgentId) -> Result<u64, ContextError> {
+        self.locked_conn().query_row("SELECT COUNT(*) FROM agent_kv WHERE agent_id = ?1 AND key NOT LIKE 'context_spill:%'", [agent_id.to_string()], |row| row.get(0))
+            .map_err(|error| ContextError::StorageError(error.to_string()))
     }
 
     /// Get the value for `key` under `agent_id`, or `None` if absent.
@@ -5124,7 +5231,7 @@ impl SqliteContextManager {
         };
         let (stored_spills, stored_spill_bytes) = conn
             .query_row(
-                "SELECT COUNT(*), COALESCE(SUM(LENGTH(value)), 0)
+                "SELECT COUNT(*), COALESCE(SUM(LENGTH(CAST(value AS BLOB))), 0)
                  FROM agent_kv
                  WHERE agent_id = ?1 AND key LIKE 'context_spill:%'",
                 params![agent_id.to_string()],
@@ -5217,7 +5324,7 @@ impl SqliteContextManager {
             .unwrap_or_else(|| DEFAULT_TENANT.to_string());
         let replaced_bytes = transaction
             .query_row(
-                "SELECT LENGTH(context_json) FROM context_snapshots
+                "SELECT LENGTH(CAST(context_json AS BLOB)) FROM context_snapshots
                  WHERE agent_id = ?1 AND label = ?2",
                 params![id_str, label],
                 |row| row.get::<_, i64>(0),
@@ -5493,7 +5600,7 @@ impl SqliteContextManager {
             .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
         let replaced_bytes = transaction
             .query_row(
-                "SELECT LENGTH(checkpoint_json) FROM generation_checkpoints
+                "SELECT LENGTH(CAST(checkpoint_json AS BLOB)) FROM generation_checkpoints
                  WHERE agent_id = ?1 AND status = 'active'
                  ORDER BY created_at DESC LIMIT 1 OFFSET ?2",
                 params![
@@ -8229,6 +8336,41 @@ mod tests {
         assert!(!receipt.1.contains(tenant_id));
         assert!(!receipt.2.contains(tenant_id));
         assert!(!receipt.1.contains(&agent_id.to_string()));
+    }
+
+    #[test]
+    fn kv_quota_counts_utf8_key_and_value_bytes_and_overwrites_atomically() {
+        let manager = SqliteContextManager::in_memory().unwrap();
+        manager
+            .set_context_storage_limits(ContextStorageLimits {
+                per_agent_bytes: 12,
+                per_tenant_bytes: 0,
+                global_bytes: 0,
+                spill_retention_seconds: 60,
+            })
+            .unwrap();
+        let agent = uuid::Uuid::new_v4();
+        manager.kv_put(agent, "é", "🦀").unwrap();
+        manager.kv_put(agent, "b", "12345").unwrap();
+        assert!(manager
+            .kv_put(agent, "c", "")
+            .unwrap_err()
+            .to_string()
+            .contains("context storage pressure"));
+        assert_eq!(manager.kv_get(agent, "c").unwrap(), None);
+        assert!(manager.kv_put(agent, "é", "🦀🦀").is_err());
+        assert_eq!(manager.kv_get(agent, "é").unwrap().as_deref(), Some("🦀"));
+        manager.kv_put(agent, "é", "").unwrap();
+        manager.kv_put(agent, "c", "123").unwrap();
+        assert_eq!(manager.kv_stat(agent, "é").unwrap().unwrap().0, 0);
+        assert_eq!(manager.kv_list_bounded(agent, 2).unwrap(), vec!["b", "c"]);
+        assert!(manager.kv_put(agent, "", "value").is_err());
+        assert!(manager
+            .kv_put(agent, &"k".repeat(MAX_KV_KEY_BYTES + 1), "value")
+            .is_err());
+        assert!(manager
+            .kv_put(agent, "key", &"v".repeat(MAX_KV_VALUE_BYTES + 1))
+            .is_err());
     }
 
     #[test]
@@ -12423,7 +12565,7 @@ mod tests {
                     &sha256(&"b".repeat(80)),
                 )
                 .unwrap_err();
-            assert!(error.to_string().contains("agent would use 160 bytes"));
+            assert!(error.to_string().contains("agent would use 225 bytes"));
             manager
                 .conn
                 .lock()
@@ -12585,7 +12727,7 @@ mod tests {
             .unwrap_err();
         assert!(tenant_error
             .to_string()
-            .contains("tenant would use 160 bytes"));
+            .contains("tenant would use 194 bytes"));
 
         manager
             .store_context_spill(c, "context_spill:c:1", &value, &sha256(&value))
@@ -12594,26 +12736,26 @@ mod tests {
             .store_context_spill(
                 c,
                 "context_spill:c:2",
-                &"y".repeat(70),
-                &sha256(&"y".repeat(70)),
+                &"y".repeat(36),
+                &sha256(&"y".repeat(36)),
             )
             .unwrap_err();
         assert!(global_error
             .to_string()
-            .contains("global would use 230 bytes"));
+            .contains("global would use 247 bytes"));
         assert_eq!(
             manager
                 .context_pressure_stats(a)
                 .unwrap()
                 .tenant_stored_bytes,
-            80
+            97
         );
         assert_eq!(
             manager
                 .context_pressure_stats(c)
                 .unwrap()
                 .global_stored_bytes,
-            160
+            194
         );
     }
 
@@ -12626,8 +12768,8 @@ mod tests {
             Arc::new(SqliteContextManager::new_without_storage_lease(&database.path).unwrap());
         let limits = ContextStorageLimits {
             per_agent_bytes: 0,
-            per_tenant_bytes: 100,
-            global_bytes: 100,
+            per_tenant_bytes: 150,
+            global_bytes: 150,
             spill_retention_seconds: 60,
         };
         first.set_context_storage_limits(limits).unwrap();

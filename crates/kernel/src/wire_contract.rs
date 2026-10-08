@@ -48,6 +48,7 @@ pub const WIRE_FEATURES: &[&str] = &[
     "tool_vfs",
     "workspace_vfs",
     "namespace_mounts",
+    "data_vfs",
 ];
 
 /// A complete top-level protocol contract returned by `describe_protocol`.
@@ -156,6 +157,46 @@ const NI: JsonKind = JsonKind::IntegerOrNull;
 const ON: JsonKind = JsonKind::ObjectOrNull;
 
 const REQUEST_VARIANTS: &[Variant] = &[
+    Variant {
+        tag: "vfs_open_data",
+        fields: &[
+            Field::required("agent_id", S),
+            Field::required("path", S),
+            Field::required("rights", A),
+        ],
+    },
+    Variant {
+        tag: "vfs_dup_data",
+        fields: &[
+            Field::required("agent_id", S),
+            Field::required("handle", S),
+            Field::required("rights", A),
+        ],
+    },
+    Variant {
+        tag: "vfs_read_data",
+        fields: &[
+            Field::required("agent_id", S),
+            Field::required("handle", S),
+            Field::optional("args", O),
+        ],
+    },
+    Variant {
+        tag: "vfs_write_data",
+        fields: &[
+            Field::required("agent_id", S),
+            Field::required("handle", S),
+            Field::required("args", O),
+        ],
+    },
+    Variant {
+        tag: "vfs_list_data",
+        fields: &[Field::required("agent_id", S), Field::required("handle", S)],
+    },
+    Variant {
+        tag: "vfs_stat_data",
+        fields: &[Field::required("agent_id", S), Field::required("handle", S)],
+    },
     Variant {
         tag: "vfs_namespace_mounts",
         fields: &[Field::required("agent_id", S)],
@@ -939,6 +980,10 @@ pub fn conformance_request_fixtures(protocol_version: u32) -> Result<Vec<Value>,
 
 const REPLY_VARIANTS: &[Variant] = &[
     Variant {
+        tag: "vfs_data_opened",
+        fields: &[Field::required("handle", O)],
+    },
+    Variant {
         tag: "workspace_opened",
         fields: &[Field::required("handle", O)],
     },
@@ -1647,8 +1692,8 @@ mod tests {
                     });
             }
         }
-        assert_eq!(conformance_request_fixtures(1).unwrap().len(), 77);
-        assert_eq!(conformance_request_fixtures(2).unwrap().len(), 108);
+        assert_eq!(conformance_request_fixtures(1).unwrap().len(), 83);
+        assert_eq!(conformance_request_fixtures(2).unwrap().len(), 114);
         assert!(conformance_request_fixtures(0).is_err());
         assert!(conformance_request_fixtures(PROTOCOL_VERSION + 1).is_err());
     }

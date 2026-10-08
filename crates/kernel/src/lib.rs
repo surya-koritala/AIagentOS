@@ -745,6 +745,7 @@ impl ResourceProvider for IpcResourceProvider {
         vec![
             "send".into(),
             "receive".into(),
+            "stat".into(),
             "delegate".into(),
             "delegation_status".into(),
             "complete_delegation".into(),
@@ -809,6 +810,11 @@ impl ResourceProvider for IpcResourceProvider {
                     .await
                     .map_err(hide_absent_recipient)?;
                 Ok(serde_json::json!({"sent": true}))
+            }
+            "stat" => {
+                let agent = parse_uuid("agent")?;
+                let pending = self.ipc.mailbox_len(agent).map_err(hide_absent_recipient)?;
+                Ok(serde_json::json!({"pending":pending,"capacity":256}))
             }
             "receive" => {
                 let agent = parse_uuid("agent")?;
@@ -1542,6 +1548,11 @@ impl AgentKernelImpl {
         resource_broker
             .register_provider(Box::new(BuiltinAppProvider))
             .expect("built-in application provider registration must be unique");
+        resource_broker
+            .register_provider(Box::new(crate::vfs::data::MemoryResourceProvider {
+                context: context_manager.clone(),
+            }))
+            .expect("built-in memory provider registration must be unique");
 
         let cgroups = Arc::new(CgroupManager::new());
         let syscall_gate = Arc::new(SyscallGate::with_mac(
@@ -1601,6 +1612,7 @@ impl AgentKernelImpl {
         tool_registry.register_advanced_tools();
         tool_registry.register_git_tools();
         tool_registry.register_ipc_tools();
+        tool_registry.register_memory_tools();
         crate::editing::register_edit_tools(&tool_registry);
 
         Ok(Self {

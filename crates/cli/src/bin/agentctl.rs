@@ -9,16 +9,23 @@ use agent_sdk::ConnectionProfile;
 /// Canonical `agentctl` usage text, shared by the usage-error and
 /// explicit-help paths so the two can never drift apart.
 const USAGE: &str = "usage: agentctl [--addr HOST:PORT] [--token TOKEN] \
-         <create|list|inspect|message|stream|cancel|checkpoints|checkpoint-resume|checkpoint-delete|capabilities|vfs-mounts|vfs-open|vfs-invoke|vfs-close|vfs-namespace-mounts|vfs-mount-entries|vfs-mount|vfs-unmount|vfs-workspace-mounts|vfs-workspace-open|vfs-open-at|vfs-dup|vfs-read|vfs-write|vfs-list|vfs-stat|providers|metrics|protocol|policy-validate|policy-explain|gate-stats|node-control-audit|cluster-membership-audit|cluster-certificate-rollout-audit|package-trust-key|package-revoke-key|package-publish|package-yank|package-fetch|package-search|package-install|package-rollback|package-remove|packages|package-run|pressure|tunables|tunable-set|tunable-rollback|tunable-history|status|pause|resume|stop|kill|wait|services|service-start|service-stop|service-restart|service-reload|service-history|backup-create|backup-retention|backup-status|data-inventory|backup-key-generate|backup-anchor-create|backup-verify|backup-restore|backup-disaster-recover|backup-corruption-recover|backup-remote-publish|backup-remote-fetch|storage-key-generate|storage-encrypt|storage-encrypt-recover|storage-key-rotate|storage-portable-export|storage-portable-verify|storage-portable-import|erase-agent|erase-user|erase-tenant> [ARGS...]\n\
+         <create|list|inspect|message|stream|cancel|checkpoints|checkpoint-resume|checkpoint-delete|capabilities|vfs-mounts|vfs-open|vfs-invoke|vfs-close|vfs-data-open|vfs-kv-open|vfs-data-dup|vfs-data-read|vfs-data-write|vfs-data-list|vfs-data-stat|vfs-namespace-mounts|vfs-mount-entries|vfs-mount|vfs-unmount|vfs-workspace-mounts|vfs-workspace-open|vfs-open-at|vfs-dup|vfs-read|vfs-write|vfs-list|vfs-stat|providers|metrics|protocol|policy-validate|policy-explain|gate-stats|node-control-audit|cluster-membership-audit|cluster-certificate-rollout-audit|package-trust-key|package-revoke-key|package-publish|package-yank|package-fetch|package-search|package-install|package-rollback|package-remove|packages|package-run|pressure|tunables|tunable-set|tunable-rollback|tunable-history|status|pause|resume|stop|kill|wait|services|service-start|service-stop|service-restart|service-reload|service-history|backup-create|backup-retention|backup-status|data-inventory|backup-key-generate|backup-anchor-create|backup-verify|backup-restore|backup-disaster-recover|backup-corruption-recover|backup-remote-publish|backup-remote-fetch|storage-key-generate|storage-encrypt|storage-encrypt-recover|storage-key-rotate|storage-portable-export|storage-portable-verify|storage-portable-import|erase-agent|erase-user|erase-tenant> [ARGS...]\n\
          \n\
          public runtime commands:\n\
            agentctl [SERVER OPTIONS] vfs-mounts AGENT_ID\n\
            agentctl [SERVER OPTIONS] vfs-open AGENT_ID /tools/NAME\n\
            agentctl [SERVER OPTIONS] vfs-invoke AGENT_ID HANDLE ARGUMENTS_JSON\n\
            agentctl [SERVER OPTIONS] vfs-close AGENT_ID HANDLE\n\
+           agentctl [SERVER OPTIONS] vfs-data-open AGENT_ID MOUNT_PATH RIGHTS\n\
+           agentctl [SERVER OPTIONS] vfs-kv-open AGENT_ID KV_MOUNT KEY RIGHTS\n\
+           agentctl [SERVER OPTIONS] vfs-data-dup AGENT_ID HANDLE RIGHTS\n\
+           agentctl [SERVER OPTIONS] vfs-data-read AGENT_ID HANDLE [ARGUMENTS_JSON]\n\
+           agentctl [SERVER OPTIONS] vfs-data-write AGENT_ID HANDLE ARGUMENTS_JSON\n\
+           agentctl [SERVER OPTIONS] vfs-data-list AGENT_ID HANDLE\n\
+           agentctl [SERVER OPTIONS] vfs-data-stat AGENT_ID HANDLE\n\
            agentctl [SERVER OPTIONS] vfs-namespace-mounts AGENT_ID\n\
            agentctl [SERVER OPTIONS] vfs-mount-entries AGENT_ID MOUNT_PATH\n\
-           agentctl [SERVER OPTIONS] vfs-mount AGENT_ID TABLE_ID TABLE_GENERATION MOUNT_PATH <tools|workspace>\n\
+           agentctl [SERVER OPTIONS] vfs-mount AGENT_ID TABLE_ID TABLE_GENERATION MOUNT_PATH <tools|workspace|memory|kv|ipc>\n\
            agentctl [SERVER OPTIONS] vfs-unmount AGENT_ID TABLE_ID TABLE_GENERATION MOUNT_PATH MOUNT_ID\n\
            agentctl [SERVER OPTIONS] vfs-workspace-mounts AGENT_ID\n\
            agentctl [SERVER OPTIONS] vfs-workspace-open AGENT_ID PATH <file|directory> RIGHTS [--allow-missing]\n\
@@ -1092,6 +1099,73 @@ async fn main() {
             print_json(&view, "workspace mount");
             return;
         }
+        "vfs-data-open" | "vfs-kv-open" => {
+            let agent = args.next().unwrap_or_else(|| usage());
+            let path = args.next().unwrap_or_else(|| usage());
+            let key = if command == "vfs-kv-open" {
+                Some(args.next().unwrap_or_else(|| usage()))
+            } else {
+                None
+            };
+            let rights = workspace_rights(&args.next().unwrap_or_else(|| usage()));
+            if args.next().is_some() {
+                usage();
+            }
+            let handle = if let Some(key) = key {
+                client.vfs_open_kv(agent, &path, &key, rights).await
+            } else {
+                client.vfs_open_data(agent, path, rights).await
+            }
+            .unwrap_or_else(|error| fail(error));
+            print_json(&handle, "data handle");
+            return;
+        }
+        "vfs-data-dup" => {
+            let agent = args.next().unwrap_or_else(|| usage());
+            let handle = args.next().unwrap_or_else(|| usage());
+            let rights = workspace_rights(&args.next().unwrap_or_else(|| usage()));
+            if args.next().is_some() {
+                usage();
+            }
+            let handle = client
+                .vfs_dup_data(agent, handle, rights)
+                .await
+                .unwrap_or_else(|error| fail(error));
+            print_json(&handle, "data handle");
+            return;
+        }
+        "vfs-data-read" | "vfs-data-write" => {
+            let agent = args.next().unwrap_or_else(|| usage());
+            let handle = args.next().unwrap_or_else(|| usage());
+            let value = args.next().unwrap_or_else(|| "{}".into());
+            let value = serde_json::from_str(&value).unwrap_or_else(|_| usage());
+            if args.next().is_some() {
+                usage();
+            }
+            let value = if command == "vfs-data-read" {
+                client.vfs_read_data(agent, handle, value).await
+            } else {
+                client.vfs_write_data(agent, handle, value).await
+            }
+            .unwrap_or_else(|error| fail(error));
+            print_json(&value, "data result");
+            return;
+        }
+        "vfs-data-list" | "vfs-data-stat" => {
+            let agent = args.next().unwrap_or_else(|| usage());
+            let handle = args.next().unwrap_or_else(|| usage());
+            if args.next().is_some() {
+                usage();
+            }
+            let value = if command == "vfs-data-list" {
+                client.vfs_list_data(agent, handle).await
+            } else {
+                client.vfs_stat_data(agent, handle).await
+            }
+            .unwrap_or_else(|error| fail(error));
+            print_json(&value, "data result");
+            return;
+        }
         "vfs-namespace-mounts" => {
             let agent = args.next().unwrap_or_else(|| usage());
             if args.next().is_some() {
@@ -1129,6 +1203,9 @@ async fn main() {
             let kind = match args.next().unwrap_or_else(|| usage()).as_str() {
                 "tools" => agent_sdk::MountKind::Tools,
                 "workspace" => agent_sdk::MountKind::Workspace,
+                "memory" => agent_sdk::MountKind::Memory,
+                "kv" => agent_sdk::MountKind::Kv,
+                "ipc" => agent_sdk::MountKind::Ipc,
                 _ => usage(),
             };
             if args.next().is_some() {

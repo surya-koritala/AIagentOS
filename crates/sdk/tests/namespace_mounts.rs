@@ -91,7 +91,7 @@ async fn mount_aliases_use_real_governed_backends_with_one_gate_per_operation() 
             .iter()
             .map(|entry| entry.path.as_str())
             .collect::<Vec<_>>(),
-        vec!["/tools", "/workspace"]
+        vec!["/ipc", "/kv", "/memory", "/tools", "/workspace"]
     );
     let tools = client
         .vfs_mount(
@@ -113,7 +113,7 @@ async fn mount_aliases_use_real_governed_backends_with_one_gate_per_operation() 
         )
         .await
         .unwrap();
-    assert_eq!(workspace.mounts.len(), 4);
+    assert_eq!(workspace.mounts.len(), 7);
     assert!(client
         .vfs_mount_entries(&agent, "/commands")
         .await

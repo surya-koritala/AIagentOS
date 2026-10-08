@@ -2,7 +2,7 @@
 
 Agents share a Mount namespace with their namespace group. Tenant-created
 agents use that tenant's group; ungrouped agents use the shared default. Each
-table starts with `/tools` and `/workspace`. A mount selects a governed built-in
+table starts with `/tools`, `/workspace`, `/memory`, `/kv` and `/ipc`. A mount selects a governed built-in
 backend for the calling agent's resources. Aliases use the same tool registry
 or agent-owned sandbox and the same authorization and quota paths.
 
@@ -29,7 +29,7 @@ unmount. Close, unmount, and stop remain safe when concurrent. Mounting the same
 path again or leaving/rejoining a namespace never resurrects old descriptors.
 
 Mount tables are process-local. Restart creates new table and binding identities
-and restores the two built-in defaults; custom mounts and unmounts must be
+and restores the built-in defaults; custom mounts and unmounts must be
 configured again. Old administrative revisions and descriptors fail. Mounts
 control VFS availability; shared gate and broker policy governs resource access
 through every supported entry point. Durable mount configuration and distributed
@@ -45,9 +45,8 @@ agentctl vfs-namespace-mounts AGENT_ID
 agentctl vfs-unmount AGENT_ID TABLE_ID TABLE_GENERATION /commands MOUNT_ID
 ```
 
-The SDK exposes the same typed methods and `MountKind::{Tools, Workspace}`.
+The SDK exposes the same typed methods and `MountKind::{Tools, Workspace, Memory, Kv, Ipc}`.
 Read the table again after each administrative change and pass its new generation.
 Clients must explicitly reconcile an indeterminate mutation outcome.
 
-Servers advertise `namespace_mounts`. Memory/KV/IPC mounts and full qualification
-remain in [#392](https://github.com/surya-koritala/AIagentOS/issues/392).
+Servers advertise `namespace_mounts`. [Data mounts](DATA_VFS.md) cover memory/KV/IPC; full qualification remains in [#392](https://github.com/surya-koritala/AIagentOS/issues/392).

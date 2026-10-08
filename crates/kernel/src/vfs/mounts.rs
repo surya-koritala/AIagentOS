@@ -20,6 +20,9 @@ pub const MAX_MOUNT_NAMESPACES: usize = 1024;
 pub enum MountKind {
     Tools,
     Workspace,
+    Memory,
+    Kv,
+    Ipc,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -105,6 +108,9 @@ impl NamespaceTable {
         for (path, kind, generation) in [
             ("/tools", MountKind::Tools, 1),
             ("/workspace", MountKind::Workspace, 2),
+            ("/memory", MountKind::Memory, 3),
+            ("/kv", MountKind::Kv, 4),
+            ("/ipc", MountKind::Ipc, 5),
         ] {
             mounts.insert(
                 path.into(),
@@ -114,7 +120,7 @@ impl NamespaceTable {
         Self {
             id: Uuid::new_v4().to_string(),
             key,
-            generation: 2,
+            generation: 5,
             mounts,
         }
     }
@@ -339,7 +345,7 @@ mod tests {
         second.tenant = "other".into();
         let initial = registry.view(&first).unwrap();
         let mut view = initial;
-        for i in 2..MAX_MOUNTS_PER_NAMESPACE {
+        for i in 5..MAX_MOUNTS_PER_NAMESPACE {
             view = registry
                 .mount(
                     &first,
@@ -360,8 +366,8 @@ mod tests {
             ),
             Err(VfsError::Capacity)
         ));
-        assert_eq!(registry.view(&second).unwrap().mounts.len(), 2);
-        assert_eq!(registry.view(&key(2)).unwrap().mounts.len(), 2);
+        assert_eq!(registry.view(&second).unwrap().mounts.len(), 5);
+        assert_eq!(registry.view(&key(2)).unwrap().mounts.len(), 5);
         for path in [
             "/tools",
             "/tools/child",
@@ -427,6 +433,6 @@ mod tests {
             registry.view(&key(MAX_MOUNT_NAMESPACES as u64)),
             Err(VfsError::Capacity)
         ));
-        assert_eq!(registry.view(&key(0)).unwrap().mounts.len(), 2);
+        assert_eq!(registry.view(&key(0)).unwrap().mounts.len(), 5);
     }
 }

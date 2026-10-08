@@ -70,6 +70,7 @@ pub use kernel::syscall_server::{
     OperatorPackageSnapshot, OperatorServiceSnapshot, OperatorSnapshot, ProviderSummary,
     WireErrorCode,
 };
+pub use kernel::vfs::data::{DataHandle, DataKind};
 pub use kernel::vfs::mounts::{MountInfo, MountKind, NamespaceMountView};
 pub use kernel::vfs::workspace::{
     WorkspaceHandle, WorkspaceKind, WorkspaceOpenRequest, WorkspaceRead, WorkspaceRight,
@@ -1303,6 +1304,125 @@ impl KernelClient {
         {
             SyscallReply::VfsNamespaceMounts { view } => Ok(view),
             other => Err(unexpected("VfsNamespaceMounts", &other)),
+        }
+    }
+
+    /// Open an agent-owned reference to a mounted memory, KV, or IPC object.
+    pub async fn vfs_open_data(
+        &mut self,
+        agent_id: impl Into<String>,
+        path: impl Into<String>,
+        rights: Vec<WorkspaceRight>,
+    ) -> Result<DataHandle, SdkError> {
+        match self
+            .call(Syscall::VfsOpenData {
+                agent_id: agent_id.into(),
+                path: path.into(),
+                rights,
+            })
+            .await?
+        {
+            SyscallReply::VfsDataOpened { handle } => Ok(handle),
+            other => Err(unexpected("VfsDataOpened", &other)),
+        }
+    }
+    /// Bind an opaque UTF-8 key using its canonical component under a KV mount.
+    pub async fn vfs_open_kv(
+        &mut self,
+        agent_id: impl Into<String>,
+        mount: &str,
+        key: &str,
+        rights: Vec<WorkspaceRight>,
+    ) -> Result<DataHandle, SdkError> {
+        let component = kernel::vfs::data::kv_component(key)
+            .map_err(|error| SdkError::Kernel(error.to_string()))?;
+        self.vfs_open_data(agent_id, format!("{mount}/{component}"), rights)
+            .await
+    }
+    pub async fn vfs_dup_data(
+        &mut self,
+        agent_id: impl Into<String>,
+        handle: impl Into<String>,
+        rights: Vec<WorkspaceRight>,
+    ) -> Result<DataHandle, SdkError> {
+        match self
+            .call(Syscall::VfsDupData {
+                agent_id: agent_id.into(),
+                handle: handle.into(),
+                rights,
+            })
+            .await?
+        {
+            SyscallReply::VfsDataOpened { handle } => Ok(handle),
+            other => Err(unexpected("VfsDataOpened", &other)),
+        }
+    }
+    pub async fn vfs_read_data(
+        &mut self,
+        agent_id: impl Into<String>,
+        handle: impl Into<String>,
+        args: serde_json::Value,
+    ) -> Result<serde_json::Value, SdkError> {
+        match self
+            .call(Syscall::VfsReadData {
+                agent_id: agent_id.into(),
+                handle: handle.into(),
+                args,
+            })
+            .await?
+        {
+            SyscallReply::ToolResult { data } => Ok(data),
+            other => Err(unexpected("ToolResult", &other)),
+        }
+    }
+    pub async fn vfs_write_data(
+        &mut self,
+        agent_id: impl Into<String>,
+        handle: impl Into<String>,
+        args: serde_json::Value,
+    ) -> Result<serde_json::Value, SdkError> {
+        match self
+            .call(Syscall::VfsWriteData {
+                agent_id: agent_id.into(),
+                handle: handle.into(),
+                args,
+            })
+            .await?
+        {
+            SyscallReply::ToolResult { data } => Ok(data),
+            other => Err(unexpected("ToolResult", &other)),
+        }
+    }
+    pub async fn vfs_list_data(
+        &mut self,
+        agent_id: impl Into<String>,
+        handle: impl Into<String>,
+    ) -> Result<serde_json::Value, SdkError> {
+        match self
+            .call(Syscall::VfsListData {
+                agent_id: agent_id.into(),
+                handle: handle.into(),
+            })
+            .await?
+        {
+            SyscallReply::ToolResult { data } => Ok(data),
+            other => Err(unexpected("ToolResult", &other)),
+        }
+    }
+    pub async fn vfs_stat_data(
+        &mut self,
+        agent_id: impl Into<String>,
+        handle: impl Into<String>,
+    ) -> Result<serde_json::Value, SdkError> {
+        match self
+            .call(Syscall::VfsStatData {
+                agent_id: agent_id.into(),
+                handle: handle.into(),
+            })
+            .await?
+        {
+            SyscallReply::ToolResult { data } => Ok(data),
+            other => Err(unexpected("ToolResult", &other)),
         }
     }
 

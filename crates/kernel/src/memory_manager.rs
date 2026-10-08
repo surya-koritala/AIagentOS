@@ -477,10 +477,7 @@ impl LshTable {
     fn signature(&self, vec: &[f32]) -> u64 {
         let mut sig = 0u64;
         for (i, plane) in self.planes.iter().enumerate() {
-            let mut dot = 0.0f32;
-            for (a, b) in vec.iter().zip(plane.iter()) {
-                dot += a * b;
-            }
+            let dot = ordered_dot(vec, plane);
             if dot >= 0.0 {
                 sig |= 1 << i;
             }
@@ -686,21 +683,33 @@ impl VectorIndex for LshIndex {
     }
 }
 
-fn vector_norm(vector: &[f32]) -> f32 {
-    let mut sum = 0.0_f32;
-    for value in vector {
-        sum += value * value;
+/// Four-element blocks reduce iterator overhead in development builds while
+/// preserving the original left-to-right f32 addition order and exact scores.
+fn ordered_dot(left: &[f32], right: &[f32]) -> f32 {
+    let dimension = left.len().min(right.len());
+    let (left_blocks, left_tail) = left[..dimension].as_chunks::<4>();
+    let (right_blocks, right_tail) = right[..dimension].as_chunks::<4>();
+    let mut dot = 0.0_f32;
+    for (left, right) in left_blocks.iter().zip(right_blocks) {
+        dot += left[0] * right[0];
+        dot += left[1] * right[1];
+        dot += left[2] * right[2];
+        dot += left[3] * right[3];
     }
-    sum.sqrt()
+    for (left, right) in left_tail.iter().zip(right_tail) {
+        dot += left * right;
+    }
+    dot
 }
+fn vector_norm(vector: &[f32]) -> f32 {
+    ordered_dot(vector, vector).sqrt()
+}
+
 fn cached_cosine(query: &[f32], query_norm: f32, vector: &[f32], norm: f32) -> f32 {
     if query.is_empty() || query.len() != vector.len() {
         return 0.0;
     }
-    let mut dot = 0.0_f32;
-    for (left, right) in query.iter().zip(vector) {
-        dot += left * right;
-    }
+    let dot = ordered_dot(query, vector);
     let denominator = query_norm * norm;
     if denominator > 0.0 {
         dot / denominator
@@ -799,6 +808,28 @@ impl MemoryManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn blocked_dot_keeps_original_f32_order_for_vectors_and_tails() {
+        let mut rng = SplitMix64(37);
+        for dimension in [0, 1, 3, 4, 17, 31, 256, 511] {
+            let left = (0..dimension)
+                .map(|_| rng.next_gaussian())
+                .collect::<Vec<_>>();
+            let right = (0..dimension + 3)
+                .map(|_| rng.next_gaussian())
+                .collect::<Vec<_>>();
+            let mut expected = 0.0_f32;
+            for (a, b) in left.iter().zip(&right) {
+                expected += a * b;
+            }
+            assert_eq!(ordered_dot(&left, &right).to_bits(), expected.to_bits());
+            assert_eq!(
+                cached_cosine(&left, vector_norm(&left), &left, vector_norm(&left)).to_bits(),
+                cosine_similarity(&left, &left).to_bits()
+            );
+        }
+    }
 
     #[test]
     fn undefined_cosine_scores_sort_last_with_stable_ties() {

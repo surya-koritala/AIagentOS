@@ -1,0 +1,35 @@
+[1m[92m   Compiling[0m kernel v0.4.0-rc.1 (/home/runner/work/AIagentOS/AIagentOS/crates/kernel)
+[1m[92m   Compiling[0m adapters v0.4.0-rc.1 (/home/runner/work/AIagentOS/AIagentOS/crates/adapters)
+[1m[92m   Compiling[0m agent-sdk v0.4.0-rc.1 (/home/runner/work/AIagentOS/AIagentOS/crates/sdk)
+[1m[92m   Compiling[0m coding-agent v0.4.0-rc.1 (/home/runner/work/AIagentOS/AIagentOS/crates/coding-agent)
+[1m[92m   Compiling[0m os-benchmark v0.4.0-rc.1 (/home/runner/work/AIagentOS/AIagentOS/benchmarks)
+[1m[92m    Finished[0m `dev` profile [unoptimized + debuginfo] target(s) in 32.60s
+[1m[92m     Running[0m `target/debug/coding-comparison --image 'rust:1.99.0-slim-bookworm@sha256:452176c0cefca88c0b3184ce85a4eb03e3d4fa05d2afb5366abcba853221019e'`
+{"at":"2026-10-08T08:31:51.094762040Z","agent":"34e51345-4817-48df-af88-a414b3d7977b","action":"context_prepared","detail":"normal governed provider history saved for branching"}
+{"at":"2026-10-08T08:31:51.302578104Z","agent":"9367444a-668c-4649-bb11-779e05dae5d6","action":"clone_intent","detail":"caller-known identity reserved in job journal"}
+{"at":"2026-10-08T08:31:51.302578104Z","agent":"9367444a-668c-4649-bb11-779e05dae5d6","action":"clone_intent","detail":"caller-known identity reserved in job journal"}
+{"at":"2026-10-08T08:31:51.302578104Z","agent":"9367444a-668c-4649-bb11-779e05dae5d6","action":"clone_intent","detail":"caller-known identity reserved in job journal"}
+{"at":"2026-10-08T08:31:51.302578104Z","agent":"9367444a-668c-4649-bb11-779e05dae5d6","action":"clone_intent","detail":"caller-known identity reserved in job journal"}
+{"at":"2026-10-08T08:31:51.302578104Z","agent":"9367444a-668c-4649-bb11-779e05dae5d6","action":"clone_intent","detail":"caller-known identity reserved in job journal"}
+{"at":"2026-10-08T08:31:51.302578104Z","agent":"9367444a-668c-4649-bb11-779e05dae5d6","action":"clone_intent","detail":"caller-known identity reserved in job journal"}
+{"at":"2026-10-08T08:31:51.302578104Z","agent":"9367444a-668c-4649-bb11-779e05dae5d6","action":"clone_intent","detail":"caller-known identity reserved in job journal"}
+{"at":"2026-10-08T08:31:55.040006790Z","agent":"9367444a-668c-4649-bb11-779e05dae5d6","action":"proposal","detail":"validated declared source scope and preimage"}
+{"at":"2026-10-08T08:31:55.040006790Z","agent":"9367444a-668c-4649-bb11-779e05dae5d6","action":"proposal","detail":"validated declared source scope and preimage"}
+{"at":"2026-10-08T08:31:55.832469529Z","agent":"9367444a-668c-4649-bb11-779e05dae5d6","action":"patch","detail":"src/lib.rs"}
+{"at":"2026-10-08T08:31:56.749480150Z","agent":"9367444a-668c-4649-bb11-779e05dae5d6","action":"test_started","detail":"a78669fc-bb6c-4964-9281-8592bd5c1360"}
+{"at":"2026-10-08T08:31:59.465494361Z","agent":"9367444a-668c-4649-bb11-779e05dae5d6","action":"test_completed","detail":"101"}
+{"at":"2026-10-08T08:31:59.465494361Z","agent":"9367444a-668c-4649-bb11-779e05dae5d6","action":"test_completed","detail":"101"}
+{"at":"2026-10-08T08:32:00.151988628Z","agent":"9367444a-668c-4649-bb11-779e05dae5d6","action":"discarded","detail":"runtime and durable branch data reclaimed"}
+{"at":"2026-10-08T08:32:00.320507600Z","agent":"e5d810d6-3832-4653-99cb-bf7be125f4ae","action":"clone_intent","detail":"caller-known identity reserved in job journal"}
+{"at":"2026-10-08T08:32:00.320507600Z","agent":"e5d810d6-3832-4653-99cb-bf7be125f4ae","action":"clone_intent","detail":"caller-known identity reserved in job journal"}
+{"at":"2026-10-08T08:32:00.320507600Z","agent":"e5d810d6-3832-4653-99cb-bf7be125f4ae","action":"clone_intent","detail":"caller-known identity reserved in job journal"}
+{"at":"2026-10-08T08:32:00.320507600Z","agent":"e5d810d6-3832-4653-99cb-bf7be125f4ae","action":"clone_intent","detail":"caller-known identity reserved in job journal"}
+{"at":"2026-10-08T08:32:00.320507600Z","agent":"e5d810d6-3832-4653-99cb-bf7be125f4ae","action":"clone_intent","detail":"caller-known identity reserved in job journal"}
+{"at":"2026-10-08T08:32:00.320507600Z","agent":"e5d810d6-3832-4653-99cb-bf7be125f4ae","action":"clone_intent","detail":"caller-known identity reserved in job journal"}
+{"at":"2026-10-08T08:32:00.320507600Z","agent":"e5d810d6-3832-4653-99cb-bf7be125f4ae","action":"clone_intent","detail":"caller-known identity reserved in job journal"}
+{"at":"2026-10-08T08:32:04.067385257Z","agent":"e5d810d6-3832-4653-99cb-bf7be125f4ae","action":"proposal","detail":"validated declared source scope and preimage"}
+{"at":"2026-10-08T08:32:04.067385257Z","agent":"e5d810d6-3832-4653-99cb-bf7be125f4ae","action":"proposal","detail":"validated declared source scope and preimage"}
+{"at":"2026-10-08T08:32:04.863475642Z","agent":"e5d810d6-3832-4653-99cb-bf7be125f4ae","action":"patch","detail":"src/lib.rs"}
+{"at":"2026-10-08T08:32:05.781490382Z","agent":"e5d810d6-3832-4653-99cb-bf7be125f4ae","action":"test_started","detail":"c65387bc-6552-4d9e-92ba-84ae5e0c6416"}
+{"at":"2026-10-08T08:32:08.061559480Z","agent":"e5d810d6-3832-4653-99cb-bf7be125f4ae","action":"test_completed","detail":"0"}
+{"at":"2026-10-08T08:32:08.229559592Z","agent":"e5d810d6-3832-4653-99cb-bf7be125f4ae","action":"selected","detail":"explicit first passing candidate policy"}

@@ -104,12 +104,12 @@ jobs:
           echo "RUSTFLAGS=--remap-path-prefix=${GITHUB_WORKSPACE}=." >> "$GITHUB_ENV"
       - name: Build twice from clean target directories at one stable path
         run: |
-          CARGO_TARGET_DIR=target-repro cargo build --release --locked --target "$TARGET" -p agent-cli --bins -p agent-tui
+          CARGO_TARGET_DIR=target-repro cargo build --release --locked --target "$TARGET" -p agent-cli --bins -p agent-tui -p coding-agent --bin agent-code
           mv target-repro target-a
-          CARGO_TARGET_DIR=target-repro cargo build --release --locked --target "$TARGET" -p agent-cli --bins -p agent-tui
+          CARGO_TARGET_DIR=target-repro cargo build --release --locked --target "$TARGET" -p agent-cli --bins -p agent-tui -p coding-agent --bin agent-code
       - name: Prove every binary is byte-for-byte reproducible
         run: |
-          for binary in agent agent-server agent-tui agentctl; do
+          for binary in agent agent-server agent-tui agentctl agent-code; do
             first="target-a/${TARGET}/release/${binary}"
             second="target-repro/${TARGET}/release/${binary}"
             if ! cmp -s "$first" "$second"; then
@@ -121,14 +121,14 @@ jobs:
       - name: Prove shipped binaries report the exact release version
         run: |
           expected="${GITHUB_REF_NAME#v}"
-          for binary in agent agent-server agent-tui agentctl; do
+          for binary in agent agent-server agent-tui agentctl agent-code; do
             actual="$(target-a/${TARGET}/release/${binary} --version)"
             test "$actual" = "${binary} ${expected}"
           done
       - name: Build canonical deterministic archive
         run: |
           mkdir -p dist/stage
-          for binary in agent agent-server agent-tui agentctl; do
+          for binary in agent agent-server agent-tui agentctl agent-code; do
             cp "target-a/${TARGET}/release/${binary}" dist/stage/
           done
           python3 scripts/build_cli_archive.py \

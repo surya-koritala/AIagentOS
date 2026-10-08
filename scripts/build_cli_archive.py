@@ -11,7 +11,7 @@ import zipfile
 from pathlib import Path
 
 
-BINARIES = ("agent", "agent-server", "agent-tui", "agentctl")
+BINARIES = ("agent", "agent-server", "agent-tui", "agentctl", "agent-code")
 MAX_BINARY_BYTES = 256 * 1024 * 1024
 
 

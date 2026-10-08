@@ -1,0 +1,9 @@
+{
+  "edits": [
+    {
+      "path": "src/lib.rs",
+      "expected_sha256": "4e4fb6b89101bd7122ff3f4d6956ab7db4158cad88adb9f2b1a3573491cf54ca",
+      "replacement": "/// Return a borrowed UTF-8 prefix within the requested byte budget.\npub fn bounded_prefix(input: &str, max_bytes: usize) -> &str {\n    let end = input.char_indices().nth(max_bytes).map_or(input.len(), |(index, _)| index);\n    &input[..end]\n}\n"
+    }
+  ]
+}

@@ -19,7 +19,6 @@ import subprocess
 import sys
 import tempfile
 import time
-import tomllib
 import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
@@ -30,7 +29,7 @@ RC_TAG_PATTERN = re.compile(r"^v([0-9]+)\.([0-9]+)\.([0-9]+)-rc\.([1-9][0-9]*)$"
 COMMIT_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 REPOSITORY_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
-EXPECTED_BINARIES = ("agent", "agent-server", "agent-tui", "agentctl")
+EXPECTED_BINARIES = ("agent", "agent-server", "agent-tui", "agentctl", "agent-code")
 EXPECTED_ARCHIVE_NAMES = frozenset(EXPECTED_BINARIES)
 MAX_ARCHIVE_BYTES = 512 * 1024 * 1024
 MAX_BINARY_BYTES = 256 * 1024 * 1024
@@ -175,6 +174,10 @@ def extract_archive(path: Path, destination: Path) -> dict[str, Path]:
 
 
 def load_release_fixture(registry_path: Path, released_tag: str) -> tuple[Path, dict[str, Any]]:
+    try:
+        import tomllib
+    except ImportError as error:
+        raise QualificationError("released-schema qualification requires Python 3.11 or newer") from error
     _require_regular_file(
         registry_path, "released-schema registry", MAX_FIXTURE_REGISTRY_BYTES
     )

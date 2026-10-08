@@ -1,0 +1,16 @@
+{"at":"2026-10-08T07:45:17.453959849Z","agent":"475eeeef-61fb-4c11-89dd-9e4d1d15e51e","action":"context_prepared","detail":"normal governed provider history saved for branching"}
+{"at":"2026-10-08T07:45:17.661136168Z","agent":"570034ff-9777-4a2d-9b22-162210c3d968","action":"clone_intent","detail":"caller-known identity reserved in job journal"}
+{"at":"2026-10-08T07:45:17.661136168Z","agent":"570034ff-9777-4a2d-9b22-162210c3d968","action":"clone_intent","detail":"caller-known identity reserved in job journal"}
+{"at":"2026-10-08T07:45:17.661136168Z","agent":"570034ff-9777-4a2d-9b22-162210c3d968","action":"clone_intent","detail":"caller-known identity reserved in job journal"}
+{"at":"2026-10-08T07:45:17.661136168Z","agent":"570034ff-9777-4a2d-9b22-162210c3d968","action":"clone_intent","detail":"caller-known identity reserved in job journal"}
+{"at":"2026-10-08T07:45:17.661136168Z","agent":"570034ff-9777-4a2d-9b22-162210c3d968","action":"clone_intent","detail":"caller-known identity reserved in job journal"}
+{"at":"2026-10-08T07:45:17.661136168Z","agent":"570034ff-9777-4a2d-9b22-162210c3d968","action":"clone_intent","detail":"caller-known identity reserved in job journal"}
+{"at":"2026-10-08T07:45:17.661136168Z","agent":"570034ff-9777-4a2d-9b22-162210c3d968","action":"clone_intent","detail":"caller-known identity reserved in job journal"}
+{"at":"2026-10-08T07:45:21.384404732Z","agent":"570034ff-9777-4a2d-9b22-162210c3d968","action":"proposal","detail":"validated declared source scope and preimage"}
+{"at":"2026-10-08T07:45:21.384404732Z","agent":"570034ff-9777-4a2d-9b22-162210c3d968","action":"proposal","detail":"validated declared source scope and preimage"}
+{"at":"2026-10-08T07:45:22.174051033Z","agent":"570034ff-9777-4a2d-9b22-162210c3d968","action":"patch","detail":"src/lib.rs"}
+{"at":"2026-10-08T07:45:23.088086761Z","agent":"570034ff-9777-4a2d-9b22-162210c3d968","action":"test_started","detail":"fc4fdf5e-6492-4bb9-ae92-a1b5ee278c0f"}
+{"at":"2026-10-08T07:45:25.345053124Z","agent":"570034ff-9777-4a2d-9b22-162210c3d968","action":"test_completed","detail":"101"}
+{"at":"2026-10-08T07:45:25.345053124Z","agent":"570034ff-9777-4a2d-9b22-162210c3d968","action":"test_completed","detail":"101"}
+{"at":"2026-10-08T07:45:26.043708661Z","agent":"570034ff-9777-4a2d-9b22-162210c3d968","action":"discarded","detail":"runtime and durable branch data reclaimed"}
+{"at":"2026-10-08T07:45:26.043708661Z","agent":"570034ff-9777-4a2d-9b22-162210c3d968","action":"discarded","detail":"runtime and durable branch data reclaimed"}

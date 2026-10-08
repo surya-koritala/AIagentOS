@@ -125,7 +125,8 @@ fn read_message_content(source: &str) -> agent_sdk::MessageContent {
     if bytes.len() as u64 == limit {
         content_input_error("message content input exceeds byte limit");
     }
-    serde_json::from_slice(&bytes).unwrap_or_else(|_| content_input_error("invalid message content input"))
+    serde_json::from_slice(&bytes)
+        .unwrap_or_else(|_| content_input_error("invalid message content input"))
 }
 
 fn content_input_error(message: &'static str) -> ! {

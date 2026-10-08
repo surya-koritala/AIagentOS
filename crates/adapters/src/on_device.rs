@@ -635,6 +635,7 @@ impl OnDeviceSession {
         events: Option<ProviderEventSink>,
         streaming: bool,
     ) -> Result<LlmResponse, ConnectorError> {
+        self.validate_content(&messages)?;
         if cancellation.is_cancelled() {
             return Err(ConnectorError::cancelled(self.provider_id.clone(), None));
         }

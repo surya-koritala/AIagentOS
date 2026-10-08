@@ -46,7 +46,7 @@ async fn image_input_four_documented_provider_shapes_and_reported_usage() {
         "content":[{"type":"text","text":"fixture result"}],"stop_reason":"end_turn","usage":{"input_tokens":3000,"output_tokens":2}
     }))).mount(&server).await;
     Mock::given(method("POST")).and(path("/v1beta/models/vision-fixture:generateContent")).respond_with(ResponseTemplate::new(200).set_body_json(json!({
-        "candidates":[{"content":{"parts":[{"text":"fixture result"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":3000,"candidatesTokenCount":2,"totalTokenCount":3002}
+        "candidates":[{"content":{"role":"model","parts":[{"text":"fixture result"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":3000,"candidatesTokenCount":2,"totalTokenCount":3002}
     }))).mount(&server).await;
     let adapters: Vec<Arc<dyn LlmProviderAdapter>> = vec![
         Arc::new(
@@ -184,7 +184,7 @@ async fn image_input_unknown_profile_unsupported_modes_and_audio_send_zero_reque
             assert!(matches!(
                 session.send(vec![message.clone()]).await,
                 Err(ConnectorError::UnsupportedContent(_))
-            ));
+            ), "{} must refuse unsupported content before send I/O", adapter.id());
             assert!(matches!(
                 session
                     .send_streaming_with_options(
@@ -194,7 +194,7 @@ async fn image_input_unknown_profile_unsupported_modes_and_audio_send_zero_reque
                     )
                     .await,
                 Err(ConnectorError::UnsupportedContent(_))
-            ));
+            ), "{} must refuse unsupported content before stream I/O", adapter.id());
             assert!(matches!(
                 session
                     .send_streaming_controlled(
@@ -205,7 +205,7 @@ async fn image_input_unknown_profile_unsupported_modes_and_audio_send_zero_reque
                     )
                     .await,
                 Err(ConnectorError::UnsupportedContent(_))
-            ));
+            ), "{} must refuse unsupported content before controlled stream I/O", adapter.id());
         }
     }
     assert!(server.received_requests().await.unwrap().is_empty());

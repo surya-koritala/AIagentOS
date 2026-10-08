@@ -135,6 +135,7 @@ impl LocalSession {
         cancellation: &tokio_util::sync::CancellationToken,
         events: Option<ProviderEventSink>,
     ) -> Result<LlmResponse, ConnectorError> {
+        self.validate_content(&messages)?;
         self.attempts.store(0, std::sync::atomic::Ordering::Release);
         let send = async {
             let body = Self::body(&messages, tools, options, &self.model, true);

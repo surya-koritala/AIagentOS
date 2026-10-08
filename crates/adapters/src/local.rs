@@ -45,7 +45,7 @@ impl LocalSession {
         let msgs: Vec<serde_json::Value> = messages
             .iter()
             .map(|m| {
-                let mut obj = serde_json::json!({"role": m.role, "content": m.content});
+                let mut obj = serde_json::json!({"role": m.role, "content": m.content.text_projection()});
                 if let Some(ref calls) = m.tool_calls {
                     obj["tool_calls"] = serde_json::json!(calls
                         .iter()

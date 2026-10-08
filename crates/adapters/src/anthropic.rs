@@ -277,7 +277,7 @@ impl LlmProviderAdapter for AnthropicAdapter {
     }
     fn capabilities(&self) -> kernel::connector::ProviderCapabilities {
         kernel::connector::ProviderCapabilities {
-            vision: self.image_profile.is_some(),
+            vision: self.image_profile.as_ref().is_some_and(|profile|profile.validate(&self.model).is_ok()),
             native_streaming: true,
             tool_calls: true,
             parallel_tool_calls: true,
@@ -304,7 +304,7 @@ impl LlmProviderAdapter for AnthropicAdapter {
     }
 
     fn translate_to_provider(&self, msg: &StandardMessage) -> serde_json::Value {
-        serde_json::json!({"role": msg.role, "content": msg.content})
+        serde_json::json!({"role": msg.role, "content": crate::vision::anthropic_content(&msg.content)})
     }
 
     fn translate_from_provider(&self, value: &serde_json::Value) -> Option<StandardMessage> {

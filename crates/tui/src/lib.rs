@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 use agent_sdk::{ConnectionProfile, KernelClient, MessageResult, MessageStreamEvent, SdkError};
 use tokio::sync::Mutex;
+pub use agent_sdk::{ContentPart,ImageInput,ImageMediaType,MessageContent};
 
 pub mod app;
 
@@ -80,6 +81,10 @@ impl TuiClient {
 }
 
 impl TuiMessageClient {
+    pub async fn send_message_content_stream<F>(&self,request_id: impl Into<String>,agent_id: impl Into<String>,content: MessageContent,on_event: F) -> Result<MessageResult,SdkError>
+    where F: FnMut(&MessageStreamEvent) {
+        self.stream.lock().await.send_message_content_stream(request_id,agent_id,content,on_event).await
+    }
     /// Drive one ordered turn on the dedicated stream connection.
     pub async fn send_message_stream<F>(
         &self,

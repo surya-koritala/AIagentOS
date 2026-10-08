@@ -23,21 +23,67 @@ plaintext tool shim is separate.
 
 | Provider | Text fixture | Native stream | Tools / parallel | Usage parsed | Cancel / timeout | Vision / audio | Model/API selection | Live evidence for this commit |
 |---|---:|---:|---:|---:|---:|---:|---|---|
-| Azure OpenAI | Yes | Yes, SSE | Yes / yes | Input, output, cached | Yes / yes | Not in the standard message contract | Deployment + configured API version | **Not run** |
-| OpenAI | Yes | Yes, SSE | Yes / yes | Input, output, cached | Yes / yes | Not in the standard message contract | Configured model; OpenAI v1 family | **Not run** |
-| Anthropic | Yes | Yes, SSE | Yes / yes | Input, output, cache-read | Yes / yes | Not in the standard message contract | Configured model; Messages API family | **Not run** |
+| Azure OpenAI | Yes | Yes, SSE | Yes / yes | Input, output, cached | Yes / yes | Inline PNG/JPEG with an explicit deployment bound; no audio | Deployment + configured API version | **Not run** |
+| OpenAI | Yes | Yes, SSE | Yes / yes | Input, output, cached | Yes / yes | Inline PNG/JPEG with an explicit model bound; no audio | Configured model; OpenAI v1 family | **Not run** |
+| Anthropic | Yes | Yes, SSE | Yes / yes | Input, output, cache-read | Yes / yes | Inline PNG/JPEG with an explicit model bound; no audio | Configured model; Messages API family | **Not run** |
 | Groq | Yes | Yes, SSE | Yes / yes | Prompt, completion, cached when present | Yes / yes | Unsupported | Configured model; OpenAI-compatible v1 | **Not run** |
 | DeepSeek | Yes | Yes, SSE | Yes / yes | Prompt, completion, cache-hit when present | Yes / yes | Unsupported | Configured model; OpenAI-compatible v1 | **Not run** |
-| Gemini | Yes | Yes, SSE | Yes / yes | Prompt, candidate + thought, cached | Yes / yes | Not in the standard message contract | Configured model; GenerateContent v1beta family | **Not run** |
+| Gemini | Yes | Yes, SSE | Yes / yes | Prompt, candidate + thought, cached | Yes / yes | Inline PNG/JPEG with an explicit model bound; no audio | Configured model; GenerateContent v1beta family | **Not run** |
 | Hugging Face text generation (default) | Yes | No; bounded non-streaming fallback | No / no; explicit governed shim or reject | Estimated input/output bytes; not provider-reported | Yes / yes | Unsupported | Configured legacy model endpoint | **Not run** |
 | Hugging Face chat router (opt-in) | Yes | Yes, SSE | Yes / yes; selected model/provider must support functions | Prompt, completion, cached when supplied | Yes / yes | Unsupported | Configured router endpoint and model:provider | **Not run** |
 | vLLM | Yes | Yes, SSE | Yes / yes | Prompt, completion, cached when present | Yes / yes | Unsupported | Configured model; OpenAI-compatible v1 | **Not run** |
 | Ollama | Yes | Yes, NDJSON | Yes / yes | Prompt/eval counts when present | Yes / yes | Unsupported | Configured endpoint and model | **Not run** |
 | Candle/GGUF | Controlled decoder/drain fixtures; gated real-model test | Yes, token decode | No / no | Generated-token count; no input usage | Cooperative decode cancellation / wall timeout | Unsupported | CPU, quantized Llama-family GGUF; Simple, ChatML, or Llama 3 template | **Not run** |
 
-No adapter currently advertises vision, audio, or a supported model-discovery
-API. Those fields default to false, so callers cannot infer support from a
-provider name.
+Vision defaults to false. The four image compilers advertise it only with a
+valid accounting profile matching the configured model or Azure deployment.
+All other modes and audio remain unsupported. Model discovery remains
+unsupported in this source. Callers must inspect configured capabilities.
+
+## Bounded image input
+
+`StandardMessage.content` retains its legacy JSON string form. Ordered user
+parts accept text and inline `image/png` or `image/jpeg`, with explicit MIME
+and standard base64 data. The reserved audio tag is rejected. Parts in system,
+assistant and tool history are rejected; native provider replay metadata stays
+separate. Images are limited to 1 MiB decoded bytes and 2048 pixels per dimension,
+four images and 32 parts per message, and 6 MiB serialized multipart content.
+URLs, file paths, animation, image output and audio input are unavailable.
+PNG validation checks chunk CRC, legal IHDR fields, palette constraints and
+critical ordering. JPEG checks bounded 8-bit Huffman DCT containers, frame/scan
+headers, table selectors and entropy framing. These checks do not decode or
+qualify raster/model quality.
+
+An operator must set an `image_input_profiles` entry for the exact selected
+provider and model (Azure uses the deployment identity), with a nonzero bounded
+`max_tokens_per_image`. This is an operator-declared input-token bound. It is
+not a measured price or a provider-verified estimate. Select it from current
+model-specific accounting documentation for the allowed dimensions and request
+detail; there is no universal image-token cost. Unknown or mismatched profiles
+fail before provider I/O. The executor adds the image bound to text/structure
+admission, includes compatible failover bounds, and prevents reported usage
+from refunding below that reservation floor. Unsupported failover candidates
+are skipped without dropping content.
+
+The serializers follow the primary [OpenAI chat image guide](https://developers.openai.com/api/docs/guides/images-vision),
+[Azure vision guide](https://learn.microsoft.com/en-us/azure/foundry/openai/how-to/gpt-with-vision?view=foundry-classic),
+[Anthropic image source contract](https://platform.claude.com/docs/en/build-with-claude/vision),
+and [Gemini GenerateContent API](https://ai.google.dev/api/generate-content).
+These endpoint shapes do not prove a configured model can interpret images.
+
+Wire v2 adds `send_message_content` and `send_message_content_stream`; v1
+strings and text convenience APIs remain unchanged. Rust SDK content methods,
+desktop backend/TUI types and `agentctl message-content AGENT_ID INPUT.json`
+or `agentctl stream-content REQUEST_ID AGENT_ID INPUT.json` use the same
+authorization, admission, ownership fences, request identity and cancellation
+paths. A dash reads bounded JSON from stdin. There is no desktop upload UI.
+The CLI's stream frames retain the ordinary event/completion envelope.
+
+Schema/min-reader 13 is established before conversation, snapshot, spill,
+checkpoint or clone writes. Complete parts remain in private durable JSON and
+survive replay; logs, debug, search indexes and checkpoint listings use redacted
+projections. Keyless tests are hosted in `image-input.yml`. Live provider,
+hardware and independent qualification remain open in #360/#120.
 
 A green nightly run with an empty provider set retains a dated `not_run` plan
 and skips live contracts. It verifies fixture contracts only; it is not live
@@ -96,7 +142,7 @@ It preserves every streamed Content entry and exact part ordering, including a
 late signature on empty text. Thought text is retained privately rather than
 published as a text delta. The opaque replay payload retains chunk-part counts
 and is capped at 256 KiB, 2048 chunks and 4096 parts; each chunk is at most 64
-parts and terminal native calls are limited to 64. Schema/min-reader 12 prevents
+parts and terminal native calls are limited to 64. Schema/min-reader 13 prevents
 older adapters from flattening even short signed histories. Usage includes
 thought tokens; a blocking final finish reason returns a typed filter error.
 

@@ -161,9 +161,9 @@ compatibility behavior, and transport limits:
 
 The schemas use JSON Schema draft 2020-12 and cover every top-level request,
 reply, and stream-event tag. The authorization/schema regression constructs
-all 128 current syscalls and rejects either a missing schema operation or an
+all 130 current syscalls and rejects either a missing schema operation or an
 undocumented extra. Deterministic golden request arrays cover all 97 v1
-operations and all 128 v2 operations. Domain payload examples and
+operations and all 130 v2 operations. Domain payload examples and
 previous-version shapes are retained under `protocol/`.
 
 ## Compatibility policy

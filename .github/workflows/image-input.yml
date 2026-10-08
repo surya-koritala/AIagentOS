@@ -49,8 +49,8 @@ jobs:
           fi
       - name: Exact versioned wire declaration
         run: python -m unittest discover -s scripts/tests -p test_verify_wire_fixtures.py
-      - name: Typed image trust boundary and legacy text
-        run: cargo test -p kernel --locked image_input
+      - name: Typed image boundaries, durable runtime and actual public clients
+        run: cargo test -p kernel -p adapters -p integration-tests -p agent-cli --locked image_input
       - name: Preserve exhaustive authorization and schema guards
         run: |
           cargo test -p kernel --locked authorization_policy_classifies_every_syscall_and_agent_resource

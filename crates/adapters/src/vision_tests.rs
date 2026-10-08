@@ -108,7 +108,9 @@ async fn image_input_four_documented_provider_shapes_and_reported_usage() {
                 ])
             );
         } else if request.url.path() == "/messages" {
-            assert!(value["messages"][0]["content"][0].get("media_type").is_none());
+            assert!(value["messages"][0]["content"][0]
+                .get("media_type")
+                .is_none());
             assert!(value["messages"][0]["content"][0].get("data").is_none());
             assert_eq!(
                 value["messages"][0]["content"],
@@ -205,8 +207,20 @@ async fn image_input_four_native_stream_compilers_preserve_order_and_native_outp
     let event = |value: serde_json::Value| format!("data: {value}\n\n");
     let openai = [event(json!({"choices":[{"delta":{"content":"image result"}}]})),
         event(json!({"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":3000,"completion_tokens":2,"total_tokens":3002}})),"data: [DONE]\n\n".into()].concat();
-    for route in ["/chat/completions","/openai/deployments/vision-fixture/chat/completions"] {
-        Mock::given(method("POST")).and(path(route)).respond_with(ResponseTemplate::new(200).insert_header("content-type","text/event-stream").set_body_string(openai.clone())).expect(1).mount(&server).await;
+    for route in [
+        "/chat/completions",
+        "/openai/deployments/vision-fixture/chat/completions",
+    ] {
+        Mock::given(method("POST"))
+            .and(path(route))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(openai.clone()),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
     }
     let anthropic = [event(json!({"type":"message_start","message":{"usage":{"input_tokens":3000}}})),
         event(json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}})),
@@ -214,32 +228,90 @@ async fn image_input_four_native_stream_compilers_preserve_order_and_native_outp
         event(json!({"type":"content_block_stop","index":0})),
         event(json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":2}})),
         event(json!({"type":"message_stop"}))].concat();
-    Mock::given(method("POST")).and(path("/messages")).respond_with(ResponseTemplate::new(200).insert_header("content-type","text/event-stream").set_body_string(anthropic)).expect(1).mount(&server).await;
+    Mock::given(method("POST"))
+        .and(path("/messages"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(anthropic),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
     Mock::given(method("POST")).and(path("/v1beta/models/vision-fixture:streamGenerateContent"))
         .respond_with(ResponseTemplate::new(200).insert_header("content-type","text/event-stream").set_body_string(event(json!({"candidates":[{"content":{"role":"model","parts":[{"text":"image result","thoughtSignature":"c2ln"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":3000,"candidatesTokenCount":2,"totalTokenCount":3002}})))).expect(1).mount(&server).await;
     let adapters: Vec<Box<dyn LlmProviderAdapter>> = vec![
-        Box::new(crate::openai::OpenAiAdapter::new("fixture-key".into()).with_base_url(server.uri()).with_model("vision-fixture".into()).with_image_input_profile(profile())),
-        Box::new(crate::azure_openai::AzureOpenAiAdapter::new(server.uri(),"vision-fixture".into(),"fixture-key".into()).with_image_input_profile(profile())),
-        Box::new(crate::anthropic::AnthropicAdapter::new("fixture-key".into()).with_base_url(server.uri()).with_model("vision-fixture".into()).with_image_input_profile(profile())),
-        Box::new(crate::gemini::GeminiAdapter::new("fixture-key".into()).with_base_url(server.uri()).with_model("vision-fixture".into()).with_image_input_profile(profile())),
+        Box::new(
+            crate::openai::OpenAiAdapter::new("fixture-key".into())
+                .with_base_url(server.uri())
+                .with_model("vision-fixture".into())
+                .with_image_input_profile(profile()),
+        ),
+        Box::new(
+            crate::azure_openai::AzureOpenAiAdapter::new(
+                server.uri(),
+                "vision-fixture".into(),
+                "fixture-key".into(),
+            )
+            .with_image_input_profile(profile()),
+        ),
+        Box::new(
+            crate::anthropic::AnthropicAdapter::new("fixture-key".into())
+                .with_base_url(server.uri())
+                .with_model("vision-fixture".into())
+                .with_image_input_profile(profile()),
+        ),
+        Box::new(
+            crate::gemini::GeminiAdapter::new("fixture-key".into())
+                .with_base_url(server.uri())
+                .with_model("vision-fixture".into())
+                .with_image_input_profile(profile()),
+        ),
     ];
     for adapter in adapters {
         let session = adapter.create_session().await.unwrap();
         let cancellation = tokio_util::sync::CancellationToken::new();
-        let (sender,mut receiver) = tokio::sync::mpsc::channel(2);
-        let send = session.send_streaming_events_controlled(vec![message()],&[],LlmRequestOptions::default(),&cancellation,ProviderEventSink::new(sender));
-        let drain = async { let mut text = String::new(); while let Some(ProviderStreamEvent::TextDelta(delta)) = receiver.recv().await { text.push_str(&delta); } text };
-        let (response,deltas) = tokio::join!(send,drain); let response = response.unwrap();
-        assert_eq!(deltas,"image result"); assert_eq!(response.content,deltas);
-        assert!(response.usage.provider_reported); assert_eq!(response.usage.input_tokens,3000);
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(2);
+        let send = session.send_streaming_events_controlled(
+            vec![message()],
+            &[],
+            LlmRequestOptions::default(),
+            &cancellation,
+            ProviderEventSink::new(sender),
+        );
+        let drain = async {
+            let mut text = String::new();
+            while let Some(ProviderStreamEvent::TextDelta(delta)) = receiver.recv().await {
+                text.push_str(&delta);
+            }
+            text
+        };
+        let (response, deltas) = tokio::join!(send, drain);
+        let response = response.unwrap();
+        assert_eq!(deltas, "image result");
+        assert_eq!(response.content, deltas);
+        assert!(response.usage.provider_reported);
+        assert_eq!(response.usage.input_tokens, 3000);
         assert!(adapter.capabilities().native_streaming);
     }
     for request in server.received_requests().await.unwrap() {
         let value: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
         match request.url.path() {
-            "/messages" => { assert_eq!(value["messages"][0]["content"][0],json!({"type":"image","source":{"type":"base64","media_type":"image/png","data":PNG}})); assert_eq!(value["stream"],true); },
-            "/v1beta/models/vision-fixture:streamGenerateContent" => assert_eq!(value["contents"][0]["parts"][0],json!({"inlineData":{"mimeType":"image/png","data":PNG}})),
-            _ => assert_eq!(value["messages"][0]["content"][0],json!({"type":"image_url","image_url":{"url":format!("data:image/png;base64,{PNG}"),"detail":"high"}})),
+            "/messages" => {
+                assert_eq!(
+                    value["messages"][0]["content"][0],
+                    json!({"type":"image","source":{"type":"base64","media_type":"image/png","data":PNG}})
+                );
+                assert_eq!(value["stream"], true);
+            }
+            "/v1beta/models/vision-fixture:streamGenerateContent" => assert_eq!(
+                value["contents"][0]["parts"][0],
+                json!({"inlineData":{"mimeType":"image/png","data":PNG}})
+            ),
+            _ => assert_eq!(
+                value["messages"][0]["content"][0],
+                json!({"type":"image_url","image_url":{"url":format!("data:image/png;base64,{PNG}"),"detail":"high"}})
+            ),
         }
     }
 }
@@ -247,9 +319,13 @@ async fn image_input_four_native_stream_compilers_preserve_order_and_native_outp
 #[tokio::test]
 async fn image_input_invalid_containers_and_model_profiles_fail_before_io() {
     let server = MockServer::start().await;
-    let adapter = crate::openai::OpenAiAdapter::new("fixture-key".into()).with_base_url(server.uri()).with_model("vision-fixture".into()).with_image_input_profile(profile());
+    let adapter = crate::openai::OpenAiAdapter::new("fixture-key".into())
+        .with_base_url(server.uri())
+        .with_model("vision-fixture".into())
+        .with_image_input_profile(profile());
     let session = adapter.create_session().await.unwrap();
-    let mut corrupted = PNG.to_string(); corrupted.replace_range(40..41,if &PNG[40..41] == "A" {"B"} else {"A"});
+    let mut corrupted = PNG.to_string();
+    corrupted.replace_range(40..41, if &PNG[40..41] == "A" { "B" } else { "A" });
     let invalid_parts = [
         json!([{"type":"image","media_type":"image/png","data":corrupted}]),
         json!([{"type":"image","media_type":"image/jpeg","data":PNG}]),
@@ -260,13 +336,39 @@ async fn image_input_invalid_containers_and_model_profiles_fail_before_io() {
         let request = json!({"op":"send_message_content","agent_id":"00000000-0000-0000-0000-000000000000","content":content});
         assert!(serde_json::from_value::<kernel::syscall_server::Syscall>(request).is_err());
     }
-    let oversized = MessageContent::Parts(vec![ContentPart::Text{text:"x".into()};kernel::message_content::MAX_CONTENT_PARTS+1]);
-    assert!(session.send(vec![StandardMessage::user_content(oversized)]).await.is_err());
-    for profile in [ImageInputProfile{model_id:"different-model".into(),max_tokens_per_image:3000},ImageInputProfile{model_id:"vision-fixture".into(),max_tokens_per_image:0}] {
-        let adapter = crate::openai::OpenAiAdapter::new("fixture-key".into()).with_base_url(server.uri()).with_model("vision-fixture".into()).with_image_input_profile(profile);
+    let oversized = MessageContent::Parts(vec![
+        ContentPart::Text { text: "x".into() };
+        kernel::message_content::MAX_CONTENT_PARTS + 1
+    ]);
+    assert!(session
+        .send(vec![StandardMessage::user_content(oversized)])
+        .await
+        .is_err());
+    for profile in [
+        ImageInputProfile {
+            model_id: "different-model".into(),
+            max_tokens_per_image: 3000,
+        },
+        ImageInputProfile {
+            model_id: "vision-fixture".into(),
+            max_tokens_per_image: 0,
+        },
+    ] {
+        let adapter = crate::openai::OpenAiAdapter::new("fixture-key".into())
+            .with_base_url(server.uri())
+            .with_model("vision-fixture".into())
+            .with_image_input_profile(profile);
         let session = adapter.create_session().await.unwrap();
         assert!(session.send(vec![message()]).await.is_err());
-        assert!(session.send_streaming_controlled(vec![message()],&[],LlmRequestOptions::default(),&tokio_util::sync::CancellationToken::new()).await.is_err());
+        assert!(session
+            .send_streaming_controlled(
+                vec![message()],
+                &[],
+                LlmRequestOptions::default(),
+                &tokio_util::sync::CancellationToken::new()
+            )
+            .await
+            .is_err());
     }
     assert!(server.received_requests().await.unwrap().is_empty());
 }

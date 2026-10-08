@@ -21,6 +21,7 @@ use agent_sdk::{
 use kernel::{syscall_gate::GateStats, syscall_server::SyscallServer, AgentKernelImpl};
 use serde::Serialize;
 use tokio::sync::Mutex;
+pub use agent_sdk::{ContentPart,ImageInput,ImageMediaType,MessageContent};
 
 #[cfg(feature = "desktop-shell")]
 pub mod commands;
@@ -576,6 +577,17 @@ impl DesktopClient {
             .await
             .send_message(agent_id, message)
             .await
+    }
+
+    /// Typed inline content through the authenticated public wire. The desktop
+    /// UI does not provide an attachment picker or upload flow.
+    pub async fn send_message_content(&self,agent_id: impl Into<String>,content: MessageContent) -> Result<MessageResult,SdkError> {
+        self.inner.lock().await.send_message_content(agent_id,content).await
+    }
+
+    pub async fn send_message_content_stream<F>(&self,request_id: impl Into<String>,agent_id: impl Into<String>,content: MessageContent,on_event: F) -> Result<MessageResult,SdkError>
+    where F: FnMut(&MessageStreamEvent) {
+        self.stream.lock().await.send_message_content_stream(request_id,agent_id,content,on_event).await
     }
 
     /// Drive one streamed turn on a dedicated wire connection.

@@ -68,6 +68,8 @@ mod e2e_pipeline;
 
 #[cfg(test)]
 mod gemini_history;
+#[cfg(test)]
+mod image_input;
 
 #[cfg(test)]
 mod provider_policy;

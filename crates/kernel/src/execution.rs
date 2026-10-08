@@ -387,11 +387,25 @@ impl AgentExecutor {
         // framing all become provider input on the next round. The structural
         // floor prevents an incomplete provider hook from under-reserving a
         // known prompt; a more accurate provider estimate can only raise it.
-        let structural_floor = Self::conservative_serialized_tokens(messages)
+        // Encoded pixels are governed by the model-specific image bound, not
+        // the UTF-8 text tokenizer. Charge their non-secret projection here.
+        let projected = messages
+            .iter()
+            .cloned()
+            .map(|mut message| {
+                message.content = message.content.text_projection().into();
+                message
+            })
+            .collect::<Vec<_>>();
+        let structural_floor = Self::conservative_serialized_tokens(&projected)
             .saturating_add((messages.len() as u32).saturating_mul(4));
-        self.session
+        let text_floor = self
+            .session
             .estimate_prompt_tokens(messages)
-            .map_or(structural_floor, |estimate| estimate.max(structural_floor))
+            .map_or(structural_floor, |estimate| estimate.max(structural_floor));
+        self.session
+            .validate_content(messages)
+            .map_or(u32::MAX, |images| text_floor.saturating_add(images))
     }
 
     fn conservative_serialized_tokens<T: serde::Serialize + ?Sized>(value: &T) -> u32 {
@@ -423,6 +437,9 @@ impl AgentExecutor {
         &mut self,
         tools: &[crate::connector::ToolDefinition],
     ) -> Result<(), KernelError> {
+        self.session
+            .validate_content(&self.messages)
+            .map_err(KernelError::Connector)?;
         self.session
             .validate_tool_policy(tools)
             .map_err(KernelError::Connector)?;
@@ -748,6 +765,15 @@ impl AgentExecutor {
     /// `run`/`run_resumable`; not called on the resume path (the checkpoint
     /// already carries the prepared `messages`).
     async fn prepare_turn(&mut self, user_message: &str) {
+        self.prepare_content_turn(&crate::message_content::MessageContent::Text(
+            user_message.into(),
+        ))
+        .await;
+    }
+
+    async fn prepare_content_turn(&mut self, content: &crate::message_content::MessageContent) {
+        let projected = content.text_projection();
+        let user_message = projected.as_str();
         // Query long-term memory for relevant facts
         if let Ok(facts) = self
             .context_manager
@@ -774,7 +800,8 @@ impl AgentExecutor {
             }
         }
 
-        self.messages.push(StandardMessage::user(user_message));
+        self.messages
+            .push(StandardMessage::user_content(content.clone()));
 
         // Message-count-only auto-summarization used to replace old content
         // with a count placeholder, silently losing semantics. Pressure is now
@@ -799,6 +826,19 @@ impl AgentExecutor {
     pub async fn run_resumable(&mut self, user_message: &str) -> Result<TurnResult, KernelError> {
         self.prepare_turn(user_message).await;
         self.drive_loop(user_message.to_string(), 0, 0, UsageTelemetry::default())
+            .await
+    }
+
+    pub async fn run_content_resumable(
+        &mut self,
+        content: crate::message_content::MessageContent,
+    ) -> Result<TurnResult, KernelError> {
+        let candidate = StandardMessage::user_content(content.clone());
+        self.session
+            .validate_content(std::slice::from_ref(&candidate))
+            .map_err(KernelError::Connector)?;
+        self.prepare_content_turn(&content).await;
+        self.drive_loop(content.text_projection(), 0, 0, UsageTelemetry::default())
             .await
     }
 
@@ -1177,6 +1217,9 @@ impl AgentExecutor {
         }
         // Filter messages: remove tool results that don't have a preceding tool_calls message
         let clean_messages = self.clean_messages();
+        self.session
+            .validate_content(&clean_messages)
+            .map_err(KernelError::Connector)?;
         let estimated_input_tokens = self
             .estimate_prompt_tokens(&clean_messages)
             .saturating_add(Self::conservative_tool_tokens(tools))
@@ -2985,6 +3028,173 @@ content: "I'll read it.\n```json\n{\"tool\": \"read_file\", \"arguments\": {\"pa
             1,
             "a permanent failure must burn exactly one durable request receipt"
         );
+    }
+
+    struct ImageBoundSession {
+        id: String,
+        calls: Arc<AtomicUsize>,
+        profile: Option<crate::connector::ImageInputProfile>,
+    }
+
+    #[async_trait::async_trait]
+    impl LlmSession for ImageBoundSession {
+        async fn send_with_tools(
+            &self,
+            messages: Vec<StandardMessage>,
+            _tools: &[ToolDefinition],
+        ) -> Result<LlmResponse, ConnectorError> {
+            self.send(messages).await
+        }
+        async fn send(
+            &self,
+            _messages: Vec<StandardMessage>,
+        ) -> Result<LlmResponse, ConnectorError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(LlmResponse {
+                content: "done".into(),
+                finish_reason: Some("stop".into()),
+                tokens_used: 2,
+                usage: LlmUsage::reported(1, 1, 0),
+                tool_calls: vec![],
+                provider_metadata: None,
+            })
+        }
+        fn provider_id(&self) -> &crate::ProviderId {
+            &self.id
+        }
+        fn validate_content(&self, messages: &[StandardMessage]) -> Result<u32, ConnectorError> {
+            crate::message_content::validate_messages(messages, &self.id, self.profile.as_ref())
+        }
+    }
+
+    fn image_content_fixture() -> crate::connector::MessageContent {
+        use crate::connector::{ContentPart, ImageInput, ImageMediaType, MessageContent};
+        let png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC";
+        MessageContent::parts(vec![
+            ContentPart::Text {
+                text: "describe image".into(),
+            },
+            ContentPart::Image {
+                image: ImageInput::new(ImageMediaType::Png, png.into()).unwrap(),
+            },
+        ])
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn image_input_unknown_and_token_budget_refusals_precede_admission_and_provider_io() {
+        for profile in [
+            None,
+            Some(crate::connector::ImageInputProfile {
+                model_id: "fixture".into(),
+                max_tokens_per_image: 3000,
+            }),
+        ] {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let limiter = execution_rate_limiter_with_tpm(2999);
+            let mut executor = AgentExecutor::new_unconfined(
+                uuid::Uuid::new_v4(),
+                Box::new(ImageBoundSession {
+                    id: "image-fixture".into(),
+                    calls: calls.clone(),
+                    profile: profile.clone(),
+                }),
+                mock_broker(),
+                Arc::new(ToolRegistry::new()),
+                mock_context_manager(),
+                "system".into(),
+            );
+            executor.set_context_budget(0);
+            executor.set_rate_limiter(limiter.clone());
+            let error = executor
+                .run_content_resumable(image_content_fixture())
+                .await
+                .unwrap_err();
+            if profile.is_none() {
+                assert!(matches!(
+                    error,
+                    KernelError::Connector(ConnectorError::UnsupportedContent(_))
+                ));
+            } else {
+                assert!(matches!(
+                    error,
+                    KernelError::RateLimit(
+                        crate::rate_limit::RateLimitError::RequestExceedsTpm { .. }
+                    )
+                ));
+            }
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+            assert_eq!(limiter.try_stats().unwrap().requests_this_minute, 0);
+        }
+        let calls = Arc::new(AtomicUsize::new(0));
+        let limiter = execution_rate_limiter_with_tpm(100_000);
+        let mut executor = AgentExecutor::new_unconfined(
+            uuid::Uuid::new_v4(),
+            Box::new(ImageBoundSession {
+                id: "image-fixture".into(),
+                calls: calls.clone(),
+                profile: Some(crate::connector::ImageInputProfile {
+                    model_id: "fixture".into(),
+                    max_tokens_per_image: 3000,
+                }),
+            }),
+            mock_broker(),
+            Arc::new(ToolRegistry::new()),
+            mock_context_manager(),
+            "system".into(),
+        );
+        executor.set_context_budget(0);
+        executor.set_rate_limiter(limiter.clone());
+        assert!(matches!(
+            executor
+                .run_content_resumable(image_content_fixture())
+                .await
+                .unwrap(),
+            TurnResult::Completed(_)
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(
+            limiter.try_stats().unwrap().tokens_this_minute >= 3000,
+            "provider underreporting cannot refund the declared image bound"
+        );
+    }
+
+    #[tokio::test]
+    async fn image_input_context_compaction_spills_exact_ordered_parts_without_flattening() {
+        let context = mock_context_manager();
+        let id = uuid::Uuid::new_v4();
+        let mut executor = AgentExecutor::new_unconfined(
+            id,
+            Box::new(ImageBoundSession {
+                id: "image-fixture".into(),
+                calls: Arc::new(AtomicUsize::new(0)),
+                profile: Some(crate::connector::ImageInputProfile {
+                    model_id: "fixture".into(),
+                    max_tokens_per_image: 3000,
+                }),
+            }),
+            mock_broker(),
+            Arc::new(ToolRegistry::new()),
+            context.clone(),
+            "system".into(),
+        );
+        let image = StandardMessage::user_content(image_content_fixture());
+        executor.messages.push(image.clone());
+        executor
+            .messages
+            .push(StandardMessage::assistant("earlier result"));
+        executor.messages.push(StandardMessage::user("latest text"));
+        executor.set_context_budget(900);
+        executor.compact_to_token_budget(&[]).await.unwrap();
+        assert!(!executor.messages.contains(&image));
+        let key = context.kv_list(id).unwrap().remove(0);
+        let raw = context.kv_get(id, &key).unwrap().unwrap();
+        let restored: Vec<StandardMessage> = serde_json::from_str(&raw).unwrap();
+        assert!(restored.contains(&image));
+        assert!(executor
+            .messages
+            .iter()
+            .any(|message| message.content.starts_with("[Durable context spill:")));
     }
 
     struct CountingContentSession {

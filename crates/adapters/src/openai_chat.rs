@@ -12,7 +12,7 @@ pub(crate) fn request(
     model: Option<&str>,
 ) -> Value {
     let messages: Vec<_> = messages.iter().map(|message| {
-        let mut value = json!({"role":message.role,"content":message.content});
+        let mut value = json!({"role":message.role,"content":crate::vision::openai_content(&message.content)});
         if let Some(id) = &message.tool_call_id { value["tool_call_id"] = json!(id); }
         if let Some(calls) = &message.tool_calls {
             value["tool_calls"] = json!(calls.iter().map(|call| json!({

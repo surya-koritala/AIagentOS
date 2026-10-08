@@ -22,6 +22,8 @@ mod branching;
 mod clone_store;
 #[path = "context/fact_index.rs"]
 pub(crate) mod fact_index;
+#[cfg(test)]
+mod image_input_tests;
 #[path = "context/shared_spills.rs"]
 mod shared_spills;
 pub use branching::{
@@ -4310,6 +4312,7 @@ impl SqliteContextManager {
     ) -> Result<(), ContextError> {
         let now = chrono::Utc::now().to_rfc3339();
         let mut conn = self.locked_conn();
+        crate::schema::require_current_writer(&conn)?;
         let transaction = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
@@ -4352,7 +4355,7 @@ impl SqliteContextManager {
             .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
         let text_content: String = tail_messages
             .iter()
-            .map(|m| m.content.as_str())
+            .map(|m| m.content.text_projection())
             .collect::<Vec<_>>()
             .join(" ");
         transaction.execute(
@@ -4854,6 +4857,7 @@ impl SqliteContextManager {
             ));
         }
         let mut conn = self.locked_conn();
+        crate::schema::require_current_writer(&conn)?;
         Self::purge_expired_spills_locked(&mut conn)?;
         let transaction = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -5636,6 +5640,7 @@ impl SqliteContextManager {
         let json = serde_json::to_string(checkpoint)
             .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;
         let mut conn = self.locked_conn();
+        crate::schema::require_current_writer(&conn)?;
         let transaction = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| ContextError::PersistenceFailed(error.to_string()))?;

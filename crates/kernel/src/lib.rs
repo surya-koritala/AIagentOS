@@ -34,6 +34,7 @@ pub mod mac;
 pub mod mcp;
 pub mod mcp_server;
 pub mod memory_manager;
+pub mod message_content;
 pub mod metrics;
 pub mod models;
 #[cfg(feature = "wasm")]
@@ -464,6 +465,9 @@ pub enum ConnectorError {
     #[error("Primary provider tool incompatibility: {0:?}")]
     ToolIncompatiblePrimary(ProviderErrorContext),
 
+    #[error("Provider content unsupported: {0:?}")]
+    UnsupportedContent(ProviderErrorContext),
+
     #[error("Provider content filter blocked request: {0:?}")]
     ContentFiltered(ProviderErrorContext),
 
@@ -475,6 +479,14 @@ pub enum ConnectorError {
 }
 
 impl ConnectorError {
+    pub fn unsupported_content(provider: ProviderId) -> Self {
+        Self::UnsupportedContent(Self::provider_context(
+            provider,
+            "image or audio input is unsupported or lacks a bounded model profile",
+            None,
+        ))
+    }
+
     fn provider_context(
         provider: ProviderId,
         message: impl Into<String>,
@@ -562,6 +574,7 @@ impl ConnectorError {
             | Self::ServiceUnavailable(context)
             | Self::InvalidRequest(context)
             | Self::ToolIncompatiblePrimary(context)
+            | Self::UnsupportedContent(context)
             | Self::ContentFiltered(context)
             | Self::Timeout(context)
             | Self::Cancelled(context) => context.request_id.as_deref(),
@@ -5413,7 +5426,7 @@ impl AgentKernelImpl {
         agent_id: AgentId,
         message: &str,
     ) -> Result<AgentOutput, KernelError> {
-        self.send_message_inner(agent_id, message, None, None, None)
+        self.send_message_inner(agent_id, message.into(), None, None, None)
             .await
     }
 
@@ -5446,7 +5459,7 @@ impl AgentKernelImpl {
         }
         self.send_message_inner(
             agent_id,
-            message,
+            message.into(),
             Some(request_id.to_string()),
             Some(events),
             request_fence,
@@ -5486,10 +5499,53 @@ impl AgentKernelImpl {
         true
     }
 
+    pub async fn send_message_content(
+        &self,
+        agent_id: AgentId,
+        content: crate::message_content::MessageContent,
+    ) -> Result<AgentOutput, KernelError> {
+        self.send_message_inner(agent_id, content, None, None, None)
+            .await
+    }
+
+    pub async fn send_message_content_stream(
+        &self,
+        agent_id: AgentId,
+        content: crate::message_content::MessageContent,
+        request_id: &str,
+        events: tokio::sync::mpsc::Sender<crate::execution::StreamEvent>,
+    ) -> Result<AgentOutput, KernelError> {
+        self.send_message_content_stream_with_fence(agent_id, content, request_id, events, None)
+            .await
+    }
+
+    pub(crate) async fn send_message_content_stream_with_fence(
+        &self,
+        agent_id: AgentId,
+        content: crate::message_content::MessageContent,
+        request_id: &str,
+        events: tokio::sync::mpsc::Sender<crate::execution::StreamEvent>,
+        request_fence: Option<ActiveRequestFence>,
+    ) -> Result<AgentOutput, KernelError> {
+        if request_id.is_empty() || request_id.len() > 128 {
+            return Err(KernelError::Policy(
+                "request id must contain 1..=128 bytes".into(),
+            ));
+        }
+        self.send_message_inner(
+            agent_id,
+            content,
+            Some(request_id.into()),
+            Some(events),
+            request_fence,
+        )
+        .await
+    }
+
     async fn send_message_inner(
         &self,
         agent_id: AgentId,
-        message: &str,
+        message: crate::message_content::MessageContent,
         request_id: Option<String>,
         events: Option<tokio::sync::mpsc::Sender<crate::execution::StreamEvent>>,
         request_fence: Option<ActiveRequestFence>,
@@ -5601,7 +5657,7 @@ impl AgentKernelImpl {
         // Set/clear around `run` (not via `?`) so the slot is freed even when
         // the turn errors.
         self.scheduler.set_running(agent_id);
-        let run_result = executor.run_resumable(message).await;
+        let run_result = executor.run_content_resumable(message).await;
         executor.clear_event_channel();
         drop(registration);
         let output = match run_result? {

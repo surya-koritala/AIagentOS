@@ -266,6 +266,9 @@ pub mod on_device;
 pub mod openai;
 mod openai_chat;
 pub mod streaming;
+mod vision;
+#[cfg(test)]
+mod vision_tests;
 pub mod vllm;
 
 #[cfg(test)]

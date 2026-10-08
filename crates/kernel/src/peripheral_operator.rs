@@ -248,7 +248,11 @@ impl LocalPeripheralOperator {
                 PeripheralOperatorRequest {
                     request_id: record.id,
                     agent_id: record.agent,
-                    agent_name: self.kernel.agent_manager.get_agent_display_name(record.agent).unwrap_or_else(|| "Stopped agent".into()),
+                    agent_name: self
+                        .kernel
+                        .agent_manager
+                        .get_agent_display_name(record.agent)
+                        .unwrap_or_else(|| "Stopped agent".into()),
                     tool_name: record.tool.clone(),
                     resource_identity: crate::resources::opaque_identity(
                         record.resource.as_bytes(),

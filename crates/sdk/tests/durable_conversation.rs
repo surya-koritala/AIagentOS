@@ -573,7 +573,7 @@ async fn clone_wire_enforces_tenants_roles_identity_and_fresh_vfs_handles() {
         .vfs_write_data(
             parent.to_string(),
             &memory.id,
-            serde_json::json!({"content":"private parent semantic fact", "category":"fact"}),
+            serde_json::json!({"content":"private parent semantic fact", "category":"Fact"}),
         )
         .await
         .unwrap();

@@ -17,7 +17,9 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
   revocation, capacity, independent close and reclamation. Abrupt OS-process
   fixtures cover pending-open, pending-write before staging, acknowledged
   committed data and fresh authorized recovery; they do not claim power-loss
-  or after-staging qualification. Relates #392;
+  or after-staging qualification. Public-wire provider deadlines reclaim pending
+  workspace opens and bound admitted writes after a client disconnect, preserving
+  original bytes and draining workers before native cleanup. Relates #392;
   independent production qualification remains open.
 
 - Added explicitly configured Hugging Face chat-router requests with shared

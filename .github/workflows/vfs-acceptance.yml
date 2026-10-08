@@ -96,6 +96,12 @@ jobs:
         run: |
           set -euo pipefail
           cargo test -p kernel --lib --locked vfs::process_crash::abrupt_process_crash_revokes_handles_and_reopens_committed_vfs_data -- --nocapture 2>&1 | tee vfs-acceptance-process-crash.log
+      - name: Public-wire provider deadlines reclaim admitted workspace operations
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p kernel --lib --locked public_wire_provider_deadline_reclaims_a_pending_workspace_open -- --nocapture 2>&1 | tee vfs-acceptance-open-deadline.log
+          cargo test -p kernel --lib --locked public_wire_disconnect_keeps_admitted_write_bounded_and_drainable -- --nocapture 2>&1 | tee vfs-acceptance-disconnected-write.log
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()
         with:

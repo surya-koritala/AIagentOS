@@ -14,7 +14,10 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
   fresh real reads by the same restored owner, and verifying that authorized COW
   cloning inherits no live tool/workspace/memory/KV/IPC handles or attenuated
   duplicates. Generated actual-wire transitions check ownership, rights,
-  revocation, capacity, independent close and reclamation. Relates #392;
+  revocation, capacity, independent close and reclamation. Abrupt OS-process
+  fixtures cover pending-open, pending-write before staging, acknowledged
+  committed data and fresh authorized recovery; they do not claim power-loss
+  or after-staging qualification. Relates #392;
   independent production qualification remains open.
 
 - Added explicitly configured Hugging Face chat-router requests with shared

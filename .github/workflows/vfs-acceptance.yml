@@ -89,6 +89,11 @@ jobs:
         run: |
           set -euo pipefail
           cargo test -p integration-tests vfs_handle_props --locked -- --nocapture 2>&1 | tee vfs-acceptance-properties.log
+      - name: Abrupt actual-process VFS death and fresh authorized recovery
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p kernel --lib --locked vfs::process_crash::abrupt_process_crash_revokes_handles_and_reopens_committed_vfs_data -- --nocapture 2>&1 | tee vfs-acceptance-process-crash.log
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()
         with:

@@ -16,13 +16,22 @@ fn default_config_discovery_is_reported_without_opening_or_overwriting_user_conf
     let output = run_isolated(env!("CARGO_BIN_EXE_agent"), &["--help"], home.path());
     assert!(output.status.success());
     let stdout = String::from_utf8(output.stdout).unwrap();
-    let path = stdout.split("Default configuration: ").nth(1).unwrap().trim();
-    #[cfg(windows)] {
+    let path = stdout
+        .split("Default configuration: ")
+        .nth(1)
+        .unwrap()
+        .trim();
+    #[cfg(windows)]
+    {
         // KnownFolder selection is native even when shell home variables lie.
-        assert_eq!(path, kernel::config::config_file_path().display().to_string());
+        assert_eq!(
+            path,
+            kernel::config::config_file_path().display().to_string()
+        );
         assert!(!std::path::Path::new(path).starts_with(home.path()));
     }
-    #[cfg(unix)] assert!(std::path::Path::new(path).starts_with(home.path()));
+    #[cfg(unix)]
+    assert!(std::path::Path::new(path).starts_with(home.path()));
     assert!(entries(home.path()).is_empty());
     assert!(output.stderr.is_empty());
 }

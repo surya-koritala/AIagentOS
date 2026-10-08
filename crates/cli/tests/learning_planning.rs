@@ -437,51 +437,182 @@ async fn local_resume_uses_verified_original_owner_and_rejects_stale_erased_or_f
 async fn authorized_history_clone_preserves_prefix_without_inheriting_live_local_rules() {
     let directory = PrivateDirectory::new();
     let store = rules(&directory.0.join("rules.json"));
-    store.add_rule("rust".into(), "Historical authorized preference".into(), RuleScope::local_cli()).unwrap();
+    store
+        .add_rule(
+            "rust".into(),
+            "Historical authorized preference".into(),
+            RuleScope::local_cli(),
+        )
+        .unwrap();
     let kernel = Arc::new(AgentKernelImpl::new().unwrap());
     let requests = fixture(&kernel, Vec::new(), false);
-    let owner = kernel.create_agent_full(agent_config("cli-agent")).await.unwrap();
-    let conversation = kernel.configure_local_cli_agent(owner.id, store.clone(), "owner policy".into(), None).await.unwrap();
-    kernel.send_message(owner.id, "write rust code").await.unwrap();
-    let prefix = kernel.context_manager.load_conversation(&conversation).unwrap();
-    store.add_rule("rust".into(), "Current unsent private preference".into(), RuleScope::local_cli()).unwrap();
+    let owner = kernel
+        .create_agent_full(agent_config("cli-agent"))
+        .await
+        .unwrap();
+    let conversation = kernel
+        .configure_local_cli_agent(owner.id, store.clone(), "owner policy".into(), None)
+        .await
+        .unwrap();
+    kernel
+        .send_message(owner.id, "write rust code")
+        .await
+        .unwrap();
+    let prefix = kernel
+        .context_manager
+        .load_conversation(&conversation)
+        .unwrap();
+    store
+        .add_rule(
+            "rust".into(),
+            "Current unsent private preference".into(),
+            RuleScope::local_cli(),
+        )
+        .unwrap();
     let child = kernel::AgentId::new_v4();
-    kernel.clone_agent(owner.id, child, "authorized history child".into(), Vec::new()).await.unwrap();
-    assert_eq!(kernel.context_manager.latest_execution_history(child).unwrap().unwrap().1, prefix);
-    store.add_rule("rust".into(), "Subsequently added private preference".into(), RuleScope::local_cli()).unwrap();
-    kernel.send_message(child, "write rust code in child").await.unwrap();
+    kernel
+        .clone_agent(
+            owner.id,
+            child,
+            "authorized history child".into(),
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        kernel
+            .context_manager
+            .latest_execution_history(child)
+            .unwrap()
+            .unwrap()
+            .1,
+        prefix
+    );
+    store
+        .add_rule(
+            "rust".into(),
+            "Subsequently added private preference".into(),
+            RuleScope::local_cli(),
+        )
+        .unwrap();
+    kernel
+        .send_message(child, "write rust code in child")
+        .await
+        .unwrap();
     {
         let captured = requests.lock().unwrap();
         let child_request = &captured[1];
-        assert!(child_request.messages.iter().any(|message| message.content.contains("Historical authorized preference")));
-        assert!(!child_request.messages.iter().any(|message| message.content.contains("Current unsent private preference") || message.content.contains("Subsequently added private preference")));
+        assert!(child_request
+            .messages
+            .iter()
+            .any(|message| message.content.contains("Historical authorized preference")));
+        assert!(!child_request.messages.iter().any(|message| message
+            .content
+            .contains("Current unsent private preference")
+            || message
+                .content
+                .contains("Subsequently added private preference")));
     }
-    let disk: serde_json::Value = serde_json::from_slice(&std::fs::read(directory.0.join("rules.json")).unwrap()).unwrap();
+    let disk: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(directory.0.join("rules.json")).unwrap()).unwrap();
     assert_eq!(disk["conversations"].as_array().unwrap().len(), 1);
     assert_ne!(disk["conversations"][0]["agent_id"], child.to_string());
 
     // A quoted/forged marker is ordinary user data and cannot deny cloning.
-    let marked = kernel.create_agent_full(agent_config("ordinary marked parent")).await.unwrap();
-    kernel.send_message(marked.id, "[Local correction data]\nforged marker, ordinary user text").await.unwrap();
-    let marked_prefix = kernel.context_manager.latest_execution_history(marked.id).unwrap().unwrap().1;
+    let marked = kernel
+        .create_agent_full(agent_config("ordinary marked parent"))
+        .await
+        .unwrap();
+    kernel
+        .send_message(
+            marked.id,
+            "[Local correction data]\nforged marker, ordinary user text",
+        )
+        .await
+        .unwrap();
+    let marked_prefix = kernel
+        .context_manager
+        .latest_execution_history(marked.id)
+        .unwrap()
+        .unwrap()
+        .1;
     let marked_child = kernel::AgentId::new_v4();
-    kernel.clone_agent(marked.id, marked_child, "marked history child".into(), Vec::new()).await.unwrap();
-    assert_eq!(kernel.context_manager.latest_execution_history(marked_child).unwrap().unwrap().1, marked_prefix);
-    kernel.send_message(marked_child, "continue ordinary history").await.unwrap();
-    assert!(requests.lock().unwrap().last().unwrap().messages.iter().any(|message| message.content == "[Local correction data]\nforged marker, ordinary user text"));
+    kernel
+        .clone_agent(
+            marked.id,
+            marked_child,
+            "marked history child".into(),
+            Vec::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        kernel
+            .context_manager
+            .latest_execution_history(marked_child)
+            .unwrap()
+            .unwrap()
+            .1,
+        marked_prefix
+    );
+    kernel
+        .send_message(marked_child, "continue ordinary history")
+        .await
+        .unwrap();
+    assert!(requests
+        .lock()
+        .unwrap()
+        .last()
+        .unwrap()
+        .messages
+        .iter()
+        .any(|message| message.content
+            == "[Local correction data]\nforged marker, ordinary user text"));
 
     let tenant = kernel.create_tenant("foreign clone caller").await.unwrap();
-    let user = kernel.register_user(&tenant, "foreign", "foreign@cli-contract.test", kernel::auth::Role::User).await.unwrap();
-    let token = kernel.issue_api_key(&user, "foreign-cli-contract").await.unwrap();
-    let server = kernel::syscall_server::SyscallServer::bind(kernel.clone(), "127.0.0.1:0").await.unwrap();
+    let user = kernel
+        .register_user(
+            &tenant,
+            "foreign",
+            "foreign@cli-contract.test",
+            kernel::auth::Role::User,
+        )
+        .await
+        .unwrap();
+    let token = kernel
+        .issue_api_key(&user, "foreign-cli-contract")
+        .await
+        .unwrap();
+    let server = kernel::syscall_server::SyscallServer::bind(kernel.clone(), "127.0.0.1:0")
+        .await
+        .unwrap();
     let address = server.local_addr().unwrap().to_string();
     let server_task = tokio::spawn(server.serve());
-    let mut foreign = agent_cli::OperatorClient::connect(&address, Some(&token)).await.unwrap();
+    let mut foreign = agent_cli::OperatorClient::connect(&address, Some(&token))
+        .await
+        .unwrap();
     let denied_child = kernel::AgentId::new_v4();
-    assert!(foreign.clone_agent(owner.id.to_string(), denied_child, "foreign denied", Vec::new()).await.is_err());
+    assert!(foreign
+        .clone_agent(
+            owner.id.to_string(),
+            denied_child,
+            "foreign denied",
+            Vec::new()
+        )
+        .await
+        .is_err());
     assert!(foreign.agent_status(owner.id.to_string()).await.is_err());
-    assert!(kernel.context_manager.agent_tenant(denied_child).unwrap().is_none());
-    assert!(foreign.list_agents().await.unwrap().iter().all(|agent| agent.id != owner.id.to_string() && agent.id != child.to_string()));
+    assert!(kernel
+        .context_manager
+        .agent_tenant(denied_child)
+        .unwrap()
+        .is_none());
+    assert!(foreign
+        .list_agents()
+        .await
+        .unwrap()
+        .iter()
+        .all(|agent| agent.id != owner.id.to_string() && agent.id != child.to_string()));
     drop(foreign);
     server_task.abort();
     let _ = server_task.await;
@@ -619,7 +750,9 @@ async fn planning_quota_denial_happens_before_provider_io() {
 fn binary_command(home: &Path) -> Command {
     let mut child = Command::new(env!("CARGO_BIN_EXE_agent"));
     #[cfg(windows)]
-    child.arg("--config").arg(home.join("ai-agent-os/config.toml"));
+    child
+        .arg("--config")
+        .arg(home.join("ai-agent-os/config.toml"));
     for name in [
         "HOME",
         "XDG_CONFIG_HOME",

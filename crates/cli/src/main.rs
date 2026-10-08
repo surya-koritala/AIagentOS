@@ -61,7 +61,15 @@ canonical operator client for an already-running kernel.";
 /// Options `agent` understands. Anything else beginning with `-` is a usage
 /// error: without this the argument fell through and was treated as a prompt,
 /// so a typo booted the kernel and persisted an agent row.
-const KNOWN_FLAGS: [&str; 7] = ["-c", "--conversation", "--config", "-h", "--help", "-V", "--version"];
+const KNOWN_FLAGS: [&str; 7] = [
+    "-c",
+    "--conversation",
+    "--config",
+    "-h",
+    "--help",
+    "-V",
+    "--version",
+];
 
 /// First unrecognized option in `argv`, if any. `-c` and `--conversation`
 /// consume the following value, which may itself begin with `-`.
@@ -121,7 +129,10 @@ async fn main() {
         .iter()
         .any(|argument| matches!(argument.as_str(), "--help" | "-h"))
     {
-        println!("{USAGE}\n\nDefault configuration: {}", kernel::config::config_file_path().display());
+        println!(
+            "{USAGE}\n\nDefault configuration: {}",
+            kernel::config::config_file_path().display()
+        );
         return;
     }
     if let Some(unknown) = unrecognized_flag(&argv) {
@@ -129,25 +140,34 @@ async fn main() {
         std::process::exit(2);
     }
 
-    let config_path = argv.iter().position(|argument| argument == "--config").map(|index| {
-        argv.get(index + 1).filter(|path| !path.trim().is_empty())
-            .unwrap_or_else(|| {
-                eprintln!("agent: --config requires a path\n\n{USAGE}");
-                std::process::exit(2);
-            })
-    });
+    let config_path = argv
+        .iter()
+        .position(|argument| argument == "--config")
+        .map(|index| {
+            argv.get(index + 1)
+                .filter(|path| !path.trim().is_empty())
+                .unwrap_or_else(|| {
+                    eprintln!("agent: --config requires a path\n\n{USAGE}");
+                    std::process::exit(2);
+                })
+        });
 
     // Install structured logging first so kernel init (persistence/auth) logs emit.
     logging::init_logging();
     let config = match config_path {
         Some(path) => {
             let path = std::path::Path::new(path);
-            if !path.is_file() { fail(format!("explicit configuration file is missing or is not a file: {}", path.display())); }
+            if !path.is_file() {
+                fail(format!(
+                    "explicit configuration file is missing or is not a file: {}",
+                    path.display()
+                ));
+            }
             Config::try_load_private_from(path)
         }
         None => Config::try_load_private(),
     }
-        .unwrap_or_else(|error| fail(format!("failed to load configuration: {error}")));
+    .unwrap_or_else(|error| fail(format!("failed to load configuration: {error}")));
     // Startup failures (unwritable data dir, corrupt DB, unreachable provider)
     // degrade to a clear message + non-zero exit rather than a panic backtrace.
     let kernel = match AgentKernelImpl::from_config(&config) {
@@ -421,9 +441,25 @@ mod tests {
     fn configuration_and_resume_values_never_become_pipe_prompts() {
         for (arguments, expected) in [
             (vec!["agent", "--config", "/private/config.toml"], None),
-            (vec!["agent", "--config", "/private/config.toml", "actual prompt"], Some("actual prompt")),
-            (vec!["agent", "--conversation", "id", "--config", "/private/config.toml", "actual prompt"], Some("actual prompt")),
-            (vec!["agent", "--", "-literal prompt"], Some("-literal prompt")),
+            (
+                vec!["agent", "--config", "/private/config.toml", "actual prompt"],
+                Some("actual prompt"),
+            ),
+            (
+                vec![
+                    "agent",
+                    "--conversation",
+                    "id",
+                    "--config",
+                    "/private/config.toml",
+                    "actual prompt",
+                ],
+                Some("actual prompt"),
+            ),
+            (
+                vec!["agent", "--", "-literal prompt"],
+                Some("-literal prompt"),
+            ),
         ] {
             let arguments: Vec<String> = arguments.into_iter().map(str::to_string).collect();
             assert_eq!(positional_prompt(&arguments), expected);

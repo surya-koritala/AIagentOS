@@ -848,7 +848,9 @@ impl AgentExecutor {
         // Correction text is user data, never elevated system policy.
         if let Some(ref store) = self.rule_store {
             self.messages.retain(|message| {
-                !message.content.starts_with(crate::learning::RULE_PROMPT_PREFIX)
+                !message
+                    .content
+                    .starts_with(crate::learning::RULE_PROMPT_PREFIX)
             });
             if let Some(rules_prompt) = store.rules_as_prompt(user_message) {
                 self.messages.push(StandardMessage::user(rules_prompt));

@@ -1422,7 +1422,11 @@ impl Config {
     /// Terminal credentials and policy require current-owner-only storage.
     pub fn try_load_private() -> Result<Self, ConfigLoadError> {
         match Self::try_load_private_from(&config_file_path()) {
-            Err(ConfigLoadError::Read { source, .. }) if source.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
+            Err(ConfigLoadError::Read { source, .. })
+                if source.kind() == std::io::ErrorKind::NotFound =>
+            {
+                Ok(Self::default())
+            }
             result => result,
         }
     }
@@ -1432,14 +1436,30 @@ impl Config {
     pub fn try_load_private_from(path: &Path) -> Result<Self, ConfigLoadError> {
         let mut file = match crate::learning::open_private_existing(path) {
             Ok(file) => file,
-            Err(source) => return Err(ConfigLoadError::Read { path: path.to_path_buf(), source }),
+            Err(source) => {
+                return Err(ConfigLoadError::Read {
+                    path: path.to_path_buf(),
+                    source,
+                })
+            }
         };
         use std::io::Read;
         let mut content = String::new();
-        file.by_ref().take(1024 * 1024 + 1).read_to_string(&mut content)
-            .map_err(|source| ConfigLoadError::Read { path: path.to_path_buf(), source })?;
+        file.by_ref()
+            .take(1024 * 1024 + 1)
+            .read_to_string(&mut content)
+            .map_err(|source| ConfigLoadError::Read {
+                path: path.to_path_buf(),
+                source,
+            })?;
         if content.len() > 1024 * 1024 {
-            return Err(ConfigLoadError::Read { path: path.to_path_buf(), source: std::io::Error::new(std::io::ErrorKind::InvalidData, "private terminal configuration exceeds 1 MiB") });
+            return Err(ConfigLoadError::Read {
+                path: path.to_path_buf(),
+                source: std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "private terminal configuration exceeds 1 MiB",
+                ),
+            });
         }
         Self::from_toml_at(&content, path)
     }
@@ -1758,8 +1778,12 @@ mod tests {
         assert!(Config::try_load_private_from(&path).is_err());
         let config = Config::default();
         config.save_to(&path).unwrap();
-        assert_eq!(Config::try_load_private_from(&path).unwrap().llm_provider, config.llm_provider);
-        #[cfg(unix)] {
+        assert_eq!(
+            Config::try_load_private_from(&path).unwrap().llm_provider,
+            config.llm_provider
+        );
+        #[cfg(unix)]
+        {
             use std::os::unix::fs::PermissionsExt;
             let alias = root.path().join("config-alias.toml");
             std::os::unix::fs::symlink(&path, &alias).unwrap();
@@ -1768,7 +1792,8 @@ mod tests {
             assert!(Config::try_load_private_from(&path).is_err());
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
         }
-        #[cfg(windows)] {
+        #[cfg(windows)]
+        {
             crate::windows_private_fs::grant_world_read_for_test(&path, false);
             assert!(Config::try_load_private_from(&path).is_err());
             config.save_to(&path).unwrap();

@@ -140,6 +140,8 @@ state and failure metadata only—never prompts or secret values.
 
 ## Qualification boundary
 
+<!-- capability-claim: init-supervisor=production-qualified -->Recorded contract tier: Production-qualified.
+
 The production-qualified contract covers a single kernel owner on Linux, macOS,
 and Windows: atomic configuration, deterministic dependency lifecycle,
 kernel-state readiness/liveness, restart/backoff/exhaustion, durable crash

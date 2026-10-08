@@ -42,56 +42,56 @@ Sizes: **S** ≈ days, **M** ≈ 1–2 weeks, **L** ≈ 3–6 weeks, **XL** ≈ 
 
 | ID | Title | Size | Deps | Status |
 |----|-------|------|------|--------|
-| **B0.1** | Syscall server: expose `AgentKernelImpl` over the canonical JSON syscall API (TCP + Unix socket); explicitly retire the numbered prototype from the public boundary | XL | — | **Done** (`syscall_server`: agent lifecycle + LLM turn/providers + memory store/query/update/delete/reindex + tool call + gate stats/agent info; TCP **and** Unix socket; optional shared-secret auth; enforcement over the wire; see ADR 0001) |
-| **B0.2** | Embeddable **Rust SDK** crate: `Agent` builder + typed client over the syscall API (and an in-process mode), `llm` / `memory` / `storage` / `tool` calls | L | B0.1 | **Done** (`agent-sdk`: `KernelClient` + `Agent` builder; create/list/send/tool/gate + providers/memory lifecycle/load_package) |
-| **B0.3** | Agent package format + loader/runner (a Rust agent crate + a manifest the kernel can load and run) | M | B0.2 | **Done** (`agent_package`: TOML `AgentManifest` + `load_package`/`run_package`; `LoadPackage` syscall + SDK; `docs/AGENT_PACKAGE.md` + sample) |
+| **B0.1** | Syscall server: expose `AgentKernelImpl` over the canonical JSON syscall API (TCP + Unix socket); explicitly retire the numbered prototype from the public boundary | XL | — | <!-- capability-claim: wire-protocol=public-api-e2e -->**Public-API E2E** (`syscall_server`: agent lifecycle + LLM turn/providers + memory store/query/update/delete/reindex + tool call + gate stats/agent info; TCP **and** Unix socket; optional shared-secret auth; enforcement over the wire; see ADR 0001) |
+| **B0.2** | Embeddable **Rust SDK** crate: `Agent` builder + typed client over the syscall API (and an in-process mode), `llm` / `memory` / `storage` / `tool` calls | L | B0.1 | <!-- capability-claim: wire-protocol=public-api-e2e -->**Public-API E2E** (`agent-sdk`: `KernelClient` + `Agent` builder; create/list/send/tool/gate + providers/memory lifecycle/load_package) |
+| **B0.3** | Agent package format + loader/runner (a Rust agent crate + a manifest the kernel can load and run) | M | B0.2 | <!-- capability-claim: secondary-modules=unit-tested -->**Unit-tested** (`agent_package`: TOML `AgentManifest` + `load_package`/`run_package`; `LoadPackage` syscall + SDK; `docs/AGENT_PACKAGE.md` + sample) |
 
 ## Phase 1 — LLM Core
 
 | ID | Title | Size | Deps | Notes |
 |----|-------|------|------|-------|
-| **B1.1** | LLM backend breadth: add more `LlmProviderAdapter`s — 4 → 9+ | M | — | **Public-API E2E** (9 network providers plus feature-gated on-device GGUF; typed errors, cancellation/timeouts, circuits, compatible routing, exact attempt accounting, fixtures, and protected evidence workflows are implemented. Production promotion waits for reviewed live/provider-model artifacts in #120.) |
-| **B1.2** | LLM-request scheduling: scheduler dispatches queued LLM *requests* to LLM cores (CFS-inspired `TurnAdmission` gates agent *turns*) | L | B0.1 | **Production-qualified** (bounded per-request LLM cores, priority aging, cancellation-safe RAII admission, starvation escape, shared-resource priority inheritance, class/yield metrics, and sustained contention tests; scheduling remains cooperative rather than CPU preemption). |
-| **B1.3** | Function-calling shim for open-source models (structured tool-calling for models without native support) | M | — | **Done** (`function_calling`: render_tools_prompt + parse_tool_calls; executor plaintext-fallback path) |
+| **B1.1** | <!-- capability-claim: llm-memory-backends=public-api-e2e --> LLM backend breadth: add more `LlmProviderAdapter`s — 4 → 9+ | M | — | **Public-API E2E** (9 network providers plus feature-gated on-device GGUF; typed errors, cancellation/timeouts, circuits, compatible routing, exact attempt accounting, fixtures, and protected evidence workflows are implemented. Production promotion waits for reviewed live/provider-model artifacts in #120.) |
+| **B1.2** | LLM-request scheduling: scheduler dispatches queued LLM *requests* to LLM cores (CFS-inspired `TurnAdmission` gates agent *turns*) | L | B0.1 | <!-- capability-claim: scheduling-admission=production-qualified -->**Production-qualified** (bounded per-request LLM cores, priority aging, cancellation-safe RAII admission, starvation escape, shared-resource priority inheritance, class/yield metrics, and sustained contention tests; scheduling remains cooperative rather than CPU preemption). |
+| **B1.3** | Function-calling shim for open-source models (structured tool-calling for models without native support) | M | — | <!-- capability-claim: llm-memory-backends=integrated -->**Integrated** (`function_calling`: render_tools_prompt + parse_tool_calls; executor plaintext-fallback path) |
 
 ## Phase 2 — Context management
 
 | ID | Title | Size | Deps | Notes |
 |----|-------|------|------|-------|
-| **B2.1** | Context snapshot / restore (persist + restore an agent's in-flight context so a turn can pause/resume) | L | — | **Done** (`context_snapshots` table + `snapshot/restore/list/delete` methods; `Snapshot*`/`RestoreSnapshot` syscalls + SDK) |
-| **B2.2** | Mid-generation context switch (pause/resume LLM decoding; feasible with local/vLLM, checkpoint-at-token-boundary for hosted APIs) | XL | B2.1, B1.1 | **Production-qualified** (versioned/tenant-scoped durable checkpoints, lifecycle pause/resume, restart recovery, pending-tool reconstruction, expiry/corruption/incompatibility behavior, latency metrics, completion-race handling, and repeated multi-agent qualification; hosted APIs remain request-boundary and crash-window side effects are documented at-least-once). |
+| **B2.1** | Context snapshot / restore (persist + restore an agent's in-flight context so a turn can pause/resume) | L | — | <!-- capability-claim: turn-checkpoints=production-qualified -->**Production-qualified** (`context_snapshots` table + `snapshot/restore/list/delete` methods; `Snapshot*`/`RestoreSnapshot` syscalls + SDK) |
+| **B2.2** | Mid-generation context switch (pause/resume LLM decoding; feasible with local/vLLM, checkpoint-at-token-boundary for hosted APIs) | XL | B2.1, B1.1 | <!-- capability-claim: turn-checkpoints=production-qualified -->**Production-qualified** (versioned/tenant-scoped durable checkpoints, lifecycle pause/resume, restart recovery, pending-tool reconstruction, expiry/corruption/incompatibility behavior, latency metrics, completion-race handling, and repeated multi-agent qualification; hosted APIs remain request-boundary and crash-window side effects are documented at-least-once). |
 
 ## Phase 3 — Memory & storage
 
 | ID | Title | Size | Deps | Notes |
 |----|-------|------|------|-------|
-| **B3.1** | Memory Manager with retrieval: promote `query_memory` into a per-agent subsystem with embeddings + vector search | L | — | **Public-API E2E** (`memory_manager`: versioned deterministic offline embeddings, exact + LSH ranking, stale/corrupt rebuild, owner update/delete/reindex, concurrent/purge regressions, and a blocking exact-vs-ANN quality gate. Sustained cached-index/100k+ performance remains #125.) |
-| **B3.2** | Storage Manager: formalize persistent-storage syscalls beyond raw SQLite | M | B0.1 | **Done** (per-agent `agent_kv` store on SqliteContextManager; `Storage{Put,Get,List,Delete}` syscalls + SDK methods) |
+| **B3.1** | <!-- capability-claim: llm-memory-backends=public-api-e2e --> Memory Manager with retrieval: promote `query_memory` into a per-agent subsystem with embeddings + vector search | L | — | **Public-API E2E** (`memory_manager`: versioned deterministic offline embeddings, exact + LSH ranking, stale/corrupt rebuild, owner update/delete/reindex, concurrent/purge regressions, and a blocking exact-vs-ANN quality gate. Sustained cached-index/100k+ performance remains #125.) |
+| **B3.2** | Storage Manager: formalize persistent-storage syscalls beyond raw SQLite | M | B0.1 | <!-- capability-claim: durable-state=integrated -->**Integrated** (per-agent `agent_kv` store on SqliteContextManager; `Storage{Put,Get,List,Delete}` syscalls + SDK methods) |
 | **B3.3** | Semantic file system over agent storage | XL | B3.2 | **Optional / defer** |
 
 ## Phase 4 — Tools
 
 | ID | Title | Size | Deps | Notes |
 |----|-------|------|------|-------|
-| **B4.1** | MCP *server* (we have an MCP client; add a server so agents expose/consume MCP tools) | M | — | **Done** (`mcp_server`: JSON-RPC `initialize`/`tools.list`/`tools.call` over TCP; gate-enforced call path, denials as JSON-RPC errors) |
-| **B4.2** | Shareable tool registry (downloadable Rust tools / templates) | M | B0.3 | **Done** (`tool_registry_share`: `SharedToolRegistry`/`SharedToolDef`; publish/fetch, install into `ToolRegistry`, resolve from package `tools`) |
+| **B4.1** | MCP *server* (we have an MCP client; add a server so agents expose/consume MCP tools) | M | — | <!-- capability-claim: wire-protocol=public-api-e2e -->**Public-API E2E** (`mcp_server`: JSON-RPC `initialize`/`tools.list`/`tools.call` over TCP; gate-enforced call path, denials as JSON-RPC errors) |
+| **B4.2** | Shareable tool registry (downloadable Rust tools / templates) | M | B0.3 | <!-- capability-claim: secondary-modules=unit-tested -->**Unit-tested** (`tool_registry_share`: `SharedToolRegistry`/`SharedToolDef`; publish/fetch, install into `ToolRegistry`, resolve from package `tools`) |
 | **B4.3** | Computer-use / sandboxed automation controller | XL | — | **Optional / defer** |
 
 ## Phase 5 — Ecosystem
 
 | ID | Title | Size | Deps | Notes |
 |----|-------|------|------|-------|
-| **B5.1** | Rust agent templates + reference patterns (ReAct-style loop, planner/executor) shipped on the SDK | L | B0.2 | **Done** (`agent_sdk::patterns`: `ReActLoop<Reasoner>` + `PlannerExecutor<Planner>` over `KernelClient`; wiremock-backed e2e) |
-| **B5.2** | Agent hub (publish/fetch/share Rust agent packages) | L | B0.3 | **Done** (`agent_hub::AgentHub`: versioned publish/fetch/list/search of `AgentManifest`s; fetched package loads via `load_package`) |
-| **B5.3** | Rust TUI / extend the desktop app for observing + driving agents | M | B0.2 | **Done** (`agent-tui` crate: ratatui/crossterm TUI over the syscall server — live agents/gate/node, create + message; render-free testable `App`) |
+| **B5.1** | Rust agent templates + reference patterns (ReAct-style loop, planner/executor) shipped on the SDK | L | B0.2 | <!-- capability-claim: wire-protocol=public-api-e2e -->**Public-API E2E** (`agent_sdk::patterns`: `ReActLoop<Reasoner>` + `PlannerExecutor<Planner>` over `KernelClient`; wiremock-backed e2e) |
+| **B5.2** | Agent hub (publish/fetch/share Rust agent packages) | L | B0.3 | <!-- capability-claim: secondary-modules=unit-tested -->**Unit-tested** (`agent_hub::AgentHub`: versioned publish/fetch/list/search of `AgentManifest`s; fetched package loads via `load_package`) |
+| **B5.3** | Rust TUI / extend the desktop app for observing + driving agents | M | B0.2 | <!-- capability-claim: operator-clients=integrated -->**Integrated** (`agent-tui` crate: ratatui/crossterm TUI over the syscall server — live agents/gate/node, create + message; render-free testable `App`) |
 
 ## Phase 6 — Distributed & validation
 
 | ID | Title | Size | Deps | Notes |
 |----|-------|------|------|-------|
 | **B6.1** | Remote kernel / distributed deployment | L | B0.1 | **In progress** (remote operation and a public multi-node client are integrated. Durable identity, mTLS with live node-local certificate/trust reload and revocation, drain/quarantine, constrained placement, monotonic ownership leases, pre-fenced exact-ID creation, durable partial-creation reconciliation, opt-in idle renewal/route health, destination mutation fencing, fenced streaming, and durable OpenRaft storage-v2 are implemented. Strict default-off quorum mode routes public membership and ownership writes/linearizable reads through a deterministic replicated authority with failover/restart and no-quorum coverage. Forwarded external writes now require short-lived application-node signatures bound to the authenticated Raft source, active membership, exact operation/command, and canonical system-node actor. Destinations in quorum mode independently perform a linearizable exact-ownership check before installing or retiring a fence. Bounded application-listener rollout, term/expiry fencing, learner/joint-consensus voter changes, and separate transport-trust generations for learner and leaf/CA rotation are implemented. End-user credential delegation, offline quorum certificates, live administration, migration, cross-node IPC, global quotas, trust convergence, rolling upgrades, and broader partition/disaster qualification remain #122.) |
-| **B6.2** | Benchmarks + eval harness: run `stress_test` in CI; add an agent-task benchmark | M | — | **Done** (`agent-bench` bin + Rust eval harness in `benchmarks/`; fast CI smoke test runs under `cargo test --workspace`) |
-| **B6.3** | Docs site + examples | M | — | **Done** (mdBook site under `docs/`: `book.toml` + `SUMMARY.md`; intro/getting-started/concepts pages wrapping the canonical docs) |
+| **B6.2** | Benchmarks + eval harness: run `stress_test` in CI; add an agent-task benchmark | M | — | <!-- capability-claim: production-operations=unit-tested -->**Unit-tested** (`agent-bench` bin + Rust eval harness in `benchmarks/`; fast CI smoke test runs under `cargo test --workspace`) |
+| **B6.3** | Docs site + examples | M | — | <!-- capability-claim: claim-integrity=public-api-e2e -->**Public-API E2E** (mdBook site under `docs/`: `book.toml` + `SUMMARY.md`; intro/getting-started/concepts pages wrapping the canonical docs) |
 
 ## Keep our lead (do not regress)
 

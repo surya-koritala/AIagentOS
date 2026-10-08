@@ -12,6 +12,9 @@ const MATURITY_MODEL: [&str; 5] = [
     "production-qualified",
 ];
 
+#[path = "public_claims.rs"]
+mod public_claims;
+
 #[derive(Debug, Deserialize)]
 struct Registry {
     schema_version: u32,

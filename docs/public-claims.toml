@@ -1,0 +1,407 @@
+# Public Markdown surface inventory; tiers remain in capabilities.toml.
+schema_version = 1
+
+[[surface]]
+path = "README.md"
+kind = "current"
+
+[[surface]]
+path = "docs/ACCESSIBILITY.md"
+kind = "current"
+
+[[surface]]
+path = "docs/ACCOUNTING.md"
+kind = "current"
+
+[[surface]]
+path = "docs/ADR-0001-PUBLIC-ABI.md"
+kind = "current"
+
+[[surface]]
+path = "docs/AGENT_PACKAGE.md"
+kind = "current"
+
+[[surface]]
+path = "docs/ARCHITECTURE.md"
+kind = "current"
+
+[[surface]]
+path = "docs/CAPACITY_QUALIFICATION.md"
+kind = "current"
+
+[[surface]]
+path = "docs/CHECKPOINTS.md"
+kind = "current"
+
+[[surface]]
+path = "docs/COMPLETE_SPEC.md"
+kind = "historical"
+
+[[surface]]
+path = "docs/CONTEXT_PRESSURE.md"
+kind = "current"
+
+[[surface]]
+path = "docs/DATA_VFS.md"
+kind = "current"
+
+[[surface]]
+path = "docs/DESKTOP_DISTRIBUTION.md"
+kind = "current"
+
+[[surface]]
+path = "docs/DISTRIBUTED_CONTROL_PLANE.md"
+kind = "current"
+
+[[surface]]
+path = "docs/DURABILITY.md"
+kind = "current"
+
+[[surface]]
+path = "docs/DURABLE_EXECUTION_HISTORY.md"
+kind = "current"
+
+[[surface]]
+path = "docs/EXTERNAL_DELETION_QUALIFICATION.md"
+kind = "current"
+
+[[surface]]
+path = "docs/FULL_ROADMAP.md"
+kind = "historical"
+
+[[surface]]
+path = "docs/GAME_DAY_QUALIFICATION.md"
+kind = "current"
+
+[[surface]]
+path = "docs/HOST_STORAGE_FAULT_QUALIFICATION.md"
+kind = "current"
+
+[[surface]]
+path = "docs/HTTP_EMBEDDINGS.md"
+kind = "current"
+
+[[surface]]
+path = "docs/INCIDENT_RESPONSE.md"
+kind = "current"
+
+[[surface]]
+path = "docs/LINUX_CLI_RC.md"
+kind = "current"
+
+[[surface]]
+path = "docs/MACOS_PROCESS_ISOLATION.md"
+kind = "current"
+
+[[surface]]
+path = "docs/MEMORY_RETRIEVAL.md"
+kind = "current"
+
+[[surface]]
+path = "docs/NAMESPACE_MOUNTS.md"
+kind = "current"
+
+[[surface]]
+path = "docs/OBSERVABILITY.md"
+kind = "current"
+
+[[surface]]
+path = "docs/OPERATIONS_API.md"
+kind = "current"
+
+[[surface]]
+path = "docs/PHASE1_PROMOTION_QUALIFICATION.md"
+kind = "current"
+
+[[surface]]
+path = "docs/PLATFORM_ROADMAP.md"
+kind = "current"
+
+[[surface]]
+path = "docs/POLICY.md"
+kind = "current"
+
+[[surface]]
+path = "docs/PROTECTED_QUALIFICATION_INFRASTRUCTURE.md"
+kind = "current"
+
+[[surface]]
+path = "docs/PROTOCOL.md"
+kind = "current"
+
+[[surface]]
+path = "docs/PROVIDERS.md"
+kind = "current"
+
+[[surface]]
+path = "docs/PROVIDER_MATRIX.md"
+kind = "current"
+
+[[surface]]
+path = "docs/PUBLIC_CLAIMS.md"
+kind = "current"
+
+[[surface]]
+path = "docs/README.md"
+kind = "current"
+
+[[surface]]
+path = "docs/RELEASE_SLO_QUALIFICATION.md"
+kind = "current"
+
+[[surface]]
+path = "docs/REMOTE_BACKUP_QUALIFICATION.md"
+kind = "current"
+
+[[surface]]
+path = "docs/REPOSITORY_METADATA_PROPOSAL.md"
+kind = "current"
+
+[[surface]]
+path = "docs/RESILIENCE_QUALIFICATION.md"
+kind = "current"
+
+[[surface]]
+path = "docs/RETRIEVAL_SCALE.md"
+kind = "current"
+
+[[surface]]
+path = "docs/RUNBOOK.md"
+kind = "current"
+
+[[surface]]
+path = "docs/SANDBOX_QUALIFICATION.md"
+kind = "current"
+
+[[surface]]
+path = "docs/SCHEDULER.md"
+kind = "current"
+
+[[surface]]
+path = "docs/SECONDARY_CAPABILITIES.md"
+kind = "current"
+
+[[surface]]
+path = "docs/SERVER_QUICKSTART.md"
+kind = "current"
+
+[[surface]]
+path = "docs/SERVICES.md"
+kind = "current"
+
+[[surface]]
+path = "docs/SOAK_QUALIFICATION.md"
+kind = "current"
+
+[[surface]]
+path = "docs/STORAGE_PROFILE_QUALIFICATION.md"
+kind = "current"
+
+[[surface]]
+path = "docs/SUPPORTED_PLATFORMS.md"
+kind = "current"
+
+[[surface]]
+path = "docs/THREAT_MODEL.md"
+kind = "current"
+
+[[surface]]
+path = "docs/VFS.md"
+kind = "current"
+
+[[surface]]
+path = "docs/WORKSPACE_VFS.md"
+kind = "current"
+
+[[surface]]
+path = "docs/src/SUMMARY.md"
+kind = "current"
+
+[[surface]]
+path = "docs/src/agent-package.md"
+kind = "current"
+
+[[surface]]
+path = "docs/src/architecture.md"
+kind = "current"
+
+[[surface]]
+path = "docs/src/capacity-qualification.md"
+kind = "current"
+
+[[surface]]
+path = "docs/src/checkpoints.md"
+kind = "current"
+
+[[surface]]
+path = "docs/src/complete-spec.md"
+kind = "current"
+
+[[surface]]
+path = "docs/src/concepts.md"
+kind = "current"
+
+[[surface]]
+path = "docs/src/context-pressure.md"
+kind = "current"
+
+[[surface]]
+path = "docs/src/data-vfs.md"
+kind = "current"
+
+[[surface]]
+path = "docs/src/distributed-control-plane.md"
+kind = "current"
+
+[[surface]]
+path = "docs/src/durable-execution-history.md"
+kind = "current"
+
+[[surface]]
+path = "docs/src/external-deletion-qualification.md"
+kind = "current"
+
+[[surface]]
+path = "docs/src/full-roadmap.md"
+kind = "current"
+
+[[surface]]
+path = "docs/src/game-day-qualification.md"
+kind = "current"
+
+[[surface]]
+path = "docs/src/getting-started.md"
+kind = "current"
+
+[[surface]]
+path = "docs/src/host-storage-fault-qualification.md"
+kind = "current"
+
+[[surface]]
+path = "docs/src/incident-response.md"
+kind = "current"
+
+[[surface]]
+path = "docs/src/introduction.md"
+kind = "current"
+
+[[surface]]
+path = "docs/src/linux-cli-rc.md"
+kind = "current"
+
+[[surface]]
+path = "docs/src/namespace-mounts.md"
+kind = "current"
+
+[[surface]]
+path = "docs/src/observability.md"
+kind = "current"
+
+[[surface]]
+path = "docs/src/operations-api.md"
+kind = "current"
+
+[[surface]]
+path = "docs/src/phase1-promotion-qualification.md"
+kind = "current"
+
+[[surface]]
+path = "docs/src/platform-roadmap.md"
+kind = "current"
+
+[[surface]]
+path = "docs/src/protected-qualification-infrastructure.md"
+kind = "current"
+
+[[surface]]
+path = "docs/src/protocol.md"
+kind = "current"
+
+[[surface]]
+path = "docs/src/provider-matrix.md"
+kind = "current"
+
+[[surface]]
+path = "docs/src/providers.md"
+kind = "current"
+
+[[surface]]
+path = "docs/src/public-abi.md"
+kind = "current"
+
+[[surface]]
+path = "docs/src/release-slo-qualification.md"
+kind = "current"
+
+[[surface]]
+path = "docs/src/remote-backup-qualification.md"
+kind = "current"
+
+[[surface]]
+path = "docs/src/resilience-qualification.md"
+kind = "current"
+
+[[surface]]
+path = "docs/src/runbook.md"
+kind = "current"
+
+[[surface]]
+path = "docs/src/sandbox-qualification.md"
+kind = "current"
+
+[[surface]]
+path = "docs/src/scheduler.md"
+kind = "current"
+
+[[surface]]
+path = "docs/src/secondary-capabilities.md"
+kind = "current"
+
+[[surface]]
+path = "docs/src/services.md"
+kind = "current"
+
+[[surface]]
+path = "docs/src/soak-qualification.md"
+kind = "current"
+
+[[surface]]
+path = "docs/src/storage-profile-qualification.md"
+kind = "current"
+
+[[surface]]
+path = "docs/src/supported-platforms.md"
+kind = "current"
+
+[[surface]]
+path = "docs/src/syscall-gate.md"
+kind = "current"
+
+[[surface]]
+path = "docs/src/tutorials/custom-tools.md"
+kind = "current"
+
+[[surface]]
+path = "docs/src/tutorials/service-files.md"
+kind = "current"
+
+[[surface]]
+path = "docs/src/vfs.md"
+kind = "current"
+
+[[surface]]
+path = "docs/src/workspace-vfs.md"
+kind = "current"
+
+[[surface]]
+path = "docs/tutorials/custom-tools.md"
+kind = "current"
+
+[[surface]]
+path = "docs/tutorials/getting-started.md"
+kind = "current"
+
+[[surface]]
+path = "docs/tutorials/service-files.md"
+kind = "current"
+

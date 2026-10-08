@@ -1,5 +1,9 @@
 # Tool VFS
 
+<!-- capability-claim: tool-vfs=integrated -->Recorded capability evidence: Integrated. Independent qualification remains in
+[#392](https://github.com/surya-koritala/AIagentOS/issues/392), with tiers defined
+by [capabilities.toml](capabilities.toml).
+
 The process-local namespace table can mount governed aliases and revoke an
 exact binding. See [Namespace mounts](NAMESPACE_MOUNTS.md) for authority,
 generation, restart, and in-flight-operation semantics.

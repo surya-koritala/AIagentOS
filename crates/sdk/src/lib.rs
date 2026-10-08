@@ -70,6 +70,17 @@ pub use kernel::syscall_server::{
     OperatorPackageSnapshot, OperatorServiceSnapshot, OperatorSnapshot, ProviderSummary,
     WireErrorCode,
 };
+pub use kernel::vfs::workspace::{
+    WorkspaceHandle, WorkspaceKind, WorkspaceOpenRequest, WorkspaceRead, WorkspaceRight,
+    WorkspaceStat,
+};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceBytes {
+    pub bytes: Vec<u8>,
+    pub offset: u64,
+    pub eof: bool,
+}
 pub use kernel::vfs::{VfsHandle, VfsMountView};
 pub use kernel::wire_contract::{ProtocolDescription, TransportDescription};
 
@@ -1265,6 +1276,211 @@ impl KernelClient {
         {
             SyscallReply::VfsClosed => Ok(()),
             other => Err(unexpected("VfsClosed", &other)),
+        }
+    }
+
+    /// Inspect the workspace mount without reading its file contents.
+    pub async fn vfs_workspace_mounts(
+        &mut self,
+        agent_id: impl Into<String>,
+    ) -> Result<VfsMountView, SdkError> {
+        match self
+            .call(Syscall::VfsWorkspaceMounts {
+                agent_id: agent_id.into(),
+            })
+            .await?
+        {
+            SyscallReply::VfsMounts { view } => Ok(view),
+            other => Err(unexpected("VfsMounts", &other)),
+        }
+    }
+
+    /// Open a workspace entry with explicit rights. File writes replace the
+    /// bound entry atomically; directory capabilities cannot redirect by rename.
+    pub async fn vfs_open_workspace(
+        &mut self,
+        agent_id: impl Into<String>,
+        request: WorkspaceOpenRequest,
+    ) -> Result<WorkspaceHandle, SdkError> {
+        match self
+            .call(Syscall::VfsOpenWorkspace {
+                agent_id: agent_id.into(),
+                request,
+            })
+            .await?
+        {
+            SyscallReply::WorkspaceOpened { handle } => Ok(handle),
+            other => Err(unexpected("WorkspaceOpened", &other)),
+        }
+    }
+
+    /// Open relative to a directory handle, with rights narrowed to its set.
+    pub async fn vfs_open_at(
+        &mut self,
+        agent_id: impl Into<String>,
+        parent: impl Into<String>,
+        request: WorkspaceOpenRequest,
+    ) -> Result<WorkspaceHandle, SdkError> {
+        match self
+            .call(Syscall::VfsOpenAt {
+                agent_id: agent_id.into(),
+                parent: parent.into(),
+                request,
+            })
+            .await?
+        {
+            SyscallReply::WorkspaceOpened { handle } => Ok(handle),
+            other => Err(unexpected("WorkspaceOpened", &other)),
+        }
+    }
+
+    /// Duplicate an entry reference with equal or narrower rights. Close is
+    /// independent for each descriptor; no descriptor transfers to another agent.
+    pub async fn vfs_dup_workspace(
+        &mut self,
+        agent_id: impl Into<String>,
+        handle: impl Into<String>,
+        rights: Vec<WorkspaceRight>,
+    ) -> Result<WorkspaceHandle, SdkError> {
+        match self
+            .call(Syscall::VfsDupWorkspace {
+                agent_id: agent_id.into(),
+                handle: handle.into(),
+                rights,
+            })
+            .await?
+        {
+            SyscallReply::WorkspaceOpened { handle } => Ok(handle),
+            other => Err(unexpected("WorkspaceOpened", &other)),
+        }
+    }
+
+    /// Read a bounded binary chunk. `eof` distinguishes a complete read from a
+    /// partial one; offsets refer to the current bound file entry.
+    pub async fn vfs_read_workspace(
+        &mut self,
+        agent_id: impl Into<String>,
+        handle: impl Into<String>,
+        offset: u64,
+        max_bytes: u32,
+    ) -> Result<WorkspaceRead, SdkError> {
+        match self
+            .call(Syscall::VfsReadWorkspace {
+                agent_id: agent_id.into(),
+                handle: handle.into(),
+                offset,
+                max_bytes,
+            })
+            .await?
+        {
+            SyscallReply::WorkspaceRead { chunk } => Ok(chunk),
+            other => Err(unexpected("WorkspaceRead", &other)),
+        }
+    }
+
+    /// Decode a bounded workspace read for byte-oriented SDK consumers.
+    pub async fn vfs_read_bytes(
+        &mut self,
+        agent_id: impl Into<String>,
+        handle: impl Into<String>,
+        offset: u64,
+        max_bytes: u32,
+    ) -> Result<WorkspaceBytes, SdkError> {
+        use base64::Engine;
+        let chunk = self
+            .vfs_read_workspace(agent_id, handle, offset, max_bytes)
+            .await?;
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(&chunk.data_base64)
+            .map_err(|_| SdkError::UnexpectedReply {
+                expected: "bounded base64 workspace bytes",
+                got: "invalid byte encoding".into(),
+            })?;
+        if bytes.len() > max_bytes as usize {
+            return Err(SdkError::UnexpectedReply {
+                expected: "bounded workspace bytes",
+                got: "read exceeded requested length".into(),
+            });
+        }
+        Ok(WorkspaceBytes {
+            bytes,
+            offset: chunk.offset,
+            eof: chunk.eof,
+        })
+    }
+
+    pub async fn vfs_write_bytes(
+        &mut self,
+        agent_id: impl Into<String>,
+        handle: impl Into<String>,
+        bytes: &[u8],
+    ) -> Result<u64, SdkError> {
+        use base64::Engine;
+        if bytes.len() > kernel::vfs::workspace::MAX_WORKSPACE_TRANSFER_BYTES {
+            return Err(SdkError::Configuration(
+                "workspace transfer limit exceeded".into(),
+            ));
+        }
+        self.vfs_write_workspace(
+            agent_id,
+            handle,
+            base64::engine::general_purpose::STANDARD.encode(bytes),
+        )
+        .await
+    }
+
+    /// Atomically replace an entry with base64-encoded bytes under its current
+    /// write policy and whole-workspace disk quota.
+    pub async fn vfs_write_workspace(
+        &mut self,
+        agent_id: impl Into<String>,
+        handle: impl Into<String>,
+        data_base64: impl Into<String>,
+    ) -> Result<u64, SdkError> {
+        match self
+            .call(Syscall::VfsWriteWorkspace {
+                agent_id: agent_id.into(),
+                handle: handle.into(),
+                data_base64: data_base64.into(),
+            })
+            .await?
+        {
+            SyscallReply::WorkspaceWritten { written_bytes } => Ok(written_bytes),
+            other => Err(unexpected("WorkspaceWritten", &other)),
+        }
+    }
+
+    pub async fn vfs_list_workspace(
+        &mut self,
+        agent_id: impl Into<String>,
+        handle: impl Into<String>,
+    ) -> Result<serde_json::Value, SdkError> {
+        match self
+            .call(Syscall::VfsListWorkspace {
+                agent_id: agent_id.into(),
+                handle: handle.into(),
+            })
+            .await?
+        {
+            SyscallReply::ToolResult { data } => Ok(data),
+            other => Err(unexpected("ToolResult", &other)),
+        }
+    }
+
+    pub async fn vfs_stat_workspace(
+        &mut self,
+        agent_id: impl Into<String>,
+        handle: impl Into<String>,
+    ) -> Result<WorkspaceStat, SdkError> {
+        match self
+            .call(Syscall::VfsStatWorkspace {
+                agent_id: agent_id.into(),
+                handle: handle.into(),
+            })
+            .await?
+        {
+            SyscallReply::WorkspaceStat { metadata } => Ok(metadata),
+            other => Err(unexpected("WorkspaceStat", &other)),
         }
     }
 
@@ -2969,6 +3185,7 @@ fn safe_to_replay_after_reconnect(call: &Syscall) -> bool {
             | Syscall::StorageGet { .. }
             | Syscall::StorageList { .. }
             | Syscall::VfsMounts { .. }
+            | Syscall::VfsWorkspaceMounts { .. }
             | Syscall::ContextPressure { .. }
             | Syscall::ListSnapshots { .. }
             | Syscall::Hello { .. }

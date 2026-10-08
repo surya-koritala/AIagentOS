@@ -361,6 +361,44 @@ pub enum Syscall {
         agent_id: String,
         handle: String,
     },
+    VfsWorkspaceMounts {
+        agent_id: String,
+    },
+    VfsOpenWorkspace {
+        agent_id: String,
+        request: crate::vfs::workspace::WorkspaceOpenRequest,
+    },
+    VfsOpenAt {
+        agent_id: String,
+        parent: String,
+        request: crate::vfs::workspace::WorkspaceOpenRequest,
+    },
+    VfsDupWorkspace {
+        agent_id: String,
+        handle: String,
+        rights: Vec<crate::vfs::workspace::WorkspaceRight>,
+    },
+    VfsReadWorkspace {
+        agent_id: String,
+        handle: String,
+        #[serde(default)]
+        offset: u64,
+        #[serde(default = "default_workspace_read_bytes")]
+        max_bytes: u32,
+    },
+    VfsWriteWorkspace {
+        agent_id: String,
+        handle: String,
+        data_base64: String,
+    },
+    VfsListWorkspace {
+        agent_id: String,
+        handle: String,
+    },
+    VfsStatWorkspace {
+        agent_id: String,
+        handle: String,
+    },
     /// Snapshot of the syscall gate's enforcement counters.
     GateStats,
     /// Read-only introspection of one agent's enforcement state: the
@@ -1196,6 +1234,18 @@ pub enum SyscallReply {
         handle: crate::vfs::VfsHandle,
     },
     VfsClosed,
+    WorkspaceOpened {
+        handle: crate::vfs::workspace::WorkspaceHandle,
+    },
+    WorkspaceRead {
+        chunk: crate::vfs::workspace::WorkspaceRead,
+    },
+    WorkspaceWritten {
+        written_bytes: u64,
+    },
+    WorkspaceStat {
+        metadata: crate::vfs::workspace::WorkspaceStat,
+    },
     GateStats {
         allowed: u64,
         denied_capability: u64,
@@ -1487,6 +1537,7 @@ impl std::fmt::Debug for Syscall {
             Self::Authenticate { .. } => &["token"],
             Self::SendMessage { .. } | Self::SendMessageStream { .. } => &["message"],
             Self::CallTool { .. } | Self::VfsInvoke { .. } => &["args"],
+            Self::VfsWriteWorkspace { .. } => &["data_base64"],
             Self::MemoryStore { .. } | Self::MemoryUpdate { .. } => &["content"],
             Self::StoragePut { .. } => &["value"],
             Self::LoadPackage { .. } => &["manifest_toml"],
@@ -1507,6 +1558,7 @@ impl std::fmt::Debug for SyscallReply {
             Self::Message { .. } | Self::StreamCompleted { .. } => &["content"],
             Self::StreamEvent { .. } => &["event"],
             Self::ToolResult { .. } => &["data"],
+            Self::WorkspaceRead { .. } => &["chunk"],
             Self::Memory { .. } => &["facts"],
             Self::StorageValue { .. } => &["value"],
             Self::PackageArchive { .. } => &["archive_hex"],
@@ -1599,6 +1651,23 @@ fn syscall_policy(call: &Syscall) -> (AccessLevel, &'static str, Option<&str>) {
             (AccessLevel::User, "agent.call_tool", Some(agent_id))
         }
         Syscall::VfsClose { agent_id, .. } => (AccessLevel::User, "vfs.close", Some(agent_id)),
+        Syscall::VfsWorkspaceMounts { agent_id } => (
+            AccessLevel::ReadOnly,
+            "vfs.workspace.mounts",
+            Some(agent_id),
+        ),
+        Syscall::VfsOpenWorkspace { agent_id, .. } | Syscall::VfsOpenAt { agent_id, .. } => {
+            (AccessLevel::User, "vfs.workspace.open", Some(agent_id))
+        }
+        Syscall::VfsDupWorkspace { agent_id, .. } => {
+            (AccessLevel::User, "vfs.workspace.dup", Some(agent_id))
+        }
+        Syscall::VfsReadWorkspace { agent_id, .. }
+        | Syscall::VfsWriteWorkspace { agent_id, .. }
+        | Syscall::VfsListWorkspace { agent_id, .. }
+        | Syscall::VfsStatWorkspace { agent_id, .. } => {
+            (AccessLevel::User, "agent.call_tool", Some(agent_id))
+        }
         Syscall::GateStats => (AccessLevel::System, "system.gate_stats", None),
         Syscall::AgentInfo { agent_id } => (AccessLevel::ReadOnly, "agent.info", Some(agent_id)),
         Syscall::ListProviders => (AccessLevel::ReadOnly, "provider.list", None),
@@ -1952,6 +2021,13 @@ fn starts_new_work(call: &Syscall) -> bool {
             | Syscall::CallTool { .. }
             | Syscall::VfsOpen { .. }
             | Syscall::VfsInvoke { .. }
+            | Syscall::VfsOpenWorkspace { .. }
+            | Syscall::VfsOpenAt { .. }
+            | Syscall::VfsDupWorkspace { .. }
+            | Syscall::VfsReadWorkspace { .. }
+            | Syscall::VfsWriteWorkspace { .. }
+            | Syscall::VfsListWorkspace { .. }
+            | Syscall::VfsStatWorkspace { .. }
             | Syscall::RunInstalledPackage { .. }
     )
 }
@@ -1971,6 +2047,13 @@ fn mutable_agent_target(call: &Syscall) -> Option<&str> {
         | Syscall::VfsOpen { agent_id, .. }
         | Syscall::VfsInvoke { agent_id, .. }
         | Syscall::VfsClose { agent_id, .. }
+        | Syscall::VfsOpenWorkspace { agent_id, .. }
+        | Syscall::VfsOpenAt { agent_id, .. }
+        | Syscall::VfsDupWorkspace { agent_id, .. }
+        | Syscall::VfsReadWorkspace { agent_id, .. }
+        | Syscall::VfsWriteWorkspace { agent_id, .. }
+        | Syscall::VfsListWorkspace { agent_id, .. }
+        | Syscall::VfsStatWorkspace { agent_id, .. }
         | Syscall::MemoryStore { agent_id, .. }
         | Syscall::MemoryUpdate { agent_id, .. }
         | Syscall::MemoryDelete { agent_id, .. }
@@ -2058,6 +2141,46 @@ fn quarantine_recovery_call(call: &Syscall) -> bool {
             | Syscall::KillAgent { .. }
             | Syscall::CancelRequest { .. }
     )
+}
+
+fn default_workspace_read_bytes() -> u32 {
+    64 * 1024
+}
+
+fn workspace_error(error: crate::vfs::workspace::WorkspaceError) -> SyscallReply {
+    use crate::vfs::workspace::WorkspaceError;
+    match error {
+        WorkspaceError::Vfs(error) => vfs_error(error),
+        WorkspaceError::Invalid(message) => SyscallReply::TypedError {
+            code: WireErrorCode::InvalidArgument,
+            message,
+            retryable: false,
+        },
+        WorkspaceError::PermissionDenied => SyscallReply::TypedError {
+            code: WireErrorCode::PermissionDenied,
+            message: "workspace handle rights denied".into(),
+            retryable: false,
+        },
+        WorkspaceError::Tool(crate::tools::ToolAuthorizationError::InvalidDeclaration(message))
+            if message == "VFS tool binding revoked"
+                || message == crate::tools::TOOL_NOT_FOUND_ERROR =>
+        {
+            vfs_error(crate::vfs::VfsError::NotFound)
+        }
+        WorkspaceError::Tool(error) => SyscallReply::Error {
+            message: format!("workspace tool denied by kernel: {error}"),
+        },
+        WorkspaceError::Backing(message)
+            if message.to_ascii_lowercase().contains("quota exceeded") =>
+        {
+            SyscallReply::TypedError {
+                code: WireErrorCode::QuotaExceeded,
+                message,
+                retryable: false,
+            }
+        }
+        WorkspaceError::Backing(message) => SyscallReply::Error { message },
+    }
 }
 
 fn vfs_error(error: crate::vfs::VfsError) -> SyscallReply {
@@ -2846,6 +2969,7 @@ async fn dispatch_scoped_inner_with_fence(
                 Err(_) => Err(crate::vfs::VfsError::NotFound),
             };
             match lease {
+                Ok(lease) if lease.is_workspace => vfs_error(crate::vfs::VfsError::NotFound),
                 Ok(lease) => {
                     dispatch_tool_call(kernel, &agent_id, &lease.name.clone(), &args, Some(lease))
                         .await
@@ -2857,6 +2981,82 @@ async fn dispatch_scoped_inner_with_fence(
             Ok(id) => match kernel.tool_vfs.close(id, &handle) {
                 Ok(()) => SyscallReply::VfsClosed,
                 Err(error) => vfs_error(error),
+            },
+            Err(_) => vfs_error(crate::vfs::VfsError::NotFound),
+        },
+        Syscall::VfsWorkspaceMounts { agent_id } => match uuid::Uuid::parse_str(&agent_id) {
+            Ok(id) => match kernel.vfs_workspace_mounts(id) {
+                Ok(view) => SyscallReply::VfsMounts { view },
+                Err(error) => vfs_error(error),
+            },
+            Err(_) => vfs_error(crate::vfs::VfsError::NotFound),
+        },
+        Syscall::VfsOpenWorkspace { agent_id, request } => match uuid::Uuid::parse_str(&agent_id) {
+            Ok(id) => match kernel.vfs_open_workspace(id, request).await {
+                Ok(handle) => SyscallReply::WorkspaceOpened { handle },
+                Err(error) => workspace_error(error),
+            },
+            Err(_) => vfs_error(crate::vfs::VfsError::NotFound),
+        },
+        Syscall::VfsOpenAt {
+            agent_id,
+            parent,
+            request,
+        } => match uuid::Uuid::parse_str(&agent_id) {
+            Ok(id) => match kernel.vfs_open_at(id, &parent, request).await {
+                Ok(handle) => SyscallReply::WorkspaceOpened { handle },
+                Err(error) => workspace_error(error),
+            },
+            Err(_) => vfs_error(crate::vfs::VfsError::NotFound),
+        },
+        Syscall::VfsDupWorkspace {
+            agent_id,
+            handle,
+            rights,
+        } => match uuid::Uuid::parse_str(&agent_id) {
+            Ok(id) => match kernel.vfs_dup_workspace(id, &handle, rights).await {
+                Ok(handle) => SyscallReply::WorkspaceOpened { handle },
+                Err(error) => workspace_error(error),
+            },
+            Err(_) => vfs_error(crate::vfs::VfsError::NotFound),
+        },
+        Syscall::VfsReadWorkspace {
+            agent_id,
+            handle,
+            offset,
+            max_bytes,
+        } => match uuid::Uuid::parse_str(&agent_id) {
+            Ok(id) => match kernel
+                .vfs_read_workspace(id, &handle, offset, max_bytes)
+                .await
+            {
+                Ok(chunk) => SyscallReply::WorkspaceRead { chunk },
+                Err(error) => workspace_error(error),
+            },
+            Err(_) => vfs_error(crate::vfs::VfsError::NotFound),
+        },
+        Syscall::VfsWriteWorkspace {
+            agent_id,
+            handle,
+            data_base64,
+        } => match uuid::Uuid::parse_str(&agent_id) {
+            Ok(id) => match kernel.vfs_write_workspace(id, &handle, data_base64).await {
+                Ok(written_bytes) => SyscallReply::WorkspaceWritten { written_bytes },
+                Err(error) => workspace_error(error),
+            },
+            Err(_) => vfs_error(crate::vfs::VfsError::NotFound),
+        },
+        Syscall::VfsListWorkspace { agent_id, handle } => match uuid::Uuid::parse_str(&agent_id) {
+            Ok(id) => match kernel.vfs_list_workspace(id, &handle).await {
+                Ok(data) => SyscallReply::ToolResult { data },
+                Err(error) => workspace_error(error),
+            },
+            Err(_) => vfs_error(crate::vfs::VfsError::NotFound),
+        },
+        Syscall::VfsStatWorkspace { agent_id, handle } => match uuid::Uuid::parse_str(&agent_id) {
+            Ok(id) => match kernel.vfs_stat_workspace(id, &handle).await {
+                Ok(metadata) => SyscallReply::WorkspaceStat { metadata },
+                Err(error) => workspace_error(error),
             },
             Err(_) => vfs_error(crate::vfs::VfsError::NotFound),
         },
@@ -9294,6 +9494,52 @@ memory = ["remember this"]
                 agent_id: id.clone(),
                 handle: uuid::Uuid::new_v4().to_string(),
             },
+            Syscall::VfsWorkspaceMounts {
+                agent_id: id.clone(),
+            },
+            Syscall::VfsOpenWorkspace {
+                agent_id: id.clone(),
+                request: crate::vfs::workspace::WorkspaceOpenRequest {
+                    path: "/workspace/file.bin".into(),
+                    kind: crate::vfs::workspace::WorkspaceKind::File,
+                    rights: vec![crate::vfs::workspace::WorkspaceRight::Read],
+                    allow_missing: false,
+                },
+            },
+            Syscall::VfsOpenAt {
+                agent_id: id.clone(),
+                parent: uuid::Uuid::new_v4().to_string(),
+                request: crate::vfs::workspace::WorkspaceOpenRequest {
+                    path: "file.bin".into(),
+                    kind: crate::vfs::workspace::WorkspaceKind::File,
+                    rights: vec![crate::vfs::workspace::WorkspaceRight::Read],
+                    allow_missing: false,
+                },
+            },
+            Syscall::VfsDupWorkspace {
+                agent_id: id.clone(),
+                handle: uuid::Uuid::new_v4().to_string(),
+                rights: vec![crate::vfs::workspace::WorkspaceRight::Read],
+            },
+            Syscall::VfsReadWorkspace {
+                agent_id: id.clone(),
+                handle: uuid::Uuid::new_v4().to_string(),
+                offset: 0,
+                max_bytes: 64,
+            },
+            Syscall::VfsWriteWorkspace {
+                agent_id: id.clone(),
+                handle: uuid::Uuid::new_v4().to_string(),
+                data_base64: "AA==".into(),
+            },
+            Syscall::VfsListWorkspace {
+                agent_id: id.clone(),
+                handle: uuid::Uuid::new_v4().to_string(),
+            },
+            Syscall::VfsStatWorkspace {
+                agent_id: id.clone(),
+                handle: uuid::Uuid::new_v4().to_string(),
+            },
             Syscall::AgentInfo {
                 agent_id: id.clone(),
             },
@@ -9839,7 +10085,7 @@ memory = ["remember this"]
                     .to_string()
             })
             .collect::<std::collections::HashSet<_>>();
-        assert_eq!(calls.len(), 96);
+        assert_eq!(calls.len(), 104);
         assert_eq!(fixture_tags, schema_tags);
     }
 

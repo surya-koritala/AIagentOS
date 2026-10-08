@@ -80,3 +80,105 @@ async fn agentctl_vfs_open_invoke_and_close_use_the_public_server() {
     let _ = task.await;
     std::fs::remove_dir_all(root).unwrap();
 }
+
+#[tokio::test]
+async fn agentctl_workspace_handles_drive_real_binary_io_and_rights() {
+    let root = std::env::temp_dir().join(format!("agentos-cli-workspace-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(root.join("project")).unwrap();
+    std::fs::write(root.join("project/file.bin"), b"old").unwrap();
+    std::fs::write(root.join("source.bin"), [0u8, 255, 42]).unwrap();
+    let kernel = Arc::new(AgentKernelImpl::new().unwrap());
+    let agent = kernel
+        .create_agent_full(AgentConfig {
+            name: "cli-workspace".into(),
+            task: "workspace CLI proof".into(),
+            llm_provider: "stub".into(),
+            permission_profile: "standard".into(),
+            priority: Priority::default(),
+            sandbox_config: Some(SandboxConfig {
+                workspace_dir: root.clone(),
+                isolation_level: IsolationLevel::Filesystem,
+                allowed_network_hosts: Some(Vec::new()),
+                max_disk_usage_bytes: Some(100000),
+                max_memory_bytes: None,
+                container_image: None,
+            }),
+        })
+        .await
+        .unwrap()
+        .id
+        .to_string();
+    let server = SyscallServer::bind(kernel, "127.0.0.1:0").await.unwrap();
+    let addr = server.local_addr().unwrap();
+    let task = tokio::spawn(server.serve());
+    assert_eq!(
+        command(addr, vec!["vfs-workspace-mounts".into(), agent.clone()]).await["mount"],
+        "/workspace"
+    );
+    let parent = command(
+        addr,
+        vec![
+            "vfs-workspace-open".into(),
+            agent.clone(),
+            "/workspace/project".into(),
+            "directory".into(),
+            "read,write,list,stat".into(),
+        ],
+    )
+    .await;
+    let parent = parent["id"].as_str().unwrap().to_string();
+    let file = command(
+        addr,
+        vec![
+            "vfs-open-at".into(),
+            agent.clone(),
+            parent.clone(),
+            "file.bin".into(),
+            "file".into(),
+            "read,write,stat".into(),
+        ],
+    )
+    .await;
+    let file = file["id"].as_str().unwrap().to_string();
+    assert_eq!(
+        command(
+            addr,
+            vec![
+                "vfs-write".into(),
+                agent.clone(),
+                file.clone(),
+                root.join("source.bin").to_string_lossy().into_owned()
+            ]
+        )
+        .await["written_bytes"],
+        3
+    );
+    assert_eq!(
+        command(addr, vec!["vfs-read".into(), agent.clone(), file.clone()]).await["data_base64"],
+        "AP8q"
+    );
+    assert_eq!(
+        command(addr, vec!["vfs-stat".into(), agent.clone(), file.clone()]).await["size"],
+        3
+    );
+    assert_eq!(
+        command(addr, vec!["vfs-list".into(), agent.clone(), parent.clone()]).await["entries"],
+        json!(["file.bin"])
+    );
+    let duplicate = command(
+        addr,
+        vec!["vfs-dup".into(), agent.clone(), file.clone(), "read".into()],
+    )
+    .await;
+    assert_eq!(duplicate["rights"], json!(["read"]));
+    assert_eq!(
+        std::fs::read(root.join("project/file.bin")).unwrap(),
+        [0u8, 255, 42]
+    );
+    for handle in [file, parent, duplicate["id"].as_str().unwrap().to_string()] {
+        command(addr, vec!["vfs-close".into(), agent.clone(), handle]).await;
+    }
+    task.abort();
+    let _ = task.await;
+    std::fs::remove_dir_all(root).unwrap();
+}

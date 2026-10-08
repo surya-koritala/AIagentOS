@@ -81,6 +81,7 @@ version = "0.4.0-rc.1"
 dependencies = [
  "adapters",
  "async-trait",
+ "base64 0.23.1",
  "chrono",
  "kernel",
  "rcgen",

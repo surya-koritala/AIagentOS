@@ -1,5 +1,65 @@
 [
   {
+    "agent_id": "00000000-0000-0000-0000-000000000001",
+    "op": "vfs_workspace_mounts"
+  },
+  {
+    "agent_id": "00000000-0000-0000-0000-000000000001",
+    "op": "vfs_open_workspace",
+    "request": {
+      "allow_missing": false,
+      "kind": "file",
+      "path": "/workspace/file.bin",
+      "rights": [
+        "read",
+        "stat"
+      ]
+    }
+  },
+  {
+    "agent_id": "00000000-0000-0000-0000-000000000001",
+    "op": "vfs_open_at",
+    "parent": "fixture",
+    "request": {
+      "allow_missing": false,
+      "kind": "file",
+      "path": "file.bin",
+      "rights": [
+        "read",
+        "stat"
+      ]
+    }
+  },
+  {
+    "agent_id": "00000000-0000-0000-0000-000000000001",
+    "handle": "fixture",
+    "op": "vfs_dup_workspace",
+    "rights": []
+  },
+  {
+    "agent_id": "00000000-0000-0000-0000-000000000001",
+    "handle": "fixture",
+    "max_bytes": 1,
+    "offset": 1,
+    "op": "vfs_read_workspace"
+  },
+  {
+    "agent_id": "00000000-0000-0000-0000-000000000001",
+    "data_base64": "fixture",
+    "handle": "fixture",
+    "op": "vfs_write_workspace"
+  },
+  {
+    "agent_id": "00000000-0000-0000-0000-000000000001",
+    "handle": "fixture",
+    "op": "vfs_list_workspace"
+  },
+  {
+    "agent_id": "00000000-0000-0000-0000-000000000001",
+    "handle": "fixture",
+    "op": "vfs_stat_workspace"
+  },
+  {
     "agent_id": null,
     "name": "fixture",
     "op": "create_agent",

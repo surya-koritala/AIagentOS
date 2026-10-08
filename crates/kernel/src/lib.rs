@@ -702,12 +702,15 @@ impl ResourceProvider for BuiltinFilesystemProvider {
     fn supported_operations(&self) -> Vec<String> {
         vec![
             "read".into(),
+            "read_bytes".into(),
             "write".into(),
+            "write_bytes".into(),
             "create".into(),
             "create_dir".into(),
             "edit".into(),
             "delete".into(),
             "list".into(),
+            "stat".into(),
         ]
     }
     async fn execute(

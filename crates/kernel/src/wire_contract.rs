@@ -46,6 +46,7 @@ pub const WIRE_FEATURES: &[&str] = &[
     "token_streaming",
     "typed_errors",
     "tool_vfs",
+    "workspace_vfs",
 ];
 
 /// A complete top-level protocol contract returned by `describe_protocol`.
@@ -154,6 +155,58 @@ const NI: JsonKind = JsonKind::IntegerOrNull;
 const ON: JsonKind = JsonKind::ObjectOrNull;
 
 const REQUEST_VARIANTS: &[Variant] = &[
+    Variant {
+        tag: "vfs_workspace_mounts",
+        fields: &[Field::required("agent_id", S)],
+    },
+    Variant {
+        tag: "vfs_open_workspace",
+        fields: &[
+            Field::required("agent_id", S),
+            Field::required("request", O),
+        ],
+    },
+    Variant {
+        tag: "vfs_open_at",
+        fields: &[
+            Field::required("agent_id", S),
+            Field::required("parent", S),
+            Field::required("request", O),
+        ],
+    },
+    Variant {
+        tag: "vfs_dup_workspace",
+        fields: &[
+            Field::required("agent_id", S),
+            Field::required("handle", S),
+            Field::required("rights", A),
+        ],
+    },
+    Variant {
+        tag: "vfs_read_workspace",
+        fields: &[
+            Field::required("agent_id", S),
+            Field::required("handle", S),
+            Field::optional("offset", I),
+            Field::optional("max_bytes", I),
+        ],
+    },
+    Variant {
+        tag: "vfs_write_workspace",
+        fields: &[
+            Field::required("agent_id", S),
+            Field::required("handle", S),
+            Field::required("data_base64", S),
+        ],
+    },
+    Variant {
+        tag: "vfs_list_workspace",
+        fields: &[Field::required("agent_id", S), Field::required("handle", S)],
+    },
+    Variant {
+        tag: "vfs_stat_workspace",
+        fields: &[Field::required("agent_id", S), Field::required("handle", S)],
+    },
     Variant {
         tag: "create_agent",
         fields: &[
@@ -800,6 +853,7 @@ pub fn conformance_request_fixtures(protocol_version: u32) -> Result<Vec<Value>,
                     ("signature_hex", JsonKind::String) => Value::String("00".into()),
                     ("availability", JsonKind::String) => Value::String("active".into()),
                     ("state", JsonKind::String) => Value::String("left".into()),
+                    ("request", JsonKind::Object) => serde_json::json!({"path":if variant.tag == "vfs_open_at" { "file.bin" } else { "/workspace/file.bin" },"kind":"file","rights":["read","stat"],"allow_missing":false}),
                     ("registration", JsonKind::Object) => serde_json::json!({
                         "node_id": "00000000-0000-0000-0000-000000000004",
                         "fingerprint": "0000000000000000000000000000000000000000000000000000000000000000",
@@ -854,6 +908,22 @@ pub fn conformance_request_fixtures(protocol_version: u32) -> Result<Vec<Value>,
 }
 
 const REPLY_VARIANTS: &[Variant] = &[
+    Variant {
+        tag: "workspace_opened",
+        fields: &[Field::required("handle", O)],
+    },
+    Variant {
+        tag: "workspace_read",
+        fields: &[Field::required("chunk", O)],
+    },
+    Variant {
+        tag: "workspace_written",
+        fields: &[Field::required("written_bytes", I)],
+    },
+    Variant {
+        tag: "workspace_stat",
+        fields: &[Field::required("metadata", O)],
+    },
     Variant {
         tag: "agent_created",
         fields: &[Field::required("id", S)],
@@ -1543,8 +1613,8 @@ mod tests {
                     });
             }
         }
-        assert_eq!(conformance_request_fixtures(1).unwrap().len(), 65);
-        assert_eq!(conformance_request_fixtures(2).unwrap().len(), 96);
+        assert_eq!(conformance_request_fixtures(1).unwrap().len(), 73);
+        assert_eq!(conformance_request_fixtures(2).unwrap().len(), 104);
         assert!(conformance_request_fixtures(0).is_err());
         assert!(conformance_request_fixtures(PROTOCOL_VERSION + 1).is_err());
     }

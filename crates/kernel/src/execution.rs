@@ -1869,17 +1869,22 @@ mod tests {
             })
             .await;
         assert_eq!(missing, foreign);
-        assert!(missing.starts_with("Tool not found."));
+        let visible_names = missing
+            .strip_prefix("Tool not found. Available tools: ")
+            .expect("tool lookup errors use the same public recovery envelope")
+            .split(", ")
+            .collect::<Vec<_>>();
         assert!(
-            !missing.contains("read_file")
-                && !missing.contains("does_not_exist")
+            !visible_names.contains(&"read_file")
+                && !visible_names.contains(&"does_not_exist")
                 && !missing.contains("ns="),
             "tool lookup errors must not reflect guessed or foreign catalog data: {missing}"
         );
         assert!(
-            missing.contains("write_file"),
+            visible_names.contains(&"write_file"),
             "visible global tools should remain useful recovery suggestions: {missing}"
         );
+        assert!(visible_names.contains(&"read_file_bytes"));
     }
 
     // Regression guard for the CLI wiring fix: once a syscall gate is installed
@@ -2837,7 +2842,8 @@ mod tests {
             mock_context_manager(),
             "test".into(),
         );
-        let limiter = execution_rate_limiter();
+        // Three billed attempts include the complete built-in tool catalog.
+        let limiter = execution_rate_limiter_with_tpm(20_000);
         executor.set_rate_limiter(limiter.clone());
 
         let output = executor.run("test").await.unwrap();
@@ -3023,11 +3029,15 @@ mod tests {
     }
 
     fn execution_rate_limiter() -> Arc<crate::rate_limit::RateLimiter> {
+        execution_rate_limiter_with_tpm(10_000)
+    }
+
+    fn execution_rate_limiter_with_tpm(tpm: u64) -> Arc<crate::rate_limit::RateLimiter> {
         Arc::new(
             crate::rate_limit::RateLimiter::with_store(
                 crate::rate_limit::RateLimitConfig {
                     rpm: 100,
-                    tpm: 10_000,
+                    tpm,
                     max_concurrent: 4,
                 },
                 mock_context_manager(),

@@ -55,7 +55,8 @@ Ownership-fenced deployments wrap handle mutations in the existing
 ## Remaining VFS work
 
 Issue [#392](https://github.com/surya-koritala/AIagentOS/issues/392) stays open.
-Workspace file/directory handles with attenuated rights, administrable
+[Workspace entry handles](WORKSPACE_VFS.md) now provide attenuated rights and
+governed read/write/list/stat with native directory capabilities. Administrable
 per-namespace mounts and unmount generations, memory/KV/IPC mounts, and
 dup/inheritance semantics remain separate delivery slices. This tool mount
 does not establish a complete VFS or production qualification. Durable

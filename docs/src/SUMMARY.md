@@ -49,3 +49,5 @@
 - [Operations Runbook](./runbook.md)
 
 - [Tool VFS](./vfs.md)
+
+- [Workspace VFS](./workspace-vfs.md)

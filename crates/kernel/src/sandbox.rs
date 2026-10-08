@@ -7,7 +7,7 @@ use std::collections::HashSet;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 #[cfg(test)]
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
 use cap_primitives::fs::FollowSymlinks;
@@ -36,6 +36,17 @@ pub(crate) const MAX_PROCESS_ARGUMENT_BYTES: usize = 64 * 1024;
 pub(crate) const MAX_PROCESS_ARGUMENT_BYTES_TOTAL: usize = 1024 * 1024;
 #[cfg(test)]
 type FilesystemTestPause = (Arc<AtomicBool>, Arc<AtomicBool>, Arc<AtomicBool>);
+
+#[cfg(test)]
+pub(crate) const WRITE_CRASH_EXIT_CODE: i32 = 73;
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug)]
+#[repr(u8)]
+pub(crate) enum WriteCrashBoundary {
+    AfterStageSync = 1,
+    AfterRename = 2,
+}
 
 /// The Sandbox Manager trait.
 #[async_trait::async_trait]
@@ -179,6 +190,8 @@ struct SandboxState {
     container_image: Option<String>,
     operation_lock: Arc<Mutex<()>>,
     process_lock: Arc<tokio::sync::Semaphore>,
+    #[cfg(test)]
+    write_crash_boundary: Arc<AtomicU8>,
 }
 
 /// Concrete sandbox manager implementation.
@@ -229,6 +242,28 @@ impl SandboxManagerImpl {
     #[cfg(test)]
     pub(crate) fn fail_next_destroy_for_test(&self) {
         self.fail_next_destroy.store(true, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn crash_next_write_for_test(
+        &self,
+        sandbox_id: SandboxId,
+        boundary: WriteCrashBoundary,
+    ) {
+        self.sandboxes
+            .get(&sandbox_id)
+            .expect("crash fixture has an actual sandbox")
+            .write_crash_boundary
+            .store(boundary as u8, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    fn write_crash_checkpoint_for_test(state: &SandboxState, boundary: WriteCrashBoundary) {
+        if state.write_crash_boundary.load(Ordering::Acquire) == boundary as u8 {
+            // Bypass every destructor in this dedicated child process. No
+            // production configuration or public syscall can arm this hook.
+            std::process::exit(WRITE_CRASH_EXIT_CODE);
+        }
     }
 
     #[cfg(test)]
@@ -561,6 +596,8 @@ impl SandboxManagerImpl {
             container_image: config.container_image.clone(),
             operation_lock: Arc::new(Mutex::new(())),
             process_lock: Arc::new(tokio::sync::Semaphore::new(1)),
+            #[cfg(test)]
+            write_crash_boundary: Arc::new(AtomicU8::new(0)),
         };
         if managed_workspace {
             managed_registry
@@ -957,6 +994,8 @@ impl SandboxManagerImpl {
             cancellation,
         )?;
         let temporary = Self::stage_file(workspace, relative, content, permissions, cancellation)?;
+        #[cfg(test)]
+        Self::write_crash_checkpoint_for_test(state, WriteCrashBoundary::AfterStageSync);
         if let Err(error) = Self::filesystem_checkpoint(cancellation) {
             let _ = workspace.remove_file(&temporary);
             return Err(error);
@@ -965,6 +1004,8 @@ impl SandboxManagerImpl {
             let _ = workspace.remove_file(&temporary);
             return Err(Self::filesystem_error("write commit", error));
         }
+        #[cfg(test)]
+        Self::write_crash_checkpoint_for_test(state, WriteCrashBoundary::AfterRename);
         Self::sync_parent_directory(workspace, relative)
     }
 

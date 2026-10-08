@@ -697,6 +697,14 @@ impl ResourceBrokerImpl {
         Self::build(permission_system, None, false)
     }
 
+    #[cfg(test)]
+    pub(crate) fn available_resource_permits_for_test(&self, resource: ResourceType) -> usize {
+        self.admission
+            .get(&resource)
+            .expect("resource class has an admission semaphore")
+            .available_permits()
+    }
+
     fn sandbox_action(request: &ResourceRequest) -> Result<SandboxAction, ResourceError> {
         let target = provider_target(
             &request.resource_type,

@@ -11,6 +11,7 @@ on:
       - 'crates/kernel/src/vfs/**'
       - 'crates/kernel/src/vfs.rs'
       - 'crates/kernel/src/sandbox.rs'
+      - 'crates/kernel/src/resources.rs'
       - 'tests/src/vfs_handle_props.rs'
       - '.github/workflows/vfs-acceptance.yml'
 
@@ -114,6 +115,12 @@ jobs:
           set -euo pipefail
           cargo test -p agent-sdk --test workspace_vfs windows_public_wire_ --locked -- --nocapture 2>&1 | tee vfs-acceptance-windows-reparse.log
           grep -F 'test result: ok. 3 passed; 0 failed; 0 ignored;' vfs-acceptance-windows-reparse.log
+      - name: Actual memory provider deadlines prevent late durable publication
+        if: ${{ !cancelled() && steps.source.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p kernel --lib --locked public_wire_memory_deadline_and_disconnect_cannot_publish_a_late_fact -- --nocapture 2>&1 | tee vfs-acceptance-memory-deadline.log
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()
         with:

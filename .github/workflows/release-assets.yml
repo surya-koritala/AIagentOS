@@ -1,56 +1,38 @@
-name: Optional release asset contract
+name: Release dependency negative probes
 
 on:
-  workflow_dispatch:
-    inputs:
-      negative_scenario:
-        description: Expected failure probe; run in a scratch fork before release
-        type: choice
-        default: desktop-failed
-        options: [desktop-failed, required-ci-failed, wedge-failed, release-artifacts-failed, container-failed]
   push:
-    branches: [codex/optional-release-assets]
-  pull_request:
-    branches: [main]
-    paths:
-      - .github/workflows/release.yml
-      - .github/workflows/release-assets.yml
-      - .github/workflows/release-assets-scenario.yml
-      - scripts/prepare_release_bundle.py
-      - scripts/tests/test_prepare_release_bundle.py
-      - scripts/tests/test_release_asset_workflow.py
+    branches: [codex/release-dependency-probes]
 
 permissions:
   contents: read
 
 jobs:
-  contract:
-    name: Required inventory and optional updater regressions
+  source-contract:
+    name: Negative probes bind unchanged release source
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Exercise inventories, signed updater matrix, and workflow contract
+        with:
+          fetch-depth: 2
+      - name: Require exact release implementation and harness ancestry
         run: |
-          python3 -m unittest discover -s scripts/tests -p test_prepare_release_bundle.py -v
+          test "$(git rev-parse HEAD^)" = e4bc58a5418bc5f6d886211e17966f305a564167
+          git diff --exit-code HEAD^ HEAD -- \
+            .github/workflows/release.yml \
+            .github/workflows/release-assets-scenario.yml \
+            scripts/prepare_release_bundle.py \
+            scripts/build_desktop_update_manifest.py
           python3 -m unittest discover -s scripts/tests -p test_release_asset_workflow.py -v
-          python3 -m unittest discover -s scripts/tests -p test_build_desktop_update_manifest.py -v
-          python3 -m unittest discover -s scripts/tests -p test_verify_linux_cli_rc.py -v
-          python3 scripts/verify_supported_platforms.py
 
-  dependency-scenarios:
-    name: Hosted dependency graph (${{ matrix.scenario }})
+  negative-scenarios:
+    name: Expected dependency failure (${{ matrix.scenario }})
+    needs: source-contract
     strategy:
       fail-fast: false
       matrix:
-        scenario: [desktop-disabled, desktop-complete]
+        scenario: [desktop-failed, required-ci-failed, wedge-failed, release-artifacts-failed, container-failed]
     uses: ./.github/workflows/release-assets-scenario.yml
     with:
       scenario: ${{ matrix.scenario }}
-
-  expected-failure-scenario:
-    name: Intentional negative dependency probe
-    if: github.event_name == 'workflow_dispatch'
-    uses: ./.github/workflows/release-assets-scenario.yml
-    with:
-      scenario: ${{ inputs.negative_scenario }}

@@ -334,43 +334,7 @@ impl SseDecoder {
 }
 
 fn regular_response(json: &Value, provider: &str) -> Result<LlmResponse, ConnectorError> {
-    let message = &json["choices"][0]["message"];
-    if !message.is_object() {
-        return Err(protocol("missing completion message"));
-    }
-    if let Some(error) =
-        crate::content_filter_error(provider, json["choices"][0]["finish_reason"].as_str())
-    {
-        return Err(error);
-    }
-    let mut state = StreamState {
-        done: true,
-        content: message["content"].as_str().unwrap_or("").to_string(),
-        finish_reason: json["choices"][0]["finish_reason"]
-            .as_str()
-            .map(ToString::to_string),
-        ..Default::default()
-    };
-    if let Some((usage, tokens_used)) = read_usage(json) {
-        state.usage = usage;
-        state.tokens_used = tokens_used;
-    }
-    if let Some(calls) = message["tool_calls"].as_array() {
-        if calls.len() > MAX_TOOL_CALLS {
-            return Err(protocol("excessive tool calls"));
-        }
-        for (index, call) in calls.iter().enumerate() {
-            let mut pending = PendingTool::default();
-            update_identity(&mut pending.id, &call["id"])?;
-            update_identity(&mut pending.name, &call["function"]["name"])?;
-            pending.arguments = call["function"]["arguments"]
-                .as_str()
-                .ok_or_else(|| protocol("invalid tool arguments field"))?
-                .to_string();
-            state.tools.insert(index, pending);
-        }
-    }
-    state.response()
+    crate::openai_chat::parse(json, provider)
 }
 
 async fn parse_openai_stream(

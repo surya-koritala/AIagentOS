@@ -68,15 +68,18 @@ pub(crate) fn parse(value: &Value, provider: &str) -> Result<LlmResponse, Connec
             calls.push(ToolCall {id:id.to_string(), name:name.to_string(), arguments});
         }
     }
-    let reported = value["usage"].is_object();
+    let usage_value = value.get("usage").filter(|usage| usage.is_object())
+        .unwrap_or(&value["x_groq"]["usage"]);
+    let reported = usage_value.is_object();
     let usage = LlmUsage {
-        input_tokens: crate::json_usage_u32(&value["usage"]["prompt_tokens"]),
-        output_tokens: crate::json_usage_u32(&value["usage"]["completion_tokens"]),
-        cached_tokens: crate::json_usage_u32(&value["usage"]["prompt_tokens_details"]["cached_tokens"]),
+        input_tokens: crate::json_usage_u32(&usage_value["prompt_tokens"]),
+        output_tokens: crate::json_usage_u32(&usage_value["completion_tokens"]),
+        cached_tokens: crate::json_usage_u32(usage_value["prompt_tokens_details"].get("cached_tokens")
+            .or_else(|| usage_value.get("prompt_cache_hit_tokens")).unwrap_or(&Value::Null)),
         provider_reported: reported,
     };
     Ok(LlmResponse {
-        tokens_used: if reported { crate::json_usage_u32(&value["usage"]["total_tokens"]).max(usage.total()) }
+        tokens_used: if reported { crate::json_usage_u32(&usage_value["total_tokens"]).max(usage.total()) }
             else { u32::try_from(content.len()).unwrap_or(u32::MAX) },
         content, finish_reason: choice["finish_reason"].as_str().map(str::to_string), usage,
         tool_calls: calls, provider_metadata: None,

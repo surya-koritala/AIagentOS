@@ -176,7 +176,10 @@ mod tests {
             let (mut stream, _) = listener.accept().await.unwrap();
             let mut request = [0u8; 1024];
             assert!(stream.read(&mut request).await.unwrap() > 0);
-            stream.write_all(b"invalid HTTP response\r\n").await.unwrap();
+            stream
+                .write_all(b"invalid HTTP response\r\n")
+                .await
+                .unwrap();
             stream.shutdown().await.unwrap();
         };
         let request = session.send(vec![StandardMessage::user("Hi")]);

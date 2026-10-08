@@ -6442,6 +6442,8 @@ mod tests {
         subject: &str,
         step: &str,
     ) {
+        let child_temporary = database.root.join("crash-process-temp");
+        std::fs::create_dir(&child_temporary).unwrap();
         let child = std::process::Command::new(std::env::current_exe().unwrap())
             .arg("--ignored")
             .arg("live_erasure_crash_child_only")
@@ -6452,9 +6454,11 @@ mod tests {
             // Rehydration reconciles the process-local managed workspace root.
             // Give every crash child its own root so it cannot classify a
             // concurrently running test process's workspaces as orphaned.
-            .env("TMPDIR", &database.root)
-            .env("TMP", &database.root)
-            .env("TEMP", &database.root)
+            // Keep this separate from the private database parent, whose ACL
+            // must not be mistaken for a shared temporary-root mutation.
+            .env("TMPDIR", &child_temporary)
+            .env("TMP", &child_temporary)
+            .env("TEMP", &child_temporary)
             .status()
             .unwrap();
         assert_eq!(

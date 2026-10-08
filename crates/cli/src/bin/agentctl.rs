@@ -114,18 +114,23 @@ fn read_message_content(source: &str) -> agent_sdk::MessageContent {
         std::io::stdin()
             .take(limit)
             .read_to_end(&mut bytes)
-            .unwrap_or_else(|_| fail("could not read content input"));
+            .unwrap_or_else(|_| content_input_error("could not read content input"));
     } else {
         std::fs::File::open(source)
-            .unwrap_or_else(|_| fail("could not open content input"))
+            .unwrap_or_else(|_| content_input_error("could not open content input"))
             .take(limit)
             .read_to_end(&mut bytes)
-            .unwrap_or_else(|_| fail("could not read content input"));
+            .unwrap_or_else(|_| content_input_error("could not read content input"));
     }
     if bytes.len() as u64 == limit {
-        fail("message content input exceeds byte limit");
+        content_input_error("message content input exceeds byte limit");
     }
-    serde_json::from_slice(&bytes).unwrap_or_else(|_| fail("invalid message content input"))
+    serde_json::from_slice(&bytes).unwrap_or_else(|_| content_input_error("invalid message content input"))
+}
+
+fn content_input_error(message: &'static str) -> ! {
+    eprintln!("error: {message}");
+    std::process::exit(1);
 }
 
 /// Usage error. Diagnostics go to stderr with a non-zero exit so a mistyped

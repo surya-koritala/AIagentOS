@@ -122,7 +122,10 @@ impl LlmSession for OpenAiSession {
             Ok(resp) if resp.status().is_success() => {
                 crate::openai_chat::response(resp, &self.provider_id).await
             }
-            Ok(resp) => Err(crate::vision::protect_error(crate::provider_http_error(&self.provider_id, resp).await,&messages)),
+            Ok(resp) => Err(crate::vision::protect_error(
+                crate::provider_http_error(&self.provider_id, resp).await,
+                &messages,
+            )),
             Err(e) => Err(crate::transport_error(&self.provider_id, e)),
         }
     }
@@ -163,7 +166,7 @@ impl LlmSession for OpenAiSession {
             None,
         )
         .await
-        .map_err(|error|crate::vision::protect_error(error,&messages))
+        .map_err(|error| crate::vision::protect_error(error, &messages))
     }
 
     async fn send_streaming_events_controlled(
@@ -183,7 +186,7 @@ impl LlmSession for OpenAiSession {
             Some(events),
         )
         .await
-        .map_err(|error|crate::vision::protect_error(error,&messages))
+        .map_err(|error| crate::vision::protect_error(error, &messages))
     }
 
     fn enforces_max_output_tokens(&self) -> bool {

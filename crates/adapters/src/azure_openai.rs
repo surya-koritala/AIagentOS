@@ -201,7 +201,10 @@ impl LlmSession for AzureSession {
                     provider_metadata: None,
                 })
             }
-            Ok(resp) => Err(crate::vision::protect_error(crate::provider_http_error(&self.provider_id, resp).await,&messages)),
+            Ok(resp) => Err(crate::vision::protect_error(
+                crate::provider_http_error(&self.provider_id, resp).await,
+                &messages,
+            )),
             Err(e) => Err(crate::transport_error(&self.provider_id, e)),
         }
     }
@@ -242,7 +245,7 @@ impl LlmSession for AzureSession {
             None,
         )
         .await
-        .map_err(|error|crate::vision::protect_error(error,&messages))
+        .map_err(|error| crate::vision::protect_error(error, &messages))
     }
 
     async fn send_streaming_events_controlled(
@@ -262,7 +265,7 @@ impl LlmSession for AzureSession {
             Some(events),
         )
         .await
-        .map_err(|error|crate::vision::protect_error(error,&messages))
+        .map_err(|error| crate::vision::protect_error(error, &messages))
     }
 
     fn enforces_max_output_tokens(&self) -> bool {

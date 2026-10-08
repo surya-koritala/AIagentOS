@@ -90,7 +90,7 @@ impl AnthropicSession {
             events,
         )
         .await
-        .map_err(|error|crate::vision::protect_error(error,&messages))
+        .map_err(|error| crate::vision::protect_error(error, &messages))
     }
 }
 
@@ -191,7 +191,10 @@ impl LlmSession for AnthropicSession {
                     tool_calls,
                 })
             }
-            Ok(resp) => Err(crate::vision::protect_error(crate::provider_http_error(&self.provider_id, resp).await,&messages)),
+            Ok(resp) => Err(crate::vision::protect_error(
+                crate::provider_http_error(&self.provider_id, resp).await,
+                &messages,
+            )),
             Err(e) => Err(crate::transport_error(&self.provider_id, e)),
         }
     }

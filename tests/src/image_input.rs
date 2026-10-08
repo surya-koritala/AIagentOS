@@ -256,30 +256,135 @@ async fn image_input_typed_stream_fences_and_exact_cancellation_prevent_replay()
     use agent_sdk::AgentMutationFenceProof;
     use std::time::Duration;
     let provider = MockServer::start().await;
-    Mock::given(method("POST")).and(path("/chat/completions"))
-        .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(5)).set_body_string("data: [DONE]\n\n")).expect(1).mount(&provider).await;
-    let kernel = Arc::new(AgentKernelImpl::new().unwrap()); register(&kernel,&provider);
-    let agent = kernel.create_agent_full(config()).await.unwrap().id.to_string();
-    let proof = AgentMutationFenceProof{cluster_id:uuid::Uuid::new_v4().to_string(),owner_node_id:kernel.cluster_control.identity().node_id.clone(),authority_term:2,authority_generation:7,fencing_token:3,proof_expires_at:chrono::Utc::now()+chrono::Duration::seconds(60)};
-    kernel.cluster_control.install_agent_mutation_fence(&agent,&proof.cluster_id,&proof.owner_node_id,proof.authority_term,proof.authority_generation,proof.fencing_token,proof.proof_expires_at,"system","image fixture").unwrap();
-    let server = SyscallServer::bind(kernel.clone(),"127.0.0.1:0").await.unwrap().with_auth_token("image-system-fixture");
-    let address = server.local_addr().unwrap().to_string(); let task = tokio::spawn(server.serve());
-    let mut stream_client = KernelClient::connect(&address).await.unwrap();stream_client.authenticate("image-system-fixture").await.unwrap();
-    assert_eq!(stream_client.send_message_content(&agent,content()).await.unwrap_err().wire_code(),Some(WireErrorCode::Conflict));
-    let mut stale = proof.clone();stale.fencing_token=2;
-    assert_eq!(stream_client.send_message_content_fenced(&agent,stale,content()).await.unwrap_err().wire_code(),Some(WireErrorCode::Conflict));
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(Duration::from_secs(5))
+                .set_body_string("data: [DONE]\n\n"),
+        )
+        .expect(1)
+        .mount(&provider)
+        .await;
+    let kernel = Arc::new(AgentKernelImpl::new().unwrap());
+    register(&kernel, &provider);
+    let agent = kernel
+        .create_agent_full(config())
+        .await
+        .unwrap()
+        .id
+        .to_string();
+    let proof = AgentMutationFenceProof {
+        cluster_id: uuid::Uuid::new_v4().to_string(),
+        owner_node_id: kernel.cluster_control.identity().node_id.clone(),
+        authority_term: 2,
+        authority_generation: 7,
+        fencing_token: 3,
+        proof_expires_at: chrono::Utc::now() + chrono::Duration::seconds(60),
+    };
+    kernel
+        .cluster_control
+        .install_agent_mutation_fence(
+            &agent,
+            &proof.cluster_id,
+            &proof.owner_node_id,
+            proof.authority_term,
+            proof.authority_generation,
+            proof.fencing_token,
+            proof.proof_expires_at,
+            "system",
+            "image fixture",
+        )
+        .unwrap();
+    let server = SyscallServer::bind(kernel.clone(), "127.0.0.1:0")
+        .await
+        .unwrap()
+        .with_auth_token("image-system-fixture");
+    let address = server.local_addr().unwrap().to_string();
+    let task = tokio::spawn(server.serve());
+    let mut stream_client = KernelClient::connect(&address).await.unwrap();
+    stream_client
+        .authenticate("image-system-fixture")
+        .await
+        .unwrap();
+    assert_eq!(
+        stream_client
+            .send_message_content(&agent, content())
+            .await
+            .unwrap_err()
+            .wire_code(),
+        Some(WireErrorCode::Conflict)
+    );
+    let mut stale = proof.clone();
+    stale.fencing_token = 2;
+    assert_eq!(
+        stream_client
+            .send_message_content_fenced(&agent, stale, content())
+            .await
+            .unwrap_err()
+            .wire_code(),
+        Some(WireErrorCode::Conflict)
+    );
     assert!(provider.received_requests().await.unwrap().is_empty());
-    let mut cancellation = KernelClient::connect(&address).await.unwrap();cancellation.authenticate("image-system-fixture").await.unwrap();
-    let owned_agent = agent.clone();let owned_proof = proof.clone();
-    let (started,mut events) = tokio::sync::mpsc::unbounded_channel();
-    let stream = tokio::spawn(async move {stream_client.send_message_content_stream_fenced("image-fenced-cancel",owned_agent,owned_proof,content(),|event|if matches!(event,MessageStreamEvent::Started){let _=started.send(());}).await});
-    tokio::time::timeout(Duration::from_secs(2),events.recv()).await.unwrap().unwrap();
-    tokio::time::timeout(Duration::from_secs(2),async {while provider.received_requests().await.unwrap().is_empty(){tokio::task::yield_now().await;}}).await.unwrap();
-    assert!(!cancellation.cancel_request_fenced("wrong-image-request",&agent,proof.clone()).await.unwrap());
-    assert!(cancellation.cancel_request_fenced("image-fenced-cancel",&agent,proof.clone()).await.unwrap());
-    let error = tokio::time::timeout(Duration::from_secs(2),stream).await.unwrap().unwrap().unwrap_err();
-    assert_eq!(error.wire_code(),Some(WireErrorCode::Cancelled));
-    assert!(!cancellation.cancel_request_fenced("image-fenced-cancel",&agent,proof).await.unwrap());
-    assert_eq!(provider.received_requests().await.unwrap().len(),1,"cancelled image turn must not retry");
-    drop(cancellation);task.abort();let _=task.await; kernel.stop_agent(agent.parse().unwrap()).await.unwrap();
+    let mut cancellation = KernelClient::connect(&address).await.unwrap();
+    cancellation
+        .authenticate("image-system-fixture")
+        .await
+        .unwrap();
+    let owned_agent = agent.clone();
+    let owned_proof = proof.clone();
+    let (started, mut events) = tokio::sync::mpsc::unbounded_channel();
+    let stream = tokio::spawn(async move {
+        stream_client
+            .send_message_content_stream_fenced(
+                "image-fenced-cancel",
+                owned_agent,
+                owned_proof,
+                content(),
+                |event| {
+                    if matches!(event, MessageStreamEvent::Started) {
+                        let _ = started.send(());
+                    }
+                },
+            )
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(2), events.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while provider.received_requests().await.unwrap().is_empty() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(!cancellation
+        .cancel_request_fenced("wrong-image-request", &agent, proof.clone())
+        .await
+        .unwrap());
+    assert!(cancellation
+        .cancel_request_fenced("image-fenced-cancel", &agent, proof.clone())
+        .await
+        .unwrap());
+    let error = tokio::time::timeout(Duration::from_secs(2), stream)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(error.wire_code(), Some(WireErrorCode::Cancelled));
+    assert!(!cancellation
+        .cancel_request_fenced("image-fenced-cancel", &agent, proof)
+        .await
+        .unwrap());
+    assert_eq!(
+        provider.received_requests().await.unwrap().len(),
+        1,
+        "cancelled image turn must not retry"
+    );
+    drop(cancellation);
+    task.abort();
+    let _ = task.await;
+    kernel.stop_agent(agent.parse().unwrap()).await.unwrap();
 }

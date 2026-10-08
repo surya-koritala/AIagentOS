@@ -729,8 +729,10 @@ pub fn validate_messages(
     {
         return Ok(0);
     }
-    if image_count > MAX_IMAGES_PER_REQUEST || image_bytes > MAX_IMAGE_BYTES_PER_REQUEST
-        || serde_json::to_vec(messages).map_or(true,|bytes|bytes.len() > MAX_IMAGE_REQUEST_BYTES) {
+    if image_count > MAX_IMAGES_PER_REQUEST
+        || image_bytes > MAX_IMAGE_BYTES_PER_REQUEST
+        || serde_json::to_vec(messages).map_or(true, |bytes| bytes.len() > MAX_IMAGE_REQUEST_BYTES)
+    {
         return Err(ConnectorError::ProtocolError(invalid()));
     }
     let profile = profile.ok_or_else(|| ConnectorError::unsupported_content(provider.clone()))?;
@@ -933,6 +935,8 @@ mod tests {
             .decode(PNG)
             .unwrap();
         bytes[16..20].copy_from_slice(&(MAX_IMAGE_DIMENSION + 1).to_be_bytes());
+        let crc = png_crc(&bytes[12..29]);
+        bytes[29..33].copy_from_slice(&crc.to_be_bytes());
         assert!(ImageInput::new(
             ImageMediaType::Png,
             base64::engine::general_purpose::STANDARD.encode(bytes)
@@ -969,7 +973,12 @@ mod tests {
             3000
         );
         assert!(profile.validate("another-model").is_err());
-        assert!(validate_messages(&vec![message.clone();MAX_IMAGES_PER_REQUEST+1],&provider,Some(&profile)).is_err());
+        assert!(validate_messages(
+            &vec![message.clone(); MAX_IMAGES_PER_REQUEST + 1],
+            &provider,
+            Some(&profile)
+        )
+        .is_err());
         let audio = crate::connector::StandardMessage::user_content(
             MessageContent::parts(vec![ContentPart::Audio]).unwrap(),
         );

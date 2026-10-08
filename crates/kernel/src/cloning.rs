@@ -428,6 +428,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn restart_preserves_managed_clone_data_for_every_isolation_backend() {
+        for level in [
+            crate::IsolationLevel::Filesystem,
+            crate::IsolationLevel::Trusted,
+            crate::IsolationLevel::Container,
+        ] {
+            let root = std::env::temp_dir().join(format!("clone-backend-{}", AgentId::new_v4()));
+            std::fs::create_dir_all(&root).unwrap();
+            let path = root.join("store.db");
+            let (parent, child, workspace) = {
+                let kernel = AgentKernelImpl::with_db_path(&path).unwrap();
+                let parent = kernel.create_agent_full(config()).await.unwrap().id;
+                let child = AgentId::new_v4();
+                kernel
+                    .clone_agent(parent, child, "backend clone".into(), vec![])
+                    .await
+                    .unwrap();
+                let mut record = kernel
+                    .context_manager
+                    .load_all_agents()
+                    .unwrap()
+                    .into_iter()
+                    .find(|record| record.id == child)
+                    .unwrap();
+                let mut sandbox: crate::SandboxConfig =
+                    serde_json::from_str(record.sandbox_config_json.as_deref().unwrap()).unwrap();
+                let workspace = sandbox.workspace_dir.clone();
+                std::fs::write(workspace.join("retained.txt"), "independent child data").unwrap();
+                // This recovery fixture changes only the backend metadata. It
+                // invokes no process and therefore requires no container image.
+                sandbox.isolation_level = level.clone();
+                sandbox.container_image = Some(format!("fixture@sha256:{}", "f".repeat(64)));
+                record.sandbox_config_json = Some(serde_json::to_string(&sandbox).unwrap());
+                kernel.context_manager.save_agent(&record).unwrap();
+                (parent, child, workspace)
+            };
+            let kernel = AgentKernelImpl::with_db_path(&path).unwrap();
+            assert_eq!(
+                std::fs::read_to_string(workspace.join("retained.txt")).unwrap(),
+                "independent child data"
+            );
+            if kernel.agent_manager.get_agent_state(child).is_some() {
+                kernel.stop_agent(child).await.unwrap();
+                assert!(
+                    !workspace.exists(),
+                    "restored managed ownership must reclaim its workspace"
+                );
+            } else {
+                // An unsupported backend stays unadmitted while its owned
+                // contents remain available for recovery on a supported host.
+                std::fs::remove_dir_all(&workspace).unwrap();
+            }
+            kernel.stop_agent(parent).await.unwrap();
+            drop(kernel);
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[tokio::test]
     async fn stop_and_clone_serialize_without_a_dangling_child() {
         let kernel = AgentKernelImpl::new().unwrap();
         let parent = kernel.create_agent_full(config()).await.unwrap().id;

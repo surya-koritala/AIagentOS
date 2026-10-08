@@ -152,7 +152,14 @@ def qualify(dist: Path, archive: Path, target: str, commit: str, output: Path) -
                 if result.stdout.strip() != "arm64":
                     raise InstallationError("macOS archive contains a non-native or universal binary")
         config = root / "config.toml"
-        config.write_text(f"data_dir = {json.dumps(str(root / 'data'))}\nsetup_complete = true\n", encoding="utf-8")
+        config.write_text(
+            'llm_provider = "offline-installation-fixture"\n'
+            'default_model = "no-provider-call"\n'
+            'api_keys = {}\n'
+            f"data_dir = {json.dumps(str(root / 'data'))}\n"
+            "setup_complete = true\n",
+            encoding="utf-8",
+        )
         environment["AGENT_SERVER_CONFIG"] = str(config)
         with socket.socket() as reservation:
             reservation.bind(("127.0.0.1", 0))

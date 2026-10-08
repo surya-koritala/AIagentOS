@@ -49,11 +49,13 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Verify synchronized versions and platform assets
-        run: python3 scripts/verify_desktop_release.py
+        run: |
+          python3 scripts/verify_desktop_release.py
+          python3 scripts/verify_supported_platforms.py
       - name: Block public tags until native signing and clean-host qualification land
         if: startsWith(github.ref, 'refs/tags/v')
         run: |
-          echo "::error title=Desktop publication is not qualified::Native platform signing, notarization, clean-host install/upgrade/failed-update/rollback evidence, and the supported-platform matrix remain release blockers under issue #126."
+          echo "::error title=Desktop publication is not qualified::Native platform signing, notarization, and final-artifact clean-host install/upgrade/failed-update/rollback qualification for the documented platform matrix remain release blockers under issue #126."
           exit 1
 
   desktop-artifacts:

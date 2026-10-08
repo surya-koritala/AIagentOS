@@ -273,8 +273,13 @@ impl SandboxManagerImpl {
     }
 
     pub fn is_managed_config(config: &SandboxConfig) -> bool {
-        if !config.workspace_dir.starts_with(Self::managed_root())
-            || config.isolation_level != IsolationLevel::Filesystem
+        let reserved_root = std::fs::canonicalize(Self::managed_root()).ok();
+        let parent = config
+            .workspace_dir
+            .parent()
+            .and_then(|parent| std::fs::canonicalize(parent).ok());
+        if reserved_root.is_none()
+            || parent != reserved_root
             || !config
                 .workspace_dir
                 .file_name()

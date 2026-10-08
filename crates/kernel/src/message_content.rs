@@ -159,7 +159,7 @@ fn png_dimensions(bytes: &[u8]) -> Result<(u32, u32), String> {
                     || data_ended
                     || matches!(color, 0 | 4)
                     || length == 0
-                    || length % 3 != 0
+                    || !length.is_multiple_of(3)
                     || length > 768
                     || (color == 3 && length / 3 > 1usize << depth)
                 {
@@ -237,7 +237,7 @@ fn jpeg_dimensions(bytes: &[u8]) -> Result<(u32, u32), String> {
         let end = offset.checked_add(size).ok_or_else(invalid)?;
         let segment = bytes.get(offset + 2..end).ok_or_else(invalid)?;
         match marker {
-            0xc0 | 0xc1 | 0xc2 => {
+            0xc0..=0xc2 => {
                 if dimensions.is_some() || segment.len() < 6 || segment[0] != 8 {
                     return Err(invalid());
                 }

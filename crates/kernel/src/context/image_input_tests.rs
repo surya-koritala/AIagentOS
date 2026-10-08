@@ -73,7 +73,7 @@ fn image_input_schema13_restart_snapshots_spills_checkpoints_and_erasure_retain_
         let child = agent(&manager, "tenant-image");
         let foreign = agent(&manager, "tenant-foreign");
         let image = image_message();
-        let spill = serde_json::to_string(&[image.clone()]).unwrap();
+        let spill = serde_json::to_string(std::slice::from_ref(&image)).unwrap();
         let digest = memory_content_hash(&spill);
         let key = "context_spill:image:fixture";
         manager

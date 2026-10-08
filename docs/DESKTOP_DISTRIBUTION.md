@@ -75,9 +75,12 @@ generated binaries.
 
 ## Fail-closed publication
 
-A manual dispatch of `release.yml` qualifies updater-signed but native-unsigned
-installers only when the protected updater identity is provisioned. A public
-`v*` tag is deliberately rejected by `desktop-release-contract` until all of
+A manual dispatch of `release.yml` builds desktop qualification installers only
+when `desktop_assets=true` and the protected updater identity is provisioned.
+Desktop assets are disabled by default. Stable tags request them only when
+`DESKTOP_ASSETS_QUALIFIED=true`; a CLI-only tag excludes desktop and updater
+assets and explains those omissions in its release notes. A public `v*` tag
+that requests desktop assets is deliberately rejected by `desktop-release-contract` until all of
 the following are implemented and exercised against the exact release candidate:
 
 1. protected native signing identities for Linux, macOS, and Windows;
@@ -87,5 +90,8 @@ the following are implemented and exercised against the exact release candidate:
 4. an explicit supported OS/architecture matrix and user-facing verification
    instructions.
 
-Skipping or weakening that gate is not a release procedure. The remaining work
-is tracked by issue #126.
+The desktop block does not prevent required CLI evidence from being assembled.
+Its failure still excludes every desktop artifact, including partial matrix
+output. `latest.json` requires signed pairs for every updater format on all five
+platforms; missing pairs omit it and malformed signatures fail closed. The
+remaining desktop qualification work is tracked by issue #126.

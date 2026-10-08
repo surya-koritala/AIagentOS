@@ -1,0 +1,68 @@
+name: Bounded wire frame latency evidence
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - crates/kernel/src/wire_io.rs
+      - crates/kernel/src/wire_io/**
+      - crates/kernel/src/syscall_server.rs
+      - .github/workflows/wire-framing.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: wire-framing-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+env:
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  wire-proof:
+    name: Framing, real SDK, and paired loopback (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    env:
+      OPENSSL_SRC_PERL: ${{ matrix.os == 'windows-latest' && 'C:/Strawberry/perl/bin/perl.exe' || 'perl' }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
+        with:
+          toolchain: 1.97.1
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+        with:
+          save-if: false
+      - name: Retain source and environment
+        env:
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          printf '%s\n' "$PR_HEAD" > wire-head.txt
+          git rev-parse HEAD > wire-tested-merge.txt
+          rustc --version > wire-toolchain.txt
+          git status --porcelain --untracked-files=no > wire-source-state.txt
+      - name: Bounded framing and identical paired loopback trials
+        run: |
+          set -euo pipefail
+          cargo test -p kernel --lib --locked wire_io:: -- --nocapture 2>&1 | tee wire-boundary-and-latency.log
+      - name: Real public SDK VFS effects and authority regressions
+        if: success() || failure()
+        run: |
+          set -euo pipefail
+          cargo test -p agent-sdk --test vfs --locked -- --nocapture 2>&1 | tee wire-sdk-vfs.log
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: wire-framing-${{ matrix.os }}-${{ github.run_id }}
+          path: |
+            wire-*.txt
+            wire-*.log
+          if-no-files-found: error

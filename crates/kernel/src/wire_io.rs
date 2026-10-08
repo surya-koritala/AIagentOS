@@ -209,15 +209,21 @@ where
     W: AsyncWrite + Unpin,
     T: Serialize + ?Sized,
 {
-    let payload = serde_json::to_vec(value).map_err(std::io::Error::other)?;
+    let mut payload = serde_json::to_vec(value).map_err(std::io::Error::other)?;
     if payload.len() > max_bytes {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!("JSON frame exceeds {max_bytes} bytes"),
         ));
     }
+    // Keep the delimiter with its JSON so a tiny second write cannot wait on
+    // an acknowledgement while the peer waits for the rest of this frame.
+    // Reserve exactly one byte rather than doubling a full-size frame buffer.
+    payload
+        .try_reserve_exact(1)
+        .map_err(std::io::Error::other)?;
+    payload.push(b'\n');
     writer.write_all(&payload).await?;
-    writer.write_all(b"\n").await?;
     writer.flush().await
 }
 
@@ -253,6 +259,9 @@ where
         )),
     }
 }
+
+#[cfg(test)]
+mod latency_tests;
 
 #[cfg(test)]
 mod tests {
@@ -469,6 +478,12 @@ mod tests {
             .await
             .expect_err("oversized");
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(output, b"{\"ok\":true}\n", "rejected frames emit no partial bytes");
+        let mut exact = Vec::new();
+        write_bounded_json(&mut exact, &"λ", 4).await.unwrap();
+        assert_eq!(exact, "\"λ\"\n".as_bytes());
+        assert!(write_bounded_json(&mut exact, &"λ", 3).await.is_err());
+        assert_eq!(exact, "\"λ\"\n".as_bytes());
     }
 
     #[tokio::test]

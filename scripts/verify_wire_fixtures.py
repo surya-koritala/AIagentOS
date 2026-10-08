@@ -40,6 +40,7 @@ V2_ONLY_OPERATIONS = {
     "list_cluster_membership_audit",
     "list_agent_mutation_fence_audit",
     "list_node_control_audit",
+    "list_provider_models",
     "ping",
     "prove_node_identity",
     "prepare_cluster_member_certificate_rollout",

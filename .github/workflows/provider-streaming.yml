@@ -12,6 +12,8 @@ on:
       - 'crates/sdk/**'
       - 'crates/cli/**'
       - 'protocol/**'
+      - 'scripts/verify_wire_fixtures.py'
+      - 'scripts/tests/test_verify_wire_fixtures.py'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - '.github/workflows/provider-streaming.yml'
@@ -54,6 +56,8 @@ jobs:
             git diff --binary > rustfmt.patch
             exit 1
           fi
+      - name: Versioned operation-set conformance without provider calls
+        run: python -m unittest discover -s scripts/tests -p 'test_verify_wire_fixtures.py'
       - name: Early bounded model discovery and capability contracts
         run: cargo test -p adapters --all-features --locked model_discovery
       - name: System-only catalog authorization and third-party bounds

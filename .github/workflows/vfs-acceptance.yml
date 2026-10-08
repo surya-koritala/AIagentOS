@@ -9,6 +9,8 @@ on:
       - 'crates/sdk/tests/data_vfs.rs'
       - 'crates/sdk/tests/durable_conversation.rs'
       - 'crates/kernel/src/vfs/**'
+      - 'crates/kernel/src/vfs.rs'
+      - 'crates/kernel/src/sandbox.rs'
       - 'tests/src/vfs_handle_props.rs'
       - '.github/workflows/vfs-acceptance.yml'
 

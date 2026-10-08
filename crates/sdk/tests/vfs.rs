@@ -143,7 +143,13 @@ async fn vfs_restart_never_restores_an_old_handle() {
     assert_eq!(client.agent_status(&agent).await.unwrap(), "Running");
     let fresh = client.vfs_open(&agent, "/tools/read_file").await.unwrap();
     assert_ne!(fresh.id, handle.id);
-    assert_eq!(client.vfs_invoke(&agent, &fresh.id, json!({"path":"proof.txt"})).await.unwrap()["content"], "governed file contents");
+    assert_eq!(
+        client
+            .vfs_invoke(&agent, &fresh.id, json!({"path":"proof.txt"}))
+            .await
+            .unwrap()["content"],
+        "governed file contents"
+    );
     client.vfs_close(&agent, fresh.id).await.unwrap();
     client.close().await.unwrap();
     task.abort();

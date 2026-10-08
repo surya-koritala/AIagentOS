@@ -520,20 +520,87 @@ async fn clone_wire_enforces_tenants_roles_identity_and_fresh_vfs_handles() {
         )
         .await
         .unwrap();
-    let kv_read = client.vfs_dup_data(parent.to_string(), &handle.id, vec![WorkspaceRight::Read]).await.unwrap();
-    let tool = client.vfs_open(parent.to_string(), "/tools/read_file").await.unwrap();
-    let workspace = client.vfs_open_workspace(parent.to_string(), WorkspaceOpenRequest {
-        path: "/workspace".into(), kind: WorkspaceKind::Directory,
-        rights: vec![WorkspaceRight::Read, WorkspaceRight::Write, WorkspaceRight::List, WorkspaceRight::Stat],
-        allow_missing: false,
-    }).await.unwrap();
-    let workspace_list = client.vfs_dup_workspace(parent.to_string(), &workspace.id, vec![WorkspaceRight::List]).await.unwrap();
-    let memory = client.vfs_open_data(parent.to_string(), "/memory", vec![WorkspaceRight::Read, WorkspaceRight::Write, WorkspaceRight::Stat]).await.unwrap();
-    let memory_read = client.vfs_dup_data(parent.to_string(), &memory.id, vec![WorkspaceRight::Read]).await.unwrap();
-    client.vfs_write_data(parent.to_string(), &memory.id, serde_json::json!({"content":"private parent semantic fact", "category":"fact"})).await.unwrap();
-    let ipc = client.vfs_open_data(parent.to_string(), "/ipc", vec![WorkspaceRight::Read, WorkspaceRight::Write, WorkspaceRight::Stat]).await.unwrap();
-    let ipc_read = client.vfs_dup_data(parent.to_string(), &ipc.id, vec![WorkspaceRight::Read]).await.unwrap();
-    client.vfs_write_data(parent.to_string(), &ipc.id, serde_json::json!({"to":parent, "payload":{"private":"parent mailbox"}})).await.unwrap();
+    let kv_read = client
+        .vfs_dup_data(parent.to_string(), &handle.id, vec![WorkspaceRight::Read])
+        .await
+        .unwrap();
+    let tool = client
+        .vfs_open(parent.to_string(), "/tools/read_file")
+        .await
+        .unwrap();
+    let workspace = client
+        .vfs_open_workspace(
+            parent.to_string(),
+            WorkspaceOpenRequest {
+                path: "/workspace".into(),
+                kind: WorkspaceKind::Directory,
+                rights: vec![
+                    WorkspaceRight::Read,
+                    WorkspaceRight::Write,
+                    WorkspaceRight::List,
+                    WorkspaceRight::Stat,
+                ],
+                allow_missing: false,
+            },
+        )
+        .await
+        .unwrap();
+    let workspace_list = client
+        .vfs_dup_workspace(
+            parent.to_string(),
+            &workspace.id,
+            vec![WorkspaceRight::List],
+        )
+        .await
+        .unwrap();
+    let memory = client
+        .vfs_open_data(
+            parent.to_string(),
+            "/memory",
+            vec![
+                WorkspaceRight::Read,
+                WorkspaceRight::Write,
+                WorkspaceRight::Stat,
+            ],
+        )
+        .await
+        .unwrap();
+    let memory_read = client
+        .vfs_dup_data(parent.to_string(), &memory.id, vec![WorkspaceRight::Read])
+        .await
+        .unwrap();
+    client
+        .vfs_write_data(
+            parent.to_string(),
+            &memory.id,
+            serde_json::json!({"content":"private parent semantic fact", "category":"fact"}),
+        )
+        .await
+        .unwrap();
+    let ipc = client
+        .vfs_open_data(
+            parent.to_string(),
+            "/ipc",
+            vec![
+                WorkspaceRight::Read,
+                WorkspaceRight::Write,
+                WorkspaceRight::Stat,
+            ],
+        )
+        .await
+        .unwrap();
+    let ipc_read = client
+        .vfs_dup_data(parent.to_string(), &ipc.id, vec![WorkspaceRight::Read])
+        .await
+        .unwrap();
+    client
+        .vfs_write_data(
+            parent.to_string(),
+            &ipc.id,
+            serde_json::json!({"to":parent, "payload":{"private":"parent mailbox"}}),
+        )
+        .await
+        .unwrap();
     client
         .vfs_write_data(
             parent.to_string(),
@@ -559,22 +626,104 @@ async fn clone_wire_enforces_tenants_roles_identity_and_fresh_vfs_handles() {
         "parent descriptor is not inherited"
     );
     let gates = kernel.syscall_gate.stats();
-    for id in [&handle.id, &kv_read.id, &memory.id, &memory_read.id, &ipc.id, &ipc_read.id] {
-        assert_eq!(client.vfs_read_data(child.to_string(), id, serde_json::json!({})).await.unwrap_err().wire_code(), Some(WireErrorCode::NotFound));
-        assert_eq!(client.vfs_close(child.to_string(), id).await.unwrap_err().wire_code(), Some(WireErrorCode::NotFound));
+    for id in [
+        &handle.id,
+        &kv_read.id,
+        &memory.id,
+        &memory_read.id,
+        &ipc.id,
+        &ipc_read.id,
+    ] {
+        assert_eq!(
+            client
+                .vfs_read_data(child.to_string(), id, serde_json::json!({}))
+                .await
+                .unwrap_err()
+                .wire_code(),
+            Some(WireErrorCode::NotFound)
+        );
+        assert_eq!(
+            client
+                .vfs_close(child.to_string(), id)
+                .await
+                .unwrap_err()
+                .wire_code(),
+            Some(WireErrorCode::NotFound)
+        );
     }
-    assert_eq!(client.vfs_invoke(child.to_string(), &tool.id, serde_json::json!({"path":"parent-only.txt"})).await.unwrap_err().wire_code(), Some(WireErrorCode::NotFound));
+    assert_eq!(
+        client
+            .vfs_invoke(
+                child.to_string(),
+                &tool.id,
+                serde_json::json!({"path":"parent-only.txt"})
+            )
+            .await
+            .unwrap_err()
+            .wire_code(),
+        Some(WireErrorCode::NotFound)
+    );
     for id in [&workspace.id, &workspace_list.id] {
-        assert_eq!(client.vfs_list_workspace(child.to_string(), id).await.unwrap_err().wire_code(), Some(WireErrorCode::NotFound));
-        assert_eq!(client.vfs_close(child.to_string(), id).await.unwrap_err().wire_code(), Some(WireErrorCode::NotFound));
+        assert_eq!(
+            client
+                .vfs_list_workspace(child.to_string(), id)
+                .await
+                .unwrap_err()
+                .wire_code(),
+            Some(WireErrorCode::NotFound)
+        );
+        assert_eq!(
+            client
+                .vfs_close(child.to_string(), id)
+                .await
+                .unwrap_err()
+                .wire_code(),
+            Some(WireErrorCode::NotFound)
+        );
     }
-    assert_eq!(kernel.syscall_gate.stats().allowed, gates.allowed, "foreign descriptors never enter backing authorization");
-    assert_eq!(client.vfs_mounts(child.to_string()).await.unwrap().open_handles, 0);
+    assert_eq!(
+        kernel.syscall_gate.stats().allowed,
+        gates.allowed,
+        "foreign descriptors never enter backing authorization"
+    );
+    assert_eq!(
+        client
+            .vfs_mounts(child.to_string())
+            .await
+            .unwrap()
+            .open_handles,
+        0
+    );
     // Child denial did not close or alter the parent's attenuated references.
-    assert_eq!(client.vfs_read_data(parent.to_string(), &kv_read.id, serde_json::json!({})).await.unwrap()["value"], "private parent KV");
-    assert_eq!(client.vfs_read_data(parent.to_string(), &memory_read.id, serde_json::json!({"query":"private parent semantic fact"})).await.unwrap()["facts"][0]["content"], "private parent semantic fact");
-    assert_eq!(client.vfs_read_data(parent.to_string(), &ipc_read.id, serde_json::json!({})).await.unwrap()["payload"]["private"], "parent mailbox");
-    assert!(client.vfs_list_workspace(parent.to_string(), &workspace_list.id).await.is_ok());
+    assert_eq!(
+        client
+            .vfs_read_data(parent.to_string(), &kv_read.id, serde_json::json!({}))
+            .await
+            .unwrap()["value"],
+        "private parent KV"
+    );
+    assert_eq!(
+        client
+            .vfs_read_data(
+                parent.to_string(),
+                &memory_read.id,
+                serde_json::json!({"query":"private parent semantic fact"})
+            )
+            .await
+            .unwrap()["facts"][0]["content"],
+        "private parent semantic fact"
+    );
+    assert_eq!(
+        client
+            .vfs_read_data(parent.to_string(), &ipc_read.id, serde_json::json!({}))
+            .await
+            .unwrap()["payload"]["private"],
+        "parent mailbox"
+    );
+    assert!(client
+        .vfs_list_workspace(parent.to_string(), &workspace_list.id)
+        .await
+        .is_ok());
     let fresh = client
         .vfs_open_kv(
             child.to_string(),
@@ -592,27 +741,116 @@ async fn clone_wire_enforces_tenants_roles_identity_and_fresh_vfs_handles() {
             .is_null(),
         "agent-private KV does not transfer"
     );
-    let fresh_memory = client.vfs_open_data(child.to_string(), "/memory", vec![WorkspaceRight::Read, WorkspaceRight::Stat]).await.unwrap();
-    assert_eq!(client.vfs_stat_data(child.to_string(), &fresh_memory.id).await.unwrap()["facts"], 0);
-    assert!(client.vfs_read_data(child.to_string(), &fresh_memory.id, serde_json::json!({"query":"private parent semantic fact"})).await.unwrap()["facts"].as_array().unwrap().is_empty());
-    let fresh_ipc = client.vfs_open_data(child.to_string(), "/ipc", vec![WorkspaceRight::Read, WorkspaceRight::Stat]).await.unwrap();
-    assert_eq!(client.vfs_stat_data(child.to_string(), &fresh_ipc.id).await.unwrap()["pending"], 0);
-    assert_eq!(client.vfs_read_data(child.to_string(), &fresh_ipc.id, serde_json::json!({})).await.unwrap()["empty"], true);
-    let fresh_workspace = client.vfs_open_workspace(child.to_string(), WorkspaceOpenRequest {
-        path: "/workspace".into(), kind: WorkspaceKind::Directory,
-        rights: vec![WorkspaceRight::List], allow_missing: false,
-    }).await.unwrap();
-    assert!(client.vfs_list_workspace(child.to_string(), &fresh_workspace.id).await.unwrap()["entries"].as_array().unwrap().is_empty());
-    let fresh_tool = client.vfs_open(child.to_string(), "/tools/read_file").await.unwrap();
+    let fresh_memory = client
+        .vfs_open_data(
+            child.to_string(),
+            "/memory",
+            vec![WorkspaceRight::Read, WorkspaceRight::Stat],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        client
+            .vfs_stat_data(child.to_string(), &fresh_memory.id)
+            .await
+            .unwrap()["facts"],
+        0
+    );
+    assert!(client
+        .vfs_read_data(
+            child.to_string(),
+            &fresh_memory.id,
+            serde_json::json!({"query":"private parent semantic fact"})
+        )
+        .await
+        .unwrap()["facts"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    let fresh_ipc = client
+        .vfs_open_data(
+            child.to_string(),
+            "/ipc",
+            vec![WorkspaceRight::Read, WorkspaceRight::Stat],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        client
+            .vfs_stat_data(child.to_string(), &fresh_ipc.id)
+            .await
+            .unwrap()["pending"],
+        0
+    );
+    assert_eq!(
+        client
+            .vfs_read_data(child.to_string(), &fresh_ipc.id, serde_json::json!({}))
+            .await
+            .unwrap()["empty"],
+        true
+    );
+    let fresh_workspace = client
+        .vfs_open_workspace(
+            child.to_string(),
+            WorkspaceOpenRequest {
+                path: "/workspace".into(),
+                kind: WorkspaceKind::Directory,
+                rights: vec![WorkspaceRight::List],
+                allow_missing: false,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(client
+        .vfs_list_workspace(child.to_string(), &fresh_workspace.id)
+        .await
+        .unwrap()["entries"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    let fresh_tool = client
+        .vfs_open(child.to_string(), "/tools/read_file")
+        .await
+        .unwrap();
     assert_ne!(fresh_tool.id, tool.id);
-    for id in [&handle.id, &kv_read.id, &tool.id, &workspace.id, &workspace_list.id, &memory.id, &memory_read.id, &ipc.id, &ipc_read.id] {
+    for id in [
+        &handle.id,
+        &kv_read.id,
+        &tool.id,
+        &workspace.id,
+        &workspace_list.id,
+        &memory.id,
+        &memory_read.id,
+        &ipc.id,
+        &ipc_read.id,
+    ] {
         client.vfs_close(parent.to_string(), id).await.unwrap();
     }
-    for id in [&fresh.id, &fresh_memory.id, &fresh_ipc.id, &fresh_workspace.id, &fresh_tool.id] {
+    for id in [
+        &fresh.id,
+        &fresh_memory.id,
+        &fresh_ipc.id,
+        &fresh_workspace.id,
+        &fresh_tool.id,
+    ] {
         client.vfs_close(child.to_string(), id).await.unwrap();
     }
-    assert_eq!(client.vfs_mounts(parent.to_string()).await.unwrap().open_handles, 0);
-    assert_eq!(client.vfs_mounts(child.to_string()).await.unwrap().open_handles, 0);
+    assert_eq!(
+        client
+            .vfs_mounts(parent.to_string())
+            .await
+            .unwrap()
+            .open_handles,
+        0
+    );
+    assert_eq!(
+        client
+            .vfs_mounts(child.to_string())
+            .await
+            .unwrap()
+            .open_handles,
+        0
+    );
     client
         .authenticate(kernel.issue_api_key(&reader, "clone-reader").await.unwrap())
         .await

@@ -42,7 +42,12 @@ fn file_request(path: &str, allow_missing: bool) -> WorkspaceOpenRequest {
 async fn connect(address: std::net::SocketAddr) -> SyscallClient {
     let mut client = SyscallClient::connect(address).await.unwrap();
     assert!(matches!(
-        client.call(Syscall::Hello { protocol_version: 2 }).await.unwrap(),
+        client
+            .call(Syscall::Hello {
+                protocol_version: 2
+            })
+            .await
+            .unwrap(),
         SyscallReply::Hello { .. }
     ));
     client
@@ -83,7 +88,10 @@ async fn crash(mut child: Child) {
         .await
         .expect("abrupt VFS child termination did not finish")
         .unwrap();
-    assert!(!status.success(), "the child must die without graceful teardown");
+    assert!(
+        !status.success(),
+        "the child must die without graceful teardown"
+    );
 }
 
 /// Invoked in a fresh OS process by the acceptance test below. Normal suite
@@ -98,63 +106,96 @@ async fn vfs_crash_child_process() {
     let kernel = Arc::new(AgentKernelImpl::with_db_path(&root.join("state.db")).unwrap());
     let agent = if mode == "recover" {
         let agent: crate::AgentId = std::fs::read_to_string(root.join("agent-id"))
-            .unwrap().parse().unwrap();
+            .unwrap()
+            .parse()
+            .unwrap();
         assert_eq!(kernel.get_agent_status(agent).unwrap(), AgentState::Running);
         agent
     } else {
-        let agent = kernel.create_agent_full(AgentConfig {
-            name: "crash-boundary".into(),
-            task: "VFS process-crash fixture".into(),
-            llm_provider: "stub".into(),
-            permission_profile: "standard".into(),
-            priority: Priority::default(),
-            sandbox_config: Some(SandboxConfig {
-                workspace_dir: root.join("workspace"),
-                isolation_level: IsolationLevel::Filesystem,
-                allowed_network_hosts: Some(Vec::new()),
-                max_disk_usage_bytes: Some(1024 * 1024),
-                max_memory_bytes: None,
-                container_image: None,
-            }),
-        }).await.unwrap().id;
+        let agent = kernel
+            .create_agent_full(AgentConfig {
+                name: "crash-boundary".into(),
+                task: "VFS process-crash fixture".into(),
+                llm_provider: "stub".into(),
+                permission_profile: "standard".into(),
+                priority: Priority::default(),
+                sandbox_config: Some(SandboxConfig {
+                    workspace_dir: root.join("workspace"),
+                    isolation_level: IsolationLevel::Filesystem,
+                    allowed_network_hosts: Some(Vec::new()),
+                    max_disk_usage_bytes: Some(1024 * 1024),
+                    max_memory_bytes: None,
+                    container_image: None,
+                }),
+            })
+            .await
+            .unwrap()
+            .id;
         std::fs::write(root.join("agent-id"), agent.to_string()).unwrap();
         agent
     };
-    let server = SyscallServer::bind(kernel.clone(), "127.0.0.1:0").await.unwrap();
+    let server = SyscallServer::bind(kernel.clone(), "127.0.0.1:0")
+        .await
+        .unwrap();
     let address = server.local_addr().unwrap();
     tokio::spawn(server.serve());
     let mut client = connect(address).await;
     let mut ready = Ready {
-        address, agent: agent.to_string(), tool: String::new(),
-        workspace: String::new(), data: String::new(),
+        address,
+        agent: agent.to_string(),
+        tool: String::new(),
+        workspace: String::new(),
+        data: String::new(),
     };
     if mode == "recover" {
         assert_eq!(kernel.get_agent_status(agent).unwrap(), AgentState::Running);
         assert_eq!(kernel.vfs_mounts(agent).unwrap().open_handles, 0);
     } else {
-        ready.tool = match client.call(Syscall::VfsOpen {
-            agent_id: ready.agent.clone(), path: "/tools/read_file".into(),
-        }).await.unwrap() {
+        ready.tool = match client
+            .call(Syscall::VfsOpen {
+                agent_id: ready.agent.clone(),
+                path: "/tools/read_file".into(),
+            })
+            .await
+            .unwrap()
+        {
             SyscallReply::VfsOpened { handle } => handle.id,
             other => panic!("tool open failed: {other:?}"),
         };
-        ready.workspace = match client.call(Syscall::VfsOpenWorkspace {
-            agent_id: ready.agent.clone(), request: file_request("/workspace/proof.bin", false),
-        }).await.unwrap() {
+        ready.workspace = match client
+            .call(Syscall::VfsOpenWorkspace {
+                agent_id: ready.agent.clone(),
+                request: file_request("/workspace/proof.bin", false),
+            })
+            .await
+            .unwrap()
+        {
             SyscallReply::WorkspaceOpened { handle } => handle.id,
             other => panic!("workspace open failed: {other:?}"),
         };
-        ready.data = match client.call(Syscall::VfsOpenData {
-            agent_id: ready.agent.clone(), path: KV_PATH.into(),
-            rights: vec![WorkspaceRight::Read, WorkspaceRight::Write],
-        }).await.unwrap() {
+        ready.data = match client
+            .call(Syscall::VfsOpenData {
+                agent_id: ready.agent.clone(),
+                path: KV_PATH.into(),
+                rights: vec![WorkspaceRight::Read, WorkspaceRight::Write],
+            })
+            .await
+            .unwrap()
+        {
             SyscallReply::VfsDataOpened { handle } => handle.id,
             other => panic!("KV open failed: {other:?}"),
         };
-        assert!(matches!(client.call(Syscall::VfsWriteData {
-            agent_id: ready.agent.clone(), handle: ready.data.clone(),
-            args: serde_json::json!({"value":"committed before crash"}),
-        }).await.unwrap(), SyscallReply::ToolResult { .. }));
+        assert!(matches!(
+            client
+                .call(Syscall::VfsWriteData {
+                    agent_id: ready.agent.clone(),
+                    handle: ready.data.clone(),
+                    args: serde_json::json!({"value":"committed before crash"}),
+                })
+                .await
+                .unwrap(),
+            SyscallReply::ToolResult { .. }
+        ));
         if mode == "committed-write" {
             assert!(matches!(client.call(Syscall::VfsWriteWorkspace {
                 agent_id: ready.agent.clone(), handle: ready.workspace.clone(),
@@ -164,12 +205,14 @@ async fn vfs_crash_child_process() {
             let (entered, _release, _) = kernel.sandbox_manager.pause_next_filesystem_for_test();
             let request = if mode == "pending-open" {
                 Syscall::VfsOpenWorkspace {
-                    agent_id: ready.agent.clone(), request: file_request("/workspace/pending.bin", true),
+                    agent_id: ready.agent.clone(),
+                    request: file_request("/workspace/pending.bin", true),
                 }
             } else {
                 assert_eq!(mode, "pending-write");
                 Syscall::VfsWriteWorkspace {
-                    agent_id: ready.agent.clone(), handle: ready.workspace.clone(),
+                    agent_id: ready.agent.clone(),
+                    handle: ready.workspace.clone(),
                     data_base64: base64::engine::general_purpose::STANDARD.encode(REPLACEMENT),
                 }
             };
@@ -178,7 +221,9 @@ async fn vfs_crash_child_process() {
                 while !entered.load(Ordering::Acquire) {
                     tokio::time::sleep(Duration::from_millis(1)).await;
                 }
-            }).await.expect("the public VFS operation was not admitted into its controlled worker");
+            })
+            .await
+            .expect("the public VFS operation was not admitted into its controlled worker");
         }
     }
     println!("{READY_PREFIX}{}", serde_json::to_string(&ready).unwrap());
@@ -194,48 +239,108 @@ async fn abrupt_process_crash_revokes_handles_and_reopens_committed_vfs_data() {
         std::fs::write(root.path().join("workspace/proof.bin"), ORIGINAL).unwrap();
         let (child, old) = start_child(root.path(), mode).await;
         crash(child).await;
-        let expected = if mode == "committed-write" { REPLACEMENT } else { ORIGINAL };
-        assert_eq!(std::fs::read(root.path().join("workspace/proof.bin")).unwrap(), expected);
+        let expected = if mode == "committed-write" {
+            REPLACEMENT
+        } else {
+            ORIGINAL
+        };
+        assert_eq!(
+            std::fs::read(root.path().join("workspace/proof.bin")).unwrap(),
+            expected
+        );
         assert!(!root.path().join("workspace/pending.bin").exists());
-        assert_eq!(std::fs::read_dir(root.path().join("workspace")).unwrap().count(), 1);
+        assert_eq!(
+            std::fs::read_dir(root.path().join("workspace"))
+                .unwrap()
+                .count(),
+            1
+        );
 
         let (recovered, fresh) = start_child(root.path(), "recover").await;
         assert_eq!(fresh.agent, old.agent);
         let mut client = connect(fresh.address).await;
         for request in [
-            Syscall::VfsInvoke { agent_id: old.agent.clone(), handle: old.tool, args: serde_json::json!({"path":"proof.bin"}) },
-            Syscall::VfsReadWorkspace { agent_id: old.agent.clone(), handle: old.workspace, offset: 0, max_bytes: 256 },
-            Syscall::VfsReadData { agent_id: old.agent.clone(), handle: old.data, args: serde_json::json!({}) },
+            Syscall::VfsInvoke {
+                agent_id: old.agent.clone(),
+                handle: old.tool,
+                args: serde_json::json!({"path":"proof.bin"}),
+            },
+            Syscall::VfsReadWorkspace {
+                agent_id: old.agent.clone(),
+                handle: old.workspace,
+                offset: 0,
+                max_bytes: 256,
+            },
+            Syscall::VfsReadData {
+                agent_id: old.agent.clone(),
+                handle: old.data,
+                args: serde_json::json!({}),
+            },
         ] {
-            assert!(matches!(client.call(request).await.unwrap(), SyscallReply::TypedError {
-                code: WireErrorCode::NotFound, ..
-            }));
+            assert!(matches!(
+                client.call(request).await.unwrap(),
+                SyscallReply::TypedError {
+                    code: WireErrorCode::NotFound,
+                    ..
+                }
+            ));
         }
-        let handle = match client.call(Syscall::VfsOpenWorkspace {
-            agent_id: fresh.agent.clone(), request: file_request("/workspace/proof.bin", false),
-        }).await.unwrap() {
+        let handle = match client
+            .call(Syscall::VfsOpenWorkspace {
+                agent_id: fresh.agent.clone(),
+                request: file_request("/workspace/proof.bin", false),
+            })
+            .await
+            .unwrap()
+        {
             SyscallReply::WorkspaceOpened { handle } => handle.id,
             other => panic!("fresh authorized workspace open failed: {other:?}"),
         };
-        match client.call(Syscall::VfsReadWorkspace {
-            agent_id: fresh.agent.clone(), handle, offset: 0, max_bytes: 256,
-        }).await.unwrap() {
+        match client
+            .call(Syscall::VfsReadWorkspace {
+                agent_id: fresh.agent.clone(),
+                handle,
+                offset: 0,
+                max_bytes: 256,
+            })
+            .await
+            .unwrap()
+        {
             SyscallReply::WorkspaceRead { chunk } => {
                 assert!(chunk.eof);
-                assert_eq!(base64::engine::general_purpose::STANDARD.decode(chunk.data_base64).unwrap(), expected);
+                assert_eq!(
+                    base64::engine::general_purpose::STANDARD
+                        .decode(chunk.data_base64)
+                        .unwrap(),
+                    expected
+                );
             }
             other => panic!("fresh workspace read failed: {other:?}"),
         }
-        let handle = match client.call(Syscall::VfsOpenData {
-            agent_id: fresh.agent.clone(), path: KV_PATH.into(), rights: vec![WorkspaceRight::Read],
-        }).await.unwrap() {
+        let handle = match client
+            .call(Syscall::VfsOpenData {
+                agent_id: fresh.agent.clone(),
+                path: KV_PATH.into(),
+                rights: vec![WorkspaceRight::Read],
+            })
+            .await
+            .unwrap()
+        {
             SyscallReply::VfsDataOpened { handle } => handle.id,
             other => panic!("fresh authorized KV open failed: {other:?}"),
         };
-        match client.call(Syscall::VfsReadData {
-            agent_id: fresh.agent, handle, args: serde_json::json!({}),
-        }).await.unwrap() {
-            SyscallReply::ToolResult { data } => assert_eq!(data["value"], "committed before crash"),
+        match client
+            .call(Syscall::VfsReadData {
+                agent_id: fresh.agent,
+                handle,
+                args: serde_json::json!({}),
+            })
+            .await
+            .unwrap()
+        {
+            SyscallReply::ToolResult { data } => {
+                assert_eq!(data["value"], "committed before crash")
+            }
             other => panic!("fresh committed KV read failed: {other:?}"),
         }
         client.close().await.unwrap();

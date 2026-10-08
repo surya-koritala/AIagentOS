@@ -176,7 +176,9 @@ async fn signed_parallel_tool_turn_and_final_text_replay_after_kernel_restart() 
         {"functionCall": {"name": "read_file", "args": {"path": "fixture.txt"}}}
     ]);
     Mock::given(method("POST"))
-        .and(path("/v1beta/models/fixture-native-model:streamGenerateContent"))
+        .and(path(
+            "/v1beta/models/fixture-native-model:streamGenerateContent",
+        ))
         .respond_with(response(native_parts.clone()))
         .up_to_n_times(1)
         .with_priority(1)
@@ -184,7 +186,9 @@ async fn signed_parallel_tool_turn_and_final_text_replay_after_kernel_restart() 
         .await;
     let final_parts = json!([{"text": "verified fixture", "thoughtSignature": "c2lnbmVkLXRleHQ="}]);
     Mock::given(method("POST"))
-        .and(path("/v1beta/models/fixture-native-model:streamGenerateContent"))
+        .and(path(
+            "/v1beta/models/fixture-native-model:streamGenerateContent",
+        ))
         .respond_with(response(final_parts.clone()))
         .with_priority(2)
         .mount(&server)

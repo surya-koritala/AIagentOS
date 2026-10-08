@@ -553,6 +553,22 @@ async fn clone_wire_enforces_tenants_roles_identity_and_fresh_vfs_handles() {
         )
         .await
         .unwrap();
+    let workspace_file = client
+        .vfs_open_workspace(
+            parent.to_string(),
+            WorkspaceOpenRequest {
+                path: "/workspace/parent-only.bin".into(),
+                kind: WorkspaceKind::File,
+                rights: vec![WorkspaceRight::Read, WorkspaceRight::Write],
+                allow_missing: true,
+            },
+        )
+        .await
+        .unwrap();
+    client
+        .vfs_write_bytes(parent.to_string(), &workspace_file.id, b"private parent bytes")
+        .await
+        .unwrap();
     let memory = client
         .vfs_open_data(
             parent.to_string(),
@@ -682,6 +698,22 @@ async fn clone_wire_enforces_tenants_roles_identity_and_fresh_vfs_handles() {
         );
     }
     assert_eq!(
+        client
+            .vfs_read_bytes(child.to_string(), &workspace_file.id, 0, 64)
+            .await
+            .unwrap_err()
+            .wire_code(),
+        Some(WireErrorCode::NotFound)
+    );
+    assert_eq!(
+        client
+            .vfs_close(child.to_string(), &workspace_file.id)
+            .await
+            .unwrap_err()
+            .wire_code(),
+        Some(WireErrorCode::NotFound)
+    );
+    assert_eq!(
         kernel.syscall_gate.stats().allowed,
         gates.allowed,
         "foreign descriptors never enter backing authorization"
@@ -723,7 +755,18 @@ async fn clone_wire_enforces_tenants_roles_identity_and_fresh_vfs_handles() {
     assert!(client
         .vfs_list_workspace(parent.to_string(), &workspace_list.id)
         .await
-        .is_ok());
+        .unwrap()["entries"]
+        .as_array()
+        .unwrap()
+        .contains(&serde_json::json!("parent-only.bin")));
+    assert_eq!(
+        client
+            .vfs_read_bytes(parent.to_string(), &workspace_file.id, 0, 64)
+            .await
+            .unwrap()
+            .bytes,
+        b"private parent bytes"
+    );
     let fresh = client
         .vfs_open_kv(
             child.to_string(),
@@ -801,13 +844,13 @@ async fn clone_wire_enforces_tenants_roles_identity_and_fresh_vfs_handles() {
         )
         .await
         .unwrap();
-    assert!(client
+    assert!(!client
         .vfs_list_workspace(child.to_string(), &fresh_workspace.id)
         .await
         .unwrap()["entries"]
         .as_array()
         .unwrap()
-        .is_empty());
+        .contains(&serde_json::json!("parent-only.bin")));
     let fresh_tool = client
         .vfs_open(child.to_string(), "/tools/read_file")
         .await
@@ -819,6 +862,7 @@ async fn clone_wire_enforces_tenants_roles_identity_and_fresh_vfs_handles() {
         &tool.id,
         &workspace.id,
         &workspace_list.id,
+        &workspace_file.id,
         &memory.id,
         &memory_read.id,
         &ipc.id,

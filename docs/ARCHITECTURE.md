@@ -321,7 +321,7 @@ transport (`handle<R, W>`):
   (`bind_tls`/`connect_tls`, rustls/ring). Optional shared-secret `Authenticate`.
 - **Syscalls (current surface):**
   `CreateAgent · ListAgents · AgentInfo · SendMessage · CallTool · GateStats ·
-   ListProviders · MemoryStore · MemoryQuery · StoragePut/Get/List/Delete ·
+   ListProviders · ListProviderModels · MemoryStore · MemoryQuery · StoragePut/Get/List/Delete ·
    SnapshotContext · RestoreSnapshot · ListSnapshots · DeleteSnapshot ·
    LoadPackage · NodeInfo · Authenticate`
 

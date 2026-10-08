@@ -267,7 +267,11 @@ async fn main() {
             Err(e) => eprintln!("\x1b[31m  Error: {}\x1b[0m\n", e),
         }
     }
-    eprintln!("\n\x1b[90mSaved: {}\x1b[0m", conversation);
+    if kernel.context_manager.conversation_owner(&conversation).ok() == Some(handle.id) {
+        eprintln!("\n\x1b[90mSaved: {}\x1b[0m", conversation);
+    } else {
+        eprintln!("\n\x1b[90mNo messages saved. Conversation: {}\x1b[0m", conversation);
+    }
 }
 
 fn atty_is_terminal() -> bool {

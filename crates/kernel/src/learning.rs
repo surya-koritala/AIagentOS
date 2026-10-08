@@ -305,6 +305,8 @@ mod tests {
         std::fs::create_dir(&path).unwrap();
         assert!(store.add_rule("a".into(), "b".into(), RuleScope::local_cli()).is_err());
         assert!(store.get_rules(None).is_empty());
+        assert!(store.check_health().is_err());
+        assert!(store.add_rule("another".into(), "correction".into(), RuleScope::local_cli()).is_err());
         drop(store);
         std::fs::remove_dir(&path).unwrap();
         crate::config::write_owner_only_atomic(&path, b"{corrupt}").unwrap();

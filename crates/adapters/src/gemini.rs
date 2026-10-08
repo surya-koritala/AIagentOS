@@ -230,8 +230,12 @@ impl LlmProviderAdapter for GeminiAdapter {
 
     async fn list_models(&self) -> Result<Vec<String>, ConnectorError> {
         crate::model_discovery::discover(
-            &self.id, &self.base_url, crate::model_discovery::DiscoveryApi::Gemini, &self.api_key,
-        ).await
+            &self.id,
+            &self.base_url,
+            crate::model_discovery::DiscoveryApi::Gemini,
+            &self.api_key,
+        )
+        .await
     }
 
     async fn is_available(&self) -> bool {

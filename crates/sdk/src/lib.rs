@@ -2613,7 +2613,12 @@ impl KernelClient {
         &mut self,
         provider_id: impl Into<String>,
     ) -> Result<ModelCatalog, SdkError> {
-        match self.call(Syscall::ListProviderModels { provider_id: provider_id.into() }).await? {
+        match self
+            .call(Syscall::ListProviderModels {
+                provider_id: provider_id.into(),
+            })
+            .await?
+        {
             SyscallReply::ProviderModels { catalog } => Ok(catalog),
             other => Err(unexpected("ProviderModels", &other)),
         }

@@ -1388,7 +1388,10 @@ async fn main() {
             if args.next().is_some() {
                 usage();
             }
-            let catalog = client.list_provider_models(provider_id).await.unwrap_or_else(|error| fail(error));
+            let catalog = client
+                .list_provider_models(provider_id)
+                .await
+                .unwrap_or_else(|error| fail(error));
             print_json(&catalog, "configured provider models");
             return;
         }

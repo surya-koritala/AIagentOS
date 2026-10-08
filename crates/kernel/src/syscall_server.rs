@@ -1958,19 +1958,60 @@ fn model_discovery_error_reply(error: crate::ConnectorError) -> SyscallReply {
     // Third-party adapters may include secrets in prose, so never forward
     // their detail even when the built-in transport already redacts it.
     let (code, message, retryable) = match error {
-        ConnectorError::UnsupportedFeature(_) => (WireErrorCode::Unsupported, "model discovery is unsupported", false),
-        ConnectorError::ProviderUnavailable(_) => (WireErrorCode::NotFound, "configured provider not registered", false),
-        ConnectorError::Authentication(_) => (WireErrorCode::AuthenticationFailed, "model discovery provider authentication failed", false),
-        ConnectorError::Authorization(_) => (WireErrorCode::AuthorizationDenied, "model discovery provider authorization failed", false),
-        ConnectorError::Timeout(_) => (WireErrorCode::Timeout, "model discovery deadline exceeded", true),
-        ConnectorError::Cancelled(_) => (WireErrorCode::Cancelled, "model discovery cancelled", false),
-        ConnectorError::RateLimited(_) => (WireErrorCode::Provider, "model discovery provider rate limited the request", true),
-        ConnectorError::ConnectionFailed(_) | ConnectorError::ServiceUnavailable(_)
-        | ConnectorError::StreamError(_) => (WireErrorCode::Unavailable, "model discovery provider unavailable", true),
-        ConnectorError::ProtocolError(_) | ConnectorError::InvalidRequest(_)
-        | ConnectorError::ContentFiltered(_) | ConnectorError::PartialStream(_) => (WireErrorCode::InvalidRequest, "model discovery returned an invalid response", false),
+        ConnectorError::UnsupportedFeature(_) => (
+            WireErrorCode::Unsupported,
+            "model discovery is unsupported",
+            false,
+        ),
+        ConnectorError::ProviderUnavailable(_) => (
+            WireErrorCode::NotFound,
+            "configured provider not registered",
+            false,
+        ),
+        ConnectorError::Authentication(_) => (
+            WireErrorCode::AuthenticationFailed,
+            "model discovery provider authentication failed",
+            false,
+        ),
+        ConnectorError::Authorization(_) => (
+            WireErrorCode::AuthorizationDenied,
+            "model discovery provider authorization failed",
+            false,
+        ),
+        ConnectorError::Timeout(_) => (
+            WireErrorCode::Timeout,
+            "model discovery deadline exceeded",
+            true,
+        ),
+        ConnectorError::Cancelled(_) => {
+            (WireErrorCode::Cancelled, "model discovery cancelled", false)
+        }
+        ConnectorError::RateLimited(_) => (
+            WireErrorCode::Provider,
+            "model discovery provider rate limited the request",
+            true,
+        ),
+        ConnectorError::ConnectionFailed(_)
+        | ConnectorError::ServiceUnavailable(_)
+        | ConnectorError::StreamError(_) => (
+            WireErrorCode::Unavailable,
+            "model discovery provider unavailable",
+            true,
+        ),
+        ConnectorError::ProtocolError(_)
+        | ConnectorError::InvalidRequest(_)
+        | ConnectorError::ContentFiltered(_)
+        | ConnectorError::PartialStream(_) => (
+            WireErrorCode::InvalidRequest,
+            "model discovery returned an invalid response",
+            false,
+        ),
     };
-    SyscallReply::TypedError { code, message: message.into(), retryable }
+    SyscallReply::TypedError {
+        code,
+        message: message.into(),
+        retryable,
+    }
 }
 
 fn audit_authorization_denial(
@@ -3535,8 +3576,11 @@ async fn dispatch_scoped_inner_with_fence(
             SyscallReply::Providers { providers }
         }
         Syscall::ListProviderModels { provider_id } => {
-            if provider_id.is_empty() || provider_id.len() > 128
-                || !provider_id.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+            if provider_id.is_empty()
+                || provider_id.len() > 128
+                || !provider_id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
             {
                 return SyscallReply::TypedError {
                     code: WireErrorCode::InvalidArgument,
@@ -3545,7 +3589,11 @@ async fn dispatch_scoped_inner_with_fence(
                 };
             }
             let cancellation = tokio_util::sync::CancellationToken::new();
-            match kernel.connector.list_provider_models(&provider_id, &cancellation).await {
+            match kernel
+                .connector
+                .list_provider_models(&provider_id, &cancellation)
+                .await
+            {
                 Ok(catalog) => SyscallReply::ProviderModels { catalog },
                 Err(error) => model_discovery_error_reply(error),
             }

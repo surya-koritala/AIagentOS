@@ -37,7 +37,9 @@ pub fn normalize_model_ids(mut models: Vec<String>) -> Result<Vec<String>, Conne
                 byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b':' | b'/')
             })
             || id.contains("://")
-            || id.split('/').any(|part| part.is_empty() || part == "." || part == "..")
+            || id
+                .split('/')
+                .any(|part| part.is_empty() || part == "." || part == "..")
         {
             return Err(ConnectorError::ProtocolError(
                 "model discovery returned an invalid identifier".into(),
@@ -56,17 +58,34 @@ mod tests {
     #[test]
     fn model_discovery_normalization_preserves_namespaces_and_deduplicates() {
         assert_eq!(
-            normalize_model_ids(vec!["org/Model:latest".into(), "a-model".into(), "a-model".into()])
-                .unwrap(),
+            normalize_model_ids(vec![
+                "org/Model:latest".into(),
+                "a-model".into(),
+                "a-model".into()
+            ])
+            .unwrap(),
             vec!["a-model", "org/Model:latest"]
         );
     }
 
     #[test]
     fn model_discovery_rejects_untrusted_identifiers_and_raw_count_overflow() {
-        for id in ["", "../model", "a\nsecret", "a model", "https://account.test/model", "a//b", "a/../b"] {
-            let error = normalize_model_ids(vec![id.into()]).unwrap_err().to_string();
-            assert_eq!(error, "Protocol error: model discovery returned an invalid identifier");
+        for id in [
+            "",
+            "../model",
+            "a\nsecret",
+            "a model",
+            "https://account.test/model",
+            "a//b",
+            "a/../b",
+        ] {
+            let error = normalize_model_ids(vec![id.into()])
+                .unwrap_err()
+                .to_string();
+            assert_eq!(
+                error,
+                "Protocol error: model discovery returned an invalid identifier"
+            );
         }
         assert!(normalize_model_ids(vec!["a".repeat(MAX_MODEL_ID_BYTES + 1)]).is_err());
         assert!(normalize_model_ids(vec!["a".into(); MAX_DISCOVERED_MODELS + 1]).is_err());

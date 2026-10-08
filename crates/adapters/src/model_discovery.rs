@@ -30,9 +30,14 @@ pub(crate) async fn discover(
     api: DiscoveryApi,
     api_key: &str,
 ) -> Result<Vec<String>, ConnectorError> {
-    tokio::time::timeout(MODEL_DISCOVERY_TIMEOUT, discover_inner(provider, base_url, api, api_key))
-        .await
-        .map_err(|_| ConnectorError::timeout(provider.into(), "model discovery deadline exceeded", None))?
+    tokio::time::timeout(
+        MODEL_DISCOVERY_TIMEOUT,
+        discover_inner(provider, base_url, api, api_key),
+    )
+    .await
+    .map_err(|_| {
+        ConnectorError::timeout(provider.into(), "model discovery deadline exceeded", None)
+    })?
 }
 
 async fn discover_inner(
@@ -41,8 +46,8 @@ async fn discover_inner(
     api: DiscoveryApi,
     api_key: &str,
 ) -> Result<Vec<String>, ConnectorError> {
-    let mut endpoint = reqwest::Url::parse(base_url)
-        .map_err(|_| protocol_error("invalid configured endpoint"))?;
+    let mut endpoint =
+        reqwest::Url::parse(base_url).map_err(|_| protocol_error("invalid configured endpoint"))?;
     if !matches!(endpoint.scheme(), "http" | "https")
         || endpoint.host_str().is_none()
         || !endpoint.username().is_empty()
@@ -57,13 +62,18 @@ async fn discover_inner(
         DiscoveryApi::Gemini => "/v1beta/models",
         DiscoveryApi::Ollama => "/api/tags",
     };
-    endpoint.set_path(&format!("{}{suffix}", endpoint.path().trim_end_matches('/')));
+    endpoint.set_path(&format!(
+        "{}{suffix}",
+        endpoint.path().trim_end_matches('/')
+    ));
     // A separate client prevents x-api-key/x-goog-api-key from following a
     // redirect to another origin. System proxy configuration remains honored.
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .build()
-        .map_err(|_| ConnectorError::ConnectionFailed("model discovery transport setup failed".into()))?;
+        .map_err(|_| {
+            ConnectorError::ConnectionFailed("model discovery transport setup failed".into())
+        })?;
     let mut bytes_received = 0usize;
     let mut models = Vec::new();
     let mut cursor: Option<String> = None;
@@ -77,7 +87,8 @@ async fn discover_inner(
                 }
             }
             DiscoveryApi::Anthropic => {
-                request = request.header("x-api-key", api_key)
+                request = request
+                    .header("x-api-key", api_key)
                     .header("anthropic-version", "2023-06-01")
                     .query(&[("limit", "1000")]);
                 if let Some(cursor) = &cursor {
@@ -85,7 +96,9 @@ async fn discover_inner(
                 }
             }
             DiscoveryApi::Gemini => {
-                request = request.header("x-goog-api-key", api_key).query(&[("pageSize", "1000")]);
+                request = request
+                    .header("x-goog-api-key", api_key)
+                    .query(&[("pageSize", "1000")]);
                 if let Some(cursor) = &cursor {
                     request = request.query(&[("pageToken", cursor)]);
                 }
@@ -94,24 +107,38 @@ async fn discover_inner(
         }
         let response = request.send().await.map_err(|error| {
             if error.is_timeout() {
-                ConnectorError::timeout(provider.into(), "model discovery transport timed out", None)
+                ConnectorError::timeout(
+                    provider.into(),
+                    "model discovery transport timed out",
+                    None,
+                )
             } else {
                 ConnectorError::ConnectionFailed("model discovery transport failed".into())
             }
         })?;
         if !response.status().is_success() {
             // Do not consume, echo or interpret diagnostic/account bodies.
-            return Err(crate::http_status_error(provider, response.status(), None, None,
-                crate::retry_after_ms(response.headers())));
+            return Err(crate::http_status_error(
+                provider,
+                response.status(),
+                None,
+                None,
+                crate::retry_after_ms(response.headers()),
+            ));
         }
         let remaining = MAX_MODEL_DISCOVERY_BYTES.saturating_sub(bytes_received);
-        if response.content_length().is_some_and(|length| length > remaining as u64) {
+        if response
+            .content_length()
+            .is_some_and(|length| length > remaining as u64)
+        {
             return Err(protocol_error("response byte limit exceeded"));
         }
         let mut stream = response.bytes_stream();
         let mut bytes = Vec::new();
         while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|_| ConnectorError::ConnectionFailed("model discovery response interrupted".into()))?;
+            let chunk = chunk.map_err(|_| {
+                ConnectorError::ConnectionFailed("model discovery response interrupted".into())
+            })?;
             if chunk.len() > MAX_MODEL_DISCOVERY_BYTES.saturating_sub(bytes_received) {
                 return Err(protocol_error("response byte limit exceeded"));
             }
@@ -125,7 +152,9 @@ async fn discover_inner(
             DiscoveryApi::Gemini => ("models", "name"),
             DiscoveryApi::Ollama => ("models", "model"),
         };
-        let entries = value.get(field).and_then(Value::as_array)
+        let entries = value
+            .get(field)
+            .and_then(Value::as_array)
             .ok_or_else(|| protocol_error("missing model array"))?;
         if entries.len() > MAX_DISCOVERED_MODELS.saturating_sub(models.len()) {
             return Err(protocol_error("model count limit exceeded"));
@@ -135,10 +164,15 @@ async fn discover_inner(
                 entry.get("name")
             } else {
                 entry.get(id_field)
-            }.and_then(Value::as_str).ok_or_else(|| protocol_error("missing model identifier"))?;
+            }
+            .and_then(Value::as_str)
+            .ok_or_else(|| protocol_error("missing model identifier"))?;
             let id = if matches!(api, DiscoveryApi::Gemini) {
-                id.strip_prefix("models/").ok_or_else(|| protocol_error("invalid model resource name"))?
-            } else { id };
+                id.strip_prefix("models/")
+                    .ok_or_else(|| protocol_error("invalid model resource name"))?
+            } else {
+                id
+            };
             if !api_key.is_empty() && id.contains(api_key) {
                 return Err(protocol_error("credential echoed in model identifier"));
             }
@@ -146,12 +180,20 @@ async fn discover_inner(
         }
         let next = match api {
             DiscoveryApi::Anthropic => {
-                let has_more = value.get("has_more").and_then(Value::as_bool)
+                let has_more = value
+                    .get("has_more")
+                    .and_then(Value::as_bool)
                     .ok_or_else(|| protocol_error("missing pagination state"))?;
                 if has_more {
-                    Some(value.get("last_id").and_then(Value::as_str)
-                        .ok_or_else(|| protocol_error("missing pagination cursor"))?)
-                } else { None }
+                    Some(
+                        value
+                            .get("last_id")
+                            .and_then(Value::as_str)
+                            .ok_or_else(|| protocol_error("missing pagination cursor"))?,
+                    )
+                } else {
+                    None
+                }
             }
             DiscoveryApi::Gemini => match value.get("nextPageToken") {
                 None => None,
@@ -166,8 +208,13 @@ async fn discover_inner(
                 None
             }
         };
-        let Some(next) = next else { return normalize_model_ids(models); };
-        if entries.is_empty() || next.is_empty() || next.len() > 4096 || !next.bytes().all(|byte| byte.is_ascii_graphic())
+        let Some(next) = next else {
+            return normalize_model_ids(models);
+        };
+        if entries.is_empty()
+            || next.is_empty()
+            || next.len() > 4096
+            || !next.bytes().all(|byte| byte.is_ascii_graphic())
             || !seen_cursors.insert(next.to_string())
         {
             return Err(protocol_error("invalid or repeated pagination cursor"));

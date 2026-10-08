@@ -780,11 +780,17 @@ impl AgentConnectorImpl {
         provider_id: &ProviderId,
         cancellation: &tokio_util::sync::CancellationToken,
     ) -> Result<crate::model_discovery::ModelCatalog, ConnectorError> {
-        let adapter = self.providers.get(provider_id).map(|entry| Arc::clone(entry.value()))
-            .ok_or_else(|| ConnectorError::ProviderUnavailable("configured provider not registered".into()))?;
+        let adapter = self
+            .providers
+            .get(provider_id)
+            .map(|entry| Arc::clone(entry.value()))
+            .ok_or_else(|| {
+                ConnectorError::ProviderUnavailable("configured provider not registered".into())
+            })?;
         if !adapter.capabilities().model_discovery {
             return Err(ConnectorError::unsupported_feature(
-                adapter.id().clone(), "model discovery is not supported by this adapter",
+                adapter.id().clone(),
+                "model discovery is not supported by this adapter",
             ));
         }
         let models = tokio::select! {

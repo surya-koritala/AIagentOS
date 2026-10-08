@@ -359,8 +359,12 @@ impl LlmProviderAdapter for LocalLlmAdapter {
 
     async fn list_models(&self) -> Result<Vec<String>, ConnectorError> {
         crate::model_discovery::discover(
-            &self.id, &self.base_url, crate::model_discovery::DiscoveryApi::Ollama, "",
-        ).await
+            &self.id,
+            &self.base_url,
+            crate::model_discovery::DiscoveryApi::Ollama,
+            "",
+        )
+        .await
     }
 
     async fn is_available(&self) -> bool {

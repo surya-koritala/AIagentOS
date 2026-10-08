@@ -1730,14 +1730,28 @@ mod tests {
     fn model_discovery_wire_contract_is_v2_typed_and_identifier_only() {
         let description = protocol_description();
         assert!(description.features.contains(&"model_discovery".into()));
-        assert!(tags(&description.request_schema, "op").contains(&"list_provider_models".to_string()));
-        assert!(tags(&description.reply_schema, "status").contains(&"provider_models".to_string()));
-        let catalog: crate::syscall_server::SyscallReply = serde_json::from_str(include_str!("../../../protocol/v2/provider-models.json")).unwrap();
-        assert!(matches!(catalog, crate::syscall_server::SyscallReply::ProviderModels { catalog }
-            if catalog.provider_id == "openai" && catalog.models == ["fixture-model"]));
-        let unsupported: crate::syscall_server::SyscallReply = serde_json::from_str(include_str!("../../../protocol/v2/unsupported-model-discovery.json")).unwrap();
-        assert!(matches!(unsupported, crate::syscall_server::SyscallReply::TypedError {
-            code: crate::syscall_server::WireErrorCode::Unsupported, retryable: false, ..
-        }));
+        let requests = tags(&description.request_schema, "op");
+        let replies = tags(&description.reply_schema, "status");
+        assert!(requests.contains(&"list_provider_models".into()));
+        assert!(replies.contains(&"provider_models".into()));
+        let catalog: crate::syscall_server::SyscallReply =
+            serde_json::from_str(include_str!("../../../protocol/v2/provider-models.json"))
+                .unwrap();
+        assert!(
+            matches!(catalog, crate::syscall_server::SyscallReply::ProviderModels { catalog }
+            if catalog.provider_id == "openai" && catalog.models == ["fixture-model"])
+        );
+        let unsupported: crate::syscall_server::SyscallReply = serde_json::from_str(include_str!(
+            "../../../protocol/v2/unsupported-model-discovery.json"
+        ))
+        .unwrap();
+        assert!(matches!(
+            unsupported,
+            crate::syscall_server::SyscallReply::TypedError {
+                code: crate::syscall_server::WireErrorCode::Unsupported,
+                retryable: false,
+                ..
+            }
+        ));
     }
 }

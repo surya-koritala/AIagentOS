@@ -6614,8 +6614,12 @@ impl SyscallServer {
         let connection_limit = self.connection_limit.clone();
         let connection_metrics = self.connection_metrics.clone();
         let idle_timeout = self.idle_timeout;
+        // Accepted connections belong to this server lifetime. Dropping an
+        // aborted listener cancels its handlers and releases their kernel refs.
+        let mut connections = tokio::task::JoinSet::new();
         match self.listener {
             Listener::Tcp(listener) => loop {
+                while connections.try_join_next().is_some() {}
                 let (stream, _peer) = listener.accept().await?;
                 let Ok(connection_permit) = connection_limit.clone().try_acquire_owned() else {
                     connection_metrics.reject();
@@ -6626,7 +6630,7 @@ impl SyscallServer {
                 let kernel = self.kernel.clone();
                 let auth = self.auth_token.clone();
                 let connection_metrics = connection_metrics.clone();
-                tokio::spawn(async move {
+                connections.spawn(async move {
                     let _connection_permit = connection_permit;
                     let _active_connection = active_connection;
                     let (read, write) = stream.into_split();
@@ -6647,6 +6651,7 @@ impl SyscallServer {
                 });
             },
             Listener::Tls(listener, reload) => loop {
+                while connections.try_join_next().is_some() {}
                 let (stream, _peer) = listener.accept().await?;
                 let Ok(connection_permit) = connection_limit.clone().try_acquire_owned() else {
                     connection_metrics.reject();
@@ -6658,7 +6663,7 @@ impl SyscallServer {
                 let auth = self.auth_token.clone();
                 let reload = reload.clone();
                 let connection_metrics = connection_metrics.clone();
-                tokio::spawn(async move {
+                connections.spawn(async move {
                     let _connection_permit = connection_permit;
                     let _active_connection = active_connection;
                     let (generation, config, generation_rx) = match reload.snapshot() {
@@ -6709,6 +6714,7 @@ impl SyscallServer {
             },
             #[cfg(unix)]
             Listener::Unix(listener) => loop {
+                while connections.try_join_next().is_some() {}
                 let (stream, _peer) = listener.accept().await?;
                 let Ok(connection_permit) = connection_limit.clone().try_acquire_owned() else {
                     connection_metrics.reject();
@@ -6719,7 +6725,7 @@ impl SyscallServer {
                 let kernel = self.kernel.clone();
                 let auth = self.auth_token.clone();
                 let connection_metrics = connection_metrics.clone();
-                tokio::spawn(async move {
+                connections.spawn(async move {
                     let _connection_permit = connection_permit;
                     let _active_connection = active_connection;
                     let (read, write) = stream.into_split();
@@ -9319,6 +9325,45 @@ mod tests {
             SyscallReply::Hello { .. }
         ));
         fresh.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn stopping_the_listener_reclaims_live_connections_and_the_store() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("listener-lifetime.db");
+        let kernel = Arc::new(AgentKernelImpl::with_db_path(&path).unwrap());
+        let context = Arc::downgrade(&kernel.context_manager);
+        let server = SyscallServer::bind(kernel.clone(), "127.0.0.1:0")
+            .await
+            .unwrap();
+        let address = server.local_addr().unwrap();
+        let metrics = server.connection_metrics();
+        let task = tokio::spawn(server.serve());
+        let mut client = SyscallClient::connect(address).await.unwrap();
+        assert!(matches!(
+            client
+                .call(Syscall::Hello {
+                    protocol_version: PROTOCOL_VERSION
+                })
+                .await
+                .unwrap(),
+            SyscallReply::Hello { .. }
+        ));
+        assert_eq!(metrics.snapshot().active, 1);
+        drop(kernel);
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while context.strong_count() != 0 || metrics.snapshot().active != 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("aborted server must reclaim handlers without waiting for client EOF");
+        assert!(client.ping().await.is_err());
+        let reopened = AgentKernelImpl::with_db_path(&path).unwrap();
+        drop(reopened);
+        root.close().unwrap();
     }
 
     #[tokio::test]

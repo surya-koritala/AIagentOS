@@ -850,7 +850,7 @@ mod tests {
                     |r| r.get::<_, i64>(0)
                 )
                 .unwrap(),
-                10
+                crate::schema::MIN_READER_SCHEMA_VERSION
             );
         }
         for query in [

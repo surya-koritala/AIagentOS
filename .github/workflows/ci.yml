@@ -60,6 +60,8 @@ jobs:
         run: mdbook build docs
       - name: All-feature compilation
         run: cargo build --workspace --exclude tauri-app --all-features --locked
+      - name: All-feature provider protocol fixtures
+        run: cargo test -p adapters --all-features --locked
       - name: Off-by-default Wasm module system
         run: |
           cargo test -p kernel --features wasm --locked modules::

@@ -16,7 +16,7 @@ pub(crate) const CURRENT_SCHEMA_VERSION: i64 = 11;
 const MIN_READABLE_SCHEMA_VERSION: i64 = 1;
 // Older readers cannot preserve native assistant replay state, binary fact
 // embeddings, or clone security.
-const MIN_READER_SCHEMA_VERSION: i64 = 11;
+pub(crate) const MIN_READER_SCHEMA_VERSION: i64 = 11;
 
 const MIGRATIONS: &[(i64, &str)] = &[
     (1, "adopt-versioned-kernel-schema"),

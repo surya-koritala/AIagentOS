@@ -12,7 +12,9 @@ use std::process::Command;
 use std::time::{Duration, Instant, SystemTime};
 
 use adapters::on_device::{ChatTemplate, OnDeviceConfig, OnDeviceLlmAdapter};
-use kernel::connector::{LlmProviderAdapter, LlmRequestOptions, StandardMessage, ProviderEventSink, ProviderStreamEvent};
+use kernel::connector::{
+    LlmProviderAdapter, LlmRequestOptions, ProviderEventSink, ProviderStreamEvent, StandardMessage,
+};
 use kernel::ConnectorError;
 use ring::digest::{Context as DigestContext, SHA256};
 use serde_json::{json, Value};
@@ -430,29 +432,60 @@ async fn execute(arguments: Arguments) -> Result<bool, String> {
     let (sender, mut receiver) = tokio::sync::mpsc::channel(4);
     let stream_cancel = CancellationToken::new();
     let stream = session.send_streaming_events_controlled(
-        vec![StandardMessage::user("Write the numbers one through twelve separated by spaces.")], &[],
-        LlmRequestOptions { max_output_tokens: Some(MAX_OUTPUT_TOKENS), timeout: Some(Duration::from_secs(arguments.max_generation_seconds)) },
-        &stream_cancel, ProviderEventSink::new(sender));
-    let collect = async { let mut deltas = Vec::new(); while let Some(ProviderStreamEvent::TextDelta(text)) = receiver.recv().await { deltas.push(text); } deltas };
+        vec![StandardMessage::user(
+            "Write the numbers one through twelve separated by spaces.",
+        )],
+        &[],
+        LlmRequestOptions {
+            max_output_tokens: Some(MAX_OUTPUT_TOKENS),
+            timeout: Some(Duration::from_secs(arguments.max_generation_seconds)),
+        },
+        &stream_cancel,
+        ProviderEventSink::new(sender),
+    );
+    let collect = async {
+        let mut deltas = Vec::new();
+        while let Some(ProviderStreamEvent::TextDelta(text)) = receiver.recv().await {
+            deltas.push(text);
+        }
+        deltas
+    };
     let (streamed, deltas) = tokio::join!(stream, collect);
     let streamed = streamed.map_err(|_| "real-model native streaming failed".to_string())?;
     let stream_ms = duration_ms(stream_started);
-    let stream_exact = deltas.concat() == streamed.content && streamed.content == response.content && streamed.tokens_used == response.tokens_used;
+    let stream_exact = deltas.concat() == streamed.content
+        && streamed.content == response.content
+        && streamed.tokens_used == response.tokens_used;
     let stream_native = adapter.capabilities().native_streaming && deltas.len() >= 2;
 
     let decode_cancel = CancellationToken::new();
-    let trigger = decode_cancel.clone(); let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+    let trigger = decode_cancel.clone();
+    let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
     let decode_cancel_started = Instant::now();
     let send = session.send_streaming_events_controlled(
-        vec![StandardMessage::user("Continue writing numbers in order until you reach one hundred.")], &[],
-        LlmRequestOptions { max_output_tokens: Some(256), timeout: Some(Duration::from_secs(arguments.max_cancellation_seconds)) },
-        &decode_cancel, ProviderEventSink::new(sender));
+        vec![StandardMessage::user(
+            "Continue writing numbers in order until you reach one hundred.",
+        )],
+        &[],
+        LlmRequestOptions {
+            max_output_tokens: Some(256),
+            timeout: Some(Duration::from_secs(arguments.max_cancellation_seconds)),
+        },
+        &decode_cancel,
+        ProviderEventSink::new(sender),
+    );
     let observe = async {
-        let first = tokio::time::timeout(Duration::from_secs(arguments.max_cancellation_seconds), receiver.recv()).await;
-        let observed = matches!(first, Ok(Some(ProviderStreamEvent::TextDelta(ref text))) if !text.is_empty());
+        let first = tokio::time::timeout(
+            Duration::from_secs(arguments.max_cancellation_seconds),
+            receiver.recv(),
+        )
+        .await;
+        let observed =
+            matches!(first, Ok(Some(ProviderStreamEvent::TextDelta(ref text))) if !text.is_empty());
         trigger.cancel();
         // Dropping the caller sink tests cancellation while the bridge can be full.
-        drop(receiver); observed
+        drop(receiver);
+        observed
     };
     let (decode_cancelled, first_delta_observed) = tokio::join!(send, observe);
     let decode_cancellation_ms = duration_ms(decode_cancel_started);
@@ -498,9 +531,17 @@ async fn execute(arguments: Arguments) -> Result<bool, String> {
     let checks = BTreeMap::from([
         ("native_incremental_stream", stream_native),
         ("stream_batch_byte_parity", stream_exact),
-        ("bounded_stream_generation", stream_ms <= arguments.max_generation_seconds.saturating_mul(1000)),
+        (
+            "bounded_stream_generation",
+            stream_ms <= arguments.max_generation_seconds.saturating_mul(1000),
+        ),
         ("mid_decode_cancellation_observed", first_delta_observed),
-        ("mid_decode_worker_drained", decode_drained && decode_cancellation_ms <= arguments.max_cancellation_seconds.saturating_mul(1000)),
+        (
+            "mid_decode_worker_drained",
+            decode_drained
+                && decode_cancellation_ms
+                    <= arguments.max_cancellation_seconds.saturating_mul(1000),
+        ),
         ("bounded_generation", {
             response.tokens_used > 0
                 && response.tokens_used <= MAX_OUTPUT_TOKENS

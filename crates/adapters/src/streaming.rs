@@ -385,10 +385,13 @@ pub(crate) trait NativeSseProtocol: Send {
 }
 
 pub(crate) async fn controlled_provider_future<F>(
-    provider: &str, options: LlmRequestOptions,
-    cancellation: &tokio_util::sync::CancellationToken, send: F,
+    provider: &str,
+    options: LlmRequestOptions,
+    cancellation: &tokio_util::sync::CancellationToken,
+    send: F,
 ) -> Result<LlmResponse, ConnectorError>
-where F: std::future::Future<Output = Result<LlmResponse, ConnectorError>> + Send,
+where
+    F: std::future::Future<Output = Result<LlmResponse, ConnectorError>> + Send,
 {
     tokio::pin!(send);
     match options.timeout {
@@ -409,34 +412,61 @@ where F: std::future::Future<Output = Result<LlmResponse, ConnectorError>> + Sen
 
 /// NDJSON shares the SSE protocol-state contract, wire ceiling and event sink.
 pub(crate) async fn read_ndjson<D: NativeSseProtocol>(
-    response: reqwest::Response, mut state: D, events: Option<ProviderEventSink>,
+    response: reqwest::Response,
+    mut state: D,
+    events: Option<ProviderEventSink>,
 ) -> Result<LlmResponse, ConnectorError> {
-    if response.content_length().is_some_and(|size| size > MAX_OPENAI_STREAM_BYTES as u64) {
+    if response
+        .content_length()
+        .is_some_and(|size| size > MAX_OPENAI_STREAM_BYTES as u64)
+    {
         return Err(protocol("response exceeded the 8 MiB wire ceiling"));
     }
-    let mut bytes = response.bytes_stream(); let mut total = 0_usize; let mut line = Vec::new();
+    let mut bytes = response.bytes_stream();
+    let mut total = 0_usize;
+    let mut line = Vec::new();
     while let Some(chunk) = bytes.next().await {
-        let chunk = chunk.map_err(|_| ConnectorError::StreamError("NDJSON transport failed".into()))?;
+        let chunk =
+            chunk.map_err(|_| ConnectorError::StreamError("NDJSON transport failed".into()))?;
         total = total.saturating_add(chunk.len());
-        if total > MAX_OPENAI_STREAM_BYTES { return Err(protocol("response exceeded the 8 MiB wire ceiling")); }
+        if total > MAX_OPENAI_STREAM_BYTES {
+            return Err(protocol("response exceeded the 8 MiB wire ceiling"));
+        }
         for byte in chunk {
             if byte != b'\n' {
-                if line.len() >= 1024 * 1024 { return Err(protocol("NDJSON record exceeded the 1 MiB ceiling")); }
-                line.push(byte); continue;
+                if line.len() >= 1024 * 1024 {
+                    return Err(protocol("NDJSON record exceeded the 1 MiB ceiling"));
+                }
+                line.push(byte);
+                continue;
             }
             if line.iter().any(|byte| !byte.is_ascii_whitespace()) {
-                let json = serde_json::from_slice(&line).map_err(|_| protocol("malformed NDJSON record"))?;
+                let json = serde_json::from_slice(&line)
+                    .map_err(|_| protocol("malformed NDJSON record"))?;
                 for text in state.event(json)? {
-                    if !text.is_empty() { if let Some(sink) = &events { sink.emit(ProviderStreamEvent::TextDelta(text)).await; } }
+                    if !text.is_empty() {
+                        if let Some(sink) = &events {
+                            sink.emit(ProviderStreamEvent::TextDelta(text)).await;
+                        }
+                    }
                 }
-                if state.complete() { return state.finish(); }
+                if state.complete() {
+                    return state.finish();
+                }
             }
             line.clear();
         }
     }
     if line.iter().any(|byte| !byte.is_ascii_whitespace()) {
-        let json = serde_json::from_slice(&line).map_err(|_| ConnectorError::StreamError("NDJSON ended within a record".into()))?;
-        for text in state.event(json)? { if !text.is_empty() { if let Some(sink) = &events { sink.emit(ProviderStreamEvent::TextDelta(text)).await; } } }
+        let json = serde_json::from_slice(&line)
+            .map_err(|_| ConnectorError::StreamError("NDJSON ended within a record".into()))?;
+        for text in state.event(json)? {
+            if !text.is_empty() {
+                if let Some(sink) = &events {
+                    sink.emit(ProviderStreamEvent::TextDelta(text)).await;
+                }
+            }
+        }
     }
     state.finish()
 }

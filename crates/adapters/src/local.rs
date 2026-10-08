@@ -33,7 +33,13 @@ struct LocalSession {
 }
 
 impl LocalSession {
-    fn body(messages: &[StandardMessage], tools: &[ToolDefinition], options: LlmRequestOptions, model: &str, stream: bool) -> serde_json::Value {
+    fn body(
+        messages: &[StandardMessage],
+        tools: &[ToolDefinition],
+        options: LlmRequestOptions,
+        model: &str,
+        stream: bool,
+    ) -> serde_json::Value {
         // Assistant tool-call turns and tool results must survive the round
         // trip, or a multi-step tool conversation loses its own history.
         let msgs: Vec<serde_json::Value> = messages
@@ -78,7 +84,11 @@ impl LocalSession {
         body
     }
 
-    async fn post_with_template_fallback(&self, body: &serde_json::Value, has_tools: bool) -> Result<reqwest::Response, ConnectorError> {
+    async fn post_with_template_fallback(
+        &self,
+        body: &serde_json::Value,
+        has_tools: bool,
+    ) -> Result<reqwest::Response, ConnectorError> {
         let resp = self.post_chat(body).await?;
 
         // Ollama rejects `tools` for a model whose template lacks tool support,
@@ -116,23 +126,35 @@ impl LocalSession {
         Ok(response)
     }
 
-    async fn stream(&self, messages: Vec<StandardMessage>, tools: &[ToolDefinition], options: LlmRequestOptions,
-        cancellation: &tokio_util::sync::CancellationToken, events: Option<ProviderEventSink>) -> Result<LlmResponse, ConnectorError> {
+    async fn stream(
+        &self,
+        messages: Vec<StandardMessage>,
+        tools: &[ToolDefinition],
+        options: LlmRequestOptions,
+        cancellation: &tokio_util::sync::CancellationToken,
+        events: Option<ProviderEventSink>,
+    ) -> Result<LlmResponse, ConnectorError> {
         self.attempts.store(0, std::sync::atomic::Ordering::Release);
         let send = async {
             let body = Self::body(&messages, tools, options, &self.model, true);
-            let response = self.post_with_template_fallback(&body, !tools.is_empty()).await?;
-            if !response.status().is_success() { return Err(crate::provider_http_error(&self.provider_id, response).await); }
+            let response = self
+                .post_with_template_fallback(&body, !tools.is_empty())
+                .await?;
+            if !response.status().is_success() {
+                return Err(crate::provider_http_error(&self.provider_id, response).await);
+            }
             crate::streaming::read_ndjson(response, protocol::OllamaStream::default(), events).await
         };
-        crate::streaming::controlled_provider_future(&self.provider_id, options, cancellation, send).await
+        crate::streaming::controlled_provider_future(&self.provider_id, options, cancellation, send)
+            .await
     }
 
     async fn post_chat(
         &self,
         body: &serde_json::Value,
     ) -> Result<reqwest::Response, ConnectorError> {
-        self.attempts.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        self.attempts
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         self.client
             .post(format!("{}/api/chat", self.base_url.trim_end_matches('/')))
             .json(body)
@@ -166,7 +188,9 @@ impl LlmSession for LocalSession {
         self.attempts.store(0, std::sync::atomic::Ordering::Release);
         let body = Self::body(&messages, tools, options, &self.model, false);
 
-        let resp = self.post_with_template_fallback(&body, !tools.is_empty()).await?;
+        let resp = self
+            .post_with_template_fallback(&body, !tools.is_empty())
+            .await?;
 
         if !resp.status().is_success() {
             return Err(crate::provider_http_error(&self.provider_id, resp).await);
@@ -226,25 +250,72 @@ impl LlmSession for LocalSession {
         })
     }
 
-    async fn send_controlled(&self, messages: Vec<StandardMessage>, tools: &[ToolDefinition], options: LlmRequestOptions,
-        cancellation: &tokio_util::sync::CancellationToken) -> Result<LlmResponse, ConnectorError> {
+    async fn send_controlled(
+        &self,
+        messages: Vec<StandardMessage>,
+        tools: &[ToolDefinition],
+        options: LlmRequestOptions,
+        cancellation: &tokio_util::sync::CancellationToken,
+    ) -> Result<LlmResponse, ConnectorError> {
         self.attempts.store(0, std::sync::atomic::Ordering::Release);
-        crate::streaming::controlled_provider_future(&self.provider_id, options, cancellation, self.send_with_options(messages, tools, options)).await
+        crate::streaming::controlled_provider_future(
+            &self.provider_id,
+            options,
+            cancellation,
+            self.send_with_options(messages, tools, options),
+        )
+        .await
     }
-    async fn send_streaming(&self, messages: Vec<StandardMessage>, tools: &[ToolDefinition]) -> Result<LlmResponse, ConnectorError> {
-        self.send_streaming_with_options(messages, tools, LlmRequestOptions::default()).await
+    async fn send_streaming(
+        &self,
+        messages: Vec<StandardMessage>,
+        tools: &[ToolDefinition],
+    ) -> Result<LlmResponse, ConnectorError> {
+        self.send_streaming_with_options(messages, tools, LlmRequestOptions::default())
+            .await
     }
-    async fn send_streaming_with_options(&self, messages: Vec<StandardMessage>, tools: &[ToolDefinition], options: LlmRequestOptions) -> Result<LlmResponse, ConnectorError> {
-        self.stream(messages, tools, options, &tokio_util::sync::CancellationToken::new(), None).await
+    async fn send_streaming_with_options(
+        &self,
+        messages: Vec<StandardMessage>,
+        tools: &[ToolDefinition],
+        options: LlmRequestOptions,
+    ) -> Result<LlmResponse, ConnectorError> {
+        self.stream(
+            messages,
+            tools,
+            options,
+            &tokio_util::sync::CancellationToken::new(),
+            None,
+        )
+        .await
     }
-    async fn send_streaming_controlled(&self, messages: Vec<StandardMessage>, tools: &[ToolDefinition], options: LlmRequestOptions, cancellation: &tokio_util::sync::CancellationToken) -> Result<LlmResponse, ConnectorError> {
-        self.stream(messages, tools, options, cancellation, None).await
+    async fn send_streaming_controlled(
+        &self,
+        messages: Vec<StandardMessage>,
+        tools: &[ToolDefinition],
+        options: LlmRequestOptions,
+        cancellation: &tokio_util::sync::CancellationToken,
+    ) -> Result<LlmResponse, ConnectorError> {
+        self.stream(messages, tools, options, cancellation, None)
+            .await
     }
-    async fn send_streaming_events_controlled(&self, messages: Vec<StandardMessage>, tools: &[ToolDefinition], options: LlmRequestOptions, cancellation: &tokio_util::sync::CancellationToken, events: ProviderEventSink) -> Result<LlmResponse, ConnectorError> {
-        self.stream(messages, tools, options, cancellation, Some(events)).await
+    async fn send_streaming_events_controlled(
+        &self,
+        messages: Vec<StandardMessage>,
+        tools: &[ToolDefinition],
+        options: LlmRequestOptions,
+        cancellation: &tokio_util::sync::CancellationToken,
+        events: ProviderEventSink,
+    ) -> Result<LlmResponse, ConnectorError> {
+        self.stream(messages, tools, options, cancellation, Some(events))
+            .await
     }
-    fn last_attempts(&self) -> Option<u32> { Some(self.attempts.load(std::sync::atomic::Ordering::Acquire)) }
-    fn max_provider_attempts(&self) -> u32 { 2 }
+    fn last_attempts(&self) -> Option<u32> {
+        Some(self.attempts.load(std::sync::atomic::Ordering::Acquire))
+    }
+    fn max_provider_attempts(&self) -> u32 {
+        2
+    }
 
     fn enforces_max_output_tokens(&self) -> bool {
         true
@@ -281,7 +352,9 @@ impl LlmProviderAdapter for LocalLlmAdapter {
         }
     }
 
-    fn max_provider_attempts(&self) -> u32 { 2 }
+    fn max_provider_attempts(&self) -> u32 {
+        2
+    }
 
     async fn is_available(&self) -> bool {
         self.client

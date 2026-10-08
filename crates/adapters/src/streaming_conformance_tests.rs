@@ -94,12 +94,25 @@ pub(super) async fn collect(
     Ok((response?, deltas))
 }
 
-pub(super) fn assert_conformance(adapter: &dyn LlmProviderAdapter, response: &LlmResponse, deltas: &[String]) {
+pub(super) fn assert_conformance(
+    adapter: &dyn LlmProviderAdapter,
+    response: &LlmResponse,
+    deltas: &[String],
+) {
     assert_eq!(deltas.concat(), response.content, "{}", adapter.id());
     if adapter.capabilities().native_streaming {
-        assert!(deltas.len() >= 2, "{} claimed native streaming", adapter.id());
+        assert!(
+            deltas.len() >= 2,
+            "{} claimed native streaming",
+            adapter.id()
+        );
     } else {
-        assert_eq!(deltas.len(), 1, "{} claimed fallback streaming", adapter.id());
+        assert_eq!(
+            deltas.len(),
+            1,
+            "{} claimed fallback streaming",
+            adapter.id()
+        );
     }
 }
 
@@ -144,13 +157,19 @@ async fn nine_network_adapters_conform_to_declared_streaming() {
         .expect(1)
         .mount(&server)
         .await;
-    Mock::given(method("POST")).and(path("/api/chat"))
-        .and(body_partial_json(json!({"stream": true, "options": {"num_predict": 41}})))
-        .respond_with(ResponseTemplate::new(200).set_body_string(crate::local_streaming_tests::ndjson_fixture()))
-        .expect(1).mount(&server).await;
-    let fallback_fixtures = [
-        ("/models/fixture", json!([{"generated_text": "Hello 🌐"}])),
-    ];
+    Mock::given(method("POST"))
+        .and(path("/api/chat"))
+        .and(body_partial_json(
+            json!({"stream": true, "options": {"num_predict": 41}}),
+        ))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(crate::local_streaming_tests::ndjson_fixture()),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let fallback_fixtures = [("/models/fixture", json!([{"generated_text": "Hello 🌐"}]))];
     for (request_path, fixture) in fallback_fixtures {
         Mock::given(method("POST"))
             .and(path(request_path))

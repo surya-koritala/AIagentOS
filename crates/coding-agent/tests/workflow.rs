@@ -460,6 +460,65 @@ async fn optional_reads_distinguish_absence_from_existing_files_through_director
 }
 
 #[tokio::test]
+async fn speculative_branch_cannot_gain_network_or_escape_workspace_authority() {
+    let h = Harness::new(Arc::new(AgentKernelImpl::new().unwrap())).await;
+    let (j, mut io) = h.create_job().await;
+    let child = Uuid::new_v4();
+    io.client
+        .clone_agent(
+            j.parent.to_string(),
+            child,
+            "denied probe",
+            vec!["CAP_NET_ACCESS".into()],
+        )
+        .await
+        .unwrap();
+    let network = io
+        .client
+        .vfs_open(child.to_string(), "/tools/http_get")
+        .await
+        .unwrap();
+    let denied = io
+        .client
+        .vfs_invoke(
+            child.to_string(),
+            &network.id,
+            serde_json::json!({"url":"https://example.com"}),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(
+        denied.wire_code(),
+        Some(agent_sdk::WireErrorCode::PermissionDenied)
+    );
+    assert!(io
+        .client
+        .vfs_open_workspace(
+            child.to_string(),
+            agent_sdk::WorkspaceOpenRequest {
+                path: "/workspace/../outside".into(),
+                kind: agent_sdk::WorkspaceKind::File,
+                rights: vec![agent_sdk::WorkspaceRight::Read],
+                allow_missing: false,
+            }
+        )
+        .await
+        .is_err());
+    io.client
+        .vfs_close(child.to_string(), &network.id)
+        .await
+        .unwrap();
+    io.control.kill_agent(child.to_string()).await.unwrap();
+    io.control
+        .erase_agent_data(child, agent_sdk::CONFIRM_DATA_ERASURE)
+        .await
+        .unwrap();
+    io.client.close().await.unwrap();
+    io.control.close().await.unwrap();
+    h.kernel.stop_agent(j.parent).await.unwrap();
+}
+
+#[tokio::test]
 async fn a_kernel_restart_resumes_after_a_completed_test_without_replaying_the_failure() {
     let root = std::env::temp_dir().join(format!("coding-restart-{}", Uuid::new_v4()));
     std::fs::create_dir_all(&root).unwrap();

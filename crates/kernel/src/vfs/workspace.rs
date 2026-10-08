@@ -1025,4 +1025,167 @@ mod tests {
         server.abort();
         let _ = server.await;
     }
+
+    #[tokio::test]
+    async fn public_wire_provider_deadline_reclaims_a_pending_workspace_open() {
+        use crate::syscall_server::{
+            Syscall, SyscallClient, SyscallReply, SyscallServer, WireErrorCode,
+        };
+        let (root, kernel, agent, existing) = setup().await;
+        let server = SyscallServer::bind(kernel.clone(), "127.0.0.1:0")
+            .await
+            .unwrap();
+        let address = server.local_addr().unwrap();
+        let server = tokio::spawn(server.serve());
+        let mut client = SyscallClient::connect(address).await.unwrap();
+        client
+            .call(Syscall::Hello {
+                protocol_version: 2,
+            })
+            .await
+            .unwrap();
+        let (entered, release, canceled) = kernel.sandbox_manager.pause_next_filesystem_for_test();
+        client
+            .send(&Syscall::VfsOpenWorkspace {
+                agent_id: agent.to_string(),
+                request: WorkspaceOpenRequest {
+                    path: "/workspace/deadline.bin".into(),
+                    kind: WorkspaceKind::File,
+                    rights: vec![WorkspaceRight::Write],
+                    allow_missing: true,
+                },
+            })
+            .await
+            .unwrap();
+        observed(&entered).await;
+        assert_eq!(kernel.vfs_mounts(agent).unwrap().open_handles, 2);
+        // Exercise the real 30-second provider deadline without changing either
+        // it or the 130-second public wire request deadline.
+        tokio::time::timeout(std::time::Duration::from_secs(40), async {
+            while !canceled.load(Ordering::Acquire) {
+                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .expect("provider deadline did not cancel the admitted native worker");
+        assert!(!root.path().join("deadline.bin").exists());
+        release.store(true, Ordering::Release);
+        assert!(matches!(
+            client.read_reply().await.unwrap(),
+            SyscallReply::TypedError {
+                code: WireErrorCode::Timeout,
+                ..
+            }
+        ));
+        assert_eq!(kernel.vfs_mounts(agent).unwrap().open_handles, 1);
+        assert!(!root.path().join("deadline.bin").exists());
+        let fresh = match client
+            .call(Syscall::VfsOpenWorkspace {
+                agent_id: agent.to_string(),
+                request: WorkspaceOpenRequest {
+                    path: "/workspace/file.bin".into(),
+                    kind: WorkspaceKind::File,
+                    rights: vec![WorkspaceRight::Read],
+                    allow_missing: false,
+                },
+            })
+            .await
+            .unwrap()
+        {
+            SyscallReply::WorkspaceOpened { handle } => handle,
+            other => panic!("fresh authorized open after deadline failed: {other:?}"),
+        };
+        assert_eq!(kernel.vfs_mounts(agent).unwrap().open_handles, 2);
+        for handle in [fresh.id, existing.id] {
+            assert!(matches!(
+                client
+                    .call(Syscall::VfsClose {
+                        agent_id: agent.to_string(),
+                        handle
+                    })
+                    .await
+                    .unwrap(),
+                SyscallReply::VfsClosed
+            ));
+        }
+        client.close().await.unwrap();
+        server.abort();
+        let _ = server.await;
+        drop(kernel);
+        root.close().unwrap();
+    }
+
+    #[tokio::test]
+    async fn public_wire_disconnect_keeps_admitted_write_bounded_and_drainable() {
+        use crate::syscall_server::{Syscall, SyscallClient, SyscallReply, SyscallServer};
+        use base64::Engine;
+        let (root, kernel, agent, handle) = setup().await;
+        let server = SyscallServer::bind(kernel.clone(), "127.0.0.1:0")
+            .await
+            .unwrap();
+        let address = server.local_addr().unwrap();
+        let server = tokio::spawn(server.serve());
+        let mut writer = SyscallClient::connect(address).await.unwrap();
+        let (entered, release, canceled) = kernel.sandbox_manager.pause_next_filesystem_for_test();
+        writer
+            .send(&Syscall::VfsWriteWorkspace {
+                agent_id: agent.to_string(),
+                handle: handle.id.clone(),
+                data_base64: base64::engine::general_purpose::STANDARD.encode(b"never commit"),
+            })
+            .await
+            .unwrap();
+        observed(&entered).await;
+        drop(writer);
+        // Disconnect is an indeterminate transport outcome, not an immediate
+        // rollback promise. The admitted worker remains bounded by its real
+        // provider deadline and observes cancellation before this mutation.
+        tokio::time::timeout(std::time::Duration::from_secs(40), async {
+            while !canceled.load(Ordering::Acquire) {
+                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .expect("abandoned native write escaped its provider deadline");
+        assert_eq!(
+            std::fs::read(root.path().join("file.bin")).unwrap(),
+            b"original"
+        );
+        release.store(true, Ordering::Release);
+        let mut reader = SyscallClient::connect(address).await.unwrap();
+        match reader
+            .call(Syscall::VfsReadWorkspace {
+                agent_id: agent.to_string(),
+                handle: handle.id.clone(),
+                offset: 0,
+                max_bytes: 64,
+            })
+            .await
+            .unwrap()
+        {
+            SyscallReply::WorkspaceRead { chunk } => assert_eq!(
+                base64::engine::general_purpose::STANDARD
+                    .decode(chunk.data_base64)
+                    .unwrap(),
+                b"original"
+            ),
+            other => panic!("fresh public read after abandoned worker drain failed: {other:?}"),
+        }
+        assert_eq!(kernel.vfs_mounts(agent).unwrap().open_handles, 1);
+        assert!(matches!(
+            reader
+                .call(Syscall::VfsClose {
+                    agent_id: agent.to_string(),
+                    handle: handle.id
+                })
+                .await
+                .unwrap(),
+            SyscallReply::VfsClosed
+        ));
+        reader.close().await.unwrap();
+        server.abort();
+        let _ = server.await;
+        drop(kernel);
+        root.close().unwrap();
+    }
 }

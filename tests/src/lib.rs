@@ -55,6 +55,9 @@ mod shutdown_props;
 mod gate_adversarial_props;
 
 #[cfg(test)]
+mod vfs_handle_props;
+
+#[cfg(test)]
 mod prerequisite_props;
 
 #[cfg(test)]

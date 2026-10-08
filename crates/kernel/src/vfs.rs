@@ -7,6 +7,9 @@ pub mod data;
 pub mod mounts;
 pub mod workspace;
 
+#[cfg(test)]
+mod process_crash;
+
 use crate::{AgentId, AgentKernelImpl};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;

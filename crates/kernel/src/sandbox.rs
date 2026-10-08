@@ -2294,6 +2294,141 @@ fn is_public_ip(ip: std::net::IpAddr) -> bool {
 mod tests {
     use super::*;
 
+    #[cfg(windows)]
+    fn matching_native_file_handles(path: &Path) -> std::io::Result<Vec<(usize, u32, u32)>> {
+        use std::os::windows::fs::OpenOptionsExt;
+        use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+        use windows_sys::Wdk::System::Threading::{
+            NtQueryInformationProcess, ProcessHandleInformation,
+        };
+        use windows_sys::Win32::Foundation::{DuplicateHandle, DUPLICATE_SAME_ACCESS};
+        use windows_sys::Win32::Storage::FileSystem::{
+            GetFileInformationByHandle, GetFileType, BY_HANDLE_FILE_INFORMATION,
+            FILE_FLAG_BACKUP_SEMANTICS, FILE_READ_ATTRIBUTES, FILE_TYPE_DISK,
+        };
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        struct HandleEntry {
+            value: *mut core::ffi::c_void,
+            _handle_count: usize,
+            _pointer_count: usize,
+            access: u32,
+            _object_type: u32,
+            attributes: u32,
+            _reserved: u32,
+        }
+
+        // Compare native identities rather than DOS path spellings: the runner
+        // TEMP path may contain a short-name alias. Exclude the diagnostic
+        // handle itself so the live-workspace positive control is meaningful.
+        let target = std::fs::OpenOptions::new()
+            .access_mode(FILE_READ_ATTRIBUTES)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(path)?;
+        let mut target_info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+        if unsafe { GetFileInformationByHandle(target.as_raw_handle(), &mut target_info) } == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let identity = |info: &BY_HANDLE_FILE_INFORMATION| {
+            (
+                info.dwVolumeSerialNumber,
+                info.nFileIndexHigh,
+                info.nFileIndexLow,
+            )
+        };
+
+        // Read only this test process. Native pointers/paths from unrelated
+        // handles are neither dereferenced nor logged. Bound all query storage
+        // and validate the returned table before reading its entries.
+        let mut bytes = 16 * 1024;
+        let snapshot = loop {
+            let mut buffer = vec![0usize; bytes / std::mem::size_of::<usize>()];
+            let mut needed = 0u32;
+            let status = unsafe {
+                NtQueryInformationProcess(
+                    GetCurrentProcess(),
+                    ProcessHandleInformation,
+                    buffer.as_mut_ptr().cast(),
+                    bytes as u32,
+                    &mut needed,
+                )
+            };
+            if status == 0 {
+                break buffer;
+            }
+            if status as u32 != 0xc000_0004 || bytes == 16 * 1024 * 1024 {
+                return Err(std::io::Error::other(format!(
+                    "native handle snapshot status {status:#x}"
+                )));
+            }
+            if needed as usize > 16 * 1024 * 1024 {
+                return Err(std::io::Error::other(
+                    "native handle snapshot exceeds bound",
+                ));
+            }
+            bytes = (bytes * 2)
+                .max(needed as usize)
+                .next_multiple_of(std::mem::size_of::<usize>());
+        };
+        let header_bytes = 2 * std::mem::size_of::<usize>();
+        let count = snapshot[0];
+        let capacity = (snapshot.len() * std::mem::size_of::<usize>() - header_bytes)
+            / std::mem::size_of::<HandleEntry>();
+        if count > capacity {
+            return Err(std::io::Error::other(
+                "native handle snapshot has invalid count",
+            ));
+        }
+        let entries = unsafe {
+            std::slice::from_raw_parts(snapshot.as_ptr().add(2).cast::<HandleEntry>(), count)
+        };
+        let provenance = crate::windows_private_fs::test_open_provenance(identity(&target_info));
+        for event in provenance {
+            eprintln!(
+                "target_private_open_provenance access={:#x} share={:#x} callsite={}:{}",
+                event.access, event.share, event.file, event.line
+            );
+        }
+        let mut matching = Vec::new();
+        for entry in entries {
+            if entry.value == target.as_raw_handle() {
+                continue;
+            }
+            // The snapshot number can be closed/reused by another test. Pin
+            // the current object with a non-inheritable duplicate before both
+            // queries; close only this duplicate through OwnedHandle.
+            let mut duplicate = std::ptr::null_mut();
+            if unsafe {
+                DuplicateHandle(
+                    GetCurrentProcess(),
+                    entry.value,
+                    GetCurrentProcess(),
+                    &mut duplicate,
+                    0,
+                    0,
+                    DUPLICATE_SAME_ACCESS,
+                )
+            } == 0
+            {
+                continue;
+            }
+            let owned = unsafe { OwnedHandle::from_raw_handle(duplicate) };
+            if unsafe { GetFileType(owned.as_raw_handle()) } != FILE_TYPE_DISK {
+                continue;
+            }
+            let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+            if unsafe { GetFileInformationByHandle(owned.as_raw_handle(), &mut info) } == 0 {
+                continue;
+            }
+            if identity(&info) == identity(&target_info) {
+                matching.push((entry.value as usize, entry.access, entry.attributes));
+            }
+        }
+        Ok(matching)
+    }
+
     fn test_config() -> SandboxConfig {
         SandboxConfig {
             workspace_dir: std::env::temp_dir()
@@ -3310,10 +3445,30 @@ mod tests {
 
     #[test]
     fn capability_directory_listing_is_deterministic_typed_and_bounded() {
+        #[cfg(windows)]
+        fn deletion_handle(path: &Path) -> std::io::Result<std::fs::File> {
+            use std::os::windows::fs::OpenOptionsExt;
+            use windows_sys::Win32::Storage::FileSystem::{DELETE, FILE_FLAG_BACKUP_SEMANTICS};
+
+            std::fs::OpenOptions::new()
+                .access_mode(DELETE)
+                .share_mode(0)
+                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+                .open(path)
+        }
+
         let mgr = SandboxManagerImpl::new();
         let config = test_config();
         let root = config.workspace_dir.clone();
         let sid = mgr.create_sandbox(uuid::Uuid::new_v4(), &config).unwrap();
+        // Retaining state must not retain its native directory capability
+        // after teardown, including the bounded-listing early error path.
+        let retained = mgr.sandboxes.get(&sid).unwrap().clone();
+        #[cfg(windows)]
+        assert!(
+            !matching_native_file_handles(&root).unwrap().is_empty(),
+            "native snapshot must find the live workspace capability"
+        );
         std::fs::write(root.join("z.txt"), "z").unwrap();
         std::fs::create_dir(root.join("a-dir")).unwrap();
         #[cfg(unix)]
@@ -3355,7 +3510,62 @@ mod tests {
             .execute_filesystem(sid, "list", &serde_json::json!({"path": "crowded"}))
             .is_err());
 
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            use std::os::windows::io::AsRawHandle;
+            use windows_sys::Win32::Storage::FileSystem::{
+                FILE_FLAG_BACKUP_SEMANTICS, FILE_READ_ATTRIBUTES, READ_CONTROL, WRITE_DAC,
+            };
+
+            // An unrelated metadata/protection handle has the observed access
+            // mask, but must never match the crowded directory's file identity.
+            let unrelated = root.join("unrelated-identity-control");
+            std::fs::create_dir(&unrelated).unwrap();
+            let metadata = std::fs::OpenOptions::new()
+                .access_mode(READ_CONTROL | WRITE_DAC | FILE_READ_ATTRIBUTES)
+                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+                .open(&unrelated)
+                .unwrap();
+            let raw = metadata.as_raw_handle() as usize;
+            assert!(matching_native_file_handles(&unrelated)
+                .unwrap()
+                .iter()
+                .any(|entry| entry.0 == raw));
+            assert!(!matching_native_file_handles(&crowded)
+                .unwrap()
+                .iter()
+                .any(|entry| entry.0 == raw));
+            drop(metadata);
+
+            // The workspace capability deliberately denies delete sharing
+            // until teardown; the failed listing's child iterator must already
+            // have released its own native directory reference.
+            assert_eq!(deletion_handle(&root).unwrap_err().raw_os_error(), Some(32));
+            match deletion_handle(&crowded) {
+                Ok(handle) => drop(handle),
+                Err(error) => panic!("bounded-list directory sharing failure: {error}; current_process_matching_handles={:?}", matching_native_file_handles(&crowded)),
+            }
+        }
         mgr.destroy_sandbox(sid).unwrap();
+        assert!(retained.workspace.lock().unwrap().is_none());
+        assert!(retained.workspace_directories.lock().unwrap().is_empty());
+        assert!(!mgr.sandboxes.contains_key(&sid));
+        assert!(mgr
+            .execute_filesystem(sid, "list", &serde_json::json!({"path": "."}))
+            .is_err());
+        #[cfg(windows)]
+        for directory in [&root, &crowded] {
+            // A directory capability opened without FILE_SHARE_DELETE would
+            // prevent this exclusive open. Exercise the actual Windows handle
+            // lifetime before recursive deletion, without retries or new flags
+            // on the production capabilities.
+            let exclusive = deletion_handle(directory)
+                .expect("destroyed listing sandbox retained a native directory handle");
+            drop(exclusive);
+        }
+        drop(retained);
+        drop(mgr);
         std::fs::remove_dir_all(root).unwrap();
     }
 

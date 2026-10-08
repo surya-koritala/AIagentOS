@@ -43,6 +43,63 @@ use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken}
 
 const MAX_TOKEN_BYTES: usize = 64 * 1024;
 
+#[cfg(test)]
+#[derive(Clone, Debug)]
+pub(crate) struct TestOpenProvenance {
+    pub identity: (u32, u32, u32),
+    pub access: u32,
+    pub share: u32,
+    pub file: &'static str,
+    pub line: u32,
+}
+
+#[cfg(test)]
+fn test_open_events() -> &'static std::sync::Mutex<std::collections::VecDeque<TestOpenProvenance>> {
+    static EVENTS: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::VecDeque<TestOpenProvenance>>,
+    > = std::sync::OnceLock::new();
+    EVENTS.get_or_init(|| std::sync::Mutex::new(std::collections::VecDeque::new()))
+}
+
+#[cfg(test)]
+#[track_caller]
+fn record_test_open(file: &File, access: u32, share: u32) {
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+    };
+    let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { zeroed() };
+    if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) } == 0 {
+        return;
+    }
+    let caller = std::panic::Location::caller();
+    let mut events = test_open_events().lock().unwrap();
+    if events.len() == 4096 {
+        events.pop_front();
+    }
+    events.push_back(TestOpenProvenance {
+        identity: (
+            info.dwVolumeSerialNumber,
+            info.nFileIndexHigh,
+            info.nFileIndexLow,
+        ),
+        access,
+        share,
+        file: caller.file(),
+        line: caller.line(),
+    });
+}
+
+#[cfg(test)]
+pub(crate) fn test_open_provenance(identity: (u32, u32, u32)) -> Vec<TestOpenProvenance> {
+    test_open_events()
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|event| event.identity == identity)
+        .cloned()
+        .collect()
+}
+
 fn denied(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::PermissionDenied, message)
 }
@@ -250,6 +307,7 @@ fn reject_reparse_ancestors(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
+#[cfg_attr(test, track_caller)]
 fn open(path: &Path, directory: bool, access: u32) -> io::Result<File> {
     reject_reparse_ancestors(path)?;
     let wide = local_path(path)?;
@@ -277,6 +335,12 @@ fn open(path: &Path, directory: bool, access: u32) -> io::Result<File> {
     if actual != directory {
         return Err(denied("private storage object has the wrong type"));
     }
+    #[cfg(test)]
+    record_test_open(
+        &file,
+        access | FILE_READ_ATTRIBUTES,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+    );
     Ok(file)
 }
 
@@ -382,6 +446,15 @@ pub(crate) fn check_directory(path: &Path) -> io::Result<()> {
 }
 
 pub(crate) fn protect_path(path: &Path, directory: bool) -> io::Result<()> {
+    #[cfg(test)]
+    if directory {
+        let target = std::fs::canonicalize(path)?;
+        let shared_temporary = std::fs::canonicalize(std::env::temp_dir())?;
+        assert_ne!(
+            target, shared_temporary,
+            "private storage test fixtures must own their directory before ACL mutation"
+        );
+    }
     let file = open(path, directory, READ_CONTROL | WRITE_DAC)?;
     let descriptor = PrivateDescriptor::new(directory)?;
     // A permissive object owned by the exact current TokenUser/TokenOwner may

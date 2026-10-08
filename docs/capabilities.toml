@@ -243,10 +243,10 @@ maturity = "production-qualified"
 release = "v0.6"
 tracking_issue = 117
 kernel_modules = ["observability", "operator_control", "procfs", "sysctl"]
-source_paths = ["crates/kernel/src/operator_control.rs", "crates/kernel/src/syscall_server.rs", "crates/kernel/src/context.rs", "docs/OPERATIONS_API.md"]
-public_entry_points = ["crates/kernel/src/syscall_server.rs::Syscall::OperatorSnapshot", "crates/kernel/src/syscall_server.rs::Syscall::SetOperatorTunable", "crates/sdk/src/lib.rs::KernelClient::operator_snapshot", "crates/sdk/src/lib.rs::KernelClient::set_operator_tunable", "crates/cli/src/bin/agentctl.rs"]
+source_paths = ["crates/kernel/src/operator_control.rs", "crates/kernel/src/syscall_server.rs", "crates/kernel/src/syscall_gate.rs", "crates/kernel/src/tools.rs", "crates/kernel/src/wire_contract.rs", "crates/kernel/src/context.rs", "crates/sdk/src/lib.rs", "protocol/v2/agent-info.json", ".github/workflows/agent-gate-statistics.yml", "docs/OPERATIONS_API.md"]
+public_entry_points = ["crates/kernel/src/syscall_server.rs::Syscall::OperatorSnapshot", "crates/kernel/src/syscall_server.rs::Syscall::AgentInfo", "crates/kernel/src/syscall_server.rs::Syscall::SetOperatorTunable", "crates/sdk/src/lib.rs::KernelClient::operator_snapshot", "crates/sdk/src/lib.rs::KernelClient::agent_gate_stats", "crates/sdk/src/lib.rs::KernelClient::set_operator_tunable", "crates/cli/src/bin/agentctl.rs"]
 runtime_call_paths = ["crates/kernel/src/syscall_server.rs::dispatch_scoped", "crates/kernel/src/operator_control.rs::OperatorControl::set", "crates/kernel/src/metrics.rs::MetricsSnapshot::collect"]
-test_evidence = ["crates/kernel/src/operator_control.rs", "crates/kernel/src/syscall_server.rs", "crates/sdk/tests/kernel_client.rs", "crates/cli/tests/runtime_commands.rs", "crates/tui/src/app.rs"]
+test_evidence = ["crates/kernel/src/operator_control.rs", "crates/kernel/src/syscall_server.rs", "crates/kernel/src/gate_statistics_tests.rs", "crates/sdk/tests/kernel_client.rs", "crates/sdk/tests/gate_statistics.rs", "crates/cli/tests/runtime_commands.rs", "crates/cli/tests/gate_statistics_commands.rs", ".github/workflows/agent-gate-statistics.yml", "crates/tui/src/app.rs"]
 platforms = ["linux", "macos", "windows"]
 limitations = ["The operator package view intentionally contains only non-sensitive loaded-instance metadata; signed registry, trust, lock, and audit state is accessed through the dedicated package API. Provider health is availability/timeout evidence; provider contract and circuit-breaker qualification remains #120. Gate decision counters are process-local and reset on restart. Legacy ProcFs/Sysctl helpers are not public sources of truth or host mounts."]
 

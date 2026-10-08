@@ -1035,6 +1035,9 @@ impl ToolRegistry {
         // registry so an exact guess is indistinguishable from a missing name.
         // Preserve UnknownAgent for unregistered callers.
         if gate.pid_of(agent_id).is_some() && !gate.tool_visible_to_agent(agent_id, name) {
+            // The diagnostic class must also match an absent name: otherwise
+            // before/after counters would disclose a hidden tool's existence.
+            gate.record_invalid_tool_declaration(agent_id);
             return Err(ToolAuthorizationError::InvalidDeclaration(
                 TOOL_NOT_FOUND_ERROR.to_string(),
             ));
@@ -1042,6 +1045,7 @@ impl ToolRegistry {
         let mut prepared = self
             .prepare_bound_execution(agent_id, name, arguments, binding_id)
             .map_err(|error| {
+                gate.record_invalid_tool_declaration(agent_id);
                 if error.starts_with("unknown tool '") {
                     ToolAuthorizationError::InvalidDeclaration(TOOL_NOT_FOUND_ERROR.to_string())
                 } else {

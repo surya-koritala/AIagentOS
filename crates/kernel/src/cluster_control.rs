@@ -3067,18 +3067,21 @@ mod tests {
     struct ClusterCrashDatabase {
         authority_path: std::path::PathBuf,
         member_path: std::path::PathBuf,
+        _directory: tempfile::TempDir,
     }
 
     impl ClusterCrashDatabase {
         fn new(operation: &str, step: usize) -> Self {
             let id = uuid::Uuid::new_v4();
+            let directory = tempfile::tempdir().unwrap();
             Self {
-                authority_path: std::env::temp_dir().join(format!(
+                authority_path: directory.path().join(format!(
                     "aiagentos-cluster-crash-authority-{operation}-{step}-{id}.db"
                 )),
-                member_path: std::env::temp_dir().join(format!(
+                member_path: directory.path().join(format!(
                     "aiagentos-cluster-crash-member-{operation}-{step}-{id}.db"
                 )),
+                _directory: directory,
             }
         }
     }

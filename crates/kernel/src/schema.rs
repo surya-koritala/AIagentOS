@@ -12,10 +12,11 @@ use crate::ContextError;
 /// ASCII `AIOS`, registered on every database owned by this kernel.
 pub(crate) const APPLICATION_ID: i64 = 0x4149_4f53;
 /// Latest schema this binary can read and write.
-pub(crate) const CURRENT_SCHEMA_VERSION: i64 = 10;
+pub(crate) const CURRENT_SCHEMA_VERSION: i64 = 11;
 const MIN_READABLE_SCHEMA_VERSION: i64 = 1;
-// Older readers cannot preserve binary fact embeddings or clone security.
-const MIN_READER_SCHEMA_VERSION: i64 = 10;
+// Older readers cannot preserve native assistant replay state, binary fact
+// embeddings, or clone security.
+const MIN_READER_SCHEMA_VERSION: i64 = 11;
 
 const MIGRATIONS: &[(i64, &str)] = &[
     (1, "adopt-versioned-kernel-schema"),
@@ -28,6 +29,7 @@ const MIGRATIONS: &[(i64, &str)] = &[
     (8, "share-immutable-execution-history-prefixes"),
     (9, "add-atomic-agent-clone-lifecycle"),
     (10, "retain-fact-indexes-with-binary-embeddings"),
+    (11, "preserve-native-provider-history-metadata"),
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -30,6 +30,7 @@ impl CliTestSession {
             tokio::time::sleep(Duration::from_secs(30)).await;
         }
         Ok(LlmResponse {
+            provider_metadata: None,
             content: format!("response from {}", self.id),
             finish_reason: Some("stop".into()),
             tokens_used: 7,

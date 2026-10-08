@@ -3705,6 +3705,7 @@ mod protocol_tests {
                 std::future::pending::<()>().await;
             }
             Ok(LlmResponse {
+                provider_metadata: None,
                 content: "wire resume complete".into(),
                 finish_reason: Some("stop".into()),
                 tokens_used: 5,

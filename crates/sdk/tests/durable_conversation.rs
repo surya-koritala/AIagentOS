@@ -34,6 +34,7 @@ impl LlmSession for CaptureSession {
             boundary.release.notified().await;
         }
         Ok(LlmResponse {
+            provider_metadata: None,
             content: "fixture reply".into(),
             finish_reason: Some("stop".into()),
             tokens_used: 104,

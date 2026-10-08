@@ -28,7 +28,7 @@ plaintext tool shim is separate.
 | Anthropic | Yes | No; bounded non-streaming fallback | Yes / yes | Input, output, cache-read | Yes / yes | Not in the standard message contract | Configured model; Messages API family | **Not run** |
 | Groq | Yes | No; bounded non-streaming fallback | Yes / yes | Prompt, completion, cached when present | Yes / yes | Unsupported | Configured model; OpenAI-compatible v1 | **Not run** |
 | DeepSeek | Yes | No; bounded non-streaming fallback | Yes / yes | Prompt, completion, cache-hit when present | Yes / yes | Unsupported | Configured model; OpenAI-compatible v1 | **Not run** |
-| Gemini | Yes | No; bounded non-streaming fallback | No / no | Prompt, candidate, cached | Yes / yes | Not in the standard message contract | Configured model; GenerateContent v1beta family | **Not run** |
+| Gemini | Yes | No; bounded non-streaming fallback | Yes / yes | Prompt, candidate + thought, cached | Yes / yes | Not in the standard message contract | Configured model; GenerateContent v1beta family | **Not run** |
 | Hugging Face inference | Yes | No; bounded non-streaming fallback | No / no | Provider usage unavailable; runtime estimate | Yes / yes | Unsupported | Configured model endpoint | **Not run** |
 | vLLM | Yes | No; bounded non-streaming fallback | Yes / yes | Prompt, completion, cached when present | Yes / yes | Unsupported | Configured model; OpenAI-compatible v1 | **Not run** |
 | Ollama | Yes | No; bounded non-streaming fallback | Yes / yes | Prompt/eval counts when present | Yes / yes | Unsupported | Configured endpoint and model | **Not run** |
@@ -94,6 +94,37 @@ successful response, including failover. Provider-reported input, output, and
 cached usage stays distinct from conservative admission estimates. Missing
 provider usage is explicitly marked as estimated; the runtime does not invent a
 vendor invoice.
+
+## Gemini native history
+
+The GenerateContent adapter sends JSON-schema function declarations and parses
+all native function calls in response order. Tool results are paired by call ID
+and returned as functionResponse parts in original call order in one user turn
+for parallel calls, even when results arrive in reverse order.
+Upstream IDs are retained when present; missing IDs receive a durable unique
+synthetic ID. Synthetic IDs are never inserted into signed native response parts.
+System instructions use the separate systemInstruction field.
+
+Bounded provider/model-specific assistant metadata preserves native parts and
+thought signatures exactly through saved conversations, checkpoints and cloning.
+Thought-marked text is excluded from visible answer content. Native text is
+returned as text even when a code example resembles the plaintext tool shim. Malformed parts,
+non-object arguments, duplicate IDs, changed signed content, orphan results and
+incompatible provider/model history fail closed. Native history cannot fail over
+to a provider or model that cannot replay it. Signed history and its following
+messages stay pinned under context pressure; insufficient context rejects the
+request before provider I/O. Usage includes thought tokens in output accounting.
+
+Responses are limited to 1 MiB, native messages to 64 parts, and opaque replay
+payloads to 256 KiB. Replay state is not a tool permission. Tool calls still pass
+through the declaration, namespace, capability, MAC, approval and cgroup gate.
+The wiremock and kernel restart tests are fixtures; live Gemini evidence remains
+**not run**. Schema 11 prevents an older reader from discarding replay state.
+Custom Rust adapters constructing StandardMessage or LlmResponse literals must
+initialize the new optional provider_metadata field, normally to None.
+
+The contracts follow Google's [GenerateContent API reference](https://ai.google.dev/api/generate-content)
+and [thinking state documentation](https://ai.google.dev/gemini-api/docs/thinking).
 
 ## On-device boundary
 

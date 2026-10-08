@@ -330,6 +330,7 @@ impl LlmSession for DelayedSession {
             .sum::<usize>()
             .min(u32::MAX as usize) as u32;
         Ok(LlmResponse {
+            provider_metadata: None,
             content: "resilience response".into(),
             finish_reason: Some("stop".into()),
             tokens_used: input.saturating_add(4),
@@ -624,6 +625,7 @@ impl LlmSession for NetworkPartitionSession {
             .sum::<usize>()
             .min(u32::MAX as usize) as u32;
         Ok(LlmResponse {
+            provider_metadata: None,
             content: "network recovered".into(),
             finish_reason: Some("stop".into()),
             tokens_used: input.saturating_add(4),

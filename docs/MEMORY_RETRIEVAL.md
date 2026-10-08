@@ -33,7 +33,8 @@ inside the existing atomic schema transaction. Model, version, dimension,
 content hash and blob shape are checked when warming; stale/corrupt rows are
 rebuilt with the configured embedder. Byte quotas count both legacy JSON and
 binary representations. Encryption, backups and subject erasure cover the same
-SQLite store. Reader versions below 10 must not open the upgraded database.
+SQLite store. Binary embeddings were introduced in schema 10. The current store also retains
+native assistant replay state; readers below schema 11 must not open it.
 
 ## Verification
 

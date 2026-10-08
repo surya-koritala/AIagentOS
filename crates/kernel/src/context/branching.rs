@@ -795,6 +795,47 @@ mod tests {
     }
 
     #[test]
+    fn signed_native_history_survives_shared_fork_restart_and_parent_erasure() {
+        let dir = std::env::temp_dir().join(format!("agentos-native-history-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("store.db");
+        let (parent, child, expected) = {
+            let manager = SqliteContextManager::new(&path).unwrap();
+            let parent = agent(&manager, "tenant");
+            let child = agent(&manager, "tenant");
+            let mut assistant = StandardMessage::assistant("signed answer");
+            assistant.provider_metadata = Some(
+                crate::connector::ProviderMessageMetadata::new(
+                    "gemini".into(),
+                    "fixture-model".into(),
+                    serde_json::json!({
+                        "parts": [{"text": "signed answer", "thoughtSignature": "c2ln"}],
+                        "tool_call_ids": []
+                    }),
+                )
+                .unwrap(),
+            );
+            let messages = vec![StandardMessage::user("task"), assistant];
+            manager
+                .save_conversation("parent", parent, &messages)
+                .unwrap();
+            manager
+                .fork_conversation(parent, "parent", child, "child")
+                .unwrap();
+            assert_eq!(manager.load_conversation("child").unwrap(), messages);
+            (parent, child, messages)
+        };
+        let manager = SqliteContextManager::new(&path).unwrap();
+        assert_eq!(manager.load_conversation("child").unwrap(), expected);
+        manager.delete_agent(parent).unwrap();
+        assert_eq!(manager.load_conversation("child").unwrap(), expected);
+        manager.delete_agent(child).unwrap();
+        assert_eq!(count(&manager, "execution_context_snapshots"), 0);
+        drop(manager);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn quota_admission_charges_logical_history_and_rolls_back_failed_forks() {
         let manager = SqliteContextManager::in_memory().unwrap();
         let parent = agent(&manager, "tenant");

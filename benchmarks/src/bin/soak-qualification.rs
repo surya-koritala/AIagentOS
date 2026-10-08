@@ -243,6 +243,7 @@ impl LlmSession for SoakSession {
             .sum::<usize>()
             .min(u32::MAX as usize) as u32;
         Ok(LlmResponse {
+            provider_metadata: None,
             content: "soak-response".into(),
             finish_reason: Some("stop".into()),
             tokens_used: input.saturating_add(3),

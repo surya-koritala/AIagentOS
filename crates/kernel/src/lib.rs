@@ -7720,6 +7720,7 @@ mod tests {
                 self.entered.notify_one();
                 self.release.notified().await;
                 Ok(crate::connector::LlmResponse {
+                    provider_metadata: None,
                     content: "must be cancelled".into(),
                     finish_reason: Some("stop".into()),
                     tokens_used: 1,

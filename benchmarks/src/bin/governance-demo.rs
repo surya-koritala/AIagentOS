@@ -485,6 +485,7 @@ async fn run_optional_live_turn(kernel: &Arc<AgentKernelImpl>) {
         }
     };
     let messages = vec![StandardMessage {
+        provider_metadata: None,
         role: "user".into(),
         content: "In one short sentence, what is least-privilege access control?".into(),
         tool_call_id: None,

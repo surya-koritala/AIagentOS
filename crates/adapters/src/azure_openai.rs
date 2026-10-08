@@ -169,6 +169,7 @@ impl AzureSession {
             })
             .unwrap_or_default();
         Ok(LlmResponse {
+            provider_metadata: None,
             content,
             finish_reason: json["choices"][0]["finish_reason"]
                 .as_str()
@@ -338,6 +339,7 @@ impl AzureSession {
             }
         }
         Ok(LlmResponse {
+            provider_metadata: None,
             content: state.content,
             finish_reason: state.finish_reason,
             tokens_used: state.tokens_used,
@@ -448,6 +450,7 @@ impl LlmSession for AzureSession {
                     })
                     .unwrap_or_default();
                 Ok(LlmResponse {
+                    provider_metadata: None,
                     content,
                     finish_reason: json["choices"][0]["finish_reason"]
                         .as_str()
@@ -577,6 +580,7 @@ impl LlmSession for AzureSession {
                     })
                     .unwrap_or_default();
                 return Ok(LlmResponse {
+                    provider_metadata: None,
                     content,
                     finish_reason: json["choices"][0]["finish_reason"]
                         .as_str()
@@ -662,6 +666,7 @@ impl LlmSession for AzureSession {
         }
 
         Ok(LlmResponse {
+            provider_metadata: None,
             content,
             finish_reason,
             tokens_used,
@@ -760,6 +765,7 @@ impl LlmProviderAdapter for AzureOpenAiAdapter {
 
     fn translate_from_provider(&self, value: &serde_json::Value) -> Option<StandardMessage> {
         Some(StandardMessage {
+            provider_metadata: None,
             role: value.get("role")?.as_str()?.to_string(),
             content: value
                 .get("content")

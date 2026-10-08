@@ -52,6 +52,7 @@ pub async fn parse_azure_sse_stream(
                             }
                         }
                         return Ok(LlmResponse {
+                            provider_metadata: None,
                             content,
                             finish_reason: Some("stop".into()),
                             tokens_used,
@@ -127,6 +128,7 @@ pub async fn parse_azure_sse_stream(
     }
 
     Ok(LlmResponse {
+        provider_metadata: None,
         content,
         finish_reason: Some("stop".into()),
         tokens_used,

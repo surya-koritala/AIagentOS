@@ -2,6 +2,13 @@ name: Exact fact quota accounting comparison
 
 on:
   workflow_dispatch:
+  push:
+    branches: [codex/context-quota-index]
+    paths:
+      - '.github/workflows/quota-index.yml'
+      - 'crates/kernel/src/context.rs'
+      - 'crates/kernel/src/context/fact_index.rs'
+      - 'crates/kernel/src/context/storage_index_tests.rs'
 
 permissions:
   contents: read

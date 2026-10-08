@@ -61,7 +61,7 @@ jobs:
       - name: Bind evidence to the exact checked-out source
         run: |
           git rev-parse HEAD > operator-source.txt
-          git status --porcelain >> operator-source.txt
+          git status --porcelain --untracked-files=no >> operator-source.txt
       - name: Wire roles, tenant scope, revocation, schema, and redaction
         shell: bash
         run: |

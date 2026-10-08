@@ -338,6 +338,12 @@ fn parse_portable_file_options(
 
 #[tokio::main]
 async fn main() {
+    // Keep the command state machine off the small Windows main-thread stack.
+    // Offline recovery can construct a complete kernel beneath this frame.
+    Box::pin(run()).await;
+}
+
+async fn run() {
     let argv: Vec<String> = std::env::args().collect();
     if argv.len() == 2 && matches!(argv[1].as_str(), "--version" | "-V") {
         println!("agentctl {}", env!("CARGO_PKG_VERSION"));

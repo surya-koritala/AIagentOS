@@ -284,6 +284,10 @@ async fn first_operator_bootstrap_two_tenants_multiple_agents_and_crash_restart_
     assert!(!denied_scope.status.success());
     let mut a = tenant_client(&server.address, &key_a).await;
     let mut b = tenant_client(&server.address, &key_b).await;
+    let invalid_revoke = a
+        .revoke_api_key(&key_a, agent_sdk::CONFIRM_IDENTITY_REVOCATION)
+        .await;
+    assert!(matches!(invalid_revoke, Err(SdkError::Configuration(_))));
     authorization_denied(a.issue_api_key(&admin_b, "forbidden").await);
     authorization_denied(a.storage_get(&foreign, "proof").await);
     authorization_denied(b.storage_get(&first, "proof").await);

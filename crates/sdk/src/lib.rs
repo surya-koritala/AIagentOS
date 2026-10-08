@@ -3103,9 +3103,15 @@ impl KernelClient {
         key_id: impl Into<String>,
         _confirmation: ConfirmIdentityRevocation,
     ) -> Result<bool, SdkError> {
+        let key_id = key_id.into();
+        if key_id.len() != 64 || !key_id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(SdkError::Configuration(
+                "invalid API-key identifier; use the key_id from api-keys".into(),
+            ));
+        }
         match self
             .call(Syscall::RevokeApiKey {
-                key_id: key_id.into(),
+                key_id,
                 confirm: true,
             })
             .await?

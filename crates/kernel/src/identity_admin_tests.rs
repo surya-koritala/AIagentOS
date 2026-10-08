@@ -198,6 +198,26 @@ async fn identity_revocations_deny_new_and_live_connections_and_allow_self_revoc
     let task = tokio::spawn(server.serve());
     let mut system = connect(addr, BOOTSTRAP_TOKEN).await;
     let (tenant, user, id, key) = bootstrap(&mut system, "self-revoke").await;
+    for call in [
+        Syscall::RevokeTenant {
+            tenant_id: key.clone(),
+            confirm: true,
+        },
+        Syscall::RevokeUser {
+            user_id: key.clone(),
+            confirm: true,
+        },
+    ] {
+        let reply = system.call(call).await.unwrap();
+        assert!(matches!(
+            reply,
+            SyscallReply::TypedError {
+                code: WireErrorCode::InvalidArgument,
+                ..
+            }
+        ));
+        assert!(!serde_json::to_string(&reply).unwrap().contains(&key));
+    }
     let mut live = connect(addr, &key).await;
     let mut admin = connect(addr, &key).await;
     assert!(matches!(

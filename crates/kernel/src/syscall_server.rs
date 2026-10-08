@@ -3016,6 +3016,9 @@ async fn dispatch_scoped_inner_with_fence(
             tenants: kernel.list_tenants().await,
         },
         Syscall::RevokeTenant { tenant_id, confirm } => {
+            if uuid::Uuid::parse_str(&tenant_id).is_err() {
+                return identity_error("invalid tenant identifier");
+            }
             if !confirm {
                 return identity_error("tenant revocation requires confirmation");
             }
@@ -3064,6 +3067,9 @@ async fn dispatch_scoped_inner_with_fence(
             users: kernel.list_users(&tenant_id).await,
         },
         Syscall::RevokeUser { user_id, confirm } => {
+            if uuid::Uuid::parse_str(&user_id).is_err() {
+                return identity_error("invalid user identifier");
+            }
             if !confirm {
                 return identity_error("user revocation requires confirmation");
             }

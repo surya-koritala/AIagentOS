@@ -255,6 +255,8 @@ pub mod anthropic;
 pub mod azure_openai;
 pub mod deepseek;
 pub mod gemini;
+
+mod openai_chat;
 pub mod groq;
 pub mod huggingface;
 pub mod local;

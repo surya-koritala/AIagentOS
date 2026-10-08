@@ -29,7 +29,8 @@ plaintext tool shim is separate.
 | Groq | Yes | Yes, SSE | Yes / yes | Prompt, completion, cached when present | Yes / yes | Unsupported | Configured model; OpenAI-compatible v1 | **Not run** |
 | DeepSeek | Yes | Yes, SSE | Yes / yes | Prompt, completion, cache-hit when present | Yes / yes | Unsupported | Configured model; OpenAI-compatible v1 | **Not run** |
 | Gemini | Yes | No; bounded non-streaming fallback | Yes / yes | Prompt, candidate + thought, cached | Yes / yes | Not in the standard message contract | Configured model; GenerateContent v1beta family | **Not run** |
-| Hugging Face inference | Yes | No; bounded non-streaming fallback | No / no | Provider usage unavailable; runtime estimate | Yes / yes | Unsupported | Configured model endpoint | **Not run** |
+| Hugging Face text generation (default) | Yes | No; bounded non-streaming fallback | No / no; explicit governed shim or reject | Estimated input/output bytes; not provider-reported | Yes / yes | Unsupported | Configured legacy model endpoint | **Not run** |
+| Hugging Face chat router (opt-in) | Yes | Yes, SSE | Yes / yes; selected model/provider must support functions | Prompt, completion, cached when supplied | Yes / yes | Unsupported | Configured router endpoint and model:provider | **Not run** |
 | vLLM | Yes | Yes, SSE | Yes / yes | Prompt, completion, cached when present | Yes / yes | Unsupported | Configured model; OpenAI-compatible v1 | **Not run** |
 | Ollama | Yes | No; bounded non-streaming fallback | Yes / yes | Prompt/eval counts when present | Yes / yes | Unsupported | Configured endpoint and model | **Not run** |
 | Candle/GGUF | Failure/template fixtures; gated real-model test | No | No / no | Generated-token count; no input usage | Cooperative decode cancellation / wall timeout | Unsupported | CPU, quantized Llama-family GGUF; Simple, ChatML, or Llama 3 template | **Not run** |
@@ -45,9 +46,9 @@ fail, and every explicitly selected live provider must still report `passed`.
 
 ## Native streaming conformance
 
-Azure/OpenAI/Groq/DeepSeek/vLLM use one bounded byte-safe SSE reader with
+Azure/OpenAI/Groq/DeepSeek/vLLM and Hugging Face chat mode use one bounded byte-safe SSE reader with
 ordered native call assembly, usage, cancellation/backpressure and partial-output
-retry suppression. Keyless nine-adapter conformance remains distinct from live
+retry suppression. Keyless conformance covers nine providers and both Hugging Face modes and remains distinct from live
 provider qualification. See issue #351 and the hosted streaming fixtures.
 
 ## Shared runtime contract
@@ -125,6 +126,42 @@ successful response, including failover. Provider-reported input, output, and
 cached usage stays distinct from conservative admission estimates. Missing
 provider usage is explicitly marked as estimated; the runtime does not invent a
 vendor invoice.
+
+## Hugging Face endpoint selection
+
+Checked **2026-10-08**: the official [chat-completion API](https://huggingface.co/docs/inference-providers/en/tasks/chat-completion)
+documents router tools, token usage and SSE. The [function-calling guide](https://huggingface.co/docs/inference-providers/en/guides/function-calling)
+requires a compatible provider/model pair; streaming availability also varies.
+The [supported-model table](https://huggingface.co/inference/models) lists
+`Qwen/Qwen3.5-9B` with tool support on DeepInfra, Together and OVHcloud. The
+adapter's older default, `meta-llama/Llama-3.1-8B-Instruct`, is listed with tools
+on DeepInfra and without tools on Novita/Nscale. Provider mappings alone do not
+establish function support. These are upstream declarations, not a live AIagentOS test.
+
+Select chat mode explicitly and pin the provider:
+
+```toml
+llm_provider = "huggingface"
+default_model = "Qwen/Qwen3.5-9B:deepinfra"
+huggingface_api_mode = "chat-completions"
+# Optional compatible gateway override; default is https://router.huggingface.co/v1.
+# huggingface_base_url = "https://gateway.example/v1"
+```
+
+Credentials retain the existing configured key or `HUGGINGFACE_API_KEY` /
+`HF_API_KEY` sources. Chat mode uses shared OpenAI-shaped request/response code
+and the bounded SSE reader; it preserves native call IDs and tool-result turns.
+Malformed calls fail the entire response before execution. Unsupported
+model/provider requests surface typed upstream errors; there is no automatic
+switch to the completion endpoint or hidden tool removal.
+
+Omitting the mode keeps `text-generation`. Direct native tool requests now
+return `ToolIncompatiblePrimary` before HTTP. The normal kernel path retains
+the default governed plaintext shim, a once-per-session degradation audit and
+turn counters. Legacy usage contains conservative UTF-8 byte estimates with
+`provider_reported = false`; it is not a tokenizer measurement or an invoice.
+Chat requests without returned usage are likewise marked unreported. Both
+modes have deterministic CI fixtures; live provider quality remains **not run**.
 
 ## Gemini native history
 

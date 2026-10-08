@@ -70,6 +70,9 @@ mod gemini_history;
 mod provider_policy;
 
 #[cfg(test)]
+mod huggingface_router;
+
+#[cfg(test)]
 mod edge_cases;
 
 #[cfg(test)]

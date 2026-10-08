@@ -49,53 +49,9 @@ pub(crate) fn openai_streaming_body(
     options: LlmRequestOptions,
     model: Option<&str>,
 ) -> Value {
-    let messages: Vec<_> = messages
-        .iter()
-        .map(|message| {
-            let mut value = json!({"role": message.role, "content": message.content});
-            if let Some(id) = &message.tool_call_id {
-                value["tool_call_id"] = json!(id);
-            }
-            if let Some(calls) = &message.tool_calls {
-                value["tool_calls"] = json!(calls
-                    .iter()
-                    .map(|call| json!({
-                        "id": call.id,
-                        "type": "function",
-                        "function": {
-                            "name": call.name,
-                            "arguments": call.arguments.to_string()
-                        }
-                    }))
-                    .collect::<Vec<_>>());
-            }
-            value
-        })
-        .collect();
-    let mut body = json!({
-        "messages": messages,
-        "stream": true,
-        "stream_options": {"include_usage": true}
-    });
-    if let Some(model) = model {
-        body["model"] = json!(model);
-    }
-    if let Some(max_output_tokens) = options.max_output_tokens {
-        body["max_tokens"] = json!(max_output_tokens);
-    }
-    if !tools.is_empty() {
-        body["tools"] = json!(tools
-            .iter()
-            .map(|tool| json!({
-                "type": "function",
-                "function": {
-                    "name": tool.name,
-                    "description": tool.description,
-                    "parameters": tool.parameters
-                }
-            }))
-            .collect::<Vec<_>>());
-    }
+    let mut body = crate::openai_chat::request(messages, tools, options, model);
+    body["stream"] = json!(true);
+    body["stream_options"] = json!({"include_usage":true});
     body
 }
 

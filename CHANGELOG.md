@@ -10,6 +10,12 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
 
 ## [Unreleased]
 
+- Added explicitly configured Hugging Face chat-router requests with shared
+  native function, usage and SSE decoding. Legacy completions reject direct
+  native tools, retain the audited governed shim and mark usage estimated.
+  Dated upstream compatibility references and keyless CI fixtures cover both
+  modes; live qualification remains not run. Relates #355.
+
 - Added explicit native-tool policy for an incompatible primary provider.
   Operators can reject before request/failover I/O or retain the default governed
   plaintext shim with one per-session degradation audit and per-turn counters.

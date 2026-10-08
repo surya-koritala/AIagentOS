@@ -1,0 +1,55 @@
+name: Hugging Face router fixtures
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [main, 'codex/**']
+    paths:
+      - '.github/workflows/huggingface-router.yml'
+      - 'crates/adapters/**'
+      - 'crates/cli/src/providers.rs'
+      - 'crates/kernel/src/config.rs'
+      - 'tests/src/huggingface_router.rs'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: huggingface-router-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  router-fixtures:
+    name: Hugging Face protocol and governed tool fixtures
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
+        with:
+          toolchain: 1.97.1
+          components: rustfmt
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16
+        with:
+          save-if: false
+      - name: Format and preserve a repair patch
+        run: |
+          mkdir -p target/qualification
+          if ! cargo fmt --all -- --check; then
+            cargo fmt --all
+            git diff --binary > target/qualification/rustfmt.patch
+          fi
+      - name: All-feature adapter protocols and streaming boundaries
+        run: cargo test -p adapters --all-features --locked
+      - name: Actual registered Hugging Face path and governance
+        run: cargo test -p integration-tests huggingface_router --locked
+      - name: Existing primary policy remains enforced
+        run: cargo test -p integration-tests provider_policy --locked
+      - name: Require formatted source for final evidence
+        run: test ! -s target/qualification/rustfmt.patch
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: always()
+        with:
+          name: huggingface-router-${{ github.sha }}
+          path: target/qualification
+          retention-days: 30

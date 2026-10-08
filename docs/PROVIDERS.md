@@ -85,8 +85,9 @@ tool_incompatible_primary = "reject"
 `reject` returns `ToolIncompatiblePrimary` before provider request or failover I/O;
 it is permanent on the wire. Empty tool sets are accepted, and native primaries
 produce no degradation event. Provider views expose this routing policy. The
-rendered protocol's serialized bytes are reserved alongside the original prompt
-and declarations before context/token admission. This is fixture-tested behavior;
+rendered protocol's serialized bytes and native declarations are alternative
+representations. Context/token admission reserves their maximum with the prompt,
+so failover is covered without charging both representations. This is fixture-tested behavior;
 real model quality remains not run.
 
 Failover is compatibility-checked before any backup receives a prompt:

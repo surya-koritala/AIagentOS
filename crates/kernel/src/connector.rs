@@ -1532,11 +1532,17 @@ impl LlmSession for ResilientSession {
             return 0;
         }
         let message = StandardMessage::system(crate::function_calling::render_tools_prompt(tools));
-        serde_json::to_vec(&message).map_or(u32::MAX, |bytes| {
+        let shim_tokens = serde_json::to_vec(&message).map_or(u32::MAX, |bytes| {
             u32::try_from(bytes.len())
                 .unwrap_or(u32::MAX)
                 .saturating_add(4)
-        })
+        });
+        let native_tokens = serde_json::to_vec(tools).map_or(u32::MAX, |bytes| {
+            u32::try_from(bytes.len()).unwrap_or(u32::MAX)
+        });
+        // Native definitions and their plaintext replacement are alternative
+        // wire representations. Reserve their maximum for failover, not both.
+        shim_tokens.saturating_sub(native_tokens)
     }
 
     fn validate_tool_policy(&self, tools: &[ToolDefinition]) -> Result<(), ConnectorError> {

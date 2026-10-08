@@ -50,6 +50,11 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
   fixtures cover capability declarations, parallel tool argument assembly,
   usage, cancellation, deadlines, wire ceilings and partial-output replay
   suppression. Real-service qualification remains pending. Closes #351.
+### Distribution
+- Add native Linux and macOS arm64 release targets, architecture-bound desktop
+  updater assets, fail-closed platform documentation checks, and fresh-runner ARM
+  CLI installation evidence. Native desktop signing and public installer
+  qualification remain open (#344, #346).
 
 - Added governed memory, KV and IPC VFS references with explicit rights, exact
   bindings, bounded persistent data and messaging, current gate/broker checks,

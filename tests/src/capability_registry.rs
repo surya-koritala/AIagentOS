@@ -1582,7 +1582,9 @@ fn desktop_release_foundation_is_versioned_and_fail_closed() {
         .join(" ");
     for contract in [
         "**qualification artifacts only**",
-        "Production requirement still open",
+        "Support tier",
+        "CI candidate; native signing and clean-host qualification pending",
+        "SUPPORTED_PLATFORMS.md",
         "do not replace native platform signing",
         "signed-updater foundation",
         "TAURI_SIGNING_PRIVATE_KEY",

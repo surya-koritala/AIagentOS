@@ -49,11 +49,13 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Verify synchronized versions and platform assets
-        run: python3 scripts/verify_desktop_release.py
+        run: |
+          python3 scripts/verify_desktop_release.py
+          python3 scripts/verify_supported_platforms.py
       - name: Block public tags until native signing and clean-host qualification land
         if: startsWith(github.ref, 'refs/tags/v')
         run: |
-          echo "::error title=Desktop publication is not qualified::Native platform signing, notarization, clean-host install/upgrade/failed-update/rollback evidence, and the supported-platform matrix remain release blockers under issue #126."
+          echo "::error title=Desktop publication is not qualified::Native platform signing, notarization, and final-artifact clean-host install/upgrade/failed-update/rollback qualification for the documented platform matrix remain release blockers under issue #126."
           exit 1
 
   desktop-artifacts:
@@ -66,14 +68,27 @@ jobs:
         include:
           - runner: ubuntu-22.04
             platform: linux-x86_64
+            target: x86_64-unknown-linux-gnu
+            bundles: deb,appimage
+            perl: perl
+          - runner: ubuntu-22.04-arm
+            platform: linux-aarch64
+            target: aarch64-unknown-linux-gnu
             bundles: deb,appimage
             perl: perl
           - runner: macos-15-intel
             platform: macos-x86_64
+            target: x86_64-apple-darwin
+            bundles: app,dmg
+            perl: perl
+          - runner: macos-15
+            platform: macos-aarch64
+            target: aarch64-apple-darwin
             bundles: app,dmg
             perl: perl
           - runner: windows-latest
             platform: windows-x86_64
+            target: x86_64-pc-windows-msvc
             bundles: msi,nsis
             perl: C:/Strawberry/perl/bin/perl.exe
     runs-on: ${{ matrix.runner }}
@@ -122,30 +137,17 @@ jobs:
           test -n "$TAURI_SIGNING_PRIVATE_KEY_PASSWORD"
       - name: Build native qualification installers and signed update artifacts
         working-directory: crates/tauri-app
-        run: cargo tauri build --ci --bundles "${{ matrix.bundles }}"
+        run: cargo tauri build --ci --bundles "${{ matrix.bundles }}" --target "${{ matrix.target }}"
       - name: Collect native installers and their updater signatures
-        run: |
-          mkdir -p dist
-          case "${{ runner.os }}" in
-            Linux)
-              find target/release/bundle -type f \( -name '*.deb' -o -name '*.AppImage' -o -name '*.deb.sig' -o -name '*.AppImage.sig' \) -exec cp {} dist/ \;
-              ;;
-            macOS)
-              find target/release/bundle -type f \( -name '*.dmg' -o -name '*.app.tar.gz' -o -name '*.app.tar.gz.sig' \) -exec cp {} dist/ \;
-              ;;
-            Windows)
-              find target/release/bundle -type f \( -name '*.msi' -o -name '*-setup.exe' -o -name '*.msi.sig' -o -name '*-setup.exe.sig' \) -exec cp {} dist/ \;
-              ;;
-          esac
-          test -n "$(find dist -maxdepth 1 -type f -print -quit)"
-          test -n "$(find dist -maxdepth 1 -type f -name '*.sig' -print -quit)"
-          for signature in dist/*.sig; do
-            test -f "${signature%.sig}"
-          done
+        run: >-
+          python3 scripts/collect_desktop_assets.py
+          --bundle-root "target/${{ matrix.target }}/release/bundle"
+          --dist dist --version "$ARTIFACT_VERSION"
+          --platform "${{ matrix.platform }}"
       - uses: anchore/sbom-action/download-syft@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
       - name: Generate desktop bundle CycloneDX SBOM
         run: >-
-          syft dir:target/release/bundle
+          syft dir:target/${{ matrix.target }}/release/bundle
           -o "cyclonedx-json=dist/agentos-${ARTIFACT_VERSION}-desktop-${{ matrix.platform }}.cdx.json"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -161,12 +163,20 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - runner: ubuntu-latest
+          - runner: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
+            extension: ""
+            perl: perl
+          - runner: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
             extension: ""
             perl: perl
           - runner: macos-15-intel
             target: x86_64-apple-darwin
+            extension: ""
+            perl: perl
+          - runner: macos-15
+            target: aarch64-apple-darwin
             extension: ""
             perl: perl
           - runner: windows-latest
@@ -176,6 +186,8 @@ jobs:
     runs-on: ${{ matrix.runner }}
     env:
       OPENSSL_SRC_PERL: ${{ matrix.perl }}
+      # The archive floor matches the desktop Info.plist contract.
+      MACOSX_DEPLOYMENT_TARGET: "13.0"
     defaults:
       run:
         shell: bash
@@ -218,6 +230,20 @@ jobs:
             fi
           done
           test "$reproducible" = "1"
+      - name: Verify native architecture and exact executable versions
+        if: runner.os != 'Windows'
+        run: |
+          for binary in agent agent-server agent-tui agentctl agent-code; do
+            path="target-a/${{ matrix.target }}/release/${binary}"
+            file "$path"
+            case "${{ matrix.target }}" in
+              aarch64-apple-darwin) test "$(lipo -archs "$path")" = arm64 ;;
+              x86_64-apple-darwin) test "$(lipo -archs "$path")" = x86_64 ;;
+              aarch64-unknown-linux-gnu) file "$path" | grep -q 'ARM aarch64' ;;
+              x86_64-unknown-linux-gnu) file "$path" | grep -q 'x86-64' ;;
+            esac
+            "$path" --version
+          done
       - name: Create deterministic archive
         run: |
           mkdir -p dist/stage

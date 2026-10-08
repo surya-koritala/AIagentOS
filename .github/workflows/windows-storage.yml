@@ -90,7 +90,7 @@ jobs:
         if: runner.os == 'Windows'
         run: >-
           cargo test -p kernel --lib --locked windows_private_fs::
-          -- --test-threads=1 > reports/native-windows.log 2>&1
+          -- --test-threads=1 --nocapture > reports/native-windows.log 2>&1
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()
         with:

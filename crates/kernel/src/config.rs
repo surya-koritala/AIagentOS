@@ -1384,7 +1384,7 @@ impl Config {
     pub fn resolve_mac(&self) -> Result<(bool, Vec<crate::mac::PolicyRule>), String> {
         match &self.policy_file {
             Some(path) => {
-                let content = std::fs::read_to_string(path)
+                let content = read_configuration_text(path)
                     .map_err(|e| format!("cannot read policy file {}: {e}", path.display()))?;
                 let doc = crate::policy::PolicyDocument::from_toml(&content)
                     .map_err(|e| format!("invalid policy file {}: {e}", path.display()))?;
@@ -1432,7 +1432,7 @@ impl Config {
 
     /// Strictly load config from `path`; see [`Config::try_load`].
     pub fn try_load_from(path: &Path) -> Result<Self, ConfigLoadError> {
-        let content = match std::fs::read_to_string(path) {
+        let content = match read_configuration_text(path) {
             Ok(content) => content,
             Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
                 return Ok(Self::default());
@@ -1549,6 +1549,22 @@ impl Config {
     /// Set API key for a provider.
     pub fn set_api_key(&mut self, provider: &str, key: String) {
         self.api_keys.insert(provider.to_string(), key);
+    }
+}
+
+/// Read operator configuration without following Windows reparse objects.
+fn read_configuration_text(path: &Path) -> std::io::Result<String> {
+    #[cfg(windows)]
+    {
+        use std::io::Read;
+        let mut file = crate::windows_private_fs::open_read(path, false)?;
+        let mut content = String::new();
+        file.read_to_string(&mut content)?;
+        Ok(content)
+    }
+    #[cfg(not(windows))]
+    {
+        std::fs::read_to_string(path)
     }
 }
 
@@ -1973,6 +1989,9 @@ mod tests {
             Config::load_from(&path).get_api_key("private-fixture"),
             Some("fixture-value-no-live-provider")
         );
+        let linked = path.parent().unwrap().join("linked-config.toml");
+        std::os::windows::fs::symlink_file(&path, &linked).unwrap();
+        assert!(Config::try_load_from(&linked).is_err());
     }
 
     #[test]

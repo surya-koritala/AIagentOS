@@ -29,7 +29,8 @@ use windows_sys::Win32::Security::{
     SetSecurityDescriptorOwner, TokenOwner, TokenUser, ACCESS_ALLOWED_ACE, ACL, ACL_REVISION,
     ACL_SIZE_INFORMATION, CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION, OBJECT_INHERIT_ACE,
     OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
-    SECURITY_ATTRIBUTES, SECURITY_DESCRIPTOR, SE_DACL_PROTECTED, TOKEN_OWNER, TOKEN_QUERY, TOKEN_USER,
+    SECURITY_ATTRIBUTES, SECURITY_DESCRIPTOR, SE_DACL_PROTECTED, TOKEN_OWNER, TOKEN_QUERY,
+    TOKEN_USER,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     CreateDirectoryW, CreateFileW, FileAttributeTagInfo, FlushFileBuffers,
@@ -494,11 +495,21 @@ pub(crate) fn durable_rename(source: &Path, destination: &Path) -> io::Result<()
     }
 }
 
+#[derive(Debug)]
+enum DirectorySyncMechanism {
+    DirectoryHandleFlush,
+    WriteThroughMetadataMarker,
+}
+
 /// A real directory flush, or a flushed write-through metadata barrier.
 pub(crate) fn sync_directory(path: &Path) -> io::Result<()> {
+    sync_directory_with_evidence(path).map(|_| ())
+}
+
+fn sync_directory_with_evidence(path: &Path) -> io::Result<DirectorySyncMechanism> {
     let directory = open(path, true, FILE_GENERIC_WRITE | READ_CONTROL)?;
     if unsafe { FlushFileBuffers(directory.as_raw_handle()) } != 0 {
-        return Ok(());
+        return Ok(DirectorySyncMechanism::DirectoryHandleFlush);
     }
     let error = io::Error::last_os_error();
     if !matches!(error.raw_os_error(), Some(code) if code == ERROR_INVALID_HANDLE as i32
@@ -524,7 +535,7 @@ pub(crate) fn sync_directory(path: &Path) -> io::Result<()> {
         let _ = std::fs::remove_file(&stage);
         let _ = std::fs::remove_file(&published);
     }
-    result
+    result.map(|()| DirectorySyncMechanism::WriteThroughMetadataMarker)
 }
 
 pub(crate) fn write_config(path: &Path, bytes: &[u8]) -> io::Result<()> {
@@ -645,42 +656,74 @@ mod tests {
     impl NativeTestUser {
         fn create() -> Self {
             use windows_sys::Win32::NetworkManagement::NetManagement::{
-                NetApiBufferFree, NetUserAdd, NetUserGetInfo, USER_INFO_1, USER_INFO_23,
-                USER_PRIV_USER, UF_NORMAL_ACCOUNT, UF_SCRIPT,
+                NetApiBufferFree, NetUserAdd, NetUserGetInfo, UF_NORMAL_ACCOUNT, UF_SCRIPT,
+                USER_INFO_1, USER_INFO_23, USER_PRIV_USER,
             };
-            let mut name: Vec<u16> = format!("aofs_{}\0", &uuid::Uuid::new_v4().simple().to_string()[..8])
-                .encode_utf16().collect();
+            let mut name: Vec<u16> =
+                format!("aofs_{}\0", &uuid::Uuid::new_v4().simple().to_string()[..8])
+                    .encode_utf16()
+                    .collect();
             let mut password: Vec<u16> = format!("Aa7!{}\0", uuid::Uuid::new_v4().simple())
-                .encode_utf16().collect();
+                .encode_utf16()
+                .collect();
             let info = USER_INFO_1 {
-                usri1_name: name.as_mut_ptr(), usri1_password: password.as_mut_ptr(),
-                usri1_priv: USER_PRIV_USER, usri1_flags: UF_NORMAL_ACCOUNT | UF_SCRIPT,
+                usri1_name: name.as_mut_ptr(),
+                usri1_password: password.as_mut_ptr(),
+                usri1_priv: USER_PRIV_USER,
+                usri1_flags: UF_NORMAL_ACCOUNT | UF_SCRIPT,
                 ..Default::default()
             };
             let mut parameter = 0;
-            let result = unsafe { NetUserAdd(null(), 1, (&info as *const USER_INFO_1).cast(), &mut parameter) };
+            let result = unsafe {
+                NetUserAdd(
+                    null(),
+                    1,
+                    (&info as *const USER_INFO_1).cast(),
+                    &mut parameter,
+                )
+            };
             password.fill(0);
-            assert_eq!(result, 0, "disposable Windows user fixture creation failed at parameter {parameter}");
-            let mut user = Self { name, sid: Vec::new() };
+            assert_eq!(
+                result, 0,
+                "disposable Windows user fixture creation failed at parameter {parameter}"
+            );
+            let mut user = Self {
+                name,
+                sid: Vec::new(),
+            };
             let mut buffer = null_mut();
             unsafe {
-                assert_eq!(NetUserGetInfo(null(), user.name.as_ptr(), 23, &mut buffer), 0);
+                assert_eq!(
+                    NetUserGetInfo(null(), user.name.as_ptr(), 23, &mut buffer),
+                    0
+                );
                 let sid = (*(buffer.cast::<USER_INFO_23>())).usri23_user_sid;
                 assert_ne!(IsValidSid(sid), 0);
                 let bytes = GetLengthSid(sid) as usize;
                 user.sid = vec![0_usize; bytes.div_ceil(size_of::<usize>())];
-                std::ptr::copy_nonoverlapping(sid.cast::<u8>(), user.sid.as_mut_ptr().cast::<u8>(), bytes);
+                std::ptr::copy_nonoverlapping(
+                    sid.cast::<u8>(),
+                    user.sid.as_mut_ptr().cast::<u8>(),
+                    bytes,
+                );
                 assert_eq!(NetApiBufferFree(buffer.cast()), 0);
             }
             user
         }
-        fn sid(&self) -> PSID { self.sid.as_ptr().cast_mut().cast() }
+        fn sid(&self) -> PSID {
+            self.sid.as_ptr().cast_mut().cast()
+        }
     }
 
     impl Drop for NativeTestUser {
         fn drop(&mut self) {
             // The account exists only in a disposable hosted CI test process.
-            unsafe { windows_sys::Win32::NetworkManagement::NetManagement::NetUserDel(null(), self.name.as_ptr()); }
+            unsafe {
+                windows_sys::Win32::NetworkManagement::NetManagement::NetUserDel(
+                    null(),
+                    self.name.as_ptr(),
+                );
+            }
         }
     }
 
@@ -696,10 +739,24 @@ mod tests {
         let mut owner = null_mut();
         let mut descriptor = null_mut();
         unsafe {
-            assert_eq!(GetSecurityInfo(file.as_raw_handle(), SE_FILE_OBJECT, OWNER_SECURITY_INFORMATION,
-                &mut owner, null_mut(), null_mut(), null_mut(), &mut descriptor), 0);
-            assert_ne!(EqualSid(owner, UserSid::current().unwrap().user()), 0,
-                "new private objects must explicitly use TokenUser, not a default owner group");
+            assert_eq!(
+                GetSecurityInfo(
+                    file.as_raw_handle(),
+                    SE_FILE_OBJECT,
+                    OWNER_SECURITY_INFORMATION,
+                    &mut owner,
+                    null_mut(),
+                    null_mut(),
+                    null_mut(),
+                    &mut descriptor
+                ),
+                0
+            );
+            assert_ne!(
+                EqualSid(owner, UserSid::current().unwrap().user()),
+                0,
+                "new private objects must explicitly use TokenUser, not a default owner group"
+            );
             LocalFree(descriptor);
         }
         file.write_all(b"private fixture bytes").unwrap();
@@ -796,7 +853,8 @@ mod tests {
         output.sync_all().unwrap();
         drop(output);
         durable_rename(&source, &destination).unwrap();
-        sync_directory(root.path()).unwrap();
+        let mechanism = sync_directory_with_evidence(root.path()).unwrap();
+        println!("native_directory_sync_mechanism={mechanism:?}");
         verify_path(&destination, false).unwrap();
         let mut bytes = String::new();
         open_read(&destination, true)
@@ -949,21 +1007,55 @@ mod tests {
         }
         let other_user = NativeTestUser::create();
         unsafe {
-            assert_eq!(SetSecurityInfo(file.as_raw_handle(), SE_FILE_OBJECT, OWNER_SECURITY_INFORMATION,
-                other_user.sid(), null_mut(), null(), null()), 0);
+            assert_eq!(
+                SetSecurityInfo(
+                    file.as_raw_handle(),
+                    SE_FILE_OBJECT,
+                    OWNER_SECURITY_INFORMATION,
+                    other_user.sid(),
+                    null_mut(),
+                    null(),
+                    null()
+                ),
+                0
+            );
         }
         assert!(crate::storage_encryption::load_storage_encryption_key(&path).is_err());
         assert!(protect_path(&path, false).is_err());
         let mut actual_owner = null_mut();
         let mut actual_descriptor = null_mut();
         unsafe {
-            assert_eq!(GetSecurityInfo(file.as_raw_handle(), SE_FILE_OBJECT, OWNER_SECURITY_INFORMATION,
-                &mut actual_owner, null_mut(), null_mut(), null_mut(), &mut actual_descriptor), 0);
-            assert_ne!(EqualSid(actual_owner, other_user.sid()), 0,
-                "rejected protection must preserve the foreign user's ownership");
+            assert_eq!(
+                GetSecurityInfo(
+                    file.as_raw_handle(),
+                    SE_FILE_OBJECT,
+                    OWNER_SECURITY_INFORMATION,
+                    &mut actual_owner,
+                    null_mut(),
+                    null_mut(),
+                    null_mut(),
+                    &mut actual_descriptor
+                ),
+                0
+            );
+            assert_ne!(
+                EqualSid(actual_owner, other_user.sid()),
+                0,
+                "rejected protection must preserve the foreign user's ownership"
+            );
             LocalFree(actual_descriptor);
-            assert_eq!(SetSecurityInfo(file.as_raw_handle(), SE_FILE_OBJECT, OWNER_SECURITY_INFORMATION,
-                UserSid::current().unwrap().user(), null_mut(), null(), null()), 0);
+            assert_eq!(
+                SetSecurityInfo(
+                    file.as_raw_handle(),
+                    SE_FILE_OBJECT,
+                    OWNER_SECURITY_INFORMATION,
+                    UserSid::current().unwrap().user(),
+                    null_mut(),
+                    null(),
+                    null()
+                ),
+                0
+            );
         }
     }
 

@@ -566,7 +566,11 @@ async fn clone_wire_enforces_tenants_roles_identity_and_fresh_vfs_handles() {
         .await
         .unwrap();
     client
-        .vfs_write_bytes(parent.to_string(), &workspace_file.id, b"private parent bytes")
+        .vfs_write_bytes(
+            parent.to_string(),
+            &workspace_file.id,
+            b"private parent bytes",
+        )
         .await
         .unwrap();
     let memory = client

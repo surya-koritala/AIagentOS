@@ -521,11 +521,11 @@ tracking_issue = 128
 qualification_issue = 127
 kernel_modules = ["editing", "function_calling", "indexer", "learning", "modules", "planning"]
 source_paths = ["crates/kernel/src", "docs/SECONDARY_CAPABILITIES.md"]
-public_entry_points = []
-runtime_call_paths = []
-test_evidence = ["tests/src/edge_cases.rs", "tests/src/module_props.rs"]
+public_entry_points = ["crates/cli/src/main.rs::main"]
+runtime_call_paths = ["crates/cli/src/slash.rs::handle_slash", "crates/kernel/src/lib.rs::configure_local_cli_agent", "crates/kernel/src/lib.rs::generate_plan"]
+test_evidence = ["tests/src/edge_cases.rs", "tests/src/module_props.rs", "crates/cli/tests/learning_planning.rs", "crates/kernel/src/learning.rs", "crates/kernel/src/planning.rs"]
 platforms = ["linux", "macos", "windows"]
-limitations = ["The per-module disposition explicitly retains editing/function-calling on the governed live path and defers the in-memory agent hub/marketplace, planning, learning, indexer, shell, direct GitHub/database/MCP-client, vision/voice, Wasm modules, and linux_compat from the v1 public runtime until their stated security contracts are met. Marketplace ratings/download counters are never consulted by the signed package registry. The Wasm module system sits behind the off-by-default kernel/wasm feature: it is absent from every default build and is compiled and exercised only by the all-features CI job, so no shipped binary links wasmtime or Cranelift."]
+limitations = ["The per-module disposition explicitly retains editing/function-calling on the governed live path and retains bounded local terminal planning/corrections without step execution or remote learning, and defers the in-memory agent hub/marketplace, public planning/learning services, indexer, shell, direct GitHub/database/MCP-client, vision/voice, Wasm modules, and linux_compat from the v1 public runtime until their stated security contracts are met. Marketplace ratings/download counters are never consulted by the signed package registry. The Wasm module system sits behind the off-by-default kernel/wasm feature: it is absent from every default build and is compiled and exercised only by the all-features CI job, so no shipped binary links wasmtime or Cranelift."]
 
 [[capability]]
 id = "release-governance"

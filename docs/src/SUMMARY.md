@@ -6,6 +6,7 @@
 
 - [Getting Started](./getting-started.md)
 - [Restricted Linux CLI Release Candidate](./linux-cli-rc.md)
+- [Terminal Corrections and Planning](./cli-learning.md)
 - [Supported Platforms and Installation Evidence](./supported-platforms.md)
 - [Concepts](./concepts.md)
   - [Architecture](./architecture.md)

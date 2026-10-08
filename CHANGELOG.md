@@ -10,6 +10,14 @@ moves it to a versioned, dated section. See [RELEASING.md](RELEASING.md).
 
 ## [Unreleased]
 
+- Wired terminal `/learn` and `/unlearn` to bounded private correction storage
+  with operator provenance, atomic persistence, visible errors, restart, and
+  explicitly scoped executor injection. `/plan` generates bounded parsed
+  steps through kernel provider admission/accounting and clearly reports that
+  step execution is deferred. Slash help matches the accepted commands.
+  GitHub CI checks shipped binary restart, rule isolation, tool denial,
+  planning bounds, quota admission, and cancellation. Relates #338.
+
 - Added public-wire VFS acceptance proof pairing stale descriptor rejection with
   fresh real reads by the same restored owner, and verifying that authorized COW
   cloning inherits no live tool/workspace/memory/KV/IPC handles or attenuated

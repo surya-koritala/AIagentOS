@@ -185,6 +185,63 @@ struct ProviderCall {
     tool_degradation: Option<crate::connector::ProviderToolDegradation>,
 }
 
+/// Private session facade lets the existing planning generator use the
+/// executor's provider accounting/admission without offering a tool route.
+struct GovernedPlanningSession<'a> {
+    executor: &'a AgentExecutor,
+    usage: std::sync::Mutex<UsageTelemetry>,
+}
+
+#[async_trait::async_trait]
+impl LlmSession for GovernedPlanningSession<'_> {
+    async fn send(
+        &self,
+        messages: Vec<StandardMessage>,
+    ) -> Result<crate::connector::LlmResponse, crate::ConnectorError> {
+        let (response, usage) =
+            self.executor
+                .send_plan_request(messages)
+                .await
+                .map_err(|error| {
+                    crate::ConnectorError::invalid_request(
+                        self.executor.session.provider_id().clone(),
+                        error.to_string(),
+                        None,
+                    )
+                })?;
+        *self.usage.lock().map_err(|_| {
+            crate::ConnectorError::invalid_request(
+                self.executor.session.provider_id().clone(),
+                "plan accounting lock failed",
+                None,
+            )
+        })? = usage;
+        Ok(response)
+    }
+
+    async fn send_with_tools(
+        &self,
+        messages: Vec<StandardMessage>,
+        tools: &[crate::connector::ToolDefinition],
+    ) -> Result<crate::connector::LlmResponse, crate::ConnectorError> {
+        if !tools.is_empty() {
+            return Err(crate::ConnectorError::invalid_request(
+                self.executor.session.provider_id().clone(),
+                "plan generation does not offer executable tools",
+                None,
+            ));
+        }
+        self.send(messages).await
+    }
+
+    fn provider_id(&self) -> &crate::ProviderId {
+        self.executor.session.provider_id()
+    }
+    fn model_id(&self) -> &str {
+        self.executor.session.model_id()
+    }
+}
+
 /// The agent executor — drives the think→act→observe loop.
 pub struct AgentExecutor {
     pub agent_id: AgentId,
@@ -649,6 +706,23 @@ impl AgentExecutor {
     }
 
     /// Resume from a saved conversation.
+    pub(crate) fn configure_terminal_prompt(
+        &mut self,
+        prompt: String,
+        conversation: Option<&str>,
+    ) -> Result<(), KernelError> {
+        self.system_prompt = prompt.clone();
+        self.messages = match conversation {
+            Some(id) => {
+                self.conversation_id = id.to_string();
+                self.context_manager.load_conversation(id)?
+            }
+            None => vec![StandardMessage::system(prompt)],
+        };
+        Ok(())
+    }
+
+    /// Resume from a saved conversation.
     pub fn with_conversation(mut self, conversation_id: &str) -> Self {
         self.conversation_id = conversation_id.to_string();
         if let Ok(messages) = self.context_manager.load_conversation(conversation_id) {
@@ -680,8 +754,32 @@ impl AgentExecutor {
     }
 
     /// Set a rule store for learning from corrections.
-    pub fn set_rule_store(&mut self, store: Arc<crate::learning::RuleStore>) {
+    pub fn set_rule_store(
+        &mut self,
+        store: Arc<crate::learning::RuleStore>,
+    ) -> Result<(), KernelError> {
+        let authorized = match store.scope() {
+            crate::learning::RuleScope::Agent(agent) => agent == &self.agent_id.to_string(),
+            crate::learning::RuleScope::LocalOperator {
+                tenant_id,
+                operator,
+            } => {
+                store.is_durable()
+                    && operator == "local-cli"
+                    && self
+                        .context_admission
+                        .as_ref()
+                        .is_some_and(|(_, tenant)| tenant == tenant_id)
+            }
+            _ => false,
+        };
+        if !authorized {
+            return Err(KernelError::Policy(
+                "correction scope does not match this executor".into(),
+            ));
+        }
         self.rule_store = Some(store);
+        Ok(())
     }
 
     /// Get a cancellation token for this executor.
@@ -767,10 +865,16 @@ impl AgentExecutor {
             }
         }
 
-        // Inject applicable correction rules
+        // Replace prior correction data each turn, including after removal.
+        // Correction text is user data, never elevated system policy.
         if let Some(ref store) = self.rule_store {
+            self.messages.retain(|message| {
+                !message
+                    .content
+                    .starts_with(crate::learning::RULE_PROMPT_PREFIX)
+            });
             if let Some(rules_prompt) = store.rules_as_prompt(user_message) {
-                self.messages.push(StandardMessage::system(rules_prompt));
+                self.messages.push(StandardMessage::user(rules_prompt));
             }
         }
 
@@ -780,6 +884,68 @@ impl AgentExecutor {
         // with a count placeholder, silently losing semantics. Pressure is now
         // handled in `compact_to_token_budget`: full evicted messages are durably
         // spilled and a retrievable reference remains in the active prompt.
+    }
+
+    /// Generate a plan through the same provider admission and accounting as
+    /// an ordinary turn. Returned calls are data errors, never tool execution.
+    pub(crate) async fn run_plan(&self, task: &str) -> Result<TurnResult, KernelError> {
+        crate::planning::validate_plan_task(task)?;
+        let session = GovernedPlanningSession {
+            executor: self,
+            usage: std::sync::Mutex::new(UsageTelemetry::default()),
+        };
+        let plan = crate::planning::generate_plan(&session, task).await;
+        let usage = *session
+            .usage
+            .lock()
+            .map_err(|_| KernelError::Policy("plan accounting lock failed".into()))?;
+        // Even an invalid textual plan is a consumed, accounted response. The
+        // kernel records usage before returning the explicit parse error.
+        let result = plan.map_err(|error| error.to_string());
+        let content = serde_json::to_string(&result)
+            .map_err(|error| KernelError::Policy(error.to_string()))?;
+        Ok(TurnResult::Completed(self.output(
+            content,
+            0,
+            usage.input_tokens.saturating_add(usage.output_tokens),
+            usage,
+        )))
+    }
+
+    async fn send_plan_request(
+        &self,
+        messages: Vec<StandardMessage>,
+    ) -> Result<(crate::connector::LlmResponse, UsageTelemetry), KernelError> {
+        if self.context_budget_tokens > 0
+            && self.estimate_prompt_tokens(&messages) > self.context_budget_tokens
+        {
+            return Err(KernelError::Policy(
+                "plan prompt exceeds the configured active-context budget".into(),
+            ));
+        }
+        let budget_call = match &self.budget_enforcer {
+            Some(budget) => Some(
+                budget
+                    .begin_call(self.agent_id)
+                    .await
+                    .map_err(|error| KernelError::Policy(error.message()))?,
+            ),
+            None => None,
+        };
+        let call = self.send_prepared_with_retry(messages, &[]).await?;
+        let mut usage = UsageTelemetry::default();
+        usage.record(&call);
+        if let Some(budget) = &self.budget_enforcer {
+            let (_, charged) = budget.record_usage_charge(
+                self.agent_id,
+                &call.provider_id,
+                &call.model_id,
+                call.usage,
+            );
+            usage.charged_cost_micros = usage.charged_cost_micros.saturating_add(charged);
+        }
+        drop(budget_call);
+        Ok((call.response, usage))
     }
 
     /// Pause-aware run of a turn for `user_message`.
@@ -797,6 +963,11 @@ impl AgentExecutor {
     /// [`GenerationCheckpoint`] for the honest note on token-level vs
     /// turn-boundary granularity across local and hosted backends.
     pub async fn run_resumable(&mut self, user_message: &str) -> Result<TurnResult, KernelError> {
+        if let Some(store) = &self.rule_store {
+            store
+                .check_health()
+                .map_err(|error| KernelError::Policy(error.to_string()))?;
+        }
         self.prepare_turn(user_message).await;
         self.drive_loop(user_message.to_string(), 0, 0, UsageTelemetry::default())
             .await
@@ -1164,6 +1335,15 @@ impl AgentExecutor {
         &self,
         tools: &[crate::connector::ToolDefinition],
     ) -> Result<ProviderCall, KernelError> {
+        self.send_prepared_with_retry(self.clean_messages(), tools)
+            .await
+    }
+
+    async fn send_prepared_with_retry(
+        &self,
+        clean_messages: Vec<StandardMessage>,
+        tools: &[crate::connector::ToolDefinition],
+    ) -> Result<ProviderCall, KernelError> {
         self.session
             .validate_tool_policy(tools)
             .map_err(KernelError::Connector)?;
@@ -1176,7 +1356,6 @@ impl AgentExecutor {
             )));
         }
         // Filter messages: remove tool results that don't have a preceding tool_calls message
-        let clean_messages = self.clean_messages();
         let estimated_input_tokens = self
             .estimate_prompt_tokens(&clean_messages)
             .saturating_add(Self::conservative_tool_tokens(tools))
@@ -1561,7 +1740,23 @@ impl AgentExecutor {
     fn save_conversation(&self) -> Result<(), KernelError> {
         self.context_manager
             .save_conversation(&self.conversation_id, self.agent_id, &self.messages)
-            .map_err(KernelError::Context)
+            .map_err(KernelError::Context)?;
+        if let Some(store) = &self.rule_store {
+            if store.scope() == &crate::learning::RuleScope::local_cli() {
+                let tenant = self
+                    .context_manager
+                    .agent_tenant(self.agent_id)?
+                    .ok_or(crate::AgentError::NotFound(self.agent_id))?;
+                store
+                    .register_cli_conversation(&self.conversation_id, self.agent_id, &tenant)
+                    .map_err(|error| {
+                        KernelError::Policy(format!(
+                            "conversation registry persistence could not be confirmed: {error}"
+                        ))
+                    })?;
+            }
+        }
+        Ok(())
     }
 
     /// Clean messages: remove orphaned tool results (tool messages without preceding tool_calls).

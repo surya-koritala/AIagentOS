@@ -7,7 +7,7 @@ use serde_json::{json, Value};
 use std::{
     collections::BTreeSet,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Mutex, Weak},
 };
 use uuid::Uuid;
 
@@ -169,9 +169,39 @@ struct WorkspaceObject {
     sandbox: SandboxId,
     path: String,
     directory_path: PathBuf,
-    directory: Arc<Dir>,
+    directory: Arc<WorkspaceDirectory>,
     entry: PathBuf,
     kind: WorkspaceKind,
+}
+
+/// Shared native reference whose retirement does not depend on async callers
+/// releasing their opaque capability clones.
+#[derive(Debug)]
+pub(crate) struct WorkspaceDirectory {
+    directory: Mutex<Option<Dir>>,
+}
+
+impl WorkspaceDirectory {
+    pub(crate) fn revoke(&self) {
+        self.directory
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take();
+    }
+
+    fn with<T>(
+        &self,
+        apply: impl FnOnce(&Dir) -> Result<T, SandboxError>,
+    ) -> Result<T, SandboxError> {
+        let directory = self
+            .directory
+            .lock()
+            .map_err(|_| denied("workspace directory unavailable"))?;
+        let directory = directory
+            .as_ref()
+            .ok_or_else(|| denied("workspace directory revoked"))?;
+        apply(directory)
+    }
 }
 
 pub(crate) struct WorkspaceBinding {
@@ -233,7 +263,9 @@ impl WorkspaceCapability {
                 sandbox,
                 path,
                 directory_path,
-                directory: Arc::new(directory),
+                directory: Arc::new(WorkspaceDirectory {
+                    directory: Mutex::new(Some(directory)),
+                }),
                 entry,
                 kind,
             }),
@@ -258,8 +290,14 @@ impl WorkspaceCapability {
     pub(crate) fn directory_path(&self) -> &Path {
         &self.object.directory_path
     }
-    pub(crate) fn directory(&self) -> &Dir {
-        &self.object.directory
+    pub(crate) fn with_directory<T>(
+        &self,
+        apply: impl FnOnce(&Dir) -> Result<T, SandboxError>,
+    ) -> Result<T, SandboxError> {
+        self.object.directory.with(apply)
+    }
+    pub(crate) fn directory_reference(&self) -> Weak<WorkspaceDirectory> {
+        Arc::downgrade(&self.object.directory)
     }
     pub(crate) fn entry(&self) -> &Path {
         &self.object.entry
@@ -583,6 +621,143 @@ mod tests {
         })
         .await
         .expect("controlled filesystem checkpoint reached");
+    }
+
+    #[tokio::test]
+    async fn managed_teardown_releases_a_retained_native_workspace_reference() {
+        use crate::syscall_server::{Syscall, SyscallClient, SyscallReply, SyscallServer};
+        let kernel = Arc::new(AgentKernelImpl::new().unwrap());
+        let agent = kernel
+            .create_agent_full(AgentConfig {
+                name: "managed-capability-retirement".into(),
+                task: "managed VFS lifecycle".into(),
+                llm_provider: "stub".into(),
+                permission_profile: "standard".into(),
+                priority: Priority::default(),
+                sandbox_config: None,
+            })
+            .await
+            .unwrap()
+            .id;
+        let handle = kernel
+            .vfs_open_workspace(
+                agent,
+                WorkspaceOpenRequest {
+                    path: "/workspace".into(),
+                    kind: WorkspaceKind::Directory,
+                    rights: vec![WorkspaceRight::List],
+                    allow_missing: false,
+                },
+            )
+            .await
+            .unwrap();
+        let scope = kernel
+            .tool_vfs
+            .acquire(agent, &handle.id)
+            .unwrap()
+            .workspace()
+            .unwrap();
+        assert!(scope.with_directory(directory_identity).is_ok());
+        let server = SyscallServer::bind(kernel.clone(), "127.0.0.1:0")
+            .await
+            .unwrap();
+        let address = server.local_addr().unwrap();
+        let server = tokio::spawn(server.serve());
+        let mut client = SyscallClient::connect(address).await.unwrap();
+        assert!(matches!(
+            client
+                .call(Syscall::StopAgent {
+                    agent_id: agent.to_string()
+                })
+                .await
+                .unwrap(),
+            SyscallReply::AgentStatus { .. }
+        ));
+        assert!(scope.with_directory(directory_identity).is_err());
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn managed_stop_can_finish_before_a_native_open_publishes_its_handle() {
+        let kernel = Arc::new(AgentKernelImpl::new().unwrap());
+        let agent = kernel
+            .create_agent_full(AgentConfig {
+                name: "managed-publication-race".into(),
+                task: "managed VFS publication".into(),
+                llm_provider: "stub".into(),
+                permission_profile: "standard".into(),
+                priority: Priority::default(),
+                sandbox_config: None,
+            })
+            .await
+            .unwrap()
+            .id;
+        let row = kernel
+            .context_manager
+            .load_all_agents()
+            .unwrap()
+            .into_iter()
+            .find(|row| row.id == agent)
+            .unwrap();
+        let config: SandboxConfig =
+            serde_json::from_str(row.sandbox_config_json.as_ref().unwrap()).unwrap();
+        let (entered, release, _) = kernel.sandbox_manager.pause_next_filesystem_for_test();
+        let opening = tokio::spawn({
+            let kernel = kernel.clone();
+            async move {
+                kernel
+                    .vfs_open_workspace(
+                        agent,
+                        WorkspaceOpenRequest {
+                            path: "/workspace".into(),
+                            kind: WorkspaceKind::Directory,
+                            rights: vec![WorkspaceRight::List],
+                            allow_missing: false,
+                        },
+                    )
+                    .await
+            }
+        });
+        observed(&entered).await;
+        let lifecycle = kernel.lifecycle_lock(agent);
+        let held = lifecycle.lock().await;
+        let mut stopping = std::pin::pin!(kernel.stop_agent(agent));
+        // Poll stop into the fair lifecycle queue before native open resumes.
+        tokio::select! {
+            biased;
+            result = &mut stopping => panic!("stop crossed a held lifecycle lock: {result:?}"),
+            () = tokio::task::yield_now() => {},
+        }
+        release.store(true, Ordering::Release);
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while kernel
+                .cgroups
+                .get(kernel.cgroups.root())
+                .unwrap()
+                .usage
+                .active_tool_calls
+                != 0
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("native open completed and released tool admission");
+        assert!(!opening.is_finished(), "publication waits behind stop");
+        drop(held);
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(3), stopping)
+                .await
+                .unwrap()
+                .unwrap(),
+            crate::AgentState::Stopped
+        );
+        assert!(matches!(
+            opening.await.unwrap(),
+            Err(WorkspaceError::Vfs(super::super::VfsError::NotFound))
+        ));
+        assert!(!config.workspace_dir.exists());
     }
 
     #[tokio::test]

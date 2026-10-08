@@ -54,6 +54,9 @@ stop/open deadlocks. Close prevents new work; already admitted work may finish.
 The existing controlled worker owns its admission permit through real I/O and
 drain, and observes cancellation before mutation. Stop/kill revoke descriptor
 admission and the sandbox; no retired capability can commit later work.
+Sandbox teardown also closes retained native directory references, including
+capability clones in requests awaiting admission or lifecycle publication.
+They cannot keep a managed directory pinned after teardown completes.
 
 ## SDK and CLI
 

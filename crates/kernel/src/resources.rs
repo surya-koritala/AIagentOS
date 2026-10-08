@@ -495,7 +495,9 @@ impl ProviderTaskGuard {
         let handle = tokio::spawn(async move {
             let _permit = permit;
             if peripheral && provider_cancellation.is_cancelled() {
-                return Err(ResourceError::OperationFailed("peripheral use revoked".into()));
+                return Err(ResourceError::OperationFailed(
+                    "peripheral use revoked".into(),
+                ));
             }
             provider
                 .execute_controlled(&operation, &parameters, &provider_cancellation)

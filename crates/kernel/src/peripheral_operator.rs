@@ -232,10 +232,19 @@ impl LocalPeripheralOperator {
 
     pub fn requests(&self) -> Vec<PeripheralOperatorRequest> {
         let records = self.requests.records.lock().unwrap().clone();
-        records.iter()
+        records
+            .iter()
             .map(|record| {
-                if self.kernel.tool_registry.with_peripheral_binding(&record.tool, record.binding, || ()).is_none() {
-                    record.cancel(&self.kernel.syscall_gate, PeripheralRequestStatus::Cancelled);
+                if self
+                    .kernel
+                    .tool_registry
+                    .with_peripheral_binding(&record.tool, record.binding, || ())
+                    .is_none()
+                {
+                    record.cancel(
+                        &self.kernel.syscall_gate,
+                        PeripheralRequestStatus::Cancelled,
+                    );
                 }
                 let recorded_status = record.status.lock().unwrap();
                 let state = self
@@ -279,8 +288,7 @@ impl LocalPeripheralOperator {
         let request = self.requests.find(id)?;
         // Publication -> request -> gate matches unregister's cancellation
         // order. No registry lock survives the async admission retry.
-        self
-            .kernel
+        self.kernel
             .tool_registry
             .with_peripheral_binding(&request.tool, request.binding, || {
                 let mut status = request.status.lock().unwrap();
@@ -292,14 +300,14 @@ impl LocalPeripheralOperator {
                 self.kernel
                     .syscall_gate
                     .local_peripheral_contract(request.contract(), LocalPeripheralAction::Approve)
-                    .ok_or_else(|| KernelError::Policy("peripheral request authority changed".into()))?;
+                    .ok_or_else(|| {
+                        KernelError::Policy("peripheral request authority changed".into())
+                    })?;
                 *status = PeripheralRequestStatus::Approved;
                 request.decision.send_replace(*status);
                 Ok(())
             })
-            .ok_or_else(|| KernelError::Policy(
-                "peripheral request authority changed".into(),
-            ))?
+            .ok_or_else(|| KernelError::Policy("peripheral request authority changed".into()))?
     }
 
     pub fn deny(&self, id: uuid::Uuid) -> Result<(), KernelError> {

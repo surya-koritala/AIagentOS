@@ -660,7 +660,6 @@ fn peripheral_access_stays_unavailable_and_requires_a_revocable_local_grant() {
     for contract in [
         "MAX_REQUESTS: usize = 64",
         "APPROVAL_WAIT: Duration = Duration::from_secs(30)",
-        "crate::resources::opaque_identity(record.resource.as_bytes())",
         "with_peripheral_binding",
         "LocalPeripheralAction::Revoke",
         "struct PendingPeripheralResume",
@@ -670,6 +669,16 @@ fn peripheral_access_stays_unavailable_and_requires_a_revocable_local_grant() {
             "native peripheral handoff lost {contract:?}"
         );
     }
+    let compact_native: String = native
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect();
+    let opaque_projection = "resource_identity:crate::resources::opaque_identity(record.resource.as_bytes()";
+    assert!(
+        compact_native.contains(&format!("{opaque_projection})"))
+            || compact_native.contains(&format!("{opaque_projection},)")),
+        "native resource identity must derive only from the opaque target digest"
+    );
     let desktop = read_workspace_file("crates/tauri-app/src/lib.rs");
     assert!(desktop.contains("peripheral_operator: Option<kernel::LocalPeripheralOperator>"));
     assert!(desktop.contains("peripheral approval requires the embedded desktop kernel"));

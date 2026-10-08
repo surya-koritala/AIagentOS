@@ -970,12 +970,16 @@ impl ToolRegistry {
         if request.resource_type == ResourceType::Peripheral {
             // A replacement of the same named peripheral declaration is a new
             // authority lifetime, even when its arguments/security are equal.
-            approval_contract.as_object_mut().expect("contract is an object").insert(
-                "binding_identity".into(), serde_json::json!(binding_identity),
-            );
+            approval_contract
+                .as_object_mut()
+                .expect("contract is an object")
+                .insert(
+                    "binding_identity".into(),
+                    serde_json::json!(binding_identity),
+                );
         }
         let approval_contract = serde_json::to_vec(&approval_contract)
-        .map_err(|error| format!("tool '{name}' contract serialization failed: {error}"))?;
+            .map_err(|error| format!("tool '{name}' contract serialization failed: {error}"))?;
         let digest = ring::digest::digest(&ring::digest::SHA256, &approval_contract);
         let mut approval_contract_digest = String::with_capacity(7 + digest.as_ref().len() * 2);
         approval_contract_digest.push_str("sha256:");

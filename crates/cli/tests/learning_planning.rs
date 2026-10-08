@@ -301,18 +301,41 @@ async fn unhealthy_correction_store_blocks_text_typed_content_and_planning_befor
     let store = rules(&path);
     let kernel = AgentKernelImpl::new().unwrap();
     let requests = fixture(&kernel, Vec::new(), false);
-    let local = kernel.create_agent_full(agent_config("unhealthy-store")).await.unwrap();
-    kernel.configure_local_cli_agent(local.id, store.clone(), "trusted policy".into(), None)
-        .await.unwrap();
+    let local = kernel
+        .create_agent_full(agent_config("unhealthy-store"))
+        .await
+        .unwrap();
+    kernel
+        .configure_local_cli_agent(local.id, store.clone(), "trusted policy".into(), None)
+        .await
+        .unwrap();
     // A real failed atomic persistence operation marks this live store unsafe.
     std::fs::remove_file(&path).unwrap();
     std::fs::create_dir(&path).unwrap();
-    assert!(store.add_rule("rust".into(), "unconfirmed correction".into(), RuleScope::local_cli()).is_err());
+    assert!(store
+        .add_rule(
+            "rust".into(),
+            "unconfirmed correction".into(),
+            RuleScope::local_cli()
+        )
+        .is_err());
     assert!(store.check_health().is_err());
-    assert!(kernel.send_message(local.id, "write rust code").await.is_err());
-    assert!(kernel.send_message_content(local.id, "typed legacy text".into()).await.is_err());
-    assert!(kernel.generate_plan(local.id, "plan a small edit").await.is_err());
-    assert!(requests.lock().unwrap().is_empty(), "unconfirmed corrections must not reach any provider path");
+    assert!(kernel
+        .send_message(local.id, "write rust code")
+        .await
+        .is_err());
+    assert!(kernel
+        .send_message_content(local.id, "typed legacy text".into())
+        .await
+        .is_err());
+    assert!(kernel
+        .generate_plan(local.id, "plan a small edit")
+        .await
+        .is_err());
+    assert!(
+        requests.lock().unwrap().is_empty(),
+        "unconfirmed corrections must not reach any provider path"
+    );
     kernel.stop_agent(local.id).await.unwrap();
     drop(kernel);
     drop(store);
@@ -355,7 +378,11 @@ async fn corrections_cannot_grant_denied_tool_authority() {
         .iter()
         .any(|message| message.role == "tool"
             && (message.content.contains("CAP_")
-                || message.content.text_projection().to_lowercase().contains("capability"))));
+                || message
+                    .content
+                    .text_projection()
+                    .to_lowercase()
+                    .contains("capability"))));
 }
 
 #[tokio::test]

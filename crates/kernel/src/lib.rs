@@ -5773,7 +5773,9 @@ impl AgentKernelImpl {
         let run_result = if planning {
             match message.legacy_text() {
                 Some(task) => executor.run_plan(task).await,
-                None => Err(KernelError::Policy("planning requires legacy text input".into())),
+                None => Err(KernelError::Policy(
+                    "planning requires legacy text input".into(),
+                )),
             }
         } else {
             executor.run_content_resumable(message).await

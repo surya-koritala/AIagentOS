@@ -1090,7 +1090,7 @@ async fn workspace_symlinks_never_escape_or_redirect_a_capability() {
 #[cfg(windows)]
 mod windows_public_wire {
     use super::*;
-    use std::{io::ErrorKind, os::windows::fs::MetadataExt, path::Path};
+    use std::{ffi::OsString, os::windows::{ffi::{OsStrExt, OsStringExt}, fs::MetadataExt}, path::Path};
 
     const ORIGINAL: &[u8] = &[0, 255, 1, 2, 3, 128];
     const OUTSIDE: &[u8] = b"private outside fixture bytes";
@@ -1115,8 +1115,8 @@ mod windows_public_wire {
         // pathname mock or changing the runtime's native sharing policy.
         let output = std::process::Command::new("cmd.exe")
             .args(["/D", "/C", "mklink", "/J"])
-            .arg(link)
-            .arg(target)
+            .arg(cmd_path(link))
+            .arg(cmd_path(target))
             .output()
             .unwrap();
         assert!(
@@ -1128,11 +1128,18 @@ mod windows_public_wire {
         assert_reparse(link);
     }
 
+    fn cmd_path(path: &Path) -> OsString {
+        // cmd built-ins interpret forward slashes as switches, even when the
+        // same host path is accepted by the native filesystem APIs.
+        OsString::from_wide(&path.as_os_str().encode_wide()
+            .map(|unit| if unit == u16::from(b'/') { u16::from(b'\\') } else { unit })
+            .collect::<Vec<_>>())
+    }
+
     fn held_directory_cannot_move(source: &Path, destination: &Path) {
         let error = std::fs::rename(source, destination)
             .expect_err("a live native directory capability must prevent retirement");
-        assert_eq!(error.kind(), ErrorKind::PermissionDenied);
-        assert!(matches!(error.raw_os_error(), Some(5 | 32)), "{error}");
+        assert!(matches!(error.raw_os_error(), Some(5 | 32)), "{error:?}");
     }
 
     async fn finish(

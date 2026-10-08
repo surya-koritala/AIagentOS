@@ -168,6 +168,33 @@ struct ProviderCall {
     latency_ms: u64,
 }
 
+/// Private session facade lets the existing planning generator use the
+/// executor's provider accounting/admission without offering a tool route.
+struct GovernedPlanningSession<'a> {
+    executor: &'a AgentExecutor,
+    usage: std::sync::Mutex<UsageTelemetry>,
+}
+
+#[async_trait::async_trait]
+impl LlmSession for GovernedPlanningSession<'_> {
+    async fn send(&self, messages: Vec<StandardMessage>) -> Result<crate::connector::LlmResponse, crate::ConnectorError> {
+        let (response, usage) = self.executor.send_plan_request(messages).await
+            .map_err(|error| crate::ConnectorError::invalid_request(self.executor.session.provider_id().clone(), error.to_string(), None))?;
+        *self.usage.lock().map_err(|_| crate::ConnectorError::invalid_request(self.executor.session.provider_id().clone(), "plan accounting lock failed", None))? = usage;
+        Ok(response)
+    }
+
+    async fn send_with_tools(&self, messages: Vec<StandardMessage>, tools: &[crate::connector::ToolDefinition]) -> Result<crate::connector::LlmResponse, crate::ConnectorError> {
+        if !tools.is_empty() {
+            return Err(crate::ConnectorError::invalid_request(self.executor.session.provider_id().clone(), "plan generation does not offer executable tools", None));
+        }
+        self.send(messages).await
+    }
+
+    fn provider_id(&self) -> &crate::ProviderId { self.executor.session.provider_id() }
+    fn model_id(&self) -> &str { self.executor.session.model_id() }
+}
+
 /// The agent executor — drives the think→act→observe loop.
 pub struct AgentExecutor {
     pub agent_id: AgentId,
@@ -789,30 +816,33 @@ impl AgentExecutor {
     /// an ordinary turn. Returned calls are data errors, never tool execution.
     pub(crate) async fn run_plan(&self, task: &str) -> Result<TurnResult, KernelError> {
         crate::planning::validate_plan_task(task)?;
-        let mut usage = UsageTelemetry::default();
-        let accounted_usage = &mut usage;
-        let plan = crate::planning::generate_plan_with(task, |messages| async move {
-            if self.context_budget_tokens > 0 && self.estimate_prompt_tokens(&messages) > self.context_budget_tokens {
-                return Err(KernelError::Policy("plan prompt exceeds the configured active-context budget".into()));
-            }
-            let budget_call = match &self.budget_enforcer {
-                Some(budget) => Some(budget.begin_call(self.agent_id).await.map_err(|error| KernelError::Policy(error.message()))?),
-                None => None,
-            };
-            let call = self.send_prepared_with_retry(messages, &[]).await?;
-            accounted_usage.record(&call);
-            if let Some(budget) = &self.budget_enforcer {
-                let (_, charged) = budget.record_usage_charge(self.agent_id, &call.provider_id, &call.model_id, call.usage);
-                accounted_usage.charged_cost_micros = accounted_usage.charged_cost_micros.saturating_add(charged);
-            }
-            drop(budget_call);
-            Ok(call.response)
-        }).await;
+        let session = GovernedPlanningSession { executor: self, usage: std::sync::Mutex::new(UsageTelemetry::default()) };
+        let plan = crate::planning::generate_plan(&session, task).await;
+        let usage = *session.usage.lock().map_err(|_| KernelError::Policy("plan accounting lock failed".into()))?;
         // Even an invalid textual plan is a consumed, accounted response. The
         // kernel records usage before returning the explicit parse error.
         let result = plan.map_err(|error| error.to_string());
         let content = serde_json::to_string(&result).map_err(|error| KernelError::Policy(error.to_string()))?;
         Ok(TurnResult::Completed(self.output(content, 0, usage.input_tokens.saturating_add(usage.output_tokens), usage)))
+    }
+
+    async fn send_plan_request(&self, messages: Vec<StandardMessage>) -> Result<(crate::connector::LlmResponse, UsageTelemetry), KernelError> {
+        if self.context_budget_tokens > 0 && self.estimate_prompt_tokens(&messages) > self.context_budget_tokens {
+            return Err(KernelError::Policy("plan prompt exceeds the configured active-context budget".into()));
+        }
+        let budget_call = match &self.budget_enforcer {
+            Some(budget) => Some(budget.begin_call(self.agent_id).await.map_err(|error| KernelError::Policy(error.message()))?),
+            None => None,
+        };
+        let call = self.send_prepared_with_retry(messages, &[]).await?;
+        let mut usage = UsageTelemetry::default();
+        usage.record(&call);
+        if let Some(budget) = &self.budget_enforcer {
+            let (_, charged) = budget.record_usage_charge(self.agent_id, &call.provider_id, &call.model_id, call.usage);
+            usage.charged_cost_micros = usage.charged_cost_micros.saturating_add(charged);
+        }
+        drop(budget_call);
+        Ok((call.response, usage))
     }
 
     /// Pause-aware run of a turn for `user_message`.

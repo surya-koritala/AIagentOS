@@ -2094,6 +2094,11 @@ fn model_discovery_error_reply(error: crate::ConnectorError) -> SyscallReply {
             "model discovery is unsupported",
             false,
         ),
+        ConnectorError::UnsupportedContent(_) => (
+            WireErrorCode::UnsupportedContent,
+            "model discovery provider returned unsupported content",
+            false,
+        ),
         ConnectorError::ProviderUnavailable(_) => (
             WireErrorCode::NotFound,
             "configured provider not registered",

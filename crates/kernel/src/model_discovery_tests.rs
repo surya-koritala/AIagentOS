@@ -48,6 +48,14 @@ impl LlmProviderAdapter for CatalogFixture {
             std::future::pending::<()>().await;
         }
         if self.fail {
+            if self.id == "unsupported-content" {
+                let mut error = ConnectorError::unsupported_content(self.id.clone());
+                if let ConnectorError::UnsupportedContent(context) = &mut error {
+                    context.message = "private-provider-secret".into();
+                    context.request_id = Some("secret-request-id".into());
+                }
+                return Err(error);
+            }
             return Err(ConnectorError::ProtocolError(
                 "private-provider-secret".into(),
             ));
@@ -186,17 +194,20 @@ async fn model_discovery_requires_system_scope_before_provider_io() {
 #[tokio::test]
 async fn model_discovery_wire_failures_are_typed_and_redact_adapter_prose() {
     let kernel = AgentKernelImpl::new().unwrap();
-    kernel
-        .register_provider(Arc::new(CatalogFixture {
-            id: "failing".into(),
-            calls: Arc::new(AtomicUsize::new(0)),
-            models: vec![],
-            pending: false,
-            fail: true,
-        }))
-        .unwrap();
+    for id in ["failing", "unsupported-content"] {
+        kernel
+            .register_provider(Arc::new(CatalogFixture {
+                id: id.into(),
+                calls: Arc::new(AtomicUsize::new(0)),
+                models: vec![],
+                pending: false,
+                fail: true,
+            }))
+            .unwrap();
+    }
     for (id, expected) in [
         ("failing", WireErrorCode::InvalidRequest),
+        ("unsupported-content", WireErrorCode::UnsupportedContent),
         ("absent", WireErrorCode::NotFound),
         ("x?key=secret", WireErrorCode::InvalidArgument),
     ] {

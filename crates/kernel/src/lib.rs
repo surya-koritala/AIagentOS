@@ -6230,7 +6230,23 @@ mod tests {
         database: &LiveErasureCrashDatabase,
         scope: &str,
     ) -> (String, String, AgentId) {
-        let kernel = AgentKernelImpl::from_config(&database.config()).unwrap();
+        let opened = AgentKernelImpl::from_config(&database.config());
+        #[cfg(windows)]
+        if opened.is_err() {
+            let mut lock_name = database.path.as_os_str().to_os_string();
+            lock_name.push(".lock");
+            let lock = std::path::PathBuf::from(lock_name);
+            for (label, path, directory) in [
+                ("parent", &database.root, true),
+                ("database", &database.path, false),
+                ("lease", &lock, false),
+            ] {
+                let exists = std::fs::symlink_metadata(path).is_ok();
+                let verified = crate::windows_private_fs::verify_path(path, directory);
+                eprintln!("erasure_seed_object label={label} exists={exists} protected={} error_kind={:?} os_error={:?}", verified.is_ok(), verified.as_ref().err().map(std::io::Error::kind), verified.as_ref().err().and_then(std::io::Error::raw_os_error));
+            }
+        }
+        let kernel = opened.unwrap();
         let tenant = kernel
             .create_tenant(&format!("{scope}-live-erasure"))
             .await

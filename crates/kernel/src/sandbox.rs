@@ -2386,7 +2386,10 @@ mod tests {
         };
         let provenance = crate::windows_private_fs::test_open_provenance(identity(&target_info));
         for event in provenance {
-            eprintln!("target_private_open_provenance access={:#x} share={:#x} callsite={}:{}", event.access, event.share, event.file, event.line);
+            eprintln!(
+                "target_private_open_provenance access={:#x} share={:#x} callsite={}:{}",
+                event.access, event.share, event.file, event.line
+            );
         }
         let mut matching = Vec::new();
         for entry in entries {

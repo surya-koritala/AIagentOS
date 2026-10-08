@@ -55,28 +55,49 @@ pub(crate) struct TestOpenProvenance {
 
 #[cfg(test)]
 fn test_open_events() -> &'static std::sync::Mutex<std::collections::VecDeque<TestOpenProvenance>> {
-    static EVENTS: std::sync::OnceLock<std::sync::Mutex<std::collections::VecDeque<TestOpenProvenance>>> = std::sync::OnceLock::new();
+    static EVENTS: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::VecDeque<TestOpenProvenance>>,
+    > = std::sync::OnceLock::new();
     EVENTS.get_or_init(|| std::sync::Mutex::new(std::collections::VecDeque::new()))
 }
 
 #[cfg(test)]
 #[track_caller]
 fn record_test_open(file: &File, access: u32, share: u32) {
-    use windows_sys::Win32::Storage::FileSystem::{GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION};
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+    };
     let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { zeroed() };
-    if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) } == 0 { return; }
+    if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) } == 0 {
+        return;
+    }
     let caller = std::panic::Location::caller();
     let mut events = test_open_events().lock().unwrap();
-    if events.len() == 4096 { events.pop_front(); }
+    if events.len() == 4096 {
+        events.pop_front();
+    }
     events.push_back(TestOpenProvenance {
-        identity: (info.dwVolumeSerialNumber, info.nFileIndexHigh, info.nFileIndexLow),
-        access, share, file: caller.file(), line: caller.line(),
+        identity: (
+            info.dwVolumeSerialNumber,
+            info.nFileIndexHigh,
+            info.nFileIndexLow,
+        ),
+        access,
+        share,
+        file: caller.file(),
+        line: caller.line(),
     });
 }
 
 #[cfg(test)]
 pub(crate) fn test_open_provenance(identity: (u32, u32, u32)) -> Vec<TestOpenProvenance> {
-    test_open_events().lock().unwrap().iter().filter(|event| event.identity == identity).cloned().collect()
+    test_open_events()
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|event| event.identity == identity)
+        .cloned()
+        .collect()
 }
 
 fn denied(message: &'static str) -> io::Error {
@@ -315,7 +336,11 @@ fn open(path: &Path, directory: bool, access: u32) -> io::Result<File> {
         return Err(denied("private storage object has the wrong type"));
     }
     #[cfg(test)]
-    record_test_open(&file, access | FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE);
+    record_test_open(
+        &file,
+        access | FILE_READ_ATTRIBUTES,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+    );
     Ok(file)
 }
 

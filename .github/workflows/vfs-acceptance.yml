@@ -1,0 +1,117 @@
+name: VFS acceptance evidence
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'crates/sdk/tests/vfs.rs'
+      - 'crates/sdk/tests/workspace_vfs.rs'
+      - 'crates/sdk/tests/data_vfs.rs'
+      - 'crates/sdk/tests/durable_conversation.rs'
+      - 'crates/kernel/src/vfs/**'
+      - 'crates/kernel/src/vfs.rs'
+      - 'crates/kernel/src/sandbox.rs'
+      - 'tests/src/vfs_handle_props.rs'
+      - '.github/workflows/vfs-acceptance.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: vfs-acceptance-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  formatting:
+    name: VFS acceptance source formatting
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
+        with:
+          toolchain: 1.97.1
+          components: rustfmt
+      - name: Generate formatting patch on CI
+        run: |
+          cargo fmt --all
+          git diff --binary > vfs-acceptance-formatting.patch
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: vfs-acceptance-formatting-${{ github.run_id }}
+          path: vfs-acceptance-formatting.patch
+      - name: Formatting must match committed source
+        run: git diff --exit-code
+
+  proofs:
+    name: VFS restart and clone acceptance (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    env:
+      OPENSSL_SRC_PERL: ${{ matrix.os == 'windows-latest' && 'C:/Strawberry/perl/bin/perl.exe' || 'perl' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
+        with:
+          toolchain: 1.97.1
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+        with:
+          save-if: false
+      - name: Bind proof to PR source and tested merge
+        id: source
+        shell: bash
+        env:
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          printf '%s\n' "$PR_HEAD" > vfs-acceptance-head.txt
+          git rev-parse HEAD > vfs-acceptance-tested-merge.txt
+          git status --porcelain --untracked-files=no > vfs-acceptance-source-state.txt
+          rustc --version > vfs-acceptance-toolchain.txt
+      - name: Same restored owner, stale descriptors denied, fresh real reads succeed
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p agent-sdk --test vfs vfs_restart_never_restores_an_old_handle --locked -- --nocapture 2>&1 | tee vfs-acceptance-tool-restart.log
+          cargo test -p agent-sdk --test workspace_vfs workspace_handles_are_not_resurrected_after_durable_agent_restart --locked -- --nocapture 2>&1 | tee vfs-acceptance-workspace-restart.log
+          cargo test -p agent-sdk --test data_vfs persistent_data_survives_restart_and_old_descriptors_do_not --locked -- --nocapture 2>&1 | tee vfs-acceptance-data-restart.log
+      - name: Authorized COW child cannot inherit any live descriptor family
+        if: ${{ !cancelled() && steps.source.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p agent-sdk --test durable_conversation clone_wire_enforces_tenants_roles_identity_and_fresh_vfs_handles --locked -- --nocapture 2>&1 | tee vfs-acceptance-clone.log
+      - name: Generated actual-wire lifecycle rights and capacity invariants
+        if: ${{ !cancelled() && steps.source.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p integration-tests vfs_handle_props --locked -- --nocapture 2>&1 | tee vfs-acceptance-properties.log
+      - name: Abrupt actual-process VFS death and fresh authorized recovery
+        if: ${{ !cancelled() && steps.source.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p kernel --lib --locked vfs::process_crash::abrupt_process_crash_revokes_handles_and_reopens_committed_vfs_data -- --nocapture 2>&1 | tee vfs-acceptance-process-crash.log
+      - name: Public-wire provider deadlines reclaim admitted workspace operations
+        if: ${{ !cancelled() && steps.source.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p kernel --lib --locked public_wire_provider_deadline_reclaims_a_pending_workspace_open -- --nocapture 2>&1 | tee vfs-acceptance-open-deadline.log
+          cargo test -p kernel --lib --locked public_wire_disconnect_keeps_admitted_write_bounded_and_drainable -- --nocapture 2>&1 | tee vfs-acceptance-disconnected-write.log
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: vfs-acceptance-${{ matrix.os }}-${{ github.run_id }}
+          path: |
+            vfs-acceptance-*.txt
+            vfs-acceptance-*.log
+          if-no-files-found: error

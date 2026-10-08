@@ -994,12 +994,34 @@ async fn workspace_handles_are_not_resurrected_after_durable_agent_restart() {
     let mut client = KernelClient::connect(addr).await.unwrap();
     assert_eq!(
         client
-            .vfs_read_bytes(&agent, file.id, 0, 64)
+            .vfs_read_bytes(&agent, &file.id, 0, 64)
             .await
             .unwrap_err()
             .wire_code(),
         Some(WireErrorCode::NotFound)
     );
+    assert_eq!(client.agent_status(&agent).await.unwrap(), "Running");
+    let fresh = client
+        .vfs_open_workspace(
+            &agent,
+            request(
+                "/workspace/project/file.bin",
+                WorkspaceKind::File,
+                &[WorkspaceRight::Read],
+            ),
+        )
+        .await
+        .unwrap();
+    assert_ne!(fresh.id, file.id);
+    assert_eq!(
+        client
+            .vfs_read_bytes(&agent, &fresh.id, 0, 64)
+            .await
+            .unwrap()
+            .bytes,
+        [0u8, 255, 1, 2, 3, 128]
+    );
+    client.vfs_close(&agent, fresh.id).await.unwrap();
     client.close().await.unwrap();
     task.abort();
     let _ = task.await;

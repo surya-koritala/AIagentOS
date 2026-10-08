@@ -27,8 +27,10 @@ use std::time::Duration;
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 
+pub use crate::message_content::{
+    ContentPart, ImageInput, ImageInputProfile, ImageMediaType, MessageContent,
+};
 use crate::{AgentId, ConnectorError, ProviderId};
-pub use crate::message_content::{ContentPart, ImageInput, ImageInputProfile, ImageMediaType, MessageContent};
 
 /// Classify a connector error as transient (worth retrying) or permanent.
 ///
@@ -304,7 +306,13 @@ pub fn validate_provider_history(
 
 impl StandardMessage {
     pub fn user_content(content: MessageContent) -> Self {
-        Self { role: "user".into(), content, tool_call_id: None, tool_calls: None, provider_metadata: None }
+        Self {
+            role: "user".into(),
+            content,
+            tool_call_id: None,
+            tool_calls: None,
+            provider_metadata: None,
+        }
     }
 
     pub fn user(content: impl Into<String>) -> Self {
@@ -695,7 +703,9 @@ pub trait LlmProviderAdapter: Send + Sync {
     async fn is_available(&self) -> bool;
     async fn create_session(&self) -> Result<Box<dyn LlmSession>, ConnectorError>;
 
-    fn image_input_profile(&self) -> Option<&ImageInputProfile> { None }
+    fn image_input_profile(&self) -> Option<&ImageInputProfile> {
+        None
+    }
 
     fn validate_content(&self, messages: &[StandardMessage]) -> Result<u32, ConnectorError> {
         crate::message_content::validate_messages(messages, self.id(), self.image_input_profile())
@@ -841,13 +851,26 @@ impl AgentConnectorImpl {
 
     /// Reserve the largest supported model-specific image bound before the
     /// first attempt. Unsupported backups never receive attachment bytes.
-    fn content_token_bound(&self, primary: &ProviderId, messages: &[StandardMessage]) -> Result<u32, ConnectorError> {
-        let primary_adapter = self.providers.get(primary).map(|entry| Arc::clone(entry.value()))
+    fn content_token_bound(
+        &self,
+        primary: &ProviderId,
+        messages: &[StandardMessage],
+    ) -> Result<u32, ConnectorError> {
+        let primary_adapter = self
+            .providers
+            .get(primary)
+            .map(|entry| Arc::clone(entry.value()))
             .ok_or_else(|| ConnectorError::ProviderUnavailable(primary.clone()))?;
         let mut bound = primary_adapter.validate_content(messages)?;
         for id in self.failover_chain(primary).into_iter().skip(1) {
-            if let Some(adapter) = self.providers.get(&id).map(|entry| Arc::clone(entry.value())) {
-                if let Ok(candidate) = adapter.validate_content(messages) { bound = bound.max(candidate); }
+            if let Some(adapter) = self
+                .providers
+                .get(&id)
+                .map(|entry| Arc::clone(entry.value()))
+            {
+                if let Ok(candidate) = adapter.validate_content(messages) {
+                    bound = bound.max(candidate);
+                }
             }
         }
         Ok(bound)
@@ -1132,7 +1155,9 @@ impl AgentConnectorImpl {
                 }
             };
             if let Err(error) = adapter.validate_content(&messages) {
-                if provider_index == 0 { return Err(error); }
+                if provider_index == 0 {
+                    return Err(error);
+                }
                 last_err = Some(error);
                 continue;
             }

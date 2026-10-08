@@ -38,6 +38,8 @@ jobs:
         with:
           save-if: false
       - name: Formatting gate and repair artifact
+        id: format
+        continue-on-error: true
         run: |
           if ! cargo fmt --all -- --check > rustfmt-check.txt 2>&1; then
             cat rustfmt-check.txt
@@ -55,6 +57,9 @@ jobs:
           cargo test -p kernel --locked generated_request_fixtures_cover_every_operation
       - name: All adapter modes and protocols without live credentials
         run: cargo test -p adapters --all-features --locked
+      - name: Require formatted source
+        if: always() && steps.format.outcome != 'success'
+        run: exit 1
       - name: Retain exact source and actual fixture diagnostics
         if: always()
         run: git rev-parse HEAD > source-commit.txt

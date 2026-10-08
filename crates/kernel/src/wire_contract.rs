@@ -431,11 +431,18 @@ const REQUEST_VARIANTS: &[Variant] = &[
     },
     Variant {
         tag: "send_message_content",
-        fields: &[Field::required("agent_id", S), Field::required("content", SA)],
+        fields: &[
+            Field::required("agent_id", S),
+            Field::required("content", SA),
+        ],
     },
     Variant {
         tag: "send_message_content_stream",
-        fields: &[Field::required("request_id", S), Field::required("agent_id", S), Field::required("content", SA)],
+        fields: &[
+            Field::required("request_id", S),
+            Field::required("agent_id", S),
+            Field::required("content", SA),
+        ],
     },
     Variant {
         tag: "send_message_stream",

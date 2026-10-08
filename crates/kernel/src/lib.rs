@@ -480,7 +480,11 @@ pub enum ConnectorError {
 
 impl ConnectorError {
     pub fn unsupported_content(provider: ProviderId) -> Self {
-        Self::UnsupportedContent(Self::provider_context(provider, "image or audio input is unsupported or lacks a bounded model profile", None))
+        Self::UnsupportedContent(Self::provider_context(
+            provider,
+            "image or audio input is unsupported or lacks a bounded model profile",
+            None,
+        ))
     }
 
     fn provider_context(
@@ -5495,19 +5499,47 @@ impl AgentKernelImpl {
         true
     }
 
-    pub async fn send_message_content(&self, agent_id: AgentId, content: crate::message_content::MessageContent) -> Result<AgentOutput, KernelError> {
-        self.send_message_inner(agent_id, content, None, None, None).await
+    pub async fn send_message_content(
+        &self,
+        agent_id: AgentId,
+        content: crate::message_content::MessageContent,
+    ) -> Result<AgentOutput, KernelError> {
+        self.send_message_inner(agent_id, content, None, None, None)
+            .await
     }
 
-    pub async fn send_message_content_stream(&self, agent_id: AgentId, content: crate::message_content::MessageContent,
-        request_id: &str, events: tokio::sync::mpsc::Sender<crate::execution::StreamEvent>) -> Result<AgentOutput, KernelError> {
-        self.send_message_content_stream_with_fence(agent_id, content, request_id, events, None).await
+    pub async fn send_message_content_stream(
+        &self,
+        agent_id: AgentId,
+        content: crate::message_content::MessageContent,
+        request_id: &str,
+        events: tokio::sync::mpsc::Sender<crate::execution::StreamEvent>,
+    ) -> Result<AgentOutput, KernelError> {
+        self.send_message_content_stream_with_fence(agent_id, content, request_id, events, None)
+            .await
     }
 
-    pub(crate) async fn send_message_content_stream_with_fence(&self, agent_id: AgentId, content: crate::message_content::MessageContent,
-        request_id: &str, events: tokio::sync::mpsc::Sender<crate::execution::StreamEvent>, request_fence: Option<ActiveRequestFence>) -> Result<AgentOutput, KernelError> {
-        if request_id.is_empty() || request_id.len() > 128 { return Err(KernelError::Policy("request id must contain 1..=128 bytes".into())); }
-        self.send_message_inner(agent_id, content, Some(request_id.into()), Some(events), request_fence).await
+    pub(crate) async fn send_message_content_stream_with_fence(
+        &self,
+        agent_id: AgentId,
+        content: crate::message_content::MessageContent,
+        request_id: &str,
+        events: tokio::sync::mpsc::Sender<crate::execution::StreamEvent>,
+        request_fence: Option<ActiveRequestFence>,
+    ) -> Result<AgentOutput, KernelError> {
+        if request_id.is_empty() || request_id.len() > 128 {
+            return Err(KernelError::Policy(
+                "request id must contain 1..=128 bytes".into(),
+            ));
+        }
+        self.send_message_inner(
+            agent_id,
+            content,
+            Some(request_id.into()),
+            Some(events),
+            request_fence,
+        )
+        .await
     }
 
     async fn send_message_inner(

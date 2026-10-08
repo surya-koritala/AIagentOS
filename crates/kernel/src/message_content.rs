@@ -60,57 +60,177 @@ impl std::fmt::Debug for ImageInput {
     }
 }
 
+fn png_crc(bytes: &[u8]) -> u32 {
+    let mut crc = u32::MAX;
+    for byte in bytes {
+        crc ^= u32::from(*byte);
+        for _ in 0..8 { crc = (crc >> 1) ^ (0xedb8_8320 & 0u32.wrapping_sub(crc & 1)); }
+    }
+    !crc
+}
+
 fn png_dimensions(bytes: &[u8]) -> Result<(u32, u32), String> {
-    if bytes.len() < 45 || &bytes[..8] != b"\x89PNG\r\n\x1a\n"
-        || &bytes[8..12] != 13u32.to_be_bytes().as_slice() || &bytes[12..16] != b"IHDR"
-    { return Err(invalid()); }
-    let width = u32::from_be_bytes(bytes[16..20].try_into().map_err(|_| invalid())?);
-    let height = u32::from_be_bytes(bytes[20..24].try_into().map_err(|_| invalid())?);
+    if bytes.len() < 45 || !bytes.starts_with(b"\x89PNG\r\n\x1a\n") { return Err(invalid()); }
     let mut offset = 8usize;
-    let mut saw_data = false;
-    let mut saw_end = false;
+    let mut dimensions = None;
+    let mut color = 0u8;
+    let mut depth = 0u8;
+    let mut palette = false;
+    let mut data_started = false;
+    let mut data_bytes = 0usize;
+    let mut data_ended = false;
     while offset < bytes.len() {
         let header = bytes.get(offset..offset.saturating_add(8)).ok_or_else(invalid)?;
         let length = u32::from_be_bytes(header[..4].try_into().map_err(|_| invalid())?) as usize;
         let end = offset.checked_add(12).and_then(|n| n.checked_add(length)).ok_or_else(invalid)?;
-        if end > bytes.len() { return Err(invalid()); }
+        let chunk = bytes.get(offset+8..end.saturating_sub(4)).ok_or_else(invalid)?;
+        let expected = u32::from_be_bytes(bytes.get(end.saturating_sub(4)..end).ok_or_else(invalid)?.try_into().map_err(|_| invalid())?);
         let kind = &header[4..8];
-        if kind == b"acTL" || kind == b"fcTL" || kind == b"fdAT" { return Err(invalid()); }
-        if kind == b"IDAT" { saw_data = true; }
-        if kind == b"IEND" {
-            if length != 0 || end != bytes.len() { return Err(invalid()); }
-            saw_end = true;
+        if !kind.iter().all(u8::is_ascii_alphabetic) || !kind[2].is_ascii_uppercase()
+            || png_crc(&bytes[offset+4..end-4]) != expected { return Err(invalid()); }
+        if dimensions.is_none() && kind != b"IHDR" { return Err(invalid()); }
+        match kind {
+            b"IHDR" => {
+                if dimensions.is_some() || length != 13 { return Err(invalid()); }
+                depth = chunk[8]; color = chunk[9];
+                let legal_depth = match color {
+                    0 => matches!(depth,1|2|4|8|16), 2|4|6 => matches!(depth,8|16),
+                    3 => matches!(depth,1|2|4|8), _ => false,
+                };
+                if !legal_depth || chunk[10] != 0 || chunk[11] != 0 || chunk[12] > 1 { return Err(invalid()); }
+                dimensions = Some((u32::from_be_bytes(chunk[..4].try_into().map_err(|_| invalid())?), u32::from_be_bytes(chunk[4..8].try_into().map_err(|_| invalid())?)));
+            }
+            b"PLTE" => {
+                if palette || data_started || data_ended || matches!(color,0|4)
+                    || length == 0 || length % 3 != 0 || length > 768
+                    || (color == 3 && length / 3 > 1usize << depth) { return Err(invalid()); }
+                palette = true;
+            }
+            b"IDAT" => {
+                if data_ended || (color == 3 && !palette) { return Err(invalid()); }
+                data_started = true;
+                data_bytes = data_bytes.checked_add(length).ok_or_else(invalid)?;
+            }
+            b"IEND" => {
+                if length != 0 || end != bytes.len() || data_bytes == 0 { return Err(invalid()); }
+                return dimensions.ok_or_else(invalid);
+            }
+            b"acTL"|b"fcTL"|b"fdAT" => return Err(invalid()),
+            _ => {
+                if kind[0].is_ascii_uppercase() { return Err(invalid()); }
+                if data_started { data_ended = true; }
+            }
         }
         offset = end;
     }
-    if !saw_data || !saw_end { return Err(invalid()); }
-    Ok((width, height))
+    Err(invalid())
 }
 
+// Validate the bounded interchange container, not compressed raster samples.
+// Only 8-bit Huffman sequential/progressive DCT with up to four components is
+// accepted; arithmetic, lossless, hierarchical and deferred-height modes fail.
 fn jpeg_dimensions(bytes: &[u8]) -> Result<(u32, u32), String> {
-    if bytes.len() < 12 || !bytes.starts_with(&[0xff, 0xd8]) || !bytes.ends_with(&[0xff, 0xd9]) {
-        return Err(invalid());
-    }
+    if !bytes.starts_with(&[0xff,0xd8]) { return Err(invalid()); }
     let mut offset = 2usize;
     let mut dimensions = None;
-    while offset < bytes.len().saturating_sub(2) {
+    let mut frame_marker = 0;
+    let mut components = Vec::<(u8,u8,u8)>::new();
+    let mut quantization = [false;4];
+    let mut huffman = [[false;4];2];
+    let mut restart_interval = 0u16;
+    let mut scans = 0usize;
+    while offset < bytes.len() {
         if bytes[offset] != 0xff { return Err(invalid()); }
         while bytes.get(offset) == Some(&0xff) { offset += 1; }
-        let marker = *bytes.get(offset).ok_or_else(invalid)?;
-        offset += 1;
-        if marker == 0xd9 { break; }
-        if marker == 0x00 || marker == 0xd8 || (0xd0..=0xd7).contains(&marker) { return Err(invalid()); }
-        let size_bytes = bytes.get(offset..offset.saturating_add(2)).ok_or_else(invalid)?;
-        let size = u16::from_be_bytes(size_bytes.try_into().map_err(|_| invalid())?) as usize;
-        if size < 2 || offset.saturating_add(size) > bytes.len() { return Err(invalid()); }
-        if matches!(marker, 0xc0 | 0xc1 | 0xc2) {
-            if size < 8 || dimensions.is_some() { return Err(invalid()); }
-            let height = u16::from_be_bytes(bytes[offset+3..offset+5].try_into().map_err(|_| invalid())?) as u32;
-            let width = u16::from_be_bytes(bytes[offset+5..offset+7].try_into().map_err(|_| invalid())?) as u32;
-            dimensions = Some((width, height));
+        let marker = *bytes.get(offset).ok_or_else(invalid)?; offset += 1;
+        if marker == 0xd9 {
+            if scans == 0 || offset != bytes.len() { return Err(invalid()); }
+            return dimensions.ok_or_else(invalid);
         }
-        if marker == 0xda { return dimensions.ok_or_else(invalid); }
-        offset += size;
+        let size_bytes = bytes.get(offset..offset.saturating_add(2)).ok_or_else(invalid)?;
+        let size = usize::from(u16::from_be_bytes(size_bytes.try_into().map_err(|_| invalid())?));
+        if size < 2 { return Err(invalid()); }
+        let end = offset.checked_add(size).ok_or_else(invalid)?;
+        let segment = bytes.get(offset+2..end).ok_or_else(invalid)?;
+        match marker {
+            0xc0|0xc1|0xc2 => {
+                if dimensions.is_some() || segment.len() < 6 || segment[0] != 8 { return Err(invalid()); }
+                let count = usize::from(segment[5]);
+                if !(1..=4).contains(&count) || segment.len() != 6+3*count { return Err(invalid()); }
+                for component in segment[6..].chunks_exact(3) {
+                    if components.iter().any(|(id,_,_)| *id == component[0])
+                        || !(1..=4).contains(&(component[1] >> 4)) || !(1..=4).contains(&(component[1]&15))
+                        || component[2] > 3 { return Err(invalid()); }
+                    components.push((component[0],component[1],component[2]));
+                }
+                frame_marker = marker;
+                dimensions = Some((u32::from(u16::from_be_bytes(segment[3..5].try_into().map_err(|_| invalid())?)), u32::from(u16::from_be_bytes(segment[1..3].try_into().map_err(|_| invalid())?))));
+            }
+            0xdb => {
+                let mut position = 0usize;
+                while position < segment.len() {
+                    let selector = segment[position]; position += 1;
+                    if selector >> 4 > 1 || selector & 15 > 3 { return Err(invalid()); }
+                    let size = if selector >> 4 == 0 { 64 } else { 128 };
+                    let table = segment.get(position..position+size).ok_or_else(invalid)?;
+                    if (size == 64 && table.contains(&0)) || (size == 128 && table.chunks_exact(2).any(|value| value == [0,0])) { return Err(invalid()); }
+                    quantization[usize::from(selector&15)] = true; position += size;
+                }
+                if segment.is_empty() { return Err(invalid()); }
+            }
+            0xc4 => {
+                let mut position = 0usize;
+                while position < segment.len() {
+                    let header = segment.get(position..position+17).ok_or_else(invalid)?;
+                    if header[0] >> 4 > 1 || header[0]&15 > 3 { return Err(invalid()); }
+                    let count = header[1..].iter().map(|count| usize::from(*count)).sum::<usize>();
+                    let mut remaining = 1i32;
+                    for count in &header[1..] { remaining = remaining*2-i32::from(*count); if remaining < 0 { return Err(invalid()); } }
+                    if count == 0 || count > 256 || segment.get(position+17..position+17+count).is_none() { return Err(invalid()); }
+                    huffman[usize::from(header[0] >> 4)][usize::from(header[0]&15)] = true;
+                    position += 17+count;
+                }
+                if segment.is_empty() { return Err(invalid()); }
+            }
+            0xdd if segment.len() == 2 => { restart_interval = u16::from_be_bytes(segment.try_into().map_err(|_| invalid())?); }
+            0xda => {
+                if dimensions.is_none() || segment.len() < 4 { return Err(invalid()); }
+                let count = usize::from(segment[0]);
+                if count == 0 || count > components.len() || segment.len() != 4+2*count { return Err(invalid()); }
+                let start = segment[1+2*count]; let finish = segment[2+2*count]; let approximation = segment[3+2*count];
+                if frame_marker == 0xc2 {
+                    if start > finish || finish > 63 || (start == 0 && finish != 0) || (start != 0 && count != 1)
+                        || approximation >> 4 > 13 || approximation&15 > 13
+                        || (approximation >> 4 != 0 && approximation >> 4 != (approximation&15)+1) { return Err(invalid()); }
+                } else if start != 0 || finish != 63 || approximation != 0 { return Err(invalid()); }
+                let mut selected = Vec::new(); let mut sampling = 0u16;
+                for component in segment[1..1+2*count].chunks_exact(2) {
+                    let (index,(_,sample,table)) = components.iter().enumerate().find(|(_,value)| value.0 == component[0]).ok_or_else(invalid)?;
+                    if selected.last().is_some_and(|previous| *previous >= index) || component[1] >> 4 > 3 || component[1]&15 > 3
+                        || !quantization[usize::from(*table)]
+                        || (start == 0 && approximation >> 4 == 0 && !huffman[0][usize::from(component[1] >> 4)])
+                        || (finish != 0 && !huffman[1][usize::from(component[1]&15)]) { return Err(invalid()); }
+                    selected.push(index); sampling += u16::from(sample >> 4)*u16::from(sample&15);
+                }
+                if count > 1 && sampling > 10 { return Err(invalid()); }
+                scans += 1; if scans > 256 { return Err(invalid()); }
+                offset = end; let mut entropy_bytes = 0usize; let mut restart = 0u8;
+                while offset < bytes.len() {
+                    if bytes[offset] != 0xff { entropy_bytes += 1; offset += 1; continue; }
+                    let next = *bytes.get(offset+1).ok_or_else(invalid)?;
+                    if next == 0 { entropy_bytes += 1; offset += 2; }
+                    else if (0xd0..=0xd7).contains(&next) {
+                        if restart_interval == 0 || next != 0xd0+restart { return Err(invalid()); }
+                        restart = (restart+1)%8; offset += 2;
+                    } else { break; }
+                }
+                if entropy_bytes == 0 { return Err(invalid()); }
+                continue;
+            }
+            0xe0..=0xef|0xfe => {},
+            _ => return Err(invalid()),
+        }
+        offset = end;
     }
     Err(invalid())
 }
@@ -278,6 +398,68 @@ mod tests {
             ContentPart::Image { image: ImageInput::new(ImageMediaType::Png, PNG.into()).unwrap() }]).unwrap()
     }
 
+    fn png_chunk(kind: &[u8;4], data: &[u8]) -> Vec<u8> {
+        let mut result = (data.len() as u32).to_be_bytes().to_vec();
+        result.extend_from_slice(kind); result.extend_from_slice(data);
+        result.extend_from_slice(&png_crc(&result[4..]).to_be_bytes()); result
+    }
+
+    fn jpeg_fixture() -> Vec<u8> {
+        let mut bytes = vec![0xff,0xd8];
+        let mut segment = |marker: u8, data: &[u8]| {
+            bytes.extend_from_slice(&[0xff,marker]);
+            bytes.extend_from_slice(&((data.len()+2) as u16).to_be_bytes()); bytes.extend_from_slice(data);
+        };
+        let mut quantization = vec![0]; quantization.extend_from_slice(&[1;64]); segment(0xdb,&quantization);
+        segment(0xc0,&[8,0,1,0,1,1,1,0x11,0]);
+        let mut huffman = vec![0,1]; huffman.extend_from_slice(&[0;15]); huffman.push(0);
+        huffman.extend_from_slice(&[0x10,1]); huffman.extend_from_slice(&[0;15]); huffman.push(0);
+        segment(0xc4,&huffman); segment(0xda,&[1,1,0,0,63,0]);
+        bytes.extend_from_slice(&[0x3f,0xff,0xd9]); bytes
+    }
+
+    #[test]
+    fn image_input_png_checks_crc_ihdr_palette_and_critical_order() {
+        let original = base64::engine::general_purpose::STANDARD.decode(PNG).unwrap();
+        assert_eq!(png_crc(b"IEND"),0xae42_6082);
+        let mut corrupted = original.clone(); corrupted[29] ^= 1;
+        assert!(png_dimensions(&corrupted).is_err());
+        for (index,value) in [(8,3),(9,1),(10,1),(11,1),(12,2)] {
+            let mut header = original[16..29].to_vec(); header[index]=value;
+            let mut bytes = original[..8].to_vec(); bytes.extend(png_chunk(b"IHDR",&header)); bytes.extend_from_slice(&original[33..]);
+            assert!(png_dimensions(&bytes).is_err(),"invalid IHDR field {index}");
+        }
+        let mut indexed_header = original[16..29].to_vec(); indexed_header[8]=1; indexed_header[9]=3;
+        let mut indexed = original[..8].to_vec(); indexed.extend(png_chunk(b"IHDR",&indexed_header)); indexed.extend_from_slice(&original[33..]);
+        assert!(png_dimensions(&indexed).is_err());
+        for extra in [png_chunk(b"IHDR",&original[16..29]),png_chunk(b"PLTE",&[1,2]),png_chunk(b"ABCD",&[]),png_chunk(b"acTL",&[0;8])] {
+            let mut bytes = original[..33].to_vec(); bytes.extend(extra); bytes.extend_from_slice(&original[33..]);
+            assert!(png_dimensions(&bytes).is_err());
+        }
+        let mut split = original[..original.len()-12].to_vec(); split.extend(png_chunk(b"tEXt",b"key\0value"));
+        split.extend(png_chunk(b"IDAT",&[])); split.extend_from_slice(&original[original.len()-12..]);
+        assert!(png_dimensions(&split).is_err());
+    }
+
+    #[test]
+    fn image_input_jpeg_requires_complete_sof_sos_tables_and_entropy_framing() {
+        let original = jpeg_fixture();
+        let image = ImageInput::new(ImageMediaType::Jpeg,base64::engine::general_purpose::STANDARD.encode(&original)).unwrap();
+        assert_eq!(image.dimensions(),(1,1));
+        let frame = original.windows(2).position(|value| value == [0xff,0xc0]).unwrap();
+        let scan = original.windows(2).position(|value| value == [0xff,0xda]).unwrap();
+        for (index,value) in [(frame+4,12),(frame+9,2),(frame+11,0),(frame+12,4),(scan+4,2),(scan+5,9),(scan+6,0x44),(scan+7,1),(scan+9,1)] {
+            let mut bytes = original.clone(); bytes[index]=value;
+            assert!(jpeg_dimensions(&bytes).is_err(),"invalid JPEG field {index}");
+        }
+        let mut truncated = original.clone(); truncated.truncate(scan+10); truncated.extend_from_slice(&[0xff,0xd9]);
+        assert!(jpeg_dimensions(&truncated).is_err());
+        let mut trailing = original.clone(); trailing.push(0); assert!(jpeg_dimensions(&trailing).is_err());
+        let mut restart = original.clone(); restart.splice(original.len()-2..original.len()-2,[0xff,0xd0]);
+        assert!(jpeg_dimensions(&restart).is_err());
+        assert!(jpeg_dimensions(&[0xff,0xd8,0xff,0xc0,0,8,8,0,1,0,1,0,0xff,0xda,0,2,0xff,0xd9]).is_err());
+    }
+
     #[test]
     fn image_input_legacy_string_json_and_projection_remain_exact() {
         let text: MessageContent = serde_json::from_str(r#""legacy \u03bb""#).unwrap();
@@ -338,6 +520,15 @@ mod tests {
         fn image_input_untrusted_base64_never_panics_or_echoes_data(data in ".{0,2048}") {
             if let Err(error) = ImageInput::new(ImageMediaType::Png, data) {
                 proptest::prop_assert_eq!(error, "invalid or oversized message content");
+            }
+        }
+
+        #[test]
+        fn image_input_random_containers_remain_bounded_and_redacted(bytes in proptest::collection::vec(proptest::num::u8::ANY,0..2048)) {
+            for media in [ImageMediaType::Png,ImageMediaType::Jpeg] {
+                if let Err(error) = ImageInput::new(media,base64::engine::general_purpose::STANDARD.encode(&bytes)) {
+                    proptest::prop_assert_eq!(error,"invalid or oversized message content");
+                }
             }
         }
     }

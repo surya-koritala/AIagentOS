@@ -4,8 +4,15 @@ use kernel::connector::{ContentPart, ImageInputProfile, MessageContent, Standard
 use kernel::ConnectorError;
 use serde_json::{json, Value};
 
-pub(crate) fn preflight(provider: &str, model: &str, profile: Option<&ImageInputProfile>, messages: &[StandardMessage]) -> Result<u32, ConnectorError> {
-    if let Some(profile) = profile { profile.validate(model)?; }
+pub(crate) fn preflight(
+    provider: &str,
+    model: &str,
+    profile: Option<&ImageInputProfile>,
+    messages: &[StandardMessage],
+) -> Result<u32, ConnectorError> {
+    if let Some(profile) = profile {
+        profile.validate(model)?;
+    }
     kernel::message_content::validate_messages(messages, &provider.to_string(), profile)
 }
 
@@ -39,12 +46,15 @@ pub(crate) fn anthropic_content(content: &MessageContent) -> Value {
 pub(crate) fn gemini_parts(content: &MessageContent) -> Value {
     match content {
         MessageContent::Text(text) => json!([{"text":text}]),
-        MessageContent::Parts(parts) => json!(parts.iter().map(|part| match part {
-            ContentPart::Text { text } => json!({"text":text}),
-            ContentPart::Image { image } => json!({"inlineData":{
-                "mimeType":image.media_type().as_str(),"data":image.base64_data()
-            }}),
-            ContentPart::Audio => json!({"unsupportedAudio":{}}),
-        }).collect::<Vec<_>>()),
+        MessageContent::Parts(parts) => json!(parts
+            .iter()
+            .map(|part| match part {
+                ContentPart::Text { text } => json!({"text":text}),
+                ContentPart::Image { image } => json!({"inlineData":{
+                    "mimeType":image.media_type().as_str(),"data":image.base64_data()
+                }}),
+                ContentPart::Audio => json!({"unsupportedAudio":{}}),
+            })
+            .collect::<Vec<_>>()),
     }
 }

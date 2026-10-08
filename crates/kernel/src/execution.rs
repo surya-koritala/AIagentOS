@@ -389,16 +389,23 @@ impl AgentExecutor {
         // known prompt; a more accurate provider estimate can only raise it.
         // Encoded pixels are governed by the model-specific image bound, not
         // the UTF-8 text tokenizer. Charge their non-secret projection here.
-        let projected = messages.iter().cloned().map(|mut message| {
-            message.content = message.content.text_projection().into();
-            message
-        }).collect::<Vec<_>>();
+        let projected = messages
+            .iter()
+            .cloned()
+            .map(|mut message| {
+                message.content = message.content.text_projection().into();
+                message
+            })
+            .collect::<Vec<_>>();
         let structural_floor = Self::conservative_serialized_tokens(&projected)
             .saturating_add((messages.len() as u32).saturating_mul(4));
-        let text_floor = self.session
+        let text_floor = self
+            .session
             .estimate_prompt_tokens(messages)
             .map_or(structural_floor, |estimate| estimate.max(structural_floor));
-        self.session.validate_content(messages).map_or(u32::MAX, |images| text_floor.saturating_add(images))
+        self.session
+            .validate_content(messages)
+            .map_or(u32::MAX, |images| text_floor.saturating_add(images))
     }
 
     fn conservative_serialized_tokens<T: serde::Serialize + ?Sized>(value: &T) -> u32 {
@@ -430,7 +437,9 @@ impl AgentExecutor {
         &mut self,
         tools: &[crate::connector::ToolDefinition],
     ) -> Result<(), KernelError> {
-        self.session.validate_content(&self.messages).map_err(KernelError::Connector)?;
+        self.session
+            .validate_content(&self.messages)
+            .map_err(KernelError::Connector)?;
         self.session
             .validate_tool_policy(tools)
             .map_err(KernelError::Connector)?;
@@ -756,7 +765,10 @@ impl AgentExecutor {
     /// `run`/`run_resumable`; not called on the resume path (the checkpoint
     /// already carries the prepared `messages`).
     async fn prepare_turn(&mut self, user_message: &str) {
-        self.prepare_content_turn(&crate::message_content::MessageContent::Text(user_message.into())).await;
+        self.prepare_content_turn(&crate::message_content::MessageContent::Text(
+            user_message.into(),
+        ))
+        .await;
     }
 
     async fn prepare_content_turn(&mut self, content: &crate::message_content::MessageContent) {
@@ -788,7 +800,8 @@ impl AgentExecutor {
             }
         }
 
-        self.messages.push(StandardMessage::user_content(content.clone()));
+        self.messages
+            .push(StandardMessage::user_content(content.clone()));
 
         // Message-count-only auto-summarization used to replace old content
         // with a count placeholder, silently losing semantics. Pressure is now
@@ -816,11 +829,17 @@ impl AgentExecutor {
             .await
     }
 
-    pub async fn run_content_resumable(&mut self, content: crate::message_content::MessageContent) -> Result<TurnResult, KernelError> {
+    pub async fn run_content_resumable(
+        &mut self,
+        content: crate::message_content::MessageContent,
+    ) -> Result<TurnResult, KernelError> {
         let candidate = StandardMessage::user_content(content.clone());
-        self.session.validate_content(std::slice::from_ref(&candidate)).map_err(KernelError::Connector)?;
+        self.session
+            .validate_content(std::slice::from_ref(&candidate))
+            .map_err(KernelError::Connector)?;
         self.prepare_content_turn(&content).await;
-        self.drive_loop(content.text_projection(), 0, 0, UsageTelemetry::default()).await
+        self.drive_loop(content.text_projection(), 0, 0, UsageTelemetry::default())
+            .await
     }
 
     /// Resume a turn from a checkpoint and drive it to completion (it can itself
@@ -1198,7 +1217,9 @@ impl AgentExecutor {
         }
         // Filter messages: remove tool results that don't have a preceding tool_calls message
         let clean_messages = self.clean_messages();
-        self.session.validate_content(&clean_messages).map_err(KernelError::Connector)?;
+        self.session
+            .validate_content(&clean_messages)
+            .map_err(KernelError::Connector)?;
         let estimated_input_tokens = self
             .estimate_prompt_tokens(&clean_messages)
             .saturating_add(Self::conservative_tool_tokens(tools))

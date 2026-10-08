@@ -1834,8 +1834,16 @@ fn syscall_policy(call: &Syscall) -> (AccessLevel, &'static str, Option<&str>) {
         Syscall::SendMessage { agent_id, .. } => {
             (AccessLevel::User, "agent.send_message", Some(agent_id))
         }
-        Syscall::SendMessageContent { agent_id, .. } => (AccessLevel::User, "agent.send_message_content", Some(agent_id)),
-        Syscall::SendMessageContentStream { agent_id, .. } => (AccessLevel::User, "agent.send_message_content_stream", Some(agent_id)),
+        Syscall::SendMessageContent { agent_id, .. } => (
+            AccessLevel::User,
+            "agent.send_message_content",
+            Some(agent_id),
+        ),
+        Syscall::SendMessageContentStream { agent_id, .. } => (
+            AccessLevel::User,
+            "agent.send_message_content_stream",
+            Some(agent_id),
+        ),
         Syscall::SendMessageStream { agent_id, .. } => (
             AccessLevel::User,
             "agent.send_message_stream",
@@ -3572,16 +3580,27 @@ async fn dispatch_scoped_inner_with_fence(
                 message: format!("invalid agent id: {agent_id}"),
             },
         },
-        Syscall::SendMessageContent { agent_id, content } => match uuid::Uuid::parse_str(&agent_id) {
+        Syscall::SendMessageContent { agent_id, content } => match uuid::Uuid::parse_str(&agent_id)
+        {
             Ok(id) => match kernel.send_message_content(id, content).await {
-                Ok(output) => SyscallReply::Message { content: output.content, tool_calls: output.tool_calls_made, tokens: output.tokens_used },
-                Err(error) => SyscallReply::Error { message: error.to_string() },
+                Ok(output) => SyscallReply::Message {
+                    content: output.content,
+                    tool_calls: output.tool_calls_made,
+                    tokens: output.tokens_used,
+                },
+                Err(error) => SyscallReply::Error {
+                    message: error.to_string(),
+                },
             },
-            Err(_) => SyscallReply::Error { message: "invalid agent id".into() },
+            Err(_) => SyscallReply::Error {
+                message: "invalid agent id".into(),
+            },
         },
-        Syscall::SendMessageStream { .. } | Syscall::SendMessageContentStream { .. } => SyscallReply::Error {
-            message: "streaming requests require the streaming wire transport".into(),
-        },
+        Syscall::SendMessageStream { .. } | Syscall::SendMessageContentStream { .. } => {
+            SyscallReply::Error {
+                message: "streaming requests require the streaming wire transport".into(),
+            }
+        }
         Syscall::CancelRequest {
             request_id,
             agent_id,
@@ -6075,10 +6094,14 @@ where
     }
     let call = match &multipart {
         Some(content) => Syscall::SendMessageContentStream {
-            request_id: request_id.clone(), agent_id: agent_id.clone(), content: content.clone(),
+            request_id: request_id.clone(),
+            agent_id: agent_id.clone(),
+            content: content.clone(),
         },
         None => Syscall::SendMessageStream {
-            request_id: request_id.clone(), agent_id: agent_id.clone(), message: message.clone(),
+            request_id: request_id.clone(),
+            agent_id: agent_id.clone(),
+            message: message.clone(),
         },
     };
     let authorization_call = match fence.as_ref() {
@@ -6879,8 +6902,21 @@ impl SyscallServer {
                     unreachable!("fenced stream pattern checked above")
                 };
                 let (request_id, agent_id, message, multipart) = match *mutation {
-                    Syscall::SendMessageStream { request_id, agent_id, message } => (request_id, agent_id, message, None),
-                    Syscall::SendMessageContentStream { request_id, agent_id, content } => (request_id, agent_id, content.text_projection(), Some(content)),
+                    Syscall::SendMessageStream {
+                        request_id,
+                        agent_id,
+                        message,
+                    } => (request_id, agent_id, message, None),
+                    Syscall::SendMessageContentStream {
+                        request_id,
+                        agent_id,
+                        content,
+                    } => (
+                        request_id,
+                        agent_id,
+                        content.text_projection(),
+                        Some(content),
+                    ),
                     _ => unreachable!("nested stream pattern checked above"),
                 };
                 if let Some(identity) = credential.as_ref() {
@@ -6931,12 +6967,26 @@ impl SyscallServer {
             if authed
                 && matches!(
                     &parsed,
-Ok(Syscall::SendMessageStream { .. } | Syscall::SendMessageContentStream { .. })
+                    Ok(Syscall::SendMessageStream { .. }
+                        | Syscall::SendMessageContentStream { .. })
                 )
             {
                 let (request_id, agent_id, message, multipart) = match parsed {
-                    Ok(Syscall::SendMessageStream { request_id, agent_id, message }) => (request_id, agent_id, message, None),
-                    Ok(Syscall::SendMessageContentStream { request_id, agent_id, content }) => (request_id, agent_id, content.text_projection(), Some(content)),
+                    Ok(Syscall::SendMessageStream {
+                        request_id,
+                        agent_id,
+                        message,
+                    }) => (request_id, agent_id, message, None),
+                    Ok(Syscall::SendMessageContentStream {
+                        request_id,
+                        agent_id,
+                        content,
+                    }) => (
+                        request_id,
+                        agent_id,
+                        content.text_projection(),
+                        Some(content),
+                    ),
                     _ => unreachable!("stream pattern checked above"),
                 };
                 if let Some(identity) = credential.as_ref() {
@@ -10314,8 +10364,15 @@ memory = ["remember this"]
                 agent_id: id.clone(),
                 checkpoint_id: checkpoint,
             },
-            Syscall::SendMessageContent { agent_id: id.clone(), content: "test".into() },
-            Syscall::SendMessageContentStream { request_id: "content-fixture".into(), agent_id: id.clone(), content: "test".into() },
+            Syscall::SendMessageContent {
+                agent_id: id.clone(),
+                content: "test".into(),
+            },
+            Syscall::SendMessageContentStream {
+                request_id: "content-fixture".into(),
+                agent_id: id.clone(),
+                content: "test".into(),
+            },
             Syscall::SendMessage {
                 agent_id: id.clone(),
                 message: "test".into(),

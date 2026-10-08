@@ -111,12 +111,20 @@ fn read_message_content(source: &str) -> agent_sdk::MessageContent {
     let mut bytes = Vec::new();
     let limit = kernel::message_content::MAX_MESSAGE_CONTENT_BYTES as u64 + 1;
     if source == "-" {
-        std::io::stdin().take(limit).read_to_end(&mut bytes).unwrap_or_else(|_| fail("could not read content input"));
+        std::io::stdin()
+            .take(limit)
+            .read_to_end(&mut bytes)
+            .unwrap_or_else(|_| fail("could not read content input"));
     } else {
-        std::fs::File::open(source).unwrap_or_else(|_| fail("could not open content input"))
-            .take(limit).read_to_end(&mut bytes).unwrap_or_else(|_| fail("could not read content input"));
+        std::fs::File::open(source)
+            .unwrap_or_else(|_| fail("could not open content input"))
+            .take(limit)
+            .read_to_end(&mut bytes)
+            .unwrap_or_else(|_| fail("could not read content input"));
     }
-    if bytes.len() as u64 == limit { fail("message content input exceeds byte limit"); }
+    if bytes.len() as u64 == limit {
+        fail("message content input exceeds byte limit");
+    }
     serde_json::from_slice(&bytes).unwrap_or_else(|_| fail("invalid message content input"))
 }
 
@@ -1130,9 +1138,14 @@ async fn run_online(
         "message-content" => {
             let agent_id = args.next().unwrap_or_else(|| usage());
             let source = args.next().unwrap_or_else(|| usage());
-            if args.next().is_some() { usage(); }
+            if args.next().is_some() {
+                usage();
+            }
             let content = read_message_content(&source);
-            let result = client.send_message_content(agent_id, content).await.unwrap_or_else(|error| fail(error));
+            let result = client
+                .send_message_content(agent_id, content)
+                .await
+                .unwrap_or_else(|error| fail(error));
             print_json(&result, "agent message");
             return;
         }
@@ -1140,12 +1153,17 @@ async fn run_online(
             let request_id = args.next().unwrap_or_else(|| usage());
             let agent_id = args.next().unwrap_or_else(|| usage());
             let source = args.next().unwrap_or_else(|| usage());
-            if args.next().is_some() { usage(); }
+            if args.next().is_some() {
+                usage();
+            }
             let content = read_message_content(&source);
-            let result = client.send_message_content_stream(request_id, agent_id, content, |event| {
-                println!("{}", serde_json::to_string(event).expect("stream event"));
-                let _ = std::io::stdout().flush();
-            }).await.unwrap_or_else(|error| fail(error));
+            let result = client
+                .send_message_content_stream(request_id, agent_id, content, |event| {
+                    println!("{}", serde_json::to_string(event).expect("stream event"));
+                    let _ = std::io::stdout().flush();
+                })
+                .await
+                .unwrap_or_else(|error| fail(error));
             print_json(&result, "agent stream");
             return;
         }

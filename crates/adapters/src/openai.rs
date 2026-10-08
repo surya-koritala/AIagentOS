@@ -25,7 +25,10 @@ impl OpenAiAdapter {
     }
 
     /// Declare a conservative image-token bound for the exact selected model.
-    pub fn with_image_input_profile(mut self, profile: kernel::connector::ImageInputProfile) -> Self {
+    pub fn with_image_input_profile(
+        mut self,
+        profile: kernel::connector::ImageInputProfile,
+    ) -> Self {
         self.image_profile = Some(profile);
         self
     }
@@ -77,7 +80,12 @@ impl OpenAiSession {
 #[async_trait::async_trait]
 impl LlmSession for OpenAiSession {
     fn validate_content(&self, messages: &[StandardMessage]) -> Result<u32, ConnectorError> {
-        crate::vision::preflight(&self.provider_id, &self.model, self.image_profile.as_ref(), messages)
+        crate::vision::preflight(
+            &self.provider_id,
+            &self.model,
+            self.image_profile.as_ref(),
+            messages,
+        )
     }
 
     async fn send(&self, messages: Vec<StandardMessage>) -> Result<LlmResponse, ConnectorError> {
@@ -194,7 +202,9 @@ impl LlmProviderAdapter for OpenAiAdapter {
     fn validate_content(&self, messages: &[StandardMessage]) -> Result<u32, ConnectorError> {
         crate::vision::preflight(&self.id, &self.model, self.image_profile.as_ref(), messages)
     }
-    fn image_input_profile(&self) -> Option<&kernel::connector::ImageInputProfile> { self.image_profile.as_ref() }
+    fn image_input_profile(&self) -> Option<&kernel::connector::ImageInputProfile> {
+        self.image_profile.as_ref()
+    }
 
     fn id(&self) -> &ProviderId {
         &self.id

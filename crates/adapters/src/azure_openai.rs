@@ -81,7 +81,12 @@ impl AzureSession {
 #[async_trait::async_trait]
 impl LlmSession for AzureSession {
     fn validate_content(&self, messages: &[StandardMessage]) -> Result<u32, ConnectorError> {
-        crate::vision::preflight(&self.provider_id, &self.model_id, self.image_profile.as_ref(), messages)
+        crate::vision::preflight(
+            &self.provider_id,
+            &self.model_id,
+            self.image_profile.as_ref(),
+            messages,
+        )
     }
 
     async fn send(&self, messages: Vec<StandardMessage>) -> Result<LlmResponse, ConnectorError> {
@@ -273,9 +278,16 @@ impl LlmSession for AzureSession {
 
 #[async_trait::async_trait]
 impl LlmProviderAdapter for AzureOpenAiAdapter {
-    fn image_input_profile(&self) -> Option<&ImageInputProfile> { self.image_profile.as_ref() }
+    fn image_input_profile(&self) -> Option<&ImageInputProfile> {
+        self.image_profile.as_ref()
+    }
     fn validate_content(&self, messages: &[StandardMessage]) -> Result<u32, ConnectorError> {
-        crate::vision::preflight(&self.id, &self.deployment, self.image_profile.as_ref(), messages)
+        crate::vision::preflight(
+            &self.id,
+            &self.deployment,
+            self.image_profile.as_ref(),
+            messages,
+        )
     }
 
     fn id(&self) -> &ProviderId {

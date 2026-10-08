@@ -1199,13 +1199,20 @@ mod windows_public_wire {
             .vfs_open_at(&agent, &directory.id, request("escape/secret.bin", WorkspaceKind::File, &[WorkspaceRight::Read]))
             .await
             .is_err());
-        assert_eq!(f.kernel.syscall_gate.stats().allowed, before + 4);
+        let inside_alias = f.root.join("inside-alias");
+        junction(&inside_alias, &f.root.join("project"));
+        assert_eq!(std::fs::read(inside_alias.join("file.bin")).unwrap(), ORIGINAL);
+        assert!(client.vfs_open_workspace(&agent,
+            request("/workspace/inside-alias/file.bin", WorkspaceKind::File, &[WorkspaceRight::Read]))
+            .await.is_err(), "NoFollow also rejects an alias whose target stays inside the workspace");
+        assert_eq!(f.kernel.syscall_gate.stats().allowed, before + 5);
         assert!(!outside.join("new.bin").exists());
         assert_eq!(std::fs::read(outside.join("secret.bin")).unwrap(), OUTSIDE);
         assert_eq!(client.vfs_workspace_mounts(&agent).await.unwrap().open_handles, 1);
         client.vfs_close(&agent, &directory.id).await.unwrap();
         assert_eq!(client.vfs_workspace_mounts(&agent).await.unwrap().open_handles, 0);
         std::fs::remove_dir(f.root.join("project/escape")).unwrap();
+        std::fs::remove_dir(inside_alias).unwrap();
         std::fs::remove_dir(alias).unwrap();
         let root = f.root.clone();
         finish(f, client, &agent, &root, &outside).await;

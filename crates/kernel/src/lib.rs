@@ -2684,6 +2684,42 @@ impl AgentKernelImpl {
         Ok(id)
     }
 
+    /// List tenant identities for trusted-system administration.
+    pub async fn list_tenants(&self) -> Vec<crate::auth::Tenant> {
+        let auth = self.auth.read().await;
+        let mut tenants: Vec<_> = auth.list_tenants().into_iter().cloned().collect();
+        tenants.sort_by(|a, b| a.id.cmp(&b.id));
+        tenants
+    }
+
+    /// List only the requested tenant's users.
+    pub async fn list_users(&self, tenant_id: &str) -> Vec<crate::auth::User> {
+        let auth = self.auth.read().await;
+        let mut users: Vec<_> = auth.list_users(tenant_id).into_iter().cloned().collect();
+        users.sort_by(|a, b| a.id.cmp(&b.id));
+        users
+    }
+
+    pub async fn list_api_keys(&self, tenant_id: &str) -> Vec<crate::auth::ApiKeyDescriptor> {
+        self.auth.read().await.list_api_keys(tenant_id)
+    }
+
+    pub async fn user_belongs_to_tenant(&self, user_id: &str, tenant_id: &str) -> bool {
+        self.auth
+            .read()
+            .await
+            .get_user(user_id)
+            .is_some_and(|user| user.tenant_id == tenant_id)
+    }
+
+    pub async fn api_key_belongs_to_tenant(&self, key_id: &str, tenant_id: &str) -> bool {
+        self.auth
+            .read()
+            .await
+            .get_api_key(key_id)
+            .is_some_and(|key| key.tenant_id == tenant_id)
+    }
+
     /// Register a user under a tenant and persist it. Returns the user id, or an
     /// error if the tenant is unknown.
     pub async fn register_user(
@@ -2842,9 +2878,20 @@ impl AgentKernelImpl {
     /// Revoke an API key with the same per-credential drain boundary as session
     /// revocation.
     pub async fn revoke_api_key(&self, key: &str) -> Result<bool, KernelError> {
+        self.revoke_api_key_id(&crate::auth::hash_secret(key)).await
+    }
+
+    /// Revoke by the complete non-secret inventory identifier. Uses the same
+    /// durable commit and in-flight drain boundary as plaintext revocation.
+    pub async fn revoke_api_key_id(&self, key_id: &str) -> Result<bool, KernelError> {
+        if key_id.len() != 64 || !key_id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(KernelError::Context(crate::ContextError::StorageError(
+                "invalid API-key identifier".into(),
+            )));
+        }
         let identity = crate::auth::CredentialIdentity {
             kind: crate::auth::CredentialKind::ApiKey,
-            id: crate::auth::hash_secret(key),
+            id: key_id.to_string(),
         };
         let (persisted, removed, drain) = {
             let _mutation = self.auth_mutation_lock.lock().await;

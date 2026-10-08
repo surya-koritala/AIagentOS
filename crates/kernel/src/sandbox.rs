@@ -2296,8 +2296,15 @@ mod tests {
 
     #[cfg(windows)]
     fn matching_native_file_handles(path: &Path) -> std::io::Result<Vec<(usize, u32, u32)>> {
-        use windows_sys::Wdk::System::Threading::{NtQueryInformationProcess, ProcessHandleInformation};
-        use windows_sys::Win32::Storage::FileSystem::{GetFileType, GetFinalPathNameByHandleW, FILE_TYPE_DISK};
+        use std::os::windows::fs::OpenOptionsExt;
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Wdk::System::Threading::{
+            NtQueryInformationProcess, ProcessHandleInformation,
+        };
+        use windows_sys::Win32::Storage::FileSystem::{
+            GetFileInformationByHandle, GetFileType, BY_HANDLE_FILE_INFORMATION,
+            FILE_FLAG_BACKUP_SEMANTICS, FILE_READ_ATTRIBUTES, FILE_TYPE_DISK,
+        };
         use windows_sys::Win32::System::Threading::GetCurrentProcess;
 
         #[repr(C)]
@@ -2312,6 +2319,25 @@ mod tests {
             _reserved: u32,
         }
 
+        // Compare native identities rather than DOS path spellings: the runner
+        // TEMP path may contain a short-name alias. Exclude the diagnostic
+        // handle itself so the live-workspace positive control is meaningful.
+        let target = std::fs::OpenOptions::new()
+            .access_mode(FILE_READ_ATTRIBUTES)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(path)?;
+        let mut target_info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+        if unsafe { GetFileInformationByHandle(target.as_raw_handle(), &mut target_info) } == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let identity = |info: &BY_HANDLE_FILE_INFORMATION| {
+            (
+                info.dwVolumeSerialNumber,
+                info.nFileIndexHigh,
+                info.nFileIndexLow,
+            )
+        };
+
         // Read only this test process. Native pointers/paths from unrelated
         // handles are neither dereferenced nor logged. Bound all query storage
         // and validate the returned table before reading its entries.
@@ -2319,42 +2345,58 @@ mod tests {
         let snapshot = loop {
             let mut buffer = vec![0usize; bytes / std::mem::size_of::<usize>()];
             let mut needed = 0u32;
-            let status = unsafe { NtQueryInformationProcess(
-                GetCurrentProcess(), ProcessHandleInformation, buffer.as_mut_ptr().cast(),
-                bytes as u32, &mut needed,
-            ) };
-            if status == 0 { break buffer; }
+            let status = unsafe {
+                NtQueryInformationProcess(
+                    GetCurrentProcess(),
+                    ProcessHandleInformation,
+                    buffer.as_mut_ptr().cast(),
+                    bytes as u32,
+                    &mut needed,
+                )
+            };
+            if status == 0 {
+                break buffer;
+            }
             if status as u32 != 0xc000_0004 || bytes == 16 * 1024 * 1024 {
-                return Err(std::io::Error::other(format!("native handle snapshot status {status:#x}")));
+                return Err(std::io::Error::other(format!(
+                    "native handle snapshot status {status:#x}"
+                )));
             }
             if needed as usize > 16 * 1024 * 1024 {
-                return Err(std::io::Error::other("native handle snapshot exceeds bound"));
+                return Err(std::io::Error::other(
+                    "native handle snapshot exceeds bound",
+                ));
             }
-            bytes = (bytes * 2).max(needed as usize).next_multiple_of(std::mem::size_of::<usize>());
+            bytes = (bytes * 2)
+                .max(needed as usize)
+                .next_multiple_of(std::mem::size_of::<usize>());
         };
         let header_bytes = 2 * std::mem::size_of::<usize>();
         let count = snapshot[0];
         let capacity = (snapshot.len() * std::mem::size_of::<usize>() - header_bytes)
             / std::mem::size_of::<HandleEntry>();
         if count > capacity {
-            return Err(std::io::Error::other("native handle snapshot has invalid count"));
+            return Err(std::io::Error::other(
+                "native handle snapshot has invalid count",
+            ));
         }
-        let entries = unsafe { std::slice::from_raw_parts(
-            snapshot.as_ptr().add(2).cast::<HandleEntry>(), count,
-        ) };
-        let normalize = |value: &str| value.strip_prefix("\\\\?\\").unwrap_or(value).to_lowercase();
-        let target = normalize(&path.to_string_lossy());
-        let mut names = vec![0u16; 32 * 1024];
+        let entries = unsafe {
+            std::slice::from_raw_parts(snapshot.as_ptr().add(2).cast::<HandleEntry>(), count)
+        };
         let mut matching = Vec::new();
         for entry in entries {
             // A concurrent test may have closed/reused a snapshot handle. The
             // Win32 queries fail normally; no ownership is taken or close made.
-            if unsafe { GetFileType(entry.value) } != FILE_TYPE_DISK { continue; }
-            let length = unsafe { GetFinalPathNameByHandleW(
-                entry.value, names.as_mut_ptr(), names.len() as u32, 0,
-            ) } as usize;
-            if length == 0 || length >= names.len() { continue; }
-            if normalize(&String::from_utf16_lossy(&names[..length])) == target {
+            if entry.value == target.as_raw_handle()
+                || unsafe { GetFileType(entry.value) } != FILE_TYPE_DISK
+            {
+                continue;
+            }
+            let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+            if unsafe { GetFileInformationByHandle(entry.value, &mut info) } == 0 {
+                continue;
+            }
+            if identity(&info) == identity(&target_info) {
                 matching.push((entry.value as usize, entry.access, entry.attributes));
             }
         }
@@ -3397,7 +3439,10 @@ mod tests {
         // after teardown, including the bounded-listing early error path.
         let retained = mgr.sandboxes.get(&sid).unwrap().clone();
         #[cfg(windows)]
-        assert!(!matching_native_file_handles(&root).unwrap().is_empty(), "native snapshot must find the live workspace capability");
+        assert!(
+            !matching_native_file_handles(&root).unwrap().is_empty(),
+            "native snapshot must find the live workspace capability"
+        );
         std::fs::write(root.join("z.txt"), "z").unwrap();
         std::fs::create_dir(root.join("a-dir")).unwrap();
         #[cfg(unix)]

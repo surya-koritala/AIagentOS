@@ -9331,7 +9331,12 @@ mod tests {
         let task = tokio::spawn(server.serve());
         let mut client = SyscallClient::connect(address).await.unwrap();
         assert!(matches!(
-            client.call(Syscall::Hello { protocol_version: PROTOCOL_VERSION }).await.unwrap(),
+            client
+                .call(Syscall::Hello {
+                    protocol_version: PROTOCOL_VERSION
+                })
+                .await
+                .unwrap(),
             SyscallReply::Hello { .. }
         ));
         assert_eq!(metrics.snapshot().active, 1);

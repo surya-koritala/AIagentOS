@@ -73,12 +73,14 @@
   {:else if requests.length === 0}
     <p>No peripheral requests. Device backends are unavailable by default.</p>
   {:else}
+    <p>Pending approval requests: {requests.filter(request => request.status === 'awaiting-approval').length}.</p>
     <ul aria-label="Peripheral request state">
       {#each requests as request (request.request_id)}
         <li>
           <strong>{request.agent_name}</strong> — {request.tool_name}
           <p>Resource identity: <code>{request.resource_identity}</code></p>
-          <p>Status: {request.status}. Pending grant: {request.grant_pending ? 'yes' : 'no'}. Active uses: {request.active_uses}.</p>
+          <p>Status: {request.status}. Pending grants: {request.grant_pending ? 1 : 0}. Active uses: {request.active_uses}.</p>
+          {#if request.active_uses > 0}<p class="in-use">In use</p>{/if}
           {#if request.status === 'awaiting-approval'}
             <button on:click={() => review(request)} disabled={deciding || !connected} aria-label={`Review peripheral request for ${request.agent_name}`}>Review request</button>
           {/if}
@@ -113,6 +115,7 @@
   h2 { margin: 0; font-size: 1.1rem; }
   p { margin: 0.65rem 0; }
   .summary { color: #c5cee3; }
+  .in-use { font-weight: 700; color: #baf0c9; }
   ul { margin: 0; padding: 0; list-style: none; }
   li { border-top: 1px solid #46506b; padding: 0.75rem 0; }
   code { overflow-wrap: anywhere; }

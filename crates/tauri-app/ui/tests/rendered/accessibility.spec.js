@@ -301,7 +301,7 @@ test('peripheral approval dialog is keyboard operable, opaque-only, and revokes 
   await expectWcagAxeClean(page);
   await dialog.getByRole('button', { name: 'Approve exact call' }).click();
   await expect(dialog).toHaveCount(0);
-  await expect(page.getByText(/Pending grant: yes\. Active uses: 0\./)).toBeVisible();
+  await expect(page.getByText(/Pending grants: 1\. Active uses: 0\./)).toBeVisible();
   await page.getByRole('button', { name: 'Revoke peripheral access for Research agent' }).click();
   await expect(page.getByText('Pending grant revoked: yes; active uses cancelled: 0.', { exact: true })).toBeVisible();
   const decisions = await page.evaluate(() => window.__TAURI_CALLS__.filter(call => ['approve_peripheral_request', 'revoke_peripheral_request'].includes(call.command)));
@@ -325,7 +325,7 @@ test('peripheral state shows exact active counts, denial, and lifecycle cleanup 
   await page.getByRole('button', { name: 'Revoke peripheral access for Research agent' }).click();
   await expect(page.getByText('Pending grant revoked: no; active uses cancelled: 2.', { exact: true })).toBeVisible();
   await page.evaluate(() => { window.__PERIPHERAL_FIXTURE__[0].status = 'cancelled'; });
-  await expect(page.getByText(/Status: cancelled\. Pending grant: no\. Active uses: 0\./)).toBeVisible();
+  await expect(page.getByText(/Status: cancelled\. Pending grants: 0\. Active uses: 0\./)).toBeVisible();
   await expect(page.getByRole('button', { name: 'Revoke peripheral access for Research agent' })).toHaveCount(0);
   await expectWcagAxeClean(page);
 });

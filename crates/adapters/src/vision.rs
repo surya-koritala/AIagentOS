@@ -10,8 +10,10 @@ pub(crate) fn preflight(
     profile: Option<&ImageInputProfile>,
     messages: &[StandardMessage],
 ) -> Result<u32, ConnectorError> {
-    if let Some(profile) = profile {
-        profile.validate(model)?;
+    if messages.iter().any(|message| message.content.images().next().is_some()) {
+        if let Some(profile) = profile {
+            profile.validate(model)?;
+        }
     }
     kernel::message_content::validate_messages(messages, &provider.to_string(), profile)
 }

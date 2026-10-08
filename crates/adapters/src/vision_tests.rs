@@ -554,3 +554,44 @@ async fn image_input_http_diagnostics_and_request_ids_cannot_echo_encoded_images
         }
     }
 }
+
+#[tokio::test]
+async fn image_input_stale_image_profile_preserves_text_and_rejects_images_before_io() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "choices":[{"message":{"content":"legacy result"},"finish_reason":"stop"}],
+            "content":[{"type":"text","text":"legacy result"}],"stop_reason":"end_turn",
+            "candidates":[{"content":{"role":"model","parts":[{"text":"legacy result"}]},"finishReason":"STOP"}],
+            "usage":{"prompt_tokens":1,"completion_tokens":1,"input_tokens":1,"output_tokens":1},
+            "usageMetadata":{"promptTokenCount":1,"candidatesTokenCount":1,"totalTokenCount":2}
+        })))
+        .expect(4)
+        .mount(&server)
+        .await;
+    let stale = ImageInputProfile {
+        model_id: "previous-model".into(),
+        max_tokens_per_image: 3000,
+    };
+    let adapters: Vec<Box<dyn LlmProviderAdapter>> = vec![
+        Box::new(crate::openai::OpenAiAdapter::new("fixture-key".into()).with_base_url(server.uri()).with_model("vision-fixture".into()).with_image_input_profile(stale.clone())),
+        Box::new(crate::azure_openai::AzureOpenAiAdapter::new(server.uri(),"vision-fixture".into(),"fixture-key".into()).with_image_input_profile(stale.clone())),
+        Box::new(crate::anthropic::AnthropicAdapter::new("fixture-key".into()).with_base_url(server.uri()).with_model("vision-fixture".into()).with_image_input_profile(stale.clone())),
+        Box::new(crate::gemini::GeminiAdapter::new("fixture-key".into()).with_base_url(server.uri()).with_model("vision-fixture".into()).with_image_input_profile(stale)),
+    ];
+    for adapter in adapters {
+        assert!(!adapter.capabilities().vision);
+        let session = adapter.create_session().await.unwrap();
+        let text = StandardMessage::user("legacy request");
+        assert_eq!(session.validate_content(std::slice::from_ref(&text)).unwrap(), 0);
+        assert_eq!(session.send(vec![text]).await.unwrap().content, "legacy result");
+        assert!(matches!(session.send(vec![message()]).await, Err(ConnectorError::ProtocolError(_))));
+        assert!(matches!(session.send_streaming_controlled(vec![message()],&[],LlmRequestOptions::default(),&tokio_util::sync::CancellationToken::new()).await, Err(ConnectorError::ProtocolError(_))));
+        assert!(matches!(session.send(vec![StandardMessage::user_content(MessageContent::parts(vec![ContentPart::Audio]).unwrap())]).await, Err(ConnectorError::UnsupportedContent(_))));
+        let oversized = MessageContent::Parts(vec![ContentPart::Text { text: "x".into() }; kernel::message_content::MAX_CONTENT_PARTS+1]);
+        assert!(matches!(session.send(vec![StandardMessage::user_content(oversized)]).await, Err(ConnectorError::ProtocolError(_))));
+    }
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 4);
+    assert!(requests.iter().all(|request| !String::from_utf8_lossy(&request.body).contains(PNG)));
+}

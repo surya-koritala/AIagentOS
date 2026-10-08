@@ -95,9 +95,21 @@ async fn image_input_sdk_desktop_tui_wire_auth_and_version_guards_use_the_same_t
         .await
         .unwrap()
         .id;
-    let stream_agent = kernel.create_agent_for_tenant(&tenant, config()).await.unwrap().id;
-    let desktop_agent = kernel.create_agent_for_tenant(&tenant, config()).await.unwrap().id;
-    let tui_agent = kernel.create_agent_for_tenant(&tenant, config()).await.unwrap().id;
+    let stream_agent = kernel
+        .create_agent_for_tenant(&tenant, config())
+        .await
+        .unwrap()
+        .id;
+    let desktop_agent = kernel
+        .create_agent_for_tenant(&tenant, config())
+        .await
+        .unwrap()
+        .id;
+    let tui_agent = kernel
+        .create_agent_for_tenant(&tenant, config())
+        .await
+        .unwrap()
+        .id;
     let foreign_agent = kernel
         .create_agent_for_tenant(&foreign, config())
         .await
@@ -199,7 +211,9 @@ async fn image_input_sdk_desktop_tui_wire_auth_and_version_guards_use_the_same_t
     task.abort();
     let _ = task.await;
     kernel.stop_agent(owner).await.unwrap();
-    for id in [stream_agent,desktop_agent,tui_agent] { kernel.stop_agent(id).await.unwrap(); }
+    for id in [stream_agent, desktop_agent, tui_agent] {
+        kernel.stop_agent(id).await.unwrap();
+    }
     kernel.stop_agent(foreign_agent).await.unwrap();
 }
 

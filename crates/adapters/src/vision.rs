@@ -10,7 +10,10 @@ pub(crate) fn preflight(
     profile: Option<&ImageInputProfile>,
     messages: &[StandardMessage],
 ) -> Result<u32, ConnectorError> {
-    if messages.iter().any(|message| message.content.images().next().is_some()) {
+    if messages
+        .iter()
+        .any(|message| message.content.images().next().is_some())
+    {
         if let Some(profile) = profile {
             profile.validate(model)?;
         }

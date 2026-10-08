@@ -45,10 +45,19 @@ path = "src/bin/soak-qualification.rs"
 name = "remote-backup-qualification"
 path = "src/bin/remote-backup-qualification.rs"
 
+[[bin]]
+name = "clone-benchmark"
+path = "src/bin/clone-benchmark.rs"
+
+[[bin]]
+name = "coding-comparison"
+path = "src/bin/coding-comparison.rs"
+
 [dependencies]
 kernel = { path = "../crates/kernel", version = "=0.4.0-rc.1", features = ["qualification"] }
 adapters = { path = "../crates/adapters", version = "=0.4.0-rc.1" }
 agent-sdk = { path = "../crates/sdk", version = "=0.4.0-rc.1" }
+coding-agent = { path = "../crates/coding-agent", version = "=0.4.0-rc.1" }
 tokio = { version = "1", features = ["full"] }
 tokio-util = { workspace = true }
 uuid = { version = "1", features = ["v4"] }
@@ -60,3 +69,9 @@ serde_json = { workspace = true }
 toml = { workspace = true }
 rusqlite = { workspace = true }
 libc = "0.2"
+
+ring = { workspace = true }
+tempfile = { workspace = true }
+
+[dev-dependencies]
+wiremock = { workspace = true }

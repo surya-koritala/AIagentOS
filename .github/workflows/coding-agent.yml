@@ -1,0 +1,148 @@
+name: Coding agent fixture
+
+on:
+  pull_request:
+    paths:
+      - 'crates/coding-agent/**'
+      - 'crates/kernel/**'
+      - 'crates/sdk/**'
+      - 'fixtures/coding-agent/**'
+      - 'Cargo.lock'
+      - 'scripts/build_cli_archive.py'
+      - 'scripts/linux_cli_rc_qualification.py'
+      - 'scripts/verify_coding_install.py'
+      - '.github/workflows/coding-agent.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  candidate-package:
+    name: Build downloadable coding CLI candidate
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    env:
+      CARGO_INCREMENTAL: 0
+      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: 1
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
+        with:
+          toolchain: 1.97.1
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+      - name: Build the canonical five-binary archive
+        run: |
+          export SOURCE_DATE_EPOCH="$(git show -s --format=%ct HEAD)"
+          export RUSTFLAGS="--remap-path-prefix=${GITHUB_WORKSPACE}=."
+          cargo build --release --locked -p agent-cli --bins -p agent-tui -p coding-agent --bin agent-code
+          mkdir -p dist/stage
+          for binary in agent agent-server agent-tui agentctl agent-code; do
+            cp "target/release/$binary" dist/stage/
+          done
+          python3 scripts/build_cli_archive.py --source dist/stage --output dist/agentos-coding-candidate.zip
+          sha256sum dist/agentos-coding-candidate.zip > dist/SHA256SUMS
+          cp scripts/verify_coding_install.py scripts/linux_cli_rc_qualification.py dist/
+          target/release/agent-code --version | cut -d ' ' -f 2 > dist/VERSION
+          git rev-parse HEAD > dist/SOURCE_COMMIT
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: coding-cli-candidate-${{ github.sha }}
+          path: |
+            dist/agentos-coding-candidate.zip
+            dist/SHA256SUMS
+            dist/VERSION
+            dist/SOURCE_COMMIT
+            dist/verify_coding_install.py
+            dist/linux_cli_rc_qualification.py
+
+  candidate-install:
+    name: Verify downloaded coding CLI on a clean runner
+    needs: candidate-package
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    env:
+      CODING_RUST_IMAGE: rust:1.99.0-slim-bookworm@sha256:452176c0cefca88c0b3184ce85a4eb03e3d4fa05d2afb5366abcba853221019e
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: coding-cli-candidate-${{ github.sha }}
+          path: downloaded
+      - uses: docker/setup-docker-action@77e84dbf09b47d1e29270283c22f16145aa85ca1 # v5
+        with:
+          version: v29.6.2
+          rootless: true
+          daemon-config: |
+            {"exec-opts": ["native.cgroupdriver=cgroupfs"]}
+      - name: Verify checksum and source before installation
+        run: |
+          test "$(cat downloaded/SOURCE_COMMIT)" = "$GITHUB_SHA"
+          expected="$(cut -d ' ' -f 1 downloaded/SHA256SUMS)"
+          actual="$(sha256sum downloaded/agentos-coding-candidate.zip | cut -d ' ' -f 1)"
+          test "$actual" = "$expected"
+          docker info --format '{{json .SecurityOptions}}' | grep -qi rootless
+          docker pull "$CODING_RUST_IMAGE"
+          python3 downloaded/verify_coding_install.py --archive downloaded/agentos-coding-candidate.zip \
+            --sha256 "$expected" --version "$(cat downloaded/VERSION)" --image "$CODING_RUST_IMAGE" \
+            --destination "$RUNNER_TEMP/coding-install" --report downloaded/install-report.json
+          test -z "$(docker ps -aq --filter label=aiagentos.sandbox=true)"
+      - name: Retain install results and task receipts
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: coding-cli-install-${{ github.sha }}
+          path: |
+            downloaded/install-report.json
+            ${{ runner.temp }}/coding-install/reports/
+
+  coding-fixture:
+    name: Governed coding fixture and restart
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      CARGO_INCREMENTAL: 0
+      CODING_RUST_IMAGE: rust:1.99.0-slim-bookworm@sha256:452176c0cefca88c0b3184ce85a4eb03e3d4fa05d2afb5366abcba853221019e
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
+        with:
+          toolchain: 1.97.1
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+      - uses: docker/setup-docker-action@77e84dbf09b47d1e29270283c22f16145aa85ca1 # v5
+        with:
+          version: v29.6.2
+          rootless: true
+          daemon-config: |
+            {"exec-opts": ["native.cgroupdriver=cgroupfs"]}
+      - name: Verify the supported backend and pull the pinned operator image
+        run: |
+          docker info --format '{{json .SecurityOptions}}' | grep -qi rootless
+          docker pull "$CODING_RUST_IMAGE"
+      - name: Build the application and run the first failed branch
+        run: |
+          cargo build -p coding-agent --bin agent-code --locked
+          mkdir -p target/coding-evidence
+          target/debug/agent-code fixture --image "$CODING_RUST_IMAGE" \
+            --data-dir "$RUNNER_TEMP/coding-fixture" --pause-after-branch \
+            > target/coding-evidence/paused.json 2> target/coding-evidence/paused-events.jsonl
+          jq -e '.status == "paused" and .branches[0].phase == "discarded" and .branches[0].test.exit_code != 0 and .branches[0].test.kind == "isolated_process"' target/coding-evidence/paused.json
+      - name: Resume in a fresh process and select the correct fix
+        run: |
+          target/debug/agent-code resume --data-dir "$RUNNER_TEMP/coding-fixture" \
+            > target/coding-evidence/completed.json 2> target/coding-evidence/completed-events.jsonl
+          jq -e '.status == "completed" and .selected_agent == .branches[1].id and .branches[1].test.exit_code == 0 and .branches[1].test.kind == "isolated_process" and .original_repository_written == false' target/coding-evidence/completed.json
+          target/debug/agent-code resume --data-dir "$RUNNER_TEMP/coding-fixture" > target/coding-evidence/replayed-report.json
+          test "$(jq .provider_tokens target/coding-evidence/completed.json)" = "$(jq .provider_tokens target/coding-evidence/replayed-report.json)"
+          test -z "$(docker ps -aq --filter label=aiagentos.sandbox=true)"
+      - name: Compare the same fixture with sequential and contained direct attempts
+        run: |
+          cargo run -p os-benchmark --bin coding-comparison --locked -- --image "$CODING_RUST_IMAGE" \
+            > target/coding-evidence/comparison.json 2> target/coding-evidence/comparison-events.jsonl
+          jq -e '.evidence_class == "deterministic_fixture" and .provider_api_calls == 0 and .containment_in_every_strategy == true and (.results | length == 3) and all(.results[]; .completed == true and .attempts == 2)' target/coding-evidence/comparison.json
+          test -z "$(docker ps -aq --filter label=aiagentos.sandbox=true)"
+      - name: Retain actual fixture outcomes
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: coding-fixture-${{ github.sha }}
+          path: target/coding-evidence/

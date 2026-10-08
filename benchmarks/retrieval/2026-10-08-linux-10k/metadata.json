@@ -1,0 +1,20 @@
+{
+  "source_head": "e47275e1d53ec926e733b01ba6abc4c38e9702b7",
+  "tested_merge_commit": "23c49e8e13999340e939c98ccc642d52622cf36d",
+  "dependency_head": "0ce8301a267e30cd37f89d49387f0c192919c8d3",
+  "pull_request": 405,
+  "run_id": 37761904835,
+  "job_id": 113260105588,
+  "artifact_id": 11541994815,
+  "artifact_name": "memory-qualification",
+  "job_conclusion": "success",
+  "platform": "Ubuntu 24.04 x86_64 GitHub-hosted runner",
+  "rust_toolchain": "1.97.1",
+  "build_profile": "dev (default cargo run)",
+  "corpus": "deterministic planted repository incident text",
+  "command": "cargo run -p os-benchmark --bin memory-qualification --locked",
+  "provider_api_calls": 0,
+  "scheduled_100k_qualification": "not_run",
+  "production_query_latency": "not_measured_by_this_index_benchmark",
+  "resident_memory": "current RSS after both indexes, not peak RSS"
+}

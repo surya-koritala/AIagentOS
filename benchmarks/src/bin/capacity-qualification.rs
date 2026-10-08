@@ -315,6 +315,7 @@ impl DelayedSession {
         tokio::time::sleep(self.delay).await;
         let input_tokens = u32::try_from(bytes.div_ceil(4)).unwrap_or(u32::MAX);
         Ok(LlmResponse {
+            provider_metadata: None,
             content: "deterministic qualification response".into(),
             finish_reason: Some("stop".into()),
             tokens_used: input_tokens.saturating_add(8),

@@ -42,6 +42,7 @@ pub const WIRE_FEATURES: &[&str] = &[
     "service_supervision",
     "signed_packages",
     "tenant_bound_auth",
+    "tenant_identity_administration",
     "tls",
     "token_streaming",
     "typed_errors",
@@ -49,6 +50,7 @@ pub const WIRE_FEATURES: &[&str] = &[
     "workspace_vfs",
     "namespace_mounts",
     "data_vfs",
+    "durable_cloning",
 ];
 
 /// A complete top-level protocol contract returned by `describe_protocol`.
@@ -157,6 +159,74 @@ const NI: JsonKind = JsonKind::IntegerOrNull;
 const ON: JsonKind = JsonKind::ObjectOrNull;
 
 const REQUEST_VARIANTS: &[Variant] = &[
+    Variant {
+        tag: "create_tenant",
+        fields: &[Field::required("name", S)],
+    },
+    Variant {
+        tag: "list_tenants",
+        fields: &[],
+    },
+    Variant {
+        tag: "revoke_tenant",
+        fields: &[
+            Field::required("tenant_id", S),
+            Field::optional("confirm", B),
+        ],
+    },
+    Variant {
+        tag: "create_user",
+        fields: &[
+            Field::required("username", S),
+            Field::required("email", S),
+            Field::required("role", S),
+        ],
+    },
+    Variant {
+        tag: "list_users",
+        fields: &[],
+    },
+    Variant {
+        tag: "revoke_user",
+        fields: &[Field::required("user_id", S), Field::optional("confirm", B)],
+    },
+    Variant {
+        tag: "issue_api_key",
+        fields: &[Field::required("user_id", S), Field::required("name", S)],
+    },
+    Variant {
+        tag: "list_api_keys",
+        fields: &[],
+    },
+    Variant {
+        tag: "revoke_api_key",
+        fields: &[Field::required("key_id", S), Field::optional("confirm", B)],
+    },
+    Variant {
+        tag: "create_user_for_tenant",
+        fields: &[
+            Field::required("tenant_id", S),
+            Field::required("username", S),
+            Field::required("email", S),
+            Field::required("role", S),
+        ],
+    },
+    Variant {
+        tag: "list_users_for_tenant",
+        fields: &[Field::required("tenant_id", S)],
+    },
+    Variant {
+        tag: "issue_api_key_for_tenant",
+        fields: &[
+            Field::required("tenant_id", S),
+            Field::required("user_id", S),
+            Field::required("name", S),
+        ],
+    },
+    Variant {
+        tag: "list_api_keys_for_tenant",
+        fields: &[Field::required("tenant_id", S)],
+    },
     Variant {
         tag: "vfs_open_data",
         fields: &[
@@ -292,6 +362,16 @@ const REQUEST_VARIANTS: &[Variant] = &[
     Variant {
         tag: "list_agents",
         fields: &[],
+    },
+    Variant {
+        tag: "clone_agent",
+        fields: &[
+            Field::required("agent_id", S),
+            Field::required("child_agent_id", S),
+            Field::optional("child_ownership_proof", ON),
+            Field::required("name", S),
+            Field::optional("drop_capabilities", A),
+        ],
     },
     Variant {
         tag: "pause_agent",
@@ -908,6 +988,9 @@ pub fn conformance_request_fixtures(protocol_version: u32) -> Result<Vec<Value>,
                     ("agent_id", JsonKind::String) => {
                         Value::String("00000000-0000-0000-0000-000000000001".into())
                     }
+                    ("child_agent_id", JsonKind::String) => {
+                        Value::String("00000000-0000-0000-0000-000000000005".into())
+                    }
                     ("owner_node_id", JsonKind::String) => {
                         Value::String("00000000-0000-0000-0000-000000000004".into())
                     }
@@ -959,6 +1042,7 @@ pub fn conformance_request_fixtures(protocol_version: u32) -> Result<Vec<Value>,
                     ("manifest_toml", JsonKind::String) => {
                         Value::String("name = \"fixture\"\nversion = \"0.1.0\"".into())
                     }
+                    ("role", JsonKind::String) => Value::String("user".into()),
                     (_, JsonKind::String) => Value::String("fixture".into()),
                     (_, JsonKind::Integer) => Value::Number(1.into()),
                     (_, JsonKind::Boolean) => Value::Bool(true),
@@ -979,6 +1063,42 @@ pub fn conformance_request_fixtures(protocol_version: u32) -> Result<Vec<Value>,
 }
 
 const REPLY_VARIANTS: &[Variant] = &[
+    Variant {
+        tag: "tenant_created",
+        fields: &[Field::required("id", S)],
+    },
+    Variant {
+        tag: "tenants",
+        fields: &[Field::required("tenants", A)],
+    },
+    Variant {
+        tag: "tenant_revoked",
+        fields: &[Field::required("existed", B)],
+    },
+    Variant {
+        tag: "user_created",
+        fields: &[Field::required("id", S)],
+    },
+    Variant {
+        tag: "users",
+        fields: &[Field::required("users", A)],
+    },
+    Variant {
+        tag: "user_revoked",
+        fields: &[Field::required("existed", B)],
+    },
+    Variant {
+        tag: "api_key_issued",
+        fields: &[Field::required("key_id", S), Field::required("key", S)],
+    },
+    Variant {
+        tag: "api_keys",
+        fields: &[Field::required("keys", A)],
+    },
+    Variant {
+        tag: "api_key_revoked",
+        fields: &[Field::required("existed", B)],
+    },
     Variant {
         tag: "vfs_data_opened",
         fields: &[Field::required("handle", O)],
@@ -1002,6 +1122,10 @@ const REPLY_VARIANTS: &[Variant] = &[
     Variant {
         tag: "agent_created",
         fields: &[Field::required("id", S)],
+    },
+    Variant {
+        tag: "agent_cloned",
+        fields: &[Field::required("result", O)],
     },
     Variant {
         tag: "agents",
@@ -1692,8 +1816,8 @@ mod tests {
                     });
             }
         }
-        assert_eq!(conformance_request_fixtures(1).unwrap().len(), 83);
-        assert_eq!(conformance_request_fixtures(2).unwrap().len(), 114);
+        assert_eq!(conformance_request_fixtures(1).unwrap().len(), 97);
+        assert_eq!(conformance_request_fixtures(2).unwrap().len(), 128);
         assert!(conformance_request_fixtures(0).is_err());
         assert!(conformance_request_fixtures(PROTOCOL_VERSION + 1).is_err());
     }

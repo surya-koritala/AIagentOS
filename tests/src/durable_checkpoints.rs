@@ -47,6 +47,7 @@ impl LlmSession for BoundarySession {
             std::future::pending::<()>().await;
         }
         Ok(LlmResponse {
+            provider_metadata: None,
             content: "resumed exactly once".into(),
             finish_reason: Some("stop".into()),
             tokens_used: 7,
@@ -142,6 +143,7 @@ impl LlmSession for CyclingSession {
             std::future::pending::<()>().await;
         }
         Ok(LlmResponse {
+            provider_metadata: None,
             content: "resumed cycle".into(),
             finish_reason: Some("stop".into()),
             tokens_used: 4,
@@ -234,6 +236,7 @@ impl LlmSession for RestartToolSession {
     ) -> Result<LlmResponse, ConnectorError> {
         match self.calls.fetch_add(1, Ordering::SeqCst) {
             0 => Ok(LlmResponse {
+                provider_metadata: None,
                 content: String::new(),
                 finish_reason: Some("tool_calls".into()),
                 tokens_used: 4,
@@ -252,6 +255,7 @@ impl LlmSession for RestartToolSession {
                 std::future::pending::<Result<LlmResponse, ConnectorError>>().await
             }
             _ => Ok(LlmResponse {
+                provider_metadata: None,
                 content: "continued after restart".into(),
                 finish_reason: Some("stop".into()),
                 tokens_used: 4,
@@ -349,6 +353,7 @@ impl LlmSession for CompletionRaceSession {
             self.release.notified().await;
         }
         Ok(LlmResponse {
+            provider_metadata: None,
             content: "completion race resolved".into(),
             finish_reason: Some("stop".into()),
             tokens_used: 4,

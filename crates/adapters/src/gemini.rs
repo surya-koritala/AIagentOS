@@ -2,11 +2,14 @@
 //!
 //! Uses Gemini's native `generateContent` shape rather than an OpenAI-compatible
 //! surface: requests carry a `contents` array of role-tagged `parts`, and the
-//! API key travels as a query parameter. Roles map `assistant` -> `model`,
-//! everything else -> `user`.
+//! API key travels in a header. Native function calls, results and signed
+//! assistant parts survive durable multi-step conversations.
 
 use kernel::connector::*;
 use kernel::{ConnectorError, ProviderId};
+
+#[path = "gemini_protocol.rs"]
+mod protocol;
 
 const DEFAULT_BASE_URL: &str = "https://generativelanguage.googleapis.com";
 const DEFAULT_MODEL: &str = "gemini-1.5-flash";
@@ -49,11 +52,38 @@ struct GeminiSession {
     model: String,
 }
 
-/// Maps a standard chat role to Gemini's role vocabulary (`user` / `model`).
-fn gemini_role(role: &str) -> &'static str {
-    match role {
-        "assistant" | "model" => "model",
-        _ => "user",
+impl GeminiSession {
+    async fn stream(
+        &self,
+        messages: Vec<StandardMessage>,
+        tools: &[ToolDefinition],
+        options: LlmRequestOptions,
+        cancellation: &tokio_util::sync::CancellationToken,
+        events: Option<ProviderEventSink>,
+    ) -> Result<LlmResponse, ConnectorError> {
+        let mut body = protocol::request(&messages, tools, &self.provider_id, &self.model)?;
+        if let Some(max_output_tokens) = options.max_output_tokens {
+            body["generationConfig"] = serde_json::json!({"maxOutputTokens": max_output_tokens});
+        }
+        let request = self
+            .client
+            .post(format!(
+                "{}/v1beta/models/{}:streamGenerateContent?alt=sse",
+                self.base_url.trim_end_matches('/'),
+                self.model
+            ))
+            .header("x-goog-api-key", &self.api_key)
+            .json(&body);
+        let state = protocol::GeminiStream::new(self.provider_id.clone(), self.model.clone());
+        crate::streaming::send_native_sse_controlled(
+            &self.provider_id,
+            request,
+            state,
+            options,
+            cancellation,
+            events,
+        )
+        .await
     }
 }
 
@@ -75,20 +105,10 @@ impl LlmSession for GeminiSession {
     async fn send_with_options(
         &self,
         messages: Vec<StandardMessage>,
-        _tools: &[ToolDefinition],
+        tools: &[ToolDefinition],
         options: LlmRequestOptions,
     ) -> Result<LlmResponse, ConnectorError> {
-        let contents: Vec<serde_json::Value> = messages
-            .iter()
-            .map(|m| {
-                serde_json::json!({
-                    "role": gemini_role(&m.role),
-                    "parts": [{"text": m.content}],
-                })
-            })
-            .collect();
-
-        let mut body = serde_json::json!({ "contents": contents });
+        let mut body = protocol::request(&messages, tools, &self.provider_id, &self.model)?;
         if let Some(max_output_tokens) = options.max_output_tokens {
             body["generationConfig"] = serde_json::json!({
                 "maxOutputTokens": max_output_tokens
@@ -113,39 +133,63 @@ impl LlmSession for GeminiSession {
 
         match result {
             Ok(resp) if resp.status().is_success() => {
-                let json: serde_json::Value = resp
-                    .json()
-                    .await
-                    .map_err(|e| ConnectorError::ProtocolError(e.to_string()))?;
-                if let Some(error) = crate::content_filter_error(
-                    &self.provider_id,
-                    json["candidates"][0]["finishReason"].as_str(),
-                ) {
-                    return Err(error);
-                }
-                let content = json["candidates"][0]["content"]["parts"][0]["text"]
-                    .as_str()
-                    .unwrap_or("")
-                    .to_string();
-                let tokens = crate::json_usage_u32(&json["usageMetadata"]["totalTokenCount"]);
-                let finish_reason = json["candidates"][0]["finishReason"]
-                    .as_str()
-                    .map(|s| s.to_string());
-                Ok(LlmResponse {
-                    content,
-                    finish_reason,
-                    tokens_used: tokens,
-                    usage: kernel::connector::LlmUsage::reported(
-                        crate::json_usage_u32(&json["usageMetadata"]["promptTokenCount"]),
-                        crate::json_usage_u32(&json["usageMetadata"]["candidatesTokenCount"]),
-                        crate::json_usage_u32(&json["usageMetadata"]["cachedContentTokenCount"]),
-                    ),
-                    tool_calls: vec![],
-                })
+                let bytes = protocol::response_bytes(resp).await?;
+                let json: serde_json::Value = serde_json::from_slice(&bytes).map_err(|_| {
+                    ConnectorError::ProtocolError("invalid Gemini response JSON".into())
+                })?;
+                protocol::response(&json, &self.provider_id, &self.model)
             }
             Ok(resp) => Err(crate::provider_http_error(&self.provider_id, resp).await),
             Err(e) => Err(crate::transport_error(&self.provider_id, e)),
         }
+    }
+
+    async fn send_streaming(
+        &self,
+        messages: Vec<StandardMessage>,
+        tools: &[ToolDefinition],
+    ) -> Result<LlmResponse, ConnectorError> {
+        self.send_streaming_with_options(messages, tools, LlmRequestOptions::default())
+            .await
+    }
+
+    async fn send_streaming_with_options(
+        &self,
+        messages: Vec<StandardMessage>,
+        tools: &[ToolDefinition],
+        options: LlmRequestOptions,
+    ) -> Result<LlmResponse, ConnectorError> {
+        self.stream(
+            messages,
+            tools,
+            options,
+            &tokio_util::sync::CancellationToken::new(),
+            None,
+        )
+        .await
+    }
+
+    async fn send_streaming_controlled(
+        &self,
+        messages: Vec<StandardMessage>,
+        tools: &[ToolDefinition],
+        options: LlmRequestOptions,
+        cancellation: &tokio_util::sync::CancellationToken,
+    ) -> Result<LlmResponse, ConnectorError> {
+        self.stream(messages, tools, options, cancellation, None)
+            .await
+    }
+
+    async fn send_streaming_events_controlled(
+        &self,
+        messages: Vec<StandardMessage>,
+        tools: &[ToolDefinition],
+        options: LlmRequestOptions,
+        cancellation: &tokio_util::sync::CancellationToken,
+        events: ProviderEventSink,
+    ) -> Result<LlmResponse, ConnectorError> {
+        self.stream(messages, tools, options, cancellation, Some(events))
+            .await
     }
 
     fn enforces_max_output_tokens(&self) -> bool {
@@ -175,6 +219,9 @@ impl LlmProviderAdapter for GeminiAdapter {
     fn capabilities(&self) -> kernel::connector::ProviderCapabilities {
         kernel::connector::ProviderCapabilities {
             prompt_cancellation: true,
+            native_streaming: true,
+            tool_calls: true,
+            parallel_tool_calls: true,
             api_family: "gemini-generate-content-v1beta".into(),
             ..Default::default()
         }
@@ -202,21 +249,14 @@ impl LlmProviderAdapter for GeminiAdapter {
     }
 
     fn translate_to_provider(&self, msg: &StandardMessage) -> serde_json::Value {
-        serde_json::json!({
-            "role": gemini_role(&msg.role),
-            "parts": [{"text": msg.content}],
-        })
+        // Pairing tool results requires complete history. The session request
+        // compiler is the fallible authority for multi-step conversations.
+        protocol::single_message(msg, &self.id, &self.model)
+            .ok()
+            .unwrap_or(serde_json::Value::Null)
     }
 
     fn translate_from_provider(&self, value: &serde_json::Value) -> Option<StandardMessage> {
-        let role = value.get("role")?.as_str()?;
-        let text = value["parts"][0]["text"].as_str().unwrap_or("").to_string();
-        let std_role = if role == "model" { "assistant" } else { "user" };
-        Some(StandardMessage {
-            role: std_role.to_string(),
-            content: text,
-            tool_call_id: None,
-            tool_calls: None,
-        })
+        protocol::message(value, &self.id, &self.model).ok()
     }
 }

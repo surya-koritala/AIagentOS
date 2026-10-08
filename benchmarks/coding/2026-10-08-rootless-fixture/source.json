@@ -1,0 +1,18 @@
+{
+  "evidence_class": "deterministic_rootless_fixture",
+  "production_claim_allowed": false,
+  "provider_api_calls": 0,
+  "head_commit": "623b1927cc0590b9116c7fda54be0f4be14def0f",
+  "tested_merge_commit": "02fbdc746e163897d97df05182a5e331f52e4625",
+  "run_id": 37745077639,
+  "job_id": 113204518433,
+  "artifact_id": 11535761395,
+  "rust_image": "rust:1.99.0-slim-bookworm@sha256:452176c0cefca88c0b3184ce85a4eb03e3d4fa05d2afb5366abcba853221019e",
+  "sha256": {
+    "completed-events.jsonl": "9217164c47271916fd02df427379236c1a07cbfdc38b94f9ecbad1e621a6b656",
+    "completed.json": "db09773a8f20a7cb7c5f4cc3bd784e40d192bf9ab4734b334e3ebce613c38a41",
+    "paused-events.jsonl": "6b3a807af5edbfbf2d2a6fc75c4f2b69a3b4bbd8869ffd3d78bb9b4a6f43e341",
+    "paused.json": "1ec857338832b542dc717b504ae918c0d5f2ad7821905ba10a43364bd12e5f42",
+    "replayed-report.json": "db09773a8f20a7cb7c5f4cc3bd784e40d192bf9ab4734b334e3ebce613c38a41"
+  }
+}

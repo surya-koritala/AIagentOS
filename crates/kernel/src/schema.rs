@@ -12,8 +12,11 @@ use crate::ContextError;
 /// ASCII `AIOS`, registered on every database owned by this kernel.
 pub(crate) const APPLICATION_ID: i64 = 0x4149_4f53;
 /// Latest schema this binary can read and write.
-pub(crate) const CURRENT_SCHEMA_VERSION: i64 = 7;
+pub(crate) const CURRENT_SCHEMA_VERSION: i64 = 12;
 const MIN_READABLE_SCHEMA_VERSION: i64 = 1;
+// Older adapters flatten streamed native Content boundaries even when they
+// retain opaque metadata. Refuse them before they can mutate this history.
+pub(crate) const MIN_READER_SCHEMA_VERSION: i64 = 12;
 
 const MIGRATIONS: &[(i64, &str)] = &[
     (1, "adopt-versioned-kernel-schema"),
@@ -23,6 +26,11 @@ const MIGRATIONS: &[(i64, &str)] = &[
     (5, "add-destination-agent-mutation-fences"),
     (6, "add-durable-cluster-raft-storage"),
     (7, "bind-destination-fences-to-authority-terms-and-expiry"),
+    (8, "share-immutable-execution-history-prefixes"),
+    (9, "add-atomic-agent-clone-lifecycle"),
+    (10, "retain-fact-indexes-with-binary-embeddings"),
+    (11, "preserve-native-provider-history-metadata"),
+    (12, "preserve-streamed-native-content-boundaries"),
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -36,8 +44,15 @@ pub(crate) struct StorageMetadata {
 const REQUIRED_TABLES: &[&str] = &[
     "contexts",
     "facts",
+    "fact_index_generations",
     "conversations",
     "conversations_fts",
+    "execution_context_snapshots",
+    "conversation_snapshot_refs",
+    "execution_snapshot_fts",
+    "execution_spill_blobs",
+    "execution_spill_edges",
+    "execution_snapshot_spills",
     "usage_log",
     "agent_kv",
     "context_spills",
@@ -90,6 +105,7 @@ const REQUIRED_TABLES: &[&str] = &[
 const LEGACY_MARKER_TABLES: &[&str] = &[
     "contexts",
     "facts",
+    "fact_index_generations",
     "conversations",
     "usage_log",
     "agent_kv",
@@ -338,7 +354,7 @@ pub(crate) fn complete_migration(
             params![
                 APPLICATION_ID,
                 CURRENT_SCHEMA_VERSION,
-                MIN_READABLE_SCHEMA_VERSION,
+                MIN_READER_SCHEMA_VERSION,
                 uuid::Uuid::new_v4().to_string(),
                 &now
             ],
@@ -381,7 +397,7 @@ pub(crate) fn verify(connection: &Connection) -> Result<(), ContextError> {
     ) != (
         APPLICATION_ID,
         CURRENT_SCHEMA_VERSION,
-        MIN_READABLE_SCHEMA_VERSION,
+        MIN_READER_SCHEMA_VERSION,
     ) {
         return Err(storage_error(format!(
             "schema metadata is inconsistent: application_id={}, schema_version={}, \

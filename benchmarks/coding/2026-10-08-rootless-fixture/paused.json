@@ -1,0 +1,94 @@
+{
+  "branches": [
+    {
+      "applied": [
+        "src/lib.rs"
+      ],
+      "error": null,
+      "id": "570034ff-9777-4a2d-9b22-162210c3d968",
+      "index": 0,
+      "owned": true,
+      "phase": "discarded",
+      "proposal": {
+        "edits": [
+          {
+            "expected_sha256": "4e4fb6b89101bd7122ff3f4d6956ab7db4158cad88adb9f2b1a3573491cf54ca",
+            "path": "src/lib.rs",
+            "replacement": "/// Return a borrowed UTF-8 prefix within the requested byte budget.\npub fn bounded_prefix(input: &str, max_bytes: usize) -> &str {\n    let end = input.char_indices().nth(max_bytes).map_or(input.len(), |(index, _)| index);\n    &input[..end]\n}\n"
+          }
+        ]
+      },
+      "request_id": "coding-d7f73e78-b024-4e4f-b58e-3886fd4c6544-0",
+      "seeded": [
+        "Cargo.lock",
+        "Cargo.toml",
+        "src/lib.rs",
+        "tests/utf8_budget.rs"
+      ],
+      "test": {
+        "duration_ms": 553,
+        "exit_code": 101,
+        "kind": "isolated_process",
+        "operation_id": "fc4fdf5e-6492-4bb9-ae92-a1b5ee278c0f",
+        "stderr": "   Compiling coding-utf8-budget-fixture v0.0.0 (/workspace)\n    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.22s\n     Running tests/utf8_budget.rs (target/debug/deps/utf8_budget-eaae964466df3073)\nerror: test failed, to rerun pass `--test utf8_budget`\n",
+        "stdout": "\nrunning 2 tests\ntest ascii_empty_and_unlimited_budgets ... ok\ntest multibyte_text_never_panics_or_exceeds_the_byte_budget ... FAILED\n\nfailures:\n\n---- multibyte_text_never_panics_or_exceeds_the_byte_budget stdout ----\n\nthread 'multibyte_text_never_panics_or_exceeds_the_byte_budget' (96) panicked at tests/utf8_budget.rs:16:13:\nassertion failed: actual.len() <= budget\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n\n\nfailures:\n    multibyte_text_never_panics_or_exceeds_the_byte_budget\n\ntest result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n",
+        "tool": "/tools/coding_tests"
+      },
+      "test_operation": "fc4fdf5e-6492-4bb9-ae92-a1b5ee278c0f"
+    }
+  ],
+  "changed_files": [],
+  "configured_cost_usd": 0.0,
+  "events": [
+    {
+      "action": "context_prepared",
+      "agent": "475eeeef-61fb-4c11-89dd-9e4d1d15e51e",
+      "at": "2026-10-08T07:45:17.453959849Z",
+      "detail": "normal governed provider history saved for branching"
+    },
+    {
+      "action": "clone_intent",
+      "agent": "570034ff-9777-4a2d-9b22-162210c3d968",
+      "at": "2026-10-08T07:45:17.661136168Z",
+      "detail": "caller-known identity reserved in job journal"
+    },
+    {
+      "action": "proposal",
+      "agent": "570034ff-9777-4a2d-9b22-162210c3d968",
+      "at": "2026-10-08T07:45:21.384404732Z",
+      "detail": "validated declared source scope and preimage"
+    },
+    {
+      "action": "patch",
+      "agent": "570034ff-9777-4a2d-9b22-162210c3d968",
+      "at": "2026-10-08T07:45:22.174051033Z",
+      "detail": "src/lib.rs"
+    },
+    {
+      "action": "test_started",
+      "agent": "570034ff-9777-4a2d-9b22-162210c3d968",
+      "at": "2026-10-08T07:45:23.088086761Z",
+      "detail": "fc4fdf5e-6492-4bb9-ae92-a1b5ee278c0f"
+    },
+    {
+      "action": "test_completed",
+      "agent": "570034ff-9777-4a2d-9b22-162210c3d968",
+      "at": "2026-10-08T07:45:25.345053124Z",
+      "detail": "101"
+    },
+    {
+      "action": "discarded",
+      "agent": "570034ff-9777-4a2d-9b22-162210c3d968",
+      "at": "2026-10-08T07:45:26.043708661Z",
+      "detail": "runtime and durable branch data reclaimed"
+    }
+  ],
+  "isolation": "linux_rootless_container",
+  "job_id": "d7f73e78-b024-4e4f-b58e-3886fd4c6544",
+  "mode": "fixture",
+  "model": null,
+  "original_repository_written": false,
+  "provider_tokens": 1359,
+  "selected_agent": null,
+  "status": "paused"
+}

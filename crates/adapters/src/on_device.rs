@@ -40,7 +40,10 @@ use candle_core::quantized::gguf_file;
 use candle_core::{Device, Tensor};
 use candle_transformers::generation::LogitsProcessor;
 use candle_transformers::models::quantized_llama::ModelWeights;
-use tokenizers::Tokenizer;
+use tokenizers::{
+    DecoderWrapper, ModelWrapper, NormalizerWrapper, PostProcessorWrapper, PreTokenizerWrapper,
+    Tokenizer,
+};
 
 use kernel::connector::*;
 use kernel::{ConnectorError, ProviderId};
@@ -159,6 +162,114 @@ struct Engine {
     chat_template: ChatTemplate,
 }
 
+type InferenceResult = Result<(String, u32), ConnectorError>;
+const MAX_DECODED_BYTES: usize = 64 * 1024;
+const PROGRESS_BUFFER: usize = 4;
+
+trait InferenceBackend: Send + Sync {
+    fn model_id(&self) -> &str;
+    fn chat_template(&self) -> ChatTemplate;
+    fn generate(
+        &self,
+        prompt: &str,
+        max_output_tokens: Option<usize>,
+        provider: &ProviderId,
+        cancellation: &tokio_util::sync::CancellationToken,
+        progress: Option<&BlockingProgress>,
+    ) -> InferenceResult;
+}
+
+struct BlockingProgress {
+    sender: tokio::sync::mpsc::Sender<String>,
+    cancellation: tokio_util::sync::CancellationToken,
+    provider: ProviderId,
+}
+
+impl BlockingProgress {
+    fn emit(&self, delta: String) -> Result<(), ConnectorError> {
+        if self.cancellation.is_cancelled() {
+            return Err(ConnectorError::cancelled(self.provider.clone(), None));
+        }
+        self.sender
+            .blocking_send(delta)
+            .map_err(|_| ConnectorError::cancelled(self.provider.clone(), None))
+    }
+}
+
+type Decoder<'a> = tokenizers::tokenizer::DecodeStream<
+    'a,
+    ModelWrapper,
+    NormalizerWrapper,
+    PreTokenizerWrapper,
+    PostProcessorWrapper,
+    DecoderWrapper,
+>;
+
+struct TokenProgress<'a> {
+    tokenizer: &'a Tokenizer,
+    decoder: Decoder<'a>,
+    generated: Vec<u32>,
+    emitted: String,
+    sink: Option<&'a BlockingProgress>,
+}
+
+impl<'a> TokenProgress<'a> {
+    fn new(tokenizer: &'a Tokenizer, sink: Option<&'a BlockingProgress>) -> Self {
+        Self {
+            tokenizer,
+            decoder: tokenizer.decode_stream(true),
+            generated: Vec::new(),
+            emitted: String::new(),
+            sink,
+        }
+    }
+    fn step(&mut self, token: u32) -> Result<(), ConnectorError> {
+        self.generated.push(token);
+        if let Some(sink) = self.sink {
+            if let Some(delta) = self.decoder.step(token).map_err(|_| {
+                ConnectorError::ProtocolError(
+                    "on-device streaming detokenizer rejected its prefix".into(),
+                )
+            })? {
+                if self.emitted.len().saturating_add(delta.len()) > MAX_DECODED_BYTES {
+                    return Err(ConnectorError::ProtocolError(
+                        "on-device output exceeded the byte ceiling".into(),
+                    ));
+                }
+                self.emitted.push_str(&delta);
+                if !delta.is_empty() {
+                    sink.emit(delta)?;
+                }
+            }
+        }
+        Ok(())
+    }
+    fn finish(self) -> InferenceResult {
+        let text = self.tokenizer.decode(&self.generated, true).map_err(|_| {
+            ConnectorError::ProtocolError("on-device batch detokenization failed".into())
+        })?;
+        if text.len() > MAX_DECODED_BYTES {
+            return Err(ConnectorError::ProtocolError(
+                "on-device output exceeded the byte ceiling".into(),
+            ));
+        }
+        if let Some(sink) = self.sink {
+            let tail = text.strip_prefix(&self.emitted).ok_or_else(|| {
+                ConnectorError::ProtocolError(
+                    "on-device stream differs from batch detokenization".into(),
+                )
+            })?;
+            if !tail.is_empty() {
+                sink.emit(tail.to_string())?;
+            }
+        }
+        Ok((
+            text,
+            u32::try_from(self.generated.len()).unwrap_or(u32::MAX),
+        ))
+    }
+}
+
 impl Engine {
     /// Load a GGUF model and its tokenizer into memory. This is the expensive,
     /// one-time step (reads + maps all tensors), done eagerly at construction.
@@ -224,10 +335,12 @@ impl Engine {
         max_output_tokens: Option<usize>,
         provider_id: &ProviderId,
         cancellation: &tokio_util::sync::CancellationToken,
+        progress: Option<&BlockingProgress>,
     ) -> Result<(String, u32), ConnectorError> {
         if cancellation.is_cancelled() {
             return Err(ConnectorError::cancelled(provider_id.clone(), None));
         }
+
         let encoding = self
             .tokenizer
             .encode(prompt, true)
@@ -255,13 +368,23 @@ impl Engine {
         };
         let mut logits_processor = LogitsProcessor::new(self.seed, temperature, None);
 
-        let mut model = self
-            .model
-            .lock()
-            .map_err(|_| ConnectorError::ConnectionFailed("model lock poisoned".into()))?;
-        if cancellation.is_cancelled() {
-            return Err(ConnectorError::cancelled(provider_id.clone(), None));
-        }
+        let mut model = loop {
+            if cancellation.is_cancelled() {
+                return Err(ConnectorError::cancelled(provider_id.clone(), None));
+            }
+            match self.model.try_lock() {
+                Ok(model) => break model,
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    std::thread::sleep(Duration::from_millis(1))
+                }
+                Err(std::sync::TryLockError::Poisoned(_)) => {
+                    return Err(ConnectorError::ConnectionFailed(
+                        "model lock poisoned".into(),
+                    ))
+                }
+            }
+        };
+        model.clear_kv_cache();
 
         const PROMPT_CHUNK_TOKENS: usize = 64;
         let mut logits = None;
@@ -287,7 +410,7 @@ impl Engine {
             .sample(&logits)
             .map_err(|e| ConnectorError::ProtocolError(format!("sample: {e}")))?;
 
-        let mut generated = Vec::new();
+        let mut generated = TokenProgress::new(&self.tokenizer, progress);
         let max_new_tokens = max_output_tokens
             .unwrap_or(self.max_new_tokens)
             .min(self.max_new_tokens)
@@ -299,7 +422,7 @@ impl Engine {
             if self.eos_ids.contains(&next) {
                 break;
             }
-            generated.push(next);
+            generated.step(next)?;
             let input = Tensor::new(&[next], &self.device)
                 .and_then(|t| t.unsqueeze(0))
                 .map_err(|e| ConnectorError::ProtocolError(format!("step tensor: {e}")))?;
@@ -312,11 +435,26 @@ impl Engine {
                 .map_err(|e| ConnectorError::ProtocolError(format!("sample: {e}")))?;
         }
 
-        let text = self
-            .tokenizer
-            .decode(&generated, true)
-            .map_err(|e| ConnectorError::ProtocolError(format!("detokenize: {e}")))?;
-        Ok((text, u32::try_from(generated.len()).unwrap_or(u32::MAX)))
+        generated.finish()
+    }
+}
+
+impl InferenceBackend for Engine {
+    fn model_id(&self) -> &str {
+        &self.model_id
+    }
+    fn chat_template(&self) -> ChatTemplate {
+        self.chat_template
+    }
+    fn generate(
+        &self,
+        prompt: &str,
+        max: Option<usize>,
+        provider: &ProviderId,
+        cancellation: &tokio_util::sync::CancellationToken,
+        progress: Option<&BlockingProgress>,
+    ) -> InferenceResult {
+        Engine::generate(self, prompt, max, provider, cancellation, progress)
     }
 }
 
@@ -374,7 +512,7 @@ pub fn build_prompt_with_template(messages: &[StandardMessage], template: ChatTe
 /// On-device, in-process LLM provider backed by a quantized GGUF model.
 pub struct OnDeviceLlmAdapter {
     id: ProviderId,
-    engine: std::sync::Arc<Engine>,
+    engine: std::sync::Arc<dyn InferenceBackend>,
 }
 
 impl OnDeviceLlmAdapter {
@@ -391,10 +529,73 @@ impl OnDeviceLlmAdapter {
 
 struct OnDeviceSession {
     provider_id: ProviderId,
-    engine: std::sync::Arc<Engine>,
+    engine: std::sync::Arc<dyn InferenceBackend>,
 }
 
-type InferenceResult = Result<(String, u32), ConnectorError>;
+#[cfg(test)]
+struct ControlledDecode {
+    tokenizer: Tokenizer,
+    tokens: Vec<u32>,
+    hold_until_cancel: bool,
+    cleaned: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[cfg(test)]
+impl InferenceBackend for ControlledDecode {
+    fn model_id(&self) -> &str {
+        "controlled-token-fixture"
+    }
+    fn chat_template(&self) -> ChatTemplate {
+        ChatTemplate::Simple
+    }
+    fn generate(
+        &self,
+        _prompt: &str,
+        max: Option<usize>,
+        provider: &ProviderId,
+        cancellation: &tokio_util::sync::CancellationToken,
+        sink: Option<&BlockingProgress>,
+    ) -> InferenceResult {
+        let result = (|| {
+            let mut progress = TokenProgress::new(&self.tokenizer, sink);
+            for &token in self.tokens.iter().take(max.unwrap_or(self.tokens.len())) {
+                if cancellation.is_cancelled() {
+                    return Err(ConnectorError::cancelled(provider.clone(), None));
+                }
+                progress.step(token)?;
+            }
+            if self.hold_until_cancel {
+                while !cancellation.is_cancelled() {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                return Err(ConnectorError::cancelled(provider.clone(), None));
+            }
+            progress.finish()
+        })();
+        self.cleaned
+            .store(true, std::sync::atomic::Ordering::Release);
+        result
+    }
+}
+
+#[cfg(test)]
+fn controlled_tokenizer() -> Tokenizer {
+    Tokenizer::from_bytes(br#"{"version":"1.0","truncation":null,"padding":null,"added_tokens":[],"normalizer":null,"pre_tokenizer":null,"post_processor":null,"decoder":null,"model":{"type":"WordLevel","vocab":{"one":0,"two":1,"three":2},"unk_token":"one"}}"#).expect("controlled tokenizer fixture")
+}
+
+#[cfg(test)]
+pub(crate) fn controlled_streaming_fixture() -> OnDeviceLlmAdapter {
+    OnDeviceLlmAdapter {
+        id: "on-device-fixture".into(),
+        engine: std::sync::Arc::new(ControlledDecode {
+            tokenizer: controlled_tokenizer(),
+            tokens: vec![0, 1, 2],
+            hold_until_cancel: false,
+            cleaned: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }),
+    }
+}
+
 const INFERENCE_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
 async fn drain_inference_worker(
@@ -415,6 +616,99 @@ async fn drain_inference_worker(
             ),
             None,
         )),
+    }
+}
+
+struct WorkerCancellation(tokio_util::sync::CancellationToken);
+impl Drop for WorkerCancellation {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
+}
+
+impl OnDeviceSession {
+    async fn run(
+        &self,
+        messages: Vec<StandardMessage>,
+        options: LlmRequestOptions,
+        cancellation: &tokio_util::sync::CancellationToken,
+        events: Option<ProviderEventSink>,
+        streaming: bool,
+    ) -> Result<LlmResponse, ConnectorError> {
+        if cancellation.is_cancelled() {
+            return Err(ConnectorError::cancelled(self.provider_id.clone(), None));
+        }
+        let prompt = build_prompt_with_template(&messages, self.engine.chat_template());
+        let engine = self.engine.clone();
+        let provider = self.provider_id.clone();
+        let worker_provider = provider.clone();
+        let max = options.max_output_tokens.map(|limit| limit as usize);
+        let worker_cancel = tokio_util::sync::CancellationToken::new();
+        let _cancel_on_drop = WorkerCancellation(worker_cancel.clone());
+        let worker_token = worker_cancel.clone();
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(PROGRESS_BUFFER);
+        let mut worker = tokio::task::spawn_blocking(move || {
+            let progress = BlockingProgress {
+                sender,
+                cancellation: worker_token.clone(),
+                provider: worker_provider.clone(),
+            };
+            engine.generate(
+                &prompt,
+                max,
+                &worker_provider,
+                &worker_token,
+                streaming.then_some(&progress),
+            )
+        });
+        let (interrupted, result) = {
+            let collect = async {
+                let mut open = true;
+                loop {
+                    tokio::select! {
+                        biased;
+                        delta = receiver.recv(), if open => match delta {
+                            Some(delta) => if let Some(sink) = &events { sink.emit(ProviderStreamEvent::TextDelta(delta)).await; },
+                            None => open = false,
+                        },
+                        result = &mut worker => break result.map_err(|error| ConnectorError::ConnectionFailed(format!("inference task: {error}")))?,
+                    }
+                }
+            };
+            tokio::pin!(collect);
+            match options.timeout {
+                Some(timeout) => tokio::select! {
+                    biased;
+                    _ = cancellation.cancelled() => (true, None),
+                    _ = tokio::time::sleep(timeout) => (true, Some(Err(ConnectorError::timeout(provider.clone(), "on-device inference exceeded its deadline", None)))),
+                    result = &mut collect => (false, Some(result)),
+                },
+                None => tokio::select! {
+                    biased;
+                    _ = cancellation.cancelled() => (true, None),
+                    result = &mut collect => (false, Some(result)),
+                },
+            }
+        };
+        if interrupted {
+            worker_cancel.cancel();
+            receiver.close();
+            drop(receiver);
+            drain_inference_worker(&mut worker, &provider, INFERENCE_DRAIN_TIMEOUT).await?;
+            return match result {
+                Some(result) => result.map(|_| unreachable!()),
+                None => Err(ConnectorError::cancelled(provider, None)),
+            };
+        }
+        let (content, tokens) = result.expect("completed worker result")?;
+        Ok(LlmResponse {
+            content,
+            finish_reason: Some("stop".to_string()),
+            tokens_used: tokens,
+            usage: Default::default(),
+            tool_calls: vec![],
+            provider_metadata: None,
+        })
     }
 }
 
@@ -451,81 +745,50 @@ impl LlmSession for OnDeviceSession {
         options: LlmRequestOptions,
         cancellation: &tokio_util::sync::CancellationToken,
     ) -> Result<LlmResponse, ConnectorError> {
-        if cancellation.is_cancelled() {
-            return Err(ConnectorError::cancelled(self.provider_id.clone(), None));
-        }
-        let prompt = build_prompt_with_template(&messages, self.engine.chat_template);
-        let engine = self.engine.clone();
-        let max_output_tokens = options.max_output_tokens.map(|limit| limit as usize);
-        let provider_id = self.provider_id.clone();
-        let worker_cancel = tokio_util::sync::CancellationToken::new();
-        let worker_token = worker_cancel.clone();
-        let worker_provider = provider_id.clone();
-        let mut worker = tokio::task::spawn_blocking(move || {
-            engine.generate(&prompt, max_output_tokens, &worker_provider, &worker_token)
-        });
-        let result = match options.timeout {
-            Some(timeout) => {
-                tokio::select! {
-                    biased;
-                    _ = cancellation.cancelled() => {
-                        worker_cancel.cancel();
-                        drain_inference_worker(
-                            &mut worker,
-                            &provider_id,
-                            INFERENCE_DRAIN_TIMEOUT,
-                        ).await?;
-                        Err(ConnectorError::cancelled(provider_id.clone(), None))
-                    }
-                    _ = tokio::time::sleep(timeout) => {
-                        worker_cancel.cancel();
-                        drain_inference_worker(
-                            &mut worker,
-                            &provider_id,
-                            INFERENCE_DRAIN_TIMEOUT,
-                        ).await?;
-                        Err(ConnectorError::timeout(
-                            provider_id.clone(),
-                            format!("on-device inference exceeded {} ms", timeout.as_millis()),
-                            None,
-                        ))
-                    }
-                    result = &mut worker => {
-                        result.map_err(|error| ConnectorError::ConnectionFailed(
-                            format!("inference task: {error}")
-                        ))?
-                    },
-                }
-            }
-            None => {
-                tokio::select! {
-                    biased;
-                    _ = cancellation.cancelled() => {
-                        worker_cancel.cancel();
-                        drain_inference_worker(
-                            &mut worker,
-                            &provider_id,
-                            INFERENCE_DRAIN_TIMEOUT,
-                        ).await?;
-                        Err(ConnectorError::cancelled(provider_id.clone(), None))
-                    }
-                    result = &mut worker => {
-                        result.map_err(|error| ConnectorError::ConnectionFailed(
-                            format!("inference task: {error}")
-                        ))?
-                    },
-                }
-            }
-        };
-        let (content, tokens) = result?;
-
-        Ok(LlmResponse {
-            content,
-            finish_reason: Some("stop".to_string()),
-            tokens_used: tokens,
-            usage: Default::default(),
-            tool_calls: vec![],
-        })
+        self.run(messages, options, cancellation, None, false).await
+    }
+    async fn send_streaming(
+        &self,
+        messages: Vec<StandardMessage>,
+        tools: &[ToolDefinition],
+    ) -> Result<LlmResponse, ConnectorError> {
+        self.send_streaming_with_options(messages, tools, LlmRequestOptions::default())
+            .await
+    }
+    async fn send_streaming_with_options(
+        &self,
+        messages: Vec<StandardMessage>,
+        _tools: &[ToolDefinition],
+        options: LlmRequestOptions,
+    ) -> Result<LlmResponse, ConnectorError> {
+        self.run(
+            messages,
+            options,
+            &tokio_util::sync::CancellationToken::new(),
+            None,
+            true,
+        )
+        .await
+    }
+    async fn send_streaming_controlled(
+        &self,
+        messages: Vec<StandardMessage>,
+        _tools: &[ToolDefinition],
+        options: LlmRequestOptions,
+        cancellation: &tokio_util::sync::CancellationToken,
+    ) -> Result<LlmResponse, ConnectorError> {
+        self.run(messages, options, cancellation, None, true).await
+    }
+    async fn send_streaming_events_controlled(
+        &self,
+        messages: Vec<StandardMessage>,
+        _tools: &[ToolDefinition],
+        options: LlmRequestOptions,
+        cancellation: &tokio_util::sync::CancellationToken,
+        events: ProviderEventSink,
+    ) -> Result<LlmResponse, ConnectorError> {
+        self.run(messages, options, cancellation, Some(events), true)
+            .await
     }
 
     fn enforces_max_output_tokens(&self) -> bool {
@@ -537,7 +800,7 @@ impl LlmSession for OnDeviceSession {
     }
 
     fn model_id(&self) -> &str {
-        &self.engine.model_id
+        self.engine.model_id()
     }
 }
 
@@ -555,6 +818,7 @@ impl LlmProviderAdapter for OnDeviceLlmAdapter {
     }
     fn capabilities(&self) -> ProviderCapabilities {
         ProviderCapabilities {
+            native_streaming: true,
             prompt_cancellation: true,
             api_family: "candle-gguf".into(),
             ..Default::default()
@@ -579,6 +843,7 @@ impl LlmProviderAdapter for OnDeviceLlmAdapter {
 
     fn translate_from_provider(&self, value: &serde_json::Value) -> Option<StandardMessage> {
         Some(StandardMessage {
+            provider_metadata: None,
             role: value.get("role")?.as_str()?.to_string(),
             content: value.get("content")?.as_str().unwrap_or("").to_string(),
             tool_call_id: None,
@@ -712,6 +977,147 @@ mod tests {
             .expect("test worker should complete cleanly");
     }
 
+    #[tokio::test]
+    async fn controlled_decode_cancellation_closes_backpressure_and_drains_worker() {
+        let cleaned = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let adapter = OnDeviceLlmAdapter {
+            id: "controlled-cancel".into(),
+            engine: std::sync::Arc::new(ControlledDecode {
+                tokenizer: controlled_tokenizer(),
+                tokens: (0..10_000).map(|value| value % 3).collect(),
+                hold_until_cancel: false,
+                cleaned: cleaned.clone(),
+            }),
+        };
+        let session = adapter.create_session().await.unwrap();
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let cancel = cancellation.clone();
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+        let task = tokio::spawn(async move {
+            session
+                .send_streaming_events_controlled(
+                    vec![StandardMessage::user("fixture")],
+                    &[],
+                    LlmRequestOptions {
+                        max_output_tokens: Some(10_000),
+                        timeout: Some(Duration::from_secs(5)),
+                    },
+                    &cancellation,
+                    ProviderEventSink::new(sender),
+                )
+                .await
+        });
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), receiver.recv())
+                .await
+                .unwrap(),
+            Some(ProviderStreamEvent::TextDelta("one".into()))
+        );
+        assert!(!task.is_finished());
+        cancel.cancel();
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(2), task)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap_err(),
+            ConnectorError::Cancelled(_)
+        ));
+        assert!(cleaned.load(std::sync::atomic::Ordering::Acquire));
+        // Any remaining event was accepted before cancellation. Once drained,
+        // the closed channel proves no producer survives the returned error.
+        while receiver.recv().await.is_some() {}
+        assert_eq!(receiver.recv().await, None);
+    }
+
+    #[tokio::test]
+    async fn controlled_decode_deadline_also_drains_a_blocked_progress_worker() {
+        let cleaned = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let adapter = OnDeviceLlmAdapter {
+            id: "controlled-timeout".into(),
+            engine: std::sync::Arc::new(ControlledDecode {
+                tokenizer: controlled_tokenizer(),
+                tokens: vec![0, 1, 2],
+                hold_until_cancel: true,
+                cleaned: cleaned.clone(),
+            }),
+        };
+        let session = adapter.create_session().await.unwrap();
+        let (sender, _receiver) = tokio::sync::mpsc::channel(1);
+        let result = session
+            .send_streaming_events_controlled(
+                vec![StandardMessage::user("fixture")],
+                &[],
+                LlmRequestOptions {
+                    timeout: Some(Duration::from_millis(100)),
+                    ..Default::default()
+                },
+                &tokio_util::sync::CancellationToken::new(),
+                ProviderEventSink::new(sender),
+            )
+            .await;
+        assert!(matches!(result, Err(ConnectorError::Timeout(_))));
+        assert!(cleaned.load(std::sync::atomic::Ordering::Acquire));
+    }
+
+    #[test]
+    fn byte_fallback_progress_waits_for_utf8_and_flushes_exact_batch_tail() {
+        let vocab = [
+            ("<0x20>".to_string(), 0),
+            ("<0xC3>".to_string(), 1),
+            ("<0xA9>".to_string(), 2),
+        ];
+        let model = tokenizers::models::bpe::BPE::builder()
+            .vocab_and_merges(vocab, vec![])
+            .byte_fallback(true)
+            .build()
+            .unwrap();
+        let mut tokenizer = Tokenizer::new(model);
+        tokenizer.with_decoder(Some(
+            tokenizers::decoders::byte_fallback::ByteFallback::default(),
+        ));
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(8);
+        let sink = BlockingProgress {
+            sender,
+            cancellation: tokio_util::sync::CancellationToken::new(),
+            provider: "controlled-bytes".into(),
+        };
+        let mut progress = TokenProgress::new(&tokenizer, Some(&sink));
+        progress.step(0).unwrap();
+        assert_eq!(receiver.try_recv().unwrap(), " ");
+        progress.step(1).unwrap();
+        assert!(receiver.try_recv().is_err());
+        progress.step(2).unwrap();
+        assert_eq!(receiver.try_recv().unwrap(), "é");
+        let (text, count) = progress.finish().unwrap();
+        assert_eq!(text, tokenizer.decode(&[0, 1, 2], true).unwrap());
+        assert_eq!(count, 3);
+        let mut incomplete = TokenProgress::new(&tokenizer, Some(&sink));
+        incomplete.step(1).unwrap();
+        let (text, count) = incomplete.finish().unwrap();
+        assert_eq!(receiver.try_recv().unwrap(), text);
+        assert_eq!(text, tokenizer.decode(&[1], true).unwrap());
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn progress_never_returns_a_terminal_response_with_changed_published_prefix() {
+        let tokenizer = controlled_tokenizer();
+        let (sender, _receiver) = tokio::sync::mpsc::channel(4);
+        let sink = BlockingProgress {
+            sender,
+            cancellation: tokio_util::sync::CancellationToken::new(),
+            provider: "controlled-prefix".into(),
+        };
+        let mut progress = TokenProgress::new(&tokenizer, Some(&sink));
+        progress.step(0).unwrap();
+        progress.emitted.push_str("changed");
+        assert!(matches!(
+            progress.finish(),
+            Err(ConnectorError::ProtocolError(_))
+        ));
+    }
+
     /// Real end-to-end generation. Skipped unless a model is provisioned on the
     /// box via env vars — so CI (which has no weights) never runs it, but it is
     /// a one-command smoke test on a Pi:
@@ -735,5 +1141,38 @@ mod tests {
             resp.content.len()
         );
         assert!(resp.tokens_used > 0, "model should emit at least one token");
+        let messages = vec![StandardMessage::user(
+            "Write the numbers one through twelve separated by spaces.",
+        )];
+        let batch = session
+            .send(messages.clone())
+            .await
+            .expect("batch parity reference");
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(4);
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let send = session.send_streaming_events_controlled(
+            messages,
+            &[],
+            LlmRequestOptions::default(),
+            &cancellation,
+            ProviderEventSink::new(sender),
+        );
+        let collect = async {
+            let mut deltas = Vec::new();
+            while let Some(ProviderStreamEvent::TextDelta(text)) = receiver.recv().await {
+                deltas.push(text);
+            }
+            deltas
+        };
+        let (streamed, deltas) = tokio::join!(send, collect);
+        let streamed = streamed.expect("real native stream");
+        assert!(adapter.capabilities().native_streaming);
+        assert!(
+            deltas.len() >= 2,
+            "native decode must produce incremental text"
+        );
+        assert_eq!(deltas.concat(), streamed.content);
+        assert_eq!(streamed.content, batch.content);
+        assert_eq!(streamed.tokens_used, batch.tokens_used);
     }
 }

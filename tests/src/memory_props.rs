@@ -26,13 +26,13 @@ use kernel::memory_manager::{
 struct LengthBucketEmbedder;
 
 impl Embedder for LengthBucketEmbedder {
-    fn embed(&self, text: &str) -> Vec<f32> {
+    fn embed(&self, text: &str) -> Result<Vec<f32>, kernel::memory_manager::EmbeddingError> {
         let mut v = vec![0.0f32; EMBED_DIM];
         let n = text.chars().count();
         if n > 0 {
             v[n % EMBED_DIM] = 1.0;
         }
-        v
+        Ok(v)
     }
     fn dim(&self) -> usize {
         EMBED_DIM
@@ -117,7 +117,7 @@ proptest! {
 
         // Holds for an explicit Embedder impl too, behind the trait object.
         let e: Arc<dyn Embedder> = Arc::new(BlendedEmbedder::default());
-        prop_assert_eq!(e.embed(&text), e.embed(&text));
+        prop_assert_eq!(e.embed(&text).unwrap(), e.embed(&text).unwrap());
         prop_assert_eq!(e.dim(), EMBED_DIM);
     }
 
@@ -213,7 +213,7 @@ proptest! {
 
             // The alternate embedder produced the LengthBucketEmbedder vector,
             // proving the injected seam is actually on the store path.
-            prop_assert_eq!(&alt_emb, &LengthBucketEmbedder.embed(&content));
+            prop_assert_eq!(&alt_emb, &LengthBucketEmbedder.embed(&content).unwrap());
 
             Ok(())
         })?;
@@ -249,7 +249,7 @@ fn embedder_output_collision_still_honors_the_injected_seam() {
         let alternate_hit = alternate_mgr.query_memory(agent_id, content).await.unwrap();
         assert_eq!(
             alternate_hit[0].embedding.as_ref().unwrap(),
-            &LengthBucketEmbedder.embed(content)
+            &LengthBucketEmbedder.embed(content).unwrap()
         );
     });
 }
@@ -260,7 +260,7 @@ fn embedder_output_collision_still_honors_the_injected_seam() {
 #[test]
 fn alternate_embedder_changes_a_known_multitoken_vector() {
     let content = "the user prefers dark mode";
-    assert_ne!(embed(content), LengthBucketEmbedder.embed(content));
+    assert_ne!(embed(content), LengthBucketEmbedder.embed(content).unwrap());
 }
 
 /// (d, fixed): a hand-checked swappability case independent of proptest input,
@@ -281,6 +281,11 @@ fn legacy_embedder_still_usable_through_seam() {
         assert_eq!(hits.len(), 1);
         let emb = hits[0].embedding.clone().unwrap();
         assert_eq!(emb.len(), EMBED_DIM);
-        assert_eq!(emb, FeatureHashEmbedder.embed("the user prefers dark mode"));
+        assert_eq!(
+            emb,
+            FeatureHashEmbedder
+                .embed("the user prefers dark mode")
+                .unwrap()
+        );
     });
 }

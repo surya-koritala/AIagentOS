@@ -438,8 +438,9 @@ def _expect_exact_identity(
     release_candidate: str,
     expected_commit: str,
     expected_environment: str | None = None,
+    expected_schema_version: int = 1,
 ) -> None:
-    if report.get("schema_version") != 1:
+    if report.get("schema_version") != expected_schema_version:
         raise QualificationError(f"{label} schema_version is unsupported")
     if report.get("qualification_class") != qualification_class:
         raise QualificationError(f"{label} qualification_class is invalid")
@@ -561,6 +562,7 @@ def _validate_evidence(
             release_candidate=release_candidate,
             expected_commit=expected_commit,
             expected_environment=on_device_environment,
+            expected_schema_version=2,
         )
         blockers.extend(
             _failed_boolean_checks(
@@ -569,6 +571,11 @@ def _validate_evidence(
                 (
                     ("passed",),
                     ("on_device_proof_eligible",),
+                    ("checks", "native_incremental_stream"),
+                    ("checks", "stream_batch_byte_parity"),
+                    ("checks", "bounded_stream_generation"),
+                    ("checks", "mid_decode_cancellation_observed"),
+                    ("checks", "mid_decode_worker_drained"),
                     ("checks", "bounded_generation"),
                     ("checks", "cancellation_worker_drained"),
                     ("checks", "load_within_target"),

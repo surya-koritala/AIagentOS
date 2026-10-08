@@ -5,11 +5,15 @@ but it is not yet a publicly supported installer. The release workflow produces
 **qualification artifacts only** and now fails closed unless the protected
 Tauri updater signing identity is available:
 
-| Platform | Qualification bundles | Production requirement still open |
+| Platform | Qualification bundles | Support tier |
 | --- | --- | --- |
-| Linux x86-64 | Debian package and AppImage, built on Ubuntu 22.04 | Native package/AppImage signing and supported-distribution install/upgrade evidence |
-| macOS x86-64 | App bundle and DMG | Developer ID signing, notarization, stapling, and Gatekeeper install/upgrade evidence |
-| Windows x86-64 | MSI and NSIS installer | Authenticode signing and clean-host install/upgrade evidence |
+| Linux x86-64 and arm64 | Debian package and AppImage, built natively on Ubuntu 22.04 | CI candidate; native signing and clean-host qualification pending |
+| macOS Intel and Apple Silicon | Native app bundle and DMG; macOS 13.0 candidate floor | CI candidate; Developer ID, notarization, stapling, and clean-host qualification pending |
+| Windows x86-64 | MSI and NSIS installer | CI candidate; Authenticode and clean-host qualification pending |
+
+The [platform matrix](SUPPORTED_PLATFORMS.md) distinguishes published assets from
+candidate CI artifacts and lists exact names, OS floors, dependencies, and
+per-platform verification. No desktop installer is currently published.
 
 Every bundle is built from the production frontend, receives a CycloneDX SBOM,
 is included in the release SHA-256 manifest, and is covered by the workflow's
@@ -28,11 +32,16 @@ missing values stop the build before packaging.
 Tauri creates updater artifacts and `.sig` files for the Debian, AppImage,
 macOS app, MSI, and NSIS formats. `scripts/build_desktop_update_manifest.py`
 then creates a strict static manifest for tagged builds. It requires exactly one
-artifact/signature pair for every supported installer type, embeds signature
+artifact/signature pair for every supported architecture and installer type, embeds signature
 contents rather than paths, binds download URLs to the exact `vX.Y.Z` tag, and
 rejects malformed signatures, ambiguous assets, non-SemVer versions, and tag
 drift. A real Tauri-signed fixture proves the checked-in public key accepts the
 expected bytes and rejects tampering.
+
+The collector binds every filename to the native OS/architecture before artifacts
+are combined, including the otherwise colliding macOS app archives. The manifest
+rejects missing architectures, unlabelled assets, and duplicate matches rather
+than selecting the first file with a matching suffix.
 
 The Settings screen checks update metadata without exposing the updater plugin
 directly, bounds all data crossing IPC, and requires a second confirmation

@@ -1,0 +1,171 @@
+name: Native ARM archive installation
+
+on:
+  pull_request:
+    branches: [main, 'codex/**']
+    paths:
+      - '.github/workflows/platform-installation.yml'
+      - '.github/workflows/release.yml'
+      - 'scripts/*desktop*'
+      - 'scripts/*platform*'
+      - 'scripts/tests/test_*desktop*'
+      - 'scripts/tests/test_*platform*'
+      - 'docs/SUPPORTED_PLATFORMS.md'
+      - 'crates/cli/**'
+      - 'crates/tui/**'
+      - 'crates/kernel/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: native-installation-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_INCREMENTAL: 0
+  CARGO_PROFILE_RELEASE_CODEGEN_UNITS: 1
+  CARGO_TERM_COLOR: always
+  MACOSX_DEPLOYMENT_TARGET: "13.0"
+
+jobs:
+  contracts:
+    name: Native platform and updater contracts
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.12'
+      - name: Verify exact documented targets and native artifact naming
+        run: |
+          python3 scripts/verify_supported_platforms.py
+          python3 -m unittest discover -s scripts/tests -p 'test_*desktop*.py'
+          python3 -m unittest discover -s scripts/tests -p 'test_*platform*.py'
+
+  native-build:
+    name: Reproducible ARM archive (${{ matrix.target }})
+    needs: contracts
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+          - runner: macos-15
+            target: aarch64-apple-darwin
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.12'
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
+        with:
+          toolchain: 1.97.1
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+        with:
+          save-if: false
+          shared-key: native-arm-installation-${{ matrix.target }}
+      - name: Bind source SHA and deterministic compiler inputs
+        shell: bash
+        run: |
+          echo "INSTALLATION_SOURCE_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+          echo "SOURCE_DATE_EPOCH=$(git show -s --format=%ct HEAD)" >> "$GITHUB_ENV"
+          echo "RUSTFLAGS=--remap-path-prefix=${GITHUB_WORKSPACE}=." >> "$GITHUB_ENV"
+      - name: Build twice at the same stable path and compare every binary
+        shell: bash
+        run: |
+          CARGO_TARGET_DIR=target-repro cargo build --release --locked --target "${{ matrix.target }}" -p agent-cli --bins -p agent-tui -p coding-agent --bin agent-code
+          mv target-repro target-a
+          CARGO_TARGET_DIR=target-repro cargo build --release --locked --target "${{ matrix.target }}" -p agent-cli --bins -p agent-tui -p coding-agent --bin agent-code
+          for binary in agent agent-server agentctl agent-tui agent-code; do
+            cmp "target-a/${{ matrix.target }}/release/$binary" "target-repro/${{ matrix.target }}/release/$binary"
+            file "target-a/${{ matrix.target }}/release/$binary"
+            if [[ "${{ matrix.target }}" == aarch64-apple-darwin ]]; then
+              test "$(lipo -archs "target-a/${{ matrix.target }}/release/$binary")" = arm64
+            else
+              file "target-a/${{ matrix.target }}/release/$binary" | grep -q 'ARM aarch64'
+            fi
+          done
+      - name: Create deterministic final archive and source binding
+        shell: bash
+        run: |
+          mkdir -p dist
+          python3 scripts/build_cli_archive.py \
+            --source "target-a/${{ matrix.target }}/release" \
+            --output "dist/agentos-ci-${INSTALLATION_SOURCE_SHA}-${{ matrix.target }}.zip"
+          printf '%s\n' "$INSTALLATION_SOURCE_SHA" > dist/source-commit.txt
+      - uses: anchore/sbom-action/download-syft@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
+      - name: Bind exact installed binaries to a CycloneDX SBOM and checksums
+        shell: bash
+        run: |
+          mkdir -p sbom-stage
+          for binary in agent agent-server agentctl agent-tui agent-code; do
+            cp "target-a/${{ matrix.target }}/release/$binary" sbom-stage/
+          done
+          syft dir:sbom-stage -o "cyclonedx-json=dist/agentos-ci-${INSTALLATION_SOURCE_SHA}-${{ matrix.target }}.cdx.json"
+          cd dist
+          shasum -a 256 *.zip *.cdx.json > SHA256SUMS
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: native-cli-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  fresh-install:
+    name: Fresh ARM install (${{ matrix.target }})
+    needs: native-build
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+          - runner: macos-15
+            target: aarch64-apple-darwin
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.12'
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: native-cli-${{ matrix.target }}
+          path: dist
+      - name: Install final archive, boot multiple agents, authenticate, and restart
+        shell: bash
+        run: |
+          source_commit="$(cat dist/source-commit.txt)"
+          test "$source_commit" = "$(git rev-parse HEAD)"
+          python3 scripts/platform_archive_installation.py \
+            --dist dist \
+            --archive "dist/agentos-ci-${source_commit}-${{ matrix.target }}.zip" \
+            --target "${{ matrix.target }}" --commit "$source_commit" \
+            --output "reports/${{ matrix.target }}.json"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: native-installation-${{ matrix.target }}
+          path: reports/*
+          if-no-files-found: error
+
+  required:
+    name: Required native ARM installation
+    if: always()
+    needs: [contracts, native-build, fresh-install]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Reject failed or skipped native qualification
+        env:
+          NEEDS_JSON: ${{ toJson(needs) }}
+        run: test "$(jq -r '[.[] | .result == "success"] | all' <<< "$NEEDS_JSON")" = "true"

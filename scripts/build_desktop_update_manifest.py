@@ -12,6 +12,8 @@ from datetime import datetime
 from pathlib import Path
 from urllib.parse import quote
 
+from collect_desktop_assets import FORMATS, asset_name
+
 
 SEMVER = re.compile(
     r"^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)"
@@ -32,11 +34,13 @@ def _regular_file(path: Path, label: str) -> None:
         raise ManifestError(f"{label} must be a regular non-symlink file: {path}")
 
 
-def _one_asset(dist: Path, suffix: str, label: str) -> Path:
+def _one_asset(dist: Path, suffix: str, label: str, version: str, platform: str) -> Path:
+    expected = asset_name(f"v{version}", platform, suffix)
+    prefix = asset_name(f"v{version}", platform, "")
     matches = sorted(
         path
         for path in dist.iterdir()
-        if path.name.endswith(suffix)
+        if path.name.startswith(prefix) and path.name.endswith(suffix)
         and not path.name.endswith(f"{suffix}.sig")
         and path.is_file()
         and not path.is_symlink()
@@ -44,6 +48,8 @@ def _one_asset(dist: Path, suffix: str, label: str) -> Path:
     if len(matches) != 1:
         names = ", ".join(path.name for path in matches) or "none"
         raise ManifestError(f"{label} requires exactly one *{suffix} asset; found {names}")
+    if matches[0].name != expected:
+        raise ManifestError(f"{label} asset name must exactly equal {expected}")
     return matches[0]
 
 
@@ -95,32 +101,45 @@ def build_manifest(
     except ValueError as error:
         raise ManifestError("pub-date must be RFC 3339") from error
 
-    appimage = _platform(
-        _one_asset(dist, ".AppImage", "Linux AppImage"), repository, tag
-    )
-    deb = _platform(_one_asset(dist, ".deb", "Linux Debian"), repository, tag)
-    mac_app = _platform(
-        _one_asset(dist, ".app.tar.gz", "macOS app"), repository, tag
-    )
-    msi = _platform(_one_asset(dist, ".msi", "Windows MSI"), repository, tag)
-    nsis = _platform(
-        _one_asset(dist, "-setup.exe", "Windows NSIS"), repository, tag
-    )
+    platforms: dict[str, dict[str, str]] = {}
+    for architecture in ("x86_64", "aarch64"):
+        linux = f"linux-{architecture}"
+        appimage = _platform(
+            _one_asset(dist, ".AppImage", linux, version, linux), repository, tag
+        )
+        deb = _platform(_one_asset(dist, ".deb", linux, version, linux), repository, tag)
+        macos = f"macos-{architecture}"
+        mac_app = _platform(
+            _one_asset(dist, ".app.tar.gz", macos, version, macos), repository, tag
+        )
+        platforms[linux] = appimage
+        platforms[f"{linux}-appimage"] = appimage
+        platforms[f"{linux}-deb"] = deb
+        platforms[f"darwin-{architecture}"] = mac_app
+        platforms[f"darwin-{architecture}-app"] = mac_app
+    windows = "windows-x86_64"
+    msi = _platform(_one_asset(dist, ".msi", windows, version, windows), repository, tag)
+    nsis = _platform(_one_asset(dist, "-setup.exe", windows, version, windows), repository, tag)
+    platforms[windows] = nsis
+    platforms[f"{windows}-msi"] = msi
+    platforms[f"{windows}-nsis"] = nsis
+
+    expected = {
+        asset_name(tag, platform, suffix)
+        for platform, suffixes in FORMATS.items()
+        for suffix in suffixes
+        if suffix != ".dmg"
+    }
+    for path in dist.iterdir():
+        if path.name.endswith((".AppImage", ".deb", ".app.tar.gz", ".msi", "-setup.exe")):
+            if path.name not in expected:
+                raise ManifestError(f"unrecognized updater asset {path.name}")
 
     return {
         "version": version,
         "notes": notes,
         "pub_date": pub_date,
-        "platforms": {
-            "darwin-x86_64": mac_app,
-            "darwin-x86_64-app": mac_app,
-            "linux-x86_64": appimage,
-            "linux-x86_64-appimage": appimage,
-            "linux-x86_64-deb": deb,
-            "windows-x86_64": nsis,
-            "windows-x86_64-msi": msi,
-            "windows-x86_64-nsis": nsis,
-        },
+        "platforms": platforms,
     }
 
 

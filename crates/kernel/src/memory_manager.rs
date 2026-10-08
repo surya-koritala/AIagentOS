@@ -27,6 +27,10 @@
 
 use std::sync::Arc;
 
+#[path = "memory_manager/http_embeddings.rs"]
+mod http_embeddings;
+pub use http_embeddings::{HttpEmbedder, HttpEmbeddingConfig, HttpEmbeddingProtocol};
+
 /// Dimensionality of the embedding space. Fixed so stored vectors stay
 /// comparable across runs and process restarts.
 pub const EMBED_DIM: usize = 256;
@@ -94,6 +98,32 @@ fn normalize(mut acc: [f32; EMBED_DIM]) -> Vec<f32> {
     acc.to_vec()
 }
 
+/// Typed failures from optional embedding services. Diagnostics never contain
+/// request text, credential values, response bodies or endpoint URLs.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum EmbeddingError {
+    #[error("invalid embedding configuration: {0}")]
+    Configuration(&'static str),
+    #[error("invalid embedding input: {0}")]
+    InvalidInput(&'static str),
+    #[error("embedding service is busy")]
+    Busy,
+    #[error("embedding request timed out")]
+    Timeout,
+    #[error("embedding transport failed")]
+    Transport,
+    #[error("fact store changed during embedding; retry the read")]
+    StoreChanged,
+    #[error("embedding service authentication failed")]
+    Authentication,
+    #[error("embedding service rate limit reached")]
+    RateLimited,
+    #[error("embedding service returned HTTP {0}")]
+    Upstream(u16),
+    #[error("invalid embedding response: {0}")]
+    InvalidResponse(&'static str),
+}
+
 /// An object-safe text → vector embedder.
 ///
 /// Implementations must be **deterministic**: the same input text always
@@ -101,9 +131,30 @@ fn normalize(mut acc: [f32; EMBED_DIM]) -> Vec<f32> {
 /// behind `Arc<dyn Embedder>` so the embedding strategy is injectable.
 pub trait Embedder: Send + Sync {
     /// Embed `text` into a vector of length [`Embedder::dim`].
-    fn embed(&self, text: &str) -> Vec<f32>;
+    fn embed(&self, text: &str) -> Result<Vec<f32>, EmbeddingError>;
     /// The dimensionality of vectors produced by [`Embedder::embed`].
     fn dim(&self) -> usize;
+    /// Validate declared dimensions before a vector is persisted or ranked.
+    fn embed_checked(&self, text: &str) -> Result<Vec<f32>, EmbeddingError> {
+        let vector = self.embed(text)?;
+        if vector.len() != self.dim()
+            || vector.is_empty()
+            || vector.iter().any(|value| !value.is_finite())
+        {
+            return Err(EmbeddingError::InvalidResponse(
+                "dimension or finite-vector contract mismatch",
+            ));
+        }
+        Ok(vector)
+    }
+    /// Fallible batches preserve input order; remote implementations may batch I/O.
+    fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, EmbeddingError> {
+        texts.iter().map(|text| self.embed(text)).collect()
+    }
+    /// Remote work is offloaded from asynchronous context entry points.
+    fn is_remote(&self) -> bool {
+        false
+    }
     /// Stable persistence identifier. Changing the embedding algorithm requires
     /// a new model id or version so stale rows are rebuilt deterministically.
     fn model_id(&self) -> &str {
@@ -121,7 +172,7 @@ pub trait Embedder: Send + Sync {
 pub struct FeatureHashEmbedder;
 
 impl Embedder for FeatureHashEmbedder {
-    fn embed(&self, text: &str) -> Vec<f32> {
+    fn embed(&self, text: &str) -> Result<Vec<f32>, EmbeddingError> {
         let tokens = tokenize(text);
         let mut acc = [0.0f32; EMBED_DIM];
 
@@ -135,7 +186,7 @@ impl Embedder for FeatureHashEmbedder {
             }
         }
 
-        normalize(acc)
+        Ok(normalize(acc))
     }
 
     fn dim(&self) -> usize {
@@ -187,7 +238,7 @@ impl BlendedEmbedder {
 }
 
 impl Embedder for BlendedEmbedder {
-    fn embed(&self, text: &str) -> Vec<f32> {
+    fn embed(&self, text: &str) -> Result<Vec<f32>, EmbeddingError> {
         use std::collections::HashMap;
 
         let tokens = tokenize(text);
@@ -236,7 +287,7 @@ impl Embedder for BlendedEmbedder {
             }
         }
 
-        normalize(acc)
+        Ok(normalize(acc))
     }
 
     fn dim(&self) -> usize {
@@ -264,7 +315,9 @@ pub fn default_embedder() -> Arc<dyn Embedder> {
 /// Backwards-compatible free function: existing call sites in [`crate::context`]
 /// keep working unchanged. Empty or token-free input yields an all-zero vector.
 pub fn embed(text: &str) -> Vec<f32> {
-    BlendedEmbedder::default().embed(text)
+    BlendedEmbedder::default()
+        .embed(text)
+        .expect("offline embedding is infallible")
 }
 
 /// Cosine similarity between two vectors.
@@ -321,6 +374,18 @@ pub trait VectorIndex: Send + Sync {
     fn add(&mut self, id: u64, vec: Vec<f32>);
     /// Return up to `k` ids most similar to `query`, best (highest score) first.
     fn search(&self, query: &[f32], k: usize) -> Vec<(u64, f32)>;
+    /// Apply the caller's durable ordering to equal-scoring candidates.
+    fn search_with_tiebreak(
+        &self,
+        query: &[f32],
+        k: usize,
+        compare: &dyn Fn(u64, u64) -> std::cmp::Ordering,
+    ) -> Vec<(u64, f32)> {
+        let mut hits = self.search(query, self.len());
+        hits.sort_by(|a, b| score_order(a, b).then_with(|| compare(a.0, b.0)));
+        hits.truncate(k);
+        hits
+    }
     /// Number of vectors currently stored.
     fn len(&self) -> usize;
     /// Whether the index holds no vectors.
@@ -336,7 +401,8 @@ pub trait VectorIndex: Send + Sync {
 /// in an ANN index behind [`VectorIndex`] when corpora grow.
 #[derive(Debug, Default, Clone)]
 pub struct BruteForceIndex {
-    entries: Vec<(u64, Vec<f32>)>,
+    entries: Vec<(u64, Vec<f32>, f32)>,
+    positions: std::collections::HashMap<u64, usize>,
 }
 
 impl BruteForceIndex {
@@ -344,26 +410,40 @@ impl BruteForceIndex {
     pub fn new() -> Self {
         Self {
             entries: Vec::new(),
+            positions: std::collections::HashMap::new(),
         }
     }
 }
 
 impl VectorIndex for BruteForceIndex {
     fn add(&mut self, id: u64, vec: Vec<f32>) {
-        if let Some(slot) = self.entries.iter_mut().find(|(eid, _)| *eid == id) {
-            slot.1 = vec;
+        let norm = vector_norm(&vec);
+        if let Some(position) = self.positions.get(&id).copied() {
+            self.entries[position].1 = vec;
+            self.entries[position].2 = norm;
         } else {
-            self.entries.push((id, vec));
+            self.positions.insert(id, self.entries.len());
+            self.entries.push((id, vec, norm));
         }
     }
 
     fn search(&self, query: &[f32], k: usize) -> Vec<(u64, f32)> {
+        self.search_with_tiebreak(query, k, &|_, _| std::cmp::Ordering::Equal)
+    }
+
+    fn search_with_tiebreak(
+        &self,
+        query: &[f32],
+        k: usize,
+        compare: &dyn Fn(u64, u64) -> std::cmp::Ordering,
+    ) -> Vec<(u64, f32)> {
+        let query_norm = vector_norm(query);
         let mut scored: Vec<(u64, f32)> = self
             .entries
             .iter()
-            .map(|(id, v)| (*id, cosine_similarity(query, v)))
+            .map(|(id, v, norm)| (*id, cached_cosine(query, query_norm, v, *norm)))
             .collect();
-        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        scored.sort_by(|a, b| score_order(a, b).then_with(|| compare(a.0, b.0)));
         scored.truncate(k);
         scored
     }
@@ -408,9 +488,40 @@ impl SplitMix64 {
 /// One LSH table: a fixed set of random hyperplanes plus the buckets they induce.
 struct LshTable {
     /// `bits` hyperplanes, each a `dim`-length Gaussian vector.
-    planes: Vec<Vec<f32>>,
-    /// Signature → ids that hash to it in this table.
-    buckets: std::collections::HashMap<u64, Vec<u64>>,
+    planes: std::sync::Arc<Vec<Vec<f32>>>,
+    /// Signature → sparse bitset of dense vector slots.
+    buckets: std::collections::HashMap<u64, CandidateBucket>,
+}
+
+#[derive(Default)]
+struct CandidateBucket {
+    // Sorted nonempty blocks compress repeated members without allocating a
+    // corpus-sized bitset for every sparse signature bucket.
+    blocks: Vec<(usize, u64)>,
+}
+impl CandidateBucket {
+    fn add(&mut self, slot: usize) {
+        let block = slot / 64;
+        let mask = 1_u64 << (slot % 64);
+        match self
+            .blocks
+            .binary_search_by_key(&block, |(block, _)| *block)
+        {
+            Ok(index) => self.blocks[index].1 |= mask,
+            Err(index) => self.blocks.insert(index, (block, mask)),
+        }
+    }
+    fn remove(&mut self, slot: usize) {
+        if let Ok(index) = self
+            .blocks
+            .binary_search_by_key(&(slot / 64), |(block, _)| *block)
+        {
+            self.blocks[index].1 &= !(1_u64 << (slot % 64));
+            if self.blocks[index].1 == 0 {
+                self.blocks.remove(index);
+            }
+        }
+    }
 }
 
 impl LshTable {
@@ -419,10 +530,7 @@ impl LshTable {
     fn signature(&self, vec: &[f32]) -> u64 {
         let mut sig = 0u64;
         for (i, plane) in self.planes.iter().enumerate() {
-            let mut dot = 0.0f32;
-            for (a, b) in vec.iter().zip(plane.iter()) {
-                dot += a * b;
-            }
+            let dot = ordered_dot(vec, plane);
             if dot >= 0.0 {
                 sig |= 1 << i;
             }
@@ -451,8 +559,9 @@ impl LshTable {
 /// degrades gracefully rather than dropping results.
 pub struct LshIndex {
     tables: Vec<LshTable>,
-    /// Source of truth: id → vector. Survives bucket churn on overwrite.
-    vectors: std::collections::HashMap<u64, Vec<f32>>,
+    /// Dense insertion-ordered vectors; buckets contain slot ordinals.
+    vectors: Vec<(u64, Vec<f32>, f32)>,
+    slots: std::collections::HashMap<u64, usize>,
 }
 
 impl LshIndex {
@@ -466,18 +575,18 @@ impl LshIndex {
     pub fn new(dim: usize, num_tables: usize, bits_per_table: usize) -> Self {
         let num_tables = num_tables.max(1);
         let bits = bits_per_table.clamp(1, 64);
-        let mut rng = SplitMix64(Self::SEED);
-        let tables = (0..num_tables)
-            .map(|_| LshTable {
-                planes: (0..bits)
-                    .map(|_| (0..dim).map(|_| rng.next_gaussian()).collect())
-                    .collect(),
+        let planes = shared_lsh_planes(dim, num_tables, bits);
+        let tables = planes
+            .iter()
+            .map(|planes| LshTable {
+                planes: planes.clone(),
                 buckets: std::collections::HashMap::new(),
             })
             .collect();
         Self {
             tables,
-            vectors: std::collections::HashMap::new(),
+            vectors: Vec::new(),
+            slots: std::collections::HashMap::new(),
         }
     }
 
@@ -493,8 +602,8 @@ impl LshIndex {
         for table in &mut self.tables {
             let sig = table.signature(vec);
             if let Some(ids) = table.buckets.get_mut(&sig) {
-                ids.retain(|&x| x != id);
-                if ids.is_empty() {
+                ids.remove(id as usize);
+                if ids.blocks.is_empty() {
                     table.buckets.remove(&sig);
                 }
             }
@@ -502,21 +611,67 @@ impl LshIndex {
     }
 }
 
+type PlaneBank = Vec<std::sync::Arc<Vec<Vec<f32>>>>;
+type PlaneKey = (usize, usize, usize);
+type PlaneCache = std::collections::HashMap<PlaneKey, std::sync::Arc<PlaneBank>>;
+fn shared_lsh_planes(dim: usize, tables: usize, bits: usize) -> std::sync::Arc<PlaneBank> {
+    static BANKS: std::sync::OnceLock<std::sync::Mutex<PlaneCache>> = std::sync::OnceLock::new();
+    let mut banks = BANKS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    banks
+        .entry((dim, tables, bits))
+        .or_insert_with(|| {
+            // Preserve the exact previous PRNG traversal: table, plane, component.
+            let mut rng = SplitMix64(LshIndex::SEED);
+            std::sync::Arc::new(
+                (0..tables)
+                    .map(|_| {
+                        std::sync::Arc::new(
+                            (0..bits)
+                                .map(|_| (0..dim).map(|_| rng.next_gaussian()).collect())
+                                .collect(),
+                        )
+                    })
+                    .collect(),
+            )
+        })
+        .clone()
+}
+
 impl VectorIndex for LshIndex {
     fn add(&mut self, id: u64, vec: Vec<f32>) {
-        // Overwrite: drop the id from every table's old bucket first so no table
-        // holds a stale signature for it.
-        if let Some(old) = self.vectors.get(&id).cloned() {
-            self.remove_id(&old, id);
+        let slot = self.slots.get(&id).copied().unwrap_or(self.vectors.len());
+        // Overwrites retain their original insertion ordinal and remove all
+        // prior bucket memberships before the replacement is published.
+        if let Some((_, old, _)) = self.vectors.get(slot) {
+            self.remove_id(&old.clone(), slot as u64);
         }
         for table in &mut self.tables {
             let sig = table.signature(&vec);
-            table.buckets.entry(sig).or_default().push(id);
+            table.buckets.entry(sig).or_default().add(slot);
         }
-        self.vectors.insert(id, vec);
+        let norm = vector_norm(&vec);
+        if slot == self.vectors.len() {
+            self.vectors.push((id, vec, norm));
+            self.slots.insert(id, slot);
+        } else {
+            self.vectors[slot].1 = vec;
+            self.vectors[slot].2 = norm;
+        }
     }
 
     fn search(&self, query: &[f32], k: usize) -> Vec<(u64, f32)> {
+        self.search_with_tiebreak(query, k, &|a, b| self.slots[&a].cmp(&self.slots[&b]))
+    }
+
+    fn search_with_tiebreak(
+        &self,
+        query: &[f32],
+        k: usize,
+        compare: &dyn Fn(u64, u64) -> std::cmp::Ordering,
+    ) -> Vec<(u64, f32)> {
         if k == 0 || self.vectors.is_empty() {
             return Vec::new();
         }
@@ -526,40 +681,101 @@ impl VectorIndex for LshIndex {
         // radius 1 (cheap: `bits` extra lookups per table) is what lifts recall
         // for the moderate-cosine pairs that text embeddings produce — a near
         // pair that misses on one bit per table still collides.
-        let mut candidates: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        // A dense bitset avoids hashing every repeated bucket member and
+        // looking up each vector again. The candidate union is unchanged.
+        let mut candidates = vec![0_u64; self.vectors.len().div_ceil(64)];
         for table in &self.tables {
             let sig = table.signature(query);
-            if let Some(ids) = table.buckets.get(&sig) {
-                candidates.extend(ids.iter().copied());
-            }
-            for bit in 0..table.planes.len() {
-                if let Some(ids) = table.buckets.get(&(sig ^ (1 << bit))) {
-                    candidates.extend(ids.iter().copied());
+            for signature in
+                std::iter::once(sig).chain((0..table.planes.len()).map(|bit| sig ^ (1 << bit)))
+            {
+                if let Some(slots) = table.buckets.get(&signature) {
+                    for &(block, mask) in &slots.blocks {
+                        candidates[block] |= mask;
+                    }
                 }
             }
         }
-
-        // Safety net: still too few (sparse/unlucky) — score everything. Exact
-        // and bounded by the corpus size, so results are never silently dropped.
-        if candidates.len() < k {
-            candidates = self.vectors.keys().copied().collect();
+        let mut candidate_count = candidates
+            .iter()
+            .map(|block| block.count_ones() as usize)
+            .sum::<usize>();
+        // Preserve the exact safety-net rule and the previous candidate set.
+        if candidate_count < k {
+            candidates.fill(u64::MAX);
+            candidate_count = self.vectors.len();
         }
-
-        let mut scored: Vec<(u64, f32)> = candidates
-            .into_iter()
-            .filter_map(|id| {
-                self.vectors
-                    .get(&id)
-                    .map(|v| (id, cosine_similarity(query, v)))
-            })
-            .collect();
-        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        let query_norm = vector_norm(query);
+        let mut scored = Vec::with_capacity(candidate_count);
+        for (block, mut bits) in candidates.into_iter().enumerate() {
+            while bits != 0 {
+                let slot = block * 64 + bits.trailing_zeros() as usize;
+                bits &= bits - 1;
+                if let Some((id, vector, norm)) = self.vectors.get(slot) {
+                    scored.push((*id, cached_cosine(query, query_norm, vector, *norm)));
+                }
+            }
+        }
+        let compare_hits = |a: &(u64, f32), b: &(u64, f32)| {
+            score_order(a, b)
+                .then_with(|| compare(a.0, b.0))
+                .then_with(|| self.slots[&a.0].cmp(&self.slots[&b.0]))
+        };
+        // Only the returned prefix needs sorting. A total tie order makes the
+        // partition deterministic even for identical or zero vectors.
+        if k < scored.len() {
+            scored.select_nth_unstable_by(k, compare_hits);
+        }
         scored.truncate(k);
+        scored.sort_by(compare_hits);
         scored
     }
 
     fn len(&self) -> usize {
         self.vectors.len()
+    }
+}
+
+/// Four-element blocks reduce iterator overhead in development builds while
+/// preserving the original left-to-right f32 addition order and exact scores.
+fn ordered_dot(left: &[f32], right: &[f32]) -> f32 {
+    let dimension = left.len().min(right.len());
+    let (left_blocks, left_tail) = left[..dimension].as_chunks::<4>();
+    let (right_blocks, right_tail) = right[..dimension].as_chunks::<4>();
+    let mut dot = 0.0_f32;
+    for (left, right) in left_blocks.iter().zip(right_blocks) {
+        dot += left[0] * right[0];
+        dot += left[1] * right[1];
+        dot += left[2] * right[2];
+        dot += left[3] * right[3];
+    }
+    for (left, right) in left_tail.iter().zip(right_tail) {
+        dot += left * right;
+    }
+    dot
+}
+fn vector_norm(vector: &[f32]) -> f32 {
+    ordered_dot(vector, vector).sqrt()
+}
+
+fn cached_cosine(query: &[f32], query_norm: f32, vector: &[f32], norm: f32) -> f32 {
+    if query.is_empty() || query.len() != vector.len() {
+        return 0.0;
+    }
+    let dot = ordered_dot(query, vector);
+    let denominator = query_norm * norm;
+    if denominator > 0.0 {
+        dot / denominator
+    } else {
+        0.0
+    }
+}
+
+fn score_order(a: &(u64, f32), b: &(u64, f32)) -> std::cmp::Ordering {
+    match (a.1.is_nan(), b.1.is_nan()) {
+        (true, false) => std::cmp::Ordering::Greater,
+        (false, true) => std::cmp::Ordering::Less,
+        _ => b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal),
     }
 }
 
@@ -630,21 +846,158 @@ impl MemoryManager {
     }
 
     /// Embed `text` with this manager's embedder.
-    pub fn embed(&self, text: &str) -> Vec<f32> {
+    pub fn embed(&self, text: &str) -> Result<Vec<f32>, EmbeddingError> {
         self.embedder.embed(text)
     }
 
     /// Rank `(item, embedding)` pairs by cosine similarity to `query` text,
     /// embedding the query with this manager's embedder. Best-first.
-    pub fn rank_by_query<T>(&self, query: &str, items: Vec<(T, Vec<f32>)>) -> Vec<(T, f32)> {
-        let q = self.embed(query);
-        rank(&q, items)
+    pub fn rank_by_query<T>(
+        &self,
+        query: &str,
+        items: Vec<(T, Vec<f32>)>,
+    ) -> Result<Vec<(T, f32)>, EmbeddingError> {
+        let q = self.embed(query)?;
+        Ok(rank(&q, items))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn blocked_dot_keeps_original_f32_order_for_vectors_and_tails() {
+        let mut rng = SplitMix64(37);
+        for dimension in [0, 1, 3, 4, 17, 31, 256, 511] {
+            let left = (0..dimension)
+                .map(|_| rng.next_gaussian())
+                .collect::<Vec<_>>();
+            let right = (0..dimension + 3)
+                .map(|_| rng.next_gaussian())
+                .collect::<Vec<_>>();
+            let mut expected = 0.0_f32;
+            for (a, b) in left.iter().zip(&right) {
+                expected += a * b;
+            }
+            assert_eq!(ordered_dot(&left, &right).to_bits(), expected.to_bits());
+            assert_eq!(
+                cached_cosine(&left, vector_norm(&left), &left, vector_norm(&left)).to_bits(),
+                cosine_similarity(&left, &left).to_bits()
+            );
+        }
+    }
+
+    #[test]
+    fn undefined_cosine_scores_sort_last_with_stable_ties() {
+        // Finite vectors can still overflow the f32 norm/dot accumulators.
+        let query = [1.0; 32];
+        let mut indexes: Vec<Box<dyn VectorIndex>> = vec![
+            Box::new(BruteForceIndex::new()),
+            Box::new(LshIndex::with_dim(32)),
+        ];
+        for index in &mut indexes {
+            index.add(7, vec![f32::MAX; 32]);
+            index.add(2, query.to_vec());
+            index.add(99, vec![f32::MAX; 32]);
+            let first = index.search(&query, 3);
+            let second = index.search(&query, 3);
+            assert_eq!(
+                first.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+                vec![2, 7, 99]
+            );
+            assert_eq!(
+                second.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+                vec![2, 7, 99]
+            );
+            assert_eq!(index.search(&query, 1)[0].0, 2);
+        }
+    }
+
+    #[test]
+    fn compressed_candidate_union_preserves_original_probe_and_overwrite_results() {
+        let mut rng = SplitMix64(17);
+        let mut index = LshIndex::new(32, 4, 4);
+        for id in (1..=171).rev() {
+            index.add(id, (0..32).map(|_| rng.next_gaussian()).collect());
+        }
+        index.add(13, vec![1.0; 32]);
+        for query in [
+            vec![0.0; 32],
+            vec![1.0; 32],
+            (0..32).map(|_| rng.next_gaussian()).collect(),
+        ] {
+            for k in [0, 1, 16, 170, 200] {
+                let mut candidates = index
+                    .vectors
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, (_, vector, _))| {
+                        index.tables.iter().any(|table| {
+                            (table.signature(&query) ^ table.signature(vector)).count_ones() <= 1
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                if candidates.len() < k {
+                    candidates = index.vectors.iter().enumerate().collect();
+                }
+                let mut oracle = candidates
+                    .into_iter()
+                    .map(|(slot, (id, vector, _))| (slot, *id, cosine_similarity(&query, vector)))
+                    .collect::<Vec<_>>();
+                oracle.sort_by(|a, b| {
+                    b.2.partial_cmp(&a.2)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                        .then_with(|| a.0.cmp(&b.0))
+                });
+                oracle.truncate(k);
+                assert_eq!(
+                    index.search(&query, k),
+                    oracle
+                        .into_iter()
+                        .map(|(_, id, score)| (id, score))
+                        .collect::<Vec<_>>()
+                );
+            }
+        }
+        let mut tied = LshIndex::new(8, 2, 2);
+        for id in [7, 2, 99, 1] {
+            tied.add(id, vec![1.0; 8]);
+        }
+        tied.add(2, vec![1.0; 8]);
+        assert_eq!(
+            tied.search(&[1.0; 8], 3)
+                .iter()
+                .map(|(id, _)| *id)
+                .collect::<Vec<_>>(),
+            vec![7, 2, 99]
+        );
+        assert_eq!(
+            tied.search_with_tiebreak(&[1.0; 8], 3, &|a, b| b.cmp(&a))
+                .iter()
+                .map(|(id, _)| *id)
+                .collect::<Vec<_>>(),
+            vec![99, 7, 2]
+        );
+    }
+
+    #[test]
+    fn lsh_planes_are_shared_but_agent_vector_buckets_remain_independent() {
+        let mut first = LshIndex::new(32, 4, 8);
+        let second = LshIndex::new(32, 4, 8);
+        for (left, right) in first.tables.iter().zip(&second.tables) {
+            assert!(std::sync::Arc::ptr_eq(&left.planes, &right.planes));
+        }
+        first.add(7, vec![1.0; 32]);
+        assert_eq!(first.len(), 1);
+        assert_eq!(second.len(), 0);
+        assert!(second.search(&[1.0; 32], 1).is_empty());
+        let different = LshIndex::new(32, 5, 8);
+        assert!(!std::sync::Arc::ptr_eq(
+            &first.tables[0].planes,
+            &different.tables[0].planes
+        ));
+    }
 
     #[test]
     fn embed_is_deterministic() {
@@ -739,7 +1092,7 @@ mod tests {
                 add_feature(&mut acc, fnv1a(bigram.as_bytes()), 1.0);
             }
         }
-        assert_eq!(e.embed("the quick brown fox"), normalize(acc));
+        assert_eq!(e.embed("the quick brown fox").unwrap(), normalize(acc));
         assert_eq!(e.dim(), EMBED_DIM);
     }
 
@@ -751,10 +1104,10 @@ mod tests {
         let blended = BlendedEmbedder::default();
         let words = FeatureHashEmbedder;
 
-        let a_b = blended.embed("editor settings");
-        let b_b = blended.embed("editing settings");
-        let a_w = words.embed("editor settings");
-        let b_w = words.embed("editing settings");
+        let a_b = blended.embed("editor settings").unwrap();
+        let b_b = blended.embed("editing settings").unwrap();
+        let a_w = words.embed("editor settings").unwrap();
+        let b_w = words.embed("editing settings").unwrap();
 
         let sim_blended = cosine_similarity(&a_b, &b_b);
         let sim_words = cosine_similarity(&a_w, &b_w);
@@ -926,7 +1279,7 @@ mod tests {
     #[test]
     fn memory_manager_default_uses_blended() {
         let mm = MemoryManager::default();
-        assert_eq!(mm.embed("hello world"), embed("hello world"));
+        assert_eq!(mm.embed("hello world").unwrap(), embed("hello world"));
         assert_eq!(mm.embedder().dim(), EMBED_DIM);
     }
 
@@ -934,8 +1287,8 @@ mod tests {
     fn memory_manager_accepts_custom_embedder() {
         let mm = MemoryManager::new(Arc::new(FeatureHashEmbedder));
         assert_eq!(
-            mm.embed("hello world"),
-            FeatureHashEmbedder.embed("hello world")
+            mm.embed("hello world").unwrap(),
+            FeatureHashEmbedder.embed("hello world").unwrap()
         );
     }
 }

@@ -1,0 +1,29 @@
+{
+  "schema_version": 1,
+  "qualification_class": "coding_cli_clean_runner_fixture",
+  "production_claim_allowed": false,
+  "artifact_sha256": "6d3c4d0a1f6160f6c9deaf552737fd8615fa9e5428e094c836a766c0567ec1ae",
+  "versions": {
+    "agent": "agent 0.4.0-rc.1",
+    "agent-code": "agent-code 0.4.0-rc.1",
+    "agent-server": "agent-server 0.4.0-rc.1",
+    "agent-tui": "agent-tui 0.4.0-rc.1",
+    "agentctl": "agentctl 0.4.0-rc.1"
+  },
+  "binary_sha256": {
+    "agent": "a0a90d274bbff3561acfe4a6fede992427fe95c3f08667890df899663ae3a2f3",
+    "agent-code": "f7bc758ce4d3e0536fbdfacf8d450b7c890d4c4df1e27720700581751bdc99fe",
+    "agent-server": "4e54790a8a26e26bc5faf0f5f90ce8a1473ee55209b47eb1ac06fe93abd8e0d3",
+    "agent-tui": "c471a4bf0b45b6006c57d7307c4c9328f4d30854e1bc2bce344956497ed705de",
+    "agentctl": "246392839847438249c34728ac4df314b8381ffc051b13edd6375ca67092cd6e"
+  },
+  "image": "rust:1.99.0-slim-bookworm@sha256:452176c0cefca88c0b3184ce85a4eb03e3d4fa05d2afb5366abcba853221019e",
+  "environment": {
+    "os": "Linux",
+    "architecture": "x86_64"
+  },
+  "task_completed": true,
+  "fresh_process_resume": true,
+  "completed_effects_replayed": false,
+  "provider_api_calls": 0
+}

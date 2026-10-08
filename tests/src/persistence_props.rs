@@ -66,6 +66,7 @@ impl LlmSession for FixedUsageSession {
     ) -> Result<LlmResponse, ConnectorError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         Ok(LlmResponse {
+            provider_metadata: None,
             content: "deterministic accounting response".into(),
             finish_reason: Some("stop".into()),
             tokens_used: self.input_tokens.saturating_add(self.output_tokens),

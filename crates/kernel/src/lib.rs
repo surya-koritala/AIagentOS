@@ -10,6 +10,7 @@ pub mod auth;
 pub mod budget;
 pub mod cfs;
 pub mod cgroups;
+pub mod cloning;
 pub mod cluster_consensus;
 pub mod cluster_control;
 pub mod cluster_runtime;
@@ -65,6 +66,8 @@ pub mod tool_registry_share;
 pub mod tools;
 pub mod vfs;
 pub mod vision;
+#[cfg(windows)]
+pub(crate) mod windows_private_fs;
 pub mod wire_contract;
 #[cfg(feature = "fuzzing")]
 #[doc(hidden)]
@@ -351,6 +354,9 @@ pub enum SchedulerError {
 /// Errors related to context and memory management.
 #[derive(Debug, thiserror::Error, Clone, PartialEq, Eq)]
 pub enum ContextError {
+    #[error("Embedding failed: {0}")]
+    Embedding(#[from] crate::memory_manager::EmbeddingError),
+
     #[error("Context persistence failed: {0}")]
     PersistenceFailed(String),
 
@@ -455,6 +461,9 @@ pub enum ConnectorError {
     #[error("Provider rejected request: {0:?}")]
     InvalidRequest(ProviderErrorContext),
 
+    #[error("Primary provider tool incompatibility: {0:?}")]
+    ToolIncompatiblePrimary(ProviderErrorContext),
+
     #[error("Provider content filter blocked request: {0:?}")]
     ContentFiltered(ProviderErrorContext),
 
@@ -552,6 +561,7 @@ impl ConnectorError {
             | Self::Authorization(context)
             | Self::ServiceUnavailable(context)
             | Self::InvalidRequest(context)
+            | Self::ToolIncompatiblePrimary(context)
             | Self::ContentFiltered(context)
             | Self::Timeout(context)
             | Self::Cancelled(context) => context.request_id.as_deref(),
@@ -1382,7 +1392,13 @@ impl AgentKernelImpl {
     ) -> Result<Self, KernelError> {
         set_max_browse_chars(config.max_browse_chars);
         let db_path = config.data_dir.join("agent_os.db");
-        let context_manager = Arc::new(match config.storage_encryption.key_path.as_deref() {
+        let embedding = config
+            .embeddings
+            .clone()
+            .map(crate::memory_manager::HttpEmbedder::new)
+            .transpose()
+            .map_err(|error| KernelError::Context(ContextError::Embedding(error)))?;
+        let mut context_store = match config.storage_encryption.key_path.as_deref() {
             Some(key_path) => {
                 let key = crate::storage_encryption::load_storage_encryption_key(key_path)
                     .map_err(KernelError::Context)?;
@@ -1411,7 +1427,11 @@ impl AgentKernelImpl {
             }
             None => SqliteContextManager::new_without_storage_lease(&db_path)
                 .map_err(KernelError::Context)?,
-        });
+        };
+        if let Some(embedding) = embedding {
+            context_store = context_store.with_embedder(Arc::new(embedding));
+        }
+        let context_manager = Arc::new(context_store);
         tracing::info!(
             target: "agentos::storage",
             storage_encryption_enabled = context_manager.storage_encryption_key_id().is_some(),
@@ -1441,6 +1461,11 @@ impl AgentKernelImpl {
             Some(storage_lease),
         )?;
         kernel.backup_maintenance.configure(config.backup.clone())?;
+        for (provider, policy) in &config.provider_routing {
+            kernel
+                .connector
+                .set_routing_policy(provider, policy.clone());
+        }
         if let Some(service_dir) = &config.service_dir {
             *kernel
                 .service_directory
@@ -1564,6 +1589,8 @@ impl AgentKernelImpl {
         // decisions (and denials) are recorded in the agent activity log.
         let observability = Arc::new(ObservabilityEngineImpl::new());
         syscall_gate.set_audit_sink(observability.clone());
+        let connector = Arc::new(AgentConnectorImpl::new());
+        connector.set_degradation_audit_sink(observability.clone());
         // Cumulative USD spend ceiling (inert unless price + ceiling configured).
         // Rehydrate exact fixed-point charges before any agent can be admitted;
         // resetting a configured lifetime ceiling on restart would fail open.
@@ -1627,7 +1654,7 @@ impl AgentKernelImpl {
             sandbox_manager,
             ipc,
             observability,
-            connector: Arc::new(AgentConnectorImpl::new()),
+            connector,
             resource_broker,
             tool_registry,
             tool_vfs: crate::vfs::ToolVfs::default(),
@@ -1728,6 +1755,28 @@ impl AgentKernelImpl {
     /// Create agent with full subsystem coordination.
     pub async fn create_agent_full(&self, config: AgentConfig) -> Result<AgentHandle, KernelError> {
         self.create_agent_grouped(config, None, crate::context::DEFAULT_TENANT, None)
+            .await
+    }
+
+    /// Trusted application bootstrap with a freshly allocated owned workspace.
+    /// The supplied workspace path is replaced; it cannot claim or overwrite an
+    /// operator directory. Lifecycle cleanup owns filesystem/container roots.
+    pub async fn create_agent_with_managed_sandbox(
+        &self,
+        mut config: AgentConfig,
+        mut sandbox: SandboxConfig,
+    ) -> Result<AgentHandle, KernelError> {
+        if !matches!(
+            sandbox.isolation_level,
+            IsolationLevel::Filesystem | IsolationLevel::Container
+        ) {
+            return Err(KernelError::Policy(
+                "managed application bootstrap requires an isolated backend".into(),
+            ));
+        }
+        sandbox.workspace_dir = SandboxManagerImpl::default_config().workspace_dir;
+        config.sandbox_config = Some(sandbox);
+        self.create_agent_grouped_owned(config, None, crate::context::DEFAULT_TENANT, None, true)
             .await
     }
 
@@ -2265,10 +2314,22 @@ impl AgentKernelImpl {
 
     async fn create_agent_grouped(
         &self,
+        config: AgentConfig,
+        group: Option<&str>,
+        tenant_id: &str,
+        requested_agent_id: Option<AgentId>,
+    ) -> Result<AgentHandle, KernelError> {
+        self.create_agent_grouped_owned(config, group, tenant_id, requested_agent_id, false)
+            .await
+    }
+
+    async fn create_agent_grouped_owned(
+        &self,
         mut config: AgentConfig,
         group: Option<&str>,
         tenant_id: &str,
         requested_agent_id: Option<AgentId>,
+        owned_sandbox: bool,
     ) -> Result<AgentHandle, KernelError> {
         let _operator_mutation = self.operator_control.mutation_guard().await;
         let max_agents = self.operator_control.max_agents();
@@ -2283,8 +2344,8 @@ impl AgentKernelImpl {
         // Absence means the secure managed default, never host-unconfined. Only
         // in-process operator code can explicitly request IsolationLevel::Trusted;
         // the wire and package formats do not expose that bypass.
-        let managed_sandbox = config.sandbox_config.is_none();
-        if managed_sandbox {
+        let managed_sandbox = config.sandbox_config.is_none() || owned_sandbox;
+        if config.sandbox_config.is_none() {
             config.sandbox_config = Some(SandboxManagerImpl::default_config());
         }
         // 1. Create agent via agent manager
@@ -2352,7 +2413,7 @@ impl AgentKernelImpl {
         // 9. Persist the agent's durable identity (incl. tenant) so it survives a
         //    restart, then broadcast the creation event. Persistence commits
         //    immediately, so even an abrupt stop recovers this agent + its tenant.
-        if let Err(error) = self.persist_agent_registry(agent_id, &config, tenant_id) {
+        if let Err(error) = self.persist_agent_registry(agent_id, &config, tenant_id, group) {
             self.rollback_created_agent(agent_id).await;
             return Err(error);
         }
@@ -2439,6 +2500,7 @@ impl AgentKernelImpl {
         agent_id: AgentId,
         config: &AgentConfig,
         tenant_id: &str,
+        group: Option<&str>,
     ) -> Result<(), KernelError> {
         let state = self
             .agent_manager
@@ -2480,7 +2542,7 @@ impl AgentKernelImpl {
             created_at: now,
             last_activity_at: now,
         };
-        self.context_manager.save_agent(&record)?;
+        self.context_manager.save_agent_with_group(&record, group)?;
         Ok(())
     }
 
@@ -2493,6 +2555,8 @@ impl AgentKernelImpl {
     /// and best-effort per agent: a malformed row is skipped, not fatal. Returns
     /// the ids that were brought back. A fresh / empty DB rehydrates nothing.
     pub async fn rehydrate_agents(&self) -> Result<Vec<AgentId>, KernelError> {
+        let _operator = self.operator_control.mutation_guard().await;
+        self.context_manager.reconcile_pending_clones()?;
         // Rehydrate tenancy first so an agent's tenant is known to the AuthSystem
         // by the time the agent is re-placed into its tenant's namespace/cgroup.
         self.rehydrate_tenancy().await;
@@ -2586,6 +2650,18 @@ impl AgentKernelImpl {
                 restored.push(p.id);
                 continue;
             }
+            let clone_security = match self.context_manager.clone_security(p.id) {
+                Ok(Some(security))
+                    if security.version == 1 && security.profile == config.permission_profile =>
+                {
+                    Some(security)
+                }
+                Ok(None) => None,
+                _ => {
+                    tracing::warn!("Skipping agent {}: invalid clone security metadata", p.id);
+                    continue;
+                }
+            };
             let sandbox_result = if SandboxManagerImpl::is_managed_config(&sandbox_config) {
                 self.sandbox_manager
                     .create_managed_sandbox(p.id, &sandbox_config)
@@ -2603,24 +2679,35 @@ impl AgentKernelImpl {
                 p.id,
                 p.session_id,
                 config.clone(),
-                state.clone(),
+                if clone_security.is_some() {
+                    AgentState::Initializing
+                } else {
+                    state.clone()
+                },
                 p.created_at,
                 p.last_activity_at,
+            );
+            PermissionSystem::assign_profile(
+                &*self.permission_manager,
+                p.id,
+                &config.permission_profile,
             );
             // Re-admit to the priority scheduler and re-place into OS subsystems,
             // re-arming the agent's tenant isolation: a tenanted agent rejoins its
             // tenant's namespace group + cgroup exactly as at creation, so
             // cross-tenant isolation survives the restart.
-            self.scheduler.admit_id(p.id);
-            let group = if p.tenant_id == crate::context::DEFAULT_TENANT {
-                None
+            let persisted_group = self.context_manager.agent_namespace_group(p.id)?;
+            let group = persisted_group.as_deref().or_else(|| {
+                (p.tenant_id != crate::context::DEFAULT_TENANT).then_some(p.tenant_id.as_str())
+            });
+            let placed = if let Some(security) = clone_security.as_ref() {
+                self.place_cloned_agent(p.id, &config, group, &p.tenant_id, security)
+                    .await
             } else {
-                Some(p.tenant_id.as_str())
+                self.place_agent_in_subsystems(p.id, &config, group, &p.tenant_id)
+                    .await
             };
-            if let Err(error) = self
-                .place_agent_in_subsystems(p.id, &config, group, &p.tenant_id)
-                .await
-            {
+            if let Err(error) = placed {
                 tracing::warn!(
                     "Skipping persisted agent {} because enforcement could not be restored: {}",
                     p.id,
@@ -2630,6 +2717,30 @@ impl AgentKernelImpl {
                 self.agent_manager.purge_agent(p.id);
                 continue;
             }
+            if clone_security.is_some() {
+                if let Some(pid) = self.syscall_gate.pid_of(p.id) {
+                    self.os.procfs.lock().await.set_agent_info(
+                        pid,
+                        "state".into(),
+                        if state == AgentState::Paused {
+                            "paused".into()
+                        } else {
+                            "running".into()
+                        },
+                    );
+                }
+                self.ipc.register_agent(p.id);
+                self.agent_manager
+                    .transition_state(p.id, AgentState::Running)?;
+                if state == AgentState::Paused {
+                    self.agent_manager
+                        .transition_state(p.id, AgentState::Paused)?;
+                }
+                self.syscall_gate
+                    .reopen_tool_admission(p.id)
+                    .map_err(|error| KernelError::Policy(error.to_string()))?;
+            }
+            self.scheduler.admit_id(p.id);
             if state == AgentState::Paused {
                 self.scheduler.set_paused(p.id);
             }
@@ -2682,6 +2793,42 @@ impl AgentKernelImpl {
             return Err(KernelError::Context(error));
         }
         Ok(id)
+    }
+
+    /// List tenant identities for trusted-system administration.
+    pub async fn list_tenants(&self) -> Vec<crate::auth::Tenant> {
+        let auth = self.auth.read().await;
+        let mut tenants: Vec<_> = auth.list_tenants().into_iter().cloned().collect();
+        tenants.sort_by(|a, b| a.id.cmp(&b.id));
+        tenants
+    }
+
+    /// List only the requested tenant's users.
+    pub async fn list_users(&self, tenant_id: &str) -> Vec<crate::auth::User> {
+        let auth = self.auth.read().await;
+        let mut users: Vec<_> = auth.list_users(tenant_id).into_iter().cloned().collect();
+        users.sort_by(|a, b| a.id.cmp(&b.id));
+        users
+    }
+
+    pub async fn list_api_keys(&self, tenant_id: &str) -> Vec<crate::auth::ApiKeyDescriptor> {
+        self.auth.read().await.list_api_keys(tenant_id)
+    }
+
+    pub async fn user_belongs_to_tenant(&self, user_id: &str, tenant_id: &str) -> bool {
+        self.auth
+            .read()
+            .await
+            .get_user(user_id)
+            .is_some_and(|user| user.tenant_id == tenant_id)
+    }
+
+    pub async fn api_key_belongs_to_tenant(&self, key_id: &str, tenant_id: &str) -> bool {
+        self.auth
+            .read()
+            .await
+            .get_api_key(key_id)
+            .is_some_and(|key| key.tenant_id == tenant_id)
     }
 
     /// Register a user under a tenant and persist it. Returns the user id, or an
@@ -2842,9 +2989,20 @@ impl AgentKernelImpl {
     /// Revoke an API key with the same per-credential drain boundary as session
     /// revocation.
     pub async fn revoke_api_key(&self, key: &str) -> Result<bool, KernelError> {
+        self.revoke_api_key_id(&crate::auth::hash_secret(key)).await
+    }
+
+    /// Revoke by the complete non-secret inventory identifier. Uses the same
+    /// durable commit and in-flight drain boundary as plaintext revocation.
+    pub async fn revoke_api_key_id(&self, key_id: &str) -> Result<bool, KernelError> {
+        if key_id.len() != 64 || !key_id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(KernelError::Context(crate::ContextError::StorageError(
+                "invalid API-key identifier".into(),
+            )));
+        }
         let identity = crate::auth::CredentialIdentity {
             kind: crate::auth::CredentialKind::ApiKey,
-            id: crate::auth::hash_secret(key),
+            id: key_id.to_string(),
         };
         let (persisted, removed, drain) = {
             let _mutation = self.auth_mutation_lock.lock().await;
@@ -5102,6 +5260,13 @@ impl AgentKernelImpl {
             .agent_manager
             .get_agent_provider(agent_id)
             .ok_or(AgentError::NotFound(agent_id))?;
+        let tools = self
+            .tool_registry
+            .definitions_for_agent(&self.syscall_gate, agent_id);
+        self.connector
+            .validate_primary_tool_policy(&provider_id, &tools)
+            .map_err(KernelError::Connector)?;
+        let restored_history = self.context_manager.latest_execution_history(agent_id)?;
         let session = self
             .connector
             .connect_resilient(agent_id, &provider_id)
@@ -5116,6 +5281,9 @@ impl AgentKernelImpl {
             self.syscall_gate.clone(),
             "You are a helpful AI assistant. Use the available tools to help the user.".into(),
         );
+        if let Some((conversation_id, messages)) = restored_history {
+            executor = executor.with_restored_history(conversation_id, messages);
+        }
         executor.set_budget_enforcer(self.budget_enforcer.clone());
         executor.set_rate_limiter(self.rate_limiter.clone());
         executor.set_context_budget(self.context_budget_tokens);
@@ -5180,6 +5348,18 @@ impl AgentKernelImpl {
                 .usage
                 .charged_cost_micros
                 .saturating_sub(baseline_usage.charged_cost_micros),
+            degraded_requests: output
+                .usage
+                .degraded_requests
+                .saturating_sub(baseline_usage.degraded_requests),
+            dropped_native_tool_definitions: output
+                .usage
+                .dropped_native_tool_definitions
+                .saturating_sub(baseline_usage.dropped_native_tool_definitions),
+            shim_recovered_tool_calls: output
+                .usage
+                .shim_recovered_tool_calls
+                .saturating_sub(baseline_usage.shim_recovered_tool_calls),
         };
         self.agent_manager.record_activity(agent_id);
         ObservabilityEngine::record_metrics(
@@ -7652,6 +7832,7 @@ mod tests {
                 self.entered.notify_one();
                 self.release.notified().await;
                 Ok(crate::connector::LlmResponse {
+                    provider_metadata: None,
                     content: "must be cancelled".into(),
                     finish_reason: Some("stop".into()),
                     tokens_used: 1,

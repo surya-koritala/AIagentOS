@@ -1582,18 +1582,28 @@ fn read_configuration_text(path: &Path) -> std::io::Result<String> {
 pub fn write_owner_only_atomic(path: &Path, contents: &[u8]) -> Result<(), std::io::Error> {
     use std::io::Write;
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
-    let parent = path.parent().filter(|parent| !parent.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
     let existing = match std::fs::symlink_metadata(path) {
         Ok(metadata) => {
             if !metadata.is_file() || metadata.uid() != unsafe { libc::geteuid() } {
-                return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied,
-                    "operator file must be a regular current-user-owned object"));
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "operator file must be a regular current-user-owned object",
+                ));
             }
-            let file = std::fs::OpenOptions::new().write(true)
-                .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW).open(path)?;
+            let file = std::fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+                .open(path)?;
             let opened = file.metadata()?;
             if opened.dev() != metadata.dev() || opened.ino() != metadata.ino() {
-                return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "operator file changed before protection"));
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "operator file changed before protection",
+                ));
             }
             // Tighten the old object before any new secret bytes are written.
             file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
@@ -1604,21 +1614,35 @@ pub fn write_owner_only_atomic(path: &Path, contents: &[u8]) -> Result<(), std::
     };
     let stage = parent.join(format!(".agentos-operator-{}.stage", uuid::Uuid::new_v4()));
     let result = (|| {
-        let mut output = std::fs::OpenOptions::new().write(true).create_new(true)
-            .mode(0o600).custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW).open(&stage)?;
+        let mut output = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+            .open(&stage)?;
         output.write_all(contents)?;
         output.sync_all()?;
         drop(output);
         match (existing.as_ref(), std::fs::symlink_metadata(path)) {
-            (Some(previous), Ok(current)) if current.is_file() && current.uid() == unsafe { libc::geteuid() }
-                && previous.dev() == current.dev() && previous.ino() == current.ino() => {},
-            (None, Err(error)) if error.kind() == std::io::ErrorKind::NotFound => {},
-            _ => return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "operator file changed before publication")),
+            (Some(previous), Ok(current))
+                if current.is_file()
+                    && current.uid() == unsafe { libc::geteuid() }
+                    && previous.dev() == current.dev()
+                    && previous.ino() == current.ino() => {}
+            (None, Err(error)) if error.kind() == std::io::ErrorKind::NotFound => {}
+            _ => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "operator file changed before publication",
+                ))
+            }
         }
         std::fs::rename(&stage, path)?;
         std::fs::File::open(parent)?.sync_all()
     })();
-    if result.is_err() { let _ = std::fs::remove_file(&stage); }
+    if result.is_err() {
+        let _ = std::fs::remove_file(&stage);
+    }
     result
 }
 
@@ -1686,7 +1710,10 @@ pub fn local_operator_identity() -> std::io::Result<String> {
     }
     #[cfg(not(any(unix, windows)))]
     {
-        Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "local operator identity is unsupported"))
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "local operator identity is unsupported",
+        ))
     }
 }
 
@@ -1720,7 +1747,10 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
         }
         #[cfg(windows)]
         crate::windows_private_fs::verify_path(&path, false).unwrap();
@@ -1732,7 +1762,10 @@ mod tests {
         assert!(write_owner_only_atomic(&linked, first).is_err());
         assert_eq!(std::fs::read(&path).unwrap(), second);
         assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 2);
-        assert_eq!(local_operator_identity().unwrap(), local_operator_identity().unwrap());
+        assert_eq!(
+            local_operator_identity().unwrap(),
+            local_operator_identity().unwrap()
+        );
     }
 
     #[test]

@@ -587,7 +587,14 @@ pub(crate) fn operator_identity() -> io::Result<String> {
     }
     let bytes = unsafe { std::slice::from_raw_parts(sid.cast::<u8>(), size) };
     let identity = ring::digest::digest(&ring::digest::SHA256, bytes);
-    Ok(format!("windows-user:{}", identity.as_ref().iter().map(|byte| format!("{byte:02x}")).collect::<String>()))
+    Ok(format!(
+        "windows-user:{}",
+        identity
+            .as_ref()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    ))
 }
 
 #[cfg(test)]

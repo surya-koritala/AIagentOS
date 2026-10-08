@@ -8,6 +8,9 @@ on:
       - 'crates/sdk/**'
       - 'fixtures/coding-agent/**'
       - 'Cargo.lock'
+      - 'scripts/build_cli_archive.py'
+      - 'scripts/linux_cli_rc_qualification.py'
+      - 'scripts/verify_coding_install.py'
       - '.github/workflows/coding-agent.yml'
   workflow_dispatch:
 
@@ -15,6 +18,83 @@ permissions:
   contents: read
 
 jobs:
+  candidate-package:
+    name: Build downloadable coding CLI candidate
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    env:
+      CARGO_INCREMENTAL: 0
+      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: 1
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
+        with:
+          toolchain: 1.97.1
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
+      - name: Build the canonical five-binary archive
+        run: |
+          export SOURCE_DATE_EPOCH="$(git show -s --format=%ct HEAD)"
+          export RUSTFLAGS="--remap-path-prefix=${GITHUB_WORKSPACE}=."
+          cargo build --release --locked -p agent-cli --bins -p agent-tui -p coding-agent --bin agent-code
+          mkdir -p dist/stage
+          for binary in agent agent-server agent-tui agentctl agent-code; do
+            cp "target/release/$binary" dist/stage/
+          done
+          python3 scripts/build_cli_archive.py --source dist/stage --output dist/agentos-coding-candidate.zip
+          sha256sum dist/agentos-coding-candidate.zip > dist/SHA256SUMS
+          cp scripts/verify_coding_install.py scripts/linux_cli_rc_qualification.py dist/
+          target/release/agent-code --version | cut -d ' ' -f 2 > dist/VERSION
+          git rev-parse HEAD > dist/SOURCE_COMMIT
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: coding-cli-candidate-${{ github.sha }}
+          path: |
+            dist/agentos-coding-candidate.zip
+            dist/SHA256SUMS
+            dist/VERSION
+            dist/SOURCE_COMMIT
+            dist/verify_coding_install.py
+            dist/linux_cli_rc_qualification.py
+
+  candidate-install:
+    name: Verify downloaded coding CLI on a clean runner
+    needs: candidate-package
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    env:
+      CODING_RUST_IMAGE: rust:1.99.0-slim-bookworm@sha256:452176c0cefca88c0b3184ce85a4eb03e3d4fa05d2afb5366abcba853221019e
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: coding-cli-candidate-${{ github.sha }}
+          path: downloaded
+      - uses: docker/setup-docker-action@77e84dbf09b47d1e29270283c22f16145aa85ca1 # v5
+        with:
+          version: v29.6.2
+          rootless: true
+          daemon-config: |
+            {"exec-opts": ["native.cgroupdriver=cgroupfs"]}
+      - name: Verify checksum and source before installation
+        run: |
+          test "$(cat downloaded/SOURCE_COMMIT)" = "$GITHUB_SHA"
+          expected="$(cut -d ' ' -f 1 downloaded/SHA256SUMS)"
+          actual="$(sha256sum downloaded/agentos-coding-candidate.zip | cut -d ' ' -f 1)"
+          test "$actual" = "$expected"
+          docker info --format '{{json .SecurityOptions}}' | grep -qi rootless
+          docker pull "$CODING_RUST_IMAGE"
+          python3 downloaded/verify_coding_install.py --archive downloaded/agentos-coding-candidate.zip \
+            --sha256 "$expected" --version "$(cat downloaded/VERSION)" --image "$CODING_RUST_IMAGE" \
+            --destination "$RUNNER_TEMP/coding-install" --report downloaded/install-report.json
+          test -z "$(docker ps -aq --filter label=aiagentos.sandbox=true)"
+      - name: Retain install results and task receipts
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: coding-cli-install-${{ github.sha }}
+          path: |
+            downloaded/install-report.json
+            ${{ runner.temp }}/coding-install/reports/
+
   coding-fixture:
     name: Governed coding fixture and restart
     runs-on: ubuntu-latest

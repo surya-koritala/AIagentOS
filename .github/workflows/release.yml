@@ -6,6 +6,12 @@ on:
       - "v*"
       - "!v*-rc.*"
   workflow_dispatch:
+    inputs:
+      desktop_assets:
+        description: Build optional desktop qualification installers
+        type: boolean
+        default: false
+        required: true
 
 permissions:
   contents: read
@@ -43,6 +49,7 @@ jobs:
 
   desktop-release-contract:
     name: Desktop release contract
+    if: (github.event_name == 'workflow_dispatch' && inputs.desktop_assets) || (github.event_name == 'push' && vars.DESKTOP_ASSETS_QUALIFIED == 'true')
     needs: required-ci
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -60,6 +67,7 @@ jobs:
 
   desktop-artifacts:
     name: Qualification installers (${{ matrix.platform }})
+    if: (github.event_name == 'workflow_dispatch' && inputs.desktop_assets) || (github.event_name == 'push' && vars.DESKTOP_ASSETS_QUALIFIED == 'true')
     needs: [required-ci, desktop-release-contract]
     timeout-minutes: 60
     strategy:
@@ -333,8 +341,14 @@ jobs:
 
   assemble:
     name: Checksums, signatures, and provenance
+    if: >-
+      always() &&
+      needs.required-ci.result == 'success' &&
+      needs.wedge.result == 'success' &&
+      needs.release-artifacts.result == 'success' &&
+      needs.container.result == 'success'
     needs:
-      [required-ci, wedge, desktop-artifacts, release-artifacts, container]
+      [required-ci, wedge, desktop-release-contract, desktop-artifacts, release-artifacts, container]
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
@@ -348,8 +362,23 @@ jobs:
           pattern: release-*
           path: dist
           merge-multiple: true
+      - name: Require CLI evidence and account for optional desktop assets
+        id: inventory
+        env:
+          DESKTOP_REQUESTED: ${{ (github.event_name == 'workflow_dispatch' && inputs.desktop_assets) || (github.event_name == 'push' && vars.DESKTOP_ASSETS_QUALIFIED == 'true') }}
+          DESKTOP_CONTRACT_RESULT: ${{ needs.desktop-release-contract.result }}
+          DESKTOP_RESULT: ${{ needs.desktop-artifacts.result }}
+        run: |
+          python3 scripts/prepare_release_bundle.py \
+            --dist dist --version "$ARTIFACT_VERSION" \
+            --desktop-requested "$DESKTOP_REQUESTED" \
+            --desktop-contract-result "$DESKTOP_CONTRACT_RESULT" \
+            --desktop-result "$DESKTOP_RESULT" \
+            --report release-asset-inventory.json \
+            --notes-output DISTRIBUTION_NOTES.md \
+            --github-output "$GITHUB_OUTPUT"
       - name: Build strict static updater metadata for a tagged release
-        if: startsWith(github.ref, 'refs/tags/v')
+        if: startsWith(github.ref, 'refs/tags/v') && steps.inventory.outputs.updater_ready == 'true'
         run: |
           version="${GITHUB_REF_NAME#v}"
           awk -v v="$version" '
@@ -366,6 +395,10 @@ jobs:
             --notes-file UPDATE_NOTES.md \
             --pub-date "$(git show -s --format=%cI HEAD)" \
             --output dist/latest.json
+      - name: Include release asset inventory and omission notes
+        run: |
+          cp release-asset-inventory.json dist/release-asset-inventory.json
+          cp DISTRIBUTION_NOTES.md dist/DISTRIBUTION_NOTES.md
       - name: Generate SHA-256 manifest
         working-directory: dist
         run: >-
@@ -389,7 +422,7 @@ jobs:
 
   publish:
     name: Publish tagged GitHub release
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: always() && startsWith(github.ref, 'refs/tags/v') && needs.assemble.result == 'success'
     needs: assemble
     runs-on: ubuntu-latest
     permissions:
@@ -409,6 +442,8 @@ jobs:
             grab {print}
           ' CHANGELOG.md > RELEASE_NOTES.md
           test -s RELEASE_NOTES.md
+          test -s dist/DISTRIBUTION_NOTES.md
+          cat dist/DISTRIBUTION_NOTES.md >> RELEASE_NOTES.md
       - name: Create GitHub release from the existing tag
         env:
           GH_TOKEN: ${{ github.token }}

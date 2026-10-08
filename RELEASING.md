@@ -86,8 +86,10 @@ defines candidate OS floors, architectures, exact artifact names, dependencies,
 and native verification. Its CI drift check must pass before release qualification.
 
 Before tagging, manually dispatch `.github/workflows/release.yml` on the release
-branch. This qualification mode creates the complete signed evidence bundle but
-cannot publish a GitHub Release. A `v*` tag runs the same workflow and
+branch. This qualification mode creates the required signed CLI evidence bundle
+but cannot publish a GitHub Release. Desktop artifacts default to disabled;
+select `desktop_assets=true` only for a desktop qualification run with its
+protected signing identity. A `v*` tag runs the same workflow and
 **publishes only if all of these pass** against the exact tagged commit:
 
 1. **Full required CI** — the same release-blocking workflow used by protected
@@ -97,7 +99,7 @@ cannot publish a GitHub Release. A `v*` tag runs the same workflow and
    contained and audited, compliant agents keep working. If the product's one
    job regresses, the release is blocked.
 3. **Reproducible platform binaries** — Linux, macOS, and Windows CLI, server,
-   and TUI binaries are built twice in isolated target directories and must be
+   TUI, operator, and coding-agent binaries are built twice in isolated target directories and must be
    byte-for-byte identical before deterministic archives are accepted.
 4. **Container qualification** — the pinned-base, non-root `agent-server` image
    builds, boots, answers a real `{"op":"node_info"}` syscall round-trip, and
@@ -105,14 +107,19 @@ cannot publish a GitHub Release. A `v*` tag runs the same workflow and
 5. **Supply-chain evidence** — each platform archive has a CycloneDX SBOM, the
    container has an SPDX SBOM, every asset appears in `SHA256SUMS`, and assets
    are keyless-signed with Sigstore and covered by GitHub build provenance.
-6. **Desktop installer qualification** — Linux Debian/AppImage, macOS DMG, and
+6. **Optional desktop installer qualification** — Linux Debian/AppImage, macOS DMG, and
    Windows MSI/NSIS installers build from the production frontend on their
    native platform, carry a CycloneDX SBOM, and enter the same checksum,
    Sigstore, and provenance bundle. These are qualification artifacts, not a
    substitute for native platform trust.
 
-Only then does the workflow publish a GitHub Release whose notes are the matching
-`CHANGELOG.md` section. Verify a downloaded release with:
+All five required gates must succeed. Skipped, cancelled, or failed optional
+desktop jobs do not waive any CLI gate and their partial output is excluded.
+The release notes contain the matching `CHANGELOG.md` section followed by an
+asset inventory and explicit omitted classes and reasons. The inventory and
+distribution notes enter the checksum, Sigstore, and provenance bundle too.
+The container SPDX SBOM is included; this workflow does not publish a container
+image to a registry. Verify a downloaded release with:
 
 ```bash
 sha256sum --check SHA256SUMS
@@ -128,12 +135,27 @@ gh attestation verify agentos-vX.Y.Z-x86_64-unknown-linux-gnu.zip \
 This is how "are we building the right product?" gets enforced mechanically: a
 release that can't contain a rogue agent or boot a server doesn't ship.
 
-Stable public tags are currently blocked by the desktop release contract. Native
-platform signing, macOS notarization, signed updater metadata, clean-host
-upgrade/rollback evidence, and the supported-platform matrix must land before
-that block can be removed. Restricted `vX.Y.Z-rc.N` tags use the separately
+Stable tags default to CLI-only assets. A repository variable
+`DESKTOP_ASSETS_QUALIFIED=true` requests desktop contributions, but cannot waive
+the existing desktop release contract: native platform signing, macOS
+notarization, signed updater metadata, clean-host upgrade/rollback evidence,
+and the supported-platform matrix must land before that block can be replaced.
+No desktop output from a failed contract or installer matrix is published.
+`latest.json` is emitted only for a complete signed updater matrix across all
+five platforms, including each installer-specific format; a missing pair omits
+the manifest, while a malformed present signature still fails closed.
+Restricted `vX.Y.Z-rc.N` tags use the separately
 scoped Linux CLI prerelease gate above. See
 [desktop distribution](docs/DESKTOP_DISTRIBUTION.md).
+
+The PR `Optional release asset contract` workflow tests required inventories and
+the actual hosted dependency graph for skipped desktop jobs and a complete
+fixture matrix. Its manual negative scenarios intentionally fail one dependency
+and verify that the publication boundary is skipped. They have read-only
+permissions and never create tags, releases, signatures, or installers. These
+fixtures do not qualify a public release. Before first stable publication,
+retain scratch-fork stable-tag success and one actual negative run for each
+mandatory production job under #340, then obtain publication approval.
 
 ## Repository merge policy
 

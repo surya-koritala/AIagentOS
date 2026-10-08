@@ -1159,12 +1159,18 @@ async fn run_online(
             let content = read_message_content(&source);
             let result = client
                 .send_message_content_stream(request_id.clone(), agent_id, content, |event| {
-                    println!("{}", serde_json::json!({"type":"event","request_id":request_id,"event":event}));
+                    println!(
+                        "{}",
+                        serde_json::json!({"type":"event","request_id":request_id,"event":event})
+                    );
                     let _ = std::io::stdout().flush();
                 })
                 .await
                 .unwrap_or_else(|error| fail(error));
-            println!("{}",serde_json::json!({"type":"completed","request_id":request_id,"result":result}));
+            println!(
+                "{}",
+                serde_json::json!({"type":"completed","request_id":request_id,"result":result})
+            );
             return;
         }
         "message" => {

@@ -48,6 +48,8 @@ and standard base64 data. The reserved audio tag is rejected. Parts in system,
 assistant and tool history are rejected; native provider replay metadata stays
 separate. Images are limited to 1 MiB decoded bytes and 2048 pixels per dimension,
 four images and 32 parts per message, and 6 MiB serialized multipart content.
+An image-bearing request additionally has at most 16 images, 4 MiB decoded
+image bytes and 8 MiB of serialized standardized history.
 URLs, file paths, animation, image output and audio input are unavailable.
 PNG validation checks chunk CRC, legal IHDR fields, palette constraints and
 critical ordering. JPEG checks bounded 8-bit Huffman DCT containers, frame/scan
@@ -82,7 +84,9 @@ The CLI's stream frames retain the ordinary event/completion envelope.
 Schema/min-reader 13 is established before conversation, snapshot, spill,
 checkpoint or clone writes. Complete parts remain in private durable JSON and
 survive replay; logs, debug, search indexes and checkpoint listings use redacted
-projections. Keyless tests are hosted in `image-input.yml`. Live provider,
+projections. Image-bearing requests retain typed failures and retry hints while
+discarding vendor diagnostic text and request IDs that could echo input bytes.
+Keyless tests are hosted in `image-input.yml`. Live provider,
 hardware and independent qualification remain open in #360/#120.
 
 A green nightly run with an empty provider set retains a dated `not_run` plan

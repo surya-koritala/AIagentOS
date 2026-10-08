@@ -10,6 +10,9 @@ pub const MAX_IMAGES_PER_MESSAGE: usize = 4;
 pub const MAX_IMAGE_BYTES: usize = 1024 * 1024;
 pub const MAX_IMAGE_DIMENSION: u32 = 2048;
 pub const MAX_MESSAGE_CONTENT_BYTES: usize = 6 * 1024 * 1024;
+pub const MAX_IMAGES_PER_REQUEST: usize = 16;
+pub const MAX_IMAGE_BYTES_PER_REQUEST: usize = 4 * 1024 * 1024;
+pub const MAX_IMAGE_REQUEST_BYTES: usize = 8 * 1024 * 1024;
 
 fn invalid() -> String {
     "invalid or oversized message content".into()
@@ -414,7 +417,10 @@ impl ImageInput {
         if bytes.is_empty() || bytes.len() > MAX_IMAGE_BYTES {
             return Err(invalid());
         }
-        Self::new(media_type, base64::engine::general_purpose::STANDARD.encode(bytes))
+        Self::new(
+            media_type,
+            base64::engine::general_purpose::STANDARD.encode(bytes),
+        )
     }
     /// Accept only explicit PNG/JPEG containers with bounded bytes/dimensions.
     /// No URL fetch, filesystem access, raster decoding or animation occurs.
@@ -701,6 +707,8 @@ pub fn validate_messages(
     provider: &ProviderId,
     profile: Option<&ImageInputProfile>,
 ) -> Result<u32, ConnectorError> {
+    let mut image_count = 0usize;
+    let mut image_bytes = 0usize;
     for message in messages {
         if let MessageContent::Parts(parts) = &message.content {
             MessageContent::parts(parts.clone()).map_err(ConnectorError::ProtocolError)?;
@@ -710,12 +718,20 @@ pub fn validate_messages(
         {
             return Err(ConnectorError::unsupported_content(provider.clone()));
         }
+        for image in message.content.images() {
+            image_count = image_count.saturating_add(1);
+            image_bytes = image_bytes.saturating_add(image.decoded_bytes());
+        }
     }
     if !messages
         .iter()
         .any(|message| message.content.is_multimodal())
     {
         return Ok(0);
+    }
+    if image_count > MAX_IMAGES_PER_REQUEST || image_bytes > MAX_IMAGE_BYTES_PER_REQUEST
+        || serde_json::to_vec(messages).map_or(true,|bytes|bytes.len() > MAX_IMAGE_REQUEST_BYTES) {
+        return Err(ConnectorError::ProtocolError(invalid()));
     }
     let profile = profile.ok_or_else(|| ConnectorError::unsupported_content(provider.clone()))?;
     profile.token_bound(&profile.model_id, messages)
@@ -953,6 +969,7 @@ mod tests {
             3000
         );
         assert!(profile.validate("another-model").is_err());
+        assert!(validate_messages(&vec![message.clone();MAX_IMAGES_PER_REQUEST+1],&provider,Some(&profile)).is_err());
         let audio = crate::connector::StandardMessage::user_content(
             MessageContent::parts(vec![ContentPart::Audio]).unwrap(),
         );

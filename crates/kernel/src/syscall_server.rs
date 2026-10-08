@@ -5935,6 +5935,7 @@ where
 
 /// Authorize and drive one live stream on the current connection. The
 /// credential lease acquired by the caller remains held until this returns.
+#[allow(clippy::too_many_arguments)]
 async fn dispatch_message_stream<W>(
     kernel: &AgentKernelImpl,
     request_id: String,

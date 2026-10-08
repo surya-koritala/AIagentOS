@@ -126,10 +126,13 @@ fn storage_error(message: impl Into<String>) -> ContextError {
 /// Validate database identity, compatibility, and physical integrity before any
 /// startup PRAGMA or migration is allowed to mutate the file.
 pub(crate) fn preflight(connection: &Connection) -> Result<i64, ContextError> {
-    preflight_for_reader(connection,CURRENT_SCHEMA_VERSION)
+    preflight_for_reader(connection, CURRENT_SCHEMA_VERSION)
 }
 
-pub(crate) fn preflight_for_reader(connection: &Connection, supported: i64) -> Result<i64, ContextError> {
+pub(crate) fn preflight_for_reader(
+    connection: &Connection,
+    supported: i64,
+) -> Result<i64, ContextError> {
     let integrity: String = connection
         .query_row("PRAGMA quick_check(1)", [], |row| row.get(0))
         .map_err(|error| {
@@ -206,16 +209,23 @@ pub(crate) fn preflight_for_reader(connection: &Connection, supported: i64) -> R
 
 /// Cheap writer fence within the existing storage transaction. A migrated
 /// manager cannot write typed history into a downgraded or foreign store.
-pub(crate) fn require_current_writer(connection: &Connection) -> Result<(),ContextError> {
-    let version: i64 = connection.pragma_query_value(None,"user_version",|row|row.get(0))
-        .map_err(|_|storage_error("cannot verify storage writer version"))?;
-    let application: i64 = connection.pragma_query_value(None,"application_id",|row|row.get(0))
-        .map_err(|_|storage_error("cannot verify storage writer ownership"))?;
+pub(crate) fn require_current_writer(connection: &Connection) -> Result<(), ContextError> {
+    let version: i64 = connection
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .map_err(|_| storage_error("cannot verify storage writer version"))?;
+    let application: i64 = connection
+        .pragma_query_value(None, "application_id", |row| row.get(0))
+        .map_err(|_| storage_error("cannot verify storage writer ownership"))?;
     let metadata = read_storage_metadata(connection)?;
-    if application != APPLICATION_ID || version != CURRENT_SCHEMA_VERSION
-        || metadata.application_id != APPLICATION_ID || metadata.schema_version != CURRENT_SCHEMA_VERSION
-        || metadata.min_reader_schema_version != MIN_READER_SCHEMA_VERSION {
-        return Err(storage_error("storage schema or minimum reader is incompatible with typed history"));
+    if application != APPLICATION_ID
+        || version != CURRENT_SCHEMA_VERSION
+        || metadata.application_id != APPLICATION_ID
+        || metadata.schema_version != CURRENT_SCHEMA_VERSION
+        || metadata.min_reader_schema_version != MIN_READER_SCHEMA_VERSION
+    {
+        return Err(storage_error(
+            "storage schema or minimum reader is incompatible with typed history",
+        ));
     }
     Ok(())
 }

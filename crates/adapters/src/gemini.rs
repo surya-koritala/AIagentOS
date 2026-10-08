@@ -73,6 +73,7 @@ impl GeminiSession {
         cancellation: &tokio_util::sync::CancellationToken,
         events: Option<ProviderEventSink>,
     ) -> Result<LlmResponse, ConnectorError> {
+        self.validate_content(&messages)?;
         let mut body = protocol::request(&messages, tools, &self.provider_id, &self.model)?;
         if let Some(max_output_tokens) = options.max_output_tokens {
             body["generationConfig"] = serde_json::json!({"maxOutputTokens": max_output_tokens});
@@ -96,6 +97,7 @@ impl GeminiSession {
             events,
         )
         .await
+        .map_err(|error|crate::vision::protect_error(error,&messages))
     }
 }
 
@@ -161,7 +163,7 @@ impl LlmSession for GeminiSession {
                 })?;
                 protocol::response(&json, &self.provider_id, &self.model)
             }
-            Ok(resp) => Err(crate::provider_http_error(&self.provider_id, resp).await),
+            Ok(resp) => Err(crate::vision::protect_error(crate::provider_http_error(&self.provider_id, resp).await,&messages)),
             Err(e) => Err(crate::transport_error(&self.provider_id, e)),
         }
     }
@@ -250,7 +252,10 @@ impl LlmProviderAdapter for GeminiAdapter {
     fn capabilities(&self) -> kernel::connector::ProviderCapabilities {
         kernel::connector::ProviderCapabilities {
             prompt_cancellation: true,
-            vision: self.image_profile.as_ref().is_some_and(|profile|profile.validate(&self.model).is_ok()),
+            vision: self
+                .image_profile
+                .as_ref()
+                .is_some_and(|profile| profile.validate(&self.model).is_ok()),
             native_streaming: true,
             tool_calls: true,
             parallel_tool_calls: true,

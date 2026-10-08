@@ -3791,8 +3791,10 @@ fn mutation_operation_name(call: &Syscall) -> &'static str {
         Syscall::CallTool { .. } | Syscall::VfsInvoke { .. } => "tool call",
         Syscall::VfsOpen { .. } => "VFS open",
         Syscall::VfsClose { .. } => "VFS close",
-        Syscall::SendMessage { .. } | Syscall::SendMessageStream { .. }
-        | Syscall::SendMessageContent { .. } | Syscall::SendMessageContentStream { .. } => "agent turn",
+        Syscall::SendMessage { .. }
+        | Syscall::SendMessageStream { .. }
+        | Syscall::SendMessageContent { .. }
+        | Syscall::SendMessageContentStream { .. } => "agent turn",
         Syscall::FencedAgentMutation { mutation, .. } => mutation_operation_name(mutation),
         _ => "side-effecting syscall",
     }

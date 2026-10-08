@@ -18,12 +18,12 @@ use crate::{AgentId, ContextError};
 
 #[path = "context/branching.rs"]
 mod branching;
-#[cfg(test)]
-mod image_input_tests;
 #[path = "context/clone_store.rs"]
 mod clone_store;
 #[path = "context/fact_index.rs"]
 pub(crate) mod fact_index;
+#[cfg(test)]
+mod image_input_tests;
 #[path = "context/shared_spills.rs"]
 mod shared_spills;
 pub use branching::{

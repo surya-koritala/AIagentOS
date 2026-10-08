@@ -242,7 +242,7 @@ pub(super) fn response(
     }
     let usage = &json["usageMetadata"];
     Ok(LlmResponse {
-        content: message.content.into(),
+        content: message.content.text_only(provider)?,
         finish_reason: candidate["finishReason"].as_str().map(str::to_string),
         tokens_used: crate::json_usage_u32(&usage["totalTokenCount"]),
         usage: LlmUsage::reported(

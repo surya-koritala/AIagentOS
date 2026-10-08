@@ -92,7 +92,7 @@ fn flatten_prompt(messages: &[StandardMessage]) -> String {
     for m in messages {
         prompt.push_str(&m.role);
         prompt.push_str(": ");
-        prompt.push_str(&m.content);
+        prompt.push_str(&m.content.text_projection());
         prompt.push('\n');
     }
     prompt.push_str("assistant: ");

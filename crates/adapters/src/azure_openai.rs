@@ -201,7 +201,7 @@ impl LlmSession for AzureSession {
                     provider_metadata: None,
                 })
             }
-            Ok(resp) => Err(crate::provider_http_error(&self.provider_id, resp).await),
+            Ok(resp) => Err(crate::vision::protect_error(crate::provider_http_error(&self.provider_id, resp).await,&messages)),
             Err(e) => Err(crate::transport_error(&self.provider_id, e)),
         }
     }
@@ -242,6 +242,7 @@ impl LlmSession for AzureSession {
             None,
         )
         .await
+        .map_err(|error|crate::vision::protect_error(error,&messages))
     }
 
     async fn send_streaming_events_controlled(
@@ -261,6 +262,7 @@ impl LlmSession for AzureSession {
             Some(events),
         )
         .await
+        .map_err(|error|crate::vision::protect_error(error,&messages))
     }
 
     fn enforces_max_output_tokens(&self) -> bool {
@@ -301,7 +303,10 @@ impl LlmProviderAdapter for AzureOpenAiAdapter {
     }
     fn capabilities(&self) -> kernel::connector::ProviderCapabilities {
         kernel::connector::ProviderCapabilities {
-            vision: self.image_profile.as_ref().is_some_and(|profile|profile.validate(&self.deployment).is_ok()),
+            vision: self
+                .image_profile
+                .as_ref()
+                .is_some_and(|profile| profile.validate(&self.deployment).is_ok()),
             native_streaming: true,
             tool_calls: true,
             parallel_tool_calls: true,

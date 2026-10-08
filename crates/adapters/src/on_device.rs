@@ -475,7 +475,7 @@ pub fn build_prompt_with_template(messages: &[StandardMessage], template: ChatTe
                 out.push_str("<|im_start|>");
                 out.push_str(&message.role);
                 out.push('\n');
-                out.push_str(&message.content);
+                out.push_str(&message.content.text_projection());
                 out.push_str("<|im_end|>\n");
             }
             out.push_str("<|im_start|>assistant\n");
@@ -487,7 +487,7 @@ pub fn build_prompt_with_template(messages: &[StandardMessage], template: ChatTe
                 out.push_str("<|start_header_id|>");
                 out.push_str(&message.role);
                 out.push_str("<|end_header_id|>\n\n");
-                out.push_str(&message.content);
+                out.push_str(&message.content.text_projection());
                 out.push_str("<|eot_id|>");
             }
             out.push_str("<|start_header_id|>assistant<|end_header_id|>\n\n");

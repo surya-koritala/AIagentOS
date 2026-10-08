@@ -65,6 +65,7 @@ impl AnthropicSession {
         cancellation: &tokio_util::sync::CancellationToken,
         events: Option<ProviderEventSink>,
     ) -> Result<LlmResponse, ConnectorError> {
+        self.validate_content(&messages)?;
         let body = protocol::request(
             &messages,
             tools,
@@ -89,6 +90,7 @@ impl AnthropicSession {
             events,
         )
         .await
+        .map_err(|error|crate::vision::protect_error(error,&messages))
     }
 }
 
@@ -189,7 +191,7 @@ impl LlmSession for AnthropicSession {
                     tool_calls,
                 })
             }
-            Ok(resp) => Err(crate::provider_http_error(&self.provider_id, resp).await),
+            Ok(resp) => Err(crate::vision::protect_error(crate::provider_http_error(&self.provider_id, resp).await,&messages)),
             Err(e) => Err(crate::transport_error(&self.provider_id, e)),
         }
     }
@@ -277,7 +279,10 @@ impl LlmProviderAdapter for AnthropicAdapter {
     }
     fn capabilities(&self) -> kernel::connector::ProviderCapabilities {
         kernel::connector::ProviderCapabilities {
-            vision: self.image_profile.as_ref().is_some_and(|profile|profile.validate(&self.model).is_ok()),
+            vision: self
+                .image_profile
+                .as_ref()
+                .is_some_and(|profile| profile.validate(&self.model).is_ok()),
             native_streaming: true,
             tool_calls: true,
             parallel_tool_calls: true,

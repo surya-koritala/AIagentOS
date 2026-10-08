@@ -185,6 +185,7 @@ async fn image_input_unknown_profile_unsupported_modes_and_audio_send_zero_reque
                 session.send(vec![message.clone()]).await,
                 Err(ConnectorError::UnsupportedContent(_))
             ));
+            assert!(matches!(session.send_streaming_with_options(vec![message.clone()],&[],LlmRequestOptions::default()).await,Err(ConnectorError::UnsupportedContent(_))));
             assert!(matches!(
                 session
                     .send_streaming_controlled(
@@ -371,4 +372,57 @@ async fn image_input_invalid_containers_and_model_profiles_fail_before_io() {
             .is_err());
     }
     assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn image_input_failover_reserves_largest_profile_and_skips_unsupported_backup() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST")).and(path("/chat/completions")).respond_with(ResponseTemplate::new(503)).expect(1).mount(&server).await;
+    Mock::given(method("POST")).and(path("/openai/deployments/vision-fixture/chat/completions")).respond_with(ResponseTemplate::new(200).set_body_json(json!({"choices":[{"message":{"content":"image backup"},"finish_reason":"stop"}],"usage":{"prompt_tokens":7000,"completion_tokens":2}}))).expect(1).mount(&server).await;
+    let connector = Arc::new(AgentConnectorImpl::new().with_retry_policy(RetryPolicy{max_attempts:1,..RetryPolicy::default()}));
+    connector.register_provider(Arc::new(crate::openai::OpenAiAdapter::new("fixture-key".into()).with_base_url(server.uri()).with_model("vision-fixture".into()).with_image_input_profile(profile()))).unwrap();
+    connector.register_provider(Arc::new(crate::local::LocalLlmAdapter::new(server.uri(),"fixture".into()))).unwrap();
+    connector.register_provider(Arc::new(crate::azure_openai::AzureOpenAiAdapter::new(server.uri(),"vision-fixture".into(),"fixture-key".into()).with_image_input_profile(ImageInputProfile{model_id:"vision-fixture".into(),max_tokens_per_image:7000}))).unwrap();
+    connector.set_backup(&"openai".into(),&"local".into()); connector.set_backup(&"local".into(),&"azure-openai".into());
+    let session = connector.connect_resilient("00000000-0000-0000-0000-000000000001".parse().unwrap(),&"openai".into()).await.unwrap();
+    assert_eq!(session.validate_content(&[message()]).unwrap(),7000);
+    let response = session.send(vec![message()]).await.unwrap(); assert_eq!(response.content,"image backup");
+    assert_eq!(session.last_attribution(),Some(("azure-openai".into(),"vision-fixture".into())));
+    let requests = server.received_requests().await.unwrap(); assert_eq!(requests.len(),2);
+    assert!(requests.iter().all(|request|request.url.path().ends_with("chat/completions")));
+}
+
+#[test]
+fn image_input_jpeg_mime_is_preserved_by_all_four_documented_compilers() {
+    let mut bytes = vec![0xff,0xd8];
+    let mut segment = |marker: u8,data: &[u8]| {bytes.extend_from_slice(&[0xff,marker]);bytes.extend_from_slice(&((data.len()+2) as u16).to_be_bytes());bytes.extend_from_slice(data);};
+    let mut quantization = vec![0];quantization.extend_from_slice(&[1;64]);segment(0xdb,&quantization);
+    segment(0xc0,&[8,0,1,0,1,1,1,0x11,0]);
+    let mut huffman = vec![0,1];huffman.extend_from_slice(&[0;15]);huffman.push(0);huffman.extend_from_slice(&[0x10,1]);huffman.extend_from_slice(&[0;15]);huffman.push(0);
+    segment(0xc4,&huffman);segment(0xda,&[1,1,0,0,63,0]);bytes.extend_from_slice(&[0x3f,0xff,0xd9]);
+    let image = ImageInput::from_bytes(ImageMediaType::Jpeg,&bytes).unwrap();let data = image.base64_data().to_string();
+    let content = MessageContent::parts(vec![ContentPart::Image{image}]).unwrap();
+    assert_eq!(crate::vision::openai_content(&content)[0]["image_url"]["url"],format!("data:image/jpeg;base64,{data}"));
+    assert_eq!(crate::vision::anthropic_content(&content)[0]["source"],json!({"type":"base64","media_type":"image/jpeg","data":data}));
+    assert_eq!(crate::vision::gemini_parts(&content)[0]["inlineData"],json!({"mimeType":"image/jpeg","data":data}));
+}
+
+#[tokio::test]
+async fn image_input_http_diagnostics_and_request_ids_cannot_echo_encoded_images() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST")).respond_with(ResponseTemplate::new(429).insert_header("x-request-id",PNG).insert_header("retry-after","2")
+        .set_body_json(json!({"error":{"message":format!("vendor echoed {PNG}"),"data":PNG,"image_url":format!("data:image/png;base64,{PNG}")}}))).expect(8).mount(&server).await;
+    let adapters: Vec<Box<dyn LlmProviderAdapter>> = vec![
+        Box::new(crate::openai::OpenAiAdapter::new("fixture-key".into()).with_base_url(server.uri()).with_model("vision-fixture".into()).with_image_input_profile(profile())),
+        Box::new(crate::azure_openai::AzureOpenAiAdapter::new(server.uri(),"vision-fixture".into(),"fixture-key".into()).with_image_input_profile(profile())),
+        Box::new(crate::anthropic::AnthropicAdapter::new("fixture-key".into()).with_base_url(server.uri()).with_model("vision-fixture".into()).with_image_input_profile(profile())),
+        Box::new(crate::gemini::GeminiAdapter::new("fixture-key".into()).with_base_url(server.uri()).with_model("vision-fixture".into()).with_image_input_profile(profile())),
+    ];
+    for adapter in adapters {
+        let session = adapter.create_session().await.unwrap();
+        for error in [session.send(vec![message()]).await.unwrap_err(),session.send_streaming_controlled(vec![message()],&[],LlmRequestOptions::default(),&tokio_util::sync::CancellationToken::new()).await.unwrap_err()] {
+            assert!(!format!("{error:?}").contains(PNG));assert!(!error.to_string().contains(PNG));assert!(error.request_id().is_none());
+            match error { ConnectorError::RateLimited(rate) => assert_eq!(rate.retry_after_ms,Some(2000)), other=>panic!("changed typed throttle class: {other:?}") }
+        }
+    }
 }

@@ -16,6 +16,25 @@ pub(crate) fn preflight(
     kernel::message_content::validate_messages(messages, &provider.to_string(), profile)
 }
 
+/// Vendor diagnostics and request IDs can echo an image under arbitrary JSON
+/// keys. Preserve the typed class and retry hint, never their untrusted text.
+pub(crate) fn protect_error(mut error: ConnectorError,messages: &[StandardMessage]) -> ConnectorError {
+    if !messages.iter().any(|message|message.content.images().next().is_some()) { return error; }
+    match &mut error {
+        ConnectorError::Authentication(context)|ConnectorError::Authorization(context)
+        |ConnectorError::ServiceUnavailable(context)|ConnectorError::InvalidRequest(context)
+        |ConnectorError::ToolIncompatiblePrimary(context)|ConnectorError::UnsupportedContent(context)
+        |ConnectorError::ContentFiltered(context)|ConnectorError::Timeout(context)|ConnectorError::Cancelled(context) => {
+            context.message="image request failed; provider diagnostic redacted".into();context.request_id=None;
+        }
+        ConnectorError::RateLimited(rate) => {rate.context.message="image request rate limited; provider diagnostic redacted".into();rate.context.request_id=None;}
+        ConnectorError::ConnectionFailed(detail)|ConnectorError::ProtocolError(detail)
+        |ConnectorError::StreamError(detail)|ConnectorError::PartialStream(detail) => {*detail="image request failed; provider diagnostic redacted".into();}
+        ConnectorError::ProviderUnavailable(_) => {},
+    }
+    error
+}
+
 pub(crate) fn openai_content(content: &MessageContent) -> Value {
     match content {
         MessageContent::Text(text) => json!(text),

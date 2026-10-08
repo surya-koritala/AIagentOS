@@ -340,17 +340,25 @@ fn seal_tail(
         shared_spills::attach_tail(conn, &metadata.id.to_string(), agent, tenant, conversation)?;
     conn.execute("UPDATE execution_context_snapshots SET spill_manifest_hash = ?1,node_hash = ?2 WHERE id = ?3",
         params![&manifest,node_hash(&metadata,tenant,&parent,&digest,&manifest)?,metadata.id.to_string()]).map_err(sql_error)?;
-    let payload: String = conn.query_row(
-        "SELECT payload_json FROM execution_context_snapshots WHERE id = ?1",
-        [metadata.id.to_string()],|row|row.get(0)
-    ).map_err(sql_error)?;
-    let messages: Vec<StandardMessage> = serde_json::from_str(&payload)
-        .map_err(|_|failed("invalid execution snapshot content"))?;
-    let projection = messages.iter().map(|message|message.content.text_projection()).collect::<Vec<_>>().join(" ");
+    let payload: String = conn
+        .query_row(
+            "SELECT payload_json FROM execution_context_snapshots WHERE id = ?1",
+            [metadata.id.to_string()],
+            |row| row.get(0),
+        )
+        .map_err(sql_error)?;
+    let messages: Vec<StandardMessage> =
+        serde_json::from_str(&payload).map_err(|_| failed("invalid execution snapshot content"))?;
+    let projection = messages
+        .iter()
+        .map(|message| message.content.text_projection())
+        .collect::<Vec<_>>()
+        .join(" ");
     conn.execute(
         "INSERT INTO execution_snapshot_fts(snapshot_id,content) VALUES (?1,?2)",
-        params![metadata.id.to_string(),projection]
-    ).map_err(sql_error)?;
+        params![metadata.id.to_string(), projection],
+    )
+    .map_err(sql_error)?;
     crash_multi_table_mutation_after_step_for_test("fork.snapshot");
     Ok(metadata)
 }

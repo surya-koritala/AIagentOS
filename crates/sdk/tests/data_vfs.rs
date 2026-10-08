@@ -731,7 +731,7 @@ async fn persistent_data_survives_restart_and_old_descriptors_do_not() {
             .wire_code(),
         Some(WireErrorCode::NotFound)
     );
-    // Interrupted running agents rehydrate as non-runnable; durable data is retained.
+    // The same runnable owner is restored, with private durable data retained.
     assert_eq!(
         kernel
             .context_manager
@@ -740,6 +740,11 @@ async fn persistent_data_survives_restart_and_old_descriptors_do_not() {
             .as_deref(),
         Some("survived")
     );
+    assert_eq!(client.agent_status(&actor).await.unwrap(), "Running");
+    let fresh = client.vfs_open_kv(&actor, "/kv", "key", vec![Right::Read]).await.unwrap();
+    assert_ne!(fresh.id, old);
+    assert_eq!(client.vfs_read_data(&actor, &fresh.id, serde_json::json!({})).await.unwrap()["value"], "survived");
+    client.vfs_close(&actor, fresh.id).await.unwrap();
     client.close().await.unwrap();
     task.abort();
     let _ = task.await;

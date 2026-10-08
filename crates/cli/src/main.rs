@@ -50,6 +50,7 @@ USAGE:
 OPTIONS:
   -c <COMMAND>                   Run one command and exit
   --conversation <ID>            Resume a registered local conversation <ID>
+  --config <PATH>                Use a private configuration file
   -h, --help                     Print this help and exit
   -V, --version                  Print the exact build version and exit
 
@@ -60,7 +61,7 @@ canonical operator client for an already-running kernel.";
 /// Options `agent` understands. Anything else beginning with `-` is a usage
 /// error: without this the argument fell through and was treated as a prompt,
 /// so a typo booted the kernel and persisted an agent row.
-const KNOWN_FLAGS: [&str; 6] = ["-c", "--conversation", "-h", "--help", "-V", "--version"];
+const KNOWN_FLAGS: [&str; 7] = ["-c", "--conversation", "--config", "-h", "--help", "-V", "--version"];
 
 /// First unrecognized option in `argv`, if any. `-c` and `--conversation`
 /// consume the following value, which may itself begin with `-`.
@@ -75,7 +76,7 @@ fn unrecognized_flag(argv: &[String]) -> Option<&str> {
             if !KNOWN_FLAGS.contains(&argument) {
                 return Some(argument);
             }
-            if matches!(argument, "-c" | "--conversation") {
+            if matches!(argument, "-c" | "--conversation" | "--config") {
                 index += 1;
             }
         }
@@ -115,9 +116,24 @@ async fn main() {
         std::process::exit(2);
     }
 
+    let config_path = argv.iter().position(|argument| argument == "--config").map(|index| {
+        argv.get(index + 1).filter(|path| !path.trim().is_empty())
+            .unwrap_or_else(|| {
+                eprintln!("agent: --config requires a path\n\n{USAGE}");
+                std::process::exit(2);
+            })
+    });
+
     // Install structured logging first so kernel init (persistence/auth) logs emit.
     logging::init_logging();
-    let config = Config::try_load()
+    let config = match config_path {
+        Some(path) => {
+            let path = std::path::Path::new(path);
+            if !path.is_file() { fail(format!("explicit configuration file is missing or is not a file: {}", path.display())); }
+            Config::try_load_from(path)
+        }
+        None => Config::try_load(),
+    }
         .unwrap_or_else(|error| fail(format!("failed to load configuration: {error}")));
     // Startup failures (unwritable data dir, corrupt DB, unreachable provider)
     // degrade to a clear message + non-zero exit rather than a panic backtrace.

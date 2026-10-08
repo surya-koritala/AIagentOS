@@ -10,6 +10,11 @@ rules and their UUIDs, operator identity, and creation times. `/unlearn UUID`
 removes the rule. Both changes survive an ordinary quit and restart of
 `agent`; no conversation flag is required. A missing rule or failed write
 produces an error, never a success acknowledgment.
+The existing platform configuration location remains the default. Optional
+`agent --config PATH` selects a particular private configuration file; a
+missing explicit file is an error before the kernel creates durable state.
+This permits isolated Windows CI fixtures without changing the runner's
+native user configuration or relying on ignored `APPDATA` overrides.
 An uncertain durability failure fences further rule use until the process
 reopens the store, so a failed acknowledgment cannot cause a later overwrite
 from stale in-memory state.

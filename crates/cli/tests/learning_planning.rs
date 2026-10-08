@@ -618,6 +618,8 @@ async fn planning_quota_denial_happens_before_provider_io() {
 
 fn binary_command(home: &Path) -> Command {
     let mut child = Command::new(env!("CARGO_BIN_EXE_agent"));
+    #[cfg(windows)]
+    child.arg("--config").arg(home.join("ai-agent-os/config.toml"));
     for name in [
         "HOME",
         "XDG_CONFIG_HOME",
